@@ -140,7 +140,7 @@ impl OpMatcher for ConstantMatcher {
 // ---------------------------------------------------------------------------
 
 use crate::kernels::expect_op;
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// Constant fill — LogicalConstant is F32 by its dtype rule.
 pub(crate) fn kernel(

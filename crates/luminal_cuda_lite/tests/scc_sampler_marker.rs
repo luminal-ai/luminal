@@ -18,12 +18,12 @@
 //! Election at 2x4 is REPORTED, not asserted (the 12x16 pin in
 //! `cublaslt_election.rs` owns that claim).
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
 
 fn weights(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
@@ -39,12 +39,12 @@ fn canonical_2d_matmul_searches_green_at_the_harness_budget() {
     let _out = a.matmul(b).output();
 
     let mut rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
-    let data: FxHashMap<NodeIndex, TypedBuffer> =
+    let data: FxHashMap<NodeIndex, HostBuffer> =
         [(a.id, weights(32, 1).into()), (b.id, weights(24, 2).into())]
             .into_iter()
             .collect();
 
-    let options = luminal::test_support::harness_search_options();
+    let options = luminal_cuda_lite::harness_search_options();
     let outcome = rt
         .search(&data, &options)
         .unwrap_or_else(|e| panic!("the marker 2-cycle must not exhaust the 2x4 budget: {e:#}"));

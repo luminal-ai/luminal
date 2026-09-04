@@ -27,20 +27,20 @@
 //!    creation; the decoded `L` IS the read path, and how it is spelled
 //!    is the e-graph's business.)
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::implementation_search::ImplementationSearchOptions;
 use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
 
 /// Search budget for the view fixtures: profiling is static (bytes
 /// moved), so generations are cheap — enough sampling that the
 /// all-views plan is reliably in the profiled set, seeded for
 /// deterministic pins.
-fn view_search_options() -> ImplementationSearchOptions {
-    ImplementationSearchOptions {
+fn view_search_options() -> CompileOptions {
+    CompileOptions {
         generations: 4,
         generation_size: 8,
         mutations: 4,
@@ -53,10 +53,10 @@ fn view_search_options() -> ImplementationSearchOptions {
 /// Load → search on the CUDA runtime; return the best plan.
 fn plan_for(
     cx: &Graph,
-    inputs: &[(NodeIndex, TypedBuffer)],
-) -> BufferIrGraph<luminal_cuda_lite::CudaLayout> {
+    inputs: &[(NodeIndex, HostBuffer)],
+) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     let mut rt = CudaRuntime::load(cx).expect("cuda load");
-    let data: FxHashMap<NodeIndex, TypedBuffer> = inputs.iter().cloned().collect();
+    let data: FxHashMap<NodeIndex, HostBuffer> = inputs.iter().cloned().collect();
     let outcome = rt
         .search(&data, &view_search_options())
         .expect("cuda search");
@@ -68,9 +68,9 @@ fn plan_for(
 /// (compute_count, copy_count, buffer_count, folded slots) — a "folded
 /// slot" being an operand whose carried layout does NOT reduce to the
 /// identity read over its own domain.
-type FoldedSlot = (String, usize, luminal_cuda_lite::CudaLayout);
+type FoldedSlot = (String, usize, luminal::layouts::DecodedLayout);
 fn audit(
-    plan: &BufferIrGraph<luminal_cuda_lite::CudaLayout>,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
 ) -> (usize, usize, usize, Vec<FoldedSlot>) {
     let mut computes = 0usize;
     let mut copies = 0usize;
@@ -204,7 +204,7 @@ fn eval_term(expr: &luminal::layouts::IntExprTerm, coords: &[usize]) -> i64 {
 /// frames. (Honesty note carried from the kernels module: with the chain
 /// gone, the only bounds fence is the final index against the layout's
 /// span where the constructor discloses one.)
-fn flat_index(layout: &luminal_cuda_lite::CudaLayout, out_coord: &[usize]) -> i64 {
+fn flat_index(layout: &luminal::layouts::DecodedLayout, out_coord: &[usize]) -> i64 {
     use luminal::layouts::MirrorLayout as M;
     let flat = match &layout.mirror {
         M::RightMajor(rm) => {

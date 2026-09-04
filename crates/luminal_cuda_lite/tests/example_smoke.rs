@@ -6,12 +6,12 @@
 //! CUDA search path without making the full-size applications into smoke
 //! tests.
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
 use mini_conv::MiniConvNet;
 
 /// The examples' shared seeding discipline (examples/support/mod.rs,
@@ -28,17 +28,17 @@ fn conv_example_graph_searches_with_zero_refusals() {
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
     let x = cx.tensor((1, 1, 5, 5), DType::F32);
     let out = model.forward(x).output();
-    let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (x.id, weights(25, 1).into()),
         (model.conv1.weight.id, weights(18, 2).into()),
         (model.conv2.weight.id, weights(54, 3).into()),
         (model.head.weight.id, weights(6, 4).into()),
     ];
-    let data: FxHashMap<NodeIndex, TypedBuffer> = pairs.iter().cloned().collect();
+    let data: FxHashMap<NodeIndex, HostBuffer> = pairs.iter().cloned().collect();
 
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let outcome = rt
-        .search(&data, &luminal::test_support::harness_search_options())
+        .search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("cuda search");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
     let b = &outcome.refusal_breakdown;

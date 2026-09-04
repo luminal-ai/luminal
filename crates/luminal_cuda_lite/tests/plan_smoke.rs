@@ -23,7 +23,7 @@ fn search_produces_a_codegen_complete_plan() {
     .into_iter()
     .collect();
     let outcome = rt
-        .search(&data, &luminal::test_support::harness_search_options())
+        .search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("search under the CUDA allow list");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
 
@@ -65,7 +65,7 @@ fn search_produces_a_codegen_complete_plan() {
         // the hand-computed numerics: (a+b)*a.
         rt.execute().expect("device execute");
         let got = rt.get_f32(_out.id).expect("output payload");
-        assert_eq!(got, &vec![11.0f32, 44., 99., 176., 275., 396.]);
+        assert_eq!(got, vec![11.0f32, 44., 99., 176., 275., 396.]);
     }
 }
 
@@ -77,8 +77,8 @@ fn codegen_emits_wellformed_sources() {
     use luminal::layouts::{
         BitWidthTerm, IntExprTerm, MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm,
     };
-    fn rm_layout(dims: &[i64]) -> luminal_cuda_lite::layouts::CudaLayout {
-        luminal_cuda_lite::layouts::CudaLayout {
+    fn rm_layout(dims: &[i64]) -> luminal_cuda_lite::layouts::DecodedLayout {
+        luminal_cuda_lite::layouts::DecodedLayout {
             mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
                 shape: ShapeTerm(dims.iter().map(|&d| IntExprTerm::Lit(d)).collect()),
                 width: BitWidthTerm(32),

@@ -5,18 +5,19 @@
 //!
 //! Everything up to `execute` is device-free and runs anywhere: load
 //! accumulates the native program parts, bind_* appends bounds seeds,
-//! search assembles + saturates + runs the genetic search with OUR
-//! allow list (candidate profiling stays on the reference host
-//! executor in CL-1 — a documented cost proxy). Only `execute`
-//! requires the `device` feature and a CUDA device.
+//! search assembles + saturates + runs THIS crate's genetic search
+//! ([`crate::search`]) with OUR allow list, ranking candidates by the
+//! device-free heuristic ([`crate::heuristic`] — a weak static prior,
+//! not a measurement). Only `execute` requires the `device` feature and
+//! a CUDA device.
 
+use crate::host_buffer::HostBuffer;
 use anyhow::{anyhow, bail, Context, Result};
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferIrGraph;
 
-use crate::layouts::CudaLayout;
+use crate::search::{CompileOptions, SearchOutcome};
 use luminal::graph;
-use luminal::implementation_search::{ImplementationSearchOptions, SearchOutcome};
+use luminal::layouts::DecodedLayout;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal::shape;
 
@@ -41,17 +42,26 @@ pub struct CudaRuntime {
     /// re-description 2-cycle (see [`crate::ops::cuda_registry_with_cublaslt`]);
     /// enabled through [`CudaRuntime::load_with_cublaslt`].
     cublaslt: bool,
-    plan: Option<BufferIrGraph<CudaLayout>>,
+    plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Host-staged input payloads by BufferLit id, H2D'd at execute.
-    staged: FxHashMap<i64, TypedBuffer>,
+    staged: FxHashMap<i64, HostBuffer>,
     /// Host copies of each output slot's BACKING buffer plus its elected
     /// layout, filled by execute (D2H) — the escape-and-disclose fetch,
     /// keyed by slot index (an escaped slot's backing buffer is a minted
     /// allocation with no BufferLit, so slot order is the stable key).
-    outputs_host: FxHashMap<usize, (TypedBuffer, luminal::bufferize::OutputBinding<CudaLayout>)>,
+    outputs_host: FxHashMap<usize, (HostBuffer, luminal::bufferize::OutputBinding<DecodedLayout>)>,
     input_buffers: FxHashMap<NodeIndex, i64>,
     /// Bound output tensor → its slot index (program slot order).
     output_index: FxHashMap<NodeIndex, usize>,
+    /// BUCKETS (D7, 2026-09-03): per-dim intervals one search covers.
+    /// Empty = the ordinary single-pin ladder, unchanged.
+    dim_buckets: std::collections::BTreeMap<shape::Symbol, Vec<graph::DimBucket>>,
+    /// One finished plan per Cartesian bucket combination.
+    bucket_plans: Vec<crate::search::BucketPlan>,
+    /// The dim values this runtime currently holds — every `[n, n]`
+    /// `bind_dyn_range` pin plus whatever [`Self::set_dim`] sets. With
+    /// buckets bound this is what picks the plan at execute time.
+    dims: shape::DynMap,
 }
 
 impl CudaRuntime {
@@ -107,15 +117,109 @@ impl CudaRuntime {
         lower: u64,
         upper: u64,
     ) -> Result<()> {
+        let name = var.into();
+        anyhow::ensure!(
+            !self.dim_buckets.contains_key(&name),
+            "dim `{name}` has buckets bound; a bucketed dim is seeded per bucket \
+             and must not carry a second range binding"
+        );
         let native = self
             .native
             .as_mut()
             .ok_or_else(|| anyhow!("load before bind"))?;
-        let name = var.into();
         native.binding_seeds.push_str(&format!(
             "(set (lower-bound-of (IntVar \"{name}\")) (bigint {lower}))\n\
              (set (upper-bound-of (IntVar \"{name}\")) (bigint {upper}))\n"
         ));
+        // A tight [n, n] binding IS a pin: remember it, so a bucketed
+        // plan's representative records the whole assignment.
+        if lower == upper {
+            self.dims.insert(name, lower as usize);
+        }
+        Ok(())
+    }
+
+    /// BIND BUCKETS for a dynamic dimension (D7, 2026-09-03): a set of
+    /// disjoint intervals, each of which gets its own searched plan.
+    /// `search` then runs one search per Cartesian combination and
+    /// `execute` picks the covering plan from the current dims.
+    ///
+    /// THE BUCKETS MUST PARTITION CLEANLY: non-empty, sorted by `min`,
+    /// and pairwise disjoint. Overlap is REFUSED rather than resolved
+    /// first-wins — two plans that both claim a value is an ambiguity in
+    /// the caller's model, and picking one silently is how a graph ends
+    /// up running the plan its author did not mean.
+    pub fn bind_dim_buckets(
+        &mut self,
+        dim: impl Into<shape::Symbol>,
+        buckets: Vec<graph::DimBucket>,
+    ) -> Result<()> {
+        let dim = dim.into();
+        anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
+        anyhow::ensure!(
+            !self.dims.contains_key(&dim),
+            "dim `{dim}` is already pinned by bind_dyn_range; a bucketed dim is \
+             seeded per bucket and must not carry a second range binding"
+        );
+        for pair in buckets.windows(2) {
+            anyhow::ensure!(
+                pair[0].max < pair[1].min,
+                "dim `{dim}` buckets must be sorted and disjoint, but [{}, {}] and \
+                 [{}, {}] are not",
+                pair[0].min,
+                pair[0].max,
+                pair[1].min,
+                pair[1].max
+            );
+        }
+        self.dim_buckets.insert(dim, buckets);
+        Ok(())
+    }
+
+    /// Set a dynamic dimension's value for EXECUTION (D7). With buckets
+    /// bound this is what selects the plan.
+    pub fn set_dim(&mut self, dim: impl Into<shape::Symbol>, value: usize) {
+        self.dims.insert(dim.into(), value);
+    }
+
+    /// The finished per-bucket plans (empty until a bucketed `search`).
+    pub fn bucket_plans(&self) -> &[crate::search::BucketPlan] {
+        &self.bucket_plans
+    }
+
+    /// Pick and load the bucket plan covering the current dims.
+    ///
+    /// THE STATIC-PLAN REFUSAL (the Phase 1 limitation, stated rather
+    /// than solved): a bucket's winning plan was searched at ONE pin and
+    /// carries LITERAL spans, so it allocates and indexes for that pin
+    /// and nothing else. Executing it at another value inside the same
+    /// bucket would silently run the representative's geometry over the
+    /// caller's data, so it is refused by name. Lifting this needs
+    /// symbolic plans (spans as expressions) and the capacity contract
+    /// that goes with them.
+    fn select_bucket_plan(&mut self) -> Result<()> {
+        let Some(plan) = crate::search::select_bucket(&self.bucket_plans, &self.dims) else {
+            let covered: Vec<_> = self.bucket_plans.iter().map(|p| p.ranges.clone()).collect();
+            bail!(
+                "no bucket covers dims {:?}; the searched buckets are {covered:?}",
+                self.dims
+            );
+        };
+        for (dim, representative) in &plan.representative {
+            if let Some(value) = self.dims.get(dim) {
+                anyhow::ensure!(
+                    value == representative,
+                    "bucket {:?} was searched at `{dim} = {representative}` and its plan is \
+                     STATIC at that pin (plan spans are literals), but this runtime is set \
+                     to `{dim} = {value}`. Re-search at this pin, or pick a bucket whose \
+                     representative is it. Running the representative's plan here would \
+                     silently use the wrong geometry — the open item is symbolic plans \
+                     (spans as expressions) and the capacity contract that goes with them.",
+                    plan.ranges
+                );
+            }
+        }
+        self.plan = Some(plan.outcome.best_plan.clone());
         Ok(())
     }
 
@@ -243,33 +347,84 @@ impl CudaRuntime {
     /// isolation to name the door, mirroring the reference runtime.
     pub fn search(
         &mut self,
-        input_data: &FxHashMap<NodeIndex, TypedBuffer>,
-        options: &ImplementationSearchOptions,
-    ) -> Result<SearchOutcome<CudaLayout>> {
+        input_data: &FxHashMap<NodeIndex, HostBuffer>,
+        options: &CompileOptions,
+    ) -> Result<SearchOutcome> {
         let (serialized, program) = self.assemble_and_saturate()?;
         let native = self
             .native
             .as_ref()
             .ok_or_else(|| anyhow!("load before search"))?;
 
-        // Own matchers, own allow list, and a profiler that never
-        // touches another runtime: candidates rank by the heuristic
-        // byte-move estimate (device profiling arrives with CL-3).
-        let outcome = luminal::implementation_search::search_implementations_with_runtime(
-            &serialized,
-            &program,
-            input_data,
-            options,
-            Some(if self.cublaslt {
-                Self::allow_list_with_cublaslt()
-            } else {
-                Self::allow_list()
-            }),
-            self.matchers(),
-            &crate::layouts::CudaLayoutDecoder,
-            &mut luminal::implementation_search::StaticProfiler,
-        )?;
+        // The caller's payloads are CHECKED here and go no further: this
+        // backend's search ranks candidates with the device-free
+        // heuristic (D6, 2026-09-03), which never runs anything, so
+        // there is nothing to stage. The check stays because binding a
+        // tensor that is not an input of the loaded program is a caller
+        // bug either way.
+        for tensor in input_data.keys() {
+            assert!(
+                program
+                    .input_slots
+                    .iter()
+                    .any(|slot| slot.tensor == *tensor),
+                "tensor {tensor:?} is not a bound input"
+            );
+        }
 
+        let allow = Some(if self.cublaslt {
+            Self::allow_list_with_cublaslt()
+        } else {
+            Self::allow_list()
+        });
+
+        // Own matchers, own allow list, own ranking: nothing in this
+        // search touches another runtime.
+        let outcome = if self.dim_buckets.is_empty() {
+            crate::search::search_implementations(
+                &serialized,
+                &program,
+                options,
+                allow,
+                self.matchers(),
+            )?
+        } else {
+            // BUCKETED (D7): one search per Cartesian combination, each
+            // validated bucket-wide before its representative is
+            // searched. Unlike the reference runtime this needs no
+            // per-bucket caller data — the ranking is device-free — so
+            // the ordinary `search` entry serves both shapes.
+            let assembly = crate::search::BucketAssembly {
+                assembled_program: &luminal::egglog_snippet::assembled_program_for(
+                    &self.matchers(),
+                ),
+                pre_schedule: &native.pre_schedule,
+                binding_seeds: &native.binding_seeds,
+                schedule: crate::bindings::CudaBindings::SCHEDULE,
+                post_checks: &native.post_checks,
+                input_slots: &native.input_slots,
+                output_slots: &native.output_slots,
+                base_dims: &self.dims,
+            };
+            let plans = crate::search::bucketed_search_implementations(
+                &assembly,
+                &self.dim_buckets,
+                options,
+                allow,
+                || self.matchers(),
+            )?;
+            let first = plans
+                .first()
+                .map(|plan| plan.outcome.clone())
+                .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
+            self.bucket_plans = plans;
+            first
+        };
+
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("load before search"))?;
         self.input_buffers = native
             .input_slots
             .iter()
@@ -281,13 +436,19 @@ impl CudaRuntime {
             .enumerate()
             .map(|(index, slot)| (slot.tensor, index))
             .collect();
-        self.plan = Some(outcome.best_plan.clone());
+        if self.bucket_plans.is_empty() {
+            self.plan = Some(outcome.best_plan.clone());
+        } else {
+            // With buckets the plan is chosen at execute time; load
+            // eagerly only if the runtime already sits at a covered pin.
+            let _ = self.select_bucket_plan();
+        }
         Ok(outcome)
     }
 
     /// Stage input payload for a bound tensor (host side; H2D happens
     /// inside execute).
-    pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<TypedBuffer>) {
+    pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) {
         let Some(&buffer) = self.input_buffers.get(&tensor) else {
             panic!("set_data on a tensor with no input binding");
         };
@@ -297,6 +458,12 @@ impl CudaRuntime {
     /// Run the plan on the CUDA device. Requires the `device` feature
     /// and an available device; refuses loudly otherwise.
     pub fn execute(&mut self) -> Result<()> {
+        // With buckets bound, the plan is chosen HERE, from the current
+        // dims (see [`Self::select_bucket_plan`] for the static-plan
+        // refusal). Without them nothing changes.
+        if !self.bucket_plans.is_empty() {
+            self.select_bucket_plan()?;
+        }
         let plan = self
             .plan
             .as_ref()
@@ -346,11 +513,27 @@ impl CudaRuntime {
     /// [`Self::output_layout`], read by [`crate::layouts::dense_f32`])
     /// remains correct for every layout and is what callers that cannot
     /// assume a dense output should use.
-    pub fn get_f32(&self, tensor: NodeIndex) -> Result<&Vec<f32>> {
-        match self.fetch(tensor)? {
-            (TypedBuffer::F32(values), _) => Ok(values),
-            (other, _) => bail!("output is {}, not f32", other.type_name()),
-        }
+    pub fn get_f32(&self, tensor: NodeIndex) -> Result<Vec<f32>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_f32()
+    }
+
+    /// [`Self::get_f32`] for 32-bit integer outputs.
+    pub fn get_i32(&self, tensor: NodeIndex) -> Result<Vec<i32>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_i32()
+    }
+
+    /// [`Self::get_f32`] for 64-bit integer outputs.
+    pub fn get_i64(&self, tensor: NodeIndex) -> Result<Vec<i64>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_i64()
+    }
+
+    /// [`Self::get_f32`] for boolean outputs: the two-legal-code bytes.
+    pub fn get_bool8(&self, tensor: NodeIndex) -> Result<&[u8]> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_bool8()
     }
 
     /// The universal escape-and-disclose fetch: the output slot's backing
@@ -359,7 +542,10 @@ impl CudaRuntime {
     pub fn fetch(
         &self,
         tensor: NodeIndex,
-    ) -> Result<(&TypedBuffer, &luminal::bufferize::OutputBinding<CudaLayout>)> {
+    ) -> Result<(
+        &HostBuffer,
+        &luminal::bufferize::OutputBinding<DecodedLayout>,
+    )> {
         let index = self
             .output_index
             .get(&tensor)
@@ -374,12 +560,12 @@ impl CudaRuntime {
     pub fn output_layout(
         &self,
         tensor: NodeIndex,
-    ) -> Result<&luminal::bufferize::OutputBinding<CudaLayout>> {
+    ) -> Result<&luminal::bufferize::OutputBinding<DecodedLayout>> {
         Ok(self.fetch(tensor)?.1)
     }
 
     /// The searched plan, for inspection and tests.
-    pub fn plan(&self) -> Option<&BufferIrGraph<CudaLayout>> {
+    pub fn plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
         self.plan.as_ref()
     }
 }

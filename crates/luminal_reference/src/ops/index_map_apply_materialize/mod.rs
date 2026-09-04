@@ -215,7 +215,7 @@ fn parse_entry_list(
 // ---------------------------------------------------------------------------
 
 use crate::kernels::{expect_op, move_gathered};
-use luminal::buffer_tensor_ir::ReferenceKernelCtx;
+use crate::typed_buffer::ReferenceKernelCtx;
 
 /// Index-map materialization: evaluate the parsed per-axis entry
 /// expressions at every OUT coordinate and copy the addressed parent

@@ -15,18 +15,18 @@
 //! gather, scatter). The allow list stays honest by construction —
 //! search can only elect what this table generates.
 
-use crate::layouts::CudaLayout;
 use anyhow::{bail, Result};
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use luminal::bufferize::SlotDescriptor;
 use luminal::dtype::PlanDtype;
 use luminal::index_expr::IotaExpr;
+use luminal::layouts::DecodedLayout;
 use std::any::TypeId;
 
 /// Geometry + typing for one compute node, in plan order: operands
 /// (destination-last, the DPS convention), then destinations again as
 /// the write set. EVERYTHING here derives from the node's own
-/// [`SlotDescriptor`] layouts — this runtime's carried `CudaLayout` per
+/// [`SlotDescriptor`] layouts — this runtime's carried `DecodedLayout` per
 /// slot: dims are the layout's literal domain extents, dtypes its
 /// carried dtype fact, and EVERY read goes through the layout's own
 /// offset expression ([`layout_read_index`]) — unconditionally, with no
@@ -46,7 +46,7 @@ pub struct CodegenCtx {
     /// operand's OWN elected layout as the runtime's decoder minted it
     /// (for a folded operand, the view's COMPOSED layout, addressing
     /// the residence's bytes directly).
-    pub operand_layouts: Vec<CudaLayout>,
+    pub operand_layouts: Vec<DecodedLayout>,
 }
 
 impl CodegenCtx {
@@ -57,15 +57,15 @@ impl CodegenCtx {
     /// never a guess.
     pub fn from_descriptors(
         label: &str,
-        operand_info: &[SlotDescriptor<CudaLayout>],
-        result_info: &[SlotDescriptor<CudaLayout>],
+        operand_info: &[SlotDescriptor<DecodedLayout>],
+        result_info: &[SlotDescriptor<DecodedLayout>],
     ) -> Result<Self> {
-        let dims_of = |slot: &SlotDescriptor<CudaLayout>, role: &str| -> Result<Vec<usize>> {
+        let dims_of = |slot: &SlotDescriptor<DecodedLayout>, role: &str| -> Result<Vec<usize>> {
             slot.layout.mirror.literal_extents().ok_or_else(|| {
                 anyhow::anyhow!("{label} {role} has symbolic layout extents (no numeric codegen)")
             })
         };
-        let dtype_of = |slot: &SlotDescriptor<CudaLayout>, role: &str| -> Result<PlanDtype> {
+        let dtype_of = |slot: &SlotDescriptor<DecodedLayout>, role: &str| -> Result<PlanDtype> {
             slot.layout
                 .dtype
                 .ok_or_else(|| anyhow::anyhow!("{label} {role} carries no dtype fact"))
@@ -133,7 +133,7 @@ impl CodegenCtx {
     /// There is no companion predicate asking whether it "needs" to be
     /// lowered, because there is nothing to select between: the layout
     /// IS the read, and whatever it simplifies to is what gets emitted.
-    pub fn operand_layout(&self, slot: usize) -> &CudaLayout {
+    pub fn operand_layout(&self, slot: usize) -> &DecodedLayout {
         &self.operand_layouts[slot]
     }
 }
@@ -362,7 +362,7 @@ fn affine_of_term(expr: &luminal::layouts::IntExprTerm, rank: usize) -> Option<A
 /// be literal and equal `dims` (its domain IS the value's shape); a
 /// foreign domain is a planner/decoder incoherence and is refused
 /// downstream, so it yields `None` here rather than a read.
-fn read_affine(layout: &CudaLayout, dims: &[usize]) -> Option<Affine> {
+fn read_affine(layout: &DecodedLayout, dims: &[usize]) -> Option<Affine> {
     use luminal::layouts::MirrorLayout as M;
     let rank = dims.len();
     if layout.mirror.literal_extents().as_deref() != Some(dims) {
@@ -491,7 +491,7 @@ impl<'a> Coords<'a> {
 /// expression simplified to. Callers emit `name[<expr>]` unconditionally.
 pub fn layout_read_index(
     operand: &str,
-    layout: &CudaLayout,
+    layout: &DecodedLayout,
     slot_dims: &[usize],
     coords: Coords<'_>,
 ) -> Result<(String, String)> {

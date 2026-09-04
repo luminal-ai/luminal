@@ -33,9 +33,9 @@ pub fn embedding_projection(input: GraphTensor, weight: GraphTensor) -> GraphTen
 #[cfg(test)]
 mod tests {
     use super::embedding;
-    use luminal::implementation_search::ImplementationSearchOptions;
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
+    use luminal_reference::CompileOptions;
     use luminal_reference::ReferenceRuntime;
     use rustc_hash::FxHashMap;
 
@@ -71,7 +71,7 @@ mod tests {
         data.insert(ids.id, ids_data.clone().into());
         data.insert(weight.id, WEIGHT.to_vec().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&data, &ImplementationSearchOptions::default())
+        rt.search(&data, &CompileOptions::default())
             .expect("search finds a plan");
         rt.set_data(ids.id, ids_data);
         rt.set_data(weight.id, WEIGHT.to_vec());
@@ -103,7 +103,7 @@ mod tests {
         data.insert(ids.id, ids_data.clone().into());
         data.insert(weight.id, WEIGHT.to_vec().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&data, &ImplementationSearchOptions::default())
+        rt.search(&data, &CompileOptions::default())
             .expect("search finds a plan");
         rt.set_data(ids.id, ids_data);
         rt.set_data(weight.id, WEIGHT.to_vec());

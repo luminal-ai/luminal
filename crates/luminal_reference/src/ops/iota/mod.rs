@@ -156,7 +156,7 @@ impl OpMatcher for IotaMatcher {
 // ---------------------------------------------------------------------------
 
 use crate::kernels::expect_op;
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// Iota coordinate generator. Typed dests 2026-08-11: the exact i64
 /// evaluation lands in NATIVE integer storage (the old `as f32` store

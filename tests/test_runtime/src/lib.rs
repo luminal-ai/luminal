@@ -19,13 +19,22 @@
 //! need, while the reference registry moves toward
 //! canonical-layout-only. Nothing is kept in sync on purpose.
 //!
-//! No runtime machinery is duplicated: extraction and egglog assembly
-//! are runtime-injectable
-//! (`luminal::extractor::extract_layout_ir_with_matchers`,
-//! `luminal::egglog_snippet::assembled_program_for`), so this crate is a
-//! MATCHER LIST, its own op folders, and fixture runners. It is
-//! plan-level only — no kernels, no executor: everything it asserts is a
-//! property of an `ExtractedGraph` or a `BufferIrGraph`.
+//! Egglog assembly is runtime-injectable
+//! (`luminal::egglog_snippet::assembled_program_for`), so beyond that
+//! this crate is a MATCHER LIST, its own op folders, and fixture
+//! runners. It is plan-level only — no kernels, no executor: everything
+//! it asserts is a property of an `ExtractedGraph` or a `BufferIrGraph`.
+//!
+//! ONE EXCEPTION, as of the #420/#422 rejoin Phase 1 (2026-09-03):
+//! post-saturation search is runtime-owned, so [`extractor`] and
+//! [`sampler`] are THIS crate's copies of what used to be
+//! `luminal::extractor` and `luminal::implementation_search`. The
+//! charter above says it plainly — "anything it turns out to want from
+//! another runtime gets REPLICATED here, never borrowed" — so the
+//! duplication is the charter working, not a hole in it.
+
+pub mod extractor;
+pub mod sampler;
 
 pub mod bindings;
 pub mod ops;
@@ -115,7 +124,7 @@ fn try_extract_text_with_ops(
     allowed: &[&str],
 ) -> anyhow::Result<Option<ExtractedGraph>> {
     let serialized = serialize_fixture(script_text);
-    luminal::extractor::extract_layout_ir_with_ops_and_matchers(
+    crate::extractor::extract_layout_ir_with_ops_and_matchers(
         &serialized,
         Some(allowed),
         matchers(),
@@ -141,7 +150,7 @@ pub fn serialize_fixture(script_text: &str) -> luminal::prelude::egraph_serializ
 /// runtime's vocabulary.
 pub fn extract_fixture(script_text: &str) -> ExtractedGraph {
     let serialized = serialize_fixture(script_text);
-    luminal::extractor::extract_layout_ir_with_matchers(&serialized, matchers())
+    crate::extractor::extract_layout_ir_with_matchers(&serialized, matchers())
         .expect("extraction succeeds")
         .expect("fixture produced no extracted graph")
 }
@@ -154,15 +163,46 @@ pub fn extract_fixture(script_text: &str) -> ExtractedGraph {
 // ---------------------------------------------------------------------------
 
 type ProducerOrdering<'a> =
-    &'a dyn Fn(&[(String, luminal::extractor::ProducerChoice)], usize) -> Vec<usize>;
+    &'a dyn Fn(&[(String, crate::extractor::ProducerChoice)], usize) -> Vec<usize>;
 
 /// See `luminal_cuda_lite::ops::cublaslt::election::genome_preferring` —
 /// this wrapper binds the board vocabulary.
 pub fn genome_preferring(
     egraph: &luminal::prelude::egraph_serialize::EGraph,
     preferences: &[&str],
-) -> luminal::extractor::Genome {
-    luminal_cuda_lite::ops::cublaslt::election::genome_preferring(egraph, matchers(), preferences)
+) -> crate::extractor::Genome {
+    adopt_genome(
+        luminal_cuda_lite::ops::cublaslt::election::genome_preferring(
+            egraph,
+            matchers(),
+            preferences,
+        ),
+    )
+}
+
+/// THE COPY BOUNDARY. The election core stays with the marker estate in
+/// CUDA-lite (the charter's one borrowing exception), and since Phase 1
+/// of the #420/#422 rejoin that crate has its OWN extractor copy — so
+/// its `Genome` is a DIFFERENT TYPE from ours with the same two fields.
+/// Re-keying it is structural, total and unambiguous: `ClassId` and
+/// `NodeId` come from the shared `egraph-serialize` crate, and a
+/// producer choice is nothing but a pair of them.
+fn adopt_genome(other: luminal_cuda_lite::extractor::Genome) -> crate::extractor::Genome {
+    let mut genome = crate::extractor::Genome::default();
+    for (class, choice) in other.choices {
+        genome.choices.insert(class, adopt_choice(&choice));
+    }
+    genome
+}
+
+/// [`adopt_genome`] for one choice (see there).
+fn adopt_choice(
+    other: &luminal_cuda_lite::extractor::ProducerChoice,
+) -> crate::extractor::ProducerChoice {
+    crate::extractor::ProducerChoice {
+        enode: other.enode.clone(),
+        output_index: other.output_index,
+    }
 }
 
 /// Re-export: the strictness-level admission predicate (rehomed core).
@@ -175,8 +215,28 @@ pub use luminal_cuda_lite::ops::cublaslt::election::level_admits;
 pub fn genome_with_ordering(
     egraph: &luminal::prelude::egraph_serialize::EGraph,
     ordered: ProducerOrdering<'_>,
-) -> luminal::extractor::Genome {
-    luminal_cuda_lite::ops::cublaslt::election::genome_with_ordering(egraph, matchers(), ordered)
+) -> crate::extractor::Genome {
+    // The ordering closure speaks OUR `ProducerChoice`; the core hands
+    // it ITS own (see [`adopt_genome`]). The bridge re-keys the
+    // candidate list and passes the indices straight back — `ordered`
+    // returns POSITIONS in the list it was given, which the re-keying
+    // preserves exactly.
+    let bridge = |candidates: &[(String, luminal_cuda_lite::extractor::ProducerChoice)],
+                  level: usize|
+     -> Vec<usize> {
+        let ours: Vec<(String, crate::extractor::ProducerChoice)> = candidates
+            .iter()
+            .map(|(name, choice)| (name.clone(), adopt_choice(choice)))
+            .collect();
+        ordered(&ours, level)
+    };
+    adopt_genome(
+        luminal_cuda_lite::ops::cublaslt::election::genome_with_ordering(
+            egraph,
+            matchers(),
+            &bridge,
+        ),
+    )
 }
 
 /// Genome-driven fixture extraction (the selection adapter's walk) plus the
@@ -187,13 +247,13 @@ pub fn extract_fixture_with_genome(
 ) -> (ExtractedGraph, u64) {
     let serialized = serialize_fixture(script_text);
     let genome = genome_preferring(&serialized, preferences);
-    let graph = luminal::extractor::extract_layout_ir_with_genome_and_matchers(
+    let graph = crate::extractor::extract_layout_ir_with_genome_and_matchers(
         &serialized,
         &genome,
         matchers(),
     )
     .expect("genome extraction runs")
     .expect("genome extraction reaches the boundary");
-    let fingerprint = luminal::extractor::plan_fingerprint(&graph);
+    let fingerprint = crate::extractor::plan_fingerprint(&graph);
     (graph, fingerprint)
 }

@@ -131,7 +131,7 @@ impl OpMatcher for Log2FunctionalMatcher {
 // 2026-08-13: everything about an op lives in the op's folder).
 // ---------------------------------------------------------------------------
 
-use luminal::buffer_tensor_ir::ReferenceKernelCtx;
+use crate::typed_buffer::ReferenceKernelCtx;
 
 pub(crate) fn kernel(
     _op: &dyn BufferTensorIrOp,

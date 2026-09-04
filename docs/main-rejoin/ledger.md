@@ -2318,6 +2318,93 @@ every gap above is a capability it was never asked for. This section exists so
 that when it IS asked for, the list is already written and already measured
 against the code.
 
+## Program: #420/#422 rejoin — Phase 1 (runtime-owned search)
+
+**The move.** Post-saturation search left core. Core now keeps only what
+every runtime shares — the logical program and its recorder, the egglog
+assembly, `dps_rewrite`, `layouts::decode_layout_table`, `bufferize`, the
+IR types, the visualizers — and nothing that decides which
+implementation wins.
+
+| Was | Is now | Notes |
+| --- | --- | --- |
+| `src/extractor.rs` (4288 lines) | `luminal_reference::extractor`, `luminal_cuda_lite::extractor`, `test_runtime::extractor` | Three verbatim copies, minus `decoded_layout_table`. Tests (`render_memo_tests`, plus `chain_strides_destructure_contract` moved in from core `test_support`) live with the REFERENCE copy only. |
+| `src/implementation_search.rs` (1849 lines) | `luminal_reference::search`, `luminal_cuda_lite::search`; the sampler half also as `test_runtime::sampler` | The GA loop, the SCC sampler, both tripwires, `SearchProgress`, `BucketPlan`/`select_bucket`. Tests (`progress_tests`, `early_stop_tests`, `sampler_tests`, the dedup search test) live with the REFERENCE copy only. |
+| `extractor::decoded_layout_table` + `layout_ir::LayoutDecoder<L>` | `layouts::decode_layout_table` + `layouts::DecodedLayout` (core) | D9. The per-runtime decoder hook is deleted; both runtimes instantiate `BufferIrGraph` with core's struct. `RefLayout`/`ReferenceLayoutDecoder`/`CudaLayout`/`CudaLayoutDecoder` are gone. |
+| `buffer_tensor_ir::TypedBuffer` + `ReferenceKernelCtx` (552 lines) | `luminal_reference::typed_buffer` | D4. Out of core's prelude too. |
+| — | `luminal_cuda_lite::host_buffer::HostBuffer` | D4. Bytes + a dtype tag; the device bridge became a memcpy. |
+| `implementation_search::{PlanProfiler, StaticProfiler}` | DELETED | Each loop evaluates INLINE: the reference runs the candidate, CL calls `luminal_cuda_lite::heuristic::heuristic_cost_of`. |
+| `ImplementationSearchOptions` | `CompileOptions` (per runtime) | D5, main's name. Same fields, defaults, builder. |
+| `test_support::harness_search_options` | `luminal_reference::harness_search_options`, `luminal_cuda_lite::harness_search_options` | A production-path helper (the CL examples call it) that names a runtime's option type. |
+| `implementation_search::bucketed_search_implementations` | each runtime's `search.rs`, re-expressed over `BucketAssembly` | D7. Driven from the ladder: `bind_dim_buckets` / `set_dim` / `bucket_plans`. |
+
+**The rulings this implements** (Austin, 2026-09-03). Simple duplication
+per runtime rather than a generic seam; `SearchSpace` wherever it lands;
+`bufferize` stays in core because multiple backends use it; the thing
+that ranked CL candidates is a HEURISTIC and is named one; saturation is
+runtime-triggered; the reference keeps its profiling GA and CL keeps a
+genetic search over a device-free prior; runtimes call `bufferize`
+themselves; `TypedBuffer` is the reference runtime's; buckets now; the
+core decoder produces the layout struct the runtimes import directly;
+CL search lives in the runtime and runtimes choose how to handle
+failures.
+
+**Decisions inside the latitude.**
+
+- *`test_runtime` gets a THIRD copy* rather than borrowing CUDA-lite's
+  (which it already depends on for the cuBLASLt marker estate). Its
+  Cargo charter is explicit that anything it wants from another runtime
+  is replicated, never borrowed, and the marker estate is the single
+  named exception. Consequence: the election core's `Genome` is now a
+  different type from `test_runtime`'s, so the wrappers re-key it
+  structurally (`adopt_genome` / `adopt_choice` — `ClassId` and `NodeId`
+  come from the shared `egraph-serialize`, so the mapping is total and
+  unambiguous).
+- *`HostBuffer` has no `From<Vec<u8>>`.* Bool8 goes through the
+  validated `HostBuffer::bool8` constructor: a `From` is by definition
+  an unchecked door, and Bool8 has exactly two legal codes. `Vec<f64>`
+  likewise has none, for the reason `TypedBuffer` has none — an
+  unsuffixed float literal would silently pick it.
+- *`CudaRuntime::get_f32` returns `Vec<f32>`,* not `&Vec<f32>`: bytes
+  cannot lend a typed vector. `get_i32` / `get_i64` / `get_bool8` join
+  it.
+- *The reference bucketed entry is `search_buckets`,* taking the input
+  data as a FUNCTION of the pins. Buckets searched at different
+  representatives want differently sized payloads, so one fixed map
+  cannot stage them all; `search` refuses when buckets are bound instead
+  of mis-fitting them. CUDA-lite's `search` serves both shapes because
+  its ranking reads no data at all.
+- *One test was DELETED rather than moved:*
+  `search_passes_the_incumbent_metric_to_every_later_profile_call`. It
+  drove a hand-written `PlanProfiler` to observe the `best_so_far`
+  cutoff crossing the trait boundary — and that boundary no longer
+  exists. #386's semantics stay pinned by `early_stop_exceeded`'s own
+  board, which is where the predicate lives.
+- *The per-candidate input clone stays.* Each candidate gets a fresh
+  `ReferenceRuntime` and `set_data_buffer` takes ownership. Removing it
+  is a runtime-surface change (a borrowing stage API), not a Phase 1
+  one.
+- *One latent bug fixed by the move.* The extractor's op-cache lookup
+  was `if let Some(..) = cache.borrow().get(..) { .. } else {
+  ..borrow_mut().. }`, which is correct under edition 2024 (where the
+  `if let` temporary dies before the `else`) and panics under edition
+  2021 — which is where all three copies live. Split into a statement +
+  `match`.
+
+**The limitation Phase 1 states rather than solves.** Every bucket's
+winning plan is STATIC at its representative: plan spans are literals,
+so a plan searched at `a = 3` allocates and indexes for `a = 3`. Both
+ladders REFUSE loudly when asked to execute a bucket's plan at another
+value inside that bucket, naming the representative and pointing at the
+open item — symbolic plans (spans as expressions) and the capacity
+contract that goes with them. Pinned on both sides.
+
+**Still owed.** Device profiling for CUDA-lite (the heuristic is a weak
+prior — bytes moved is uncorrelated with occupancy, launch count,
+coalescing, library dispatch); the arena allocator behind the runtimes'
+`bufferize` call; whatever consolidation the three copies eventually
+earn, which is a question to ask after the runtimes diverge, not before.
+
 ## #420 search into the runtime — parks banked, the boundary move scheduled
 
 RULED 2026-09-03: *"we're going to ignore all the loop unrolling, loop rolling

@@ -139,7 +139,7 @@ impl OpMatcher for ReduceSumMatcher {
 // ---------------------------------------------------------------------------
 
 use crate::kernels::expect_op;
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// Axis reduce-sum. Typed arms 2026-08-11: Int sums are CHECKED
 /// (non-wrapping ruling — an accumulator overflow is a loud kernel

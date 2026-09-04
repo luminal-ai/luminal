@@ -42,13 +42,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use luminal::dtype::DType;
-use luminal::extractor::{edges_have_cycle, ExtractionSession, Genome, SamplingSpace};
 use luminal::graph::Graph;
-use luminal::implementation_search::{
-    mutate_genome_with_seed, sample_genome_with_seed, ProducerIndex,
-};
 use luminal::layout_ir::ExtractedNode;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
+use test_runtime::extractor::{edges_have_cycle, ExtractionSession, Genome, SamplingSpace};
+use test_runtime::sampler::{mutate_genome_with_seed, sample_genome_with_seed, ProducerIndex};
 
 // ---------------------------------------------------------------------------
 // Shared machinery.

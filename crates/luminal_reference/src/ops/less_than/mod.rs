@@ -129,7 +129,7 @@ impl OpMatcher for LessThanMatcher {
 // 2026-08-13: everything about an op lives in the op's folder).
 // ---------------------------------------------------------------------------
 
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 pub(crate) fn kernel(
     _op: &dyn BufferTensorIrOp,

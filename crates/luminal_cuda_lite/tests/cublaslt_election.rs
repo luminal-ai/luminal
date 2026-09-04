@@ -24,12 +24,12 @@
 //! family upstream of any marker concern; the search diverges, so attempting
 //! it here would hang, not fail fast.
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
 
 /// Deterministic pseudo-random values — the seeding discipline copied
 /// from `examples/support/mod.rs` (same `(n, seed)`, same values).
@@ -61,20 +61,20 @@ enum Row {
 /// rank) per value, retired 2026-09-01 (`view_arity_lock.rs` in
 /// test_runtime pins both sides). If "Illegal merge" ever returns, a
 /// new class-keyed invariant has been introduced somewhere.
-fn search_and_count(name: &str, cx: &Graph, pairs: &[(NodeIndex, TypedBuffer)]) -> Row {
+fn search_and_count(name: &str, cx: &Graph, pairs: &[(NodeIndex, HostBuffer)]) -> Row {
     search_and_count_opts(
         name,
         cx,
         pairs,
-        &luminal::test_support::harness_search_options(),
+        &luminal_cuda_lite::harness_search_options(),
     )
 }
 
 fn search_and_count_opts(
     name: &str,
     cx: &Graph,
-    pairs: &[(NodeIndex, TypedBuffer)],
-    options: &luminal::implementation_search::ImplementationSearchOptions,
+    pairs: &[(NodeIndex, HostBuffer)],
+    options: &luminal_cuda_lite::CompileOptions,
 ) -> Row {
     let mut rt = CudaRuntime::load_with_cublaslt(cx).expect("load");
     let mut vars: Vec<_> = cx.dyn_map.iter().collect();
@@ -83,7 +83,7 @@ fn search_and_count_opts(
         rt.bind_dyn_range(*var, *value as u64, *value as u64)
             .expect("dyn pin");
     }
-    let data: FxHashMap<NodeIndex, TypedBuffer> = pairs.iter().cloned().collect();
+    let data: FxHashMap<NodeIndex, HostBuffer> = pairs.iter().cloned().collect();
     let outcome = match rt.search(&data, options) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -181,7 +181,7 @@ fn canonical_2d_matmul_elects_the_marker() {
     let b = cx.tensor((8usize, 3usize), DType::F32);
     let _out = a.matmul(b).output();
 
-    let pairs: Vec<(NodeIndex, TypedBuffer)> =
+    let pairs: Vec<(NodeIndex, HostBuffer)> =
         vec![(a.id, weights(32, 1).into()), (b.id, weights(24, 2).into())];
     // MEASURED (Train 3): the marker's sibling-site minting fills the
     // genome pool with choice-cycle (unfit) samples, so election needs
@@ -189,7 +189,7 @@ fn canonical_2d_matmul_elects_the_marker() {
     // elected CublasLt on 5 of 6 seeds (seed 0's best plan is the ideal
     // fused [BufferAlloc, CublasLt]); the 2x4 harness budget found none.
     // Seeded, so this pin is deterministic.
-    let options = luminal::implementation_search::ImplementationSearchOptions {
+    let options = luminal_cuda_lite::CompileOptions {
         generations: 12,
         generation_size: 16,
         mutations: 4,
@@ -227,7 +227,7 @@ fn election_row_conv() {
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
     let x = cx.tensor((1, 1, 5, 5), DType::F32);
     let _out = model.forward(x).output();
-    let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (x.id, weights(25, 1).into()),
         (model.conv1.weight.id, weights(18, 2).into()),
         (model.conv2.weight.id, weights(54, 3).into()),
@@ -257,7 +257,7 @@ fn election_row_llama3() {
     let _logits = logits.output();
 
     let block = &model.blocks[0];
-    let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![3i32].into()),
         (model.embed.weight.id, weights(VOCAB * D, 1).into()),
         (block.wq.weight.id, weights(D * D, 2).into()),
@@ -298,7 +298,7 @@ fn election_row_qwen3() {
 
     let block = &model.blocks[0];
     let (q_norm, k_norm) = block.qk_norm.expect("qwen3 block carries QK-norm");
-    let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![3i32].into()),
         (model.embed.weight.id, weights(VOCAB * D, 1).into()),
         (block.wq.weight.id, weights(D * D, 2).into()),
@@ -329,7 +329,7 @@ fn election_row_whisper() {
     let audio = cx.tensor((2, D), DType::F32);
     let tokens = cx.tensor((1, D), DType::F32);
     let _out = model.forward(audio, tokens).output();
-    let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (audio.id, weights(2 * D, 1).into()),
         (tokens.id, weights(D, 2).into()),
         (model.enc_wq.weight.id, weights(D * D, 3).into()),
@@ -369,7 +369,7 @@ fn election_row_qwen3_moe() {
 
     let block = &model.blocks[0];
     let moe = &block.moe;
-    let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![2i32].into()),
         (model.embed.weight.id, weights(VOCAB * D, 1).into()),
         (block.wq.weight.id, weights(D * D, 2).into()),
@@ -407,7 +407,7 @@ fn election_row_gemma4_moe() {
 
     let block = &model.blocks[0];
     let moe = &block.moe;
-    let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![2i32].into()),
         (model.embed.weight.id, weights(VOCAB * D, 1).into()),
         (block.wq.weight.id, weights(D * D, 2).into()),
@@ -475,7 +475,7 @@ fn election_row_gemma3() {
     );
     let _logits = logits.output();
 
-    let mut pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let mut pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![3i32].into()),
         (model.embed.weight.id, weights(VOCAB * D, 199).into()),
         (gather_idx.id, vec![0i32, 1].into()),

@@ -626,9 +626,9 @@ mod tests {
         paged_attention, scatter_rows, sequence_isolation_bias, sliding_window_bias,
     };
     use crate::{CacheAccess, KvCache};
-    use luminal::implementation_search::ImplementationSearchOptions;
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
+    use luminal_reference::CompileOptions;
     use luminal_reference::ReferenceRuntime;
     use rustc_hash::FxHashMap;
 
@@ -658,7 +658,7 @@ mod tests {
         inputs.insert(data.id, data_vals.clone().into());
         inputs.insert(idx.id, idx_vals.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&inputs, &ImplementationSearchOptions::default())
+        rt.search(&inputs, &CompileOptions::default())
             .expect("search finds a plan");
         rt.set_data(data.id, data_vals);
         rt.set_data(idx.id, idx_vals);
@@ -716,7 +716,7 @@ mod tests {
         inputs.insert(idx.id, idx_vals.clone().into());
         inputs.insert(dest.id, dest_vals.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&inputs, &ImplementationSearchOptions::default())
+        rt.search(&inputs, &CompileOptions::default())
             .expect("search finds a plan");
         rt.set_data(src.id, src_vals);
         rt.set_data(idx.id, idx_vals);

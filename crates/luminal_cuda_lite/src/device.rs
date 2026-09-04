@@ -11,18 +11,18 @@
 //! operand buffers, the destination is a fresh zeroed slice swapped in
 //! after the launch — mirroring the reference's alias-safety
 //! convention; `ties` are ordering-only in CL-2). Phase 4 copies each
-//! output SLOT's backing buffer back to a host `TypedBuffer`, keyed by
+//! output SLOT's backing buffer back to a host `HostBuffer`, keyed by
 //! slot index and paired with the slot's [`OutputBinding`] — the
 //! escape-and-disclose contract (ruling 2026-08-27): the caller gets
 //! the backing bytes (possibly parent-sized, for an escaped view
 //! election) plus the layout to interpret them under.
 
+use crate::host_buffer::{dtype_bytes, HostBuffer};
 use anyhow::{anyhow, bail, Context, Result};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode, EdgeKind, OutputBinding};
 use luminal::dtype::PlanDtype;
 use luminal::prelude::FxHashMap;
@@ -31,64 +31,24 @@ use std::sync::Arc;
 
 use crate::kernels::{codegen_for, CodegenCtx};
 
-fn dtype_bytes(dtype: PlanDtype) -> Result<usize> {
-    Ok(match dtype {
-        PlanDtype::F32 => 4,
-        PlanDtype::Int => 4,
-        PlanDtype::Int64 => 8,
-        PlanDtype::Bool | PlanDtype::Bool8 => 1,
-        other => bail!("cuda-lite CL-2 has no device representation for {other:?}"),
-    })
+/// STAGING AND READBACK are memcpys now (ruling D4, 2026-09-03): a
+/// [`HostBuffer`] IS bytes plus a dtype tag, which is exactly what an
+/// H2D/D2H copy wants. The eleven-variant match these two used to be
+/// went with `TypedBuffer` to the reference runtime, where kernels
+/// really do need typed Rust slices.
+fn typed_to_bytes(data: &HostBuffer) -> &[u8] {
+    &data.bytes
 }
 
-fn typed_to_bytes(data: &TypedBuffer) -> &[u8] {
-    match data {
-        TypedBuffer::F32(v) => bytemuck_cast(v),
-        TypedBuffer::I32(v) => bytemuck_cast(v),
-        TypedBuffer::I64(v) => bytemuck_cast(v),
-        TypedBuffer::Bool8(v) => v.as_slice(),
-        TypedBuffer::F8E4M3(_) => unreachable!("dtype_bytes refuses F8 first"),
-        // F64 is executable on the reference runtime (ruling
-        // 2026-09-02) but has no CL kernel and no device
-        // representation, so `dtype_bytes` refuses it by name before a
-        // buffer ever reaches this bridge.
-        TypedBuffer::F64(_) => unreachable!("dtype_bytes refuses F64 first"),
-        // Likewise the narrow integers (ruling 2026-09-02): reference
-        // storage only, no CL kernel, no device representation.
-        TypedBuffer::I8(_) | TypedBuffer::U8(_) | TypedBuffer::I16(_) => {
-            unreachable!("dtype_bytes refuses narrow integers first")
-        }
+/// D2H: the device's bytes under the plan's dtype. Boolean readback
+/// still passes the VALIDATED door — a device that wrote a byte other
+/// than 0x00/0x01 into a Bool8 buffer has broken the two-legal-codes
+/// contract, and this is where that becomes visible.
+fn bytes_to_typed(bytes: &[u8], dtype: PlanDtype) -> Result<HostBuffer> {
+    match dtype {
+        PlanDtype::Bool | PlanDtype::Bool8 => HostBuffer::bool8(bytes.to_vec()),
+        other => HostBuffer::new(other, bytes.to_vec()),
     }
-}
-
-fn bytemuck_cast<T>(v: &[T]) -> &[u8] {
-    // Plain-old-data reinterpretation for f32/i32/i64 payloads.
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
-}
-
-fn bytes_to_typed(bytes: &[u8], dtype: PlanDtype) -> Result<TypedBuffer> {
-    Ok(match dtype {
-        PlanDtype::F32 => TypedBuffer::F32(
-            bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
-                .collect(),
-        ),
-        PlanDtype::Int => TypedBuffer::I32(
-            bytes
-                .chunks_exact(4)
-                .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
-                .collect(),
-        ),
-        PlanDtype::Int64 => TypedBuffer::I64(
-            bytes
-                .chunks_exact(8)
-                .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
-                .collect(),
-        ),
-        PlanDtype::Bool | PlanDtype::Bool8 => TypedBuffer::bool8(bytes.to_vec())?,
-        other => bail!("cuda-lite CL-2 cannot read back {other:?}"),
-    })
 }
 
 struct KernelCache {
@@ -119,9 +79,9 @@ impl KernelCache {
 /// [`OutputBinding`] (the elected layout) — the escape-and-disclose
 /// fetch, universal over dense and view elections.
 pub fn execute_plan(
-    plan: &BufferIrGraph<crate::layouts::CudaLayout>,
-    staged: &FxHashMap<i64, TypedBuffer>,
-) -> Result<FxHashMap<usize, (TypedBuffer, OutputBinding<crate::layouts::CudaLayout>)>> {
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+    staged: &FxHashMap<i64, HostBuffer>,
+) -> Result<FxHashMap<usize, (HostBuffer, OutputBinding<luminal::layouts::DecodedLayout>)>> {
     // ESCAPE GUARD (ruling 2026-08-27): an output slot's backing storage
     // must SURVIVE the call — FreedBy::Caller, whatever the owner.
     // FreedBy::Program backing an output hands the caller bytes the

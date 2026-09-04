@@ -8,7 +8,7 @@
 
 use std::fs;
 
-use luminal::extractor;
+use crate::extractor;
 use luminal::layout_ir::ExtractedGraph;
 
 /// Fixture scripts live in the WORKSPACE-ROOT Egglog core tree; this crate
@@ -206,12 +206,7 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     // VALUE-keyed table: decode over the POST-DPS graph bufferize sees.
     let dps = luminal::dps::dps_rewrite(&extracted);
-    let layouts = extractor::decoded_layout_table(
-        &serialized,
-        &dps,
-        &crate::layouts::ReferenceLayoutDecoder,
-        &mut std::collections::HashMap::new(),
-    )?;
+    let layouts = luminal::layouts::decode_layout_table(&serialized, &dps, "plain plan")?;
     luminal::bufferize::bufferize(&dps, &layouts)?;
     eprintln!("[plain-plan] dps+bufferize {:?}", start.elapsed());
     Ok(())
@@ -224,13 +219,10 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
 /// output reads. The frontend candle differentials and the reference
 /// differentials both run through here — the same load → bind → search →
 /// execute ladder as the nn module tests, on the harness budget
-/// (`luminal::test_support::harness_search_options`).
+/// (`luminal_reference::harness_search_options`).
 pub fn run_reference(
     cx: &luminal::graph::Graph,
-    inputs: &[(
-        petgraph::graph::NodeIndex,
-        luminal::buffer_tensor_ir::TypedBuffer,
-    )],
+    inputs: &[(petgraph::graph::NodeIndex, crate::typed_buffer::TypedBuffer)],
 ) -> crate::runtime::ReferenceRuntime {
     run_reference_with_ranges(cx, inputs, &[])
 }
@@ -243,10 +235,7 @@ pub fn run_reference(
 /// `bind_value_range` between load and search.
 pub fn run_reference_with_ranges(
     cx: &luminal::graph::Graph,
-    inputs: &[(
-        petgraph::graph::NodeIndex,
-        luminal::buffer_tensor_ir::TypedBuffer,
-    )],
+    inputs: &[(petgraph::graph::NodeIndex, crate::typed_buffer::TypedBuffer)],
     ranges: &[(petgraph::graph::NodeIndex, i64, i64)],
 ) -> crate::runtime::ReferenceRuntime {
     let mut rt =
@@ -262,7 +251,7 @@ pub fn run_reference_with_ranges(
             .expect("value range binds");
     }
     let data: rustc_hash::FxHashMap<_, _> = inputs.iter().cloned().collect();
-    rt.search(&data, &luminal::test_support::harness_search_options())
+    rt.search(&data, &crate::search::harness_search_options())
         .expect("search finds a plan");
     for (node, values) in inputs {
         rt.set_data(*node, values.clone());

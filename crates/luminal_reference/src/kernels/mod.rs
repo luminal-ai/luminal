@@ -24,7 +24,8 @@
 //! layout-specialized kernel changes nothing here: the family still
 //! claims once; its kernel branches internally on instance data.
 
-use luminal::buffer_tensor_ir::{BufferTensorIrOp, ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
+use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use std::any::TypeId;
 
 #[derive(Clone, Copy)]

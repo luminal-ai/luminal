@@ -6,39 +6,52 @@
 //! allow-list seam — but executing on a CUDA device with
 //! NVRTC-compiled kernels instead of host loops.
 //!
+//! THIS CRATE OWNS ITS SEARCH (ruling 2026-09-03, #420/#422 rejoin
+//! Phase 1): [`extractor`] and [`search`] are this runtime's own copies
+//! — core keeps the shared machinery (program, assembly, `dps_rewrite`,
+//! `decode_layout_table`, `bufferize`) and nothing that decides which
+//! implementation wins. Candidates rank through [`heuristic`], a
+//! device-free byte-move prior; there is no profiler trait anywhere any
+//! more, in core or here. Host payloads are [`host_buffer::HostBuffer`],
+//! not the reference runtime's `TypedBuffer`.
+//!
 //! Stage discipline (M4 kickoff ruling, 2026-08-17: "just focus on
 //! getting cuda lite up and running"):
-//! - CL-1 (this): plan-level runtime + codegen table, buildable and
-//!   testable everywhere; device execution behind the `device`
-//!   feature. Zero core-crate edits: the runtime claims a SUBSET of
-//!   the reference op inventory via the public allow-list seam, and
-//!   candidate profiling stays on the reference host executor (a cost
-//!   proxy until the profiler seam is parameterized in CL-3).
+//! - CL-1: plan-level runtime + codegen table, buildable and testable
+//!   everywhere; device execution behind the `device` feature.
 //! - CL-2: bring-up on a real device; fidelity vs the reference over
 //!   the mini battery.
-//! - CL-3: CUDA-native ops (cuBLASLt first) — lands the
-//!   matcher-injectable search + profiler trait in core.
+//! - CL-3: CUDA-native ops (cuBLASLt first).
 //! - CL-4: in-place ties (the Mutating family), views + resident
 //!   geometry.
+//! - STILL OWED: profiling ON DEVICE, mirroring the reference
+//!   evaluator's design, so this runtime ranks by measured time instead
+//!   of by the heuristic's weak prior.
 //!
-//! Out-of-place by design in CL-1: kernels read operand buffers and
+//! Out-of-place by design: kernels read operand buffers and
 //! write fresh destinations, mirroring the reference executor's
 //! alias-safety convention; `ties` and `Anti` edges are honored in the
 //! toposort order but no in-place claim is made.
 
 pub mod binding_check;
 pub mod bindings;
+pub mod extractor;
+pub mod heuristic;
+pub mod host_buffer;
 pub mod kernels;
 pub mod layouts;
 pub mod ops;
 pub mod runtime;
+pub mod search;
 
 #[cfg(feature = "device")]
 pub mod device;
 
 pub use bindings::CudaBindings;
-pub use layouts::{CudaLayout, CudaLayoutDecoder, CudaPlan};
+pub use host_buffer::HostBuffer;
+pub use layouts::CudaPlan;
 pub use runtime::CudaRuntime;
+pub use search::{harness_search_options, CompileOptions, SearchOutcome};
 
 /// PLAN-TRANSPARENT (M4 Phase 5): claimable WITHOUT a kernel iff the
 /// op's DECLARED EFFECTS prove the planner folds it — no operand ever

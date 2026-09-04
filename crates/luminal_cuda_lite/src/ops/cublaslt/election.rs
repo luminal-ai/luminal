@@ -15,7 +15,7 @@
 use luminal::layout_ir::OpMatcher;
 
 type ProducerOrdering<'a> =
-    &'a dyn Fn(&[(String, luminal::extractor::ProducerChoice)], usize) -> Vec<usize>;
+    &'a dyn Fn(&[(String, crate::extractor::ProducerChoice)], usize) -> Vec<usize>;
 
 /// Build a TOTAL genome over a fixture's produced classes: each class takes
 /// the first preference (an implementation constructor name) it can satisfy,
@@ -28,10 +28,10 @@ pub fn genome_preferring(
     egraph: &luminal::prelude::egraph_serialize::EGraph,
     matchers: Vec<Box<dyn OpMatcher>>,
     preferences: &[&str],
-) -> luminal::extractor::Genome {
+) -> crate::extractor::Genome {
     let preferences: Vec<String> = preferences.iter().map(|s| s.to_string()).collect();
     let ordered =
-        |candidates: &[(String, luminal::extractor::ProducerChoice)], level: usize| -> Vec<usize> {
+        |candidates: &[(String, crate::extractor::ProducerChoice)], level: usize| -> Vec<usize> {
             let admitted = level_admits(level);
             let mut order: Vec<usize> = Vec::new();
             for preferred in &preferences {
@@ -83,11 +83,11 @@ pub fn genome_with_ordering(
     egraph: &luminal::prelude::egraph_serialize::EGraph,
     matchers: Vec<Box<dyn OpMatcher>>,
     ordered: ProducerOrdering<'_>,
-) -> luminal::extractor::Genome {
+) -> crate::extractor::Genome {
     use luminal::prelude::egraph_serialize::ClassId;
     use std::collections::{BTreeSet, HashMap};
 
-    let index = luminal::extractor::producer_index_with_matchers(egraph, matchers);
+    let index = crate::extractor::producer_index_with_matchers(egraph, matchers);
 
     // ------------------------------------------------------------------
     // ROUND 11: VIABILITY-AWARE primary election. The cycle-anatomy
@@ -239,7 +239,7 @@ pub fn genome_with_ordering(
 
     #[derive(Clone, PartialEq)]
     enum Outcome {
-        Viable(luminal::extractor::ProducerChoice),
+        Viable(crate::extractor::ProducerChoice),
         Dead,
     }
 
@@ -249,7 +249,7 @@ pub fn genome_with_ordering(
         level: usize,
         index: &std::collections::BTreeMap<
             ClassId,
-            Vec<(String, luminal::extractor::ProducerChoice)>,
+            Vec<(String, crate::extractor::ProducerChoice)>,
         >,
         egraph: &luminal::prelude::egraph_serialize::EGraph,
         terminals: &BTreeSet<ClassId>,
@@ -274,7 +274,7 @@ pub fn genome_with_ordering(
         };
         path.push(class.clone());
         let mut cyclic_failure = false;
-        let mut result: Option<luminal::extractor::ProducerChoice> = None;
+        let mut result: Option<crate::extractor::ProducerChoice> = None;
         'cands: for i in ordered(candidates, level) {
             let (_, choice) = &candidates[i];
             let Some(op_class) = egraph.nodes.get(&choice.enode).map(|n| n.eclass.clone()) else {
@@ -338,10 +338,10 @@ pub fn genome_with_ordering(
     }
 
     let mut memo: HashMap<(ClassId, usize), Outcome> = HashMap::new();
-    let mut genome = luminal::extractor::Genome::default();
+    let mut genome = crate::extractor::Genome::default();
     for (class, candidates) in &index {
         // Escalate strictness only when nothing viable exists below.
-        let mut pick: Option<luminal::extractor::ProducerChoice> = None;
+        let mut pick: Option<crate::extractor::ProducerChoice> = None;
         for level in 0..3usize {
             let mut path = Vec::new();
             if let Some(Outcome::Viable(choice)) = choose(

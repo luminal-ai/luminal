@@ -32,7 +32,7 @@ use std::collections::HashMap;
 /// [`kernels::layout_read_index`] and reports whether it needed a chain.
 /// An unlowerable layout answers `false` — it is certainly not a flat
 /// read.
-fn reads_flat(layout: &luminal_cuda_lite::layouts::CudaLayout, dims: &[usize]) -> bool {
+fn reads_flat(layout: &luminal_cuda_lite::layouts::DecodedLayout, dims: &[usize]) -> bool {
     kernels::layout_read_index("probe", layout, dims, Coords::FlatIndex { prefix: "c" })
         .is_ok_and(|(chain, idx)| chain.is_empty() && idx == "i")
 }
@@ -56,7 +56,7 @@ fn reads_flat(layout: &luminal_cuda_lite::layouts::CudaLayout, dims: &[usize]) -
 /// operand, so the replication route refuses instead. `Err` here IS
 /// divergence, of the loudest kind.
 fn sources_via_buffer_table(
-    plan: &BufferIrGraph<luminal_cuda_lite::CudaLayout>,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
 ) -> Vec<(String, Result<Vec<String>, String>)> {
     let geometry: HashMap<BufferId, (Vec<usize>, PlanDtype)> = plan
         .buffers
@@ -119,20 +119,20 @@ fn searched_plan(
         &mut luminal::graph::Graph,
     ) -> FxHashMap<
         luminal::prelude::petgraph::graph::NodeIndex,
-        luminal::buffer_tensor_ir::TypedBuffer,
+        luminal_cuda_lite::HostBuffer,
     >,
-) -> BufferIrGraph<luminal_cuda_lite::CudaLayout> {
+) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     let mut cx = luminal::graph::Graph::new();
     let data = build(&mut cx);
     let mut rt = CudaRuntime::load(&cx).expect("load");
     let outcome = rt
-        .search(&data, &luminal::test_support::harness_search_options())
+        .search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("search under the CUDA allow list");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
     rt.plan().expect("plan loaded").clone()
 }
 
-fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal_cuda_lite::CudaLayout>)> {
+fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal::layouts::DecodedLayout>)> {
     vec![
         (
             "elementwise",
@@ -184,7 +184,7 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal_cuda_lite:
 /// (any operand carrying composed access) — the Phase-5 restatement
 /// keys on it.
 fn sources_via_descriptors(
-    plan: &BufferIrGraph<luminal_cuda_lite::CudaLayout>,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
 ) -> Vec<(String, Vec<String>, bool)> {
     let mut out = Vec::new();
     for node in plan.dag.node_weights() {
@@ -263,11 +263,11 @@ mod strided {
     use luminal::dtype::PlanDtype;
     use luminal_cuda_lite::{kernels, ops};
 
+    use luminal::layouts::DecodedLayout;
     use luminal::layouts::{
         BitWidthTerm, ElementOffsetExpressionLayout, IntExprTerm, MirrorLayout,
         RightMajorContiguousElementLayout, ShapeTerm, StridedElementLayout,
     };
-    use luminal_cuda_lite::CudaLayout;
 
     fn lit(v: i64) -> IntExprTerm {
         IntExprTerm::Lit(v)
@@ -284,13 +284,13 @@ mod strided {
     fn shape(dims: &[i64]) -> ShapeTerm {
         ShapeTerm(dims.iter().map(|&d| lit(d)).collect())
     }
-    fn typed(mirror: MirrorLayout) -> CudaLayout {
-        CudaLayout {
+    fn typed(mirror: MirrorLayout) -> DecodedLayout {
+        DecodedLayout {
             mirror,
             dtype: Some(PlanDtype::F32),
         }
     }
-    fn rm_layout(dims: &[i64]) -> CudaLayout {
+    fn rm_layout(dims: &[i64]) -> DecodedLayout {
         typed(MirrorLayout::RightMajor(
             RightMajorContiguousElementLayout {
                 shape: shape(dims),
@@ -298,14 +298,14 @@ mod strided {
             },
         ))
     }
-    fn strided_layout(dims: &[i64], chain: Vec<IntExprTerm>) -> CudaLayout {
+    fn strided_layout(dims: &[i64], chain: Vec<IntExprTerm>) -> DecodedLayout {
         typed(MirrorLayout::Strided(StridedElementLayout {
             shape: shape(dims),
             chain,
             width: BitWidthTerm(32),
         }))
     }
-    fn offset_layout(dims: &[i64], offset: IntExprTerm) -> CudaLayout {
+    fn offset_layout(dims: &[i64], offset: IntExprTerm) -> DecodedLayout {
         typed(MirrorLayout::ElementOffset(ElementOffsetExpressionLayout {
             offset,
             shape: shape(dims),
@@ -317,13 +317,13 @@ mod strided {
     /// EVERYTHING the codegen needs — extents, dtype, read path — comes
     /// from that one layout: the descriptor has no dims/dtype/hop fields
     /// left to fill (corrected contract, 2026-08-31).
-    fn slot(dims: Vec<i64>) -> SlotDescriptor<CudaLayout> {
+    fn slot(dims: Vec<i64>) -> SlotDescriptor<DecodedLayout> {
         slot_l(rm_layout(&dims))
     }
 
     /// PROTOTYPE (Option B): a slot carrying its OWN elected layout —
     /// the one vocabulary every family reads through.
-    fn slot_l(layout: CudaLayout) -> SlotDescriptor<CudaLayout> {
+    fn slot_l(layout: DecodedLayout) -> SlotDescriptor<DecodedLayout> {
         SlotDescriptor {
             value: luminal::prelude::egraph_serialize::ClassId::from("val$synthetic"),
             buffer: BufferId::Allocated(0),
@@ -332,8 +332,8 @@ mod strided {
     }
 
     /// The same slot with a different dtype fact on its carried layout
-    /// (a RUNTIME-side field: dtype rides `CudaLayout`, never the plan).
-    fn slot_dt(dims: Vec<i64>, dtype: PlanDtype) -> SlotDescriptor<CudaLayout> {
+    /// (a RUNTIME-side field: dtype rides `DecodedLayout`, never the plan).
+    fn slot_dt(dims: Vec<i64>, dtype: PlanDtype) -> SlotDescriptor<DecodedLayout> {
         let mut s = slot(dims);
         s.layout.dtype = Some(dtype);
         s
@@ -343,8 +343,8 @@ mod strided {
     /// descriptors, through the table row (the real dispatch path).
     fn generate(
         op: &dyn BufferTensorIrOp,
-        operand_info: &[SlotDescriptor<CudaLayout>],
-        result_info: &[SlotDescriptor<CudaLayout>],
+        operand_info: &[SlotDescriptor<DecodedLayout>],
+        result_info: &[SlotDescriptor<DecodedLayout>],
     ) -> String {
         let ctx = kernels::CodegenCtx::from_descriptors(op.label(), operand_info, result_info)
             .expect("descriptor ctx builds");
@@ -693,7 +693,7 @@ mod strided {
         use luminal::layouts::BitOffsetExpressionLayout;
         let dims = [2usize, 3usize];
         // from-end: coord(0) = c1 (stride 1), coord(1) = c0 (stride 3).
-        let spellings: Vec<(&str, CudaLayout)> = vec![
+        let spellings: Vec<(&str, DecodedLayout)> = vec![
             ("right-major", rm_layout(&[2, 3])),
             (
                 "strided, dense chain",
@@ -799,7 +799,7 @@ mod strided {
     /// cases, aimed at the surviving subject.
     #[test]
     fn only_the_identity_collapses() {
-        let cases: Vec<(&str, Vec<usize>, CudaLayout, bool)> = vec![
+        let cases: Vec<(&str, Vec<usize>, DecodedLayout, bool)> = vec![
             (
                 "transposed [3,2]",
                 vec![3, 2],
@@ -894,10 +894,10 @@ mod strided {
 #[test]
 fn descriptor_ctx_bails_loudly_on_unusable_layouts() {
     use luminal::bufferize::SlotDescriptor;
+    use luminal::layouts::DecodedLayout;
     use luminal::layouts::{
         BitWidthTerm, IntExprTerm, MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm,
     };
-    use luminal_cuda_lite::CudaLayout;
     let rm = |shape: ShapeTerm| {
         MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
             shape,
@@ -908,13 +908,13 @@ fn descriptor_ctx_bails_loudly_on_unusable_layouts() {
     let filled = SlotDescriptor {
         value: luminal::prelude::egraph_serialize::ClassId::from("val$x"),
         buffer: luminal::bufferize::BufferId::Allocated(0),
-        layout: CudaLayout {
+        layout: DecodedLayout {
             mirror: rm(lit_shape.clone()),
             dtype: Some(PlanDtype::F32),
         },
     };
     let symbolic = SlotDescriptor {
-        layout: CudaLayout {
+        layout: DecodedLayout {
             mirror: rm(ShapeTerm(vec![
                 IntExprTerm::Var("n".to_string()),
                 IntExprTerm::Lit(3),
@@ -934,7 +934,7 @@ fn descriptor_ctx_bails_loudly_on_unusable_layouts() {
         "got: {err}"
     );
     let untyped = SlotDescriptor {
-        layout: CudaLayout {
+        layout: DecodedLayout {
             mirror: rm(lit_shape),
             dtype: None,
         },

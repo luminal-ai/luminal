@@ -774,6 +774,97 @@ pub fn decode_layout_for(egraph: &EGraph, class: &ClassId, who: &str) -> Result<
     decode_layout(egraph, class).map_err(|err| anyhow!("{who}: {err}"))
 }
 
+// =============================================================================
+// THE DECODED LAYOUT and its table — core's DECODER (ruling D9,
+// 2026-09-03: "the core can have a decoder producing the layout struct
+// from core; the runtimes should just directly import and use these
+// layout structs"). The per-runtime `LayoutDecoder<L>` hook is GONE: it
+// bought a genericity nobody exercised (both runtimes decoded the same
+// mirror struct plus the same dtype fact), and the search that called it
+// now lives in the runtimes anyway.
+//
+// THE BUFFERIZER STILL NEVER READS THIS. `bufferize` stays generic over
+// an opaque `PlanLayout`; this is simply the layout type both shipped
+// runtimes choose to instantiate it with.
+// =============================================================================
+
+/// One elected value's decoded layout: the mirror layout plus the
+/// value's `dtype-of` fact. `dtype: None` is representable (a value with
+/// no `dtype-of` row) and bails loudly at USE — staging, allocation
+/// typing, readback — never silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedLayout {
+    pub mirror: MirrorLayout,
+    pub dtype: Option<crate::dtype::PlanDtype>,
+}
+
+/// Build the decoded-layout table for one extracted graph, keyed by
+/// VALUE e-class: enumerate every elected value and decode its layout
+/// class into a [`DecodedLayout`].
+///
+/// THE CACHE KEY is `(layout class, dtype-of fact)` — all spellings of a
+/// layout class denote one function, and the dtype fact is the one
+/// extraction-side value fact folded into the decoded type — so one
+/// per-call cache serves every value of the graph. A decode error is
+/// LOUD and refuses the graph: there is no default layout.
+///
+/// CALL IT ON THE GRAPH BUFFERIZE WILL SEE — the POST-DPS one. The table
+/// is VALUE-keyed, and the DPS rewrite mints fresh poison-destination
+/// VALUES, so a pre-DPS table is not total over the post-DPS graph and
+/// `extraction_layouts` refuses it loudly. Decoding post-DPS is free:
+/// each poison clones its tied result's layout class AND dtype fact, so
+/// it hits the `(layout class, dtype)` cache.
+pub fn decode_layout_table(
+    egraph: &EGraph,
+    graph: &crate::layout_ir::ExtractedGraph,
+    who: &str,
+) -> Result<HashMap<ClassId, DecodedLayout>> {
+    use crate::layout_ir::ExtractedNode;
+
+    let mut table: HashMap<ClassId, DecodedLayout> = HashMap::new();
+    let mut cache: HashMap<(ClassId, Option<crate::dtype::PlanDtype>), DecodedLayout> =
+        HashMap::new();
+    let mut decode = |value: &crate::layout_ir::LayoutTensorInfo,
+                      table: &mut HashMap<ClassId, DecodedLayout>|
+     -> Result<()> {
+        if table.contains_key(&value.eclass) {
+            return Ok(());
+        }
+        let key = (value.layout.eclass.clone(), value.dtype_enum);
+        let decoded = match cache.get(&key) {
+            Some(decoded) => decoded.clone(),
+            None => {
+                let decoded = DecodedLayout {
+                    mirror: decode_layout(egraph, &value.layout.eclass).map_err(|err| {
+                        anyhow!(
+                            "{who}: decoding the layout of value {} (layout class {}): {err}",
+                            value.eclass,
+                            value.layout.eclass
+                        )
+                    })?,
+                    dtype: value.dtype_enum,
+                };
+                cache.insert(key, decoded.clone());
+                decoded
+            }
+        };
+        table.insert(value.eclass.clone(), decoded);
+        Ok(())
+    };
+    for node in graph.dag.node_weights() {
+        match node {
+            ExtractedNode::BufferInput(input) => decode(&input.value, &mut table)?,
+            ExtractedNode::LayoutOp(op) => {
+                for output in &op.outputs {
+                    decode(output, &mut table)?;
+                }
+            }
+            ExtractedNode::BufferOutput(_) => {}
+        }
+    }
+    Ok(table)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

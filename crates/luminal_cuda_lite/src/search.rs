@@ -1,47 +1,32 @@
-//! THE IMPLEMENTATION SEARCH — the reference runtime's copy.
+//! THE IMPLEMENTATION SEARCH — the CUDA-lite runtime's copy.
 //!
 //! There is NO search at the logical level: saturation discovers the
-//! implementations, and this module only SELECTS among them, pricing
-//! every candidate by EXECUTING its bufferized plan on this runtime.
+//! implementations, and this module only SELECTS among them.
 //!
 //! RUNTIME-OWNED (ruling 2026-09-03, #420/#422 rejoin Phase 1). This was
 //! `luminal::implementation_search`, generic over a `PlanProfiler` trait
-//! that exactly two runtimes implemented. Both the loop and the
+//! core defined and two runtimes implemented. Both the loop and the
 //! extractor it drives now live in each runtime, duplicated rather than
-//! generalized ("SearchSpace can live wherever... duplication is fine
-//! for now. Don't worry about doing this generic thing."), and the
-//! profiler trait is GONE: this copy evaluates candidates inline, by
-//! running them (see [`profile_on_reference_runtime`]).
+//! generalized ("just put this search in the cuda lite runtime\'s crate.
+//! it\'s fine."), and the profiler trait is GONE: this copy ranks
+//! candidates inline with the DEVICE-FREE HEURISTIC in
+//! [`crate::heuristic`] — a weak static prior, never a measurement.
 //!
-//! A mutation-only hill climb over per-value producer genomes — luminal's
-//! search shape (no cost models, profile the real thing, keep the best,
-//! mutate) over our genome representation. Genomes that fail to extract
-//! (cycles, contract violations) are discarded and replaced with fresh
-//! random rolls — the repair strategy. Many genomes build the same plan
-//! (dead rows are unread), so every built plan is fingerprinted and
-//! duplicates reuse the cached measurement instead of burning profile
-//! time (the plan-hash dedup ruling, 2026-07-27).
-//!
-//! THE TESTS FOR ALL THREE SEARCH COPIES LIVE HERE. The CUDA-lite copy
-//! carries none.
+//! Tests live with the reference copy (`luminal_reference::search`).
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anyhow::{anyhow, ensure, Result};
 use colored::Colorize;
-use egraph_serialize::ClassId;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rustc_hash::{FxHashMap, FxHashSet};
-
-use crate::typed_buffer::TypedBuffer;
-use luminal::bufferize::BufferIrGraph;
-use luminal::graph::LogicalProgram;
-use luminal::layouts::DecodedLayout;
 
 use crate::extractor::{self, Genome, ProducerChoice, SamplingSpace};
-use crate::runtime::{reference_allow_list, ReferenceRuntime};
+use luminal::bufferize::BufferIrGraph;
+use luminal::graph::LogicalProgram;
+use luminal::prelude::egraph_serialize::{self, ClassId};
+use luminal::prelude::{FxHashMap, FxHashSet};
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
@@ -223,77 +208,6 @@ impl<W: std::io::Write> SearchProgress<W> {
     }
 }
 
-#[cfg(test)]
-mod progress_tests {
-    use super::SearchProgress;
-
-    /// Read the WORDS whatever `colored` decided about this terminal:
-    /// drop every escape sequence, keep the carriage returns (they are
-    /// the transient-line mechanism the test is pinning).
-    fn strip_ansi(text: &str) -> String {
-        let mut out = String::new();
-        let mut chars = text.chars();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for c in chars.by_ref() {
-                    if ('\x40'..='\x7e').contains(&c) && c != '[' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn progress_prints_start_once_faster_per_improvement_and_a_resetting_slower_counter() {
-        let mut sink: Vec<u8> = Vec::new();
-        {
-            let mut progress = SearchProgress::new(&mut sink);
-            progress.start(4_000_000);
-            // The baseline is announced exactly once, even if the loop
-            // were to ask twice.
-            progress.start(9_000_000);
-            progress.report(false, 9_000_000);
-            progress.report(false, 8_000_000);
-            progress.report(true, 3_000_000);
-            progress.report(false, 5_000_000);
-            progress.finish();
-        }
-        let raw = String::from_utf8(sink).expect("utf8");
-        let text = strip_ansi(&raw);
-
-        assert_eq!(text.matches("Start").count(), 1, "Start once: {text:?}");
-        assert!(text.contains("Start 4.000 ms"), "baseline nanos: {text:?}");
-
-        assert_eq!(
-            text.matches("Faster").count(),
-            1,
-            "one improvement: {text:?}"
-        );
-        assert!(
-            text.contains("Faster 3.000 ms"),
-            "the new best rides the Faster line: {text:?}"
-        );
-
-        // The counter climbs while nothing improves and RESETS on the
-        // improvement, so the last candidate is x1 again, not x3.
-        assert!(text.contains("Slower x1"), "{text:?}");
-        assert!(text.contains("Slower x2"), "{text:?}");
-        assert!(!text.contains("Slower x3"), "counter must reset: {text:?}");
-        assert_eq!(text.matches("Slower x1").count(), 2, "{text:?}");
-
-        // Every report (and the finish) rewrites the transient line in
-        // place: no bar-relative cursor math, just \r + erase-line.
-        assert_eq!(raw.matches("\r\x1b[2K").count(), 5, "{raw:?}");
-        // Faster/Start lines are permanent (newline-terminated); the
-        // pending Slower line is not, and finish() clears it.
-        assert!(raw.ends_with("\r\x1b[2K"), "{raw:?}");
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub best_plan: BufferIrGraph<luminal::layouts::DecodedLayout>,
@@ -386,102 +300,6 @@ impl SearchTimings {
             ms(self.plan_build_nanos),
             ms(self.profile_nanos)
         )
-    }
-}
-
-/// THE REFERENCE EVALUATOR — the search's price for one candidate plan:
-/// build a FRESH `ReferenceRuntime`, load the plan, stage the caller's
-/// data, run once for warmup and validity, then time `trials` executes.
-///
-/// THE METRIC IS THE MEAN over trials (ruling 2, 2026-09-02), not the
-/// best-of-trials minimum it used to be. A minimum can still fall on a
-/// later trial, so truncating a minimum is a heuristic that can promote
-/// a candidate whose truncated metric flatters it; a mean only rises as
-/// trials accumulate, which is what makes #386's early stop an exact
-/// argument rather than a guess. Every reader of `best_nanos` is
-/// reading a mean.
-///
-/// THE INPUT CLONE is deliberate and unavoidable today: each candidate
-/// gets its OWN runtime (no state carried between candidates), and
-/// `set_data_buffer` takes ownership of the payload. A borrowing stage
-/// API would remove it; that is a runtime-surface change, not a Phase 1
-/// one.
-fn profile_on_reference_runtime(
-    plan: &BufferIrGraph<DecodedLayout>,
-    input_data: &FxHashMap<i64, TypedBuffer>,
-    trials: usize,
-    best_so_far: Option<u128>,
-) -> Result<u128> {
-    let mut runtime = ReferenceRuntime::default();
-    runtime.load_plan(plan.clone());
-    for (id, data) in input_data {
-        runtime.set_data_buffer(*id, data.clone());
-    }
-    runtime.execute()?; // warmup + validity
-    let total = trials.max(1);
-    let mut sum = 0u128;
-    for trial in 0..total {
-        let start = Instant::now();
-        runtime.execute()?;
-        sum += start.elapsed().as_nanos();
-        let completed = trial + 1;
-        // EARLY STOP (#386). The cutoff is applied to a LOWER BOUND on
-        // this candidate's FINAL mean — the trials so far averaged over
-        // ALL of them, i.e. assuming every remaining trial costs zero.
-        // Once even that bound exceeds the incumbent, no continuation
-        // can win and the remaining trials are pure waste. Factor 1.0:
-        // main's margin knob (`early_stop_factor`) is a device-runtime
-        // tuning parameter; here the exact bound is available, so the
-        // stop is taken exactly when the candidate has provably lost.
-        // The partial mean returned is >= that bound, so it is still a
-        // loss when ranked, exactly as on main.
-        if completed < total
-            && best_so_far.is_some_and(|best| early_stop_exceeded(sum / total as u128, best, 1.0))
-        {
-            return Ok(sum / completed as u128);
-        }
-    }
-    Ok(sum / total as u128)
-}
-
-/// Main's `early_stop_exceeded` (its `src/op.rs`), retyped from
-/// `Duration` to this branch's u128 nanos: true once a candidate's mean
-/// trial cost exceeds `best * factor`, i.e. the candidate has already
-/// lost by at least that margin and further trials can only refine a
-/// metric that is out of contention.
-///
-/// The in-core caller ([`crate::search`]'s reference
-/// profiler, in `luminal_reference`) applies it at `factor = 1.0` to a
-/// LOWER BOUND on the candidate's final mean, which makes the stop
-/// exact rather than heuristic: a candidate whose best conceivable
-/// final mean already exceeds the incumbent cannot win. The factor
-/// survives because it is main's semantics and main's tuning knob
-/// (`CompileOptions::early_stop_factor`), and a device profiler
-/// mirroring this design will want it.
-pub fn early_stop_exceeded(mean_nanos: u128, best_nanos: u128, factor: f64) -> bool {
-    mean_nanos as f64 > best_nanos as f64 * factor
-}
-
-#[cfg(test)]
-mod early_stop_tests {
-    use super::early_stop_exceeded;
-
-    /// Main's `test_early_stop_exceeded` (`src/op.rs`), retyped from
-    /// `Duration` to nanos.
-    #[test]
-    fn early_stop_exceeded_keeps_mains_margin_semantics() {
-        const MS: u128 = 1_000_000;
-        let best = 5 * MS;
-        // 2x cutoff: 10ms mean is at the boundary, not over it.
-        assert!(!early_stop_exceeded(10 * MS, best, 2.0));
-        assert!(early_stop_exceeded(11 * MS, best, 2.0));
-        // A candidate faster than best never stops early.
-        assert!(!early_stop_exceeded(4 * MS, best, 2.0));
-        // Factor 1.0 stops anything slower than best.
-        assert!(early_stop_exceeded(6 * MS, best, 1.0));
-        // ...and NOT a tie: the incumbent keeps its seat, but a tied
-        // candidate is still worth finishing (it is not yet losing).
-        assert!(!early_stop_exceeded(5 * MS, best, 1.0));
     }
 }
 
@@ -785,39 +603,25 @@ fn bufferize_cycle_tripwire(
     ))
 }
 
-/// THE SELECTION LOOP, defaulted to this crate's registry: search the
-/// saturated e-graph for the fastest executable plan on the reference
-/// runtime, profiling with the given caller data. Deterministic for a
-/// fixed seed. `allow_override` narrows the matcher set to a runtime's
-/// ALLOWABLE-OPS inventory (M3 Step 2: per-runtime, unstandardized);
-/// `None` keeps the reference runtime's own allow list.
-pub fn search_implementations_with_ops(
+/// THE SELECTION LOOP for this backend: the caller supplies its OWN
+/// matcher vocabulary (the cuBLASLt marker set is an instance option)
+/// and its OWN allow list. Deterministic for a fixed seed.
+///
+/// NO CALLER DATA (D6, 2026-09-03): candidates are ranked by
+/// [`crate::heuristic::heuristic_cost_of`], which never runs anything,
+/// so there is nothing to stage. The ladder's `search` still takes the
+/// caller's payloads and still checks them against the program's bound
+/// inputs — it just does not hand them here.
+pub fn search_implementations(
     egraph: &egraph_serialize::EGraph,
     program: &LogicalProgram,
-    input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
+    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
 ) -> Result<SearchOutcome> {
-    let matchers = crate::ops::built_in_matchers();
-    let allow_override = allow_override.or_else(|| Some(reference_allow_list()));
-    // Tensor-keyed at the boundary (the retired-HLIR-keyspace design);
-    // buffer-keyed internally via the program's slots.
-    let buffer_data: FxHashMap<i64, crate::typed_buffer::TypedBuffer> = input_data
-        .iter()
-        .map(|(tensor, data)| {
-            let slot = program
-                .input_slots
-                .iter()
-                .find(|slot| slot.tensor == *tensor)
-                .unwrap_or_else(|| panic!("tensor {tensor:?} is not a bound input"));
-            (slot.buffer, data.clone())
-        })
-        .collect();
-    let input_data = &buffer_data;
-
     let mut timings = SearchTimings::default();
     let analysis_start = Instant::now();
-    // The allow list narrows this crate's matcher set; None = the whole set.
+    // The allow list narrows the caller's matcher set; None = the whole set.
     let allow = allow_override;
     let mut session =
         extractor::ExtractionSession::new_with_matcher_set(egraph, allow.as_deref(), matchers);
@@ -978,16 +782,11 @@ pub fn search_implementations_with_ops(
                         }
                     };
                     let profile_start = Instant::now();
-                    // The incumbent's metric is the early-stop cutoff
-                    // (#386). `None` on the first candidate: it IS the
-                    // baseline, so there is nothing to have lost to.
-                    let best_so_far = best.as_ref().map(|(best_nanos, _, _)| *best_nanos);
-                    let profiled = profile_on_reference_runtime(
-                        &plan,
-                        input_data,
-                        options.trials,
-                        best_so_far,
-                    );
+                    // DEVICE-FREE RANKING (D6): a static prior over the
+                    // extracted graph, never a measurement. See
+                    // [`crate::heuristic`] for what it does and does not
+                    // claim.
+                    let profiled: Result<u128> = Ok(crate::heuristic::heuristic_cost_of(&graph));
                     timings.profile_nanos += profile_start.elapsed().as_nanos();
                     let nanos = match profiled {
                         Ok(nanos) => nanos,
@@ -1120,9 +919,9 @@ pub struct BucketAssembly<'a> {
 pub fn bucketed_search_implementations(
     assembly: &BucketAssembly<'_>,
     dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
-    input_data: impl Fn(&luminal::shape::DynMap) -> FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
+    matchers: impl Fn() -> Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
 ) -> Result<Vec<BucketPlan>> {
     ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
     let mut plans = Vec::new();
@@ -1132,14 +931,15 @@ pub fn bucketed_search_implementations(
         egraph
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
-        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
-        let data = input_data(&representative);
-        let outcome = search_implementations_with_ops(
+        let serialized = egraph
+            .serialize(luminal::prelude::egglog::SerializeConfig::default())
+            .egraph;
+        let outcome = search_implementations(
             &serialized,
             &program,
-            &data,
             options,
             allow_override.clone(),
+            matchers(),
         )?;
         plans.push(BucketPlan {
             ranges,
@@ -1259,14 +1059,14 @@ pub fn select_bucket<'a>(
 
 /// The test/example harness's search budget — the SAME genetic algorithm
 /// as the module-level ladder tests, sized for a suite of hundreds of
-/// graphs (ruling 2026-08-06: everything in the main tree runs the
-/// genetic implementation search — there is no plain-walk bypass).
-/// Deterministic (fixed seed); 2 generations x 4 genomes exercises
-/// random genomes plus the mutation step without profiling 64 candidates
-/// per differential.
+/// graphs. Deterministic (fixed seed); 2 generations x 4 genomes
+/// exercises random genomes plus the mutation step without profiling 64
+/// candidates per differential.
 ///
 /// Moved out of core `test_support` with the search itself: it is a
-/// PRODUCTION-PATH helper (the CL examples call it), not a test fixture.
+/// PRODUCTION-PATH helper (this crate's examples call it), not a test
+/// fixture. Duplicated from `luminal_reference::search` per the
+/// duplication ruling.
 pub fn harness_search_options() -> CompileOptions {
     CompileOptions {
         generations: 2,
@@ -1275,417 +1075,5 @@ pub fn harness_search_options() -> CompileOptions {
         trials: 1,
         seed: 0,
         search_log: false,
-    }
-}
-
-/// Search the saturated e-graph for the fastest executable plan on the
-/// reference runtime, profiling with the given caller data.
-/// Deterministic for a fixed seed.
-pub fn search_implementations(
-    egraph: &egraph_serialize::EGraph,
-    program: &LogicalProgram,
-    input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
-    options: &CompileOptions,
-) -> Result<SearchOutcome> {
-    search_implementations_with_ops(egraph, program, input_data, options, None)
-}
-
-#[cfg(test)]
-mod tests {
-    use egglog::SerializeConfig;
-    use rustc_hash::FxHashMap;
-
-    use luminal::dtype::DType;
-    use luminal::graph::Graph;
-
-    use super::{search_implementations, CompileOptions};
-    use crate::ReferenceRuntime;
-
-    /// A REAL selection space (x+y and x*y from shared inputs offers the
-    /// fused kernel vs the pair, plus commuted and mutating variants): the
-    /// search must return a numerically correct plan, and the fingerprint
-    /// cache must absorb duplicate plans.
-    #[test]
-    fn search_returns_a_correct_plan_and_dedups_duplicate_plans() {
-        let build = || {
-            let mut cx = Graph::new();
-            let x = cx.tensor(4, DType::F32);
-            let y = cx.tensor(4, DType::F32);
-            let a = (x + y).output();
-            let m = (x * y).output();
-            (cx, x, y, a, m)
-        };
-        let x_data = vec![1.0, 2.0, 3.0, 4.0];
-        let y_data = vec![10.0, 20.0, 30.0, 40.0];
-
-        // GOLDEN (pinned: x + y and x * y on the fixed data).
-        let their_a = vec![11.0, 22.0, 33.0, 44.0];
-        let their_m = vec![10.0, 40.0, 90.0, 160.0];
-
-        // Our search.
-        let (cx2, x2, y2, a2, m2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::ReferenceBindings)
-            .expect("native program");
-        let text = format!("{}\n\n{}", crate::assembled_program(), program.text);
-        let mut egraph = luminal::egglog_snippet::new_egraph();
-        egraph
-            .parse_and_run_program(None, &text)
-            .expect("program runs");
-        let serialized = egraph.serialize(SerializeConfig::default()).egraph;
-
-        let mut inputs = FxHashMap::default();
-        inputs.insert(x2.id, x_data.clone().into());
-        inputs.insert(y2.id, y_data.clone().into());
-        let outcome =
-            search_implementations(&serialized, &program, &inputs, &CompileOptions::default())
-                .expect("search finds an executable plan");
-
-        assert!(
-            outcome.fingerprint_hits > 0,
-            "small space, many genomes: the plan cache must fire \
-             (profiled {}, hits {})",
-            outcome.plans_profiled,
-            outcome.fingerprint_hits
-        );
-
-        let mut runtime = ReferenceRuntime::default();
-        runtime.stage_slots(&program.input_slots, &program.output_slots);
-        runtime.load_plan(outcome.best_plan.clone());
-        runtime.set_data(x2.id, x_data);
-        runtime.set_data(y2.id, y_data);
-        runtime.execute().expect("best plan executes");
-        let ours_a = runtime.get_f32(a2.id).unwrap();
-        let ours_m = runtime.get_f32(m2.id).unwrap();
-        for (ours, theirs) in [(ours_a, &their_a), (ours_m, &their_m)] {
-            assert_eq!(ours.len(), theirs.len());
-            for (index, (lhs, rhs)) in ours.iter().zip(theirs).enumerate() {
-                assert!(
-                    (lhs - rhs).abs() <= 1e-5 * rhs.abs().max(1.0),
-                    "element {index}: ours {lhs} vs theirs {rhs}"
-                );
-            }
-        }
-    }
-}
-
-/// THE SAMPLER-INVARIANT UNIT BOARD (2026-09-02): components, forest
-/// sampling and the mutation cycle check on hand-built candidate
-/// graphs — no e-graph, no runtime, so the rule itself is under test
-/// rather than a graph that happens to exercise it.
-///
-/// These boards are HAND-BUILT: they construct a producer index and a
-/// candidate graph directly, so the sampling rule itself is under test
-/// rather than a graph that happens to exercise it.
-#[cfg(test)]
-mod sampler_tests {
-    use std::collections::BTreeMap;
-
-    use egraph_serialize::{ClassId, NodeId};
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
-
-    use crate::extractor::{edges_have_cycle, Genome, ProducerChoice, SamplingSpace};
-
-    use super::{bufferize_cycle_tripwire, mutate_genome, sample_genome, ProducerIndex};
-
-    fn class(name: &str) -> ClassId {
-        ClassId::from(name)
-    }
-
-    /// One candidate of one class: `(candidate name, input classes)`.
-    type CandidateRow<'a> = (&'a str, &'a [&'a str]);
-    /// One class of a hand-built board: `(class, its candidates)`.
-    type BoardRow<'a> = (&'a str, &'a [CandidateRow<'a>]);
-
-    /// A producer index and its candidate graph from one table:
-    /// `(class, [(candidate name, [input classes])])`. Candidate
-    /// positions line up between the two by construction — the same
-    /// parallelism `SamplingSpace` assumes of the real index.
-    fn build(table: &[BoardRow<'_>]) -> (ProducerIndex, SamplingSpace) {
-        let mut index: ProducerIndex = BTreeMap::new();
-        let mut inputs: BTreeMap<ClassId, Vec<Vec<ClassId>>> = BTreeMap::new();
-        for (owner, candidates) in table {
-            index.insert(
-                class(owner),
-                candidates
-                    .iter()
-                    .map(|(name, _)| {
-                        (
-                            (*name).to_string(),
-                            ProducerChoice {
-                                enode: NodeId::from(format!("{owner}::{name}")),
-                                output_index: 0,
-                            },
-                        )
-                    })
-                    .collect(),
-            );
-            inputs.insert(
-                class(owner),
-                candidates
-                    .iter()
-                    .map(|(_, sources)| sources.iter().map(|s| class(s)).collect())
-                    .collect(),
-            );
-        }
-        let space = SamplingSpace::from_candidate_inputs(inputs);
-        (index, space)
-    }
-
-    /// The genome electing the named candidate per class — the hand-built
-    /// genome a FREE sampler (uniform over every candidate, no invariant)
-    /// is free to draw.
-    fn genome_electing(index: &ProducerIndex, picks: &[(&str, &str)]) -> Genome {
-        let mut genome = Genome::default();
-        for (owner, name) in picks {
-            let (_, choice) = index[&class(owner)]
-                .iter()
-                .find(|(candidate, _)| candidate == name)
-                .expect("the board names this candidate");
-            genome.choices.insert(class(owner), choice.clone());
-        }
-        genome
-    }
-
-    /// The candidate NAME the genome elected per class, sorted by class
-    /// — a readable genome identity for coverage assertions.
-    fn spelling(index: &ProducerIndex, genome: &Genome) -> Vec<String> {
-        index
-            .iter()
-            .map(|(owner, candidates)| {
-                let choice = &genome.choices[owner];
-                let (name, _) = candidates
-                    .iter()
-                    .find(|(_, candidate)| candidate == choice)
-                    .expect("the genome names an index entry");
-                format!("{owner}={name}")
-            })
-            .collect()
-    }
-
-    fn cyclic(index: &ProducerIndex, space: &SamplingSpace, genome: &Genome) -> bool {
-        edges_have_cycle(&space.chosen_edges(index, genome))
-    }
-
-    /// (i) TWO CLASSES RE-DESCRIBING EACH OTHER — the cuBLASLt
-    /// collapse's shape in miniature. One component of size 2; over 200
-    /// seeds the (intra, intra) pair never appears and all three acyclic
-    /// combinations do.
-    #[test]
-    fn mutual_re_description_is_one_component_and_only_the_cycle_is_excluded() {
-        let (index, space) = build(&[
-            ("a", &[("prog", &[]), ("reads_b", &["b"])]),
-            ("b", &[("prog", &[]), ("reads_a", &["a"])]),
-        ]);
-        assert_eq!(
-            space.components,
-            vec![vec![class("a"), class("b")]],
-            "two classes reading each other are one non-trivial component"
-        );
-
-        let mut seen: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
-        for seed in 0..200u64 {
-            let genome = sample_genome(&index, &space, &mut StdRng::seed_from_u64(seed));
-            assert!(
-                !cyclic(&index, &space, &genome),
-                "seed {seed} sampled a cyclic genome: {:?}",
-                spelling(&index, &genome)
-            );
-            seen.insert(spelling(&index, &genome));
-        }
-        let expected: std::collections::BTreeSet<Vec<String>> = [
-            vec!["a=prog".to_string(), "b=prog".to_string()],
-            vec!["a=prog".to_string(), "b=reads_a".to_string()],
-            vec!["a=reads_b".to_string(), "b=prog".to_string()],
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(
-            seen, expected,
-            "exactly the three acyclic genomes are reachable"
-        );
-    }
-
-    /// (ii) COVERAGE OF CHAINS: a 3-cycle of re-descriptions
-    /// (a<-c, b<-a, c<-b) with a progressing option each. The CHAIN
-    /// genome — a progresses, b reads a, c reads b — is a forest, not
-    /// a star, and the 2026-08-07 sampler could not build it. It must
-    /// be reachable; the all-intra 3-cycle must not be.
-    #[test]
-    fn chains_inside_a_component_are_reachable() {
-        let (index, space) = build(&[
-            ("a", &[("prog", &[]), ("reads_c", &["c"])]),
-            ("b", &[("prog", &[]), ("reads_a", &["a"])]),
-            ("c", &[("prog", &[]), ("reads_b", &["b"])]),
-        ]);
-        assert_eq!(
-            space.components,
-            vec![vec![class("a"), class("b"), class("c")]],
-            "the 3-cycle is one component"
-        );
-
-        let chain = vec![
-            "a=prog".to_string(),
-            "b=reads_a".to_string(),
-            "c=reads_b".to_string(),
-        ];
-        let mut chain_seen = false;
-        for seed in 0..200u64 {
-            let genome = sample_genome(&index, &space, &mut StdRng::seed_from_u64(seed));
-            assert!(
-                !cyclic(&index, &space, &genome),
-                "seed {seed} sampled a cyclic genome: {:?}",
-                spelling(&index, &genome)
-            );
-            chain_seen |= spelling(&index, &genome) == chain;
-        }
-        assert!(
-            chain_seen,
-            "the chain genome (a progresses, b reads a, c reads b) must be sampled"
-        );
-    }
-
-    /// (iii) A COMPONENT WITH NO PROGRESSING MEMBER: every candidate of
-    /// every member is intra-component, so the first member processed
-    /// has no admissible candidate and takes the documented full-list
-    /// fallback. The sampler must produce a total genome and not panic;
-    /// the resulting cycle is the refusal accounting's business.
-    #[test]
-    fn a_component_with_no_progressing_member_falls_back() {
-        let (index, space) = build(&[("a", &[("reads_b", &["b"])]), ("b", &[("reads_a", &["a"])])]);
-        assert_eq!(space.components, vec![vec![class("a"), class("b")]]);
-        for seed in 0..32u64 {
-            let genome = sample_genome(&index, &space, &mut StdRng::seed_from_u64(seed));
-            assert_eq!(genome.choices.len(), 2, "the genome stays total");
-            assert!(
-                cyclic(&index, &space, &genome),
-                "the fallback is the ONLY route to a cyclic sample, and here it is forced"
-            );
-        }
-    }
-
-    /// MUTATION keeps the invariant: from every acyclic parent, 500
-    /// mutated children over the two-class and three-class boards are
-    /// acyclic — and the flip check is not merely refusing everything,
-    /// since the children do move.
-    #[test]
-    fn mutation_never_closes_a_cycle() {
-        for table in [
-            &[
-                (
-                    "a",
-                    &[("prog", &[] as &[&str]), ("reads_b", &["b"] as &[&str])]
-                        as &[(&str, &[&str])],
-                ),
-                ("b", &[("prog", &[]), ("reads_a", &["a"])]),
-            ] as &[(&str, &[(&str, &[&str])])],
-            &[
-                ("a", &[("prog", &[]), ("reads_c", &["c"])]),
-                ("b", &[("prog", &[]), ("reads_a", &["a"])]),
-                ("c", &[("prog", &[]), ("reads_b", &["b"])]),
-            ],
-        ] {
-            let (index, space) = build(table);
-            let classes: Vec<ClassId> = index.keys().cloned().collect();
-            let mut moved = 0usize;
-            for seed in 0..500u64 {
-                let mut rng = StdRng::seed_from_u64(seed);
-                let parent = sample_genome(&index, &space, &mut rng);
-                let child = mutate_genome(&parent, &index, &space, &classes, &mut rng, 2);
-                assert!(
-                    !cyclic(&index, &space, &child),
-                    "seed {seed}: mutation closed a cycle: {:?} -> {:?}",
-                    spelling(&index, &parent),
-                    spelling(&index, &child)
-                );
-                if spelling(&index, &child) != spelling(&index, &parent) {
-                    moved += 1;
-                }
-            }
-            assert!(moved > 0, "mutation must actually move the genome");
-        }
-    }
-
-    /// A class whose candidate sources from ITSELF is a self-loop: a
-    /// one-member component, and the sampler must never elect it.
-    #[test]
-    fn a_self_sourcing_candidate_is_never_elected() {
-        let (index, space) = build(&[("a", &[("prog", &[]), ("reads_self", &["a"])])]);
-        assert_eq!(
-            space.components,
-            vec![vec![class("a")]],
-            "a self-loop is a non-trivial component of one"
-        );
-        let classes: Vec<ClassId> = index.keys().cloned().collect();
-        for seed in 0..200u64 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let genome = sample_genome(&index, &space, &mut rng);
-            assert_eq!(spelling(&index, &genome), vec!["a=prog".to_string()]);
-            let child = mutate_genome(&genome, &index, &space, &classes, &mut rng, 3);
-            assert_eq!(spelling(&index, &child), vec!["a=prog".to_string()]);
-        }
-    }
-
-    /// THE BUFFERIZE TRIPWIRE fires on the cyclic-graph refusal and on
-    /// nothing else, and it prints the genome's own chosen
-    /// intra-component edges — the evidence for "the sampler's candidate
-    /// graph disagrees with the plan the extractor emitted".
-    #[test]
-    fn the_bufferize_tripwire_fires_only_on_the_cycle_refusal() {
-        let (index, space) = build(&[
-            ("a", &[("prog", &[]), ("reads_b", &["b"])]),
-            ("b", &[("prog", &[]), ("reads_a", &["a"])]),
-        ]);
-        let genome = genome_electing(&index, &[("a", "reads_b"), ("b", "prog")]);
-
-        let ordinary = anyhow::anyhow!("op declares result 0 as internally allocated");
-        assert!(
-            bufferize_cycle_tripwire(&ordinary, &index, &space, &genome).is_ok(),
-            "every other bufferize refusal stays an ordinary refusal"
-        );
-
-        let cyclic = anyhow::anyhow!(
-            "{}; cannot bufferize: the cycle runs through 2 node(s): [Copy -> a | Copy -> b]",
-            luminal::bufferize::EXTRACTED_GRAPH_CYCLE
-        );
-        let err = bufferize_cycle_tripwire(&cyclic, &index, &space, &genome)
-            .expect_err("a cyclic extracted graph from a sampled genome stops the search");
-        let text = format!("{err:#}");
-        assert!(text.contains("sampler invariant violated"), "{text}");
-        assert!(
-            text.contains("a <- [ClassId(\"b\")]") && text.contains("b <- []"),
-            "the bail names the genome's chosen intra-component edges: {text}"
-        );
-        assert!(
-            text.contains("the cycle runs through 2 node(s)"),
-            "and carries bufferize's cycle members: {text}"
-        );
-    }
-
-    /// Classes OUTSIDE every component are free: a plain DAG of
-    /// candidates yields no components and full-list sampling.
-    #[test]
-    fn an_acyclic_candidate_graph_has_no_components() {
-        let (index, space) = build(&[
-            ("a", &[("prog", &[])]),
-            ("b", &[("prog", &[]), ("reads_a", &["a"])]),
-            ("c", &[("reads_a", &["a"]), ("reads_b", &["b"])]),
-        ]);
-        assert!(space.components.is_empty());
-        for per_candidate in space.intra_sources.values() {
-            for sources in per_candidate {
-                assert!(sources.is_empty(), "no component, no intra sources");
-            }
-        }
-        let mut seen: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
-        for seed in 0..200u64 {
-            seen.insert(spelling(
-                &index,
-                &sample_genome(&index, &space, &mut StdRng::seed_from_u64(seed)),
-            ));
-        }
-        assert_eq!(seen.len(), 4, "all 1x2x2 combinations stay reachable");
     }
 }

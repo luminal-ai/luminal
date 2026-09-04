@@ -8,7 +8,7 @@ use luminal::layouts::{
     MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm, StridedElementLayout,
 };
 use luminal::prelude::egraph_serialize::ClassId;
-use luminal_cuda_lite::layouts::CudaLayout;
+use luminal_cuda_lite::layouts::DecodedLayout;
 use luminal_cuda_lite::ops::cublaslt::exec::{
     bind_destination, plan_call, plan_call_from_spec, validate_ld_bounds, CSource, LtDesc,
 };
@@ -355,8 +355,8 @@ fn shape(dims: &[i64]) -> ShapeTerm {
     ShapeTerm(dims.iter().map(|&d| IntExprTerm::Lit(d)).collect())
 }
 
-fn right_major(dims: &[i64]) -> CudaLayout {
-    CudaLayout {
+fn right_major(dims: &[i64]) -> DecodedLayout {
+    DecodedLayout {
         mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
             shape: shape(dims),
             width: BitWidthTerm(32),
@@ -365,8 +365,8 @@ fn right_major(dims: &[i64]) -> CudaLayout {
     }
 }
 
-fn left_major(dims: &[i64]) -> CudaLayout {
-    CudaLayout {
+fn left_major(dims: &[i64]) -> DecodedLayout {
+    DecodedLayout {
         mirror: MirrorLayout::LeftMajor(LeftMajorContiguousElementLayout {
             shape: shape(dims),
             width: BitWidthTerm(32),
@@ -449,7 +449,7 @@ fn dest_frame_refuses_layouts_this_backend_cannot_write() {
     // destination refusal: cuBLASLt has exactly two matrix orders,
     // so a strided or offset-expression destination is not writable by
     // this route. Loud, never wrong bytes.
-    let strided = CudaLayout {
+    let strided = DecodedLayout {
         mirror: MirrorLayout::Strided(StridedElementLayout {
             shape: shape(&[4, 3]),
             chain: vec![
@@ -469,7 +469,7 @@ fn dest_frame_refuses_layouts_this_backend_cannot_write() {
         "the refusal must classify itself: {msg}"
     );
 
-    let offset = CudaLayout {
+    let offset = DecodedLayout {
         mirror: MirrorLayout::ElementOffset(ElementOffsetExpressionLayout {
             offset: IntExprTerm::Coord { axis_from_end: 0 },
             shape: shape(&[4, 3]),
@@ -487,7 +487,7 @@ fn dest_frame_refuses_layouts_this_backend_cannot_write() {
 
 #[test]
 fn dest_frame_refuses_symbolic_extents() {
-    let symbolic = CudaLayout {
+    let symbolic = DecodedLayout {
         mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
             shape: ShapeTerm(vec![IntExprTerm::Var("s".into()), IntExprTerm::Lit(3)]),
             width: BitWidthTerm(32),

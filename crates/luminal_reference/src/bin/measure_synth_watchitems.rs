@@ -4,6 +4,7 @@
 //! the baseline and transparent worktrees; measurement-only.
 
 use luminal::prelude::*;
+use luminal_reference::TypedBuffer;
 use std::time::Instant;
 
 fn random_vec(n: usize) -> Vec<f32> {
@@ -68,7 +69,7 @@ fn measure_plan(
         let data = pairs.iter().cloned().collect();
         let t = Instant::now();
         let outcome = rt
-            .search(&data, &luminal::test_support::harness_search_options())
+            .search(&data, &luminal_reference::harness_search_options())
             .expect("search finds a plan");
         let search_ms = t.elapsed().as_millis();
         println!(

@@ -17,13 +17,14 @@
 //! within tolerance.
 #![cfg(feature = "device")]
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::implementation_search::ImplementationSearchOptions;
 use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
+use luminal_reference::TypedBuffer;
 
 /// Read the device output DENSELY through its RETURNED LAYOUT
 /// (escape-and-disclose + the corrected contract, 2026-08-31): a
@@ -40,16 +41,15 @@ use luminal_cuda_lite::CudaRuntime;
 /// readback: no fixture assumes dense.
 fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
     let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
-    let bytes = match data {
-        TypedBuffer::F32(values) => values,
-        other => panic!("output is {}, not f32", other.type_name()),
-    };
-    luminal_cuda_lite::layouts::dense_f32(bytes, &binding.layout)
+    let bytes = data
+        .as_f32()
+        .unwrap_or_else(|err| panic!("output is not f32: {err}"));
+    luminal_cuda_lite::layouts::dense_f32(&bytes, &binding.layout)
         .expect("the returned layout reads dense over its backing buffer")
 }
 
-fn view_search_options() -> ImplementationSearchOptions {
-    ImplementationSearchOptions {
+fn view_search_options() -> CompileOptions {
+    CompileOptions {
         generations: 4,
         generation_size: 8,
         mutations: 4,
@@ -78,7 +78,11 @@ fn run_differential(
 
     // CUDA side: search under the CL allow list (view electable).
     let mut rt = CudaRuntime::load(cx).expect("cuda load");
-    let data: FxHashMap<NodeIndex, TypedBuffer> = inputs
+    // THE TWO RUNTIMES TAKE DIFFERENT HOST PAYLOADS (ruling D4,
+    // 2026-09-03): the reference side stages `TypedBuffer` (its kernels
+    // read typed slices), the CL side `HostBuffer` (bytes plus a dtype
+    // tag, ready for an H2D copy). Same numbers, staged twice.
+    let data: FxHashMap<NodeIndex, HostBuffer> = inputs
         .iter()
         .map(|(id, v)| (*id, v.clone().into()))
         .collect();

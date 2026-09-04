@@ -135,7 +135,7 @@ impl OpMatcher for AddFunctionalMatcher {
 // 2026-08-13: everything about an op lives in the op's folder).
 // ---------------------------------------------------------------------------
 
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// Int arithmetic is CHECKED (non-wrapping by ruling 2026-08-11): an
 /// overflow is a loud kernel error, never a wrapped value — until the

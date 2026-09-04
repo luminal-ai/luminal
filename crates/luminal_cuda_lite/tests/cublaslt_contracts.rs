@@ -21,9 +21,9 @@
 #![cfg(feature = "device")]
 
 use cudarc::driver::{CudaContext, CudaSlice};
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
 use luminal::prelude::{DType, FxHashMap, NodeIndex};
+use luminal_cuda_lite::HostBuffer;
 
 /// The universal escape-and-disclose readback (the device_fidelity
 /// pattern): fetch the backing bytes + binding, walk each output
@@ -31,13 +31,12 @@ use luminal::prelude::{DType, FxHashMap, NodeIndex};
 /// identity, view elections the composed chain.
 fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
     let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
-    let bytes = match data {
-        TypedBuffer::F32(values) => values,
-        other => panic!("output is {}, not f32", other.type_name()),
-    };
+    let bytes = data
+        .as_f32()
+        .unwrap_or_else(|err| panic!("output is not f32: {err}"));
     // The value's shape and read path both come from the RETURNED
     // LAYOUT; there is no `dims` field and no hop chain any more.
-    luminal_cuda_lite::layouts::dense_f32(bytes, &binding.layout)
+    luminal_cuda_lite::layouts::dense_f32(&bytes, &binding.layout)
         .expect("the returned layout reads dense over its backing buffer")
 }
 use luminal_cuda_lite::ops::cublaslt::device_call;
@@ -355,17 +354,16 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
         let out = luminal_nn::linear(x, weight, Some(bias)).output();
         (cx, x.id, weight.id, bias.id, out.id)
     };
-    let data_for =
-        |x: NodeIndex, w: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, TypedBuffer> {
-            [
-                (x, TypedBuffer::from(weights(32, 1))),
-                (w, TypedBuffer::from(weights(24, 2))),
-                (b, TypedBuffer::from(weights(3, 3))),
-            ]
-            .into_iter()
-            .collect()
-        };
-    let options = luminal::implementation_search::ImplementationSearchOptions {
+    let data_for = |x: NodeIndex, w: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, HostBuffer> {
+        [
+            (x, HostBuffer::from(weights(32, 1))),
+            (w, HostBuffer::from(weights(24, 2))),
+            (b, HostBuffer::from(weights(3, 3))),
+        ]
+        .into_iter()
+        .collect()
+    };
+    let options = luminal_cuda_lite::CompileOptions {
         generations: 12,
         generation_size: 16,
         mutations: 4,
@@ -402,7 +400,7 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
     plain
         .search(
             &data_for(x, w, b),
-            &luminal::test_support::harness_search_options(),
+            &luminal_cuda_lite::harness_search_options(),
         )
         .expect("plain search");
     plain.set_data(x, weights(32, 1));
@@ -427,17 +425,17 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
         let out = a.matmul(b).output();
         (cx, a, b, out)
     };
-    let data_for = |a: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, TypedBuffer> {
+    let data_for = |a: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, HostBuffer> {
         [
-            (a, TypedBuffer::from(weights(32, 1))),
-            (b, TypedBuffer::from(weights(24, 2))),
+            (a, HostBuffer::from(weights(32, 1))),
+            (b, HostBuffer::from(weights(24, 2))),
         ]
         .into_iter()
         .collect()
     };
     // The seeded budget the CPU election pin measured green (see
     // tests/cublaslt_election.rs).
-    let options = luminal::implementation_search::ImplementationSearchOptions {
+    let options = luminal_cuda_lite::CompileOptions {
         generations: 12,
         generation_size: 16,
         mutations: 4,
@@ -472,7 +470,7 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
     let mut plain = CudaRuntime::load(&cx).expect("load plain");
     let data = data_for(a.id, b.id);
     plain
-        .search(&data, &luminal::test_support::harness_search_options())
+        .search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("plain search");
     plain.set_data(a.id, weights(32, 1));
     plain.set_data(b.id, weights(24, 2));
