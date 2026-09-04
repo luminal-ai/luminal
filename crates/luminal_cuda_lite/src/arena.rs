@@ -307,17 +307,19 @@ struct FreeList {
 
 impl FreeList {
     fn alloc(&mut self, need: usize) -> usize {
-        // BEST fit, not first fit: the tightest hole that holds `need`,
-        // ties to the lowest address. Measured on the two-layer
-        // mini-llama block, first fit left 20% of the slab in holes
-        // nothing fit into (596480 B against a 498176 B peak live);
-        // best fit is the one-line answer to that.
-        if let Some((&offset, &len)) = self
-            .holes
-            .iter()
-            .filter(|(_, &len)| len >= need)
-            .min_by_key(|(offset, &len)| (len, **offset))
-        {
+        // FIRST fit, in offset order — MEASURED against the obvious
+        // alternative and kept. First fit leaves about a fifth of the
+        // slab in holes on the two-layer mini-llama block (596480 B
+        // high-water against a 498176 B peak live, which is the
+        // fragmentation-free lower bound over the same order), and BEST
+        // fit — the tightest hole that holds the request — is WORSE:
+        // 663040 B on the same plan, because it shaves every large hole
+        // down into slivers nothing later fits into. If this is ever
+        // revisited, the thing to try is not another fit rule but
+        // offset assignment over whole lifetimes (the greedy-by-size
+        // arena planners), which is a different pass, not a different
+        // line.
+        if let Some((&offset, &len)) = self.holes.iter().find(|(_, &len)| len >= need) {
             self.holes.remove(&offset);
             if len > need {
                 self.holes.insert(offset + need, len - need);
