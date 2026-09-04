@@ -22,7 +22,9 @@ the self-contained repo-side summary.
   reference inventory (`tests/plan_smoke.rs`).
 - Candidate profiling during search runs on the reference HOST
   executor — a documented CL-1 cost proxy (the profiler seam
-  parameterization is CL-3, `implementation_search.rs:326`).
+  parameterization is CL-3; the loop now lives in
+  `crates/luminal_cuda_lite/src/search.rs`, ranking through
+  `crates/luminal_cuda_lite/src/heuristic.rs`).
 - `execute` is behind the `device` feature and refuses loudly
   without it. Plan-layer tests are green on macOS.
 - The predecessor crate targeting the deleted HLIR pipeline is parked

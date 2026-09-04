@@ -14,6 +14,14 @@ pub mod shape;
 // The logical-SSA layout compiler. Egglog program assembly and registries live
 // beside the ops; the fixture suite runs as core tests. See src/egglog_core/
 // for the core preamble and fixtures.
+//
+// WHAT IS NOT HERE (ruling 2026-09-03, #420/#422 rejoin Phase 1):
+// post-saturation SEARCH. The extractor and the selection loop are
+// runtime-owned — `luminal_reference::{extractor, search}`,
+// `luminal_cuda_lite::{extractor, search}`, `test_runtime::{extractor,
+// sampler}` — and core keeps only what every runtime shares: the
+// logical program, the egglog assembly, `dps_rewrite`,
+// `layouts::decode_layout_table`, `bufferize`, and the IR types.
 pub mod buffer_tensor_ir;
 pub mod bufferize;
 pub mod dps;

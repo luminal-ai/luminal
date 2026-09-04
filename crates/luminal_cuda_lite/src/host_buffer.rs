@@ -49,7 +49,7 @@ impl HostBuffer {
     pub fn new(dtype: PlanDtype, bytes: Vec<u8>) -> Result<Self> {
         let width = dtype_bytes(dtype)?;
         ensure!(
-            bytes.len() % width == 0,
+            bytes.len().is_multiple_of(width),
             "{} bytes is not a whole number of {dtype:?} elements ({width} bytes each)",
             bytes.len()
         );
