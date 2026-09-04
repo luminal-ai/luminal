@@ -138,6 +138,7 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
             trials: 1,
             seed: 0,
             search_log: false,
+            ..Default::default()
         }
     };
     let start = std::time::Instant::now();

@@ -422,12 +422,13 @@ impl CudaRuntime {
             .as_ref()
             .ok_or_else(|| anyhow!("load before search"))?;
 
-        // The caller's payloads are CHECKED here and go no further: this
-        // backend's search ranks candidates with the device-free
-        // heuristic (D6, 2026-09-03), which never runs anything, so
-        // there is nothing to stage. The check stays because binding a
-        // tensor that is not an input of the loaded program is a caller
-        // bug either way.
+        // The caller's payloads are CHECKED here always, because binding
+        // a tensor that is not an input of the loaded program is a
+        // caller bug under either evaluator. Whether they go FURTHER
+        // depends on how the search prices candidates: the device-free
+        // heuristic (D6, 2026-09-03) never runs anything and so needs
+        // nothing staged, while device profiling (Phase 4) executes each
+        // candidate and needs exactly these bytes.
         for tensor in input_data.keys() {
             assert!(
                 program
@@ -437,10 +438,64 @@ impl CudaRuntime {
                 "tensor {tensor:?} is not a bound input"
             );
         }
+        #[cfg(not(feature = "device"))]
+        anyhow::ensure!(
+            !options.profile_on_device,
+            "device profiling requested but cuda-lite was built without the `device` \
+             feature: this host can search by the heuristic, but a request to MEASURE \
+             must not be answered with a prior"
+        );
+
+        // THE SEARCH-TIME STAGING (Phase 4), by BufferLit id and BY
+        // REFERENCE — the ladder's `set_data` staging is a separate,
+        // later step and is untouched. A full-size model's weights are
+        // gigabytes; the search must borrow them, never copy them.
+        #[cfg(feature = "device")]
+        let staged_for_search: FxHashMap<i64, &HostBuffer> = if options.profile_on_device {
+            program
+                .input_slots
+                .iter()
+                .filter_map(|slot| input_data.get(&slot.tensor).map(|data| (slot.buffer, data)))
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
+        // THE DEVICE IS CREATED LAZILY, here or at the first `execute`
+        // (Phase 3's persistent device, unchanged): a search that ranks
+        // by the heuristic still touches no CUDA API at all.
+        #[cfg(feature = "device")]
+        if options.profile_on_device && self.device.is_none() {
+            self.device = Some(crate::device::CudaDevice::new(0)?);
+        }
 
         // THIS INSTANCE's claim set, derived at load from THIS
         // instance's registry — no crate-level default is consulted.
         let allow = Some(self.allow.clone());
+        // FIELD BORROWS, not `self.matchers()`: the device evaluator
+        // holds `&mut self.device` at the same time, and only disjoint
+        // FIELD borrows can coexist — a `&self` method would borrow the
+        // whole runtime.
+        let matchers = &self.matchers;
+        let evaluator = {
+            #[cfg(feature = "device")]
+            {
+                if options.profile_on_device {
+                    crate::search::Evaluator::Device {
+                        device: self
+                            .device
+                            .as_mut()
+                            .expect("the device was just created if it was missing"),
+                        staged: &staged_for_search,
+                    }
+                } else {
+                    crate::search::Evaluator::Heuristic
+                }
+            }
+            #[cfg(not(feature = "device"))]
+            {
+                crate::search::Evaluator::Heuristic
+            }
+        };
 
         // Own matchers, own allow list, own ranking: nothing in this
         // search touches another runtime.
@@ -450,16 +505,17 @@ impl CudaRuntime {
                 &program,
                 options,
                 allow,
-                self.matchers(),
+                matchers,
+                evaluator,
             )?
         } else {
             // BUCKETED (D7): one search per Cartesian combination, each
             // validated bucket-wide before its representative is
-            // searched. Unlike the reference runtime this needs no
-            // per-bucket caller data — the ranking is device-free — so
-            // the ordinary `search` entry serves both shapes.
+            // searched. The caller's data is staged ONCE and every
+            // bucket's search borrows the same map — a bucket only
+            // changes the dim seeds, never the payloads.
             let assembly = crate::search::BucketAssembly {
-                assembled_program: &luminal::egglog_snippet::assembled_program_for(self.matchers()),
+                assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
                 pre_schedule: &native.pre_schedule,
                 binding_seeds: &native.binding_seeds,
                 schedule: crate::bindings::CudaBindings::SCHEDULE,
@@ -473,7 +529,8 @@ impl CudaRuntime {
                 &self.dim_buckets,
                 options,
                 allow,
-                self.matchers(),
+                matchers,
+                evaluator,
             )?;
             let first = plans
                 .first()
@@ -538,11 +595,16 @@ impl CudaRuntime {
                 .plan
                 .as_ref()
                 .ok_or_else(|| anyhow!("search before execute"))?;
+            // SERVING KEEPS THE SLAB (#422 policy, Phase 4): nothing
+            // here releases it — only the search does, between
+            // candidates.
+            let staged: FxHashMap<i64, &HostBuffer> =
+                self.staged.iter().map(|(lit, data)| (*lit, data)).collect();
             let device = self
                 .device
                 .as_mut()
                 .expect("the device was just created if it was missing");
-            let outputs = crate::device::execute_plan(device, plan, &self.staged)?;
+            let outputs = crate::device::execute_plan(device, plan, &staged)?;
             self.outputs_host = outputs;
             Ok(())
         }

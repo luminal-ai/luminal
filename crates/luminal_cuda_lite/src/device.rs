@@ -186,6 +186,23 @@ impl CudaDevice {
     pub fn slab_bytes(&self) -> usize {
         self.slab.as_ref().map(|slab| slab.len()).unwrap_or(0)
     }
+
+    /// RELEASE THE SLAB — the SEARCH-TIME hygiene (#422 policy, Phase
+    /// 4, reversing #401's retention for this one caller):
+    /// [`crate::search`] calls this after every profiled candidate, so a
+    /// candidate whose arena high-water mark is outsized cannot hold
+    /// that memory for the rest of the search and starve its successors.
+    /// The next [`execute_plan`] re-allocates through `ensure_slab`.
+    ///
+    /// SERVING NEVER CALLS IT. `CudaRuntime::execute` keeps the slab
+    /// exactly as Phase 3 landed it: one grow-only allocation for the
+    /// runtime's life, which is the point of the persistent device.
+    /// Nothing else is released here — the context, the stream and the
+    /// NVRTC module cache all survive, which is what keeps kernel
+    /// compilation a once-per-source cost across a whole search.
+    pub fn release_slab(&mut self) {
+        self.slab = None;
+    }
 }
 
 /// A bound buffer: where its bytes are and how many there are. Derived
@@ -249,10 +266,17 @@ fn buffer_bytes(buffer: &Buffer<luminal::layouts::DecodedLayout>) -> Result<usiz
 /// index, a host copy of the slot's BACKING buffer plus its
 /// [`OutputBinding`] (the elected layout) — the escape-and-disclose
 /// fetch, universal over dense and view elections.
+///
+/// `staged` is a map of BORROWED payloads by BufferLit id (Phase 4). It
+/// used to hold the payloads themselves, which was fine while the only
+/// caller was the serving ladder — the runtime already owns them. The
+/// search now stages too, and it stages the CALLER's map, which for a
+/// full-size model is gigabytes of weights: a map of references costs
+/// one pointer per input and no copy at all.
 pub fn execute_plan(
     device: &mut CudaDevice,
     plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
-    staged: &FxHashMap<i64, HostBuffer>,
+    staged: &FxHashMap<i64, &HostBuffer>,
 ) -> Result<FxHashMap<usize, (HostBuffer, OutputBinding<luminal::layouts::DecodedLayout>)>> {
     // ESCAPE GUARD (ruling 2026-08-27): an output slot's backing storage
     // must SURVIVE the call — FreedBy::Caller, whatever the owner.

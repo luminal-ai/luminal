@@ -127,9 +127,16 @@ pub mod device {
     /// The full-size CUDA run shared by every model application:
     ///
     /// 1. CUDA-lite `load → bind dyn pins → search` on the shared harness
-    ///    budget,
+    ///    budget, PROFILED ON DEVICE (Phase 4, 2026-09-03): these
+    ///    applications run on a real GPU by construction, so their search
+    ///    ranks candidates by measured time rather than by the byte-move
+    ///    prior. The winner's measurement and its heuristic cost are
+    ///    printed side by side.
     /// 2. plan stats + refusal counters (all zero expected — the ladder
-    ///    acceptance from `tests/ladder_refusals.rs`; nonzero FAILS),
+    ///    acceptance from `tests/ladder_refusals.rs`; nonzero FAILS).
+    ///    TIMED-OUT candidates print separately and do NOT gate: nothing
+    ///    failed, the plan was merely too slow to finish measuring (and
+    ///    these applications set no budget, so the count is zero anyway).
     /// 3. device execute and fetch through the disclosed layout.
     pub fn run_cuda(
         name: &str,
@@ -145,23 +152,33 @@ pub mod device {
             rt.bind_dyn_range(*var, *value as u64, *value as u64)
                 .context("cuda dyn pin")?;
         }
-        // Own one copy of the hardware-sized parameter set. Search borrows it;
-        // staging then moves the same buffers into the runtime.
+        // Own one copy of the hardware-sized parameter set. Search BORROWS
+        // it (a device-profiled search stages by reference, never copying
+        // a full-size model's weights); staging then moves the same
+        // buffers into the runtime.
         let mut data: FxHashMap<NodeIndex, HostBuffer> = pairs.into_iter().collect();
+        let options = luminal_cuda_lite::CompileOptions {
+            profile_on_device: true,
+            ..luminal_cuda_lite::harness_search_options()
+        };
         let t = std::time::Instant::now();
-        let outcome = rt
-            .search(&data, &luminal_cuda_lite::harness_search_options())
-            .context("cuda search")?;
+        let outcome = rt.search(&data, &options).context("cuda search")?;
         let search_ms = t.elapsed().as_millis();
         println!(
             "{name}: search {search_ms} ms | plans profiled {} | [{}]",
             outcome.plans_profiled,
             outcome.timings.summary()
         );
+        println!(
+            "{name}: winner {:.3} ms measured on device (heuristic cost {} bytes moved)",
+            outcome.best_nanos as f64 / 1e6,
+            outcome.best_heuristic_cost.saturating_sub(1)
+        );
 
         // 2. Refusal counters — all zero expected (ladder acceptance).
         let b = &outcome.refusal_breakdown;
         println!("{name}: refusals {}", b.summary());
+        println!("{name}: timed out {} (not a gate)", b.timed_out);
         if b.extract_refusals != 0 || b.plan_build_refusals != 0 || b.execute_refusals != 0 {
             bail!(
                 "nonzero search refusals — the ladder expects zero with views admitted: {}",

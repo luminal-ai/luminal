@@ -391,6 +391,7 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
         trials: 1,
         seed: BIAS_ELECTING_SEED,
         search_log: false,
+        ..Default::default()
     };
 
     let (cx, x, w, b, out) = build();
@@ -463,6 +464,7 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
         trials: 1,
         seed: 0,
         search_log: false,
+        ..Default::default()
     };
 
     // Marker-elected route.

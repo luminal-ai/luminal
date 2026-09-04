@@ -223,6 +223,7 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
             trials: 1,
             seed,
             search_log: false,
+            ..Default::default()
         };
         let mut rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
         let outcome = match rt.search(&data, &options) {
