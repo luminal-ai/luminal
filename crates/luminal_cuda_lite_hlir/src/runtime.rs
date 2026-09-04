@@ -365,16 +365,15 @@ struct PersistentArena {
     pool: Option<sys::CUmemoryPool>,
 }
 
-struct ValidatedBucketSet {
+pub(crate) struct ValidatedBucketSet {
     compiled_buckets: Vec<CompiledBucket>,
     representative_dyn_maps: Vec<DynMap>,
     input_lengths_complete: bool,
 }
 
-struct ValidatedProfileCandidate {
-    dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
-    buckets: ValidatedBucketSet,
-    display: String,
+pub(crate) struct ValidatedProfileCandidate {
+    pub(crate) buckets: ValidatedBucketSet,
+    pub(crate) display: String,
 }
 
 impl ArenaReleasePlan {
@@ -3128,7 +3127,7 @@ impl CudaRuntime {
     /// Post-mortem aid for sticky CUDA errors during search: keep the most
     /// recent candidate's LLIR on disk so a crash identifies the genome that
     /// was executing. Gated on LUMINAL_SEARCH_DUMP_LAST_LLIR.
-    fn dump_candidate_llir_for_postmortem(llir_graph: &LLIRGraph, dyn_map: &DynMap) {
+    pub(crate) fn dump_candidate_llir_for_postmortem(llir_graph: &LLIRGraph, dyn_map: &DynMap) {
         if std::env::var_os("LUMINAL_SEARCH_DUMP_LAST_LLIR").is_none() {
             return;
         }
@@ -3277,15 +3276,20 @@ impl CudaRuntime {
         }
     }
 
-    fn candidate_allocation_dyn_map(context: luminal::op::CandidateFilterContext<'_>) -> DynMap {
-        if let Some(bucket_context) = context.bucket_context {
+    /// Dyn values a candidate's resources are planned at: bucket capacities
+    /// (maxima) when bucketed, otherwise the profiling dyn values.
+    fn candidate_allocation_dyn_map(
+        dyn_map: &DynMap,
+        ctx: &luminal::search::BucketContext<'_>,
+    ) -> DynMap {
+        if ctx.is_bucketed() {
             Self::bucket_capacity_dyn_map_from_context(
-                context.dyn_map,
-                bucket_context.bucket_indices,
-                bucket_context.dim_buckets,
+                dyn_map,
+                ctx.bucket_indices(),
+                ctx.dim_buckets(),
             )
         } else {
-            context.dyn_map.clone()
+            dyn_map.clone()
         }
     }
 
@@ -3876,13 +3880,6 @@ fn logical_interval_peak(planned: &[PlannedBuffer]) -> usize {
 }
 
 impl CudaRuntime {
-    fn invalid_profile_metric(reason: impl std::fmt::Display) -> (Duration, String) {
-        (
-            Duration::from_secs(24 * 60 * 60),
-            format!("invalid CUDA candidate: {reason}"),
-        )
-    }
-
     /// Assume a worst-case dynamic-dimension change: drop every cached
     /// decision derived from live dyn values (per-bucket length tables and
     /// each captured graph's dyn state) so the next execute pays the same
@@ -3936,7 +3933,7 @@ impl CudaRuntime {
     /// write into the buffer via substitution), so the step cost the search
     /// measures is the step cost deployment pays. User registrations take
     /// precedence; scratch fills the rest and is reused across candidates.
-    fn profile_loaded_llir(
+    pub(crate) fn profile_loaded_llir(
         &mut self,
         llir_graph: &LLIRGraph,
         dyn_map: &DynMap,
@@ -4134,7 +4131,7 @@ impl CudaRuntime {
     /// Keeping this separate from compilation lets search filtering hand the
     /// exact accepted CUDA executable to profiling without invoking NVRTC or
     /// retained-resource planning a second time.
-    fn install_validated_bucket_set(
+    pub(crate) fn install_validated_bucket_set(
         &mut self,
         dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         validated: ValidatedBucketSet,
@@ -4198,7 +4195,7 @@ impl CudaRuntime {
     /// Aggregate search filtering and final loading share this path so a set
     /// accepted during selection cannot encounter a different resource plan at
     /// load time.
-    fn compile_and_validate_bucket_set(
+    pub(crate) fn compile_and_validate_bucket_set(
         &mut self,
         dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIRRef<'_>],
@@ -4313,12 +4310,13 @@ impl CudaRuntime {
     /// cheap static plan rejects impossible candidates before NVRTC; the
     /// returned set has then passed the same exact retained-resource planning
     /// used by final loading and is safe to install without recompilation.
-    fn compile_and_validate_profile_candidate(
+    pub(crate) fn compile_and_validate_profile_candidate(
         &mut self,
         llir_graph: &LLIRGraph,
-        context: luminal::op::CandidateFilterContext<'_>,
-    ) -> Result<ValidatedProfileCandidate, luminal::op::CandidateFilterResult> {
-        let allocation_dyn_map = Self::candidate_allocation_dyn_map(context);
+        dyn_map: &DynMap,
+        ctx: &luminal::search::BucketContext<'_>,
+    ) -> Result<ValidatedProfileCandidate, String> {
+        let allocation_dyn_map = Self::candidate_allocation_dyn_map(dyn_map, ctx);
         let static_plan = match prepare_static_llir_resources(
             llir_graph,
             &allocation_dyn_map,
@@ -4326,9 +4324,8 @@ impl CudaRuntime {
         ) {
             Ok(plan) => plan,
             Err(violation) => {
-                return Err(luminal::op::CandidateFilterResult::reject_with_display(
-                    format!("candidate reject: {violation}"),
-                ));
+                luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
+                return Err(format!("candidate reject: {violation}"));
             }
         };
         if let Err(violation) = validate_resource_plan(
@@ -4339,25 +4336,19 @@ impl CudaRuntime {
             },
             self.candidate_device_resource_limits(),
         ) {
-            return Err(luminal::op::CandidateFilterResult::reject_with_display(
-                format!("resource reject: {violation}"),
-            ));
+            luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
+            return Err(format!("resource reject: {violation}"));
         }
 
-        let dim_buckets = context
-            .bucket_context
-            .map(|bucket_context| bucket_context.dim_buckets.clone())
-            .unwrap_or_default();
-        let bucket_indices = context
-            .bucket_context
-            .map(|bucket_context| bucket_context.bucket_indices.clone())
-            .unwrap_or_default();
-        let representative_dyn_map = context
-            .bucket_context
-            .map(|bucket_context| bucket_context.representative_dyn_map)
-            .unwrap_or(context.dyn_map);
+        // Unbucketed candidates are prepared at the profiling dyn values;
+        // bucketed ones at the bucket representative, matching final load.
+        let representative_dyn_map = if ctx.is_bucketed() {
+            &ctx.representative_dyn_map
+        } else {
+            dyn_map
+        };
         let candidate = BucketLLIRRef {
-            bucket_indices: &bucket_indices,
+            bucket_indices: ctx.bucket_indices(),
             representative_dyn_map,
             llir: llir_graph,
         };
@@ -4370,15 +4361,10 @@ impl CudaRuntime {
                 std::slice::from_ref(&allocation_dyn_map),
                 Some(std::slice::from_ref(&static_plan.kernel_to_host)),
             )
-            .map_err(|error| {
-                luminal::op::CandidateFilterResult::reject_with_display(format!(
-                    "resource reject: {error}"
-                ))
-            })?;
+            .map_err(|error| format!("resource reject: {error}"))?;
         let display =
             format_memory_bytes(Self::peak_planned_arena_bytes(&validated.compiled_buckets));
         Ok(ValidatedProfileCandidate {
-            dim_buckets,
             buckets: validated,
             display,
         })
@@ -4389,52 +4375,6 @@ impl Runtime for CudaRuntime {
     type Ops = (crate::kernel::Ops, crate::host::Ops);
     type CompileArg = Arc<CudaStream>;
     type ExecReturn = ();
-    type ProfileMetric = Duration;
-
-    fn filter_llir_candidate(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        context: luminal::op::CandidateFilterContext<'_>,
-    ) -> luminal::op::CandidateFilterResult {
-        match self.compile_and_validate_profile_candidate(llir_graph, context) {
-            Ok(candidate) => {
-                luminal::op::CandidateFilterResult::accept_with_display(candidate.display)
-            }
-            Err(rejection) => rejection,
-        }
-    }
-
-    fn prepare_profile_candidate(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        context: luminal::op::CandidateFilterContext<'_>,
-    ) -> luminal::op::CandidateFilterResult {
-        let candidate = match self.compile_and_validate_profile_candidate(llir_graph, context) {
-            Ok(candidate) => candidate,
-            Err(rejection) => return rejection,
-        };
-        match self.install_validated_bucket_set(&candidate.dim_buckets, candidate.buckets) {
-            Ok(()) => luminal::op::CandidateFilterResult::accept_with_display(candidate.display),
-            Err(error) => luminal::op::CandidateFilterResult::reject_with_display(format!(
-                "{}; candidate load reject: {error}",
-                candidate.display
-            )),
-        }
-    }
-
-    fn filter_llir_bucket_set(
-        &mut self,
-        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
-        bucket_llirs: &[BucketLLIRRef<'_>],
-        _search_options: &CompileOptions,
-    ) -> luminal::op::CandidateFilterResult {
-        match self.compile_and_validate_bucket_set(dim_buckets, bucket_llirs) {
-            Ok(_) => luminal::op::CandidateFilterResult::accept(),
-            Err(error) => luminal::op::CandidateFilterResult::reject_with_display(format!(
-                "aggregate bucket resource reject: {error}"
-            )),
-        }
-    }
 
     fn initialize(stream: Self::CompileArg) -> Self {
         let device_resource_limits = Some(
@@ -4490,113 +4430,19 @@ impl Runtime for CudaRuntime {
         }
     }
 
-    fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
-        metrics.iter().copied().sum()
+    fn compile(
+        &mut self,
+        space: &luminal::search::SearchSpace,
+        dyn_map: &DynMap,
+        options: &CompileOptions,
+        rng: &mut dyn luminal::prelude::RngCore,
+    ) {
+        self.search_and_load(space, dyn_map, options, rng);
     }
 
     #[tracing::instrument(skip_all)]
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
         self.try_load_llir(llir_graph).unwrap();
-    }
-
-    fn allocate_dummy_input(&mut self, node_index: usize, num_bytes: usize) {
-        // Boundary scratch buffers are sized in raw bytes and may represent
-        // non-float tensors such as gather/scatter indices. Initialize with zero
-        // bytes so integer boundaries stay in-range and the raw allocation size
-        // matches the requested tensor storage.
-        let host_data = vec![0u8; num_bytes];
-        let buf = self.cuda_stream.clone_htod(&host_data).unwrap();
-        let id = NodeIndex::new(node_index);
-        self.hlir_buffers.insert(
-            id,
-            CudaInput::Buffer {
-                buf,
-                len: num_bytes,
-            },
-        );
-        self.changed_hlir.insert(id);
-    }
-
-    fn has_hlir_buffer(&self, node_index: usize) -> bool {
-        self.hlir_buffers.contains_key(&NodeIndex::new(node_index))
-    }
-
-    fn clear_intermediate_buffers(&mut self) {
-        self.park_all_bucket_arenas();
-    }
-
-    fn intermediate_buffer_bytes(&self) -> usize {
-        self.persistent_arena
-            .as_ref()
-            .map(|arena| arena.allocation.len())
-            .unwrap_or(0)
-            + self
-                .compiled_buckets
-                .iter()
-                .map(|b| b.arena.as_ref().map(|arena| arena.len()).unwrap_or(0))
-                .sum::<usize>()
-    }
-
-    fn profile_prepared_candidate(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Self::ProfileMetric, f64)>,
-        _bucket_context: Option<luminal::op::ProfileBucketContext<'_>>,
-    ) -> (Self::ProfileMetric, String) {
-        Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
-        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout, early_stop)
-    }
-
-    #[tracing::instrument(skip_all)]
-    fn profile(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Self::ProfileMetric, f64)>,
-    ) -> (Self::ProfileMetric, String) {
-        Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
-        // Clear active bucket's arena before loading new LLIR for profiling.
-        if !self.compiled_buckets.is_empty() {
-            self.park_bucket_arena(self.active_bucket);
-        }
-        if let Err(e) = self.try_load_llir(llir_graph) {
-            return Self::invalid_profile_metric(e);
-        }
-        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout, early_stop)
-    }
-
-    fn profile_with_bucket_context(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Self::ProfileMetric, f64)>,
-        bucket_context: luminal::op::ProfileBucketContext<'_>,
-    ) -> (Self::ProfileMetric, String) {
-        // Profile with the same bucket metadata that final bucket compilation
-        // uses, so bucket-sensitive graph packaging decisions match search.
-        if bucket_context.dim_buckets.is_empty() {
-            return self.profile(llir_graph, dyn_map, trials, timeout, early_stop);
-        }
-        Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
-        if !self.compiled_buckets.is_empty() {
-            self.park_bucket_arena(self.active_bucket);
-        }
-        let bucket_llirs = vec![(
-            bucket_context.bucket_indices.clone(),
-            bucket_context.representative_dyn_map.clone(),
-            llir_graph.clone(),
-        )];
-        if let Err(e) = self.try_load_llir_buckets(bucket_context.dim_buckets, &bucket_llirs) {
-            return Self::invalid_profile_metric(e);
-        }
-        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout, early_stop)
     }
 
     #[tracing::instrument(skip_all)]
@@ -4886,8 +4732,31 @@ impl Runtime for CudaRuntime {
             );
         }
     }
+}
 
-    fn load_llir_buckets(
+impl CudaRuntime {
+    /// Park every bucket's intermediate arena at runtime scope so the next
+    /// loaded or profiled graph starts without graph-specific bindings.
+    pub fn clear_intermediate_buffers(&mut self) {
+        self.park_all_bucket_arenas();
+    }
+
+    /// Total bytes of intermediate arenas currently allocated.
+    pub fn intermediate_buffer_bytes(&self) -> usize {
+        self.persistent_arena
+            .as_ref()
+            .map(|arena| arena.allocation.len())
+            .unwrap_or(0)
+            + self
+                .compiled_buckets
+                .iter()
+                .map(|b| b.arena.as_ref().map(|arena| arena.len()).unwrap_or(0))
+                .sum::<usize>()
+    }
+
+    /// Load one compiled LLIR per bucket combination. `execute` dispatches
+    /// between them by the dyn map.
+    pub fn load_llir_buckets(
         &mut self,
         dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],
@@ -5625,7 +5494,7 @@ mod arena_plan_tests {
         rt.compiled_buckets[0].arena = Some(arena);
         rt.compiled_buckets[0].arena_bytes = 1024;
 
-        Runtime::clear_intermediate_buffers(&mut rt);
+        rt.clear_intermediate_buffers();
 
         assert!(rt.compiled_buckets[0].arena.is_none());
         assert_eq!(
@@ -5634,7 +5503,7 @@ mod arena_plan_tests {
                 .map(|arena| arena.allocation.device_ptr(&rt.cuda_stream).0),
             Some(ptr)
         );
-        assert_eq!(Runtime::intermediate_buffer_bytes(&rt), 4096);
+        assert_eq!(rt.intermediate_buffer_bytes(), 4096);
 
         rt.attach_persistent_arena(0);
 
@@ -5650,7 +5519,7 @@ mod arena_plan_tests {
         rt.free_intermediate_buffers();
         assert!(rt.compiled_buckets[0].arena.is_none());
         assert!(rt.persistent_arena.is_none());
-        assert_eq!(Runtime::intermediate_buffer_bytes(&rt), 0);
+        assert_eq!(rt.intermediate_buffer_bytes(), 0);
     }
 
     #[test]
