@@ -62,6 +62,7 @@ Dispositions:
 | `e891a57e` | #466 | Report memory state on CUDA graph capture failure | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (7th commit) | — nothing live corresponds (no materialization to fail; see **#430 dyn-dims on rebuild**) — see **#466 capture-failure diagnostics** below |
 | `fbe47db7` | #467 | Reclaim CUDA memory before graph replacement | FILE-LEVEL (2 files into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (8th commit) | — nothing live corresponds (no graph executables, no stream-ordered pool use; see **#430 dyn-dims on rebuild**) — see **#467 reclaim before replacement** below |
 | `9614ddef` | #472 | Trim CUDA pools after graph recapture | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (9th commit) | — nothing live corresponds (no recapture path, no async-alloc pool use; see **#430 dyn-dims on rebuild**) — see **#472 trim after recapture** below |
+| `d9682b80` | #487 | Reclaim CUDA pools after full graph rebuilds | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (10th commit) | — nothing live corresponds (no full-rebuild path; see **#430 dyn-dims on rebuild**) — see **#487 reclaim on full rebuild** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4260,6 +4261,28 @@ happen after that, before the next shape change prepares another complete
 generation. **Disposition: FILE-LEVEL park, path-rewritten only** — applied
 verbatim to `crates/luminal_cuda_lite_hlir/src/kernel/to_host.rs`; diff-of-diffs
 identical.
+
+## #487 reclaim on full rebuild — parked
+
+Main's `d9682b80` (+37/-19, one file) closes the last leak in this line: #472's
+trim covered the SURGICAL recapture path, but a FULL rebuild — where the whole
+materialization is thrown away — did not reclaim anything.
+`reset_materialization_state_and_trim` pairs the reset with
+`trim_recapture_memory`, and all three full-rebuild sites now use it: captured
+HostOp shape change, captured HostOp pointer rebuild, and the internal-buffer
+realloc path, which is restructured so the retire happens BEFORE the new
+internal buffers are allocated rather than as a scattered
+`cuda_graph = None; cuda_graph_exec = None; graph_node = None; kernel_params.clear()`
+block afterwards. `trim_recapture_memory` and `retire_failed_graph_exec` also
+become `&self` methods so the former can synchronize the PRIVATE capture stream
+(`self.capture_stream.borrow()`) before trimming — after end-capture returns
+CUDA may still hold stream-ordered allocations for the retired capture until
+that stream reaches a synchronization boundary. **Disposition: FILE-LEVEL park,
+path-rewritten only** — applied verbatim to
+`crates/luminal_cuda_lite_hlir/src/kernel/to_host.rs`; diff-of-diffs identical.
+Note that this rewrites the very hunk #430 added, and the park took both in
+order, so the park's `to_host.rs` now matches main's post-#487 file exactly at
+these sites.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
