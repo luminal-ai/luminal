@@ -1892,6 +1892,8 @@ DESTINATION width, not at f32 unconditionally), and it wants a
 reference-vs-CUDA bit-equality test of the shape main added on the Metal side.
 Recorded here as an open pin.
 
+AMENDED 2026-09-04: fixed in PR #490 (fix/cuda-float-literal-emission).
+
 ## #416 vLLM regions — banked; the zero-extent slice question answered
 
 RULED 2026-09-03: *"this is great and we should merge it. I don't think we
