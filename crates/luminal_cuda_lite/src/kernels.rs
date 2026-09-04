@@ -654,6 +654,39 @@ pub(crate) fn cuda_type(dtype: PlanDtype) -> Result<&'static str> {
     })
 }
 
+/// An `f64` as a C token NVRTC will actually parse. Rust's `Display`
+/// for `f64` is not a C literal syntax: non-finite values print as
+/// `inf`/`-inf`/`NaN`, which are not C tokens at all, and a
+/// large-magnitude finite value prints as a bare digit string with no
+/// decimal point and no exponent — `f32::MIN as f64` becomes
+/// `-340282346638528860000000000000000000000`, which C reads as an
+/// *integer* literal too large for any integer type, and the kernel
+/// fails to compile. `{:e}` closes the finite case: it is the shortest
+/// round-trip form and always carries an exponent, so it is always a
+/// `double` literal.
+///
+/// The non-finite cases go through bit patterns rather than the
+/// `INFINITY`/`NAN` macros because this runtime compiles kernels with
+/// NVRTC (`cudarc::nvrtc::compile_ptx`, see `device.rs`), which has no
+/// host math headers, so those macros do not exist there — the same
+/// reason, and the same technique, as the `-inf` reduction identity in
+/// [`crate::ops::reduce_max`]. The bit patterns are `float`-typed; the
+/// caller's existing `({to})` cast converts to the destination type
+/// exactly as it does for a finite literal.
+pub(crate) fn cuda_f64_literal(v: f64) -> String {
+    if v.is_nan() {
+        return "__uint_as_float(0x7fc00000u)".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() {
+            "__uint_as_float(0x7f800000u)".to_string()
+        } else {
+            "__uint_as_float(0xff800000u)".to_string()
+        };
+    }
+    format!("{v:e}")
+}
+
 pub(crate) fn numel(dims: &[usize]) -> usize {
     dims.iter().product()
 }
