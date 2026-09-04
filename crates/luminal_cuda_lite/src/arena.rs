@@ -307,7 +307,17 @@ struct FreeList {
 
 impl FreeList {
     fn alloc(&mut self, need: usize) -> usize {
-        if let Some((&offset, &len)) = self.holes.iter().find(|(_, &len)| len >= need) {
+        // BEST fit, not first fit: the tightest hole that holds `need`,
+        // ties to the lowest address. Measured on the two-layer
+        // mini-llama block, first fit left 20% of the slab in holes
+        // nothing fit into (596480 B against a 498176 B peak live);
+        // best fit is the one-line answer to that.
+        if let Some((&offset, &len)) = self
+            .holes
+            .iter()
+            .filter(|(_, &len)| len >= need)
+            .min_by_key(|(offset, &len)| (len, **offset))
+        {
             self.holes.remove(&offset);
             if len > need {
                 self.holes.insert(offset + need, len - need);
