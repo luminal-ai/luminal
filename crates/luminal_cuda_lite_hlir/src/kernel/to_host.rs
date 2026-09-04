@@ -3456,6 +3456,13 @@ impl CudaGraphOp {
             let active_prepared = prepared.or_else(|| op.prepared.clone()).ok_or_else(|| {
                 anyhow::anyhow!("cuBLASLt recapture is missing prepared resources")
             })?;
+            // Drop the least-recently-used capture before materializing its
+            // replacement. Evicting after capture transiently retains
+            // capacity + 1 CUDA graphs, which can OOM even when the steady
+            // state fits the planner's accounted resource ceiling.
+            if op.capture_cache.len() >= cublaslt_capture_cache_capacity() {
+                op.capture_cache.remove(0);
+            }
             let child_graph = Self::capture_cublaslt_child_graph(
                 stream,
                 capture_stream,
@@ -3468,9 +3475,6 @@ impl CudaGraphOp {
             if let Some(profile) = profile.as_deref_mut() {
                 profile.capture_collect_nodes += timer.elapsed();
                 profile.captured_nodes += 1;
-            }
-            if op.capture_cache.len() >= cublaslt_capture_cache_capacity() {
-                op.capture_cache.remove(0);
             }
             op.capture_cache.push(CachedCuBlasLtCapture {
                 signature,
@@ -3869,6 +3873,14 @@ impl CudaGraphOp {
                         )?
                     };
 
+                    // Make room before capture so graph construction never
+                    // transiently exceeds the configured retained capacity.
+                    {
+                        let op = &mut state.cublaslt_ops[idx];
+                        if op.capture_cache.len() >= cublaslt_capture_cache_capacity() {
+                            op.capture_cache.remove(0);
+                        }
+                    }
                     let capture_stream = self.capture_stream()?;
                     let child_graph = Self::capture_cublaslt_child_graph(
                         stream,
@@ -3887,9 +3899,6 @@ impl CudaGraphOp {
                     op.prepared = Some(prepared);
                     op.ptrs = Some(ptrs);
                     op.signature = Some(signature);
-                    if op.capture_cache.len() >= cublaslt_capture_cache_capacity() {
-                        op.capture_cache.remove(0);
-                    }
                     op.capture_cache.push(CachedCuBlasLtCapture {
                         signature,
                         graph: child_graph,
