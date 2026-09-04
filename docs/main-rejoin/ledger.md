@@ -36,7 +36,7 @@ Dispositions:
 | `727918cd` | #394 | Optimize CUDA graph materialization and StaticCache writebacks | FILE-LEVEL (parks) + INTENT-ONLY (core) | branch `merge/main-394-cuda-graph-park` | REQUIREMENT FOR THE CL EXECUTOR: durable external device-pointer registration, exact binding-delta graph patching, cached reverse indexes, resource-signature reuse — see **#394 CL executor persistence** below |
 | `b3b975ae` | #396 | shape: name symbolic dimensions instead of numbering them a..z | FILE-LEVEL (parks) + LANDED-BY-EQUIVALENT (core, `90f687bf`) + RE-EXPRESSED (`Symbol::try_new_dim`) | branch `merge/main-396-symbol-parked` | core: resolve later — the branch's own Symbol is the keeper; the PT2 remap and Metal's `dyn[]` slot layout are re-attachment requirements; see **#396 Symbol** below |
 | `2fbf5b6a` | #400 | cuda_lite: retype dim maps | DROPPED | — | ruling 5 of 2026-09-02: *"okay, we can drop"*. But the mismatch it repairs is now VERIFIABLY PRESENT in the park — see **#400 dropped** below, which names all 8 sites |
-| `1d07093c` | #401 | Reuse persistent CUDA intermediate arena | FILE-LEVEL (park) + INTENT-ONLY (core) | branch `merge/main-401-arena-park` | REQUIREMENT FOR THE CL EXECUTOR: honour the plan's `BufferAlloc`/`BufferFree` against one runtime-owned high-water slab; park-don't-free, keep-the-largest, re-attach-only-if-wanted — see **#401 persistent arena** below |
+| `1d07093c` | #401 | Reuse persistent CUDA intermediate arena | FILE-LEVEL (park) + INTENT-ONLY (core) | branch `merge/main-401-arena-park` | REQUIREMENT FOR THE CL EXECUTOR: honour the plan's `BufferAlloc`/`BufferFree` against one runtime-owned high-water slab; park-don't-free, keep-the-largest, re-attach-only-if-wanted — see **#401 persistent arena** below. SUPERSEDED at #422 (`598e5ca7`): one `SharedArena`, grow-only high-water sized to max over retained buckets, freed per search candidate; see **#422 reusable CUDA runtime** |
 | `7e7deb2a` | #404 | Spec | FILE-LEVEL (`spec.md`) | branch `merge/main-404-spec` | ruling 7 of 2026-09-02: *"this is just a snapshot, we'll update it later"* — the text describes main's architecture (translator-fed HLIR, loop-rolling, genetic LLIR extraction), NOT this branch's; see **#404 spec.md** below for the line-by-line divergence |
 | `d6d26cbe` | #402 | translate_module: hand back the translated graph without the pytorch wrappings | FILE-LEVEL (4 seam files) + SUPERSEDED (the `scatter_nd` fix) | branch `merge/main-402-translate-seam` | the seam's REQUIREMENT for the python re-attachment: a host must be able to take the translated graph WITHOUT inheriting luminal's dim buckets or search budget — see **#402 translate_module** below |
 | `be22fa60` | #405 | ci: stop running the OpInfo suite in the main Python CUDA job | FILE-LEVEL | branch `merge/main-405-ci-opinfo` | — (the ignore flag is a main-side CI decision; nothing in this workflow runs on this branch) |
@@ -49,6 +49,8 @@ Dispositions:
 | `38640588` | #416 | Allow vLLM FX region compilation | FILE-LEVEL (11 python-park files + 1 into the `cuda_lite_hlir` park) + DROPPED (the zero-extent slice special case, by ruling) + RE-EXPRESSED (one recording-only pin) | branch `merge/main-416-vllm-regions` | RULED 2026-09-03: *"let's not special case slices producing extent zero for now"* — and the answer to *"nothing bad should happen?"* is: nothing does; the shared-destination invariant is already enforced by the conflict engine — see **#416 vLLM regions** below |
 | `477d3626` | #417 | Preserve concrete dtypes through loop rolling | INTENT-ONLY (the law written into the estate beside `dtype-of`) | branch `merge/main-417-dtype-contract` | RULED 2026-09-03: *"This is good, let's merge it."* Nothing is file-mergeable — `src/hlir.rs` and `src/op.rs` are deleted and `src/graph.rs` is a different file (the recorder). The principle main paid for is already this branch's design and is now written down; the `output_dtype` table, `concrete_node_dtypes` and the marker assertions are uncarried — see **#417 dtype contracts** below |
 | `6681720b` | #418 | Add CUDA serving runtime support for vLLM integration | FILE-LEVEL (12 python-park files + 4 into the `cuda_lite_hlir` park + 1 metal-park file) + UNCARRIED (`src/dyn_backend.rs`, deleted on this branch) | branch `merge/main-418-serving-parks` | RULED 2026-09-03: *"we'll record only, we'll eventually have to get to parity."* Five EMBEDDABILITY REQUIREMENTS on the live CL executor, each checked against today's `crates/luminal_cuda_lite/src/device.rs`: device selection, a caller-owned borrowed stream with a synchronize-or-not policy, fixed-capacity caller-owned output buffers, functionalized mutation writebacks, and a versioned FFI seam — see **#418 vLLM serving** below |
+| `f285d229` | #420 | Move post-saturation search into the runtime | FILE-LEVEL (3 files into the `cuda_lite_hlir` park + 1 metal-park file) + INTENT-ONLY (15 core/doc files, nothing applied) + DROPPED (all loop unroll / roll / packed machinery, main's `Runtime` trait shape) | branch `rejoin/p0-record-and-park` | RULED 2026-09-03: *"we're going to ignore all the loop unrolling, loop rolling stuff, but we're going to follow all the other aspects and move all of that functionality out of core and into the runtimes."* The boundary move is the program's thesis and lands in later phases; THIS row is record-and-park — see **#420 search into the runtime** below |
+| `598e5ca7` | #422 | Share reusable CUDA runtime through Lite | FILE-LEVEL (41 files into the `cuda_lite_hlir` park, incl. 5 deletions + 1 non-gating `ci/` file) + INTENT-ONLY (arena, runtime-configurable op/matcher selection) + PUNTED-TO-PARK (fusion, attention, cuda-heavy composition) + DROPPED (the `subsume` fusion rule and the four `delete` rules, `CudaRuntimeImpl<O>`) | branch `rejoin/p0-record-and-park` | RULED 2026-09-03: *"put these fusion changes in hlir and punt on them temporarily"*, *"we're going to copy it into the hlir folder and then actually implement it once we're caught up"* (attention/FA3), *"Update the hlir_folder so we have a record of what the target code looks like"* (full-CUDA downstream), *"no code for now"* (zero-copy rebinding) — see **#422 reusable CUDA runtime** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -738,9 +740,9 @@ cleanly over the park's drift, including the three earlier commits of this
 batch; every content line is main's, and the diff-of-diffs against `1d07093c`
 is empty modulo hunk offsets. Not a workspace member, so nothing builds.
 
-**What the commit does.** Previously every bucket switch, candidate load,
-profiling call and `clear_intermediate_buffers` FREED the bucket's
-intermediate arena — a single big `CudaSlice<u8>` sub-divided by per-node
+**What the commit does.** AT ITS OWN COMMIT: previously every bucket switch,
+candidate load, profiling call and `clear_intermediate_buffers` FREED the
+bucket's intermediate arena — a single big `CudaSlice<u8>` sub-divided by per-node
 offsets — and the next bucket allocated a fresh one. Now a runtime-scoped
 `PersistentArena { allocation, pool }` is PARKED instead of freed
 (`park_bucket_arena` / `park_all_bucket_arenas`), only the LARGEST allocation
@@ -749,7 +751,12 @@ bucket (`attach_persistent_arena`) only when that bucket's `arena_bytes != 0`.
 A park discards graph-specific bindings only — cached buffer pointers, device
 buffers, dirty-node sets, `hlir_synced` — while the device pointer survives.
 `release_all_arenas` remains the true-free path, and
-`intermediate_buffer_bytes` now counts the parked allocation too.
+`intermediate_buffer_bytes` now counts the parked allocation too. All of this
+is removed by #422 (`598e5ca7`): `PersistentArena` / `park_*` / `attach_*` /
+`retain_larger_arena` deleted; replaced by `SharedArena` +
+`ensure_shared_arena_capacity` + `bind_intermediate_buffers`;
+`intermediate_buffer_bytes` = shared arena len; `clear_intermediate_buffers`
+is a true free again.
 
 **INTENT for CL.** The branch has NO analogue and, importantly, has not yet
 reached the problem: `crates/luminal_cuda_lite/src/device.rs` materializes one
@@ -760,22 +767,42 @@ never churns device arenas. When CL grows on-device candidate profiling or
 bucketed re-execution, the re-expression is a persistent-allocation field on
 `CudaRuntime` plus honouring `BufferAlloc`/`BufferFree` against ONE
 runtime-owned high-water slab in `device.rs`, kept across `execute` calls
-rather than dropped with the `storage` map.
+rather than dropped with the `storage` map (= #422's `SharedArena` form; if CL
+ever profiles candidates on-device, decide explicitly whether to follow #422's
+per-candidate free or #401's retention — they conflict).
 
-The transferable design is three rules:
+The transferable design, after #422:
 
-1. **Park, don't free**, on graph replacement.
-2. **Keep only the largest** allocation.
-3. **Re-attach only when the incoming plan actually wants intermediates.**
+(a) ONE runtime-owned slab (`SharedArena`) whose base is stable across bucket
+switches; buckets hold non-owning views (`bound_arena_ptr`) — nothing is
+parked or re-attached (#401 rules 1 and 3 were main's intermediate form,
+superseded).
+(b) Grow-only high-water sizing = max over retained bucket plans
+(`ensure_shared_arena_capacity` / `peak_planned_arena_bytes`) — #401 rule 2 in
+its serving form.
+(c) Search is the exception: the arena is freed after every candidate and at
+every bucket boundary (`release_search_candidate_allocations`,
+`discard_search_bucket_compilation_state`) — #422 reverses #401's search-time
+retention on purpose, because a losing candidate's arena "starves later
+candidate compilation".
+(d) A bucket with `arena_bytes == 0` contributes 0 to sizing and binds
+nothing.
 
 And one ordering discipline a naive re-expression WOULD drop: the free must be
-enqueued stream-ordered BEFORE the memory pool is synchronized and trimmed.
+enqueued stream-ordered BEFORE the memory pool is synchronized and trimmed
+(still present at #422: `release_arena` `:671-676` -> `finish_arena_releases`
+`:782-795`; growth additionally destroys every bucket's CUDA graphs and
+synchronizes before the free, `:808-811`).
 
 Main's one new test, `clear_parks_and_reattaches_the_same_persistent_arena`,
-cannot move — it is device-gated and pokes
-`rt.compiled_buckets[0].arena` / `rt.persistent_arena` directly, fields absent
-from this branch's `CudaRuntime`. A branch-side equivalent has to be written
-fresh against `device.rs` storage and would need an A100.
+is DELETED by #422; its successors
+`compiled_buckets_bind_different_layouts_to_one_shared_arena`
+(`598e5ca7:runtime.rs:6151`) and
+`search_cleanup_releases_candidate_arenas_and_bucket_state` (`:6217`) are
+likewise device-gated and poke `rt.shared_arena` /
+`compiled_buckets[i].arena_bytes` directly; nothing moves to CL. A branch-side
+equivalent has to be written fresh against `device.rs` storage and would need
+an A100.
 
 ## #404 spec.md — a snapshot of the OTHER architecture, landed as-is
 
@@ -2251,6 +2278,9 @@ CONTRACT-1 bind-time check, is written for exactly this future:
 
 That is where a caller pointer table would be bound, and the disjointness
 assert is what would catch a host handing in two overlapping ranges.
+#422's zero-copy fix implies: a registration carries `(ptr, capacity)`; a grown
+dynamic output must be re-registered before the plan is bound, never patched in
+the executor — RECORDED ONLY, no runtime checks by ruling (2026-09-03).
 
 **(4) Functionalized mutation writebacks.** *Today: absent from the executor,
 though the PLAN ontology already has the vocabulary.* A serving host's KV
@@ -2287,6 +2317,319 @@ shape is banked even though the seam is not.
 every gap above is a capability it was never asked for. This section exists so
 that when it IS asked for, the list is already written and already measured
 against the code.
+
+## #420 search into the runtime — parks banked, the boundary move scheduled
+
+RULED 2026-09-03: *"we're going to ignore all the loop unrolling, loop rolling
+stuff, but we're going to follow all the other aspects and move all of that
+functionality out of core and into the runtimes."* Main's `f285d229`
+(+5432/-4812, 19 files) deletes 4946 lines from `src/graph.rs` and moves the
+whole post-saturation search — extraction, mutation, profiling, hard
+filtering, bucket-set validation and loading — out of core into each runtime.
+Core is left with a NAMED ARTIFACT (`SearchSpace`) and a TOOLKIT
+(`luminal::search`) that core itself never invokes; the module doc says it
+plainly (`src/search/mod.rs:1-20`): *"Core stops at a `SearchSpace` ...
+Choosing a program from it is the runtime's job ... core never invokes any of
+it."*
+
+This is the commit this branch has been converging on from the other side, so
+the code re-expression is a multi-phase program of its own, planned at
+https://claude.ai/code/artifact/6b5d25e3-94cf-4089-8977-8e44f971b8a5 (phases,
+gates, per-phase A100 checkpoints, and the twenty decisions it turns on). THIS
+row records and parks only.
+
+### FILE-LEVEL: 4 park files
+
+Three `crates/luminal_cuda_lite/src/` files path-rewritten into
+`crates/luminal_cuda_lite_hlir/`: `lib.rs` (+1), `runtime.rs` (+70/-203), and
+the NEW `search.rs` (+173) — the runtime-side driver loop that is the whole
+point of the commit; plus one metal-park file,
+`crates/luminal_metal/src/runtime.rs` (+82/-44), where `Runtime::profile`
+becomes an inherent method.
+
+Two conflicts, both park drift, both resolved to main's content:
+`compile_and_validate_profile_candidate`'s two reject arms (the park had lost
+main's `luminal::mask_events::RESOURCE_REJECT.record_with` line) and the metal
+`profile` block (the park copy carried #386's `early_stop` parameter). The
+metal park keeps its local `early_stop_exceeded` stub spelling, since
+`luminal::op` does not exist here. Diff-of-diffs residue is those two items
+and nothing else. Neither crate is a workspace member; nothing builds.
+
+### INTENT: the 15 files NOT applied, and what replaces them
+
+`src/search/{mod,genetic,finalist,lattice,diagnostics,packed,unroll,tests}.rs`,
+`src/graph.rs`, `src/op.rs`, `src/hlir.rs`, `src/egglog_utils/mod.rs`,
+`src/lib.rs`, `spec.md`, `AGENTS.md`. None is applicable as a patch: this
+branch deleted `src/hlir.rs` and `src/op.rs` with the HLIR layer, `src/graph.rs`
+is a different file (the recorder), there is no LLIR and no `Runtime` trait —
+only `RuntimeBindingsGenerator` (`src/runtime_binding.rs:19`) — and search
+lives in `src/implementation_search.rs` over the e-graph. The requirements the
+later phases must satisfy, each checked against today's tree:
+
+**(1) A `SearchSpace` named at saturation.** Main's
+`Graph::build_search_space` (`f285d229:src/graph.rs:1585-1628`) saturates ONCE
+per dynamic-dim bucket combination and hands back
+`SearchSpace { buckets, ops, custom_ops, dim_buckets }`. Here there is no such
+artifact and no single owner of saturation: it happens inside
+`ReferenceRuntime::search` (`crates/luminal_reference/src/runtime.rs:213-284`)
+and inside `CudaRuntime::assemble_and_saturate`
+(`crates/luminal_cuda_lite/src/runtime.rs:186-239`) as near-duplicate blocks,
+plus once more in core's unmounted, test-only
+`bucketed_search_implementations` (`src/implementation_search.rs:1099-1213`).
+The requirement is one core function that assembles and saturates, called by
+the runtime, returning a named artifact — the runtime keeps deciding WHEN.
+
+**(2) Runtime-owned search, profiling and loading.** Main deletes thirteen
+`Runtime` hooks (`profile`, `profile_with_bucket_context`,
+`prepare_profile_candidate`, `profile_prepared_candidate`,
+`filter_llir_candidate`, `filter_llir_bucket_set`, `aggregate_profile_metrics`,
+`allocate_dummy_input`, `has_hlir_buffer`, `clear_intermediate_buffers`,
+`intermediate_buffer_bytes`, `load_llir_buckets`, `type ProfileMetric`) and
+replaces the lot with ONE required method,
+`compile(&mut self, space, dyn_map, options, rng)`, whose contract is *"choose
+one program per bucket of `space` — by any strategy — and leave the runtime
+ready to `execute`."* On this branch the analogous surface is `PlanProfiler`
+(`src/implementation_search.rs:386-408`) plus core's own GA loop
+(`search_implementations_with_runtime`, `:781-1073`), the byte-move cost model
+(`src/extractor.rs:1684-1719`), `dps_rewrite`, `bufferize` and the
+deterministic extractor. The requirement is the same INVERSION — a pull-style
+machine the runtime drives, with the runtime owning candidate evaluation — not
+main's trait shape.
+
+**(3) `extract_one` as the zero-ranking strategy.** `extract_one(space, ctx,
+rng)` (`f285d229:src/search/mod.rs:218-226`) is the complete "search" for a
+runtime with nothing to rank on, and main's reference runtime uses it with
+`CLEANUP_HLIR = false`. This branch DIVERGES by decision: the reference
+runtime IS the profiling template (ruling: CL "must mirror the reference
+profiler's design"), and the deterministic
+`extract_layout_ir_with_ops_and_matchers` (`src/extractor.rs:482`) already
+fills the fixture/golden role. Recorded as a deliberate divergence, not an
+oversight.
+
+**(4) The GA as runtime-local code.** Main's `GeneticSearch<'a, M>` is a
+pull-style state machine (`src/search/genetic.rs`) generic over the metric,
+with `Finalists` and `BucketLattice` beside it. The branch's loop is NOT
+equivalent to it at any setting — main hunts a single viable initial genome
+(panicking after 100 attempts), counts MEASURED rather than sampled
+candidates with a `count_choice_sets_up_to` cap and a truncated last
+generation, dedups genome and program before hand-out at no budget cost,
+forces a random resample after a measurement-less generation, and panics on
+exhaustion where this branch returns `Err`. Twenty-one `harness_search_options()`
+call sites in 14 files and every seeded cuBLASLt election pin depend on the
+branch's trajectory, so the machine to lift is the BRANCH's loop, with main's
+budget fields added opt-in later and only where a device evaluator consumes
+them.
+
+**(5) Buckets.** `SearchSpace.buckets` (one saturated e-graph per bucket
+combination), `BucketContext`, `bucket_index_combinations` and the
+interval-narrowing that precedes each saturation are a pure addition here;
+carry the space field when the artifact lands, mount `bind_dim_buckets` and
+execute-time `select_bucket` only when a decode-shaped example demands it, and
+require disjoint buckets at bind time (main's `select_bucket` is first-wins on
+overlap).
+
+### DROPPED
+
+- **All loop machinery**, by ruling: `src/search/unroll.rs` (1059 lines:
+  `collect_loop_regions`, `materialize_unrolled_view`, `unroll_packed_llir`,
+  `unroll_loops_in_llir`, `collapse_loops_to_first_iter`,
+  `materialize_unrolled_llir`) and the auto loop-rolling prepass
+  (`f285d229:src/graph.rs:1590`). The branch has no loop-rolling stage at all.
+- **`src/search/packed.rs`** (`PackedLLIRGraph`, `LlirFingerprint`): LLIR-shaped,
+  and the branch's `plan_fingerprint` (`src/extractor.rs:884-928`) is already a
+  full structural hash of the deployment plan and already the dedup key.
+- **`SearchSpace.custom_ops: Vec<LLIROp>`**: no custom ops on this branch.
+- **The LLIR diagnostics family** — `Candidate.llir`/`pre_collapse`,
+  `Finalist.llir`/`pre_unroll`, `BucketLLIR`, `LLIR_DUMP_DIR`,
+  `LLIR_DUMP_PRE_UNROLL`, `LUMINAL_LOG_LLIR`, `LUMINAL_CANDIDATE_OPS`,
+  `dump_failed_candidate`, `log_candidate_ops`, `log_best_llir`,
+  `maybe_dump_selected_llir`, the `ProgressBars` choreography,
+  `panic_initial_filter_limit`. The branch's refusal anatomy
+  (`RefusalBreakdown`, `failure_breakdown`, `SearchTimings`, `to_dot`/`ToHtml`)
+  and #391's `SearchProgress` are the re-expression, and the branch returns
+  `Err` rather than panicking.
+- **Main's `Runtime` trait shape** and `compile(space, dyn_map, options, rng)`
+  as a signature: the branch ladder is `load -> bind_* -> search -> set_data ->
+  execute -> get_*`, and the seam is `search()` driving a core machine with the
+  rng seeded inside.
+- **`spec.md` / `AGENTS.md` text**: describes the other architecture (see
+  **#404 spec.md**, and the out-of-date note now at the top of `spec.md`).
+- **Main's 900-trace-line fidelity harness claim**: not in the tree.
+
+## #422 reusable CUDA runtime — banked into the park; the arena is the only intent
+
+Main's `598e5ca7` (+3285/-4026, 42 files) makes the CUDA runtime REUSABLE by a
+closed-source superset: `CudaRuntime` becomes `CudaRuntimeImpl<O>` over an op
+tuple, thirty-odd internals go `pub #[doc(hidden)]`, five full-only kernels and
+the sink-attention/FA3 stack LEAVE Lite, one shared intermediate arena replaces
+the per-bucket ones, and elementwise fusion is turned on with a destructive
+egglog rule. It builds directly on #420's runtime-side search, which is why
+#420 is banked first.
+
+RULED 2026-09-03, four ways: *"put these fusion changes in hlir and punt on
+them temporarily... just put this in the hlir folder for now and we'll handle
+implementing it once we're up to date with main"*; *"we're going to copy it
+into the hlir folder and then actually implement it once we're caught up"*
+(attention/FA3); *"Update the hlir_folder so we have a record of what the
+target code looks like"* (the full-CUDA downstream); *"no code for now"*
+(zero-copy rebinding). So this row is a bank, with exactly one intent carried
+forward — the arena — and one already-ruled ledger consequence: #401 is
+superseded (see **#401 persistent arena**, amended above).
+
+### FILE-LEVEL: 41 park files (+3284/-4025) and one `ci/` line
+
+All 41 `crates/luminal_cuda_lite/**` files path-rewritten into
+`crates/luminal_cuda_lite_hlir/`, INCLUDING the five deletions applied as
+deletions under the park path:
+`src/host/flashinfer/{sink_attention.egg, sink_attention.rs, wrapper_fa3.cu,
+wrapper_fa3.h}` and `src/kernel/moe_gemv.rs`. Two of those could not be
+deleted by patch — the park's copies carry the `Expression` -> `IntExpr`
+re-spelling, so the whole-file deletion hunk does not match; each was diffed
+against main first to prove the drift is ONLY that re-spelling, then removed
+with `git rm`.
+
+Eleven files conflicted; the park has drifted and every conflict was resolved
+to main's content in park spellings. Every re-spelling the resolution
+would otherwise have dropped was restored and re-verified mechanically
+(`cx.tensor(shape, DType)` / `named_tensor(name, shape, DType)` for main's
+`.as_dtype`, `IntExpr` for `Expression`), including in lines main ADDS.
+Residue against main's own diff: the `Symbol` -> `char` dyn-dim key
+convention, one
+`luminal::mask_events::ALIAS_HAZARD_REJECT.record()` line the park had lost
+and now regains, and two hunks git split differently whose resulting text is
+byte-identical to main's. Nothing else. Not a workspace member; nothing
+builds.
+
+`ci/example_output.py:27` takes its one-line hunk file-level: qwen3_moe
+`max_tpot_ms` 35.0 -> 50.0 (TTFT unchanged). Per the standing ci ruling this
+SYNCS main's number and gates nothing here. Its cause is worth recording:
+#422 removes `KernelMoEGemv` from Lite, so qwen3_moe decode falls back to the
+`GLUMoE` host op or gathered `GenericMatmul`s and gets slower — main relaxed
+its own gate to match. The figure still has to be re-baselined against CL A100
+draws before it ever gates anything on this branch.
+
+### INTENT: the arena, and runtime-configurable op selection
+
+**(1) One runtime-owned slab in the CUDA runtime, as a separate alloc/free ->
+slice mapper.** #422's form is the target: `SharedArena { allocation, pool }`
+at runtime scope, grow-only, sized to `peak_planned_arena_bytes` = the max of
+`planned_allocation_bytes` over ALL retained buckets, with buckets holding
+non-owning `bound_arena_ptr` views; the base moves only inside
+`ensure_shared_arena_capacity`, which first destroys every bucket's CUDA
+graphs and synchronizes. Search is the exception and deliberately reverses
+#401: `release_search_candidate_allocations` frees after every candidate and
+`discard_search_bucket_compilation_state` at every bucket boundary, because
+*"a slow copying alternative can require several GiB more than the eventual
+winner, and retaining that losing arena starves later candidate
+compilation."* Today CL is nowhere near this: `execute_plan`
+(`crates/luminal_cuda_lite/src/device.rs`) materializes one fresh
+`alloc_zeros` per `BufferId` per execute and treats the plan's `BufferAlloc` /
+`BufferFree` nodes as explicit no-ops. The re-expression is a runtime-owned
+slab in `device.rs` that honours those nodes — a separate alloc/free -> slice
+MAPPER, never plan-level offsets, because geometry back into the plan is
+rejected by the 2026-08-31 bufferizer correction (`src/bufferize.rs:124-130`).
+Two things the spec must get right: exclusion from the slab keys on
+`FreedBy::Caller`, not `Owner::Caller`, and the issue order must be
+liveness-aware or the slab is a sum-of-buffers peak with extra steps.
+
+**(2) Configurable op / matcher selection at runtime init.** Main's answer is
+a type tuple (`CudaRuntimeImpl<O: IntoEgglogOp>`, `DefaultCudaOps =
+(kernel::Ops, host::Ops)`, `CudaDynBackend<O>`, `cuda_factory_for`). The
+intent — a downstream backend picks its op set and inherits the compiler,
+resource planner, arena, graph capture and search — is carried; the TYPE
+tuple is not (see DROPPED). The branch form is a value-level registry with the
+execution face injected at load: the estate already composes that way
+(`assembled_program_for` over any matcher list), branch ops carry their rules
+as `.egg` files rather than Rust methods, and the refactor deletes the two
+closed seams that exist today (the `host_dispatchable` name list and the
+executor's downcast arm). Do that BEFORE flipping cuBLASLt always-on, or
+always-on lands as a third registry function the refactor immediately deletes.
+
+**(3) Fusion — PUNTED to the park, by ruling.** #422 turns on the first
+multi-op fusion Lite has ever had: a singleton region per eligible elementwise
+op (now including flat `Cast`), and one destructive rule
+`inline-safe-FE-through-FS` that `union`s a `FusionStart(FusionEnd(x))`
+boundary with the producer's interior and `subsume`s the boundary spelling,
+run as a single late pass over the saturated e-graph. Eleven previously
+`#[ignore]`d fusion tests are re-enabled and four are INVERTED to assert no
+materialized boundary survives. It is banked verbatim in the park and will be
+implemented once this branch is caught up with main; the form it takes here is
+a separate question (see DROPPED for why the rule itself is not adopted).
+
+**(4) Attention / FA3 — PUNTED to the park, by ruling.** The sink-attention
+`HostOp`, its 232-line `.egg`, the FA3 wrapper ABI, and the generic
+`FlashInferJitSource` / `compile_flashinfer_source` replacement, together with
+the new `HostOp::{execute_with_id, output_dtype, cuda_graph_capture_*,
+prepare_cuda_graph_*}` hooks, `CudaGraphCaptureSharedState`, host mirrors
+(`set_data_with_host_mirror`), the shared dyn-dims buffer and `uses_input`.
+None of it is reachable on CL — no attention op, no CUDA-graph capture, no
+JIT/nvcc — so it is a record of the target, not a requirement yet. One piece
+is already-equivalent here: `output_dtype` is a declared fact
+(`CudaLayout.dtype`), not a query. The ruling that must PRECEDE any vendor
+attention op is the float contract for library attention (online softmax is
+not bit-equal to the chain; see `reduction-order-contract` and the vendor
+matching gap ledger), not anything in #422.
+
+**(5) Zero-copy output rebinding — RECORDED, no code.** #422 fixes a real bug:
+a dynamic output that grows keeps its stale `External` resolution through
+`prepare_bucket_buffers`, so the arena skips the node and the refresh applies
+the larger logical length to a view whose capacity is the previous request's
+byte count. Main's fix is `detach_dirty_external_output_bindings`, which drops
+the stale resolution so the arena rebinds at planned capacity before the new
+external view is installed. Not reachable here (no external output pointers on
+CL); folded into **#418** requirement 3 as a contract sentence — registrations
+carry `(ptr, capacity)`, growth re-registers rather than patching — with no
+runtime checks by ruling.
+
+**(6) Cuda-heavy composition — punted.** The `pub #[doc(hidden)]` surface
+(`cuda_dtype`, `compile_module_image_for_current_device`,
+`device_compute_major`, `eval_resource_expression`, `DeviceBuffer::capacity`,
+`KernelRoPE::from_parts`, `swiglu_chain_atoms`, `apply_rope_half_as`) exists
+to let an external superset layer kernels on Lite's codegen. Recorded as the
+shape of the target; nothing here yet has a downstream to serve.
+
+### DROPPED
+
+- **Destructive fusion as landed**: the `union` + `subsume`
+  `inline-safe-FE-through-FS` rule, the `fusion_inline_safe_late` late pass,
+  `safe_fusion_late_pass`, the singleton-`Cast` region rule and the eleven
+  un-ignored / four inverted fusion tests. Parked, not adopted. It is a
+  heuristic dressed as cleanup: it removes a form extraction may want, it is
+  keyed on `?shape ?stride ?dt` spelling equality, and it fails the cleanup
+  stratum's every-cost-model dominance bar. Even the narrow single-consumer
+  case has no expressible premise — egglog has no negation, `!=` is a
+  snapshot, and the estate carries no use-count facts. Main's own shared
+  interiors are recomputed per region by design, which is a cost-model
+  concern, not an invariant violation. The door left open is a fused-region
+  FORM elected by cost, after an A100 launch-overhead measurement — never a
+  destructive rule.
+- **The four `delete` rules** added in the same commit ("kernel argmax last
+  axis", "prefer fused argmax over decomposed max", "kernel stable ranks
+  descending", "kernel rms norm bf16"). Same doctrine — removal by fiat, not
+  by measurement — and none of those kernels exists on CL.
+- **`CudaRuntimeImpl<O: IntoEgglogOp>`**, `DefaultCudaOps`, `CudaDynBackend<O>`,
+  `cuda_factory_for`, and the `#[doc(hidden)]` accessors as a TYPE-level
+  extension axis. Parked. A tuple buys nothing here: no `DynBackend` exists on
+  this branch, and registry rows express the same thing at value level.
+- **The full-only kernel removals themselves** (`KernelGemvF8`,
+  `KernelMoEGemv`, `KernelRMSNormQuant`, `KernelSwigluQuant`,
+  `KernelRoPEScatterFused`), the `KernelArgmax` shared-memory fix, the cuBLASLt
+  autotune REPS/events change, `load_safetensors` dtype conversion: N/A —
+  none of those kernels exists on CL, which is primitive kernels by
+  construction. The park receives them file-level.
+- **Main's resource planner shape** (plan-level offsets,
+  `prepare_static_llir_resources`, `validate_resource_plan`) and
+  `DeviceBuffer{len, capacity}` with `with_logical_len`: geometry back into the
+  plan is rejected here; the capacity vocabulary arrives with #418 req 3 if
+  ever.
+- **Two-stage ranking** (`rerank_cuda_graph_finalists`,
+  `profile_finalist_cuda_graph`), `search_candidate_node_limit`, and
+  `bounded_search_intermediate_bytes` / `search_cache_under_pressure`: no CUDA
+  graphs on CL, and a live-memory-dependent cap makes the search space
+  run-to-run nondeterministic. Noted for the on-device profiler phase, not
+  adopted.
+- **`detach_dirty_external_output_bindings`**: not reachable; folded into #418
+  requirement 3 as a sentence (above).
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
