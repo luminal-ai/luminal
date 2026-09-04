@@ -3198,25 +3198,54 @@ THE PROBE, `tests/device_profile.rs` on the mini-llama3 decode block
 output projection) at the 2x4 harness budget with `profile_on_device`:
 
 ```
-search 12017 ms | plans profiled 6 | fingerprint hits 2
-  [saturation 0ms, serialize 0ms, analysis 88ms, extract 1207ms,
-   plan-build 5996ms, profile-exec 3411ms]
-winner 3.559355 ms measured on device, heuristic cost 11680847 bytes moved
+debug:   search 12017 ms | plans profiled 6 | fingerprint hits 2
+  [analysis 88ms, extract 1207ms, plan-build 5996ms, profile-exec 3411ms]
+  winner 3.559355 ms measured on device
+release: search  5504 ms | plans profiled 6 | fingerprint hits 2
+  [analysis 19ms, extract 152ms, plan-build 1090ms, profile-exec 3352ms]
+  winner 0.974485 ms measured on device
 refusals extract 0 (choice-cycles 0, dead-ends 0), bufferize 0, execute 0, timed out 0
 ```
 
 Six plans profiled on the GPU, ZERO compile/stage/warmup failures, zero
 execute failures, zero timeouts, and the elected plan still matches the
 reference runtime's logits to the fidelity battery's tolerance (1e-5
-relative). PROFILE-EXEC IS NOW 28% OF THE SEARCH (3.4 s of 12.0 s) where
-it used to be ~0 — that is the cost of measuring, and plan-build (6.0 s)
-is still the larger term. The debug-build numbers are what they are: the
-3.56 ms includes the whole `execute` call (divergence 2 above).
+relative). PROFILE-EXEC IS THE SEARCH'S LARGEST TERM IN RELEASE — 3.35 s
+of 5.50 s, 61%, where it used to be ~0. Note what is inside it: the
+PREPARE execute compiles this plan's kernels through NVRTC, so
+`SearchTimings::profile_nanos` is measurement PLUS first-compile, not
+measurement alone. Only the trials are timed for RANKING; the timings
+struct is coarser than the metric.
+
+THE PRIOR AND THE MEASUREMENT DISAGREE, which is the point:
+
+```
+the PRIOR would elect a plan of 10465553 bytes moved;
+the MEASUREMENT elected one of 11709143
+  (DIFFERENT — the measurement did not pick the prior's winner)
+```
+
+Same seed, same budget, same six candidates; the only difference is what
+decides. The plan the device timed fastest moves ~12% MORE bytes than the
+one the byte-move heuristic would have crowned. That is D6's worry
+measured on hardware rather than argued: on this backend the prior was
+not merely imprecise, it was electing a different plan. (Reported, never
+asserted — which plan measures fastest is device- and noise-dependent,
+and pinning it would pin the noise.)
 
 The second probe pins the timeout semantics: `candidate_timeout:
 Some(Duration::ZERO)` times EVERY candidate out, so none is ranked and
 the search refuses NAMING THE TIMEOUT rather than reporting an execution
 failure.
+
+NO FULL-SIZE EXAMPLE WAS RUN, for two independent reasons from the
+2026-09-01 sizing work: llama3-8B in f32 is ~32 GB of weights on a 40 GB
+A100 and the sizing verdict was "no fused matmul + pre-alloc-everything
+=> decode weights x2", i.e. it does not fit; and the one example that HAS
+passed full-size (yolo_v11n) took 94 minutes of search under the
+HEURISTIC, which device profiling only lengthens. A full-size
+device-profiled run is an hours-scale exercise and belongs to its own
+sitting.
 
 TRUNK ATTRIBUTION for the cuBLASLt election pin. Phase 3 found
 `cublaslt_contracts::marker_elected_bias_plan_matches_decomposed_route_tolerance_based`
