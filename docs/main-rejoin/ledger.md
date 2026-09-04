@@ -60,6 +60,7 @@ Dispositions:
 | `fb6bf0a4` | #450 | Bound serving CUDA graph bucket residency | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (5th commit) | — nothing live corresponds: this branch has no per-bucket CUDA graph residency to bound (see **#430 dyn-dims on rebuild**) — see **#450 bucket residency** below |
 | `dd3d6633` | #453 | Raise Qwen3 MoE TTFT CI limit | IGNORED (nothing applied; `ci/example_output.py` deliberately NOT synced) | — | RULED 2026-09-04: *"just ignore the number in CI for now, we're eventually going to move these tests out of CI/CD into their own system"* — this reverses the earlier sync-main's-numbers decision (ruling 1 of 2026-09-02) for this one line — see **#453 qwen3_moe TTFT** below |
 | `e891a57e` | #466 | Report memory state on CUDA graph capture failure | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (7th commit) | — nothing live corresponds (no materialization to fail; see **#430 dyn-dims on rebuild**) — see **#466 capture-failure diagnostics** below |
+| `fbe47db7` | #467 | Reclaim CUDA memory before graph replacement | FILE-LEVEL (2 files into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (8th commit) | — nothing live corresponds (no graph executables, no stream-ordered pool use; see **#430 dyn-dims on rebuild**) — see **#467 reclaim before replacement** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4217,6 +4218,27 @@ The point is that the failures worth debugging here are OOMs caused by
 residency policy, and the residency state (#450) is exactly what the old
 message omitted. **Disposition: FILE-LEVEL park, path-rewritten only** —
 applied verbatim to `crates/luminal_cuda_lite_hlir/src/runtime.rs`;
+diff-of-diffs identical.
+
+## #467 reclaim before replacement — parked
+
+Main's `fbe47db7` (+40/-2, two files) applies #442's principle — never hold the
+old thing and its replacement at once — to CUDA graph EXECUTABLES and to the two
+independent driver pools. `CudaGraphOp::retire_failed_graph_exec` synchronizes,
+drops the executable that just rejected an `update_from_graph`, binds the
+context and calls `cuDeviceGraphMemTrim` BEFORE the replacement is instantiated,
+because CUDA can retain a model-sized graph allocation until both the executable
+is destroyed and the graph pool is trimmed; it is wired into both
+re-instantiation sites (the cuBLASLt post-recapture update and the generic
+`old_exec` update path, which previously just fell through to
+`graph.instantiate()?`). In `runtime.rs`, bucket eviction additionally calls
+`trim_current_memory_pool` before `trim_device_graph_memory`, since releasing a
+bucket also drops prepared library workspaces and internal buffers from the
+STREAM-ORDERED pool, whose retained pages the graph allocator cannot reuse — two
+pools, both trimmed. Note the dependency: this builds on #450's
+`prepare_materialized_bucket_slot`, not on #466. **Disposition: FILE-LEVEL park,
+path-rewritten only** — applied verbatim to
+`crates/luminal_cuda_lite_hlir/src/kernel/to_host.rs` and `.../src/runtime.rs`;
 diff-of-diffs identical.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)

@@ -11,7 +11,8 @@ use std::{
 };
 
 use cudarc::driver::{
-    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, sys::CUgraphNode,
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr,
+    sys::{self, CUgraphNode},
 };
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
@@ -937,6 +938,23 @@ impl CudaGraphArenaOrdering {
 }
 
 impl CudaGraphOp {
+    /// Destroy an executable that rejected a source-graph update before
+    /// allocating its replacement. CUDA can retain a model-sized graph
+    /// allocation until both the executable is destroyed and the device graph
+    /// pool is trimmed; instantiating first transiently requires both copies.
+    fn retire_failed_graph_exec(
+        stream: &Arc<CudaStream>,
+        exec: CudaGraphExecHandle,
+    ) -> anyhow::Result<()> {
+        stream.synchronize()?;
+        drop(exec);
+        stream.context().bind_to_thread()?;
+        unsafe {
+            sys::cuDeviceGraphMemTrim(stream.context().cu_device()).result()?;
+        }
+        Ok(())
+    }
+
     /// Whether this packaged graph currently owns both a mutable source graph
     /// and an executable instance. Bucket-LRU eviction deliberately releases
     /// both while retaining the compiled operation descriptions.
@@ -3069,6 +3087,14 @@ impl CudaGraphOp {
                                 "CudaGraph cuBLASLt exec update failed after recapture; reinstantiating executable graph: {err:?}",
                             );
                         }
+                        // `exec` still owns the rejected executable. Retire it
+                        // before instantiating the replacement so peak graph
+                        // memory is one executable, not two.
+                        Self::retire_failed_graph_exec(
+                            stream,
+                            exec.take()
+                                .expect("failed graph update lost its executable"),
+                        )?;
                         let timer = Instant::now();
                         state.cuda_graph_exec =
                             Some(state.cuda_graph.as_ref().unwrap().instantiate()?);
@@ -3999,7 +4025,13 @@ impl CudaGraphOp {
         let exec = if let Some(mut exec) = old_exec {
             match exec.update_from_graph(&graph) {
                 Ok(()) => exec,
-                Err(_) => graph.instantiate()?,
+                Err(_) => {
+                    // The rejected executable may own most of the device graph
+                    // pool. It must be destroyed and the unused pool returned
+                    // before allocating the replacement.
+                    Self::retire_failed_graph_exec(stream, exec)?;
+                    graph.instantiate()?
+                }
             }
         } else {
             graph.instantiate()?
