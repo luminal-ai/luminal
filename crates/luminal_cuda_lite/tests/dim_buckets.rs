@@ -178,3 +178,25 @@ fn a_dim_cannot_be_both_pinned_and_bucketed() {
         .expect_err("a bucketed dim must not take a range binding");
     assert!(format!("{err:#}").contains("has buckets bound"), "{err:#}");
 }
+
+/// A BOUNDS-DEPENDENT AUTHORING CHECK UNDER BUCKETS (review C3/C10).
+/// `reduce_max` emits `require_extent_at_least` on its axis, which needs
+/// `lower-bound-of` for that dim. A bucketed dim is seeded PER BUCKET,
+/// never in a base render — so a base render of this graph carries no
+/// bounds for 'a' at all and the check refuses. The bucketed ladder must
+/// never render one: every per-bucket render seeds the interval and
+/// passes.
+#[test]
+fn a_bucketed_dim_may_carry_a_bounds_dependent_check() {
+    let mut cx = Graph::new();
+    cx.set_dim('a', 3);
+    let x = cx.tensor(('a', 2), DType::F32);
+    let _out = x.max(0).output();
+
+    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
+        .expect("disjoint sorted buckets bind");
+    rt.search(&Default::default(), &harness_search_options())
+        .expect("a bucketed search never renders the unseeded base program");
+    assert_eq!(rt.bucket_plans().len(), 2, "one plan per bucket");
+}

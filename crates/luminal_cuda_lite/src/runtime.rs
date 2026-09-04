@@ -434,7 +434,6 @@ impl CudaRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
-        let (serialized, program) = self.assemble_and_saturate()?;
         let native = self
             .native
             .as_ref()
@@ -447,12 +446,14 @@ impl CudaRuntime {
         // heuristic (D6, 2026-09-03) never runs anything and so needs
         // nothing staged, while device profiling (Phase 4) executes each
         // candidate and needs exactly these bytes.
+        //
+        // The slot list is the LOAD-TIME one, `native.input_slots` — the
+        // same list a rendered program's `input_slots` is cloned from, and
+        // the one the bucketed ladder has, which renders no base program
+        // at all.
         for tensor in input_data.keys() {
             assert!(
-                program
-                    .input_slots
-                    .iter()
-                    .any(|slot| slot.tensor == *tensor),
+                native.input_slots.iter().any(|slot| slot.tensor == *tensor),
                 "tensor {tensor:?} is not a bound input"
             );
         }
@@ -470,7 +471,7 @@ impl CudaRuntime {
         // gigabytes; the search must borrow them, never copy them.
         #[cfg(feature = "device")]
         let staged_for_search: FxHashMap<i64, &HostBuffer> = if options.profile_on_device {
-            program
+            native
                 .input_slots
                 .iter()
                 .filter_map(|slot| input_data.get(&slot.tensor).map(|data| (slot.buffer, data)))
@@ -485,6 +486,26 @@ impl CudaRuntime {
         if options.profile_on_device && self.device.is_none() {
             self.device = Some(crate::device::CudaDevice::new(0)?);
         }
+
+        // THE BASE PROGRAM IS RENDERED AND SATURATED ONLY FOR THE
+        // SINGLE-PIN LADDER. A bucketed dim carries no seeds in this
+        // render — `bind_dyn_range` is refused on it, and the intervals
+        // are seeded per bucket inside `bucketed_search_implementations`
+        // — so an unbucketed render validates nothing the bucketed
+        // search will use, and an authoring check that NEEDS bounds
+        // (`reduce_max`'s `require_extent_at_least`, an iota's value
+        // bounds) would refuse the whole bucketed search over a program
+        // every per-bucket render accepts. It is also a full fixpoint
+        // whose result the bucketed arm discards. The reference ladder's
+        // `search_buckets` never rendered one.
+        //
+        // Computed HERE, before the evaluator borrows `self.device`
+        // mutably: `assemble_and_saturate` takes `&self`.
+        let base = if self.dim_buckets.is_empty() {
+            Some(self.assemble_and_saturate()?)
+        } else {
+            None
+        };
 
         // THIS INSTANCE's claim set, derived at load from THIS
         // instance's registry — no crate-level default is consulted.
@@ -524,7 +545,8 @@ impl CudaRuntime {
         // plan is whichever FINALIST the bucket lattice selected under the
         // aggregate device budget. With no budget set they coincide,
         // which is why every existing caller sees the trajectory it had.
-        let (outcome, unbucketed_plan, searched_buckets) = if self.dim_buckets.is_empty() {
+        let (outcome, unbucketed_plan, searched_buckets) = if let Some((serialized, program)) = base
+        {
             let mut outcome = crate::search::search_implementations(
                 &serialized,
                 &program,
