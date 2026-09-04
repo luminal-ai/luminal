@@ -24,13 +24,26 @@ pub mod shape;
 // What core keeps is what decides nothing: the logical program, the
 // egglog assembly, `dps_rewrite`, `layouts::decode_layout_table`,
 // `bufferize`, the IR types — and, since #420/#422 rejoin Phase 8
-// (2026-09-04), [`extraction`], the e-graph walk that turns a genome
-// into an `ExtractedGraph`. It left core in Phase 1 and was duplicated
-// verbatim into all three runtimes; seven phases later the copies
-// differed by one API-shape hunk and zero logic lines, so the ruling's
-// own "maybe if there are some core utilities, they can belong in core"
-// clause was taken. The runtime modules named `extractor` are aliases
-// for it.
+// (2026-09-04), the two halves of search that make no choice:
+//
+//   [`extraction`]      — turning a genome into an `ExtractedGraph`.
+//   [`search_support`]  — drawing genomes, plus the vocabulary a search
+//                         reports itself in: `RefusalBreakdown`,
+//                         `SearchTimings`, `SearchProgress`,
+//                         `early_stop_exceeded`.
+//
+// Both left core in Phase 1 and were duplicated verbatim into the
+// runtimes (three copies of the walk and the sampler, two of the
+// reporting). Seven phases later the copies differed by one API-shape
+// hunk and zero logic lines, so the ruling's own "maybe if there are
+// some core utilities, they can belong in core" clause was taken. The
+// runtime modules named `extractor` and `sampler` are aliases for
+// these, and each runtime's `search` re-exports what it used to define.
+//
+// The line between the two sides is not "core vs runtime" but
+// "describes vs decides". A genome is drawn the same way everywhere; a
+// genome is PRICED differently everywhere, and pricing happens in the
+// middle of the loop — which is why the loop is not here.
 pub mod buffer_tensor_ir;
 pub mod bufferize;
 pub mod dps;

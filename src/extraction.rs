@@ -14,8 +14,9 @@
 //! 8, 2026-09-04). Each runtime keeps what chooses: its op registry,
 //! its allow list, its evaluator (how a plan is priced), its option
 //! knobs and outcome shape, its finalist/lattice policy, and the search
-//! loop that runs them. This module holds the half that decides
-//! nothing.
+//! loop that runs them. This module and [`crate::search_support`] hold
+//! the two halves that decide nothing — turning a genome into a graph,
+//! and drawing genomes.
 //!
 //! History: the walk left core in Phase 1 ("move extractor.rs to each
 //! runtime. Maybe if there are some core utilities, they can belong in
@@ -1513,13 +1514,12 @@ impl<'a> Extractor<'a> {
         // else { ..borrow_mut().. }` reads correctly and panics in
         // edition 2021, where the scrutinee temporary outlives the
         // `else` arm; edition 2024 shortened exactly that scope, and
-        // since Phase 7 all three copies live in 2024 crates, so that
+        // every crate in this workspace is 2024 since Phase 7, so that
         // spelling would compile-and-run correctly here too. It is
         // still not used: a lookup in its own statement drops the
         // `Ref` at the semicolon, so the guard is released before the
-        // miss path writes in EVERY edition, and these three files are
-        // hand-kept copies whose correctness should not depend on the
-        // edition of whichever crate is holding them.
+        // miss path writes in EVERY edition, and a re-entrancy
+        // argument should not rest on an edition.
         let cached = self.op_cache.borrow().get(node_id).cloned();
         let op: Box<dyn LayoutIrOp> = match cached {
             Some(cached) => cached,
