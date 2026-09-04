@@ -798,15 +798,28 @@ pub struct DecodedLayout {
     pub dtype: Option<crate::dtype::PlanDtype>,
 }
 
+/// The caller-owned decoded-layout cache: `(layout class, dtype-of fact)`
+/// → the decoded layout. Decoding is a PURE function of that key, so one
+/// map serves every candidate a search decodes over ONE serialized
+/// e-graph — and only that one: `ClassId`s are meaningful only inside the
+/// e-graph they came from, so a new render gets a new cache.
+pub type LayoutDecodeCache = HashMap<(ClassId, Option<crate::dtype::PlanDtype>), DecodedLayout>;
+
 /// Build the decoded-layout table for one extracted graph, keyed by
 /// VALUE e-class: enumerate every elected value and decode its layout
 /// class into a [`DecodedLayout`].
 ///
-/// THE CACHE KEY is `(layout class, dtype-of fact)` — all spellings of a
-/// layout class denote one function, and the dtype fact is the one
-/// extraction-side value fact folded into the decoded type — so one
-/// per-call cache serves every value of the graph. A decode error is
-/// LOUD and refuses the graph: there is no default layout.
+/// THE CACHE IS THE CALLER'S, keyed by `(layout class, dtype-of fact)` —
+/// all spellings of a layout class denote one function, and the dtype
+/// fact is the one extraction-side value fact folded into the decoded
+/// type, so decoding is a PURE function of that key and one cache serves
+/// every value of the graph AND every later graph over the same e-graph.
+/// A search loop holds one for its whole run: `decode_layout` builds a
+/// fresh `Reader` that walks and sorts every node of the serialized
+/// e-graph, so a per-call cache would pay that index once per distinct
+/// layout class per CANDIDATE. A one-shot caller passes
+/// `&mut HashMap::new()`. A decode error is LOUD and refuses the graph:
+/// there is no default layout.
 ///
 /// CALL IT ON THE GRAPH BUFFERIZE WILL SEE — the POST-DPS one. The table
 /// is VALUE-keyed, and the DPS rewrite mints fresh poison-destination
@@ -818,12 +831,11 @@ pub fn decode_layout_table(
     egraph: &EGraph,
     graph: &crate::layout_ir::ExtractedGraph,
     who: &str,
+    cache: &mut LayoutDecodeCache,
 ) -> Result<HashMap<ClassId, DecodedLayout>> {
     use crate::layout_ir::ExtractedNode;
 
     let mut table: HashMap<ClassId, DecodedLayout> = HashMap::new();
-    let mut cache: HashMap<(ClassId, Option<crate::dtype::PlanDtype>), DecodedLayout> =
-        HashMap::new();
     let mut decode = |value: &crate::layout_ir::LayoutTensorInfo,
                       table: &mut HashMap<ClassId, DecodedLayout>|
      -> Result<()> {

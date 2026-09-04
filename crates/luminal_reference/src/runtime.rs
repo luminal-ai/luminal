@@ -1681,8 +1681,13 @@ mod tests {
         .expect("extracts")
         .expect("plan");
         let dps = luminal::dps::dps_rewrite(&extracted);
-        let layouts = luminal::layouts::decode_layout_table(&serialized, &dps, "test")
-            .expect("layouts decode");
+        let layouts = luminal::layouts::decode_layout_table(
+            &serialized,
+            &dps,
+            "test",
+            &mut luminal::layouts::LayoutDecodeCache::new(),
+        )
+        .expect("layouts decode");
         let plan = luminal::bufferize::bufferize(&dps, &layouts).expect("bufferizes");
         let mut rt = crate::ReferenceRuntime::default();
         rt.stage_slots(&program.input_slots, &program.output_slots);

@@ -851,6 +851,14 @@ pub fn search_implementations_with_ops(
 
     // fingerprint → measured nanos (the dedup cache).
     let mut cache: FxHashMap<u64, u128> = FxHashMap::default();
+    // THE DECODED-LAYOUT CACHE, one per search and CALLER-OWNED
+    // (`decode_layout_table` takes it by `&mut`). Decoding is a pure
+    // function of `(layout class, dtype)`, and every decode builds a
+    // fresh `Reader` over the whole serialized e-graph — so a cache that
+    // did not span candidates would pay that index once per distinct
+    // layout class per candidate. `egraph` is fixed for this loop, which
+    // is what makes the `ClassId` keys comparable across candidates.
+    let mut layout_cache = luminal::layouts::LayoutDecodeCache::new();
     let mut plans_profiled = 0usize;
     let mut fingerprint_hits = 0usize;
     // Refusal accounting, minimal form (Step 5 down-payment): keep the
@@ -960,6 +968,7 @@ pub fn search_implementations_with_ops(
                         egraph,
                         &dps,
                         "implementation search",
+                        &mut layout_cache,
                     )
                     .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
                     timings.plan_build_nanos += build_start.elapsed().as_nanos();
@@ -1026,9 +1035,13 @@ pub fn search_implementations_with_ops(
             {
                 let build_start = Instant::now();
                 let dps = luminal::dps::dps_rewrite(&graph);
-                let built =
-                    luminal::layouts::decode_layout_table(egraph, &dps, "implementation search")
-                        .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
+                let built = luminal::layouts::decode_layout_table(
+                    egraph,
+                    &dps,
+                    "implementation search",
+                    &mut layout_cache,
+                )
+                .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
                 timings.plan_build_nanos += build_start.elapsed().as_nanos();
                 let plan = match built {
                     Ok(plan) => plan,
