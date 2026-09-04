@@ -19,10 +19,19 @@
 //! count, coalescing, tensor-core eligibility, library dispatch — so two
 //! plans this ranks a hair apart may differ by an order of magnitude on
 //! a device, and the winner it returns is "the plan that touches the
-//! least memory", never "the fastest plan". It is a placeholder until
-//! this runtime profiles ON DEVICE, mirroring the reference runtime's
-//! evaluator. Read `SearchOutcome::best_nanos` from a CL search as a
-//! byte count with a unit-shaped name, not as a duration.
+//! least memory", never "the fastest plan". Read
+//! `SearchOutcome::best_nanos` from a HEURISTIC CL search as a byte
+//! count with a unit-shaped name, not as a duration.
+//!
+//! ON DEVICE IT IS NOT CONSULTED AT ALL (Phase 4, 2026-09-03 — D6's
+//! "doesn't bias search too much", taken at full strength). With
+//! `CompileOptions::profile_on_device` set, the search ranks on measured
+//! device time and nothing else: no blend, no tie-break, no prior
+//! seeding the first generation. This function still runs once per
+//! profiled candidate, but only so the winner's byte-move cost can be
+//! REPORTED beside its measurement
+//! (`SearchOutcome::best_heuristic_cost`) — which is how the prior's
+//! bias gets measured instead of argued about.
 //!
 //! THE +1 (inherited from the retired `StaticProfiler`) keeps the metric
 //! strictly positive so a zero-cost plan — a pure-identity graph, every

@@ -8,14 +8,29 @@
 //! core defined and two runtimes implemented. Both the loop and the
 //! extractor it drives now live in each runtime, duplicated rather than
 //! generalized ("just put this search in the cuda lite runtime\'s crate.
-//! it\'s fine."), and the profiler trait is GONE: this copy ranks
-//! candidates inline with the DEVICE-FREE HEURISTIC in
-//! [`crate::heuristic`] — a weak static prior, never a measurement.
+//! it\'s fine."), and the profiler trait is GONE: candidates are ranked
+//! INLINE by whichever [`Evaluator`] the caller hands in — there is no
+//! trait, no object, and no third implementation waiting to be written.
+//!
+//! TWO EVALUATORS (Phase 4, 2026-09-03):
+//!
+//! * [`Evaluator::Heuristic`] — the DEVICE-FREE default
+//!   ([`crate::heuristic`]): a weak static prior, never a measurement.
+//!   It is what runs on the hosts most of this crate's suite runs on.
+//! * [`Evaluator::Device`] — ON-DEVICE PROFILING ([`crate::profile`]),
+//!   selected by `CompileOptions::profile_on_device`: each candidate
+//!   plan is compiled, warmed and TIMED on a real CUDA device, mirroring
+//!   the reference runtime's evaluator (ruling 4 on #386: *"we need to
+//!   mirror that design"*).
+//!
+//! The two are never blended: with device profiling on, the heuristic is
+//! not consulted at all (D6's "doesn't bias search too much", taken at
+//! full strength — a device build ranks on measured time only).
 //!
 //! Tests live with the reference copy (`luminal_reference::search`).
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, ensure, Result};
 use colored::Colorize;
@@ -43,6 +58,30 @@ pub struct CompileOptions {
     /// `CompileOptions::search_log`; overridden by `SEARCH_LOG=0`/`1`
     /// or `LUMINAL_LOG=1`.
     pub search_log: bool,
+    /// RANK CANDIDATES BY MEASURED DEVICE TIME (Phase 4, 2026-09-03)
+    /// instead of by the device-free heuristic. OFF by default, so every
+    /// trajectory that existed before this option is byte-for-byte the
+    /// one it was.
+    ///
+    /// ON requires the `device` feature, a CUDA device, and the caller's
+    /// input payloads (the ladder's `search` stages them); without the
+    /// feature the search REFUSES by name rather than silently falling
+    /// back to the heuristic — a caller that asked for measurement must
+    /// never be handed a prior.
+    pub profile_on_device: bool,
+    /// PER-CANDIDATE BUDGET FOR THE TIMED RUN — and for nothing else
+    /// (ruling, 2026-09-03: *"timeout should just cover run"*). The
+    /// clock starts at the first TIMED trial, after the candidate has
+    /// been compiled and warmed, and is checked BETWEEN trials; a
+    /// candidate that exceeds it is not ranked and is counted under
+    /// [`RefusalBreakdown::timed_out`]. `None` = no budget.
+    ///
+    /// It is deliberately NOT a compile budget: NVRTC time is paid once
+    /// per distinct kernel source across the whole search (the device's
+    /// persistent module cache), so charging it to whichever candidate
+    /// happened to hit a cold cache would time out plans for a cost
+    /// their successors do not pay.
+    pub candidate_timeout: Option<Duration>,
 }
 
 impl Default for CompileOptions {
@@ -54,6 +93,8 @@ impl Default for CompileOptions {
             trials: 3,
             seed: 0,
             search_log: true,
+            profile_on_device: false,
+            candidate_timeout: None,
         }
     }
 }
@@ -213,6 +254,14 @@ pub struct SearchOutcome {
     pub best_plan: BufferIrGraph<luminal::layouts::DecodedLayout>,
     pub best_genome: Genome,
     pub best_nanos: u128,
+    /// THE WINNER'S HEURISTIC COST, always computed, never consulted by
+    /// a device-profiled ranking. With [`Evaluator::Heuristic`] it IS
+    /// `best_nanos`; with [`Evaluator::Device`] the two sit side by side
+    /// so a caller can see how far the byte-move prior was from the
+    /// measurement (which is the only honest way to talk about D6's
+    /// "doesn't bias search too much" — by reporting the gap, not by
+    /// mixing the numbers).
+    pub best_heuristic_cost: u128,
     /// Plans actually profiled (distinct fingerprints).
     pub plans_profiled: usize,
     /// Candidates answered from the fingerprint cache without re-profiling.
@@ -247,8 +296,23 @@ pub struct RefusalBreakdown {
     /// candidate at all).
     pub with_dead_ends: usize,
     /// Genomes that extracted but failed bufferize / execute.
+    ///
+    /// UNDER DEVICE PROFILING (Phase 4) the plan-build count also
+    /// carries candidates whose PREPARE step failed — NVRTC compilation,
+    /// module load, staging, or the warmup execution. That is a
+    /// deliberate classification (D10: *"runtimes can choose how to
+    /// handle failures at different points"*): a plan the device cannot
+    /// compile is an ordinary unfit candidate, indistinguishable in kind
+    /// from one bufferize refused, and it must NOT fail the ladder.
     pub plan_build_refusals: usize,
+    /// Failures in a TIMED trial, after the warmup already succeeded.
     pub execute_refusals: usize,
+    /// Candidates whose TIMED RUN exceeded
+    /// [`CompileOptions::candidate_timeout`]. NOT a refusal in the
+    /// execute sense — nothing failed, the plan is simply too slow to
+    /// finish measuring — so it is counted apart and is not part of the
+    /// zero-refusal ladder acceptance.
+    pub timed_out: usize,
     /// First few classified summaries, verbatim.
     pub exemplars: Vec<String>,
 }
@@ -256,13 +320,119 @@ pub struct RefusalBreakdown {
 impl RefusalBreakdown {
     pub fn summary(&self) -> String {
         format!(
-            "extract refusals {} (choice-cycles {}, dead-ends {}), bufferize {}, execute {}",
+            "extract refusals {} (choice-cycles {}, dead-ends {}), bufferize {}, execute {}, \
+             timed out {}",
             self.extract_refusals,
             self.with_choice_cycles,
             self.with_dead_ends,
             self.plan_build_refusals,
-            self.execute_refusals
+            self.execute_refusals,
+            self.timed_out
         )
+    }
+}
+
+/// HOW ONE CANDIDATE IS PRICED — the whole of what used to be a
+/// `PlanProfiler` trait, as a two-variant enum the caller constructs.
+///
+/// NO TRAIT (ruling, 2026-09-03: keep it simple, no new traits). There
+/// are exactly two ways this crate prices a plan and both live in this
+/// crate, so an enum names them and the match is exhaustive.
+pub enum Evaluator<'a> {
+    /// The DEVICE-FREE prior ([`crate::heuristic`]): bytes moved over
+    /// the extracted graph. Nothing executes.
+    Heuristic,
+    /// ON-DEVICE MEASUREMENT ([`crate::profile::profile_candidate`]) on
+    /// a persistent device — the module cache and the slab are the
+    /// runtime's, so kernel compilation is paid once per distinct source
+    /// across the search rather than once per candidate.
+    ///
+    /// `staged` is BORROWED, by BufferLit id, exactly as
+    /// [`crate::device::execute_plan`] wants it. It is a map of
+    /// references and not of payloads on purpose: a full-size model's
+    /// weights are gigabytes on the host and the search must not hold a
+    /// second copy of them.
+    #[cfg(feature = "device")]
+    Device {
+        device: &'a mut crate::device::CudaDevice,
+        staged: &'a FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
+    },
+    /// The lifetime placeholder for builds WITHOUT the `device` feature,
+    /// so [`search_implementations`]'s signature is the same in both.
+    /// Unconstructible in practice — [`Evaluator::Heuristic`] is the
+    /// only variant a device-free build has.
+    #[cfg(not(feature = "device"))]
+    #[doc(hidden)]
+    NoDevice(std::marker::PhantomData<&'a ()>),
+}
+
+impl Evaluator<'_> {
+    /// Lend this evaluator to a nested search (the bucketed entry runs
+    /// one search per Cartesian combination and must hand the SAME
+    /// device to each).
+    pub fn reborrow(&mut self) -> Evaluator<'_> {
+        match self {
+            Evaluator::Heuristic => Evaluator::Heuristic,
+            #[cfg(feature = "device")]
+            Evaluator::Device { device, staged } => Evaluator::Device { device, staged },
+            #[cfg(not(feature = "device"))]
+            Evaluator::NoDevice(marker) => Evaluator::NoDevice(*marker),
+        }
+    }
+
+    /// Does this evaluator measure on a device?
+    fn is_device(&self) -> bool {
+        #[cfg(feature = "device")]
+        {
+            matches!(self, Evaluator::Device { .. })
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            false
+        }
+    }
+}
+
+/// Main's `early_stop_exceeded` (its `src/op.rs`), retyped from
+/// `Duration` to this branch's u128 nanos: true once a candidate's mean
+/// trial cost exceeds `best * factor`, i.e. the candidate has already
+/// lost by at least that margin and further trials can only refine a
+/// metric that is out of contention.
+///
+/// THE DEVICE EVALUATOR ([`crate::profile`]) applies it at `factor =
+/// 1.0` to a LOWER BOUND on the candidate's final mean (the trials so
+/// far divided by ALL of them, i.e. assuming every remaining trial costs
+/// zero), which makes the stop exact rather than heuristic: a candidate
+/// whose best conceivable final mean already exceeds the incumbent
+/// cannot win. The factor survives because it is main's semantics and
+/// main's tuning knob (`CompileOptions::early_stop_factor`).
+///
+/// Duplicated from `luminal_reference::search` under the duplication
+/// ruling — the two runtimes share no search code.
+pub fn early_stop_exceeded(mean_nanos: u128, best_nanos: u128, factor: f64) -> bool {
+    mean_nanos as f64 > best_nanos as f64 * factor
+}
+
+#[cfg(test)]
+mod early_stop_tests {
+    use super::early_stop_exceeded;
+
+    /// Main's `test_early_stop_exceeded` (`src/op.rs`), retyped from
+    /// `Duration` to nanos.
+    #[test]
+    fn early_stop_exceeded_keeps_mains_margin_semantics() {
+        const MS: u128 = 1_000_000;
+        let best = 5 * MS;
+        // 2x cutoff: 10ms mean is at the boundary, not over it.
+        assert!(!early_stop_exceeded(10 * MS, best, 2.0));
+        assert!(early_stop_exceeded(11 * MS, best, 2.0));
+        // A candidate faster than best never stops early.
+        assert!(!early_stop_exceeded(4 * MS, best, 2.0));
+        // Factor 1.0 stops anything slower than best.
+        assert!(early_stop_exceeded(6 * MS, best, 1.0));
+        // ...and NOT a tie: the incumbent keeps its seat, but a tied
+        // candidate is still worth finishing (it is not yet losing).
+        assert!(!early_stop_exceeded(5 * MS, best, 1.0));
     }
 }
 
@@ -603,6 +773,33 @@ fn bufferize_cycle_tripwire(
     ))
 }
 
+/// The incumbent: the best-ranked candidate so far, its plan, and the
+/// heuristic cost of the same graph (carried alongside, never mixed into
+/// the ranking — see [`SearchOutcome::best_heuristic_cost`]).
+struct Best {
+    nanos: u128,
+    heuristic: u128,
+    genome: Genome,
+    plan: BufferIrGraph<luminal::layouts::DecodedLayout>,
+}
+
+/// What pricing one candidate produced. A cost is ranked; the other
+/// three are accounted and the candidate is dropped.
+///
+/// Only the device evaluator can produce the last three, so a
+/// device-free build constructs `Cost` alone.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+enum Priced {
+    Cost(u128),
+    /// The timed run exceeded [`CompileOptions::candidate_timeout`].
+    TimedOut(String),
+    /// Compile / stage / warmup failed — an ordinary unfit candidate
+    /// (D10), counted with the bufferize refusals.
+    PrepareFailed(String),
+    /// A timed trial failed after the warmup had succeeded.
+    ExecuteFailed(String),
+}
+
 /// THE SELECTION LOOP for this backend: the caller supplies its OWN
 /// matcher vocabulary and its OWN allow list — both are properties of
 /// the runtime INSTANCE, chosen when it was loaded (see
@@ -612,18 +809,36 @@ fn bufferize_cycle_tripwire(
 /// not clonable, so the list lives in the runtime and is lent here.
 /// Deterministic for a fixed seed.
 ///
-/// NO CALLER DATA (D6, 2026-09-03): candidates are ranked by
-/// [`crate::heuristic::heuristic_cost_of`], which never runs anything,
-/// so there is nothing to stage. The ladder's `search` still takes the
-/// caller's payloads and still checks them against the program's bound
-/// inputs — it just does not hand them here.
+/// HOW CANDIDATES ARE PRICED is the caller's too, as the one extra
+/// argument: [`Evaluator::Heuristic`] ranks device-free and needs no
+/// caller data (D6, 2026-09-03), [`Evaluator::Device`] carries the
+/// device and the staged payloads and ranks by measured time (Phase 4).
+/// `options.profile_on_device` and the evaluator must AGREE — a
+/// mismatch is refused up front rather than silently ranking by the
+/// prior when measurement was asked for.
+// The evaluator is mutated (reborrowed per candidate) only by the
+// device arm, which a device-free build compiles out.
+#[cfg_attr(not(feature = "device"), allow(unused_mut))]
 pub fn search_implementations(
     egraph: &egraph_serialize::EGraph,
     program: &LogicalProgram,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
+    mut evaluator: Evaluator<'_>,
 ) -> Result<SearchOutcome> {
+    ensure!(
+        !options.profile_on_device || evaluator.is_device(),
+        "device profiling requested but {}",
+        if cfg!(feature = "device") {
+            "this search was handed the heuristic evaluator (the ladder's \
+             `CudaRuntime::search` builds the device one)"
+        } else {
+            "the `device` feature is off: this build has no device evaluator, and \
+             ranking by the heuristic instead would answer a request for a \
+             measurement with a prior"
+        }
+    );
     let mut timings = SearchTimings::default();
     let analysis_start = Instant::now();
     // The allow list narrows the caller's matcher set; None = the whole set.
@@ -667,7 +882,7 @@ pub fn search_implementations(
     // causes instead of shrugging.
     let mut refusals: Vec<String> = Vec::new();
     let mut breakdown = RefusalBreakdown::default();
-    let mut best: Option<(u128, Genome, BufferIrGraph<luminal::layouts::DecodedLayout>)> = None;
+    let mut best: Option<Best> = None;
     // Live progress (#391), on stderr (via the capture-aware adapter, so
     // test output stays clean) and never on a caller's stdout.
     // `None` = the option (or `SEARCH_LOG`) says quiet.
@@ -683,8 +898,8 @@ pub fn search_implementations(
                     candidates.push(random_genome(&mut rng));
                 }
             }
-            Some((_, parent, _)) => {
-                let parent = parent.clone();
+            Some(incumbent) => {
+                let parent = incumbent.genome.clone();
                 for _ in 0..options.generation_size {
                     candidates.push(mutate(&parent, &mut rng, options.mutations));
                 }
@@ -786,19 +1001,101 @@ pub fn search_implementations(
                             continue;
                         }
                     };
+                    // The heuristic cost of this graph is ALWAYS computed
+                    // — it is what the outcome reports beside a measured
+                    // winner — but under device profiling it is never
+                    // ranked on.
+                    let heuristic = crate::heuristic::heuristic_cost_of(&graph);
                     let profile_start = Instant::now();
-                    // DEVICE-FREE RANKING (D6): a static prior over the
-                    // extracted graph, never a measurement. See
-                    // [`crate::heuristic`] for what it does and does not
-                    // claim.
-                    let profiled: Result<u128> = Ok(crate::heuristic::heuristic_cost_of(&graph));
+                    let priced = if options.profile_on_device {
+                        // ON-DEVICE MEASUREMENT (Phase 4). Compile +
+                        // warm + time on the persistent device, then
+                        // RELEASE THE SLAB: at search time a candidate's
+                        // arena is not kept between candidates (#422
+                        // reversing #401's retention), so a plan with an
+                        // outsized high-water mark cannot starve the
+                        // next candidate of device memory. Serving keeps
+                        // it — `CudaRuntime::execute` never releases.
+                        #[cfg(feature = "device")]
+                        {
+                            let Evaluator::Device { device, staged } = &mut evaluator else {
+                                unreachable!(
+                                    "profile_on_device without a device evaluator is refused \
+                                     before the loop"
+                                )
+                            };
+                            let measured = crate::profile::profile_candidate(
+                                device,
+                                &plan,
+                                staged,
+                                options.trials,
+                                best.as_ref().map(|incumbent| incumbent.nanos),
+                                options.candidate_timeout,
+                            );
+                            device.release_slab();
+                            match measured {
+                                Ok(crate::profile::Measurement::Timed { mean_nanos, .. }) => {
+                                    Priced::Cost(mean_nanos)
+                                }
+                                Ok(crate::profile::Measurement::TimedOut {
+                                    elapsed_nanos,
+                                    completed_trials,
+                                }) => Priced::TimedOut(format!(
+                                    "candidate exceeded the timed-run budget after \
+                                     {completed_trials} trial(s), {:.3} ms elapsed",
+                                    elapsed_nanos as f64 / 1e6
+                                )),
+                                Err(crate::profile::ProfileFailure::Prepare(err)) => {
+                                    Priced::PrepareFailed(format!("{err:#}"))
+                                }
+                                Err(crate::profile::ProfileFailure::Execute(err)) => {
+                                    Priced::ExecuteFailed(format!("{err:#}"))
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "device"))]
+                        {
+                            unreachable!(
+                                "profile_on_device without the `device` feature is refused \
+                                 before the loop"
+                            )
+                        }
+                    } else {
+                        // DEVICE-FREE RANKING (D6): a static prior over
+                        // the extracted graph, never a measurement. See
+                        // [`crate::heuristic`] for what it does and does
+                        // not claim.
+                        Priced::Cost(heuristic)
+                    };
                     timings.profile_nanos += profile_start.elapsed().as_nanos();
-                    let nanos = match profiled {
-                        Ok(nanos) => nanos,
-                        Err(err) => {
+                    let nanos = match priced {
+                        Priced::Cost(nanos) => nanos,
+                        Priced::TimedOut(note) => {
+                            // NOT a refusal: nothing failed, the plan is
+                            // just too slow to finish measuring. Counted
+                            // apart so the zero-refusal ladder
+                            // acceptance stays about failures.
+                            breakdown.timed_out += 1;
+                            if refusals.len() < 8 {
+                                refusals.push(format!("timed out: {note}"));
+                            }
+                            continue;
+                        }
+                        Priced::PrepareFailed(note) => {
+                            // D10: a plan the device cannot compile,
+                            // stage or warm up is an ordinary unfit
+                            // candidate — accounted with the other
+                            // plan-build refusals, never fatal.
+                            breakdown.plan_build_refusals += 1;
+                            if refusals.len() < 8 {
+                                refusals.push(format!("device prepare: {note}"));
+                            }
+                            continue;
+                        }
+                        Priced::ExecuteFailed(note) => {
                             breakdown.execute_refusals += 1;
                             if refusals.len() < 8 {
-                                refusals.push(format!("execute: {err:#}"));
+                                refusals.push(format!("execute: {note}"));
                             }
                             continue;
                         }
@@ -807,7 +1104,7 @@ pub fn search_implementations(
                     plans_profiled += 1;
                     let improved = best
                         .as_ref()
-                        .is_none_or(|(best_nanos, _, _)| nanos < *best_nanos);
+                        .is_none_or(|incumbent| nanos < incumbent.nanos);
                     if let Some(progress) = progress.as_mut() {
                         // The FIRST profiled plan IS the baseline, so it
                         // reports as `Start`, never as an improvement on
@@ -819,14 +1116,19 @@ pub fn search_implementations(
                         }
                     }
                     if improved {
-                        best = Some((nanos, genome.clone(), plan));
+                        best = Some(Best {
+                            nanos,
+                            heuristic,
+                            genome: genome.clone(),
+                            plan,
+                        });
                     }
                     continue;
                 }
             };
             if best
                 .as_ref()
-                .is_none_or(|(best_nanos, _, _)| nanos < *best_nanos)
+                .is_none_or(|incumbent| nanos < incumbent.nanos)
             {
                 let build_start = Instant::now();
                 let dps = luminal::dps::dps_rewrite(&graph);
@@ -841,7 +1143,12 @@ pub fn search_implementations(
                         continue;
                     }
                 };
-                best = Some((nanos, genome.clone(), plan));
+                best = Some(Best {
+                    nanos,
+                    heuristic: crate::heuristic::heuristic_cost_of(&graph),
+                    genome: genome.clone(),
+                    plan,
+                });
             }
         }
 
@@ -853,14 +1160,15 @@ pub fn search_implementations(
     if let Some(progress) = progress.as_mut() {
         progress.finish();
     }
-    let (best_nanos, best_genome, best_plan) = best.ok_or_else(|| {
+    let best = best.ok_or_else(|| {
         anyhow!("no candidate genome produced an executable plan; refusals: {refusals:#?}")
     })?;
     let _ = program; // binding tables travel with the caller; kept for future bucket plumbing
     Ok(SearchOutcome {
-        best_plan,
-        best_genome,
-        best_nanos,
+        best_plan: best.plan,
+        best_genome: best.genome,
+        best_nanos: best.nanos,
+        best_heuristic_cost: best.heuristic,
         plans_profiled,
         fingerprint_hits,
         timings,
@@ -927,6 +1235,7 @@ pub fn bucketed_search_implementations(
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
+    mut evaluator: Evaluator<'_>,
 ) -> Result<Vec<BucketPlan>> {
     ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
     let mut plans = Vec::new();
@@ -945,6 +1254,10 @@ pub fn bucketed_search_implementations(
             options,
             allow_override.clone(),
             matchers,
+            // Every bucket's search prices on the SAME device: the
+            // module cache and the staged payloads are shared across
+            // combinations, so the evaluator is lent, not rebuilt.
+            evaluator.reborrow(),
         )?;
         plans.push(BucketPlan {
             ranges,
@@ -1080,5 +1393,10 @@ pub fn harness_search_options() -> CompileOptions {
         trials: 1,
         seed: 0,
         search_log: false,
+        // UNCHANGED BY PHASE 4: the harness budget is device-free, so
+        // every suite that uses it keeps the trajectory it had. Callers
+        // that want measurement flip the flag on a copy (the examples'
+        // `run_cuda` does, and `tests/device_profile.rs`).
+        ..CompileOptions::default()
     }
 }

@@ -31,9 +31,12 @@
 //! - CL-3: CUDA-native ops (cuBLASLt first).
 //! - CL-4: in-place ties (the Mutating family), views + resident
 //!   geometry.
-//! - STILL OWED: profiling ON DEVICE, mirroring the reference
-//!   evaluator's design, so this runtime ranks by measured time instead
-//!   of by the heuristic's weak prior.
+//! - CL-5 (#420/#422 rejoin Phase 4, 2026-09-03): PROFILING ON DEVICE,
+//!   mirroring the reference evaluator's design —
+//!   `CompileOptions::profile_on_device` ranks candidates by measured
+//!   device time ([`profile`]) instead of by [`heuristic`]'s weak prior.
+//!   The heuristic remains the default and the device-free hosts' only
+//!   option; the two are never blended.
 //!
 //! Out-of-place by design: kernels read operand buffers and
 //! write fresh destinations, mirroring the reference executor's
@@ -54,13 +57,17 @@ pub mod search;
 
 #[cfg(feature = "device")]
 pub mod device;
+/// ON-DEVICE CANDIDATE PROFILING (Phase 4): the search's device
+/// evaluator. Device builds only — it measures, so it needs a device.
+#[cfg(feature = "device")]
+pub mod profile;
 
 pub use bindings::CudaBindings;
 pub use host_buffer::HostBuffer;
 pub use layouts::CudaPlan;
 pub use ops::{cuda_registry, cuda_registry_filtered, cuda_registry_with_cublaslt, RegisteredOp};
 pub use runtime::CudaRuntime;
-pub use search::{harness_search_options, CompileOptions, SearchOutcome};
+pub use search::{harness_search_options, CompileOptions, Evaluator, SearchOutcome};
 
 /// PLAN-TRANSPARENT (M4 Phase 5): claimable WITHOUT a kernel iff the
 /// op's DECLARED EFFECTS prove the planner folds it — no operand ever

@@ -56,6 +56,7 @@ fn view_search_options() -> CompileOptions {
         trials: 1,
         seed: 0,
         search_log: false,
+        ..Default::default()
     }
 }
 
