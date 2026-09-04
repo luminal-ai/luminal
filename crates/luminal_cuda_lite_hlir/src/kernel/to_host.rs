@@ -11,7 +11,7 @@ use std::{
 };
 
 use cudarc::driver::{
-    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr,
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, result,
     sys::{self, CUgraphNode},
 };
 use fixedbitset::FixedBitSet;
@@ -938,6 +938,27 @@ impl CudaGraphArenaOrdering {
 }
 
 impl CudaGraphOp {
+    /// Return allocations retired by graph recapture to CUDA. Prepared
+    /// library state is allocated from the stream-ordered pool, while graph
+    /// executable updates use the separate device graph pool. Shape-changing
+    /// serving workloads can otherwise leave each generation cached in a
+    /// different pool until the process exhausts the device.
+    fn trim_recapture_memory(stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+        stream.synchronize()?;
+        let context = stream.context();
+        context.bind_to_thread()?;
+        if context.has_async_alloc() {
+            let pool = unsafe { result::device::get_mem_pool(context.cu_device())? };
+            unsafe {
+                result::mem_pool::trim_to(pool, 0)?;
+            }
+        }
+        unsafe {
+            sys::cuDeviceGraphMemTrim(context.cu_device()).result()?;
+        }
+        Ok(())
+    }
+
     /// Destroy an executable that rejected a source-graph update before
     /// allocating its replacement. CUDA can retain a model-sized graph
     /// allocation until both the executable is destroyed and the device graph
@@ -948,11 +969,7 @@ impl CudaGraphOp {
     ) -> anyhow::Result<()> {
         stream.synchronize()?;
         drop(exec);
-        stream.context().bind_to_thread()?;
-        unsafe {
-            sys::cuDeviceGraphMemTrim(stream.context().cu_device()).result()?;
-        }
-        Ok(())
+        Self::trim_recapture_memory(stream)
     }
 
     /// Whether this packaged graph currently owns both a mutable source graph
@@ -3109,6 +3126,11 @@ impl CudaGraphOp {
                         profile.instantiate_count += 1;
                     }
                 }
+                // Replacing captured library plans drops their prior device
+                // buffers only after the executable points at the new graph.
+                // Reclaim those now-unused allocations before the next shape
+                // change prepares another complete generation.
+                Self::trim_recapture_memory(stream)?;
             } else {
                 // No topology/capture mutation happened; update the executable
                 // kernel nodes directly.
