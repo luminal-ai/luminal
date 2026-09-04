@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+import textwrap
 import time
 
 import pytest
@@ -8,15 +12,15 @@ from torch import fx
 
 import luminal.region_compile as region_compile_module
 from luminal.artifact_cache import (
-    ArtifactCacheStats,
     CompiledArtifact,
     artifact_cache_stats,
     clear_artifact_cache,
     get_or_compile,
+    get_or_load,
     region_artifact_key,
 )
 from luminal.compiled_model import CompiledModel
-from luminal.region_compile import compile_region
+from luminal.region_compile import compile_region, load_region_artifact
 from luminal.region_export import export_region
 
 
@@ -121,12 +125,140 @@ def test_artifact_cache_compiles_once() -> None:
     assert get_or_compile("region", compile_artifact) is artifact
     assert get_or_compile("region", compile_artifact) is artifact
     assert calls == 1
-    assert artifact_cache_stats() == ArtifactCacheStats(
-        unique_artifacts=1,
-        reuse_hits=1,
-        searches=1,
-    )
+    stats = artifact_cache_stats()
+    assert (stats.unique_artifacts, stats.reuse_hits, stats.searches) == (1, 1, 1)
+    assert stats.search_seconds > 0
     clear_artifact_cache()
+
+
+def test_region_artifact_loads_once_and_binds_each_model(monkeypatch) -> None:
+    clear_artifact_cache()
+    bindings = []
+
+    class Artifact:
+        def bind(self, **kwargs):
+            bindings.append(kwargs)
+            return len(bindings)
+
+    artifact = Artifact()
+    loads = 0
+
+    def deserialize(*args, **kwargs):
+        nonlocal loads
+        loads += 1
+        return artifact
+
+    monkeypatch.setattr(CompiledArtifact, "deserialize", deserialize)
+    monkeypatch.setattr(region_compile_module, "_cuda_factory", object)
+
+    common = {"device_index": 0, "external_cuda_graph": True}
+    assert (
+        load_region_artifact(b"{}", input_indices=(0,), output_spec="first", **common)
+        == 1
+    )
+    assert (
+        load_region_artifact(b"{}", input_indices=(1,), output_spec="second", **common)
+        == 2
+    )
+    assert loads == 1
+    assert [binding["user_indices"] for binding in bindings] == [(0,), (1,)]
+    stats = artifact_cache_stats()
+    assert (stats.loads, stats.load_reuse_hits) == (1, 1)
+    assert stats.load_seconds > 0
+    clear_artifact_cache()
+
+
+def test_loaded_artifact_uses_structural_identity() -> None:
+    clear_artifact_cache()
+    common = {
+        "luminal_artifact_key": "region",
+        "schema_version": 4,
+        "backend": "cuda_lite",
+    }
+    first = json.dumps({**common, "value": 1}).encode()
+    second = json.dumps({**common, "value": 2}).encode()
+    artifact = object()
+
+    assert get_or_load(first, lambda: artifact, device_index=0) is artifact
+    assert get_or_load(second, lambda: object(), device_index=0) is artifact
+    clear_artifact_cache()
+
+
+def test_loaded_artifact_identity_includes_compatibility() -> None:
+    clear_artifact_cache()
+    first = json.dumps(
+        {"luminal_artifact_key": "region", "schema_version": 4, "backend": "cuda_lite"}
+    ).encode()
+    second = json.dumps(
+        {"luminal_artifact_key": "region", "schema_version": 4, "backend": "reference"}
+    ).encode()
+    artifacts = [object(), object()]
+
+    assert get_or_load(first, lambda: artifacts[0]) is artifacts[0]
+    assert get_or_load(second, lambda: artifacts[1]) is artifacts[1]
+    clear_artifact_cache()
+
+
+def test_compiled_artifact_serializes_structural_identity() -> None:
+    clear_artifact_cache()
+
+    class Graph:
+        def serialize_artifact(self, cache_key=None):
+            return json.dumps({"luminal_artifact_key": cache_key}).encode()
+
+    graph = Graph()
+    artifact = get_or_compile("region", lambda: CompiledArtifact(graph))
+
+    assert json.loads(artifact.serialize())["luminal_artifact_key"] == "region"
+    clear_artifact_cache()
+
+
+def test_compiled_artifact_round_trip_cpu() -> None:
+    from luminal.luminal import _reference_factory_capsule
+    from luminal.pt2 import compile as luminal_compile
+
+    inputs = [torch.randn(2, 4), torch.randn(2, 4)]
+    compiled = luminal_compile(_add_graph(), inputs, search_iterations=1)
+    loaded = CompiledArtifact.deserialize(
+        compiled.serialize_artifact(),
+        _reference_factory_capsule(),
+    ).bind()
+
+    (actual,) = loaded(*inputs)
+    torch.testing.assert_close(actual, inputs[0] + inputs[1])
+
+
+def test_compiled_artifact_rejects_bound_weights() -> None:
+    from luminal.pt2 import compile as luminal_compile
+
+    class Weighted(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.randn(4))
+
+        def forward(self, value):
+            return value * self.weight
+
+    compiled = luminal_compile(Weighted(), [torch.randn(4)], search_iterations=1)
+
+    with pytest.raises(RuntimeError, match="bound weights"):
+        compiled.serialize_artifact()
+
+
+def test_compiled_artifact_rejects_old_schema() -> None:
+    from luminal.luminal import _reference_factory_capsule
+    from luminal.pt2 import compile as luminal_compile
+
+    inputs = [torch.randn(2, 4), torch.randn(2, 4)]
+    compiled = luminal_compile(_add_graph(), inputs, search_iterations=1)
+    artifact = json.loads(compiled.serialize_artifact())
+    artifact["schema_version"] = 1
+
+    with pytest.raises(RuntimeError, match="unsupported artifact schema 1"):
+        CompiledArtifact.deserialize(
+            json.dumps(artifact).encode(),
+            _reference_factory_capsule(),
+        )
 
 
 def test_shared_artifact_rebinds_inputs_between_models() -> None:
@@ -348,6 +480,100 @@ def test_compile_region_from_fake_cuda_metadata() -> None:
     ]
     (actual,) = compiled(*real_inputs)
     torch.testing.assert_close(actual, real_inputs[0] + real_inputs[1])
+
+
+@pytest.mark.skipif(
+    _CUDA_SKIP_REASON is not None, reason=_CUDA_SKIP_REASON or "CUDA is unavailable"
+)
+def test_region_artifact_round_trip_without_cuda_recompile() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        fake_inputs = [
+            torch.empty((2, 4), device="cuda", dtype=torch.float16),
+            torch.empty((2, 4), device="cuda", dtype=torch.float16),
+        ]
+        region = export_region(_add_graph(), fake_inputs)
+
+    compiled = compile_region(region, search_iterations=1)
+    artifact = compiled.serialize_artifact()
+    payload = json.loads(artifact)
+    assert payload["schema_version"] == 4
+    backend_artifact = json.loads(payload["backend_artifact"])
+    assert backend_artifact["version"] == 2
+    assert backend_artifact["images"]
+    loaded = load_region_artifact(
+        artifact,
+        input_indices=region.input_indices,
+        output_spec=region.output_spec,
+        device_index=region.device_index,
+    )
+    inputs = [torch.randn((2, 4), device="cuda", dtype=torch.float16) for _ in range(2)]
+
+    (actual,) = loaded(*inputs)
+    torch.testing.assert_close(actual, inputs[0] + inputs[1])
+
+
+@pytest.mark.skipif(
+    _CUDA_SKIP_REASON is not None, reason=_CUDA_SKIP_REASON or "CUDA is unavailable"
+)
+def test_region_artifact_loads_in_fresh_process(tmp_path) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        fake_inputs = [
+            torch.empty((2, 4), device="cuda", dtype=torch.float16),
+            torch.empty((2, 4), device="cuda", dtype=torch.float16),
+        ]
+        region = export_region(_add_graph(), fake_inputs)
+
+    artifact_path = tmp_path / "region.luminal"
+    artifact_path.write_bytes(
+        compile_region(region, search_iterations=1).serialize_artifact()
+    )
+    script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+
+        import torch
+        from torch import fx
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from luminal.region_compile import load_region_artifact
+        from luminal.region_export import export_region
+
+        graph = fx.Graph()
+        left = graph.placeholder("left")
+        right = graph.placeholder("right")
+        result = graph.call_function(torch.ops.aten.add.Tensor, (left, right))
+        graph.output((result,))
+        module = fx.GraphModule(torch.nn.Module(), graph)
+        with FakeTensorMode():
+            fake_inputs = [
+                torch.empty((2, 4), device="cuda", dtype=torch.float16),
+                torch.empty((2, 4), device="cuda", dtype=torch.float16),
+            ]
+            region = export_region(module, fake_inputs)
+        model = load_region_artifact(
+            Path(sys.argv[1]).read_bytes(),
+            input_indices=region.input_indices,
+            output_spec=region.output_spec,
+            device_index=region.device_index,
+        )
+        inputs = [
+            torch.randn((2, 4), device="cuda", dtype=torch.float16)
+            for _ in range(2)
+        ]
+        (actual,) = model(*inputs)
+        torch.testing.assert_close(actual, inputs[0] + inputs[1])
+        """
+    )
+
+    subprocess.run(
+        [sys.executable, "-c", script, str(artifact_path)],
+        check=True,
+        text=True,
+    )
 
 
 @pytest.mark.skipif(

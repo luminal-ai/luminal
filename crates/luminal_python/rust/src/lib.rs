@@ -11,7 +11,7 @@ pub mod pt2_schema;
 mod pt2_util;
 pub mod translator;
 
-use compiled_graph::CompiledGraph;
+use compiled_graph::{CompiledGraph, load_compiled_artifact};
 use pt2_compiled_model::{TranslatedModule, process_pt2, translate_module};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
@@ -21,6 +21,7 @@ use torch_dtype::TorchDType;
 #[pymodule]
 pub fn luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(process_pt2, m)?)?;
+    m.add_function(wrap_pyfunction!(load_compiled_artifact, m)?)?;
     m.add_function(wrap_pyfunction!(translate_module, m)?)?;
     m.add_class::<TranslatedModule>()?;
     m.add_class::<CompiledGraph>()?;

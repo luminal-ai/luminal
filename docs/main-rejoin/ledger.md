@@ -52,6 +52,7 @@ Dispositions:
 | `f285d229` | #420 | Move post-saturation search into the runtime | FILE-LEVEL (3 files into the `cuda_lite_hlir` park + 1 metal-park file) + INTENT-ONLY (15 core/doc files, nothing applied) + DROPPED (all loop unroll / roll / packed machinery, main's `Runtime` trait shape) | branch `rejoin/p0-record-and-park` | RULED 2026-09-03: *"we're going to ignore all the loop unrolling, loop rolling stuff, but we're going to follow all the other aspects and move all of that functionality out of core and into the runtimes."* The boundary move is the program's thesis and lands in later phases; THIS row is record-and-park — see **#420 search into the runtime** below |
 | `598e5ca7` | #422 | Share reusable CUDA runtime through Lite | FILE-LEVEL (41 files into the `cuda_lite_hlir` park, incl. 5 deletions + 1 non-gating `ci/` file) + INTENT-ONLY at walk — DELIVERED by Phase 3 (arena) and PARTIALLY by Phase 2 (runtime-configurable op/matcher selection: the registry half; the execution face still PUNTED) + PUNTED-TO-PARK (fusion, attention, cuda-heavy composition) + DROPPED (the `subsume` fusion rule and the four `delete` rules, `CudaRuntimeImpl<O>`) | branch `rejoin/p0-record-and-park` | RULED 2026-09-03: *"put these fusion changes in hlir and punt on them temporarily"*, *"we're going to copy it into the hlir folder and then actually implement it once we're caught up"* (attention/FA3), *"Update the hlir_folder so we have a record of what the target code looks like"* (full-CUDA downstream), *"no code for now"* (zero-copy rebinding) — see **#422 reusable CUDA runtime** below |
 | `e7f9127a` | #430 | Restore CUDA dyn dims buffer on graph rebuild | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-430-487-cuda-graph-parks` (1st commit) | — nothing live corresponds: this branch's `crates/luminal_cuda_lite` captures no CUDA graphs at all, so there is no rebuild path to fix — see **#430 dyn-dims on rebuild** below, which says that once for the whole eight-commit line |
+| `188e92e8` | #435 | Add persistent compiled artifact reuse for Python and CUDA backends | FILE-LEVEL (7 files into the `cuda_lite_hlir` park + 1 metal-park file + 9 python-park files, 2 re-spelled `Expression` -> `IntExpr`) + FULL-FILE PARK (11 core files, post-#435, into `crates/luminal_cuda_lite_hlir/main_core/`) | branch `merge/main-cuda-graph-line-parks-wip` (2nd commit) | **PARITY REQUIRED — LUM-806** (https://linear.app/luminalai/issue/LUM-806). RULED 2026-09-04: *"you'll have to park it in the HLIR copy and then record that we need to get to feature parity for this. It is something we absolutely need to have eventually."* A compiled artifact must persist the SELECTED SCHEDULE so a fresh process runs without re-running the genetic search — see **#435 persistent compiled artifacts** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4031,6 +4032,48 @@ park TRACKS so the target CL must eventually reach keeps moving. When CL grows
 graph capture, this section and the seven below it are the list of hazards main
 has already paid for; until then they are records only, and nothing here is
 compiled — `crates/luminal_cuda_lite_hlir` is not a workspace member.
+
+## #435 persistent compiled artifacts — parked whole, parity owed (LUM-806)
+
+Main's `188e92e8` (28 files, +1526/-132) makes a compiled graph SURVIVE THE
+PROCESS: core gains `src/graph/artifact.rs` and a `SelectedSchedule` — per
+dyn-dim bucket, the saturated program's identity plus the chosen genome — that
+serializes beside the backend's own artifact (`crates/luminal_cuda_lite/src/artifact.rs`),
+so a later run deserializes the schedule, rebuilds the plan and executes it
+instead of re-running the genetic search; the Python side keys and reuses those
+artifacts across FX regions (`artifact_cache.py`, `region_compile.py`,
+`rust/src/compiled_graph/artifact.rs`, schema version 4). Seventeen of its
+twenty-eight files are park files and applied cleanly — 7 path-rewritten from
+main's `crates/luminal_cuda_lite/` into `crates/luminal_cuda_lite_hlir/`, 1
+metal-park signature line, 9 python-park files — with two lines re-spelled to
+the parks' vocabulary (`Expression` -> `IntExpr` in
+`crates/luminal_cuda_lite_hlir/src/kernel/fusion/region_codegen.rs:1446` and
+three times in the new `crates/luminal_python/rust/src/compiled_graph/artifact.rs`);
+the diff-of-diffs over the crates half is identical to main's hunk set modulo
+exactly those two respellings. The other eleven files are main's CORE
+(`src/{dtype,dyn_backend,hlir,op,graph}.rs`, `src/graph/artifact.rs`,
+`src/egglog_utils/mod.rs`, `src/search/{mod,finalist,genetic,lattice}.rs`) and
+no diff can apply: on this branch `hlir.rs`, `op.rs`, `dyn_backend.rs`,
+`egglog_utils/` and the whole `src/search/` tree are DELETED, and `graph.rs` and
+`dtype.rs` are different files (the recorder, and this branch's dtype ontology),
+so per Austin's ruling the post-#435 FULL FILES are parked verbatim under
+`crates/luminal_cuda_lite_hlir/main_core/` at main's relative paths — a record,
+documented in that crate's README, compiled by nothing and touching no live file.
+
+**THE PARITY REQUIREMENT (Austin, 2026-09-04 — LUM-806).** This branch must
+eventually ship a compiled artifact that persists the selected schedule: per
+bucket, the saturated program's identity or fingerprint plus the chosen
+genome/plan, such that a fresh process loads it and runs without re-running the
+genetic search. Where it attaches here is already visible: the runtime-owned
+search outcome is `crates/luminal_cuda_lite`'s `CudaPlan`
+(`crates/luminal_cuda_lite/src/lib.rs:90`, held as `FinalistEntry::plan` in
+`finalists.rs:73`), with the reference runtime's plan as its mirror, and the
+selection itself is core's shared `luminal::extraction::Genome`
+(`src/extraction.rs:538`) — a `HashMap<ClassId, ProducerChoice>` keyed by class
+NAME, not by a positional index, so no index-determinism fix is owed for the
+serialization itself. (Whether those class names reproduce across processes is
+the separate, already-recorded class-id stability question, and it is the first
+thing a schedule-loading implementation has to answer.)
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

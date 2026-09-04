@@ -145,41 +145,7 @@ pub fn process_pt2(
     device_index: Option<usize>,
     external_cuda_graph: bool,
 ) -> PyResult<CompiledGraph> {
-    let factory: BackendFactory = {
-        let expected = ::luminal::dyn_backend::BACKEND_FACTORY_CAPSULE_NAME;
-        match factory_capsule.name()? {
-            Some(name) => {
-                // SAFETY: the &CStr is used immediately (for a byte-wise
-                // comparison) and never stored; the capsule is borrowed for
-                // the duration of this function, so the name pointer stays
-                // valid for as long as we read it here.
-                let actual = unsafe { name.as_cstr() };
-                if actual != expected {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "factory_capsule has wrong name: expected {:?}, got {:?}",
-                        expected, actual,
-                    )));
-                }
-            }
-            None => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "factory_capsule has no name; expected {:?}",
-                    expected
-                )));
-            }
-        }
-        let wrapper_ptr = factory_capsule
-            .pointer_checked(Some(expected))
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?
-            .as_ptr() as *const *const std::ffi::c_void;
-        let fn_ptr = unsafe { *wrapper_ptr };
-        if fn_ptr.is_null() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "factory_capsule inner function pointer is null",
-            ));
-        }
-        unsafe { std::mem::transmute(fn_ptr) }
-    };
+    let factory = backend_factory(factory_capsule)?;
     compile_pt2(
         pt2_path,
         weights_path,
@@ -190,6 +156,39 @@ pub fn process_pt2(
         external_cuda_graph,
     )
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
+}
+
+pub(crate) fn backend_factory(factory_capsule: &Bound<'_, PyCapsule>) -> PyResult<BackendFactory> {
+    let expected = ::luminal::dyn_backend::BACKEND_FACTORY_CAPSULE_NAME;
+    match factory_capsule.name()? {
+        Some(name) => {
+            // SAFETY: the capsule owns its name for the duration of this call.
+            let actual = unsafe { name.as_cstr() };
+            if actual != expected {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "factory_capsule has wrong name: expected {:?}, got {:?}",
+                    expected, actual,
+                )));
+            }
+        }
+        None => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "factory_capsule has no name; expected {:?}",
+                expected
+            )));
+        }
+    }
+    let wrapper_ptr = factory_capsule
+        .pointer_checked(Some(expected))
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?
+        .as_ptr() as *const *const std::ffi::c_void;
+    let fn_ptr = unsafe { *wrapper_ptr };
+    if fn_ptr.is_null() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "factory_capsule inner function pointer is null",
+        ));
+    }
+    Ok(unsafe { std::mem::transmute::<*const std::ffi::c_void, BackendFactory>(fn_ptr) })
 }
 
 fn compile_pt2(

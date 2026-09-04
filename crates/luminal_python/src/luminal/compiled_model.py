@@ -123,6 +123,11 @@ class CompiledModel:
         """Set a dynamic dimension value by its param name."""
         self._graph.set_dim(param_name, value)
 
+    def serialize_artifact(self) -> bytes:
+        if self._artifact is None:
+            raise RuntimeError("compiled model has no serializable artifact")
+        return self._artifact.serialize()
+
     @property
     def writeback_inputs(self) -> dict:
         """{output name: input name it writes back to} for the in-place input
