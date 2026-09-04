@@ -943,8 +943,15 @@ impl CudaGraphOp {
     /// executable updates use the separate device graph pool. Shape-changing
     /// serving workloads can otherwise leave each generation cached in a
     /// different pool until the process exhausts the device.
-    fn trim_recapture_memory(stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+    fn trim_recapture_memory(&self, stream: &Arc<CudaStream>) -> anyhow::Result<()> {
         stream.synchronize()?;
+        // Child-library graphs are captured on a private stream. Even after
+        // end-capture returns, CUDA may retain stream-ordered allocations for
+        // the retired capture until that stream reaches a synchronization
+        // boundary. Synchronize it before trimming the process pools.
+        if let Some(capture_stream) = self.capture_stream.borrow().as_ref() {
+            capture_stream.synchronize()?;
+        }
         let context = stream.context();
         context.bind_to_thread()?;
         if context.has_async_alloc() {
@@ -964,12 +971,13 @@ impl CudaGraphOp {
     /// allocation until both the executable is destroyed and the device graph
     /// pool is trimmed; instantiating first transiently requires both copies.
     fn retire_failed_graph_exec(
+        &self,
         stream: &Arc<CudaStream>,
         exec: CudaGraphExecHandle,
     ) -> anyhow::Result<()> {
         stream.synchronize()?;
         drop(exec);
-        Self::trim_recapture_memory(stream)
+        self.trim_recapture_memory(stream)
     }
 
     /// Whether this packaged graph currently owns both a mutable source graph
@@ -2105,6 +2113,19 @@ impl CudaGraphOp {
         state.dyn_dims_buffer = None;
     }
 
+    /// Drop a complete graph generation and immediately return its retired
+    /// stream-ordered and driver graph allocations. Full rebuilds happen when
+    /// captured HostOp geometry changes and do not pass through the surgical
+    /// recapture cleanup below.
+    fn reset_materialization_state_and_trim(
+        &self,
+        state: &mut CudaGraphOpState,
+        stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<()> {
+        Self::reset_materialization_state(state);
+        self.trim_recapture_memory(stream)
+    }
+
     /// Release driver-side graph resources while retaining the compiled op
     /// descriptions needed to materialize this bucket again later.
     pub(crate) fn release_materialization(&self) {
@@ -2529,28 +2550,25 @@ impl CudaGraphOp {
         let captured_host_shape_changed = state.cuda_graph.is_some()
             && !changed_dyn_vars.is_disjoint(&self.captured_host_dyn_dims);
         if captured_host_shape_changed {
-            Self::reset_materialization_state(&mut state);
+            self.reset_materialization_state_and_trim(&mut state, stream)?;
         }
 
         // Check if any kernel's internal buffer dimensions changed
         let needs_internal_realloc = !changed_dyn_vars.is_disjoint(&self.internal_buffer_dyn_dims);
 
-        // Reallocate internal buffers if needed
+        // Retire graphs that still reference the old internal buffers before
+        // replacing those allocations. This is another full-rebuild path and
+        // must reclaim the old generation before allocating the new one.
+        if needs_internal_realloc && (state.cuda_graph.is_some() || state.cuda_graph_exec.is_some())
+        {
+            self.reset_materialization_state_and_trim(&mut state, stream)?;
+        }
+
+        // Reallocate internal buffers if needed.
         if needs_internal_realloc {
             for kernel in state.kernels.iter_mut() {
                 kernel.internal_bufs = kernel.kernel_op.allocate_internal_buffers(stream, dyn_map);
             }
-        }
-        // Only force full rebuild when internal buffer sizes change.
-        // Dim-only changes (e.g. position offset `p` incrementing each decode step) are
-        // handled by updating the dyn_dims device buffer + kernel node params in-place.
-        if needs_internal_realloc {
-            state.cuda_graph = None;
-            state.cuda_graph_exec = None;
-            for kernel in &mut state.kernels {
-                kernel.graph_node = None;
-            }
-            state.kernel_params.clear();
         }
 
         // Allocate dyn_dims_buffer if needed
@@ -2642,7 +2660,7 @@ impl CudaGraphOp {
                     "CudaGraph captured HostOp pointer rebuild: nodes={changed_captured_nodes:?} changes={pointer_changes:?} dyn={dyn_map:?}"
                 );
             }
-            Self::reset_materialization_state(&mut state);
+            self.reset_materialization_state_and_trim(&mut state, stream)?;
             // Reset releases the graph-owned dynamic-dimension buffer. The
             // replacement graph must receive a valid ABI pointer before it is
             // built; otherwise its first binding update tries to parameterize
@@ -3107,7 +3125,7 @@ impl CudaGraphOp {
                         // `exec` still owns the rejected executable. Retire it
                         // before instantiating the replacement so peak graph
                         // memory is one executable, not two.
-                        Self::retire_failed_graph_exec(
+                        self.retire_failed_graph_exec(
                             stream,
                             exec.take()
                                 .expect("failed graph update lost its executable"),
@@ -3130,7 +3148,7 @@ impl CudaGraphOp {
                 // buffers only after the executable points at the new graph.
                 // Reclaim those now-unused allocations before the next shape
                 // change prepares another complete generation.
-                Self::trim_recapture_memory(stream)?;
+                self.trim_recapture_memory(stream)?;
             } else {
                 // No topology/capture mutation happened; update the executable
                 // kernel nodes directly.
@@ -4051,7 +4069,7 @@ impl CudaGraphOp {
                     // The rejected executable may own most of the device graph
                     // pool. It must be destroyed and the unused pool returned
                     // before allocating the replacement.
-                    Self::retire_failed_graph_exec(stream, exec)?;
+                    self.retire_failed_graph_exec(stream, exec)?;
                     graph.instantiate()?
                 }
             }
