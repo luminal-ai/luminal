@@ -391,13 +391,21 @@ impl GraphTensor {
         (-not_equal + 1.0).cast(DType::Bool)
     }
 
-    /// Raise the tensor to a power
-    pub fn pow<T>(self, e: T) -> GraphTensor
-    where
-        Self: Mul<T, Output = Self>,
-    {
-        // Approximate, see full impl here: https://github.com/tinygrad/tinygrad/blob/a32c67760140dd26b60d7932268f2e62e96a66e0/tinygrad/tensor.py#L568
-        self.abs().log().mul(e).exp()
+    /// Raise the tensor to a power.
+    ///
+    /// The general case is the real-valued approximation `exp(e * log|self|)`
+    /// (see tinygrad's full impl), which reads the base through `abs` and so
+    /// drops the sign of a negative base at every exponent. A compile-time
+    /// scalar exponent that is finite and a whole number has exact
+    /// multiplication semantics instead, so it is lowered structurally by
+    /// exponentiation by squaring: odd powers keep the sign of a negative
+    /// base, `x^0` is ones, `x^1` is `x`, and a negative exponent is the
+    /// reciprocal of the positive power. That structural path is capped at
+    /// `|e| <= 64`, beyond which the chain of multiplies is not worth its
+    /// graph size and the approximation is used again; tensor exponents always
+    /// take the approximation.
+    pub fn pow<T: PowExponent>(self, e: T) -> GraphTensor {
+        e.raise(self)
     }
 
     // Clipping ops (minimum, maximum, clip)
@@ -444,6 +452,69 @@ impl GraphTensor {
             "self and other need to be the same dtype!"
         );
         (cond.cast(self.dtype) * self) + ((1.0 - cond.cast(DType::F32)).cast(other.dtype) * other)
+    }
+}
+
+/// The largest `|exponent|` [`GraphTensor::pow`] lowers structurally. Past it
+/// the multiply chain costs more graph than the approximation is worth.
+const MAX_STRUCTURAL_POW: i64 = 64;
+
+/// The exponent side of [`GraphTensor::pow`]: how a given exponent type raises
+/// a base. Implemented for `f32` (structural when the scalar is integral) and
+/// for `GraphTensor` (always the approximation).
+pub trait PowExponent {
+    /// Raise `base` to `self`.
+    fn raise(self, base: GraphTensor) -> GraphTensor;
+}
+
+impl PowExponent for GraphTensor {
+    fn raise(self, base: GraphTensor) -> GraphTensor {
+        // Approximate, see full impl here: https://github.com/tinygrad/tinygrad/blob/a32c67760140dd26b60d7932268f2e62e96a66e0/tinygrad/tensor.py#L568
+        base.abs().log().mul(self).exp()
+    }
+}
+
+impl PowExponent for f32 {
+    fn raise(self, base: GraphTensor) -> GraphTensor {
+        if self.is_finite() && self.fract() == 0.0 && self.abs() <= MAX_STRUCTURAL_POW as f32 {
+            return integral_pow(base, self as i64);
+        }
+        // Approximate, see full impl here: https://github.com/tinygrad/tinygrad/blob/a32c67760140dd26b60d7932268f2e62e96a66e0/tinygrad/tensor.py#L568
+        base.abs().log().mul(self).exp()
+    }
+}
+
+/// `base ^ exponent` by exponentiation by squaring, which is exact and keeps
+/// the sign of a negative base at odd exponents. The graph it builds is
+/// logarithmic in `|exponent|`.
+fn integral_pow(base: GraphTensor, exponent: i64) -> GraphTensor {
+    if exponent == 0 {
+        return base
+            .graph()
+            .constant_float(1.0)
+            .cast(base.dtype)
+            .expand_rhs(base.dims());
+    }
+    let mut remaining = exponent.unsigned_abs();
+    let mut factor = base;
+    let mut result = None;
+    while remaining > 0 {
+        if remaining & 1 == 1 {
+            result = Some(match result {
+                Some(value) => value * factor,
+                None => factor,
+            });
+        }
+        remaining >>= 1;
+        if remaining > 0 {
+            factor = factor * factor;
+        }
+    }
+    let result = result.expect("a nonzero exponent sets at least one bit");
+    if exponent < 0 {
+        result.reciprocal()
+    } else {
+        result
     }
 }
 
@@ -775,6 +846,43 @@ pub(super) mod tests {
             shift_from_zero,
             identity,
         );
+    }
+
+    /// Run `func` over one fixed input vector, the way `test_binary_transforms`
+    /// does, but against an expected vector rather than a candle tensor —
+    /// candle's `powf` is IEEE `pow`, which answers NaN exactly where the
+    /// sign-preserving cases below need a number.
+    fn run_pow(values: Vec<f32>, func: impl Fn(GraphTensor) -> GraphTensor) -> Vec<f32> {
+        let mut cx = Graph::new();
+        let a = cx.tensor(vec![values.len()], luminal::dtype::DType::F32);
+        let b = func(a).output();
+        let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, values.into())]);
+        rt.get_f32(b.id).unwrap().to_vec()
+    }
+
+    #[test]
+    fn test_pow_integral_scalar_exponent_keeps_sign() {
+        let input = vec![-2.0f32, -1.0, -0.5, 0.5, 1.0, 2.0];
+        // (-2)^3 = -8, (-2)^2 = 4, (-2)^0 = 1, x^1 = x, (-2)^-1 = -0.5.
+        let cases: Vec<(f32, Vec<f32>)> = vec![
+            (3.0, input.iter().map(|x| x * x * x).collect()),
+            (2.0, input.iter().map(|x| x * x).collect()),
+            (0.0, vec![1.0; input.len()]),
+            (1.0, input.clone()),
+            (-1.0, input.iter().map(|x| 1.0 / x).collect()),
+        ];
+        for (exponent, expected) in cases {
+            assert_close(&run_pow(input.clone(), |a| a.pow(exponent)), &expected);
+        }
+    }
+
+    #[test]
+    fn test_pow_non_integral_scalar_exponent_keeps_the_approximation() {
+        let input = vec![-2.0f32, -1.5, 0.5, 1.5];
+        // The abs-based approximation, sign dropped, is still what non-whole
+        // exponents get.
+        let expected = input.iter().map(|x| x.abs().powf(2.5)).collect::<Vec<_>>();
+        assert_close(&run_pow(input, |a| a.pow(2.5f32)), &expected);
     }
 
     #[test]
