@@ -151,7 +151,7 @@ pub mod device {
         let mut data: FxHashMap<NodeIndex, TypedBuffer> = pairs.into_iter().collect();
         let t = std::time::Instant::now();
         let outcome = rt
-            .search(&data, &luminal::test_support::harness_search_options())
+            .search(&data, &luminal_cuda_lite::harness_search_options())
             .context("cuda search")?;
         let search_ms = t.elapsed().as_millis();
         println!(

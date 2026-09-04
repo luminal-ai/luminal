@@ -691,9 +691,9 @@ fn assert_coherent(tag: &str, s: &EGraph) -> usize {
 
 fn extract_with_genome(
     s: &EGraph,
-    genome: &luminal::extractor::Genome,
+    genome: &test_runtime::extractor::Genome,
 ) -> luminal::layout_ir::ExtractedGraph {
-    luminal::extractor::extract_layout_ir_with_genome_and_matchers(
+    test_runtime::extractor::extract_layout_ir_with_genome_and_matchers(
         s,
         genome,
         test_runtime::matchers(),
@@ -702,66 +702,68 @@ fn extract_with_genome(
     .expect("genome extraction reaches the boundary")
 }
 
-fn genome_flavored(s: &EGraph, preferences: &[&str]) -> luminal::extractor::Genome {
+fn genome_flavored(s: &EGraph, preferences: &[&str]) -> test_runtime::extractor::Genome {
     // ROUND 11: routed through the shared viability-aware election core;
     // preference ORDER unchanged (explicit names > any CublasLt > the
     // transpose view > non-Copy > Copy) — see the round-2 battery's
     // genome comment for the rationale.
-    let ordered =
-        |candidates: &[(String, luminal::extractor::ProducerChoice)], level: usize| -> Vec<usize> {
-            let admitted = test_runtime::level_admits(level);
-            let mut order: Vec<usize> = Vec::new();
-            let push_where = |order: &mut Vec<usize>, pred: &dyn Fn(&str) -> bool| {
-                for (i, (name, _)) in candidates.iter().enumerate() {
-                    if admitted(name) && pred(name) && !order.contains(&i) {
-                        order.push(i);
-                    }
+    let ordered = |candidates: &[(String, test_runtime::extractor::ProducerChoice)],
+                   level: usize|
+     -> Vec<usize> {
+        let admitted = test_runtime::level_admits(level);
+        let mut order: Vec<usize> = Vec::new();
+        let push_where = |order: &mut Vec<usize>, pred: &dyn Fn(&str) -> bool| {
+            for (i, (name, _)) in candidates.iter().enumerate() {
+                if admitted(name) && pred(name) && !order.contains(&i) {
+                    order.push(i);
                 }
-            };
-            for want in preferences {
-                push_where(&mut order, &|name| name == *want);
             }
-            push_where(&mut order, &|name| {
-                name.starts_with("LayoutTensorOpCublasLt")
-            });
-            push_where(&mut order, &|name| {
-                name == "LayoutTensorOpIndexMapApplyViewGeneric"
-            });
-            push_where(&mut order, &|name| !name.contains("Copy"));
-            push_where(&mut order, &|_| true);
-            order
         };
+        for want in preferences {
+            push_where(&mut order, &|name| name == *want);
+        }
+        push_where(&mut order, &|name| {
+            name.starts_with("LayoutTensorOpCublasLt")
+        });
+        push_where(&mut order, &|name| {
+            name == "LayoutTensorOpIndexMapApplyViewGeneric"
+        });
+        push_where(&mut order, &|name| !name.contains("Copy"));
+        push_where(&mut order, &|_| true);
+        order
+    };
     test_runtime::genome_with_ordering(s, &ordered)
 }
 
 /// A genome that ELECTS one specific op enode wherever it is a candidate —
 /// the per-enode pairing probe.
-fn genome_electing(s: &EGraph, enode: &NodeId) -> (luminal::extractor::Genome, bool) {
+fn genome_electing(s: &EGraph, enode: &NodeId) -> (test_runtime::extractor::Genome, bool) {
     // ROUND 11: the exact-enode election rides the shared viability-aware
     // core — the exact enode outranks everything (at every strictness
     // level), then the PIN names, then non-Copy, then Copy.
-    let index = luminal::extractor::producer_index_with_matchers(s, test_runtime::matchers());
+    let index = test_runtime::extractor::producer_index_with_matchers(s, test_runtime::matchers());
     let elected = index
         .values()
         .any(|candidates| candidates.iter().any(|(_, choice)| &choice.enode == enode));
-    let ordered =
-        |candidates: &[(String, luminal::extractor::ProducerChoice)], level: usize| -> Vec<usize> {
-            let admitted = test_runtime::level_admits(level);
-            let mut order: Vec<usize> = Vec::new();
-            let push_where = |order: &mut Vec<usize>, pred: &dyn Fn(&str) -> bool| {
-                for (i, (name, _)) in candidates.iter().enumerate() {
-                    if admitted(name) && pred(name) && !order.contains(&i) {
-                        order.push(i);
-                    }
+    let ordered = |candidates: &[(String, test_runtime::extractor::ProducerChoice)],
+                   level: usize|
+     -> Vec<usize> {
+        let admitted = test_runtime::level_admits(level);
+        let mut order: Vec<usize> = Vec::new();
+        let push_where = |order: &mut Vec<usize>, pred: &dyn Fn(&str) -> bool| {
+            for (i, (name, _)) in candidates.iter().enumerate() {
+                if admitted(name) && pred(name) && !order.contains(&i) {
+                    order.push(i);
                 }
-            };
-            for want in PIN {
-                push_where(&mut order, &|name| name == *want);
             }
-            push_where(&mut order, &|name| !name.contains("Copy"));
-            push_where(&mut order, &|_| true);
-            order
         };
+        for want in PIN {
+            push_where(&mut order, &|name| name == *want);
+        }
+        push_where(&mut order, &|name| !name.contains("Copy"));
+        push_where(&mut order, &|_| true);
+        order
+    };
     let mut genome = test_runtime::genome_with_ordering(s, &ordered);
     // The exact enode is elected UNCONDITIONALLY wherever it is a
     // candidate (the probe's point — round-10 semantics): viability-aware

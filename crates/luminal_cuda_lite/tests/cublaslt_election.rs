@@ -66,7 +66,7 @@ fn search_and_count(name: &str, cx: &Graph, pairs: &[(NodeIndex, TypedBuffer)]) 
         name,
         cx,
         pairs,
-        &luminal::test_support::harness_search_options(),
+        &luminal_cuda_lite::harness_search_options(),
     )
 }
 
@@ -74,7 +74,7 @@ fn search_and_count_opts(
     name: &str,
     cx: &Graph,
     pairs: &[(NodeIndex, TypedBuffer)],
-    options: &luminal::implementation_search::ImplementationSearchOptions,
+    options: &luminal_cuda_lite::CompileOptions,
 ) -> Row {
     let mut rt = CudaRuntime::load_with_cublaslt(cx).expect("load");
     let mut vars: Vec<_> = cx.dyn_map.iter().collect();
@@ -189,7 +189,7 @@ fn canonical_2d_matmul_elects_the_marker() {
     // elected CublasLt on 5 of 6 seeds (seed 0's best plan is the ideal
     // fused [BufferAlloc, CublasLt]); the 2x4 harness budget found none.
     // Seeded, so this pin is deterministic.
-    let options = luminal::implementation_search::ImplementationSearchOptions {
+    let options = luminal_cuda_lite::CompileOptions {
         generations: 12,
         generation_size: 16,
         mutations: 4,

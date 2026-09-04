@@ -19,5 +19,9 @@ luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
 # petgraph types must UNIFY with luminal's so the fixture runners can hand
 # this crate's egraphs to luminal's extractor and bufferizer.
 egglog = { git = "https://github.com/egraphs-good/egglog", rev = "c2c0f1510a3633b768fb3d30ad284b211290e4b2" }
+egraph-serialize = { version = "0.3.0", default-features = false, features = ["graphviz", "serde"]}
+petgraph = "0.6.4"
 rustc-hash = "2.1.1"
 anyhow = "1.0"
+# This crate owns its extractor + sampler copy (see src/extractor.rs).
+rand = "0.9.2"

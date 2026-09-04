@@ -28,10 +28,13 @@
 
 pub mod binding_check;
 pub mod bindings;
+pub mod extractor;
+pub mod heuristic;
 pub mod kernels;
 pub mod layouts;
 pub mod ops;
 pub mod runtime;
+pub mod search;
 
 #[cfg(feature = "device")]
 pub mod device;
@@ -39,6 +42,7 @@ pub mod device;
 pub use bindings::CudaBindings;
 pub use layouts::CudaPlan;
 pub use runtime::CudaRuntime;
+pub use search::{harness_search_options, CompileOptions, SearchOutcome};
 
 /// PLAN-TRANSPARENT (M4 Phase 5): claimable WITHOUT a kernel iff the
 /// op's DECLARED EFFECTS prove the planner folds it — no operand ever

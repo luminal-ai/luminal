@@ -213,8 +213,8 @@ impl ReferenceRuntime {
     pub fn search(
         &mut self,
         input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
-        options: &luminal::implementation_search::ImplementationSearchOptions,
-    ) -> Result<luminal::implementation_search::SearchOutcome> {
+        options: &crate::search::CompileOptions,
+    ) -> Result<crate::search::SearchOutcome> {
         let spec = self
             .native
             .take()
@@ -1476,7 +1476,7 @@ mod tests {
             .expect("program runs");
         let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
         let allow = crate::reference_allow_list();
-        let extracted = luminal::extractor::extract_layout_ir_with_ops_and_matchers(
+        let extracted = crate::extractor::extract_layout_ir_with_ops_and_matchers(
             &serialized,
             Some(&allow),
             crate::ops::built_in_matchers(),
@@ -1842,7 +1842,7 @@ mod tests {
         let mut data = FxHashMap::default();
         data.insert(x.id, TypedBuffer::I64(vec![i64::from(i32::MAX) + 1]));
         let err = rt
-            .search(&data, &luminal::test_support::harness_search_options())
+            .search(&data, &crate::search::harness_search_options())
             .unwrap_err();
         let message = format!("{err:#}");
         assert!(
@@ -1985,7 +1985,7 @@ mod tests {
         let mut data = FxHashMap::default();
         data.insert(mask2.id, TypedBuffer::bool8(vec![1u8, 0, 1, 0]).unwrap());
         data.insert(x2.id, x_vals.clone().into());
-        rt2.search(&data, &luminal::test_support::harness_search_options())
+        rt2.search(&data, &crate::search::harness_search_options())
             .expect("search finds a plan");
         rt2.set_data(mask2.id, vec![1.0f32, 0.0, 1.0, 0.0]);
         rt2.set_data(x2.id, x_vals);
@@ -2008,7 +2008,7 @@ mod tests {
         rt.bind_value_range(idx.id, 0, 4).expect("range binds");
         let mut data = FxHashMap::default();
         data.insert(idx.id, vec![0i32, 1, 2, 3, 4].into());
-        rt.search(&data, &luminal::test_support::harness_search_options())
+        rt.search(&data, &crate::search::harness_search_options())
             .expect("proven mul implements");
         rt.set_data(idx.id, vec![0i32, 1, 2, 3, 4]);
         rt.execute().expect("executes");
@@ -2034,7 +2034,7 @@ mod tests {
         data.insert(a.id, vec![1i32].into());
         data.insert(b.id, vec![2i32].into());
         let err = rt
-            .search(&data, &luminal::test_support::harness_search_options())
+            .search(&data, &crate::search::harness_search_options())
             .unwrap_err();
         let message = format!("{err:#}");
         assert!(
@@ -2055,7 +2055,7 @@ mod tests {
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.bind_value_range(a.id, 0, 1000).expect("range binds");
         rt.bind_value_range(b.id, 0, 1000).expect("range binds");
-        rt.search(&data, &luminal::test_support::harness_search_options())
+        rt.search(&data, &crate::search::harness_search_options())
             .expect("proven add implements");
         rt.set_data(a.id, vec![700i32]);
         rt.set_data(b.id, vec![300i32]);
@@ -2079,7 +2079,7 @@ mod tests {
         let mut data = FxHashMap::default();
         data.insert(a.id, vec![7i32, -7, 100, -1].into());
         data.insert(b.id, vec![2i32, 2, 3, 4].into());
-        rt.search(&data, &luminal::test_support::harness_search_options())
+        rt.search(&data, &crate::search::harness_search_options())
             .expect("proven trunc-div implements");
         rt.set_data(a.id, vec![7i32, -7, 100, -1]);
         rt.set_data(b.id, vec![2i32, 2, 3, 4]);
@@ -2097,7 +2097,7 @@ mod tests {
         data.insert(a.id, vec![7i32].into());
         data.insert(b.id, vec![2i32].into());
         let err = rt
-            .search(&data, &luminal::test_support::harness_search_options())
+            .search(&data, &crate::search::harness_search_options())
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("no candidate genome"),

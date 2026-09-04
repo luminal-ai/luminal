@@ -17,7 +17,7 @@ fn genome_flavored(
     want_c: bool,
     want_bias: bool,
     want_relu: bool,
-) -> luminal::extractor::Genome {
+) -> test_runtime::extractor::Genome {
     use std::collections::HashMap;
     let mut class_ops: HashMap<&luminal::prelude::egraph_serialize::ClassId, Vec<&str>> =
         HashMap::new();
@@ -57,40 +57,41 @@ fn genome_flavored(
     // non-Copy > Copy; the core additionally checks the chosen subtree
     // reaches terminals and escalates its Materialize/Copy strictness
     // only when nothing viable exists below.
-    let ordered =
-        |candidates: &[(String, luminal::extractor::ProducerChoice)], level: usize| -> Vec<usize> {
-            let admitted = test_runtime::level_admits(level);
-            let mut order: Vec<usize> = Vec::new();
-            let push_where =
-                |order: &mut Vec<usize>,
-                 pred: &dyn Fn(&str, &luminal::extractor::ProducerChoice) -> bool| {
-                    for (i, (name, choice)) in candidates.iter().enumerate() {
-                        if admitted(name) && pred(name, choice) && !order.contains(&i) {
-                            order.push(i);
-                        }
+    let ordered = |candidates: &[(String, test_runtime::extractor::ProducerChoice)],
+                   level: usize|
+     -> Vec<usize> {
+        let admitted = test_runtime::level_admits(level);
+        let mut order: Vec<usize> = Vec::new();
+        let push_where =
+            |order: &mut Vec<usize>,
+             pred: &dyn Fn(&str, &test_runtime::extractor::ProducerChoice) -> bool| {
+                for (i, (name, choice)) in candidates.iter().enumerate() {
+                    if admitted(name) && pred(name, choice) && !order.contains(&i) {
+                        order.push(i);
                     }
-                };
-            push_where(&mut order, &|name, choice| {
-                if name != want_name {
-                    return false;
                 }
-                let Some(node) = egraph.nodes.get(&choice.enode) else {
-                    return false;
-                };
-                let relu_real = child_class(node, ep_slot)
-                    .is_some_and(|c| class_has(&c, "CublasLtEpilogueRelu"));
-                relu_real == want_relu
-            });
-            push_where(&mut order, &|name, _| {
-                name.starts_with("LayoutTensorOpCublasLt")
-            });
-            push_where(&mut order, &|name, _| {
-                name == "LayoutTensorOpIndexMapApplyViewGeneric"
-            });
-            push_where(&mut order, &|name, _| !name.contains("Copy"));
-            push_where(&mut order, &|_, _| true);
-            order
-        };
+            };
+        push_where(&mut order, &|name, choice| {
+            if name != want_name {
+                return false;
+            }
+            let Some(node) = egraph.nodes.get(&choice.enode) else {
+                return false;
+            };
+            let relu_real =
+                child_class(node, ep_slot).is_some_and(|c| class_has(&c, "CublasLtEpilogueRelu"));
+            relu_real == want_relu
+        });
+        push_where(&mut order, &|name, _| {
+            name.starts_with("LayoutTensorOpCublasLt")
+        });
+        push_where(&mut order, &|name, _| {
+            name == "LayoutTensorOpIndexMapApplyViewGeneric"
+        });
+        push_where(&mut order, &|name, _| !name.contains("Copy"));
+        push_where(&mut order, &|_, _| true);
+        order
+    };
     test_runtime::genome_with_ordering(egraph, &ordered)
 }
 
@@ -132,7 +133,7 @@ fn flavored_ops(
 ) -> Vec<(CublasLt, Vec<String>, String)> {
     let serialized = test_runtime::serialize_fixture(text);
     let genome = genome_flavored(&serialized, want_c, want_bias, want_relu);
-    let graph = luminal::extractor::extract_layout_ir_with_genome_and_matchers(
+    let graph = test_runtime::extractor::extract_layout_ir_with_genome_and_matchers(
         &serialized,
         &genome,
         test_runtime::matchers(),

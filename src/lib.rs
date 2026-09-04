@@ -18,7 +18,6 @@ pub mod buffer_tensor_ir;
 pub mod bufferize;
 pub mod dps;
 pub mod egglog_snippet;
-pub mod extractor;
 pub mod index_expr;
 pub mod layout_ir;
 pub mod poison;
@@ -28,7 +27,6 @@ pub mod subst_primitive;
 // CALLS ANY OF THIS — the planner stays generic over an opaque layout type,
 // and backends may ignore this module entirely (Austin's fold-into-core
 // amendment, resident-geometry cleanup 2026-08-31).
-pub mod implementation_search;
 pub mod layouts;
 pub mod logical_op;
 pub mod test_support;

@@ -159,13 +159,14 @@ fn r10_debug_c6() {
     println!("PIN genome: ok={}", r.is_ok());
     // Plain deterministic min-cost extraction:
     let s = test_runtime::serialize_fixture(&text);
-    let graph = luminal::extractor::extract_layout_ir_with_matchers(&s, test_runtime::matchers());
+    let graph =
+        test_runtime::extractor::extract_layout_ir_with_matchers(&s, test_runtime::matchers());
     println!(
         "plain extraction: {:?}",
         graph.as_ref().map(|g| g.is_some())
     );
     // Walk the genome choices from the boundary lt: which class dies?
-    let index = luminal::extractor::producer_index_with_matchers(&s, test_runtime::matchers());
+    let index = test_runtime::extractor::producer_index_with_matchers(&s, test_runtime::matchers());
     let genome = test_runtime::genome_preferring(&s, PIN);
     fn lit_inputs_of_op_class(s: &EGraph, op_class: &ClassId) -> Vec<Vec<ClassId>> {
         let mut lists = Vec::new();
@@ -215,9 +216,9 @@ fn r10_debug_c6() {
         s: &EGraph,
         index: &std::collections::BTreeMap<
             ClassId,
-            Vec<(String, luminal::extractor::ProducerChoice)>,
+            Vec<(String, test_runtime::extractor::ProducerChoice)>,
         >,
-        genome: &luminal::extractor::Genome,
+        genome: &test_runtime::extractor::Genome,
         class: &ClassId,
         path: &mut Vec<ClassId>,
         terminals: &std::collections::BTreeSet<ClassId>,

@@ -18,9 +18,9 @@
 
 use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::graph::Graph;
-use luminal::implementation_search::ImplementationSearchOptions;
 use luminal::prelude::{DType, FxHashMap, NodeIndex};
 use luminal::shape::IntExpr;
+use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
 use mini_llama3::{model_support::Namespace, MiniLlama3Layer};
 
@@ -127,11 +127,11 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
 
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let budget = if default_budget {
-        ImplementationSearchOptions::default()
+        CompileOptions::default()
     } else {
         // The fixed 8-genome budget of the original ladder's depth-1
         // rungs: comparable refusal RATES across d.
-        ImplementationSearchOptions {
+        CompileOptions {
             generations: 2,
             generation_size: 4,
             mutations: 2,

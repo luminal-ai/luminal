@@ -5,17 +5,18 @@
 //!
 //! Everything up to `execute` is device-free and runs anywhere: load
 //! accumulates the native program parts, bind_* appends bounds seeds,
-//! search assembles + saturates + runs the genetic search with OUR
-//! allow list (candidate profiling stays on the reference host
-//! executor in CL-1 — a documented cost proxy). Only `execute`
-//! requires the `device` feature and a CUDA device.
+//! search assembles + saturates + runs THIS crate's genetic search
+//! ([`crate::search`]) with OUR allow list, ranking candidates by the
+//! device-free heuristic ([`crate::heuristic`] — a weak static prior,
+//! not a measurement). Only `execute` requires the `device` feature and
+//! a CUDA device.
 
 use anyhow::{anyhow, bail, Context, Result};
 use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferIrGraph;
 
+use crate::search::{CompileOptions, SearchOutcome};
 use luminal::graph;
-use luminal::implementation_search::{ImplementationSearchOptions, SearchOutcome};
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal::shape;
@@ -250,7 +251,7 @@ impl CudaRuntime {
     pub fn search(
         &mut self,
         input_data: &FxHashMap<NodeIndex, TypedBuffer>,
-        options: &ImplementationSearchOptions,
+        options: &CompileOptions,
     ) -> Result<SearchOutcome> {
         let (serialized, program) = self.assemble_and_saturate()?;
         let native = self
@@ -258,13 +259,27 @@ impl CudaRuntime {
             .as_ref()
             .ok_or_else(|| anyhow!("load before search"))?;
 
-        // Own matchers, own allow list, and a profiler that never
-        // touches another runtime: candidates rank by the heuristic
-        // byte-move estimate (device profiling arrives with CL-3).
-        let outcome = luminal::implementation_search::search_implementations_with_runtime(
+        // The caller's payloads are CHECKED here and go no further: this
+        // backend's search ranks candidates with the device-free
+        // heuristic (D6, 2026-09-03), which never runs anything, so
+        // there is nothing to stage. The check stays because binding a
+        // tensor that is not an input of the loaded program is a caller
+        // bug either way.
+        for tensor in input_data.keys() {
+            assert!(
+                program
+                    .input_slots
+                    .iter()
+                    .any(|slot| slot.tensor == *tensor),
+                "tensor {tensor:?} is not a bound input"
+            );
+        }
+
+        // Own matchers, own allow list, own ranking: nothing in this
+        // search touches another runtime.
+        let outcome = crate::search::search_implementations(
             &serialized,
             &program,
-            input_data,
             options,
             Some(if self.cublaslt {
                 Self::allow_list_with_cublaslt()
@@ -272,7 +287,6 @@ impl CudaRuntime {
                 Self::allow_list()
             }),
             self.matchers(),
-            &mut luminal::implementation_search::StaticProfiler,
         )?;
 
         self.input_buffers = native

@@ -294,7 +294,7 @@ fn the_producer_index_offers_no_producer_for_an_input_terminal() {
     let rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
     let egraph = rt.saturated_egraph().expect("saturation");
 
-    let index = luminal::extractor::producer_index_with_matchers(
+    let index = luminal_cuda_lite::extractor::producer_index_with_matchers(
         &egraph,
         luminal_cuda_lite::ops::cuda_matchers_with_cublaslt(),
     );
@@ -352,7 +352,7 @@ fn sampled_genomes_never_hand_bufferize_a_cyclic_graph() {
             [(a, weights(32, 1).into()), (b, weights(24, 2).into())]
                 .into_iter()
                 .collect();
-        let mut options = luminal::test_support::harness_search_options();
+        let mut options = luminal_cuda_lite::harness_search_options();
         options.seed = seed;
         match rt.search(&data, &options) {
             Ok(outcome) => {

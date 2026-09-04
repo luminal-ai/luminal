@@ -593,7 +593,10 @@ impl TestGraph {
 // the run_reference harness moved to `luminal_reference::harness` with the
 // reference registry (Step B, ruling 2026-08-17): they default the matcher
 // set to the reference ops, which core no longer owns. Core keeps only the
-// runtime-neutral pieces: TestGraph/mocks above and harness_search_options.
+// runtime-neutral pieces: the TestGraph builder and the mocks above.
+// (`harness_search_options` left with the search in Phase 1 of the
+// #420/#422 rejoin — it is a production-path helper, and it names a
+// runtime's option type.)
 
 #[cfg(test)]
 mod harness_tests {
@@ -2109,23 +2112,6 @@ mod intcoordvar_probe {
     }
 }
 
-/// The test harness's search budget — the SAME genetic algorithm as the
-/// module-level ladder tests, sized for a suite of hundreds of graphs
-/// (ruling 2026-08-06: everything in the main tree runs the genetic
-/// implementation search — there is no plain-walk bypass). Deterministic
-/// (fixed seed); 2 generations × 4 genomes exercises random genomes plus
-/// the mutation step without profiling 64 candidates per differential.
-pub fn harness_search_options() -> crate::implementation_search::ImplementationSearchOptions {
-    crate::implementation_search::ImplementationSearchOptions {
-        generations: 2,
-        generation_size: 4,
-        mutations: 2,
-        trials: 1,
-        seed: 0,
-        search_log: false,
-    }
-}
-
 #[cfg(test)]
 mod stage4b_probes {
     use luminal::dtype::DType;
@@ -2152,88 +2138,10 @@ mod stage4b_probes {
         assert_eq!(got, &vec![1.0, 2.0]);
     }
 
-    /// Austin's stride-destructuring contract (chain world, 2026-08-04):
-    /// live axes yield their stride class, stride-1 axes yield Unit, a
-    /// zero slot on a live axis is the DETERMINED broadcast Some(Zero),
-    /// and a provably extent-1 slot is None — the free parameter each
-    /// consumer resolves for itself.
-    #[test]
-    fn chain_strides_destructure_contract() {
-        use luminal::extractor::{ChainStride, chain_strides};
-        let body = r#"
-(let psh (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 3) (IntExprNil)))))
-(let p (RightMajorContiguousElementLayoutLit psh (bits-of (F32))))
-(let plog (LogicalTensorInputLit (LogicalIdLit "p") psh (F32)))
-(let plt (LayoutTensorLit plog p))
-(let osh (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 5) (IntExprCons (IntLit 3) (IntExprNil))))))
-(let v (LogicalIndexMapApply plog (IndexMapLit (IntExprCons (CoordVar osh 2) (IntExprCons (CoordVar osh 0) (IntExprNil))) psh) osh))
-(let dsh (ShapeLit (IntExprCons (IntLit 1) (IntExprCons (IntLit 2) (IntExprNil)))))
-(let d (RightMajorContiguousElementLayoutLit dsh (bits-of (F32))))
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
-"#;
-        let full = format!("{}\n\n{body}", luminal_reference::assembled_program());
-        let mut egraph = luminal::egglog_snippet::new_egraph();
-        egraph
-            .parse_and_run_program(None, &full)
-            .expect("program runs");
-        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
-
-        let by_let = |name: &str| {
-            serialized
-                .class_data
-                .iter()
-                .find(|(_, data)| data.extra.get("let").map(String::as_str) == Some(name))
-                .map(|(class, _)| class.clone())
-                .unwrap_or_else(|| panic!("let {name} not found"))
-        };
-
-        // Parent (2,3) right-major: strides [3, 1].
-        let p = chain_strides(&serialized, &by_let("p")).expect("parent destructures");
-        assert_eq!(p.len(), 2);
-        assert!(matches!(p[0], Some(ChainStride::Expr(_))), "{p:?}");
-        assert_eq!(p[1], Some(ChainStride::Unit), "{p:?}");
-
-        // Degenerate (1,2): the extent-1 slot is the FREE parameter.
-        let d = chain_strides(&serialized, &by_let("d")).expect("degenerate destructures");
-        assert_eq!(
-            d[0], None,
-            "extent-1 slot must be the consumer's choice: {d:?}"
-        );
-        assert_eq!(d[1], Some(ChainStride::Unit), "{d:?}");
-
-        // Broadcast view (2,5,3): [3, DETERMINED 0, 1].
-        let v_logical = by_let("v");
-        let view_layout = serialized
-            .nodes
-            .iter()
-            .find_map(|(_, node)| {
-                if node.op != "LayoutTensorLit" {
-                    return None;
-                }
-                let logical = node.children.first()?;
-                if serialized.nid_to_cid(logical) != &v_logical {
-                    return None;
-                }
-                // The materializing copy pairs the SAME logical with an
-                // RM target layout — skip it; the view's own layout is
-                // the composed (non-contiguous) one.
-                let layout = serialized.nid_to_cid(node.children.get(1)?).clone();
-                let is_rm = serialized.nodes.iter().any(|(nid2, n2)| {
-                    n2.op == "RightMajorContiguousElementLayoutLit"
-                        && serialized.nid_to_cid(nid2) == &layout
-                });
-                if is_rm { None } else { Some(layout) }
-            })
-            .expect("view LayoutTensor exists");
-        let v = chain_strides(&serialized, &view_layout).expect("view destructures");
-        assert!(matches!(v[0], Some(ChainStride::Expr(_))), "{v:?}");
-        assert_eq!(
-            v[1],
-            Some(ChainStride::Zero),
-            "broadcast axis is determined: {v:?}"
-        );
-        assert_eq!(v[2], Some(ChainStride::Unit), "{v:?}");
-    }
+    // (`chain_strides_destructure_contract` moved to
+    // `luminal_reference::extractor`'s test module with `chain_strides`
+    // itself — the extractor is runtime-owned as of the #420/#422 rejoin
+    // Phase 1, so the contract is pinned beside the copy that holds it.)
 
     // (The script-corpus gate and the assembled-program dump moved to
     // crates/luminal_reference/tests/corpus.rs with the reference registry
@@ -3038,10 +2946,7 @@ mod subst_guard_study {
         .collect();
         rt.bind_dyn_range('s', 2, 2).expect("bind");
         let err = rt
-            .search(
-                &data,
-                &luminal::implementation_search::ImplementationSearchOptions::default(),
-            )
+            .search(&data, &luminal_reference::CompileOptions::default())
             .expect_err("extent 2 violates the squeeze contract");
         assert!(
             format!("{err:#}").contains("axis extent must be exactly 1"),
@@ -3101,10 +3006,7 @@ mod subst_guard_study {
         .collect();
         rt.bind_dyn_range('s', 2, 2).expect("bind");
         let err = rt
-            .search(
-                &data,
-                &luminal::implementation_search::ImplementationSearchOptions::default(),
-            )
+            .search(&data, &luminal_reference::CompileOptions::default())
             .expect_err("kernel 3 cannot fit in extent 2");
         assert!(
             format!("{err:#}").contains("unfold window on axis 0"),

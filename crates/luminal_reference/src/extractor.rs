@@ -1,17 +1,33 @@
+//! THE EXTRACTOR — the reference runtime's copy.
+//!
+//! Post-saturation selection is RUNTIME-OWNED (ruling 2026-09-03,
+//! #420/#422 rejoin Phase 1): the e-graph walk that turns a saturated
+//! program plus a genome into an [`luminal::layout_ir::ExtractedGraph`]
+//! left core and was duplicated, verbatim, into every runtime that
+//! searches. Austin's ruling on the duplication: "move extractor.rs to
+//! each runtime. Maybe if there are some core utilities, they can belong
+//! in core, but for now just do a simple duplication in each runtime."
+//!
+//! THE TESTS FOR ALL THREE COPIES LIVE HERE (the reference copy):
+//! `render_memo_tests` below. The sibling copies carry none.
+//!
+//! Sibling copies: `luminal_reference::extractor`,
+//! `luminal_cuda_lite::extractor`, `test_runtime::extractor`.
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use petgraph::graph::{DiGraph, NodeIndex};
 
-use crate::layout_ir::{
+use luminal::layout_ir::{
     Access, BufferInfo, ExtractedDag, ExtractedEdge, ExtractedGraph, ExtractedNode, ExtractionSite,
     FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText, LogicalInfo, OpInput,
     OpMatcher, OpNode, OutputNode, OutputSlot,
 };
-use crate::logical_op::{LogicalRender, logical_op_for};
+use luminal::logical_op::{logical_op_for, LogicalRender};
 
 type Bounds = (Option<i128>, Option<i128>);
 type BoundsIndex = HashMap<ClassId, Bounds>;
@@ -65,7 +81,7 @@ struct Extractor<'a> {
     /// bounds index (op = function name, children[0] = the argument
     /// node, the row's own eclass holds the value member); pinned by
     /// `dtype_index_reads_serialized_rows` in test_support.
-    dtype_index: std::cell::RefCell<Option<HashMap<ClassId, crate::dtype::PlanDtype>>>,
+    dtype_index: std::cell::RefCell<Option<HashMap<ClassId, luminal::dtype::PlanDtype>>>,
     /// GENOME-INDEPENDENT stable-key memo (measured 2026-08-10: eager
     /// per-comparison rendering was 99% of deep extraction — 7395/7471
     /// sampled stacks inside `is_better`). The rendered form of an enode
@@ -165,7 +181,7 @@ struct ProducerRef {
 /// TestRuntime seam — see `Extractor::new_with_matchers`).
 pub fn extract_layout_ir_with_matchers(
     egraph: &EGraph,
-    matchers: Vec<Box<dyn crate::layout_ir::OpMatcher>>,
+    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
 ) -> Result<Option<ExtractedGraph>> {
     Extractor::new_with_matchers(egraph, None, None, matchers).extract()
 }
@@ -185,7 +201,7 @@ impl<'a> ExtractionSession<'a> {
     pub fn new_with_matcher_set(
         egraph: &'a EGraph,
         allowed_ops: Option<&[&str]>,
-        matchers: Vec<Box<dyn crate::layout_ir::OpMatcher>>,
+        matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
     ) -> Self {
         let allowed = allowed_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect());
         let mut extractor = Extractor::new_with_matchers(egraph, allowed, None, matchers);
@@ -344,7 +360,7 @@ impl<'a> ExtractionSession<'a> {
             let dtype = extractor.with_dtype_index(|index| index.get(&logical).copied())?;
             if !matches!(
                 dtype,
-                crate::dtype::PlanDtype::Int | crate::dtype::PlanDtype::Int64
+                luminal::dtype::PlanDtype::Int | luminal::dtype::PlanDtype::Int64
             ) {
                 return None;
             }
@@ -482,7 +498,7 @@ impl<'a> ExtractionSession<'a> {
 pub fn extract_layout_ir_with_ops_and_matchers(
     egraph: &EGraph,
     allowed_ops: Option<&[&str]>,
-    matchers: Vec<Box<dyn crate::layout_ir::OpMatcher>>,
+    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
 ) -> Result<Option<ExtractedGraph>> {
     let allowed = allowed_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect());
     let mut extractor = Extractor::new_with_matchers(egraph, allowed, None, matchers);
@@ -520,7 +536,7 @@ pub struct Genome {
 pub fn extract_layout_ir_with_genome_and_matchers(
     egraph: &EGraph,
     genome: &Genome,
-    matchers: Vec<Box<dyn crate::layout_ir::OpMatcher>>,
+    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
 ) -> Result<Option<ExtractedGraph>> {
     let mut extractor = Extractor::new_with_matchers(egraph, None, Some(genome), matchers);
     extractor.apply_viability_filter();
@@ -534,7 +550,7 @@ pub fn extract_layout_ir_with_genome_and_matchers(
 /// from. Classes with no producers (boundary inputs) are absent.
 pub fn producer_index_with_matchers(
     egraph: &EGraph,
-    matchers: Vec<Box<dyn crate::layout_ir::OpMatcher>>,
+    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
 ) -> std::collections::BTreeMap<ClassId, Vec<(String, ProducerChoice)>> {
     let mut extractor = Extractor::new_with_matchers(egraph, None, None, matchers);
     extractor.apply_viability_filter();
@@ -827,7 +843,7 @@ pub fn plan_fingerprint(graph: &ExtractedGraph) -> u64 {
             ExtractedNode::LayoutOp(op) => {
                 "op".hash(&mut hasher);
                 op.op.label().hash(&mut hasher);
-                if let crate::layout_ir::Provenance::Extracted {
+                if let luminal::layout_ir::Provenance::Extracted {
                     source_enode,
                     selected_output_index,
                     ..
@@ -1472,18 +1488,28 @@ impl<'a> Extractor<'a> {
                 matcher.metadata_slots(),
             )
         });
-        let op: Box<dyn LayoutIrOp> = if let Some(cached) = self.op_cache.borrow().get(node_id) {
-            cached.clone()
-        } else {
-            let op = matcher.extract(&ExtractionSite {
-                egraph: self.egraph,
-                node_id,
-                node,
-            });
-            self.op_cache
-                .borrow_mut()
-                .insert(node_id.clone(), op.clone());
-            op
+        // THE BORROW ENDS BEFORE THE MISS PATH, explicitly. Spelling
+        // this as `if let ... = self.op_cache.borrow().get(..) { .. }
+        // else { ..borrow_mut().. }` reads correctly and panics in
+        // edition 2021, where the scrutinee temporary outlives the
+        // `else` arm (edition 2024 shortened exactly this scope). These
+        // copies live in 2021 crates, so the lookup takes its own
+        // statement and the guard is released by the time the miss path
+        // writes.
+        let cached = self.op_cache.borrow().get(node_id).cloned();
+        let op: Box<dyn LayoutIrOp> = match cached {
+            Some(cached) => cached,
+            None => {
+                let op = matcher.extract(&ExtractionSite {
+                    egraph: self.egraph,
+                    node_id,
+                    node,
+                });
+                self.op_cache
+                    .borrow_mut()
+                    .insert(node_id.clone(), op.clone());
+                op
+            }
         };
 
         let children = self.op_children(&spec.inputs, op.as_ref());
@@ -1789,18 +1815,18 @@ impl<'a> Extractor<'a> {
     }
 
     /// The serialized `dtype-of` rows, indexed once: LogicalTensor
-    /// class → [`crate::dtype::PlanDtype`]. `dtype-of` is `:no-merge`
+    /// class → [`luminal::dtype::PlanDtype`]. `dtype-of` is `:no-merge`
     /// in the preamble (a dtype divergence is a saturation panic), so
     /// at most one dtype per class can survive to serialization — a
     /// second, different row here means the invariant broke upstream
     /// and we refuse loudly rather than pick one.
     fn with_dtype_index<R>(
         &self,
-        read: impl FnOnce(&HashMap<ClassId, crate::dtype::PlanDtype>) -> R,
+        read: impl FnOnce(&HashMap<ClassId, luminal::dtype::PlanDtype>) -> R,
     ) -> R {
         let mut slot = self.dtype_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, crate::dtype::PlanDtype> = HashMap::new();
+            let mut index: HashMap<ClassId, luminal::dtype::PlanDtype> = HashMap::new();
             for node in self.egraph.nodes.values() {
                 if node.op != "dtype-of" {
                     continue;
@@ -1839,11 +1865,11 @@ impl<'a> Extractor<'a> {
 
     /// A `Dtype` class: the childless member whose op is one of the
     /// egglog dtype spellings.
-    fn plan_dtype_value(&self, class: &ClassId) -> Option<crate::dtype::PlanDtype> {
+    fn plan_dtype_value(&self, class: &ClassId) -> Option<luminal::dtype::PlanDtype> {
         for node_id in self.class_nodes.get(class)? {
             let node = self.egraph.nodes.get(node_id)?;
             if node.children.is_empty() {
-                if let Some(dtype) = crate::dtype::PlanDtype::from_egglog_name(&node.op) {
+                if let Some(dtype) = luminal::dtype::PlanDtype::from_egglog_name(&node.op) {
                     return Some(dtype);
                 }
             }
@@ -1953,7 +1979,7 @@ struct ClassRenderer<'a> {
 }
 
 /// The renderer's implementation of the [`LogicalRender`] callbacks: the
-/// bridge each [`crate::logical_op::LogicalOp`] formats itself through.
+/// bridge each [`luminal::logical_op::LogicalOp`] formats itself through.
 /// Carries the recursion guard (`visiting`) so `child_expr` cycles fall back
 /// to labels exactly as direct recursion did.
 struct LogicalRenderCtx<'r, 'a, 'v> {
@@ -2251,7 +2277,7 @@ impl<'a> ClassRenderer<'a> {
 
     fn choose_logical_node(&self, class: &ClassId) -> Option<&NodeId> {
         let node_ids = self.class_nodes.get(class)?;
-        for op in crate::logical_op::built_in_logical_ops() {
+        for op in luminal::logical_op::built_in_logical_ops() {
             if let Some(node_id) = node_ids.iter().find(|node_id| {
                 self.egraph
                     .nodes
@@ -3381,7 +3407,7 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                 };
                 let node = OpNode {
                     op: op.clone(),
-                    provenance: crate::layout_ir::Provenance::Extracted {
+                    provenance: luminal::layout_ir::Provenance::Extracted {
                         op_eclass,
                         source_enode: source_enode.clone(),
                         selected_output_index: plan.selected_output_index.unwrap_or(0),
@@ -4219,5 +4245,99 @@ mod render_memo_tests {
         let second = ClassRenderer::render_class_prefer(&ctx.renderer(), &root, 3, None);
         assert_eq!(first, second);
         assert_eq!(ctx.memo.borrow().len(), filled);
+    }
+}
+
+/// THE STRIDE-DESTRUCTURING CONTRACT, moved here with `chain_strides`
+/// (was `luminal::test_support::stage4b_probes`, #420/#422 rejoin Phase
+/// 1): the extractor is runtime-owned now, so its contracts are pinned
+/// beside the copy that holds them.
+#[cfg(test)]
+mod chain_stride_tests {
+    /// Austin's stride-destructuring contract (chain world, 2026-08-04):
+    /// live axes yield their stride class, stride-1 axes yield Unit, a
+    /// zero slot on a live axis is the DETERMINED broadcast Some(Zero),
+    /// and a provably extent-1 slot is None — the free parameter each
+    /// consumer resolves for itself.
+    #[test]
+    fn chain_strides_destructure_contract() {
+        use super::{chain_strides, ChainStride};
+        let body = r#"
+(let psh (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 3) (IntExprNil)))))
+(let p (RightMajorContiguousElementLayoutLit psh (bits-of (F32))))
+(let plog (LogicalTensorInputLit (LogicalIdLit "p") psh (F32)))
+(let plt (LayoutTensorLit plog p))
+(let osh (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 5) (IntExprCons (IntLit 3) (IntExprNil))))))
+(let v (LogicalIndexMapApply plog (IndexMapLit (IntExprCons (CoordVar osh 2) (IntExprCons (CoordVar osh 0) (IntExprNil))) psh) osh))
+(let dsh (ShapeLit (IntExprCons (IntLit 1) (IntExprCons (IntLit 2) (IntExprNil)))))
+(let d (RightMajorContiguousElementLayoutLit dsh (bits-of (F32))))
+(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+"#;
+        let full = format!("{}\n\n{body}", crate::assembled_program());
+        let mut egraph = luminal::egglog_snippet::new_egraph();
+        egraph
+            .parse_and_run_program(None, &full)
+            .expect("program runs");
+        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
+
+        let by_let = |name: &str| {
+            serialized
+                .class_data
+                .iter()
+                .find(|(_, data)| data.extra.get("let").map(String::as_str) == Some(name))
+                .map(|(class, _)| class.clone())
+                .unwrap_or_else(|| panic!("let {name} not found"))
+        };
+
+        // Parent (2,3) right-major: strides [3, 1].
+        let p = chain_strides(&serialized, &by_let("p")).expect("parent destructures");
+        assert_eq!(p.len(), 2);
+        assert!(matches!(p[0], Some(ChainStride::Expr(_))), "{p:?}");
+        assert_eq!(p[1], Some(ChainStride::Unit), "{p:?}");
+
+        // Degenerate (1,2): the extent-1 slot is the FREE parameter.
+        let d = chain_strides(&serialized, &by_let("d")).expect("degenerate destructures");
+        assert_eq!(
+            d[0], None,
+            "extent-1 slot must be the consumer's choice: {d:?}"
+        );
+        assert_eq!(d[1], Some(ChainStride::Unit), "{d:?}");
+
+        // Broadcast view (2,5,3): [3, DETERMINED 0, 1].
+        let v_logical = by_let("v");
+        let view_layout = serialized
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                if node.op != "LayoutTensorLit" {
+                    return None;
+                }
+                let logical = node.children.first()?;
+                if serialized.nid_to_cid(logical) != &v_logical {
+                    return None;
+                }
+                // The materializing copy pairs the SAME logical with an
+                // RM target layout — skip it; the view's own layout is
+                // the composed (non-contiguous) one.
+                let layout = serialized.nid_to_cid(node.children.get(1)?).clone();
+                let is_rm = serialized.nodes.iter().any(|(nid2, n2)| {
+                    n2.op == "RightMajorContiguousElementLayoutLit"
+                        && serialized.nid_to_cid(nid2) == &layout
+                });
+                if is_rm {
+                    None
+                } else {
+                    Some(layout)
+                }
+            })
+            .expect("view LayoutTensor exists");
+        let v = chain_strides(&serialized, &view_layout).expect("view destructures");
+        assert!(matches!(v[0], Some(ChainStride::Expr(_))), "{v:?}");
+        assert_eq!(
+            v[1],
+            Some(ChainStride::Zero),
+            "broadcast axis is determined: {v:?}"
+        );
+        assert_eq!(v[2], Some(ChainStride::Unit), "{v:?}");
     }
 }

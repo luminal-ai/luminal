@@ -365,7 +365,7 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
             .into_iter()
             .collect()
         };
-    let options = luminal::implementation_search::ImplementationSearchOptions {
+    let options = luminal_cuda_lite::CompileOptions {
         generations: 12,
         generation_size: 16,
         mutations: 4,
@@ -402,7 +402,7 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
     plain
         .search(
             &data_for(x, w, b),
-            &luminal::test_support::harness_search_options(),
+            &luminal_cuda_lite::harness_search_options(),
         )
         .expect("plain search");
     plain.set_data(x, weights(32, 1));
@@ -437,7 +437,7 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
     };
     // The seeded budget the CPU election pin measured green (see
     // tests/cublaslt_election.rs).
-    let options = luminal::implementation_search::ImplementationSearchOptions {
+    let options = luminal_cuda_lite::CompileOptions {
         generations: 12,
         generation_size: 16,
         mutations: 4,
@@ -472,7 +472,7 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
     let mut plain = CudaRuntime::load(&cx).expect("load plain");
     let data = data_for(a.id, b.id);
     plain
-        .search(&data, &luminal::test_support::harness_search_options())
+        .search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("plain search");
     plain.set_data(a.id, weights(32, 1));
     plain.set_data(b.id, weights(24, 2));

@@ -216,7 +216,7 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
     // one the plan assertions run on.
     let mut elected_seed = None;
     for seed in 0..6u64 {
-        let options = luminal::implementation_search::ImplementationSearchOptions {
+        let options = luminal_cuda_lite::CompileOptions {
             generations: 12,
             generation_size: 16,
             mutations: 4,

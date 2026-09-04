@@ -55,7 +55,7 @@ fn run(
     let data = pairs.iter().cloned().collect();
     let mut runtime = ReferenceRuntime::load(&cx).expect("reference load");
     runtime
-        .search(&data, &luminal::test_support::harness_search_options())
+        .search(&data, &luminal_reference::harness_search_options())
         .expect("mini graph searches");
     for (id, value) in pairs {
         runtime.set_data(id, value);

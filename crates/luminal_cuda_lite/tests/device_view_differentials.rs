@@ -21,8 +21,8 @@ use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::implementation_search::ImplementationSearchOptions;
 use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
 
 /// Read the device output DENSELY through its RETURNED LAYOUT
@@ -48,8 +48,8 @@ fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
         .expect("the returned layout reads dense over its backing buffer")
 }
 
-fn view_search_options() -> ImplementationSearchOptions {
-    ImplementationSearchOptions {
+fn view_search_options() -> CompileOptions {
+    CompileOptions {
         generations: 4,
         generation_size: 8,
         mutations: 4,

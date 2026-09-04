@@ -31,16 +31,16 @@ use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::implementation_search::ImplementationSearchOptions;
 use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
 
 /// Search budget for the view fixtures: profiling is static (bytes
 /// moved), so generations are cheap — enough sampling that the
 /// all-views plan is reliably in the profiled set, seeded for
 /// deterministic pins.
-fn view_search_options() -> ImplementationSearchOptions {
-    ImplementationSearchOptions {
+fn view_search_options() -> CompileOptions {
+    CompileOptions {
         generations: 4,
         generation_size: 8,
         mutations: 4,

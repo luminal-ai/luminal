@@ -33,8 +33,8 @@ pub fn linear(input: GraphTensor, weight: GraphTensor, bias: Option<GraphTensor>
 #[cfg(test)]
 mod tests {
     use super::linear;
-    use luminal::implementation_search::ImplementationSearchOptions;
     use luminal::prelude::*;
+    use luminal_reference::CompileOptions;
     use luminal_reference::ReferenceRuntime;
     use rustc_hash::FxHashMap;
 
@@ -70,7 +70,7 @@ mod tests {
         data.insert(x.id, x_data.clone().into());
         data.insert(weight.id, w_data.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&data, &ImplementationSearchOptions::default())
+        rt.search(&data, &CompileOptions::default())
             .expect("search finds a plan");
         rt.set_data(x.id, x_data);
         rt.set_data(weight.id, w_data);
@@ -105,7 +105,7 @@ mod tests {
         data.insert(weight.id, w_data.clone().into());
         data.insert(bias.id, b_data.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&data, &ImplementationSearchOptions::default())
+        rt.search(&data, &CompileOptions::default())
             .expect("search finds a plan");
         rt.set_data(x.id, x_data);
         rt.set_data(weight.id, w_data);

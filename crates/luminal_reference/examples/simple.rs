@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     let data = pairs.iter().cloned().collect();
 
     let mut runtime = ReferenceRuntime::load(&cx)?;
-    runtime.search(&data, &luminal::test_support::harness_search_options())?;
+    runtime.search(&data, &luminal_reference::harness_search_options())?;
     for (id, value) in pairs {
         runtime.set_data(id, value);
     }

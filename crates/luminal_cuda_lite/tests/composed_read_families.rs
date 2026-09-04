@@ -23,8 +23,8 @@ use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::implementation_search::ImplementationSearchOptions;
 use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::{kernels, CudaRuntime};
 
 /// The view fixtures' search budget (mirrors `view_admission`):
@@ -33,8 +33,8 @@ use luminal_cuda_lite::{kernels, CudaRuntime};
 /// spellings of a movement class are cost-TIED (same bytes), so which
 /// one the genome elects is sampling — a fixture that needs a specific
 /// tied spelling pins the seed that elects it.
-fn view_search_options(seed: u64) -> ImplementationSearchOptions {
-    ImplementationSearchOptions {
+fn view_search_options(seed: u64) -> CompileOptions {
+    CompileOptions {
         generations: 4,
         generation_size: 8,
         mutations: 4,

@@ -47,7 +47,7 @@ fn run_both(cx: &Graph, inputs: &[(NodeIndex, Vec<f32>)], out: NodeIndex) -> (Ve
         .iter()
         .map(|(id, v)| (*id, v.clone().into()))
         .collect();
-    rt.search(&data, &luminal::test_support::harness_search_options())
+    rt.search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("cuda search");
     for (id, v) in inputs {
         rt.set_data(*id, v.clone());

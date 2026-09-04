@@ -8,7 +8,7 @@
 
 use std::fs;
 
-use luminal::extractor;
+use crate::extractor;
 use luminal::layout_ir::ExtractedGraph;
 
 /// Fixture scripts live in the WORKSPACE-ROOT Egglog core tree; this crate
@@ -219,7 +219,7 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
 /// output reads. The frontend candle differentials and the reference
 /// differentials both run through here — the same load → bind → search →
 /// execute ladder as the nn module tests, on the harness budget
-/// (`luminal::test_support::harness_search_options`).
+/// (`luminal_reference::harness_search_options`).
 pub fn run_reference(
     cx: &luminal::graph::Graph,
     inputs: &[(
@@ -257,7 +257,7 @@ pub fn run_reference_with_ranges(
             .expect("value range binds");
     }
     let data: rustc_hash::FxHashMap<_, _> = inputs.iter().cloned().collect();
-    rt.search(&data, &luminal::test_support::harness_search_options())
+    rt.search(&data, &crate::search::harness_search_options())
         .expect("search finds a plan");
     for (node, values) in inputs {
         rt.set_data(*node, values.clone());
