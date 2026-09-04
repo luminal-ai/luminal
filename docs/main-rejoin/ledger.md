@@ -53,6 +53,7 @@ Dispositions:
 | `598e5ca7` | #422 | Share reusable CUDA runtime through Lite | FILE-LEVEL (41 files into the `cuda_lite_hlir` park, incl. 5 deletions + 1 non-gating `ci/` file) + INTENT-ONLY at walk — DELIVERED by Phase 3 (arena) and PARTIALLY by Phase 2 (runtime-configurable op/matcher selection: the registry half; the execution face still PUNTED) + PUNTED-TO-PARK (fusion, attention, cuda-heavy composition) + DROPPED (the `subsume` fusion rule and the four `delete` rules, `CudaRuntimeImpl<O>`) | branch `rejoin/p0-record-and-park` | RULED 2026-09-03: *"put these fusion changes in hlir and punt on them temporarily"*, *"we're going to copy it into the hlir folder and then actually implement it once we're caught up"* (attention/FA3), *"Update the hlir_folder so we have a record of what the target code looks like"* (full-CUDA downstream), *"no code for now"* (zero-copy rebinding) — see **#422 reusable CUDA runtime** below |
 | `e7f9127a` | #430 | Restore CUDA dyn dims buffer on graph rebuild | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-430-487-cuda-graph-parks` (1st commit) | — nothing live corresponds: this branch's `crates/luminal_cuda_lite` captures no CUDA graphs at all, so there is no rebuild path to fix — see **#430 dyn-dims on rebuild** below, which says that once for the whole eight-commit line |
 | `188e92e8` | #435 | Add persistent compiled artifact reuse for Python and CUDA backends | FILE-LEVEL (7 files into the `cuda_lite_hlir` park + 1 metal-park file + 9 python-park files, 2 re-spelled `Expression` -> `IntExpr`) + FULL-FILE PARK (11 core files, post-#435, into `crates/luminal_cuda_lite_hlir/main_core/`) | branch `merge/main-cuda-graph-line-parks-wip` (2nd commit) | **PARITY REQUIRED — LUM-806** (https://linear.app/luminalai/issue/LUM-806). RULED 2026-09-04: *"you'll have to park it in the HLIR copy and then record that we need to get to feature parity for this. It is something we absolutely need to have eventually."* A compiled artifact must persist the SELECTED SCHEDULE so a fresh process runs without re-running the genetic search — see **#435 persistent compiled artifacts** below |
+| `a3c5df9f` | #437 | Fix signed integral aten.pow.Tensor_Scalar lowering | FILE-LEVEL | branch `merge/main-python-parks-wip` | the defect main fixes in the translator is LIVE in this branch's own frontend — `GraphTensor::pow` at `src/frontend/binary.rs:395` is the same `abs().log().mul(e).exp()`; RULED 2026-09-04 *"fix the front end"*, delivered as PR #491 — see **#437 signed integral pow** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4072,6 +4073,37 @@ NAME, not by a positional index, so no index-determinism fix is owed for the
 serialization itself. (Whether those class names reproduce across processes is
 the separate, already-recorded class-id stability question, and it is the first
 thing a schedule-loading implementation has to answer.)
+## #437 signed integral pow — banked, and the same defect fixed in the frontend
+
+Main's `a3c5df9f` replaces the `aten.pow.Tensor_Scalar` arm's one special case
+(`exp == 2` becomes `a * a`) with `translate_tensor_scalar_pow`, which lowers
+every finite whole-number scalar exponent by exponentiation by squaring —
+reciprocal for negative exponents, a ones constant at zero — and falls through
+to `GraphTensor::pow` only for non-integral exponents. All four files applied
+3-way with no conflict and the diff-of-diffs against `a3c5df9f` is EMPTY: this
+commit needed no re-spelling, because everything it reaches for
+(`output_meta_dtype`, `get_float_arg`, `constant_like`,
+`GraphTensor::reciprocal`) already exists here under main's name and no hunk
+touches a `ShapeTracker`, a `.shape` or an `Expression`.
+
+The reason main needed it is live in this branch too, and not only in the park:
+`GraphTensor::pow` at `src/frontend/binary.rs:395` was the identical
+sign-dropping approximation, `self.abs().log().mul(e).exp()`, so `(-2)^3`
+answered `+8` for every caller and GPT-2's approximate GELU — whose cubic term
+is `x.pow(3)` — was corrupted on every negative input. Austin ruled 2026-09-04
+*"fix the front end"*, and that fix is **PR #491**: a `PowExponent` trait whose
+`f32` impl lowers finite whole-number exponents structurally (capped at
+`|e| <= 64`) while tensor exponents and non-whole scalars keep the
+approximation. With #491 landed the park's own workaround becomes redundant
+rather than wrong — the M4 translator re-attachment can drop
+`translate_tensor_scalar_pow` and call `pow` directly, and that is the
+follow-up this row owes.
+
+Nothing was rebuilt or rerun for the park: `crates/luminal_python` is not a
+workspace member here, so main's pytest verification (the parametrised
+`test_pow_by_integral_scalar_preserves_sign`, the integer-base dtype promotion
+check, and the GPT-2 GELU regression) remains main's, measured against main's
+HLIR backend.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

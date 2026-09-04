@@ -1139,6 +1139,25 @@ class PowByConstantModel(torch.nn.Module):
         return x**constant
 
 
+class PowByScalarModel(torch.nn.Module):
+    """Tests aten.pow.Tensor_Scalar with a compile-time scalar exponent."""
+
+    def __init__(self, exponent: float) -> None:
+        super().__init__()
+        self.exponent = exponent
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.pow(self.exponent)
+
+
+class Gpt2ApproxGeluModel(torch.nn.Module):
+    """GPT-2's GELU formula, whose cubic term must preserve negative signs."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cubic = x.pow(3.0)
+        return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * (x + 0.044715 * cubic)))
+
+
 # ========== Where Node Test Models ==========
 
 
