@@ -85,6 +85,7 @@ from test_models import (
     # GELU models
     GeluTestModel,
     GeluTanhModel,
+    Gpt2ApproxGeluModel,
     LinearGeluBatchedModel,
     # LayerNormalization model
     ConvGroupNormSiLUModel,
@@ -125,6 +126,7 @@ from test_models import (
     # Or model
     OrTestModel,
     PowByConstantModel,
+    PowByScalarModel,
     # Pow models
     PowTestModel,
     ReduceMax3DAxis1Model,
@@ -1490,6 +1492,38 @@ def test_pow_by_constant(device: torch.device):
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("exponent", [0.0, 1.0, 2.0, 3.0, 4.0, -3.0])
+def test_pow_by_integral_scalar_preserves_sign(device: torch.device, exponent: float):
+    """Integral scalar powers preserve negative bases and reciprocal signs."""
+    model: torch.nn.Module = PowByScalarModel(exponent).to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.tensor([-3.0, -1.0, -0.5, 0.5, 1.0, 3.0], device=device)
+    original = model(x)
+    output = model_compiled(x)
+    assert torch.allclose(output, original, rtol=1e-4, atol=1e-4)
+
+
+def test_pow_by_float_scalar_promotes_integer_base(device: torch.device):
+    """A float scalar exponent promotes an integer tensor to PyTorch's output dtype."""
+    model: torch.nn.Module = PowByScalarModel(3.0).to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.tensor([-3, -1, 1, 3], dtype=torch.int32, device=device)
+    original = model(x)
+    output = model_compiled(x)
+    assert output.dtype == original.dtype
+    assert torch.equal(output, original)
+
+
+def test_gpt2_approx_gelu_preserves_cubic_sign(device: torch.device):
+    """Regression for GPT-2 logits corrupted by lowering x.pow(3) as abs(x)^3."""
+    model: torch.nn.Module = Gpt2ApproxGeluModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.linspace(-5.0, 5.0, 129, device=device)
+    original = model(x)
+    output = model_compiled(x)
+    assert torch.allclose(output, original, rtol=1e-5, atol=1e-5)
 
 
 # ========== PT2 Where Node Tests ==========

@@ -234,6 +234,50 @@ impl<'a> Translator<'a> {
         Ok(result)
     }
 
+    pub(crate) fn translate_tensor_scalar_pow(&mut self, node: &Node) -> Result<GraphTensor> {
+        let output_dtype = self.output_meta_dtype(node)?;
+        let base = self.get_input_tensor(node, 0)?.cast(output_dtype);
+        let exponent = self.get_float_arg(node, 1)?;
+
+        // GraphTensor::pow implements the general real-valued approximation
+        // through abs(base).log(), which loses the sign of negative bases.
+        // Integral scalar exponents have exact multiplication semantics, so
+        // lower them structurally and preserve odd-power signs. Exponentiation
+        // by squaring keeps the graph logarithmic in the exponent.
+        if exponent.is_finite() && exponent.fract() == 0.0 && exponent.abs() < i64::MAX as f64 {
+            let exponent = exponent as i64;
+            if exponent == 0 {
+                return Ok(self.constant_like(base, 1.0));
+            }
+
+            let reciprocal = exponent < 0;
+            let mut remaining = exponent.unsigned_abs();
+            let mut factor = base;
+            let mut result = None;
+            while remaining > 0 {
+                if remaining & 1 == 1 {
+                    result = Some(match result {
+                        Some(value) => value * factor,
+                        None => factor,
+                    });
+                }
+                remaining >>= 1;
+                if remaining > 0 {
+                    factor = factor * factor;
+                }
+            }
+
+            let result = result.expect("nonzero integral exponent must produce a power");
+            return Ok(if reciprocal {
+                result.reciprocal()
+            } else {
+                result
+            });
+        }
+
+        Ok(base.pow(exponent as f32))
+    }
+
     /// Lower boolean OR through numeric HLIR ops until HLIR has native logical ops.
     pub(crate) fn apply_bool_or(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
         let a = a.cast(DType::F32);
