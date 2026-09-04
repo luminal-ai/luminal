@@ -18,7 +18,7 @@ use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode};
 use luminal::dtype::{DType, PlanDtype};
 use luminal::prelude::FxHashMap;
 use luminal_cuda_lite::kernels::Coords;
-use luminal_cuda_lite::{kernels, CudaRuntime};
+use luminal_cuda_lite::{CudaRuntime, kernels};
 use std::collections::HashMap;
 
 /// Does this layout's read, taken at coordinates that ARE `i`

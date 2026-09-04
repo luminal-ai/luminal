@@ -15,7 +15,7 @@
 //! gather, scatter). The allow list stays honest by construction —
 //! search can only elect what this table generates.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use luminal::bufferize::SlotDescriptor;
 use luminal::dtype::PlanDtype;
@@ -498,19 +498,19 @@ pub fn layout_read_index(
     // EXPRESSION SIMPLIFICATION (not a fork): if these coordinates are
     // `i` decomposed over `slot_dims`, then `i == Σ strides*c`, and an
     // index function equal to that sum is literally `i`.
-    if let Coords::FlatIndex { .. } = coords {
-        if let Some(affine) = read_affine(layout, slot_dims) {
-            let strides = strides_of(slot_dims);
-            let is_flat_index = affine.constant == 0
-                && (0..slot_dims.len()).all(|axis| {
-                    // An extent-1 axis pins its coordinate to 0, so its
-                    // coefficient is unobservable — a fact about the
-                    // function, not a licence.
-                    slot_dims[axis] == 1 || i64::try_from(strides[axis]) == Ok(affine.coeffs[axis])
-                });
-            if is_flat_index {
-                return Ok((String::new(), "i".to_string()));
-            }
+    if let Coords::FlatIndex { .. } = coords
+        && let Some(affine) = read_affine(layout, slot_dims)
+    {
+        let strides = strides_of(slot_dims);
+        let is_flat_index = affine.constant == 0
+            && (0..slot_dims.len()).all(|axis| {
+                // An extent-1 axis pins its coordinate to 0, so its
+                // coefficient is unobservable — a fact about the
+                // function, not a licence.
+                slot_dims[axis] == 1 || i64::try_from(strides[axis]) == Ok(affine.coeffs[axis])
+            });
+        if is_flat_index {
+            return Ok((String::new(), "i".to_string()));
         }
     }
     let in_prefix = coords.prefix();
@@ -540,15 +540,14 @@ pub fn layout_read_index(
         MirrorLayout::RightMajor(rm) => {
             check_domain(&rm.shape)?;
             let strides = strides_of(slot_dims);
-            let flat = if rank == 0 {
+            if rank == 0 {
                 "0LL".to_string()
             } else {
                 (0..rank)
                     .map(|axis| format!("{in_prefix}{axis} * {}LL", strides[axis]))
                     .collect::<Vec<_>>()
                     .join(" + ")
-            };
-            flat
+            }
         }
         MirrorLayout::LeftMajor(lm) => {
             check_domain(&lm.shape)?;
@@ -556,15 +555,14 @@ pub fn layout_read_index(
             for axis in 1..rank {
                 strides[axis] = strides[axis - 1] * slot_dims[axis - 1];
             }
-            let flat = if rank == 0 {
+            if rank == 0 {
                 "0LL".to_string()
             } else {
                 (0..rank)
                     .map(|axis| format!("{in_prefix}{axis} * {}LL", strides[axis]))
                     .collect::<Vec<_>>()
                     .join(" + ")
-            };
-            flat
+            }
         }
         MirrorLayout::Strided(st) => {
             check_domain(&st.shape)?;

@@ -62,7 +62,9 @@ fn measure_plan(
             depth.insert(id, d);
         }
     }
-    println!("{name}: MODEL rows={rows} applies={applies} max_apply_chain={max_chain} record_us={rec_us}");
+    println!(
+        "{name}: MODEL rows={rows} applies={applies} max_apply_chain={max_chain} record_us={rec_us}"
+    );
     println!("{name}: CHAIN_DEPTH_HIST {hist:?}");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut rt = luminal_reference::ReferenceRuntime::load(cx).expect("native load");
@@ -89,17 +91,15 @@ fn measure_plan(
             if line.starts_with("anti (") {
                 in_ops = false;
             }
-            if in_ops {
-                if let Some(rest) = line.strip_prefix("  ") {
-                    let label = rest.split(':').next().unwrap_or("");
-                    if label.contains("Materialize") {
-                        mats += 1;
-                    }
-                    if label == "BufferAlloc" {
-                        allocs += 1;
-                    }
-                    total += 1;
+            if in_ops && let Some(rest) = line.strip_prefix("  ") {
+                let label = rest.split(':').next().unwrap_or("");
+                if label.contains("Materialize") {
+                    mats += 1;
                 }
+                if label == "BufferAlloc" {
+                    allocs += 1;
+                }
+                total += 1;
             }
         }
         println!("{name}: PLAN total_ops={total} materialize={mats} buffer_alloc={allocs}");

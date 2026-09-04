@@ -14,9 +14,9 @@ use luminal::layout_ir::{
 };
 
 use crate::kernels::{
-    coord_prelude, cuda_type, layout_read_index, numel, CodegenCtx, Coords, KernelSource,
+    CodegenCtx, Coords, KernelSource, coord_prelude, cuda_type, layout_read_index, numel,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// `GatherGeneric(data, coord0, .., coord{r-1}) -> out` — pure
 /// dataflow form; total operands = 1 + rank.

@@ -14,7 +14,7 @@
 //! died with the hop machinery — the corrected contract deleted
 //! `ComposedAccess` from the plan entirely.
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{Result, anyhow, bail, ensure};
 use luminal::layouts::{IntExprTerm, MirrorLayout, ShapeTerm};
 
 /// Evaluate a mirror [`IntExprTerm`] at concrete coordinates

@@ -52,7 +52,7 @@
 
 use anyhow::Result;
 
-use crate::arena::{buffer_bytes, plan_arena, ArenaPlan};
+use crate::arena::{ArenaPlan, buffer_bytes, plan_arena};
 use crate::extractor::{self, Genome};
 use crate::layouts::CudaPlan;
 use luminal::prelude::egraph_serialize;

@@ -11,8 +11,8 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{cuda_type, numel, CodegenCtx, KernelSource};
-use anyhow::{bail, Result};
+use crate::kernels::{CodegenCtx, KernelSource, cuda_type, numel};
+use anyhow::{Result, bail};
 
 /// `ConstantGeneric() -> out` — pure dataflow source form.
 #[derive(Debug, Clone, Copy, PartialEq)]

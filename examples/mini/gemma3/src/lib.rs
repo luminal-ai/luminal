@@ -6,8 +6,8 @@
 mod model_support;
 
 use crate::model_support::{
-    causal_bias, paged_attention, rms_norm_heads, rotary_apply, sliding_window_bias,
-    AttentionGeometry, CacheAccess, Embedding, KvCache, LayerNorm, Linear, Namespace,
+    AttentionGeometry, CacheAccess, Embedding, KvCache, LayerNorm, Linear, Namespace, causal_bias,
+    paged_attention, rms_norm_heads, rotary_apply, sliding_window_bias,
 };
 use luminal::prelude::*;
 use luminal::shape::IntExpr;

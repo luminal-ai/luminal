@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
 use colored::Colorize;
 use egraph_serialize::ClassId;
 use rand::rngs::StdRng;
@@ -44,7 +44,7 @@ use luminal::graph::LogicalProgram;
 use luminal::layouts::DecodedLayout;
 
 use crate::extractor::{self, Genome, ProducerChoice, SamplingSpace};
-use crate::runtime::{reference_allow_list, ReferenceRuntime};
+use crate::runtime::{ReferenceRuntime, reference_allow_list};
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
@@ -1316,7 +1316,7 @@ mod tests {
     use luminal::dtype::DType;
     use luminal::graph::Graph;
 
-    use super::{search_implementations, CompileOptions};
+    use super::{CompileOptions, search_implementations};
     use crate::ReferenceRuntime;
 
     /// A REAL selection space (x+y and x*y from shared inputs offers the
@@ -1401,12 +1401,12 @@ mod sampler_tests {
     use std::collections::BTreeMap;
 
     use egraph_serialize::{ClassId, NodeId};
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
-    use crate::extractor::{edges_have_cycle, Genome, ProducerChoice, SamplingSpace};
+    use crate::extractor::{Genome, ProducerChoice, SamplingSpace, edges_have_cycle};
 
-    use super::{bufferize_cycle_tripwire, mutate_genome, sample_genome, ProducerIndex};
+    use super::{ProducerIndex, bufferize_cycle_tripwire, mutate_genome, sample_genome};
 
     fn class(name: &str) -> ClassId {
         ClassId::from(name)

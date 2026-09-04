@@ -15,7 +15,7 @@
 //! HLIR node indices, so differential tests against `ReferenceRuntime`
 //! bind identically on both sides.
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use petgraph::algo::toposort;
 use rustc_hash::FxHashMap;
 
@@ -913,10 +913,10 @@ impl ReferenceRuntime {
             .as_ref()
             .ok_or_else(|| anyhow!("no plan loaded"))?;
         for node in plan.dag.node_weights() {
-            if let BufferNode::BufferOutput { slots } = node {
-                if let Some(slot) = slots.iter().find(|slot| slot.index == index) {
-                    return Ok(slot);
-                }
+            if let BufferNode::BufferOutput { slots } = node
+                && let Some(slot) = slots.iter().find(|slot| slot.index == index)
+            {
+                return Ok(slot);
             }
         }
         Err(anyhow!("no output slot {index} in the loaded plan"))
@@ -935,9 +935,9 @@ impl ReferenceRuntime {
 
 #[cfg(test)]
 mod tests {
+    use crate::ReferenceRuntime;
     use crate::harness::run_reference;
     use crate::typed_buffer::TypedBuffer;
-    use crate::ReferenceRuntime;
     use luminal::dtype::DType;
     use luminal::graph::Graph;
     use rustc_hash::FxHashMap;
@@ -1722,10 +1722,11 @@ mod tests {
             reason.contains("synthetic guard"),
             "attributable reason: {reason}"
         );
-        assert!(cx
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
-            .is_err());
+        assert!(
+            cx.logical
+                .bound_program(&crate::bindings::ReferenceBindings)
+                .is_err()
+        );
     }
 
     /// M3 STEP 1: THE FIRST NATIVE DIFFERENTIAL — the recorder's model +

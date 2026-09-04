@@ -10,7 +10,7 @@ use luminal::layouts::{
 use luminal::prelude::egraph_serialize::ClassId;
 use luminal_cuda_lite::layouts::DecodedLayout;
 use luminal_cuda_lite::ops::cublaslt::exec::{
-    bind_destination, plan_call, plan_call_from_spec, validate_ld_bounds, CSource, LtDesc,
+    CSource, LtDesc, bind_destination, plan_call, plan_call_from_spec, validate_ld_bounds,
 };
 use luminal_cuda_lite::ops::cublaslt::{CuDim, CuEpilogue, CublasLt, CublasLtForm, LtMatmulSpec};
 

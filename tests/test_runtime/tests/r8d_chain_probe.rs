@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 
 use luminal::layout_ir::ExtractionSite;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
-use test_runtime::cublaslt_marker::{parse_spec, CublasLtForm};
+use test_runtime::cublaslt_marker::{CublasLtForm, parse_spec};
 
 const SCHEDULE: &str = "(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 

@@ -138,15 +138,14 @@ impl Dim {
 
 fn parse_dim(s: &EGraph, class: &ClassId) -> Dim {
     for lit in nodes_in_class(s, class, "IntLit") {
-        if let Some(payload) = class_of_child(s, lit, 0) {
-            if let Some(v) = s
+        if let Some(payload) = class_of_child(s, lit, 0)
+            && let Some(v) = s
                 .nodes
                 .values()
                 .filter(|n| n.eclass == payload)
                 .find_map(|n| n.op.parse::<i64>().ok())
-            {
-                return Dim::Lit(v);
-            }
+        {
+            return Dim::Lit(v);
         }
     }
     Dim::Sym(class.clone())
@@ -243,10 +242,10 @@ fn pitch_factor_classes(s: &EGraph, layout_class: &ClassId) -> Vec<ClassId> {
                     if !other_is_coord {
                         continue;
                     }
-                    if let Some(factor) = class_of_child(s, mul, child) {
-                        if !factors.contains(&factor) {
-                            factors.push(factor);
-                        }
+                    if let Some(factor) = class_of_child(s, mul, child)
+                        && !factors.contains(&factor)
+                    {
+                        factors.push(factor);
                     }
                 }
             }
@@ -316,14 +315,15 @@ fn reading_ld(
     // neighbouring extent is contiguous (and then ld == rows by
     // construction); anything else is the creator's pitch. Dead axes
     // (extent 1) are never read.
-    if storage[0] != Dim::Lit(1) && storage[1] != Dim::Lit(1) {
-        if let Some(layout) = layout_of_lt(s, lt) {
-            let factors = pitch_factor_classes(s, &layout);
-            if let [factor] = factors.as_slice() {
-                let f = parse_dim(s, factor);
-                if f != storage[1] && f != storage[0] && f != Dim::Unknown && f != Dim::Lit(1) {
-                    return f;
-                }
+    if storage[0] != Dim::Lit(1)
+        && storage[1] != Dim::Lit(1)
+        && let Some(layout) = layout_of_lt(s, lt)
+    {
+        let factors = pitch_factor_classes(s, &layout);
+        if let [factor] = factors.as_slice() {
+            let f = parse_dim(s, factor);
+            if f != storage[1] && f != storage[0] && f != Dim::Unknown && f != Dim::Lit(1) {
+                return f;
             }
         }
     }
@@ -2897,10 +2897,10 @@ fn ru3_m1_corner_multiplicity() {
             .first()
             .unwrap();
         for i in 0..3 {
-            if let Some(c) = class_of_child(&s, site_node, i) {
-                if !own.contains(&c) {
-                    own.push(c);
-                }
+            if let Some(c) = class_of_child(&s, site_node, i)
+                && !own.contains(&c)
+            {
+                own.push(c);
             }
         }
     }

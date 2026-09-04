@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use petgraph::graph::{DiGraph, NodeIndex};
 
@@ -26,7 +26,7 @@ use luminal::layout_ir::{
     FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText, LogicalInfo, OpInput,
     OpMatcher, OpNode, OutputNode, OutputSlot,
 };
-use luminal::logical_op::{logical_op_for, LogicalRender};
+use luminal::logical_op::{LogicalRender, logical_op_for};
 
 type Bounds = (Option<i128>, Option<i128>);
 type BoundsIndex = HashMap<ClassId, Bounds>;
@@ -1084,10 +1084,9 @@ impl<'a> Extractor<'a> {
                             .children
                             .first()
                             .and_then(|c| self.egraph.nodes.get(c).map(|n| n.eclass.clone()))
+                            && self.memo.get(&element).cloned().flatten().is_none()
                         {
-                            if self.memo.get(&element).cloned().flatten().is_none() {
-                                failing.push(index);
-                            }
+                            failing.push(index);
                         }
                         index += 1;
                         spine = cons
@@ -1499,10 +1498,14 @@ impl<'a> Extractor<'a> {
         // this as `if let ... = self.op_cache.borrow().get(..) { .. }
         // else { ..borrow_mut().. }` reads correctly and panics in
         // edition 2021, where the scrutinee temporary outlives the
-        // `else` arm (edition 2024 shortened exactly this scope). These
-        // copies live in 2021 crates, so the lookup takes its own
-        // statement and the guard is released by the time the miss path
-        // writes.
+        // `else` arm; edition 2024 shortened exactly that scope, and
+        // since Phase 7 all three copies live in 2024 crates, so that
+        // spelling would compile-and-run correctly here too. It is
+        // still not used: a lookup in its own statement drops the
+        // `Ref` at the semicolon, so the guard is released before the
+        // miss path writes in EVERY edition, and these three files are
+        // hand-kept copies whose correctness should not depend on the
+        // edition of whichever crate is holding them.
         let cached = self.op_cache.borrow().get(node_id).cloned();
         let op: Box<dyn LayoutIrOp> = match cached {
             Some(cached) => cached,
@@ -1875,10 +1878,10 @@ impl<'a> Extractor<'a> {
     fn plan_dtype_value(&self, class: &ClassId) -> Option<luminal::dtype::PlanDtype> {
         for node_id in self.class_nodes.get(class)? {
             let node = self.egraph.nodes.get(node_id)?;
-            if node.children.is_empty() {
-                if let Some(dtype) = luminal::dtype::PlanDtype::from_egglog_name(&node.op) {
-                    return Some(dtype);
-                }
+            if node.children.is_empty()
+                && let Some(dtype) = luminal::dtype::PlanDtype::from_egglog_name(&node.op)
+            {
+                return Some(dtype);
             }
         }
         None
@@ -1889,10 +1892,10 @@ impl<'a> Extractor<'a> {
     fn bigint_value(&self, class: &ClassId) -> Option<i128> {
         for node_id in self.class_nodes.get(class)? {
             let node = self.egraph.nodes.get(node_id)?;
-            if node.children.is_empty() {
-                if let Ok(value) = node.op.parse::<i128>() {
-                    return Some(value);
-                }
+            if node.children.is_empty()
+                && let Ok(value) = node.op.parse::<i128>()
+            {
+                return Some(value);
             }
         }
         None
@@ -2722,15 +2725,15 @@ impl<'a> ClassRenderer<'a> {
             if let Some(dtype) = self.logical_dtype(&logical_class) {
                 details.push(("dtype".to_string(), dtype));
             }
-            if !details.iter().any(|(key, _)| key == "shape") {
-                if let Some(shape) = self.layout_shape(&layout_class) {
-                    details.push(("shape".to_string(), shape));
-                }
+            if !details.iter().any(|(key, _)| key == "shape")
+                && let Some(shape) = self.layout_shape(&layout_class)
+            {
+                details.push(("shape".to_string(), shape));
             }
-            if !details.iter().any(|(key, _)| key == "dtype") {
-                if let Some(dtype) = self.layout_dtype(&layout_class) {
-                    details.push(("dtype".to_string(), dtype));
-                }
+            if !details.iter().any(|(key, _)| key == "dtype")
+                && let Some(dtype) = self.layout_dtype(&layout_class)
+            {
+                details.push(("dtype".to_string(), dtype));
             }
             details.push(("layout".to_string(), self.canonical_layout(&layout_class)));
             details.push(("layout_eclass".to_string(), layout_class.to_string()));
@@ -3950,15 +3953,15 @@ fn choose_render_node<'a>(
     node_ids: &'a [NodeId],
     preferred_op: Option<&str>,
 ) -> Option<&'a NodeId> {
-    if let Some(preferred_op) = preferred_op {
-        if let Some(node_id) = node_ids.iter().find(|node_id| {
+    if let Some(preferred_op) = preferred_op
+        && let Some(node_id) = node_ids.iter().find(|node_id| {
             egraph
                 .nodes
                 .get(*node_id)
                 .is_some_and(|node| node.op == preferred_op)
-        }) {
-            return Some(node_id);
-        }
+        })
+    {
+        return Some(node_id);
     }
 
     if let Some(node_id) = node_ids.iter().find(|node_id| {

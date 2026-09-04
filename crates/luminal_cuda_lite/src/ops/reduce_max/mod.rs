@@ -11,8 +11,8 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{reduce, CodegenCtx, KernelSource};
-use anyhow::{bail, Context, Result};
+use crate::kernels::{CodegenCtx, KernelSource, reduce};
+use anyhow::{Context, Result, bail};
 
 /// `ReduceMaxGeneric(input) -> out` — pure dataflow form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -565,7 +565,9 @@ fn named_input_keeps_its_name_bearing_spellings() {
             .get(class)
             .and_then(|data| data.extra.get("let"))
             .unwrap_or_else(|| {
-                panic!("named input {name:?} class {class:?} lost its let-name; binders: {let_names:?}")
+                panic!(
+                    "named input {name:?} class {class:?} lost its let-name; binders: {let_names:?}"
+                )
             });
         assert!(
             let_names.get(binder) == Some(class),

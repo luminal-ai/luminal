@@ -178,10 +178,10 @@ pub fn ref_paged_step_gqa(
                 // Sliding window (gemma local layers): gathered position
                 // j is outside when j < q_pos − (window − 1) — mirror of
                 // the graph-side mask in paged_attention_windowed.
-                if let Some(window) = window {
-                    if (position as i64) < q_pos as i64 - (window as i64 - 1) {
-                        return f32::NEG_INFINITY;
-                    }
+                if let Some(window) = window
+                    && (position as i64) < q_pos as i64 - (window as i64 - 1)
+                {
+                    return f32::NEG_INFINITY;
                 }
                 let k_row = &k_cache[slot * kv_dim + kv_head * head_dim..][..head_dim];
                 q_h.iter().zip(k_row).map(|(a, b)| a * b).sum::<f32>() * scale

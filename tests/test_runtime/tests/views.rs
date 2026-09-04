@@ -14,7 +14,7 @@
 //! `basic_program.egg`. Nothing here reaches into the core script tree.
 
 use luminal::layout_ir::Access;
-use luminal::test_support::{bufferize_mock, MockOp, TestGraph};
+use luminal::test_support::{MockOp, TestGraph, bufferize_mock};
 
 /// THE REAL VIEW OP, plan level (Step 3): `IndexMapApplyView` feeding a
 /// compute op contributes ZERO plan nodes — the result binds its parent's

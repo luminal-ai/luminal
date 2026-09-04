@@ -20,8 +20,8 @@ fn main() {
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
     use llama3::{
-        model_support::{named_kv_cache_pool, Namespace},
         Llama3, Llama3Dims,
+        model_support::{Namespace, named_kv_cache_pool},
     };
     use luminal::prelude::*;
     use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};

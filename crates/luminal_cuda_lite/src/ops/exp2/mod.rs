@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{unary, CodegenCtx, KernelSource};
+use crate::kernels::{CodegenCtx, KernelSource, unary};
 use anyhow::Result;
 
 /// `Exp2FunctionalGeneric(input) -> out` — pure dataflow form.

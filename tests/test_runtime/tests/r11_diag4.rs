@@ -42,21 +42,21 @@ fn diag_a5() {
                 .collect();
             let outs: Vec<String> = op.outputs.iter().map(|o| format!("{}", o.eclass)).collect();
             println!("PLAN {}: ins={ins:?} outs={outs:?}", op.op.label());
-            if let Some(c) = (*op.op).as_any().downcast_ref::<CublasLt>() {
-                if let Some(spec) = &c.spec {
-                    println!(
-                        "  spec m={} n={} k={} ta={} tb={} lda={} ldb={} a_lt={} b_lt={}",
-                        spec.m,
-                        spec.n,
-                        spec.k,
-                        spec.trans_a,
-                        spec.trans_b,
-                        spec.lda,
-                        spec.ldb,
-                        spec.desc_a_layout_tensor,
-                        spec.desc_b_layout_tensor
-                    );
-                }
+            if let Some(c) = (*op.op).as_any().downcast_ref::<CublasLt>()
+                && let Some(spec) = &c.spec
+            {
+                println!(
+                    "  spec m={} n={} k={} ta={} tb={} lda={} ldb={} a_lt={} b_lt={}",
+                    spec.m,
+                    spec.n,
+                    spec.k,
+                    spec.trans_a,
+                    spec.trans_b,
+                    spec.lda,
+                    spec.ldb,
+                    spec.desc_a_layout_tensor,
+                    spec.desc_b_layout_tensor
+                );
             }
         }
     }

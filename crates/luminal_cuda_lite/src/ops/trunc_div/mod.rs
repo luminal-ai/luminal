@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{binary, CodegenCtx, KernelSource};
+use crate::kernels::{CodegenCtx, KernelSource, binary};
 use anyhow::Result;
 
 /// `TruncDivFunctionalGeneric(numerator, denominator) -> out` — pure dataflow form.

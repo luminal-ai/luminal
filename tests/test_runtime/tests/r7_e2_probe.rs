@@ -42,23 +42,21 @@ fn e2_fill_depth_from_live_recorder() {
         let mut depth1 = 0usize;
         let mut apply_of_const = std::collections::BTreeSet::new();
         for n in s.nodes.values() {
-            if n.op == "LogicalIndexMapApply" {
-                if let Some(src) = n.children.first().and_then(|id| s.nodes.get(id)) {
-                    if const_classes.contains(&src.eclass) {
-                        depth1 += 1;
-                        apply_of_const.insert(n.eclass.clone());
-                    }
-                }
+            if n.op == "LogicalIndexMapApply"
+                && let Some(src) = n.children.first().and_then(|id| s.nodes.get(id))
+                && const_classes.contains(&src.eclass)
+            {
+                depth1 += 1;
+                apply_of_const.insert(n.eclass.clone());
             }
         }
         let mut depth2 = 0usize;
         for n in s.nodes.values() {
-            if n.op == "LogicalIndexMapApply" {
-                if let Some(src) = n.children.first().and_then(|id| s.nodes.get(id)) {
-                    if apply_of_const.contains(&src.eclass) {
-                        depth2 += 1;
-                    }
-                }
+            if n.op == "LogicalIndexMapApply"
+                && let Some(src) = n.children.first().and_then(|id| s.nodes.get(id))
+                && apply_of_const.contains(&src.eclass)
+            {
+                depth2 += 1;
             }
         }
         println!("E2 {name}: depth-1 fill applies = {depth1}, depth-2+ = {depth2}");
@@ -105,14 +103,12 @@ fn e2_composition_canonicalization_probe() {
         if n.op != "LogicalIndexMapApply" {
             continue;
         }
-        if let Some(src) = n.children.first().and_then(|id| s.nodes.get(id)) {
-            if src.op == "LogicalIndexMapApply" {
-                if let Some(inner) = src.children.first().and_then(|id| s.nodes.get(id)) {
-                    if const_classes.contains(&inner.eclass) {
-                        nested_class = Some(n.eclass.clone());
-                    }
-                }
-            }
+        if let Some(src) = n.children.first().and_then(|id| s.nodes.get(id))
+            && src.op == "LogicalIndexMapApply"
+            && let Some(inner) = src.children.first().and_then(|id| s.nodes.get(id))
+            && const_classes.contains(&inner.eclass)
+        {
+            nested_class = Some(n.eclass.clone());
         }
     }
     let one_level = s
@@ -128,7 +124,9 @@ fn e2_composition_canonicalization_probe() {
         })
         .count();
     match nested_class {
-        Some(_) => println!("E2 composition probe: nested spelling SURVIVES; {one_level} one-level"),
+        Some(_) => {
+            println!("E2 composition probe: nested spelling SURVIVES; {one_level} one-level")
+        }
         None => println!(
             "E2 composition probe: NESTED SPELLING GONE (canonicalized away); {one_level} one-level apply-of-const spelling(s) remain"
         ),

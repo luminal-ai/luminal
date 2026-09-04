@@ -2440,7 +2440,10 @@ failures.
   ..borrow_mut().. }`, which is correct under edition 2024 (where the
   `if let` temporary dies before the `else`) and panics under edition
   2021 — which is where all three copies live. Split into a statement +
-  `match`.
+  `match`. AMENDED 2026-09-04: the three copies live in 2024 crates
+  now — see **Program: #420/#422 rejoin — Phase 7 (edition 2024 for
+  the runtime crates)** below. The split STAYS: it is correct in both
+  editions, and copies should not depend on their host's edition.
 
 **The limitation Phase 1 states rather than solves.** Every bucket's
 winning plan is STATIC at its representative: plan spans are literals,
@@ -3694,6 +3697,149 @@ recorded, not taken: it changes allow-list derivation and would need checking
 against every shipped prototype. C25's optional aside (the pre-existing
 LAYOUT-vs-VALUE e-class contradiction in `bufferize`'s doc paragraph, identical
 at trunk) is left alone as out of this program's scope.
+
+## Program: #420/#422 rejoin — Phase 7 (edition 2024 for the runtime crates)
+
+**The ruling** (Austin, 2026-09-04): *"we can flip to 2024 version, let's do
+that."* Decision 24 of this program: Phase 1 found the extractor's op-cache
+lookup spelled `if let Some(..) = cache.borrow().get(..) { .. } else {
+..borrow_mut().. }` — correct in core's edition (2024, where the `if let`
+scrutinee temporary dies before the `else` arm) and a guaranteed
+`BorrowMutError` in the three copies' edition (2021, where it does not). Phase
+1 split the site rather than move the crates. Phase 7 moves the crates.
+
+**Every workspace member's edition, before and after.** The workspace
+inherits `[workspace.package] edition = "2024"`, so the split was never
+philosophical — it was three crates that spelled the field themselves and
+were never updated.
+
+| member | before | after |
+| --- | --- | --- |
+| `luminal` (root) | 2024 (`edition.workspace`) | unchanged |
+| `crates/luminal_reference` | **2021** | **2024** |
+| `crates/luminal_cuda_lite` | **2021** | **2024** |
+| `tests/test_runtime` | **2021** | **2024** |
+| `crates/luminal_nn` | 2024 | unchanged |
+| `crates/luminal_tracing` | 2024 (`edition.workspace`) | unchanged |
+| `examples/flux2` | 2024 | unchanged |
+| `examples/{qwen3,llama3,paged_llama3,llama3_1_fp8,gemma3,qwen3_moe,gemma4_moe,whisper,yolo_v11}` | 2024 (`edition.workspace`) | unchanged |
+| `tests/scalar_refs` | 2021 | **left at 2021** |
+| `examples/mini/{llama3,qwen3,gemma3,qwen3_moe,gemma4_moe,whisper,conv,flux}` | 2021 | **left at 2021** |
+
+Nine members stay at 2021 by scope, not by argument: none of them carries an
+extractor copy, none was implicated in the Phase 1 bug, and flipping them is a
+separate decision for Austin. Six further `Cargo.toml`s in the tree
+(`crates/luminal_metal`, `crates/luminal_cuda_lite_hlir`, `crates/luminal_bench`,
+`crates/luminal_training`, `crates/luminal_python/rust`, `docs/company`) are not
+workspace members at all and were not touched.
+
+**What `cargo fix --edition` found.** Run on the OLD edition with
+`--all-targets` (the migration lints only exist there), once per crate, and
+once more for `luminal_cuda_lite --features device`:
+
+| crate | machine-applicable fixes | remaining warnings |
+| --- | --- | --- |
+| `luminal_reference` | 0 | 0 |
+| `test_runtime` | 0 | 0 |
+| `luminal_cuda_lite` | 1 (`rust_2024_incompatible_pat`) | 1 (`tail_expr_drop_order`) |
+
+The one fix is `arena.rs`'s first-fit hole search: `self.holes.iter().find(|(_,
+&len)| len >= need)` becomes `find(|&(_, &len)| len >= need)`. RFC 3627 forbids
+a `&` sub-pattern under an inherited reference binding mode in 2024; the
+explicit outer `&` restores the same binding. Nothing about `gen`, `unsafe
+extern`, `unsafe_op_in_unsafe_fn`, RPIT lifetime capture, `!` fallback, or
+`expr_2021` matchers appeared anywhere — this codebase had no 2015-era habits
+left to shed.
+
+**The one drop-order difference, analysed rather than papered over.**
+`tail_expr_drop_order` fires on
+`crates/luminal_cuda_lite/tests/input_producer_cleanup.rs`, at the `match
+rt.search(&data, &options) { .. }` that closes the body of the per-seed loop in
+`sampled_genomes_never_hand_bufferize_a_cyclic_graph`. It is a tail expression,
+so its scrutinee temporary — a `Result<SearchOutcome, anyhow::Error>` — is
+dropped AFTER the block's locals (`cx`, `a`, `b`, `rt`, `data`, `options`) in
+2021 and BEFORE them in 2024. It is inert, for a reason the lint cannot see:
+both arms bind by value (`Ok(outcome)`, `Err(err)`), so the temporary is
+drop-flagged moved-from by the time either edition reaches it, and its drop is
+a no-op in both. Even if it were not, neither `anyhow::Error`'s destructor nor
+`CudaRuntime`'s observes the other. Left exactly as written; the test is in the
+gate and passes (5 passed, 7.49 s).
+
+**The op-cache site: the split STAYS.** Under 2024 the original `if let ...
+else` would now be correct here — that is the whole point of the flip, and it
+is why core never hit the bug. It is not restored. The statement + `match` is
+correct in BOTH editions, and these three extractors are hand-kept copies whose
+correctness should not turn on the edition of whichever crate is holding them
+this month. What changed is the comment: it used to end "These copies live in
+2021 crates", which the flip made false. It now says the 2024 spelling would
+work and why the edition-independent one is kept anyway. (There was no
+dedicated test pinning the site — the split was pinned only by every search
+test in the suite, all of which would panic on a regression. Those still pass.)
+
+**What the flip cost, and it is not nothing: 55 new clippy warnings.** At
+2021 all three crates were clippy-clean — measured, by reverting the edition
+field and re-running: zero warnings without `--features device`, and with it
+only one pre-existing `type_complexity` on `device_profile.rs`'s fixture
+signature. At 2024 two lints wake up because let-chains now exist:
+
+- `collapsible_if` x53 — `if a { if let P = b { .. } }` becomes `if a && let P
+  = b { .. }`. Only spellable in 2024. Nesting and an `&&`-chain evaluate
+  identically (left to right, short-circuiting), and clippy offers it only
+  where NEITHER `if` has an `else`.
+- `let_and_return` x2 — `let flat = if .. {..} else {..}; flat` in
+  `kernels.rs`. In 2021 the lint stays quiet because removing the binding moves
+  temporaries into tail position and LENGTHENS their lives; 2024's
+  tail-expression scope rule removes that difference, so the lint fires and the
+  rewrite is exact. Both values are `String`.
+
+All 55 applied with `cargo clippy --fix` (once plain, once `--features
+device`), then read. The three extractor copies received byte-identical hunks —
+checked, because they are copies. The line-continued `bail!` strings in
+`arena.rs` shift their first line left; a `\`-continued newline eats the
+following indentation, so the messages are byte-identical. Device clippy is
+back to its 2021 baseline exactly: the one pre-existing `type_complexity`,
+which is not this phase's business.
+
+**Formatting.** rustfmt's style edition follows the crate's Rust edition, and
+there is no `rustfmt.toml` pinning a style, so the three crates reformat under
+2024's rules and nothing else in the workspace moves. 72 files, 149/130 lines,
+taken as-is in its own commit so the semantic diff stays reviewable: `use`
+items sort case-sensitively again (`{Context, Result, anyhow, bail}`); over-long
+`assert!`/`println!` arguments break after the opening paren instead of hanging
+off the receiver; short `if`/`else` and match arms that fit collapse to one
+line. Verified mechanical — for 71 of 72 files the token multiset is identical
+before and after, and the 72nd (`r7_e2_probe.rs`) differs by one `{}` pair
+replacing one `,` where a match arm gained a block.
+
+**Gate** (full CPU gate, macOS, rustc 1.91.1). `cargo build --workspace
+--all-targets` and `cargo build -p luminal_cuda_lite --all-targets --features
+device`: zero warnings, zero errors. `cargo test -p luminal --lib`: 228 passed,
+0 failed, 6 ignored (the six rank-≥2 pad consumers named in **#406 pad** below
+— `test_pad_2d`, `test_concat`, `test_slice_pad`, `test_unfold`,
+`test_cumulative`, `test_stack` — all ran and passed; total 16 s, not the
+76-minute cliff). `cargo test -p luminal_reference`: 66 passed, 2 ignored (58 lib + 1
+`corpus` + 7 `mini_model_smoke`). `cargo test -p luminal_cuda_lite`: 90 passed
+across the lib and 18 integration binaries, plus 1 doc-test, 3 ignored.
+`cargo test -p test_runtime`: 212 passed across the lib and 40 integration
+binaries, 1 ignored. `cargo test -p luminal_nn`: 31 passed. Zero failures anywhere. `cargo clippy` (both feature
+sets) and `cargo fmt --all -- --check` clean.
+
+**Nothing semantic changed.** That is the finding, and it was not assumed: the
+only two places where 2024 could have altered behaviour are the `arena.rs`
+pattern (same binding, spelled explicitly) and the `input_producer_cleanup`
+drop order (a moved-from temporary), and both were checked by hand before the
+gate confirmed them.
+
+**Amended 2026-09-04 (Austin: "by default lets make everything 2024, no reason to have the
+divergence").** The nine members left at 2021 above — `tests/scalar_refs` and the eight
+`examples/mini/*` crates — now inherit the workspace edition (`edition.workspace = true`,
+the spelling `examples/llama3` already used). The workspace built clean at 2024 before any
+migration lint ran (no `cargo fix --edition` change was needed), clippy reported nothing
+on the nine, rustfmt's 2024 style touched seven source files, and the suites that
+exercise them (`scalar_refs`, `luminal_reference` `mini_model_smoke` 7 passed,
+`luminal_cuda_lite` `example_smoke` 1 passed) are green. Every workspace member is now
+edition 2024. The six non-member parks keep their own `Cargo.toml`s untouched (they track
+main file-level and do not build).
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

@@ -22,8 +22,8 @@ fn run() -> anyhow::Result<()> {
     use luminal::prelude::*;
     use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};
     use qwen3::{
-        model_support::{named_kv_cache_pool, Namespace},
         Qwen, QwenDims,
+        model_support::{Namespace, named_kv_cache_pool},
     };
 
     const SLOTS: usize = 4;

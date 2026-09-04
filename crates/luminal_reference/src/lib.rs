@@ -26,10 +26,10 @@ pub mod typed_buffer;
 pub use bindings::ReferenceBindings;
 pub use harness::{extract_layout_ir, extract_layout_ir_with_genome, producer_index_with_ops};
 pub use layouts::ReferencePlan;
-pub use runtime::{reference_allow_list, ReferenceRuntime};
+pub use runtime::{ReferenceRuntime, reference_allow_list};
 pub use search::{
-    harness_search_options, search_implementations, search_implementations_with_ops,
-    CompileOptions, SearchOutcome,
+    CompileOptions, SearchOutcome, harness_search_options, search_implementations,
+    search_implementations_with_ops,
 };
 pub use typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 

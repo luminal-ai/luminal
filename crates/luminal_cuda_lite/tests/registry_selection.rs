@@ -14,8 +14,8 @@ use luminal::dtype::DType;
 use luminal::prelude::FxHashMap;
 use luminal_cuda_lite::ops::cublaslt::{CublasLt, CublasLtForm, CublasLtMarkerMatcher};
 use luminal_cuda_lite::{
-    cuda_registry, cuda_registry_filtered, cuda_registry_with_cublaslt, harness_search_options,
-    CudaRuntime, RegisteredOp,
+    CudaRuntime, RegisteredOp, cuda_registry, cuda_registry_filtered, cuda_registry_with_cublaslt,
+    harness_search_options,
 };
 
 const ADD: &str = "LayoutTensorOpAddFunctionalGeneric";
