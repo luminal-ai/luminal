@@ -69,7 +69,7 @@ pub mod tests;
 
 pub mod prelude {
     pub use crate::dtype::DType;
-    pub use crate::frontend::binary::F32Pow;
+    pub use crate::frontend::binary::{F32Pow, PowExponent};
     pub use crate::frontend::*;
     pub use crate::graph::*;
     pub use crate::shape::*;
