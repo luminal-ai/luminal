@@ -56,6 +56,7 @@ Dispositions:
 | `a3c5df9f` | #437 | Fix signed integral aten.pow.Tensor_Scalar lowering | FILE-LEVEL | branch `merge/main-python-parks-wip` | the defect main fixes in the translator is LIVE in this branch's own frontend — `GraphTensor::pow` at `src/frontend/binary.rs:395` is the same `abs().log().mul(e).exp()`; RULED 2026-09-04 *"fix the front end"*, delivered as PR #491 — see **#437 signed integral pow** below |
 | `2b368a29` | #440 | Make cuBLASLt capture cache capacity configurable | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (3rd commit) | — nothing live corresponds (no capture cache exists here; see **#430 dyn-dims on rebuild** for the once-stated reason) — see **#440 capture cache capacity** below |
 | `e8780fc8` | #441 | Lower inference native batch norm | FILE-LEVEL | branch `merge/main-python-parks-wip` | the search-space argument is a REQUIREMENT on the M4 re-attachment: an eval-mode BatchNorm must emit no batch reductions at all, not dead ones the extractor still has to cost — see **#441 inference batch norm** below |
+| `cb8d270d` | #442 | Evict cached cuBLASLt graphs before recapture | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (4th commit) | — nothing live corresponds (no capture cache exists here; see **#430 dyn-dims on rebuild**) — see **#440 capture cache capacity** and **#442 evict before recapture** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4152,6 +4153,21 @@ training/inference-forked lowering. Nothing was rebuilt or rerun:
 `crates/luminal_python` is not a workspace member here, so main's pytest
 (`test_inference_batch_norm_uses_running_stats_and_returns_empty_saved_stats`,
 affine and non-affine) remains main's.
+
+## #442 evict before recapture — parked
+
+Main's `cb8d270d` (+15/-6, one file) moves the cuBLASLt capture-cache eviction
+from AFTER the new child graph is captured and pushed to BEFORE the capture
+starts, at both call sites (the recapture path and the fresh-prepare path).
+Evicting afterwards transiently holds `capacity + 1` CUDA graphs alive, which
+can OOM on device even when the steady state fits the ceiling the planner
+accounted for at #440 — the accounting prices `capacity`, so the peak must never
+exceed it. The fresh-prepare site needs a small scoped borrow
+(`{ let op = &mut state.cublaslt_ops[idx]; ... }`) to make room before
+`capture_cublaslt_child_graph` is called. **Disposition: FILE-LEVEL park,
+path-rewritten only** — applied verbatim, no re-expression was needed because
+the park had just taken #440 verbatim and so carried main's exact preimage,
+evict-after-push at both sites included; diff-of-diffs identical.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
