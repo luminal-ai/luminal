@@ -2370,8 +2370,8 @@ implementation wins.
 
 | Was | Is now | Notes |
 | --- | --- | --- |
-| `src/extractor.rs` (4288 lines) | `luminal_reference::extractor`, `luminal_cuda_lite::extractor`, `test_runtime::extractor` | Three verbatim copies, minus `decoded_layout_table`. Tests (`render_memo_tests`, plus `chain_strides_destructure_contract` moved in from core `test_support`) live with the REFERENCE copy only. |
-| `src/implementation_search.rs` (1849 lines) | `luminal_reference::search`, `luminal_cuda_lite::search`; the sampler half also as `test_runtime::sampler` | The GA loop, the SCC sampler, both tripwires, `SearchProgress`, `BucketPlan`/`select_bucket`. Tests (`progress_tests`, `early_stop_tests`, `sampler_tests`, the dedup search test) live with the REFERENCE copy only. |
+| `src/extractor.rs` (4288 lines) | `luminal_reference::extractor`, `luminal_cuda_lite::extractor`, `test_runtime::extractor` | Three verbatim copies, minus `decoded_layout_table`. Tests (`render_memo_tests`, plus `chain_strides_destructure_contract` moved in from core `test_support`) live with the REFERENCE copy only. **AMENDED 2026-09-04, Phase 8: the three copies are one again, `luminal::extraction`; these names are aliases for it.** |
+| `src/implementation_search.rs` (1849 lines) | `luminal_reference::search`, `luminal_cuda_lite::search`; the sampler half also as `test_runtime::sampler` | The GA loop, the SCC sampler, both tripwires, `SearchProgress`, `BucketPlan`/`select_bucket`. Tests (`progress_tests`, `early_stop_tests`, `sampler_tests`, the dedup search test) live with the REFERENCE copy only. **AMENDED 2026-09-04, Phase 8: the sampler, the tripwires, `SearchProgress`, `RefusalBreakdown`, `SearchTimings` and `early_stop_exceeded` are `luminal::search_support`, one copy; the LOOPS, the options, the outcomes and the bucketed drivers stay here.** |
 | `extractor::decoded_layout_table` + `layout_ir::LayoutDecoder<L>` | `layouts::decode_layout_table` + `layouts::DecodedLayout` (core) | D9. The per-runtime decoder hook is deleted; both runtimes instantiate `BufferIrGraph` with core's struct. `RefLayout`/`ReferenceLayoutDecoder`/`CudaLayout`/`CudaLayoutDecoder` are gone. |
 | `buffer_tensor_ir::TypedBuffer` + `ReferenceKernelCtx` (552 lines) | `luminal_reference::typed_buffer` | D4. Out of core's prelude too. |
 | — | `luminal_cuda_lite::host_buffer::HostBuffer` | D4. Bytes + a dtype tag; the device bridge became a memcpy. |
@@ -2401,7 +2401,10 @@ failures.
   different type from `test_runtime`'s, so the wrappers re-key it
   structurally (`adopt_genome` / `adopt_choice` — `ClassId` and `NodeId`
   come from the shared `egraph-serialize`, so the mapping is total and
-  unambiguous).
+  unambiguous). **AMENDED 2026-09-04, Phase 8: the charter is about
+  RUNTIMES and core is not one, so `test_runtime` takes core's copy like
+  everyone else; `adopt_genome` / `adopt_choice` and the bridge closure
+  are DELETED — there is one `Genome`.**
 - *`HostBuffer` has no `From<Vec<u8>>`.* Bool8 goes through the
   validated `HostBuffer::bool8` constructor: a `From` is by definition
   an unchecked door, and Bool8 has exactly two legal codes. `Vec<f64>`
@@ -2465,7 +2468,12 @@ the persistent device)** below; the reference runtime has none, by
 ruling. Still open: the spec re-authoring against this shape (see
 **#404 spec.md**), and whatever consolidation the three copies
 eventually earn — a question to ask after the runtimes diverge, not
-before.
+before. **ANSWERED 2026-09-04: they did not diverge. Seven phases on the
+three walks differed by one API-shape hunk and zero logic lines, the
+census put 86% of 9,567 duplicated lines in the extractor with zero
+runtime residue, and the walk, the sampler and the reporting came back
+to core — see Program: #420/#422 rejoin — Phase 8 below. The loops
+stayed.**
 
 ## Program: #420/#422 rejoin — Phase 2 (configurable registry)
 
@@ -3840,6 +3848,147 @@ exercise them (`scalar_refs`, `luminal_reference` `mini_model_smoke` 7 passed,
 `luminal_cuda_lite` `example_smoke` 1 passed) are green. Every workspace member is now
 edition 2024. The six non-member parks keep their own `Cargo.toml`s untouched (they track
 main file-level and do not build).
+
+## Program: #420/#422 rejoin — Phase 8 (extraction and sampler back into core)
+
+**The question, and the census that answered it** (Austin, 2026-09-03/04:
+*"how much repetition would be removed by factoring out a shared core util?
+similar to how bufferize is used?"*). Measured at `1bff0235` over the six files
+Phase 1 created, by `diff -u` and an LCS with autojunk off:
+
+| | raw lines | stripped |
+| --- | ---: | ---: |
+| all six copies (3 extractor + 3 search/sampler) | 16,328 | 11,488 |
+| **duplicated** (every copy beyond one canonical) | **9,567** | **7,499** |
+| of which the extractor (2 extra copies x 4,130 shared) | 8,260 | 6,618 |
+| of which search/sampler | 1,307 | 881 |
+
+**The extractor was 86% of the duplication and its runtime-specific residue was
+exactly zero lines.** No copy named its own kernels, layouts or buffers; the
+only `crate::` reference in any of the three was inside the reference copy's
+test module. Its one runtime input was already an argument of a core trait type
+(`&[Box<dyn luminal::layout_ir::OpMatcher>]`), so it needed no type parameter at
+all — LESS machinery than `bufferize<L: PlanLayout>`, which is generic because a
+layout is an opaque runtime value core clones and transports. The three walks
+had drifted, in seven phases, by ONE hunk: CUDA-lite borrows the matcher slice
+(Phase 2, `0219855b`), reference and test-runtime still took an owned `Vec`.
+Eleven lines, all of them API shape. Zero logic lines. Zero bug-fix drift.
+
+**The ruling** (Austin, 2026-09-04, on the judge's recommendation: *"I will
+follow your recommendation. proceed with your recommended plan"*). Take the
+first two commits of shape A — move the extractor, the sampler, and the
+byte-identical accounting and reporting into core as plain functions and types —
+and STOP. Do not consolidate the GA loop. No trait, no type parameter, no
+closure. Phase 1's own ruling had left the door open (*"Maybe if there are some
+core utilities, they can belong in core"*), and the divergence the ledger said
+to wait for (*"a question to ask after the runtimes diverge, not before"*) did
+not happen.
+
+**What moved.**
+
+| Was | Is now | Lines |
+| --- | --- | ---: |
+| `luminal_reference::extractor`, `luminal_cuda_lite::extractor`, `test_runtime::extractor` | `luminal::extraction` — CUDA-lite's borrowed-matcher body (the more general form: a `Vec` owner passes `&vec`) plus the reference copy's `render_memo_tests` and `chain_stride_tests` | 12,638 -> 4,369 |
+| the sampler block, three copies (`ProducerIndex`, `choose_position`, `sample_genome{,_reporting,_with_seed}`, `flip_closes_cycle`, `mutate_genome{,_reporting,_with_seed}`, `bufferize_cycle_tripwire`) + `sampler_tests` | `luminal::search_support` | 3 -> 1 |
+| `SearchProgress`, `CaptureAwareStderr`, `log_channel_enabled`, `parse_log_flag`, `display_nanos` + `progress_tests` | `luminal::search_support` | 2 -> 1 |
+| `RefusalBreakdown` (+ `summary`), `SearchTimings` (+ `summary`) | `luminal::search_support` | 2 -> 1 |
+| `early_stop_exceeded` + `early_stop_tests` (Phase 4 duplicated both) | `luminal::search_support` | 2 -> 1 |
+
+`RefusalBreakdown` takes CUDA-lite's form, the superset: the reference runtime
+gains a `timed_out` field it always leaves at zero and a `, timed out 0` tail on
+a diagnostic string no test reads. `bufferize_cycle_tripwire` moved although it
+was not on the list, because it IS a sampler invariant check — half of what
+`sampler_tests` exists to pin — and the tests moved with the sampler.
+
+**Old names still resolve.** `luminal_reference::extractor`,
+`luminal_cuda_lite::extractor` and `test_runtime::extractor` are
+`pub use luminal::extraction as extractor;`. `test_runtime::sampler` is
+`pub use luminal::search_support as sampler;`. Both runtimes' `search` modules
+re-export the moved items under their own name, so
+`luminal_cuda_lite::search::early_stop_exceeded` (which `profile.rs` imports)
+and `test_runtime::sampler::{ProducerIndex, sample_genome_with_seed,
+mutate_genome_with_seed}` (which `tests/scc_sampler.rs` imports) are untouched.
+The only call-site edits were an `&` where a runtime handed over an owned
+matcher list — five in `luminal_reference::harness`, one each in its `runtime.rs`
+and `search.rs`, three in `test_runtime::lib`, and seven in test files (five of
+which needed a `let matchers = ...` local, because an `ExtractionSession`
+borrows the list for longer than a temporary lives).
+
+**A collateral deletion.** `test_runtime`'s `adopt_genome` / `adopt_choice` and
+the ordering-closure bridge (~45 lines) existed only because CUDA-lite's
+`Genome` and test-runtime's `Genome` were structurally identical but nominally
+distinct types. There is one `Genome` now, so the election wrappers just
+forward.
+
+**What deliberately stays runtime-local, and why.** The GA loop is the one piece
+that cannot have `bufferize`'s shape: it must PRICE a plan in the middle of
+every iteration — the reference runtime builds a fresh `ReferenceRuntime`, loads
+the plan, stages the caller's data and times `trials` executes; CUDA-lite reads
+a heuristic or compiles, warms and times the candidate on a real device. Sharing
+the loop means core calling back out mid-call, which is a closure or a trait —
+the seam `1f18a04b` deleted and the 2026-09-03 ruling closed. That is ~284
+duplicated lines bought with ~250 lines of glue, and it was not taken. Staying
+with the loops for the same reason: `CompileOptions` and `SearchOutcome` (whose
+shapes differ per runtime), the evaluators (`profile_on_reference_runtime`;
+`Evaluator`/`Priced`), the bucketed drivers and `select_bucket` (the reference
+needs per-bucket data, CUDA-lite one device for all buckets),
+`harness_search_options`, and CUDA-lite's `finalists`/`lattice`.
+
+The line this phase draws is not "core vs runtime" but **describes vs decides**.
+A genome is drawn the same way everywhere and a graph is walked the same way
+everywhere; a genome is PRICED differently everywhere. Runtime-specific now
+means SELECTION: the op registry, the allow list, the evaluator, the option
+knobs and outcome shape, the finalist policy, and the loop. Saturation stays
+runtime-triggered; nothing here touches it.
+
+**The numbers.** Code delta versus `rejoin/p7-edition-2024`, before this ledger
+entry: 18 files changed, **1,209 insertions, 10,277 deletions — net -9,068**.
+Of the 9,567 duplicated lines the census counted, essentially all are gone; what
+remains is not duplication but re-export lines. File sizes:
+`crates/luminal_reference/src/extractor.rs` 4,342 + `crates/luminal_cuda_lite/src/extractor.rs`
+4,152 + `tests/test_runtime/src/extractor.rs` 4,144 -> `src/extraction.rs` 4,369;
+`crates/luminal_reference/src/search.rs` 1,709 -> 774;
+`crates/luminal_cuda_lite/src/search.rs` 1,701 -> 1,147;
+`tests/test_runtime/src/sampler.rs` 285 -> 0; `src/search_support.rs` 998 new.
+
+**Where the tests went.** Nine test functions moved from
+`luminal_reference::search` and its extractor copy into core, so
+`cargo test -p luminal --lib` went 233 -> 242 and `cargo test -p luminal_reference
+--lib` went 53 -> 44. Core's `chain_stride_tests` reaches for a registry through
+the `luminal_reference` dev-dependency and spells the crossing `luminal::`, per
+the dep-world rule (the cyclic dev-dependency compiles the library twice and the
+two builds' types do not unify).
+
+**Trajectory: nothing that consumes the RNG changed.** The stream is consumed
+only by `choose_position`, through `sample_genome_reporting` /
+`mutate_genome_reporting`, in the order each loop calls them; the index is a
+`BTreeMap` and the sampling space is sorted. All of it moved verbatim and both
+loops call it in the same order, so the seeded pins see the same genomes. They
+were run by name and are unchanged: `cublaslt_election` (9 passed, including
+`canonical_2d_matmul_elects_the_marker` and the seven per-model election rows),
+`cublaslt_bias_premise` (3), `cublaslt_contracts_cpu` (19), `finalists_lattice`
+(4), `dim_buckets` (5).
+
+**The gate.** `cargo build --workspace --all-targets` clean;
+`cargo check -p luminal_cuda_lite --features device --all-targets` clean;
+`cargo test -p luminal --lib` 242 passed / 6 ignored (was 233 — the nine that
+moved); `cargo test -p luminal_reference` 44 lib + 1 `corpus` + 7
+`mini_model_smoke` passed, 2 ignored (the lib was 53); `cargo test -p
+luminal_cuda_lite` 90 passed / 3 ignored across the lib, 18 integration binaries
+and 1 doc-test; `cargo test -p test_runtime` 212 passed / 1 ignored across the
+lib and 41 integration binaries; `cargo test -p luminal_nn` 31 passed. The
+CUDA-lite, test-runtime and nn totals are IDENTICAL to Phase 7's. `cargo clippy -p luminal -p luminal_reference -p luminal_cuda_lite -p
+test_runtime --all-targets` clean; with `--features device` the one warning is
+`device_profile.rs`'s pre-existing `type_complexity` on a fixture signature this
+phase did not touch. `cargo fmt --all -- --check` clean. Device-gated suites
+still need the A100 box per the recipe.
+
+**What is owed.** The aliases (`pub use luminal::extraction as extractor;` x3,
+`as sampler`) keep three crates exposing a module they do not own — convenient
+here, because it made the move a zero-diff change for 12 external files, but a
+rename sweep is owed eventually. And the GA loop is still two copies of ~290
+lines; if it is ever consolidated it needs the evaluator seam, which needs
+Austin.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

@@ -230,7 +230,7 @@ fn flavored_cublaslt(
     let graph = test_runtime::extractor::extract_layout_ir_with_genome_and_matchers(
         &serialized,
         &genome,
-        test_runtime::matchers(),
+        &test_runtime::matchers(),
     )
     .expect("genome extraction runs")
     .expect("genome extraction reaches the boundary");
@@ -3822,7 +3822,7 @@ fn attack_u3_bufferize_duplicate_operand_accumulate() {
     let graph = test_runtime::extractor::extract_layout_ir_with_genome_and_matchers(
         &serialized,
         &genome,
-        test_runtime::matchers(),
+        &test_runtime::matchers(),
     )
     .expect("genome extraction runs")
     .expect("genome extraction reaches the boundary");

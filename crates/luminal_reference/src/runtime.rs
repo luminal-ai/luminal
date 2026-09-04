@@ -1676,7 +1676,7 @@ mod tests {
         let extracted = crate::extractor::extract_layout_ir_with_ops_and_matchers(
             &serialized,
             Some(&allow),
-            crate::ops::built_in_matchers(),
+            &crate::ops::built_in_matchers(),
         )
         .expect("extracts")
         .expect("plan");

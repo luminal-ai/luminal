@@ -696,7 +696,7 @@ fn extract_with_genome(
     test_runtime::extractor::extract_layout_ir_with_genome_and_matchers(
         s,
         genome,
-        test_runtime::matchers(),
+        &test_runtime::matchers(),
     )
     .expect("genome extraction runs")
     .expect("genome extraction reaches the boundary")
@@ -741,7 +741,7 @@ fn genome_electing(s: &EGraph, enode: &NodeId) -> (test_runtime::extractor::Geno
     // ROUND 11: the exact-enode election rides the shared viability-aware
     // core — the exact enode outranks everything (at every strictness
     // level), then the PIN names, then non-Copy, then Copy.
-    let index = test_runtime::extractor::producer_index_with_matchers(s, test_runtime::matchers());
+    let index = test_runtime::extractor::producer_index_with_matchers(s, &test_runtime::matchers());
     let elected = index
         .values()
         .any(|candidates| candidates.iter().any(|(_, choice)| &choice.enode == enode));

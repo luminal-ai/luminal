@@ -1,17 +1,32 @@
-//! THE EXTRACTOR — the test runtime's copy.
+//! THE EXTRACTOR — a core utility every runtime calls with its own
+//! matcher list.
 //!
-//! Post-saturation selection is RUNTIME-OWNED (ruling 2026-09-03,
-//! #420/#422 rejoin Phase 1): the e-graph walk that turns a saturated
-//! program plus a genome into an [`luminal::layout_ir::ExtractedGraph`]
-//! left core and was duplicated, verbatim, into every runtime that
-//! searches. Austin's ruling on the duplication: "move extractor.rs to
-//! each runtime. Maybe if there are some core utilities, they can belong
-//! in core, but for now just do a simple duplication in each runtime."
+//! It decides nothing. Given a saturated e-graph and a genome (a choice
+//! of producer enode per e-class) it walks the graph and returns a
+//! [`crate::layout_ir::ExtractedGraph`]; given no genome it reports the
+//! space those genomes are drawn from (`producer_index`,
+//! [`SamplingSpace`]). Its one runtime input is the op registry, and
+//! that arrives as an argument of a core trait type
+//! (`&[Box<dyn crate::layout_ir::OpMatcher>]`) — there is no runtime
+//! type in this file, so there is nothing here to specialize.
 //!
-//! Tests live with the reference copy (`luminal_reference::extractor`).
+//! RUNTIME-SPECIFIC IS SELECTION, NOT THE WALK (#420/#422 rejoin Phase
+//! 8, 2026-09-04). Each runtime keeps what chooses: its op registry,
+//! its allow list, its evaluator (how a plan is priced), its option
+//! knobs and outcome shape, its finalist/lattice policy, and the search
+//! loop that runs them. This module and [`crate::search_support`] hold
+//! the two halves that decide nothing — turning a genome into a graph,
+//! and drawing genomes.
 //!
-//! Sibling copies: `luminal_reference::extractor`,
-//! `luminal_cuda_lite::extractor`, `test_runtime::extractor`.
+//! History: the walk left core in Phase 1 ("move extractor.rs to each
+//! runtime. Maybe if there are some core utilities, they can belong in
+//! core, but for now just do a simple duplication in each runtime") and
+//! was duplicated into `luminal_reference`, `luminal_cuda_lite` and
+//! `test_runtime`. Seven phases later the three copies differed by one
+//! API-shape hunk and zero logic lines, so the "maybe" clause was
+//! taken: this is that one copy, in the borrowed-matcher form Phase 2
+//! gave the CUDA-lite runtime. The runtime modules named `extractor`
+//! are now aliases for this one.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -21,12 +36,12 @@ use anyhow::{Context, Result, bail};
 use egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use petgraph::graph::{DiGraph, NodeIndex};
 
-use luminal::layout_ir::{
+use crate::layout_ir::{
     Access, BufferInfo, ExtractedDag, ExtractedEdge, ExtractedGraph, ExtractedNode, ExtractionSite,
     FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText, LogicalInfo, OpInput,
     OpMatcher, OpNode, OutputNode, OutputSlot,
 };
-use luminal::logical_op::{LogicalRender, logical_op_for};
+use crate::logical_op::{LogicalRender, logical_op_for};
 
 type Bounds = (Option<i128>, Option<i128>);
 type BoundsIndex = HashMap<ClassId, Bounds>;
@@ -40,7 +55,7 @@ struct Extractor<'a> {
     /// structural plumbing — inputs, outputs, buffer lists — is never
     /// filtered). This registry is the ONLY dispatch: an enode whose label
     /// has no entry here simply offers no implementation candidate.
-    matchers: HashMap<&'static str, Box<dyn OpMatcher>>,
+    matchers: HashMap<&'static str, &'a dyn OpMatcher>,
     class_nodes: HashMap<ClassId, Vec<NodeId>>,
     /// The shared rendering state: the render-time class index and the
     /// per-(class, depth, preference) render memo, behind an `Rc` so the
@@ -80,7 +95,7 @@ struct Extractor<'a> {
     /// bounds index (op = function name, children[0] = the argument
     /// node, the row's own eclass holds the value member); pinned by
     /// `dtype_index_reads_serialized_rows` in test_support.
-    dtype_index: std::cell::RefCell<Option<HashMap<ClassId, luminal::dtype::PlanDtype>>>,
+    dtype_index: std::cell::RefCell<Option<HashMap<ClassId, crate::dtype::PlanDtype>>>,
     /// GENOME-INDEPENDENT stable-key memo (measured 2026-08-10: eager
     /// per-comparison rendering was 99% of deep extraction — 7395/7471
     /// sampled stacks inside `is_better`). The rendered form of an enode
@@ -180,7 +195,7 @@ struct ProducerRef {
 /// TestRuntime seam — see `Extractor::new_with_matchers`).
 pub fn extract_layout_ir_with_matchers(
     egraph: &EGraph,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn crate::layout_ir::OpMatcher>],
 ) -> Result<Option<ExtractedGraph>> {
     Extractor::new_with_matchers(egraph, None, None, matchers).extract()
 }
@@ -200,7 +215,7 @@ impl<'a> ExtractionSession<'a> {
     pub fn new_with_matcher_set(
         egraph: &'a EGraph,
         allowed_ops: Option<&[&str]>,
-        matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+        matchers: &'a [Box<dyn crate::layout_ir::OpMatcher>],
     ) -> Self {
         let allowed = allowed_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect());
         let mut extractor = Extractor::new_with_matchers(egraph, allowed, None, matchers);
@@ -359,7 +374,7 @@ impl<'a> ExtractionSession<'a> {
             let dtype = extractor.with_dtype_index(|index| index.get(&logical).copied())?;
             if !matches!(
                 dtype,
-                luminal::dtype::PlanDtype::Int | luminal::dtype::PlanDtype::Int64
+                crate::dtype::PlanDtype::Int | crate::dtype::PlanDtype::Int64
             ) {
                 return None;
             }
@@ -497,7 +512,7 @@ impl<'a> ExtractionSession<'a> {
 pub fn extract_layout_ir_with_ops_and_matchers(
     egraph: &EGraph,
     allowed_ops: Option<&[&str]>,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn crate::layout_ir::OpMatcher>],
 ) -> Result<Option<ExtractedGraph>> {
     let allowed = allowed_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect());
     let mut extractor = Extractor::new_with_matchers(egraph, allowed, None, matchers);
@@ -535,7 +550,7 @@ pub struct Genome {
 pub fn extract_layout_ir_with_genome_and_matchers(
     egraph: &EGraph,
     genome: &Genome,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn crate::layout_ir::OpMatcher>],
 ) -> Result<Option<ExtractedGraph>> {
     let mut extractor = Extractor::new_with_matchers(egraph, None, Some(genome), matchers);
     extractor.apply_viability_filter();
@@ -549,7 +564,7 @@ pub fn extract_layout_ir_with_genome_and_matchers(
 /// from. Classes with no producers (boundary inputs) are absent.
 pub fn producer_index_with_matchers(
     egraph: &EGraph,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn crate::layout_ir::OpMatcher>],
 ) -> std::collections::BTreeMap<ClassId, Vec<(String, ProducerChoice)>> {
     let mut extractor = Extractor::new_with_matchers(egraph, None, None, matchers);
     extractor.apply_viability_filter();
@@ -842,7 +857,7 @@ pub fn plan_fingerprint(graph: &ExtractedGraph) -> u64 {
             ExtractedNode::LayoutOp(op) => {
                 "op".hash(&mut hasher);
                 op.op.label().hash(&mut hasher);
-                if let luminal::layout_ir::Provenance::Extracted {
+                if let crate::layout_ir::Provenance::Extracted {
                     source_enode,
                     selected_output_index,
                     ..
@@ -885,10 +900,18 @@ impl<'a> Extractor<'a> {
         egraph: &'a EGraph,
         allowed_ops: Option<HashSet<String>>,
         genome: Option<&Genome>,
-        matcher_set: Vec<Box<dyn OpMatcher>>,
+        matcher_set: &'a [Box<dyn OpMatcher>],
     ) -> Self {
-        let matchers: HashMap<&'static str, Box<dyn OpMatcher>> = matcher_set
-            .into_iter()
+        // THE MATCHER SET IS LENT, NOT OWNED (Phase 2, 2026-09-03): the
+        // vocabulary belongs to the runtime INSTANCE that was loaded
+        // with it, and one instance runs many extractions (every genome
+        // of every bucket). Borrowing is what lets the runtime hold the
+        // list once instead of rebuilding it per call — `dyn OpMatcher`
+        // is not `Clone` and the registry is chosen at `load`, so there
+        // is nothing to rebuild it FROM down here.
+        let matchers: HashMap<&'static str, &'a dyn OpMatcher> = matcher_set
+            .iter()
+            .map(|matcher| matcher.as_ref())
             .filter(|matcher| {
                 allowed_ops
                     .as_ref()
@@ -1491,13 +1514,12 @@ impl<'a> Extractor<'a> {
         // else { ..borrow_mut().. }` reads correctly and panics in
         // edition 2021, where the scrutinee temporary outlives the
         // `else` arm; edition 2024 shortened exactly that scope, and
-        // since Phase 7 all three copies live in 2024 crates, so that
+        // every crate in this workspace is 2024 since Phase 7, so that
         // spelling would compile-and-run correctly here too. It is
         // still not used: a lookup in its own statement drops the
         // `Ref` at the semicolon, so the guard is released before the
-        // miss path writes in EVERY edition, and these three files are
-        // hand-kept copies whose correctness should not depend on the
-        // edition of whichever crate is holding them.
+        // miss path writes in EVERY edition, and a re-entrancy
+        // argument should not rest on an edition.
         let cached = self.op_cache.borrow().get(node_id).cloned();
         let op: Box<dyn LayoutIrOp> = match cached {
             Some(cached) => cached,
@@ -1817,18 +1839,18 @@ impl<'a> Extractor<'a> {
     }
 
     /// The serialized `dtype-of` rows, indexed once: LogicalTensor
-    /// class → [`luminal::dtype::PlanDtype`]. `dtype-of` is `:no-merge`
+    /// class → [`crate::dtype::PlanDtype`]. `dtype-of` is `:no-merge`
     /// in the preamble (a dtype divergence is a saturation panic), so
     /// at most one dtype per class can survive to serialization — a
     /// second, different row here means the invariant broke upstream
     /// and we refuse loudly rather than pick one.
     fn with_dtype_index<R>(
         &self,
-        read: impl FnOnce(&HashMap<ClassId, luminal::dtype::PlanDtype>) -> R,
+        read: impl FnOnce(&HashMap<ClassId, crate::dtype::PlanDtype>) -> R,
     ) -> R {
         let mut slot = self.dtype_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, luminal::dtype::PlanDtype> = HashMap::new();
+            let mut index: HashMap<ClassId, crate::dtype::PlanDtype> = HashMap::new();
             for node in self.egraph.nodes.values() {
                 if node.op != "dtype-of" {
                     continue;
@@ -1867,11 +1889,11 @@ impl<'a> Extractor<'a> {
 
     /// A `Dtype` class: the childless member whose op is one of the
     /// egglog dtype spellings.
-    fn plan_dtype_value(&self, class: &ClassId) -> Option<luminal::dtype::PlanDtype> {
+    fn plan_dtype_value(&self, class: &ClassId) -> Option<crate::dtype::PlanDtype> {
         for node_id in self.class_nodes.get(class)? {
             let node = self.egraph.nodes.get(node_id)?;
             if node.children.is_empty()
-                && let Some(dtype) = luminal::dtype::PlanDtype::from_egglog_name(&node.op)
+                && let Some(dtype) = crate::dtype::PlanDtype::from_egglog_name(&node.op)
             {
                 return Some(dtype);
             }
@@ -1981,7 +2003,7 @@ struct ClassRenderer<'a> {
 }
 
 /// The renderer's implementation of the [`LogicalRender`] callbacks: the
-/// bridge each [`luminal::logical_op::LogicalOp`] formats itself through.
+/// bridge each [`crate::logical_op::LogicalOp`] formats itself through.
 /// Carries the recursion guard (`visiting`) so `child_expr` cycles fall back
 /// to labels exactly as direct recursion did.
 struct LogicalRenderCtx<'r, 'a, 'v> {
@@ -2279,7 +2301,7 @@ impl<'a> ClassRenderer<'a> {
 
     fn choose_logical_node(&self, class: &ClassId) -> Option<&NodeId> {
         let node_ids = self.class_nodes.get(class)?;
-        for op in luminal::logical_op::built_in_logical_ops() {
+        for op in crate::logical_op::built_in_logical_ops() {
             if let Some(node_id) = node_ids.iter().find(|node_id| {
                 self.egraph
                     .nodes
@@ -3409,7 +3431,7 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                 };
                 let node = OpNode {
                     op: op.clone(),
-                    provenance: luminal::layout_ir::Provenance::Extracted {
+                    provenance: crate::layout_ir::Provenance::Extracted {
                         op_eclass,
                         source_enode: source_enode.clone(),
                         selected_output_index: plan.selected_output_index.unwrap_or(0),
@@ -4141,4 +4163,207 @@ pub fn chain_strides(egraph: &EGraph, layout: &ClassId) -> Option<Vec<Option<Cha
 fn child_class(egraph: &EGraph, node: &Node, index: usize) -> Option<ClassId> {
     let child_id = node.children.get(index)?;
     egraph.nodes.get(child_id).map(|child| child.eclass.clone())
+}
+
+#[cfg(test)]
+mod render_memo_tests {
+    //! The render memo's two obligations (ruling 2026-09-01): it must
+    //! return the string the uncached walk would have returned, and it
+    //! must not deadlock on its own recursion.
+
+    use egraph_serialize::{ClassId, EGraph, Node, NodeId};
+
+    use super::{ClassRenderer, RenderCtx};
+
+    /// A chain `a4(a3(a2(a1(leaf, leaf), leaf), leaf), leaf)` — every level
+    /// shares one leaf class, which is exactly the shape (a convergent DAG)
+    /// that made the uncached renderer exponential in depth.
+    fn shared_child_chain() -> EGraph {
+        let mut egraph = EGraph::default();
+        let mut add = |id: &str, op: &str, children: Vec<&str>| {
+            egraph.add_node(
+                NodeId::from(id),
+                Node {
+                    op: op.to_string(),
+                    children: children.into_iter().map(NodeId::from).collect(),
+                    eclass: ClassId::from(format!("class-{id}")),
+                    cost: ordered_float::NotNan::new(1.0).unwrap(),
+                    subsumed: false,
+                },
+            );
+        };
+        add("leaf", "Leaf", vec![]);
+        add("a1", "A1", vec!["leaf", "leaf"]);
+        add("a2", "A2", vec!["a1", "leaf"]);
+        add("a3", "A3", vec!["a2", "leaf"]);
+        add("a4", "A4", vec!["a3", "leaf"]);
+        egraph
+    }
+
+    /// The memo returns the SAME text on the second call, and adds no
+    /// entries — the second call is pure lookup. (Identity is what the
+    /// ruling turns on: this text feeds `stable_key`, which breaks plan
+    /// selection ties.)
+    #[test]
+    fn memo_is_output_identical_and_does_no_second_walk() {
+        let ctx = RenderCtx::new(&shared_child_chain());
+        let renderer = ctx.renderer();
+        let root = ClassId::from("class-a4");
+
+        let first = renderer.render_class_prefer(&root, 3, None);
+        let filled = ctx.memo.borrow().len();
+        let second = renderer.render_class_prefer(&root, 3, None);
+
+        assert_eq!(first, second, "a memo hit must reproduce the render");
+        assert_eq!(
+            ctx.memo.borrow().len(),
+            filled,
+            "the second call walked the graph again instead of hitting the memo"
+        );
+        assert!(filled > 0, "nothing was memoized");
+        // Spelled out, so a change to the render grammar has to face this
+        // test rather than silently re-electing plans.
+        assert_eq!(first, "A4(A3(A2(class-a1, class-leaf), Leaf), Leaf)");
+    }
+
+    /// Depth is part of the key: the same class at a shallower depth is a
+    /// DIFFERENT string, and a memo that dropped depth would serve the
+    /// deep answer to a shallow caller.
+    #[test]
+    fn memo_keys_on_depth_and_preference() {
+        let ctx = RenderCtx::new(&shared_child_chain());
+        let renderer = ctx.renderer();
+        let root = ClassId::from("class-a4");
+
+        assert_eq!(
+            renderer.render_class_prefer(&root, 1, None),
+            "A4(class-a3, class-leaf)"
+        );
+        assert_eq!(
+            renderer.render_class_prefer(&root, 2, None),
+            "A4(A3(class-a2, class-leaf), Leaf)"
+        );
+        assert_eq!(renderer.render_class_prefer(&root, 0, None), "class-a4");
+    }
+
+    /// `render_class_prefer` recurses into itself through `render_node`.
+    /// Holding the memo's `Ref` across that call is a `BorrowMutError` at
+    /// runtime, not a compile error, so a deep render is the guard.
+    #[test]
+    fn deep_render_does_not_double_borrow_the_memo() {
+        let ctx = RenderCtx::new(&shared_child_chain());
+        let rendered = ctx
+            .renderer()
+            .render_class_prefer(&ClassId::from("class-a4"), 32, None);
+        assert!(rendered.starts_with("A4("));
+    }
+
+    /// Both renderer views over one ctx share the memo — the guarantee
+    /// that a deferred tooltip rendered later reuses the session's work.
+    #[test]
+    fn views_over_one_ctx_share_the_memo() {
+        let ctx = RenderCtx::new(&shared_child_chain());
+        let root = ClassId::from("class-a4");
+        let first = ClassRenderer::render_class_prefer(&ctx.renderer(), &root, 3, None);
+        let filled = ctx.memo.borrow().len();
+        let second = ClassRenderer::render_class_prefer(&ctx.renderer(), &root, 3, None);
+        assert_eq!(first, second);
+        assert_eq!(ctx.memo.borrow().len(), filled);
+    }
+}
+
+/// THE STRIDE-DESTRUCTURING CONTRACT, pinned beside `chain_strides`
+/// itself (it was `luminal::test_support::stage4b_probes` before the
+/// #420/#422 rejoin, then rode the reference copy of the extractor
+/// through Phases 1-7; it comes home with the walk in Phase 8).
+///
+/// The program text comes from `luminal_reference` through core's
+/// dev-dependency — a registry has to come from SOMEWHERE and core owns
+/// none. Values that cross that boundary must be spelled `luminal::`,
+/// never `crate::`: the cyclic dev-dependency compiles this library
+/// twice and the two builds' types do not unify.
+#[cfg(test)]
+mod chain_stride_tests {
+    /// Austin's stride-destructuring contract (chain world, 2026-08-04):
+    /// live axes yield their stride class, stride-1 axes yield Unit, a
+    /// zero slot on a live axis is the DETERMINED broadcast Some(Zero),
+    /// and a provably extent-1 slot is None — the free parameter each
+    /// consumer resolves for itself.
+    #[test]
+    fn chain_strides_destructure_contract() {
+        use super::{ChainStride, chain_strides};
+        let body = r#"
+(let psh (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 3) (IntExprNil)))))
+(let p (RightMajorContiguousElementLayoutLit psh (bits-of (F32))))
+(let plog (LogicalTensorInputLit (LogicalIdLit "p") psh (F32)))
+(let plt (LayoutTensorLit plog p))
+(let osh (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 5) (IntExprCons (IntLit 3) (IntExprNil))))))
+(let v (LogicalIndexMapApply plog (IndexMapLit (IntExprCons (CoordVar osh 2) (IntExprCons (CoordVar osh 0) (IntExprNil))) psh) osh))
+(let dsh (ShapeLit (IntExprCons (IntLit 1) (IntExprCons (IntLit 2) (IntExprNil)))))
+(let d (RightMajorContiguousElementLayoutLit dsh (bits-of (F32))))
+(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+"#;
+        let full = format!("{}\n\n{body}", luminal_reference::assembled_program());
+        let mut egraph = luminal::egglog_snippet::new_egraph();
+        egraph
+            .parse_and_run_program(None, &full)
+            .expect("program runs");
+        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
+
+        let by_let = |name: &str| {
+            serialized
+                .class_data
+                .iter()
+                .find(|(_, data)| data.extra.get("let").map(String::as_str) == Some(name))
+                .map(|(class, _)| class.clone())
+                .unwrap_or_else(|| panic!("let {name} not found"))
+        };
+
+        // Parent (2,3) right-major: strides [3, 1].
+        let p = chain_strides(&serialized, &by_let("p")).expect("parent destructures");
+        assert_eq!(p.len(), 2);
+        assert!(matches!(p[0], Some(ChainStride::Expr(_))), "{p:?}");
+        assert_eq!(p[1], Some(ChainStride::Unit), "{p:?}");
+
+        // Degenerate (1,2): the extent-1 slot is the FREE parameter.
+        let d = chain_strides(&serialized, &by_let("d")).expect("degenerate destructures");
+        assert_eq!(
+            d[0], None,
+            "extent-1 slot must be the consumer's choice: {d:?}"
+        );
+        assert_eq!(d[1], Some(ChainStride::Unit), "{d:?}");
+
+        // Broadcast view (2,5,3): [3, DETERMINED 0, 1].
+        let v_logical = by_let("v");
+        let view_layout = serialized
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                if node.op != "LayoutTensorLit" {
+                    return None;
+                }
+                let logical = node.children.first()?;
+                if serialized.nid_to_cid(logical) != &v_logical {
+                    return None;
+                }
+                // The materializing copy pairs the SAME logical with an
+                // RM target layout — skip it; the view's own layout is
+                // the composed (non-contiguous) one.
+                let layout = serialized.nid_to_cid(node.children.get(1)?).clone();
+                let is_rm = serialized.nodes.iter().any(|(nid2, n2)| {
+                    n2.op == "RightMajorContiguousElementLayoutLit"
+                        && serialized.nid_to_cid(nid2) == &layout
+                });
+                if is_rm { None } else { Some(layout) }
+            })
+            .expect("view LayoutTensor exists");
+        let v = chain_strides(&serialized, &view_layout).expect("view destructures");
+        assert!(matches!(v[0], Some(ChainStride::Expr(_))), "{v:?}");
+        assert_eq!(
+            v[1],
+            Some(ChainStride::Zero),
+            "broadcast axis is determined: {v:?}"
+        );
+        assert_eq!(v[2], Some(ChainStride::Unit), "{v:?}");
+    }
 }

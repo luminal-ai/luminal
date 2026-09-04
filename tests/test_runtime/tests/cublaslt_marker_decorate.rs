@@ -136,7 +136,7 @@ fn flavored_ops(
     let graph = test_runtime::extractor::extract_layout_ir_with_genome_and_matchers(
         &serialized,
         &genome,
-        test_runtime::matchers(),
+        &test_runtime::matchers(),
     )
     .expect("genome extraction runs")
     .expect("genome extraction reaches the boundary");
