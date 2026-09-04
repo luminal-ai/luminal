@@ -3830,6 +3830,17 @@ pattern (same binding, spelled explicitly) and the `input_producer_cleanup`
 drop order (a moved-from temporary), and both were checked by hand before the
 gate confirmed them.
 
+**Amended 2026-09-04 (Austin: "by default lets make everything 2024, no reason to have the
+divergence").** The nine members left at 2021 above — `tests/scalar_refs` and the eight
+`examples/mini/*` crates — now inherit the workspace edition (`edition.workspace = true`,
+the spelling `examples/llama3` already used). The workspace built clean at 2024 before any
+migration lint ran (no `cargo fix --edition` change was needed), clippy reported nothing
+on the nine, rustfmt's 2024 style touched seven source files, and the suites that
+exercise them (`scalar_refs`, `luminal_reference` `mini_model_smoke` 7 passed,
+`luminal_cuda_lite` `example_smoke` 1 passed) are green. Every workspace member is now
+edition 2024. The six non-member parks keep their own `Cargo.toml`s untouched (they track
+main file-level and do not build).
+
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
 Ruling 4b's "option i" (`select_by_index`: packed 2N iota + two `scatter1d` +

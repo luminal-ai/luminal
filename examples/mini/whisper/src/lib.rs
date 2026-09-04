@@ -5,7 +5,7 @@
 #[path = "../../../common/model_support.rs"]
 mod model_support;
 
-use crate::model_support::{attention, LayerNorm, Linear, Namespace};
+use crate::model_support::{LayerNorm, Linear, Namespace, attention};
 use luminal::prelude::*;
 
 /// The whisper-family mini: one encoder block (bidirectional

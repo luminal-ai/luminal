@@ -7,7 +7,7 @@
 #[path = "../../../common/model_support.rs"]
 mod model_support;
 
-use crate::model_support::{scatter_rows, LayerNorm, Linear, Namespace};
+use crate::model_support::{LayerNorm, Linear, Namespace, scatter_rows};
 use luminal::prelude::*;
 
 /// MiniDit — the flux2 family mini. Family-unique constructs carried
@@ -467,8 +467,8 @@ impl MiniDit {
         let v = heads(proj.slice_along(2 * d..3 * d, 1));
         let attn = unheads(sdpa(rope(q), rope(k), v)); // (s, d)
         let mlp_out = swiglu(proj.slice_along(3 * d..3 * d + 2 * mlp, 1)); // (s, mlp)
-                                                                           // Fused out-projection over [attn ‖ mlp], spelled as the
-                                                                           // row-split sum (see the single_out_* field note).
+        // Fused out-projection over [attn ‖ mlp], spelled as the
+        // row-split sum (see the single_out_* field note).
         hidden += gate(
             self.single_out_attn.forward(attn) + self.single_out_mlp.forward(mlp_out),
             s_gate,
