@@ -31,7 +31,11 @@
 use std::collections::BTreeSet;
 
 use luminal::bufferize::BufferNode;
+use luminal::egglog_utils::eclass::EGraphView;
 use luminal::graph::Graph;
+use luminal::layouts::{
+    Layout, LeftMajorContiguousElementLayout, RightMajorContiguousElementLayout,
+};
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
 use luminal::prelude::{DType, FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
@@ -146,12 +150,15 @@ fn linear_with_bias_mints_the_bias_form_on_a_left_major_d() {
     {
         d_classes.insert(d_layout_class(&egraph, node));
     }
+    let view = EGraphView::new(&egraph, rt.decoders());
     for class in &d_classes {
         let ops = class_ops(&egraph, class);
-        let mirror = luminal::layouts::decode_layout_for(&egraph, class, "bias-premise pin")
-            .expect("the D layout class decodes");
+        let decoded = view.class(class);
         println!("BIAS-PREMISE CublasLtBias D layout class {class:?}: ops={ops:?}");
-        println!("BIAS-PREMISE   decoded (most-structured spelling): {mirror:?}");
+        println!(
+            "BIAS-PREMISE   registered Layout spellings present: {:?}",
+            decoded.present::<Layout>()
+        );
         assert!(
             ops.contains("LeftMajorContiguousElementLayoutLit"),
             "the bias form's D class must hold the LeftMajor spelling: {ops:?}"
@@ -169,10 +176,20 @@ fn linear_with_bias_mints_the_bias_form_on_a_left_major_d() {
             ops.contains("StridedElementLayoutLit"),
             "the native-chain-composition rung 3a reads: {ops:?}"
         );
+        // THE PREMISE, ASKED OF THE CLASS: the LeftMajor spelling is
+        // there and the RightMajor one is NOT — as it must be, since a
+        // [3,4] left-major over the bytes of a [4,3] right-major is not
+        // right-major. No preference order is consulted to learn this.
         assert!(
-            matches!(mirror, luminal::layouts::MirrorLayout::LeftMajor(_)),
-            "the decoder's most-structured spelling is LeftMajor (RightMajor is absent, \
-             as it must be: a [3,4] left-major over the bytes of a [4,3] right-major): {mirror:?}"
+            decoded.has::<LeftMajorContiguousElementLayout>(),
+            "the class holds a decodable LeftMajor spelling: {:?}",
+            decoded.present::<Layout>()
+        );
+        assert!(
+            !decoded.has::<RightMajorContiguousElementLayout>(),
+            "a [3,4] left-major over the bytes of a [4,3] right-major is not \
+             right-major: {:?}",
+            decoded.present::<Layout>()
         );
     }
 
@@ -314,7 +331,10 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
             .first()
             .expect("single-destination contract")
             .layout;
-        println!("BIAS-PREMISE elected destination layout: {:?}", dest.mirror);
+        println!(
+            "BIAS-PREMISE elected destination layout: spellings {:?}",
+            dest.present()
+        );
         bind_destination(&mut call, dest, "bias-premise pin")
             .expect("a bias form binds its destination (LeftMajor -> COL)");
         println!("BIAS-PREMISE LtCall: {call:#?}");

@@ -130,7 +130,6 @@ fn audit(
                 for (slot, info) in operand_info.iter().enumerate() {
                     let dims = info
                         .layout
-                        .mirror
                         .literal_extents()
                         .expect("elected slot layouts are literal in these fixtures");
                     // Ask the PRODUCTION read path what it emits: a read
@@ -151,7 +150,6 @@ fn audit(
                 for info in result_info {
                     let dims = info
                         .layout
-                        .mirror
                         .literal_extents()
                         .expect("elected slot layouts are literal in these fixtures");
                     // THE WRITE-CAPABILITY CONSTRAINT'S REGRESSION
@@ -185,27 +183,6 @@ fn audit(
     (computes, copies, plan.buffers.len(), composed)
 }
 
-/// Evaluate a mirror term at concrete coordinates (front-indexed;
-/// `Coord{axis_from_end}` reads `coords[rank-1-axis_from_end]`). The
-/// fixtures' layouts use only the affine subset.
-fn eval_term(expr: &luminal::layouts::IntExprTerm, coords: &[usize]) -> i64 {
-    use luminal::layouts::IntExprTerm as T;
-    let rank = coords.len();
-    match expr {
-        T::Lit(v) => *v,
-        T::Coord { axis_from_end } => {
-            let axis = usize::try_from(*axis_from_end).expect("non-negative axis");
-            assert!(axis < rank, "coordinate axis {axis} out of rank {rank}");
-            coords[rank - 1 - axis] as i64
-        }
-        T::Add(a, b) => eval_term(a, coords) + eval_term(b, coords),
-        T::Mul(a, b) => eval_term(a, coords) * eval_term(b, coords),
-        T::TruncDiv(a, b) => eval_term(a, coords) / eval_term(b, coords),
-        T::TruncRem(a, b) => eval_term(a, coords) % eval_term(b, coords),
-        other => panic!("fixture layouts use no {other:?}"),
-    }
-}
-
 /// THE READ PATH, evaluated: the slot's own carried layout at one
 /// out-coordinate, down to the FLAT ELEMENT INDEX into the residence's
 /// bytes. This replaces the hop-chain walk — there are no intermediate
@@ -214,40 +191,9 @@ fn eval_term(expr: &luminal::layouts::IntExprTerm, coords: &[usize]) -> i64 {
 /// gone, the only bounds fence is the final index against the layout's
 /// span where the constructor discloses one.)
 fn flat_index(layout: &luminal::layouts::DecodedLayout, out_coord: &[usize]) -> i64 {
-    use luminal::layouts::MirrorLayout as M;
-    let flat = match &layout.mirror {
-        M::RightMajor(rm) => {
-            let extents = rm.shape.0.iter().map(|e| eval_term(e, &[]) as usize);
-            out_coord
-                .iter()
-                .zip(extents)
-                .fold(0usize, |acc, (&c, d)| acc * d + c) as i64
-        }
-        M::LeftMajor(lm) => {
-            let extents: Vec<usize> = lm
-                .shape
-                .0
-                .iter()
-                .map(|e| eval_term(e, &[]) as usize)
-                .collect();
-            let mut stride = 1usize;
-            let mut acc = 0usize;
-            for (&c, &d) in out_coord.iter().zip(&extents) {
-                acc += c * stride;
-                stride *= d;
-            }
-            acc as i64
-        }
-        M::Strided(st) => st.chain.iter().map(|s| eval_term(s, out_coord)).sum(),
-        M::ElementOffset(eo) => eval_term(&eo.offset, out_coord),
-        M::BitOffset(bo) => {
-            let bits = eval_term(&bo.offset, out_coord);
-            assert_eq!(bits % bo.width.0, 0, "bit offset is element-aligned");
-            bits / bo.width.0
-        }
-    };
-    assert!(flat >= 0, "negative element index {flat}");
-    flat
+    layout
+        .element_index(out_coord)
+        .expect("the elected layout reads at this coordinate") as i64
 }
 
 /// TRANSPOSE CONSUMER: x(2,3) permuted then multiplied. The searched
@@ -280,7 +226,7 @@ fn transpose_consumer_folds_and_carries_the_swap_map() {
     assert_eq!(label, "MulFunctionalGeneric");
     // The layout's DOMAIN is the view's shape (3,2) — the value's own
     // extents, which is exactly why no `dims` field is needed.
-    assert_eq!(layout.mirror.literal_extents(), Some(vec![3, 2]));
+    assert_eq!(layout.literal_extents(), Some(vec![3, 2]));
     for i in 0..3usize {
         for j in 0..2usize {
             // Parent x is (2,3) row-major; the transpose's (i,j) is
@@ -320,7 +266,7 @@ fn slice_consumer_folds_and_carries_the_offset_map() {
         plan.summary()
     );
     let (_, _, layout) = &composed[0];
-    assert_eq!(layout.mirror.literal_extents(), Some(vec![2, 6]));
+    assert_eq!(layout.literal_extents(), Some(vec![2, 6]));
     for i in 0..2usize {
         for j in 0..6usize {
             // Parent x is (4,6) row-major; rows 1..3, so out (i,j) is
@@ -361,7 +307,7 @@ fn broadcast_consumer_folds_and_carries_the_stride0_map() {
         plan.summary()
     );
     let (_, _, layout) = &composed[0];
-    assert_eq!(layout.mirror.literal_extents(), Some(vec![2, 3]));
+    assert_eq!(layout.literal_extents(), Some(vec![2, 3]));
     for i in 0..2usize {
         for j in 0..3usize {
             // Parent x is (3,) — the broadcast axis is stride-0, so every

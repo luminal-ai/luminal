@@ -3982,11 +3982,12 @@ mod escape_execution_tests {
         assert_eq!(bytes.len(), 6, "the BACKING buffer is parent-sized");
         // The value's shape comes from the CARRIED LAYOUT's domain — there
         // is no dims field to read.
-        use luminal::layouts::{IntExprTerm, MirrorLayout};
-        assert_eq!(binding.layout.mirror.literal_extents(), Some(vec![3, 2]));
-        let MirrorLayout::Strided(strided) = &binding.layout.mirror else {
-            panic!("the disclosed layout is the composed strided form");
-        };
+        use luminal::layouts::{IntExprTerm, StridedElementLayout};
+        assert_eq!(binding.layout.literal_extents(), Some(vec![3, 2]));
+        let strided = binding
+            .layout
+            .first::<StridedElementLayout>()
+            .expect("the disclosed layout is the composed strided form");
         // Evaluate one chain summand at concrete coords (from-end axes).
         fn eval(expr: &IntExprTerm, coords: &[usize]) -> i64 {
             match expr {

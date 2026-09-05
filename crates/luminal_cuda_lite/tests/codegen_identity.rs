@@ -64,7 +64,6 @@ fn sources_via_buffer_table(
         .map(|(id, buffer)| {
             let dims = buffer
                 .layout
-                .mirror
                 .literal_extents()
                 .expect("plan buffer's layout has literal extents");
             (
@@ -231,7 +230,6 @@ fn sources_via_descriptors(
         let folded = operand_info.iter().any(|slot| {
             let dims = slot
                 .layout
-                .mirror
                 .literal_extents()
                 .expect("elected slot layouts are literal in these fixtures");
             // Ask the PRODUCTION read path: an operand whose expression

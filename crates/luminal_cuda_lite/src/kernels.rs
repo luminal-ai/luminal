@@ -20,7 +20,11 @@ use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use luminal::bufferize::SlotDescriptor;
 use luminal::dtype::PlanDtype;
 use luminal::index_expr::IotaExpr;
-use luminal::layouts::DecodedLayout;
+use luminal::layouts::{
+    BitOffsetExpressionLayout as BO, DecodedLayout, ElementOffsetExpressionLayout as EO,
+    LeftMajorContiguousElementLayout as LM, RightMajorContiguousElementLayout as RM,
+    StridedElementLayout as ST,
+};
 use std::any::TypeId;
 
 /// Geometry + typing for one compute node, in plan order: operands
@@ -61,7 +65,7 @@ impl CodegenCtx {
         result_info: &[SlotDescriptor<DecodedLayout>],
     ) -> Result<Self> {
         let dims_of = |slot: &SlotDescriptor<DecodedLayout>, role: &str| -> Result<Vec<usize>> {
-            slot.layout.mirror.literal_extents().ok_or_else(|| {
+            slot.layout.literal_extents().ok_or_else(|| {
                 anyhow::anyhow!("{label} {role} has symbolic layout extents (no numeric codegen)")
             })
         };
@@ -142,7 +146,8 @@ impl CodegenCtx {
 // PROTOTYPE (Option B): reading operands through their SLOT LAYOUTS.
 //
 // The slot's own elected layout (`SlotDescriptor::layout`, the runtime's
-// decoded `MirrorLayout`) is the ONE vocabulary for how a value
+// decoded `DecodedLayout` — every spelling of the elected class) is the
+// ONE vocabulary for how a value
 // addresses its residence — for a folded operand it is the view's
 // COMPOSED layout, which the e-graph already minted (preamble view
 // BitOffset composition / native strided chains). The elementwise family
@@ -357,33 +362,41 @@ fn affine_of_term(expr: &luminal::layouts::IntExprTerm, rank: usize) -> Option<A
 }
 
 /// The slot layout's READ FUNCTION, reduced to an affine form over the
-/// value's coordinates — one `Affine` per mirror spelling, never a
+/// value's coordinates — one `Affine` per spelling, never a
 /// classification of the spelling itself. The layout's own domain must
 /// be literal and equal `dims` (its domain IS the value's shape); a
 /// foreign domain is a planner/decoder incoherence and is refused
 /// downstream, so it yields `None` here rather than a read.
+///
+/// THE PREFERENCE IS THIS CALL SITE'S, and it is stated here: all
+/// spellings of a class denote one function, so the codegen asks first
+/// for the most structured one, which yields the simplest C. Nobody
+/// else's decoder chooses for it.
 fn read_affine(layout: &DecodedLayout, dims: &[usize]) -> Option<Affine> {
-    use luminal::layouts::MirrorLayout as M;
     let rank = dims.len();
-    if layout.mirror.literal_extents().as_deref() != Some(dims) {
+    if layout.literal_extents().as_deref() != Some(dims) {
         return None;
     }
-    match &layout.mirror {
-        // The packed ladder states its strides structurally.
-        M::RightMajor(_) => Affine::from_strides(&strides_of(dims)),
-        M::LeftMajor(_) => {
-            let mut strides = vec![1usize; rank];
-            for axis in 1..rank {
-                strides[axis] = strides[axis - 1] * dims[axis - 1];
-            }
-            Affine::from_strides(&strides)
+    // The packed ladder states its strides structurally.
+    if layout.has::<RM>() {
+        Affine::from_strides(&strides_of(dims))
+    } else if layout.has::<LM>() {
+        let mut strides = vec![1usize; rank];
+        for axis in 1..rank {
+            strides[axis] = strides[axis - 1] * dims[axis - 1];
         }
-        // The expression forms state it as a term.
-        M::Strided(st) => st.chain.iter().try_fold(Affine::zero(rank), |acc, s| {
+        Affine::from_strides(&strides)
+    // The expression forms state it as a term.
+    } else if let Some(st) = layout.first::<ST>() {
+        st.chain.iter().try_fold(Affine::zero(rank), |acc, s| {
             acc.add(affine_of_term(s, rank)?)
-        }),
-        M::ElementOffset(eo) => affine_of_term(&eo.offset, rank),
-        M::BitOffset(bo) => affine_of_term(&bo.offset, rank)?.exact_div(bo.width.0),
+        })
+    } else if let Some(eo) = layout.first::<EO>() {
+        affine_of_term(&eo.offset, rank)
+    } else if let Some(bo) = layout.first::<BO>() {
+        affine_of_term(&bo.offset, rank)?.exact_div(bo.width.0)
+    } else {
+        None
     }
 }
 
@@ -514,7 +527,6 @@ pub fn layout_read_index(
         }
     }
     let in_prefix = coords.prefix();
-    use luminal::layouts::MirrorLayout;
     let rank = slot_dims.len();
     let idx = format!("{operand}_idx");
     let check_domain = |shape: &luminal::layouts::ShapeTerm| -> Result<()> {
@@ -536,66 +548,70 @@ pub fn layout_read_index(
     };
     // The flat element offset expression. No bound travels with it: see
     // the NO RUNTIME BOUNDS TRAPS note above.
-    let offset: String = match &layout.mirror {
-        MirrorLayout::RightMajor(rm) => {
-            check_domain(&rm.shape)?;
-            let strides = strides_of(slot_dims);
-            if rank == 0 {
-                "0LL".to_string()
-            } else {
-                (0..rank)
-                    .map(|axis| format!("{in_prefix}{axis} * {}LL", strides[axis]))
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            }
+    // THE PREFERENCE IS THIS CALL SITE'S (same order as `read_affine`):
+    // every spelling of the class denotes one function, and this codegen
+    // asks for the one it emits the simplest C for. A class holding none
+    // of them is a capability refusal, not a guess.
+    let offset: String = if let Some(rm) = layout.first::<RM>() {
+        check_domain(&rm.shape)?;
+        let strides = strides_of(slot_dims);
+        if rank == 0 {
+            "0LL".to_string()
+        } else {
+            (0..rank)
+                .map(|axis| format!("{in_prefix}{axis} * {}LL", strides[axis]))
+                .collect::<Vec<_>>()
+                .join(" + ")
         }
-        MirrorLayout::LeftMajor(lm) => {
-            check_domain(&lm.shape)?;
-            let mut strides = vec![1usize; rank];
-            for axis in 1..rank {
-                strides[axis] = strides[axis - 1] * slot_dims[axis - 1];
-            }
-            if rank == 0 {
-                "0LL".to_string()
-            } else {
-                (0..rank)
-                    .map(|axis| format!("{in_prefix}{axis} * {}LL", strides[axis]))
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            }
+    } else if let Some(lm) = layout.first::<LM>() {
+        check_domain(&lm.shape)?;
+        let mut strides = vec![1usize; rank];
+        for axis in 1..rank {
+            strides[axis] = strides[axis - 1] * slot_dims[axis - 1];
         }
-        MirrorLayout::Strided(st) => {
-            check_domain(&st.shape)?;
-            let summands = st
-                .chain
-                .iter()
-                .map(|s| lower_layout_term(s, rank, in_prefix))
-                .collect::<Result<Vec<_>>>()?;
-            if summands.is_empty() {
-                "0LL".to_string()
-            } else {
-                summands.join(" + ")
-            }
+        if rank == 0 {
+            "0LL".to_string()
+        } else {
+            (0..rank)
+                .map(|axis| format!("{in_prefix}{axis} * {}LL", strides[axis]))
+                .collect::<Vec<_>>()
+                .join(" + ")
         }
-        MirrorLayout::ElementOffset(eo) => {
-            check_domain(&eo.shape)?;
-            lower_layout_term(&eo.offset, rank, in_prefix)?
+    } else if let Some(st) = layout.first::<ST>() {
+        check_domain(&st.shape)?;
+        let summands = st
+            .chain
+            .iter()
+            .map(|s| lower_layout_term(s, rank, in_prefix))
+            .collect::<Result<Vec<_>>>()?;
+        if summands.is_empty() {
+            "0LL".to_string()
+        } else {
+            summands.join(" + ")
         }
-        MirrorLayout::BitOffset(bo) => {
-            check_domain(&bo.shape)?;
-            let bits = lower_layout_term(&bo.offset, rank, in_prefix)?;
-            let width = bo.width.0;
-            // Bit form: element index = bit offset / width. The bit
-            // offset's divisibility by the element width is a COMPILER
-            // invariant (a mid-element bit offset has no element read) —
-            // it used to be re-derived at runtime in every thread; see
-            // the NO RUNTIME BOUNDS TRAPS note above for why it is not.
-            let bits_var = format!("{operand}_bits");
-            let code = format!(
-                "    long long {bits_var} = {bits};\n    long long {idx} = {bits_var} / {width}LL;\n"
-            );
-            return Ok((code, idx));
-        }
+    } else if let Some(eo) = layout.first::<EO>() {
+        check_domain(&eo.shape)?;
+        lower_layout_term(&eo.offset, rank, in_prefix)?
+    } else if let Some(bo) = layout.first::<BO>() {
+        check_domain(&bo.shape)?;
+        let bits = lower_layout_term(&bo.offset, rank, in_prefix)?;
+        let width = bo.width.0;
+        // Bit form: element index = bit offset / width. The bit
+        // offset's divisibility by the element width is a COMPILER
+        // invariant (a mid-element bit offset has no element read) —
+        // it used to be re-derived at runtime in every thread; see
+        // the NO RUNTIME BOUNDS TRAPS note above for why it is not.
+        let bits_var = format!("{operand}_bits");
+        let code = format!(
+            "    long long {bits_var} = {bits};\n    long long {idx} = {bits_var} / {width}LL;\n"
+        );
+        return Ok((code, idx));
+    } else {
+        bail!(
+            "operand {operand}: no lowerable layout spelling — the elected class \
+             holds {:?}",
+            layout.present()
+        );
     };
     Ok((format!("    long long {idx} = {offset};\n"), idx))
 }
