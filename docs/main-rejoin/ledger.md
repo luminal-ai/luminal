@@ -2510,6 +2510,14 @@ saturation, extraction and search all read the instance's list;
 `cuda_allow_list()` survive unchanged as the PRESETS' claim sets, for
 callers with no graph in hand.
 
+> **SUPERSEDED 2026-09-04 (cuBLASLt on by default).** The default-off
+> budget decision above is reversed: `cuda_registry()` is now the FULL
+> registry, markers included, and `load` is that call. The names
+> `cuda_registry_with_cublaslt`, `load_with_cublaslt` and
+> `allow_list_with_cublaslt` are deleted; the decomposed route is asked
+> for by name through the new `cuda_registry_without_cublaslt()`. The
+> paragraph above stands as the record of the Phase-2 state.
+
 **The configuration surface** (all outside-callable, no CL edit):
 `cuda_registry_filtered(|op| ...)` narrows the FULL registry (marker rows
 included, so a predicate can opt a row in as easily as out);

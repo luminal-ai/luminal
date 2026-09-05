@@ -13,8 +13,8 @@
 //! rejoin Phase 2: *"you should select the allowed ops when you
 //! initialize the runtime ... You should not need to edit CL in order to
 //! modify this. It should be configurable."*). [`cuda_registry`] and
-//! [`cuda_registry_with_cublaslt`] are just the two PRESETS this crate
-//! ships; what a [`crate::CudaRuntime`] assembles, saturates, searches
+//! [`cuda_registry_without_cublaslt`] are just the two PRESETS this
+//! crate ships; what a [`crate::CudaRuntime`] assembles, saturates, searches
 //! and claims with is the `Vec<RegisteredOp>` it was handed at
 //! [`crate::CudaRuntime::load_with_registry`]. A caller narrows the
 //! vocabulary with [`cuda_registry_filtered`] over
@@ -113,10 +113,52 @@ impl RegisteredOp {
     }
 }
 
-/// The registry this runtime assembles, extracts, and derives claims
-/// with: every matcher paired with a prototype of the (functional-form)
-/// op its `extract` produces.
+/// THE DEFAULT REGISTRY (cuBLASLt ON BY DEFAULT, ruling 2026-09-04):
+/// every matcher this crate ships, paired with a prototype of the
+/// (functional-form) op its `extract` produces — the kernel-bearing and
+/// plan-transparent rows of [`cuda_registry_without_cublaslt`] PLUS the
+/// four fixed-arity cuBLASLt marker contracts, whose execution row is a
+/// HOST LIBRARY CALL (`cublasLtMatmul`), never an NVRTC kernel (the
+/// third claim class — see [`crate::CudaRuntime::allow_list`]).
+///
+/// WHY THE MARKERS USED TO SIT BEHIND AN EXPLICIT SEAM, and why they no
+/// longer do. Splicing the marker vocabulary into every assembly once
+/// detonated the `view-arity-lock` (`Illegal merge attempted`) on all
+/// seven minis, because that lock keyed a ROUTE fact (an apply's parent
+/// rank) on a VALUE (its output class) and the collapse rule's sound
+/// union `x ≡ Tᵀ(x)` put two different-parent-rank spellings in one
+/// class; the check now lives on the `IndexMapLit` (entry count == rank
+/// of the source-shape tag) and saturation succeeds. What kept the
+/// default at the Train-2 set after that was the SEARCH BUDGET: the same
+/// union is a re-description 2-cycle, and at the 2×4 harness budget the
+/// sampler exhausts on unfit genomes on real graphs (they elect at
+/// 12×16). Both are settled, so the markers are simply part of what a
+/// default CL runtime searches with.
+///
+/// A caller who wants the DECOMPOSED route on purpose asks for
+/// [`cuda_registry_without_cublaslt`]; see [`cuda_registry_filtered`]
+/// for row-by-row narrowing (and for why the four marker rows are ONE
+/// estate that must be kept or dropped together).
 pub fn cuda_registry() -> Vec<RegisteredOp> {
+    let mut registry = cuda_registry_without_cublaslt();
+    for form in cublaslt::CublasLtForm::ALL {
+        registry.push(RegisteredOp {
+            matcher: Box::new(cublaslt::CublasLtMarkerMatcher { form }),
+            prototype: Box::new(cublaslt::CublasLt { form, spec: None }),
+        });
+    }
+    registry
+}
+
+/// The registry WITHOUT the cuBLASLt estate: the kernel-bearing and
+/// plan-transparent rows only, so every matmul keeps its DECOMPOSED
+/// spelling (the multiply/reduce chain CL's own NVRTC kernels execute).
+///
+/// This is for callers that want the decomposed route ON PURPOSE — the
+/// marker-vs-decomposed tolerance comparisons, the kernel-count pins,
+/// and anyone measuring what the library call is worth. It is NOT the
+/// default: [`cuda_registry`] is.
+pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
     fn reg(
         matcher: impl OpMatcher + 'static,
         prototype: impl LayoutIrOp + 'static,
@@ -180,45 +222,6 @@ pub fn cuda_registry() -> Vec<RegisteredOp> {
     ]
 }
 
-/// The registry WITH the cuBLASLt estate (Train 3): the four
-/// fixed-arity marker contracts, registered as real CL ops whose
-/// execution row is a HOST LIBRARY CALL (`cublasLtMatmul`), never an
-/// NVRTC kernel — the third claim class (see `CudaRuntime::allow_list`).
-///
-/// WHY A SEPARATE SURFACE, as of 2026-09-01: the marker is RULED
-/// always-on, and the tripwire that blocked it is fixed — splicing the
-/// marker vocabulary into every assembly used to detonate the
-/// `view-arity-lock` (`Illegal merge attempted`) on all seven minis,
-/// because that lock keyed a ROUTE fact (an apply's parent rank) on a
-/// VALUE (its output class) and the collapse rule's sound union
-/// `x ≡ Tᵀ(x)` put two different-parent-rank spellings in one class.
-/// The check now lives on the `IndexMapLit` (entry count == rank of the
-/// source-shape tag) and saturation succeeds. What still keeps the
-/// default vocabulary at the Train-2 set is the SEARCH: the same union
-/// is a re-description 2-cycle, and at the 2×4 harness budget the
-/// sampler exhausts on unfit genomes on real graphs (they elect at
-/// 12×16). Until the budget/sampler decision lands, the marker joins an
-/// assembly through this EXPLICIT seam
-/// ([`crate::CudaRuntime::load_with_cublaslt`]), and the 2D
-/// canonical-form election pin runs marker-enabled.
-///
-/// AS OF PHASE 2 this preset is nothing but a registry VALUE: it is what
-/// [`crate::CudaRuntime::load_with_cublaslt`] hands to
-/// [`crate::CudaRuntime::load_with_registry`], and any caller can build
-/// the same list (or half of it) with [`cuda_registry_filtered`]. The
-/// default's Train-2 set is a BUDGET decision, not a capability one, and
-/// it now costs a caller one argument to overrule.
-pub fn cuda_registry_with_cublaslt() -> Vec<RegisteredOp> {
-    let mut registry = cuda_registry();
-    for form in cublaslt::CublasLtForm::ALL {
-        registry.push(RegisteredOp {
-            matcher: Box::new(cublaslt::CublasLtMarkerMatcher { form }),
-            prototype: Box::new(cublaslt::CublasLt { form, spec: None }),
-        });
-    }
-    registry
-}
-
 /// THE CONFIGURATION SEAM: the FULL registry (every row this crate
 /// ships, cuBLASLt markers included) narrowed by the caller's own
 /// predicate. This is how a vocabulary is chosen without editing CL:
@@ -234,10 +237,10 @@ pub fn cuda_registry_with_cublaslt() -> Vec<RegisteredOp> {
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 ///
-/// It starts from the marker-enabled superset ON PURPOSE, so one
-/// predicate can opt a row IN as easily as OUT — `keep` sees every row
-/// that exists. The two presets remain available whole
-/// ([`cuda_registry`], [`cuda_registry_with_cublaslt`]).
+/// It starts from the FULL registry ON PURPOSE, so one predicate can
+/// opt a row IN as easily as OUT — `keep` sees every row that exists.
+/// The two presets remain available whole ([`cuda_registry`],
+/// [`cuda_registry_without_cublaslt`]).
 ///
 /// THE FOUR cuBLASLt MARKER ROWS ARE ONE ESTATE, not four independent
 /// ones: the Base row's snippets declare all four constructors and mint
@@ -254,25 +257,18 @@ pub fn cuda_registry_with_cublaslt() -> Vec<RegisteredOp> {
 /// load-bearing; labels carry their `Generic` suffix (see
 /// [`RegisteredOp::label`]).
 pub fn cuda_registry_filtered(keep: impl Fn(&RegisteredOp) -> bool) -> Vec<RegisteredOp> {
-    cuda_registry_with_cublaslt()
+    cuda_registry()
         .into_iter()
         .filter(|entry| keep(entry))
         .collect()
 }
 
 /// The matcher set the DEFAULT preset assembles and extracts with — the
-/// registry's matcher column. An instance's own column is derived from
-/// the registry it was loaded with, never from this.
+/// registry's matcher column, cuBLASLt markers included. An instance's
+/// own column is derived from the registry it was loaded with, never
+/// from this.
 pub fn cuda_matchers() -> Vec<Box<dyn OpMatcher>> {
     cuda_registry()
-        .into_iter()
-        .map(|entry| entry.matcher)
-        .collect()
-}
-
-/// The matcher column of [`cuda_registry_with_cublaslt`].
-pub fn cuda_matchers_with_cublaslt() -> Vec<Box<dyn OpMatcher>> {
-    cuda_registry_with_cublaslt()
         .into_iter()
         .map(|entry| entry.matcher)
         .collect()
