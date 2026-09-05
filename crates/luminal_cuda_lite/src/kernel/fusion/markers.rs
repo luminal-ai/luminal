@@ -63,11 +63,16 @@ impl EgglogOp for FusionStart {
     fn n_inputs(&self) -> usize {
         1
     }
+    fn egglog_declarations(&self) -> Vec<String> {
+        vec![crate::kernel::other_ops::SCATTER_ALIAS_DECLARATION.to_string()]
+    }
     fn rewrites(&self) -> Vec<Rule> {
-        // No idempotence rule: boundary normalization belongs to the
-        // destructive FE -> FS rule below, which removes the exact spelling
-        // it absorbs instead of adding equivalent marker layers.
-        Vec::new()
+        vec![Rule::raw(
+            "(rule ((= ?alias (Op (FusionStart ?shape ?strides ?dt)
+                                  (ICons ?input (INil)))))
+                   ((cuda-scatter-alias ?alias))
+                   :ruleset post_cleanup)",
+        )]
     }
     fn cleanup(&self) -> bool {
         false

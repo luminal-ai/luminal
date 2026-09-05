@@ -966,11 +966,11 @@ impl CudaGraphOp {
         Ok(())
     }
 
-    /// Destroy an executable that rejected a source-graph update before
+    /// Destroy an executable that cannot safely reuse a source-graph update before
     /// allocating its replacement. CUDA can retain a model-sized graph
     /// allocation until both the executable is destroyed and the device graph
     /// pool is trimmed; instantiating first transiently requires both copies.
-    fn retire_failed_graph_exec(
+    fn retire_graph_exec(
         &self,
         stream: &Arc<CudaStream>,
         exec: CudaGraphExecHandle,
@@ -2819,6 +2819,7 @@ impl CudaGraphOp {
             profile.source_kernel_update += timer.elapsed();
 
             let mut recaptured_cublaslt = false;
+            let mut cublaslt_spec_changed = false;
             if !state.cublaslt_ops.is_empty() {
                 let mut pending_recaptures = Vec::new();
                 let mut prepared_cache_plan = state.cublaslt_prepare_cache.clone();
@@ -2888,6 +2889,7 @@ impl CudaGraphOp {
                         }
                         let needs_prepare =
                             state.cublaslt_ops[idx].signature.is_none() || spec_changed;
+                        cublaslt_spec_changed |= needs_prepare;
                         let prepared = if needs_prepare {
                             let prepare_key = resolved.prepare_key();
                             let step = state.cublaslt_step_indices[idx];
@@ -3104,6 +3106,16 @@ impl CudaGraphOp {
 
             if recaptured_cublaslt {
                 let mut exec = state.cuda_graph_exec.take();
+                // A changed cuBLASLt problem may capture a different kernel
+                // implementation and launch attributes. On B300, updating the
+                // parent executable can report success yet return zeros after
+                // BF16 attention changes from (s=16,c=512) to (s=19,c=19).
+                // Reinstantiate for changed library specs so the executable
+                // is built from the current child graph. Pointer-only changes
+                // still use the incremental update path.
+                if cublaslt_spec_changed && let Some(old_exec) = exec.take() {
+                    self.retire_graph_exec(stream, old_exec)?;
+                }
                 let timer = Instant::now();
                 let update_result = {
                     let graph = state.cuda_graph.as_ref().unwrap();
@@ -3125,7 +3137,7 @@ impl CudaGraphOp {
                         // `exec` still owns the rejected executable. Retire it
                         // before instantiating the replacement so peak graph
                         // memory is one executable, not two.
-                        self.retire_failed_graph_exec(
+                        self.retire_graph_exec(
                             stream,
                             exec.take()
                                 .expect("failed graph update lost its executable"),
@@ -4069,7 +4081,7 @@ impl CudaGraphOp {
                     // The rejected executable may own most of the device graph
                     // pool. It must be destroyed and the unused pool returned
                     // before allocating the replacement.
-                    self.retire_failed_graph_exec(stream, exec)?;
+                    self.retire_graph_exec(stream, exec)?;
                     graph.instantiate()?
                 }
             }

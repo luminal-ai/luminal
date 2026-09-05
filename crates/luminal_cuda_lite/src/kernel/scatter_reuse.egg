@@ -1,0 +1,60 @@
+; Run only after lowering and fusion have finished introducing consumers.
+; This is a conservative proof over every spelling in the egraph, not the
+; number of consumers in one extracted program. Alternative implementations
+; of the same consumer share an IR eclass and do not count as distinct uses.
+(ruleset cuda_scatter_uses)
+(ruleset cuda_scatter_reuse)
+(relation cuda-scatter-list-use (IList IR))
+(relation cuda-scatter-use (IR IR))
+(function cuda-scatter-blocked (IR) bool :merge (or old new))
+
+(rule ((= ?list (ICons ?head ?tail)))
+      ((cuda-scatter-list-use ?list ?head))
+      :ruleset cuda_scatter_uses)
+(rule ((= ?list (ICons ?head ?tail))
+       (cuda-scatter-list-use ?tail ?input))
+      ((cuda-scatter-list-use ?list ?input))
+      :ruleset cuda_scatter_uses)
+(rule ((= ?consumer (Op ?kind ?inputs))
+       (cuda-scatter-list-use ?inputs ?input))
+      ((cuda-scatter-use ?input ?consumer))
+      :ruleset cuda_scatter_uses)
+; Persist retains storage; an ordinary Output observes the old logical value.
+(rule ((= ?output (Output ?input ?id false)))
+      ((cuda-scatter-use ?input ?output))
+      :ruleset cuda_scatter_uses)
+
+(rule ((= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                       (ICons ?dest (ICons ?indexes (ICons ?src (INil)))))))
+      ((set (cuda-scatter-blocked ?scatter) false))
+      :ruleset cuda_scatter_uses)
+(rule ((= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                       (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+       (cuda-scatter-use ?dest ?consumer)
+       (!= ?scatter ?consumer))
+      ((set (cuda-scatter-blocked ?scatter) true))
+      :ruleset cuda_scatter_uses)
+; A pure view does not own its storage. Its other aliases need not be direct
+; consumers of this IR value, so a single-consumer check alone is insufficient.
+(rule ((= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                       (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+       (cuda-scatter-alias ?dest))
+      ((set (cuda-scatter-blocked ?scatter) true))
+      :ruleset cuda_scatter_uses)
+
+; Read the completed analysis only once: absence of other uses is not
+; monotone while lowering/fusion are still adding alternatives. Duplicate
+; inputs also forbid mutation even though they have just one consumer eclass.
+(rule ((= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                       (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+       (= (cuda-scatter-blocked ?scatter) false)
+       (!= ?dest ?src)
+       (!= ?dest ?indexes)
+       (= ?dst ?os)
+       (= ?dty (dtype ?src)))
+      ((let ?nocopy (Op (KernelScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                       (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+       (union ?scatter ?nocopy)
+       (set (dtype ?nocopy) ?dty))
+      :ruleset cuda_scatter_reuse
+      :name "scatter to scatter-no-copy with exclusive destination")

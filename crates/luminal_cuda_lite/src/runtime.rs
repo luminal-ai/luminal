@@ -4928,11 +4928,15 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
     type ExecReturn = ();
 
     fn late_egglog_passes(
-        _ops: &[Arc<Box<dyn luminal::op::EgglogOp>>],
+        ops: &[Arc<Box<dyn luminal::op::EgglogOp>>],
         _options: &CompileOptions,
         _dyn_map: &DynMap,
     ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
-        vec![crate::search::safe_fusion_late_pass()]
+        let mut passes = vec![crate::search::safe_fusion_late_pass()];
+        if ops.iter().any(|op| op.sort().name == "KernelScatterNoCopy") {
+            passes.push(crate::kernel::other_ops::scatter_reuse_late_pass());
+        }
+        passes
     }
 
     fn initialize(stream: Self::CompileArg) -> Self {

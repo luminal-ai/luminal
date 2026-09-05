@@ -101,6 +101,26 @@ fn build_batch(
     (scatter_idx, gather_idx, q_pos, mask)
 }
 
+/// Allocate decode rows only for live sequences. Keeping completed sequences'
+/// terminal tokens unchanged makes completion sticky across subsequent ticks.
+fn prepare_decode_batch(
+    page_table: &mut PageTable,
+    sequences: &[(usize, u32)],
+) -> (Vec<(usize, Vec<usize>)>, Vec<i32>) {
+    let mut entries = Vec::new();
+    let mut input = Vec::new();
+    for &(seq_id, token) in sequences {
+        if token == EOS_TOKEN || token == STOP_TOKEN {
+            continue;
+        }
+        let position = page_table.context_len(seq_id);
+        page_table.allocate(seq_id, 1);
+        entries.push((seq_id, vec![position]));
+        input.push(token as i32);
+    }
+    (entries, input)
+}
+
 // ─── Sampling ───
 
 fn sample_greedy(logits_row: &[f32], seen: &FxHashSet<u32>, penalty: f32) -> u32 {
@@ -357,19 +377,16 @@ fn main() {
     let seq_b = page_table.new_sequence();
     let n_b = tokens_b.len();
     page_table.allocate(seq_b, n_b);
-    let pos_a_mixed = page_table.context_len(seq_a);
-    page_table.allocate(seq_a, 1); // 1 new slot for A's decode
-    let positions_b: Vec<usize> = (0..n_b).collect();
-    let total_mixed = 1 + n_b; // A: 1 decode token + B: n_b prefill tokens
+    let (mut mixed_entries, mut mixed_input) =
+        prepare_decode_batch(&mut page_table, &[(seq_a, next_a)]);
+    let a_decode_rows = mixed_entries.len();
+    mixed_entries.push((seq_b, (0..n_b).collect()));
+    let total_mixed = a_decode_rows + n_b;
     println!(
-        "\n══ Phase 3: Mixed Prefill+Decode (A decode 1 + B prefill {}, s={}) ══",
-        n_b, total_mixed
+        "\n══ Phase 3: Mixed Prefill+Decode (A decode {} + B prefill {}, s={}) ══",
+        a_decode_rows, n_b, total_mixed
     );
-    let (scatter, gather, qpos, mask) = build_batch(
-        &[(seq_a, vec![pos_a_mixed]), (seq_b, positions_b)],
-        &page_table,
-    );
-    let mut mixed_input = vec![next_a as i32];
+    let (scatter, gather, qpos, mask) = build_batch(&mixed_entries, &page_table);
     mixed_input.extend(tokens_b.iter().map(|&t| t as i32));
     runtime.set_data(input, mixed_input);
     runtime.set_data(q_pos_t, qpos);
@@ -387,9 +404,12 @@ fn main() {
         &cache_outputs,
     );
     let mixed_dur = mixed_start.elapsed();
-    // Row 0 = A's decode logits, row n_b = B's last prefill logits
-    next_a = sample_greedy(logits_row(&logits_data_mixed, 0), &seen_a, penalty);
-    seen_a.insert(next_a);
+    // A has a decode row only if phase 2 did not finish it. B's last
+    // prefill row is always the final row, regardless of A's state.
+    if a_decode_rows != 0 {
+        next_a = sample_greedy(logits_row(&logits_data_mixed, 0), &seen_a, penalty);
+        seen_a.insert(next_a);
+    }
     let mut seen_b = FxHashSet::default();
     let mut next_b = sample_greedy(
         logits_row(&logits_data_mixed, total_mixed - 1),
@@ -415,42 +435,39 @@ fn main() {
     let mut text_b = String::new();
     let mut super_times = vec![];
     for _ in 0..gen_tokens {
-        let a_done = next_a == EOS_TOKEN || next_a == STOP_TOKEN;
-        let b_done = next_b == EOS_TOKEN || next_b == STOP_TOKEN;
-        if a_done && b_done {
+        let start = std::time::Instant::now();
+        let (entries, decode_input) =
+            prepare_decode_batch(&mut page_table, &[(seq_a, next_a), (seq_b, next_b)]);
+        if entries.is_empty() {
             break;
         }
-        let start = std::time::Instant::now();
-        let pos_a = page_table.context_len(seq_a);
-        let pos_b = page_table.context_len(seq_b);
-        page_table.allocate(seq_a, 1);
-        page_table.allocate(seq_b, 1);
-        let (scatter, gather, qpos, mask) =
-            build_batch(&[(seq_a, vec![pos_a]), (seq_b, vec![pos_b])], &page_table);
+        let (scatter, gather, qpos, mask) = build_batch(&entries, &page_table);
         runtime.set_data(q_pos_t, qpos);
         runtime.set_data(attn_mask_t, mask);
         runtime.set_data(scatter_idx_t, scatter.to_vec());
         runtime.set_data(gather_idx_t, gather.to_vec());
-        runtime.set_data(input, vec![next_a as i32, next_b as i32]);
+        runtime.set_data(input, decode_input);
         let logits_data = tick(
             &mut cx,
             &mut runtime,
-            2,
+            entries.len(),
             gather.len(),
             logits,
             &kv_cache,
             &cache_outputs,
         );
         super_times.push(start.elapsed());
-        next_a = sample_greedy(logits_row(&logits_data, 0), &seen_a, penalty);
-        next_b = sample_greedy(logits_row(&logits_data, 1), &seen_b, penalty);
-        seen_a.insert(next_a);
-        seen_b.insert(next_b);
-        if !a_done {
-            text_a += &tokenizer.decode(&[next_a], true).unwrap();
-        }
-        if !b_done {
-            text_b += &tokenizer.decode(&[next_b], true).unwrap();
+        for (row, (seq_id, _)) in entries.iter().enumerate() {
+            let (next, seen, text) = if *seq_id == seq_a {
+                (&mut next_a, &mut seen_a, &mut text_a)
+            } else {
+                (&mut next_b, &mut seen_b, &mut text_b)
+            };
+            *next = sample_greedy(logits_row(&logits_data, row), seen, penalty);
+            seen.insert(*next);
+            if *next != EOS_TOKEN && *next != STOP_TOKEN {
+                *text += &tokenizer.decode(&[*next], true).unwrap();
+            }
         }
     }
     println!("[A] ...{text_a}");
@@ -458,7 +475,7 @@ fn main() {
     if super_times.len() > 1 {
         let avg = super_times.iter().skip(1).sum::<Duration>() / (super_times.len() - 1) as u32;
         println!(
-            "  Avg supersequence TPOT: {:.2} ms (2 tokens/step)",
+            "  Avg supersequence tick: {:.2} ms (one token per active sequence)",
             avg.as_secs_f64() * 1e3
         );
     }
@@ -468,4 +485,66 @@ fn main() {
         page_table.next_free_slot
     );
     println!("Done.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_sequences_are_not_resumed_or_allocated() {
+        for stop in [EOS_TOKEN, STOP_TOKEN] {
+            let mut pages = PageTable::new();
+            let a = pages.new_sequence();
+            let b = pages.new_sequence();
+            pages.allocate(a, 3);
+            pages.allocate(b, 2);
+            for token in [17, 18] {
+                let (entries, input) = prepare_decode_batch(&mut pages, &[(a, stop), (b, token)]);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].0, b);
+                assert_eq!(input, vec![token as i32]);
+                let (scatter, gather, positions, mask) = build_batch(&entries, &pages);
+                assert_eq!(pages.context_len(a), 3);
+                assert_eq!(
+                    gather,
+                    pages
+                        .context_slots(b)
+                        .iter()
+                        .map(|&s| s as i32)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    scatter,
+                    vec![*pages.context_slots(b).last().unwrap() as i32]
+                );
+                assert_eq!(positions, vec![pages.context_len(b) as i32 - 1]);
+                assert_eq!(mask, vec![0.0; pages.context_len(b)]);
+            }
+            let allocated = pages.next_free_slot;
+            let (entries, input) = prepare_decode_batch(&mut pages, &[(a, stop), (b, stop)]);
+            assert!(entries.is_empty() && input.is_empty());
+            assert_eq!(pages.next_free_slot, allocated);
+        }
+    }
+
+    #[test]
+    fn live_decode_rows_keep_sequence_order_and_attention_isolation() {
+        let mut pages = PageTable::new();
+        let a = pages.new_sequence();
+        let b = pages.new_sequence();
+        pages.allocate(a, 2);
+        pages.allocate(b, 1);
+        let (entries, input) = prepare_decode_batch(&mut pages, &[(a, 11), (b, 22)]);
+        assert_eq!(entries, vec![(a, vec![2]), (b, vec![1])]);
+        assert_eq!(input, vec![11, 22]);
+        let (scatter, gather, positions, mask) = build_batch(&entries, &pages);
+        assert_eq!(scatter, vec![3, 4]);
+        assert_eq!(gather, vec![0, 1, 3, 2, 4]);
+        assert_eq!(positions, vec![2, 1]);
+        assert_eq!(
+            mask,
+            vec![0.0, 0.0, 0.0, -1e10, -1e10, -1e10, -1e10, -1e10, 0.0, 0.0]
+        );
+    }
 }

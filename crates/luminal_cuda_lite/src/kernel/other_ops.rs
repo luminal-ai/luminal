@@ -19,6 +19,25 @@ use luminal::{
 
 pub type Ops = (KernelMeanReduce, KernelScatterNoCopy);
 
+// Pure storage aliases register here so scatter's late ownership proof can
+// reject destinations whose storage has uses through another logical value.
+pub(crate) const SCATTER_ALIAS_DECLARATION: &str = "(relation cuda-scatter-alias (IR))";
+
+/// Run after structural fusion. The proof deliberately requires exclusive use
+/// across the entire egraph; even safe ordered prior reads fall back to copying.
+/// No-copy chains remain safe because every old version is exclusively used.
+/// RoPE-scatter specialization inherits this proof from its no-copy input.
+pub(crate) fn scatter_reuse_late_pass() -> luminal::egglog_utils::LateEgglogPass {
+    luminal::egglog_utils::LateEgglogPass::new(
+        "",
+        "(seq
+            (saturate cuda_scatter_uses)
+            cuda_scatter_reuse
+            kernel_fuse_late2_rope
+            (saturate dtype_prop))",
+    )
+}
+
 #[derive(Default, Debug, Clone)]
 
 pub struct KernelMeanReduce {
@@ -275,70 +294,15 @@ impl EgglogOp for KernelScatterNoCopy {
         )
     }
 
-    fn ir_defs(&self) -> Vec<String> {
-        vec!["(ConsumedBuffer IR)".to_string()]
+    fn egglog_declarations(&self) -> Vec<String> {
+        vec![
+            SCATTER_ALIAS_DECLARATION.to_string(),
+            include_str!("scatter_reuse.egg").to_string(),
+        ]
     }
 
     fn n_inputs(&self) -> usize {
         3
-    }
-
-    fn rewrites(&self) -> Vec<Rule> {
-        // Match KernelScatter and rewrite to KernelScatterNoCopy with ConsumedBuffer on dest.
-        // ConsumedBuffer wraps dest to signal in-place modification.
-        // This is only valid when the destination buffer can also represent
-        // the scatter output layout. If dest is a strided/broadcast view,
-        // regular Scatter must first materialize a contiguous output copy.
-        //
-        // ConsumedBuffer is an egraph marker only. It is resolved after
-        // saturation; selected LLIR candidates then prove alias safety from
-        // their actual dependency order. This preserves legal prior reads such
-        // as `src = f(dest); scatter(dest, src)` while rejecting unordered
-        // competing reads without globally pruning the no-copy alternative.
-        let mut rules = vec![
-            // Rewrite: KernelScatter -> KernelScatterNoCopy with ConsumedBuffer
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                            (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
-                        (= ?dst ?os)
-                        (= ?dty (dtype ?src))
-                    )
-                    (
-                        (let ?consumed (ConsumedBuffer ?dest))
-                        (let ?nocopy (Op (KernelScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                            (ICons ?consumed (ICons ?indexes (ICons ?src (INil))))))
-                        (union ?scatter ?nocopy)
-                        (set (dtype ?nocopy) ?dty)
-                    )
-                    :ruleset buffer_reuse
-                    :name \"scatter to scatter-no-copy\"
-                )",
-            ),
-            // Dtype propagation for ConsumedBuffer
-            Rule::raw(
-                "(rule
-                    ((= ?cb (ConsumedBuffer ?a))
-                     (= ?dt (dtype ?a)))
-                    ((set (dtype ?cb) ?dt))
-                    :ruleset dtype_prop
-                    :name \"consumed-buffer-dtype\"
-                )",
-            ),
-        ];
-        // Resolve the marker after all alternatives have been generated. Alias
-        // validity is checked per extracted LLIR candidate, not per eclass.
-        rules.push(Rule::raw(
-            "(rule
-                ((= ?cb (ConsumedBuffer ?a)))
-                ((union ?cb ?a)
-                 (delete (ConsumedBuffer ?a)))
-                :ruleset base_cleanup
-                :name \"consumed-buffer-resolve\"
-            )",
-        ));
-        rules
     }
 
     fn cleanup(&self) -> bool {

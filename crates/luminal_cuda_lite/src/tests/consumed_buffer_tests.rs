@@ -6,7 +6,7 @@ use rand::SeedableRng;
 use luminal::egglog_utils::{random_initial_choice, validate_choice_set};
 
 use crate::kernel::KernelOp;
-use crate::resource::{ResourceViolation, plan_static_llir_resources};
+use crate::resource::plan_static_llir_resources;
 use crate::runtime::CudaRuntime;
 use crate::tests::utilities::{
     ForcedExtractionConfig, egraph_has_op_alternatives,
@@ -100,6 +100,58 @@ fn extract_forced_all_kernel_llir(
     panic!("could not extract all {expected_count} {egglog_kind} candidates");
 }
 
+fn assert_copy_only(cx: &Graph) {
+    let egraph = cx.egraph().expect("egraph not built");
+    assert!(
+        op_ir_nodes(egraph, "KernelScatterNoCopy").is_empty(),
+        "no-copy must not be generated without an exclusive destination proof",
+    );
+    assert!(!op_ir_nodes(egraph, "KernelScatter").is_empty());
+}
+
+/// One consumer eclass may still read the destination through multiple inputs.
+#[test]
+fn test_scatter_nocopy_not_generated_for_duplicate_input() {
+    let mut cx = Graph::default();
+    let dest = cx.tensor(5).persist();
+    let indexes = cx.tensor(5).as_dtype(DType::Int).persist();
+    dest.scatter(indexes, dest).output();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert_copy_only(&cx);
+}
+
+/// A destination view can have only one direct consumer while the underlying
+/// allocation is still observed through another alias.
+#[test]
+fn test_scatter_nocopy_not_generated_for_destination_alias() {
+    use luminal::{egglog_utils::run_egglog_with_late_passes, hlir::HLIROps, op::IntoEgglogOp};
+
+    let mut ops = <<CudaRuntime as Runtime>::Ops as IntoEgglogOp>::into_vec();
+    ops.extend(HLIROps::into_vec());
+    let passes =
+        CudaRuntime::late_egglog_passes(&ops, &CompileOptions::default(), &FxHashMap::default());
+    let egraph = run_egglog_with_late_passes(
+        r#"
+        (let base (Input 0 "base" (F32)))
+        (let indexes (Input 1 "indexes" (Int)))
+        (let src (Input 2 "src" (F32)))
+        (let shape (ECons (MNum 5) (ENil)))
+        (let strides (ECons (MIter) (ENil)))
+        (let dest (Op (FusionStart shape strides (F32)) (ICons base (INil))))
+        (let scatter (Op (KernelScatter shape strides shape strides strides strides (F32))
+                         (ICons dest (ICons indexes (ICons src (INil))))))
+        (let root (OutputJoin (Output base 3 false) (Output scatter 4 false)))
+        "#,
+        "root",
+        &ops,
+        true,
+        &passes,
+    )
+    .unwrap();
+    assert!(op_ir_nodes(&egraph, "KernelScatterNoCopy").is_empty());
+    assert!(!op_ir_nodes(&egraph, "KernelScatter").is_empty());
+}
+
 /// When dest is not shared, copying and in-place scatter are both semantically
 /// legal and must remain available for measured selection.
 #[test]
@@ -126,6 +178,40 @@ fn test_scatter_copy_and_nocopy_coexist_when_dest_unshared() {
     );
 }
 
+/// Exclusive logical versions may form an in-place chain, but observing an
+/// intermediate version requires the next update to copy it.
+#[test]
+fn test_scatter_nocopy_chain_preserves_observed_versions() {
+    let stream = CudaContext::new(0).unwrap().default_stream();
+    for observe_intermediate in [false, true] {
+        let mut cx = Graph::default();
+        let dest = cx.tensor(5).persist();
+        let first_src = cx.tensor(1).persist();
+        let second_src = cx.tensor(1).persist();
+        let indexes = cx.tensor(1).as_dtype(DType::Int).persist();
+        let first = first_src.scatter(indexes, dest);
+        if observe_intermediate {
+            first.output();
+        }
+        let second = second_src.scatter(indexes, first).output();
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+        let count = if observe_intermediate { 1 } else { 2 };
+        let llir =
+            extract_forced_all_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy", count);
+        let mut rt = CudaRuntime::initialize(stream.clone());
+        rt.load_llir(&llir);
+        rt.set_data(dest, vec![1.0f32, 2.0, 3.0, 4.0, 5.0]);
+        rt.set_data(first_src, vec![10.0f32]);
+        rt.set_data(second_src, vec![20.0f32]);
+        rt.set_data(indexes, vec![2i32]);
+        rt.execute(&cx.dyn_map);
+        assert_eq!(rt.get_f32(second), vec![1.0, 2.0, 20.0, 4.0, 5.0]);
+        if observe_intermediate {
+            assert_eq!(rt.get_f32(first), vec![1.0, 2.0, 10.0, 4.0, 5.0]);
+        }
+    }
+}
+
 /// An ordinary Output observes a logical value; unlike `persist()`, it cannot
 /// silently become an alias of a later in-place update.
 #[test]
@@ -138,25 +224,15 @@ fn test_scatter_nocopy_rejected_when_old_dest_is_observed_output() {
     src.scatter(indexes, dest).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    assert!(
-        egraph_has_op_alternatives(&cx, &["KernelScatter", "KernelScatterNoCopy"]),
-        "observing the old value must not globally erase the no-copy implementation"
-    );
-
-    let nocopy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
-    assert!(matches!(
-        plan_static_llir_resources(&nocopy, &FxHashMap::default()),
-        Err(ResourceViolation::AliasingHazard { .. })
-    ));
+    assert_copy_only(&cx);
 
     let copying = extract_forced_kernel_llir(&cx, "KernelScatter", "Scatter");
     assert!(plan_static_llir_resources(&copying, &FxHashMap::default()).is_ok());
 }
 
-/// An unordered read of the old destination makes a selected no-copy plan
-/// invalid, but must not globally erase that implementation from the egraph.
+/// An unordered read of the old destination prevents the no-copy rewrite.
 #[test]
-fn test_scatter_nocopy_candidate_rejected_when_dest_has_unordered_read() {
+fn test_scatter_nocopy_not_generated_when_dest_has_unordered_read() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
 
@@ -175,18 +251,7 @@ fn test_scatter_nocopy_candidate_rejected_when_dest_has_unordered_read() {
     let _result = scatter_result.output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    assert!(
-        egraph_has_op_alternatives(&cx, &["KernelScatter", "KernelScatterNoCopy"]),
-        "both scatter implementations should remain searchable"
-    );
-    let no_copy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
-    assert!(
-        matches!(
-            plan_static_llir_resources(&no_copy, &FxHashMap::default()),
-            Err(ResourceViolation::AliasingHazard { .. })
-        ),
-        "the selected no-copy plan must reject the unordered old-value read"
-    );
+    assert_copy_only(&cx);
     let copying = extract_forced_kernel_llir(&cx, "KernelScatter", "Scatter");
     plan_static_llir_resources(&copying, &FxHashMap::default())
         .expect("the copying scatter remains a legal candidate");
@@ -202,21 +267,22 @@ fn test_scatter_search_handles_shared_destination_branches() {
 
     let mut cx = Graph::default();
     let dest = cx.tensor(8).persist();
-    let indexes = cx.tensor(8).as_dtype(DType::Int).persist();
-    let zero = cx.tensor(8).persist();
+    let indexes = cx.tensor(4).as_dtype(DType::Int).persist();
+    let zero = cx.tensor(4).persist();
     let shared = zero.scatter(indexes, dest);
-    let sources: Vec<_> = (0..4).map(|_| cx.tensor(8).persist()).collect();
-    for source in &sources {
-        source.scatter(indexes, shared).output();
-    }
+    let sources: Vec<_> = (0..32).map(|_| cx.tensor(4).persist()).collect();
+    let outputs: Vec<_> = sources
+        .iter()
+        .map(|source| source.scatter(indexes, shared).output())
+        .collect();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut runtime = CudaRuntime::initialize(stream);
-    runtime.set_data(dest, vec![0.0f32; 8]);
-    runtime.set_data(indexes, (0..8).collect::<Vec<i32>>());
-    runtime.set_data(zero, vec![0.0f32; 8]);
+    runtime.set_data(dest, (10..18).map(|v| v as f32).collect::<Vec<_>>());
+    runtime.set_data(indexes, vec![0i32, 2, 4, 6]);
+    runtime.set_data(zero, vec![0.0f32; 4]);
     for (value, source) in sources.into_iter().enumerate() {
-        runtime.set_data(source, vec![value as f32; 8]);
+        runtime.set_data(source, vec![(value + 1) as f32; 4]);
     }
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(0x5CA7_5A4E);
@@ -231,7 +297,7 @@ fn test_scatter_search_handles_shared_destination_branches() {
         .copied()
         .filter(|name| name.contains("Scatter"))
         .collect();
-    assert_eq!(scatter_names.len(), 5);
+    assert_eq!(scatter_names.len(), 33);
     assert!(
         scatter_names
             .iter()
@@ -240,12 +306,21 @@ fn test_scatter_search_handles_shared_destination_branches() {
             <= 1,
         "shared destination branches must use copying scatter: {scatter_names:?}",
     );
+    runtime.execute(&cx.dyn_map);
+    for (branch, output) in outputs.into_iter().enumerate() {
+        let value = (branch + 1) as f32;
+        assert_eq!(
+            runtime.get_f32(output),
+            vec![value, 11.0, value, 13.0, value, 15.0, value, 17.0],
+            "shared-destination branch {branch}",
+        );
+    }
 }
 
-/// Candidate-local validation follows every edge, including reads where the
-/// destination is not the first input (Gather takes indexes before data).
+/// Eligibility follows every input, including later inputs (Gather takes
+/// indexes before data).
 #[test]
-fn test_scatter_nocopy_candidate_rejected_for_unordered_later_input_read() {
+fn test_scatter_nocopy_not_generated_for_unordered_later_input_read() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
 
@@ -261,31 +336,31 @@ fn test_scatter_nocopy_candidate_rejected_for_unordered_later_input_read() {
     let _result = scatter_result.output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    let no_copy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
-    assert!(
-        matches!(
-            plan_static_llir_resources(&no_copy, &FxHashMap::default()),
-            Err(ResourceViolation::AliasingHazard { .. })
-        ),
-        "the no-copy plan must reject an unordered gather of the old destination"
-    );
+    assert_copy_only(&cx);
 }
 
-/// A read that produces the scatter source is dependency-ordered before the
-/// mutation, so sharing the destination in this form is safe for no-copy.
+/// Ordered prior reads are legal for the runtime, but the conservative
+/// egraph-wide ownership proof intentionally falls back to copying here.
 #[test]
-fn test_scatter_nocopy_allows_ordered_prior_read() {
+fn test_scatter_ordered_prior_read_conservatively_copies() {
     let mut cx = Graph::default();
     let dest = cx.tensor(5).persist();
     let delta = cx.tensor(5).persist();
     let indexes = cx.tensor(5).as_dtype(DType::Int).persist();
     let src = dest + delta;
-    src.scatter(indexes, dest).output();
+    let result = src.scatter(indexes, dest).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    let no_copy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
-    plan_static_llir_resources(&no_copy, &FxHashMap::default())
-        .expect("the data dependency proves the old destination read precedes mutation");
+    assert_copy_only(&cx);
+    let copying = extract_forced_kernel_llir(&cx, "KernelScatter", "Scatter");
+    let stream = CudaContext::new(0).unwrap().default_stream();
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&copying);
+    rt.set_data(dest, vec![1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    rt.set_data(delta, vec![10.0f32; 5]);
+    rt.set_data(indexes, vec![4i32, 3, 2, 1, 0]);
+    rt.execute(&cx.dyn_map);
+    assert_eq!(rt.get_f32(result), vec![15.0, 14.0, 13.0, 12.0, 11.0]);
 }
 
 /// ScatterNoCopy aliases the destination buffer as the output, so it is only

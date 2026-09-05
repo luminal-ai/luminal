@@ -1105,6 +1105,75 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
     assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
 }
 
+/// Gemma profiles attention at (s=16, c=512), then prefills 19 tokens.
+/// Updating the captured BF16 child graph across that change must update the
+/// executable as well. On B300, cuGraphExecUpdate can report success while
+/// the old executable returns zeros; a fresh executable gives the reference.
+#[test]
+fn cuda_graph_bf16_batched_matmul_profile_to_prefill_transition() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream)
+        || !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream)
+    {
+        return;
+    }
+    let (heads, width) = (8usize, 256usize);
+    let mut cx = Graph::new();
+    let probabilities = cx.tensor((heads, 's', 'c')).as_dtype(DType::Bf16);
+    let values = cx.tensor((heads, 'c', width)).as_dtype(DType::Bf16);
+    let out = probabilities.matmul(values).output();
+    cx.set_dim('s', 16);
+    cx.set_dim('c', 512);
+    let llir =
+        extract_forced_cublaslt_llir_where(&mut cx, "Gemma BF16 attention transition", |llir| {
+            llir.node_weights()
+                .filter_map(|op| op.to_dialect::<dyn HostOp>())
+                .any(|op| {
+                    cublaslt_matrix_orders(op.as_ref().as_ref())
+                        == Some(("COL", "COL", "COL", "COL"))
+                        && cublaslt_transpose_ops(op.as_ref().as_ref()) == Some(("N", "N"))
+                })
+        });
+    let mut rt = CudaRuntime::initialize(stream);
+    // Stable, generously sized bindings isolate the shape change from pointer
+    // relocation. Each probability row selects one value row, so the expected
+    // result is independent of matmul accumulation/rounding details.
+    let mut probs = vec![bf16::ZERO; heads * 64 * 512];
+    let mut vals = vec![bf16::ZERO; heads * 512 * width];
+    for head in 0..heads {
+        for row in 0..19 {
+            probs[(head * 19 + row) * 19 + row] = bf16::ONE;
+            for col in 0..width {
+                vals[(head * 19 + row) * width + col] =
+                    bf16::from_f32(((head * 17 + row * 3 + col) % 31) as f32 / 16.0 - 1.0);
+            }
+        }
+    }
+    let expected = vals[..heads * 19 * width].to_vec();
+    rt.set_data(probabilities, probs);
+    rt.set_data(values, vals);
+    rt.load_llir_buckets(
+        &FxHashMap::default(),
+        &[(FxHashMap::default(), cx.dyn_map.clone(), llir)],
+    );
+    cx.set_dim('s', 19);
+    cx.set_dim('c', 19);
+    rt.execute(&cx.dyn_map);
+    let actual = rt.get_bf16(out);
+    assert_eq!(actual.len(), expected.len());
+    let mismatch = actual
+        .iter()
+        .zip(&expected)
+        .enumerate()
+        .find(|(_, (a, b))| a != b);
+    assert!(
+        mismatch.is_none(),
+        "captured BF16 attention mismatch after profile-to-prefill shape change: {mismatch:?}"
+    );
+}
+
 #[test]
 fn cublaslt_with_dynamic_c_spec_is_captured() {
     let Some(stream) = get_cuda_stream() else {

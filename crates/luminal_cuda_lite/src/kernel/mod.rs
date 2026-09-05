@@ -320,6 +320,9 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
 
     /// If this kernel's output aliases one of its inputs (i.e., writes in-place),
     /// return the input index. Used to propagate buffer pointers in CUDA graphs.
+    /// Pure aliases must also emit the `cuda-scatter-alias` egglog fact (see
+    /// FusionStart), so late scatter reuse cannot mistake a view for owned
+    /// storage. Mutating specializations must inherit an exclusive-use proof.
     fn output_aliases_input(&self) -> Option<usize> {
         None
     }

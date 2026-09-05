@@ -1340,7 +1340,8 @@ fn rope_half_scatter_fusion_requires_exact_shape_and_layout() {
         rope.dtype,
     );
     let shape_indexes = cx.tensor((1, S * KVD)).as_dtype(DType::Int);
-    wrong_shape.scatter(shape_indexes, dest).output();
+    let shape_dest = cx.tensor((10, KVD)).as_dtype(DType::Bf16).persist();
+    wrong_shape.scatter(shape_indexes, shape_dest).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
