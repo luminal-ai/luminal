@@ -21,9 +21,9 @@ petgraph = "0.6.4"
 rand = "0.9.2"
 colored = "2.0.4"
 float8 = { version = "0.7", features = ["bytemuck", "num-traits"] }
-# Pin tracks the workspace Cargo.toml exactly (luminal-ai egglog fork).
-egglog = { git = "https://github.com/luminal-ai/egglog", rev = "1bb30831e11121bd639caf93d84465d8d110e3f7" }
-egraph-serialize = { version = "0.3.0", default-features = false, features = ["graphviz", "serde"]}
+# Neither egglog nor egraph-serialize is pinned here: both reach this crate
+# through `luminal::prelude::{egglog, egraph_serialize}`, so the types UNIFY
+# with luminal's by construction (see the root Cargo.toml).
 
 [dev-dependencies]
 # The extractor copy's render-memo board hand-builds serialized e-nodes.

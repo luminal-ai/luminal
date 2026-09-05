@@ -15,11 +15,11 @@ luminal = { path = "../.." }
 # would be asserting on a copy. This is a CPU-side dependency: CL
 # compiles fully without its `device` feature.
 luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
-# Versions track luminal's Cargo.toml exactly — the egglog/egraph-serialize/
-# petgraph types must UNIFY with luminal's so the fixture runners can hand
-# this crate's egraphs to luminal's extractor and bufferizer.
-egglog = { git = "https://github.com/luminal-ai/egglog", rev = "1bb30831e11121bd639caf93d84465d8d110e3f7" }
-egraph-serialize = { version = "0.3.0", default-features = false, features = ["graphviz", "serde"]}
+# The petgraph version tracks luminal's Cargo.toml exactly — the types must
+# UNIFY with luminal's so the fixture runners can hand this crate's egraphs to
+# luminal's extractor and bufferizer. Neither egglog nor egraph-serialize is
+# pinned here: both reach this crate through
+# `luminal::prelude::{egglog, egraph_serialize}`.
 petgraph = "0.6.4"
 rustc-hash = "2.1.1"
 anyhow = "1.0"

@@ -1,17 +1,23 @@
 [package]
 name = "luminal_bench"
 version = "0.1.0"
-edition.workspace = true
+edition = "2024"
 description = "Universal benchmark infrastructure for Luminal backends"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+
+# Not a member of the root workspace (a parked crate), and its own workspace
+# root so `cargo build --manifest-path crates/luminal_bench/Cargo.toml`
+# resolves standalone. egglog and egraph-serialize are deliberately absent:
+# they arrive through `luminal::prelude::{egglog, egglog_ast,
+# egraph_serialize}`, so the root pins are the only ones.
+[workspace]
 
 [dependencies]
 luminal = { path = "../.." }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
-egraph-serialize = { version = "0.3.0", default-features = false }
 
 # Backend dependencies - optional, enabled via features
 luminal_metal = { path = "../luminal_metal", optional = true }

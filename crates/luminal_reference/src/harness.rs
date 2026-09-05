@@ -10,6 +10,7 @@ use std::fs;
 
 use crate::extractor;
 use luminal::layout_ir::ExtractedGraph;
+use luminal::prelude::egraph_serialize;
 
 /// Fixture scripts live in the WORKSPACE-ROOT Egglog core tree; this crate
 /// runs two directories below it.
@@ -70,7 +71,7 @@ pub fn producer_index_with_ops(
 /// Run `test_scripts/<script>` through egglog (with the full preamble) and
 /// hand back the serialized e-graph — the selection tooling's raw material.
 pub fn serialize_fixture(script: &str) -> egraph_serialize::EGraph {
-    use egglog::SerializeConfig;
+    use luminal::prelude::egglog::SerializeConfig;
 
     let preamble = crate::assembled_program();
     let source = fs::read_to_string(fixture_path(script))
@@ -187,7 +188,9 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("saturation: {err}"))?;
     eprintln!("[plain-plan] saturation {:?}", start.elapsed());
     let start = std::time::Instant::now();
-    let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
+    let serialized = egraph
+        .serialize(luminal::prelude::egglog::SerializeConfig::default())
+        .egraph;
     eprintln!(
         "[plain-plan] serialize {:?} ({} nodes, {} classes)",
         start.elapsed(),

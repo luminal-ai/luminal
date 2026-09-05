@@ -6,6 +6,7 @@ use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
+use luminal::prelude::egraph_serialize;
 
 /// `IndexMapApplyMaterialize(input) -> out`
 ///

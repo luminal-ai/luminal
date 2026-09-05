@@ -43,6 +43,7 @@ use crate::typed_buffer::TypedBuffer;
 use luminal::bufferize::BufferIrGraph;
 use luminal::graph::LogicalProgram;
 use luminal::layouts::DecodedLayout;
+use luminal::prelude::egraph_serialize;
 
 use crate::extractor::{self, Genome};
 use crate::runtime::{ReferenceRuntime, reference_allow_list};
@@ -535,7 +536,9 @@ pub fn bucketed_search_implementations(
         egraph
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
-        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
+        let serialized = egraph
+            .serialize(luminal::prelude::egglog::SerializeConfig::default())
+            .egraph;
         let data = input_data(&representative);
         let outcome = search_implementations_with_ops(
             &serialized,
@@ -695,7 +698,7 @@ pub fn search_implementations(
 
 #[cfg(test)]
 mod tests {
-    use egglog::SerializeConfig;
+    use luminal::prelude::egglog::SerializeConfig;
     use rustc_hash::FxHashMap;
 
     use luminal::dtype::DType;

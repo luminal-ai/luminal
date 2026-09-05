@@ -79,7 +79,7 @@ fn bounded_program(iters: usize, with_collapse: bool) -> String {
 }
 
 fn node_count(program: &str) -> usize {
-    use egglog::SerializeConfig;
+    use luminal::prelude::egglog::SerializeConfig;
     let mut egraph = luminal::egglog_snippet::new_egraph();
     egraph
         .parse_and_run_program(None, program)

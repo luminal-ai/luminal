@@ -362,7 +362,9 @@ impl ReferenceRuntime {
         }
         let saturation_nanos = saturation_start.elapsed().as_nanos();
         let serialize_start = std::time::Instant::now();
-        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
+        let serialized = egraph
+            .serialize(luminal::prelude::egglog::SerializeConfig::default())
+            .egraph;
         let serialize_nanos = serialize_start.elapsed().as_nanos();
         let mut outcome = crate::search::search_implementations_with_ops(
             &serialized,
@@ -1671,7 +1673,9 @@ mod tests {
         egraph
             .parse_and_run_program(None, &text)
             .expect("program runs");
-        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
+        let serialized = egraph
+            .serialize(luminal::prelude::egglog::SerializeConfig::default())
+            .egraph;
         let allow = crate::reference_allow_list();
         let extracted = crate::extractor::extract_layout_ir_with_ops_and_matchers(
             &serialized,
