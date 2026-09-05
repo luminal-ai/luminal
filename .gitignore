@@ -38,5 +38,3 @@ dist/
 build/
 uv.lock
 crates/luminal_training/examples/mnist_data/
-# the local egglog clone (dir, or a symlink to one) — never tracked; recipe in vendor/README.md
-vendor/egglog-checkout

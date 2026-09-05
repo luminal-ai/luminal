@@ -363,7 +363,7 @@ impl Walk<'_> {
                     };
                     let name = self.ctors[node.ctor].name.clone();
                     // A subsumed source row's copy is born retired
-                    // (add_subsumed, local engine patch): a live window —
+                    // (add_subsumed, our egglog fork): a live window —
                     // even one round — re-arms the orbit our :subsume
                     // termination discipline exists to prevent. A COMMITTED
                     // row is never force-retired (independent live material

@@ -1,16 +1,20 @@
 # vendor/
 
-`egglog-add-subsumed.patch` — the local engine addition the vendored
-substitution walk needs: `Write::add_subsumed` /
-`TableAction::lookup_or_insert_subsumed`, an atomic insert-born-retired
-(a staged insert cannot be re-subsumed through the public API, and even
-a one-round live window for a copied retired spelling re-arms the
-orbits the `:subsume` termination discipline prevents).
+The egglog engine this workspace builds against is the **luminal-ai fork**,
+<https://github.com/luminal-ai/egglog>, branch `luminal/subsumed-c2c0f151` —
+upstream `c2c0f151` plus one commit, `1bb30831`, adding the atomic
+`add_subsumed` write (`Write::add_subsumed` /
+`TableAction::lookup_or_insert_subsumed`) the substitution walk needs: an
+insert-born-retired row, because a staged insert cannot be re-subsumed through
+the public API, and even a one-round live window for a copied retired spelling
+re-arms the orbits the `:subsume` termination discipline prevents. The same
+addition is proposed upstream alongside egglog-experimental #60.
 
-The patch is applied to a checkout of egglog @ c2c0f151 living at
-`vendor/egglog-checkout (gitignored)`, referenced by the
-`[patch]` section in the workspace `Cargo.toml`. BEFORE this branch
-goes anywhere shared, the fork/upstream ask still stands; meanwhile every machine clones+patches into the SAME relative path — a luminal-ai
-egglog fork or the upstream ask (proposed alongside
-egglog-experimental #60). Regenerate the checkout by cloning egglog at
-c2c0f151 and applying this patch file.
+The fork is the source of truth. There is no local checkout, no patch file and
+no `[patch]` section any more: cargo fetches the fork from GitHub like any other
+git dependency, so a fresh machine needs nothing but `cargo build`. To move to a
+newer upstream egglog, rebase `luminal/subsumed-c2c0f151` onto the new upstream
+commit, push it, and bump the `rev` in the three manifests that pin egglog —
+`Cargo.toml`, `crates/luminal_reference/Cargo.toml`,
+`tests/test_runtime/Cargo.toml` (they must stay identical so the engine types
+unify across crates).
