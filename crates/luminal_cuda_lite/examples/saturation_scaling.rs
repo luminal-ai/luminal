@@ -78,6 +78,13 @@ struct Options {
     cap_secs: f64,
     extract: bool,
     seed: u64,
+    /// How many characters of a rule's name print. MOST OF OUR RULES
+    /// ARE ANONYMOUS, so egglog names them by their whole source text,
+    /// and the arms of a rule FAMILY share a long common prefix — the
+    /// cuBLASLt marker rules agree for ~200 characters and differ only
+    /// in their `CoordVar` indices. 100 shows which family; naming the
+    /// exact arm needs several hundred.
+    rule_chars: usize,
 }
 
 impl Default for Options {
@@ -88,6 +95,7 @@ impl Default for Options {
             cap_secs: 300.0,
             extract: false,
             seed: 0,
+            rule_chars: 100,
         }
     }
 }
@@ -119,11 +127,12 @@ fn parse_args() -> Result<Options> {
             }
             "--cap-secs" => options.cap_secs = value()?.parse()?,
             "--seed" => options.seed = value()?.parse()?,
+            "--rule-chars" => options.rule_chars = value()?.parse()?,
             "--extract" => options.extract = true,
             "--help" | "-h" => {
                 println!(
                     "saturation_scaling [--model qwen3|gemma3] [--layers 1,2,3,4] \
-                     [--cap-secs 300] [--seed 0] [--extract]"
+                     [--cap-secs 300] [--seed 0] [--rule-chars 100] [--extract]"
                 );
                 std::process::exit(0);
             }
@@ -190,7 +199,7 @@ fn run() -> Result<()> {
         } else {
             None
         };
-        print_block(options.model, layers, build_ms, &stats);
+        print_block(options.model, layers, build_ms, &stats, options.rule_chars);
 
         let saturation_ms = stats.saturation_nanos as f64 / 1e6;
         rows.push(Row {
@@ -333,7 +342,13 @@ fn flatten(name: &str, width: usize) -> String {
     }
 }
 
-fn print_block(model: Model, layers: usize, build_ms: f64, stats: &SaturationStats) {
+fn print_block(
+    model: Model,
+    layers: usize,
+    build_ms: f64,
+    stats: &SaturationStats,
+    rule_chars: usize,
+) {
     let ms = |n: u128| n as f64 / 1e6;
     println!(
         "\n===== {} layers={layers} =====",
@@ -370,7 +385,7 @@ fn print_block(model: Model, layers: usize, build_ms: f64, stats: &SaturationSta
             rank + 1,
             ms(rule.search_and_apply_nanos),
             rule.matches,
-            flatten(&rule.name, 100)
+            flatten(&rule.name, rule_chars)
         );
     }
     for (rank, (op, count)) in stats.nodes_per_constructor.iter().take(15).enumerate() {
