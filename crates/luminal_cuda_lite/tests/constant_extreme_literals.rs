@@ -11,7 +11,7 @@
 //!     `LogicalOp::Constant(v as f64)`; the term's f64 child is written
 //!     into the egglog program by `Graph`'s renderer as Rust's `{:?}`
 //!     form — `-3.4028234663852886e38`, `-inf`, `NaN` — which the
-//!     vendored egglog parser accepts as f64 literals.
+//!     egglog parser accepts as f64 literals.
 //!  2. `expand_rhs` records the broadcast view of that rank-0 constant,
 //!     and the sum with a runtime input keeps the value opaque to any
 //!     algebraic simplification: nothing in the graph can fold it away.

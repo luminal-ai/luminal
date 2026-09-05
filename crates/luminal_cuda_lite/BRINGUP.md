@@ -36,19 +36,10 @@ the self-contained repo-side summary.
 
 ## Before anything builds on the CUDA machine
 
-The workspace `[patch]` section points at a LOCAL patched egglog
-checkout. Recreate it (see `vendor/README.md`):
-
-```sh
-git clone https://github.com/egraphs-good/egglog /path/to/egglog-add-subsumed
-cd /path/to/egglog-add-subsumed && git checkout c2c0f1510a3633b768fb3d30ad284b211290e4b2
-git apply /path/to/luminal/vendor/egglog-add-subsumed.patch
-# then fix the two [patch] paths in the workspace Cargo.toml
-```
-
-(The durable fix is a luminal-ai egglog fork carrying the patch —
-`add_subsumed` is also proposed upstream alongside
-egglog-experimental #60.)
+Nothing. egglog is an ordinary git dependency on the luminal-ai fork
+(`luminal/subsumed-c2c0f151`, which carries the `add_subsumed` addition);
+cargo fetches it. The clone-and-patch recipe and the workspace `[patch]`
+section are retired — see `vendor/README.md`.
 
 ## CL-2: device bring-up (the work on the CUDA machine)
 
