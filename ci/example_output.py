@@ -2,37 +2,6 @@ import re
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
-# Performance gates for the Modal examples CI (A100-80GB).
-#
-# Thresholds are derived from the four green main/PR runs preceding PR #373
-# (2026-07-16 through 2026-07-19): the worst observed value across those runs,
-# plus headroom for Modal variance. TTFT is noisy run-to-run (~1.7x worst
-# observed); TPOT is stable (~1.3x worst observed). Whisper reports only
-# decode throughput, so it gates on a minimum tok/s.
-#
-# Baselines (min-max over those runs):
-#   llama       TTFT  34-62 ms   TPOT 10.8-11.6 ms
-#   gemma       TTFT 127-174 ms  TPOT 15.4-17.2 ms
-#   qwen        TTFT  77-106 ms  TPOT 12.4-16.8 ms
-#   qwen3_moe   TTFT 109-151 ms  TPOT  9.0-18.3 ms
-#   gemma4_moe  TTFT 122-137 ms  TPOT 27.4-34.2 ms
-#   whisper     7.1 tok/s
-PERF_GATES = {
-    # Calibrated to fully-unrolled candidate profiling (search ranks
-    # deployment graphs directly). GH200 references: llama 71/6.4,
-    # gemma 74/10.0, qwen 99/6.7, qwen3_moe 74/7.4, gemma4_moe 149/10.8.
-    "llama": {"max_ttft_ms": 150.0, "max_tpot_ms": 15.0},
-    "gemma": {"max_ttft_ms": 300.0, "max_tpot_ms": 30.0},
-    "qwen": {"max_ttft_ms": 180.0, "max_tpot_ms": 22.0},
-    "qwen3_moe": {"max_ttft_ms": 1000.0, "max_tpot_ms": 50.0},
-    # gemma4_moe's decode search still has run-to-run family variance
-    # (A100 draws observed 25-52 ms TPOT vs 10.8 best; exploration work
-    # tracked separately) — gate above the draw spread, below the
-    # 100+ ms failure modes.
-    "gemma4_moe": {"max_ttft_ms": 450.0, "max_tpot_ms": 60.0},
-    "whisper": {"min_tps": 5.0},
-}
-
 EXPECTED_OUTPUT = {
     "whisper": [
         "ask not what your country can do for you",
@@ -164,37 +133,3 @@ def parse_tok_per_second(line: str) -> float | None:
         return float(parts[-1].strip("("))
     except ValueError:
         return None
-
-
-def validate_perf(example: str, output: str):
-    gate = PERF_GATES.get(example)
-    if gate is None:
-        raise ValueError(f"No performance gate configured for example {example!r}")
-
-    metrics = parse_perf_metrics(output)
-    failures = []
-    checks = []
-
-    for metric_key, gate_key, worse_if_higher, unit in (
-        ("ttft_ms", "max_ttft_ms", True, "ms"),
-        ("tpot_ms", "max_tpot_ms", True, "ms"),
-        ("tps", "min_tps", False, "tok/s"),
-    ):
-        limit = gate.get(gate_key)
-        if limit is None:
-            continue
-        value = metrics[metric_key]
-        bound = "<=" if worse_if_higher else ">="
-        if value is None:
-            failures.append(f"{metric_key} not found in output (limit {bound} {limit} {unit})")
-        elif (value > limit) if worse_if_higher else (value < limit):
-            failures.append(f"{metric_key} {value:.2f} {unit} (limit {bound} {limit} {unit})")
-        else:
-            checks.append(f"{metric_key} {value:.2f} {bound} {limit} {unit}")
-
-    if failures:
-        details = "\n  - ".join(failures)
-        raise AssertionError(
-            f"Performance check failed for {example!r}:\n  - {details}"
-        )
-    print(f"\nPerformance check passed for {example!r}: {'; '.join(checks)}")

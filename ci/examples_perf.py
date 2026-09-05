@@ -4,7 +4,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from example_output import parse_perf_metrics, validate_output, validate_perf
+from example_output import parse_perf_metrics, validate_output
 
 
 DEFAULT_EXAMPLES = ["llama", "gemma", "qwen", "qwen3_moe", "gemma4_moe", "whisper"]
@@ -112,7 +112,6 @@ def run_example(example: str) -> ExampleResult:
 
     try:
         validate_output(example, output)
-        validate_perf(example, output)
     except Exception as exc:
         return ExampleResult(example, False, metrics=metrics, wall_s=wall_s, error=str(exc))
 

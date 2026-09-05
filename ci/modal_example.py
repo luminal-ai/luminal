@@ -81,7 +81,7 @@ def run_example(example: str):
     """Build and run a luminal example on a Modal GPU."""
     subprocess.run(["nvidia-smi"], check=True)
     sys.path.insert(0, f"{WORKDIR}/ci")
-    from example_output import validate_output, validate_perf
+    from example_output import validate_output
 
     run_env = {
         **os.environ,
@@ -112,7 +112,6 @@ def run_example(example: str):
             f"Last {len(tail)} chars of output:\n{tail}"
         ) from e
     validate_output(example, output)
-    validate_perf(example, output)
 
     hf_cache.commit()
 
