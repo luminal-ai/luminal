@@ -927,13 +927,21 @@ pub fn bucketed_search_implementations(
     for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
         let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
+        // THE PER-BUCKET SATURATION CLOCK (2026-09-05): a bucketed
+        // search saturates ONCE PER COMBINATION, so each bucket's
+        // outcome carries ITS OWN saturation and serialization, never a
+        // sum over the lattice.
+        let saturation_start = std::time::Instant::now();
         egraph
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
+        let saturation_nanos = saturation_start.elapsed().as_nanos();
+        let serialize_start = std::time::Instant::now();
         let serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
             .egraph;
-        let outcome = search_implementations(
+        let serialize_nanos = serialize_start.elapsed().as_nanos();
+        let mut outcome = search_implementations(
             &serialized,
             &program,
             options,
@@ -944,6 +952,8 @@ pub fn bucketed_search_implementations(
             // combinations, so the evaluator is lent, not rebuilt.
             evaluator.reborrow(),
         )?;
+        outcome.timings.saturation_nanos = saturation_nanos;
+        outcome.timings.serialize_nanos = serialize_nanos;
         egraphs.push(serialized);
         searched.push((ranges, representative, program, outcome));
     }

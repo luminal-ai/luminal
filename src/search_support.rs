@@ -303,6 +303,15 @@ impl RefusalBreakdown {
 /// Stage wall-clock totals for one search, in nanoseconds. Saturation
 /// and serialization happen in the runtime's `search` wrapper and are
 /// stamped there; the rest accumulate inside the selection loop.
+///
+/// THE ACCOUNTING CONTRACT (2026-09-05, "we need to instrument the
+/// search process better"): the TOP-LEVEL buckets below are disjoint
+/// and [`SearchTimings::attributed_nanos`] is their sum, so
+/// `total_nanos - attributed_nanos` is the wall time no bucket claims.
+/// A number that grows there is a MISSING BUCKET, not noise — which is
+/// exactly how the pre-instrumentation hour hid (a qwen3 search spent
+/// 65 of its 83 minutes in `saturation`/`serialize`, both of which
+/// CUDA-lite never stamped).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SearchTimings {
     /// egglog parse + saturation to fixpoint (one per search).
@@ -318,21 +327,51 @@ pub struct SearchTimings {
     /// All candidate executions: warmup + timed trials (cumulative) —
     /// the part that shrinks with a faster runtime.
     pub profile_nanos: u128,
+    /// THE WHOLE SEARCH's wall clock, measured ONCE around the
+    /// runtime's `search` body and stamped by it. 0 means the caller
+    /// never stamped it, and the residual line says `total unmeasured`
+    /// rather than inventing a denominator.
+    pub total_nanos: u128,
 }
 
 impl SearchTimings {
-    /// A compact human-readable ms breakdown for test logs.
+    /// The sum of the DISJOINT top-level buckets — what
+    /// [`Self::total_nanos`] is compared against.
+    pub fn attributed_nanos(&self) -> u128 {
+        self.saturation_nanos
+            + self.serialize_nanos
+            + self.analysis_nanos
+            + self.extract_nanos
+            + self.plan_build_nanos
+            + self.profile_nanos
+    }
+
+    /// Wall time NO bucket claims: `total - attributed`, saturating (a
+    /// caller that never stamped `total_nanos` reports 0, not a
+    /// wraparound).
+    pub fn unattributed_nanos(&self) -> u128 {
+        self.total_nanos.saturating_sub(self.attributed_nanos())
+    }
+
+    /// A compact human-readable ms breakdown for test logs, ending in
+    /// the RESIDUAL LINE — `total | attributed | unattributed` — so a
+    /// bucket that is missing shows up as a number instead of as
+    /// silence.
     pub fn summary(&self) -> String {
         let ms = |n: u128| n as f64 / 1e6;
         format!(
             "saturation {:.0}ms, serialize {:.0}ms, analysis {:.0}ms, extract {:.0}ms, \
-             plan-build {:.0}ms, profile-exec {:.0}ms",
+             plan-build {:.0}ms, profile-exec {:.0}ms | total {:.0}ms | attributed {:.0}ms \
+             | unattributed {:.0}ms",
             ms(self.saturation_nanos),
             ms(self.serialize_nanos),
             ms(self.analysis_nanos),
             ms(self.extract_nanos),
             ms(self.plan_build_nanos),
-            ms(self.profile_nanos)
+            ms(self.profile_nanos),
+            ms(self.total_nanos),
+            ms(self.attributed_nanos()),
+            ms(self.unattributed_nanos())
         )
     }
 }
@@ -374,6 +413,46 @@ mod early_stop_tests {
         // ...and NOT a tie: the incumbent keeps its seat, but a tied
         // candidate is still worth finishing (it is not yet losing).
         assert!(!early_stop_exceeded(5 * MS, best, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::SearchTimings;
+
+    const MS: u128 = 1_000_000;
+
+    /// THE RESIDUAL IS THE POINT: an unstamped bucket surfaces as
+    /// `unattributed`, never as silence.
+    #[test]
+    fn unattributed_is_total_minus_the_disjoint_buckets() {
+        let timings = SearchTimings {
+            saturation_nanos: 10 * MS,
+            serialize_nanos: 5 * MS,
+            analysis_nanos: 4 * MS,
+            extract_nanos: 3 * MS,
+            plan_build_nanos: 2 * MS,
+            profile_nanos: 1 * MS,
+            total_nanos: 40 * MS,
+        };
+        assert_eq!(timings.attributed_nanos(), 25 * MS);
+        assert_eq!(timings.unattributed_nanos(), 15 * MS);
+        let summary = timings.summary();
+        assert!(
+            summary.ends_with("| total 40ms | attributed 25ms | unattributed 15ms"),
+            "summary must end with the residual line: {summary}"
+        );
+    }
+
+    /// A caller that never stamped the wall clock reports 0 rather than
+    /// wrapping around.
+    #[test]
+    fn unstamped_total_never_wraps() {
+        let timings = SearchTimings {
+            extract_nanos: 7 * MS,
+            ..SearchTimings::default()
+        };
+        assert_eq!(timings.unattributed_nanos(), 0);
     }
 }
 
