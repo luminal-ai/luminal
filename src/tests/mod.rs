@@ -141,6 +141,22 @@ pub fn assert_close_precision(a_vec: &[f32], b_vec: &[f32], threshold: f32) {
     }
 }
 
+/// Ensure two arrays are nearly equal, and that neither contains a NaN.
+///
+/// [`assert_close`] compares with `>`, which is false when either side is NaN,
+/// so a NaN on either side passes silently. Use this where a NaN would mean the
+/// operation under test is broken rather than merely imprecise.
+pub fn assert_close_finite(a_vec: &[f32], b_vec: &[f32]) {
+    assert_eq!(a_vec.len(), b_vec.len(), "Number of elements doesn't match");
+    for (i, (a, b)) in a_vec.iter().zip(b_vec.iter()).enumerate() {
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "non-finite value at index {i}: got {a}, expected {b}"
+        );
+    }
+    assert_close(a_vec, b_vec);
+}
+
 /// Ensure two arrays are exactly equal
 pub fn assert_exact<T: PartialEq + Debug>(a_vec: &[T], b_vec: &[T]) {
     assert_eq!(a_vec.len(), b_vec.len(), "Number of elements doesn't match");
