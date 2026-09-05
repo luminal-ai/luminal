@@ -40,7 +40,37 @@ fn conv_example_graph_searches_with_zero_refusals() {
     let outcome = rt
         .search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("cuda search");
+    // THE ATTRIBUTION, visible on a host run (`-- --nocapture`): the
+    // one-line summary with its residual, the per-bucket breakdown, and
+    // egglog's account of where saturation went.
+    println!("conv example: [{}]", outcome.timings.summary());
+    println!(
+        "conv example: timing breakdown{}",
+        outcome.timings.breakdown()
+    );
+    println!(
+        "conv example: {}",
+        outcome
+            .saturation
+            .as_ref()
+            .expect("the runtime stamps the saturation report")
+            .summary()
+    );
     assert!(outcome.plans_profiled > 0, "no plans profiled");
+    // EVERY SECOND ATTRIBUTED: the residual is what no bucket claimed.
+    // A host search is seconds long, so this is a real check that the
+    // buckets add up, not a formality — it is deliberately loose (10%
+    // of the wall) because the timers themselves are not free.
+    let timings = &outcome.timings;
+    assert!(
+        timings.total_nanos > 0,
+        "the runtime never stamped the wall"
+    );
+    assert!(
+        timings.unattributed_nanos() * 10 < timings.total_nanos,
+        "more than 10% of the search is in no bucket: [{}]",
+        timings.summary()
+    );
     let b = &outcome.refusal_breakdown;
     assert_eq!(
         (

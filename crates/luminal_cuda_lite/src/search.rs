@@ -59,10 +59,10 @@ use luminal::prelude::egraph_serialize;
 // `profile.rs`'s, and the tests read `RefusalBreakdown` off the
 // outcome).
 pub use luminal::search_support::{
-    CaptureAwareStderr, ProducerIndex, RefusalBreakdown, SearchProgress, SearchTimings,
-    bufferize_cycle_tripwire, early_stop_exceeded, log_channel_enabled, mutate_genome,
-    mutate_genome_reporting, mutate_genome_with_seed, sample_genome, sample_genome_reporting,
-    sample_genome_with_seed,
+    CaptureAwareStderr, ProducerIndex, RefusalBreakdown, RuleTiming, RulesetTiming,
+    SaturationReport, SearchProgress, SearchTimings, bufferize_cycle_tripwire, early_stop_exceeded,
+    log_channel_enabled, mutate_genome, mutate_genome_reporting, mutate_genome_with_seed,
+    sample_genome, sample_genome_reporting, sample_genome_with_seed,
 };
 
 #[derive(Debug, Clone)]
@@ -151,7 +151,7 @@ impl CompileOptions {
         self
     }
 
-    fn search_log_enabled(&self) -> bool {
+    pub fn search_log_enabled(&self) -> bool {
         log_channel_enabled(self.search_log, "SEARCH_LOG")
     }
 }
@@ -177,6 +177,13 @@ pub struct SearchOutcome {
     /// programmatic answer to "what is the search time actually spent
     /// on" (no env vars; read it from the outcome).
     pub timings: SearchTimings,
+    /// WHAT SATURATION SPENT ITS TIME ON (2026-09-05), read off
+    /// egglog's own run report: per-ruleset totals and the slowest
+    /// rules with their match counts. `None` when the caller saturated
+    /// somewhere this search cannot see — the genetic loop itself never
+    /// saturates, so it always leaves this `None` and the runtime
+    /// stamps it.
+    pub saturation: Option<SaturationReport>,
     /// What rejected genomes were rejected FOR (diagnosis ruling
     /// 2026-08-07: understand the breakdown, no auto-repair).
     pub refusal_breakdown: RefusalBreakdown,
@@ -346,6 +353,11 @@ pub fn search_implementations(
         }
     );
     let mut timings = SearchTimings::default();
+    // THE LOOP'S OWN WALL (2026-09-05): everything in this body is
+    // either a named bucket or `other_nanos`, computed at the end as
+    // this wall minus the named ones. Nothing between here and the
+    // return can hide.
+    let body_start = Instant::now();
     let analysis_start = Instant::now();
     // The allow list narrows the caller's matcher set; None = the whole set.
     let allow = allow_override;
@@ -372,7 +384,9 @@ pub fn search_implementations(
     // when it closes no cycle (see [`mutate_genome`]). Everything
     // outside a component is sampled freely: its edges leave the
     // component and the condensation is a DAG.
+    let space_start = Instant::now();
     let space = session.sampling_space(&index);
+    timings.space_nanos = space_start.elapsed().as_nanos();
 
     let random_genome = |rng: &mut StdRng| sample_genome(&index, &space, rng);
     let mutate = |parent: &Genome, rng: &mut StdRng, count: usize| {
@@ -389,6 +403,13 @@ pub fn search_implementations(
     // layout class per candidate. `egraph` is fixed for this loop, which
     // is what makes the `ClassId` keys comparable across candidates.
     let mut layout_cache = luminal::layouts::LayoutDecodeCache::new();
+    // The device evaluator's own sub-clocks (prepare / compile / trials
+    // and the kernel-cache lookup counts), accumulated across
+    // candidates and folded into `timings` after the loop. Declared
+    // unconditionally so the fold below reads the same on every build;
+    // a device-free search leaves it at zero.
+    #[cfg(feature = "device")]
+    let mut profile_stats = crate::profile::ProfileTimings::default();
     let mut plans_profiled = 0usize;
     let mut fingerprint_hits = 0usize;
     // Refusal accounting, minimal form (Step 5 down-payment): keep the
@@ -412,6 +433,7 @@ pub fn search_implementations(
 
     for generation in 0..options.generations {
         let mut candidates: Vec<Genome> = Vec::with_capacity(options.generation_size);
+        let sample_start = Instant::now();
         match &best {
             None => {
                 for _ in 0..options.generation_size {
@@ -425,6 +447,7 @@ pub fn search_implementations(
                 }
             }
         }
+        timings.sample_nanos += sample_start.elapsed().as_nanos();
 
         for genome in candidates {
             // Extraction failure = invalid genome (cycle, contract breach):
@@ -481,7 +504,9 @@ pub fn search_implementations(
                     continue;
                 }
             };
+            let fingerprint_start = Instant::now();
             let fingerprint = extractor::plan_fingerprint(&graph);
+            timings.fingerprint_nanos += fingerprint_start.elapsed().as_nanos();
             let nanos = match cache.get(&fingerprint) {
                 Some(nanos) => {
                     fingerprint_hits += 1;
@@ -499,14 +524,21 @@ pub fn search_implementations(
                     // values. They clone their tied result's layout class
                     // AND dtype fact, so every poison is a decoder-cache
                     // HIT: value-keying costs no extra decoder calls.
+                    let dps_start = Instant::now();
                     let dps = luminal::dps::dps_rewrite(&graph);
-                    let built = luminal::layouts::decode_layout_table(
+                    timings.dps_rewrite_nanos += dps_start.elapsed().as_nanos();
+                    let decode_start = Instant::now();
+                    let decoded = luminal::layouts::decode_layout_table(
                         egraph,
                         &dps,
                         "implementation search",
                         &mut layout_cache,
-                    )
-                    .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
+                    );
+                    timings.decode_nanos += decode_start.elapsed().as_nanos();
+                    let bufferize_start = Instant::now();
+                    let built =
+                        decoded.and_then(|table| luminal::bufferize::bufferize(&dps, &table));
+                    timings.bufferize_nanos += bufferize_start.elapsed().as_nanos();
                     timings.plan_build_nanos += build_start.elapsed().as_nanos();
                     let plan = match built {
                         Ok(plan) => plan,
@@ -526,7 +558,9 @@ pub fn search_implementations(
                     // — it is what the outcome reports beside a measured
                     // winner — but under device profiling it is never
                     // ranked on.
+                    let heuristic_start = Instant::now();
                     let heuristic = crate::heuristic::heuristic_cost_of(&graph);
+                    timings.heuristic_nanos += heuristic_start.elapsed().as_nanos();
                     let profile_start = Instant::now();
                     let priced = if options.profile_on_device {
                         // ON-DEVICE MEASUREMENT (Phase 4). Compile +
@@ -552,6 +586,7 @@ pub fn search_implementations(
                                 options.trials,
                                 best.as_ref().map(|incumbent| incumbent.nanos),
                                 options.candidate_timeout,
+                                &mut profile_stats,
                             );
                             device.release_slab();
                             match measured {
@@ -653,14 +688,20 @@ pub fn search_implementations(
                 .is_none_or(|incumbent| nanos < incumbent.nanos)
             {
                 let build_start = Instant::now();
+                let dps_start = Instant::now();
                 let dps = luminal::dps::dps_rewrite(&graph);
-                let built = luminal::layouts::decode_layout_table(
+                timings.dps_rewrite_nanos += dps_start.elapsed().as_nanos();
+                let decode_start = Instant::now();
+                let decoded = luminal::layouts::decode_layout_table(
                     egraph,
                     &dps,
                     "implementation search",
                     &mut layout_cache,
-                )
-                .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
+                );
+                timings.decode_nanos += decode_start.elapsed().as_nanos();
+                let bufferize_start = Instant::now();
+                let built = decoded.and_then(|table| luminal::bufferize::bufferize(&dps, &table));
+                timings.bufferize_nanos += bufferize_start.elapsed().as_nanos();
                 timings.plan_build_nanos += build_start.elapsed().as_nanos();
                 let plan = match built {
                     Ok(plan) => plan,
@@ -670,9 +711,12 @@ pub fn search_implementations(
                     }
                 };
                 rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
+                let heuristic_start = Instant::now();
+                let heuristic = crate::heuristic::heuristic_cost_of(&graph);
+                timings.heuristic_nanos += heuristic_start.elapsed().as_nanos();
                 best = Some(Best {
                     nanos,
-                    heuristic: crate::heuristic::heuristic_cost_of(&graph),
+                    heuristic,
                     genome: genome.clone(),
                     plan,
                 });
@@ -687,6 +731,32 @@ pub fn search_implementations(
     if let Some(progress) = progress.as_mut() {
         progress.finish();
     }
+    // THE SUB-BUCKETS, folded once. Extraction's phase clocks are
+    // cumulative on the session (it extracted every genome), and the
+    // device evaluator's are cumulative on the loop's own accumulator.
+    timings.absorb_extract(session.extract_timings());
+    #[cfg(feature = "device")]
+    {
+        timings.prepare_nanos = profile_stats.prepare_nanos;
+        timings.prepare_compile_nanos = profile_stats.prepare_compile_nanos;
+        timings.trials_nanos = profile_stats.trials_nanos;
+        timings.kernel_cache_hits = profile_stats.kernel_cache_hits;
+        timings.kernel_cache_misses = profile_stats.kernel_cache_misses;
+    }
+    // THE LOOP RESIDUAL, computed LAST so it is literally "the wall this
+    // body did not name": genome clones, cache lookups, `rank_insert`,
+    // refusal bookkeeping, progress printing — and anything a later
+    // change forgets to time.
+    timings.other_nanos = body_start.elapsed().as_nanos().saturating_sub(
+        timings.analysis_nanos
+            + timings.space_nanos
+            + timings.extract_nanos
+            + timings.plan_build_nanos
+            + timings.profile_nanos
+            + timings.sample_nanos
+            + timings.fingerprint_nanos
+            + timings.heuristic_nanos,
+    );
     let best = best.ok_or_else(|| {
         anyhow!("no candidate genome produced an executable plan; refusals: {refusals:#?}")
     })?;
@@ -699,6 +769,9 @@ pub fn search_implementations(
         plans_profiled,
         fingerprint_hits,
         timings,
+        // Stamped by whoever saturated (the runtime, or the bucketed
+        // driver below); the loop never does.
+        saturation: None,
         refusal_breakdown: breakdown,
         ranked,
         // The lattice has not run yet; the runtime stamps this once it
@@ -927,13 +1000,22 @@ pub fn bucketed_search_implementations(
     for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
         let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
+        // THE PER-BUCKET SATURATION CLOCK (2026-09-05): a bucketed
+        // search saturates ONCE PER COMBINATION, so each bucket's
+        // outcome carries ITS OWN saturation and serialization, never a
+        // sum over the lattice.
+        let saturation_start = std::time::Instant::now();
         egraph
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
+        let saturation_nanos = saturation_start.elapsed().as_nanos();
+        let saturation_report = SaturationReport::from_egraph(&egraph);
+        let serialize_start = std::time::Instant::now();
         let serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
             .egraph;
-        let outcome = search_implementations(
+        let serialize_nanos = serialize_start.elapsed().as_nanos();
+        let mut outcome = search_implementations(
             &serialized,
             &program,
             options,
@@ -944,12 +1026,16 @@ pub fn bucketed_search_implementations(
             // combinations, so the evaluator is lent, not rebuilt.
             evaluator.reborrow(),
         )?;
+        outcome.timings.saturation_nanos = saturation_nanos;
+        outcome.timings.serialize_nanos = serialize_nanos;
+        outcome.saturation = Some(saturation_report);
         egraphs.push(serialized);
         searched.push((ranges, representative, program, outcome));
     }
 
     // PHASE 5: the buckets' ranked genomes become finalists, and the
     // lattice picks one SET of them under the aggregate budget.
+    let finalist_start = Instant::now();
     let (selected, rejections) = {
         let buckets: Vec<crate::finalists::Finalists<'_>> = searched
             .iter()
@@ -968,6 +1054,11 @@ pub fn bucketed_search_implementations(
             .collect();
         select_finalist_set(buckets, options, &mut evaluator)?
     };
+    // ONE lattice runs over ALL the buckets, so its cost is charged to
+    // the FIRST bucket's outcome (the one `CudaRuntime::search` returns
+    // as the report) rather than duplicated onto every bucket, where a
+    // reader summing the buckets would count it once per combination.
+    let finalist_nanos = finalist_start.elapsed().as_nanos();
 
     let mut installed: BTreeMap<usize, crate::finalists::PendingFinalist> =
         selected.into_iter().collect();
@@ -978,6 +1069,9 @@ pub fn bucketed_search_implementations(
             .remove(&index)
             .ok_or_else(|| anyhow!("the lattice selected no plan for bucket {index}"))?;
         outcome.lattice_rejections = rejections;
+        if index == 0 {
+            outcome.timings.finalist_nanos = finalist_nanos;
+        }
         plans.push(BucketPlan {
             ranges,
             representative,

@@ -101,6 +101,23 @@ pub struct CudaRuntime {
     device: Option<crate::device::CudaDevice>,
 }
 
+/// What [`CudaRuntime::assemble_and_saturate`] produced, WITH the wall
+/// clock of the two halves that produced it (2026-09-05). The timings
+/// travel in the return value rather than in a global or an out-param
+/// because there are two callers and one of them
+/// ([`CudaRuntime::saturated_egraph`]) wants only the e-graph.
+struct SaturatedProgram {
+    serialized: luminal::prelude::egraph_serialize::EGraph,
+    program: graph::LogicalProgram,
+    /// egglog parse + run of the assembled program, to fixpoint.
+    saturation_nanos: u128,
+    /// `EGraph::serialize` of the saturated database.
+    serialize_nanos: u128,
+    /// egglog's OWN account of where the saturation went: per-ruleset
+    /// totals and the slowest rules with their match counts.
+    report: luminal::search_support::SaturationReport,
+}
+
 impl CudaRuntime {
     /// Record the graph's native program under the DEFAULT op registry
     /// ([`crate::ops::cuda_registry`]) — which since the 2026-09-04
@@ -392,8 +409,7 @@ impl CudaRuntime {
     /// (which constructors were minted, which spellings a layout class
     /// holds) rather than on an election that depends on the budget.
     pub fn saturated_egraph(&self) -> Result<luminal::prelude::egraph_serialize::EGraph> {
-        let (serialized, _program) = self.assemble_and_saturate()?;
-        Ok(serialized)
+        Ok(self.assemble_and_saturate()?.serialized)
     }
 
     /// Assemble the program under this runtime's bindings and matcher
@@ -402,12 +418,7 @@ impl CudaRuntime {
     /// the two can never see different programs. On saturation failure
     /// the labeled post-checks are re-run in isolation to name the door,
     /// mirroring the reference runtime.
-    fn assemble_and_saturate(
-        &self,
-    ) -> Result<(
-        luminal::prelude::egraph_serialize::EGraph,
-        graph::LogicalProgram,
-    )> {
+    fn assemble_and_saturate(&self) -> Result<SaturatedProgram> {
         let native = self
             .native
             .as_ref()
@@ -429,6 +440,12 @@ impl CudaRuntime {
             program.text
         );
         let mut egraph = luminal::egglog_snippet::new_egraph();
+        // THE SATURATION CLOCK (2026-09-05). It runs from here to the
+        // end of `parse_and_run_program` and NOTHING else: the failure
+        // path's door-naming re-saturation is a diagnostic that only a
+        // failed search pays, and charging it to the bucket would price
+        // a green search by a red one's work.
+        let saturation_start = std::time::Instant::now();
         if let Err(err) = egraph.parse_and_run_program(None, &full) {
             // Name the door: re-saturate without checks, then probe each
             // labeled check alone.
@@ -453,8 +470,21 @@ impl CudaRuntime {
             }
             bail!("shape contracts failed:\n  - {}", doors.join("\n  - "));
         }
+        let saturation_nanos = saturation_start.elapsed().as_nanos();
+        // TAKEN BEFORE SERIALIZATION, off the e-graph that just ran:
+        // the report borrows from the `EGraph`, so it is copied into
+        // owned data here rather than kept as a borrow.
+        let report = luminal::search_support::SaturationReport::from_egraph(&egraph);
+        let serialize_start = std::time::Instant::now();
         let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
-        Ok((serialized.egraph, program))
+        let serialize_nanos = serialize_start.elapsed().as_nanos();
+        Ok(SaturatedProgram {
+            serialized: serialized.egraph,
+            program,
+            saturation_nanos,
+            serialize_nanos,
+            report,
+        })
     }
 
     /// Assemble, saturate, and search — with THIS backend's allow list.
@@ -469,6 +499,13 @@ impl CudaRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
+        // THE WALL CLOCK, started once around the WHOLE body (2026-09-05)
+        // and stamped onto the outcome at the end. Everything the search
+        // does — saturation, serialization, the genetic loop, the
+        // finalist lattice, the install — is inside it, which is what
+        // makes `unattributed` a claim about missing buckets rather than
+        // about where the caller happened to put its own timer.
+        let search_start = std::time::Instant::now();
         let native = self
             .native
             .as_ref()
@@ -580,8 +617,14 @@ impl CudaRuntime {
         // plan is whichever FINALIST the bucket lattice selected under the
         // aggregate device budget. With no budget set they coincide,
         // which is why every existing caller sees the trajectory it had.
-        let (outcome, unbucketed_plan, searched_buckets) = if let Some((serialized, program)) = base
-        {
+        let (mut outcome, unbucketed_plan, searched_buckets) = if let Some(base) = base {
+            let SaturatedProgram {
+                serialized,
+                program,
+                saturation_nanos,
+                serialize_nanos,
+                report,
+            } = base;
             let mut outcome = crate::search::search_implementations(
                 &serialized,
                 &program,
@@ -590,6 +633,14 @@ impl CudaRuntime {
                 matchers,
                 evaluator.reborrow(),
             )?;
+            // THE TWO BUCKETS THE GENETIC LOOP CANNOT FILL: they were
+            // spent before it started, in `assemble_and_saturate`. The
+            // reference runtime has stamped them since Phase 8; this
+            // backend never did, which is where a qwen3 search's missing
+            // 65 minutes were (2026-09-05).
+            outcome.timings.saturation_nanos = saturation_nanos;
+            outcome.timings.serialize_nanos = serialize_nanos;
+            outcome.saturation = Some(report);
             // THE UNBUCKETED LATTICE (Phase 5) — a lattice over ONE
             // bucket, so unbucketed and bucketed installs run the same
             // code. Main's "one designed difference" from its pre-#420
@@ -605,8 +656,13 @@ impl CudaRuntime {
                 outcome.ranked.clone(),
                 Some(outcome.best_plan.clone()),
             )];
+            let finalist_start = std::time::Instant::now();
             let (selected, rejections) =
                 crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
+            // THE LATTICE IS NOT FREE on a device build: it warms up
+            // every finalist it considers. Its own bucket, so it can
+            // never sit in the residual.
+            outcome.timings.finalist_nanos = finalist_start.elapsed().as_nanos();
             outcome.lattice_rejections = rejections;
             let (_, finalist) = selected
                 .into_iter()
@@ -673,6 +729,7 @@ impl CudaRuntime {
             // eagerly only if the runtime already sits at a covered pin.
             let _ = self.select_bucket_plan();
         }
+        outcome.timings.total_nanos = search_start.elapsed().as_nanos();
         Ok(outcome)
     }
 

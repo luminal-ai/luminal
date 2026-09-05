@@ -72,6 +72,32 @@ pub enum Measurement {
     },
 }
 
+/// WHERE ONE CANDIDATE's profiling time went (2026-09-05), accumulated
+/// across candidates by the search.
+///
+/// WHAT IS AND IS NOT SEPARABLE. `execute_plan` is ONE call that
+/// compiles, allocates, stages, launches, synchronizes and reads back,
+/// so STAGE and WARM cannot be split from each other without
+/// restructuring the executor — and that restructuring is exactly the
+/// stage-once/run-many surgery this module's header defers. What CAN be
+/// split out is COMPILATION, because the device's kernel cache times
+/// its own miss path: `prepare_compile_nanos` is the NVRTC + module-load
+/// share of `prepare_nanos`, and the remainder is stage + warm.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProfileTimings {
+    /// The untimed first `execute_plan`: compile + stage + one run.
+    pub prepare_nanos: u128,
+    /// The compilation inside it (device kernel-cache miss path).
+    pub prepare_compile_nanos: u128,
+    /// The timed trials, from the first one to the last.
+    pub trials_nanos: u128,
+    /// Kernel-cache lookups that hit, over the whole profiling call
+    /// (the trials re-look-up the same kernels, and those hits count).
+    pub kernel_cache_hits: u64,
+    /// Kernel-cache misses — kernel sources NVRTC compiled here.
+    pub kernel_cache_misses: u64,
+}
+
 /// Why a candidate produced no measurement — classified, because the
 /// search accounts the two differently (D10: *"runtimes can choose how
 /// to handle failures at different points"*).
@@ -141,48 +167,77 @@ pub fn profile_candidate(
     trials: usize,
     best_so_far: Option<u128>,
     candidate_timeout: Option<Duration>,
+    stats: &mut ProfileTimings,
 ) -> Result<Measurement, ProfileFailure> {
     // 1. PREPARE: compile + stage + one untimed run (warmup + validity).
-    execute_plan(device, plan, staged).map_err(ProfileFailure::Prepare)?;
+    // The compile share is read as a DELTA on the device's own kernel
+    // cache, which is the one place that can see NVRTC time.
+    let compile_before = device.kernel_compile_nanos();
+    let hits_before = device.kernel_cache_hits();
+    let misses_before = device.kernel_cache_misses();
+    let prepare_start = Instant::now();
+    let prepared = execute_plan(device, plan, staged);
+    stats.prepare_nanos += prepare_start.elapsed().as_nanos();
+    // Stamped even when prepare FAILED: a candidate NVRTC refuses still
+    // spent the compile attempt, and dropping it would hide exactly the
+    // time a refusing candidate costs.
+    stats.prepare_compile_nanos += device.kernel_compile_nanos().saturating_sub(compile_before);
+    let count_lookups = |device: &CudaDevice, stats: &mut ProfileTimings| {
+        stats.kernel_cache_hits += device.kernel_cache_hits().saturating_sub(hits_before);
+        stats.kernel_cache_misses += device.kernel_cache_misses().saturating_sub(misses_before);
+    };
+    if let Err(err) = prepared {
+        count_lookups(device, stats);
+        return Err(ProfileFailure::Prepare(err));
+    }
 
     // 2. THE TIMED RUN. The budget's clock starts HERE.
     let total = trials.max(1);
     let run_start = Instant::now();
     let mut sum = 0u128;
-    for trial in 0..total {
-        let start = Instant::now();
-        execute_plan(device, plan, staged).map_err(ProfileFailure::Execute)?;
-        sum += start.elapsed().as_nanos();
-        let completed = trial + 1;
-        if completed == total {
-            break;
+    // The trial loop is a closure ONLY so its several early returns (the
+    // timeout, the early stop) all pass through one place that stamps
+    // `trials_nanos`. Nothing about the measurement changes.
+    let mut timed = || -> Result<Measurement, ProfileFailure> {
+        for trial in 0..total {
+            let start = Instant::now();
+            execute_plan(device, plan, staged).map_err(ProfileFailure::Execute)?;
+            sum += start.elapsed().as_nanos();
+            let completed = trial + 1;
+            if completed == total {
+                break;
+            }
+            // TIMEOUT, checked between trials.
+            if candidate_timeout.is_some_and(|budget| run_start.elapsed() > budget) {
+                return Ok(Measurement::TimedOut {
+                    elapsed_nanos: run_start.elapsed().as_nanos(),
+                    completed_trials: completed,
+                });
+            }
+            // 3. EARLY STOP (#386), on the lower bound of the final mean.
+            if best_so_far.is_some_and(|best| early_stop_exceeded(sum / total as u128, best, 1.0)) {
+                return Ok(Measurement::Timed {
+                    mean_nanos: sum / completed as u128,
+                    completed_trials: completed,
+                });
+            }
         }
-        // TIMEOUT, checked between trials.
+        // A single trial that ran longer than the whole budget is a timeout
+        // too — the between-trials check cannot see it, and reporting it as
+        // a measurement would rank a plan the caller asked not to wait for.
         if candidate_timeout.is_some_and(|budget| run_start.elapsed() > budget) {
             return Ok(Measurement::TimedOut {
                 elapsed_nanos: run_start.elapsed().as_nanos(),
-                completed_trials: completed,
+                completed_trials: total,
             });
         }
-        // 3. EARLY STOP (#386), on the lower bound of the final mean.
-        if best_so_far.is_some_and(|best| early_stop_exceeded(sum / total as u128, best, 1.0)) {
-            return Ok(Measurement::Timed {
-                mean_nanos: sum / completed as u128,
-                completed_trials: completed,
-            });
-        }
-    }
-    // A single trial that ran longer than the whole budget is a timeout
-    // too — the between-trials check cannot see it, and reporting it as
-    // a measurement would rank a plan the caller asked not to wait for.
-    if candidate_timeout.is_some_and(|budget| run_start.elapsed() > budget) {
-        return Ok(Measurement::TimedOut {
-            elapsed_nanos: run_start.elapsed().as_nanos(),
+        Ok(Measurement::Timed {
+            mean_nanos: sum / total as u128,
             completed_trials: total,
-        });
-    }
-    Ok(Measurement::Timed {
-        mean_nanos: sum / total as u128,
-        completed_trials: total,
-    })
+        })
+    };
+    let measured = timed();
+    stats.trials_nanos += run_start.elapsed().as_nanos();
+    count_lookups(device, stats);
+    measured
 }
