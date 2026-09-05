@@ -27,6 +27,8 @@ serde_json = "1.0.140"
 # The luminal-ai fork carries the atomic add_subsumed write the substitution
 # walk needs (proposed upstream alongside egglog-experimental #60), on branch
 # `luminal/subsumed-c2c0f151`. Bumping egglog = rebasing that branch, new rev.
+# Core is the ONLY crate that names egglog; every other crate uses
+# `luminal::prelude::{egglog, egglog_ast, egraph_serialize}`.
 egglog = { git = "https://github.com/luminal-ai/egglog", rev = "1bb30831e11121bd639caf93d84465d8d110e3f7" }
 egglog-ast = { git = "https://github.com/luminal-ai/egglog", rev = "1bb30831e11121bd639caf93d84465d8d110e3f7" }
 # egglog-reports: crate absorbed upstream; RunReport types re-export via egglog (pin bump 2026-08-11)
@@ -89,6 +91,11 @@ members = [
     "tests/scalar_refs",
     "tests/test_runtime",
 ]
+# Parked crates are not members. luminal_bench is excluded explicitly so it
+# still builds standalone (`cargo build --manifest-path
+# crates/luminal_bench/Cargo.toml`); it reaches egglog through the prelude,
+# so its lock cannot drift the rev above.
+exclude = ["crates/luminal_bench"]
 
 # Model examples are logical definitions only. Executable applications
 # belong to runtime crates, which bind and run these backend-neutral graphs.

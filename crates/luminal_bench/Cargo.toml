@@ -1,10 +1,16 @@
 [package]
 name = "luminal_bench"
 version = "0.1.0"
-edition.workspace = true
+edition = "2024"
 description = "Universal benchmark infrastructure for Luminal backends"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+
+# Not a member of the root workspace (a parked crate), and its own workspace
+# root so `cargo build --manifest-path crates/luminal_bench/Cargo.toml`
+# resolves standalone. egglog is deliberately absent: it arrives through
+# `luminal::prelude::{egglog, egglog_ast}`, so the root pin is the only one.
+[workspace]
 
 [dependencies]
 luminal = { path = "../.." }

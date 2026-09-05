@@ -31,9 +31,9 @@
 
 use std::collections::BTreeSet;
 
-use egglog::SerializeConfig;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
+use luminal::prelude::egglog::SerializeConfig;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
 
 fn count(s: &EGraph, op: &str) -> usize {

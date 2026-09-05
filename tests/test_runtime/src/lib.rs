@@ -135,7 +135,7 @@ fn try_extract_text_with_ops(
 /// fixture script, run to saturation and serialized — the raw material
 /// for every extraction below. Panics on any failure: these are fixtures.
 pub fn serialize_fixture(script_text: &str) -> luminal::prelude::egraph_serialize::EGraph {
-    use egglog::SerializeConfig;
+    use luminal::prelude::egglog::SerializeConfig;
 
     let preamble = luminal::egglog_snippet::assembled_program_for(&matchers());
     let program = format!("{preamble}\n\n{script_text}");
