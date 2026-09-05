@@ -312,14 +312,23 @@ impl RefusalBreakdown {
 /// exactly how the pre-instrumentation hour hid (a qwen3 search spent
 /// 65 of its 83 minutes in `saturation`/`serialize`, both of which
 /// CUDA-lite never stamped).
+///
+/// THE SUB-BUCKETS are a partition of the big buckets and are NOT part
+/// of that sum. They answer the next question — WHERE inside extract,
+/// plan-build and profile the time went — and each one names the phase
+/// the code names.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SearchTimings {
+    // ---- top-level buckets, disjoint, summed by `attributed_nanos` ----
     /// egglog parse + saturation to fixpoint (one per search).
     pub saturation_nanos: u128,
     /// e-graph serialization (one per search).
     pub serialize_nanos: u128,
     /// ExtractionSession::new + producer index + viability fixpoint.
     pub analysis_nanos: u128,
+    /// The SAMPLING SPACE: the candidate graph's strongly connected
+    /// components, built once per search from the producer index.
+    pub space_nanos: u128,
     /// All genome extractions (extract_with_genome, cumulative).
     pub extract_nanos: u128,
     /// All DPS rewrites + bufferizations (cumulative).
@@ -327,23 +336,89 @@ pub struct SearchTimings {
     /// All candidate executions: warmup + timed trials (cumulative) —
     /// the part that shrinks with a faster runtime.
     pub profile_nanos: u128,
+    /// Drawing candidates: `sample_genome` in generation 0 and
+    /// `mutate_genome` in every generation after it (cumulative).
+    pub sample_nanos: u128,
+    /// `plan_fingerprint` over the extracted graphs (cumulative) — the
+    /// dedup cache's key, paid on every candidate including the hits.
+    pub fingerprint_nanos: u128,
+    /// `heuristic_cost_of` (cumulative). Always computed, even under
+    /// device profiling, because the outcome reports it beside the
+    /// measurement.
+    pub heuristic_nanos: u128,
+    /// The Phase 5 finalist lattice (`select_finalist_set`), which on a
+    /// device build warms up each finalist it considers.
+    pub finalist_nanos: u128,
+    /// THE LOOP RESIDUAL: the selection loop's wall minus everything
+    /// the loop timed. Genome clones, the fingerprint cache lookups,
+    /// `rank_insert`, refusal bookkeeping and progress printing live
+    /// here, and so does anything a later change forgets to time.
+    pub other_nanos: u128,
+
+    // ---- sub-buckets of `extract_nanos` (see `ExtractTimings`) ----
+    /// Discovery: the BFS that walks candidates from the roots to build
+    /// the class universe `relax_to_fixpoint` relaxes over.
+    pub extract_discovery_nanos: u128,
+    /// The relaxation fixpoint itself — the pass loop.
+    pub extract_relax_nanos: u128,
+    /// How many relaxation PASSES those nanoseconds bought, summed over
+    /// every genome extraction in the search.
+    pub extract_relax_passes: u64,
+    /// `build_extracted_graph` and the root checks around it: turning
+    /// the settled memo into the extracted graph.
+    pub extract_assemble_nanos: u128,
+
+    // ---- sub-buckets of `plan_build_nanos` ----
+    /// `dps_rewrite`.
+    pub dps_rewrite_nanos: u128,
+    /// `decode_layout_table` (cache misses do the work; hits are cheap).
+    pub decode_nanos: u128,
+    /// `bufferize`.
+    pub bufferize_nanos: u128,
+
+    // ---- sub-buckets of `profile_nanos` (device evaluator only) ----
+    /// PREPARE: the untimed first `execute_plan` — NVRTC compilation,
+    /// slab growth, staging and one run. It is one call, so stage and
+    /// warm are NOT separable from each other without restructuring the
+    /// executor; only compilation is, because the kernel cache times
+    /// itself.
+    pub prepare_nanos: u128,
+    /// The compilation INSIDE `prepare_nanos`, measured by the device's
+    /// kernel cache on its miss path (NVRTC + module load).
+    pub prepare_compile_nanos: u128,
+    /// The timed trials.
+    pub trials_nanos: u128,
+    /// Kernel-cache hits over the whole search — kernels a previous
+    /// candidate already compiled.
+    pub kernel_cache_hits: u64,
+    /// Kernel-cache misses: distinct kernel sources NVRTC compiled.
+    pub kernel_cache_misses: u64,
+
+    // ---- the wall ----
     /// THE WHOLE SEARCH's wall clock, measured ONCE around the
     /// runtime's `search` body and stamped by it. 0 means the caller
-    /// never stamped it, and the residual line says `total unmeasured`
+    /// never stamped it, and the residual line says 0 unattributed
     /// rather than inventing a denominator.
     pub total_nanos: u128,
 }
 
 impl SearchTimings {
     /// The sum of the DISJOINT top-level buckets — what
-    /// [`Self::total_nanos`] is compared against.
+    /// [`Self::total_nanos`] is compared against. Sub-buckets are
+    /// deliberately absent: they partition their parents.
     pub fn attributed_nanos(&self) -> u128 {
         self.saturation_nanos
             + self.serialize_nanos
             + self.analysis_nanos
+            + self.space_nanos
             + self.extract_nanos
             + self.plan_build_nanos
             + self.profile_nanos
+            + self.sample_nanos
+            + self.fingerprint_nanos
+            + self.heuristic_nanos
+            + self.finalist_nanos
+            + self.other_nanos
     }
 
     /// Wall time NO bucket claims: `total - attributed`, saturating (a
@@ -353,26 +428,153 @@ impl SearchTimings {
         self.total_nanos.saturating_sub(self.attributed_nanos())
     }
 
-    /// A compact human-readable ms breakdown for test logs, ending in
-    /// the RESIDUAL LINE — `total | attributed | unattributed` — so a
-    /// bucket that is missing shows up as a number instead of as
-    /// silence.
+    /// Fold one extraction session's cumulative phase timings into the
+    /// `extract_*` sub-buckets.
+    pub fn absorb_extract(&mut self, extract: ExtractTimings) {
+        self.extract_discovery_nanos += extract.discovery_nanos;
+        self.extract_relax_nanos += extract.relax_nanos;
+        self.extract_relax_passes += extract.relax_passes;
+        self.extract_assemble_nanos += extract.assemble_nanos;
+    }
+
+    /// A compact ONE-LINE ms breakdown for test logs, ending in the
+    /// RESIDUAL LINE — `total | attributed | unattributed` — so a bucket
+    /// that is missing shows up as a number instead of as silence.
     pub fn summary(&self) -> String {
         let ms = |n: u128| n as f64 / 1e6;
         format!(
-            "saturation {:.0}ms, serialize {:.0}ms, analysis {:.0}ms, extract {:.0}ms, \
-             plan-build {:.0}ms, profile-exec {:.0}ms | total {:.0}ms | attributed {:.0}ms \
-             | unattributed {:.0}ms",
+            "saturation {:.0}ms, serialize {:.0}ms, analysis {:.0}ms, space {:.0}ms, \
+             extract {:.0}ms, plan-build {:.0}ms, profile-exec {:.0}ms, sample {:.0}ms, \
+             fingerprint {:.0}ms, heuristic {:.0}ms, finalists {:.0}ms, other {:.0}ms \
+             | total {} | attributed {:.0}ms | unattributed {:.0}ms",
             ms(self.saturation_nanos),
             ms(self.serialize_nanos),
             ms(self.analysis_nanos),
+            ms(self.space_nanos),
             ms(self.extract_nanos),
             ms(self.plan_build_nanos),
             ms(self.profile_nanos),
-            ms(self.total_nanos),
+            ms(self.sample_nanos),
+            ms(self.fingerprint_nanos),
+            ms(self.heuristic_nanos),
+            ms(self.finalist_nanos),
+            ms(self.other_nanos),
+            self.wall(),
             ms(self.attributed_nanos()),
             ms(self.unattributed_nanos())
         )
+    }
+
+    /// The wall as the residual line spells it: `unmeasured` when no
+    /// caller stamped [`Self::total_nanos`], so a runtime that does not
+    /// measure its own `search` body says so instead of reporting a
+    /// zero-length search.
+    fn wall(&self) -> String {
+        if self.total_nanos == 0 {
+            "unmeasured".to_string()
+        } else {
+            format!("{:.0}ms", self.total_nanos as f64 / 1e6)
+        }
+    }
+
+    /// THE FULL BREAKDOWN, one bucket per line with its sub-buckets
+    /// beside it, ending in the same residual line. This is the form to
+    /// print when a search took long enough that someone is reading.
+    pub fn breakdown(&self) -> String {
+        use std::fmt::Write;
+        let ms = |n: u128| n as f64 / 1e6;
+        let mut out = String::new();
+        let mut row = |label: &str, nanos: u128, note: String| {
+            let share = if self.total_nanos == 0 {
+                String::new()
+            } else {
+                format!(" {:>5.1}%", nanos as f64 * 100.0 / self.total_nanos as f64)
+            };
+            let _ = write!(out, "\n  {label:<14}{:>11.0}ms{share}", ms(nanos));
+            if !note.is_empty() {
+                let _ = write!(out, "   {note}");
+            }
+        };
+        row("saturation", self.saturation_nanos, String::new());
+        row("serialize", self.serialize_nanos, String::new());
+        row("analysis", self.analysis_nanos, String::new());
+        row("space", self.space_nanos, String::new());
+        row(
+            "extract",
+            self.extract_nanos,
+            format!(
+                "discovery {:.0}ms, relax {:.0}ms over {} pass(es), assemble {:.0}ms",
+                ms(self.extract_discovery_nanos),
+                ms(self.extract_relax_nanos),
+                self.extract_relax_passes,
+                ms(self.extract_assemble_nanos)
+            ),
+        );
+        row(
+            "plan-build",
+            self.plan_build_nanos,
+            format!(
+                "dps {:.0}ms, decode {:.0}ms, bufferize {:.0}ms",
+                ms(self.dps_rewrite_nanos),
+                ms(self.decode_nanos),
+                ms(self.bufferize_nanos)
+            ),
+        );
+        row(
+            "profile-exec",
+            self.profile_nanos,
+            format!(
+                "prepare {:.0}ms (compile {:.0}ms, {} kernel miss(es) / {} hit(s)), \
+                 trials {:.0}ms",
+                ms(self.prepare_nanos),
+                ms(self.prepare_compile_nanos),
+                self.kernel_cache_misses,
+                self.kernel_cache_hits,
+                ms(self.trials_nanos)
+            ),
+        );
+        row("sample", self.sample_nanos, String::new());
+        row("fingerprint", self.fingerprint_nanos, String::new());
+        row("heuristic", self.heuristic_nanos, String::new());
+        row("finalists", self.finalist_nanos, String::new());
+        row("other", self.other_nanos, "loop residual".to_string());
+        let _ = write!(
+            out,
+            "\n  total {} | attributed {:.0}ms | unattributed {:.0}ms",
+            self.wall(),
+            ms(self.attributed_nanos()),
+            ms(self.unattributed_nanos())
+        );
+        out
+    }
+}
+
+/// ONE EXTRACTION SESSION's phase clocks, cumulative over every genome
+/// it extracted (2026-09-05). The phases are the ones
+/// `Extractor::extract` and `Extractor::relax_to_fixpoint` already name
+/// in their own comments — discovery, the relaxation fixpoint, and the
+/// graph assembly that reads the settled memo.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtractTimings {
+    /// The candidate-walk BFS that builds the class universe.
+    pub discovery_nanos: u128,
+    /// The relaxation pass loop, plus the settle that records the
+    /// definitive `None`s.
+    pub relax_nanos: u128,
+    /// Passes the relaxation took, summed over extractions.
+    pub relax_passes: u64,
+    /// The root checks and `build_extracted_graph`.
+    pub assemble_nanos: u128,
+}
+
+/// A rule name on ONE LINE, at most `width` characters, cut on a char
+/// boundary. Runs of whitespace collapse to a single space so a rule
+/// body's indentation does not eat the budget.
+fn one_line(name: &str, width: usize) -> String {
+    let flat = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(width) {
+        Some((cut, _)) => format!("{}...", &flat[..cut]),
+        None => flat,
     }
 }
 
@@ -431,6 +633,13 @@ pub struct SaturationReport {
 impl SaturationReport {
     /// How many rules [`Self::from_egraph`] keeps.
     pub const TOP_RULES: usize = 15;
+
+    /// How wide a rule name prints. MOST OF OUR RULES ARE ANONYMOUS, so
+    /// egglog names them by their SOURCE TEXT — a whole multi-line rule
+    /// body per name. [`Self::summary`] prints the head of that on one
+    /// line (egglog's own `Display` does the same at 80); the untruncated
+    /// name stays in [`RuleTiming::name`] for anything reading the data.
+    pub const NAME_WIDTH: usize = 110;
 
     /// Take the report off a saturated e-graph. Call it AFTER the run;
     /// on an e-graph that never ran it yields zeros, which is what a
@@ -511,10 +720,17 @@ impl SaturationReport {
             ms(self.rule_total_nanos)
         );
         for ruleset in &self.rulesets {
+            // egglog names the unnamed ruleset with the empty string —
+            // the rules that carry no `:ruleset`. Say so.
+            let name = if ruleset.name.is_empty() {
+                "(default)"
+            } else {
+                ruleset.name.as_str()
+            };
             let _ = write!(
                 out,
                 "\n  ruleset {:<28} search+apply {:>9.0}ms  merge {:>7.0}ms  rebuild {:>8.0}ms",
-                ruleset.name,
+                name,
                 ms(ruleset.search_and_apply_nanos),
                 ms(ruleset.merge_nanos),
                 ms(ruleset.rebuild_nanos)
@@ -527,7 +743,7 @@ impl SaturationReport {
                 rank + 1,
                 ms(rule.search_and_apply_nanos),
                 rule.matches,
-                rule.name
+                one_line(&rule.name, Self::NAME_WIDTH)
             );
         }
         if self.rulesets.is_empty() && self.top_rules.is_empty() {
@@ -593,8 +809,9 @@ mod timing_tests {
             analysis_nanos: 4 * MS,
             extract_nanos: 3 * MS,
             plan_build_nanos: 2 * MS,
-            profile_nanos: 1 * MS,
+            profile_nanos: MS,
             total_nanos: 40 * MS,
+            ..SearchTimings::default()
         };
         assert_eq!(timings.attributed_nanos(), 25 * MS);
         assert_eq!(timings.unattributed_nanos(), 15 * MS);
@@ -614,6 +831,11 @@ mod timing_tests {
             ..SearchTimings::default()
         };
         assert_eq!(timings.unattributed_nanos(), 0);
+        assert!(
+            timings.summary().contains("| total unmeasured |"),
+            "an unstamped wall must say so: {}",
+            timings.summary()
+        );
     }
 }
 

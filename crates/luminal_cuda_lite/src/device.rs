@@ -113,6 +113,16 @@ fn bytes_to_typed(bytes: &[u8], dtype: PlanDtype) -> Result<HostBuffer> {
 struct KernelCache {
     ctx: Arc<CudaContext>,
     modules: HashMap<u64, (Arc<CudaModule>, CudaFunction)>,
+    /// COMPILATION ACCOUNTING (2026-09-05). NVRTC time is paid once per
+    /// distinct kernel source for the whole life of the device, so it
+    /// belongs to no single candidate — but it is real search time, and
+    /// the only place that can see it is the miss path itself. The
+    /// counters are read by [`crate::profile::profile_candidate`] as
+    /// deltas, which is how the search attributes compilation inside
+    /// the prepare phase without restructuring `execute_plan`.
+    hits: u64,
+    misses: u64,
+    compile_nanos: u128,
 }
 
 impl KernelCache {
@@ -122,12 +132,16 @@ impl KernelCache {
         source.hash(&mut hasher);
         let key = hasher.finish();
         if let Some((_, func)) = self.modules.get(&key) {
+            self.hits += 1;
             return Ok(func.clone());
         }
+        self.misses += 1;
+        let compile_start = std::time::Instant::now();
         let ptx =
             compile_ptx(source).map_err(|e| anyhow!("NVRTC failed: {e:?}\nsource:\n{source}"))?;
         let module = self.ctx.load_module(ptx).context("module load")?;
         let func = module.load_function("k").context("entry `k` missing")?;
+        self.compile_nanos += compile_start.elapsed().as_nanos();
         self.modules.insert(key, (module, func.clone()));
         Ok(func)
     }
@@ -165,6 +179,9 @@ impl CudaDevice {
             cache: KernelCache {
                 ctx: ctx.clone(),
                 modules: HashMap::new(),
+                hits: 0,
+                misses: 0,
+                compile_nanos: 0,
             },
             ctx,
             stream,
@@ -185,6 +202,24 @@ impl CudaDevice {
                 .with_context(|| format!("arena slab alloc, {bytes} bytes"))?,
         );
         Ok(())
+    }
+
+    /// KERNEL-CACHE LOOKUPS that found a compiled module, over this
+    /// device's whole life.
+    pub fn kernel_cache_hits(&self) -> u64 {
+        self.cache.hits
+    }
+
+    /// KERNEL-CACHE MISSES — distinct kernel sources this device has
+    /// compiled through NVRTC.
+    pub fn kernel_cache_misses(&self) -> u64 {
+        self.cache.misses
+    }
+
+    /// Nanoseconds spent on the miss path: NVRTC compilation, module
+    /// load and entry lookup, over this device's whole life.
+    pub fn kernel_compile_nanos(&self) -> u128 {
+        self.cache.compile_nanos
     }
 
     /// The slab's current size in bytes (0 before the first plan needs

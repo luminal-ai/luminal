@@ -656,8 +656,13 @@ impl CudaRuntime {
                 outcome.ranked.clone(),
                 Some(outcome.best_plan.clone()),
             )];
+            let finalist_start = std::time::Instant::now();
             let (selected, rejections) =
                 crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
+            // THE LATTICE IS NOT FREE on a device build: it warms up
+            // every finalist it considers. Its own bucket, so it can
+            // never sit in the residual.
+            outcome.timings.finalist_nanos = finalist_start.elapsed().as_nanos();
             outcome.lattice_rejections = rejections;
             let (_, finalist) = selected
                 .into_iter()

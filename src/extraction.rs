@@ -101,6 +101,12 @@ struct Extractor<'a> {
     /// sampled stacks inside `is_better`). The rendered form of an enode
     /// never changes within a session, so one cache serves every genome.
     stable_key_cache: std::cell::RefCell<HashMap<NodeId, std::rc::Rc<str>>>,
+    /// PHASE CLOCKS, cumulative over every genome this extractor
+    /// extracted (2026-09-05) — discovery, the relaxation fixpoint, and
+    /// the assembly that reads the settled memo. Never cleared by
+    /// `extract_with_genome`: the search wants the session's total, and
+    /// [`ExtractionSession::extract_timings`] is how it reads it.
+    timings: crate::search_support::ExtractTimings,
 }
 
 #[derive(Debug, Clone)]
@@ -490,6 +496,16 @@ impl<'a> ExtractionSession<'a> {
             out.push_str("no cyclic SCCs recorded");
         }
         out
+    }
+
+    /// THE SESSION's cumulative extraction phase clocks — discovery,
+    /// relaxation (with its pass count) and assembly, summed over every
+    /// genome extracted through it (2026-09-05). Read it after the
+    /// selection loop; the search folds it into
+    /// [`crate::search_support::SearchTimings`]'s `extract_*`
+    /// sub-buckets.
+    pub fn extract_timings(&self) -> crate::search_support::ExtractTimings {
+        self.extractor.timings
     }
 
     pub fn extract_with_genome(&mut self, genome: &Genome) -> Result<Option<ExtractedGraph>> {
@@ -985,6 +1001,7 @@ impl<'a> Extractor<'a> {
             tensor_bytes_cache: Default::default(),
             dtype_index: Default::default(),
             stable_key_cache: Default::default(),
+            timings: Default::default(),
         }
     }
 
@@ -1062,6 +1079,11 @@ impl<'a> Extractor<'a> {
         }
 
         self.relax_to_fixpoint(&roots);
+        // ASSEMBLE: everything after the fixpoint — the per-root
+        // settled-memo check (which on a refusal walks the output spine
+        // to name WHICH outputs have no plan) and the graph build that
+        // reads the memo.
+        let assemble_start = std::time::Instant::now();
         for root in &roots {
             if self.memo.get(root).cloned().flatten().is_none() {
                 // Refusal accounting: the output list is ONE class — walk
@@ -1110,6 +1132,7 @@ impl<'a> Extractor<'a> {
                             .and_then(|c| self.egraph.nodes.get(c).map(|n| n.eclass.clone()));
                     }
                 }
+                self.timings.assemble_nanos += assemble_start.elapsed().as_nanos();
                 bail!(
                     "failed to extract LayoutIR graph from BufferOutputLit eclass {root}; \
                      outputs with no plan (binding order): {failing:?}"
@@ -1117,7 +1140,9 @@ impl<'a> Extractor<'a> {
             }
         }
 
-        Ok(Some(self.build_extracted_graph(&roots)?))
+        let built = self.build_extracted_graph(&roots);
+        self.timings.assemble_nanos += assemble_start.elapsed().as_nanos();
+        Ok(Some(built?))
     }
 
     /// The candidate set for one class under the current genome (or the
@@ -1232,6 +1257,7 @@ impl<'a> Extractor<'a> {
             candidate_lists.push(candidates);
         }
         let total_candidates: usize = candidate_lists.iter().map(Vec::len).sum();
+        self.timings.discovery_nanos += discovery_start.elapsed().as_nanos();
         if discovery_start.elapsed().as_secs() >= 2 {
             eprintln!(
                 "[extract] discovery {:?}: {} classes, {} candidates",
@@ -1346,6 +1372,12 @@ impl<'a> Extractor<'a> {
                 .collect();
             self.blocked.insert(class.clone(), blockers);
         }
+        // THE RELAX CLOCK covers the pass loop, the settle that records
+        // the definitive `None`s, and the blockage record: all three are
+        // the fixpoint's own work, and a boundary drawn between them
+        // would leave a gap no bucket owns.
+        self.timings.relax_nanos += relax_start.elapsed().as_nanos();
+        self.timings.relax_passes += passes as u64;
     }
 
     fn candidate_for_node(&self, node_id: &NodeId, node: &Node) -> Option<Candidate> {

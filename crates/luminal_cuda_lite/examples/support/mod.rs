@@ -169,13 +169,15 @@ pub mod device {
             outcome.plans_profiled,
             outcome.timings.summary()
         );
-        // WHERE SATURATION WENT, behind the same flag the progress
-        // lines use: per-ruleset totals and the slowest rules, from
-        // egglog's own run report.
-        if options.search_log_enabled()
-            && let Some(report) = &outcome.saturation
-        {
-            println!("{name}: {}", report.summary());
+        // THE FULL ATTRIBUTION, behind the same flag the progress lines
+        // use: every bucket with its sub-buckets, then where saturation
+        // went (per-ruleset totals and the slowest rules, from egglog's
+        // own run report).
+        if options.search_log_enabled() {
+            println!("{name}: timing breakdown{}", outcome.timings.breakdown());
+            if let Some(report) = &outcome.saturation {
+                println!("{name}: {}", report.summary());
+            }
         }
         println!(
             "{name}: winner {:.3} ms measured on device (heuristic cost {} bytes moved)",
