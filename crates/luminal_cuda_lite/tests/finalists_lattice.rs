@@ -178,8 +178,17 @@ fn bucketed_options(budget: Option<usize>) -> CompileOptions {
 fn a_device_budget_forces_the_lattice_to_a_slower_set() {
     let cx = bucketed_fixture();
 
+    // THE DECOMPOSED ROUTE ON PURPOSE: this pin is about the LATTICE's
+    // budget fallback, which needs a bucket whose ranked finalists
+    // differ in slab size. Under the default (marker) vocabulary every
+    // finalist of this fixture elects the same host call and needs the
+    // same slab, so "one byte under the winner" admits nothing and the
+    // walk correctly runs out — a true refusal, but not this test's
+    // subject.
     // Pass 1: what does the winning set need?
-    let mut baseline = CudaRuntime::load(&cx).expect("cuda load");
+    let mut baseline =
+        CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
+            .expect("cuda load");
     baseline
         .bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(9, 11)])
         .expect("disjoint sorted buckets bind");
@@ -204,7 +213,9 @@ fn a_device_budget_forces_the_lattice_to_a_slower_set() {
 
     // Pass 2: one byte too little for the winning set.
     let budget = peak - 1;
-    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    let mut rt =
+        CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
+            .expect("cuda load");
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(9, 11)])
         .expect("disjoint sorted buckets bind");
     let outcome = rt

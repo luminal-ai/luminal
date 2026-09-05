@@ -41,8 +41,8 @@ struct NativeParts {
 /// A `Default` instance holds NO program and NO op vocabulary: every
 /// ladder method past `load` refuses it by name (`load before search`),
 /// so the empty registry a default carries is never the thing a caller
-/// searches under. `load`/`load_with_cublaslt`/`load_with_registry` are
-/// the only ways to get a usable one.
+/// searches under. `load`/`load_with_registry` are the only ways to get
+/// a usable one.
 #[derive(Default)]
 pub struct CudaRuntime {
     native: Option<NativeParts>,
@@ -103,27 +103,16 @@ pub struct CudaRuntime {
 
 impl CudaRuntime {
     /// Record the graph's native program under the DEFAULT op registry
-    /// ([`crate::ops::cuda_registry`]). Saturation happens in
-    /// [`CudaRuntime::search`].
+    /// ([`crate::ops::cuda_registry`]) — which since the 2026-09-04
+    /// ruling INCLUDES the four cuBLASLt marker contracts, so a default
+    /// search assembles the marker's egg snippets and may elect the
+    /// host-call route. Saturation happens in [`CudaRuntime::search`].
+    ///
+    /// For the DECOMPOSED route on purpose (every matmul as CL's own
+    /// multiply/reduce kernels), load with
+    /// [`crate::ops::cuda_registry_without_cublaslt`].
     pub fn load(graph: &graph::Graph) -> Result<Self> {
         Self::load_with_registry(graph, crate::ops::cuda_registry())
-    }
-
-    /// [`CudaRuntime::load`] with the cuBLASLt marker vocabulary
-    /// enabled: search assembles the marker's egg snippets and may
-    /// elect the four host-call contracts. EXPLICIT OPT-IN for now: the
-    /// view-arity tripwire that used to kill saturation on real graphs
-    /// is fixed (it now checks the map literal); at the 2×4 harness
-    /// budget the search can still die of exhaustion on the collapse's
-    /// re-description 2-cycle — loudly, never a wrong plan. The 2D
-    /// canonical matmul form searches and elects green; real graphs
-    /// elect at 12×16.
-    ///
-    /// It is now exactly [`CudaRuntime::load_with_registry`] over the
-    /// [`crate::ops::cuda_registry_with_cublaslt`] preset — a named
-    /// convenience, not a mode.
-    pub fn load_with_cublaslt(graph: &graph::Graph) -> Result<Self> {
-        Self::load_with_registry(graph, crate::ops::cuda_registry_with_cublaslt())
     }
 
     /// THE CONFIGURABLE LOAD (ruling 2026-09-03: *"you should select the
@@ -364,17 +353,14 @@ impl CudaRuntime {
     ///    [`crate::ops::cublaslt::host_dispatchable`]).
     ///
     /// THIS STATIC IS THE DEFAULT PRESET'S claim set — the same
-    /// derivation over [`crate::ops::cuda_registry`], for callers with no
-    /// graph in hand. A LOADED instance claims what its own registry
-    /// derives: [`CudaRuntime::active_allow_list`].
+    /// derivation over [`crate::ops::cuda_registry`] (markers included),
+    /// for callers with no graph in hand. A LOADED instance claims what
+    /// its own registry derives: [`CudaRuntime::active_allow_list`]. For
+    /// the decomposed preset's claim set, load with
+    /// [`crate::ops::cuda_registry_without_cublaslt`] and read that
+    /// instance's `active_allow_list`.
     pub fn allow_list() -> Vec<&'static str> {
         Self::allow_list_over(&crate::ops::cuda_registry())
-    }
-
-    /// [`CudaRuntime::allow_list`] over the marker-enabled registry —
-    /// the claim set a [`CudaRuntime::load_with_cublaslt`] search uses.
-    pub fn allow_list_with_cublaslt() -> Vec<&'static str> {
-        Self::allow_list_over(&crate::ops::cuda_registry_with_cublaslt())
     }
 
     fn allow_list_over(registry: &[crate::ops::RegisteredOp]) -> Vec<&'static str> {

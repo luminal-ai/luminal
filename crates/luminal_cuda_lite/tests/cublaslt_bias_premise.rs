@@ -122,7 +122,7 @@ fn report_forms(egraph: &EGraph, what: &str) -> (usize, usize, usize, usize) {
 #[test]
 fn linear_with_bias_mints_the_bias_form_on_a_left_major_d() {
     let (cx, _x, _w, _b, _out) = linear_with_bias();
-    let rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
+    let rt = CudaRuntime::load(&cx).expect("load");
     let egraph = rt.saturated_egraph().expect("saturation");
 
     let (base, bias, _acc, _acc_bias) = report_forms(&egraph, "linear(4x8 . 8x3)+b[3]");
@@ -225,7 +225,7 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
             search_log: false,
             ..Default::default()
         };
-        let mut rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
+        let mut rt = CudaRuntime::load(&cx).expect("load");
         let outcome = match rt.search(&data, &options) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -349,7 +349,7 @@ fn per_row_bias_does_not_mint_the_bias_form() {
     // cannot express this for the sibling call (its bias runs along the
     // sibling's rows = the recorder's COLUMNS).
     let _out = (x.matmul(w) + b_rows.expand_dim(1, N)).output();
-    let rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
+    let rt = CudaRuntime::load(&cx).expect("load");
     let egraph = rt.saturated_egraph().expect("saturation");
     let (base, bias, _acc, acc_bias) = report_forms(&egraph, "matmul + per-ROW b[4]");
     assert!(base > 0, "the matmul itself still assembles");

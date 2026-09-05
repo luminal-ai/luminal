@@ -395,7 +395,7 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
     };
 
     let (cx, x, w, b, out) = build();
-    let mut fused = CudaRuntime::load_with_cublaslt(&cx).expect("load fused");
+    let mut fused = CudaRuntime::load(&cx).expect("load fused");
     fused
         .search(&data_for(x, w, b), &options)
         .expect("fused search");
@@ -417,8 +417,13 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
         .expect("fused execute (bias epilogue under COL D)");
     let got = walked_dense(&fused, out);
 
+    // THE DECOMPOSED ROUTE ON PURPOSE: this half of the comparison has
+    // to be the multiply/reduce chain, so it loads the registry that has
+    // no marker in it (the DEFAULT registry does, since 2026-09-04).
     let (cx, x, w, b, out) = build();
-    let mut plain = CudaRuntime::load(&cx).expect("load plain");
+    let mut plain =
+        CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
+            .expect("load plain");
     plain
         .search(
             &data_for(x, w, b),
@@ -436,7 +441,8 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
 
 /// Item 4 END TO END: the marker-elected plan (searched with the
 /// marker vocabulary, executed through the host-call arm) against the
-/// decomposed route (default vocabulary, NVRTC kernels), tolerance-based
+/// decomposed route (`cuda_registry_without_cublaslt`, NVRTC kernels),
+/// tolerance-based
 /// per the reduction-order contract in `assert_close`.
 #[test]
 fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
@@ -469,7 +475,7 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
 
     // Marker-elected route.
     let (cx, a, b, out) = build();
-    let mut fused = CudaRuntime::load_with_cublaslt(&cx).expect("load fused");
+    let mut fused = CudaRuntime::load(&cx).expect("load fused");
     let data = data_for(a.id, b.id);
     fused.search(&data, &options).expect("fused search");
     let elected =
@@ -488,9 +494,14 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
     // disclosed layout (get_f32 refuses non-row-major backings by design).
     let got = walked_dense(&fused, out.id);
 
-    // Decomposed route (default vocabulary — no marker in the assembly).
+    // Decomposed route ON PURPOSE — the registry with no marker in the
+    // assembly. (The DEFAULT registry carries the marker since
+    // 2026-09-04, so this side must ask for the plain one by name or the
+    // comparison degenerates to marker-vs-marker.)
     let (cx, a, b, out) = build();
-    let mut plain = CudaRuntime::load(&cx).expect("load plain");
+    let mut plain =
+        CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
+            .expect("load plain");
     let data = data_for(a.id, b.id);
     plain
         .search(&data, &luminal_cuda_lite::harness_search_options())

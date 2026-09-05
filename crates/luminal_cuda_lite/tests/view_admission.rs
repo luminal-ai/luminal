@@ -56,7 +56,15 @@ fn plan_for(
     cx: &Graph,
     inputs: &[(NodeIndex, HostBuffer)],
 ) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
-    let mut rt = CudaRuntime::load(cx).expect("cuda load");
+    // THE DECOMPOSED ROUTE ON PURPOSE: this file audits the NVRTC plan
+    // SHAPE (materialize/copy/buffer counts, and `audit`'s standing
+    // requirement that every elected compute op have a codegen row). A
+    // cuBLASLt marker — default since 2026-09-04 — is a host library
+    // call with no codegen row, so the chained-matmul fixture would
+    // leave the audit rather than pass it.
+    let mut rt =
+        CudaRuntime::load_with_registry(cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
+            .expect("cuda load");
     let data: FxHashMap<NodeIndex, HostBuffer> = inputs.iter().cloned().collect();
     let outcome = rt
         .search(&data, &view_search_options())

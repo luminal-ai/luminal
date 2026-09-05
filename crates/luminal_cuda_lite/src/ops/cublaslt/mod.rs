@@ -48,6 +48,27 @@
 //! orientation). Split sources + Ruling 1: m/n/k AND every ld may be
 //! symbolic (bound at execute time from the dyn map); static pitches are
 //! read from the layout.
+//!
+//! CONDITIONAL SOUNDNESS — THE STANDING CAVEAT (recorded 2026-09-04,
+//! when the markers became part of the default registry). Electing a
+//! marker replaces a decomposed multiply/reduce chain with
+//! `cublasLtMatmul`, and the two are NOT bit-identical. cuBLASLt picks
+//! its own REDUCTION ORDER (split-k, tile shape and the serialization
+//! of partial sums are per-algo and per-shape choices the heuristic
+//! makes for us), and it CONTRACTS multiply-add pairs into FMA where
+//! our emitted NVRTC kernels need not. So the matmul rewrites this
+//! estate mints are equalities only up to float reassociation and
+//! contraction: sound for a real-arithmetic reading of the graph,
+//! CONDITIONALLY sound for the machine one.
+//!
+//! The e-graph has no approximate-equality stratum today — every union
+//! it holds claims exactness — so nothing here distinguishes the two.
+//! Building that stratum (an explicit approximate-rewrite pass carrying
+//! its own tolerance account, so an approximate union can never be
+//! mistaken for an exact one) is DEFERRED by ruling 2026-09-04. Until
+//! it lands, every marker election carries this caveat, and the
+//! device-side check is the TOLERANCE comparison in
+//! `tests/cublaslt_contracts.rs` — never a bit-for-bit one.
 
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::layout_ir::{

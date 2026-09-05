@@ -18,14 +18,18 @@
 //! (alpha = 1.0f const; beta in {0.0f, 1.0f} structural); strict
 //! CUBLAS_COMPUTE_32F with a startup detector at handle creation; a
 //! valid Cdesc on every call; workspace OWNED explicitly (allocated by
-//! us, sized into the heuristic preference — no silent fallback: zero
-//! heuristic results is a loud bail); stream-ordered on the CALLER's
-//! stream (the same stream the surrounding NVRTC kernels run on).
+//! us ONCE per CUDA context and reused by every dispatch — see
+//! [`workspace_slab`] — sized into the heuristic preference; no silent
+//! fallback: zero heuristic results is a loud bail); stream-ordered on
+//! the CALLER's stream (the same stream the surrounding NVRTC kernels
+//! run on).
 
 use anyhow::{Context, Result, anyhow};
 use cudarc::cublaslt::result as lt;
 use cudarc::cublaslt::sys;
-use cudarc::driver::{CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::exec::{CSource, LtCall, LtDesc, LtOrder};
@@ -118,6 +122,47 @@ fn handle() -> Result<&'static Mutex<LtHandle>> {
 /// dispatch on this process is refused.
 pub fn assert_compute_strictness() -> Result<()> {
     handle().map(|_| ())
+}
+
+/// THE cuBLASLt WORKSPACE SLAB: [`WORKSPACE_BYTES`] allocated ONCE per
+/// CUDA context and held for the life of the process, reached the same
+/// way [`handle`] is (a `static OnceLock` behind a `Mutex`).
+///
+/// WHY ONCE — SEARCH-TIME ELECTION BIAS. This used to be an
+/// `alloc_zeros` on EVERY dispatch. The search calls dispatch once per
+/// candidate genome per profiling round, so a 32 MiB allocation was
+/// charged to the marker on every measurement while the decomposed
+/// route it competes against pays nothing of the kind: the op is then
+/// ranked on its allocator cost, not its matmul. That is exactly the
+/// failure main's FlashInfer host op documents — "global workspaces
+/// (`static OnceLock`) are shared across all instances ... without this,
+/// the GA never selects FlashInfer because the first-run allocation cost
+/// dwarfs the kernel time" — and main's cuBLASLt handle cache
+/// (`try_create_cublaslt`) is the same shape for the same reason.
+///
+/// WHY KEYED BY CONTEXT, NOT BY STREAM. A `CudaSlice` is memory in the
+/// context its stream belongs to, so the key has to separate contexts.
+/// Main keys its handle cache by `stream.cu_stream()`, which cannot work
+/// here: `CudaDevice::new` takes `ctx.default_stream()`, whose
+/// `cu_stream` is the NULL stream for every ordinal, so a stream key
+/// would hand a context-A allocation to a context-B dispatch. Keying on
+/// `cu_ctx` is the faithful adaptation. Within one context CL issues
+/// everything on that one NULL stream (see `device.rs`), so a shared
+/// slab cannot be touched by two overlapping matmuls.
+///
+/// The map holds each slice PERMANENTLY and a `CudaSlice` owns an
+/// `Arc<CudaStream>`, which owns its `Arc<CudaContext>` — so a live
+/// entry pins its own context and the `cu_ctx` address behind a key can
+/// never be recycled by a different context. The cost of that is 32 MiB
+/// per context, never freed; main accepts the same trade for the same
+/// reason.
+///
+/// LOCK ORDER: [`dispatch`] takes the handle mutex and then this one,
+/// and it is the only site that holds both. Nothing takes them the other
+/// way round.
+fn workspace_slab() -> &'static Mutex<HashMap<usize, CudaSlice<u8>>> {
+    static WORKSPACES: OnceLock<Mutex<HashMap<usize, CudaSlice<u8>>>> = OnceLock::new();
+    WORKSPACES.get_or_init(Default::default)
 }
 
 /// RAII matrix layout. CUBLASLT_MATRIX_LAYOUT_ORDER is ALWAYS declared
@@ -295,9 +340,23 @@ pub fn dispatch(
     // Workspace: OURS, explicitly, sized into the preference so the
     // heuristic can only pick algos that fit it. Zero heuristic hits is
     // a loud bail (the result layer maps that to NOT_SUPPORTED).
-    let workspace = stream
-        .alloc_zeros::<u8>(WORKSPACE_BYTES)
-        .context("cuBLASLt workspace alloc")?;
+    //
+    // Allocated ONCE per CUDA context and reused by every dispatch (see
+    // `workspace_slab`), never per call — a per-call 32 MiB alloc priced
+    // the marker out of its own search. Zeroed only at creation:
+    // cuBLASLt treats the workspace as scratch and neither reads it
+    // before writing nor requires it clean between calls.
+    let mut workspaces = workspace_slab()
+        .lock()
+        .map_err(|_| anyhow!("cuBLASLt workspace mutex poisoned"))?;
+    let workspace = match workspaces.entry(stream.context().cu_ctx() as usize) {
+        Entry::Occupied(slot) => slot.into_mut(),
+        Entry::Vacant(slot) => slot.insert(
+            stream
+                .alloc_zeros::<u8>(WORKSPACE_BYTES)
+                .context("cuBLASLt workspace alloc")?,
+        ),
+    };
     let pref =
         lt::create_matmul_pref().map_err(|e| anyhow!("cublasLtMatmulPreferenceCreate: {e:?}"))?;
     struct Pref {

@@ -9,8 +9,10 @@
 //! THE OP SET IS CHOSEN AT INITIALIZATION (ruling 2026-09-03, #420/#422
 //! rejoin Phase 2): a runtime's matcher vocabulary and its derived allow
 //! list come from the `Vec<RegisteredOp>` handed to
-//! [`CudaRuntime::load_with_registry`] — [`cuda_registry`] and
-//! [`cuda_registry_with_cublaslt`] are presets, and
+//! [`CudaRuntime::load_with_registry`] — [`cuda_registry`] (the DEFAULT:
+//! every row this crate ships, cuBLASLt markers included since the
+//! 2026-09-04 ruling) and [`cuda_registry_without_cublaslt`] (the
+//! decomposed route on purpose) are the presets, and
 //! [`cuda_registry_filtered`] narrows either without editing this crate.
 //!
 //! THIS CRATE OWNS ITS SEARCH (ruling 2026-09-03, #420/#422 rejoin
@@ -88,7 +90,9 @@ pub mod profile;
 pub use bindings::CudaBindings;
 pub use host_buffer::HostBuffer;
 pub use layouts::CudaPlan;
-pub use ops::{RegisteredOp, cuda_registry, cuda_registry_filtered, cuda_registry_with_cublaslt};
+pub use ops::{
+    RegisteredOp, cuda_registry, cuda_registry_filtered, cuda_registry_without_cublaslt,
+};
 pub use runtime::CudaRuntime;
 pub use search::{CompileOptions, Evaluator, SearchOutcome, harness_search_options};
 
