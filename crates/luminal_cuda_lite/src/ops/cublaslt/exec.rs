@@ -87,6 +87,16 @@
 //! call whose D is not COL is unreachable from the estate, and reaching
 //! it is a bug to bail on, never a case to handle.
 //!
+//! ONE EXCEPTION, and it is not a drift: at a DEGENERATE destination
+//! extent (`m == 1` or `n == 1`) the right-major and left-major
+//! contiguous index maps over `[m, n]` are the SAME FUNCTION, so both
+//! spellings live in one e-class and the decoder — RightMajor first by
+//! preference order — may hand this bridge the right-major one for a
+//! class whose left-major spelling the decorator matched. There is no
+//! disagreement about bytes to refuse, so [`bind_destination`] spells
+//! the coincidence COL on a bias-bearing call (whisper, A100
+//! 2026-09-04 — the arm carries the failure verbatim).
+//!
 //! THE DESTINATION FRAME IS THE PLAN'S, NOT A CONSTANT (regression fix,
 //! 2026-08-31 — see [`bind_destination`]). The paragraph above says
 //! "the executor materializes every result DENSE ROW-MAJOR in the
@@ -342,6 +352,50 @@ pub fn bind_destination(
         );
     }
     let desc = match &dest.mirror {
+        // THE DEGENERATE-EXTENT COINCIDENCE (whisper on the A100,
+        // 2026-09-04). At `n == 1` — symmetrically `m == 1` — the
+        // right-major and left-major contiguous index maps over the
+        // `[m, n]` frame are the SAME FUNCTION: `r*n + c` and `c*m + r`
+        // agree because the collapsed axis's coordinate can only be 0.
+        // The e-graph knows it (an extent-1 `CoordVar` welds to
+        // `(IntLit 0)` by the [n,n] pin collapse, so the right-major and
+        // left-major strided chains fold together and both contiguous
+        // spellings land in ONE class), and that is exactly the drift
+        // this bridge saw: the estate's bias decorators matched the
+        // `LeftMajorContiguousElementLayoutLit` spelling, while
+        // `decode_layout`, whose preference order tries RightMajor
+        // FIRST, handed the executor the right-major spelling out of
+        // that same class. Nothing had actually diverged — but building
+        // ROW here tripped [`assert_bias_destination_order`] and refused
+        // EVERY whisper candidate genome at device prepare:
+        //
+        //   cuBLASLt CublasLtAccumulateBias: unreachable: the bias
+        //   decorators require a LeftMajor D; a bias form
+        //   (LayoutTensorOpCublasLtAccumulateBias) reached the executor
+        //   with a Row-order D descriptor (384x1 ld 1). [...]
+        //
+        // (whisper tiny.en decodes ONE token: the recorder site is
+        // x[1, 384] @ w[384, 384] + b[384], so the sandwich sibling's
+        // call frame is m = 384, n = 1.) Search then died with "no
+        // candidate genome produced an executable plan".
+        //
+        // MEMORY IDENTITY, the whole argument: ROW `m x 1 / ld 1`
+        // addresses `r*1 + 0 = r` and COL `m x 1 / ld m` addresses
+        // `0*m + r = r`, for every `r` in `[0, m)`; ROW `1 x n / ld n`
+        // addresses `0*n + c = c` and COL `1 x n / ld 1` addresses
+        // `c*1 + 0 = c`. Same elements, same order, same reach. So on a
+        // bias-bearing call the coincidence is spelled the way the
+        // LIBRARY requires — BIAS/RELU_BIAS is CUBLAS_STATUS_NOT_SUPPORTED
+        // on a ROW-order D (measured on the A100 2026-08-28) — which is
+        // also the spelling the decorator's premise matched.
+        //
+        // NON-degenerate calls are untouched, and the tripwire below
+        // stays exactly as it is: with both extents > 1 the two orders
+        // denote DIFFERENT byte orders, and a bias form arriving with a
+        // ROW D there is a real drift to bail on.
+        M::RightMajor(_) if call.bias_operand.is_some() && (call.m == 1 || call.n == 1) => {
+            LtDesc::col(call.m, call.n, call.m.max(1))
+        }
         M::RightMajor(_) => LtDesc::row(call.m, call.n, call.n.max(1)),
         M::LeftMajor(_) => LtDesc::col(call.m, call.n, call.m.max(1)),
         other => bail!(
@@ -373,7 +427,12 @@ pub fn bind_destination(
 /// LeftMajor election to `CUBLASLT_ORDER_COL`. A bias-bearing call whose
 /// D descriptor is not COL is therefore UNREACHABLE from a planned
 /// dispatch — it can only mean the estate premise and this bridge have
-/// drifted apart (or a hand-built call). Bail, never dispatch: the
+/// drifted apart (or a hand-built call). The one way that used to be
+/// reachable WITHOUT a drift — a degenerate `m == 1` / `n == 1`
+/// destination, where the two orders are the same function and the
+/// decoder's RightMajor-first preference picks the other spelling out
+/// of the shared class — is resolved in [`bind_destination`] BEFORE
+/// this runs, so it never reaches here. Bail, never dispatch: the
 /// library refuses BIAS/RELU_BIAS on a ROW-order D
 /// (CUBLAS_STATUS_NOT_SUPPORTED, measured on the A100 2026-08-28), and
 /// this check names the finding BEFORE any descriptor is built.

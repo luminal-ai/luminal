@@ -439,6 +439,125 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
     assert_close(&want, &got, "marker(bias) vs decomposed 4x8x3 + b[3]");
 }
 
+/// THE DEGENERATE-EXTENT COINCIDENCE ON DEVICE (whisper, A100
+/// 2026-09-04 — NEEDS A100 RUN). whisper tiny.en decodes ONE token, so
+/// its q/v projections are `x[1, 384] @ w[384, 384] + b[384]` and the
+/// sandwich sibling's call frame is `m = 384, n = 1`. At that degenerate
+/// extent the right-major and left-major contiguous index maps over
+/// `[m, n]` are the SAME FUNCTION, so both spellings live in ONE e-class:
+/// the estate's bias decorator matched the LeftMajor spelling while the
+/// decoder (RightMajor first by preference order) handed the executor the
+/// right-major one, `bind_destination` built a ROW D, and the tripwire
+/// refused EVERY candidate genome at prepare —
+///
+///   cuBLASLt CublasLtAccumulateBias: unreachable: the bias decorators
+///   require a LeftMajor D; a bias form
+///   (LayoutTensorOpCublasLtAccumulateBias) reached the executor with a
+///   Row-order D descriptor (384x1 ld 1). [...] refused BEFORE dispatch
+///
+/// — so the search died with "no candidate genome produced an executable
+/// plan". `bind_destination` now spells the coincidence COL on a
+/// bias-bearing call, and this is the DEVICE half: the whisper dims,
+/// searched, executed through the host-call arm with the BIAS epilogue
+/// under a COL `384x1 ld 384` D, against the decomposed route,
+/// tolerance-based.
+///
+/// The CPU halves (the class really holds both spellings; the elected
+/// call binds COL instead of bailing) are in
+/// `tests/cublaslt_bias_premise.rs`, and the descriptor arithmetic is in
+/// `tests/cublaslt_contracts_cpu.rs`.
+#[test]
+fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
+    // whisper tiny.en's `state` (examples/whisper/src/model.rs), and its
+    // decode step's single token row.
+    const STATE: usize = 384;
+    let build = || {
+        let mut cx = luminal::graph::Graph::new();
+        let weight = cx.named_tensor("q_proj.weight", (STATE, STATE), DType::F32);
+        let bias = cx.named_tensor("q_proj.bias", STATE, DType::F32);
+        let x = cx.tensor((1usize, STATE), DType::F32);
+        let out = luminal_nn::linear(x, weight, Some(bias)).output();
+        (cx, x.id, weight.id, bias.id, out.id)
+    };
+    let data_for = |x: NodeIndex, w: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, HostBuffer> {
+        [
+            (x, HostBuffer::from(weights(STATE, 1))),
+            (w, HostBuffer::from(weights(STATE * STATE, 2))),
+            (b, HostBuffer::from(weights(STATE, 3))),
+        ]
+        .into_iter()
+        .collect()
+    };
+
+    // Sweep the seeds the CPU pin sweeps: the assertion below needs a
+    // plan that actually carries a bias form, and which seed delivers one
+    // is an election fact, not a contract (see
+    // `tests/cublaslt_bias_premise.rs`, which sweeps 0..6 the same way).
+    let mut fused = None;
+    for seed in 0..6u64 {
+        let options = luminal_cuda_lite::CompileOptions {
+            generations: 12,
+            generation_size: 16,
+            mutations: 4,
+            trials: 1,
+            seed,
+            search_log: false,
+            ..Default::default()
+        };
+        let (cx, x, w, b, out) = build();
+        let mut rt = CudaRuntime::load(&cx).expect("load fused");
+        // BEFORE THE FIX this call is where whisper died: every genome
+        // carrying the bias form was refused at prepare, so the search
+        // reported "no candidate genome produced an executable plan".
+        rt.search(&data_for(x, w, b), &options)
+            .unwrap_or_else(|e| panic!("DEGENERATE-D seed {seed}: fused search: {e:#}"));
+        let elected_bias = rt.plan().expect("plan").dag.node_weights().any(|n| {
+            matches!(n, BufferNode::Compute { op, .. }
+                if op.label().starts_with("CublasLt") && op.label().contains("Bias"))
+        });
+        println!("DEGENERATE-D seed {seed}: bias form elected = {elected_bias}");
+        if elected_bias {
+            fused = Some((seed, rt, x, w, b, out));
+            break;
+        }
+    }
+    let (seed, mut fused, x, w, b, out) = fused.expect(
+        "some seed in 0..6 at the 12x16/mut-4 pin budget must elect a cuBLASLt \
+         bias form on the whisper decode shape (the CPU pin \
+         tests/cublaslt_bias_premise.rs sweeps the same seeds; re-sweep it if \
+         this moves) — without one this test is not exercising the degenerate-D \
+         binding at all",
+    );
+    println!("DEGENERATE-D: executing the plan searched at seed {seed}");
+    fused.set_data(x, weights(STATE, 1));
+    fused.set_data(w, weights(STATE * STATE, 2));
+    fused.set_data(b, weights(STATE, 3));
+    fused
+        .execute()
+        .expect("fused execute (bias epilogue under a degenerate COL D)");
+    let got = walked_dense(&fused, out);
+
+    // THE DECOMPOSED ROUTE ON PURPOSE (the default registry carries the
+    // marker since 2026-09-04, so this side asks for the plain one).
+    let (cx, x, w, b, out) = build();
+    let mut plain =
+        CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
+            .expect("load plain");
+    plain
+        .search(
+            &data_for(x, w, b),
+            &luminal_cuda_lite::harness_search_options(),
+        )
+        .expect("plain search");
+    plain.set_data(x, weights(STATE, 1));
+    plain.set_data(w, weights(STATE * STATE, 2));
+    plain.set_data(b, weights(STATE, 3));
+    plain.execute().expect("plain execute");
+    let want = walked_dense(&plain, out);
+
+    assert_close(&want, &got, "marker(bias) vs decomposed 1x384x384 + b[384]");
+}
+
 /// Item 4 END TO END: the marker-elected plan (searched with the
 /// marker vocabulary, executed through the host-call arm) against the
 /// decomposed route (`cuda_registry_without_cublaslt`, NVRTC kernels),
