@@ -93,7 +93,7 @@ pub use layouts::CudaPlan;
 pub use ops::{
     RegisteredOp, cuda_registry, cuda_registry_filtered, cuda_registry_without_cublaslt,
 };
-pub use runtime::CudaRuntime;
+pub use runtime::{CudaRuntime, ExtractionStats, SaturationStats};
 pub use search::{CompileOptions, Evaluator, SearchOutcome, harness_search_options};
 
 /// PLAN-TRANSPARENT (M4 Phase 5): claimable WITHOUT a kernel iff the
