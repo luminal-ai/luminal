@@ -118,6 +118,87 @@ struct SaturatedProgram {
     report: luminal::search_support::SaturationReport,
 }
 
+/// The LIVE saturated e-graph, before serialization
+/// ([`CudaRuntime::saturate`], 2026-09-05). Serialization throws away
+/// the database — the function tables `num_tuples` and `print_size`
+/// read — so the callers that want to size the e-graph take it here.
+struct SaturatedEgraph {
+    egraph: luminal::prelude::egglog::EGraph,
+    program: graph::LogicalProgram,
+    /// egglog parse + run of the assembled program, to fixpoint.
+    saturation_nanos: u128,
+}
+
+/// HOW BIG SATURATION GOT AND WHAT IT COST, with no search after it
+/// ([`CudaRuntime::saturation_stats`], 2026-09-05).
+///
+/// The three size cuts are three different things and are all reported
+/// because they disagree in informative ways: `num_tuples` counts ROWS
+/// IN THE LIVE DATABASE (every function, including the ones that never
+/// serialize), while `classes`/`nodes` count the SERIALIZED e-graph the
+/// extractor actually walks. A schedule that inflates the database
+/// without minting new e-nodes moves the first and not the last.
+pub struct SaturationStats {
+    /// egglog parse + run of the assembled program, to fixpoint.
+    pub saturation_nanos: u128,
+    /// `EGraph::serialize` of the saturated database.
+    pub serialize_nanos: u128,
+    /// egglog's own run report: iterations, per-ruleset totals, slowest
+    /// rules with match counts.
+    pub report: luminal::search_support::SaturationReport,
+    /// `EGraph::num_tuples` — rows summed over every function table.
+    pub num_tuples: usize,
+    /// Iterations the schedule ran (the report's, repeated here so a
+    /// caller printing a size row need not reach through).
+    pub iterations: usize,
+    /// Distinct e-classes in the serialized e-graph.
+    pub classes: usize,
+    /// E-nodes in the serialized e-graph (subsumed ones included).
+    pub nodes: usize,
+    /// E-nodes per constructor (`Node::op`), biggest first, at most
+    /// [`SaturationStats::TOP`].
+    pub nodes_per_constructor: Vec<(String, usize)>,
+    /// Live function-table sizes from `EGraph::print_size(None)`,
+    /// biggest first, at most [`SaturationStats::TOP`]. Empty if egglog
+    /// refused the query.
+    pub function_sizes: Vec<(String, usize)>,
+    /// THE E-GRAPH THESE NUMBERS DESCRIBE. Carried so a caller that
+    /// also wants to measure EXTRACTION on top
+    /// ([`CudaRuntime::extraction_stats`]) does not have to saturate a
+    /// second time — on a full-size model that second run is the whole
+    /// cost of the measurement.
+    pub serialized: luminal::prelude::egraph_serialize::EGraph,
+}
+
+impl SaturationStats {
+    /// How many constructors / functions the two `Vec`s keep.
+    pub const TOP: usize = 25;
+}
+
+/// WHAT EXTRACTION COSTS ON TOP OF SATURATION
+/// ([`CudaRuntime::extraction_stats`], 2026-09-05): the one-time
+/// session analysis, the sampling space, and ONE sampled genome's
+/// extraction with the phase clocks the session already keeps.
+///
+/// One genome, not a search: this measures the SHAPE of the cost, not
+/// an election.
+pub struct ExtractionStats {
+    /// `ExtractionSession::new_with_matcher_set` + `producer_index`.
+    pub analysis_nanos: u128,
+    /// `ExtractionSession::sampling_space`.
+    pub space_nanos: u128,
+    /// Drawing the one genome.
+    pub sample_nanos: u128,
+    /// Extracting it.
+    pub extract_nanos: u128,
+    /// Producer classes the genome ranges over.
+    pub producer_classes: usize,
+    /// Nodes in the extracted graph, or `None` if the genome was refused.
+    pub extracted_nodes: Option<usize>,
+    /// The session's own discovery / relax / assemble clocks.
+    pub sub: luminal::search_support::ExtractTimings,
+}
+
 impl CudaRuntime {
     /// Record the graph's native program under the DEFAULT op registry
     /// ([`crate::ops::cuda_registry`]) — which since the 2026-09-04
@@ -412,13 +493,160 @@ impl CudaRuntime {
         Ok(self.assemble_and_saturate()?.serialized)
     }
 
+    /// SATURATE AND MEASURE, with no search after it (2026-09-05).
+    ///
+    /// Exactly the assembly [`CudaRuntime::search`] performs — this
+    /// backend's matcher vocabulary, the bound program, the same
+    /// schedule — run once, then sized three ways and priced by
+    /// egglog's own run report. The genetic loop, the extractor and the
+    /// planner never run, so every nanosecond reported here is
+    /// saturation's.
+    pub fn saturation_stats(&self) -> Result<SaturationStats> {
+        let SaturatedEgraph {
+            egraph,
+            saturation_nanos,
+            ..
+        } = self.saturate()?;
+        let report = luminal::search_support::SaturationReport::from_egraph(&egraph);
+        let iterations = report.iterations;
+        let num_tuples = egraph.num_tuples();
+        // `print_size(None)` returns every non-hidden function's row
+        // count. It is a query, not a print: the `CommandOutput` carries
+        // the pairs. A refusal is not fatal here — the sizes are a
+        // diagnostic, and the run report is the measurement.
+        let mut function_sizes = match egraph.print_size(None) {
+            Ok(luminal::prelude::egglog::CommandOutput::PrintAllFunctionsSize(sizes)) => sizes,
+            _ => Vec::new(),
+        };
+        function_sizes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        function_sizes.truncate(SaturationStats::TOP);
+
+        let serialize_start = std::time::Instant::now();
+        let serialized = egraph
+            .serialize(luminal::prelude::egglog::SerializeConfig::default())
+            .egraph;
+        let serialize_nanos = serialize_start.elapsed().as_nanos();
+
+        let nodes = serialized.nodes.len();
+        let classes = serialized.classes().len();
+        let mut per_constructor: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for node in serialized.nodes.values() {
+            *per_constructor.entry(node.op.as_str()).or_default() += 1;
+        }
+        let mut nodes_per_constructor: Vec<(String, usize)> = per_constructor
+            .into_iter()
+            .map(|(op, count)| (op.to_string(), count))
+            .collect();
+        nodes_per_constructor.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        nodes_per_constructor.truncate(SaturationStats::TOP);
+
+        Ok(SaturationStats {
+            saturation_nanos,
+            serialize_nanos,
+            report,
+            num_tuples,
+            iterations,
+            classes,
+            nodes,
+            nodes_per_constructor,
+            function_sizes,
+            serialized,
+        })
+    }
+
+    /// ONE GENOME's extraction over an already-saturated e-graph
+    /// (2026-09-05) — the session analysis, the sampling space, and a
+    /// single sampled extraction, so a scaling study can see whether
+    /// extraction grows like saturation does.
+    ///
+    /// Takes the e-graph rather than saturating its own, because the
+    /// caller measuring both already has one
+    /// ([`SaturationStats::serialized`]) and saturating twice would
+    /// double the study's wall clock.
+    pub fn extraction_stats(
+        &self,
+        egraph: &luminal::prelude::egraph_serialize::EGraph,
+        seed: u64,
+    ) -> Result<ExtractionStats> {
+        use rand::SeedableRng;
+        let allow: Vec<&'static str> = self.active_allow_list().to_vec();
+        let analysis_start = std::time::Instant::now();
+        let mut session = luminal::extraction::ExtractionSession::new_with_matcher_set(
+            egraph,
+            Some(&allow),
+            self.matchers(),
+        );
+        let index = session.producer_index();
+        let analysis_nanos = analysis_start.elapsed().as_nanos();
+        let producer_classes = index.len();
+
+        let space_start = std::time::Instant::now();
+        let space = session.sampling_space(&index);
+        let space_nanos = space_start.elapsed().as_nanos();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let sample_start = std::time::Instant::now();
+        let genome = luminal::search_support::sample_genome(&index, &space, &mut rng);
+        let sample_nanos = sample_start.elapsed().as_nanos();
+
+        let extract_start = std::time::Instant::now();
+        let extracted = session.extract_with_genome(&genome);
+        let extract_nanos = extract_start.elapsed().as_nanos();
+        let extracted_nodes = match extracted {
+            Ok(Some(graph)) => Some(graph.dag.node_count()),
+            // A refused genome is DATA here, not a failure: the study
+            // wants the clock either way, and one draw is not a search.
+            Ok(None) | Err(_) => None,
+        };
+
+        Ok(ExtractionStats {
+            analysis_nanos,
+            space_nanos,
+            sample_nanos,
+            extract_nanos,
+            producer_classes,
+            extracted_nodes,
+            sub: session.extract_timings(),
+        })
+    }
+
     /// Assemble the program under this runtime's bindings and matcher
     /// vocabulary, run it to saturation, and serialize. Shared by
     /// [`CudaRuntime::search`] and [`CudaRuntime::saturated_egraph`] so
-    /// the two can never see different programs. On saturation failure
-    /// the labeled post-checks are re-run in isolation to name the door,
-    /// mirroring the reference runtime.
+    /// the two can never see different programs.
     fn assemble_and_saturate(&self) -> Result<SaturatedProgram> {
+        let SaturatedEgraph {
+            egraph,
+            program,
+            saturation_nanos,
+        } = self.saturate()?;
+        // TAKEN BEFORE SERIALIZATION, off the e-graph that just ran:
+        // the report borrows from the `EGraph`, so it is copied into
+        // owned data here rather than kept as a borrow.
+        let report = luminal::search_support::SaturationReport::from_egraph(&egraph);
+        let serialize_start = std::time::Instant::now();
+        let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
+        let serialize_nanos = serialize_start.elapsed().as_nanos();
+        Ok(SaturatedProgram {
+            serialized: serialized.egraph,
+            program,
+            saturation_nanos,
+            serialize_nanos,
+            report,
+        })
+    }
+
+    /// SATURATION AND NOTHING AFTER IT: assemble, parse, run the
+    /// schedule to fixpoint, and hand back the LIVE e-graph (2026-09-05).
+    ///
+    /// Split out of [`CudaRuntime::assemble_and_saturate`] because two
+    /// callers want two different things from the same run: the search
+    /// wants it serialized, and [`CudaRuntime::saturation_stats`] wants
+    /// the live database (`num_tuples`, `print_size`) that serialization
+    /// leaves behind. The saturation clock and the door-naming failure
+    /// path are here, so both callers get them identically.
+    fn saturate(&self) -> Result<SaturatedEgraph> {
         let native = self
             .native
             .as_ref()
@@ -471,19 +699,10 @@ impl CudaRuntime {
             bail!("shape contracts failed:\n  - {}", doors.join("\n  - "));
         }
         let saturation_nanos = saturation_start.elapsed().as_nanos();
-        // TAKEN BEFORE SERIALIZATION, off the e-graph that just ran:
-        // the report borrows from the `EGraph`, so it is copied into
-        // owned data here rather than kept as a borrow.
-        let report = luminal::search_support::SaturationReport::from_egraph(&egraph);
-        let serialize_start = std::time::Instant::now();
-        let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
-        let serialize_nanos = serialize_start.elapsed().as_nanos();
-        Ok(SaturatedProgram {
-            serialized: serialized.egraph,
+        Ok(SaturatedEgraph {
+            egraph,
             program,
             saturation_nanos,
-            serialize_nanos,
-            report,
         })
     }
 
