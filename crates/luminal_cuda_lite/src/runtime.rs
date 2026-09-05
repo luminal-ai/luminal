@@ -514,6 +514,7 @@ pub struct CudaRuntimeImpl<O> {
     /// kernels and the shared arena remain resident; only driver graph state
     /// is evicted and rebuilt when an older bucket is needed again.
     max_materialized_buckets: Option<usize>,
+    cuda_graphs_frozen: bool,
     materialized_bucket_lru: VecDeque<usize>,
     /// Bucket definitions per dimension (empty = single-bucket mode)
     dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
@@ -666,6 +667,11 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// `Some(0)` is invalid because the active bucket must remain usable.
     pub fn set_max_materialized_buckets(&mut self, max_buckets: Option<usize>) {
         assert!(
+            !self.cuda_graphs_frozen
+                || max_buckets.is_none_or(|cap| cap >= self.compiled_buckets.len()),
+            "cannot enable CUDA graph eviction after freezing residency"
+        );
+        assert!(
             max_buckets != Some(0),
             "materialized bucket capacity must be positive"
         );
@@ -677,6 +683,78 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     pub fn with_max_materialized_buckets(mut self, max_buckets: usize) -> Self {
         self.set_max_materialized_buckets(Some(max_buckets));
         self
+    }
+
+    fn cuda_graphs(&self) -> impl Iterator<Item = &CudaGraphOp> {
+        self.compiled_buckets.iter().flat_map(|bucket| {
+            bucket
+                .exec_graph
+                .node_weights()
+                .filter_map(|op| op.internal.as_any().downcast_ref::<CudaGraphOp>())
+        })
+    }
+
+    /// Begin startup capture of finite shape variants sharing one arena.
+    /// Other dimensions remain patchable through the dynamic ABI.
+    pub fn begin_cuda_graph_preparation(&mut self, shape_dims: &[Symbol]) {
+        assert!(
+            !self.cuda_graphs_frozen,
+            "CUDA graph residency is already frozen"
+        );
+        self.cuda_stream.synchronize().unwrap();
+        self.set_max_materialized_buckets(None);
+        for graph in self.cuda_graphs() {
+            graph.enable_residency(shape_dims);
+        }
+        self.materialized_bucket_lru.clear();
+        self.release_pooled_memory();
+    }
+
+    /// Materialize one serving shape using the caller's current, valid input
+    /// descriptors. Does not launch the model or modify its KV state.
+    pub fn prepare_cuda_graphs(&mut self, dyn_map: &DynMap) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.cuda_graphs_frozen,
+            "CUDA graph preparation is already finished"
+        );
+        self.active_bucket = self.resolve_bucket(dyn_map);
+        self.compiled_buckets[self.active_bucket].hlir_synced = false;
+        self.prepare_bucket_buffers(self.active_bucket, dyn_map);
+        self.update_shared_dyn_dims(self.active_bucket, dyn_map);
+        self.apply_output_ptr_registrations();
+        self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)?;
+        self.cuda_stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Validate every retained bucket, then forbid recapture, eviction and arena growth.
+    pub fn finish_cuda_graph_preparation(&mut self) -> anyhow::Result<()> {
+        self.cuda_stream.synchronize()?;
+        // Include all retained library plans in the final capacity check.
+        self.validated_resource_signatures.clear();
+        let capacity = self.compiled_buckets[self.active_bucket]
+            .last_resource_validation_dyn_map
+            .clone();
+        self.validate_compiled_bucket_resources(self.active_bucket, &capacity)
+            .map_err(|error| {
+                anyhow::anyhow!("resident CUDA graph resources exceed capacity: {error}")
+            })?;
+        for graph in self.cuda_graphs() {
+            graph.validate_residency()?;
+        }
+        for graph in self.cuda_graphs() {
+            graph.freeze_residency();
+        }
+        self.cuda_graphs_frozen = true;
+        Ok(())
+    }
+
+    /// Total full graph builds and currently retained executables. Cheap
+    /// counters for asserting that serving never creates a new graph.
+    pub fn cuda_graph_residency_stats(&self) -> (usize, usize) {
+        self.cuda_graphs()
+            .map(CudaGraphOp::residency_stats)
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     }
 
     /// Configure a hard per-kernel generated CUDA source limit. The runtime
@@ -921,6 +999,11 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         {
             return false;
         }
+
+        assert!(
+            !self.cuda_graphs_frozen,
+            "shared CUDA arena would grow after startup: required={required_bytes}"
+        );
 
         self.release_all_bucket_cuda_graphs();
         self.cuda_stream
@@ -1954,6 +2037,35 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let len = buf.len();
         self.hlir_buffers.insert(id, CudaInput::Buffer { buf, len });
         self.changed_hlir.insert(id);
+    }
+
+    /// Commit recurrent state without changing its input address. Alias-proven
+    /// updates are free; copy-then-modify schedules copy into the existing
+    /// allocation instead of allocating a new input on every iteration.
+    pub fn copy_output_to_input(&mut self, output: impl ToId, input: impl ToId) {
+        let source = self.resolve_output_buffer(output);
+        let input = input.to_id();
+        let CudaInput::Buffer { buf, len } = self
+            .hlir_buffers
+            .get(&input)
+            .expect("missing recurrent input buffer")
+        else {
+            panic!("copy_output_to_input requires an owned input allocation");
+        };
+        assert_eq!(source.len(), *len, "recurrent state size must remain fixed");
+        let destination = buf.device_ptr(&self.cuda_stream).0;
+        if source.ptr() != destination {
+            unsafe {
+                result::memcpy_dtod_async(
+                    destination,
+                    source.ptr(),
+                    *len,
+                    self.cuda_stream.cu_stream(),
+                )
+                .expect("recurrent state copy failed");
+            }
+        }
+        self.hlir_host_mirrors.remove(&input);
     }
 
     pub fn get_bool(&self, id: impl ToId) -> Vec<bool> {
@@ -3065,7 +3177,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 bucket.resource_validation_complete = false;
             }
         }
-        if !self.compiled_buckets[bucket_idx].resource_validation_complete {
+        let resource_validation_refreshed =
+            !self.compiled_buckets[bucket_idx].resource_validation_complete;
+        if resource_validation_refreshed {
             let resource_validation_signature =
                 self.resource_validation_signature(bucket_idx, &allocation_dyn_map);
             if !self
@@ -3151,14 +3265,19 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
 
         let timer = std::time::Instant::now();
         if stabilize_intermediate_pointers
-            && self.compiled_buckets[bucket_idx].last_dyn_map != *dyn_map
+            && (resource_validation_refreshed
+                || needs_binding
+                || !self.compiled_buckets[bucket_idx].hlir_synced
+                || self.compiled_buckets[bucket_idx].last_dyn_map != *dyn_map)
         {
             let bucket = &mut self.compiled_buckets[bucket_idx];
-            if bucket.hlir_synced {
+            if bucket.hlir_synced && !resource_validation_refreshed && !needs_binding {
                 Self::refresh_intermediate_buffer_lengths_for_changed_dims(bucket, dyn_map);
             } else {
-                // A cold bucket or relocated shared arena must rebuild every
-                // logical length before its cached views can be materialized.
+                // Capacity planning can replace last_dyn_map with the upper
+                // bound while existing views still have shorter logical
+                // lengths. Restore exact lengths after validation as well as
+                // on a cold bucket or relocated arena.
                 Self::refresh_intermediate_buffer_lengths(bucket, dyn_map);
             }
         }
@@ -3476,7 +3595,8 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() else {
                 continue;
             };
-            if !fully_dirty {
+            let variant_changed = cuda_graph.select_resident_variant(dyn_map)?;
+            if !fully_dirty && !variant_changed {
                 let mut changed_buffers = FxHashMap::default();
                 for node in dirty_nodes
                     .iter()
@@ -4985,6 +5105,7 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             compiled_buckets: vec![CompiledBucket::new()],
             active_bucket: 0,
             max_materialized_buckets: None,
+            cuda_graphs_frozen: false,
             materialized_bucket_lru: VecDeque::new(),
             dim_buckets: FxHashMap::default(),
             output_ptr_registrations: FxHashMap::default(),
@@ -5484,6 +5605,24 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     .map(CudaGraphOp::debug_summary)
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_retained_host_memory_bytes(&self) -> usize {
+        let lengths = self.hlir_resource_buffer_lengths();
+        let plans = self
+            .compiled_buckets
+            .iter()
+            .map(|bucket| {
+                Self::compiled_host_device_memory_plans(
+                    bucket,
+                    &bucket.last_resource_validation_dyn_map,
+                    &Self::planned_resource_buffer_lengths(bucket, &lengths),
+                )
+                .unwrap()
+            })
+            .collect_vec();
+        Self::aggregate_host_device_memory(&plans, &[]).unwrap().0
     }
 
     #[cfg(test)]

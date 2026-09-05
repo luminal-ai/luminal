@@ -1230,6 +1230,75 @@ fn bucket_range_and_singleton_cublaslt_buckets_are_captured() {
 }
 
 #[test]
+fn resident_cublaslt_variants_switch_without_recapture() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream)
+        || !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream)
+    {
+        return;
+    }
+    let (k, n) = (5, 11);
+    let mut cx = Graph::new();
+    let a = cx.tensor(('s', k)).persist();
+    let b = cx.tensor((k, n)).persist();
+    let out = a.matmul(b).output();
+    cx.set_dim('s', 4);
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "resident cuBLASLt variants", |_| true);
+    let dim_buckets = [(
+        Symbol::from('s'),
+        vec![DimBucket::new(1, 1), DimBucket::new(2, 4)],
+    )]
+    .into_iter()
+    .collect();
+    let buckets = [(0, 1), (1, 4)].map(|(index, size)| {
+        (
+            [(Symbol::from('s'), index)].into_iter().collect(),
+            [(Symbol::from('s'), size)].into_iter().collect(),
+            llir.clone(),
+        )
+    });
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.set_data_with_capacity(a, vec![0.0f32; 4 * k], 4 * k * 4);
+    let b_values = random_f32_vec(k * n, 17, -0.1, 0.1);
+    rt.set_data(b, b_values.clone());
+    rt.load_llir_buckets(&dim_buckets, &buckets);
+    rt.begin_cuda_graph_preparation(&['s'.into()]);
+    assert!(rt.debug_retained_host_memory_bytes() >= 2 * 32 * 1024 * 1024);
+    for s in [4, 2, 1] {
+        cx.set_dim('s', s);
+        rt.set_data(a, vec![0.0f32; s * k]);
+        rt.prepare_cuda_graphs(&cx.dyn_map).unwrap();
+    }
+    rt.finish_cuda_graph_preparation().unwrap();
+    // These tiny GEMMs do not need the 32 MiB workspace preference limit.
+    // Final residency validation must charge their actual allocations, even
+    // with several retained shapes, instead of multiplying that limit.
+    assert!(rt.debug_retained_host_memory_bytes() < 32 * 1024 * 1024);
+    let baseline = rt.cuda_graph_residency_stats();
+    let arena = rt.intermediate_buffer_bytes();
+    assert_eq!(baseline.1, 3);
+    for iteration in 0..24 {
+        let s = [1, 4, 2, 4, 1, 2][iteration % 6];
+        cx.set_dim('s', s);
+        let values = random_f32_vec(s * k, 123 + iteration as u64, -0.1, 0.1);
+        let expected = reference_matmul_2d(&values, &b_values, s, n, k);
+        rt.set_data(a, values);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out), &expected, 1e-5, 1e-5);
+        assert_eq!(rt.cuda_graph_residency_stats(), baseline);
+        assert_eq!(rt.intermediate_buffer_bytes(), arena);
+    }
+    cx.set_dim('s', 3);
+    rt.set_data(a, vec![0.0f32; 3 * k]);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.execute(&cx.dyn_map))).is_err()
+    );
+    assert_eq!(rt.cuda_graph_residency_stats(), baseline);
+}
+
+#[test]
 fn mixed_cuda_graph_cublaslt_recaptures_on_input_pointer_change() {
     let Some(stream) = get_cuda_stream() else {
         return;

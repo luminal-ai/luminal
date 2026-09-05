@@ -777,6 +777,19 @@ impl PreparedCuBlasLtMatmul {
         self.workspace_ptr
     }
 
+    pub(crate) fn owned_scale_bytes(&self) -> usize {
+        [
+            &self._a_scale,
+            &self._b_scale,
+            &self._c_scale,
+            &self._d_scale,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|scale| scale.len() * std::mem::size_of::<f32>())
+        .sum()
+    }
+
     fn update_descriptor_pointers(
         &self,
         stream: &Arc<CudaStream>,

@@ -27,6 +27,44 @@ fn bucket_options(buckets: &[DimBucket]) -> CompileOptions {
 }
 
 #[test]
+fn resident_recurrent_output_preserves_input_allocation() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let mut cx = Graph::default();
+    let input = cx.tensor(('s', 4)).persist();
+    let output = (input + input).output();
+    cx.set_dim('s', 2);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut rt = CudaRuntime::initialize(stream);
+    let initial = (1..=8).map(|value| value as f32).collect::<Vec<_>>();
+    rt.set_data(input, initial.clone());
+    let mut rng = SmallRng::seed_from_u64(19);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(5),
+        &mut rng,
+    );
+    rt.set_data(input, initial.clone());
+    rt.begin_cuda_graph_preparation(&[]);
+    rt.prepare_cuda_graphs(&cx.dyn_map).unwrap();
+    rt.finish_cuda_graph_preparation().unwrap();
+    let baseline = rt.cuda_graph_residency_stats();
+    for iteration in 1..=8 {
+        rt.execute(&cx.dyn_map);
+        assert_eq!(
+            rt.get_f32(output),
+            initial
+                .iter()
+                .map(|value| value * (1 << iteration) as f32)
+                .collect::<Vec<_>>()
+        );
+        rt.copy_output_to_input(output, input);
+        assert_eq!(rt.cuda_graph_residency_stats(), baseline);
+    }
+}
+
+#[test]
 fn test_bucket_dispatch_simple() {
     // Tests that bucketed compilation produces correct results for different dim values
     let Some(stream) = get_cuda_stream() else {
