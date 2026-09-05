@@ -1685,8 +1685,10 @@ mod tests {
         .expect("extracts")
         .expect("plan");
         let dps = luminal::dps::dps_rewrite(&extracted);
+        let view =
+            luminal::egglog_utils::eclass::EGraphView::new(&serialized, crate::decoder_registry());
         let layouts = luminal::layouts::decode_layout_table(
-            &serialized,
+            &view,
             &dps,
             "test",
             &mut luminal::layouts::LayoutDecodeCache::new(),

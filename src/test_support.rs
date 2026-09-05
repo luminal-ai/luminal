@@ -1475,8 +1475,12 @@ mod harness_tests {
         let egraph = serialize_fixture("boundary_gather.egg");
         let graph = luminal::dps::dps_rewrite(&extract_fixture("boundary_gather.egg"));
         // The POST-DPS graph: value-keyed tables cover poisons.
-        let table = luminal::layouts::decode_layout_table(
+        let view = luminal::egglog_utils::eclass::EGraphView::new(
             &egraph,
+            luminal_reference::decoder_registry(),
+        );
+        let table = luminal::layouts::decode_layout_table(
+            &view,
             &graph,
             "dtype row test",
             &mut luminal::layouts::LayoutDecodeCache::new(),
@@ -3828,18 +3832,18 @@ mod escape_execution_tests {
     /// no dims field, no walk, no vote.
     fn rm_layout(dims: &[i64]) -> DecodedLayout {
         // Dep-world discipline: `luminal::layouts`, never `crate::layouts` —
-        // DecodedLayout is the plain `luminal` build's MirrorLayout, and the
+        // DecodedLayout is the plain `luminal` build's type, and the
         // cfg(test) build's types do not unify with it.
         use luminal::layouts::{
-            BitWidthTerm, IntExprTerm, MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm,
+            BitWidthTerm, IntExprTerm, RightMajorContiguousElementLayout, ShapeTerm,
         };
-        DecodedLayout {
-            mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
+        DecodedLayout::of(
+            RightMajorContiguousElementLayout {
                 shape: ShapeTerm(dims.iter().map(|&d| IntExprTerm::Lit(d)).collect()),
                 width: BitWidthTerm(32),
-            }),
-            dtype: Some(luminal::dtype::PlanDtype::F32),
-        }
+            },
+            Some(luminal::dtype::PlanDtype::F32),
+        )
     }
 
     /// PROTOTYPE (Option B): the transpose view's COMPOSED layout — the
@@ -3847,21 +3851,19 @@ mod escape_execution_tests {
     /// reading its dense `[2,3]` parent): element (i,j) at parent flat
     /// j*3 + i, spelled as the strided chain from-end [coord0*3, coord1].
     fn transpose_strided_layout() -> DecodedLayout {
-        use luminal::layouts::{
-            BitWidthTerm, IntExprTerm, MirrorLayout, ShapeTerm, StridedElementLayout,
-        };
+        use luminal::layouts::{BitWidthTerm, IntExprTerm, ShapeTerm, StridedElementLayout};
         let coord = |axis_from_end: i64| IntExprTerm::Coord { axis_from_end };
-        DecodedLayout {
-            mirror: MirrorLayout::Strided(StridedElementLayout {
+        DecodedLayout::of(
+            StridedElementLayout {
                 shape: ShapeTerm(vec![IntExprTerm::Lit(3), IntExprTerm::Lit(2)]),
                 chain: vec![
                     IntExprTerm::Mul(Box::new(coord(0)), Box::new(IntExprTerm::Lit(3))),
                     coord(1),
                 ],
                 width: BitWidthTerm(32),
-            }),
-            dtype: Some(luminal::dtype::PlanDtype::F32),
-        }
+            },
+            Some(luminal::dtype::PlanDtype::F32),
+        )
     }
 
     /// A minimal escaped-output plan: input x `[2,3]` (BufferLit 7) is

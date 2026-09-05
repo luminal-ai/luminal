@@ -269,9 +269,10 @@ mod strided {
     use luminal::dtype::PlanDtype;
     use luminal_cuda_lite::{kernels, ops};
 
+    use luminal::egglog_utils::eclass::EgglogConstructor;
     use luminal::layouts::DecodedLayout;
     use luminal::layouts::{
-        BitWidthTerm, ElementOffsetExpressionLayout, IntExprTerm, MirrorLayout,
+        BitWidthTerm, ElementOffsetExpressionLayout, IntExprTerm, Layout,
         RightMajorContiguousElementLayout, ShapeTerm, StridedElementLayout,
     };
 
@@ -290,33 +291,30 @@ mod strided {
     fn shape(dims: &[i64]) -> ShapeTerm {
         ShapeTerm(dims.iter().map(|&d| lit(d)).collect())
     }
-    fn typed(mirror: MirrorLayout) -> DecodedLayout {
-        DecodedLayout {
-            mirror,
-            dtype: Some(PlanDtype::F32),
-        }
+    fn typed<C: EgglogConstructor<Sort = Layout> + luminal::layouts::LayoutFacts>(
+        spelling: C,
+    ) -> DecodedLayout {
+        DecodedLayout::of(spelling, Some(PlanDtype::F32))
     }
     fn rm_layout(dims: &[i64]) -> DecodedLayout {
-        typed(MirrorLayout::RightMajor(
-            RightMajorContiguousElementLayout {
-                shape: shape(dims),
-                width: BitWidthTerm(32),
-            },
-        ))
+        typed(RightMajorContiguousElementLayout {
+            shape: shape(dims),
+            width: BitWidthTerm(32),
+        })
     }
     fn strided_layout(dims: &[i64], chain: Vec<IntExprTerm>) -> DecodedLayout {
-        typed(MirrorLayout::Strided(StridedElementLayout {
+        typed(StridedElementLayout {
             shape: shape(dims),
             chain,
             width: BitWidthTerm(32),
-        }))
+        })
     }
     fn offset_layout(dims: &[i64], offset: IntExprTerm) -> DecodedLayout {
-        typed(MirrorLayout::ElementOffset(ElementOffsetExpressionLayout {
+        typed(ElementOffsetExpressionLayout {
             offset,
             shape: shape(dims),
             width: BitWidthTerm(32),
-        }))
+        })
     }
 
     /// A slot whose layout is the dense row-major read over its dims.
@@ -558,11 +556,11 @@ mod strided {
     fn unlowerable_layouts_refuse_loudly() {
         let op = ops::materialize_layout_copy::MaterializeLayoutCopyDps;
         // Symbolic extent in the layout's own domain — refused at ctx build.
-        let layout = typed(MirrorLayout::Strided(StridedElementLayout {
+        let layout = typed(StridedElementLayout {
             shape: ShapeTerm(vec![IntExprTerm::Var("n".to_string()), lit(2)]),
             chain: vec![coord(0), mul(coord(1), lit(2))],
             width: BitWidthTerm(32),
-        }));
+        });
         let err = kernels::CodegenCtx::from_descriptors(
             "Copy",
             &[slot_l(layout), slot(vec![3, 2])],
@@ -724,11 +722,11 @@ mod strided {
             ),
             (
                 "bit-offset at width 32",
-                typed(MirrorLayout::BitOffset(BitOffsetExpressionLayout {
+                typed(BitOffsetExpressionLayout {
                     offset: mul(add(mul(coord(1), lit(3)), coord(0)), lit(32)),
                     shape: shape(&[2, 3]),
                     width: BitWidthTerm(32),
-                })),
+                }),
             ),
         ];
 
@@ -860,24 +858,20 @@ mod strided {
             (
                 "left-major rank 1",
                 vec![5],
-                typed(MirrorLayout::LeftMajor(
-                    luminal::layouts::LeftMajorContiguousElementLayout {
-                        shape: shape(&[5]),
-                        width: BitWidthTerm(32),
-                    },
-                )),
+                typed(luminal::layouts::LeftMajorContiguousElementLayout {
+                    shape: shape(&[5]),
+                    width: BitWidthTerm(32),
+                }),
                 true,
             ),
             // ...and diverge at rank 2, where left-major is a transpose.
             (
                 "left-major rank 2",
                 vec![2, 3],
-                typed(MirrorLayout::LeftMajor(
-                    luminal::layouts::LeftMajorContiguousElementLayout {
-                        shape: shape(&[2, 3]),
-                        width: BitWidthTerm(32),
-                    },
-                )),
+                typed(luminal::layouts::LeftMajorContiguousElementLayout {
+                    shape: shape(&[2, 3]),
+                    width: BitWidthTerm(32),
+                }),
                 false,
             ),
         ];
@@ -902,31 +896,26 @@ fn descriptor_ctx_bails_loudly_on_unusable_layouts() {
     use luminal::bufferize::SlotDescriptor;
     use luminal::layouts::DecodedLayout;
     use luminal::layouts::{
-        BitWidthTerm, IntExprTerm, MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm,
+        BitWidthTerm, IntExprTerm, RightMajorContiguousElementLayout, ShapeTerm,
     };
-    let rm = |shape: ShapeTerm| {
-        MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
-            shape,
-            width: BitWidthTerm(32),
-        })
+    let rm = |shape: ShapeTerm| RightMajorContiguousElementLayout {
+        shape,
+        width: BitWidthTerm(32),
     };
     let lit_shape = ShapeTerm(vec![IntExprTerm::Lit(2), IntExprTerm::Lit(3)]);
     let filled = SlotDescriptor {
         value: luminal::prelude::egraph_serialize::ClassId::from("val$x"),
         buffer: luminal::bufferize::BufferId::Allocated(0),
-        layout: DecodedLayout {
-            mirror: rm(lit_shape.clone()),
-            dtype: Some(PlanDtype::F32),
-        },
+        layout: DecodedLayout::of(rm(lit_shape.clone()), Some(PlanDtype::F32)),
     };
     let symbolic = SlotDescriptor {
-        layout: DecodedLayout {
-            mirror: rm(ShapeTerm(vec![
+        layout: DecodedLayout::of(
+            rm(ShapeTerm(vec![
                 IntExprTerm::Var("n".to_string()),
                 IntExprTerm::Lit(3),
             ])),
-            dtype: Some(PlanDtype::F32),
-        },
+            Some(PlanDtype::F32),
+        ),
         ..filled.clone()
     };
     let err = kernels::CodegenCtx::from_descriptors(
@@ -940,10 +929,7 @@ fn descriptor_ctx_bails_loudly_on_unusable_layouts() {
         "got: {err}"
     );
     let untyped = SlotDescriptor {
-        layout: DecodedLayout {
-            mirror: rm(lit_shape),
-            dtype: None,
-        },
+        layout: DecodedLayout::of(rm(lit_shape), None),
         ..filled.clone()
     };
     let err =

@@ -1,14 +1,11 @@
-//! Rust mirrors of the five egglog `Layout` constructors — the CONVENIENCE
-//! vocabulary runtimes may share (resident-geometry cleanup train; folded
-//! into core from the short-lived `luminal_layouts` crate by Austin's
-//! amendment: "don't make it separate crate, people can just pull these
-//! structs from core for now").
+//! THE `Layout` SORT, mirrored: its five constructors as Rust structs,
+//! the facts they disclose, and the decoded spelling set a plan carries.
 //!
 //! THE BUFFERIZER NEVER CALLS ANY OF THIS. Living in core does not make
 //! this a core vocabulary: the bufferizer stays generic over an opaque
 //! layout type it only clones and transports, and nothing in the planner
-//! imports this module. It exists so runtimes can pull the five mirror
-//! structs, the [`SpanExpr`] trait, and [`decode_layout`] from one place
+//! imports this module. It exists so runtimes can pull the constructor
+//! structs, the [`SpanExpr`] trait and [`DecodedLayout`] from one place
 //! instead of each respelling them; a backend that wants a different
 //! layout vocabulary brings its own type and ignores this module
 //! entirely — nothing here is a closed set the planner depends on.
@@ -16,26 +13,39 @@
 //! Contents:
 //!  * [`IntExprTerm`] / [`ShapeTerm`] / [`BitWidthTerm`] — the term
 //!    vocabulary the constructor fields are spelled in;
-//!  * the five mirror structs, field-for-field with the preamble's
-//!    constructors (`RightMajorContiguousElementLayoutLit(Shape, BitWidth)`
-//!    and friends), plus the [`MirrorLayout`] sum for decoders;
-//!  * [`SpanExpr`] — the span-as-EXPRESSION trait, implemented ONLY where
-//!    a span is honest (the packed element ladder: right-major,
+//!  * the five constructor structs, field-for-field with the preamble's
+//!    constructors (`RightMajorContiguousElementLayoutLit(Shape,
+//!    BitWidth)` and friends), each implementing
+//!    [`crate::egglog_utils::eclass::EgglogConstructor`] (decode ONE
+//!    e-node of that constructor) and [`LayoutFacts`] (what it
+//!    discloses);
+//!  * [`SpanExpr`] — the span-as-EXPRESSION trait, implemented ONLY
+//!    where a span is honest (the packed element ladder: right-major,
 //!    left-major, strided). The offset-expression forms deliberately do
 //!    NOT implement it: an offset function alone does not disclose its
-//!    reach, and nothing here guesses. NOTHING consumes `span()` yet.
-//!  * [`decode_layout`] — the spelling decoder: walk one layout e-class
-//!    of a serialized e-graph into a [`MirrorLayout`]. Any spelling
-//!    present in a class is correct (all spellings of a layout class
-//!    denote one function); the walk PREFERS the most-structured spelling
-//!    present (RightMajor > LeftMajor > Strided > ElementOffset >
-//!    BitOffset) as a decoding preference only. No normalization, no
-//!    analysis — a class none of whose spellings parse is a loud error,
-//!    never a guess.
+//!    reach, and nothing here guesses;
+//!  * [`layout_decoders`] — the five `(sort, constructor)` decoders core
+//!    registers, and [`shape_term`] / [`bit_width`] / [`affine_chain`] /
+//!    [`int_expr`], the term decoders they are written in terms of;
+//!  * [`DecodedLayout`] — one elected value's layout: EVERY registered
+//!    spelling its class holds, plus the value's dtype fact, plus the
+//!    class id for diagnostics.
+//!
+//! THERE IS NO PREFERENCE ORDER. A class holds every spelling the
+//! e-graph proved of it, all denoting one function; a caller asks for
+//! the spelling IT can lower (`first::<C>()`, `has::<C>()`,
+//! `require::<C>(who)`) and states its own preference at its own call
+//! site. A class none of whose spellings parse is a loud error, never a
+//! guess.
 
-use anyhow::{Result, anyhow, bail};
-use egraph_serialize::{ClassId, EGraph, Node, NodeId};
+use crate::egglog_utils::eclass::{
+    ConstructorDecoder, ConstructorRegistry, DynFacts, EClass, EGraphView, ENode,
+    EgglogConstructor, Sort, Spellings,
+};
+use anyhow::{Result, anyhow, bail, ensure};
+use egraph_serialize::{ClassId, EGraph};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // =============================================================================
 // Term vocabulary
@@ -165,13 +175,12 @@ pub struct BitOffsetExpressionLayout {
     pub width: BitWidthTerm,
 }
 
-/// The convenience sum decoders produce — one value for "some spelling
-/// of this layout class". DECODER CONVENIENCE ONLY: the bufferizer is
-/// generic and never sees this type; a backend may decode into its own
-/// type instead. NOT a closed vocabulary — and FLAGGED for review
-/// (Austin): a sum over the five constructors may already be too
-/// enum-ish for a vocabulary that is deliberately open; kept for now as
-/// the shared decoders' return type.
+/// RETIRING (deleted in the next step of this refactor): the closed sum
+/// over the five constructors. It was flagged for review as "too
+/// enum-ish for a vocabulary that is deliberately open" and Austin ruled
+/// it out — a class holds a SET of spellings and every call site names
+/// the one it wants. Kept for exactly one step so consumers move off it
+/// one file at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MirrorLayout {
     RightMajor(RightMajorContiguousElementLayout),
@@ -281,6 +290,51 @@ impl IntExprTerm {
             IntExprTerm::LessThanCast(a, b) => i64::from(go(a)? < go(b)?),
         })
     }
+
+    /// Evaluate at concrete coordinates (FRONT-indexed: `Coord {
+    /// axis_from_end }` reads `coords[rank - 1 - axis_from_end]`).
+    /// Symbolic vars, out-of-rank axes and zero divisors refuse loudly —
+    /// runtime-side convenience, never planner machinery.
+    pub fn eval_at(&self, coords: &[usize]) -> Result<i64> {
+        let rank = coords.len();
+        Ok(match self {
+            IntExprTerm::Lit(v) => *v,
+            IntExprTerm::Var(name) => {
+                bail!("layout read: symbolic dim `{name}` cannot evaluate")
+            }
+            IntExprTerm::Coord { axis_from_end } => {
+                let axis = usize::try_from(*axis_from_end)
+                    .ok()
+                    .filter(|&a| a < rank)
+                    .ok_or_else(|| anyhow!("coordinate axis {axis_from_end} out of rank {rank}"))?;
+                coords[rank - 1 - axis] as i64
+            }
+            IntExprTerm::Add(a, b) => a.eval_at(coords)? + b.eval_at(coords)?,
+            IntExprTerm::Mul(a, b) => a.eval_at(coords)? * b.eval_at(coords)?,
+            IntExprTerm::TruncDiv(a, b) => {
+                let (a, b) = (a.eval_at(coords)?, b.eval_at(coords)?);
+                ensure!(b != 0, "division by zero in a layout expression");
+                // Rust's `/` on i64 IS truncation toward zero.
+                a / b
+            }
+            IntExprTerm::TruncRem(a, b) => {
+                let (a, b) = (a.eval_at(coords)?, b.eval_at(coords)?);
+                ensure!(b != 0, "remainder by zero in a layout expression");
+                a % b
+            }
+            IntExprTerm::CeilDiv(a, b) => {
+                let (a, b) = (a.eval_at(coords)?, b.eval_at(coords)?);
+                ensure!(
+                    b > 0,
+                    "ceil-div by non-positive divisor in a layout expression"
+                );
+                a.div_euclid(b) + i64::from(a.rem_euclid(b) != 0)
+            }
+            IntExprTerm::Min(a, b) => a.eval_at(coords)?.min(b.eval_at(coords)?),
+            IntExprTerm::Max(a, b) => a.eval_at(coords)?.max(b.eval_at(coords)?),
+            IntExprTerm::LessThanCast(a, b) => i64::from(a.eval_at(coords)? < b.eval_at(coords)?),
+        })
+    }
 }
 
 impl MirrorLayout {
@@ -333,22 +387,313 @@ impl MirrorLayout {
 
 // =============================================================================
 // The spelling decoder
+
+// =============================================================================
+// THE `Layout` SORT — its erased fact surface and its five constructors
 // =============================================================================
 
-/// Decode one layout e-class of a serialized e-graph into a
-/// [`MirrorLayout`]. Builds a class index for the walk (one pass over the
-/// e-graph), so callers decoding many classes should memoize per class
-/// (all spellings of a class denote one function, so a class decodes the
-/// same every time). Errors are LOUD and name the class — never a guess.
-pub fn decode_layout(egraph: &EGraph, class: &ClassId) -> Result<MirrorLayout> {
-    Reader::new(egraph).decode_layout(class)
+/// The egglog `Layout` sort, as [`Sort`] names it. `Layout::Facts` is
+/// [`LayoutFacts`], so `spellings::<Layout>()` hands generic code the
+/// facts every layout constructor discloses without anyone naming a
+/// constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout;
+
+impl Sort for Layout {
+    const NAME: &'static str = "Layout";
+    type Facts = dyn LayoutFacts;
 }
 
-/// The decoder's walk state: the e-graph plus its by-class node index.
-struct Reader<'a> {
-    egraph: &'a EGraph,
-    class_nodes: HashMap<&'a ClassId, Vec<&'a NodeId>>,
+/// WHAT EVERY LAYOUT CONSTRUCTOR DISCLOSES. Object-safe (no generics,
+/// every method `&self`), so `dyn LayoutFacts` is the erased item type
+/// `Spellings<Layout>` carries.
+///
+/// This is a FACT surface, never a classification: nothing here says
+/// "which kind of layout is this". A caller that needs a particular
+/// spelling names it (`first::<C>()`); a caller that needs a fact about
+/// a layout it did not author asks here.
+pub trait LayoutFacts: DynFacts {
+    /// The DOMAIN (every constructor carries one).
+    fn shape(&self) -> &ShapeTerm;
+
+    /// The element access width in bits.
+    fn width(&self) -> BitWidthTerm;
+
+    /// Storage reach in ELEMENTS as an expression, where the constructor
+    /// DISCLOSES one (the packed ladder, [`SpanExpr`]). `None` for the
+    /// offset-expression forms — an offset function alone does not
+    /// disclose its reach and nothing here guesses.
+    fn span_elements(&self) -> Option<IntExprTerm>;
+
+    /// The constructor's read function evaluated at literal coordinates
+    /// (front-indexed), down to the flat ELEMENT index. RUNTIME
+    /// convenience, never planner machinery. Fail-closed on symbolic
+    /// extents, foreign rank, out-of-domain coordinates, a mid-element
+    /// bit offset, and a negative result.
+    fn element_index(&self, coords: &[usize]) -> Result<usize>;
 }
+
+impl PartialEq for dyn LayoutFacts {
+    fn eq(&self, other: &Self) -> bool {
+        self.dyn_eq(other.as_any())
+    }
+}
+impl Eq for dyn LayoutFacts {}
+
+/// The domain extents as literals — `None` if any axis is symbolic.
+fn literal_extents_of(shape: &ShapeTerm) -> Option<Vec<usize>> {
+    shape
+        .0
+        .iter()
+        .map(|e| e.eval_literal().and_then(|v| usize::try_from(v).ok()))
+        .collect()
+}
+
+/// The domain check every `element_index` runs first: literal extents,
+/// matching rank, every coordinate inside its extent.
+fn check_domain(shape: &ShapeTerm, coords: &[usize]) -> Result<Vec<usize>> {
+    let extents =
+        literal_extents_of(shape).ok_or_else(|| anyhow!("layout read: symbolic extents"))?;
+    ensure!(
+        coords.len() == extents.len(),
+        "{} coordinates for a rank-{} layout",
+        coords.len(),
+        extents.len()
+    );
+    for (axis, (&c, &d)) in coords.iter().zip(&extents).enumerate() {
+        ensure!(c < d, "coordinate {c} out of extent {d} (axis {axis})");
+    }
+    Ok(extents)
+}
+
+fn element_of(flat: i64) -> Result<usize> {
+    usize::try_from(flat).map_err(|_| anyhow!("negative element index {flat}"))
+}
+
+impl EgglogConstructor for RightMajorContiguousElementLayout {
+    const NAME: &'static str = "RightMajorContiguousElementLayoutLit";
+    type Sort = Layout;
+    fn decode(node: &ENode<'_>) -> Result<Self> {
+        let shape = shape_term(&node.child_or_bail(0)?)
+            .ok_or_else(|| anyhow!("child 0 is not a decodable Shape"))?;
+        let width = bit_width(&node.child_or_bail(1)?)
+            .ok_or_else(|| anyhow!("child 1 is not a decodable BitWidth"))?;
+        Ok(Self { shape, width })
+    }
+    fn erase(self) -> Arc<dyn LayoutFacts> {
+        Arc::new(self)
+    }
+}
+
+impl LayoutFacts for RightMajorContiguousElementLayout {
+    fn shape(&self) -> &ShapeTerm {
+        &self.shape
+    }
+    fn width(&self) -> BitWidthTerm {
+        self.width
+    }
+    fn span_elements(&self) -> Option<IntExprTerm> {
+        Some(self.span())
+    }
+    fn element_index(&self, coords: &[usize]) -> Result<usize> {
+        let extents = check_domain(&self.shape, coords)?;
+        element_of(
+            coords
+                .iter()
+                .zip(&extents)
+                .fold(0usize, |acc, (&c, &d)| acc * d + c) as i64,
+        )
+    }
+}
+
+impl EgglogConstructor for LeftMajorContiguousElementLayout {
+    const NAME: &'static str = "LeftMajorContiguousElementLayoutLit";
+    type Sort = Layout;
+    fn decode(node: &ENode<'_>) -> Result<Self> {
+        let shape = shape_term(&node.child_or_bail(0)?)
+            .ok_or_else(|| anyhow!("child 0 is not a decodable Shape"))?;
+        let width = bit_width(&node.child_or_bail(1)?)
+            .ok_or_else(|| anyhow!("child 1 is not a decodable BitWidth"))?;
+        Ok(Self { shape, width })
+    }
+    fn erase(self) -> Arc<dyn LayoutFacts> {
+        Arc::new(self)
+    }
+}
+
+impl LayoutFacts for LeftMajorContiguousElementLayout {
+    fn shape(&self) -> &ShapeTerm {
+        &self.shape
+    }
+    fn width(&self) -> BitWidthTerm {
+        self.width
+    }
+    fn span_elements(&self) -> Option<IntExprTerm> {
+        Some(self.span())
+    }
+    fn element_index(&self, coords: &[usize]) -> Result<usize> {
+        let extents = check_domain(&self.shape, coords)?;
+        let mut stride = 1usize;
+        let mut acc = 0usize;
+        for (&c, &d) in coords.iter().zip(&extents) {
+            acc += c * stride;
+            stride *= d;
+        }
+        element_of(acc as i64)
+    }
+}
+
+impl EgglogConstructor for StridedElementLayout {
+    const NAME: &'static str = "StridedElementLayoutLit";
+    type Sort = Layout;
+    fn decode(node: &ENode<'_>) -> Result<Self> {
+        let shape_class = node.child_or_bail(0)?;
+        let chain_class = node.child_or_bail(1)?;
+        let width_class = node.child_or_bail(2)?;
+        let shape =
+            shape_term(&shape_class).ok_or_else(|| anyhow!("child 0 is not a decodable Shape"))?;
+        let width = bit_width(&width_class)
+            .ok_or_else(|| anyhow!("child 2 is not a decodable BitWidth"))?;
+        // THE OWNER-SHAPE GUARD: a coordinate owned by any OTHER shape
+        // is not one of this layout's coordinates and fails the spelling.
+        let chain = affine_chain(&chain_class, &shape_class)
+            .ok_or_else(|| anyhow!("child 1 is not a decodable affine chain over this domain"))?;
+        Ok(Self {
+            shape,
+            chain,
+            width,
+        })
+    }
+    fn erase(self) -> Arc<dyn LayoutFacts> {
+        Arc::new(self)
+    }
+}
+
+impl LayoutFacts for StridedElementLayout {
+    fn shape(&self) -> &ShapeTerm {
+        &self.shape
+    }
+    fn width(&self) -> BitWidthTerm {
+        self.width
+    }
+    fn span_elements(&self) -> Option<IntExprTerm> {
+        Some(self.span())
+    }
+    fn element_index(&self, coords: &[usize]) -> Result<usize> {
+        check_domain(&self.shape, coords)?;
+        let mut total = 0i64;
+        for summand in &self.chain {
+            total += summand.eval_at(coords)?;
+        }
+        element_of(total)
+    }
+}
+
+impl EgglogConstructor for ElementOffsetExpressionLayout {
+    const NAME: &'static str = "ElementOffsetExpressionLayoutLit";
+    type Sort = Layout;
+    fn decode(node: &ENode<'_>) -> Result<Self> {
+        let offset_class = node.child_or_bail(0)?;
+        let shape_class = node.child_or_bail(1)?;
+        let width_class = node.child_or_bail(2)?;
+        let shape =
+            shape_term(&shape_class).ok_or_else(|| anyhow!("child 1 is not a decodable Shape"))?;
+        let width = bit_width(&width_class)
+            .ok_or_else(|| anyhow!("child 2 is not a decodable BitWidth"))?;
+        let offset = int_expr(&offset_class, Some(&shape_class))
+            .ok_or_else(|| anyhow!("child 0 is not a decodable offset expression"))?;
+        Ok(Self {
+            offset,
+            shape,
+            width,
+        })
+    }
+    fn erase(self) -> Arc<dyn LayoutFacts> {
+        Arc::new(self)
+    }
+}
+
+impl LayoutFacts for ElementOffsetExpressionLayout {
+    fn shape(&self) -> &ShapeTerm {
+        &self.shape
+    }
+    fn width(&self) -> BitWidthTerm {
+        self.width
+    }
+    /// An offset function alone does not disclose its reach.
+    fn span_elements(&self) -> Option<IntExprTerm> {
+        None
+    }
+    fn element_index(&self, coords: &[usize]) -> Result<usize> {
+        check_domain(&self.shape, coords)?;
+        element_of(self.offset.eval_at(coords)?)
+    }
+}
+
+impl EgglogConstructor for BitOffsetExpressionLayout {
+    const NAME: &'static str = "BitOffsetExpressionLayoutLit";
+    type Sort = Layout;
+    fn decode(node: &ENode<'_>) -> Result<Self> {
+        let offset_class = node.child_or_bail(0)?;
+        let shape_class = node.child_or_bail(1)?;
+        let width_class = node.child_or_bail(2)?;
+        let shape =
+            shape_term(&shape_class).ok_or_else(|| anyhow!("child 1 is not a decodable Shape"))?;
+        let width = bit_width(&width_class)
+            .ok_or_else(|| anyhow!("child 2 is not a decodable BitWidth"))?;
+        let offset = int_expr(&offset_class, Some(&shape_class))
+            .ok_or_else(|| anyhow!("child 0 is not a decodable offset expression"))?;
+        Ok(Self {
+            offset,
+            shape,
+            width,
+        })
+    }
+    fn erase(self) -> Arc<dyn LayoutFacts> {
+        Arc::new(self)
+    }
+}
+
+impl LayoutFacts for BitOffsetExpressionLayout {
+    fn shape(&self) -> &ShapeTerm {
+        &self.shape
+    }
+    fn width(&self) -> BitWidthTerm {
+        self.width
+    }
+    fn span_elements(&self) -> Option<IntExprTerm> {
+        None
+    }
+    fn element_index(&self, coords: &[usize]) -> Result<usize> {
+        check_domain(&self.shape, coords)?;
+        let bits = self.offset.eval_at(coords)?;
+        ensure!(self.width.0 > 0, "non-positive bit width {}", self.width.0);
+        ensure!(
+            bits % self.width.0 == 0,
+            "bit offset {bits} is not element-aligned to width {}",
+            self.width.0
+        );
+        element_of(bits / self.width.0)
+    }
+}
+
+/// The core preamble's `Layout` constructors and their decoders, IN THIS
+/// ORDER. It is the order `Spellings<Layout>` iterates and therefore
+/// what [`DecodedLayout::present`] prints — a LISTING order, never a
+/// preference: no caller is obliged to take the first.
+pub fn layout_decoders() -> Vec<ConstructorDecoder> {
+    vec![
+        ConstructorDecoder::of::<RightMajorContiguousElementLayout>(),
+        ConstructorDecoder::of::<LeftMajorContiguousElementLayout>(),
+        ConstructorDecoder::of::<StridedElementLayout>(),
+        ConstructorDecoder::of::<ElementOffsetExpressionLayout>(),
+        ConstructorDecoder::of::<BitOffsetExpressionLayout>(),
+    ]
+}
+
+// =============================================================================
+// Term decoders — one e-class of the serialized graph into a term
+// =============================================================================
 
 /// Memo entry for the expression parse: finished, or the in-progress
 /// cycle guard (the index_expr discipline — a cycle fails the SPELLING,
@@ -358,420 +703,225 @@ enum ParseMemo {
     Done(Option<IntExprTerm>),
 }
 
-impl<'a> Reader<'a> {
-    fn new(egraph: &'a EGraph) -> Self {
-        let mut class_nodes: HashMap<&'a ClassId, Vec<&'a NodeId>> = HashMap::new();
-        for (id, node) in &egraph.nodes {
-            class_nodes.entry(&node.eclass).or_default().push(id);
-        }
-        // Deterministic spelling order regardless of map iteration order.
-        for ids in class_nodes.values_mut() {
-            ids.sort();
-        }
-        Self {
-            egraph,
-            class_nodes,
+/// `(BitWidthLit i64)`.
+pub fn bit_width(class: &EClass<'_>) -> Option<BitWidthTerm> {
+    for node in class.nodes_named("BitWidthLit") {
+        if let Some(bits) = node.child(0).and_then(|c| c.i64_literal()) {
+            return Some(BitWidthTerm(bits));
         }
     }
+    None
+}
 
-    /// Every node of `op` in `class` — unsubsumed spellings first,
-    /// subsumed ones as fallback (value PARSING reads denotations, and a
-    /// subsumed node is still a true member of its class; saturation can
-    /// subsume every constructor spelling — the slice_pad lesson).
-    fn nodes_in_class_value(
-        &self,
-        class: &ClassId,
-        op: &str,
-    ) -> impl Iterator<Item = &'a Node> + '_ {
-        let ids = self
-            .class_nodes
-            .get(class)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let matching = move |want_subsumed: bool| {
-            let op = op.to_string();
-            ids.iter()
-                .filter_map(|id| self.egraph.nodes.get(*id))
-                .filter(move |node| node.op == op && node.subsumed == want_subsumed)
+/// `(ShapeLit IntExprList)` — one extent expression per axis, outermost
+/// first.
+pub fn shape_term(class: &EClass<'_>) -> Option<ShapeTerm> {
+    for node in class.nodes_named("ShapeLit") {
+        let Some(head) = node.child(0) else {
+            continue;
         };
-        matching(false).chain(matching(true))
-    }
-
-    fn class_of_child(&self, node: &Node, index: usize) -> Option<ClassId> {
-        let child = node.children.get(index)?;
-        Some(self.egraph.nodes.get(child)?.eclass.clone())
-    }
-
-    /// Any literal-i64 node inside a class.
-    fn parse_i64(&self, class: &ClassId) -> Option<i64> {
-        self.class_nodes
-            .get(class)?
-            .iter()
-            .filter_map(|id| self.egraph.nodes.get(*id))
-            .find_map(|node| node.op.parse::<i64>().ok())
-    }
-
-    /// Any literal-string node inside a class (egraph_serialize renders
-    /// string literals as quoted ops).
-    fn parse_string(&self, class: &ClassId) -> Option<String> {
-        self.class_nodes
-            .get(class)?
-            .iter()
-            .filter_map(|id| self.egraph.nodes.get(*id))
-            .find_map(|node| {
-                let op = node.op.as_str();
-                op.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
-            })
-    }
-
-    fn decode_layout(&self, class: &ClassId) -> Result<MirrorLayout> {
-        // The decoding PREFERENCE (most-structured spelling first); any
-        // spelling present is correct, so the first that parses wins and
-        // later constructors are backtracking fallbacks only.
-        let mut present = Vec::new();
-        for node in self.nodes_in_class_value(class, "RightMajorContiguousElementLayoutLit") {
-            present.push("RightMajorContiguousElementLayoutLit");
-            let (Some(shape), Some(width)) = (
-                self.class_of_child(node, 0)
-                    .and_then(|c| self.decode_shape(&c)),
-                self.class_of_child(node, 1)
-                    .and_then(|c| self.decode_bit_width(&c)),
-            ) else {
-                continue;
-            };
-            return Ok(MirrorLayout::RightMajor(
-                RightMajorContiguousElementLayout { shape, width },
-            ));
-        }
-        for node in self.nodes_in_class_value(class, "LeftMajorContiguousElementLayoutLit") {
-            present.push("LeftMajorContiguousElementLayoutLit");
-            let (Some(shape), Some(width)) = (
-                self.class_of_child(node, 0)
-                    .and_then(|c| self.decode_shape(&c)),
-                self.class_of_child(node, 1)
-                    .and_then(|c| self.decode_bit_width(&c)),
-            ) else {
-                continue;
-            };
-            return Ok(MirrorLayout::LeftMajor(LeftMajorContiguousElementLayout {
-                shape,
-                width,
-            }));
-        }
-        for node in self.nodes_in_class_value(class, "StridedElementLayoutLit") {
-            present.push("StridedElementLayoutLit");
-            let (Some(shape_class), Some(chain_class), Some(width_class)) = (
-                self.class_of_child(node, 0),
-                self.class_of_child(node, 1),
-                self.class_of_child(node, 2),
-            ) else {
-                continue;
-            };
-            let (Some(shape), Some(width)) = (
-                self.decode_shape(&shape_class),
-                self.decode_bit_width(&width_class),
-            ) else {
-                continue;
-            };
-            let Some(chain) = self.decode_affine_chain(&chain_class, &shape_class) else {
-                continue;
-            };
-            return Ok(MirrorLayout::Strided(StridedElementLayout {
-                shape,
-                chain,
-                width,
-            }));
-        }
-        for (constructor, bit_form) in [
-            ("ElementOffsetExpressionLayoutLit", false),
-            ("BitOffsetExpressionLayoutLit", true),
-        ] {
-            for node in self.nodes_in_class_value(class, constructor) {
-                present.push(constructor);
-                let (Some(offset_class), Some(shape_class), Some(width_class)) = (
-                    self.class_of_child(node, 0),
-                    self.class_of_child(node, 1),
-                    self.class_of_child(node, 2),
-                ) else {
-                    continue;
-                };
-                let (Some(shape), Some(width)) = (
-                    self.decode_shape(&shape_class),
-                    self.decode_bit_width(&width_class),
-                ) else {
-                    continue;
-                };
-                let mut memo = HashMap::new();
-                let Some(offset) =
-                    self.parse_int_expr(&offset_class, 64, Some(&shape_class), &mut memo)
-                else {
-                    continue;
-                };
-                return Ok(if bit_form {
-                    MirrorLayout::BitOffset(BitOffsetExpressionLayout {
-                        offset,
-                        shape,
-                        width,
-                    })
-                } else {
-                    MirrorLayout::ElementOffset(ElementOffsetExpressionLayout {
-                        offset,
-                        shape,
-                        width,
-                    })
-                });
-            }
-        }
-        if present.is_empty() {
-            bail!(
-                "layout class {class} has no Layout constructor spelling — \
-                 nothing to decode (fail-closed, never a guess)"
-            );
-        }
-        bail!(
-            "layout class {class} has constructor spellings {present:?} but \
-             none parsed into the mirror vocabulary (fail-closed, never a \
-             guess)"
-        )
-    }
-
-    fn decode_bit_width(&self, class: &ClassId) -> Option<BitWidthTerm> {
-        for node in self.nodes_in_class_value(class, "BitWidthLit") {
-            let Some(bits_class) = self.class_of_child(node, 0) else {
-                continue;
-            };
-            if let Some(bits) = self.parse_i64(&bits_class) {
-                return Some(BitWidthTerm(bits));
-            }
-        }
-        None
-    }
-
-    fn decode_shape(&self, class: &ClassId) -> Option<ShapeTerm> {
-        for node in self.nodes_in_class_value(class, "ShapeLit") {
-            let Some(head) = self.class_of_child(node, 0) else {
-                continue;
-            };
-            let mut memo = HashMap::new();
-            if let Some(extents) =
-                self.decode_expr_list(&head, "IntExprCons", "IntExprNil", 64, None, &mut memo)
-            {
-                return Some(ShapeTerm(extents));
-            }
-        }
-        None
-    }
-
-    /// The strided chain: one summand per axis from-end. Coordinates are
-    /// guarded to the layout's OWN shape (a foreign shape's coordinate is
-    /// not this domain's and fails that spelling — the owner-shape guard).
-    fn decode_affine_chain(
-        &self,
-        class: &ClassId,
-        owner_shape: &ClassId,
-    ) -> Option<Vec<IntExprTerm>> {
         let mut memo = HashMap::new();
-        self.decode_expr_list(
-            class,
-            "IntAffineExprCons",
-            "IntAffineExprNil",
-            64,
-            Some(owner_shape),
-            &mut memo,
-        )
+        if let Some(extents) = expr_list(&head, "IntExprCons", "IntExprNil", 64, None, &mut memo) {
+            return Some(ShapeTerm(extents));
+        }
     }
+    None
+}
 
-    /// Cons-spine walk, existential at every level (the backtracking
-    /// doctrine): a saturated list class holds several cons spellings and
-    /// the first may dead-end while a sibling parses fine.
-    fn decode_expr_list(
-        &self,
-        class: &ClassId,
-        cons_op: &str,
-        nil_op: &str,
-        depth: usize,
-        owner_shape: Option<&ClassId>,
-        memo: &mut HashMap<ClassId, ParseMemo>,
-    ) -> Option<Vec<IntExprTerm>> {
-        if depth == 0 {
-            return None;
-        }
-        if self.nodes_in_class_value(class, nil_op).next().is_some() {
-            return Some(Vec::new());
-        }
-        for cons in self.nodes_in_class_value(class, cons_op) {
-            let Some(element) = self.class_of_child(cons, 0) else {
-                continue;
-            };
-            let Some(tail) = self.class_of_child(cons, 1) else {
-                continue;
-            };
-            let Some(expr) = self.parse_int_expr(&element, 64, owner_shape, memo) else {
-                continue;
-            };
-            if let Some(mut rest) =
-                self.decode_expr_list(&tail, cons_op, nil_op, depth - 1, owner_shape, memo)
-            {
-                rest.insert(0, expr);
-                return Some(rest);
-            }
-        }
-        None
+/// The strided chain: one summand per axis from-end. Coordinates are
+/// guarded to the layout's OWN shape (a foreign shape's coordinate is
+/// not this domain's and fails that spelling — the owner-shape guard).
+pub fn affine_chain(class: &EClass<'_>, owner_shape: &EClass<'_>) -> Option<Vec<IntExprTerm>> {
+    let mut memo = HashMap::new();
+    expr_list(
+        class,
+        "IntAffineExprCons",
+        "IntAffineExprNil",
+        64,
+        Some(owner_shape.id()),
+        &mut memo,
+    )
+}
+
+/// One `IntExpr` class into a term, optionally under the owner-shape
+/// guard.
+pub fn int_expr(class: &EClass<'_>, owner_shape: Option<&EClass<'_>>) -> Option<IntExprTerm> {
+    let owner = owner_shape.map(|c| c.id().clone());
+    let mut memo = HashMap::new();
+    parse_int_expr(class, 64, owner.as_ref(), &mut memo)
+}
+
+/// Cons-spine walk, existential at every level (the backtracking
+/// doctrine): a saturated list class holds several cons spellings and
+/// the first may dead-end while a sibling parses fine.
+fn expr_list(
+    class: &EClass<'_>,
+    cons_op: &str,
+    nil_op: &str,
+    depth: usize,
+    owner_shape: Option<&ClassId>,
+    memo: &mut HashMap<ClassId, ParseMemo>,
+) -> Option<Vec<IntExprTerm>> {
+    if depth == 0 {
+        return None;
     }
-
-    /// Parse one IntExpr class, preferring folded literals; memoized with
-    /// the cycle-taint rule (a `None` whose walk touched the in-progress
-    /// guard is contextual and not cached; an untainted `None` — every
-    /// spelling genuinely outside the subset — caches).
-    fn parse_int_expr(
-        &self,
-        class: &ClassId,
-        depth: usize,
-        owner_shape: Option<&ClassId>,
-        memo: &mut HashMap<ClassId, ParseMemo>,
-    ) -> Option<IntExprTerm> {
-        self.parse_int_expr_tainting(class, depth, owner_shape, memo, &mut false)
+    if class.nodes_named(nil_op).next().is_some() {
+        return Some(Vec::new());
     }
-
-    fn parse_int_expr_tainting(
-        &self,
-        class: &ClassId,
-        depth: usize,
-        owner_shape: Option<&ClassId>,
-        memo: &mut HashMap<ClassId, ParseMemo>,
-        tainted: &mut bool,
-    ) -> Option<IntExprTerm> {
-        match memo.get(class) {
-            Some(ParseMemo::Done(cached)) => return cached.clone(),
-            Some(ParseMemo::InProgress) => {
-                *tainted = true;
-                return None;
-            }
-            None => {}
+    for cons in class.nodes_named(cons_op) {
+        let Some(element) = cons.child(0) else {
+            continue;
+        };
+        let Some(tail) = cons.child(1) else {
+            continue;
+        };
+        let Some(expr) = parse_int_expr(&element, 64, owner_shape, memo) else {
+            continue;
+        };
+        if let Some(mut rest) = expr_list(&tail, cons_op, nil_op, depth - 1, owner_shape, memo) {
+            rest.insert(0, expr);
+            return Some(rest);
         }
-        memo.insert(class.clone(), ParseMemo::InProgress);
-        let mut local_taint = false;
-        let parsed =
-            self.parse_int_expr_uncached(class, depth, owner_shape, memo, &mut local_taint);
-        if parsed.is_none() && local_taint {
-            memo.remove(class);
+    }
+    None
+}
+
+/// Parse one IntExpr class, preferring folded literals; memoized with
+/// the cycle-taint rule (a `None` whose walk touched the in-progress
+/// guard is contextual and not cached; an untainted `None` — every
+/// spelling genuinely outside the subset — caches).
+fn parse_int_expr(
+    class: &EClass<'_>,
+    depth: usize,
+    owner_shape: Option<&ClassId>,
+    memo: &mut HashMap<ClassId, ParseMemo>,
+) -> Option<IntExprTerm> {
+    parse_int_expr_tainting(class, depth, owner_shape, memo, &mut false)
+}
+
+fn parse_int_expr_tainting(
+    class: &EClass<'_>,
+    depth: usize,
+    owner_shape: Option<&ClassId>,
+    memo: &mut HashMap<ClassId, ParseMemo>,
+    tainted: &mut bool,
+) -> Option<IntExprTerm> {
+    match memo.get(class.id()) {
+        Some(ParseMemo::Done(cached)) => return cached.clone(),
+        Some(ParseMemo::InProgress) => {
             *tainted = true;
-        } else {
-            memo.insert(class.clone(), ParseMemo::Done(parsed.clone()));
-        }
-        parsed
-    }
-
-    fn parse_int_expr_uncached(
-        &self,
-        class: &ClassId,
-        depth: usize,
-        owner_shape: Option<&ClassId>,
-        memo: &mut HashMap<ClassId, ParseMemo>,
-        tainted: &mut bool,
-    ) -> Option<IntExprTerm> {
-        if depth == 0 {
             return None;
         }
-        if let Some(lit) = self.nodes_in_class_value(class, "IntLit").next() {
-            let value_class = self.class_of_child(lit, 0)?;
-            return Some(IntExprTerm::Lit(self.parse_i64(&value_class)?));
+        None => {}
+    }
+    memo.insert(class.id().clone(), ParseMemo::InProgress);
+    let mut local_taint = false;
+    let parsed = parse_int_expr_uncached(class, depth, owner_shape, memo, &mut local_taint);
+    if parsed.is_none() && local_taint {
+        memo.remove(class.id());
+        *tainted = true;
+    } else {
+        memo.insert(class.id().clone(), ParseMemo::Done(parsed.clone()));
+    }
+    parsed
+}
+
+fn parse_int_expr_uncached(
+    class: &EClass<'_>,
+    depth: usize,
+    owner_shape: Option<&ClassId>,
+    memo: &mut HashMap<ClassId, ParseMemo>,
+    tainted: &mut bool,
+) -> Option<IntExprTerm> {
+    if depth == 0 {
+        return None;
+    }
+    if let Some(lit) = class.nodes_named("IntLit").next() {
+        return Some(IntExprTerm::Lit(lit.child(0)?.i64_literal()?));
+    }
+    for var in class.nodes_named("IntVar") {
+        let Some(name_class) = var.child(0) else {
+            continue;
+        };
+        if let Some(name) = name_class.string_literal() {
+            return Some(IntExprTerm::Var(name));
         }
-        for var in self.nodes_in_class_value(class, "IntVar") {
-            let Some(name_class) = self.class_of_child(var, 0) else {
+    }
+    for coord in class.nodes_named("CoordVar") {
+        // Child 0 is the owner Shape, child 1 the axis (from-end).
+        // The owner-shape guard: when the caller names the layout's
+        // domain, a CoordVar owned by any OTHER shape is not one of
+        // this layout's coordinates and cannot parse.
+        if let Some(expected) = owner_shape {
+            let Some(owner_class) = coord.child(0) else {
                 continue;
             };
-            if let Some(name) = self.parse_string(&name_class) {
-                return Some(IntExprTerm::Var(name));
+            if owner_class.id() != expected {
+                continue;
             }
         }
-        for coord in self.nodes_in_class_value(class, "CoordVar") {
-            // Child 0 is the owner Shape, child 1 the axis (from-end).
-            // The owner-shape guard: when the caller names the layout's
-            // domain, a CoordVar owned by any OTHER shape is not one of
-            // this layout's coordinates and cannot parse.
-            if let Some(expected) = owner_shape {
-                let Some(owner_class) = self.class_of_child(coord, 0) else {
-                    continue;
-                };
-                if owner_class != *expected {
-                    continue;
-                }
-            }
-            let Some(axis_class) = self.class_of_child(coord, 1) else {
+        let Some(axis_class) = coord.child(1) else {
+            continue;
+        };
+        return Some(IntExprTerm::Coord {
+            axis_from_end: axis_class.i64_literal()?,
+        });
+    }
+    type Build = fn(Box<IntExprTerm>, Box<IntExprTerm>) -> IntExprTerm;
+    let binary_kinds: [(&str, Build); 7] = [
+        ("IntAdd", IntExprTerm::Add),
+        ("IntMul", IntExprTerm::Mul),
+        ("IntTruncDiv", IntExprTerm::TruncDiv),
+        ("IntTruncRem", IntExprTerm::TruncRem),
+        ("IntCeilDiv", IntExprTerm::CeilDiv),
+        ("IntMin", IntExprTerm::Min),
+        ("IntMax", IntExprTerm::Max),
+    ];
+    for (kind, build) in binary_kinds {
+        for node in class.nodes_named(kind) {
+            let Some(lhs_class) = node.child(0) else {
                 continue;
             };
-            return Some(IntExprTerm::Coord {
-                axis_from_end: self.parse_i64(&axis_class)?,
-            });
-        }
-        type Build = fn(Box<IntExprTerm>, Box<IntExprTerm>) -> IntExprTerm;
-        let binary_kinds: [(&str, Build); 7] = [
-            ("IntAdd", IntExprTerm::Add),
-            ("IntMul", IntExprTerm::Mul),
-            ("IntTruncDiv", IntExprTerm::TruncDiv),
-            ("IntTruncRem", IntExprTerm::TruncRem),
-            ("IntCeilDiv", IntExprTerm::CeilDiv),
-            ("IntMin", IntExprTerm::Min),
-            ("IntMax", IntExprTerm::Max),
-        ];
-        for (kind, build) in binary_kinds {
-            for node in self.nodes_in_class_value(class, kind) {
-                let Some(lhs_class) = self.class_of_child(node, 0) else {
-                    continue;
-                };
-                let Some(rhs_class) = self.class_of_child(node, 1) else {
-                    continue;
-                };
-                let Some(lhs) =
-                    self.parse_int_expr_tainting(&lhs_class, depth - 1, owner_shape, memo, tainted)
-                else {
-                    continue;
-                };
-                let Some(rhs) =
-                    self.parse_int_expr_tainting(&rhs_class, depth - 1, owner_shape, memo, tainted)
-                else {
-                    continue;
-                };
-                return Some(build(Box::new(lhs), Box::new(rhs)));
-            }
-        }
-        for cast in self.nodes_in_class_value(class, "IntCastFromBool") {
-            let Some(bool_class) = self.class_of_child(cast, 0) else {
-                continue;
-            };
-            let Some(less_than) = self
-                .nodes_in_class_value(&bool_class, "BoolLessThanInt")
-                .next()
-            else {
-                continue;
-            };
-            let Some(lhs_class) = self.class_of_child(less_than, 0) else {
-                continue;
-            };
-            let Some(rhs_class) = self.class_of_child(less_than, 1) else {
+            let Some(rhs_class) = node.child(1) else {
                 continue;
             };
             let Some(lhs) =
-                self.parse_int_expr_tainting(&lhs_class, depth - 1, owner_shape, memo, tainted)
+                parse_int_expr_tainting(&lhs_class, depth - 1, owner_shape, memo, tainted)
             else {
                 continue;
             };
             let Some(rhs) =
-                self.parse_int_expr_tainting(&rhs_class, depth - 1, owner_shape, memo, tainted)
+                parse_int_expr_tainting(&rhs_class, depth - 1, owner_shape, memo, tainted)
             else {
                 continue;
             };
-            return Some(IntExprTerm::LessThanCast(Box::new(lhs), Box::new(rhs)));
+            return Some(build(Box::new(lhs), Box::new(rhs)));
         }
-        None
     }
-}
-
-/// Convenience for decoders that must be total: [`decode_layout`] with
-/// the error contextualized by who was asking.
-pub fn decode_layout_for(egraph: &EGraph, class: &ClassId, who: &str) -> Result<MirrorLayout> {
-    decode_layout(egraph, class).map_err(|err| anyhow!("{who}: {err}"))
+    for cast in class.nodes_named("IntCastFromBool") {
+        let Some(bool_class) = cast.child(0) else {
+            continue;
+        };
+        let Some(less_than) = bool_class.nodes_named("BoolLessThanInt").next() else {
+            continue;
+        };
+        let Some(lhs_class) = less_than.child(0) else {
+            continue;
+        };
+        let Some(rhs_class) = less_than.child(1) else {
+            continue;
+        };
+        let Some(lhs) = parse_int_expr_tainting(&lhs_class, depth - 1, owner_shape, memo, tainted)
+        else {
+            continue;
+        };
+        let Some(rhs) = parse_int_expr_tainting(&rhs_class, depth - 1, owner_shape, memo, tainted)
+        else {
+            continue;
+        };
+        return Some(IntExprTerm::LessThanCast(Box::new(lhs), Box::new(rhs)));
+    }
+    None
 }
 
 // =============================================================================
@@ -788,14 +938,220 @@ pub fn decode_layout_for(egraph: &EGraph, class: &ClassId, who: &str) -> Result<
 // runtimes choose to instantiate it with.
 // =============================================================================
 
-/// One elected value's decoded layout: the mirror layout plus the
-/// value's `dtype-of` fact. `dtype: None` is representable (a value with
-/// no `dtype-of` row) and bails loudly at USE — staging, allocation
-/// typing, readback — never silently.
+/// The `class` a hand-built plan layout carries: fixtures have no
+/// e-graph, and nothing may pin a class id anyway (2026-09-02 ruling —
+/// ids are random every run).
+pub const HAND_BUILT_CLASS: &str = "hand-built";
+
+/// One elected value's decoded layout: EVERY registered `Layout`
+/// spelling its e-class holds, plus the value's `dtype-of` fact.
+///
+/// The spelling SET, not one chosen spelling: all spellings of a layout
+/// class denote ONE function, and which of them a consumer can lower is
+/// that consumer's business (the cuBLASLt bias fence asks for the
+/// LeftMajor spelling; the CUDA codegen asks for whichever it emits
+/// simplest C for). Nothing here ranks them.
+///
+/// `dtype: None` is representable (a value with no `dtype-of` row) and
+/// bails loudly at USE — staging, allocation typing, readback — never
+/// silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedLayout {
-    pub mirror: MirrorLayout,
+    /// The layout e-class this was decoded from — DIAGNOSTICS and the
+    /// cache key only; never pinned by a test (serialized ids are random
+    /// every run). Hand-built plans carry [`HAND_BUILT_CLASS`].
+    pub class: ClassId,
     pub dtype: Option<crate::dtype::PlanDtype>,
+    /// Every registered `Layout` constructor present in the class,
+    /// decoded, in registry order.
+    pub spellings: Spellings<Layout>,
+    /// TRANSITIONAL (deleted in the next step): the first spelling in
+    /// registry order, re-spelled as the retiring [`MirrorLayout`] sum,
+    /// so consumers can move off it one file at a time.
+    pub mirror: MirrorLayout,
+}
+
+/// The first decoded spelling, re-spelled as the retiring
+/// [`MirrorLayout`] sum. Registry order IS the order the deleted
+/// preference list used, so this is bit-for-bit what the old decoder
+/// returned.
+fn mirror_of(spellings: &Spellings<Layout>) -> Option<MirrorLayout> {
+    let facts = spellings.any()?;
+    let any = facts.as_any();
+    if let Some(v) = any.downcast_ref::<RightMajorContiguousElementLayout>() {
+        return Some(MirrorLayout::RightMajor(v.clone()));
+    }
+    if let Some(v) = any.downcast_ref::<LeftMajorContiguousElementLayout>() {
+        return Some(MirrorLayout::LeftMajor(v.clone()));
+    }
+    if let Some(v) = any.downcast_ref::<StridedElementLayout>() {
+        return Some(MirrorLayout::Strided(v.clone()));
+    }
+    if let Some(v) = any.downcast_ref::<ElementOffsetExpressionLayout>() {
+        return Some(MirrorLayout::ElementOffset(v.clone()));
+    }
+    if let Some(v) = any.downcast_ref::<BitOffsetExpressionLayout>() {
+        return Some(MirrorLayout::BitOffset(v.clone()));
+    }
+    None
+}
+
+impl DecodedLayout {
+    /// THE DECODER: every registered `Layout` spelling the class holds.
+    ///
+    /// Refuses a class with ZERO decoded spellings (the message lists
+    /// what was named and why each failed), and a class whose decoded
+    /// spellings DISAGREE on `shape()` or `width()` — layout identity is
+    /// domain x interpretation, so a mixed-domain class is a false union
+    /// and never a layout.
+    pub fn from_class(class: &EClass<'_>, dtype: Option<crate::dtype::PlanDtype>) -> Result<Self> {
+        let spellings = class.spellings::<Layout>();
+        let Some(first) = spellings.any() else {
+            if spellings.present().is_empty() {
+                bail!(
+                    "layout class {} has no registered Layout constructor spelling — \
+                     nothing to decode (fail-closed, never a guess); ops in the class: {:?}",
+                    class.id(),
+                    class.ops()
+                );
+            }
+            bail!(
+                "layout class {} has constructor spellings {:?} but none parsed \
+                 (fail-closed, never a guess): {:?}",
+                class.id(),
+                spellings.present(),
+                spellings.failed()
+            );
+        };
+        for other in spellings.iter() {
+            if other.shape() != first.shape() || other.width() != first.width() {
+                bail!(
+                    "layout class {} unions spellings over DIFFERENT domains: `{}` over \
+                     {:?}/{:?} and `{}` over {:?}/{:?}. Layout identity is domain x \
+                     interpretation, so this class is a false union, not a layout — \
+                     refused, never reconciled.",
+                    class.id(),
+                    first.constructor(),
+                    first.shape(),
+                    first.width(),
+                    other.constructor(),
+                    other.shape(),
+                    other.width()
+                );
+            }
+        }
+        let mirror = mirror_of(&spellings).expect("a decoded spelling is one of the five");
+        Ok(Self {
+            class: class.id().clone(),
+            dtype,
+            spellings,
+            mirror,
+        })
+    }
+
+    /// A hand-built layout stating ONE spelling (test fixtures and plan
+    /// literals).
+    pub fn of<C: EgglogConstructor<Sort = Layout> + LayoutFacts>(
+        spelling: C,
+        dtype: Option<crate::dtype::PlanDtype>,
+    ) -> Self {
+        Self::of_spellings(vec![spelling.erase()], dtype)
+    }
+
+    /// A hand-built layout stating SEVERAL spellings of ONE function —
+    /// the degenerate-extent fixture (a `[384, 1]` frame is both
+    /// contiguous orders, and the e-graph puts both literals in one
+    /// class).
+    ///
+    /// Panics on an empty list: a layout with no spelling is not a
+    /// layout, and a fixture that writes one is a test bug, not a
+    /// runtime refusal.
+    pub fn of_spellings(
+        spellings: Vec<Arc<dyn LayoutFacts>>,
+        dtype: Option<crate::dtype::PlanDtype>,
+    ) -> Self {
+        assert!(
+            !spellings.is_empty(),
+            "a hand-built DecodedLayout states at least one spelling"
+        );
+        let spellings = Spellings::from_decoded(spellings);
+        let mirror = mirror_of(&spellings)
+            .expect("a hand-built spelling is one of the five Layout constructors");
+        Self {
+            class: ClassId::from(HAND_BUILT_CLASS),
+            dtype,
+            spellings,
+            mirror,
+        }
+    }
+
+    // ---- class-INVARIANT facts (all spellings denote one function) ----
+
+    /// The layout's DOMAIN shape.
+    pub fn shape(&self) -> &ShapeTerm {
+        self.facts().shape()
+    }
+
+    /// The element access width in bits.
+    pub fn width_bits(&self) -> i64 {
+        self.facts().width().0
+    }
+
+    /// The domain extents as literals — `None` if any axis is symbolic.
+    pub fn literal_extents(&self) -> Option<Vec<usize>> {
+        literal_extents_of(self.shape())
+    }
+
+    /// The storage reach in ELEMENTS, taken from the FIRST spelling that
+    /// discloses one and evaluated. `None` when no spelling discloses a
+    /// reach (the offset-expression forms) or the terms are symbolic —
+    /// allocation-sizing callers bail loudly on `None`, never guess.
+    pub fn literal_span_elements(&self) -> Option<usize> {
+        self.spellings
+            .iter()
+            .find_map(|f| f.span_elements())
+            .and_then(|span| span.eval_literal())
+            .and_then(|v| usize::try_from(v).ok())
+    }
+
+    /// Element `coords` down to the flat ELEMENT index, read through the
+    /// first spelling — every spelling of the class denotes the same
+    /// function, so this answer is the class's.
+    pub fn element_index(&self, coords: &[usize]) -> Result<usize> {
+        self.facts().element_index(coords)
+    }
+
+    // ---- call-site preferences, delegated to the spelling set ----
+
+    /// The decoded `C` spelling, if the class holds one.
+    pub fn first<C: EgglogConstructor<Sort = Layout>>(&self) -> Option<&C> {
+        self.spellings.first::<C>()
+    }
+
+    /// The class holds a decodable `C` spelling.
+    pub fn has<C: EgglogConstructor<Sort = Layout>>(&self) -> bool {
+        self.spellings.has::<C>()
+    }
+
+    /// [`DecodedLayout::first`] or a refusal naming `who` asked.
+    pub fn require<C: EgglogConstructor<Sort = Layout>>(&self, who: &str) -> Result<&C> {
+        self.spellings.require::<C>(who)
+    }
+
+    /// The constructor NAMES this layout's class holds, in registry
+    /// order — what diagnostics print.
+    pub fn present(&self) -> &[&'static str] {
+        self.spellings.present()
+    }
+
+    /// The first spelling's facts. Every constructor of one class
+    /// discloses the same domain and width (checked at decode), so the
+    /// class-invariant readers above go through here.
+    fn facts(&self) -> &dyn LayoutFacts {
+        self.spellings
+            .any()
+            .expect("a DecodedLayout always holds at least one spelling")
+    }
 }
 
 /// The caller-owned decoded-layout cache: `(layout class, dtype-of fact)`
@@ -814,10 +1170,7 @@ pub type LayoutDecodeCache = HashMap<(ClassId, Option<crate::dtype::PlanDtype>),
 /// fact is the one extraction-side value fact folded into the decoded
 /// type, so decoding is a PURE function of that key and one cache serves
 /// every value of the graph AND every later graph over the same e-graph.
-/// A search loop holds one for its whole run: `decode_layout` builds a
-/// fresh `Reader` that walks and sorts every node of the serialized
-/// e-graph, so a per-call cache would pay that index once per distinct
-/// layout class per CANDIDATE. A one-shot caller passes
+/// A search loop holds one for its whole run. A one-shot caller passes
 /// `&mut HashMap::new()`. A decode error is LOUD and refuses the graph:
 /// there is no default layout.
 ///
@@ -828,7 +1181,7 @@ pub type LayoutDecodeCache = HashMap<(ClassId, Option<crate::dtype::PlanDtype>),
 /// each poison clones its tied result's layout class AND dtype fact, so
 /// it hits the `(layout class, dtype)` cache.
 pub fn decode_layout_table(
-    egraph: &EGraph,
+    view: &EGraphView<'_>,
     graph: &crate::layout_ir::ExtractedGraph,
     who: &str,
     cache: &mut LayoutDecodeCache,
@@ -846,16 +1199,15 @@ pub fn decode_layout_table(
         let decoded = match cache.get(&key) {
             Some(decoded) => decoded.clone(),
             None => {
-                let decoded = DecodedLayout {
-                    mirror: decode_layout(egraph, &value.layout.eclass).map_err(|err| {
-                        anyhow!(
-                            "{who}: decoding the layout of value {} (layout class {}): {err}",
-                            value.eclass,
-                            value.layout.eclass
-                        )
-                    })?,
-                    dtype: value.dtype_enum,
-                };
+                let decoded =
+                    DecodedLayout::from_class(&view.class(&value.layout.eclass), value.dtype_enum)
+                        .map_err(|err| {
+                            anyhow!(
+                                "{who}: decoding the layout of value {} (layout class {}): {err}",
+                                value.eclass,
+                                value.layout.eclass
+                            )
+                        })?;
                 cache.insert(key, decoded.clone());
                 decoded
             }
@@ -877,9 +1229,114 @@ pub fn decode_layout_table(
     Ok(table)
 }
 
+// =============================================================================
+// TRANSITIONAL: the retiring `MirrorLayout` decoders, now one line over
+// the spelling set. Deleted in the next step with the type itself.
+// =============================================================================
+
+/// Decode one layout e-class into the retiring [`MirrorLayout`] sum: the
+/// first spelling in registry order.
+pub fn decode_layout(egraph: &EGraph, class: &ClassId) -> Result<MirrorLayout> {
+    let decoders = ConstructorRegistry::new(layout_decoders())?;
+    let view = EGraphView::new(egraph, &decoders);
+    Ok(DecodedLayout::from_class(&view.class(class), None)?.mirror)
+}
+
+/// [`decode_layout`] with the error contextualized by who was asking.
+pub fn decode_layout_for(egraph: &EGraph, class: &ClassId, who: &str) -> Result<MirrorLayout> {
+    decode_layout(egraph, class).map_err(|err| anyhow!("{who}: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE ASSEMBLY TRIPWIRE, over core's own preamble: every `Layout`
+    /// constructor the program declares has exactly one decoder, and
+    /// every decoder names a constructor the program declares.
+    #[test]
+    fn core_preamble_layout_constructors_all_have_decoders() {
+        let mut egraph = crate::egglog_snippet::new_egraph();
+        egraph
+            .parse_and_run_program(None, &crate::egglog_snippet::assembled_program_for(&[]))
+            .expect("the core preamble parses");
+        ConstructorRegistry::new(crate::egglog_snippet::core_decoders())
+            .expect("core's decoders are unique")
+            .check(&egraph)
+            .expect("core declares exactly the five Layout constructors it decodes");
+    }
+
+    /// A CONSTRUCTOR WITH NO DECODER IS NAMED — the failure mode the
+    /// tripwire exists for (someone adds a `Layout` constructor to the
+    /// preamble and forgets the struct that reads it back).
+    #[test]
+    fn a_missing_decoder_is_named() {
+        let mut egraph = crate::egglog_snippet::new_egraph();
+        egraph
+            .parse_and_run_program(None, &crate::egglog_snippet::assembled_program_for(&[]))
+            .expect("the core preamble parses");
+        let short: Vec<ConstructorDecoder> = crate::egglog_snippet::core_decoders()
+            .into_iter()
+            .filter(|d| d.name != BitOffsetExpressionLayout::NAME)
+            .collect();
+        let err = ConstructorRegistry::new(short)
+            .expect("still unique")
+            .check(&egraph)
+            .expect_err("a declared constructor with no decoder must be named");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "sort Layout: constructor `BitOffsetExpressionLayoutLit` is declared by \
+                 the program but has no registered decoder"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// ...AND THE OTHER DIRECTION: a decoder for a constructor the
+    /// program does not declare is a stale registration, named too.
+    #[test]
+    fn a_stale_decoder_is_named() {
+        let mut egraph = crate::egglog_snippet::new_egraph();
+        egraph
+            .parse_and_run_program(None, &crate::egglog_snippet::assembled_program_for(&[]))
+            .expect("the core preamble parses");
+        let mut decoders = crate::egglog_snippet::core_decoders();
+        decoders.push(ConstructorDecoder {
+            sort: "Layout",
+            name: "NoSuchLayoutLit",
+            decode: |_| bail!("this constructor does not exist"),
+        });
+        let err = ConstructorRegistry::new(decoders)
+            .expect("still unique")
+            .check(&egraph)
+            .expect_err("a decoder naming an undeclared constructor must be named");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "decoder for `NoSuchLayoutLit` names a constructor the program does not declare"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// `layout-of` is a `Custom` function row whose OUTPUT sort is
+    /// `Layout`. It is not a spelling and must not be demanded of the
+    /// registry — the check above passing is that proof; this pins the
+    /// row really is there and really is `Custom`.
+    #[test]
+    fn a_custom_row_over_a_decoded_sort_is_not_a_spelling() {
+        use egglog::ast::FunctionSubtype;
+        let mut egraph = crate::egglog_snippet::new_egraph();
+        egraph
+            .parse_and_run_program(None, &crate::egglog_snippet::assembled_program_for(&[]))
+            .expect("the core preamble parses");
+        let layout_of = egraph
+            .get_function("layout-of")
+            .expect("the preamble declares layout-of");
+        assert_eq!(layout_of.func_type().output.name(), "Layout");
+        assert_eq!(layout_of.func_type().subtype, FunctionSubtype::Custom);
+    }
 
     fn lit(v: i64) -> IntExprTerm {
         IntExprTerm::Lit(v)
@@ -993,24 +1450,125 @@ mod tests {
         );
     }
 
-    /// Mirror structs compare structurally — assertion convenience for
-    /// runtime tests (the bufferizer's bound is `Clone + Debug` only;
-    /// no planner check compares layouts).
+    /// A hand-built layout compares structurally on its SPELLING SET —
+    /// assertion convenience for runtime tests (the bufferizer's bound
+    /// is `Clone + Debug` only; no planner check compares layouts).
     #[test]
-    fn mirror_layout_equality_is_structural() {
-        let a = MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
+    fn decoded_layout_equality_is_structural() {
+        let dtype = Some(crate::dtype::PlanDtype::F32);
+        let rm = || RightMajorContiguousElementLayout {
             shape: ShapeTerm(vec![lit(2), lit(3)]),
             width: w32(),
-        });
-        let b = MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
+        };
+        let lm = || LeftMajorContiguousElementLayout {
             shape: ShapeTerm(vec![lit(2), lit(3)]),
             width: w32(),
-        });
-        let c = MirrorLayout::LeftMajor(LeftMajorContiguousElementLayout {
-            shape: ShapeTerm(vec![lit(2), lit(3)]),
-            width: w32(),
-        });
+        };
+        let a = DecodedLayout::of(rm(), dtype);
+        let b = DecodedLayout::of(rm(), dtype);
+        let c = DecodedLayout::of(lm(), dtype);
         assert_eq!(a, b);
         assert_ne!(a, c);
+        // A class holding BOTH orders is a THIRD value: same function,
+        // more spellings, and the call sites can tell.
+        let both = DecodedLayout::of_spellings(vec![rm().erase(), lm().erase()], dtype);
+        assert_ne!(both, a);
+        assert_ne!(both, c);
+        assert!(both.has::<RightMajorContiguousElementLayout>());
+        assert!(both.has::<LeftMajorContiguousElementLayout>());
+        assert_eq!(
+            both.present(),
+            [
+                "RightMajorContiguousElementLayoutLit",
+                "LeftMajorContiguousElementLayoutLit"
+            ]
+        );
+        // Class-invariant facts read the same through either.
+        assert_eq!(both.literal_extents(), Some(vec![2, 3]));
+        assert_eq!(both.width_bits(), 32);
+        assert_eq!(both.literal_span_elements(), Some(6));
+        // ...and the read function is the class's: the FIRST spelling.
+        assert_eq!(both.element_index(&[1, 2]).unwrap(), 5);
+    }
+
+    /// The five constructors evaluate their own read functions, and the
+    /// fail-closed cases refuse.
+    #[test]
+    fn element_index_reads_each_spelling() {
+        let dtype = Some(crate::dtype::PlanDtype::F32);
+        let shape = |dims: &[i64]| ShapeTerm(dims.iter().map(|&d| lit(d)).collect());
+        let rm = DecodedLayout::of(
+            RightMajorContiguousElementLayout {
+                shape: shape(&[2, 3]),
+                width: w32(),
+            },
+            dtype,
+        );
+        assert_eq!(rm.element_index(&[1, 2]).unwrap(), 5);
+        assert!(rm.element_index(&[2, 0]).is_err(), "out of domain");
+        assert!(rm.element_index(&[0]).is_err(), "foreign rank");
+
+        let lm = DecodedLayout::of(
+            LeftMajorContiguousElementLayout {
+                shape: shape(&[2, 3]),
+                width: w32(),
+            },
+            dtype,
+        );
+        assert_eq!(lm.element_index(&[1, 2]).unwrap(), 5);
+
+        let st = DecodedLayout::of(
+            StridedElementLayout {
+                shape: shape(&[3, 2]),
+                chain: vec![mul(coord(0), lit(3)), coord(1)],
+                width: w32(),
+            },
+            dtype,
+        );
+        assert_eq!(st.element_index(&[2, 1]).unwrap(), 5);
+
+        let eo = DecodedLayout::of(
+            ElementOffsetExpressionLayout {
+                offset: add(mul(coord(1), lit(3)), coord(0)),
+                shape: shape(&[2, 3]),
+                width: w32(),
+            },
+            dtype,
+        );
+        assert_eq!(eo.element_index(&[1, 2]).unwrap(), 5);
+        assert_eq!(eo.literal_span_elements(), None, "no disclosed reach");
+
+        let bo = DecodedLayout::of(
+            BitOffsetExpressionLayout {
+                offset: mul(add(mul(coord(1), lit(3)), coord(0)), lit(32)),
+                shape: shape(&[2, 3]),
+                width: w32(),
+            },
+            dtype,
+        );
+        assert_eq!(bo.element_index(&[1, 2]).unwrap(), 5);
+        let misaligned = DecodedLayout::of(
+            BitOffsetExpressionLayout {
+                offset: add(mul(coord(0), lit(32)), lit(8)),
+                shape: shape(&[4]),
+                width: w32(),
+            },
+            dtype,
+        );
+        assert!(
+            misaligned.element_index(&[1]).is_err(),
+            "a mid-element bit offset has no element read"
+        );
+
+        let symbolic = DecodedLayout::of(
+            RightMajorContiguousElementLayout {
+                shape: ShapeTerm(vec![IntExprTerm::Var("n".into()), lit(3)]),
+                width: w32(),
+            },
+            dtype,
+        );
+        assert!(symbolic.element_index(&[0, 0]).is_err());
+        assert_eq!(symbolic.literal_extents(), None);
+        assert_eq!(symbolic.literal_span_elements(), None);
     }
 }

@@ -5,7 +5,7 @@
 use luminal::dtype::PlanDtype;
 use luminal::layouts::{
     BitWidthTerm, ElementOffsetExpressionLayout, IntExprTerm, LeftMajorContiguousElementLayout,
-    MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm, StridedElementLayout,
+    RightMajorContiguousElementLayout, ShapeTerm, StridedElementLayout,
 };
 use luminal::prelude::egraph_serialize::ClassId;
 use luminal_cuda_lite::layouts::DecodedLayout;
@@ -356,23 +356,23 @@ fn shape(dims: &[i64]) -> ShapeTerm {
 }
 
 fn right_major(dims: &[i64]) -> DecodedLayout {
-    DecodedLayout {
-        mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
+    DecodedLayout::of(
+        RightMajorContiguousElementLayout {
             shape: shape(dims),
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    }
+        },
+        Some(PlanDtype::F32),
+    )
 }
 
 fn left_major(dims: &[i64]) -> DecodedLayout {
-    DecodedLayout {
-        mirror: MirrorLayout::LeftMajor(LeftMajorContiguousElementLayout {
+    DecodedLayout::of(
+        LeftMajorContiguousElementLayout {
             shape: shape(dims),
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    }
+        },
+        Some(PlanDtype::F32),
+    )
 }
 
 #[test]
@@ -449,17 +449,17 @@ fn dest_frame_refuses_layouts_this_backend_cannot_write() {
     // destination refusal: cuBLASLt has exactly two matrix orders,
     // so a strided or offset-expression destination is not writable by
     // this route. Loud, never wrong bytes.
-    let strided = DecodedLayout {
-        mirror: MirrorLayout::Strided(StridedElementLayout {
+    let strided = DecodedLayout::of(
+        StridedElementLayout {
             shape: shape(&[4, 3]),
             chain: vec![
                 IntExprTerm::Coord { axis_from_end: 1 },
                 IntExprTerm::Coord { axis_from_end: 0 },
             ],
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    };
+        },
+        Some(PlanDtype::F32),
+    );
     let mut call = plan_call_from_spec(&base_spec(4, 3, 5)).expect("plan");
     let err = bind_destination(&mut call, &strided, "pin").expect_err("strided dest");
     let msg = format!("{err:#}");
@@ -469,14 +469,14 @@ fn dest_frame_refuses_layouts_this_backend_cannot_write() {
         "the refusal must classify itself: {msg}"
     );
 
-    let offset = DecodedLayout {
-        mirror: MirrorLayout::ElementOffset(ElementOffsetExpressionLayout {
+    let offset = DecodedLayout::of(
+        ElementOffsetExpressionLayout {
             offset: IntExprTerm::Coord { axis_from_end: 0 },
             shape: shape(&[4, 3]),
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    };
+        },
+        Some(PlanDtype::F32),
+    );
     let mut call = plan_call_from_spec(&base_spec(4, 3, 5)).expect("plan");
     let err = bind_destination(&mut call, &offset, "pin").expect_err("offset dest");
     assert!(
@@ -487,13 +487,13 @@ fn dest_frame_refuses_layouts_this_backend_cannot_write() {
 
 #[test]
 fn dest_frame_refuses_symbolic_extents() {
-    let symbolic = DecodedLayout {
-        mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
+    let symbolic = DecodedLayout::of(
+        RightMajorContiguousElementLayout {
             shape: ShapeTerm(vec![IntExprTerm::Var("s".into()), IntExprTerm::Lit(3)]),
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    };
+        },
+        Some(PlanDtype::F32),
+    );
     let mut call = plan_call_from_spec(&base_spec(4, 3, 5)).expect("plan");
     let err = bind_destination(&mut call, &symbolic, "pin").expect_err("symbolic dest");
     assert!(format!("{err:#}").contains("SYMBOLIC"), "{err:#}");

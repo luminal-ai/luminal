@@ -240,13 +240,18 @@ pub fn search_implementations_with_ops(
 
     // fingerprint → measured nanos (the dedup cache).
     let mut cache: FxHashMap<u64, u128> = FxHashMap::default();
+    // THE VIEW the layout decoders read through: this e-graph plus the
+    // reference registry's `(sort, constructor)` decoders. Built once —
+    // the view indexes classes through the serialized graph's own
+    // `classes()` cache, so every later class lookup is a map hit.
+    let view = luminal::egglog_utils::eclass::EGraphView::new(egraph, crate::decoder_registry());
     // THE DECODED-LAYOUT CACHE, one per search and CALLER-OWNED
     // (`decode_layout_table` takes it by `&mut`). Decoding is a pure
-    // function of `(layout class, dtype)`, and every decode builds a
-    // fresh `Reader` over the whole serialized e-graph — so a cache that
-    // did not span candidates would pay that index once per distinct
-    // layout class per candidate. `egraph` is fixed for this loop, which
-    // is what makes the `ClassId` keys comparable across candidates.
+    // function of `(layout class, dtype)`, and the table is VALUE-keyed
+    // per candidate — so a cache that did not span candidates would
+    // re-decode every distinct layout class once per candidate.
+    // `egraph` is fixed for this loop, which is what makes the
+    // `ClassId` keys comparable across candidates.
     let mut layout_cache = luminal::layouts::LayoutDecodeCache::new();
     let mut plans_profiled = 0usize;
     let mut fingerprint_hits = 0usize;
@@ -354,7 +359,7 @@ pub fn search_implementations_with_ops(
                     // HIT: value-keying costs no extra decoder calls.
                     let dps = luminal::dps::dps_rewrite(&graph);
                     let built = luminal::layouts::decode_layout_table(
-                        egraph,
+                        &view,
                         &dps,
                         "implementation search",
                         &mut layout_cache,
@@ -425,7 +430,7 @@ pub fn search_implementations_with_ops(
                 let build_start = Instant::now();
                 let dps = luminal::dps::dps_rewrite(&graph);
                 let built = luminal::layouts::decode_layout_table(
-                    egraph,
+                    &view,
                     &dps,
                     "implementation search",
                     &mut layout_cache,
