@@ -376,6 +376,167 @@ impl SearchTimings {
     }
 }
 
+/// ONE RULESET's own totals, as egglog's `RunReport` keeps them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RulesetTiming {
+    pub name: String,
+    pub search_and_apply_nanos: u128,
+    pub merge_nanos: u128,
+    pub rebuild_nanos: u128,
+}
+
+/// ONE RULE's search+apply cost and the number of matches it paid for.
+/// The pair is the point: a rule that is expensive AND matches nothing
+/// is a different problem from one that is expensive because it fires.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleTiming {
+    pub name: String,
+    pub search_and_apply_nanos: u128,
+    pub matches: usize,
+}
+
+/// WHAT SATURATION SPENT ITS TIME ON, read off egglog's own
+/// `RunReport` (2026-09-05) — the sub-breakdown of
+/// [`SearchTimings::saturation_nanos`].
+///
+/// Plain data, taken once after the run and owned from then on: the
+/// report borrows from the `EGraph`, and the e-graph does not outlive
+/// the search that produced it.
+///
+/// THE NUMBERS ARE EGGLOG'S, not ours. Per-rule search+apply time is
+/// collected at egglog's default `ReportLevel::TimeOnly`, so nothing
+/// has to be switched on and no rule is re-run to measure it. The
+/// ruleset totals and the per-rule totals are two different cuts of the
+/// same run and do not sum to each other; neither is expected to equal
+/// `saturation_nanos`, which also carries parse, scheduling and the
+/// time between rulesets.
+#[derive(Debug, Clone, Default)]
+pub struct SaturationReport {
+    /// Iterations the schedule ran.
+    pub iterations: usize,
+    /// Per ruleset: search+apply, merge, rebuild. Sorted by search+apply,
+    /// slowest first.
+    pub rulesets: Vec<RulesetTiming>,
+    /// The slowest rules by search+apply, at most
+    /// [`SaturationReport::TOP_RULES`] of them.
+    pub top_rules: Vec<RuleTiming>,
+    /// How many rules the report carried a time for (the `top_rules`
+    /// list is a prefix of this many).
+    pub rules_reported: usize,
+    /// Search+apply summed over EVERY rule, so the top-15 prefix can be
+    /// read as a fraction of the whole.
+    pub rule_total_nanos: u128,
+}
+
+impl SaturationReport {
+    /// How many rules [`Self::from_egraph`] keeps.
+    pub const TOP_RULES: usize = 15;
+
+    /// Take the report off a saturated e-graph. Call it AFTER the run;
+    /// on an e-graph that never ran it yields zeros, which is what a
+    /// search that failed before saturation should report.
+    pub fn from_egraph(egraph: &egglog::EGraph) -> Self {
+        Self::from_egraph_with_top(egraph, Self::TOP_RULES)
+    }
+
+    /// [`Self::from_egraph`] with an explicit rule cutoff.
+    pub fn from_egraph_with_top(egraph: &egglog::EGraph, top: usize) -> Self {
+        let report = egraph.get_overall_run_report();
+        let mut rulesets: BTreeMap<String, RulesetTiming> = BTreeMap::new();
+        fn slot<'a>(
+            rulesets: &'a mut BTreeMap<String, RulesetTiming>,
+            name: &str,
+        ) -> &'a mut RulesetTiming {
+            rulesets
+                .entry(name.to_string())
+                .or_insert_with(|| RulesetTiming {
+                    name: name.to_string(),
+                    ..RulesetTiming::default()
+                })
+        }
+        for (name, time) in &report.search_and_apply_time_per_ruleset {
+            slot(&mut rulesets, name).search_and_apply_nanos = time.as_nanos();
+        }
+        for (name, time) in &report.merge_time_per_ruleset {
+            slot(&mut rulesets, name).merge_nanos = time.as_nanos();
+        }
+        for (name, time) in &report.rebuild_time_per_ruleset {
+            slot(&mut rulesets, name).rebuild_nanos = time.as_nanos();
+        }
+        let mut rulesets: Vec<RulesetTiming> = rulesets.into_values().collect();
+        // Slowest first; the name breaks ties so the order is stable
+        // across runs (egglog's maps are hashed).
+        rulesets.sort_by(|a, b| {
+            b.search_and_apply_nanos
+                .cmp(&a.search_and_apply_nanos)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let mut rules: Vec<RuleTiming> = report
+            .search_and_apply_time_per_rule
+            .iter()
+            .map(|(name, time)| RuleTiming {
+                name: name.to_string(),
+                search_and_apply_nanos: time.as_nanos(),
+                matches: report.num_matches_per_rule.get(name).copied().unwrap_or(0),
+            })
+            .collect();
+        rules.sort_by(|a, b| {
+            b.search_and_apply_nanos
+                .cmp(&a.search_and_apply_nanos)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let rules_reported = rules.len();
+        let rule_total_nanos = rules.iter().map(|rule| rule.search_and_apply_nanos).sum();
+        rules.truncate(top);
+
+        SaturationReport {
+            iterations: report.iterations.len(),
+            rulesets,
+            top_rules: rules,
+            rules_reported,
+            rule_total_nanos,
+        }
+    }
+
+    /// The human-readable cut: ruleset totals, then the top rules, one
+    /// per line, times in ms.
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let ms = |n: u128| n as f64 / 1e6;
+        let mut out = format!(
+            "saturation: {} iteration(s), {} rule(s) timed, {:.0}ms summed over rules",
+            self.iterations,
+            self.rules_reported,
+            ms(self.rule_total_nanos)
+        );
+        for ruleset in &self.rulesets {
+            let _ = write!(
+                out,
+                "\n  ruleset {:<28} search+apply {:>9.0}ms  merge {:>7.0}ms  rebuild {:>8.0}ms",
+                ruleset.name,
+                ms(ruleset.search_and_apply_nanos),
+                ms(ruleset.merge_nanos),
+                ms(ruleset.rebuild_nanos)
+            );
+        }
+        for (rank, rule) in self.top_rules.iter().enumerate() {
+            let _ = write!(
+                out,
+                "\n  rule #{:<2} {:>9.0}ms  {:>10} matches  {}",
+                rank + 1,
+                ms(rule.search_and_apply_nanos),
+                rule.matches,
+                rule.name
+            );
+        }
+        if self.rulesets.is_empty() && self.top_rules.is_empty() {
+            out.push_str("\n  (egglog reported no per-rule timing)");
+        }
+        out
+    }
+}
+
 /// Main's `early_stop_exceeded` (its `src/op.rs`), retyped from
 /// `Duration` to this branch's u128 nanos: true once a candidate's mean
 /// trial cost exceeds `best * factor`, i.e. the candidate has already
@@ -453,6 +614,66 @@ mod timing_tests {
             ..SearchTimings::default()
         };
         assert_eq!(timings.unattributed_nanos(), 0);
+    }
+}
+
+#[cfg(test)]
+mod saturation_report_tests {
+    use super::SaturationReport;
+
+    /// EGGLOG REALLY DOES REPORT THIS. The per-rule and per-ruleset
+    /// timings come from egglog's default report level, so a saturated
+    /// e-graph carries them with nothing switched on — this pins that,
+    /// because the whole saturation breakdown rests on it.
+    #[test]
+    fn a_saturated_egraph_reports_its_rulesets_and_rules() {
+        let mut egraph = egglog::EGraph::default();
+        egraph
+            .parse_and_run_program(
+                None,
+                r#"
+                (datatype Math (Num i64) (Add Math Math))
+                (ruleset folding)
+                (rule ((= e (Add (Num a) (Num b))))
+                      ((union e (Num (+ a b))))
+                      :ruleset folding :name "fold-add")
+                (let start (Add (Num 1) (Num 2)))
+                (run-schedule (saturate folding))
+                "#,
+            )
+            .expect("the fixture program saturates");
+        let report = SaturationReport::from_egraph(&egraph);
+        assert!(report.iterations > 0, "no iterations reported");
+        assert!(
+            report
+                .rulesets
+                .iter()
+                .any(|ruleset| ruleset.name == "folding"),
+            "the `folding` ruleset is missing from {:?}",
+            report.rulesets
+        );
+        let rule = report
+            .top_rules
+            .iter()
+            .find(|rule| rule.name.contains("fold-add"))
+            .unwrap_or_else(|| panic!("`fold-add` is missing from {:?}", report.top_rules));
+        assert!(rule.matches > 0, "the rule fired but reports no matches");
+        assert!(report.rules_reported >= 1, "no rule was timed");
+        // The summary names both cuts, one line each.
+        let summary = report.summary();
+        assert!(summary.contains("ruleset folding"), "{summary}");
+        assert!(summary.contains("fold-add"), "{summary}");
+    }
+
+    /// An e-graph that never ran reports zeros rather than panicking —
+    /// what a search that failed before saturation should show.
+    #[test]
+    fn an_unrun_egraph_reports_nothing_rather_than_failing() {
+        let report = SaturationReport::from_egraph(&egglog::EGraph::default());
+        assert_eq!(report.iterations, 0);
+        assert!(report.rulesets.is_empty());
+        assert!(report.top_rules.is_empty());
+        assert!(report.summary().contains("no per-rule timing"));
     }
 }
 

@@ -59,10 +59,10 @@ use luminal::prelude::egraph_serialize;
 // `profile.rs`'s, and the tests read `RefusalBreakdown` off the
 // outcome).
 pub use luminal::search_support::{
-    CaptureAwareStderr, ProducerIndex, RefusalBreakdown, SearchProgress, SearchTimings,
-    bufferize_cycle_tripwire, early_stop_exceeded, log_channel_enabled, mutate_genome,
-    mutate_genome_reporting, mutate_genome_with_seed, sample_genome, sample_genome_reporting,
-    sample_genome_with_seed,
+    CaptureAwareStderr, ProducerIndex, RefusalBreakdown, RuleTiming, RulesetTiming,
+    SaturationReport, SearchProgress, SearchTimings, bufferize_cycle_tripwire, early_stop_exceeded,
+    log_channel_enabled, mutate_genome, mutate_genome_reporting, mutate_genome_with_seed,
+    sample_genome, sample_genome_reporting, sample_genome_with_seed,
 };
 
 #[derive(Debug, Clone)]
@@ -151,7 +151,7 @@ impl CompileOptions {
         self
     }
 
-    fn search_log_enabled(&self) -> bool {
+    pub fn search_log_enabled(&self) -> bool {
         log_channel_enabled(self.search_log, "SEARCH_LOG")
     }
 }
@@ -177,6 +177,13 @@ pub struct SearchOutcome {
     /// programmatic answer to "what is the search time actually spent
     /// on" (no env vars; read it from the outcome).
     pub timings: SearchTimings,
+    /// WHAT SATURATION SPENT ITS TIME ON (2026-09-05), read off
+    /// egglog's own run report: per-ruleset totals and the slowest
+    /// rules with their match counts. `None` when the caller saturated
+    /// somewhere this search cannot see — the genetic loop itself never
+    /// saturates, so it always leaves this `None` and the runtime
+    /// stamps it.
+    pub saturation: Option<SaturationReport>,
     /// What rejected genomes were rejected FOR (diagnosis ruling
     /// 2026-08-07: understand the breakdown, no auto-repair).
     pub refusal_breakdown: RefusalBreakdown,
@@ -699,6 +706,9 @@ pub fn search_implementations(
         plans_profiled,
         fingerprint_hits,
         timings,
+        // Stamped by whoever saturated (the runtime, or the bucketed
+        // driver below); the loop never does.
+        saturation: None,
         refusal_breakdown: breakdown,
         ranked,
         // The lattice has not run yet; the runtime stamps this once it
@@ -936,6 +946,7 @@ pub fn bucketed_search_implementations(
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
         let saturation_nanos = saturation_start.elapsed().as_nanos();
+        let saturation_report = SaturationReport::from_egraph(&egraph);
         let serialize_start = std::time::Instant::now();
         let serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
@@ -954,6 +965,7 @@ pub fn bucketed_search_implementations(
         )?;
         outcome.timings.saturation_nanos = saturation_nanos;
         outcome.timings.serialize_nanos = serialize_nanos;
+        outcome.saturation = Some(saturation_report);
         egraphs.push(serialized);
         searched.push((ranges, representative, program, outcome));
     }

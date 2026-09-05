@@ -113,6 +113,9 @@ struct SaturatedProgram {
     saturation_nanos: u128,
     /// `EGraph::serialize` of the saturated database.
     serialize_nanos: u128,
+    /// egglog's OWN account of where the saturation went: per-ruleset
+    /// totals and the slowest rules with their match counts.
+    report: luminal::search_support::SaturationReport,
 }
 
 impl CudaRuntime {
@@ -468,6 +471,10 @@ impl CudaRuntime {
             bail!("shape contracts failed:\n  - {}", doors.join("\n  - "));
         }
         let saturation_nanos = saturation_start.elapsed().as_nanos();
+        // TAKEN BEFORE SERIALIZATION, off the e-graph that just ran:
+        // the report borrows from the `EGraph`, so it is copied into
+        // owned data here rather than kept as a borrow.
+        let report = luminal::search_support::SaturationReport::from_egraph(&egraph);
         let serialize_start = std::time::Instant::now();
         let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
         let serialize_nanos = serialize_start.elapsed().as_nanos();
@@ -476,6 +483,7 @@ impl CudaRuntime {
             program,
             saturation_nanos,
             serialize_nanos,
+            report,
         })
     }
 
@@ -615,6 +623,7 @@ impl CudaRuntime {
                 program,
                 saturation_nanos,
                 serialize_nanos,
+                report,
             } = base;
             let mut outcome = crate::search::search_implementations(
                 &serialized,
@@ -631,6 +640,7 @@ impl CudaRuntime {
             // 65 minutes were (2026-09-05).
             outcome.timings.saturation_nanos = saturation_nanos;
             outcome.timings.serialize_nanos = serialize_nanos;
+            outcome.saturation = Some(report);
             // THE UNBUCKETED LATTICE (Phase 5) — a lattice over ONE
             // bucket, so unbucketed and bucketed installs run the same
             // code. Main's "one designed difference" from its pre-#420

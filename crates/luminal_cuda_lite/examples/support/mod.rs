@@ -169,6 +169,14 @@ pub mod device {
             outcome.plans_profiled,
             outcome.timings.summary()
         );
+        // WHERE SATURATION WENT, behind the same flag the progress
+        // lines use: per-ruleset totals and the slowest rules, from
+        // egglog's own run report.
+        if options.search_log_enabled()
+            && let Some(report) = &outcome.saturation
+        {
+            println!("{name}: {}", report.summary());
+        }
         println!(
             "{name}: winner {:.3} ms measured on device (heuristic cost {} bytes moved)",
             outcome.best_nanos as f64 / 1e6,
