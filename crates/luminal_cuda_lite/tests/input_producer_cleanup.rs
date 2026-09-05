@@ -173,7 +173,7 @@ fn op_lit_outputs(egraph: &EGraph) -> Vec<(ClassId, Vec<ClassId>)> {
 #[test]
 fn cleanup_marks_exactly_the_ops_that_produce_an_input_layout_tensor() {
     let (cx, _a, _b) = marker_matmul();
-    let rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
+    let rt = CudaRuntime::load(&cx).expect("load");
     let egraph = rt.saturated_egraph().expect("saturation");
 
     let marked = input_producer_ops(&egraph);
@@ -264,7 +264,7 @@ fn cleanup_marks_exactly_the_ops_that_produce_an_input_layout_tensor() {
 #[test]
 fn marked_ops_produce_only_input_terminals() {
     let (cx, _a, _b) = marker_matmul();
-    let rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
+    let rt = CudaRuntime::load(&cx).expect("load");
     let egraph = rt.saturated_egraph().expect("saturation");
 
     let marked = input_producer_ops(&egraph);
@@ -291,12 +291,12 @@ fn marked_ops_produce_only_input_terminals() {
 #[test]
 fn the_producer_index_offers_no_producer_for_an_input_terminal() {
     let (cx, _a, _b) = marker_matmul();
-    let rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
+    let rt = CudaRuntime::load(&cx).expect("load");
     let egraph = rt.saturated_egraph().expect("saturation");
 
     let index = luminal_cuda_lite::extractor::producer_index_with_matchers(
         &egraph,
-        &luminal_cuda_lite::ops::cuda_matchers_with_cublaslt(),
+        &luminal_cuda_lite::ops::cuda_matchers(),
     );
 
     // Holds under #444's retain alone; pinned here because the stratum
@@ -347,7 +347,7 @@ fn sampled_genomes_never_hand_bufferize_a_cyclic_graph() {
 
     for seed in 0..SEEDS {
         let (cx, a, b) = marker_matmul();
-        let mut rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
+        let mut rt = CudaRuntime::load(&cx).expect("load");
         let data: FxHashMap<NodeIndex, HostBuffer> =
             [(a, weights(32, 1).into()), (b, weights(24, 2).into())]
                 .into_iter()
@@ -430,9 +430,7 @@ fn saturate_with_schedule(cx: &Graph, schedule: &str) -> EGraph {
         .expect("bound parts");
     let full = format!(
         "{}\n\n{pre_schedule}{schedule}{post_checks}",
-        luminal::egglog_snippet::assembled_program_for(
-            &luminal_cuda_lite::ops::cuda_matchers_with_cublaslt()
-        )
+        luminal::egglog_snippet::assembled_program_for(&luminal_cuda_lite::ops::cuda_matchers())
     );
     let mut egraph = luminal::egglog_snippet::new_egraph();
     egraph
@@ -518,7 +516,7 @@ fn subsumed_ops(egraph: &EGraph) -> BTreeMap<String, usize> {
 #[test]
 fn named_input_keeps_its_name_bearing_spellings() {
     let cx = named_marker_matmul();
-    let rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
+    let rt = CudaRuntime::load(&cx).expect("load");
     let egraph = rt.saturated_egraph().expect("saturation");
 
     // ---- (a) the name-bearing spellings are present and LIVE. ----

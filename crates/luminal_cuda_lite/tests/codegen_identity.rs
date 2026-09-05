@@ -18,7 +18,7 @@ use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode};
 use luminal::dtype::{DType, PlanDtype};
 use luminal::prelude::FxHashMap;
 use luminal_cuda_lite::kernels::Coords;
-use luminal_cuda_lite::{CudaRuntime, kernels};
+use luminal_cuda_lite::{CudaRuntime, cuda_registry_without_cublaslt, kernels};
 use std::collections::HashMap;
 
 /// Does this layout's read, taken at coordinates that ARE `i`
@@ -124,7 +124,13 @@ fn searched_plan(
 ) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     let mut cx = luminal::graph::Graph::new();
     let data = build(&mut cx);
-    let mut rt = CudaRuntime::load(&cx).expect("load");
+    // THE DECOMPOSED ROUTE ON PURPOSE: these pins compare two ways of
+    // deriving CUDA CODEGEN geometry, so every elected node must have a
+    // codegen row. A cuBLASLt marker (default since 2026-09-04) is a
+    // host library call with no codegen row at all — it would take the
+    // matmul fixture out of the comparison entirely.
+    let mut rt =
+        CudaRuntime::load_with_registry(&cx, cuda_registry_without_cublaslt()).expect("load");
     let outcome = rt
         .search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("search under the CUDA allow list");

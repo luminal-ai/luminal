@@ -76,7 +76,7 @@ fn search_and_count_opts(
     pairs: &[(NodeIndex, HostBuffer)],
     options: &luminal_cuda_lite::CompileOptions,
 ) -> Row {
-    let mut rt = CudaRuntime::load_with_cublaslt(cx).expect("load");
+    let mut rt = CudaRuntime::load(cx).expect("load");
     let mut vars: Vec<_> = cx.dyn_map.iter().collect();
     vars.sort();
     for (var, value) in vars {
@@ -134,28 +134,40 @@ fn search_and_count_opts(
 
 // ---------------------------------------------------------------------------
 // REGISTRY MEMBERSHIP: the four contracts are registered CL ops and the
-// marker-enabled claim set admits them through the host-call class
-// (never a codegen row, never plan-transparency). The DEFAULT claim set
-// excludes them FOR NOW — the tripwire that blocked always-on is fixed;
-// what remains is that at the 2×4 harness budget the collapse's
-// re-description 2-cycle exhausts the sampler on real graphs (they elect
-// at 12×16). Always-on lands with the budget/sampler decision.
+// DEFAULT claim set admits them through the host-call class (never a
+// codegen row, never plan-transparency). ALWAYS-ON SINCE 2026-09-04: the
+// tripwire that blocked it was fixed on the map literal and the search
+// budget no longer decides the preset, so the marker vocabulary is what
+// a plain `load` searches with. The registry that excludes them is now
+// the one you ask for by name.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn cublaslt_contracts_are_registered_host_call_claims() {
-    let with = CudaRuntime::allow_list_with_cublaslt();
     let default = CudaRuntime::allow_list();
+
+    // The DECOMPOSED preset's claim set, read off an instance loaded
+    // with it — the same derivation `allow_list` runs, over the registry
+    // a caller picks when it wants the multiply/reduce route.
+    let mut cx = Graph::new();
+    let a = cx.tensor((2usize, 3usize), DType::F32);
+    let b = cx.tensor((2usize, 3usize), DType::F32);
+    let _out = (a + b).output();
+    let decomposed =
+        CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
+            .expect("load decomposed");
+
     for form in luminal_cuda_lite::ops::cublaslt::CublasLtForm::ALL {
         let ctor = form.constructor_name();
         assert!(
-            with.contains(&ctor),
-            "{ctor} missing from the marker-enabled claim set"
+            default.contains(&ctor),
+            "{ctor} missing from the DEFAULT claim set — the marker vocabulary \
+             is on by default (ruling 2026-09-04)"
         );
         assert!(
-            !default.contains(&ctor),
-            "{ctor} in the DEFAULT claim set — the marker vocabulary stays \
-             opt-in until the budget/sampler decision lands (always-on is ruled)"
+            !decomposed.active_allow_list().contains(&ctor),
+            "{ctor} claimed by `cuda_registry_without_cublaslt` — that preset is \
+             exactly the one with no marker in it"
         );
     }
     // The claim is host-call-derived: no codegen row exists for the labels.

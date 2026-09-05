@@ -14,8 +14,8 @@ use luminal::dtype::DType;
 use luminal::prelude::FxHashMap;
 use luminal_cuda_lite::ops::cublaslt::{CublasLt, CublasLtForm, CublasLtMarkerMatcher};
 use luminal_cuda_lite::{
-    CudaRuntime, RegisteredOp, cuda_registry, cuda_registry_filtered, cuda_registry_with_cublaslt,
-    harness_search_options,
+    CudaRuntime, RegisteredOp, cuda_registry, cuda_registry_filtered,
+    cuda_registry_without_cublaslt, harness_search_options,
 };
 
 const ADD: &str = "LayoutTensorOpAddFunctionalGeneric";
@@ -46,9 +46,10 @@ fn payloads(
 }
 
 /// (b) The two shipped presets are ordinary registry VALUES: `load` is
-/// `load_with_registry(cuda_registry())` and `load_with_cublaslt` is the
-/// marker preset — in the claim set each instance actually derives, not
-/// merely by construction.
+/// `load_with_registry(cuda_registry())`, and `cuda_registry()` is the
+/// FULL one — markers included, since the 2026-09-04 always-on ruling.
+/// Asserted in the claim set each instance actually derives, not merely
+/// by construction.
 #[test]
 fn the_presets_are_just_registries() {
     let (cx, _a, _b) = add_graph();
@@ -66,40 +67,32 @@ fn the_presets_are_just_registries() {
         "the instance claim set must be the default preset's static one"
     );
 
-    let marker = CudaRuntime::load_with_cublaslt(&cx).expect("load marker");
-    let marker_explicit =
-        CudaRuntime::load_with_registry(&cx, cuda_registry_with_cublaslt()).expect("load explicit");
-    assert_eq!(
-        marker.active_allow_list(),
-        marker_explicit.active_allow_list(),
-        "`load_with_cublaslt` must be `load_with_registry(cuda_registry_with_cublaslt())`"
-    );
-    assert_eq!(
-        marker.active_allow_list(),
-        CudaRuntime::allow_list_with_cublaslt(),
-    );
+    let decomposed = CudaRuntime::load_with_registry(&cx, cuda_registry_without_cublaslt())
+        .expect("load decomposed");
 
-    // The marker preset is the default plus the four host-call
+    // The default is the decomposed preset plus the four host-call
     // contracts, and nothing is lost on the way.
-    for claimed in default.active_allow_list() {
+    for claimed in decomposed.active_allow_list() {
         assert!(
-            marker.active_allow_list().contains(claimed),
-            "the marker preset dropped {claimed}"
+            default.active_allow_list().contains(claimed),
+            "the default preset dropped {claimed}"
         );
     }
     for form in CublasLtForm::ALL {
         assert!(
-            marker
+            default
                 .active_allow_list()
                 .contains(&form.constructor_name()),
-            "the marker preset does not claim {}",
+            "the DEFAULT preset does not claim {} — the marker vocabulary is \
+             on by default (ruling 2026-09-04)",
             form.constructor_name()
         );
         assert!(
-            !default
+            !decomposed
                 .active_allow_list()
                 .contains(&form.constructor_name()),
-            "the DEFAULT preset claims {} — it is opt-in",
+            "`cuda_registry_without_cublaslt` claims {} — that preset is exactly \
+             the one with no marker in it",
             form.constructor_name()
         );
     }
@@ -118,7 +111,7 @@ fn a_filtered_registry_withholds_the_op_and_the_search_refuses() {
     // The narrowing is REAL, not a predicate that matched nothing.
     assert_eq!(
         without_add.len() + 1,
-        cuda_registry_with_cublaslt().len(),
+        cuda_registry().len(),
         "the filter must have removed exactly the add row"
     );
 
@@ -162,7 +155,10 @@ fn a_filtered_registry_withholds_the_op_and_the_search_refuses() {
 fn a_row_registered_from_outside_joins_the_claim_set() {
     let (cx, _a, _b) = add_graph();
 
-    let mut registry = cuda_registry();
+    // The BASE this row is added to is the decomposed preset: the
+    // default already ships all four marker rows, so adding one there
+    // would be a duplicate, not an outside registration.
+    let mut registry = cuda_registry_without_cublaslt();
     registry.push(RegisteredOp::new(
         Box::new(CublasLtMarkerMatcher {
             form: CublasLtForm::Base,
@@ -174,7 +170,8 @@ fn a_row_registered_from_outside_joins_the_claim_set() {
     ));
 
     let rt = CudaRuntime::load_with_registry(&cx, registry).expect("load");
-    let default = CudaRuntime::load(&cx).expect("load default");
+    let default = CudaRuntime::load_with_registry(&cx, cuda_registry_without_cublaslt())
+        .expect("load decomposed");
 
     assert!(
         rt.active_allow_list()
@@ -182,7 +179,7 @@ fn a_row_registered_from_outside_joins_the_claim_set() {
         "the hand-registered row is not claimed: {:?}",
         rt.active_allow_list()
     );
-    // Exactly one row more than the default, and the other three marker
+    // Exactly one row more than the base, and the other three marker
     // forms stayed out — the caller chose the vocabulary row by row.
     assert_eq!(
         rt.active_allow_list().len(),
@@ -203,7 +200,7 @@ fn a_row_registered_from_outside_joins_the_claim_set() {
 /// must not drift.
 #[test]
 fn registry_labels_agree_with_the_prototypes() {
-    for entry in cuda_registry_with_cublaslt() {
+    for entry in cuda_registry() {
         assert!(
             entry.constructor().starts_with("LayoutTensorOp"),
             "{} is not a LayoutTensorOp constructor",
@@ -229,7 +226,7 @@ fn registry_labels_agree_with_the_prototypes() {
 fn a_non_base_cublaslt_row_without_base_is_refused_at_load() {
     let (cx, _a, _b) = add_graph();
 
-    let mut registry = cuda_registry();
+    let mut registry = cuda_registry_without_cublaslt();
     registry.push(RegisteredOp::new(
         Box::new(CublasLtMarkerMatcher {
             form: CublasLtForm::Bias,
@@ -263,9 +260,8 @@ fn a_non_base_cublaslt_row_without_base_is_refused_at_load() {
 
     // Base alone, and all four together, both load.
     let (cx, _a, _b) = add_graph();
-    CudaRuntime::load_with_registry(&cx, cuda_registry_with_cublaslt())
-        .expect("the whole marker estate loads");
-    let mut base_only = cuda_registry();
+    CudaRuntime::load_with_registry(&cx, cuda_registry()).expect("the whole marker estate loads");
+    let mut base_only = cuda_registry_without_cublaslt();
     base_only.push(RegisteredOp::new(
         Box::new(CublasLtMarkerMatcher {
             form: CublasLtForm::Base,

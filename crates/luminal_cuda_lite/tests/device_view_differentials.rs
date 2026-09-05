@@ -78,7 +78,17 @@ fn run_differential(
     let want = reference.get_f32(out).expect("reference output").clone();
 
     // CUDA side: search under the CL allow list (view electable).
-    let mut rt = CudaRuntime::load(cx).expect("cuda load");
+    //
+    // THE DECOMPOSED ROUTE ON PURPOSE: the differential below asserts
+    // BYTE equality against the reference's materialize route, which
+    // only the NVRTC multiply/reduce kernels can hold. A cuBLASLt marker
+    // (default since 2026-09-04) picks its own reduction order and
+    // contracts FMAs, so the matmul fixtures would be compared
+    // bit-for-bit against a route that is only tolerance-equal — see the
+    // reduction-order contract in `tests/cublaslt_contracts.rs`.
+    let mut rt =
+        CudaRuntime::load_with_registry(cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
+            .expect("cuda load");
     // THE TWO RUNTIMES TAKE DIFFERENT HOST PAYLOADS (ruling D4,
     // 2026-09-03): the reference side stages `TypedBuffer` (its kernels
     // read typed slices), the CL side `HostBuffer` (bytes plus a dtype
