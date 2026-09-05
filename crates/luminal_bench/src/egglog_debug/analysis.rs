@@ -4,13 +4,13 @@ use super::{
     DTypeChainAnalysis, DTypeStatus, DependencyGraph, FactStatus, FunctionChainAnalysis,
     FunctionTraceEntry,
 };
-use egraph_serialize::ClassId;
 use luminal::egglog_utils;
 use luminal::hlir::HLIROps;
 use luminal::op::{EgglogOp, IntoEgglogOp, Runtime};
 use luminal::prelude::egglog;
 use luminal::prelude::egglog::prelude::exprs;
 use luminal::prelude::egglog_ast::{RustSpan, Span};
+use luminal::prelude::egraph_serialize::ClassId;
 use luminal::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

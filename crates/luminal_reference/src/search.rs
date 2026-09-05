@@ -43,6 +43,7 @@ use crate::typed_buffer::TypedBuffer;
 use luminal::bufferize::BufferIrGraph;
 use luminal::graph::LogicalProgram;
 use luminal::layouts::DecodedLayout;
+use luminal::prelude::egraph_serialize;
 
 use crate::extractor::{self, Genome};
 use crate::runtime::{ReferenceRuntime, reference_allow_list};

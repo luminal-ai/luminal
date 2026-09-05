@@ -10,6 +10,7 @@ use std::fs;
 
 use crate::extractor;
 use luminal::layout_ir::ExtractedGraph;
+use luminal::prelude::egraph_serialize;
 
 /// Fixture scripts live in the WORKSPACE-ROOT Egglog core tree; this crate
 /// runs two directories below it.
