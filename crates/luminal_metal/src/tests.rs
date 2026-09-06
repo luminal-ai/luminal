@@ -1977,3 +1977,235 @@ fn metal_constant_negative_infinity_mask_matches_reference() {
         "expected all -inf, got {metal:?}"
     );
 }
+
+// ============================================================================
+// DType::Bool coverage. Comparisons (`lt` / `le`) always produce Bool, so the
+// whole relu/abs/sign/leaky_relu/gelu family needs Bool to be representable
+// in a Metal buffer. These cover the intermediate path, the host input path,
+// the 0/1 normalisation invariant, and Bool produced from F16 operands.
+// ============================================================================
+
+/// Every op that lowers through a comparison, checked against the reference
+/// runtime. `maximum` is `(a.lt(b).cast(dt) * b) + (b.le(a).cast(dt) * a)` and
+/// `lt`/`le` always produce `DType::Bool`, so each of these needs a Bool
+/// intermediate to be representable in a Metal buffer:
+///   relu -> maximum;  abs -> relu;  sign -> abs;
+///   leaky_relu -> relu;  gelu -> abs + sign.
+#[test]
+fn metal_bool_dependent_unary_ops_match_reference() {
+    let input = seeded_data(64, 4.0, -2.0);
+
+    let cases: [(&str, fn(GraphTensor) -> GraphTensor); 5] = [
+        ("relu", |a| a.relu()),
+        ("abs", |a| a.abs()),
+        ("sign", |a| a.sign()),
+        ("leaky_relu", |a| a.leaky_relu(0.1)),
+        ("gelu", |a| a.gelu()),
+    ];
+
+    for (name, op) in cases {
+        let (metal, reference) = metal_and_reference(
+            |cx| {
+                let a = cx.tensor(64);
+                (a, op(a).output())
+            },
+            &input,
+        );
+        assert_eq!(metal.len(), reference.len(), "{name}: length mismatch");
+        for (i, (m, r)) in metal.iter().zip(reference.iter()).enumerate() {
+            let rel_err = (m - r).abs() / r.abs().max(1.0);
+            assert!(
+                rel_err < 1e-3,
+                "{name}: index {i}: metal {m}, reference {r}, rel_err {rel_err}"
+            );
+        }
+    }
+}
+/// Bool arriving as host input data, read back through a widening cast.
+/// Exercises `MetalRuntime::create_input_buffer`'s Bool arm and the
+/// `(Bool, F32)` cast pair.
+#[test]
+fn metal_bool_input_casts_to_f32() {
+    let mask = vec![true, false, true, true, false, false, true, false];
+    let expected: Vec<f32> = mask.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect();
+
+    let mut cx = Graph::default();
+    let a = cx.tensor(8).as_dtype(DType::Bool);
+    let out = a.cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(a, mask);
+    let mut rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &expected, 0.001);
+}
+/// The realistic use of a Bool input: a host-supplied selection mask driving
+/// `cond`. This is the shape an attention mask takes.
+#[test]
+fn metal_bool_input_drives_cond() {
+    let mask = vec![true, false, true, false];
+    let lhs = [10.0f32, 20.0, 30.0, 40.0];
+    let rhs = [-1.0f32, -2.0, -3.0, -4.0];
+    let expected = [10.0f32, -2.0, 30.0, -4.0];
+
+    let mut cx = Graph::default();
+    let m = cx.tensor(4).as_dtype(DType::Bool);
+    let a = cx.tensor(4);
+    let b = cx.tensor(4);
+    let out = a.cond(m, b).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(m, mask);
+    rt.set_data(a, &lhs);
+    rt.set_data(b, &rhs);
+    let mut rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &expected, 0.001);
+}
+/// A non-{0,1} byte must not reach a Bool buffer: casting F32 -> Bool
+/// normalises, so 2.5 and -3.0 both become `true`, not 2 and -3.
+#[test]
+fn metal_cast_to_bool_normalises_to_zero_or_one() {
+    let input = [0.0f32, 1.0, 2.5, -3.0, 1e-8, -0.0];
+    let expected = [0.0f32, 1.0, 1.0, 1.0, 1.0, 0.0];
+
+    let mut cx = Graph::default();
+    let a = cx.tensor(6);
+    let out = a.cast(DType::Bool).cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(a, &input);
+    let mut rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &expected, 0.001);
+}
+/// F16 -> Bool -> F32. Exercises the `(F16, Bool)` and `(Bool, F32)` cast
+/// pairs, i.e. a Bool produced from half-precision operands.
+#[test]
+fn metal_f16_comparison_through_bool() {
+    let input = [-2.0f32, -0.5, 0.0, 0.5, 2.0, 4.0, -4.0, 1.0];
+    let expected: Vec<f32> = input
+        .iter()
+        .map(|v| if *v != 0.0 { 1.0 } else { 0.0 })
+        .collect();
+
+    let mut cx = Graph::default();
+    let a = cx.tensor(8).as_dtype(DType::F16);
+    let out = a.cast(DType::Bool).cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(a, to_f16_vec(&input));
+    let mut rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &expected, 0.001);
+}
+/// `relu` on an F16 tensor: `maximum` compares two F16 operands, producing a
+/// Bool intermediate that is then cast back to F16. The whole Bool round trip
+/// happens in half precision.
+#[test]
+fn metal_f16_relu_through_bool_intermediate() {
+    let input = [-3.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0];
+    let expected = [0.0f32, 0.0, 0.0, 0.0, 0.5, 1.0, 2.0, 3.0];
+
+    let mut cx = Graph::default();
+    let a = cx.tensor(8).as_dtype(DType::F16);
+    let out = a.relu().cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(a, to_f16_vec(&input));
+    let mut rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &expected, 0.002);
+}
+/// `gelu` in half precision — the heaviest Bool consumer, since it routes
+/// through both `abs` and `sign`.
+#[test]
+fn metal_f16_gelu_through_bool_intermediate() {
+    // x = 0 is excluded deliberately. `sign(x) = x / (|x| + 1e-10)` in
+    // src/frontend/unary.rs underflows in F16 (1e-10 < the F16 min subnormal
+    // of ~6e-8), so sign(0) evaluates 0/0 = NaN on *every* backend, including
+    // the reference runtime and CUDA. That is a separate frontend issue,
+    // independent of Bool dtype support.
+    let input = [-2.0f32, -1.0, -0.5, 0.25, 0.5, 1.0, 2.0, 3.0];
+    let expected: Vec<f32> = input
+        .iter()
+        .map(|x| 0.5 * x * (1.0 + libm_erf(x / std::f32::consts::SQRT_2)))
+        .collect();
+
+    let mut cx = Graph::default();
+    let a = cx.tensor(8).as_dtype(DType::F16);
+    let out = a.gelu().cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(a, to_f16_vec(&input));
+    let mut rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    // F16 storage plus the A&S 7.1.26 erf approximation Luminal uses.
+    assert_close(&rt.get_f32(out), &expected, 0.02);
+}
+/// Abramowitz & Stegun 7.1.26 — same approximation `GraphTensor::gelu` uses,
+/// so the test measures backend error rather than approximation error.
+fn libm_erf(x: f32) -> f32 {
+    const P: f32 = 0.3275911;
+    const A: [f32; 5] = [
+        0.254829592,
+        -0.284496736,
+        1.421413741,
+        -1.453152027,
+        1.061405429,
+    ];
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + P * x);
+    let poly = ((((A[4] * t + A[3]) * t + A[2]) * t + A[1]) * t + A[0]) * t;
+    sign * (1.0 - poly * (-(x * x)).exp())
+}
+/// argmax 無法走差分 harness（見上），改為直接驗證 Metal 輸出正確。
+#[test]
+fn metal_argmax_matches_cpu() {
+    let data = seeded_data(64, 2.0, 0.5);
+    const COLS: usize = 16;
+    let expected: Vec<f32> = data
+        .as_chunks::<COLS>()
+        .0
+        .iter()
+        .map(|row| {
+            let mut bi = 0usize;
+            for (i, v) in row.iter().enumerate() {
+                if *v > row[bi] {
+                    bi = i;
+                }
+            }
+            bi as f32
+        })
+        .collect();
+
+    let mut cx = Graph::default();
+    let a = cx.tensor((4, 16));
+    let out = a.argmax(1).output();
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(a, &data);
+    let mut rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+    assert_close(&rt.get_f32(out), &expected, 0.001);
+}
