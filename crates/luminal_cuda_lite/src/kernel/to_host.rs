@@ -1246,23 +1246,33 @@ impl CudaGraphOp {
         }
     }
 
-    pub(crate) fn enable_residency(&self, dims: &[Symbol]) {
+    fn capture_sensitive_dyn_dims(&self) -> FxHashSet<Symbol> {
+        self.cublaslt_users_by_dyn_dim
+            .keys()
+            .copied()
+            .chain(self.captured_host_dyn_dims.iter().copied())
+            .chain(self.internal_buffer_dyn_dims.iter().copied())
+            .collect()
+    }
+
+    pub(crate) fn enable_residency(&self, dims: &[Symbol], strict: bool) {
         assert!(
             !self.residency_frozen.get(),
             "CUDA graph residency is already frozen"
         );
         self.release_materialization();
-        let mut relevant: FxHashSet<_> = self
-            .cublaslt_users_by_dyn_dim
-            .keys()
-            .copied()
-            .chain(self.captured_host_dyn_dims.iter().copied())
-            .chain(self.internal_buffer_dyn_dims.iter().copied())
-            .collect();
-        assert!(
-            relevant.iter().all(|dim| dims.contains(dim)),
-            "capture-sensitive dimensions {relevant:?} must be declared in startup shape_dims"
-        );
+        let mut relevant = self.capture_sensitive_dyn_dims();
+        if strict {
+            assert!(
+                relevant.iter().all(|dim| dims.contains(dim)),
+                "capture-sensitive dimensions {relevant:?} must be declared in startup shape_dims"
+            );
+        } else {
+            // Cache only the requested specialization dimensions. Other
+            // dimensions keep their exact values and use materialize_impl's
+            // normal parameter-update / library-recapture path on a cache hit.
+            relevant.retain(|dim| dims.contains(dim));
+        }
         if !self.state.borrow().flashinfer_ops.is_empty() {
             relevant.extend(dims);
         }
@@ -1318,6 +1328,12 @@ impl CudaGraphOp {
         let resident = resident
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("CUDA graph residency was not enabled"))?;
+        anyhow::ensure!(
+            self.capture_sensitive_dyn_dims()
+                .iter()
+                .all(|dim| resident.dims.contains(dim)),
+            "cannot freeze CUDA graph warmup with uncached capture-sensitive dimensions"
+        );
         anyhow::ensure!(
             resident.active_key.is_some() && self.is_materialized(),
             "every CUDA graph bucket must be prepared before serving"

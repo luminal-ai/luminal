@@ -694,9 +694,32 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         })
     }
 
-    /// Begin startup capture of finite shape variants sharing one arena.
-    /// Other dimensions remain patchable through the dynamic ABI.
+    /// Begin optional CUDA graph warmup without restricting dynamic execution.
+    ///
+    /// `cached_dims` are performance hints: keep separate materializations for
+    /// their values when the lowered graph benefits from doing so. Other
+    /// dimensions may still change anywhere within the compiled bucket ranges;
+    /// execution updates parameters or rematerializes affected library calls.
+    /// Previously unseen cached values are also prepared on demand. Pass `[]`
+    /// to reuse one mutable materialization per compiled graph.
+    ///
+    /// Call `prepare_cuda_graphs` with representative inputs to warm selected
+    /// shapes. No finish/freeze call is needed. Use `begin_cuda_graph_preparation`
+    /// only when explicitly requiring a finite, immutable set of captures.
+    pub fn begin_cuda_graph_warmup(&mut self, cached_dims: &[Symbol]) {
+        self.begin_cuda_graph_residency(cached_dims, false);
+    }
+
+    /// Begin strict startup capture of finite shape variants sharing one arena.
+    /// Every capture-sensitive dimension of the selected lowering must be in
+    /// `shape_dims`. After `finish_cuda_graph_preparation`, unseen capture shapes
+    /// are errors even inside a compile bucket. This is an opt-in restriction;
+    /// ordinary dynamic execution and `begin_cuda_graph_warmup` do not impose it.
     pub fn begin_cuda_graph_preparation(&mut self, shape_dims: &[Symbol]) {
+        self.begin_cuda_graph_residency(shape_dims, true);
+    }
+
+    fn begin_cuda_graph_residency(&mut self, shape_dims: &[Symbol], strict: bool) {
         assert!(
             !self.cuda_graphs_frozen,
             "CUDA graph residency is already frozen"
@@ -704,14 +727,15 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         self.cuda_stream.synchronize().unwrap();
         self.set_max_materialized_buckets(None);
         for graph in self.cuda_graphs() {
-            graph.enable_residency(shape_dims);
+            graph.enable_residency(shape_dims, strict);
         }
         self.materialized_bucket_lru.clear();
         self.release_pooled_memory();
     }
 
-    /// Materialize one serving shape using the caller's current, valid input
-    /// descriptors. Does not launch the model or modify its KV state.
+    /// Materialize one shape using the caller's current, valid input descriptors.
+    /// Does not launch the model or modify its KV state. Warming a representative
+    /// does not specialize the logical dimensions to that value or freeze graphs.
     pub fn prepare_cuda_graphs(&mut self, dyn_map: &DynMap) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.cuda_graphs_frozen,

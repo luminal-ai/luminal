@@ -27,6 +27,42 @@ fn bucket_options(buckets: &[DimBucket]) -> CompileOptions {
 }
 
 #[test]
+fn warmup_generated_kernel_preserves_dynamic_bucket_values() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let (mut cx, input, output) = build_dynamic_add_graph();
+    cx.build_search_space::<CudaRuntime>(bucket_options(&[
+        DimBucket::new(1, 4).representative(2),
+        DimBucket::new(5, 8).representative(6),
+    ]));
+    let mut rt = CudaRuntime::initialize(stream);
+    cx.set_dim('s', 2);
+    rt.set_data(input, vec![1.0f32; 8 * 4]);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(5),
+        &mut SmallRng::seed_from_u64(43),
+    );
+    rt.begin_cuda_graph_warmup(&[]);
+    for s in [2, 6] {
+        cx.set_dim('s', s);
+        rt.set_data(input, vec![0.0f32; s * 4]);
+        rt.prepare_cuda_graphs(&cx.dyn_map).unwrap();
+    }
+    for (iteration, s) in [1, 4, 5, 8, 3, 6, 2, 1].into_iter().enumerate() {
+        cx.set_dim('s', s);
+        let values = (0..s * 4)
+            .map(|i| i as f32 + iteration as f32)
+            .collect::<Vec<_>>();
+        let expected = values.iter().map(|v| v * 2.0).collect::<Vec<_>>();
+        rt.set_data(input, values);
+        rt.execute(&cx.dyn_map);
+        assert_eq!(rt.get_f32(output), expected);
+    }
+}
+
+#[test]
 fn resident_recurrent_output_preserves_input_allocation() {
     let Some(stream) = get_cuda_stream() else {
         return;

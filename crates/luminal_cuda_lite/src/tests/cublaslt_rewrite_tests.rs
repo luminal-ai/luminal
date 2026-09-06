@@ -1299,7 +1299,130 @@ fn bucket_range_and_singleton_cublaslt_buckets_are_captured() {
 }
 
 #[test]
+fn warmup_cublaslt_preserves_exact_dynamic_bucket_values() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream)
+        || !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream)
+    {
+        return;
+    }
+    let n = 11;
+    let mut cx = Graph::new();
+    let a = cx.tensor(('s', 'c')).persist();
+    let b = cx.tensor(('c', n)).persist();
+    let out = a.matmul(b).output();
+    cx.set_dim('s', 2);
+    cx.set_dim('c', 16);
+    // Exercise the unfused alternative regardless of which implementation
+    // happens to win a performance search on the test GPU.
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "dynamic warmup", |_| true);
+    let dim_buckets = [
+        (
+            Symbol::from('s'),
+            vec![DimBucket::new(1, 4), DimBucket::new(5, 8)],
+        ),
+        (
+            Symbol::from('c'),
+            vec![DimBucket::new(1, 32), DimBucket::new(33, 64)],
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let mut buckets = Vec::new();
+    for (si, s) in [(0, 2), (1, 6)] {
+        for (ci, c) in [(0, 16), (1, 48)] {
+            buckets.push((
+                [(Symbol::from('s'), si), (Symbol::from('c'), ci)]
+                    .into_iter()
+                    .collect(),
+                [(Symbol::from('s'), s), (Symbol::from('c'), c)]
+                    .into_iter()
+                    .collect(),
+                llir.clone(),
+            ));
+        }
+    }
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.set_data_with_capacity(a, vec![0.0f32; 8 * 64], 8 * 64 * 4);
+    rt.set_data_with_capacity(b, vec![0.0f32; 64 * n], 64 * n * 4);
+    rt.load_llir_buckets(&dim_buckets, &buckets);
+    // c is capture-sensitive in cuBLASLt, but is deliberately not a cache
+    // key. Startup must not demand knowledge of the selected op's dependencies.
+    rt.begin_cuda_graph_warmup(&['s'.into()]);
+    for s in [2, 6] {
+        for c in [16, 48] {
+            cx.set_dim('s', s);
+            cx.set_dim('c', c);
+            rt.set_data(a, vec![0.0f32; s * c]);
+            rt.set_data(b, vec![0.0f32; c * n]);
+            rt.prepare_cuda_graphs(&cx.dyn_map).unwrap();
+        }
+    }
+    // Explicit strict freezing must still reject this incomplete cache key.
+    assert!(
+        rt.finish_cuda_graph_preparation()
+            .unwrap_err()
+            .to_string()
+            .contains("uncached capture-sensitive dimensions")
+    );
+    let cases = [
+        (2, 7),
+        (2, 19),
+        (2, 7), // same cached variant: grow, shrink, reset
+        (1, 1),
+        (4, 32),
+        (5, 33),
+        (8, 64), // both bucket boundaries
+        (3, 7),
+        (7, 51),
+        (2, 19),
+        (1, 1), // unseen and reused cached values
+    ];
+    for (iteration, (s, c)) in cases.into_iter().enumerate() {
+        cx.set_dim('s', s);
+        cx.set_dim('c', c);
+        let seed = 0xC004_0000 + iteration as u64;
+        let av = random_f32_vec(s * c, seed, -0.08, 0.08);
+        let bv = random_f32_vec(c * n, seed + 100, -0.08, 0.08);
+        let expected = reference_matmul_2d(&av, &bv, s, n, c);
+        rt.set_data(a, av);
+        rt.set_data(b, bv);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out), &expected, 1e-5, 1e-5);
+        assert!(
+            rt.debug_cuda_graph_summaries()
+                .iter()
+                .any(|summary| summary.n_cublaslt == 1)
+        );
+    }
+    // Dimension changes alone must invalidate the affected library plan,
+    // even when persistent input pointers and contents are unchanged.
+    let av = random_f32_vec(8 * 64, 0xC004_1000, -0.08, 0.08);
+    let bv = random_f32_vec(64 * n, 0xC004_1001, -0.08, 0.08);
+    rt.set_data(a, av.clone());
+    rt.set_data(b, bv.clone());
+    for (s, c) in [(2, 16), (2, 7), (2, 19), (2, 7)] {
+        cx.set_dim('s', s);
+        cx.set_dim('c', c);
+        let expected = reference_matmul_2d(&av[..s * c], &bv[..c * n], s, n, c);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out), &expected, 1e-5, 1e-5);
+    }
+}
+
+#[test]
 fn resident_cublaslt_variants_switch_without_recapture() {
+    check_cublaslt_variants_switch_without_recapture(true);
+}
+
+#[test]
+fn warmup_cublaslt_variants_switch_without_recapture() {
+    check_cublaslt_variants_switch_without_recapture(false);
+}
+
+fn check_cublaslt_variants_switch_without_recapture(strict: bool) {
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -1333,14 +1456,20 @@ fn resident_cublaslt_variants_switch_without_recapture() {
     let b_values = random_f32_vec(k * n, 17, -0.1, 0.1);
     rt.set_data(b, b_values.clone());
     rt.load_llir_buckets(&dim_buckets, &buckets);
-    rt.begin_cuda_graph_preparation(&['s'.into()]);
+    if strict {
+        rt.begin_cuda_graph_preparation(&['s'.into()]);
+    } else {
+        rt.begin_cuda_graph_warmup(&['s'.into()]);
+    }
     assert!(rt.debug_retained_host_memory_bytes() >= 2 * 32 * 1024 * 1024);
     for s in [4, 2, 1] {
         cx.set_dim('s', s);
         rt.set_data(a, vec![0.0f32; s * k]);
         rt.prepare_cuda_graphs(&cx.dyn_map).unwrap();
     }
-    rt.finish_cuda_graph_preparation().unwrap();
+    if strict {
+        rt.finish_cuda_graph_preparation().unwrap();
+    }
     // These tiny GEMMs do not need the 32 MiB workspace preference limit.
     // Final residency validation must charge their actual allocations, even
     // with several retained shapes, instead of multiplying that limit.
@@ -1361,10 +1490,16 @@ fn resident_cublaslt_variants_switch_without_recapture() {
     }
     cx.set_dim('s', 3);
     rt.set_data(a, vec![0.0f32; 3 * k]);
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.execute(&cx.dyn_map))).is_err()
-    );
-    assert_eq!(rt.cuda_graph_residency_stats(), baseline);
+    if strict {
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.execute(&cx.dyn_map)))
+                .is_err()
+        );
+        assert_eq!(rt.cuda_graph_residency_stats(), baseline);
+    } else {
+        rt.execute(&cx.dyn_map);
+        assert_eq!(rt.get_f32(out), vec![0.0; 3 * n]);
+    }
 }
 
 #[test]

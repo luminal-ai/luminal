@@ -131,6 +131,8 @@ impl DimBucket {
 
     /// The representative value used during search profiling.
     /// Defaults to midpoint `(min + max) / 2`.
+    /// This is not a runtime shape constraint or implicit padding: executions
+    /// still use the exact dynamic value anywhere in the bucket's range.
     pub fn representative_value(&self) -> usize {
         self.representative_override
             .unwrap_or((self.min + self.max) / 2)
