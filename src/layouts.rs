@@ -39,11 +39,10 @@
 //! guess.
 
 use crate::egglog_utils::eclass::{
-    ConstructorDecoder, ConstructorRegistry, DynFacts, EClass, EGraphView, ENode,
-    EgglogConstructor, Sort, Spellings,
+    ConstructorDecoder, DynFacts, EClass, EGraphView, ENode, EgglogConstructor, Sort, Spellings,
 };
 use anyhow::{Result, anyhow, bail, ensure};
-use egraph_serialize::{ClassId, EGraph};
+use egraph_serialize::ClassId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -173,21 +172,6 @@ pub struct BitOffsetExpressionLayout {
     pub offset: IntExprTerm,
     pub shape: ShapeTerm,
     pub width: BitWidthTerm,
-}
-
-/// RETIRING (deleted in the next step of this refactor): the closed sum
-/// over the five constructors. It was flagged for review as "too
-/// enum-ish for a vocabulary that is deliberately open" and Austin ruled
-/// it out — a class holds a SET of spellings and every call site names
-/// the one it wants. Kept for exactly one step so consumers move off it
-/// one file at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MirrorLayout {
-    RightMajor(RightMajorContiguousElementLayout),
-    LeftMajor(LeftMajorContiguousElementLayout),
-    Strided(StridedElementLayout),
-    ElementOffset(ElementOffsetExpressionLayout),
-    BitOffset(BitOffsetExpressionLayout),
 }
 
 // =============================================================================
@@ -336,57 +320,6 @@ impl IntExprTerm {
         })
     }
 }
-
-impl MirrorLayout {
-    /// The layout's DOMAIN shape (every constructor carries one).
-    pub fn shape(&self) -> &ShapeTerm {
-        match self {
-            MirrorLayout::RightMajor(l) => &l.shape,
-            MirrorLayout::LeftMajor(l) => &l.shape,
-            MirrorLayout::Strided(l) => &l.shape,
-            MirrorLayout::ElementOffset(l) => &l.shape,
-            MirrorLayout::BitOffset(l) => &l.shape,
-        }
-    }
-
-    /// The element access width in bits.
-    pub fn width_bits(&self) -> i64 {
-        match self {
-            MirrorLayout::RightMajor(l) => l.width.0,
-            MirrorLayout::LeftMajor(l) => l.width.0,
-            MirrorLayout::Strided(l) => l.width.0,
-            MirrorLayout::ElementOffset(l) => l.width.0,
-            MirrorLayout::BitOffset(l) => l.width.0,
-        }
-    }
-
-    /// The domain extents as literals — `None` if any axis is symbolic.
-    pub fn literal_extents(&self) -> Option<Vec<usize>> {
-        self.shape()
-            .0
-            .iter()
-            .map(|e| e.eval_literal().and_then(|v| usize::try_from(v).ok()))
-            .collect()
-    }
-
-    /// The layout's storage reach in ELEMENTS, where the constructor
-    /// discloses one ([`SpanExpr`]: the packed ladder) and the terms are
-    /// literal. `None` for the offset-expression forms (undisclosed
-    /// reach) and for symbolic terms — allocation-sizing callers bail
-    /// loudly on `None`, never guess.
-    pub fn literal_span_elements(&self) -> Option<usize> {
-        let span = match self {
-            MirrorLayout::RightMajor(l) => l.span(),
-            MirrorLayout::LeftMajor(l) => l.span(),
-            MirrorLayout::Strided(l) => l.span(),
-            MirrorLayout::ElementOffset(_) | MirrorLayout::BitOffset(_) => return None,
-        };
-        span.eval_literal().and_then(|v| usize::try_from(v).ok())
-    }
-}
-
-// =============================================================================
-// The spelling decoder
 
 // =============================================================================
 // THE `Layout` SORT — its erased fact surface and its five constructors
@@ -965,35 +898,6 @@ pub struct DecodedLayout {
     /// Every registered `Layout` constructor present in the class,
     /// decoded, in registry order.
     pub spellings: Spellings<Layout>,
-    /// TRANSITIONAL (deleted in the next step): the first spelling in
-    /// registry order, re-spelled as the retiring [`MirrorLayout`] sum,
-    /// so consumers can move off it one file at a time.
-    pub mirror: MirrorLayout,
-}
-
-/// The first decoded spelling, re-spelled as the retiring
-/// [`MirrorLayout`] sum. Registry order IS the order the deleted
-/// preference list used, so this is bit-for-bit what the old decoder
-/// returned.
-fn mirror_of(spellings: &Spellings<Layout>) -> Option<MirrorLayout> {
-    let facts = spellings.any()?;
-    let any = facts.as_any();
-    if let Some(v) = any.downcast_ref::<RightMajorContiguousElementLayout>() {
-        return Some(MirrorLayout::RightMajor(v.clone()));
-    }
-    if let Some(v) = any.downcast_ref::<LeftMajorContiguousElementLayout>() {
-        return Some(MirrorLayout::LeftMajor(v.clone()));
-    }
-    if let Some(v) = any.downcast_ref::<StridedElementLayout>() {
-        return Some(MirrorLayout::Strided(v.clone()));
-    }
-    if let Some(v) = any.downcast_ref::<ElementOffsetExpressionLayout>() {
-        return Some(MirrorLayout::ElementOffset(v.clone()));
-    }
-    if let Some(v) = any.downcast_ref::<BitOffsetExpressionLayout>() {
-        return Some(MirrorLayout::BitOffset(v.clone()));
-    }
-    None
 }
 
 impl DecodedLayout {
@@ -1040,12 +944,10 @@ impl DecodedLayout {
                 );
             }
         }
-        let mirror = mirror_of(&spellings).expect("a decoded spelling is one of the five");
         Ok(Self {
             class: class.id().clone(),
             dtype,
             spellings,
-            mirror,
         })
     }
 
@@ -1074,14 +976,10 @@ impl DecodedLayout {
             !spellings.is_empty(),
             "a hand-built DecodedLayout states at least one spelling"
         );
-        let spellings = Spellings::from_decoded(spellings);
-        let mirror = mirror_of(&spellings)
-            .expect("a hand-built spelling is one of the five Layout constructors");
         Self {
             class: ClassId::from(HAND_BUILT_CLASS),
             dtype,
-            spellings,
-            mirror,
+            spellings: Spellings::from_decoded(spellings),
         }
     }
 
@@ -1229,27 +1127,10 @@ pub fn decode_layout_table(
     Ok(table)
 }
 
-// =============================================================================
-// TRANSITIONAL: the retiring `MirrorLayout` decoders, now one line over
-// the spelling set. Deleted in the next step with the type itself.
-// =============================================================================
-
-/// Decode one layout e-class into the retiring [`MirrorLayout`] sum: the
-/// first spelling in registry order.
-pub fn decode_layout(egraph: &EGraph, class: &ClassId) -> Result<MirrorLayout> {
-    let decoders = ConstructorRegistry::new(layout_decoders())?;
-    let view = EGraphView::new(egraph, &decoders);
-    Ok(DecodedLayout::from_class(&view.class(class), None)?.mirror)
-}
-
-/// [`decode_layout`] with the error contextualized by who was asking.
-pub fn decode_layout_for(egraph: &EGraph, class: &ClassId, who: &str) -> Result<MirrorLayout> {
-    decode_layout(egraph, class).map_err(|err| anyhow!("{who}: {err}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egglog_utils::eclass::ConstructorRegistry;
 
     /// THE ASSEMBLY TRIPWIRE, over core's own preamble: every `Layout`
     /// constructor the program declares has exactly one decoder, and
