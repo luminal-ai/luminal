@@ -10,8 +10,9 @@
 //!    `children[i]` is a node inside argument `i`'s class);
 //!  * [`EgglogConstructor`] — one egglog constructor mirrored as a Rust
 //!    struct that can decode ONE e-node of that constructor;
-//!  * [`Sort`] / [`DynFacts`] — a decoded sort's name and the erased
-//!    fact surface its constructors share;
+//!  * [`Sort`] / [`DynFacts`] — a decoded sort's name, the erased fact
+//!    surface its constructors share, and the one-line-per-sort upcast
+//!    to `dyn Any` that reopens a concrete spelling;
 //!  * [`ConstructorDecoder`] / [`ConstructorRegistry`] — the registered
 //!    `(sort, constructor)` decoders, and the assembly TRIPWIRE that
 //!    proves a program's every constructor of a decoded sort has exactly
@@ -377,20 +378,33 @@ impl<'g> ENode<'g> {
 pub trait Sort: 'static {
     const NAME: &'static str;
     type Facts: ?Sized + DynFacts;
+
+    /// The DOWNCAST DOOR, opened once per sort: a trait upcast from the
+    /// sort's fact object to `dyn Any` (`Any` is a supertrait of
+    /// [`DynFacts`]), so `Spellings::first::<C>()` can recover the
+    /// concrete constructor struct.
+    ///
+    /// One line per sort — `{ facts }` — because an upcast coercion is
+    /// only expressible where the concrete `dyn` type is known; over a
+    /// `?Sized` `Self::Facts` the compiler has no unsizing to perform.
+    /// Same reason [`EgglogConstructor::erase`] is written per struct.
+    /// Constructor structs still write NO boilerplate for it.
+    fn upcast_any(facts: &Self::Facts) -> &dyn Any;
 }
 
 /// The sort-agnostic erased surface every decoded constructor exposes.
 /// Blanket-implemented for every [`EgglogConstructor`] that is
 /// `PartialEq + Debug + Send + Sync`, so constructor structs write NO
 /// boilerplate for it.
+///
+/// `Any` is a SUPERTRAIT: a `dyn LayoutFacts` (or any other sort's fact
+/// object) upcasts to `dyn Any` on its own, which is why there is no
+/// `as_any()` here. [`Sort::upcast_any`] spells that upcast once per
+/// sort, where the concrete `dyn` type is known.
 pub trait DynFacts: Any + std::fmt::Debug + Send + Sync {
     /// The egglog constructor this value was decoded from — a NAME, for
     /// diagnostics. Nothing branches on it to change behaviour.
     fn constructor(&self) -> &'static str;
-    /// The downcast door (`as_any().downcast_ref::<C>()`), spelled
-    /// explicitly because trait upcasting needs Rust 1.86 and the
-    /// workspace floor is 1.85.
-    fn as_any(&self) -> &dyn Any;
     /// Structural equality against another erased value.
     fn dyn_eq(&self, other: &dyn Any) -> bool;
 }
@@ -398,9 +412,6 @@ pub trait DynFacts: Any + std::fmt::Debug + Send + Sync {
 impl<T: EgglogConstructor + PartialEq + std::fmt::Debug + Send + Sync> DynFacts for T {
     fn constructor(&self) -> &'static str {
         T::NAME
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn dyn_eq(&self, other: &dyn Any) -> bool {
         other.downcast_ref::<T>() == Some(self)
@@ -630,13 +641,13 @@ impl<S: Sort> Spellings<S> {
     pub fn first<C: EgglogConstructor<Sort = S>>(&self) -> Option<&C> {
         self.decoded
             .iter()
-            .find_map(|item| item.as_any().downcast_ref::<C>())
+            .find_map(|item| S::upcast_any(&**item).downcast_ref::<C>())
     }
 
     pub fn all<C: EgglogConstructor<Sort = S>>(&self) -> Vec<&C> {
         self.decoded
             .iter()
-            .filter_map(|item| item.as_any().downcast_ref::<C>())
+            .filter_map(|item| S::upcast_any(&**item).downcast_ref::<C>())
             .collect()
     }
 
@@ -704,7 +715,7 @@ impl<S: Sort> PartialEq for Spellings<S> {
                 .decoded
                 .iter()
                 .zip(&other.decoded)
-                .all(|(a, b)| a.dyn_eq(b.as_any()))
+                .all(|(a, b)| a.dyn_eq(S::upcast_any(&**b)))
     }
 }
 
@@ -735,6 +746,9 @@ mod tests {
     impl Sort for Pair {
         const NAME: &'static str = "Pair";
         type Facts = dyn PairFacts;
+        fn upcast_any(facts: &Self::Facts) -> &dyn Any {
+            facts
+        }
     }
 
     pub trait PairFacts: DynFacts {

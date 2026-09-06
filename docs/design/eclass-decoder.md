@@ -178,20 +178,22 @@ impl<'g> ENode<'g> {
 pub trait Sort: 'static {
     const NAME: &'static str;
     type Facts: ?Sized + DynFacts;
+    /// The downcast door, one line per sort (`{ facts }`): the trait
+    /// upcast `dyn XFacts` -> `dyn Any`. See §2.5.
+    fn upcast_any(facts: &Self::Facts) -> &dyn Any;
 }
 
 /// The sort-agnostic erased surface every decoded constructor exposes.
 /// Blanket-implemented for every `EgglogConstructor` that is
 /// `PartialEq + Debug + Send + Sync`, so constructor structs write NO
-/// boilerplate for it.
+/// boilerplate for it. `Any` is a supertrait, which is what makes a
+/// fact object upcastable (§2.5) — there is no `as_any()` here.
 pub trait DynFacts: Any + std::fmt::Debug + Send + Sync {
     fn constructor(&self) -> &'static str;
-    fn as_any(&self) -> &dyn Any;
     fn dyn_eq(&self, other: &dyn Any) -> bool;
 }
 impl<T: EgglogConstructor + PartialEq + std::fmt::Debug + Send + Sync> DynFacts for T {
     fn constructor(&self) -> &'static str { T::NAME }
-    fn as_any(&self) -> &dyn Any { self }
     fn dyn_eq(&self, other: &dyn Any) -> bool { other.downcast_ref::<T>() == Some(self) }
 }
 
@@ -249,7 +251,7 @@ pub struct Spellings<S: Sort> {
     failed: Vec<(&'static str, String)>,    // (name, reason) per undecodable node
 }
 impl<S: Sort> Spellings<S> {
-    pub fn first<C: EgglogConstructor<Sort = S>>(&self) -> Option<&C>;   // as_any().downcast_ref
+    pub fn first<C: EgglogConstructor<Sort = S>>(&self) -> Option<&C>;   // S::upcast_any().downcast_ref
     pub fn all<C: EgglogConstructor<Sort = S>>(&self) -> Vec<&C>;
     pub fn has<C: EgglogConstructor<Sort = S>>(&self) -> bool;
     pub fn require<C: EgglogConstructor<Sort = S>>(&self, who: &str) -> Result<&C>;
@@ -302,7 +304,7 @@ pub trait LayoutFacts: DynFacts {
     /// bit offset, a negative result.
     fn element_index(&self, coords: &[usize]) -> Result<usize>;
 }
-impl PartialEq for dyn LayoutFacts { fn eq(&self, o: &Self) -> bool { self.dyn_eq(o.as_any()) } }
+impl PartialEq for dyn LayoutFacts { fn eq(&self, o: &Self) -> bool { self.dyn_eq(o as &dyn Any) } }
 impl Eq for dyn LayoutFacts {}
 
 // The five structs (unchanged fields, `src/layouts.rs:129-167`) each get:
@@ -428,17 +430,44 @@ one class).
 Recovering a concrete struct from the erased path:
 
 ```rust
-// (a) explicit as_any — WORKS ON THE DECLARED MSRV
+// (a) explicit as_any — a hand-written door on the fact trait
 let lm = facts.as_any().downcast_ref::<LeftMajorContiguousElementLayout>();
 // (b) trait upcasting to dyn Any — requires Rust ≥ 1.86
 let lm = (facts as &dyn Any).downcast_ref::<LeftMajorContiguousElementLayout>();
 ```
 
-DECISION: use (a). The workspace declares `rust-version = "1.85"` (VERIFIED
-`Cargo.toml:5`); trait upcasting stabilized in 1.86, so (b) does not compile
-under the declared floor even though the local toolchain is 1.91.1. (a) costs
-nothing because `DynFacts::as_any` is blanket-provided. `Spellings::first::<C>()`
-wraps it so call sites rarely spell either.
+DECISION (2026-09-05, amended): use (b), trait upcasting. The original decision
+was (a), because the workspace declared `rust-version = "1.85"` and upcasting
+stabilized in 1.86. That floor was already false — the tree uses let-chains
+(stable 1.88) at 27 `&& let` sites — so the same follow-up raises it to
+`rust-version = "1.91"` (`Cargo.toml:5`), the oldest toolchain we run (this Mac
+1.91.1, the A100 box 1.95). `DynFacts::as_any` is therefore DELETED; `Any` stays a supertrait of
+`DynFacts`, which is exactly what makes a fact object upcastable.
+
+One nuance the type system forces, VERIFIED with rustc 1.91.1: an upcast is a
+coercion between two KNOWN types, so it cannot be written over the generic
+`S::Facts`, which is `?Sized` —
+
+```
+error[E0277]: the size for values of type `<S as Sort>::Facts` cannot be known
+              at compilation time
+   = note: required for the cast from `&<S as Sort>::Facts` to `&(dyn Any + 'static)`
+```
+
+— so the upcast is spelled once per SORT, as `Sort::upcast_any`:
+
+```rust
+impl Sort for Layout {
+    const NAME: &'static str = "Layout";
+    type Facts = dyn LayoutFacts;
+    fn upcast_any(facts: &Self::Facts) -> &dyn Any { facts }   // the upcast
+}
+```
+
+— the same shape, and for the same reason, as `EgglogConstructor::erase` (§8.2):
+one line where the concrete `dyn` type is known. Constructor structs still write
+no boilerplate, and `Spellings::first::<C>()` wraps the door so call sites spell
+neither. Concrete sites (`impl PartialEq for dyn LayoutFacts`) upcast directly.
 
 ---
 
@@ -998,8 +1027,10 @@ into `Arc<<C::Sort as Sort>::Facts>` is an unsizing coercion the compiler only
 performs where the concrete type AND the target `dyn` type are both known, so it
 cannot be written once generically over `S::Facts`; hence
 `EgglogConstructor::erase(self)` with a one-line `Arc::new(self)` per struct
-(five lines total). `DynFacts` is blanket-implemented, so `constructor()`,
-`as_any()`, `dyn_eq()` cost the structs nothing. `dyn-clone` is in `Cargo.lock`
+(five lines total). The same constraint applies to the `dyn Any` upcast in the
+other direction, hence `Sort::upcast_any` — one line per sort (§2.5). `DynFacts`
+is blanket-implemented, so `constructor()` and `dyn_eq()` cost the structs
+nothing. `dyn-clone` is in `Cargo.lock`
 (line 506) but is not needed: `Arc` gives `Clone` for free, which is why the
 items are `Arc<S::Facts>` and not `Box`.
 
@@ -1115,7 +1146,8 @@ also deletes the arm; nothing else changes.
   core `extraction.rs:4309-4311`; `test_runtime/src/lib.rs:144-146`.
 * `OpMatcher` trait: `src/layout_ir/mod.rs:518-547`; `RegisteredOp`: `crates/luminal_cuda_lite/src/ops/mod.rs:74-77`;
   `ReferenceOp`: `crates/luminal_reference/src/ops/mod.rs:144-150`; `assembled_program_for`: `src/egglog_snippet.rs:142-152`.
-* `PlanLayout: Clone + Debug`: `src/bufferize.rs:99-100`. `rust-version = "1.85"`: `Cargo.toml:5`.
+* `PlanLayout: Clone + Debug`: `src/bufferize.rs:99-100`. `rust-version = "1.91"`: `Cargo.toml:5`
+  (raised from "1.85" on 2026-09-05 with the §2.5 amendment; let-chains already needed 1.88).
 * egglog fork rev 1bb30831 (`Cargo.toml:30-31`): `functions_iter` `src/lib.rs:1236`, `get_function` :2318,
   `Function::func_type` :342, `type_info(&mut self)` :589, `pub use typechecking::FuncType` :74,
   `FuncType` fields `src/typechecking.rs:115-120`, `FunctionSubtype` `src/ast/mod.rs:1298-1302`,

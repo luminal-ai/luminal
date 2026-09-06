@@ -335,6 +335,11 @@ pub struct Layout;
 impl Sort for Layout {
     const NAME: &'static str = "Layout";
     type Facts = dyn LayoutFacts;
+    /// The sort's downcast door: `dyn LayoutFacts` upcasts to `dyn Any`
+    /// because `Any` is a supertrait of `DynFacts` (Rust 1.86+).
+    fn upcast_any(facts: &Self::Facts) -> &dyn std::any::Any {
+        facts
+    }
 }
 
 /// WHAT EVERY LAYOUT CONSTRUCTOR DISCLOSES. Object-safe (no generics,
@@ -368,7 +373,7 @@ pub trait LayoutFacts: DynFacts {
 
 impl PartialEq for dyn LayoutFacts {
     fn eq(&self, other: &Self) -> bool {
-        self.dyn_eq(other.as_any())
+        self.dyn_eq(other as &dyn std::any::Any)
     }
 }
 impl Eq for dyn LayoutFacts {}
