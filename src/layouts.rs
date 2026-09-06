@@ -85,7 +85,7 @@ pub enum IntExprTerm {
 impl IntExprTerm {
     /// Substitute every coordinate with the given per-axis replacement
     /// (axis keyed FROM THE END). Pure tree map; an axis the caller
-    /// supplies no replacement for is a violated mirror invariant and
+    /// supplies no replacement for is a violated decode invariant and
     /// panics loudly.
     fn substitute_coords(&self, replace: &dyn Fn(i64) -> IntExprTerm) -> IntExprTerm {
         let go = |e: &IntExprTerm| Box::new(e.substitute_coords(replace));
@@ -112,7 +112,7 @@ pub struct ShapeTerm(pub Vec<IntExprTerm>);
 
 impl ShapeTerm {
     /// The extent of the axis counted FROM THE END (the CoordVar basis).
-    /// Panics on an out-of-range axis — a violated mirror invariant.
+    /// Panics on an out-of-range axis — a violated decode invariant.
     fn extent_from_end(&self, axis_from_end: i64) -> &IntExprTerm {
         let rank = self.0.len();
         usize::try_from(axis_from_end)
@@ -130,7 +130,7 @@ impl ShapeTerm {
 pub struct BitWidthTerm(pub i64);
 
 // =============================================================================
-// The five mirror structs (field-for-field with preamble constructors)
+// The five constructor structs (field-for-field with the preamble)
 // =============================================================================
 
 /// `(RightMajorContiguousElementLayoutLit Shape BitWidth)`.
@@ -863,7 +863,7 @@ fn parse_int_expr_uncached(
 // from core; the runtimes should just directly import and use these
 // layout structs"). The per-runtime `LayoutDecoder<L>` hook is GONE: it
 // bought a genericity nobody exercised (both runtimes decoded the same
-// mirror struct plus the same dtype fact), and the search that called it
+// decoded layout plus the same dtype fact), and the search that called it
 // now lives in the runtimes anyway.
 //
 // THE BUFFERIZER STILL NEVER READS THIS. `bufferize` stays generic over

@@ -1458,9 +1458,9 @@ mod harness_tests {
     /// the bounds-row encoding), but they NO LONGER thread onto plan
     /// buffers: `PlanDtype` left the plan and bufferizer vocabulary
     /// entirely. What they thread onto is the RUNTIME'S OWN `L` — here
-    /// `DecodedLayout { mirror, dtype }` — which the reference decoder folds
-    /// at extraction time and which Option B then carries on each
-    /// assignment entry.
+    /// `DecodedLayout { class, dtype, spellings }` — which the reference
+    /// decoder folds at extraction time and which Option B then carries
+    /// on each assignment entry.
     ///
     /// The mixed-dtype gather fixture exercises F32 data, an Int boundary
     /// input, an Int interior iota (a planner-allocated buffer), and an
@@ -3964,7 +3964,7 @@ mod escape_execution_tests {
     /// PROBE 1, the executed-bytes half — OPTION B RESTRUCTURE: the
     /// escaped slot's fetch returns the backing buffer's bytes plus the
     /// slot's HELD LAYOUT (`binding.layout`, verbatim), and elements are
-    /// read by EVALUATING the mirror layout's own expressions — no core
+    /// read by EVALUATING the layout's own expressions — no core
     /// walker (`walk_layout_index` left core; the canonical test-equality
     /// utility lives in the testing crate `test_runtime::test_equality`,
     /// duplicated minimally here because core's own dev-tests cannot

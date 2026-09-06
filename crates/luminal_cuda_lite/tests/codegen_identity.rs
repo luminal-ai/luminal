@@ -665,12 +665,13 @@ mod strided {
     // =======================================================================
     // THE TWO-SPELLING PROOF (ruling 2026-08-31).
     //
-    // The e-graph may hand the decoder ANY spelling of a layout class —
-    // all spellings of a class denote one function, and `decode_layout`
-    // only states a PREFERENCE among the ones it finds. So the read
-    // decision may not be made on a spelling. These tests state one dense
-    // function five ways and require the emitted CUDA source to be
-    // byte-identical every time.
+    // All spellings of a layout class denote ONE function, and a caller
+    // picks the spelling IT lowers — nobody's decoder picks for it. So
+    // the read decision may not be made on a spelling. These tests state
+    // one dense function five ways and require the emitted CUDA source
+    // to be byte-identical every time; the sixth case puts TWO of those
+    // spellings in one class, the way the e-graph really delivers them,
+    // and requires the same source again.
     // =======================================================================
 
     /// The dense row-major read of a [2,3] value — strides [3,1] — in
@@ -687,9 +688,10 @@ mod strided {
     ///      the same read
     ///
     /// Each is first checked to BE the same function by the runtime's
-    /// own independent evaluator (`layouts::element_index`, which walks
-    /// the mirror structs and knows nothing about codegen), then the
-    /// emitted source is compared. Two statements, one answer.
+    /// own independent evaluator (`layouts::element_index`, which asks
+    /// each constructor for its own read function and knows nothing
+    /// about codegen), then the emitted source is compared. Two
+    /// statements, one answer.
     #[test]
     fn dense_spellings_all_collapse_to_the_flat_read() {
         use luminal::layouts::BitOffsetExpressionLayout;
@@ -725,6 +727,28 @@ mod strided {
                     shape: shape(&[2, 3]),
                     width: BitWidthTerm(32),
                 }),
+            ),
+            // 6. THE CLASS AS THE E-GRAPH DELIVERS IT: two of those
+            //    spellings in ONE class. Nothing chooses between them for
+            //    the codegen — it asks for the one it lowers.
+            (
+                "right-major AND the dense strided chain, one class",
+                DecodedLayout::of_spellings(
+                    vec![
+                        RightMajorContiguousElementLayout {
+                            shape: shape(&[2, 3]),
+                            width: BitWidthTerm(32),
+                        }
+                        .erase(),
+                        StridedElementLayout {
+                            shape: shape(&[2, 3]),
+                            chain: vec![coord(0), mul(coord(1), lit(3))],
+                            width: BitWidthTerm(32),
+                        }
+                        .erase(),
+                    ],
+                    Some(PlanDtype::F32),
+                ),
             ),
         ];
 

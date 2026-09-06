@@ -53,11 +53,12 @@ pub mod index_expr;
 pub mod layout_ir;
 pub mod poison;
 pub mod subst_primitive;
-// Convenience mirrors of the five egglog Layout constructors + SpanExpr +
-// decode_layout, for runtimes to pull from one place. THE BUFFERIZER NEVER
-// CALLS ANY OF THIS — the planner stays generic over an opaque layout type,
-// and backends may ignore this module entirely (Austin's fold-into-core
-// amendment, resident-geometry cleanup 2026-08-31).
+// The `Layout` sort's constructor structs, `LayoutFacts`, `DecodedLayout`
+// and the value-keyed table, for runtimes to pull from one place. THE
+// BUFFERIZER NEVER CALLS ANY OF THIS — the planner stays generic over an
+// opaque layout type, and backends may ignore this module entirely
+// (Austin's fold-into-core amendment, resident-geometry cleanup
+// 2026-08-31).
 pub mod layouts;
 pub mod logical_op;
 pub mod search_support;
