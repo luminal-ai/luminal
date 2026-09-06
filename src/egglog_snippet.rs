@@ -116,6 +116,17 @@ pub fn new_egraph() -> egglog::EGraph {
     use egglog::sort::Z;
 
     let mut egraph = egglog::EGraph::default();
+    // Tree decomposition OFF for every e-graph we build (measured 2026-09-05).
+    // egglog plans each rule's query with a tree decomposition — a per-rule,
+    // per-iteration cost that exceeded its benefit everywhere we measured, at a
+    // BIT-IDENTICAL fixpoint every time: same iterations, same tuples, every
+    // check passing. qwen3-4B saturation on the A100: 36 layers 3,905 s -> 68 s
+    // (57x), 16 layers 433 s -> 20 s; the two cuBLASLt matmul-recognition arms
+    // alone fell from ~1,845 s each to ~11 s at 36 layers. Host suites: 632
+    // tests, zero outcome changes. egglog's per-rule `:no-decomp` label is OR'd
+    // with this flag if a rule ever needs the planner back. Reproducer:
+    // docs/egglog-regressions/cublaslt-matmul-recognition/ (local branch today).
+    egraph.no_decomp = true;
     egglog::add_primitive!(&mut egraph, "bigint-to-i64" = |a: Z| -?> i64 {
         i64::try_from(&*a).ok()
     });
