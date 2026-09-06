@@ -485,6 +485,135 @@ fn dest_frame_refuses_layouts_this_backend_cannot_write() {
     );
 }
 
+/// `bias_spec` at an arbitrary frame, with the spec's COL readings kept
+/// CONSISTENT with it (`base_spec`'s convention: lda = m, ldb = k,
+/// ldc = ldd = m) so `validate_against` exercises real geometry.
+fn bias_spec_at(form: CublasLtForm, m: i64, n: i64, k: i64) -> LtMatmulSpec {
+    let mut spec = bias_spec(form);
+    spec.m = CuDim::Literal(m);
+    spec.n = CuDim::Literal(n);
+    spec.k = CuDim::Literal(k);
+    spec.lda = CuDim::Literal(m);
+    spec.ldb = CuDim::Literal(k);
+    spec.ldc = CuDim::Literal(m);
+    spec.ldd = CuDim::Literal(m);
+    spec
+}
+
+/// THE DEGENERATE-EXTENT COINCIDENCE (whisper on the A100, 2026-09-04).
+/// At `n == 1` the right-major and left-major contiguous index maps over
+/// `[m, n]` are the SAME function — `r*n + c` and `c*m + r` both address
+/// `r` when the collapsed axis's coordinate can only be 0 — so both
+/// spellings live in ONE e-class and `decode_layout`, RightMajor-first by
+/// preference order, may hand the bridge the right-major spelling of the
+/// very class whose LeftMajor spelling the estate's bias decorator
+/// matched. That is not a drift, and refusing it killed every whisper
+/// genome at device prepare:
+///
+///   a bias form (LayoutTensorOpCublasLtAccumulateBias) reached the
+///   executor with a Row-order D descriptor (384x1 ld 1)
+///
+/// (whisper tiny.en decodes ONE token, so the recorder site is
+/// `x[1, 384] @ w[384, 384] + b[384]` and the sandwich sibling's call
+/// frame is `m = 384`, `n = 1`.) A bias-bearing call at a degenerate
+/// extent therefore takes the COL spelling of the coincidence — the one
+/// the library accepts.
+#[test]
+fn degenerate_extent_binds_a_bias_form_col_in_both_orientations() {
+    // n == 1, THE WHISPER SHAPE: the sibling frame is [m, n] = [384, 1].
+    // ROW would be 384x1 ld 1; COL is 384x1 ld 384; both address exactly
+    // the elements 0..384 of the destination, in the same order.
+    for form in [CublasLtForm::Bias, CublasLtForm::AccumulateBias] {
+        let spec = bias_spec_at(form, 384, 1, 384);
+        let mut call = plan_call_from_spec(&spec).expect("plan");
+        assert_eq!(
+            call.d,
+            LtDesc::row(384, 1, 1),
+            "{form:?}: the spec-only default is still ROW (ld = n)"
+        );
+        bind_destination(&mut call, &right_major(&[384, 1]), "pin").expect(
+            "a degenerate-extent RightMajor election IS the LeftMajor election; \
+             the bias form must bind, not trip the fence",
+        );
+        assert_eq!(call.d, LtDesc::col(384, 1, 384), "{form:?}: COL D, ld = m");
+        assert_eq!(call.c, call.d, "{form:?}: C rides D's frame");
+        // Same 384 elements either way: COL reach = ld*(cols-1) + rows
+        // = 384*0 + 384 = 384, exactly the ROW reach 1*383 + 1.
+        // A holds m*k, B holds k*n, C (fold forms) holds m*n, bias m.
+        let mut elems = vec![384 * 384usize, 384];
+        if form.has_c() {
+            elems.push(384);
+        }
+        elems.push(384);
+        call.validate_against(&elems, 384)
+            .expect("the bound frame fits the 384-element destination");
+    }
+
+    // m == 1, the symmetric degeneracy: [1, 384]. ROW would be
+    // 1x384 ld 384; COL is 1x384 ld 1; same elements again.
+    for form in [CublasLtForm::Bias, CublasLtForm::AccumulateBias] {
+        let spec = bias_spec_at(form, 1, 384, 384);
+        let mut call = plan_call_from_spec(&spec).expect("plan");
+        assert_eq!(call.d, LtDesc::row(1, 384, 384), "the ROW default");
+        bind_destination(&mut call, &right_major(&[1, 384]), "pin")
+            .expect("the m == 1 coincidence binds too");
+        assert_eq!(
+            call.d,
+            LtDesc::col(1, 384, 1),
+            "{form:?}: COL D, ld = m = 1"
+        );
+        assert_eq!(call.c, call.d);
+        // A holds m*k = 384, B holds k*n, C (fold forms) holds m*n = 384,
+        // bias m = 1.
+        let mut elems = vec![384usize, 384 * 384];
+        if form.has_c() {
+            elems.push(384);
+        }
+        elems.push(1);
+        call.validate_against(&elems, 384)
+            .expect("the bound frame fits the 384-element destination");
+    }
+}
+
+/// THE FENCE IS INTACT. The coincidence arm is gated on the degeneracy:
+/// with BOTH extents > 1 the two orders denote different byte orders, so
+/// a bias form arriving with a RightMajor election is still the real
+/// drift `assert_bias_destination_order` exists to catch — and it still
+/// bails with the same message. (The broader default-form and
+/// bias-vs-ROW coverage lives in
+/// `bias_epilogue_forms_with_a_row_d_trip_the_unreachable_fence`; this
+/// pin exists so the degenerate carve-out can never be widened by
+/// accident.)
+#[test]
+fn a_non_degenerate_right_major_d_still_trips_the_bias_fence() {
+    for form in [CublasLtForm::Bias, CublasLtForm::AccumulateBias] {
+        // 384x2: n == 2, one step off the whisper shape, and the orders
+        // genuinely differ (ROW ld 2 vs COL ld 384 address differently).
+        let spec = bias_spec_at(form, 384, 2, 384);
+        let mut call = plan_call_from_spec(&spec).expect("plan");
+        let err = bind_destination(&mut call, &right_major(&[384, 2]), "pin")
+            .expect_err("a NON-degenerate ROW-order D under a bias form must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unreachable"), "{form:?}: {msg}");
+        assert!(
+            msg.contains("bias decorators require a LeftMajor D"),
+            "{form:?}: {msg}"
+        );
+        assert!(msg.contains("Row-order D descriptor"), "{form:?}: {msg}");
+        assert!(msg.contains("refused BEFORE dispatch"), "{form:?}: {msg}");
+    }
+    // And the carve-out is BIAS-ONLY: a degenerate destination with NO
+    // bias operand keeps its right-major election as ROW.
+    let mut call = plan_call_from_spec(&base_spec(384, 1, 384)).expect("plan");
+    bind_destination(&mut call, &right_major(&[384, 1]), "pin").expect("no bias, no carve-out");
+    assert_eq!(
+        call.d,
+        LtDesc::row(384, 1, 1),
+        "a bias-free degenerate D stays ROW: the carve-out exists only \
+         because the LIBRARY refuses BIAS on a ROW D"
+    );
+}
+
 #[test]
 fn dest_frame_refuses_symbolic_extents() {
     let symbolic = DecodedLayout {
