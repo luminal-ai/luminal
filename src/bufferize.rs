@@ -339,7 +339,7 @@ pub enum BufferNode<L: PlanLayout> {
 // something called 'test equality' or something in the testing crate").
 // Element readback through a returned layout is a TEST concern: the
 // testing crate's `test_equality` module evaluates the runtime's own
-// layout vocabulary ((buffer, layout) pairs, mirror-struct expressions),
+// layout vocabulary ((buffer, layout) pairs, constructor-struct expressions),
 // with no core involvement. Core transports layouts; it never reads
 // through them.
 

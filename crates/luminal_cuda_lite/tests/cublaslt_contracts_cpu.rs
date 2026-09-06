@@ -3,9 +3,10 @@
 //! required. The device-gated halves live in `tests/cublaslt_contracts.rs`.
 
 use luminal::dtype::PlanDtype;
+use luminal::egglog_utils::eclass::EgglogConstructor;
 use luminal::layouts::{
     BitWidthTerm, ElementOffsetExpressionLayout, IntExprTerm, LeftMajorContiguousElementLayout,
-    MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm, StridedElementLayout,
+    RightMajorContiguousElementLayout, ShapeTerm, StridedElementLayout,
 };
 use luminal::prelude::egraph_serialize::ClassId;
 use luminal_cuda_lite::layouts::DecodedLayout;
@@ -228,12 +229,12 @@ fn bias_epilogue_forms_with_a_row_d_trip_the_unreachable_fence() {
             "{form:?}: the refusal must name the estate premise: {msg}"
         );
         assert!(
-            msg.contains("Row-order D descriptor"),
-            "{form:?}: the refusal must print the order it saw: {msg}"
+            msg.contains("RightMajorContiguousElementLayoutLit"),
+            "{form:?}: the refusal must print what the class DOES hold: {msg}"
         );
         assert!(msg.contains("refused BEFORE dispatch"), "{form:?}: {msg}");
     }
-    // The default forms are untouched by the tripwire: a ROW D binds.
+    // The default forms are untouched by the fence: a ROW D binds.
     for form in [CublasLtForm::Base, CublasLtForm::Accumulate] {
         let mut spec = base_spec(4, 3, 5);
         spec.form = form;
@@ -356,23 +357,45 @@ fn shape(dims: &[i64]) -> ShapeTerm {
 }
 
 fn right_major(dims: &[i64]) -> DecodedLayout {
-    DecodedLayout {
-        mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
+    DecodedLayout::of(
+        RightMajorContiguousElementLayout {
             shape: shape(dims),
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    }
+        },
+        Some(PlanDtype::F32),
+    )
 }
 
 fn left_major(dims: &[i64]) -> DecodedLayout {
-    DecodedLayout {
-        mirror: MirrorLayout::LeftMajor(LeftMajorContiguousElementLayout {
+    DecodedLayout::of(
+        LeftMajorContiguousElementLayout {
             shape: shape(dims),
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    }
+        },
+        Some(PlanDtype::F32),
+    )
+}
+
+/// THE DEGENERATE-EXTENT CLASS as the e-graph really has it: at
+/// `m == 1` or `n == 1` the two contiguous index maps over `[m, n]` are
+/// the SAME function, so BOTH literals land in one class and the decoded
+/// layout carries both spellings.
+fn both_orders(dims: &[i64]) -> DecodedLayout {
+    DecodedLayout::of_spellings(
+        vec![
+            RightMajorContiguousElementLayout {
+                shape: shape(dims),
+                width: BitWidthTerm(32),
+            }
+            .erase(),
+            LeftMajorContiguousElementLayout {
+                shape: shape(dims),
+                width: BitWidthTerm(32),
+            }
+            .erase(),
+        ],
+        Some(PlanDtype::F32),
+    )
 }
 
 #[test]
@@ -449,51 +472,207 @@ fn dest_frame_refuses_layouts_this_backend_cannot_write() {
     // destination refusal: cuBLASLt has exactly two matrix orders,
     // so a strided or offset-expression destination is not writable by
     // this route. Loud, never wrong bytes.
-    let strided = DecodedLayout {
-        mirror: MirrorLayout::Strided(StridedElementLayout {
+    let strided = DecodedLayout::of(
+        StridedElementLayout {
             shape: shape(&[4, 3]),
             chain: vec![
                 IntExprTerm::Coord { axis_from_end: 1 },
                 IntExprTerm::Coord { axis_from_end: 0 },
             ],
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    };
+        },
+        Some(PlanDtype::F32),
+    );
     let mut call = plan_call_from_spec(&base_spec(4, 3, 5)).expect("plan");
     let err = bind_destination(&mut call, &strided, "pin").expect_err("strided dest");
     let msg = format!("{err:#}");
-    assert!(msg.contains("STRIDED"), "{msg}");
+    assert!(msg.contains("StridedElementLayoutLit"), "{msg}");
     assert!(
         msg.contains("CAPABILITY refusal"),
         "the refusal must classify itself: {msg}"
     );
 
-    let offset = DecodedLayout {
-        mirror: MirrorLayout::ElementOffset(ElementOffsetExpressionLayout {
+    let offset = DecodedLayout::of(
+        ElementOffsetExpressionLayout {
             offset: IntExprTerm::Coord { axis_from_end: 0 },
             shape: shape(&[4, 3]),
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    };
+        },
+        Some(PlanDtype::F32),
+    );
     let mut call = plan_call_from_spec(&base_spec(4, 3, 5)).expect("plan");
     let err = bind_destination(&mut call, &offset, "pin").expect_err("offset dest");
     assert!(
-        format!("{err:#}").contains("ELEMENT-OFFSET-EXPRESSION"),
+        format!("{err:#}").contains("ElementOffsetExpressionLayoutLit"),
         "{err:#}"
+    );
+}
+
+/// `bias_spec` at an arbitrary frame, with the spec's COL readings kept
+/// CONSISTENT with it (`base_spec`'s convention: lda = m, ldb = k,
+/// ldc = ldd = m) so `validate_against` exercises real geometry.
+fn bias_spec_at(form: CublasLtForm, m: i64, n: i64, k: i64) -> LtMatmulSpec {
+    let mut spec = bias_spec(form);
+    spec.m = CuDim::Literal(m);
+    spec.n = CuDim::Literal(n);
+    spec.k = CuDim::Literal(k);
+    spec.lda = CuDim::Literal(m);
+    spec.ldb = CuDim::Literal(k);
+    spec.ldc = CuDim::Literal(m);
+    spec.ldd = CuDim::Literal(m);
+    spec
+}
+
+/// THE DEGENERATE-EXTENT COINCIDENCE (whisper on the A100, 2026-09-04).
+/// At `n == 1` the right-major and left-major contiguous index maps over
+/// `[m, n]` are the SAME function — `r*n + c` and `c*m + r` both address
+/// `r` when the collapsed axis's coordinate can only be 0 — so the
+/// e-graph puts BOTH spellings in ONE class. A preference-ordered
+/// decoder handed the bridge the right-major spelling of the very class
+/// whose LeftMajor spelling the estate's bias decorator matched, the
+/// fence read that one spelling, and refusing it killed every whisper
+/// genome at device prepare:
+///
+///   a bias form (LayoutTensorOpCublasLtAccumulateBias) reached the
+///   executor with a Row-order D descriptor (384x1 ld 1)
+///
+/// (whisper tiny.en decodes ONE token, so the recorder site is
+/// `x[1, 384] @ w[384, 384] + b[384]` and the sandwich sibling's call
+/// frame is `m = 384`, `n = 1`.) THE FIX IS THE CLASS, NOT THE EXTENT:
+/// `bind_destination` asks the destination class for the LeftMajor
+/// spelling, and a class that carries both answers yes. The destination
+/// below is that class — the two spellings the e-graph really holds —
+/// and there is no degenerate-extent arm anywhere.
+#[test]
+fn degenerate_extent_binds_a_bias_form_col_in_both_orientations() {
+    // n == 1, THE WHISPER SHAPE: the sibling frame is [m, n] = [384, 1].
+    // ROW would be 384x1 ld 1; COL is 384x1 ld 384; both address exactly
+    // the elements 0..384 of the destination, in the same order.
+    for form in [CublasLtForm::Bias, CublasLtForm::AccumulateBias] {
+        let spec = bias_spec_at(form, 384, 1, 384);
+        let mut call = plan_call_from_spec(&spec).expect("plan");
+        assert_eq!(
+            call.d,
+            LtDesc::row(384, 1, 1),
+            "{form:?}: the spec-only default is still ROW (ld = n)"
+        );
+        bind_destination(&mut call, &both_orders(&[384, 1]), "pin").expect(
+            "the destination class holds the LeftMajor spelling the decorators \
+             require, so the bias form binds — no extent test involved",
+        );
+        assert_eq!(call.d, LtDesc::col(384, 1, 384), "{form:?}: COL D, ld = m");
+        assert_eq!(call.c, call.d, "{form:?}: C rides D's frame");
+        // Same 384 elements either way: COL reach = ld*(cols-1) + rows
+        // = 384*0 + 384 = 384, exactly the ROW reach 1*383 + 1.
+        // A holds m*k, B holds k*n, C (fold forms) holds m*n, bias m.
+        let mut elems = vec![384 * 384usize, 384];
+        if form.has_c() {
+            elems.push(384);
+        }
+        elems.push(384);
+        call.validate_against(&elems, 384)
+            .expect("the bound frame fits the 384-element destination");
+    }
+
+    // m == 1, the symmetric degeneracy: [1, 384]. ROW would be
+    // 1x384 ld 384; COL is 1x384 ld 1; same elements again.
+    for form in [CublasLtForm::Bias, CublasLtForm::AccumulateBias] {
+        let spec = bias_spec_at(form, 1, 384, 384);
+        let mut call = plan_call_from_spec(&spec).expect("plan");
+        assert_eq!(call.d, LtDesc::row(1, 384, 384), "the ROW default");
+        bind_destination(&mut call, &both_orders(&[1, 384]), "pin")
+            .expect("the m == 1 coincidence binds too");
+        assert_eq!(
+            call.d,
+            LtDesc::col(1, 384, 1),
+            "{form:?}: COL D, ld = m = 1"
+        );
+        assert_eq!(call.c, call.d);
+        // A holds m*k = 384, B holds k*n, C (fold forms) holds m*n = 384,
+        // bias m = 1.
+        let mut elems = vec![384usize, 384 * 384];
+        if form.has_c() {
+            elems.push(384);
+        }
+        elems.push(1);
+        call.validate_against(&elems, 384)
+            .expect("the bound frame fits the 384-element destination");
+    }
+}
+
+/// THE FENCE IS INTACT, AND IT IS ABOUT THE CLASS, NOT THE EXTENT. Two
+/// destinations, same degenerate `[384, 1]` frame:
+///
+///  * a class holding ONLY the right-major spelling is REFUSED under a
+///    bias form — the decorators' premise is not satisfied, whatever the
+///    extents are;
+///  * a class holding BOTH (the test above) binds COL.
+///
+/// So the fix cannot be widened by accident into "degenerate extents are
+/// special": there is no extent test to widen.
+#[test]
+fn a_right_major_only_d_trips_the_bias_fence_at_any_extent() {
+    for form in [CublasLtForm::Bias, CublasLtForm::AccumulateBias] {
+        for (label, dims, m, n) in [
+            // 384x2: one step off the whisper shape.
+            ("non-degenerate", [384i64, 2], 384i64, 2i64),
+            // THE NEGATIVE THE DESIGN MAKES TRUE: the degenerate frame
+            // itself, but with a class that holds only the right-major
+            // spelling. The fix is the class carrying both, never the
+            // extent.
+            ("degenerate, right-major only", [384, 1], 384, 1),
+        ] {
+            let spec = bias_spec_at(form, m, n, 384);
+            let mut call = plan_call_from_spec(&spec).expect("plan");
+            let err = bind_destination(&mut call, &right_major(&dims), "pin")
+                .expect_err("a D class with no LeftMajor spelling must be refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("unreachable"), "{form:?}/{label}: {msg}");
+            assert!(
+                msg.contains("bias decorators require a LeftMajor D"),
+                "{form:?}/{label}: {msg}"
+            );
+            assert!(
+                msg.contains("RightMajorContiguousElementLayoutLit"),
+                "{form:?}/{label}: the refusal names what the class holds: {msg}"
+            );
+            assert!(
+                msg.contains("refused BEFORE dispatch"),
+                "{form:?}/{label}: {msg}"
+            );
+        }
+    }
+    // BIAS-FREE, and now the call site's own preference decides: a class
+    // holding only the right-major spelling stays ROW...
+    let mut call = plan_call_from_spec(&base_spec(384, 1, 384)).expect("plan");
+    bind_destination(&mut call, &right_major(&[384, 1]), "pin").expect("no bias, no fence");
+    assert_eq!(
+        call.d,
+        LtDesc::row(384, 1, 1),
+        "a right-major-only D binds ROW whether or not an extent is 1"
+    );
+    // ...and a class holding BOTH binds COL, because this call site asks
+    // for LeftMajor first. Same elements, same order, same reach — COL
+    // 384x1 ld 384 reaches 0*384 + r, ROW 384x1 ld 1 reaches r*1 + 0
+    // (behaviour change flagged in the design, §8.9).
+    let mut call = plan_call_from_spec(&base_spec(384, 1, 384)).expect("plan");
+    bind_destination(&mut call, &both_orders(&[384, 1]), "pin").expect("no bias, no fence");
+    assert_eq!(
+        call.d,
+        LtDesc::col(384, 1, 384),
+        "both spellings present: this call site prefers LeftMajor -> COL"
     );
 }
 
 #[test]
 fn dest_frame_refuses_symbolic_extents() {
-    let symbolic = DecodedLayout {
-        mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
+    let symbolic = DecodedLayout::of(
+        RightMajorContiguousElementLayout {
             shape: ShapeTerm(vec![IntExprTerm::Var("s".into()), IntExprTerm::Lit(3)]),
             width: BitWidthTerm(32),
-        }),
-        dtype: Some(PlanDtype::F32),
-    };
+        },
+        Some(PlanDtype::F32),
+    );
     let mut call = plan_call_from_spec(&base_spec(4, 3, 5)).expect("plan");
     let err = bind_destination(&mut call, &symbolic, "pin").expect_err("symbolic dest");
     assert!(format!("{err:#}").contains("SYMBOLIC"), "{err:#}");

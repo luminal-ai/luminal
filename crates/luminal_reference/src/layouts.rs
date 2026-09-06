@@ -8,8 +8,9 @@
 //!
 //! Core's bufferizer stays generic over an opaque layout type it only
 //! clones and transports; THIS runtime instantiates it with core's
-//! [`luminal::layouts::DecodedLayout`] — the shared mirror vocabulary
-//! plus the value's `dtype-of` fact. The dtype is what makes plans
+//! [`luminal::layouts::DecodedLayout`] — the elected class's decoded
+//! spellings plus the value's `dtype-of` fact. The dtype is what makes
+//! plans
 //! self-contained for `load_plan` callers: staging, allocation, and
 //! readback all read the carried layout instead of a table an external
 //! caller never had.

@@ -151,6 +151,29 @@ pub fn assembled_program_for(matchers: &[Box<dyn crate::layout_ir::OpMatcher>]) 
     assemble(core, &snippets)
 }
 
+/// WHAT CORE'S OWN PREAMBLE DECLARES AND DECODES: the five `Layout`
+/// constructors. The declaration and its decoder travel together — this
+/// is the `core` half of that pairing, the matcher's
+/// [`crate::layout_ir::OpMatcher::decoders`] is the other.
+pub fn core_decoders() -> Vec<crate::egglog_utils::eclass::ConstructorDecoder> {
+    crate::layouts::layout_decoders()
+}
+
+/// The decoder registry for a runtime's matcher set — the same shape as
+/// [`assembled_program_for`]: core's built-ins first, then each
+/// matcher's contribution in registry order. A duplicate
+/// `(sort, constructor)` is REFUSED (registering two decoders for one
+/// constructor is a bug, never a preference).
+pub fn decoder_registry_for(
+    matchers: &[Box<dyn crate::layout_ir::OpMatcher>],
+) -> anyhow::Result<crate::egglog_utils::eclass::ConstructorRegistry> {
+    crate::egglog_utils::eclass::ConstructorRegistry::new(
+        core_decoders()
+            .into_iter()
+            .chain(matchers.iter().flat_map(|matcher| matcher.decoders())),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

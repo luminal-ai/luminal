@@ -541,6 +541,16 @@ pub trait OpMatcher: std::fmt::Debug {
         Vec::new()
     }
 
+    /// Decoders for every constructor this matcher's snippets DECLARE
+    /// for a decoded sort. Mirrors [`OpMatcher::snippets`]: a
+    /// constructor's declaration and the Rust struct that reads it back
+    /// travel together, so the assembly tripwire can prove the pair is
+    /// complete. Default empty — no matcher declares a `Layout`
+    /// constructor today.
+    fn decoders(&self) -> Vec<crate::egglog_utils::eclass::ConstructorDecoder> {
+        Vec::new()
+    }
+
     /// Build the concrete instance for a matched enode. Infallible by the
     /// validity contract above.
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp>;

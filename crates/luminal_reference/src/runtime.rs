@@ -360,6 +360,10 @@ impl ReferenceRuntime {
             }
             return Err(anyhow!("native saturation failed: {err}"));
         }
+        // THE ASSEMBLY TRIPWIRE: every constructor of a decoded sort in
+        // this program has exactly one decoder, checked against the LIVE
+        // schema before anything reads a serialized class.
+        crate::decoder_registry().check(&egraph)?;
         let saturation_nanos = saturation_start.elapsed().as_nanos();
         let serialize_start = std::time::Instant::now();
         let serialized = egraph
@@ -550,18 +554,14 @@ impl ReferenceRuntime {
         // variant is a loud refusal, never a conversion.
         let mut storage: FxHashMap<BufferId, TypedBuffer> = FxHashMap::default();
         for (id, buffer) in &plan.buffers {
-            let numel = buffer
-                .layout
-                .mirror
-                .literal_span_elements()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "buffer {} (backing {}) has no literal span — symbolic \
+            let numel = buffer.layout.literal_span_elements().ok_or_else(|| {
+                anyhow!(
+                    "buffer {} (backing {}) has no literal span — symbolic \
                      or undisclosed-reach layouts are not executable",
-                        buffer.label,
-                        buffer.backs
-                    )
-                })?;
+                    buffer.label,
+                    buffer.backs
+                )
+            })?;
             let dtype = buffer.layout.dtype.ok_or_else(|| {
                 anyhow!(
                     "buffer {} (backing {}) carries no dtype fact — cannot \
@@ -777,7 +777,7 @@ impl ReferenceRuntime {
                                 plan.buffers[id].label,
                             );
                         }
-                        let dims = slot.layout.mirror.literal_extents().ok_or_else(|| {
+                        let dims = slot.layout.literal_extents().ok_or_else(|| {
                             anyhow!("{} operand {k} has symbolic extents", op.label())
                         })?;
                         operand_dims.push(dims);
@@ -1685,8 +1685,10 @@ mod tests {
         .expect("extracts")
         .expect("plan");
         let dps = luminal::dps::dps_rewrite(&extracted);
+        let view =
+            luminal::egglog_utils::eclass::EGraphView::new(&serialized, crate::decoder_registry());
         let layouts = luminal::layouts::decode_layout_table(
-            &serialized,
+            &view,
             &dps,
             "test",
             &mut luminal::layouts::LayoutDecodeCache::new(),
