@@ -1803,6 +1803,120 @@ impl EgglogOp for MPSMatmul {
                 .name(name)
         };
 
+        // Leading-axis-reduction variant. luminal_training autograd rebuilds a
+        // GEMM from Mul + SumReduce VJPs without going through the frontend
+        // `matmul` builder, so the contracted axis lands as the LEADING axis of
+        // the broadcast-multiply: `SumReduce(dim=0, Mul([k, m, n]))` with the
+        // reduced axis carrying stride `m*n*z` instead of the innermost `z` the
+        // `matmul_rule` template above expects. Semantically identical (the
+        // reduction is order-independent), so we match that shape directly and
+        // union it with the same MPSMatmul op. See issue #382.
+        let matmul_rule_leading = |name: &'static str,
+                                   lhs_layout: MPSMatrixLayout,
+                                   rhs_layout: MPSMatrixLayout,
+                                   transpose_lhs: i64,
+                                   transpose_rhs: i64| {
+            let m = v("?m");
+            let n = v("?n");
+            let k = v("?k");
+            let lhs = v("?lhs");
+            let rhs = v("?rhs");
+            let lhs_row_stride = match lhs_layout {
+                MPSMatrixLayout::RowMajor => mul(k.clone(), z.clone()),
+                MPSMatrixLayout::TransposedRowMajor => mul(m.clone(), z.clone()),
+            };
+            let rhs_row_stride = match rhs_layout {
+                MPSMatrixLayout::RowMajor => mul(n.clone(), z.clone()),
+                MPSMatrixLayout::TransposedRowMajor => mul(k.clone(), z.clone()),
+            };
+            // Operand strides in [k, m, n] axis order (contraction leading).
+            let lhs_strides = match lhs_layout {
+                MPSMatrixLayout::RowMajor => {
+                    vec![z.clone(), lhs_row_stride.clone(), zero.clone()]
+                }
+                MPSMatrixLayout::TransposedRowMajor => {
+                    vec![lhs_row_stride.clone(), z.clone(), zero.clone()]
+                }
+            };
+            let rhs_strides = match rhs_layout {
+                MPSMatrixLayout::RowMajor => {
+                    vec![rhs_row_stride.clone(), zero.clone(), z.clone()]
+                }
+                MPSMatrixLayout::TransposedRowMajor => {
+                    vec![z.clone(), zero.clone(), rhs_row_stride.clone()]
+                }
+            };
+            let out_row_stride = mul(n.clone(), z.clone());
+            // Reduced (leading) axis stride in the contiguous [k, m, n] product:
+            // product of the trailing (m, n) dims times the element stride z.
+            let reduced_stride = mul(mul(z.clone(), n.clone()), m.clone());
+            // The surviving axes [m, n] must be read contiguously from the
+            // [k, m, n] product (m-stride n*z, n-stride z). Pinning these
+            // instead of leaving them free is a correctness requirement: a
+            // movement-only view that permutes the surviving axes before the
+            // reduction (e.g. a square `prod.permute((0, 2, 1)).sum(0)`)
+            // preserves the shape and reduced-axis stride but transposes the
+            // result, and must NOT be unioned with this untransposed MPSMatmul.
+            let surviving_strides = cons(out_row_stride.clone(), cons(z.clone(), nil()));
+            // The product itself is emitted contiguously as [k, m, n].
+            let mul_output_strides = cons(
+                reduced_stride.clone(),
+                cons(out_row_stride.clone(), cons(z.clone(), nil())),
+            );
+
+            let mul_op = op_term(
+                MetalMul {
+                    shape: vec![],
+                    a_strides: vec![],
+                    b_strides: vec![],
+                    output_strides: vec![],
+                }
+                .sort()
+                .call([
+                    (
+                        "shape",
+                        cons(k.clone(), cons(m.clone(), cons(n.clone(), nil()))),
+                    ),
+                    ("a_strides", expr_list(lhs_strides)),
+                    ("b_strides", expr_list(rhs_strides)),
+                    ("out_strides", mul_output_strides),
+                ]),
+                ilist(vec![lhs.clone(), rhs.clone()]),
+            );
+            let sum_op = op_term(
+                MetalSumReduce::default().sort().call([
+                    ("shape", cons(m.clone(), cons(n.clone(), nil()))),
+                    ("iters", k.clone()),
+                    ("strides", surviving_strides),
+                    ("iter_stride", reduced_stride),
+                    (
+                        "out_strides",
+                        cons(out_row_stride.clone(), cons(z.clone(), nil())),
+                    ),
+                ]),
+                ilist(vec![mul_op.clone()]),
+            );
+            let mps_op = MPSMatmul::default().sort().call([
+                ("m", m),
+                ("n", n),
+                ("k", k),
+                ("lhs", lhs),
+                ("lhs_row_stride", lhs_row_stride),
+                ("rhs", rhs),
+                ("rhs_row_stride", rhs_row_stride),
+                ("out_row_stride", out_row_stride),
+                ("transpose_lhs", lit_i64(transpose_lhs)),
+                ("transpose_rhs", lit_i64(transpose_rhs)),
+            ]);
+            let dt = v(format!("?{}_dt", name.replace('-', "_")));
+
+            rule(union(sum_op.clone(), mps_op.clone()))
+                .set(dtype(mps_op), dt.clone())
+                .fact(eq(dt, dtype(sum_op)))
+                .ruleset("kernel_lower")
+                .name(name)
+        };
+
         vec![
             matmul_rule(
                 "mps-matmul-row-row",
@@ -1827,6 +1941,34 @@ impl EgglogOp for MPSMatmul {
             ),
             matmul_rule(
                 "mps-matmul-transposed-lhs-transposed-rhs",
+                MPSMatrixLayout::TransposedRowMajor,
+                MPSMatrixLayout::TransposedRowMajor,
+                1,
+                1,
+            ),
+            matmul_rule_leading(
+                "mps-matmul-leading-row-row",
+                MPSMatrixLayout::RowMajor,
+                MPSMatrixLayout::RowMajor,
+                0,
+                0,
+            ),
+            matmul_rule_leading(
+                "mps-matmul-leading-row-transposed-rhs",
+                MPSMatrixLayout::RowMajor,
+                MPSMatrixLayout::TransposedRowMajor,
+                0,
+                1,
+            ),
+            matmul_rule_leading(
+                "mps-matmul-leading-transposed-lhs-row",
+                MPSMatrixLayout::TransposedRowMajor,
+                MPSMatrixLayout::RowMajor,
+                1,
+                0,
+            ),
+            matmul_rule_leading(
+                "mps-matmul-leading-transposed-lhs-transposed-rhs",
                 MPSMatrixLayout::TransposedRowMajor,
                 MPSMatrixLayout::TransposedRowMajor,
                 1,
