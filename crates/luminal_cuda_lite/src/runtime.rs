@@ -473,6 +473,10 @@ impl CudaRuntime {
             }
             bail!("shape contracts failed:\n  - {}", doors.join("\n  - "));
         }
+        // THE ASSEMBLY TRIPWIRE: this program's every constructor of a
+        // decoded sort has exactly one decoder, checked against the LIVE
+        // schema before anything reads a serialized class.
+        self.decoders.check(&egraph)?;
         let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
         Ok((serialized.egraph, program))
     }
@@ -648,6 +652,7 @@ impl CudaRuntime {
                 input_slots: &native.input_slots,
                 output_slots: &native.output_slots,
                 base_dims: &self.dims,
+                decoders: &self.decoders,
             };
             let plans = crate::search::bucketed_search_implementations(
                 &assembly,

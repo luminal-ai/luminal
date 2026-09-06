@@ -273,3 +273,31 @@ fn a_non_base_cublaslt_row_without_base_is_refused_at_load() {
     ));
     CudaRuntime::load_with_registry(&cx, base_only).expect("Base alone loads");
 }
+
+/// THE ASSEMBLY TRIPWIRE, over the CUDA-lite registry's own assembled
+/// program: every constructor of a decoded sort that the marker estate's
+/// snippets add to core's preamble has exactly one registered decoder,
+/// and every registered decoder names a constructor the program really
+/// declares under that sort.
+///
+/// The estate declares no `Layout` constructor today (its datatypes are
+/// `CublasLt*` and its four `LayoutTensorOp*` rows), so the check passes
+/// on core's five. The point of the pin is that it is CHECKED, not
+/// assumed: the day a matcher declares one, `OpMatcher::decoders` must
+/// carry the struct that reads it back or this fails by name.
+#[test]
+fn the_cuda_registry_declares_no_constructor_it_cannot_decode() {
+    let (cx, _a, _b) = add_graph();
+    let rt = CudaRuntime::load(&cx).expect("load with the default registry");
+    // `saturated_egraph` runs the tripwire internally; this asserts on
+    // the registry directly too, so the failure names the constructor.
+    rt.saturated_egraph()
+        .expect("the assembled program saturates and every constructor decodes");
+    let decoders = rt.decoders();
+    assert!(
+        decoders
+            .constructors_of("Layout")
+            .any(|name| name == "LeftMajorContiguousElementLayoutLit"),
+        "the Layout sort is decoded by this registry"
+    );
+}

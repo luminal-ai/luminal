@@ -896,6 +896,10 @@ pub struct BucketAssembly<'a> {
     /// representative map so a plan records the full pin it was searched
     /// at.
     pub base_dims: &'a luminal::shape::DynMap,
+    /// The runtime's `(sort, constructor)` decoders — what every
+    /// bucket's saturated program is checked against by the assembly
+    /// tripwire, and what its layout decodes read through.
+    pub decoders: &'a luminal::egglog_utils::eclass::ConstructorRegistry,
 }
 
 /// Range-seeded bucketed search: one Cartesian combination of
@@ -936,6 +940,7 @@ pub fn bucketed_search_implementations(
         egraph
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
+        assembly.decoders.check(&egraph)?;
         let serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
             .egraph;

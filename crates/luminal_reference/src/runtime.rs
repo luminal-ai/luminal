@@ -360,6 +360,10 @@ impl ReferenceRuntime {
             }
             return Err(anyhow!("native saturation failed: {err}"));
         }
+        // THE ASSEMBLY TRIPWIRE: every constructor of a decoded sort in
+        // this program has exactly one decoder, checked against the LIVE
+        // schema before anything reads a serialized class.
+        crate::decoder_registry().check(&egraph)?;
         let saturation_nanos = saturation_start.elapsed().as_nanos();
         let serialize_start = std::time::Instant::now();
         let serialized = egraph

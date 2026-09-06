@@ -541,6 +541,7 @@ pub fn bucketed_search_implementations(
         egraph
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
+        crate::decoder_registry().check(&egraph)?;
         let serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
             .egraph;
