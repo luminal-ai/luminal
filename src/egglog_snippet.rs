@@ -116,6 +116,10 @@ pub fn new_egraph() -> egglog::EGraph {
     use egglog::sort::Z;
 
     let mut egraph = egglog::EGraph::default();
+    // Tree decomposition is off for now: egglog's decomposition planner was
+    // a large performance regression on our saturations (identical fixpoints
+    // either way). Temporary until the planner is revisited.
+    egraph.no_decomp = true;
     egglog::add_primitive!(&mut egraph, "bigint-to-i64" = |a: Z| -?> i64 {
         i64::try_from(&*a).ok()
     });
