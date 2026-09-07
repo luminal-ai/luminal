@@ -1458,9 +1458,9 @@ mod harness_tests {
     /// the bounds-row encoding), but they NO LONGER thread onto plan
     /// buffers: `PlanDtype` left the plan and bufferizer vocabulary
     /// entirely. What they thread onto is the RUNTIME'S OWN `L` — here
-    /// `DecodedLayout { mirror, dtype }` — which the reference decoder folds
-    /// at extraction time and which Option B then carries on each
-    /// assignment entry.
+    /// `DecodedLayout { class, dtype, spellings }` — which the reference
+    /// decoder folds at extraction time and which Option B then carries
+    /// on each assignment entry.
     ///
     /// The mixed-dtype gather fixture exercises F32 data, an Int boundary
     /// input, an Int interior iota (a planner-allocated buffer), and an
@@ -1475,8 +1475,12 @@ mod harness_tests {
         let egraph = serialize_fixture("boundary_gather.egg");
         let graph = luminal::dps::dps_rewrite(&extract_fixture("boundary_gather.egg"));
         // The POST-DPS graph: value-keyed tables cover poisons.
-        let table = luminal::layouts::decode_layout_table(
+        let view = luminal::egglog_utils::eclass::EGraphView::new(
             &egraph,
+            luminal_reference::decoder_registry(),
+        );
+        let table = luminal::layouts::decode_layout_table(
+            &view,
             &graph,
             "dtype row test",
             &mut luminal::layouts::LayoutDecodeCache::new(),
@@ -3828,18 +3832,18 @@ mod escape_execution_tests {
     /// no dims field, no walk, no vote.
     fn rm_layout(dims: &[i64]) -> DecodedLayout {
         // Dep-world discipline: `luminal::layouts`, never `crate::layouts` —
-        // DecodedLayout is the plain `luminal` build's MirrorLayout, and the
+        // DecodedLayout is the plain `luminal` build's type, and the
         // cfg(test) build's types do not unify with it.
         use luminal::layouts::{
-            BitWidthTerm, IntExprTerm, MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm,
+            BitWidthTerm, IntExprTerm, RightMajorContiguousElementLayout, ShapeTerm,
         };
-        DecodedLayout {
-            mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
+        DecodedLayout::of(
+            RightMajorContiguousElementLayout {
                 shape: ShapeTerm(dims.iter().map(|&d| IntExprTerm::Lit(d)).collect()),
                 width: BitWidthTerm(32),
-            }),
-            dtype: Some(luminal::dtype::PlanDtype::F32),
-        }
+            },
+            Some(luminal::dtype::PlanDtype::F32),
+        )
     }
 
     /// PROTOTYPE (Option B): the transpose view's COMPOSED layout — the
@@ -3847,21 +3851,19 @@ mod escape_execution_tests {
     /// reading its dense `[2,3]` parent): element (i,j) at parent flat
     /// j*3 + i, spelled as the strided chain from-end [coord0*3, coord1].
     fn transpose_strided_layout() -> DecodedLayout {
-        use luminal::layouts::{
-            BitWidthTerm, IntExprTerm, MirrorLayout, ShapeTerm, StridedElementLayout,
-        };
+        use luminal::layouts::{BitWidthTerm, IntExprTerm, ShapeTerm, StridedElementLayout};
         let coord = |axis_from_end: i64| IntExprTerm::Coord { axis_from_end };
-        DecodedLayout {
-            mirror: MirrorLayout::Strided(StridedElementLayout {
+        DecodedLayout::of(
+            StridedElementLayout {
                 shape: ShapeTerm(vec![IntExprTerm::Lit(3), IntExprTerm::Lit(2)]),
                 chain: vec![
                     IntExprTerm::Mul(Box::new(coord(0)), Box::new(IntExprTerm::Lit(3))),
                     coord(1),
                 ],
                 width: BitWidthTerm(32),
-            }),
-            dtype: Some(luminal::dtype::PlanDtype::F32),
-        }
+            },
+            Some(luminal::dtype::PlanDtype::F32),
+        )
     }
 
     /// A minimal escaped-output plan: input x `[2,3]` (BufferLit 7) is
@@ -3962,7 +3964,7 @@ mod escape_execution_tests {
     /// PROBE 1, the executed-bytes half — OPTION B RESTRUCTURE: the
     /// escaped slot's fetch returns the backing buffer's bytes plus the
     /// slot's HELD LAYOUT (`binding.layout`, verbatim), and elements are
-    /// read by EVALUATING the mirror layout's own expressions — no core
+    /// read by EVALUATING the layout's own expressions — no core
     /// walker (`walk_layout_index` left core; the canonical test-equality
     /// utility lives in the testing crate `test_runtime::test_equality`,
     /// duplicated minimally here because core's own dev-tests cannot
@@ -3980,11 +3982,12 @@ mod escape_execution_tests {
         assert_eq!(bytes.len(), 6, "the BACKING buffer is parent-sized");
         // The value's shape comes from the CARRIED LAYOUT's domain — there
         // is no dims field to read.
-        use luminal::layouts::{IntExprTerm, MirrorLayout};
-        assert_eq!(binding.layout.mirror.literal_extents(), Some(vec![3, 2]));
-        let MirrorLayout::Strided(strided) = &binding.layout.mirror else {
-            panic!("the disclosed layout is the composed strided form");
-        };
+        use luminal::layouts::{IntExprTerm, StridedElementLayout};
+        assert_eq!(binding.layout.literal_extents(), Some(vec![3, 2]));
+        let strided = binding
+            .layout
+            .first::<StridedElementLayout>()
+            .expect("the disclosed layout is the composed strided form");
         // Evaluate one chain summand at concrete coords (from-end axes).
         fn eval(expr: &IntExprTerm, coords: &[usize]) -> i64 {
             match expr {

@@ -45,3 +45,16 @@ pub fn assembled_program() -> &'static str {
     PROGRAM
         .get_or_init(|| luminal::egglog_snippet::assembled_program_for(&ops::built_in_matchers()))
 }
+
+/// The reference registry's CONSTRUCTOR DECODERS (core's built-ins plus
+/// this crate's matcher contributions), memoized — what every reference
+/// [`luminal::egglog_utils::eclass::EGraphView`] is built with, and what
+/// the assembly tripwire checks the saturated program against.
+pub fn decoder_registry() -> &'static luminal::egglog_utils::eclass::ConstructorRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<luminal::egglog_utils::eclass::ConstructorRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        luminal::egglog_snippet::decoder_registry_for(&ops::built_in_matchers())
+            .expect("the built-in reference registry has no duplicate decoders")
+    })
+}

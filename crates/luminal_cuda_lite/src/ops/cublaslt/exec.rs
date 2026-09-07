@@ -81,11 +81,21 @@
 //! left-major contiguous over the sibling frame `[n, m]`, which is
 //! byte-identical to the recorder's row-major `[m, n]`, puts the
 //! per-feature vector on D's rows (the API's only bias axis), and is
-//! exactly what [`bind_destination`] resolves to `LtDesc::col`. The
-//! executor therefore no longer refuses the bias forms; it carries a
-//! TRIPWIRE instead ([`assert_bias_destination_order`]): a bias-bearing
-//! call whose D is not COL is unreachable from the estate, and reaching
-//! it is a bug to bail on, never a case to handle.
+//! exactly what [`bind_destination`] resolves to `LtDesc::col`.
+//!
+//! THE FENCE IS THE SAME QUESTION, ASKED OF THE CLASS.
+//! [`bind_destination`] binds a bias form's D by
+//! `dest.require::<LeftMajorContiguousElementLayout>(who)` — the
+//! decorator's premise, spelled at the call site. A destination class
+//! that holds the LeftMajor spelling binds COL; one that does not is
+//! unreachable from the estate and is refused before any descriptor
+//! exists. The degenerate-extent coincidence — at `m == 1` or `n == 1`
+//! the right-major and left-major contiguous index maps over `[m, n]`
+//! are the SAME function, so the e-graph puts BOTH literals in one
+//! class — is NOT a case here: the class carries both spellings and
+//! `require` reads the class, not one chosen spelling. (It was a case
+//! only while a preference-ordered decoder handed this bridge one
+//! spelling of that class and hid the other; that decoder is gone.)
 //!
 //! THE DESTINATION FRAME IS THE PLAN'S, NOT A CONSTANT (regression fix,
 //! 2026-08-31 — see [`bind_destination`]). The paragraph above says
@@ -109,7 +119,8 @@
 //! spec-only DEFAULT (ROW), and the executor calls [`bind_destination`]
 //! with the result slot's elected layout before dispatch.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use luminal::layouts::{LeftMajorContiguousElementLayout, RightMajorContiguousElementLayout};
 
 use super::{CuDim, CuEpilogue, CublasLt, CublasLtForm, LtMatmulSpec};
 
@@ -321,8 +332,7 @@ pub fn bind_destination(
     dest: &luminal::layouts::DecodedLayout,
     who: &str,
 ) -> Result<()> {
-    use luminal::layouts::MirrorLayout as M;
-    let extents = dest.mirror.literal_extents().ok_or_else(|| {
+    let extents = dest.literal_extents().ok_or_else(|| {
         anyhow::anyhow!(
             "cuBLASLt {who}: the destination's elected layout has SYMBOLIC extents \
              — the call frame cannot be checked against it; refused before dispatch"
@@ -341,47 +351,70 @@ pub fn bind_destination(
             call.n
         );
     }
-    let desc = match &dest.mirror {
-        M::RightMajor(_) => LtDesc::row(call.m, call.n, call.n.max(1)),
-        M::LeftMajor(_) => LtDesc::col(call.m, call.n, call.m.max(1)),
-        other => bail!(
-            "cuBLASLt {who}: the plan elected a {} destination layout; this backend \
-             writes only the two dense orders cuBLASLt can express (RightMajor -> \
-             CUBLASLT_ORDER_ROW, LeftMajor -> CUBLASLT_ORDER_COL). Strided and \
-             offset-expression destinations are NOT lowered — a CAPABILITY refusal \
-             (the host-call mirror of the codegen path's identity-index write fence), \
-             never a guess. Layout: {other:?}",
-            match other {
-                M::Strided(_) => "STRIDED",
-                M::ElementOffset(_) => "ELEMENT-OFFSET-EXPRESSION",
-                M::BitOffset(_) => "BIT-OFFSET-EXPRESSION",
-                _ => unreachable!("the dense orders are matched above"),
-            }
-        ),
+    let desc = if call.bias_operand.is_some() {
+        // THE FENCE. The estate's two bias decorators mint a bias form
+        // ONLY when the claimed D class HOLDS the LeftMajor spelling
+        // (`egg/cublaslt_marker_decorate.egg`, premise
+        // `(= ?inner_L (LeftMajorContiguousElementLayoutLit ?ishape ?d_bits2))`).
+        // Ask the class the same question — not "which spelling does a
+        // decoder prefer", which is how a degenerate extent (`m == 1` or
+        // `n == 1`, where the two contiguous index maps are ONE function
+        // and both literals share the class) once looked like a drift
+        // and refused every whisper genome. A bias form whose class
+        // lacks the spelling is unreachable from the estate: a real
+        // drift, refused BEFORE any descriptor exists.
+        dest.require::<LeftMajorContiguousElementLayout>(who)
+            .with_context(|| {
+                format!(
+                    "cuBLASLt {who}: unreachable: the bias decorators require a LeftMajor \
+                     D; a bias form ({}) reached the executor whose destination class \
+                     holds {:?} and no LeftMajorContiguousElementLayoutLit — the library \
+                     refuses BIAS/RELU_BIAS on a ROW-order D \
+                     (CUBLAS_STATUS_NOT_SUPPORTED, measured on the A100 2026-08-28); \
+                     refused BEFORE dispatch, no bytes move",
+                    call.form.constructor_name(),
+                    dest.present()
+                )
+            })?;
+        LtDesc::col(call.m, call.n, call.m.max(1))
+    } else if dest.has::<LeftMajorContiguousElementLayout>() {
+        LtDesc::col(call.m, call.n, call.m.max(1))
+    } else if dest.has::<RightMajorContiguousElementLayout>() {
+        LtDesc::row(call.m, call.n, call.n.max(1))
+    } else {
+        bail!(
+            "cuBLASLt {who}: the plan elected a destination layout whose class holds \
+             {:?}; this backend writes only the two dense orders cuBLASLt can express \
+             (RightMajor -> CUBLASLT_ORDER_ROW, LeftMajor -> CUBLASLT_ORDER_COL). \
+             Strided and offset-expression destinations are NOT lowered — a CAPABILITY \
+             refusal (the host-call mirror of the codegen path's identity-index write \
+             fence), never a guess.",
+            dest.present()
+        )
     };
     call.d = desc;
     call.c = desc;
-    // The bias/order tripwire runs HERE — after the D order is known,
-    // never before (the spec-only default is ROW and would fire falsely).
-    assert_bias_destination_order(call, who)
+    Ok(())
 }
 
-/// THE BIAS/ORDER TRIPWIRE (ruling 2026-09-01). The estate's two bias
-/// decorators (`egg/cublaslt_marker_decorate.egg`) mint a bias form ONLY
-/// when the claimed D carries the `LeftMajorContiguousElementLayoutLit`
-/// spelling over the sibling frame, and [`bind_destination`] maps a
-/// LeftMajor election to `CUBLASLT_ORDER_COL`. A bias-bearing call whose
-/// D descriptor is not COL is therefore UNREACHABLE from a planned
-/// dispatch — it can only mean the estate premise and this bridge have
-/// drifted apart (or a hand-built call). Bail, never dispatch: the
-/// library refuses BIAS/RELU_BIAS on a ROW-order D
-/// (CUBLAS_STATUS_NOT_SUPPORTED, measured on the A100 2026-08-28), and
-/// this check names the finding BEFORE any descriptor is built.
+/// THE VENDOR PRECONDITION, checked at dispatch: cuBLASLt refuses
+/// BIAS/RELU_BIAS on a ROW-order D (`CUBLAS_STATUS_NOT_SUPPORTED`,
+/// measured on the A100 2026-08-28), and the library documents no such
+/// guarantee anywhere a caller can read it. This names the finding
+/// BEFORE the call goes out.
 ///
 /// Classification (see the CHECK TAXONOMY on [`bind_destination`]): a
-/// COHERENCE FENCE between the estate's premise vocabulary (the LeftMajor
-/// literal) and the call frame the executor builds (the D order) — not an
-/// e-graph re-check, and not disposable.
+/// VENDOR CHECK — category (2), and it STAYS. Its one caller is
+/// `device_call::dispatch`, which sees every `LtCall` however built,
+/// INCLUDING the hand-built ones the direct-dispatch contract tests
+/// construct without ever passing through [`bind_destination`]. That is
+/// a release path, so a `debug_assert!` would be wrong here.
+///
+/// It is NOT called from [`bind_destination`] any more. There it merely
+/// restated that function's own postcondition — the bias branch binds
+/// COL or refuses — which is category (1), "OUT". The estate-premise
+/// fence lives in `bind_destination` itself, as
+/// `require::<LeftMajorContiguousElementLayout>`.
 pub fn assert_bias_destination_order(call: &LtCall, who: &str) -> Result<()> {
     if call.bias_operand.is_some() && call.d.order != LtOrder::Col {
         bail!(

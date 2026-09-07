@@ -2,7 +2,10 @@
 name = "luminal"
 version = "0.2.0"
 edition.workspace = true
-rust-version = "1.85"
+# MSRV: let-chains need 1.88 and trait upcasting (the eclass decoder's
+# `dyn Facts` -> `dyn Any` door) needs 1.86; 1.91 is the oldest toolchain
+# we actually run (this Mac 1.91.1, the A100 box 1.95).
+rust-version = "1.91"
 description = "Deep learning at the speed of light."
 license = "MIT OR Apache-2.0"
 

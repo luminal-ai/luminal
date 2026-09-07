@@ -62,6 +62,12 @@ pub struct CudaRuntime {
     /// The claim set derived from that same registry — see
     /// [`CudaRuntime::allow_list_over`] for the three classes.
     allow: Vec<&'static str>,
+    /// The `(sort, constructor)` DECODERS for that same matcher set:
+    /// core's built-ins plus whatever the instance's matchers declare.
+    /// Every layout decode in this runtime reads through these, and the
+    /// assembly tripwire checks each saturated program against them. A
+    /// `Default` runtime carries an empty registry, like `matchers`.
+    decoders: luminal::egglog_utils::eclass::ConstructorRegistry,
     plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Host-staged input payloads by BufferLit id, H2D'd at execute.
     staged: FxHashMap<i64, HostBuffer>,
@@ -181,7 +187,12 @@ impl CudaRuntime {
         // Derive the claim set BEFORE the rows are consumed: the allow
         // list reads the prototypes, the search reads the matchers.
         let allow = Self::allow_list_over(&registry);
-        let matchers = registry.into_iter().map(|entry| entry.matcher).collect();
+        let matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>> =
+            registry.into_iter().map(|entry| entry.matcher).collect();
+        // The decoders for that same vocabulary. Refused here if two
+        // matchers claim one `(sort, constructor)` — a registration bug,
+        // named at load rather than at the first decode.
+        let decoders = luminal::egglog_snippet::decoder_registry_for(&matchers)?;
         Ok(Self {
             native: Some(NativeParts {
                 pre_schedule,
@@ -193,6 +204,7 @@ impl CudaRuntime {
             }),
             matchers,
             allow,
+            decoders,
             ..Self::default()
         })
     }
@@ -201,6 +213,14 @@ impl CudaRuntime {
     /// LENT, never rebuilt (see the field's note).
     fn matchers(&self) -> &[Box<dyn luminal::layout_ir::OpMatcher>] {
         &self.matchers
+    }
+
+    /// THIS INSTANCE'S CONSTRUCTOR DECODERS — what to build an
+    /// [`luminal::egglog_utils::eclass::EGraphView`] over
+    /// [`Self::saturated_egraph`] with, so a caller can ask a class
+    /// which spellings it holds.
+    pub fn decoders(&self) -> &luminal::egglog_utils::eclass::ConstructorRegistry {
+        &self.decoders
     }
 
     /// The claim set THIS instance searches under — the allow list
@@ -453,6 +473,10 @@ impl CudaRuntime {
             }
             bail!("shape contracts failed:\n  - {}", doors.join("\n  - "));
         }
+        // THE ASSEMBLY TRIPWIRE: this program's every constructor of a
+        // decoded sort has exactly one decoder, checked against the LIVE
+        // schema before anything reads a serialized class.
+        self.decoders.check(&egraph)?;
         let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
         Ok((serialized.egraph, program))
     }
@@ -628,6 +652,7 @@ impl CudaRuntime {
                 input_slots: &native.input_slots,
                 output_slots: &native.output_slots,
                 base_dims: &self.dims,
+                decoders: &self.decoders,
             };
             let plans = crate::search::bucketed_search_implementations(
                 &assembly,

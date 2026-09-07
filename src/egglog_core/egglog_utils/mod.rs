@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod base;
+pub mod eclass;
 
 pub use egraph_serialize::{ClassId, NodeId};
 

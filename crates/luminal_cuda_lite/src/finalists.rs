@@ -242,7 +242,16 @@ impl<'a> Finalists<'a> {
             Err(err) => return Err(format!("extract: {err:#}")),
         };
         let dps = luminal::dps::dps_rewrite(&graph);
-        luminal::layouts::decode_layout_table(self.egraph, &dps, "finalist", &mut self.layout_cache)
+        // The decoder registry for THIS matcher set. Built here rather
+        // than held as a field because building it can REFUSE (a
+        // duplicate `(sort, constructor)` registration) and a refusal in
+        // the search path is a `Result`, never a panic — and the five
+        // core decoders cost nothing next to the extraction this walk
+        // just paid for.
+        let decoders = luminal::egglog_snippet::decoder_registry_for(self.matchers)
+            .map_err(|err| format!("decoders: {err:#}"))?;
+        let view = luminal::egglog_utils::eclass::EGraphView::new(self.egraph, &decoders);
+        luminal::layouts::decode_layout_table(&view, &dps, "finalist", &mut self.layout_cache)
             .and_then(|table| luminal::bufferize::bufferize(&dps, &table))
             .map_err(|err| format!("bufferize: {err:#}"))
     }

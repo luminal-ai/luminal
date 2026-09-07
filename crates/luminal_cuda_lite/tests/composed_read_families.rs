@@ -520,9 +520,7 @@ fn materialize_lowers_a_folded_input_operand() {
     // permute's COMPOSED view layout over the parent domain (3,2),
     // operand 1 the DPS dest, entries = the slice's map.
     let sources: Vec<String> = {
-        use luminal::layouts::{
-            BitWidthTerm, IntExprTerm, MirrorLayout, ShapeTerm, StridedElementLayout,
-        };
+        use luminal::layouts::{BitWidthTerm, IntExprTerm, ShapeTerm, StridedElementLayout};
         use luminal_cuda_lite::layouts::DecodedLayout;
 
         let dims =
@@ -531,8 +529,8 @@ fn materialize_lowers_a_folded_input_operand() {
         // x^T seen at the parent VALUE's coordinates (3,2): x is (2,3)
         // row-major, so x^T[a][b] = x flat b*3 + a — the chain
         // [c_last, c_first*3] over domain (3,2).
-        let composed = DecodedLayout {
-            mirror: MirrorLayout::Strided(StridedElementLayout {
+        let composed = DecodedLayout::of(
+            StridedElementLayout {
                 shape: dims(&[3, 2]),
                 // Coord counts FROM THE END: p0 (first axis) is
                 // coord(1) at rank 2. x^T[p0][p1] = x flat p0*1 + p1*3.
@@ -541,15 +539,17 @@ fn materialize_lowers_a_folded_input_operand() {
                     IntExprTerm::Mul(Box::new(coord(0)), Box::new(IntExprTerm::Lit(3))),
                 ],
                 width: BitWidthTerm(32),
-            }),
-            dtype: Some(luminal::dtype::PlanDtype::F32),
-        };
-        let rm = |extents: &[i64]| DecodedLayout {
-            mirror: MirrorLayout::RightMajor(luminal::layouts::RightMajorContiguousElementLayout {
-                shape: dims(extents),
-                width: BitWidthTerm(32),
-            }),
-            dtype: Some(luminal::dtype::PlanDtype::F32),
+            },
+            Some(luminal::dtype::PlanDtype::F32),
+        );
+        let rm = |extents: &[i64]| {
+            DecodedLayout::of(
+                luminal::layouts::RightMajorContiguousElementLayout {
+                    shape: dims(extents),
+                    width: BitWidthTerm(32),
+                },
+                Some(luminal::dtype::PlanDtype::F32),
+            )
         };
         let slot = |layout: DecodedLayout| luminal::bufferize::SlotDescriptor {
             value: luminal::prelude::egraph_serialize::ClassId::from("probe"),

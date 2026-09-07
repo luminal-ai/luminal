@@ -77,18 +77,14 @@ use std::collections::{BTreeMap, BinaryHeap};
 /// GPU). One rule, one place, so the two can never disagree about a
 /// buffer's size.
 pub fn buffer_bytes(buffer: &Buffer<luminal::layouts::DecodedLayout>) -> Result<usize> {
-    let numel = buffer
-        .layout
-        .mirror
-        .literal_span_elements()
-        .ok_or_else(|| {
-            anyhow!(
-                "buffer {:?} (backing {}) has no literal span — symbolic or \
+    let numel = buffer.layout.literal_span_elements().ok_or_else(|| {
+        anyhow!(
+            "buffer {:?} (backing {}) has no literal span — symbolic or \
                  undisclosed-reach layouts are not executable",
-                buffer.label,
-                buffer.backs
-            )
-        })?;
+            buffer.label,
+            buffer.backs
+        )
+    })?;
     let dtype = buffer.layout.dtype.ok_or_else(|| {
         anyhow!(
             "buffer {:?} (backing {}) carries no dtype fact",

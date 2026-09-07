@@ -90,6 +90,13 @@ impl RegisteredOp {
         Self { matcher, prototype }
     }
 
+    /// The constructor decoders this row's matcher contributes — the
+    /// other half of `snippets()`: a row that DECLARES a constructor of
+    /// a decoded sort brings the struct that reads it back.
+    pub fn decoders(&self) -> Vec<luminal::egglog_utils::eclass::ConstructorDecoder> {
+        self.matcher.decoders()
+    }
+
     /// This row's egglog constructor — the name the estate mints and the
     /// name the derived allow list carries.
     pub fn constructor(&self) -> &'static str {

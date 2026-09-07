@@ -209,8 +209,10 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     // VALUE-keyed table: decode over the POST-DPS graph bufferize sees.
     let dps = luminal::dps::dps_rewrite(&extracted);
+    let view =
+        luminal::egglog_utils::eclass::EGraphView::new(&serialized, crate::decoder_registry());
     let layouts = luminal::layouts::decode_layout_table(
-        &serialized,
+        &view,
         &dps,
         "plain plan",
         &mut luminal::layouts::LayoutDecodeCache::new(),
