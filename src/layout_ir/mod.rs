@@ -362,29 +362,105 @@ impl Clone for Box<dyn LayoutIrOp> {
 // extractor resolves candidates by looking the enode's constructor name up in
 // a registry built from that list.
 
+/// Every e-node of an e-class, keyed by class — the inverse of
+/// [`egraph_serialize::Node::eclass`], built once per extraction session
+/// and handed to every [`ExtractionSite`].
+///
+/// THE ASYMMETRY THIS CLOSES. A site's helpers answer questions of the
+/// form "the nodes of class C": what does C spell, what literal does it
+/// hold, which of its spellings is a `ShapeLit`. Each one used to be a
+/// scan of the whole e-graph filtered by `eclass ==`, so a matcher asking
+/// a few dozen such questions made a few dozen passes over every node in
+/// the program, and its cost grew with the model rather than with the
+/// class it was reading. The extractor already owned this index for its
+/// own walks; the site now reads the same shape.
+///
+/// EVERY node is indexed, in the e-graph's own order — subsumed spellings
+/// and the `"[...]"` elision marker included, no filtering at build time.
+/// That is what makes the index a drop-in rather than a change of
+/// meaning: each helper still applies exactly the filter it always
+/// applied, to exactly the same nodes, in exactly the same order, so
+/// "the first spelling wins" picks the same spelling it always picked.
+#[derive(Debug, Clone, Default)]
+pub struct ClassIndex {
+    nodes: HashMap<ClassId, Vec<NodeId>>,
+}
+
+impl ClassIndex {
+    /// Index an e-graph's nodes by their e-class.
+    pub fn new(egraph: &egraph_serialize::EGraph) -> Self {
+        let mut nodes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+        for (node_id, node) in &egraph.nodes {
+            nodes
+                .entry(node.eclass.clone())
+                .or_default()
+                .push(node_id.clone());
+        }
+        Self { nodes }
+    }
+
+    /// The class's e-nodes, in e-graph order.
+    ///
+    /// A miss is NOT "the class is empty" — an e-class exists precisely
+    /// because a node names it, and every class id a matcher can hold was
+    /// read off some node's `eclass`. A miss therefore means this index
+    /// was built from a different e-graph than the one being read, which
+    /// is an invariant violation and not a case to fall back from: the
+    /// scan this replaces would have answered a question about the wrong
+    /// program. Refuse loudly instead.
+    pub fn nodes_of(&self, class: &ClassId) -> &[NodeId] {
+        self.nodes.get(class).map(Vec::as_slice).unwrap_or_else(|| {
+            panic!(
+                "class index invariant: class {class} has no entry — the index \
+                     was built from a different e-graph than the site reads"
+            )
+        })
+    }
+}
+
 /// The matched enode, handed to [`OpMatcher::extract`]. A borrowed view of
 /// everything a matcher may read while building an instance. Today's
 /// instances are nullary and ignore it; ops whose instances carry extracted
 /// data (layouts, axes, index maps) read their children through it. Extending
 /// this struct is the sanctioned way to grow the extraction contract —
 /// matchers take `&ExtractionSite`, so new fields cost existing impls nothing.
+///
+/// `classes` is the session's [`ClassIndex`] over `egraph`. The two travel
+/// together and must describe the same e-graph — every helper below reads
+/// a class through the index and resolves the ids it returns in `egraph`.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractionSite<'a> {
     pub egraph: &'a egraph_serialize::EGraph,
     pub node_id: &'a NodeId,
     pub node: &'a egraph_serialize::Node,
+    pub classes: &'a ClassIndex,
 }
 
 impl ExtractionSite<'_> {
+    /// THE ONE CLASS READ every helper below is built from: the members of
+    /// `class`, in e-graph order. The index gives the class's node ids in
+    /// O(1); resolving each id back to its node is a lookup in the
+    /// e-graph's own map. An id the index holds but the e-graph does not
+    /// is the same invariant violation [`ClassIndex::nodes_of`] describes.
+    fn members<'s>(
+        &'s self,
+        class: &egraph_serialize::ClassId,
+    ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
+        let egraph = self.egraph;
+        self.classes.nodes_of(class).iter().map(move |node_id| {
+            egraph.nodes.get(node_id).unwrap_or_else(|| {
+                panic!("class index invariant: indexed node {node_id} is not in the e-graph")
+            })
+        })
+    }
+
     /// The matched enode's child at `index` as a literal f64 (schema-drift
     /// panic contract as [`Self::child_i64`]).
     pub fn child_f64(&self, index: usize) -> f64 {
         let class = self.child_class(index);
-        for node in self.egraph.nodes.values() {
-            if node.eclass == class {
-                if let Ok(value) = node.op.parse::<f64>() {
-                    return value;
-                }
+        for node in self.members(&class) {
+            if let Ok(value) = node.op.parse::<f64>() {
+                return value;
             }
         }
         panic!(
@@ -400,10 +476,8 @@ impl ExtractionSite<'_> {
         class: &egraph_serialize::ClassId,
         op: &str,
     ) -> Option<&egraph_serialize::Node> {
-        self.egraph
-            .nodes
-            .values()
-            .find(|node| node.eclass == *class && node.op == op && !node.subsumed)
+        self.members(class)
+            .find(|node| node.op == op && !node.subsumed)
     }
 
     /// Every node of this op in the class for VALUE PARSING, unsubsumed
@@ -421,10 +495,8 @@ impl ExtractionSite<'_> {
         op: &'a str,
     ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
         self.nodes_in_class(class, op).chain(
-            self.egraph
-                .nodes
-                .values()
-                .filter(move |node| node.eclass == *class && node.op == op && node.subsumed),
+            self.members(class)
+                .filter(move |node| node.op == op && node.subsumed),
         )
     }
 
@@ -435,18 +507,13 @@ impl ExtractionSite<'_> {
         class: &'a egraph_serialize::ClassId,
         op: &'a str,
     ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
-        self.egraph
-            .nodes
-            .values()
-            .filter(move |node| node.eclass == *class && node.op == op && !node.subsumed)
+        self.members(class)
+            .filter(move |node| node.op == op && !node.subsumed)
     }
 
     /// Any literal-i64 node inside an arbitrary class.
     pub fn node_in_class_parse_i64(&self, class: &egraph_serialize::ClassId) -> Option<i64> {
-        self.egraph
-            .nodes
-            .values()
-            .filter(|node| node.eclass == *class)
+        self.members(class)
             .find_map(|node| node.op.parse::<i64>().ok())
     }
 
@@ -465,11 +532,9 @@ impl ExtractionSite<'_> {
     /// child, anything else is schema drift (see the validity contract).
     pub fn child_i64(&self, index: usize) -> i64 {
         let class = self.child_class(index);
-        for node in self.egraph.nodes.values() {
-            if node.eclass == class {
-                if let Ok(value) = node.op.parse::<i64>() {
-                    return value;
-                }
+        for node in self.members(&class) {
+            if let Ok(value) = node.op.parse::<i64>() {
+                return value;
             }
         }
         panic!(
