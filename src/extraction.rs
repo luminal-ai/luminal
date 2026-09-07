@@ -45,6 +45,10 @@ use crate::logical_op::{LogicalRender, logical_op_for};
 
 type Bounds = (Option<i128>, Option<i128>);
 type BoundsIndex = HashMap<ClassId, Bounds>;
+/// The genome-independent candidate memo: (produced class, chosen enode,
+/// chosen output slot) → that choice's candidates. See the field on
+/// [`Extractor`].
+type ChoiceCandidateCache = std::cell::RefCell<HashMap<(ClassId, NodeId, usize), Rc<[Candidate]>>>;
 
 #[derive(Debug)]
 struct Extractor<'a> {
@@ -101,6 +105,25 @@ struct Extractor<'a> {
     /// sampled stacks inside `is_better`). The rendered form of an enode
     /// never changes within a session, so one cache serves every genome.
     stable_key_cache: std::cell::RefCell<HashMap<NodeId, std::rc::Rc<str>>>,
+    /// GENOME-INDEPENDENT candidate memo: (produced class, chosen enode,
+    /// chosen output slot) → the candidates
+    /// [`Extractor::producer_candidates_for_choice`] builds for it.
+    ///
+    /// The KEY IS THE CHOICE, so this is sound across every genome a
+    /// search evaluates: the function reads the producer index, the op
+    /// specs, the class index, the matcher set and the parsed op — all
+    /// fixed for the life of a session — and nothing else. What it saves
+    /// is the per-candidate assembly `op_cache` does NOT cover: the
+    /// matcher's metadata slot walk, the operand-name strings, and the
+    /// spec's input/output list clones. Measured on mini gemma3 with the
+    /// cuBLASLt marker registered (2026-09-07): candidate construction
+    /// 1.53 ms → 0.75 ms per genome once warm, 100% hit rate from the
+    /// fifth genome on.
+    ///
+    /// Cleared by [`Extractor::apply_viability_filter`], which is the one
+    /// thing that edits the producer index, and never otherwise — the
+    /// same contract as `op_cache`.
+    choice_candidate_cache: ChoiceCandidateCache,
 }
 
 #[derive(Debug, Clone)]
@@ -985,6 +1008,7 @@ impl<'a> Extractor<'a> {
             tensor_bytes_cache: Default::default(),
             dtype_index: Default::default(),
             stable_key_cache: Default::default(),
+            choice_candidate_cache: Default::default(),
         }
     }
 
@@ -998,6 +1022,9 @@ impl<'a> Extractor<'a> {
     /// candidates on its own), and the fixpoint is too expensive to pay
     /// on every plain extraction.
     fn apply_viability_filter(&mut self) {
+        // The candidate memo is keyed on the choice and reads the
+        // producer index; this is the one place that edits it.
+        self.choice_candidate_cache.borrow_mut().clear();
         let op_matched: HashMap<&ClassId, bool> = self
             .op_specs
             .keys()
@@ -1130,8 +1157,12 @@ impl<'a> Extractor<'a> {
     /// produced class missing from the genome violates the total-genome
     /// contract: candidates empty out and extraction fails loudly at the
     /// root (fail-open, no silent substitution). The choice DIRECTS
-    /// construction (2026-08-06): candidates are built for the chosen
-    /// enode only, never built-then-discarded per spelling.
+    /// CONSTRUCTION: [`Extractor::producer_candidates_for_choice`] builds
+    /// the chosen enode's candidates and no others. It used to build one
+    /// per spelling and `retain` the chosen one — which is the same
+    /// answer at a cost linear in the class's spelling count, and on
+    /// graphs that mint several spellings per site (the cuBLASLt marker,
+    /// one per matmul form) that discovery dominated extraction.
     fn candidates_for_class(&self, class: &ClassId) -> Vec<Candidate> {
         // AN INPUT TERMINAL IS A LEAF BY DEFINITION (2026-09-02): its
         // value exists at launch, so it is PRODUCED BY NOTHING.
@@ -1156,17 +1187,7 @@ impl<'a> Extractor<'a> {
         let mut candidates = Vec::new();
         match genome_choice {
             Some(Some(choice)) => {
-                if let Some(node) = self.egraph.nodes.get(&choice.enode) {
-                    let node_id = choice.enode.clone();
-                    if let Some(candidate) = self.candidate_for_node(&node_id, node) {
-                        candidates.push(candidate);
-                    }
-                }
-                candidates.extend(self.producer_candidates_for_output(class));
-                candidates.retain(|candidate| {
-                    candidate.source_enode.as_ref() == Some(&choice.enode)
-                        && candidate.selected_output_index == Some(choice.output_index)
-                });
+                candidates.extend(self.producer_candidates_for_choice(class, choice));
             }
             Some(None) => {} // total-genome contract violated: no candidates
             None => {
@@ -1478,6 +1499,70 @@ impl<'a> Extractor<'a> {
             }
         }
 
+        candidates
+    }
+
+    /// The candidates one genome CHOICE yields for `class`: for each
+    /// producer entry of the class, in producer-index order, whose op
+    /// class is the chosen enode's and whose output slot is the chosen
+    /// one, the chosen enode's candidate under that entry's `OpSpec`.
+    ///
+    /// This is exactly the subsequence the walk used to obtain by
+    /// building every producer spelling and then retaining the ones whose
+    /// `(source_enode, selected_output_index)` matched the choice — same
+    /// entries, same order, nothing else constructed. Two spellings the
+    /// filter used to drop are not built at all here:
+    ///
+    ///  * enodes other than the chosen one, which is the whole point; and
+    ///  * a STRUCTURAL candidate for the chosen enode
+    ///    ([`Candidate::structural`], for the buffer-list plumbing), which
+    ///    could never survive the filter in the first place — it carries
+    ///    no `selected_output_index`, and a genome choice always names a
+    ///    slot. Structural spellings still reach the plain arm, which is
+    ///    where classes that HAVE them (buffer lists, boundary literals)
+    ///    are planned; a class in the producer index is a LayoutTensor.
+    ///
+    /// Memoized on the choice — see `Extractor::choice_candidate_cache`.
+    fn producer_candidates_for_choice(
+        &self,
+        output_class: &ClassId,
+        choice: &ProducerChoice,
+    ) -> Vec<Candidate> {
+        let key = (
+            output_class.clone(),
+            choice.enode.clone(),
+            choice.output_index,
+        );
+        if let Some(cached) = self.choice_candidate_cache.borrow().get(&key) {
+            return cached.to_vec();
+        }
+        let Some(producers) = self.producer_index.get(output_class) else {
+            return Vec::new();
+        };
+        let Some(node) = self.egraph.nodes.get(&choice.enode) else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
+        for producer in producers {
+            if producer.output_index != choice.output_index || producer.op_class != node.eclass {
+                continue;
+            }
+            let Some(spec) = self
+                .op_specs
+                .get(&producer.op_class)
+                .and_then(|specs| specs.get(producer.spec_index))
+            else {
+                continue;
+            };
+            if let Some(candidate) =
+                self.candidate_for_layout_op(producer, spec, &choice.enode, node)
+            {
+                candidates.push(candidate);
+            }
+        }
+        self.choice_candidate_cache
+            .borrow_mut()
+            .insert(key, Rc::from(candidates.as_slice()));
         candidates
     }
 
@@ -1920,7 +2005,7 @@ impl<'a> Extractor<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Candidate {
     source_eclass: Option<ClassId>,
     source_enode: Option<NodeId>,
