@@ -50,6 +50,7 @@ members = [
     "crates/luminal_nn",
     "crates/luminal_cuda_lite",
     "crates/luminal_metal",
+    "crates/luminal_webgpu",
     "crates/luminal_tracing",
     "crates/luminal_bench",
     "crates/luminal_python/rust",
