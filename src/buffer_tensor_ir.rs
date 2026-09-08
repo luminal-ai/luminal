@@ -21,6 +21,7 @@ use std::fmt::Debug;
 
 use anyhow::Result;
 use egraph_serialize::ClassId;
+use fixedbitset::FixedBitSet;
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::bufferize::{Analysis, Buffer, BufferId, Bufferizer, PlanLayout};
@@ -1090,6 +1091,69 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
 }
 
 // =============================================================================
+// Path order: one closure per graph
+// =============================================================================
+
+/// Path-order ("does `a` run before `b`") for a whole buffer-tensor graph,
+/// precomputed once as bitset rows so a query is a bit test rather than a
+/// fresh depth-first search. Answers exactly what
+/// `petgraph::algo::has_path_connecting` answers, `a == b` included.
+struct Reach {
+    /// `pos[node.index()]` = the node's row, in topological order when the
+    /// graph has one.
+    pos: Vec<usize>,
+    /// `bits[pos[a]]` = the rows reachable from `a` through at least one edge.
+    bits: Vec<FixedBitSet>,
+}
+
+impl Reach {
+    fn new<N, E>(dag: &DiGraph<N, E>) -> Self {
+        let n = dag.node_count();
+        let mut pos = vec![0usize; n];
+        let mut bits = vec![FixedBitSet::with_capacity(n); n];
+        match petgraph::algo::toposort(dag, None) {
+            Ok(order) => {
+                for (rank, node) in order.iter().enumerate() {
+                    pos[node.index()] = rank;
+                }
+                // A row is its successors' rows plus the successors, and every
+                // successor outranks its source, so one reverse sweep closes it.
+                for rank in (0..n).rev() {
+                    let (head, tail) = bits.split_at_mut(rank + 1);
+                    for next in dag.neighbors(order[rank]) {
+                        let next = pos[next.index()];
+                        head[rank].insert(next);
+                        head[rank].union_with(&tail[next - rank - 1]);
+                    }
+                }
+            }
+            Err(_) => {
+                // An ordering cycle (an unschedulable plan, rejected at
+                // lowering) has no topological order: close each row on its own.
+                for node in dag.node_indices() {
+                    pos[node.index()] = node.index();
+                }
+                for node in dag.node_indices() {
+                    let row = &mut bits[node.index()];
+                    let mut stack: Vec<NodeIndex> = dag.neighbors(node).collect();
+                    while let Some(next) = stack.pop() {
+                        if row.put(next.index()) {
+                            continue;
+                        }
+                        stack.extend(dag.neighbors(next));
+                    }
+                }
+            }
+        }
+        Self { pos, bits }
+    }
+
+    fn before(&self, a: NodeIndex, b: NodeIndex) -> bool {
+        a == b || self.bits[self.pos[a.index()]].contains(self.pos[b.index()])
+    }
+}
+
+// =============================================================================
 // Buffer-tensor optimizations: the storage-lifetime pass
 // =============================================================================
 
@@ -1406,10 +1470,19 @@ pub(crate) fn optimize<L: PlanLayout>(
     }
     // Free ordering: every toucher of the buffer not already ordered before
     // its free gets an Anti edge into it. Frees gain NO out-edges, ever.
+    //
+    // The closure is of the graph as it stands here; the edges the loop adds
+    // all END at a free, whose out-degree stays zero, so such an edge can only
+    // ever be the LAST edge of a path — a later toucher is ordered before this
+    // free exactly when the closure says so, or when it reaches a toucher that
+    // already got the edge (`sources`).
+    let reach = Reach::new(&out);
+    let mut sources: Vec<NodeIndex> = Vec::new();
     for (buffer, free) in &frees {
         let Some(all) = touchers.get(buffer) else {
             continue;
         };
+        sources.clear();
         for original in all {
             let Some(&toucher) = remap.get(original) else {
                 continue;
@@ -1417,7 +1490,8 @@ pub(crate) fn optimize<L: PlanLayout>(
             if toucher == *free {
                 continue;
             }
-            let ordered = petgraph::algo::has_path_connecting(&out, toucher, *free, None);
+            let ordered = reach.before(toucher, *free)
+                || sources.iter().any(|&source| reach.before(toucher, source));
             if !ordered {
                 out.add_edge(
                     toucher,
@@ -1426,6 +1500,7 @@ pub(crate) fn optimize<L: PlanLayout>(
                         buffer: buffer.clone(),
                     },
                 );
+                sources.push(toucher);
             }
         }
     }
@@ -1457,53 +1532,61 @@ pub(crate) fn optimize<L: PlanLayout>(
 /// write nothing, so they are never writers (a future Alloc's "write"
 /// installs no binding).
 ///
-/// Ordering is judged against the DATAFLOW graph only — a snapshot taken
-/// before any Anti edge exists. Judging the live graph is a verified
+/// Ordering is judged against the DATAFLOW graph only — the graph as it
+/// stands before any Anti edge exists. Judging the live graph is a verified
 /// miscompile: the Anti edge added for one hazard "orders" the OPPOSITE
 /// hazard (two copies swapping two buffers get one edge instead of two),
 /// converting a genuinely unschedulable plan into a silent wrong-answer
-/// schedule. Against the frozen graph the swap gets both edges and fails
+/// schedule. Against the pre-Anti graph the swap gets both edges and fails
 /// loudly at the lowering's schedulability check.
 pub(crate) fn install_anti_edges<L: PlanLayout>(bt: &mut BufferTensorIrGraph<L>) {
-    let frozen = bt.dag.clone();
+    // The closure, the writers and the readers are all read off the graph
+    // BEFORE the first Anti edge, which is the snapshot the rule requires.
+    let reach = Reach::new(&bt.dag);
     let mut writers: Vec<(NodeIndex, BufferId)> = Vec::new();
-    for index in frozen.node_indices() {
-        if let BtNode::Op { op, results, .. } = &frozen[index] {
-            for (result, tensor) in results.iter().enumerate() {
-                if op.result_writes_memory(result) {
-                    writers.push((index, tensor.buffer.clone()));
-                }
+    let mut readers: HashMap<BufferId, Vec<NodeIndex>> = HashMap::new();
+    for index in bt.dag.node_indices() {
+        let BtNode::Op {
+            op,
+            operands,
+            results,
+            ..
+        } = &bt.dag[index]
+        else {
+            continue;
+        };
+        for (result, tensor) in results.iter().enumerate() {
+            if op.result_writes_memory(result) {
+                writers.push((index, tensor.buffer.clone()));
+            }
+        }
+        // One entry per (node, buffer): a node reading a buffer through two
+        // operands is still one reader of it.
+        let mut listed: HashSet<&BufferId> = HashSet::new();
+        for (operand, tensor) in operands.iter().enumerate() {
+            if op.operand_reads_memory(operand) && listed.insert(&tensor.buffer) {
+                readers
+                    .entry(tensor.buffer.clone())
+                    .or_default()
+                    .push(index);
             }
         }
     }
     for (writer, buffer) in &writers {
-        let readers: Vec<NodeIndex> = frozen
-            .node_indices()
-            .filter(|&index| {
-                if index == *writer {
-                    return false; // a use cannot conflict with itself (RMW)
-                }
-                match &frozen[index] {
-                    BtNode::Op { op, operands, .. } => operands
-                        .iter()
-                        .enumerate()
-                        .any(|(i, t)| t.buffer == *buffer && op.operand_reads_memory(i)),
-                    BtNode::Input { .. } | BtNode::Output { .. } => false,
-                }
-            })
-            .collect();
-        for reader in readers {
-            let ordered = petgraph::algo::has_path_connecting(&frozen, reader, *writer, None)
-                || petgraph::algo::has_path_connecting(&frozen, *writer, reader, None);
-            if !ordered {
-                bt.dag.add_edge(
-                    reader,
-                    *writer,
-                    BtEdge::Anti {
-                        buffer: buffer.clone(),
-                    },
-                );
+        for &reader in readers.get(buffer).map(Vec::as_slice).unwrap_or(&[]) {
+            if reader == *writer {
+                continue; // a use cannot conflict with itself (RMW)
             }
+            if reach.before(reader, *writer) || reach.before(*writer, reader) {
+                continue;
+            }
+            bt.dag.add_edge(
+                reader,
+                *writer,
+                BtEdge::Anti {
+                    buffer: buffer.clone(),
+                },
+            );
         }
     }
 }
@@ -1614,7 +1697,9 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
     }
 
     let mut consumers: Vec<(NodeIndex, &BufferTensor)> = Vec::new();
-    let mut writers: Vec<(NodeIndex, &BufferTensor)> = Vec::new();
+    // Writers grouped by the buffer they write, in node order: the residency
+    // arm below asks only for its own consumer's buffer.
+    let mut writers: HashMap<&BufferId, Vec<NodeIndex>> = HashMap::new();
     for index in bt.dag.node_indices() {
         match &bt.dag[index] {
             BtNode::Input { .. } => {}
@@ -1631,7 +1716,7 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
                 }
                 for (result, tensor) in results.iter().enumerate() {
                     if op.result_writes_memory(result) {
-                        writers.push((index, tensor));
+                        writers.entry(&tensor.buffer).or_default().push(index);
                     }
                 }
             }
@@ -1651,7 +1736,9 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
         }
     };
 
-    let mut space = petgraph::algo::DfsSpace::new(&bt.dag);
+    // The certificate's OWN path order, built here from the finished graph:
+    // it trusts nothing the passes computed.
+    let reach = Reach::new(&bt.dag);
     for (reader, tensor) in &consumers {
         let def = producer
             .get(&(tensor.value.clone(), tensor.buffer.clone()))
@@ -1674,17 +1761,16 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
                 tensor.buffer,
             );
         };
-        for (writer, written) in &writers {
-            if written.buffer != tensor.buffer {
-                continue;
-            }
+        let against = writers
+            .get(&tensor.buffer)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for writer in against {
             if *writer == def || *writer == *reader {
                 continue;
             }
-            let before_def =
-                petgraph::algo::has_path_connecting(&bt.dag, *writer, def, Some(&mut space));
-            let after_read =
-                petgraph::algo::has_path_connecting(&bt.dag, *reader, *writer, Some(&mut space));
+            let before_def = reach.before(*writer, def);
+            let after_read = reach.before(*reader, *writer);
             if !(before_def || after_read) {
                 anyhow::bail!(
                     "plan validation failed: {} writes buffer {:?} unordered \
@@ -1938,7 +2024,7 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
         let buffer_touchers = touchers.get(buffer).map(Vec::as_slice).unwrap_or(&[]);
         for &alloc in buffer_allocs {
             for &toucher in buffer_touchers {
-                if !petgraph::algo::has_path_connecting(&bt.dag, alloc, toucher, Some(&mut space)) {
+                if !reach.before(alloc, toucher) {
                     anyhow::bail!(
                         "plan validation failed: {} touches buffer {:?} \
                          unordered against its allocation — some legal \
@@ -1951,7 +2037,7 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
         }
         for &free in buffer_frees {
             for &toucher in buffer_touchers {
-                if !petgraph::algo::has_path_connecting(&bt.dag, toucher, free, Some(&mut space)) {
+                if !reach.before(toucher, free) {
                     anyhow::bail!(
                         "plan validation failed: {} touches buffer {:?} \
                          unordered against its free — some legal schedule \
