@@ -413,13 +413,7 @@ fn storage_dims(
     site: &ExtractionSite<'_>,
     logical_class: &ClassId,
 ) -> Option<Vec<(CuDim, ClassId)>> {
-    let shape_class = site.egraph.nodes.values().find_map(|node| {
-        if node.op != "shape-of" {
-            return None;
-        }
-        let child = node.children.first()?;
-        (&site.egraph.nodes.get(child)?.eclass == logical_class).then(|| node.eclass.clone())
-    })?;
+    let shape_class = site.fact_row_class("shape-of", logical_class)?;
     let shape_lit = site.nodes_in_class_value(&shape_class, "ShapeLit").next()?;
     let mut list_class = site.class_of_child(shape_lit, 0)?;
     let mut dims = Vec::new();
@@ -605,26 +599,7 @@ fn leading_dimension(
 
 /// The direct buffer of a layout tensor, if a BufferTensorLit names it.
 fn direct_buffer_of(site: &ExtractionSite<'_>, lt_class: &ClassId) -> Option<ClassId> {
-    for node in site.egraph.nodes.values() {
-        if node.op != "BufferTensorLit" {
-            continue;
-        }
-        let Some(lt) = node
-            .children
-            .first()
-            .and_then(|id| site.egraph.nodes.get(id))
-        else {
-            continue;
-        };
-        if &lt.eclass == lt_class {
-            return node
-                .children
-                .get(1)
-                .and_then(|id| site.egraph.nodes.get(id))
-                .map(|c| c.eclass.clone());
-        }
-    }
-    None
+    site.fact_row_child("BufferTensorLit", lt_class, 1)
 }
 
 /// VIEW ADMISSION (round 10): ground a descriptor's layout tensor in a
@@ -661,27 +636,9 @@ fn resolve_buffer(site: &ExtractionSite<'_>, lt_class: &ClassId, depth: usize) -
             continue;
         };
         // ...every layout tensor of that parent...
-        for plt in site.egraph.nodes.values() {
-            if plt.op != "LayoutTensorLit" {
-                continue;
-            }
-            let Some(pl) = plt
-                .children
-                .first()
-                .and_then(|id| site.egraph.nodes.get(id))
-            else {
-                continue;
-            };
-            if pl.eclass != parent_logical {
-                continue;
-            }
+        for plt in site.fact_nodes("LayoutTensorLit", &parent_logical) {
             let plt_class = plt.eclass.clone();
-            let Some(p_layout) = plt
-                .children
-                .get(1)
-                .and_then(|id| site.egraph.nodes.get(id))
-                .map(|c| c.eclass.clone())
-            else {
+            let Some(p_layout) = site.class_of_child(plt, 1) else {
                 continue;
             };
             // ...whose composition through THIS map is L (the tie).
@@ -689,21 +646,8 @@ fn resolve_buffer(site: &ExtractionSite<'_>, lt_class: &ClassId, depth: usize) -
                 .nodes_in_class_value(&p_layout, "BitOffsetExpressionLayoutLit")
                 .filter_map(|n| site.class_of_child(n, 0))
                 .any(|p_expr| {
-                    site.egraph.nodes.values().any(|n| {
-                        n.op == "int-subst-of"
-                            && n.children.len() >= 2
-                            && site
-                                .egraph
-                                .nodes
-                                .get(&n.children[0])
-                                .map(|c| c.eclass == p_expr)
-                                .unwrap_or(false)
-                            && site
-                                .egraph
-                                .nodes
-                                .get(&n.children[1])
-                                .map(|c| c.eclass == map_class)
-                                .unwrap_or(false)
+                    site.fact_nodes("int-subst-of", &p_expr).any(|n| {
+                        site.class_of_child(n, 1).as_ref() == Some(&map_class)
                             && l_exprs.contains(&n.eclass)
                     })
                 });

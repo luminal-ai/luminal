@@ -36,13 +36,8 @@ fn coordinate_rank(site: &ExtractionSite<'_>, child: usize) -> usize {
     let mut class = site.child_class(child);
     loop {
         let spine = site
-            .egraph
-            .nodes
-            .values()
-            .find(|node| {
-                node.eclass == class
-                    && (node.op == "LayoutTensorCons" || node.op == "LayoutTensorNil")
-            })
+            .members(&class)
+            .find(|node| node.op == "LayoutTensorCons" || node.op == "LayoutTensorNil")
             .unwrap_or_else(|| {
                 panic!(
                     "schema drift: coordinate-list class {class} under enode {} has no \
@@ -58,12 +53,8 @@ fn coordinate_rank(site: &ExtractionSite<'_>, child: usize) -> usize {
             panic!("schema drift: a LayoutTensorCons in class {class} has no tail child")
         });
         class = site
-            .egraph
-            .nodes
-            .get(tail_id)
-            .unwrap_or_else(|| panic!("dangling list tail node {tail_id}"))
-            .eclass
-            .clone();
+            .class_of_child(spine, 1)
+            .unwrap_or_else(|| panic!("dangling list tail node {tail_id}"));
     }
     rank
 }
