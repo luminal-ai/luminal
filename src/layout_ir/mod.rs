@@ -468,7 +468,7 @@ impl ExtractionSite<'_> {
     /// in the e-graph's own map. An id the index holds but the e-graph
     /// does not is the same invariant violation
     /// [`SerializedIndex::nodes_of`] describes.
-    pub fn members<'s>(
+    fn members<'s>(
         &'s self,
         class: &egraph_serialize::ClassId,
     ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
@@ -530,10 +530,36 @@ impl ExtractionSite<'_> {
         class: &'a egraph_serialize::ClassId,
         op: &'a str,
     ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
-        self.nodes_in_class(class, op).chain(
-            self.members(class)
-                .filter(move |node| node.op == op && node.subsumed),
-        )
+        self.nodes_in_class_ordered(class, move |spelling| spelling == op)
+    }
+
+    /// Every node in the class spelling ANY of `ops` — for a value whose
+    /// answer may wear several constructors (a list spine's cons/nil, a
+    /// layout's five spellings). Same order as
+    /// [`Self::nodes_in_class_value`].
+    pub fn nodes_in_class_value_any<'a>(
+        &'a self,
+        class: &'a egraph_serialize::ClassId,
+        ops: &'a [&'a str],
+    ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
+        self.nodes_in_class_ordered(class, move |spelling| ops.contains(&spelling))
+    }
+
+    /// THE VALUE-READ ORDER both accessors above are built from:
+    /// unsubsumed spellings in e-graph order, subsumed ones after —
+    /// trailing rather than absent, because saturation can subsume every
+    /// spelling of a class and a value reader must not starve.
+    fn nodes_in_class_ordered<'a>(
+        &'a self,
+        class: &'a egraph_serialize::ClassId,
+        keep: impl Fn(&str) -> bool + Copy + 'a,
+    ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
+        self.members(class)
+            .filter(move |node| keep(&node.op) && !node.subsumed)
+            .chain(
+                self.members(class)
+                    .filter(move |node| keep(&node.op) && node.subsumed),
+            )
     }
 
     /// EVERY non-subsumed node of this op in the class — for parsers that

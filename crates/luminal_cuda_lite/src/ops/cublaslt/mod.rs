@@ -391,7 +391,14 @@ fn layout_class_of(site: &ExtractionSite<'_>, lt_class: &ClassId) -> Option<Clas
 /// the offset-expression spellings carry Shape at child 1, the strided
 /// and contiguous ones at child 0.
 fn layout_shape_class(site: &ExtractionSite<'_>, layout_class: &ClassId) -> Option<ClassId> {
-    for node in site.members(layout_class) {
+    const LAYOUT_CONSTRUCTORS: &[&str] = &[
+        "RightMajorContiguousElementLayoutLit",
+        "LeftMajorContiguousElementLayoutLit",
+        "StridedElementLayoutLit",
+        "BitOffsetExpressionLayoutLit",
+        "ElementOffsetExpressionLayoutLit",
+    ];
+    for node in site.nodes_in_class_value_any(layout_class, LAYOUT_CONSTRUCTORS) {
         let shape_slot = match node.op.as_str() {
             "RightMajorContiguousElementLayoutLit"
             | "LeftMajorContiguousElementLayoutLit"

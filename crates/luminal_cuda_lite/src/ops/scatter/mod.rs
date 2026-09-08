@@ -30,8 +30,8 @@ fn coordinate_rank(site: &ExtractionSite<'_>, child: usize) -> usize {
     let mut class = site.child_class(child);
     loop {
         let spine = site
-            .members(&class)
-            .find(|node| node.op == "LayoutTensorCons" || node.op == "LayoutTensorNil")
+            .nodes_in_class_value_any(&class, &["LayoutTensorCons", "LayoutTensorNil"])
+            .next()
             .unwrap_or_else(|| {
                 panic!(
                     "schema drift: coordinate-list class {class} under enode {} has no \
