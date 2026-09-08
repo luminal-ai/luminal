@@ -1,6 +1,7 @@
 //! IntExpr-level egglog machinery: the base interval/expression
 //! lattice (`base`), the rule-authoring DSL (`api`), the serialized
-//! e-graph snapshot, and shortest-form IntExpr extraction.
+//! e-graph snapshot, the read-API snapshot (`snapshot`), and
+//! shortest-form IntExpr extraction.
 //!
 //! M3 Step 4b: their HLIR<->egglog compile ladder (hlir_to_egglog,
 //! egglog_to_llir, choice-set search, run_egglog report machinery) is
@@ -10,6 +11,7 @@
 pub mod api;
 pub mod base;
 pub mod eclass;
+pub mod snapshot;
 
 pub use egraph_serialize::{ClassId, NodeId};
 
