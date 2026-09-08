@@ -1697,7 +1697,9 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
     }
 
     let mut consumers: Vec<(NodeIndex, &BufferTensor)> = Vec::new();
-    let mut writers: Vec<(NodeIndex, &BufferTensor)> = Vec::new();
+    // Writers grouped by the buffer they write, in node order: the residency
+    // arm below asks only for its own consumer's buffer.
+    let mut writers: HashMap<&BufferId, Vec<NodeIndex>> = HashMap::new();
     for index in bt.dag.node_indices() {
         match &bt.dag[index] {
             BtNode::Input { .. } => {}
@@ -1714,7 +1716,7 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
                 }
                 for (result, tensor) in results.iter().enumerate() {
                     if op.result_writes_memory(result) {
-                        writers.push((index, tensor));
+                        writers.entry(&tensor.buffer).or_default().push(index);
                     }
                 }
             }
@@ -1734,7 +1736,9 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
         }
     };
 
-    let mut space = petgraph::algo::DfsSpace::new(&bt.dag);
+    // The certificate's OWN path order, built here from the finished graph:
+    // it trusts nothing the passes computed.
+    let reach = Reach::new(&bt.dag);
     for (reader, tensor) in &consumers {
         let def = producer
             .get(&(tensor.value.clone(), tensor.buffer.clone()))
@@ -1757,17 +1761,16 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
                 tensor.buffer,
             );
         };
-        for (writer, written) in &writers {
-            if written.buffer != tensor.buffer {
-                continue;
-            }
+        let against = writers
+            .get(&tensor.buffer)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for writer in against {
             if *writer == def || *writer == *reader {
                 continue;
             }
-            let before_def =
-                petgraph::algo::has_path_connecting(&bt.dag, *writer, def, Some(&mut space));
-            let after_read =
-                petgraph::algo::has_path_connecting(&bt.dag, *reader, *writer, Some(&mut space));
+            let before_def = reach.before(*writer, def);
+            let after_read = reach.before(*reader, *writer);
             if !(before_def || after_read) {
                 anyhow::bail!(
                     "plan validation failed: {} writes buffer {:?} unordered \
@@ -2021,7 +2024,7 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
         let buffer_touchers = touchers.get(buffer).map(Vec::as_slice).unwrap_or(&[]);
         for &alloc in buffer_allocs {
             for &toucher in buffer_touchers {
-                if !petgraph::algo::has_path_connecting(&bt.dag, alloc, toucher, Some(&mut space)) {
+                if !reach.before(alloc, toucher) {
                     anyhow::bail!(
                         "plan validation failed: {} touches buffer {:?} \
                          unordered against its allocation — some legal \
@@ -2034,7 +2037,7 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
         }
         for &free in buffer_frees {
             for &toucher in buffer_touchers {
-                if !petgraph::algo::has_path_connecting(&bt.dag, toucher, free, Some(&mut space)) {
+                if !reach.before(toucher, free) {
                     anyhow::bail!(
                         "plan validation failed: {} touches buffer {:?} \
                          unordered against its free — some legal schedule \
