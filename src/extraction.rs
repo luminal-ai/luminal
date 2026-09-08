@@ -37,9 +37,9 @@ use egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::layout_ir::{
-    Access, BufferInfo, ClassIndex, ExtractedDag, ExtractedEdge, ExtractedGraph, ExtractedNode,
-    ExtractionSite, FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText,
-    LogicalInfo, OpInput, OpMatcher, OpNode, OutputNode, OutputSlot,
+    Access, BufferInfo, ExtractedDag, ExtractedEdge, ExtractedGraph, ExtractedNode, ExtractionSite,
+    FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText, LogicalInfo, OpInput,
+    OpMatcher, OpNode, OutputNode, OutputSlot, SerializedIndex,
 };
 use crate::logical_op::{LogicalRender, logical_op_for};
 
@@ -61,14 +61,16 @@ struct Extractor<'a> {
     /// has no entry here simply offers no implementation candidate.
     matchers: HashMap<&'static str, &'a dyn OpMatcher>,
     class_nodes: HashMap<ClassId, Vec<NodeId>>,
-    /// The class index every [`ExtractionSite`] this extractor builds
-    /// reads through: class → its e-nodes, ALL of them, in e-graph order.
-    /// Distinct from `class_nodes` above, which is filtered to the
-    /// unsubsumed spellings this extractor's own walks consider — a
-    /// site's value readers deliberately see subsumed spellings too (see
+    /// The serialized index every [`ExtractionSite`] this extractor
+    /// builds reads through: class → its e-nodes, constructor → its
+    /// e-nodes, and (constructor, child 0's class) → its fact rows, ALL
+    /// of them, in e-graph order. Distinct from `class_nodes` above,
+    /// which is filtered to the unsubsumed spellings this extractor's
+    /// own walks consider — a site's value readers deliberately see
+    /// subsumed spellings too (see
     /// [`ExtractionSite::nodes_in_class_value`]), so they need the
     /// unfiltered inverse.
-    site_classes: ClassIndex,
+    site_index: SerializedIndex,
     /// The shared rendering state: the render-time class index and the
     /// per-(class, depth, preference) render memo, behind an `Rc` so the
     /// lazy text closures the extraction hands out can keep it alive
@@ -972,7 +974,7 @@ impl<'a> Extractor<'a> {
             .map(|matcher| (matcher.egglog_constructor(), matcher))
             .collect();
         let class_nodes = class_nodes(egraph);
-        let site_classes = ClassIndex::new(egraph);
+        let site_index = SerializedIndex::new(egraph);
         let render = Rc::new(RenderCtx::new(egraph));
         let (op_specs, mut producer_index) = collect_op_specs(egraph, &render.class_nodes);
         let output_buffer_classes = collect_output_buffer_classes(egraph, &class_nodes);
@@ -1025,7 +1027,7 @@ impl<'a> Extractor<'a> {
             egraph,
             matchers,
             class_nodes,
-            site_classes,
+            site_index,
             render,
             op_specs,
             producer_index,
@@ -1757,7 +1759,7 @@ impl<'a> Extractor<'a> {
                     egraph: self.egraph,
                     node_id,
                     node,
-                    classes: &self.site_classes,
+                    index: &self.site_index,
                 });
                 self.op_cache
                     .borrow_mut()
@@ -4451,9 +4453,19 @@ pub fn chain_strides(egraph: &EGraph, layout: &ClassId) -> Option<Vec<Option<Cha
     Some(out)
 }
 
-fn child_class(egraph: &EGraph, node: &Node, index: usize) -> Option<ClassId> {
+/// The e-class of `node`'s child at `index`, or `None` when there is no
+/// such child or its id does not resolve — the site-free twin of
+/// [`ExtractionSite::class_of_child`], for walks that hold an e-graph
+/// rather than a matched enode.
+pub fn child_class(egraph: &EGraph, node: &Node, index: usize) -> Option<ClassId> {
     let child_id = node.children.get(index)?;
     egraph.nodes.get(child_id).map(|child| child.eclass.clone())
+}
+
+/// The e-class a node id names, or `None` when the id is not in this
+/// e-graph — the total form of [`EGraph::nid_to_cid`], which panics.
+pub fn node_class(egraph: &EGraph, node_id: &NodeId) -> Option<ClassId> {
+    egraph.nodes.get(node_id).map(|node| node.eclass.clone())
 }
 
 #[cfg(test)]

@@ -362,41 +362,95 @@ impl Clone for Box<dyn LayoutIrOp> {
 // extractor resolves candidates by looking the enode's constructor name up in
 // a registry built from that list.
 
-/// Every e-node of an e-class, keyed by class — the inverse of
-/// [`egraph_serialize::Node::eclass`], built once per extraction session
-/// and handed to every [`ExtractionSite`].
+/// The lookups the SERIALIZED e-graph does not carry, built once per
+/// extraction session and handed to every [`ExtractionSite`]:
 ///
-/// THE ASYMMETRY THIS CLOSES. A site's helpers answer questions of the
-/// form "the nodes of class C": what does C spell, what literal does it
-/// hold, which of its spellings is a `ShapeLit`. Each one used to be a
-/// scan of the whole e-graph filtered by `eclass ==`, so a matcher asking
-/// a few dozen such questions made a few dozen passes over every node in
-/// the program, and its cost grew with the model rather than with the
-/// class it was reading. The extractor already owned this index for its
-/// own walks; the site now reads the same shape.
+///  * BY CLASS — every e-node of an e-class, the inverse of
+///    [`egraph_serialize::Node::eclass`].
+///  * BY OP — every e-node spelling a given constructor.
+///  * BY FACT ROW — every e-node spelling a given constructor whose
+///    FIRST child lands in a given class.
 ///
-/// EVERY node is indexed, in the e-graph's own order — subsumed spellings
-/// and the `"[...]"` elision marker included, no filtering at build time.
-/// That is what makes the index a drop-in rather than a change of
-/// meaning: each helper still applies exactly the filter it always
-/// applied, to exactly the same nodes, in exactly the same order, so
-/// "the first spelling wins" picks the same spelling it always picked.
+/// THE ASYMMETRY THIS CLOSES. A site's helpers answer questions of two
+/// forms. "The nodes of class C": what does C spell, what literal does
+/// it hold, which of its spellings is a `ShapeLit`. And "the row of
+/// function F at argument C": what is `(shape-of C)`, which
+/// `BufferTensorLit` names layout tensor C, is there an
+/// `(int-subst-of e m)` in this class. Each one used to be a scan of
+/// the whole e-graph filtered by `eclass ==` or by `op == .. &&
+/// child 0's class ==`, so a matcher asking a few dozen such questions
+/// made a few dozen passes over every node in the program, and its cost
+/// grew with the model rather than with the class or the row it was
+/// reading.
+///
+/// FACT ROWS COVER BOTH SHAPES the matchers use. A FUNCTION row is
+/// keyed by its argument and read for its own class — `(shape-of L)`
+/// answers "L's shape class". A PARENT PROBE is keyed by its child and
+/// read for its other children or its own class — `(BufferTensorLit lt
+/// buf)` answers "which buffer names lt". Both are "the nodes of op F
+/// whose child 0 is class C", so one index serves both.
+///
+/// EVERY node is indexed, in the e-graph's own order — subsumed
+/// spellings and the `"[...]"` elision marker included, no filtering at
+/// build time. That is what makes the index a drop-in rather than a
+/// change of meaning: each helper still applies exactly the filter it
+/// always applied, to exactly the same nodes, in exactly the same
+/// order, so "the first spelling wins" picks the same spelling it
+/// always picked.
+///
+/// ONE STRUCT, not one per lookup. The three maps must describe the
+/// SAME e-graph — a site resolves the ids any of them returns in its
+/// own `egraph` — and keeping them in one value the site borrows once
+/// makes that structural instead of a comment on three parallel fields.
 #[derive(Debug, Clone, Default)]
-pub struct ClassIndex {
-    nodes: HashMap<ClassId, Vec<NodeId>>,
+pub struct SerializedIndex {
+    by_class: HashMap<ClassId, Vec<NodeId>>,
+    by_op: HashMap<String, Vec<NodeId>>,
+    by_fact: HashMap<String, HashMap<ClassId, Vec<NodeId>>>,
 }
 
-impl ClassIndex {
-    /// Index an e-graph's nodes by their e-class.
+/// The bucket for `op`, minting it on first sight. Keyed by the op's
+/// own text so a lookup can hash a `&str`; the `String` is allocated
+/// once per DISTINCT constructor rather than once per node.
+fn op_bucket<'m, V: Default>(map: &'m mut HashMap<String, V>, op: &str) -> &'m mut V {
+    if !map.contains_key(op) {
+        map.insert(op.to_string(), V::default());
+    }
+    map.get_mut(op).expect("bucket just minted")
+}
+
+impl SerializedIndex {
+    /// Index an e-graph's nodes by e-class, by constructor, and by
+    /// (constructor, child 0's class) — one pass.
     pub fn new(egraph: &egraph_serialize::EGraph) -> Self {
-        let mut nodes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+        let mut by_class: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+        let mut by_op: HashMap<String, Vec<NodeId>> = HashMap::new();
+        let mut by_fact: HashMap<String, HashMap<ClassId, Vec<NodeId>>> = HashMap::new();
         for (node_id, node) in &egraph.nodes {
-            nodes
+            by_class
                 .entry(node.eclass.clone())
                 .or_default()
                 .push(node_id.clone());
+            op_bucket(&mut by_op, &node.op).push(node_id.clone());
+            // A node with no children, or one whose child 0 does not
+            // resolve, carries no fact row — exactly the `continue` the
+            // scans this replaces took on an unresolvable child 0.
+            if let Some(arg0) = node
+                .children
+                .first()
+                .and_then(|child| egraph.nodes.get(child))
+            {
+                op_bucket(&mut by_fact, &node.op)
+                    .entry(arg0.eclass.clone())
+                    .or_default()
+                    .push(node_id.clone());
+            }
         }
-        Self { nodes }
+        Self {
+            by_class,
+            by_op,
+            by_fact,
+        }
     }
 
     /// The class's e-nodes, in e-graph order.
@@ -409,12 +463,39 @@ impl ClassIndex {
     /// scan this replaces would have answered a question about the wrong
     /// program. Refuse loudly instead.
     pub fn nodes_of(&self, class: &ClassId) -> &[NodeId] {
-        self.nodes.get(class).map(Vec::as_slice).unwrap_or_else(|| {
-            panic!(
-                "class index invariant: class {class} has no entry — the index \
+        self.by_class
+            .get(class)
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| {
+                panic!(
+                    "class index invariant: class {class} has no entry — the index \
                      was built from a different e-graph than the site reads"
-            )
-        })
+                )
+            })
+    }
+
+    /// Every e-node spelling `op`, in e-graph order. A miss is EMPTY,
+    /// not an error: a program that mints no `BufferInputLit` has no
+    /// explicit inputs, and the scans this replaces read that as an
+    /// empty result too.
+    pub fn nodes_of_op(&self, op: &str) -> &[NodeId] {
+        self.by_op.get(op).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// The fact rows `op(arg0, ..)` — every e-node spelling `op` whose
+    /// child 0 lands in `arg0` — in e-graph order.
+    ///
+    /// A miss is EMPTY, not an error. Absence of a fact row is a
+    /// legitimate answer everywhere it is asked: a logical value with no
+    /// `shape-of` row, a layout tensor no `BufferTensorLit` names. Every
+    /// scan this replaces fell out of its loop and returned `None`, and
+    /// so does every lookup built on this.
+    pub fn fact_rows(&self, op: &str, arg0: &ClassId) -> &[NodeId] {
+        self.by_fact
+            .get(op)
+            .and_then(|rows| rows.get(arg0))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 
@@ -425,31 +506,92 @@ impl ClassIndex {
 /// this struct is the sanctioned way to grow the extraction contract —
 /// matchers take `&ExtractionSite`, so new fields cost existing impls nothing.
 ///
-/// `classes` is the session's [`ClassIndex`] over `egraph`. The two travel
-/// together and must describe the same e-graph — every helper below reads
-/// a class through the index and resolves the ids it returns in `egraph`.
+/// `index` is the session's [`SerializedIndex`] over `egraph`. The two
+/// travel together and must describe the same e-graph — every helper
+/// below reads a class or a fact row through the index and resolves the
+/// ids it returns in `egraph`.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractionSite<'a> {
     pub egraph: &'a egraph_serialize::EGraph,
     pub node_id: &'a NodeId,
     pub node: &'a egraph_serialize::Node,
-    pub classes: &'a ClassIndex,
+    pub index: &'a SerializedIndex,
 }
 
 impl ExtractionSite<'_> {
-    /// THE ONE CLASS READ every helper below is built from: the members of
-    /// `class`, in e-graph order. The index gives the class's node ids in
-    /// O(1); resolving each id back to its node is a lookup in the
-    /// e-graph's own map. An id the index holds but the e-graph does not
-    /// is the same invariant violation [`ClassIndex::nodes_of`] describes.
-    fn members<'s>(
+    /// THE ONE CLASS READ every class helper below is built from: the
+    /// members of `class`, in e-graph order. The index gives the class's
+    /// node ids in O(1); resolving each id back to its node is a lookup
+    /// in the e-graph's own map. An id the index holds but the e-graph
+    /// does not is the same invariant violation
+    /// [`SerializedIndex::nodes_of`] describes.
+    pub fn members<'s>(
         &'s self,
         class: &egraph_serialize::ClassId,
     ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
+        self.resolve_all(self.index.nodes_of(class))
+    }
+
+    /// THE ONE FACT-ROW READ every row helper below is built from: the
+    /// ids of the `op(arg0, ..)` rows, in e-graph order. Absence is
+    /// EMPTY, never an error — see [`SerializedIndex::fact_rows`].
+    pub fn fact_rows(&self, op: &str, arg0: &egraph_serialize::ClassId) -> &[NodeId] {
+        self.index.fact_rows(op, arg0)
+    }
+
+    /// The `op(arg0, ..)` rows as nodes, in e-graph order.
+    pub fn fact_nodes<'s>(
+        &'s self,
+        op: &str,
+        arg0: &egraph_serialize::ClassId,
+    ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
+        self.resolve_all(self.index.fact_rows(op, arg0))
+    }
+
+    /// The e-class of the FIRST `op(arg0, ..)` row — a function row's
+    /// VALUE (`(shape-of L)` is spelled by a node whose own class holds
+    /// the shape). `None` when no row exists.
+    ///
+    /// FIRST ROW WINS, and the ones behind it are not consulted: the
+    /// scans this replaces returned on their first match, so a second
+    /// row for the same argument was never read.
+    pub fn fact_row_class(
+        &self,
+        op: &str,
+        arg0: &egraph_serialize::ClassId,
+    ) -> Option<egraph_serialize::ClassId> {
+        self.fact_nodes(op, arg0)
+            .next()
+            .map(|row| row.eclass.clone())
+    }
+
+    /// The e-class of the FIRST `op(arg0, ..)` row's child at
+    /// `child_index` — a parent probe's other argument
+    /// (`(BufferTensorLit lt buf)` read at 1 is lt's buffer). `None`
+    /// when no row exists, and also when the first row is too short:
+    /// the scans this replaces committed to their first match and
+    /// returned its child, never falling through to a later row.
+    pub fn fact_row_child(
+        &self,
+        op: &str,
+        arg0: &egraph_serialize::ClassId,
+        child_index: usize,
+    ) -> Option<egraph_serialize::ClassId> {
+        let row = self.fact_nodes(op, arg0).next()?;
+        self.class_of_child(row, child_index)
+    }
+
+    /// Resolve indexed ids back to their nodes. An id the index holds
+    /// but the e-graph does not is an invariant violation, not a case
+    /// to skip.
+    fn resolve_all<'s>(
+        &'s self,
+        ids: &'s [NodeId],
+    ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
         let egraph = self.egraph;
-        self.classes.nodes_of(class).iter().map(move |node_id| {
+        ids.iter().map(move |node_id| {
             egraph.nodes.get(node_id).unwrap_or_else(|| {
-                panic!("class index invariant: indexed node {node_id} is not in the e-graph")
+                panic!("serialized index invariant: indexed node {node_id} is not in the e-graph")
             })
         })
     }
