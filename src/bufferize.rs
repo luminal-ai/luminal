@@ -73,6 +73,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 use egraph_serialize::ClassId;
+use fixedbitset::FixedBitSet;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use rustc_hash::FxHashMap;
@@ -962,9 +963,10 @@ struct Analyzer<'a> {
     ops: &'a [AnalysisOp<'a>],
     reads: Vec<ReadUse>,
     /// `reachable[a]` = ops reachable *from* op `a` through dataflow dependence
-    /// edges (i.e. ops that must run strictly after `a`). The DAG analogue of
-    /// dominance: `a` happens-before `b` iff `b` is reachable from `a`.
-    reachable: Vec<HashSet<usize>>,
+    /// edges (i.e. ops that must run strictly after `a`), one bitset row per
+    /// op. The DAG analogue of dominance: `a` happens-before `b` iff `b` is
+    /// reachable from `a`.
+    reachable: Vec<FixedBitSet>,
     alias: UnionFind,
     /// The decision relation exported as [`Analysis::storage`].
     storage: UnionFind,
@@ -1092,7 +1094,12 @@ impl<'a> Analyzer<'a> {
     /// everything reachable from `a`. Two ops with no path between them are
     /// *unordered* — neither happens-before the other — which the conflict check
     /// then treats conservatively.
-    fn compute_reachability(ops: &[AnalysisOp]) -> Vec<HashSet<usize>> {
+    ///
+    /// Positions are a topological order of that graph (the caller collects the
+    /// ops in the extracted DAG's topological order, and every dependence edge
+    /// is one of that DAG's edges), so one reverse sweep unions each op's
+    /// successors' rows into its own.
+    fn compute_reachability(ops: &[AnalysisOp]) -> Vec<FixedBitSet> {
         let n = ops.len();
         let mut producer: HashMap<ClassId, usize> = HashMap::new();
         for op in ops {
@@ -1104,17 +1111,17 @@ impl<'a> Analyzer<'a> {
         for op in ops {
             for operand in &op.operands {
                 if let Some(&from) = producer.get(operand) {
+                    debug_assert!(from < op.position, "dependence edges run forward");
                     adjacency[from].push(op.position);
                 }
             }
         }
-        let mut reachable: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-        for start in 0..n {
-            let mut stack = adjacency[start].clone();
-            while let Some(node) = stack.pop() {
-                if reachable[start].insert(node) {
-                    stack.extend(adjacency[node].iter().copied());
-                }
+        let mut reachable: Vec<FixedBitSet> = vec![FixedBitSet::with_capacity(n); n];
+        for start in (0..n).rev() {
+            let (head, tail) = reachable.split_at_mut(start + 1);
+            for &next in &adjacency[start] {
+                head[start].insert(next);
+                head[start].union_with(&tail[next - start - 1]);
             }
         }
         reachable
@@ -1128,7 +1135,7 @@ impl<'a> Analyzer<'a> {
         match reader_site {
             None => false,
             Some((reader_op, _)) => {
-                reader_op != writer_op && self.reachable[reader_op].contains(&writer_op)
+                reader_op != writer_op && self.reachable[reader_op].contains(writer_op)
             }
         }
     }
