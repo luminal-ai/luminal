@@ -27,7 +27,7 @@ use std::panic::AssertUnwindSafe;
 
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::layout_ir::{ExtractedGraph, ExtractedNode, ExtractionSite};
+use luminal::layout_ir::{ClassIndex, ExtractedGraph, ExtractedNode, ExtractionSite};
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 use test_runtime::cublaslt_marker::{
     CuDim, CuEpilogue, CublasLt, CublasLtForm, LtMatmulSpec, parse_spec,
@@ -241,6 +241,7 @@ fn flavored_cublaslt(
 /// real test: not "the elected one is right" but "none of them is wrong".
 fn specs_of_every_enode(s: &EGraph, form: CublasLtForm) -> Vec<LtMatmulSpec> {
     let name = form.constructor_name();
+    let classes = ClassIndex::new(s);
     s.nodes
         .iter()
         .filter(|(_, n)| n.op == name)
@@ -249,6 +250,7 @@ fn specs_of_every_enode(s: &EGraph, form: CublasLtForm) -> Vec<LtMatmulSpec> {
                 egraph: s,
                 node_id: id,
                 node,
+                classes: &classes,
             };
             parse_spec(&site, form)
         })
@@ -3026,12 +3028,14 @@ fn attack_p1_form_layout_mismatch_panics_loudly() {
         6,
         "the hand-built descriptor pollinates 6 combos"
     );
+    let classes = ClassIndex::new(&s);
     for (id, node) in &bad {
         let msg = panic_message(|| {
             let site = ExtractionSite {
                 egraph: &s,
                 node_id: id,
                 node,
+                classes: &classes,
             };
             parse_spec(&site, CublasLtForm::Base)
         });
@@ -3929,11 +3933,13 @@ fn attack_u6_c_layout_mismatch_panics_loudly() {
     );
     assert_eq!(accs.len(), 1, "only the hand-built term exists");
     let (id, node) = accs[0];
+    let classes = ClassIndex::new(&s);
     let msg = panic_message(|| {
         let site = ExtractionSite {
             egraph: &s,
             node_id: id,
             node,
+            classes: &classes,
         };
         parse_spec(&site, CublasLtForm::Accumulate)
     });

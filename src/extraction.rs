@@ -37,9 +37,9 @@ use egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::layout_ir::{
-    Access, BufferInfo, ExtractedDag, ExtractedEdge, ExtractedGraph, ExtractedNode, ExtractionSite,
-    FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText, LogicalInfo, OpInput,
-    OpMatcher, OpNode, OutputNode, OutputSlot,
+    Access, BufferInfo, ClassIndex, ExtractedDag, ExtractedEdge, ExtractedGraph, ExtractedNode,
+    ExtractionSite, FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText,
+    LogicalInfo, OpInput, OpMatcher, OpNode, OutputNode, OutputSlot,
 };
 use crate::logical_op::{LogicalRender, logical_op_for};
 
@@ -61,6 +61,14 @@ struct Extractor<'a> {
     /// has no entry here simply offers no implementation candidate.
     matchers: HashMap<&'static str, &'a dyn OpMatcher>,
     class_nodes: HashMap<ClassId, Vec<NodeId>>,
+    /// The class index every [`ExtractionSite`] this extractor builds
+    /// reads through: class → its e-nodes, ALL of them, in e-graph order.
+    /// Distinct from `class_nodes` above, which is filtered to the
+    /// unsubsumed spellings this extractor's own walks consider — a
+    /// site's value readers deliberately see subsumed spellings too (see
+    /// [`ExtractionSite::nodes_in_class_value`]), so they need the
+    /// unfiltered inverse.
+    site_classes: ClassIndex,
     /// The shared rendering state: the render-time class index and the
     /// per-(class, depth, preference) render memo, behind an `Rc` so the
     /// lazy text closures the extraction hands out can keep it alive
@@ -100,6 +108,14 @@ struct Extractor<'a> {
     /// node, the row's own eclass holds the value member); pinned by
     /// `dtype_index_reads_serialized_rows` in test_support.
     dtype_index: std::cell::RefCell<Option<HashMap<ClassId, crate::dtype::PlanDtype>>>,
+    /// GENOME-INDEPENDENT boundary-declaration indexes: the serialized
+    /// `buffer-access-of` / `buffer-freed-by` rows, scanned once —
+    /// BufferId class → the declared permission / free responsibility.
+    /// Same row encoding as the bounds and dtype indexes above. These
+    /// are read once per buffer per assembled graph, so un-indexed they
+    /// cost (buffers x nodes) per genome.
+    buffer_access_index: std::cell::RefCell<Option<HashMap<ClassId, Access>>>,
+    buffer_freed_by_index: std::cell::RefCell<Option<HashMap<ClassId, FreedBy>>>,
     /// GENOME-INDEPENDENT stable-key memo (measured 2026-08-10: eager
     /// per-comparison rendering was 99% of deep extraction — 7395/7471
     /// sampled stacks inside `is_better`). The rendered form of an enode
@@ -956,6 +972,7 @@ impl<'a> Extractor<'a> {
             .map(|matcher| (matcher.egglog_constructor(), matcher))
             .collect();
         let class_nodes = class_nodes(egraph);
+        let site_classes = ClassIndex::new(egraph);
         let render = Rc::new(RenderCtx::new(egraph));
         let (op_specs, mut producer_index) = collect_op_specs(egraph, &render.class_nodes);
         let output_buffer_classes = collect_output_buffer_classes(egraph, &class_nodes);
@@ -1008,6 +1025,7 @@ impl<'a> Extractor<'a> {
             egraph,
             matchers,
             class_nodes,
+            site_classes,
             render,
             op_specs,
             producer_index,
@@ -1020,6 +1038,8 @@ impl<'a> Extractor<'a> {
             bounds_index: Default::default(),
             tensor_bytes_cache: Default::default(),
             dtype_index: Default::default(),
+            buffer_access_index: Default::default(),
+            buffer_freed_by_index: Default::default(),
             stable_key_cache: Default::default(),
             choice_candidate_cache: Default::default(),
         }
@@ -1737,6 +1757,7 @@ impl<'a> Extractor<'a> {
                     egraph: self.egraph,
                     node_id,
                     node,
+                    classes: &self.site_classes,
                 });
                 self.op_cache
                     .borrow_mut()
@@ -3475,54 +3496,89 @@ impl<'a> Extractor<'a> {
     /// the program declared nothing, which input-program validation rejects
     /// for every buffer — declarations are always explicit.
     fn buffer_access(&self, buffer_id_class: &ClassId) -> Option<Access> {
-        for (node_id, node) in &self.egraph.nodes {
-            if node.subsumed || node.op != "buffer-access-of" {
-                continue;
+        self.with_buffer_access_index(|index| index.get(buffer_id_class).copied())
+    }
+
+    /// The serialized `buffer-access-of` rows, indexed once: BufferId
+    /// class -> the declared [`Access`]. Rows are walked in e-graph order
+    /// and the FIRST row naming a buffer wins, which is exactly what the
+    /// scan this replaces did by returning on its first match.
+    fn with_buffer_access_index<R>(&self, read: impl FnOnce(&HashMap<ClassId, Access>) -> R) -> R {
+        let mut slot = self.buffer_access_index.borrow_mut();
+        if slot.is_none() {
+            let mut index: HashMap<ClassId, Access> = HashMap::new();
+            for (node_id, node) in &self.egraph.nodes {
+                if node.subsumed || node.op != "buffer-access-of" {
+                    continue;
+                }
+                let Some(arg_class) = child_class(self.egraph, node, 0) else {
+                    continue;
+                };
+                let std::collections::hash_map::Entry::Vacant(entry) = index.entry(arg_class)
+                else {
+                    continue;
+                };
+                let access_class = self.egraph.nid_to_cid(node_id);
+                entry.insert(
+                    if self
+                        .renderer()
+                        .node_with_op(access_class, "ReadOnly")
+                        .is_some()
+                    {
+                        Access::ReadOnly
+                    } else {
+                        Access::ReadWrite
+                    },
+                );
             }
-            let Some(arg_class) = child_class(self.egraph, node, 0) else {
-                continue;
-            };
-            if &arg_class != buffer_id_class {
-                continue;
-            }
-            let access_class = self.egraph.nid_to_cid(node_id);
-            if self
-                .renderer()
-                .node_with_op(access_class, "ReadOnly")
-                .is_some()
-            {
-                return Some(Access::ReadOnly);
-            }
-            return Some(Access::ReadWrite);
+            *slot = Some(index);
         }
-        None
+        read(slot.as_ref().expect("buffer access index just built"))
     }
 
     /// Look up storage deallocation responsibility via `buffer-freed-by`.
     /// `None` = undeclared, which input-program validation rejects for every
     /// buffer — there is deliberately no default.
     fn buffer_freed_by(&self, buffer_id_class: &ClassId) -> Option<FreedBy> {
-        for (node_id, node) in &self.egraph.nodes {
-            if node.subsumed || node.op != "buffer-freed-by" {
-                continue;
+        self.with_buffer_freed_by_index(|index| index.get(buffer_id_class).copied())
+    }
+
+    /// The serialized `buffer-freed-by` rows, indexed once: BufferId class
+    /// -> the declared [`FreedBy`]. First row wins, as above.
+    fn with_buffer_freed_by_index<R>(
+        &self,
+        read: impl FnOnce(&HashMap<ClassId, FreedBy>) -> R,
+    ) -> R {
+        let mut slot = self.buffer_freed_by_index.borrow_mut();
+        if slot.is_none() {
+            let mut index: HashMap<ClassId, FreedBy> = HashMap::new();
+            for (node_id, node) in &self.egraph.nodes {
+                if node.subsumed || node.op != "buffer-freed-by" {
+                    continue;
+                }
+                let Some(arg_class) = child_class(self.egraph, node, 0) else {
+                    continue;
+                };
+                let std::collections::hash_map::Entry::Vacant(entry) = index.entry(arg_class)
+                else {
+                    continue;
+                };
+                let freed_class = self.egraph.nid_to_cid(node_id);
+                entry.insert(
+                    if self
+                        .renderer()
+                        .node_with_op(freed_class, "ProgramFrees")
+                        .is_some()
+                    {
+                        FreedBy::Program
+                    } else {
+                        FreedBy::Caller
+                    },
+                );
             }
-            let Some(arg_class) = child_class(self.egraph, node, 0) else {
-                continue;
-            };
-            if &arg_class != buffer_id_class {
-                continue;
-            }
-            let freed_class = self.egraph.nid_to_cid(node_id);
-            if self
-                .renderer()
-                .node_with_op(freed_class, "ProgramFrees")
-                .is_some()
-            {
-                return Some(FreedBy::Program);
-            }
-            return Some(FreedBy::Caller);
+            *slot = Some(index);
         }
-        None
+        read(slot.as_ref().expect("buffer freed-by index just built"))
     }
 
     fn output_tooltip(&self, class: &ClassId, source_enode: Option<&NodeId>) -> String {
