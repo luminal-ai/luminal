@@ -126,7 +126,7 @@ fn r10_debug_fixture1() {
                 if let Some(c) = (*op.op).as_any().downcast_ref::<CublasLt>() {
                     if let Some(spec) = &c.spec {
                         println!(
-                            "  spec m={} n={} k={} ta={} tb={} lda={} ldb={} ldd={} a_buf={:?} b_buf={:?} d_buf={:?}",
+                            "  spec m={} n={} k={} ta={} tb={} lda={} ldb={} ldd={}",
                             spec.m,
                             spec.n,
                             spec.k,
@@ -134,10 +134,7 @@ fn r10_debug_fixture1() {
                             spec.trans_b,
                             spec.lda,
                             spec.ldb,
-                            spec.ldd,
-                            spec.desc_a_buffer,
-                            spec.desc_b_buffer,
-                            spec.d_buffer
+                            spec.ldd
                         );
                     } else {
                         println!("  spec: None");

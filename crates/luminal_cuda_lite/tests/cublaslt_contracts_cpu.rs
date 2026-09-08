@@ -47,9 +47,6 @@ fn base_spec(m: i64, n: i64, k: i64) -> LtMatmulSpec {
         desc_b_layout_tensor: cid("b_lt"),
         c_tensor: None,
         bias_tensor: None,
-        desc_a_buffer: None,
-        desc_b_buffer: None,
-        d_buffer: None,
     }
 }
 

@@ -38,14 +38,12 @@
 //! frame has call-m = the recorder matmul's n, so the emitted call is
 //! numerically identical to round 9's.
 //!
-//! VIEW ADMISSION (round 10): a descriptor's layout tensor may be a VIEW —
-//! a LayoutTensorLit whose layout is a composed chain over another layout
-//! tensor's bytes, with no BufferTensor of its own. The spec resolves each
-//! descriptor's BUFFER by walking view -> parent (through the composition
-//! tie: view layout == parent layout's bit expression substituted through
-//! the apply's map) until a BufferTensorLit is found; ld comes from the
-//! composed chain itself (`leading_dimension` reads either chain
-//! orientation). Split sources + Ruling 1: m/n/k AND every ld may be
+//! VIEW ADMISSION: a descriptor's layout tensor may be a VIEW — a
+//! LayoutTensorLit whose layout is a composed chain over another layout
+//! tensor's bytes. Its dims, transposes and ld come from that composed
+//! layout alone (`leading_dimension` reads either chain orientation). The
+//! buffer a descriptor reads or writes is bound by the PLAN at execution,
+//! never derived from the e-graph at match time. m/n/k and every ld may be
 //! symbolic (bound at execute time from the dyn map); static pitches are
 //! read from the layout.
 //!
@@ -262,13 +260,6 @@ pub struct LtMatmulSpec {
     pub desc_b_layout_tensor: ClassId,
     pub c_tensor: Option<ClassId>,
     pub bias_tensor: Option<ClassId>,
-    // ---- VIEW ADMISSION (round 10): resolved buffer identities ----
-    // Each descriptor's layout tensor may be a VIEW with no BufferTensor
-    // of its own; these are the buffers the view walk grounds them in
-    // (None = unresolved, e.g. a fresh intermediate the planner allocs).
-    pub desc_a_buffer: Option<ClassId>,
-    pub desc_b_buffer: Option<ClassId>,
-    pub d_buffer: Option<ClassId>,
 }
 
 impl LtMatmulSpec {
@@ -597,71 +588,6 @@ fn leading_dimension(
     rows_prime.clone()
 }
 
-/// The direct buffer of a layout tensor, if a BufferTensorLit names it.
-fn direct_buffer_of(site: &ExtractionSite<'_>, lt_class: &ClassId) -> Option<ClassId> {
-    site.fact_row_child("BufferTensorLit", lt_class, 1)
-}
-
-/// VIEW ADMISSION (round 10): ground a descriptor's layout tensor in a
-/// BUFFER by walking view -> parent. A view layout tensor is
-/// (LayoutTensorLit v L) where v is spelled (LogicalIndexMapApply p map _)
-/// and L is EXACTLY p's layout composed through map — the tie is checked
-/// classwise ((int-subst-of p_expr map) must be L's own bit expression),
-/// so a foreign parent or a foreign layout of the same parent can never
-/// donate its buffer. Depth-bounded; returns None when no grounding
-/// exists (a fresh intermediate the planner may alloc).
-fn resolve_buffer(site: &ExtractionSite<'_>, lt_class: &ClassId, depth: usize) -> Option<ClassId> {
-    if let Some(buffer) = direct_buffer_of(site, lt_class) {
-        return Some(buffer);
-    }
-    if depth == 0 {
-        return None;
-    }
-    let logical = logical_class_of(site, lt_class)?;
-    let layout = layout_class_of(site, lt_class)?;
-    // L's own bit expressions (a class can spell several; collect all).
-    let l_exprs: Vec<ClassId> = site
-        .nodes_in_class_value(&layout, "BitOffsetExpressionLayoutLit")
-        .filter_map(|n| site.class_of_child(n, 0))
-        .collect();
-    if l_exprs.is_empty() {
-        return None;
-    }
-    // Every apply spelling of the view's logical value...
-    for apply in site.nodes_in_class_value(&logical, "LogicalIndexMapApply") {
-        let Some(parent_logical) = site.class_of_child(apply, 0) else {
-            continue;
-        };
-        let Some(map_class) = site.class_of_child(apply, 1) else {
-            continue;
-        };
-        // ...every layout tensor of that parent...
-        for plt in site.fact_nodes("LayoutTensorLit", &parent_logical) {
-            let plt_class = plt.eclass.clone();
-            let Some(p_layout) = site.class_of_child(plt, 1) else {
-                continue;
-            };
-            // ...whose composition through THIS map is L (the tie).
-            let tied = site
-                .nodes_in_class_value(&p_layout, "BitOffsetExpressionLayoutLit")
-                .filter_map(|n| site.class_of_child(n, 0))
-                .any(|p_expr| {
-                    site.fact_nodes("int-subst-of", &p_expr).any(|n| {
-                        site.class_of_child(n, 1).as_ref() == Some(&map_class)
-                            && l_exprs.contains(&n.eclass)
-                    })
-                });
-            if !tied {
-                continue;
-            }
-            if let Some(buffer) = resolve_buffer(site, &plt_class, depth - 1) {
-                return Some(buffer);
-            }
-        }
-    }
-    None
-}
-
 pub fn parse_spec(site: &ExtractionSite<'_>, form: CublasLtForm) -> Option<LtMatmulSpec> {
     let (c_slot, bias_slot, ep_slot) = form.slots();
 
@@ -774,11 +700,6 @@ pub fn parse_spec(site: &ExtractionSite<'_>, form: CublasLtForm) -> Option<LtMat
     multiset_ok(&b_rows, &b_cols, &b_storage, "B");
     multiset_ok(&d_rows, &d_cols, &d_storage, "D");
 
-    // VIEW ADMISSION: ground each descriptor in its buffer (view walk).
-    let desc_a_buffer = resolve_buffer(site, &desc_a_layout_tensor, 8);
-    let desc_b_buffer = resolve_buffer(site, &desc_b_layout_tensor, 8);
-    let d_buffer = resolve_buffer(site, &out_lt_class, 8);
-
     // Payload slots: DIRECT LayoutTensor children (enode-anchored).
     let c_tensor = c_slot.map(|slot| site.child_class(slot));
     let bias_tensor = bias_slot.map(|slot| site.child_class(slot));
@@ -841,9 +762,6 @@ pub fn parse_spec(site: &ExtractionSite<'_>, form: CublasLtForm) -> Option<LtMat
         desc_b_layout_tensor,
         c_tensor,
         bias_tensor,
-        desc_a_buffer,
-        desc_b_buffer,
-        d_buffer,
     };
     spec.validate(&d_rows, &d_cols);
     Some(spec)
