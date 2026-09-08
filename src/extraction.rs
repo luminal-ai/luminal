@@ -45,6 +45,10 @@ use crate::logical_op::{LogicalRender, logical_op_for};
 
 type Bounds = (Option<i128>, Option<i128>);
 type BoundsIndex = HashMap<ClassId, Bounds>;
+/// The genome-independent candidate memo: (produced class, chosen enode,
+/// chosen output slot) → that choice's candidates. See the field on
+/// [`Extractor`].
+type ChoiceCandidateCache = std::cell::RefCell<HashMap<(ClassId, NodeId, usize), Rc<[Candidate]>>>;
 
 #[derive(Debug)]
 struct Extractor<'a> {
@@ -101,6 +105,38 @@ struct Extractor<'a> {
     /// sampled stacks inside `is_better`). The rendered form of an enode
     /// never changes within a session, so one cache serves every genome.
     stable_key_cache: std::cell::RefCell<HashMap<NodeId, std::rc::Rc<str>>>,
+    /// GENOME-INDEPENDENT candidate memo: (produced class, chosen enode,
+    /// chosen output slot) → the candidates
+    /// [`Extractor::producer_candidates_for_choice`] builds for it.
+    ///
+    /// The KEY IS THE CHOICE, so this is sound across every genome a
+    /// search evaluates: the function reads the producer index, the op
+    /// specs, the class index, the matcher set and the parsed op — all
+    /// fixed for the life of a session — and nothing else. What it saves
+    /// is the per-candidate assembly `op_cache` does NOT cover: the
+    /// matcher's metadata slot walk, the operand-name strings, and the
+    /// spec's input/output list clones. Measured on mini gemma3 with the
+    /// cuBLASLt marker registered (2026-09-07): candidate construction
+    /// 1.53 ms → 0.75 ms per genome once warm, 100% hit rate from the
+    /// fifth genome on.
+    ///
+    /// Cleared by [`Extractor::apply_viability_filter`], which is the one
+    /// thing that edits the producer index, and never otherwise — the
+    /// same contract as `op_cache`.
+    choice_candidate_cache: ChoiceCandidateCache,
+}
+
+/// The discovered class universe for one extraction: the BFS closure from
+/// the output roots over the children of EVERY candidate of every
+/// discovered class (eligible or not), its inverse index, and the
+/// per-class candidate lists parallel to `classes`.
+struct Universe {
+    classes: Vec<ClassId>,
+    /// The inverse of `classes`: class → its universe index. Every child
+    /// class of every candidate is a key (the BFS closure), which is what
+    /// lets the worklist index its counters densely.
+    position: HashMap<ClassId, u32>,
+    candidates: Vec<Vec<Candidate>>,
 }
 
 #[derive(Debug, Clone)]
@@ -985,6 +1021,7 @@ impl<'a> Extractor<'a> {
             tensor_bytes_cache: Default::default(),
             dtype_index: Default::default(),
             stable_key_cache: Default::default(),
+            choice_candidate_cache: Default::default(),
         }
     }
 
@@ -998,6 +1035,9 @@ impl<'a> Extractor<'a> {
     /// candidates on its own), and the fixpoint is too expensive to pay
     /// on every plain extraction.
     fn apply_viability_filter(&mut self) {
+        // The candidate memo is keyed on the choice and reads the
+        // producer index; this is the one place that edits it.
+        self.choice_candidate_cache.borrow_mut().clear();
         let op_matched: HashMap<&ClassId, bool> = self
             .op_specs
             .keys()
@@ -1130,8 +1170,12 @@ impl<'a> Extractor<'a> {
     /// produced class missing from the genome violates the total-genome
     /// contract: candidates empty out and extraction fails loudly at the
     /// root (fail-open, no silent substitution). The choice DIRECTS
-    /// construction (2026-08-06): candidates are built for the chosen
-    /// enode only, never built-then-discarded per spelling.
+    /// CONSTRUCTION: [`Extractor::producer_candidates_for_choice`] builds
+    /// the chosen enode's candidates and no others. It used to build one
+    /// per spelling and `retain` the chosen one — which is the same
+    /// answer at a cost linear in the class's spelling count, and on
+    /// graphs that mint several spellings per site (the cuBLASLt marker,
+    /// one per matmul form) that discovery dominated extraction.
     fn candidates_for_class(&self, class: &ClassId) -> Vec<Candidate> {
         // AN INPUT TERMINAL IS A LEAF BY DEFINITION (2026-09-02): its
         // value exists at launch, so it is PRODUCED BY NOTHING.
@@ -1156,17 +1200,7 @@ impl<'a> Extractor<'a> {
         let mut candidates = Vec::new();
         match genome_choice {
             Some(Some(choice)) => {
-                if let Some(node) = self.egraph.nodes.get(&choice.enode) {
-                    let node_id = choice.enode.clone();
-                    if let Some(candidate) = self.candidate_for_node(&node_id, node) {
-                        candidates.push(candidate);
-                    }
-                }
-                candidates.extend(self.producer_candidates_for_output(class));
-                candidates.retain(|candidate| {
-                    candidate.source_enode.as_ref() == Some(&choice.enode)
-                        && candidate.selected_output_index == Some(choice.output_index)
-                });
+                candidates.extend(self.producer_candidates_for_choice(class, choice));
             }
             Some(None) => {} // total-genome contract violated: no candidates
             None => {
@@ -1190,18 +1224,27 @@ impl<'a> Extractor<'a> {
     /// not caching it re-explored whole subtrees exponentially on
     /// cycle-rich e-graphs (the 2-layer decoder hang — 15k nodes,
     /// more than 150s), and caching it produced wrong refusals. Relaxation has
-    /// neither problem: a class's plan materializes the pass after all
-    /// of some candidate's children have plans, costs only improve
+    /// neither problem: a class's plan materializes once all of some
+    /// candidate's children have plans, costs only improve
     /// monotonically, and cycles simply never enable — no guard, no
-    /// taint, polynomial by construction. The memo fills exactly as the
-    /// walk would have filled it; `build_extracted_graph` reads it
-    /// unchanged.
+    /// taint. The memo fills exactly as the walk would have filled it;
+    /// `build_extracted_graph` reads it unchanged.
+    ///
+    /// Three steps: DISCOVER the class universe reachable through
+    /// candidates, relax it to the fixpoint, then SETTLE — write the
+    /// definitive `None` for every class that never planned and record
+    /// what blocked it.
     fn relax_to_fixpoint(&mut self, roots: &[ClassId]) {
+        let universe = self.discover(roots);
+        self.worklist_fixpoint(&universe);
+        self.settle_and_record_blockage(&universe);
+    }
+
+    /// THE DISCOVERY WALK: the BFS closure from the output roots over the
+    /// children of every candidate of every class reached, in BFS order.
+    /// Pure construction — no planning, no memo.
+    fn discover(&self, roots: &[ClassId]) -> Universe {
         // Discover the class universe reachable through candidates.
-        // Progress reporting is PATHOLOGY-GATED: healthy extractions say
-        // nothing; anything slow narrates itself every few seconds.
-        let discovery_start = std::time::Instant::now();
-        let mut last_report = discovery_start;
         let mut discovered: HashSet<ClassId> = HashSet::new();
         let mut universe: Vec<ClassId> = Vec::new();
         let mut candidate_lists: Vec<Vec<Candidate>> = Vec::new();
@@ -1218,120 +1261,222 @@ impl<'a> Extractor<'a> {
                     }
                 }
             }
-            if last_report.elapsed().as_secs() >= 5 {
-                last_report = std::time::Instant::now();
-                eprintln!(
-                    "[extract] SLOW DISCOVERY {:?}: {} classes so far, {} queued, last class {}",
-                    discovery_start.elapsed(),
-                    universe.len(),
-                    queue.len(),
-                    class
-                );
-            }
             universe.push(class);
             candidate_lists.push(candidates);
         }
-        let total_candidates: usize = candidate_lists.iter().map(Vec::len).sum();
-        if discovery_start.elapsed().as_secs() >= 2 {
-            eprintln!(
-                "[extract] discovery {:?}: {} classes, {} candidates",
-                discovery_start.elapsed(),
-                universe.len(),
-                total_candidates
-            );
+        let position = universe
+            .iter()
+            .enumerate()
+            .map(|(index, class)| (class.clone(), index as u32))
+            .collect();
+        Universe {
+            classes: universe,
+            position,
+            candidates: candidate_lists,
+        }
+    }
+
+    /// THE RELAXATION, as a leaf-driven worklist.
+    ///
+    /// The fixpoint is the one the note above describes: a class's plan is
+    /// the cheapest over its ELIGIBLE candidates — those all of whose
+    /// children already have plans — costs only improve, and a cycle never
+    /// enables itself because every enablement chain bottoms out at a leaf.
+    /// This decides only WHEN a class is looked at.
+    ///
+    /// The relaxation used to sweep every class in the universe until a
+    /// sweep wrote nothing. Because the universe is in BFS order from the
+    /// roots — the REVERSE of the dataflow direction — one sweep moved plan
+    /// information exactly one level up the dataflow: the pass count was
+    /// the depth of the plan DAG plus one, so the loop cost depth ×
+    /// candidates, quadratic in model size (mini gemma3: 202 sweeps over
+    /// 426 candidates per genome; a 4B model, thousands over thousands,
+    /// sixty-four times per search).
+    ///
+    /// Here each candidate carries a PENDING COUNTER — how many distinct
+    /// child classes it still waits on — and each class a list of the
+    /// (class, candidate) pairs waiting on IT. A class is evaluated when
+    /// one of its candidates becomes eligible, or when a child it already
+    /// consumes gets cheaper, and never otherwise: Kahn's in-degree
+    /// scheduling with eligibility as the in-degree, which is the
+    /// topological order without computing one. Classes inside a choice
+    /// cycle are never evaluated at all — their counters never reach zero,
+    /// which IS the refusal the blockage record then names.
+    ///
+    /// A re-plan at EQUAL cost enqueues nothing: the fixpoint reads a
+    /// child's COST only (a candidate's label and stable key are its own
+    /// properties), so a label/key improvement cannot change any parent's
+    /// tuple.
+    fn worklist_fixpoint(&mut self, u: &Universe) {
+        let class_count = u.classes.len();
+        // pending[class][candidate]: distinct child classes not yet
+        // planned. dependents[child]: every (class, candidate) that waits
+        // on `child`, one entry per DISTINCT occurrence so the decrements
+        // match the counts, in (class, candidate) order so the queue is
+        // deterministic.
+        let mut pending: Vec<Vec<u32>> = Vec::with_capacity(class_count);
+        let mut dependents: Vec<Vec<(u32, u32)>> = vec![Vec::new(); class_count];
+        let mut children = Vec::new();
+        for (index, candidates) in u.candidates.iter().enumerate() {
+            let mut counters = Vec::with_capacity(candidates.len());
+            for (candidate_index, candidate) in candidates.iter().enumerate() {
+                children.clear();
+                children.extend(candidate.children.iter().map(|child| {
+                    *u.position.get(&child.class).unwrap_or_else(|| {
+                        panic!(
+                            "discovery invariant: candidate child {} of class {} is outside \
+                             the discovered universe",
+                            child.class, u.classes[index]
+                        )
+                    })
+                }));
+                children.sort_unstable();
+                children.dedup();
+                counters.push(children.len() as u32);
+                for child in &children {
+                    dependents[*child as usize].push((index as u32, candidate_index as u32));
+                }
+            }
+            pending.push(counters);
         }
 
-        let mut passes = 0usize;
-        let relax_start = std::time::Instant::now();
-        let mut last_report = relax_start;
-        loop {
-            passes += 1;
-            assert!(
-                passes <= 100_000,
-                "extraction fixpoint did not converge after {passes} passes over {} classes",
-                universe.len()
-            );
-            if last_report.elapsed().as_secs() >= 5 {
-                last_report = std::time::Instant::now();
-                let planned = self.memo.values().filter(|plan| plan.is_some()).count();
-                eprintln!(
-                    "[extract] SLOW RELAX {:?}: pass {passes}, {} planned / {} classes",
-                    relax_start.elapsed(),
-                    planned,
-                    universe.len()
-                );
-            }
-            let mut changed = false;
-            for (class, candidates) in universe.iter().zip(&candidate_lists) {
-                let mut best = self.input_terminals.get(class).map(|input| Plan {
-                    heuristic_cost: 0,
-                    source_eclass: None,
-                    source_enode: None,
-                    selected_output_index: None,
-                    input_list: Vec::new(),
-                    output_list: Vec::new(),
-                    kind: PlanKind::Input(input.clone()),
-                    children: Vec::new(),
-                    metadata: Vec::new(),
-                });
-                'candidates: for candidate in candidates {
-                    let mut heuristic_cost = self.candidate_heuristic_cost(candidate);
-                    let mut child_plans = Vec::with_capacity(candidate.children.len());
-                    for child in &candidate.children {
-                        let Some(Some(child_plan)) = self.memo.get(&child.class) else {
-                            continue 'candidates;
-                        };
-                        // Saturating: child costs are memoized per CLASS but
-                        // accumulated per plan EDGE, so a deep graph with shared
-                        // subgraphs (whisper's decode loop) counts paths, not
-                        // nodes, and overflows u64 (wrapped silently in release,
-                        // panicked in debug). Saturation stops the panic; the
-                        // path-vs-node cost model itself is a recorded follow-up.
-                        heuristic_cost = heuristic_cost.saturating_add(child_plan.heuristic_cost);
-                        child_plans.push(child.clone());
-                    }
-                    let plan = Plan {
-                        heuristic_cost,
-                        source_eclass: candidate
-                            .source_eclass
-                            .clone()
-                            .or_else(|| Some(class.clone())),
-                        source_enode: candidate.source_enode.clone(),
-                        selected_output_index: candidate.selected_output_index,
-                        input_list: candidate.input_list.clone(),
-                        output_list: candidate.output_list.clone(),
-                        kind: candidate.kind.clone(),
-                        children: child_plans,
-                        metadata: candidate.metadata.clone(),
-                    };
-                    if self.is_better(&plan, best.as_ref()) {
-                        best = Some(plan);
-                    }
-                }
-                let current = self.memo.get(class).cloned().flatten();
-                let improved = match (&best, &current) {
-                    (Some(new), Some(old)) => self.is_better(new, Some(old)),
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
-                if improved {
-                    self.memo.insert(class.clone(), best);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        let mut in_queue = vec![false; class_count];
+
+        // Seeding: input terminals are planned from the boundary outright
+        // (they are leaves by definition and hold no candidates), and any
+        // class with a childless candidate — `BufferTensorNil`, a
+        // zero-input op — is eligible from the start.
+        for (index, class) in u.classes.iter().enumerate() {
+            if let Some(plan) = self.input_terminal_plan(class) {
+                self.memo.insert(class.clone(), Some(plan));
+                release(index, &dependents, &mut pending, &mut in_queue, &mut queue);
+            } else if pending[index].contains(&0) {
+                enqueue(index as u32, &mut in_queue, &mut queue);
             }
         }
+
+        // TERMINATION. Every memo write
+        // strictly improves that class's tuple, whose cost component is a
+        // `u64` that only falls and whose label and key components range
+        // over finite sets, so each class is written finitely often and
+        // the queue drains.
+        while let Some(index) = queue.pop_front() {
+            in_queue[index as usize] = false;
+            let class = &u.classes[index as usize];
+            let mut best = self.input_terminal_plan(class);
+            for (candidate_index, candidate) in u.candidates[index as usize].iter().enumerate() {
+                if pending[index as usize][candidate_index] != 0 {
+                    continue;
+                }
+                let Some(plan) = self.candidate_plan(class, candidate) else {
+                    continue;
+                };
+                if self.is_better(&plan, best.as_ref()) {
+                    best = Some(plan);
+                }
+            }
+            let current = self.memo.get(class).cloned().flatten();
+            let improved = match (&best, &current) {
+                (Some(new), Some(old)) => self.is_better(new, Some(old)),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !improved {
+                continue;
+            }
+            let first_plan = current.is_none();
+            let cheaper = match (&best, &current) {
+                (Some(new), Some(old)) => new.heuristic_cost < old.heuristic_cost,
+                _ => false,
+            };
+            self.memo.insert(class.clone(), best);
+            if first_plan {
+                release(
+                    index as usize,
+                    &dependents,
+                    &mut pending,
+                    &mut in_queue,
+                    &mut queue,
+                );
+            } else if cheaper {
+                // Already-eligible consumers see a cheaper child; the
+                // ineligible ones will read the new cost when their own
+                // counters reach zero.
+                for &(consumer, candidate) in &dependents[index as usize] {
+                    if pending[consumer as usize][candidate as usize] == 0 {
+                        enqueue(consumer, &mut in_queue, &mut queue);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The plan a class gets straight from the boundary, when it is an
+    /// input terminal: cost 0, no children (see the leaf note on
+    /// [`Extractor::candidates_for_class`]).
+    fn input_terminal_plan(&self, class: &ClassId) -> Option<Plan> {
+        self.input_terminals.get(class).map(|input| Plan {
+            heuristic_cost: 0,
+            source_eclass: None,
+            source_enode: None,
+            selected_output_index: None,
+            input_list: Vec::new(),
+            output_list: Vec::new(),
+            kind: PlanKind::Input(input.clone()),
+            children: Vec::new(),
+            metadata: Vec::new(),
+        })
+    }
+
+    /// The plan one candidate yields for `class` against the current
+    /// memo, or `None` when the candidate is not ELIGIBLE — some child
+    /// class has no plan yet.
+    fn candidate_plan(&self, class: &ClassId, candidate: &Candidate) -> Option<Plan> {
+        let mut heuristic_cost = self.candidate_heuristic_cost(candidate);
+        let mut child_plans = Vec::with_capacity(candidate.children.len());
+        for child in &candidate.children {
+            let Some(Some(child_plan)) = self.memo.get(&child.class) else {
+                return None;
+            };
+            // Saturating: child costs are memoized per CLASS but
+            // accumulated per plan EDGE, so a deep graph with shared
+            // subgraphs (whisper's decode loop) counts paths, not
+            // nodes, and overflows u64 (wrapped silently in release,
+            // panicked in debug). Saturation stops the panic; the
+            // path-vs-node cost model itself is a recorded follow-up.
+            heuristic_cost = heuristic_cost.saturating_add(child_plan.heuristic_cost);
+            child_plans.push(child.clone());
+        }
+        Some(Plan {
+            heuristic_cost,
+            source_eclass: candidate
+                .source_eclass
+                .clone()
+                .or_else(|| Some(class.clone())),
+            source_enode: candidate.source_enode.clone(),
+            selected_output_index: candidate.selected_output_index,
+            input_list: candidate.input_list.clone(),
+            output_list: candidate.output_list.clone(),
+            kind: candidate.kind.clone(),
+            children: child_plans,
+            metadata: candidate.metadata.clone(),
+        })
+    }
+
+    /// SETTLE AND RECORD: every universe class without a plan gets its
+    /// definitive `None`, and the blockage record for the refusal
+    /// breakdown is built over the same (class, candidates) pairs.
+    fn settle_and_record_blockage(&mut self, u: &Universe) {
         // Classes that never planned: record the definitive None so the
         // failure diagnostics (and build-side plan()) read a settled memo.
-        for class in &universe {
+        for class in &u.classes {
             self.memo.entry(class.clone()).or_insert(None);
         }
         // Blockage record for the refusal breakdown: for each unplanned
         // class, which of its candidates' children are also unplanned
         // (the enablement blockers), and which have no candidates at all.
-        for (class, candidates) in universe.iter().zip(&candidate_lists) {
+        for (class, candidates) in u.classes.iter().zip(&u.candidates) {
             if self.memo.get(class).cloned().flatten().is_some() {
                 continue;
             }
@@ -1478,6 +1623,70 @@ impl<'a> Extractor<'a> {
             }
         }
 
+        candidates
+    }
+
+    /// The candidates one genome CHOICE yields for `class`: for each
+    /// producer entry of the class, in producer-index order, whose op
+    /// class is the chosen enode's and whose output slot is the chosen
+    /// one, the chosen enode's candidate under that entry's `OpSpec`.
+    ///
+    /// This is exactly the subsequence the walk used to obtain by
+    /// building every producer spelling and then retaining the ones whose
+    /// `(source_enode, selected_output_index)` matched the choice — same
+    /// entries, same order, nothing else constructed. Two spellings the
+    /// filter used to drop are not built at all here:
+    ///
+    ///  * enodes other than the chosen one, which is the whole point; and
+    ///  * a STRUCTURAL candidate for the chosen enode
+    ///    ([`Candidate::structural`], for the buffer-list plumbing), which
+    ///    could never survive the filter in the first place — it carries
+    ///    no `selected_output_index`, and a genome choice always names a
+    ///    slot. Structural spellings still reach the plain arm, which is
+    ///    where classes that HAVE them (buffer lists, boundary literals)
+    ///    are planned; a class in the producer index is a LayoutTensor.
+    ///
+    /// Memoized on the choice — see `Extractor::choice_candidate_cache`.
+    fn producer_candidates_for_choice(
+        &self,
+        output_class: &ClassId,
+        choice: &ProducerChoice,
+    ) -> Vec<Candidate> {
+        let key = (
+            output_class.clone(),
+            choice.enode.clone(),
+            choice.output_index,
+        );
+        if let Some(cached) = self.choice_candidate_cache.borrow().get(&key) {
+            return cached.to_vec();
+        }
+        let Some(producers) = self.producer_index.get(output_class) else {
+            return Vec::new();
+        };
+        let Some(node) = self.egraph.nodes.get(&choice.enode) else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
+        for producer in producers {
+            if producer.output_index != choice.output_index || producer.op_class != node.eclass {
+                continue;
+            }
+            let Some(spec) = self
+                .op_specs
+                .get(&producer.op_class)
+                .and_then(|specs| specs.get(producer.spec_index))
+            else {
+                continue;
+            };
+            if let Some(candidate) =
+                self.candidate_for_layout_op(producer, spec, &choice.enode, node)
+            {
+                candidates.push(candidate);
+            }
+        }
+        self.choice_candidate_cache
+            .borrow_mut()
+            .insert(key, Rc::from(candidates.as_slice()));
         candidates
     }
 
@@ -1920,7 +2129,7 @@ impl<'a> Extractor<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Candidate {
     source_eclass: Option<ClassId>,
     source_enode: Option<NodeId>,
@@ -3639,6 +3848,32 @@ fn plan_label(plan: &Plan) -> String {
         PlanKind::BufferTensorNil => "BufferTensorNil".to_string(),
         PlanKind::BufferTensorLit { logical_name, .. } => format!("BufferTensorLit:{logical_name}"),
         PlanKind::LayoutIr(op) => op.label().to_string(),
+    }
+}
+
+/// One class just got its FIRST plan: every candidate waiting on it is one
+/// child closer to eligible, and the ones that reach zero are queued.
+fn release(
+    class_index: usize,
+    dependents: &[Vec<(u32, u32)>],
+    pending: &mut [Vec<u32>],
+    in_queue: &mut [bool],
+    queue: &mut std::collections::VecDeque<u32>,
+) {
+    for &(consumer, candidate) in &dependents[class_index] {
+        let counter = &mut pending[consumer as usize][candidate as usize];
+        *counter -= 1;
+        if *counter == 0 {
+            enqueue(consumer, in_queue, queue);
+        }
+    }
+}
+
+/// FIFO, each class at most once in the queue at a time.
+fn enqueue(index: u32, in_queue: &mut [bool], queue: &mut std::collections::VecDeque<u32>) {
+    if !in_queue[index as usize] {
+        in_queue[index as usize] = true;
+        queue.push_back(index);
     }
 }
 
