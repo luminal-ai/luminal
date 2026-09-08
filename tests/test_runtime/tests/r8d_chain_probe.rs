@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use luminal::layout_ir::{ClassIndex, ExtractionSite};
+use luminal::layout_ir::{ExtractionSite, SerializedIndex};
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 use test_runtime::cublaslt_marker::{CublasLtForm, parse_spec};
 
@@ -259,7 +259,7 @@ fn r8d_candidate_count_on_the_shared_weight() {
     // internal cross-checks panic on any operation/descriptor
     // inconsistency, and the COL clamp is checked here explicitly.
     let mut checked = 0usize;
-    let classes = ClassIndex::new(&s);
+    let index = SerializedIndex::new(&s);
     for (id, node) in s.nodes.iter() {
         if node.op != "LayoutTensorOpCublasLt" {
             continue;
@@ -268,7 +268,7 @@ fn r8d_candidate_count_on_the_shared_weight() {
             egraph: &s,
             node_id: id,
             node,
-            classes: &classes,
+            index: &index,
         };
         let spec =
             parse_spec(&site, CublasLtForm::Base).expect("every candidate parses (no silent None)");

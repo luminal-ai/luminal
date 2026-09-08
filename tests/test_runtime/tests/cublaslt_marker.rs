@@ -108,24 +108,6 @@ fn fixture1_plain_2d_amk_bkn_spec_field_by_field() {
     assert_eq!(inputs.len(), 2);
     assert_eq!(op.operand_name(0), "a");
     assert_eq!(op.operand_name(1), "b");
-
-    // VIEW ADMISSION (round 10): the elected op lives on the sandwich
-    // sibling, whose D layout tensor is a transpose VIEW with no
-    // BufferTensor of its own; the spec's view walk must ground all three
-    // descriptors in real buffers — D through the view to the recorder's
-    // boundary buffer.
-    assert!(spec.desc_a_buffer.is_some(), "A grounded in w's buffer");
-    assert!(spec.desc_b_buffer.is_some(), "B grounded in x's buffer");
-    assert!(
-        spec.d_buffer.is_some(),
-        "D grounded THROUGH the transpose view in the caller's out buffer"
-    );
-    assert_ne!(
-        spec.desc_a_buffer, spec.desc_b_buffer,
-        "distinct operand buffers"
-    );
-    assert_ne!(spec.d_buffer, spec.desc_a_buffer);
-    assert_ne!(spec.d_buffer, spec.desc_b_buffer);
 }
 
 // ---------------------------------------------------------------------------

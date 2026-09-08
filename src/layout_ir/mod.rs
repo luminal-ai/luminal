@@ -362,59 +362,83 @@ impl Clone for Box<dyn LayoutIrOp> {
 // extractor resolves candidates by looking the enode's constructor name up in
 // a registry built from that list.
 
-/// Every e-node of an e-class, keyed by class — the inverse of
-/// [`egraph_serialize::Node::eclass`], built once per extraction session
-/// and handed to every [`ExtractionSite`].
+/// The two lookups the SERIALIZED e-graph does not carry, built once per
+/// extraction session and handed to every [`ExtractionSite`]:
 ///
-/// THE ASYMMETRY THIS CLOSES. A site's helpers answer questions of the
-/// form "the nodes of class C": what does C spell, what literal does it
-/// hold, which of its spellings is a `ShapeLit`. Each one used to be a
-/// scan of the whole e-graph filtered by `eclass ==`, so a matcher asking
-/// a few dozen such questions made a few dozen passes over every node in
-/// the program, and its cost grew with the model rather than with the
-/// class it was reading. The extractor already owned this index for its
-/// own walks; the site now reads the same shape.
+///  * BY CLASS — every e-node of an e-class, the inverse of
+///    [`egraph_serialize::Node::eclass`].
+///  * BY OP — every e-node spelling a given constructor.
 ///
-/// EVERY node is indexed, in the e-graph's own order — subsumed spellings
-/// and the `"[...]"` elision marker included, no filtering at build time.
-/// That is what makes the index a drop-in rather than a change of
-/// meaning: each helper still applies exactly the filter it always
-/// applied, to exactly the same nodes, in exactly the same order, so
-/// "the first spelling wins" picks the same spelling it always picked.
+/// Each was a scan of the whole e-graph filtered by `eclass ==` or by
+/// `op ==`, so a reader's cost grew with the model rather than with the
+/// class it read.
+///
+/// BOTH LOOKUPS GO DOWNWARD — from a class to its spellings, or from a
+/// constructor name to its enodes. There is no index from a child to its
+/// parents, because a matcher reads its own enode and the classes below
+/// it and never finds a constructor by one of its arguments.
+///
+/// EVERY node is indexed, in the e-graph's own order — subsumed
+/// spellings and the `"[...]"` elision marker included — so a helper's
+/// "first spelling wins" picks the spelling the e-graph orders first.
+///
+/// ONE STRUCT, not one per lookup: both maps must describe the SAME
+/// e-graph, since a site resolves in its own `egraph` the ids either
+/// returns.
 #[derive(Debug, Clone, Default)]
-pub struct ClassIndex {
-    nodes: HashMap<ClassId, Vec<NodeId>>,
+pub struct SerializedIndex {
+    by_class: HashMap<ClassId, Vec<NodeId>>,
+    by_op: HashMap<String, Vec<NodeId>>,
 }
 
-impl ClassIndex {
-    /// Index an e-graph's nodes by their e-class.
+/// The bucket for `op`, minting it on first sight. Keyed by the op's
+/// own text so a lookup can hash a `&str`; the `String` is allocated
+/// once per DISTINCT constructor rather than once per node.
+fn op_bucket<'m, V: Default>(map: &'m mut HashMap<String, V>, op: &str) -> &'m mut V {
+    if !map.contains_key(op) {
+        map.insert(op.to_string(), V::default());
+    }
+    map.get_mut(op).expect("bucket just minted")
+}
+
+impl SerializedIndex {
+    /// Index an e-graph's nodes by e-class and by constructor — one pass.
     pub fn new(egraph: &egraph_serialize::EGraph) -> Self {
-        let mut nodes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+        let mut by_class: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+        let mut by_op: HashMap<String, Vec<NodeId>> = HashMap::new();
         for (node_id, node) in &egraph.nodes {
-            nodes
+            by_class
                 .entry(node.eclass.clone())
                 .or_default()
                 .push(node_id.clone());
+            op_bucket(&mut by_op, &node.op).push(node_id.clone());
         }
-        Self { nodes }
+        Self { by_class, by_op }
     }
 
     /// The class's e-nodes, in e-graph order.
     ///
     /// A miss is NOT "the class is empty" — an e-class exists precisely
-    /// because a node names it, and every class id a matcher can hold was
-    /// read off some node's `eclass`. A miss therefore means this index
-    /// was built from a different e-graph than the one being read, which
-    /// is an invariant violation and not a case to fall back from: the
-    /// scan this replaces would have answered a question about the wrong
-    /// program. Refuse loudly instead.
+    /// because a node names it, so a miss means this index was built
+    /// from a different e-graph than the one being read. Refuse loudly:
+    /// the answer would be about the wrong program.
     pub fn nodes_of(&self, class: &ClassId) -> &[NodeId] {
-        self.nodes.get(class).map(Vec::as_slice).unwrap_or_else(|| {
-            panic!(
-                "class index invariant: class {class} has no entry — the index \
+        self.by_class
+            .get(class)
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| {
+                panic!(
+                    "class index invariant: class {class} has no entry — the index \
                      was built from a different e-graph than the site reads"
-            )
-        })
+                )
+            })
+    }
+
+    /// Every e-node spelling `op`, in e-graph order. A miss is EMPTY,
+    /// not an error: a program that mints no `BufferInputLit` simply has
+    /// no explicit inputs.
+    pub fn nodes_of_op(&self, op: &str) -> &[NodeId] {
+        self.by_op.get(op).map(Vec::as_slice).unwrap_or_default()
     }
 }
 
@@ -425,31 +449,43 @@ impl ClassIndex {
 /// this struct is the sanctioned way to grow the extraction contract —
 /// matchers take `&ExtractionSite`, so new fields cost existing impls nothing.
 ///
-/// `classes` is the session's [`ClassIndex`] over `egraph`. The two travel
-/// together and must describe the same e-graph — every helper below reads
-/// a class through the index and resolves the ids it returns in `egraph`.
+/// `index` is the session's [`SerializedIndex`] over `egraph`. The two
+/// travel together and must describe the same e-graph — every helper
+/// below reads a class through the index and resolves the ids it
+/// returns in `egraph`.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractionSite<'a> {
     pub egraph: &'a egraph_serialize::EGraph,
     pub node_id: &'a NodeId,
     pub node: &'a egraph_serialize::Node,
-    pub classes: &'a ClassIndex,
+    pub index: &'a SerializedIndex,
 }
 
 impl ExtractionSite<'_> {
-    /// THE ONE CLASS READ every helper below is built from: the members of
-    /// `class`, in e-graph order. The index gives the class's node ids in
-    /// O(1); resolving each id back to its node is a lookup in the
-    /// e-graph's own map. An id the index holds but the e-graph does not
-    /// is the same invariant violation [`ClassIndex::nodes_of`] describes.
+    /// THE ONE CLASS READ every class helper below is built from: the
+    /// members of `class`, in e-graph order. The index gives the class's
+    /// node ids in O(1); resolving each id back to its node is a lookup
+    /// in the e-graph's own map. An id the index holds but the e-graph
+    /// does not is the same invariant violation
+    /// [`SerializedIndex::nodes_of`] describes.
     fn members<'s>(
         &'s self,
         class: &egraph_serialize::ClassId,
     ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
+        self.resolve_all(self.index.nodes_of(class))
+    }
+
+    /// Resolve indexed ids back to their nodes. An id the index holds
+    /// but the e-graph does not is an invariant violation, not a case
+    /// to skip.
+    fn resolve_all<'s>(
+        &'s self,
+        ids: &'s [NodeId],
+    ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
         let egraph = self.egraph;
-        self.classes.nodes_of(class).iter().map(move |node_id| {
+        ids.iter().map(move |node_id| {
             egraph.nodes.get(node_id).unwrap_or_else(|| {
-                panic!("class index invariant: indexed node {node_id} is not in the e-graph")
+                panic!("serialized index invariant: indexed node {node_id} is not in the e-graph")
             })
         })
     }
@@ -494,10 +530,36 @@ impl ExtractionSite<'_> {
         class: &'a egraph_serialize::ClassId,
         op: &'a str,
     ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
-        self.nodes_in_class(class, op).chain(
-            self.members(class)
-                .filter(move |node| node.op == op && node.subsumed),
-        )
+        self.nodes_in_class_ordered(class, move |spelling| spelling == op)
+    }
+
+    /// Every node in the class spelling ANY of `ops` — for a value whose
+    /// answer may wear several constructors (a list spine's cons/nil, a
+    /// layout's five spellings). Same order as
+    /// [`Self::nodes_in_class_value`].
+    pub fn nodes_in_class_value_any<'a>(
+        &'a self,
+        class: &'a egraph_serialize::ClassId,
+        ops: &'a [&'a str],
+    ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
+        self.nodes_in_class_ordered(class, move |spelling| ops.contains(&spelling))
+    }
+
+    /// THE VALUE-READ ORDER both accessors above are built from:
+    /// unsubsumed spellings in e-graph order, subsumed ones after —
+    /// trailing rather than absent, because saturation can subsume every
+    /// spelling of a class and a value reader must not starve.
+    fn nodes_in_class_ordered<'a>(
+        &'a self,
+        class: &'a egraph_serialize::ClassId,
+        keep: impl Fn(&str) -> bool + Copy + 'a,
+    ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
+        self.members(class)
+            .filter(move |node| keep(&node.op) && !node.subsumed)
+            .chain(
+                self.members(class)
+                    .filter(move |node| keep(&node.op) && node.subsumed),
+            )
     }
 
     /// EVERY non-subsumed node of this op in the class — for parsers that

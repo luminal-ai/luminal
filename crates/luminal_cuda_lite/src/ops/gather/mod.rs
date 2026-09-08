@@ -249,13 +249,8 @@ impl OpMatcher for GatherMatcher {
         let mut class = site.child_class(1);
         loop {
             let spine = site
-                .egraph
-                .nodes
-                .values()
-                .find(|node| {
-                    node.eclass == class
-                        && (node.op == "LayoutTensorCons" || node.op == "LayoutTensorNil")
-                })
+                .nodes_in_class_value_any(&class, &["LayoutTensorCons", "LayoutTensorNil"])
+                .next()
                 .unwrap_or_else(|| {
                     panic!(
                         "schema drift: coordinate-list class {class} under enode {} has no \
@@ -271,12 +266,8 @@ impl OpMatcher for GatherMatcher {
                 panic!("schema drift: a LayoutTensorCons in class {class} has no tail child")
             });
             class = site
-                .egraph
-                .nodes
-                .get(tail_id)
-                .unwrap_or_else(|| panic!("dangling list tail node {tail_id}"))
-                .eclass
-                .clone();
+                .class_of_child(spine, 1)
+                .unwrap_or_else(|| panic!("dangling list tail node {tail_id}"));
         }
         Box::new(Gather { rank })
     }

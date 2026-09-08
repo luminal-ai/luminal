@@ -12,6 +12,7 @@
 //! plan are simply unfit; only deterministic test helpers must land on a
 //! viable plan first try.
 
+use crate::extractor::child_class;
 use luminal::layout_ir::OpMatcher;
 
 type ProducerOrdering<'a> =
@@ -88,6 +89,12 @@ pub fn genome_with_ordering(
     use std::collections::{BTreeSet, HashMap};
 
     let index = crate::extractor::producer_index_with_matchers(egraph, matchers);
+    // The serialized index this walk reads the e-graph through. Every
+    // question below is "the nodes of class C" or "the nodes of
+    // constructor F", and each one used to be a pass over the whole
+    // e-graph — nested inside the list walks, so a fixture's election
+    // cost grew with the square of the program.
+    let serialized = luminal::layout_ir::SerializedIndex::new(egraph);
 
     // ------------------------------------------------------------------
     // ROUND 11: VIABILITY-AWARE primary election. The cycle-anatomy
@@ -128,43 +135,26 @@ pub fn genome_with_ordering(
     // input instead of declaring it unreachable.
     let buffer_list_classes = |root_op: &str| -> BTreeSet<ClassId> {
         let mut out: BTreeSet<ClassId> = BTreeSet::new();
-        for node in egraph.nodes.values() {
-            if node.op != root_op {
-                continue;
-            }
-            let mut cur = node
-                .children
-                .first()
-                .and_then(|id| egraph.nodes.get(id))
-                .map(|c| c.eclass.clone());
+        for node_id in serialized.nodes_of_op(root_op) {
+            let node = &egraph[node_id];
+            let mut cur = child_class(egraph, node, 0);
             let mut guard = 0;
             while let Some(list) = cur {
                 guard += 1;
                 if guard > 64 {
                     break;
                 }
-                if egraph
-                    .nodes
-                    .values()
-                    .any(|m| m.eclass == list && m.op == "BufferTensorNil")
-                {
+                let members = || serialized.nodes_of(&list).iter().map(|id| &egraph[id]);
+                if members().any(|m| m.op == "BufferTensorNil") {
                     break;
                 }
-                let Some(cons) = egraph
-                    .nodes
-                    .values()
-                    .find(|m| m.eclass == list && m.op == "BufferTensorCons")
-                else {
+                let Some(cons) = members().find(|m| m.op == "BufferTensorCons") else {
                     break;
                 };
-                if let Some(h) = cons.children.first().and_then(|id| egraph.nodes.get(id)) {
-                    out.insert(h.eclass.clone());
+                if let Some(h) = child_class(egraph, cons, 0) {
+                    out.insert(h);
                 }
-                cur = cons
-                    .children
-                    .get(1)
-                    .and_then(|id| egraph.nodes.get(id))
-                    .map(|c| c.eclass.clone());
+                cur = child_class(egraph, cons, 1);
             }
         }
         out
@@ -173,10 +163,8 @@ pub fn genome_with_ordering(
     let output_buffer_classes = buffer_list_classes("BufferOutputLit");
     let has_explicit_inputs = !input_buffer_classes.is_empty();
     let mut terminals: BTreeSet<ClassId> = BTreeSet::new();
-    for node in egraph.nodes.values() {
-        if node.op != "BufferTensorLit" {
-            continue;
-        }
+    for node_id in serialized.nodes_of_op("BufferTensorLit") {
+        let node = &egraph[node_id];
         if has_explicit_inputs {
             if !input_buffer_classes.contains(&node.eclass) {
                 continue;
@@ -184,53 +172,40 @@ pub fn genome_with_ordering(
         } else if output_buffer_classes.contains(&node.eclass) {
             continue;
         }
-        let Some(lt) = node.children.first().and_then(|id| egraph.nodes.get(id)) else {
+        let Some(lt) = child_class(egraph, node, 0) else {
             continue;
         };
-        terminals.insert(lt.eclass.clone());
+        terminals.insert(lt);
     }
 
     // The Lit input lists of the op class a candidate enode belongs to.
     let lit_input_lists = |op_class: &ClassId| -> Vec<Vec<ClassId>> {
         let mut lists = Vec::new();
-        for n in egraph.nodes.values() {
-            if n.eclass != *op_class || n.op != "LayoutTensorOpLit" {
-                continue;
-            }
+        for n in serialized
+            .nodes_of(op_class)
+            .iter()
+            .map(|id| &egraph[id])
+            .filter(|n| n.op == "LayoutTensorOpLit")
+        {
             let mut items = Vec::new();
-            let mut cur = n
-                .children
-                .first()
-                .and_then(|id| egraph.nodes.get(id))
-                .map(|c| c.eclass.clone());
+            let mut cur = child_class(egraph, n, 0);
             let mut guard = 0;
             while let Some(list) = cur {
                 guard += 1;
                 if guard > 16 {
                     break;
                 }
-                if egraph
-                    .nodes
-                    .values()
-                    .any(|m| m.eclass == list && m.op == "LayoutTensorNil")
-                {
+                let members = || serialized.nodes_of(&list).iter().map(|id| &egraph[id]);
+                if members().any(|m| m.op == "LayoutTensorNil") {
                     break;
                 }
-                let Some(cons) = egraph
-                    .nodes
-                    .values()
-                    .find(|m| m.eclass == list && m.op == "LayoutTensorCons")
-                else {
+                let Some(cons) = members().find(|m| m.op == "LayoutTensorCons") else {
                     break;
                 };
-                if let Some(h) = cons.children.first().and_then(|id| egraph.nodes.get(id)) {
-                    items.push(h.eclass.clone());
+                if let Some(h) = child_class(egraph, cons, 0) {
+                    items.push(h);
                 }
-                cur = cons
-                    .children
-                    .get(1)
-                    .and_then(|id| egraph.nodes.get(id))
-                    .map(|c| c.eclass.clone());
+                cur = child_class(egraph, cons, 1);
             }
             lists.push(items);
         }
@@ -277,7 +252,7 @@ pub fn genome_with_ordering(
         let mut result: Option<crate::extractor::ProducerChoice> = None;
         'cands: for i in ordered(candidates, level) {
             let (_, choice) = &candidates[i];
-            let Some(op_class) = egraph.nodes.get(&choice.enode).map(|n| n.eclass.clone()) else {
+            let Some(op_class) = crate::extractor::node_class(egraph, &choice.enode) else {
                 continue;
             };
             let lists = lit_input_lists(&op_class);
