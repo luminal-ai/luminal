@@ -75,6 +75,7 @@ use anyhow::Result;
 use egraph_serialize::ClassId;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
+use rustc_hash::FxHashMap;
 
 use crate::layout_ir::{
     Access, ExtractedGraph, ExtractedNode, FreedBy, LayoutIrOp, must_ties, permits_sharing,
@@ -663,53 +664,106 @@ fn dot_escape(text: &str) -> String {
 }
 
 // =============================================================================
-// Union-find over values (ClassId)
+// Union-find over values (ClassId), interned to dense ids
 // =============================================================================
 
-/// A value-keyed disjoint-set forest. Unknown values are lazily interned as their
-/// own singleton, so callers never have to pre-register the universe.
+/// A value-keyed disjoint-set forest over DENSE ids. Values are interned to a
+/// `u32` on first sight and the forest itself is `Vec`-backed, so the hot
+/// conflict scans compare integers instead of hashing and comparing `ClassId`
+/// strings. Unknown values are lazily interned as their own singleton, so
+/// callers never have to pre-register the universe.
 #[derive(Default)]
 struct UnionFind {
-    parent: HashMap<ClassId, ClassId>,
+    /// Interned id of every value seen so far.
+    ids: FxHashMap<ClassId, u32>,
+    /// Interned id -> value, for the `ClassId`-facing results.
+    values: Vec<ClassId>,
+    /// Disjoint-set parent per interned id (`parent[i] == i` at a root).
+    parent: Vec<u32>,
+    /// Set size, meaningful at a root; drives union by size.
+    size: Vec<u32>,
 }
 
 impl UnionFind {
-    fn find(&mut self, value: &ClassId) -> ClassId {
-        let parent = match self.parent.get(value) {
-            Some(parent) => parent.clone(),
-            None => {
-                self.parent.insert(value.clone(), value.clone());
-                return value.clone();
-            }
-        };
-        if &parent == value {
-            return parent;
+    /// The interned id of `value`, minting a fresh singleton on first sight.
+    fn intern(&mut self, value: &ClassId) -> u32 {
+        if let Some(&id) = self.ids.get(value) {
+            return id;
         }
-        let root = self.find(&parent);
-        self.parent.insert(value.clone(), root.clone());
+        let id = self.values.len() as u32;
+        self.ids.insert(value.clone(), id);
+        self.values.push(value.clone());
+        self.parent.push(id);
+        self.size.push(1);
+        id
+    }
+
+    /// Representative of an interned id, with full path compression.
+    fn find_id(&mut self, id: u32) -> u32 {
+        let mut root = id;
+        while self.parent[root as usize] != root {
+            root = self.parent[root as usize];
+        }
+        let mut walk = id;
+        while walk != root {
+            let next = self.parent[walk as usize];
+            self.parent[walk as usize] = root;
+            walk = next;
+        }
         root
     }
 
-    fn union(&mut self, a: &ClassId, b: &ClassId) {
-        let ra = self.find(a);
-        let rb = self.find(b);
+    fn same_id(&mut self, a: u32, b: u32) -> bool {
+        self.find_id(a) == self.find_id(b)
+    }
+
+    /// Merge two sets, returning `(surviving root, absorbed root)`, or `None`
+    /// when they were already one set. Union by size (ties to the lower id):
+    /// only the PARTITION is observable — representatives are used as map keys
+    /// and never leave the planner — and bounding the absorbed set by half the
+    /// merged one is what keeps the per-representative indices amortized.
+    fn union_id(&mut self, a: u32, b: u32) -> Option<(u32, u32)> {
+        let ra = self.find_id(a);
+        let rb = self.find_id(b);
         if ra == rb {
-            return;
+            return None;
         }
-        // Deterministic representative (smaller id wins), independent of the order
-        // unions happen in — keeps buffer assignment reproducible.
-        let (keep, drop) = if ra <= rb { (ra, rb) } else { (rb, ra) };
-        self.parent.insert(drop, keep);
+        let (keep, drop) = if (self.size[ra as usize], rb) > (self.size[rb as usize], ra) {
+            (ra, rb)
+        } else {
+            (rb, ra)
+        };
+        self.parent[drop as usize] = keep;
+        self.size[keep as usize] += self.size[drop as usize];
+        Some((keep, drop))
+    }
+
+    fn find(&mut self, value: &ClassId) -> ClassId {
+        let id = self.intern(value);
+        let root = self.find_id(id);
+        self.values[root as usize].clone()
+    }
+
+    fn union(&mut self, a: &ClassId, b: &ClassId) {
+        let (a, b) = (self.intern(a), self.intern(b));
+        self.union_id(a, b);
     }
 
     fn same(&mut self, a: &ClassId, b: &ClassId) -> bool {
-        self.find(a) == self.find(b)
+        let (a, b) = (self.intern(a), self.intern(b));
+        self.same_id(a, b)
     }
 }
 
 // =============================================================================
 // Analysis (phase 1): decide in-place vs. out-of-place per operand
 // =============================================================================
+
+/// The group a union-find representative owns in a per-representative index,
+/// or an empty slice when it owns none.
+fn rep_group(index: &FxHashMap<u32, Vec<u32>>, rep: u32) -> &[u32] {
+    index.get(&rep).map_or(&[][..], Vec::as_slice)
+}
 
 /// One op as the analyzer sees it: a position in the (forward) schedule, the
 /// interface that declares its memory behavior, and its operand / result values.
@@ -726,9 +780,10 @@ struct AnalysisOp<'a> {
 /// decided by [`Analyzer::happens_before`] via DAG reachability, so the `site` is
 /// all we need: `None` marks a boundary-output read (logically at the end of the
 /// program, after every op).
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct ReadUse {
-    value: ClassId,
+    /// The value read, interned in the analyzer's `alias` union-find.
+    value: u32,
     /// The op + operand doing the read, or `None` for a boundary-output read.
     site: Option<(usize, usize)>,
 }
@@ -741,9 +796,10 @@ struct ReadUse {
 /// writers of one storage as long as neither admission can see the other
 /// (review-confirmed miscompile: a dead second writer of a shared destination
 /// rides the merged class into the output buffer).
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct WriteUse {
-    value: ClassId,
+    /// The overwritten value, interned in the analyzer's `alias` union-find.
+    value: u32,
     site: (usize, usize),
 }
 
@@ -904,7 +960,6 @@ pub(crate) struct Analysis {
 /// used both as `ReadUse` sites and as indices into the reachability table.
 struct Analyzer<'a> {
     ops: &'a [AnalysisOp<'a>],
-    facts: &'a ValueFacts,
     reads: Vec<ReadUse>,
     /// `reachable[a]` = ops reachable *from* op `a` through dataflow dependence
     /// edges (i.e. ops that must run strictly after `a`). The DAG analogue of
@@ -916,6 +971,23 @@ struct Analyzer<'a> {
     in_place: HashMap<(usize, usize), bool>,
     /// Writes committed by earlier in-place admissions (see [`WriteUse`]).
     committed_writes: Vec<WriteUse>,
+    /// Each op's operand / result values, interned in `alias`; the hot scans
+    /// read these instead of hashing a `ClassId`.
+    operand_ids: Vec<Vec<u32>>,
+    result_ids: Vec<Vec<u32>>,
+    /// [`ValueFacts::read_only`] interned in `alias`.
+    read_only: Vec<u32>,
+    /// Reads (indices into `reads`) grouped by their CURRENT `alias`
+    /// representative, so a conflict scan visits only the candidate's own
+    /// alias set instead of every read in the program. Regrouped on every
+    /// alias union by moving the absorbed root's group into the surviving
+    /// one. Both scans that consult these groups are EXISTENCE tests over
+    /// pure predicates — they return on the first offender and are otherwise
+    /// order-insensitive — so grouping (and the merge direction) changes no
+    /// verdict.
+    reads_by_rep: FxHashMap<u32, Vec<u32>>,
+    /// Committed writes (indices into `committed_writes`), grouped the same way.
+    writes_by_rep: FxHashMap<u32, Vec<u32>>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -924,29 +996,6 @@ impl<'a> Analyzer<'a> {
             ops.iter().enumerate().all(|(i, op)| op.position == i),
             "AnalysisOp positions must be dense and match their slice index"
         );
-
-        // Every read in the program. Operand reads happen at their op's position;
-        // boundary-output reads happen at END_OF_PROGRAM (so a pinned output keeps
-        // its value live to the very end).
-        let mut reads = Vec::new();
-        for op in ops {
-            for (operand, value) in op.operands.iter().enumerate() {
-                if op.iface.operand_reads_memory(operand) {
-                    reads.push(ReadUse {
-                        value: value.clone(),
-                        site: Some((op.position, operand)),
-                    });
-                }
-            }
-        }
-        for value in &facts.output_values {
-            reads.push(ReadUse {
-                value: value.clone(),
-                site: None,
-            });
-        }
-
-        let reachable = Self::compute_reachability(ops);
 
         // SOUNDNESS PREREQUISITE: boundary values pinned to the same buffer
         // cohabit storage, but no in-place *decision* ever relates them, so the
@@ -967,15 +1016,74 @@ impl<'a> Analyzer<'a> {
             }
         }
 
+        // Intern every value the analysis can present — the ops' operands and
+        // results, the boundary reads, the read-only seeds — so the decision
+        // sweep works on dense ids only.
+        let mut operand_ids: Vec<Vec<u32>> = Vec::with_capacity(ops.len());
+        let mut result_ids: Vec<Vec<u32>> = Vec::with_capacity(ops.len());
+        for op in ops {
+            operand_ids.push(op.operands.iter().map(|v| alias.intern(v)).collect());
+            result_ids.push(op.results.iter().map(|v| alias.intern(v)).collect());
+        }
+        let read_only: Vec<u32> = facts.read_only.iter().map(|v| alias.intern(v)).collect();
+
+        // Every read in the program. Operand reads happen at their op's position;
+        // boundary-output reads happen at END_OF_PROGRAM (so a pinned output keeps
+        // its value live to the very end).
+        let mut reads = Vec::new();
+        for op in ops {
+            for (operand, &value) in operand_ids[op.position].iter().enumerate() {
+                if op.iface.operand_reads_memory(operand) {
+                    reads.push(ReadUse {
+                        value,
+                        site: Some((op.position, operand)),
+                    });
+                }
+            }
+        }
+        for value in &facts.output_values {
+            reads.push(ReadUse {
+                value: alias.intern(value),
+                site: None,
+            });
+        }
+
+        let reachable = Self::compute_reachability(ops);
+
+        let mut reads_by_rep: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for (index, read) in reads.iter().enumerate() {
+            let rep = alias.find_id(read.value);
+            reads_by_rep.entry(rep).or_default().push(index as u32);
+        }
+
         Self {
             ops,
-            facts,
             reads,
             reachable,
             alias,
             storage: UnionFind::default(),
             in_place: HashMap::new(),
             committed_writes: Vec::new(),
+            operand_ids,
+            result_ids,
+            read_only,
+            reads_by_rep,
+            writes_by_rep: FxHashMap::default(),
+        }
+    }
+
+    /// Union two alias sets and keep the per-representative indices in step:
+    /// the absorbed root's groups move into the survivor's. Union by size
+    /// bounds the moved groups by half the merged set, so the whole sweep's
+    /// regrouping is amortized `O(n log n)`.
+    fn alias_union(&mut self, a: u32, b: u32) {
+        let Some((keep, drop)) = self.alias.union_id(a, b) else {
+            return;
+        };
+        for index in [&mut self.reads_by_rep, &mut self.writes_by_rep] {
+            if let Some(moved) = index.remove(&drop) {
+                index.entry(keep).or_default().extend(moved);
+            }
         }
     }
 
@@ -1150,16 +1258,21 @@ impl<'a> Analyzer<'a> {
             // Commit: the tied result now shares the operand's buffer.
             let operand_value = &op.operands[operand];
             let result_value = &op.results[result];
+            let operand_id = self.operand_ids[position][operand];
+            let result_id = self.result_ids[position][result];
             if op.iface.result_writes_memory(result) {
                 // Only admissions that actually WRITE the shared
                 // storage become committed writers; a pure view's
                 // admission merges alias sets without writing a byte.
+                let index = self.committed_writes.len() as u32;
                 self.committed_writes.push(WriteUse {
-                    value: operand_value.clone(),
+                    value: operand_id,
                     site: (op.position, operand),
                 });
+                let rep = self.alias.find_id(operand_id);
+                self.writes_by_rep.entry(rep).or_default().push(index);
             }
-            self.alias.union(operand_value, result_value);
+            self.alias_union(operand_id, result_id);
             // The storage relation records the ADMISSION itself —
             // there is no tie kind to record. A DPS result becomes
             // a cohabitant of its destination's class (same
@@ -1178,8 +1291,8 @@ impl<'a> Analyzer<'a> {
     /// apply — but its union still merges alias sets, so the committed-writer
     /// interference check (3) always runs.
     fn try_in_place(&mut self, op: &AnalysisOp, operand: usize, result: usize) -> bool {
-        let operand_value = op.operands[operand].clone();
-        let result_value = op.results[result].clone();
+        let operand_id = self.operand_ids[op.position][operand];
+        let result_id = self.result_ids[op.position][result];
         let introduces_write = op.iface.result_writes_memory(result);
 
         // (1) Writability (`wouldCreateWriteToNonWritableBuffer`): in-placing
@@ -1187,9 +1300,22 @@ impl<'a> Analyzer<'a> {
         // (a constant / weights / read-only input), the write is illegal,
         // regardless of liveness. A view of read-only storage is legal — it
         // writes nothing.
-        if introduces_write && self.alias_set_is_read_only(&operand_value) {
+        if introduces_write && self.alias_set_is_read_only(operand_id) {
             return false;
         }
+
+        // The candidate's own alias set, and the one its admission would merge
+        // in: the reads and committed writes that can conflict all live in
+        // these two classes, and the per-representative indices below hand
+        // them over without a scan of the program.
+        let operand_rep = self.alias.find_id(operand_id);
+        let result_rep = self.alias.find_id(result_id);
+        let reps = [operand_rep, result_rep];
+        let post_union_reps = if operand_rep == result_rep {
+            &reps[..1]
+        } else {
+            &reps[..]
+        };
 
         // (2) Read-after-write (`wouldCreateReadAfterWriteInterference`).
         // In-placing makes this op overwrite the operand's buffer. Any read of a
@@ -1199,12 +1325,15 @@ impl<'a> Analyzer<'a> {
         // reader (no dependence path to this op) is a conflict, not a free pass.
         // Skipped entirely for non-writing candidates: there is no new write to
         // interfere with anything.
+        // The operand's alias set IS the group `reads_by_rep[operand_rep]` —
+        // membership replaces the per-read `alias.same` test.
         let raw_scan = if introduces_write {
-            self.reads.clone()
+            rep_group(&self.reads_by_rep, operand_rep)
         } else {
-            Vec::new()
+            &[]
         };
-        for read in raw_scan {
+        for &index in raw_scan {
+            let read = self.reads[index as usize];
             if read.site == Some((op.position, operand)) {
                 // "A use cannot conflict with itself. Note: just being the same
                 // op is not enough. It has to be the same use." (MLIR) — the
@@ -1215,13 +1344,10 @@ impl<'a> Analyzer<'a> {
                 // operands of this op are handled below.
                 continue;
             }
-            if read.value == result_value {
+            if read.value == result_id {
                 // Reads the new contents we are placing here — the intended
                 // consumer, not a conflict.
                 continue;
-            }
-            if !self.alias.same(&read.value, &operand_value) {
-                continue; // Reads a different buffer — irrelevant.
             }
             if self.happens_before(read.site, op.position) {
                 continue; // Provably reads the old value before we overwrite it.
@@ -1256,39 +1382,38 @@ impl<'a> Analyzer<'a> {
         // alias set (review-confirmed miscompile: the dead writer's bytes
         // land in the output buffer). Re-check every committed write against
         // every read of the post-union set, with the writer's own exemptions.
-        let post_union_aliases = |uf: &mut Self, value: &ClassId| {
-            uf.alias.same(value, &operand_value)
-                || uf.alias.same(value, &result_value)
-                || *value == result_value
-        };
-        for write in self.committed_writes.clone() {
-            if !post_union_aliases(self, &write.value) {
-                continue;
-            }
-            let writer = &self.ops[write.site.0];
-            for read in self.reads.clone() {
-                if !post_union_aliases(self, &read.value) {
-                    continue;
-                }
-                if read.site == Some(write.site) {
-                    continue; // a use cannot conflict with itself (RMW operand)
-                }
-                if writer.results.contains(&read.value) {
-                    continue; // reads the contents that write defines
-                }
-                if self.happens_before(read.site, write.site.0) {
-                    continue; // provably reads before the committed write
-                }
-                if let Some((reader_op, read_idx)) = read.site {
-                    if reader_op == write.site.0 {
-                        // Same-op pair, judged by the WRITER's contract (the
-                        // same permit its own admission would apply).
-                        if permits_sharing(writer.iface, read_idx, write.site.1) {
-                            continue;
+        // The post-union alias set is exactly the two classes `post_union_reps`
+        // names (a value equal to the tied result is in the result's class by
+        // reflexivity), so the writes and reads to re-check are those classes'
+        // groups.
+        for &write_rep in post_union_reps {
+            for &write_index in rep_group(&self.writes_by_rep, write_rep) {
+                let write = self.committed_writes[write_index as usize];
+                let writer = &self.ops[write.site.0];
+                for &read_rep in post_union_reps {
+                    for &read_index in rep_group(&self.reads_by_rep, read_rep) {
+                        let read = self.reads[read_index as usize];
+                        if read.site == Some(write.site) {
+                            continue; // a use cannot conflict with itself (RMW operand)
                         }
+                        if self.result_ids[write.site.0].contains(&read.value) {
+                            continue; // reads the contents that write defines
+                        }
+                        if self.happens_before(read.site, write.site.0) {
+                            continue; // provably reads before the committed write
+                        }
+                        if let Some((reader_op, read_idx)) = read.site {
+                            if reader_op == write.site.0 {
+                                // Same-op pair, judged by the WRITER's contract (the
+                                // same permit its own admission would apply).
+                                if permits_sharing(writer.iface, read_idx, write.site.1) {
+                                    continue;
+                                }
+                            }
+                        }
+                        return false;
                     }
                 }
-                return false;
             }
         }
 
@@ -1296,12 +1421,13 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Is any value in the operand's current alias set backed by read-only storage?
-    fn alias_set_is_read_only(&mut self, operand_value: &ClassId) -> bool {
+    fn alias_set_is_read_only(&mut self, operand_id: u32) -> bool {
         // The read-only seeds are few; check each against the operand's set.
-        let read_only: Vec<ClassId> = self.facts.read_only.iter().cloned().collect();
-        read_only
-            .iter()
-            .any(|ro| self.alias.same(ro, operand_value))
+        let rep = self.alias.find_id(operand_id);
+        (0..self.read_only.len()).any(|i| {
+            let seed = self.read_only[i];
+            self.alias.find_id(seed) == rep
+        })
     }
 }
 
