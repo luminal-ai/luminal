@@ -386,6 +386,26 @@ fn layout_class_of(site: &ExtractionSite<'_>, lt_class: &ClassId) -> Option<Clas
     None
 }
 
+/// The Shape child of the first layout-constructor spelling in this
+/// class, at the slot its DECLARATION gives it (`egglog_preamble.egg`):
+/// the offset-expression spellings carry Shape at child 1, the strided
+/// and contiguous ones at child 0.
+fn layout_shape_class(site: &ExtractionSite<'_>, layout_class: &ClassId) -> Option<ClassId> {
+    for node in site.members(layout_class) {
+        let shape_slot = match node.op.as_str() {
+            "RightMajorContiguousElementLayoutLit"
+            | "LeftMajorContiguousElementLayoutLit"
+            | "StridedElementLayoutLit" => 0,
+            "BitOffsetExpressionLayoutLit" | "ElementOffsetExpressionLayoutLit" => 1,
+            _ => continue,
+        };
+        if let Some(shape) = site.class_of_child(node, shape_slot) {
+            return Some(shape);
+        }
+    }
+    None
+}
+
 fn logical_class_of(site: &ExtractionSite<'_>, lt_class: &ClassId) -> Option<ClassId> {
     for node in site.nodes_in_class_value(lt_class, "LayoutTensorLit") {
         if let Some(logical) = site.class_of_child(node, 0) {
@@ -395,16 +415,14 @@ fn logical_class_of(site: &ExtractionSite<'_>, lt_class: &ClassId) -> Option<Cla
     None
 }
 
-/// The logical tensor's rank-2 storage extents, via its class-level
-/// `shape-of` fact. CANONICAL CHOICE (doctrine point 3): the first
+/// A descriptor's rank-2 storage extents: its layout tensor's own
+/// declared Shape. CANONICAL CHOICE (doctrine point 3): the first
 /// ShapeLit spelling is taken; in extent-1 weld corners a shape class can
 /// hold role-permuted spellings, and every choice describes the same
 /// bytes under the descriptor's form/operation, so the choice is sound.
-fn storage_dims(
-    site: &ExtractionSite<'_>,
-    logical_class: &ClassId,
-) -> Option<Vec<(CuDim, ClassId)>> {
-    let shape_class = site.fact_row_class("shape-of", logical_class)?;
+fn storage_dims(site: &ExtractionSite<'_>, lt_class: &ClassId) -> Option<Vec<(CuDim, ClassId)>> {
+    let layout_class = layout_class_of(site, lt_class)?;
+    let shape_class = layout_shape_class(site, &layout_class)?;
     let shape_lit = site.nodes_in_class_value(&shape_class, "ShapeLit").next()?;
     let mut list_class = site.class_of_child(shape_lit, 0)?;
     let mut dims = Vec::new();
@@ -641,9 +659,9 @@ pub fn parse_spec(site: &ExtractionSite<'_>, form: CublasLtForm) -> Option<LtMat
     // site's b a permutation of (k, n). For a sibling site minted by the
     // sandwich rewrite these are the recorder operands under new roles,
     // and this frame is the SIBLING's — numerically the round-9 call.
-    let a_storage = storage_dims(site, &logical_class_of(site, &desc_a_layout_tensor)?)?;
-    let b_storage = storage_dims(site, &logical_class_of(site, &desc_b_layout_tensor)?)?;
-    let d_storage = storage_dims(site, &logical_out)?;
+    let a_storage = storage_dims(site, &desc_a_layout_tensor)?;
+    let b_storage = storage_dims(site, &desc_b_layout_tensor)?;
+    let d_storage = storage_dims(site, &out_lt_class)?;
     assert_eq!(a_storage.len(), 2, "cuBLASLt marker: rank-2 a expected");
     assert_eq!(b_storage.len(), 2, "cuBLASLt marker: rank-2 b expected");
     assert_eq!(d_storage.len(), 2, "cuBLASLt marker: rank-2 out expected");
