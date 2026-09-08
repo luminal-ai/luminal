@@ -2,18 +2,19 @@
 //! public read API (`functions_iter` for the schema, `constructor_enodes`
 //! / `function_entries` for the rows) instead of `EGraph::serialize`.
 //!
-//! The shape is the database's, not a term DAG's: TABLES hold ROWS, a
-//! row's columns are decoded by their DECLARED sort, and the eq-sort
-//! columns intern to dense [`ClassId`]s. Nothing is rendered to a string
-//! and nothing is re-parsed, so a reader asks the snapshot what egglog
-//! stored rather than what a serializer chose to print.
+//! The shape is the database's, not a term DAG's: TABLES hold ROWS, and
+//! every column of a row — an e-class, a literal, a container — interns to
+//! a dense [`ClassId`]. Nothing is rendered to a string and nothing is
+//! re-parsed, so a reader asks the snapshot what egglog stored rather than
+//! what a serializer chose to print, and a literal comes back as the Rust
+//! value it is.
 //!
-//! WHAT IS NOT DECODED: container values (our one `(sort SigmaMap (Map
-//! IntExpr IntExpr))`) and base sorts this module has no decoder for stay
-//! [`Child::Opaque`] — the raw `Value`, which is the identity egglog
-//! itself uses. The serializer expands a container into inner nodes;
-//! nothing here needs that, and inventing structure we do not read is how
-//! a reader starts disagreeing with the database.
+//! WHAT IS NOT DECODED: a container value (our one `(sort SigmaMap (Map
+//! IntExpr IntExpr))`) is kept as the raw `Value`, the identity egglog
+//! itself uses, and so is a base sort this module has no decoder for. The
+//! serializer expands a container into inner nodes; nothing here needs
+//! that, and inventing structure we do not read is how a reader starts
+//! disagreeing with the database.
 //!
 //! Values stored in a table are canonical after a run returns, so a
 //! column's `Value` is interned as-is; the debug tripwire checks that
@@ -29,7 +30,8 @@ use std::ops::Range;
 // Ids
 // =============================================================================
 
-/// A dense e-class id, interned per (eq-sort, `Value`) in build order.
+/// A dense class id, interned per (sort, `Value`) in build order over
+/// EVERY class: e-classes, literals and containers alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClassId(u32);
 
@@ -94,24 +96,31 @@ pub enum Literal {
     Str(String),
 }
 
-/// One column of a row.
-///
-/// `Literal` sizes this enum, and so the node table: if that footprint
-/// ever matters, literals move to a side table and this becomes a tagged
-/// `u32`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Child {
-    Class(ClassId),
+/// What a class holds. A literal and a container are classes with no rows,
+/// so every column of every row is one id.
+#[derive(Debug, Clone)]
+pub enum ClassBody {
+    /// An e-class: the rows whose output column is this class, in row order.
+    Eq { nodes: Vec<NodeId> },
+    /// One base value, interned per (sort, value) like any other class.
     Lit(Literal),
     /// A value this reader does not decode: a container, or a base sort
     /// with no decoder here.
-    Opaque(Value),
+    Container(Value),
 }
 
-impl Child {
-    pub fn class(&self) -> Option<ClassId> {
-        match self {
-            Child::Class(id) => Some(*id),
+#[derive(Debug, Clone)]
+pub struct Class {
+    pub sort: String,
+    pub body: ClassBody,
+    /// Global `(let ...)` names bound to this class, in declaration order.
+    pub let_names: Vec<String>,
+}
+
+impl Class {
+    pub fn literal(&self) -> Option<&Literal> {
+        match &self.body {
+            ClassBody::Lit(literal) => Some(literal),
             _ => None,
         }
     }
@@ -121,20 +130,9 @@ impl Child {
 #[derive(Debug, Clone)]
 pub struct Node {
     pub table: TableId,
-    pub children: Vec<Child>,
-    /// `Class` for constructors and for eq-sort-valued functions, `Lit` or
-    /// `Opaque` for a function whose output sort is not an eq sort.
-    pub output: Child,
+    pub children: Vec<ClassId>,
+    pub output: ClassId,
     pub subsumed: bool,
-}
-
-/// One e-class: every row whose output column is this class, in row order.
-#[derive(Debug, Clone)]
-pub struct Class {
-    pub sort: String,
-    pub nodes: Vec<NodeId>,
-    /// Global `(let ...)` names bound to this class, in declaration order.
-    pub let_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,8 +200,17 @@ impl Snapshot {
         &self.classes[class.index()]
     }
 
+    /// The rows of an e-class; empty for a literal or container class,
+    /// which hold none.
     pub fn nodes_of(&self, class: ClassId) -> &[NodeId] {
-        &self.classes[class.index()].nodes
+        match &self.classes[class.index()].body {
+            ClassBody::Eq { nodes } => nodes,
+            _ => &[],
+        }
+    }
+
+    pub fn literal(&self, class: ClassId) -> Option<&Literal> {
+        self.classes[class.index()].literal()
     }
 
     /// The name of the table `node`'s row came from — a row's operator.
@@ -221,8 +228,14 @@ type SortId = u32;
 
 /// How one column's `Value` is read.
 #[derive(Clone, Copy)]
-enum Column {
-    Class(SortId),
+struct Column {
+    sort: SortId,
+    kind: ColumnKind,
+}
+
+#[derive(Clone, Copy)]
+enum ColumnKind {
+    Eq,
     Base(BaseKind),
     /// A container sort, or a base sort with no decoder here.
     Opaque,
@@ -250,7 +263,7 @@ struct TableSchema {
 struct Schema {
     tables: Vec<TableSchema>,
     sorts: Vec<String>,
-    /// Parallel to `sorts`, for the debug tripwire's `value_to_class_id`.
+    /// Parallel to `sorts`, for `value_to_class_id`.
     arc_sorts: Vec<ArcSort>,
 }
 
@@ -265,26 +278,27 @@ impl Schema {
         for (_, function) in egraph.functions_iter() {
             let func_type = function.func_type();
             let mut column = |sort: &ArcSort| -> Column {
-                if sort.is_eq_sort() {
-                    let next = SortId::try_from(schema.sorts.len()).expect("sorts fit in u32");
-                    let id = *ids.entry(sort.name().to_string()).or_insert_with(|| {
-                        schema.sorts.push(sort.name().to_string());
-                        schema.arc_sorts.push(sort.clone());
-                        next
-                    });
-                    Column::Class(id)
+                let next = SortId::try_from(schema.sorts.len()).expect("sorts fit in u32");
+                let id = *ids.entry(sort.name().to_string()).or_insert_with(|| {
+                    schema.sorts.push(sort.name().to_string());
+                    schema.arc_sorts.push(sort.clone());
+                    next
+                });
+                let kind = if sort.is_eq_sort() {
+                    ColumnKind::Eq
                 } else if sort.is_container_sort() {
-                    Column::Opaque
+                    ColumnKind::Opaque
                 } else {
                     match sort.name() {
-                        "i64" => Column::Base(BaseKind::I64),
-                        "f64" => Column::Base(BaseKind::F64),
-                        "bool" => Column::Base(BaseKind::Bool),
-                        "BigInt" => Column::Base(BaseKind::BigInt),
-                        "String" => Column::Base(BaseKind::Str),
-                        _ => Column::Opaque,
+                        "i64" => ColumnKind::Base(BaseKind::I64),
+                        "f64" => ColumnKind::Base(BaseKind::F64),
+                        "bool" => ColumnKind::Base(BaseKind::Bool),
+                        "BigInt" => ColumnKind::Base(BaseKind::BigInt),
+                        "String" => ColumnKind::Base(BaseKind::Str),
+                        _ => ColumnKind::Opaque,
                     }
-                }
+                };
+                Column { sort: id, kind }
             };
             let inputs: Vec<Column> = func_type.input.iter().map(&mut column).collect();
             let output = column(&func_type.output);
@@ -421,15 +435,15 @@ impl<'s> Builder<'s> {
         subsumed: bool,
     ) {
         let node = NodeId::from_len(self.snapshot.nodes.len());
-        let children: Vec<Child> = table
+        let children: Vec<ClassId> = table
             .inputs
             .iter()
             .zip(children)
-            .map(|(column, value)| self.decode(state, *column, *value))
+            .map(|(column, value)| self.intern(state, *column, *value))
             .collect();
-        let output = self.decode(state, table.output, output);
-        if let Child::Class(class) = output {
-            self.snapshot.classes[class.index()].nodes.push(node);
+        let output = self.intern(state, table.output, output);
+        if let ClassBody::Eq { nodes } = &mut self.snapshot.classes[output.index()].body {
+            nodes.push(node);
         }
         self.snapshot.nodes.push(Node {
             table: id,
@@ -443,40 +457,35 @@ impl<'s> Builder<'s> {
     /// A let-binding table is one nullary row whose output is the bound
     /// value; the name lands on that class and the row itself is not a node.
     fn bind_let(&mut self, state: &ReadState<'_, '_>, table: &TableSchema, output: Value) {
-        if let Child::Class(class) = self.decode(state, table.output, output) {
-            self.snapshot.classes[class.index()]
-                .let_names
-                .push(table.name.clone());
-        }
+        let class = self.intern(state, table.output, output);
+        self.snapshot.classes[class.index()]
+            .let_names
+            .push(table.name.clone());
     }
 
-    fn decode(&mut self, state: &ReadState<'_, '_>, column: Column, value: Value) -> Child {
-        match column {
-            Column::Class(sort) => Child::Class(self.intern(sort, value)),
-            Column::Base(kind) => Child::Lit(decode_base(state, kind, value)),
-            Column::Opaque => Child::Opaque(value),
-        }
-    }
-
-    fn intern(&mut self, sort: SortId, value: Value) -> ClassId {
+    fn intern(&mut self, state: &ReadState<'_, '_>, column: Column, value: Value) -> ClassId {
         let classes = &mut self.snapshot.classes;
         let sorts = &self.schema.sorts;
         #[cfg(test)]
         let values = &mut self.class_values;
-        let id = *self.classes.entry((sort, value)).or_insert_with(|| {
+        let id = *self.classes.entry((column.sort, value)).or_insert_with(|| {
             let id = ClassId::from_len(classes.len());
             classes.push(Class {
-                sort: sorts[sort as usize].clone(),
-                nodes: Vec::new(),
+                sort: sorts[column.sort as usize].clone(),
+                body: match column.kind {
+                    ColumnKind::Eq => ClassBody::Eq { nodes: Vec::new() },
+                    ColumnKind::Base(kind) => ClassBody::Lit(decode_base(state, kind, value)),
+                    ColumnKind::Opaque => ClassBody::Container(value),
+                },
                 let_names: Vec::new(),
             });
             #[cfg(test)]
-            values.push((sort, value));
+            values.push((column.sort, value));
             id
         });
         #[cfg(debug_assertions)]
         if self.sampled < SAMPLE_ROWS {
-            self.tripwire.samples.push((id, sort, value));
+            self.tripwire.samples.push((id, column.sort, value));
         }
         id
     }
@@ -497,12 +506,12 @@ fn decode_base(state: &ReadState<'_, '_>, kind: BaseKind, value: Value) -> Liter
 // =============================================================================
 
 impl Tripwire {
-    /// Sampled rows agree with egglog's own class ids — one class id
+    /// Sampled columns agree with egglog's own class ids — one class id
     /// string per interned class, and no two of our classes sharing one —
-    /// every class holds at least one row, and a class whose rows are all
-    /// subsumed is a `LayoutTensorOp` (the preamble subsumes an op's `Lit`
-    /// without unioning it, and that row is the only carrier of the op's
-    /// operand lists; any other sort with no live row means a rule
+    /// every e-class holds at least one row, and an e-class whose rows are
+    /// all subsumed is a `LayoutTensorOp` (the preamble subsumes an op's
+    /// `Lit` without unioning it, and that row is the only carrier of the
+    /// op's operand lists; any other sort with no live row means a rule
     /// subsumed something it never replaced).
     #[cfg(debug_assertions)]
     fn check(&self, egraph: &EGraph, schema: &Schema, snapshot: &Snapshot) -> Result<()> {
@@ -526,7 +535,10 @@ impl Tripwire {
             }
         }
         for (index, class) in snapshot.classes.iter().enumerate() {
-            if class.nodes.is_empty() {
+            let ClassBody::Eq { nodes } = &class.body else {
+                continue;
+            };
+            if nodes.is_empty() {
                 bail!(
                     "class {index} of sort {} holds no row (let names: {:?})",
                     class.sort,
@@ -534,9 +546,9 @@ impl Tripwire {
                 );
             }
             if class.sort != "LayoutTensorOp"
-                && class.nodes.iter().all(|node| snapshot.node(*node).subsumed)
+                && nodes.iter().all(|node| snapshot.node(*node).subsumed)
             {
-                let ops: Vec<&str> = class.nodes.iter().map(|node| snapshot.op(*node)).collect();
+                let ops: Vec<&str> = nodes.iter().map(|node| snapshot.op(*node)).collect();
                 bail!(
                     "class {index} of sort {} has no live row: {ops:?}",
                     class.sort
@@ -555,7 +567,7 @@ impl Tripwire {
 mod differential {
     use super::*;
     use egraph_serialize as ser;
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap};
 
     /// Run a `test_scripts` fixture under the reference program.
     fn saturate(script: &str) -> EGraph {
@@ -608,10 +620,28 @@ mod differential {
         }
     }
 
-    fn sort_named<'a>(egraph: &'a EGraph, script: &str, name: &str) -> &'a ArcSort {
-        egraph
-            .get_sort_by_name(name)
-            .unwrap_or_else(|| panic!("{script}: sort {name} is declared"))
+    /// The op of the node egglog wrote for a class's own value: what it
+    /// printed for a literal, the sort's serialized name for a container.
+    fn printed(
+        serialized: &ser::EGraph,
+        egraph: &EGraph,
+        class: &ser::ClassId,
+        script: &str,
+    ) -> String {
+        let mut values = serialized.classes()[class].nodes.iter().filter(|node| {
+            matches!(
+                egraph.from_node_id(node),
+                egglog::SerializedNode::Primitive(_)
+            )
+        });
+        let node = values
+            .next()
+            .unwrap_or_else(|| panic!("{script}: class {class} has no value node"));
+        assert!(
+            values.next().is_none(),
+            "{script}: class {class} has more than one value node"
+        );
+        serialized.nodes[node].op.clone()
     }
 
     /// One row, spelled entirely in the serializer's vocabulary:
@@ -631,19 +661,7 @@ mod differential {
         let (snapshot, names) = Snapshot::build_named(egraph).expect("snapshot builds");
         let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
 
-        // Which sort names name e-classes, so the serializer's classes can
-        // be split into e-classes and primitive/container pseudo-classes.
-        let mut eq_sorts: HashSet<&str> = HashSet::new();
-        for (_, function) in egraph.functions_iter() {
-            let func_type = function.func_type();
-            for sort in func_type.input.iter().chain([&func_type.output]) {
-                if sort.is_eq_sort() {
-                    eq_sorts.insert(sort.name());
-                }
-            }
-        }
-
-        // (a) The renaming is a bijection onto the serializer's e-classes.
+        // (a) The renaming is a bijection over EVERY class on both sides.
         let mut backward: HashMap<&ser::ClassId, ClassId> = HashMap::new();
         for (index, name) in names.iter().enumerate() {
             let ours = ClassId::from_len(index);
@@ -652,92 +670,40 @@ mod differential {
                 "{script}: two classes share the serialized id {name}"
             );
         }
-        for (class, data) in &serialized.class_data {
-            if data
-                .typ
-                .as_deref()
-                .is_some_and(|typ| eq_sorts.contains(typ))
-            {
-                assert!(
-                    backward.contains_key(class),
-                    "{script}: serialized class {class} has no counterpart"
-                );
-            }
+        for class in serialized.class_data.keys() {
+            assert!(
+                backward.contains_key(class),
+                "{script}: serialized class {class} has no counterpart"
+            );
         }
 
-        // The BASE pseudo-classes, keyed by the sort and the value egglog
-        // printed there — how a decoded literal names its class. A
-        // container class is named by its value instead: every one of
-        // them prints the same serialized name.
-        let mut by_literal: HashMap<(&str, &str), &ser::ClassId> = HashMap::new();
-        for (class, nodes) in serialized.classes() {
-            let typ = serialized.class_data[class]
-                .typ
-                .as_deref()
-                .unwrap_or_else(|| panic!("{script}: class {class} has no sort"));
-            if eq_sorts.contains(typ) || sort_named(egraph, script, typ).is_container_sort() {
-                continue;
-            }
-            for node in &nodes.nodes {
-                if matches!(
-                    egraph.from_node_id(node),
-                    egglog::SerializedNode::Primitive(_)
-                ) {
-                    let printed = serialized.nodes[node].op.as_str();
-                    assert!(
-                        by_literal.insert((typ, printed), class).is_none(),
-                        "{script}: two {typ} classes both print {printed}"
-                    );
-                }
-            }
-        }
-
-        // A column of ours, named the way the serializer names it.
-        let column = |child: &Child, sort: &str| -> ser::ClassId {
-            match child {
-                Child::Class(class) => names[class.index()].clone(),
-                Child::Lit(literal) => {
-                    let printed = spelling(literal);
-                    (*by_literal
-                        .get(&(sort, printed.as_str()))
-                        .unwrap_or_else(|| {
-                            panic!("{script}: no serialized {sort} class prints {printed}")
-                        }))
-                    .clone()
-                }
-                Child::Opaque(value) => {
-                    egraph.value_to_class_id(sort_named(egraph, script, sort), *value)
-                }
-            }
-        };
+        // (b) The same rows in the same class, on both sides. Ours are
+        // grouped by the e-class that lists them, and the rows whose
+        // output is a literal or a container — which no class lists — by
+        // the class their output names.
         let row = |node: &Node| -> Row {
-            let table = snapshot.table_at(node.table);
             (
-                table.name.clone(),
+                snapshot.table_at(node.table).name.clone(),
                 node.children
                     .iter()
-                    .zip(&table.inputs)
-                    .map(|(child, sort)| column(child, sort))
+                    .map(|child| names[child.index()].clone())
                     .collect(),
-                column(&node.output, &table.output),
+                names[node.output.index()].clone(),
                 node.subsumed,
             )
         };
-
-        // (b) The same rows in the same class, on both sides. Ours are
-        // grouped by the class that lists them, and the rows with a
-        // primitive output — which no class of ours lists — by the
-        // pseudo-class their output names.
         let mut ours: BTreeMap<ser::ClassId, Vec<Row>> = BTreeMap::new();
         for (index, class) in snapshot.classes.iter().enumerate() {
-            let rows: Vec<Row> = class.nodes.iter().map(|n| row(snapshot.node(*n))).collect();
-            ours.insert(names[index].clone(), rows);
+            if let ClassBody::Eq { nodes } = &class.body {
+                let rows: Vec<Row> = nodes.iter().map(|n| row(snapshot.node(*n))).collect();
+                ours.insert(names[index].clone(), rows);
+            }
         }
         for node in &snapshot.nodes {
-            if node.output.class().is_none() {
-                let table = snapshot.table_at(node.table);
-                let output = column(&node.output, &table.output);
-                ours.entry(output).or_default().push(row(node));
+            if !matches!(snapshot.class(node.output).body, ClassBody::Eq { .. }) {
+                ours.entry(names[node.output.index()].clone())
+                    .or_default()
+                    .push(row(node));
             }
         }
         let mut theirs: BTreeMap<ser::ClassId, Vec<Row>> = BTreeMap::new();
@@ -784,32 +750,48 @@ mod differential {
         }
 
         for (index, class) in snapshot.classes.iter().enumerate() {
-            let data = &serialized.class_data[&names[index]];
+            let name = &names[index];
+            let data = &serialized.class_data[name];
             // (c) the same let names, in the same order.
             let ours_let = class.let_names.join(", ");
             assert_eq!(
                 data.extra.get("let").map(String::as_str),
                 (!ours_let.is_empty()).then_some(ours_let.as_str()),
-                "{script}: let names of class {}",
-                names[index]
+                "{script}: let names of class {name}"
             );
-            // (d) the same sort.
+            // (d) the same sort, a body that sort agrees with, and a
+            // literal holding the value egglog printed there.
             assert_eq!(
                 data.typ.as_deref(),
                 Some(class.sort.as_str()),
-                "{script}: sort of class {}",
-                names[index]
+                "{script}: sort of class {name}"
             );
-        }
-
-        // A global bound to a non-e-class value would carry a let name we
-        // have nowhere to put; none of our programs has one.
-        for (class, data) in &serialized.class_data {
-            if data.extra.contains_key("let") {
-                assert!(
-                    backward.contains_key(class),
-                    "{script}: class {class} is let-bound but is not an e-class"
-                );
+            let sort = egraph
+                .get_sort_by_name(&class.sort)
+                .unwrap_or_else(|| panic!("{script}: sort {} is declared", class.sort));
+            match &class.body {
+                ClassBody::Eq { .. } => assert!(
+                    sort.is_eq_sort(),
+                    "{script}: {} is not an eq sort",
+                    class.sort
+                ),
+                ClassBody::Lit(literal) => {
+                    assert!(
+                        !sort.is_eq_sort() && !sort.is_container_sort(),
+                        "{script}: {} is not a base sort",
+                        class.sort
+                    );
+                    assert_eq!(
+                        spelling(literal),
+                        printed(&serialized, egraph, name, script),
+                        "{script}: value of class {name}"
+                    );
+                }
+                ClassBody::Container(_) => assert!(
+                    sort.is_container_sort(),
+                    "{script}: {} is not a container sort",
+                    class.sort
+                ),
             }
         }
 
@@ -817,15 +799,16 @@ mod differential {
             rows: snapshot.nodes.len(),
             classes: snapshot.classes.len(),
             serialized_nodes: serialized.nodes.len(),
-            serialized_classes: backward.len(),
+            serialized_classes: serialized.class_data.len(),
             dummies,
         }
     }
 
     /// The snapshot read out of egglog holds exactly what egglog's own
     /// serializer holds — same rows per class, same operators, same
-    /// columns, same subsumption, same let names, same sorts — under the
-    /// renaming egglog's own `value_to_class_id` gives each class.
+    /// columns, same subsumption, same literal values, same let names,
+    /// same sorts — under the renaming egglog's own `value_to_class_id`
+    /// gives each class.
     #[test]
     fn snapshot_matches_the_serializer_up_to_renaming() {
         let check = |script: &str, egraph: EGraph| {
