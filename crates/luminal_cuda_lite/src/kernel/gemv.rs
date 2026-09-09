@@ -29,14 +29,12 @@ use luminal::{
     prelude::*,
 };
 
-const TPB: usize = 256;
-const WARPS_PER_BLOCK: usize = TPB / 32;
-
 #[derive(Default, Debug, Clone)]
 pub struct KernelGemv {
     n: Expression,
     k: Expression,
     dtype: DType,
+    warps_per_block: usize,
 }
 
 impl EgglogOp for KernelGemv {
@@ -44,7 +42,12 @@ impl EgglogOp for KernelGemv {
         sort(
             OP_KIND,
             "KernelGemv",
-            &[("n", EXPRESSION), ("k", EXPRESSION), ("dtype", DTYPE)],
+            &[
+                ("n", EXPRESSION),
+                ("k", EXPRESSION),
+                ("dtype", DTYPE),
+                ("warps_per_block", EXPRESSION),
+            ],
         )
     }
 
@@ -121,7 +124,7 @@ impl EgglogOp for KernelGemv {
                             (= ?dt ({dt}))
                         )
                         (
-                            (let ?gemv (Op (KernelGemv ?n ?k ({dt})) (ICons ?a (ICons ?b (INil)))))
+                            (let ?gemv (Op (KernelGemv ?n ?k ({dt}) (MNum 8)) (ICons ?a (ICons ?b (INil)))))
                             (union ?sum ?gemv)
                             (set (dtype ?gemv) ({dt}))
                         )
@@ -130,6 +133,18 @@ impl EgglogOp for KernelGemv {
                     )"
                 ))
             })
+            .chain([1, 2, 4].map(|warps| Rule::raw(format!(
+                "(rule
+                    ((= ?out (Op (KernelGemv ?n ?k ?dt (MNum 8)) ?inputs)))
+                    (
+                        (let ?tuned (Op (KernelGemv ?n ?k ?dt (MNum {warps})) ?inputs))
+                        (union ?out ?tuned)
+                        (set (dtype ?tuned) ?dt)
+                    )
+                    :ruleset matmul_backend
+                    :name \"kernel gemv {warps} warps per block\"
+                )"
+            ))))
             .collect()
     }
 
@@ -150,6 +165,10 @@ impl EgglogOp for KernelGemv {
                 n: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
                 k: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
                 dtype: extract_dtype(egraph, kind_children[2]),
+                warps_per_block: extract_expr(egraph, kind_children[3], expr_cache)
+                    .unwrap()
+                    .to_usize()
+                    .expect("GEMV warp count must be constant"),
             }) as Box<dyn KernelOp>),
             input_enodes,
         )
@@ -170,6 +189,8 @@ impl KernelOp for KernelGemv {
         Expression,
         FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
+        let warps_per_block = self.warps_per_block;
+        assert!(matches!(warps_per_block, 1 | 2 | 4 | 8));
         let vars = self
             .n
             .dyn_vars()
@@ -225,7 +246,7 @@ impl KernelOp for KernelGemv {
 {dyn_defines}
 extern \"C\" {{
     __global__ void gemv_k({ty} *out, const {ty} *x, const {ty} *w{dyn_dims_param}) {{
-        long long row = (long long)blockIdx.x * {WARPS_PER_BLOCK} + (threadIdx.x >> 5);
+        long long row = (long long)blockIdx.x * {warps_per_block} + (threadIdx.x >> 5);
         if (row >= ({n})) return;
         int lane = threadIdx.x & 31;
 {body}
@@ -255,8 +276,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (self.n.ceil_div(WARPS_PER_BLOCK), 1.into(), 1.into()),
-            (TPB.into(), 1.into(), 1.into()),
+            (self.n.ceil_div(warps_per_block), 1.into(), 1.into()),
+            ((warps_per_block * 32).into(), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
