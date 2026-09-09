@@ -1,8 +1,12 @@
+; A pointwise operation after F16/BF16 matmul observes its rounded result.
+; cuBLASLt epilogues/scales run before output conversion, so only F32
+; intermediates may cross this boundary. Keep low-precision rounding explicit.
 ; Scalar alpha/beta rewrites for cuBLASLt. These rules target scalar constants
 ; expanded across the matmul/add shape, i.e. zero strides on every logical axis.
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -50,6 +54,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -97,6 +102,8 @@
 
 (rule
     (
+        (= ?c_dtype (F32))
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -161,6 +168,8 @@
 
 (rule
     (
+        (= ?c_dtype (F32))
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -225,6 +234,8 @@
 
 (rule
     (
+        (= ?c_dtype (F32))
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -289,6 +300,8 @@
 
 (rule
     (
+        (= ?c_dtype (F32))
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
