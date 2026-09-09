@@ -417,7 +417,7 @@ impl TestGraph {
         LayoutTensorInfo {
             eclass: ClassId::from(format!("val${name}")),
             label: name.to_string(),
-            tooltip: Default::default(),
+            tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             shape: None,
             dtype: None,
             dtype_enum: None,
@@ -425,15 +425,21 @@ impl TestGraph {
             element_bits: None,
             logical: LogicalInfo {
                 eclass: ClassId::from(format!("logical${name}")),
-                label: name.to_string().into(),
-                tooltip: Default::default(),
+                label: {
+                    let text = name.to_owned();
+                    std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(move || text)))
+                },
+                tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
                 op: None,
                 children: Vec::new(),
             },
             layout: LayoutInfo {
                 eclass: ClassId::from(format!("layout${layout}")),
-                label: layout.to_string().into(),
-                tooltip: Default::default(),
+                label: {
+                    let text = layout.to_owned();
+                    std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(move || text)))
+                },
+                tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             },
         }
     }
@@ -452,10 +458,10 @@ impl TestGraph {
             lit: None,
             tensor_eclass: ClassId::from(format!("buftensor${n}")),
             tensor_label: buffer.to_string(),
-            tensor_tooltip: Default::default(),
+            tensor_tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             id_eclass: ClassId::from(format!("buf${buffer}")),
             id_label: buffer.to_string(),
-            id_tooltip: Default::default(),
+            id_tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             access,
             freed_by,
         }
@@ -520,7 +526,7 @@ impl TestGraph {
             provenance: crate::layout_ir::Provenance::Synthesized { id: n },
             inputs: op_inputs,
             outputs: output_infos,
-            tooltip: Default::default(),
+            tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             heuristic_cost: 1,
         }));
         for (index, value) in inputs.iter().enumerate() {
@@ -4092,20 +4098,28 @@ mod deferred_display_text {
             .expect("the fixture has an op with an output");
 
         assert!(
-            !value.tooltip.is_rendered(),
+            once_cell::unsync::Lazy::get(&value.tooltip).is_none(),
             "extraction rendered a value tooltip that nobody asked for"
         );
         assert!(
-            !value.layout.tooltip.is_rendered(),
+            once_cell::unsync::Lazy::get(&value.layout.tooltip).is_none(),
             "extraction rendered a layout tooltip that nobody asked for"
         );
 
+        let clone = value.tooltip.clone();
+        let _ = format!("{clone:?}");
+        assert!(once_cell::unsync::Lazy::get(&clone).is_none());
+
         let tooltip = value.tooltip.to_string();
+        assert!(std::ptr::eq(
+            once_cell::unsync::Lazy::force(&value.tooltip),
+            once_cell::unsync::Lazy::get(&clone).unwrap(),
+        ));
         assert!(
             tooltip.contains(&format!("eclass={}", value.eclass)),
             "the deferred tooltip did not build its real text: {tooltip:?}"
         );
-        assert!(value.tooltip.is_rendered());
+        assert!(once_cell::unsync::Lazy::get(&value.tooltip).is_some());
         assert_eq!(
             tooltip,
             value.tooltip.to_string(),
@@ -4134,13 +4148,13 @@ mod deferred_display_text {
             for node in graph.dag.node_weights() {
                 if let ExtractedNode::LayoutOp(op) = node {
                     assert!(
-                        op.tooltip.is_rendered(),
+                        once_cell::unsync::Lazy::get(&op.tooltip).is_some(),
                         "{script}: to_dot left an op tooltip unrendered"
                     );
                     for output in &op.outputs {
-                        assert!(output.tooltip.is_rendered());
-                        assert!(output.logical.label.is_rendered());
-                        assert!(output.layout.tooltip.is_rendered());
+                        assert!(once_cell::unsync::Lazy::get(&output.tooltip).is_some());
+                        assert!(once_cell::unsync::Lazy::get(&output.logical.label).is_some());
+                        assert!(once_cell::unsync::Lazy::get(&output.layout.tooltip).is_some());
                     }
                 }
             }

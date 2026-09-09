@@ -77,7 +77,9 @@ pub fn dps_rewrite(graph: &ExtractedGraph) -> ExtractedGraph {
                 // number would leak into buffer labels (alloc#N[poisonNN])
                 // where alloc#N already disambiguates.
                 label: "Poison".to_string(),
-                tooltip: "poison destination (contents undefined)".to_string().into(),
+                tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(|| {
+                    "poison destination (contents undefined)".to_string()
+                }))),
                 shape: result.shape.clone(),
                 dtype: result.dtype.clone(),
                 dtype_enum: result.dtype_enum,
@@ -89,8 +91,12 @@ pub fn dps_rewrite(graph: &ExtractedGraph) -> ExtractedGraph {
                     eclass: ClassId::from(format!("dps$poison_logical${synth}")),
                     // Display label only — identity lives in the eclass, so
                     // every poison shows plainly as "Poison", unnumbered.
-                    label: "Poison".to_string().into(),
-                    tooltip: "undefined contents".to_string().into(),
+                    label: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(|| {
+                        "Poison".to_string()
+                    }))),
+                    tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(|| {
+                        "undefined contents".to_string()
+                    }))),
                     op: None,
                     children: Vec::new(),
                 },
@@ -102,7 +108,9 @@ pub fn dps_rewrite(graph: &ExtractedGraph) -> ExtractedGraph {
                 provenance: Provenance::Synthesized { id: synth },
                 inputs: Vec::new(),
                 outputs: vec![poison_value],
-                tooltip: "synthesized by dps_rewrite".to_string().into(),
+                tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(|| {
+                    "synthesized by dps_rewrite".to_string()
+                }))),
                 heuristic_cost: 0,
             }));
 

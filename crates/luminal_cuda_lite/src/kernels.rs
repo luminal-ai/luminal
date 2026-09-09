@@ -1,19 +1,8 @@
-//! The CUDA codegen table: one row per executable op type, keyed by the
-//! concrete DPS struct's `TypeId` exactly like the reference kernel
-//! registry (labels repeat across functional/DPS forms; types do not).
+//! CUDA kernel registry and shared code generation helpers.
 //!
-//! A row's `codegen` turns (op instance, buffer geometry) into a
-//! self-contained CUDA source string — dense row-major, one thread per
-//! output element, geometry baked as literals. Generation is pure and
-//! host-side (snapshot-testable without a device); NVRTC compilation
-//! and launch live in the `device` module. The codegen BODIES live in
-//! the op modules under `crate::ops` (op-ownership ruling 2026-08-17);
-//! this file keeps the table and the shared lowering helpers.
-//!
-//! CL-1 coverage: the elementwise family + constant + cast + copy +
-//! axis reductions + the expression-carrying ops (iota, materialize,
-//! gather, scatter). The allow list stays honest by construction —
-//! search can only elect what this table generates.
+//! Entries are keyed by operation type because different types can share a label.
+//! Each operation's generator lives in `crate::ops` and produces CUDA source
+//! with fixed dimensions. Generation needs no GPU; `device` compiles and runs it.
 
 use anyhow::{Result, bail};
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
@@ -27,38 +16,25 @@ use luminal::layouts::{
 };
 use std::any::TypeId;
 
-/// Geometry + typing for one compute node, in plan order: operands
-/// (destination-last, the DPS convention), then destinations again as
-/// the write set. EVERYTHING here derives from the node's own
-/// [`SlotDescriptor`] layouts — this runtime's carried `DecodedLayout` per
-/// slot: dims are the layout's literal domain extents, dtypes its
-/// carried dtype fact, and EVERY read goes through the layout's own
-/// offset expression ([`layout_read_index`]) — unconditionally, with no
-/// predicate in front of it; a read whose expression simplifies to the
-/// bare `i` is emitted as `a[i]` because that is what it became. The
-/// hop-chain
-/// machinery is fully retired (corrected contract, 2026-08-31): the
-/// e-graph mints every view's composed layout at view creation, and the
-/// runtime's decoded `L` IS the read path.
+/// Shapes, data types, and read layouts for one compute node.
+///
+/// Operands follow plan order, with destinations last. Destinations are also
+/// listed separately. All metadata comes from the node's [`SlotDescriptor`]
+/// layouts, and all reads use [`layout_read_index`].
 #[derive(Debug)]
 pub struct CodegenCtx {
     pub operand_dims: Vec<Vec<usize>>,
     pub operand_dtypes: Vec<PlanDtype>,
     pub dest_dims: Vec<Vec<usize>>,
     pub dest_dtypes: Vec<PlanDtype>,
-    /// Per-operand slot layouts, parallel to `operand_dims` — each
-    /// operand's OWN elected layout as the runtime's decoder minted it
-    /// (for a folded operand, the view's COMPOSED layout, addressing
-    /// the residence's bytes directly).
+    /// Read layouts in the same order as `operand_dims`.
+    /// View layouts include the full mapping to the underlying buffer.
     pub operand_layouts: Vec<DecodedLayout>,
 }
 
 impl CodegenCtx {
-    /// Build codegen geometry from the compute node's own slot
-    /// descriptors — never the shared buffer table. Dims and dtypes come
-    /// from each slot's carried layout (the layout's DOMAIN is the
-    /// value's shape); loud on symbolic extents or a missing dtype fact,
-    /// never a guess.
+    /// Read shapes and data types from the node's slot layouts.
+    /// Return an error for symbolic dimensions or missing data types.
     pub fn from_descriptors(
         label: &str,
         operand_info: &[SlotDescriptor<DecodedLayout>],
@@ -78,43 +54,10 @@ impl CodegenCtx {
             .iter()
             .map(|s| dims_of(s, "dest"))
             .collect::<Result<_>>()?;
-        // =================================================================
-        // NO WRITE FENCE HERE (ruling 2026-09-01). This is the record.
-        //
-        // What was checked: every kernel in this runtime writes `out[i]`,
-        // so a destination is only written where it belongs if its
-        // elected layout's index function IS the flat index over the
-        // dest dims. Result slots (and the DPS dest operand slots in the
-        // elementwise / reduce / gather / scatter / materialize
-        // templates) were checked against exactly that, and a strided,
-        // transposed, or offset destination was refused loudly:
-        // "strided writes are not lowered (dests stay dense
-        // out-of-place; CL-4b)".
-        //
-        // Why it went. Austin, 2026-09-01: "This is something that needs
-        // to be expressed in egglog by matching only only to right major
-        // contiguous layouts ouputs or something, we should not have it
-        // in the codebase here. delete it." The constraint is real; its
-        // HOME is the rewrite that elects the destination layout, not a
-        // re-check in the backend after the fact.
-        //
-        // THE CONSTRAINT LANDED same day (ruling: op-match side, "only
-        // do the code gen'd kernels"). Every codegen'd kernel's egglog
-        // match rule now fires only when the out class carries the
-        // right-major contiguous spelling —
-        // `(= ?out_layout (RightMajorContiguousElementLayoutLit ...))`
-        // in every `ops/*/match_functional.egg` — so a non-dense
-        // destination is UNELECTABLE, not merely unfenced. Exempt by
-        // ruling: the view op (writes nothing; its out layout is
-        // required to be the composed spelling) and cuBLASLt ("that has
-        // their own rules"; `bind_destination` refuses loudly at the
-        // host-call layer). `tests/view_admission.rs` asserts of every
-        // elected compute result that its layout IS the flat index —
-        // that assertion is this constraint's regression test.
-        //
-        // Reading the plan's elected destination layout to re-check it
-        // here is exactly what was ruled out; do not reintroduce it.
-        // =================================================================
+        // Kernels write `out[i]`. The rules in `ops/*/match_functional.egg`
+        // require contiguous row-major destinations; enforce this there, not here.
+        // Views write nothing, and cuBLASLt checks its own destination requirements.
+        // See `tests/view_admission.rs` for coverage.
         Ok(CodegenCtx {
             operand_dims: operand_info
                 .iter()
@@ -133,103 +76,22 @@ impl CodegenCtx {
         })
     }
 
-    /// The slot's layout. Every read goes through it — unconditionally.
-    /// There is no companion predicate asking whether it "needs" to be
-    /// lowered, because there is nothing to select between: the layout
-    /// IS the read, and whatever it simplifies to is what gets emitted.
+    /// Return the layout used to compute this operand's read indices.
     pub fn operand_layout(&self, slot: usize) -> &DecodedLayout {
         &self.operand_layouts[slot]
     }
 }
 
-// ===========================================================================
-// PROTOTYPE (Option B): reading operands through their SLOT LAYOUTS.
-//
-// The slot's own elected layout (`SlotDescriptor::layout`, the runtime's
-// decoded `DecodedLayout` — every spelling of the elected class) is the
-// ONE vocabulary for how a value
-// addresses its residence — for a folded operand it is the view's
-// COMPOSED layout, which the e-graph already minted (preamble view
-// BitOffset composition / native strided chains). The elementwise family
-// below lowers that layout's offset expression DIRECTLY, retiring the
-// per-slot hop chain for this family.
-//
-// NO RUNTIME BOUNDS TRAPS (ruling 2026-08-31). This runtime emits NO
-// `__trap()`. It once did, and the question was considered rather than
-// forgotten — this note is the record.
-//
-// What was checked, and where:
-//   * here in `layout_read_index`, per read: the flat element index
-//     against the layout's disclosed SPAN for the packed ladder
-//     (right-major / left-major / strided), and non-negativity alone for
-//     the offset-expression forms (`ElementOffset` / `BitOffset`, whose
-//     `SpanExpr` is deliberately unimplemented — an offset function does
-//     not say how far it reaches);
-//   * in the `BitOffset` arm: that the bit offset divides evenly by the
-//     element width, a mid-element bit offset having no element read;
-//   * in `ops::index_map_apply_materialize`: each mapped coordinate
-//     against the parent's extent;
-//   * in `ops::gather` / `ops::scatter`: each gathered/scattered
-//     coordinate against the indexed axis extent — these read from an
-//     index BUFFER, so they were the only DATA-derived checks;
-//   * in `ops::scatter`: injectivity, `atomicExch(&flags[flat],1u)!=0u`
-//     over a zeroed scratch buffer, catching two sources writing one
-//     destination element.
-//
-// Why they went. Austin, 2026-08-31: "in the cuda runtime, we should
-// have no traps. We can put them back in, later, with a flag or
-// something but for now lets get all __trap out of the cuda codegen."
-// On the individual checks: the span check is "legitimately useless"; a
-// negative offset "would be someone violating their contract, which is
-// ub and we shouldn't test for it in runtime"; the bit-divisibility
-// check "would also be indicative of a bug somewhere in our compiler,
-// which we would have to solve directly, vs having this test at runtime
-// in every kernel." The data-derived index checks went with them: an
-// out-of-range index in a user tensor is UB at this layer, not a
-// diagnosed error.
-//
-// The consequence, stated plainly: an out-of-range index — from a
-// mis-composed layout, a compiler bug, or an out-of-range value in a
-// user index tensor — is now an out-of-bounds device access, i.e.
-// undefined behaviour, not a diagnosed fault. Debug it with
-// `compute-sanitizer`, which sees what these checks used to.
-//
-// Restoring them belongs behind a feature flag (a `checked` cargo
-// feature gating the emission), not behind a runtime branch in every
-// thread of every kernel.
-// ===========================================================================
+// Reads use each slot's layout, including any view mappings.
+// Generated kernels do not check bounds, bit alignment, or duplicate scatter
+// indices. Invalid accesses cause undefined behavior; use `compute-sanitizer`
+// to debug them. Any future runtime checks should be enabled by a feature flag.
 
-// ===========================================================================
-// THE READ SIMPLIFIER — the only decision on the read path.
-//
-// RULING (Austin, 2026-08-31): "It always needs to emit a strided
-// expression? That strided expression might just simplify to a[i]. But
-// there should be no special casing. it should always go through the
-// expression pathway and should never be special cased."
-//
-// There is ONE read path: materialize the value's coordinates from the
-// flat thread index `i`, then evaluate the slot layout's own offset
-// expression at those coordinates. For a DENSE layout that whole
-// round trip is the identity — the coordinate decomposition and the
-// index recomposition cancel — and the kernel may read `a[i]` with no
-// coordinates materialized at all. That is a SIMPLIFICATION of the
-// expression, not a fork in front of it.
-//
-// What died here: `layout_is_direct`, which answered the same question
-// by matching the mirror CONSTRUCTOR (`RightMajor` and nothing else).
-// Its own doc comment admitted the hole — "a dense class decoding
-// otherwise takes the (correct, slower) expression read" — and a
-// decision made on a SPELLING is exactly what the e-graph is entitled
-// to break: every spelling in a layout class denotes ONE function, and
-// the decoder hands us whichever it finds. `layout_read_index` below
-// lowers the FUNCTION, and whatever it simplifies to is what is
-// emitted — there is no verdict to consult.
-// ===========================================================================
+// Simplify read offset expressions, regardless of how the layout is represented.
+// For row-major coordinates derived from `i`, an equivalent offset becomes `i`.
 
-/// An AFFINE form over a value's coordinates: `constant + Σ coeffs[axis]
-/// * c{axis}`, `coeffs` FRONT-indexed and exactly `rank` long. This is a
-/// canonical form, not a spelling: two layouts denoting the same affine
-/// function reduce to the same `Affine` however they are written.
+/// An offset of the form `constant + Σ coeffs[axis] * c{axis}`.
+/// There is one coefficient per axis, numbered from the first dimension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Affine {
     constant: i64,
@@ -251,7 +113,7 @@ impl Affine {
         }
     }
 
-    /// The unit form for one FRONT axis: `c{axis}`.
+    /// The coordinate `c{axis}`, with axes numbered from the first dimension.
     fn coord(axis: usize, rank: usize) -> Self {
         let mut coeffs = vec![0; rank];
         coeffs[axis] = 1;
@@ -261,7 +123,7 @@ impl Affine {
         }
     }
 
-    /// `constant + Σ strides[axis] * c{axis}` with `constant = 0`.
+    /// Build `Σ strides[axis] * c{axis}` with a zero constant.
     fn from_strides(strides: &[usize]) -> Option<Self> {
         Some(Affine {
             constant: 0,
@@ -272,13 +134,13 @@ impl Affine {
         })
     }
 
-    /// The whole form, if it is coordinate-independent.
+    /// Return the constant if every coordinate coefficient is zero.
     fn as_constant(&self) -> Option<i64> {
         self.coeffs.iter().all(|&c| c == 0).then_some(self.constant)
     }
 
-    /// Overflow is treated as "not analyzable" (`None`) — the caller
-    /// then takes the general expression read, which is always correct.
+    /// Add two offsets. Return `None` on overflow so codegen uses the
+    /// original expression.
     fn add(self, other: Self) -> Option<Self> {
         Some(Affine {
             constant: self.constant.checked_add(other.constant)?,
@@ -302,12 +164,8 @@ impl Affine {
         })
     }
 
-    /// Division that is EXACT on every term — the only division an
-    /// affine form survives. `(6*c0 + 2*c1) / 2` is `3*c0 + c1`;
-    /// `(3*c0) / 2` is not affine and gives `None`. Exactness is what
-    /// makes this sound for truncating division at any sign: if every
-    /// term divides evenly then the whole value is `k * (affine)` and
-    /// truncation never rounds.
+    /// Divide every term by `k` without rounding.
+    /// Return `None` if any term is not divisible by `k`, or division overflows.
     fn exact_div(self, k: i64) -> Option<Self> {
         if k == 0 || self.constant % k != 0 || self.coeffs.iter().any(|c| c % k != 0) {
             return None;
@@ -323,12 +181,9 @@ impl Affine {
     }
 }
 
-/// Reduce one mirror term to an affine form over the value's `rank`
-/// coordinates. `None` means "not an affine function of the
-/// coordinates" — symbolic vars, coordinate-dependent products,
-/// inexact division, remainder, min/max, the bool bridge — and a `None`
-/// anywhere simply means the general expression read is emitted, which
-/// is always correct. Nothing here inspects a layout constructor.
+/// Try to express an integer expression as a constant plus weighted coordinates.
+/// Return `None` for unsupported expressions or overflow; codegen then uses
+/// the original expression.
 fn affine_of_term(expr: &luminal::layouts::IntExprTerm, rank: usize) -> Option<Affine> {
     use luminal::layouts::IntExprTerm as T;
     match expr {
@@ -344,8 +199,7 @@ fn affine_of_term(expr: &luminal::layouts::IntExprTerm, rank: usize) -> Option<A
             match (a.as_constant(), b.as_constant()) {
                 (Some(k), _) => b.scale(k),
                 (_, Some(k)) => a.scale(k),
-                // A product of two coordinate-dependent forms is not
-                // affine — no simplification, take the expression read.
+                // Multiplying two coordinate-dependent expressions cannot be simplified here.
                 _ => None,
             }
         }
@@ -361,23 +215,15 @@ fn affine_of_term(expr: &luminal::layouts::IntExprTerm, rank: usize) -> Option<A
     }
 }
 
-/// The slot layout's READ FUNCTION, reduced to an affine form over the
-/// value's coordinates — one `Affine` per spelling, never a
-/// classification of the spelling itself. The layout's own domain must
-/// be literal and equal `dims` (its domain IS the value's shape); a
-/// foreign domain is a planner/decoder incoherence and is refused
-/// downstream, so it yields `None` here rather than a read.
-///
-/// THE PREFERENCE IS THIS CALL SITE'S, and it is stated here: all
-/// spellings of a class denote one function, so the codegen asks first
-/// for the most structured one, which yields the simplest C. Nobody
-/// else's decoder chooses for it.
+/// Try to express the layout's read offset as a constant plus weighted coordinates.
+/// The layout must have fixed dimensions equal to `dims`. Prefer contiguous
+/// layouts, then strided layouts, then explicit offset expressions.
 fn read_affine(layout: &DecodedLayout, dims: &[usize]) -> Option<Affine> {
     let rank = dims.len();
     if layout.literal_extents().as_deref() != Some(dims) {
         return None;
     }
-    // The packed ladder states its strides structurally.
+    // Contiguous layouts provide strides directly.
     if layout.has::<RM>() {
         Affine::from_strides(&strides_of(dims))
     } else if layout.has::<LM>() {
@@ -386,7 +232,7 @@ fn read_affine(layout: &DecodedLayout, dims: &[usize]) -> Option<Affine> {
             strides[axis] = strides[axis - 1] * dims[axis - 1];
         }
         Affine::from_strides(&strides)
-    // The expression forms state it as a term.
+    // Other layouts provide offset expressions.
     } else if let Some(st) = layout.first::<ST>() {
         st.chain.iter().try_fold(Affine::zero(rank), |acc, s| {
             acc.add(affine_of_term(s, rank)?)
@@ -400,10 +246,9 @@ fn read_affine(layout: &DecodedLayout, dims: &[usize]) -> Option<Affine> {
     }
 }
 
-/// Lower a mirror-layout [`IntExprTerm`] to a C expression over
-/// `long long`, coordinates spelled `{prefix}{front_index}`
-/// (`Coord{axis_from_end}` reads `{prefix}{rank-1-axis_from_end}`).
-/// Symbolic vars bail loudly (no numeric codegen for symbolic layouts).
+/// Convert a layout integer expression to C using `long long`.
+/// Coordinates use `{prefix}{axis}`, numbered from the first dimension.
+/// Return an error for symbolic variables or invalid coordinate axes.
 fn lower_layout_term(
     expr: &luminal::layouts::IntExprTerm,
     rank: usize,
@@ -430,9 +275,7 @@ fn lower_layout_term(
         T::TruncDiv(a, b) => format!("({} / {})", rec(a)?, rec(b)?),
         T::TruncRem(a, b) => format!("({} % {})", rec(a)?, rec(b)?),
         T::CeilDiv(a, b) => {
-            // PROTOTYPE: minted layouts have not needed CeilDiv in a
-            // lowered read yet; refuse rather than guess a negative-
-            // operand convention.
+            // CeilDiv is unsupported until its behavior for negative operands is defined.
             let (_, _) = (rec(a)?, rec(b)?);
             bail!("layout read: IntCeilDiv lowering not implemented (fail-closed)")
         }
@@ -450,28 +293,11 @@ fn lower_layout_term(
     })
 }
 
-/// WHERE THE READ COORDINATES CAME FROM — a fact the CALLER owns and
-/// the layout cannot know.
+/// How the caller computed the coordinates used by [`layout_read_index`].
 ///
-/// [`layout_read_index`] emits an index expression over coordinates
-/// `{prefix}0..{prefix}{rank-1}`. Whether that expression can be
-/// SIMPLIFIED to the kernel's flat thread index `i` depends entirely on
-/// how those coordinates were bound:
-///
-///  * [`Coords::FlatIndex`] — the kernel decomposed `i` into these
-///    coordinates row-major over these very `slot_dims`, so
-///    `i == Σ strides[axis] * {prefix}{axis}` holds identically. An
-///    index expression that reduces to that same sum IS `i`, and is
-///    emitted as `i`.
-///  * [`Coords::Bound`] — the coordinates are values the kernel
-///    computed (gathered indices, a parent's coordinates, a reduction's
-///    outer/inner/loop split). No relation to `i` holds, so nothing
-///    simplifies to it and the full expression is always emitted.
-///
-/// This is NOT a layout classification: the same layout yields `i` under
-/// `FlatIndex` and a full sum under `Bound`, because the two are
-/// different functions of different variables. Getting it wrong is a
-/// miscompile, which is why the caller must say.
+/// `FlatIndex` means row-major coordinates derived from `i` over `slot_dims`;
+/// a matching layout offset can simplify to `i`. `Bound` means independently
+/// computed coordinates, so codegen keeps the full offset expression.
 #[derive(Debug, Clone, Copy)]
 pub enum Coords<'a> {
     FlatIndex { prefix: &'a str },
@@ -486,40 +312,28 @@ impl<'a> Coords<'a> {
     }
 }
 
-/// Lower one operand's SLOT LAYOUT to C statements computing its flat
-/// element read index at the current coordinates
-/// `{prefix}0..{prefix}{rank-1}` (front-indexed). Returns
-/// `(code, index_expr)`; the statements bind `{operand}_idx` and nothing
-/// else — no bounds check is emitted, deliberately (see the NO RUNTIME
-/// BOUNDS TRAPS note above for what used to be here and why). The
-/// layout's own domain (its shape) must be LITERAL and equal the slot's
-/// value dims — a foreign-domain layout is a planner/decoder
-/// incoherence and refuses loudly.
+/// Generate C code and an element index for reading an operand's layout.
+/// Coordinates use the supplied prefix, with axes numbered from the first dimension.
+/// The layout must have fixed dimensions equal to `slot_dims`.
 ///
-/// THIS IS THE ONLY READ PATH, and there is no predicate in front of it.
-/// When `coords` is [`Coords::FlatIndex`] and the layout's index
-/// function reduces to the flat index over those same dims, the returned
-/// expression is the literal `i` and the returned code is EMPTY — not
-/// because a fast path was selected, but because that is what the
-/// expression simplified to. Callers emit `name[<expr>]` unconditionally.
+/// Return `(code, index_expr)`. If a `FlatIndex` offset simplifies to `i`,
+/// return empty code and `"i"`. No runtime bounds checks are generated.
 pub fn layout_read_index(
     operand: &str,
     layout: &DecodedLayout,
     slot_dims: &[usize],
     coords: Coords<'_>,
 ) -> Result<(String, String)> {
-    // EXPRESSION SIMPLIFICATION (not a fork): if these coordinates are
-    // `i` decomposed over `slot_dims`, then `i == Σ strides*c`, and an
-    // index function equal to that sum is literally `i`.
+    // If the offset equals the row-major index used to compute these
+    // coordinates, replace it with `i`.
     if let Coords::FlatIndex { .. } = coords
         && let Some(affine) = read_affine(layout, slot_dims)
     {
         let strides = strides_of(slot_dims);
         let is_flat_index = affine.constant == 0
             && (0..slot_dims.len()).all(|axis| {
-                // An extent-1 axis pins its coordinate to 0, so its
-                // coefficient is unobservable — a fact about the
-                // function, not a licence.
+                // A size-one axis always has coordinate zero, so its coefficient
+                // can be ignored.
                 slot_dims[axis] == 1 || i64::try_from(strides[axis]) == Ok(affine.coeffs[axis])
             });
         if is_flat_index {
@@ -546,12 +360,8 @@ pub fn layout_read_index(
         }
         Ok(())
     };
-    // The flat element offset expression. No bound travels with it: see
-    // the NO RUNTIME BOUNDS TRAPS note above.
-    // THE PREFERENCE IS THIS CALL SITE'S (same order as `read_affine`):
-    // every spelling of the class denotes one function, and this codegen
-    // asks for the one it emits the simplest C for. A class holding none
-    // of them is a capability refusal, not a guess.
+    // Use the same layout preference as `read_affine`.
+    // Return an error if no supported representation is available.
     let offset: String = if let Some(rm) = layout.first::<RM>() {
         check_domain(&rm.shape)?;
         let strides = strides_of(slot_dims);
@@ -596,11 +406,8 @@ pub fn layout_read_index(
         check_domain(&bo.shape)?;
         let bits = lower_layout_term(&bo.offset, rank, in_prefix)?;
         let width = bo.width.0;
-        // Bit form: element index = bit offset / width. The bit
-        // offset's divisibility by the element width is a COMPILER
-        // invariant (a mid-element bit offset has no element read) —
-        // it used to be re-derived at runtime in every thread; see
-        // the NO RUNTIME BOUNDS TRAPS note above for why it is not.
+        // Convert the bit offset to an element index. The compiler must
+        // ensure the offset is divisible by the element width.
         let bits_var = format!("{operand}_bits");
         let code = format!(
             "    long long {bits_var} = {bits};\n    long long {idx} = {bits_var} / {width}LL;\n"
@@ -616,16 +423,8 @@ pub fn layout_read_index(
     Ok((format!("    long long {idx} = {offset};\n"), idx))
 }
 
-/// One generated launch: entry name is always `k`; `n` is the launch
-/// size (one thread per index). Every launch takes the same argument
-/// list — the op's inputs, then `out`, then `n`.
-///
-/// There was once a `scratch_bytes` field asking the executor for a
-/// zero-initialized device scratch buffer (passed before `out`), with
-/// exactly one user: scatter's injectivity `flags`. That check went with
-/// the rest of the traps (2026-08-31), leaving the scratch facility with
-/// no caller, so it went too rather than sit unexercised — restore it
-/// alongside the check.
+/// CUDA source for one launch of kernel `k`, with `n` threads.
+/// Arguments are the operation's inputs, followed by `out` and `n`.
 #[derive(Debug)]
 pub struct KernelSource {
     pub source: String,
@@ -638,9 +437,8 @@ impl KernelSource {
     }
 }
 
-/// An op lowers to an ordered launch SEQUENCE on one stream (stream
-/// order makes multi-phase ops race-free: scatter = init-copy then
-/// scattered writes).
+/// An operation's code generator. Its kernels run in order on one stream;
+/// for example, scatter copies the input before writing updates.
 pub struct CudaKernel {
     pub label: &'static str,
     pub op_type: TypeId,
@@ -658,8 +456,7 @@ fn row<T: 'static>(
     }
 }
 
-/// CUDA scalar type for a plan dtype. CL-1 covers the reference
-/// executor's own executable set; everything else refuses loudly.
+/// Return the CUDA scalar type, or an error for unsupported data types.
 pub(crate) fn cuda_type(dtype: PlanDtype) -> Result<&'static str> {
     Ok(match dtype {
         PlanDtype::F32 => "float",
@@ -670,26 +467,10 @@ pub(crate) fn cuda_type(dtype: PlanDtype) -> Result<&'static str> {
     })
 }
 
-/// An `f64` as a C token NVRTC will actually parse. Rust's `Display`
-/// for `f64` is not a C literal syntax: non-finite values print as
-/// `inf`/`-inf`/`NaN`, which are not C tokens at all, and a
-/// large-magnitude finite value prints as a bare digit string with no
-/// decimal point and no exponent — `f32::MIN as f64` becomes
-/// `-340282346638528860000000000000000000000`, which C reads as an
-/// *integer* literal too large for any integer type, and the kernel
-/// fails to compile. `{:e}` closes the finite case: it is the shortest
-/// round-trip form and always carries an exponent, so it is always a
-/// `double` literal.
-///
-/// The non-finite cases go through bit patterns rather than the
-/// `INFINITY`/`NAN` macros because this runtime compiles kernels with
-/// NVRTC (`cudarc::nvrtc::compile_ptx`, see `device.rs`), which has no
-/// host math headers, so those macros do not exist there. This function
-/// is the ONLY place in the crate where a non-finite literal is spelled:
-/// every emitter that needs one calls it, including the `-inf` seed of
-/// the reduction identity in [`crate::ops::reduce_max`]. The bit patterns
-/// are `float`-typed; the caller's existing `({to})` cast converts to the
-/// destination type exactly as it does for a finite literal.
+/// Format a number as a CUDA expression accepted by NVRTC.
+/// Finite values use scientific notation so C parses them as floating point.
+/// NaN and infinities use float bit patterns because NVRTC lacks host math
+/// headers. Callers cast the result to the destination type.
 pub(crate) fn cuda_f64_literal(v: f64) -> String {
     if v.is_nan() {
         return "__uint_as_float(0x7fc00000u)".to_string();
@@ -708,10 +489,7 @@ pub(crate) fn numel(dims: &[usize]) -> usize {
     dims.iter().product()
 }
 
-/// `out[i] = <expr of a[i], b[i]>` over the destination's numel. Both
-/// operands go through the ONE read path ([`elementwise`]); a read whose
-/// layout expression simplifies to the identity stays the literal
-/// `a[i]`.
+/// Generate a two-input elementwise kernel, reading each input through its layout.
 pub(crate) fn binary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
     let [a, b, _dest] = ctx.operand_dtypes.as_slice() else {
         bail!(
@@ -725,8 +503,7 @@ pub(crate) fn binary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> 
     elementwise(ctx, expr, &["a", "b"], &sig, to)
 }
 
-/// `out[i] = <expr of a[i]>` over the destination's numel — the same
-/// one read path as [`binary`], one operand.
+/// Generate a one-input elementwise kernel, reading the input through its layout.
 pub(crate) fn unary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
     let ta = cuda_type(ctx.operand_dtypes[0])?;
     let to = cuda_type(ctx.dest_dtypes[0])?;
@@ -734,34 +511,16 @@ pub(crate) fn unary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
     elementwise(ctx, expr, &["a"], &sig, to)
 }
 
-// RULING 2026-08-27: the Phase-5 `copy_through_fold` lowering is DELETED —
-// a BufferCopy is only ever a dumb whole-buffer memcpy. A copy
-// materialized into a specific layout is a LayoutTensor candidate in the
-// e-graph (the materialize kernel), discovered via search, never a copy
-// mode.
+// BufferCopy copies whole buffers. Layout conversions use materialize kernels
+// selected by egglog rules.
 
-/// THE elementwise read path — there is no other one. One thread per
-/// OUT element; every named operand is read at
-/// `name[f(out_coords)]`, where `f` is that operand's own slot layout
-/// lowered by [`layout_read_index`] over the out-coordinate prelude.
+/// Generate one thread per output element, reading inputs through their layouts.
+/// The template must refer to each input as `name[i]`; these tokens are replaced
+/// with the indices from [`layout_read_index`]. Omit coordinate calculations
+/// when every read simplifies to `name[i]`.
 ///
-/// THE SIMPLIFICATION (rulings 2026-08-31, 2026-09-01). Every operand
-/// is lowered; none is diverted. [`layout_read_index`] returns an index
-/// EXPRESSION, and when the operand's coordinates are `i` decomposed
-/// (they are here) and its layout's index function IS that same flat
-/// index, the expression it returns is the bare `i` and it emits no
-/// chain. So `name[i]` stays `name[i]` — not because a predicate chose
-/// the flat path, but because the expression is `i`. If no operand
-/// needed a coordinate the prelude is dead code and drops out, which is
-/// what the byte-identity pin observes.
-///
-/// Contract with the op-module exprs: the template expr reads operand
-/// `name` exactly as the literal token `name[i]`, rewritten here to
-/// `name[{name}_idx]` when the read does not simplify.
-///
-/// The DPS dest slot (the operand slot after the named reads) must
-/// write at the identity index: strided WRITES are CL-4b and refuse
-/// loudly.
+/// Inputs must match the output shape. Egglog rules require contiguous
+/// row-major destinations.
 fn elementwise(
     ctx: &CodegenCtx,
     expr: &str,
@@ -771,16 +530,8 @@ fn elementwise(
 ) -> Result<Vec<KernelSource>> {
     let out_dims = &ctx.dest_dims[0];
     let n = numel(out_dims);
-    // The DPS dest operand slots (everything past the named reads) are
-    // NOT fenced here — see the write-fence record in
-    // `CodegenCtx::from_descriptors`. Their constraint belongs to the
-    // rewrite that elects them.
-    // An elementwise operand VALUE spans the out iteration space, so its
-    // own extents must be the dest's — asked of EVERY named operand,
-    // whatever its layout spells. (It used to be asked only of operands
-    // that took the expression read, which made a coherence check
-    // spelling-dependent: a dense-but-strided operand answered it and a
-    // right-major one of the same wrong shape did not.)
+    // Every input must match the output shape, regardless of its layout.
+    // Destination layout requirements are enforced by egglog rules.
     for (k, name) in names.iter().enumerate() {
         if &ctx.operand_dims[k] != out_dims {
             bail!(
@@ -794,11 +545,8 @@ fn elementwise(
     let mut chains = String::new();
     let mut rendered = expr.to_string();
     for (k, name) in names.iter().enumerate() {
-        // EVERY named operand is lowered. An operand whose index
-        // expression simplifies to `i` returns empty code and the
-        // expression `i`, so the rewrite below is `name[i]` -> `name[i]`
-        // and contributes no chain — the flat read falls out of the
-        // simplification, it is not selected.
+        // Replace each input read with its layout index. When the index
+        // simplifies to `i`, the read stays unchanged.
         let layout = ctx.operand_layout(k);
         let (code, idx) =
             layout_read_index(name, layout, out_dims, Coords::FlatIndex { prefix: "c" })?;
@@ -810,10 +558,7 @@ fn elementwise(
         rendered = rendered.replace(&flat, &format!("{name}[{idx}]"));
     }
     if chains.is_empty() {
-        // No operand's expression referenced a coordinate, so the
-        // prelude would be dead code. Emitting it is harmless but noisy;
-        // dropping it is dead-code elimination on the generated text,
-        // not a second emission strategy.
+        // All reads use `i`, so no coordinate calculations are needed.
         let source = format!(
             r#"extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -833,8 +578,8 @@ fn elementwise(
     Ok(vec![KernelSource::plain(source, n)])
 }
 
-/// Axis reduction, axis zero-based FROM THE END (the DPS convention).
-/// One thread per output element; the reduced extent is looped.
+/// Generate a reduction with one thread per output element, looping over
+/// the reduced axis. Axis 0 is the last input dimension.
 pub(crate) fn reduce(
     ctx: &CodegenCtx,
     axis_from_end: usize,
@@ -849,30 +594,16 @@ pub(crate) fn reduce(
     }
     let axis = in_dims.len() - 1 - axis_from_end;
     let extent = in_dims[axis];
-    // Row-major strides of the input; the output walks the same dims
-    // with the reduced axis removed.
+    // Count the input elements before and after the reduced axis.
     let inner: usize = in_dims[axis + 1..].iter().product();
     let outer: usize = in_dims[..axis].iter().product();
     let n = outer * inner;
-    // There is ONE reduce body. A dense input once took a hand-written
-    // address here (`a[outer*extent*inner + r*inner + inner]`) selected
-    // by a predicate — a second emission strategy, which is exactly what
-    // the 2026-09-01 ruling removes. The expression path below computes
-    // that same address from the input's own layout.
-    //
-    // The input's flat address is the layout's own offset expression
-    // evaluated at the INPUT VALUE's coordinates `c0..c{rank-1}` —
-    // rebuilt here from the outer/inner decomposition plus the loop's
-    // own `r` at the reduced axis. Those coordinates are NOT `i`
-    // decomposed (`i` indexes the OUT space, which is one axis smaller),
-    // so this read is `Coords::Bound` and never simplifies to `i`.
-    //
-    // The dest operand slots are not fenced — see the write-fence record
-    // in `CodegenCtx::from_descriptors`.
+    // Input coordinates combine the output position with the reduction
+    // loop index. Use `Coords::Bound`: the input offset cannot simplify
+    // to `i`, which indexes the smaller output shape.
     let layout = ctx.operand_layout(0);
-    // Coordinates OUTSIDE the reduced axis are loop-invariant: decompose
-    // `inner` then `outer` (row-major, innermost axis first) before the
-    // loop; `c{axis}` is the loop variable.
+    // Compute coordinates outside the reduced axis once before the loop.
+    // The loop variable supplies `c{axis}`.
     let mut coords = String::from("    unsigned long long rem = inner;\n");
     for ax in ((axis + 1)..in_dims.len()).rev() {
         coords.push_str(&format!(
@@ -888,7 +619,7 @@ pub(crate) fn reduce(
         ));
     }
     let (chain, idx) = layout_read_index("a", layout, in_dims, Coords::Bound { prefix: "c" })?;
-    // Re-indent the chain into the loop body.
+    // Indent the generated index code inside the loop.
     let chain = chain.replace("    ", "        ");
     let source = format!(
         r#"extern "C" __global__ void k(const {ta}* a, {to}* out, unsigned long long n) {{
@@ -908,18 +639,14 @@ pub(crate) fn reduce(
     Ok(vec![KernelSource::plain(source, n)])
 }
 
-/// Lower an [`IotaExpr`] to a C expression over `long long`, with OUT
-/// coordinates available as `c0..c{rank-1}` (front-indexed, matching
-/// the reference evaluator: `Coord(axis_from_end)` reads
-/// `c[rank-1-axis_from_end]`).
+/// Convert an [`IotaExpr`] to C using `long long` and coordinates `c0..c{rank-1}`.
+/// `Coord(axis_from_end)` reads `c{rank-1-axis_from_end}`.
 pub(crate) fn lower_expr(expr: &IotaExpr, rank: usize) -> Result<String> {
     lower_expr_pref(expr, rank, "c")
 }
 
-/// [`lower_expr`] with a caller-chosen coordinate variable prefix:
-/// `Coord(axis_from_end)` reads `{prefix}{rank-1-axis_from_end}`. The
-/// composed-access chain uses this to evaluate hop `k+1`'s entries at
-/// hop `k`'s outputs (`{operand}_h{k}_{m}`) instead of `c{m}`.
+/// Like [`lower_expr`], with a caller-supplied coordinate prefix.
+/// `Coord(axis_from_end)` reads `{prefix}{rank-1-axis_from_end}`.
 pub(crate) fn lower_expr_pref(expr: &IotaExpr, rank: usize, prefix: &str) -> Result<String> {
     let rec = |e: &IotaExpr| lower_expr_pref(e, rank, prefix);
     Ok(match expr {
@@ -952,8 +679,7 @@ pub(crate) fn lower_expr_pref(expr: &IotaExpr, rank: usize, prefix: &str) -> Res
     })
 }
 
-/// The row-major coordinate prelude: decompose flat `i` into
-/// `c0..c{rank-1}` over `dims` (front-indexed).
+/// Generate row-major coordinates `c0..c{rank-1}` from flat index `i`.
 pub(crate) fn coord_prelude(dims: &[usize]) -> String {
     let mut out = String::from("    unsigned long long rem = i;\n");
     for axis in (0..dims.len()).rev() {
@@ -965,7 +691,7 @@ pub(crate) fn coord_prelude(dims: &[usize]) -> String {
     out
 }
 
-/// Row-major strides for dims.
+/// Return row-major strides for `dims`.
 pub(crate) fn strides_of(dims: &[usize]) -> Vec<usize> {
     let mut strides = vec![1usize; dims.len()];
     for k in (0..dims.len().saturating_sub(1)).rev() {
@@ -974,8 +700,8 @@ pub(crate) fn strides_of(dims: &[usize]) -> Vec<usize> {
     strides
 }
 
-/// The table. Alloc/free are handled structurally by the executor
-/// (real device alloc/free), not by codegen rows.
+/// Return the CUDA kernel registry. The executor handles buffer allocation
+/// and freeing separately.
 pub fn cuda_kernels() -> &'static [CudaKernel] {
     use crate::ops;
     use std::sync::OnceLock;
@@ -1020,7 +746,7 @@ pub fn cuda_kernels() -> &'static [CudaKernel] {
     })
 }
 
-/// Codegen lookup by concrete op type.
+/// Find a code generator by the operation's concrete Rust type.
 pub fn codegen_for(op: &dyn BufferTensorIrOp) -> Option<&'static CudaKernel> {
     let ty = op.as_any().type_id();
     cuda_kernels().iter().find(|k| k.op_type == ty)
