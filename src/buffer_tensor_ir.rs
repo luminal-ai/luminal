@@ -773,29 +773,29 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                         // nothing — the parent copy IS the view's
                         // initializing write, and view and copy must share
                         // storage).
-                        if let Some(root) = view_root.get(&operands[operand].value).cloned() {
-                            if op.op.result_writes_memory(result) {
-                                let id = BufferId::Allocated(next_alloc);
-                                next_alloc += 1;
-                                buffers.insert(
-                                    id.clone(),
-                                    Buffer {
-                                        id: id.clone(),
-                                        access: Access::ReadWrite,
-                                        freed_by: crate::layout_ir::FreedBy::Program,
-                                        owner: crate::bufferize::Owner::System,
-                                        label: "view-repair".to_string(),
-                                        lit: None,
-                                        // The base-storage copy lands the
-                                        // fold ROOT's bytes here: the
-                                        // buffer backs the root, whose
-                                        // layout sizes it (parent-shaped).
-                                        backs: root.clone(),
-                                        layout: layout_of(&root)?,
-                                    },
-                                );
-                                target = id;
-                            }
+                        if let Some(root) = view_root.get(&operands[operand].value).cloned()
+                            && op.op.result_writes_memory(result)
+                        {
+                            let id = BufferId::Allocated(next_alloc);
+                            next_alloc += 1;
+                            buffers.insert(
+                                id.clone(),
+                                Buffer {
+                                    id: id.clone(),
+                                    access: Access::ReadWrite,
+                                    freed_by: crate::layout_ir::FreedBy::Program,
+                                    owner: crate::bufferize::Owner::System,
+                                    label: "view-repair".to_string(),
+                                    lit: None,
+                                    // The base-storage copy lands the
+                                    // fold ROOT's bytes here: the
+                                    // buffer backs the root, whose
+                                    // layout sizes it (parent-shaped).
+                                    backs: root.clone(),
+                                    layout: layout_of(&root)?,
+                                },
+                            );
+                            target = id;
                         }
                         let src = operands[operand].clone();
                         let dst = BufferTensor {
@@ -1071,16 +1071,16 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                     // hangs off that copy (the view itself has no residence
                     // node in the escaping buffer; the fold re-roots at
                     // lowering).
-                    if let Some(root) = view_root.get(&tensor.value) {
-                        if let Some(&from) = producer.get(&(root.clone(), tensor.buffer.clone())) {
-                            dag.add_edge(
-                                from,
-                                out,
-                                BtEdge::Data {
-                                    value: tensor.value.clone(),
-                                },
-                            );
-                        }
+                    if let Some(root) = view_root.get(&tensor.value)
+                        && let Some(&from) = producer.get(&(root.clone(), tensor.buffer.clone()))
+                    {
+                        dag.add_edge(
+                            from,
+                            out,
+                            BtEdge::Data {
+                                value: tensor.value.clone(),
+                            },
+                        );
                     }
                 }
             }

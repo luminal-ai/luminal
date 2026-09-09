@@ -369,12 +369,11 @@ impl IntegerExpression {
         // Early exit for ((M*X)+N) pattern where M and N are integers, X is var
         {
             let terms = self.terms.read();
-            if terms.len() == 5 {
-                if let (Term::Num(_), Term::Var(_), Term::Num(_), Term::Mul, Term::Add) =
+            if terms.len() == 5
+                && let (Term::Num(_), Term::Var(_), Term::Num(_), Term::Mul, Term::Add) =
                     (terms[0], terms[1], terms[2], terms[3], terms[4])
-                {
-                    return self;
-                }
+            {
+                return self;
             }
         }
 
@@ -394,10 +393,10 @@ impl IntegerExpression {
         egglog_simplify_with_intervals(self, intervals)
     }
     pub fn as_num(&self) -> Option<i64> {
-        if let Term::Num(n) = self.terms.read()[0] {
-            if self.terms.read().len() == 1 {
-                return Some(n);
-            }
+        if let Term::Num(n) = self.terms.read()[0]
+            && self.terms.read().len() == 1
+        {
+            return Some(n);
         }
         None
     }
@@ -927,16 +926,14 @@ impl<E: Into<IntegerExpression>> Add<E> for IntegerExpression {
         // 11 in `(11*16) + rest`) and folding Y into it corrupts the value.
         if let Some(z) = rhs.as_num() {
             let self_terms = self.terms.read();
-            if self_terms.last() == Some(&Term::Add) {
-                if let Some(&Term::Num(n)) = self_terms.first() {
-                    if leading_num_is_top_add_operand(&self_terms[..self_terms.len() - 1]) {
-                        if let Some(folded) = n.checked_add(z) {
-                            let mut new_terms = self_terms.clone();
-                            new_terms[0] = Term::Num(folded);
-                            return IntegerExpression::new(new_terms);
-                        }
-                    }
-                }
+            if self_terms.last() == Some(&Term::Add)
+                && let Some(&Term::Num(n)) = self_terms.first()
+                && leading_num_is_top_add_operand(&self_terms[..self_terms.len() - 1])
+                && let Some(folded) = n.checked_add(z)
+            {
+                let mut new_terms = self_terms.clone();
+                new_terms[0] = Term::Num(folded);
+                return IntegerExpression::new(new_terms);
             }
         }
 
@@ -980,10 +977,10 @@ impl<E: Into<IntegerExpression>> Mul<E> for IntegerExpression {
         if rhs == 0 || self == 0 {
             return 0.into();
         }
-        if let (Some(a), Some(b)) = (self.as_num(), rhs.as_num()) {
-            if let Some(c) = a.checked_mul(b) {
-                return c.into();
-            }
+        if let (Some(a), Some(b)) = (self.as_num(), rhs.as_num())
+            && let Some(c) = a.checked_mul(b)
+        {
+            return c.into();
         }
         let mut terms = rhs.terms.read().clone();
         terms.extend(self.terms.read().iter().copied());
@@ -1005,12 +1002,11 @@ impl<E: Into<IntegerExpression>> Div<E> for IntegerExpression {
         if self == 0 {
             return 0.into();
         }
-        if let (Some(a), Some(b)) = (self.as_num(), rhs.as_num()) {
-            if a % b == 0 {
-                if let Some(c) = a.checked_div(b) {
-                    return c.into();
-                }
-            }
+        if let (Some(a), Some(b)) = (self.as_num(), rhs.as_num())
+            && a % b == 0
+            && let Some(c) = a.checked_div(b)
+        {
+            return c.into();
         }
         let mut terms = rhs.terms.read().clone();
         terms.extend(self.terms.read().iter().copied());

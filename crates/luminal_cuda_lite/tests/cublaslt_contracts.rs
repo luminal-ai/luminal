@@ -158,8 +158,10 @@ fn as_range(
 fn from_device(stream: &Arc<cudarc::driver::CudaStream>, slice: &CudaSlice<u8>) -> Vec<f32> {
     let mut host = vec![0u8; slice.len()];
     stream.memcpy_dtoh(slice, &mut host).expect("D2H");
-    host.chunks_exact(4)
-        .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+    host.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_ne_bytes(*c))
         .collect()
 }
 

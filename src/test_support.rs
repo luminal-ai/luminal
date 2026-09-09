@@ -1814,16 +1814,14 @@ mod harness_tests {
         for idx in plan.dag.node_indices() {
             match &plan.dag[idx] {
                 BufferNode::BufferCopy { .. } => panic!("no copies:\n{}", plan.summary()),
-                BufferNode::Compute { op, reads, .. } => {
-                    if op.label() == "BufferFree" {
-                        frees += 1;
-                        assert_eq!(
-                            reads[0],
-                            launch[0],
-                            "the free consumes the donated input buffer:\n{}",
-                            plan.summary()
-                        );
-                    }
+                BufferNode::Compute { op, reads, .. } if op.label() == "BufferFree" => {
+                    frees += 1;
+                    assert_eq!(
+                        reads[0],
+                        launch[0],
+                        "the free consumes the donated input buffer:\n{}",
+                        plan.summary()
+                    );
                 }
                 _ => {}
             }
@@ -2204,17 +2202,17 @@ mod stage4b_probes {
                     // line format is parsed as fallback.
                     for fragment in text.split('(') {
                         let fragment = fragment.trim().trim_end_matches(')');
-                        if let Some((name, count)) = fragment.rsplit_once(' ') {
-                            if let Ok(count) = count.trim().parse::<isize>() {
-                                map.insert(name.trim().to_string(), count);
-                            }
+                        if let Some((name, count)) = fragment.rsplit_once(' ')
+                            && let Ok(count) = count.trim().parse::<isize>()
+                        {
+                            map.insert(name.trim().to_string(), count);
                         }
                     }
                     for line in text.lines() {
-                        if let Some((name, count)) = line.rsplit_once(": ") {
-                            if let Ok(count) = count.trim().parse::<isize>() {
-                                map.insert(name.trim().to_string(), count);
-                            }
+                        if let Some((name, count)) = line.rsplit_once(": ")
+                            && let Ok(count) = count.trim().parse::<isize>()
+                        {
+                            map.insert(name.trim().to_string(), count);
                         }
                     }
                 }
@@ -2449,10 +2447,10 @@ mod stage4b_probes {
                 let text = chunk.to_string();
                 for fragment in text.split('(') {
                     let fragment = fragment.trim().trim_end_matches(')');
-                    if let Some((_, count)) = fragment.rsplit_once(' ') {
-                        if let Ok(count) = count.trim().parse::<isize>() {
-                            tuples += count;
-                        }
+                    if let Some((_, count)) = fragment.rsplit_once(' ')
+                        && let Ok(count) = count.trim().parse::<isize>()
+                    {
+                        tuples += count;
                     }
                 }
             }
@@ -3082,17 +3080,17 @@ mod ring_ignition_battery {
             let text = chunk.to_string();
             for fragment in text.split('(') {
                 let fragment = fragment.trim().trim_end_matches(')');
-                if let Some((n, c)) = fragment.rsplit_once(' ') {
-                    if let Ok(c) = c.trim().parse::<isize>() {
-                        map.insert(n.trim().to_string(), c);
-                    }
+                if let Some((n, c)) = fragment.rsplit_once(' ')
+                    && let Ok(c) = c.trim().parse::<isize>()
+                {
+                    map.insert(n.trim().to_string(), c);
                 }
             }
             for line in text.lines() {
-                if let Some((n, c)) = line.rsplit_once(": ") {
-                    if let Ok(c) = c.trim().parse::<isize>() {
-                        map.insert(n.trim().to_string(), c);
-                    }
+                if let Some((n, c)) = line.rsplit_once(": ")
+                    && let Ok(c) = c.trim().parse::<isize>()
+                {
+                    map.insert(n.trim().to_string(), c);
                 }
             }
         }

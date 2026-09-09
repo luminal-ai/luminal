@@ -285,10 +285,7 @@ fn issue_order<L: PlanLayout>(plan: &BufferIrGraph<L>) -> Result<Vec<NodeIndex>>
     }
     let mut order = Vec::with_capacity(plan.dag.node_count());
     let mut issued = vec![false; bound];
-    loop {
-        let Some(std::cmp::Reverse(raw)) = frees.pop().or_else(|| ordinary.pop()) else {
-            break;
-        };
+    while let Some(std::cmp::Reverse(raw)) = frees.pop().or_else(|| ordinary.pop()) {
         let index = NodeIndex::new(raw);
         // THE PULL: this node's storage comes into existence right here,
         // not at the top of the program.

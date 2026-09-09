@@ -664,14 +664,14 @@ impl LogicalGraph {
         }
         let constructor = op.constructor();
         let at = self.graph.node_count();
-        if let Some(expected) = op.fixed_arity() {
-            if operands.len() != expected {
-                self.poison(format!(
-                    "{constructor} at t{at}: expected {expected} operands, got {}",
-                    operands.len()
-                ));
-                return None;
-            }
+        if let Some(expected) = op.fixed_arity()
+            && operands.len() != expected
+        {
+            self.poison(format!(
+                "{constructor} at t{at}: expected {expected} operands, got {}",
+                operands.len()
+            ));
+            return None;
         }
         let mut ids = Vec::with_capacity(operands.len());
         for operand in operands {
@@ -1254,14 +1254,13 @@ impl LogicalGraph {
         if self.poisoned.is_some() {
             return;
         }
-        if let Some(name) = label {
-            if self
+        if let Some(name) = label
+            && self
                 .outputs
                 .iter()
                 .any(|record| record.label.as_deref() == Some(name))
-            {
-                return self.poison(format!("duplicate output name \"{name}\""));
-            }
+        {
+            return self.poison(format!("duplicate output name \"{name}\""));
         }
         let id = match self.resolve(operand, "output") {
             Ok(id) => id,
