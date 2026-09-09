@@ -132,14 +132,11 @@ impl CudaRuntime {
     ///
     /// Build the argument with [`crate::ops::cuda_registry_filtered`]
     /// (narrow either preset by label or constructor) or by pushing
-    /// [`crate::ops::RegisteredOp::new`] rows onto one. A row whose op is
-    /// neither plan-transparent, host-dispatchable, nor spelled with a
-    /// LABEL the kernel table carries is simply not claimable — it never
-    /// reaches the allow list, so the search refuses loudly instead of
-    /// electing something the device cannot run. A row that REUSES a
-    /// kernel-table label is claimed; if its extracted op is not the CL
-    /// type behind that label, the `TypeId` lookup misses and the plan is
-    /// refused at [`Self::execute`], not at search.
+    /// [`crate::ops::RegisteredOp::new`] rows onto one. An op is claimable
+    /// if its prototype is plan-transparent or its executable DPS form
+    /// exposes [`crate::KernelOp`] or [`crate::HostOp`]. A matching label
+    /// alone does not grant a claim. External ops supply the same interfaces
+    /// as built-in ops without changing this runtime's dispatch code.
     ///
     /// ONE EXCEPTION TO ROW-BY-ROW SELECTION: the four cuBLASLt marker
     /// rows are ONE vocabulary, declared and minted by the Base row's
@@ -360,17 +357,12 @@ impl CudaRuntime {
     /// `reference_allow_list()` — three classes, all derived, never
     /// name-listed (M4 Phase 5 + Train 3):
     ///
-    ///  * KERNEL-BEARING: matcher constructors whose label has a
-    ///    codegen row — claimable because the device can execute them.
-    ///  * PLAN-TRANSPARENT: constructors whose registered PROTOTYPE's
-    ///    declared effects prove the planner folds them before any
-    ///    kernel is needed (see [`crate::plan_transparent`]) —
-    ///    claimable because nothing ever executes.
-    ///  * HOST-CALL DISPATCHABLE (Train 3): constructors whose
-    ///    prototype the executor dispatches as a host library call
-    ///    (`cublasLtMatmul`) — claimable because the device runs them
-    ///    without any NVRTC kernel (see
-    ///    [`crate::ops::cublaslt::host_dispatchable`]).
+    ///  * KERNEL-BEARING: the registered prototype's DPS form exposes
+    ///    [`crate::KernelOp`], which supplies its codegen implementation.
+    ///  * PLAN-TRANSPARENT: the prototype's declared effects prove the
+    ///    planner folds it (see [`crate::plan_transparent`]).
+    ///  * HOST-CALL DISPATCHABLE: the prototype's DPS form exposes
+    ///    [`crate::HostOp`], which supplies its host launch implementation.
     ///
     /// THIS STATIC IS THE DEFAULT PRESET'S claim set — the same
     /// derivation over [`crate::ops::cuda_registry`] (markers included),
@@ -384,21 +376,18 @@ impl CudaRuntime {
     }
 
     fn allow_list_over(registry: &[crate::ops::RegisteredOp]) -> Vec<&'static str> {
-        let labels: Vec<&'static str> = crate::kernels::cuda_kernels()
-            .iter()
-            .map(|k| k.label)
-            .collect();
         registry
             .iter()
             .filter(|entry| {
-                let ctor = entry.matcher.egglog_constructor();
-                let stripped = ctor.trim_start_matches("LayoutTensorOp");
-                let kernel_bearing = labels.iter().any(|label| {
-                    stripped == *label || stripped.trim_end_matches("Generic") == *label
-                });
-                kernel_bearing
-                    || crate::plan_transparent(entry.prototype.as_ref())
-                    || crate::ops::cublaslt::host_dispatchable(entry.prototype.as_ref())
+                let prototype = entry.prototype.as_ref();
+                if crate::plan_transparent(prototype) {
+                    return true;
+                }
+                // Execution belongs to the DPS form carried by buffer plans.
+                // Derive claims from that same interface, never from a label.
+                let dps = prototype.to_dps();
+                let executable = dps.as_deref().unwrap_or(prototype);
+                crate::as_kernel_op(executable).is_some() || crate::as_host_op(executable).is_some()
             })
             .map(|entry| entry.matcher.egglog_constructor())
             .collect()

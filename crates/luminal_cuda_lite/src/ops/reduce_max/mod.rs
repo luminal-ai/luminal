@@ -11,8 +11,8 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, cuda_f64_literal, reduce};
-use anyhow::{Context, Result, bail};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_f64_literal, reduce};
+use anyhow::{Context, Result};
 
 /// `ReduceMaxGeneric(input) -> out` — pure dataflow form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,10 @@ impl OpSlotNames for ReduceMaxDps {
 }
 
 impl BufferTensorIrOp for ReduceMaxDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "ReduceMaxGeneric"
     }
@@ -92,22 +96,21 @@ impl ToDps for ReduceMaxDps {
 impl LayoutIrOp for ReduceMaxDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    let Some(r) = op.as_any().downcast_ref::<ReduceMaxDps>() else {
-        bail!("reduce_max codegen reached with a non-ReduceMax op");
-    };
-    let axis = usize::try_from(r.axis).context("negative reduce axis")?;
-    // NVRTC compiles the program with no math headers, so the INFINITY
-    // macro does not exist there and -inf has to be spelled by bit
-    // pattern. That spelling is NOT repeated here: [`cuda_f64_literal`]
-    // is the crate's single place where non-finite literals are written,
-    // and this reduction identity goes through it like any other.
-    reduce(
-        ctx,
-        axis,
-        &cuda_f64_literal(f64::NEG_INFINITY),
-        "v > acc ? v : acc",
-    )
+impl KernelOp for ReduceMaxDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        let axis = usize::try_from(self.axis).context("negative reduce axis")?;
+        // NVRTC compiles the program with no math headers, so the INFINITY
+        // macro does not exist there and -inf has to be spelled by bit
+        // pattern. That spelling is NOT repeated here: [`cuda_f64_literal`]
+        // is the crate's single place where non-finite literals are written,
+        // and this reduction identity goes through it like any other.
+        reduce(
+            ctx,
+            axis,
+            &cuda_f64_literal(f64::NEG_INFINITY),
+            "v > acc ? v : acc",
+        )
+    }
 }
 
 /// Matches `LayoutTensorOpReduceMaxGeneric` and produces this

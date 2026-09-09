@@ -144,13 +144,8 @@ fn a_filtered_registry_withholds_the_op_and_the_search_refuses() {
     assert!(outcome.plans_profiled > 0, "no plans profiled");
 }
 
-/// (c) A ROW REGISTERED FROM OUTSIDE THIS CRATE joins the instance's
-/// claim set: `RegisteredOp::new` over a matcher/prototype pair the
-/// caller assembles itself. The row here is a matcher-only one (a
-/// cuBLASLt marker: host-dispatchable, no kernel-table row), which is
-/// exactly the class an external caller can add today — a kernel-bearing
-/// row still needs a codegen entry inside CL (the punted "cuda heavy"
-/// composition story).
+/// An externally assembled matcher/prototype pair joins the claim set
+/// through the prototype's DPS HostOp interface.
 #[test]
 fn a_row_registered_from_outside_joins_the_claim_set() {
     let (cx, _a, _b) = add_graph();

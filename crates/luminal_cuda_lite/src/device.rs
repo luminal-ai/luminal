@@ -88,7 +88,9 @@ use luminal::prelude::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::kernels::{CodegenCtx, codegen_for};
+use crate::host::{DeviceRange as Bound, HostOpContext};
+use crate::kernels::CodegenCtx;
+use crate::{as_host_op, as_kernel_op};
 
 /// STAGING AND READBACK are memcpys now (ruling D4, 2026-09-03): a
 /// [`HostBuffer`] IS bytes plus a dtype tag, which is exactly what an
@@ -209,26 +211,6 @@ impl CudaDevice {
     pub fn release_slab(&mut self) {
         self.slab = None;
     }
-}
-
-/// A bound buffer: where its bytes are and how many there are. Derived
-/// either from an owned [`CudaSlice`] (the standalone and donated rows)
-/// or from the slab base plus an [`crate::arena::ArenaSlice`] offset.
-///
-/// The executor works in raw device pointers rather than cudarc's
-/// slices/views because a slab range is a BORROW of one allocation:
-/// with many ranges live at once — several read by a launch that also
-/// writes one — no set of `CudaView`/`CudaViewMut` handles can coexist
-/// under the borrow checker. Pushing the pointer as a kernel argument
-/// is ABI-identical to pushing a `&CudaSlice` (cudarc pushes exactly
-/// this `CUdeviceptr`), and the stream-event bookkeeping those handles
-/// carry is inert here: CL issues everything on one stream, so
-/// `is_managing_stream_synchronization()` is false and no event is ever
-/// recorded. A multi-stream executor would owe those events.
-#[derive(Debug, Clone, Copy)]
-struct Bound {
-    ptr: u64,
-    bytes: usize,
 }
 
 fn bound_of(bindings: &FxHashMap<BufferId, Bound>, id: &BufferId, who: &str) -> Result<Bound> {
@@ -465,100 +447,6 @@ pub fn execute_plan(
                     .map(|id| bound_of(&bindings, id, label))
                     .collect::<Result<_>>()?;
 
-                // Train 3: the HOST-CALL arm — cuBLASLt contracts
-                // dispatch as one `cublasLtMatmul` library call on the
-                // SAME stream as the surrounding kernels, never an
-                // NVRTC kernel. The destination is the arena range the
-                // planner assigned (it was a fresh zeroed slice before
-                // Phase 3 of the rejoin); the C-fold forms read their C
-                // operand buffer and write D at beta = 1.0f. C is USUALLY
-                // a distinct live range, but when the program binds D's
-                // output slot onto the same ReadWrite caller buffer that
-                // holds C, the seed is admitted through CublasLtDps's May
-                // permit on operand 2 and C == D — legal, because
-                // `bind_destination` emits identical C and D descriptors,
-                // which is the API's C == D precondition. (Recorder-
-                // produced programs never bind an output onto an input
-                // buffer, so this arises only for hand-authored
-                // boundaries.) The non-fold forms run beta = 0, which is
-                // the BLAS skip, so D's prior bytes are never read.
-                if let Some(dps) = op
-                    .as_any()
-                    .downcast_ref::<crate::ops::cublaslt::CublasLtDps>()
-                {
-                    let mut call = crate::ops::cublaslt::exec::plan_call(&dps.op)
-                        .with_context(|| format!("cuBLASLt call planning for {label}"))?;
-                    // THE PLAN/CALL-FRAME COHERENCE FENCE — restored,
-                    // strengthened, and CLASSIFIED (2026-08-31; the full
-                    // taxonomy lives on `exec::bind_destination`).
-                    //
-                    // Correction 4 of the Option-B landing deleted the
-                    // `[m, n]` frame check here as "runtime type-checking
-                    // ... rule premises, not our business". THAT
-                    // CLASSIFICATION WAS WRONG, and this is the note that
-                    // keeps the next cleanup from repeating it:
-                    //
-                    //  * An E-GRAPH RE-CHECK restates a fact a rule
-                    //    premise guarantees (F32 scope; C's dims/fold
-                    //    matching D's by rule guard). Those are gone and
-                    //    stay gone.
-                    //  * A VENDOR CHECK verifies the library where its own
-                    //    guarantees are vacuous (TF32 detector, ld bounds).
-                    //    Those stay.
-                    //  * A COHERENCE FENCE reconciles the PLAN's vocabulary
-                    //    (elected layouts) with a CALL FRAME THE EXECUTOR
-                    //    INVENTS (m/n/k, descriptors, orders, lds). No
-                    //    e-graph rule has ever seen an `LtCall`, so nothing
-                    //    upstream can guarantee the two agree. This is that
-                    //    fence. It is NOT disposable.
-                    //
-                    // It also does what the deleted check could not: the
-                    // old one compared EXTENTS only, and the regression it
-                    // was supposed to catch had matching extents and a
-                    // diverging ORDER (the transpose-sandwich sibling's
-                    // elected destination layout is LEFT-major). So the
-                    // fence RESOLVES the C/D order from the elected layout
-                    // instead of asserting a convention.
-                    let dest_slot = result_info.first().ok_or_else(|| {
-                        anyhow!("{label}: host-call node carries no result descriptor")
-                    })?;
-                    crate::ops::cublaslt::exec::bind_destination(
-                        &mut call,
-                        &dest_slot.layout,
-                        label,
-                    )
-                    .with_context(|| format!("cuBLASLt destination frame binding for {label}"))?;
-                    // E-GRAPH RE-CHECKS STAY DEAD (corrected contract,
-                    // 2026-08-31, correction 4): the F32 end-to-end
-                    // re-check and the C-operand dims/fold re-checks
-                    // that stood here restated facts the e-graph
-                    // guarantees by rule premise (the marker's contracts
-                    // match F32 dense frames; Cdesc == Ddesc by rule
-                    // guard). They are REMOVED and stay removed. The
-                    // frame check that stood alongside them was NOT one
-                    // of them — see the coherence fence above.
-                    let operand_spans: Vec<crate::ops::cublaslt::device_call::DeviceRange> = inputs
-                        .iter()
-                        .map(|b| crate::ops::cublaslt::device_call::DeviceRange {
-                            ptr: b.ptr,
-                            bytes: b.bytes,
-                        })
-                        .collect();
-                    crate::ops::cublaslt::device_call::dispatch(
-                        &call,
-                        &operand_spans,
-                        crate::ops::cublaslt::device_call::DeviceRange {
-                            ptr: dest.ptr,
-                            bytes: dest.bytes,
-                        },
-                        &stream,
-                    )
-                    .with_context(|| format!("cuBLASLt dispatch for {label}"))?;
-                    continue;
-                }
-                let Some(kernel) = codegen_for(op.as_ref()) else {
-                    bail!("no cuda codegen for {label}");
-                };
                 // Phase 3: codegen geometry comes from the node's OWN slot
                 // descriptors, never the shared buffer table — the buffer
                 // table sizes ALLOCATIONS and nothing else. A compute node
@@ -574,8 +462,27 @@ pub fn execute_plan(
                         writes.len()
                     );
                 }
+                if let Some(host) = as_host_op(op.as_ref()) {
+                    let ctx = HostOpContext {
+                        stream: &stream,
+                        inputs: &inputs,
+                        dest,
+                        operand_info,
+                        result_info,
+                    };
+                    // SAFETY: the plan's arena bindings are live through the
+                    // stream synchronization below; bufferization enforces the
+                    // op's alias and memory-effect contract.
+                    unsafe { host.execute(&ctx) }
+                        .with_context(|| format!("host execution for {label}"))?;
+                    continue;
+                }
+                let Some(kernel) = as_kernel_op(op.as_ref()) else {
+                    bail!("no CUDA execution interface for {label}");
+                };
                 let ctxinfo = CodegenCtx::from_descriptors(label, operand_info, result_info)?;
-                let launches = (kernel.codegen)(op.as_ref(), &ctxinfo)
+                let launches = kernel
+                    .codegen(&ctxinfo)
                     .with_context(|| format!("codegen for {label}"))?;
 
                 // Kernel inputs are the non-destination operands; the

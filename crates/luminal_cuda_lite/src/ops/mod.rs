@@ -22,24 +22,12 @@
 //! with [`RegisteredOp::new`] — from OUTSIDE this crate, with no edit
 //! here.
 //!
-//! WHAT IS STILL CL-ONLY: adding a KERNEL-BEARING op. Claim derivation
-//! reads three classes (see [`crate::CudaRuntime::allow_list`]); the
-//! matcher-only ones — plan-transparent and host-dispatchable — are
-//! trait answers on the prototype and travel with a `RegisteredOp`, but
-//! a row that must actually be EXECUTED needs a codegen row in
-//! [`crate::kernels`], which is keyed by `TypeId` inside this crate.
-//! The kernel-bearing class is matched by LABEL (the constructor minus
-//! `LayoutTensorOp`, `Generic` suffix tolerated) against the kernel
-//! table, while codegen is looked up by `TypeId` at execute. An outside
-//! row whose label matches no kernel-table label never reaches the allow
-//! list, so search refuses. An outside row that REUSES a kernel-table
-//! label IS claimed and can be elected; if the op it extracts is not the
-//! CL type behind that label, the plan is refused at
-//! [`crate::CudaRuntime::execute`] (`no cuda codegen for <label>`) —
-//! loud, never a wrong plan, but not at search. Composing an external
-//! kernel superset onto Lite's codegen ("cuda heavy") is PUNTED — no
-//! execution face on `RegisteredOp`, no change to the kernel table's
-//! keying.
+//! Executable DPS operations implement [`crate::KernelOp`] or
+//! [`crate::HostOp`] and expose that trait through
+//! [`crate::CudaOpInterface`]. The registry derives claims from the
+//! prototype's DPS interface (or its plan-transparent effects). External
+//! crates can supply implementations without adding a central codegen or
+//! dispatch entry; a familiar label alone never makes an op executable.
 
 pub mod add;
 pub mod cast;
@@ -110,10 +98,8 @@ impl RegisteredOp {
     /// which the `labels_agree_with_the_prototypes` pin states outright.
     ///
     /// So the `Generic` suffix IS part of a label: filter on
-    /// `"ReduceMaxGeneric"`, not `"ReduceMax"`. (The kernel table's
-    /// `label` column is a different, Generic-less vocabulary; the allow
-    /// list's kernel-bearing test tolerates the difference, callers of
-    /// this method should not have to guess about it.)
+    /// `"ReduceMaxGeneric"`, not `"ReduceMax"`. Labels identify the
+    /// rewrite vocabulary; execution is selected through the op's traits.
     pub fn label(&self) -> &'static str {
         let ctor = self.constructor();
         ctor.strip_prefix("LayoutTensorOp").unwrap_or(ctor)
@@ -125,7 +111,7 @@ impl RegisteredOp {
 /// (functional-form) op its `extract` produces — the kernel-bearing and
 /// plan-transparent rows of [`cuda_registry_without_cublaslt`] PLUS the
 /// four fixed-arity cuBLASLt marker contracts, whose execution row is a
-/// HOST LIBRARY CALL (`cublasLtMatmul`), never an NVRTC kernel (the
+/// HOST LIBRARY CALL (`cublasLtMatmul`) through `HostOp`, never an NVRTC kernel (the
 /// third claim class — see [`crate::CudaRuntime::allow_list`]).
 ///
 /// WHY THE MARKERS USED TO SIT BEHIND AN EXPLICIT SEAM, and why they no

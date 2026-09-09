@@ -226,18 +226,7 @@ impl Drop for Desc {
     }
 }
 
-/// One bound device range: base pointer and extent in bytes. The
-/// executor binds buffers to ARENA SLAB RANGES (#422, Phase 3 of the
-/// rejoin), which are sub-ranges of one allocation, so it can no longer
-/// hand this call `&CudaSlice` handles — several ranges are live at
-/// once and the borrow checker admits at most one mutable view of the
-/// slab. A pointer plus a length is exactly what `cublasLtMatmul`
-/// consumes anyway.
-#[derive(Debug, Clone, Copy)]
-pub struct DeviceRange {
-    pub ptr: u64,
-    pub bytes: usize,
-}
+pub use crate::host::DeviceRange;
 
 /// Dispatch one resolved call, stream-ordered on `stream` (the same
 /// stream the surrounding kernels use). `operands` are the Lit operand

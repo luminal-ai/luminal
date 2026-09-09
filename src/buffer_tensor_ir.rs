@@ -73,8 +73,8 @@ impl<T: BufferTensorIrOp + Clone + 'static> CloneBufferTensorIrOp for T {
 
 /// Blanket downcast access for kernel dispatch: the reference runtime's
 /// registry (`reference::kernels`) keys kernels by CONCRETE op type.
-/// Ops themselves carry no execution (ruling 2026-08-06) — a runtime that
-/// implements an op holds its kernel in that runtime's own folder.
+/// Backend-specific operations may also expose runtime-owned execution
+/// interfaces through `BufferTensorIrOp::runtime_interface`.
 pub trait AsAnyOp {
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -98,6 +98,14 @@ impl<T: 'static> AsAnyOp for T {
 pub trait BufferTensorIrOp: OpSlotNames + CloneBufferTensorIrOp + AsAnyOp + Debug {
     /// The op's IR name (see the label policy in `luminal_reference::ops`).
     fn label(&self) -> &str;
+
+    /// Optional runtime-owned interface adapter. Core transports the op without
+    /// interpreting this value; backends may use it to borrow their execution
+    /// traits from an erased plan operation. The adapter must describe this
+    /// concrete op type. Planner operations and non-executable ops return None.
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 
     /// Is this operand's buffer read? (Inputs are read.)
     fn operand_reads_memory(&self, _operand: usize) -> bool {

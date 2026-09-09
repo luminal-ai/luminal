@@ -14,8 +14,8 @@ use luminal::layout_ir::{
 use luminal::prelude::egraph_serialize;
 
 use crate::kernels::{
-    CodegenCtx, Coords, KernelSource, coord_prelude, cuda_type, layout_read_index, lower_expr,
-    numel,
+    CodegenCtx, Coords, KernelOp, KernelSource, coord_prelude, cuda_type, layout_read_index,
+    lower_expr, numel,
 };
 use anyhow::{Result, bail};
 
@@ -77,6 +77,10 @@ impl OpSlotNames for IndexMapApplyMaterializeDps {
 }
 
 impl BufferTensorIrOp for IndexMapApplyMaterializeDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "IndexMapApplyMaterialize"
     }
@@ -113,60 +117,59 @@ impl LayoutIrOp for IndexMapApplyMaterializeDps {}
 /// actually read. The WRITE side (dest0) is no longer fenced here — see
 /// the write-fence record in
 /// [`crate::kernels::CodegenCtx::from_descriptors`].
-pub(crate) fn codegen(op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    let Some(mat) = op.as_any().downcast_ref::<IndexMapApplyMaterializeDps>() else {
-        bail!("materialize codegen reached with a non-Materialize op");
-    };
-    // The dest operand slot is not fenced — see the write-fence record in
-    // `kernels::CodegenCtx::from_descriptors`.
-    let Some(entries) = &mat.entries else {
-        bail!("index map beyond the parsed expression subset (fail-closed, as the reference)");
-    };
-    let parent_dims = &ctx.operand_dims[0];
-    let out_dims = &ctx.operand_dims[1];
-    if entries.len() != parent_dims.len() {
-        bail!(
-            "index map arity {} vs parent rank {}",
-            entries.len(),
-            parent_dims.len()
-        );
-    }
-    let t = cuda_type(ctx.operand_dtypes[0])?;
-    let to = cuda_type(ctx.dest_dtypes[0])?;
-    let n = numel(out_dims);
-    let prelude = coord_prelude(out_dims);
-    // ONE body: the op's map lands on the input VALUE's coordinates
-    // (`parent_c*`), then the slot's carried layout carries them to the
-    // residence. Those coordinates are MAP OUTPUTS, not `i` decomposed,
-    // so the parent read is `Coords::Bound` and never simplifies to `i`
-    // — for a dense parent it is the row-major sum over `parent_c*`, the
-    // same address the hand-written `pflat` accumulator used to compute.
-    //
-    // Each mapped coordinate was once checked against the parent extent
-    // here; no longer — see the NO RUNTIME BOUNDS TRAPS note in
-    // `crate::kernels`.
-    let mut body = String::from("    long long idx;\n");
-    for (k, entry) in entries.iter().enumerate() {
-        let value = lower_expr(entry, out_dims.len())?;
-        body.push_str(&format!(
-            "    idx = {value};\n    long long parent_c{k} = idx;\n"
-        ));
-    }
-    let (chain, pidx) = layout_read_index(
-        "parent",
-        ctx.operand_layout(0),
-        parent_dims,
-        Coords::Bound { prefix: "parent_c" },
-    )?;
-    body.push_str(&chain);
-    let source = format!(
-        r#"extern "C" __global__ void k(const {t}* parent, {to}* out, unsigned long long n) {{
+impl KernelOp for IndexMapApplyMaterializeDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        // The dest operand slot is not fenced — see the write-fence record in
+        // `kernels::CodegenCtx::from_descriptors`.
+        let Some(entries) = &self.entries else {
+            bail!("index map beyond the parsed expression subset (fail-closed, as the reference)");
+        };
+        let parent_dims = &ctx.operand_dims[0];
+        let out_dims = &ctx.operand_dims[1];
+        if entries.len() != parent_dims.len() {
+            bail!(
+                "index map arity {} vs parent rank {}",
+                entries.len(),
+                parent_dims.len()
+            );
+        }
+        let t = cuda_type(ctx.operand_dtypes[0])?;
+        let to = cuda_type(ctx.dest_dtypes[0])?;
+        let n = numel(out_dims);
+        let prelude = coord_prelude(out_dims);
+        // ONE body: the op's map lands on the input VALUE's coordinates
+        // (`parent_c*`), then the slot's carried layout carries them to the
+        // residence. Those coordinates are MAP OUTPUTS, not `i` decomposed,
+        // so the parent read is `Coords::Bound` and never simplifies to `i`
+        // — for a dense parent it is the row-major sum over `parent_c*`, the
+        // same address the hand-written `pflat` accumulator used to compute.
+        //
+        // Each mapped coordinate was once checked against the parent extent
+        // here; no longer — see the NO RUNTIME BOUNDS TRAPS note in
+        // `crate::kernels`.
+        let mut body = String::from("    long long idx;\n");
+        for (k, entry) in entries.iter().enumerate() {
+            let value = lower_expr(entry, out_dims.len())?;
+            body.push_str(&format!(
+                "    idx = {value};\n    long long parent_c{k} = idx;\n"
+            ));
+        }
+        let (chain, pidx) = layout_read_index(
+            "parent",
+            ctx.operand_layout(0),
+            parent_dims,
+            Coords::Bound { prefix: "parent_c" },
+        )?;
+        body.push_str(&chain);
+        let source = format!(
+            r#"extern "C" __global__ void k(const {t}* parent, {to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 {prelude}{body}    out[i] = parent[{pidx}];
 }}"#
-    );
-    Ok(vec![KernelSource::plain(source, n)])
+        );
+        Ok(vec![KernelSource::plain(source, n)])
+    }
 }
 
 /// Matches `LayoutTensorOpIndexMapApplyMaterialize` and produces this

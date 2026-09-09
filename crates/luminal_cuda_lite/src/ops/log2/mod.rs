@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary};
 use anyhow::Result;
 
 /// `Log2FunctionalGeneric(input) -> out` — pure dataflow form.
@@ -57,6 +57,10 @@ impl OpSlotNames for Log2FunctionalDps {
 }
 
 impl BufferTensorIrOp for Log2FunctionalDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "Log2FunctionalGeneric"
     }
@@ -85,8 +89,10 @@ impl ToDps for Log2FunctionalDps {
 impl LayoutIrOp for Log2FunctionalDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(_op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    unary(ctx, "log2f(a[i])")
+impl KernelOp for Log2FunctionalDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        unary(ctx, "log2f(a[i])")
+    }
 }
 
 /// Matches `LayoutTensorOpLog2FunctionalGeneric` and produces this

@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, binary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, binary};
 use anyhow::Result;
 
 /// `MulFunctionalGeneric(lhs, rhs) -> out` — pure dataflow form.
@@ -59,6 +59,10 @@ impl OpSlotNames for MulFunctionalDps {
 }
 
 impl BufferTensorIrOp for MulFunctionalDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "MulFunctionalGeneric"
     }
@@ -87,8 +91,10 @@ impl ToDps for MulFunctionalDps {
 impl LayoutIrOp for MulFunctionalDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(_op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    binary(ctx, "a[i] * b[i]")
+impl KernelOp for MulFunctionalDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        binary(ctx, "a[i] * b[i]")
+    }
 }
 
 /// Matches `LayoutTensorOpMulFunctionalGeneric` and produces this

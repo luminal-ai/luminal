@@ -12,14 +12,13 @@ the self-contained repo-side summary.
   methods as `luminal::reference::ReferenceRuntime`
   (`load → bind_dyn_range → search → set_data → execute → get_f32`),
   same `BufferIrGraph` plans, allow-list claiming via the public
-  `search_implementations_with_ops` seam. Zero core-crate edits.
-- `src/kernels.rs`: the codegen table — TypeId-keyed like the
-  reference kernel registry; generates dense row-major, one-thread-
-  per-output CUDA source with geometry baked as literals. CL-1 rows:
-  elementwise family + cast + constant + copy + axis reductions.
-- `CudaRuntime::allow_list()` derives from the table — search can
-  only elect what codegen covers. Pinned as a strict subset of the
-  reference inventory (`tests/plan_smoke.rs`).
+  `search_implementations_with_ops` seam.
+- `src/kernels.rs`: the `KernelOp` codegen trait and shared helpers.
+  `src/host.rs` provides `HostOp` for library launches. Kernel operations
+  generate CUDA source with geometry baked as literals.
+- `CudaRuntime::allow_list()` derives from registered operations' DPS
+  execution interfaces and plan-transparent effects. Kernel and host
+  implementations can be provided externally without a dispatch-table edit.
 - Candidate ranking during search is DEVICE-FREE BY DEFAULT: the loop
   is this crate's own copy (`crates/luminal_cuda_lite/src/search.rs`)
   and ranks by `src/heuristic.rs::heuristic_cost_of` — a bytes-moved
@@ -56,7 +55,7 @@ section are retired — see `vendor/README.md`.
    - Phase 2 — toposort `plan.dag` INCLUDING `Anti` edges (WAR
      ordering is load-bearing; `EdgeKind::Anti` rides petgraph).
    - Phase 3 — dispatch: `BufferCopy` = D2D memcpy (length+dtype
-     checked); `Compute` = `kernels::codegen_for(op)` → NVRTC compile
+     checked); `Compute` = `as_kernel_op(op).codegen(ctx)` → NVRTC compile
      (cache by source hash) → launch over `n` with 256-thread blocks,
      operand device pointers in slot order then dest pointers then
      `n`. OUT-OF-PLACE: allocate fresh dests (mirrors the reference

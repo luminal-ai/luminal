@@ -135,7 +135,7 @@ fn search_and_count_opts(
 // ---------------------------------------------------------------------------
 // REGISTRY MEMBERSHIP: the four contracts are registered CL ops and the
 // DEFAULT claim set admits them through the host-call class (never a
-// codegen row, never plan-transparency). ALWAYS-ON SINCE 2026-09-04: the
+// kernel interface, never plan-transparency). ALWAYS-ON SINCE 2026-09-04: the
 // tripwire that blocked it was fixed on the map literal and the search
 // budget no longer decides the preset, so the marker vocabulary is what
 // a plain `load` searches with. The registry that excludes them is now
@@ -170,13 +170,14 @@ fn cublaslt_contracts_are_registered_host_call_claims() {
              exactly the one with no marker in it"
         );
     }
-    // The claim is host-call-derived: no codegen row exists for the labels.
+    // The claim is host-call-derived: no kernel interface exists for the labels.
     for form in luminal_cuda_lite::ops::cublaslt::CublasLtForm::ALL {
         let proto = luminal_cuda_lite::ops::cublaslt::CublasLt { form, spec: None };
-        assert!(luminal_cuda_lite::ops::cublaslt::host_dispatchable(&proto));
+        let dps = luminal::layout_ir::ToDps::to_dps(&proto).expect("host DPS");
+        assert!(luminal_cuda_lite::as_host_op(dps.as_ref()).is_some());
         assert!(
-            luminal_cuda_lite::kernels::codegen_for(&proto).is_none(),
-            "cuBLASLt must have NO codegen row — it is a host library call"
+            luminal_cuda_lite::as_kernel_op(dps.as_ref()).is_none(),
+            "cuBLASLt must have NO kernel interface — it is a host library call"
         );
         assert!(!luminal_cuda_lite::plan_transparent(&proto));
     }

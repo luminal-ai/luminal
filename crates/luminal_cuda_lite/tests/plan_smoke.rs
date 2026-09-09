@@ -27,8 +27,8 @@ fn search_produces_a_codegen_complete_plan() {
         .expect("search under the CUDA allow list");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
 
-    // Every elected compute node must have a codegen row — the allow
-    // list promised only what the table generates.
+    // Every elected compute node must have a kernel interface — the allow
+    // list promised executable trait implementations.
     let plan = rt.plan().expect("plan loaded");
     let mut computes = 0usize;
     for node in plan.dag.node_weights() {
@@ -39,8 +39,8 @@ fn search_produces_a_codegen_complete_plan() {
                 continue;
             }
             assert!(
-                kernels::codegen_for(op.as_ref()).is_some(),
-                "elected op {label} has no codegen row"
+                luminal_cuda_lite::as_kernel_op(op.as_ref()).is_some(),
+                "elected op {label} has no kernel interface"
             );
         }
     }
@@ -97,8 +97,8 @@ fn codegen_emits_wellformed_sources() {
         operand_layouts: vec![rm_layout(&[2, 3]), rm_layout(&[2, 3]), rm_layout(&[2, 3])],
     };
     let add = luminal_cuda_lite::ops::add::AddFunctionalDps;
-    let kernel = kernels::codegen_for(&add).expect("add has a row");
-    let launches = (kernel.codegen)(&add, &ctx).expect("codegen");
+    let kernel = luminal_cuda_lite::as_kernel_op(&add).expect("add implements KernelOp");
+    let launches = kernel.codegen(&ctx).expect("codegen");
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].n, 6);
     assert!(launches[0].source.contains("__global__ void k("));

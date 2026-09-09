@@ -88,17 +88,6 @@ pub mod election;
 /// library does not provide (ld bounds, descriptor construction).
 pub mod exec;
 
-/// HOST-CALL DISPATCHABLE: the allow-list face of the cuBLASLt estate.
-/// Kernel-bearing ops are claimable because a codegen row exists;
-/// plan-transparent ops because the planner folds them; these are
-/// claimable because the executor dispatches them as a HOST LIBRARY
-/// CALL (`cublasLtMatmul`). Derived from the registered prototype's
-/// concrete type, never from a name list.
-pub fn host_dispatchable(op: &dyn LayoutIrOp) -> bool {
-    op.as_any().downcast_ref::<CublasLt>().is_some()
-        || op.as_any().downcast_ref::<CublasLtDps>().is_some()
-}
-
 type ClassId = luminal::prelude::egraph_serialize::ClassId;
 
 // ---------------------------------------------------------------------------
@@ -866,6 +855,10 @@ impl OpSlotNames for CublasLtDps {
 }
 
 impl BufferTensorIrOp for CublasLtDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::host::<Self>())
+    }
+
     fn label(&self) -> &str {
         self.op.label() // DPS forms keep the IR name
     }
@@ -901,6 +894,28 @@ impl ToDps for CublasLtDps {
 }
 
 impl LayoutIrOp for CublasLtDps {}
+
+impl crate::host::HostOp for CublasLtDps {
+    #[cfg(feature = "device")]
+    unsafe fn execute(&self, ctx: &crate::host::HostOpContext<'_>) -> anyhow::Result<()> {
+        use anyhow::{Context, anyhow};
+
+        let label = self.label();
+        let mut call = exec::plan_call(&self.op)
+            .with_context(|| format!("cuBLASLt call planning for {label}"))?;
+        // The elected destination layout is authoritative. Reconcile it with
+        // the library call frame before dispatch, including its storage order.
+        // This preserves the descriptor coherence and C==D alias contract.
+        let dest_slot = ctx
+            .result_info
+            .first()
+            .ok_or_else(|| anyhow!("{label}: host-call node carries no result descriptor"))?;
+        exec::bind_destination(&mut call, &dest_slot.layout, label)
+            .with_context(|| format!("cuBLASLt destination frame binding for {label}"))?;
+        device_call::dispatch(&call, ctx.inputs, ctx.dest, ctx.stream)
+            .with_context(|| format!("cuBLASLt dispatch for {label}"))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The matcher family — one matcher per contract; only the Base matcher
