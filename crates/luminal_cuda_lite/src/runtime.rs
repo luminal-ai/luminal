@@ -2080,7 +2080,10 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let data_node = self.resolve_data_node(output);
         if self.active().llir_to_hlir.get(&data_node) == Some(&input)
             && !self.external_output_buffers.contains_key(&data_node)
-            && matches!(self.hlir_buffers.get(&input), Some(CudaInput::Buffer { .. }))
+            && matches!(
+                self.hlir_buffers.get(&input),
+                Some(CudaInput::Buffer { .. })
+            )
         {
             // Identity follows proven storage aliases, not data lineage. Both
             // sides are the same owned binding, so even acquiring managed CUDA
@@ -7292,26 +7295,35 @@ mod recurrent_commit_tests {
 
     #[test]
     fn aliased_recurrent_commit_enqueues_no_device_work() {
-        let Ok(context) = CudaContext::new(0) else { return; };
+        let Ok(context) = CudaContext::new(0) else {
+            return;
+        };
         let stream = context.new_stream().unwrap();
         let mut graph = Graph::new();
         let state = graph.tensor(4).persist().output();
         let doubled = (state + state).output();
         graph.build_search_space::<CudaRuntime>(CompileOptions::default());
         let mut runtime = CudaRuntime::initialize(stream.clone());
-        runtime.set_data(state, vec![1.0f32;4]);
-        runtime = graph.search_with_rng(runtime, CompileOptions::default().search_graph_limit(3), &mut StdRng::seed_from_u64(19));
-        runtime.set_data_with_host_mirror(state, vec![1.0f32,2.0,3.0,4.0]);
+        runtime.set_data(state, vec![1.0f32; 4]);
+        runtime = graph.search_with_rng(
+            runtime,
+            CompileOptions::default().search_graph_limit(3),
+            &mut StdRng::seed_from_u64(19),
+        );
+        runtime.set_data_with_host_mirror(state, vec![1.0f32, 2.0, 3.0, 4.0]);
         runtime.execute(&graph.dyn_map);
         assert!(runtime.hlir_host_mirrors.contains_key(&state.id));
         CudaGraphHandle::begin_standalone_capture(&stream).unwrap();
         runtime.copy_output_to_input(state, state);
         let captured = CudaGraphHandle::end_standalone_capture(&stream).unwrap();
-        assert!(captured.nodes().unwrap().is_empty(), "alias commit must not add synchronization events");
+        assert!(
+            captured.nodes().unwrap().is_empty(),
+            "alias commit must not add synchronization events"
+        );
         assert!(!runtime.hlir_host_mirrors.contains_key(&state.id));
-        assert_eq!(runtime.get_f32(state), vec![1.0,2.0,3.0,4.0]);
+        assert_eq!(runtime.get_f32(state), vec![1.0, 2.0, 3.0, 4.0]);
         // A distinct output must still copy into the existing state allocation.
         runtime.copy_output_to_input(doubled, state);
-        assert_eq!(runtime.get_f32(state), vec![2.0,4.0,6.0,8.0]);
+        assert_eq!(runtime.get_f32(state), vec![2.0, 4.0, 6.0, 8.0]);
     }
 }

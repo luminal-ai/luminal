@@ -2887,10 +2887,16 @@ fn cublaslt_postops_do_not_remove_low_precision_rounding() {
                 build_batched_scaled_alpha_beta_graph(LAYOUT_CASES[1], dtype, commuted),
                 build_batched_matmul_plus_column_bias_graph(LAYOUT_CASES[1], dtype, commuted),
             ] {
-                assert_no_cublaslt_llir_where(&mut graph, "postops must retain low-precision rounding", |llir| {
-                    cublaslt_epilogues(llir).contains(&"BIAS")
-                        || cublaslt_scale_value_tuples(llir).iter().any(|&(alpha,beta)| alpha != 1.0 || beta != 0.0)
-                });
+                assert_no_cublaslt_llir_where(
+                    &mut graph,
+                    "postops must retain low-precision rounding",
+                    |llir| {
+                        cublaslt_epilogues(llir).contains(&"BIAS")
+                            || cublaslt_scale_value_tuples(llir)
+                                .iter()
+                                .any(|&(alpha, beta)| alpha != 1.0 || beta != 0.0)
+                    },
+                );
             }
         }
     }
@@ -2901,31 +2907,54 @@ fn cublaslt_postops_do_not_remove_low_precision_rounding() {
 /// library bias epilogue rounds(dot + bias) to a nonzero value.
 #[test]
 fn cublaslt_bias_preserves_low_precision_matmul_rounding() {
-    let Some(stream) = get_cuda_stream() else { return; };
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
     for (dtype, delta) in [(DType::Bf16, 1.0 / 512.0), (DType::F16, 1.0 / 4096.0)] {
         let (m, n, k) = (16, 64, 64);
         let mut cx = Graph::new();
-        let a = cx.tensor((m,k)).as_dtype(dtype);
-        let b = cx.tensor((n,k)).as_dtype(dtype);
+        let a = cx.tensor((m, k)).as_dtype(dtype);
+        let b = cx.tensor((n, k)).as_dtype(dtype);
         let bias = cx.tensor(n).as_dtype(dtype);
-        let out = (a.matmul(b.t()) + bias.expand_dim(0,m)).cast(DType::F32).output();
-        assert_no_cublaslt_llir_where(&mut cx, "bias must retain low-precision rounding", |llir| cublaslt_epilogues(llir).contains(&"BIAS"));
-        let llir = extract_forced_cublaslt_llir_where(&mut cx, "rounded matmul then bias", |llir| cublaslt_epilogues(llir).contains(&"DEFAULT"));
+        let out = (a.matmul(b.t()) + bias.expand_dim(0, m))
+            .cast(DType::F32)
+            .output();
+        assert_no_cublaslt_llir_where(&mut cx, "bias must retain low-precision rounding", |llir| {
+            cublaslt_epilogues(llir).contains(&"BIAS")
+        });
+        let llir =
+            extract_forced_cublaslt_llir_where(&mut cx, "rounded matmul then bias", |llir| {
+                cublaslt_epilogues(llir).contains(&"DEFAULT")
+            });
         let mut rt = CudaRuntime::initialize(stream.clone());
         rt.load_llir(&llir);
-        let values: Vec<f32> = (0..m*k).map(|i| match i%k {0=>1.0, 1=>delta, _=>0.0}).collect();
-        let weights: Vec<f32> = (0..n*k).map(|i| if i%k<2 {1.0} else {0.0}).collect();
+        let values: Vec<f32> = (0..m * k)
+            .map(|i| match i % k {
+                0 => 1.0,
+                1 => delta,
+                _ => 0.0,
+            })
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| if i % k < 2 { 1.0 } else { 0.0 })
+            .collect();
         let encode = |data: Vec<f32>| -> Vec<u8> {
-            data.into_iter().flat_map(|x| match dtype {
-                DType::Bf16 => half::bf16::from_f32(x).to_bits().to_le_bytes(),
-                _ => half::f16::from_f32(x).to_bits().to_le_bytes(),
-            }).collect()
+            data.into_iter()
+                .flat_map(|x| match dtype {
+                    DType::Bf16 => half::bf16::from_f32(x).to_bits().to_le_bytes(),
+                    _ => half::f16::from_f32(x).to_bits().to_le_bytes(),
+                })
+                .collect()
         };
         rt.set_data(a, encode(values));
         rt.set_data(b, encode(weights));
-        rt.set_data(bias, encode(vec![-1.0;n]));
+        rt.set_data(bias, encode(vec![-1.0; n]));
         rt.execute(&cx.dyn_map);
-        assert_eq!(rt.get_f32(out), vec![0.0;m*n], "{dtype:?} rounding before bias");
+        assert_eq!(
+            rt.get_f32(out),
+            vec![0.0; m * n],
+            "{dtype:?} rounding before bias"
+        );
     }
 }
 
