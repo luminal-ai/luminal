@@ -39,6 +39,7 @@ pub type Ops = (
     argmax::KernelArgmax,
     gemv::KernelGemv,
     rms_norm::KernelRMSNorm,
+    rms_norm::RMSNormKernel,
     rope::RoPEHalfKernel,
     rope::RoPEScatterKernel,
     rope::KernelRoPE,
