@@ -134,6 +134,23 @@ pub fn new_egraph() -> egglog::EGraph {
         },
         None,
     );
+    // egglog-experimental's scheduling: `run-schedule` becomes the extended
+    // form (a superset of the core grammar, same RunSchedule output) and
+    // `let-scheduler` binds a named scheduler, e.g.
+    // `(let-scheduler bo (back-off :match-limit 1000 :ban-length 5))`, used
+    // as `(run-with bo <ruleset>)` inside a schedule.
+    egraph
+        .add_command(
+            "run-schedule".into(),
+            std::sync::Arc::new(egglog_experimental::RunExtendedSchedule),
+        )
+        .expect("run-schedule command registers");
+    egraph
+        .add_command(
+            "let-scheduler".into(),
+            std::sync::Arc::new(egglog_experimental::LetSchedulerCommand),
+        )
+        .expect("let-scheduler command registers");
     egraph
 }
 
