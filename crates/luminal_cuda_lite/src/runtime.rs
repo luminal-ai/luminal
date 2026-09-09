@@ -2075,8 +2075,20 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// updates are free; copy-then-modify schedules copy into the existing
     /// allocation instead of allocating a new input on every iteration.
     pub fn copy_output_to_input(&mut self, output: impl ToId, input: impl ToId) {
-        let source = self.resolve_output_buffer(output);
+        let output = output.to_id();
         let input = input.to_id();
+        let data_node = self.resolve_data_node(output);
+        if self.active().llir_to_hlir.get(&data_node) == Some(&input)
+            && !self.external_output_buffers.contains_key(&data_node)
+            && matches!(self.hlir_buffers.get(&input), Some(CudaInput::Buffer { .. }))
+        {
+            // Identity follows proven storage aliases, not data lineage. Both
+            // sides are the same owned binding, so even acquiring managed CUDA
+            // pointers would only enqueue redundant read events and waits.
+            self.hlir_host_mirrors.remove(&input);
+            return;
+        }
+        let source = self.resolve_output_buffer(output);
         let CudaInput::Buffer { buf, len } = self
             .hlir_buffers
             .get(&input)
@@ -7268,5 +7280,38 @@ mod arena_plan_tests {
         planned[1].start = 0;
         CudaRuntime::assign_fixed_arena_slots(&mut overlapping, planned);
         assert_eq!(overlapping.arena_slots.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod recurrent_commit_tests {
+    use super::*;
+    use crate::kernel::cuda_graph::CudaGraphHandle;
+    use cudarc::driver::CudaContext;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn aliased_recurrent_commit_enqueues_no_device_work() {
+        let Ok(context) = CudaContext::new(0) else { return; };
+        let stream = context.new_stream().unwrap();
+        let mut graph = Graph::new();
+        let state = graph.tensor(4).persist().output();
+        let doubled = (state + state).output();
+        graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+        let mut runtime = CudaRuntime::initialize(stream.clone());
+        runtime.set_data(state, vec![1.0f32;4]);
+        runtime = graph.search_with_rng(runtime, CompileOptions::default().search_graph_limit(3), &mut StdRng::seed_from_u64(19));
+        runtime.set_data_with_host_mirror(state, vec![1.0f32,2.0,3.0,4.0]);
+        runtime.execute(&graph.dyn_map);
+        assert!(runtime.hlir_host_mirrors.contains_key(&state.id));
+        CudaGraphHandle::begin_standalone_capture(&stream).unwrap();
+        runtime.copy_output_to_input(state, state);
+        let captured = CudaGraphHandle::end_standalone_capture(&stream).unwrap();
+        assert!(captured.nodes().unwrap().is_empty(), "alias commit must not add synchronization events");
+        assert!(!runtime.hlir_host_mirrors.contains_key(&state.id));
+        assert_eq!(runtime.get_f32(state), vec![1.0,2.0,3.0,4.0]);
+        // A distinct output must still copy into the existing state allocation.
+        runtime.copy_output_to_input(doubled, state);
+        assert_eq!(runtime.get_f32(state), vec![2.0,4.0,6.0,8.0]);
     }
 }
