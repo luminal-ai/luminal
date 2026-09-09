@@ -41,10 +41,9 @@ const EGGLOG_RULESETS: &[&str] = &[
     "fusion_pair",
     "fusion_grow",
     "fusion_merge",
-    // One-shot structural fusion rules (large joins), run once in the
-    // dedicated "fuse late" phase instead of inside the saturating main
-    // cycles. The _pre ruleset holds producer stages (e.g. the RoPE angle
-    // relation) consumed by rules in the main late ruleset.
+    // Structural fusion markers converge in a dedicated late phase, after
+    // dtype/shape facts are available and before cleanup removes proof nodes.
+    // The _pre rulesets seed facts consumed by the main late ruleset.
     "kernel_fuse_late_pre_rms",
     "kernel_fuse_late_pre_topk",
     "kernel_fuse_late_pre_rope",
@@ -200,7 +199,7 @@ pub struct OpTextParts {
     /// Backend-provided egglog text (see [`crate::op::Runtime::extra_egglog`]),
     /// spliced after `op_defs` and `op_declarations`, before the rewrite rules.
     /// Empty for core / the reference backend.
-    extra_egglog: String,
+    pub(crate) extra_egglog: String,
     cleanups: String,
     /// Names of op kinds that are eligible for cleanup (cleanup() == true).
     /// Used by the Rust post-processing pass to safely strip HLIR ops only
@@ -321,19 +320,12 @@ fn egglog_main_cycle_phases(cycle: usize, use_interval_analysis: bool) -> Vec<Eg
 
 fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> {
     vec![
-        // One-shot structural fusion rules with large joins. Running them
-        // once here (dtype facts present, raw HLIR rows not yet deleted by
-        // the cleanup phases) instead of inside the saturating main cycles
-        // avoids re-evaluating tens-of-seconds joins on every iteration.
-        // `seq` so each ruleset's join runs exactly once: producer stages
-        // first, then the consumer rules.
+        // Establish producer facts, converge the structural markers, then
+        // materialize consumers while the original HLIR proof nodes exist.
         EgglogSchedulePhase {
             name: "fuse late".to_string(),
-            // The second `kernel_fuse_late` run consumes relation facts the
-            // first run produced (e.g. rope_rotated); semi-naive evaluation
-            // makes it a cheap delta join.
-            // Depth = the longest relation cascade: invf(pre) → angles →
-            // rotation → concat each consume the previous run's facts.
+            // Marker rules may have arbitrary dependency depth. Reach their
+            // fixed point before consumers materialize the fused operations.
             schedule: "(seq
                 kernel_fuse_late_pre_rms
                 kernel_fuse_late_pre_topk
@@ -343,9 +335,7 @@ fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> 
                 kernel_fuse_late_pre_sink_attention_past
                 kernel_fuse_late_pre_sink_attention_finish
                 kernel_fuse_late_pre_flashinfer
-                kernel_fuse_late
-                kernel_fuse_late
-                kernel_fuse_late
+                (saturate kernel_fuse_late)
                 kernel_fuse_late2_rope
                 kernel_fuse_late2_sink_attention
                 kernel_fuse_late2_flashinfer_value
@@ -1330,7 +1320,7 @@ pub fn run_egglog_with_report_parts(
     )
 }
 
-fn run_egglog_with_report_parts_impl(
+pub(crate) fn run_egglog_with_report_parts_impl(
     program: &str,
     root: &str,
     op_parts: &OpTextParts,
@@ -1424,6 +1414,21 @@ fn run_egglog_with_report_parts_impl(
     }
     let full_report = stage_report(&egraph, full_start.elapsed());
     trace_stage_report("---- Egglog Rule Matches ----", &full_report);
+    if log && egglog_debug() {
+        let report = egraph.get_overall_run_report();
+        eprintln!("---- Egglog Overall Run Report ----\n{report}");
+        // Keep complete rule names and precise timings for cross-bucket analysis.
+        eprintln!(
+            "EGGLOG_RUN_REPORT_JSON {}",
+            serde_json::json!({
+                "search_and_apply_time_per_rule": report.search_and_apply_time_per_rule,
+                "num_matches_per_rule": report.num_matches_per_rule,
+                "search_and_apply_time_per_ruleset": report.search_and_apply_time_per_ruleset,
+                "merge_time_per_ruleset": report.merge_time_per_ruleset,
+                "rebuild_time_per_ruleset": report.rebuild_time_per_ruleset,
+            })
+        );
+    }
 
     let run_report = EgglogRunReport {
         full: full_report,
@@ -3871,6 +3876,38 @@ mod tests {
                 "seed {seed} retained a reachable cycle"
             );
         }
+    }
+
+    #[test]
+    fn late_fusion_markers_reach_a_fixed_point() {
+        let ops = <HLIROps as IntoEgglogOp>::into_vec();
+        let egraph = super::run_egglog_with_late_passes_interval_analysis_and_log(
+            "(let t0 (Input 0 \"\" (F32))) (let t1 (Output t0 0 false))",
+            "t1",
+            &ops,
+            false,
+            &[],
+            r#"
+            (relation test_late_marker (i64 IR))
+            (rule ((= ?x (Input ?id ?name ?dtype)))
+                  ((test_late_marker 0 ?x)) :ruleset kernel_fuse_late)
+            (rule ((test_late_marker ?step ?x) (< ?step 7))
+                  ((test_late_marker (+ ?step 1) ?x)) :ruleset kernel_fuse_late)
+            (rule ((test_late_marker 7 ?x) (= ?out (Output ?x ?id ?persist)))
+                  ((union ?out ?x)) :ruleset kernel_fuse_late)
+            "#,
+            false,
+            false,
+        )
+        .unwrap();
+        let root = &egraph.roots[0];
+        assert!(
+            egraph.eclasses[root]
+                .1
+                .iter()
+                .any(|node| egraph.enodes[node].0 == "Input"),
+            "the consumer must see markers deeper than the old three-run limit"
+        );
     }
 
     #[test]

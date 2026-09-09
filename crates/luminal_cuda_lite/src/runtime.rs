@@ -46,6 +46,11 @@ use std::{
 use tracing::{Level, span, trace};
 use uuid::Uuid;
 
+#[path = "profile.rs"]
+mod profile;
+pub use crate::host::ProfileState;
+pub use profile::{ProfileEvaluation, ProfileInputs, ProfileStorage, ProfileWorkload};
+
 const ARENA_ALIGNMENT: usize = 256;
 const MIN_ARENA_ALLOCATION_BYTES: usize = 16 * 1024 * 1024;
 const MIN_SEARCH_DEVICE_HEADROOM_BYTES: usize = 512 * 1024 * 1024;
@@ -465,6 +470,9 @@ pub struct CudaRuntimeImpl<O> {
     /// When true, execute() records a device interval and skips input buffer
     /// consumption (used during search/profile).
     profiling: bool,
+    profile_workload: Option<ProfileWorkload>,
+    profile_replay: Option<profile::ReplaySession>,
+    profile_evaluations: Vec<ProfileEvaluation>,
     /// Selects the deployment CUDA-graph launch path while profiling. The
     /// broad genetic search leaves this false and cheaply times prepared
     /// steps; CUDA re-ranks its small finalist set with this true so the final
@@ -476,7 +484,7 @@ pub struct CudaRuntimeImpl<O> {
     /// from candidate ranking.
     profile_start_event: CudaEvent,
     profile_end_event: CudaEvent,
-    last_profile_device_duration: Option<Duration>,
+    last_profile_duration: Option<Duration>,
     /// Monotonic identifier passed to every HostOp in one `execute` call.
     /// Host-side planners use it to share immutable per-tick preparation
     /// without carrying dynamic metadata across executions.
@@ -4536,7 +4544,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     pub(crate) fn cancel_search_profile(&mut self) {
         self.profiling = false;
         self.profile_cuda_graphs = false;
-        self.last_profile_device_duration = None;
+        self.last_profile_duration = None;
     }
 
     fn profile_loaded_llir_inner(
@@ -4551,13 +4559,21 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         self.profiling = true;
         self.profile_cuda_graphs = profile_cuda_graphs;
         let profile_start = std::time::Instant::now();
+        let diagnostic = std::env::var_os("LUMINAL_CUDA_PROFILE_EXEC").is_some();
+        if diagnostic {
+            eprintln!(
+                "SEARCH_PROFILE_BEGIN graph={profile_cuda_graphs} trials={} timing={:?} dyn={dyn_map:?}",
+                trials.max(1),
+                self.profile_timing_method()
+            );
+        }
         // Warmup absorbs one-time costs (CUDA graph materialization, lazy
         // allocations, cache warming) so the timed trials measure steady-state
         // execution instead of folding setup noise into the candidate ranking.
         self.execute(dyn_map);
         let warmup_duration = self
-            .last_profile_device_duration
-            .expect("profiled CUDA warmup did not record a device duration");
+            .last_profile_duration
+            .expect("profiled CUDA warmup did not record a duration");
         // A warmup that already blew the whole profiling budget has proven
         // the candidate slow; return it as the measurement instead of paying
         // for a timed trial of the same magnitude. Bad candidates are the
@@ -4565,20 +4581,27 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
             self.profiling = false;
             self.profile_cuda_graphs = false;
+            if diagnostic {
+                eprintln!(
+                    "SEARCH_PROFILE_END graph={profile_cuda_graphs} warmups=1 trials=0 wall_ms={:.6} warmup_metric_ms={:.6} timed_metric_ms=0",
+                    profile_start.elapsed().as_secs_f64() * 1e3,
+                    warmup_duration.as_secs_f64() * 1e3
+                );
+            }
             return (warmup_duration, format_duration_precise(&warmup_duration));
         }
         let mut durations = Vec::with_capacity(trials.max(1));
         for _ in 0..trials.max(1) {
-            // Deployment never executes the same dyn_map twice (decode's `c`
-            // is fresh every step), so mark dimensions stale before every
-            // trial. This refreshes any dimension-baked launch state before
-            // the start event; the metric itself remains strictly the
-            // resulting device execution interval.
-            self.assume_dyn_dims_stale();
+            // Keep legacy synthetic profiling's forced plan refresh. Explicit
+            // samples replay their exact dimensions; arbitrary tensor graphs do
+            // not necessarily change dimensions between invocations.
+            if self.profile_replay.is_none() {
+                self.assume_dyn_dims_stale();
+            }
             self.execute(dyn_map);
             durations.push(
-                self.last_profile_device_duration
-                    .expect("profiled CUDA trial did not record a device duration"),
+                self.last_profile_duration
+                    .expect("profiled CUDA trial did not record a duration"),
             );
             if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
                 break;
@@ -4600,6 +4623,15 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         self.profile_cuda_graphs = false;
         let duration = durations.iter().sum::<std::time::Duration>() / durations.len() as u32;
 
+        if diagnostic {
+            eprintln!(
+                "SEARCH_PROFILE_END graph={profile_cuda_graphs} warmups=1 trials={} wall_ms={:.6} warmup_metric_ms={:.6} timed_metric_ms={:.6}",
+                durations.len(),
+                profile_start.elapsed().as_secs_f64() * 1e3,
+                warmup_duration.as_secs_f64() * 1e3,
+                durations.iter().sum::<Duration>().as_secs_f64() * 1e3
+            );
+        }
         let duration_str = format_duration_precise(&duration);
         let display = duration_str;
         let display = if std::env::var_os("LUMINAL_SEARCH_OP_NAMES").is_some() {
@@ -4807,7 +4839,12 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         // to call release_pooled_memory() itself, so on a memory-tight GPU the
         // arena allocation below would otherwise OOM against the pool residue.
         self.release_pooled_memory();
+        // Explicit replay binds exact sample metadata. A bucket representative
+        // need not describe that sample (or even a coherent set of its inputs).
+        // Capture lazily on the first exact invocation, including finalist
+        // reranking; resource validation still covers the full bucket domain.
         if prebuild_cuda_graphs
+            && self.profile_replay.is_none()
             && input_lengths_complete
             && let Some(representative_dyn_map) = representative_dyn_maps.get(self.active_bucket)
         {
@@ -5115,10 +5152,13 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             compiled_function_resource_cache: CompiledFunctionResourceCache::default(),
             region_source_cache: RegionSourceCache::default(),
             profiling: false,
+            profile_workload: None,
+            profile_replay: None,
+            profile_evaluations: vec![],
             profile_cuda_graphs: false,
             profile_start_event,
             profile_end_event,
-            last_profile_device_duration: None,
+            last_profile_duration: None,
             next_execution_id: 0,
             max_intermediate_memory_bytes: None,
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
@@ -5153,7 +5193,20 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
         options: &CompileOptions,
         rng: &mut dyn luminal::prelude::RngCore,
     ) {
-        self.search_and_load(space, dyn_map, options, rng);
+        assert!(
+            self.profile_workload.is_none() || options.profile_dims.is_empty(),
+            "profile_dims cannot override an explicit profile workload"
+        );
+        let contexts = space.bucket_contexts(dyn_map);
+        self.begin_profile_replay(&contexts)
+            .expect("invalid representative profile workload");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.search_and_load(space, dyn_map, options, rng);
+        }));
+        self.finish_profile_replay();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     fn selected_schedule(&self) -> Option<luminal::graph::SelectedSchedule> {
@@ -5175,6 +5228,15 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
+        let invocation_started = std::time::Instant::now();
+        if self.profiling {
+            self.restore_profile_trial()
+                .expect("profile state restoration failed");
+        }
+        let initial_restore_time = invocation_started.elapsed();
+        let profile_invocation_start = self.profiling.then(std::time::Instant::now);
+        let mut profile_reset_duration = Duration::ZERO;
+        let mut preparation_sync_time = Duration::ZERO;
         let execution_id = self.next_execution_id;
         self.next_execution_id = self.next_execution_id.wrapping_add(1);
         // `PROFILE_EXEC` measures only these coarse runtime phases. The older
@@ -5270,7 +5332,21 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
         }
         materialize_time += timer.elapsed();
         if self.profiling {
-            self.last_profile_device_duration = None;
+            // Preparation may warm a stateful library implementation. Reset
+            // again after preparation so the timed execution starts from the
+            // sample's state, even on the first graph materialization.
+            if self.profile_replay.is_some() {
+                let sync_started = std::time::Instant::now();
+                self.cuda_stream
+                    .synchronize()
+                    .expect("profile preparation synchronization failed");
+                preparation_sync_time = sync_started.elapsed();
+                let reset = std::time::Instant::now();
+                self.restore_profile_trial()
+                    .expect("profile state restoration failed");
+                profile_reset_duration = reset.elapsed();
+            }
+            self.last_profile_duration = None;
             self.profile_start_event
                 .record(&self.cuda_stream)
                 .expect("failed to record CUDA profiling start event");
@@ -5454,6 +5530,8 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             self.cuda_stream.synchronize().unwrap();
         }
         sync_time += timer.elapsed();
+        let profile_invocation_duration = profile_invocation_start
+            .map(|start| start.elapsed().saturating_sub(profile_reset_duration));
         if std::env::var_os("LUMINAL_CUDA_PROFILE_GRAPH_STEPS").is_some() {
             for &exec_node in &bucket.exec_order {
                 let exec_op = &bucket.exec_graph[exec_node];
@@ -5493,8 +5571,12 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
                 .profile_start_event
                 .elapsed_ms(&self.profile_end_event)
                 .expect("failed to measure CUDA profiling events");
-            self.last_profile_device_duration =
-                Some(Duration::from_secs_f64(f64::from(elapsed_ms) / 1_000.0));
+            self.last_profile_duration = Some(match self.profile_timing_method() {
+                luminal::op::TimingMethod::DeviceTimestamp => {
+                    Duration::from_secs_f64(f64::from(elapsed_ms) / 1_000.0)
+                }
+                luminal::op::TimingMethod::WallClock => profile_invocation_duration.unwrap(),
+            });
         }
 
         // Populate last_kernel_stats from HostOps that report stats
@@ -5524,6 +5606,23 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
         // reinstall lifted weights. A later changed set_device_ptr call safely
         // replaces the retained non-owning view.
         if self.profiling {
+            if profile_runtime {
+                eprintln!(
+                    "SEARCH_EXEC graph={} wall_ms={:.6} initial_restore_ms={:.6} prepare_ms={:.6} materialize_ms={:.6} preparation_sync_ms={:.6} post_restore_ms={:.6} launch_sync_ms={:.6} stats_ms={:.6}",
+                    self.profile_cuda_graphs,
+                    invocation_started.elapsed().as_secs_f64() * 1e3,
+                    initial_restore_time.as_secs_f64() * 1e3,
+                    (bucket_dispatch_time + prepare_buffers_time + output_registration_time)
+                        .as_secs_f64()
+                        * 1e3,
+                    materialize_time.as_secs_f64() * 1e3,
+                    preparation_sync_time.as_secs_f64() * 1e3,
+                    profile_reset_duration.as_secs_f64() * 1e3,
+                    (graph_launch_time + host_op_time + sync_time + buffer_map_time).as_secs_f64()
+                        * 1e3,
+                    stats_time.as_secs_f64() * 1e3
+                );
+            }
             return;
         }
         let timer = std::time::Instant::now();

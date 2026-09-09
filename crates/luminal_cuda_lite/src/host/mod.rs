@@ -181,7 +181,38 @@ impl DeviceBuffer {
 /// Host operations that execute on the CPU but orchestrate GPU work.
 ///
 /// This includes operations like cuBLAS calls and CUDA graph executions.
+/// Backend-owned snapshot for an opaque operation's semantic state. RNG state
+/// can use this hook when it cannot be represented as ordinary graph inputs.
+pub trait ProfileState {
+    fn restore(&self, stream: &Arc<CudaStream>) -> anyhow::Result<()>;
+}
+impl ProfileState for () {
+    fn restore(&self, _: &Arc<CudaStream>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
+    /// Snapshot semantic state hidden outside graph buffers before representative
+    /// profiling. The snapshot restores identical state before each trial and
+    /// after candidate evaluation, including failure. The default declares all
+    /// semantic state explicit in graph tensors; caches/scratch overwritten by
+    /// execution need no snapshot. Stateful custom ops must implement this hook
+    /// or return an error when replay is unsupported.
+    fn capture_profile_state(
+        &self,
+        _stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<Box<dyn ProfileState>> {
+        Ok(Box::new(()))
+    }
+
+    /// Graph inputs this operation may modify, indexed in data-input order.
+    /// The default declares inputs read-only. Custom mutating HostOps must list
+    /// their writes so representative replay can protect shared read-only inputs.
+    fn profile_mutated_inputs(&self) -> Vec<usize> {
+        vec![]
+    }
+
     /// Execute the operation with access to buffers via a map.
     ///
     /// # Arguments

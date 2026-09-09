@@ -1,0 +1,656 @@
+//! Fixed-input replay for CUDA search. Input snapshots live on the host; one
+//! reusable set of device allocations is shared by all examples/candidates.
+use super::*;
+use luminal::search::{
+    ProfileCase, ProfileMeasurement, assign_profile_cases, weighted_profile_cost,
+};
+use std::ops::Range;
+
+/// Immutable backing bytes. Views of the same storage preserve aliasing and are
+/// restored together, once per reset. Bytes use the graph input's physical ABI.
+#[derive(Clone, Debug)]
+pub struct ProfileStorage(Arc<[u8]>);
+impl ProfileStorage {
+    pub fn new(data: impl ToCudaInput) -> Self {
+        Self(data.into_cuda_bytes().into())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InputSchema {
+    id: NodeIndex,
+    graph: usize,
+    dtype: DType,
+    bytes: Expression,
+}
+impl InputSchema {
+    fn new(t: GraphTensor) -> Self {
+        Self {
+            id: t.id,
+            graph: t.graph_ref as usize,
+            dtype: t.dtype,
+            bytes: (t.shape.physical_span() * t.dtype.bits() + 7) / 8,
+        }
+    }
+    fn validate(&self, graph: &Graph) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.graph == graph as *const Graph as usize,
+            "profile input belongs to another graph"
+        );
+        anyhow::ensure!(
+            graph
+                .input_meta
+                .get(&self.id)
+                .is_some_and(|(_, dtype)| *dtype == self.dtype),
+            "profile binding {:?} is not an input with dtype {:?}",
+            self.id,
+            self.dtype
+        );
+        Ok(())
+    }
+    fn length(&self, dims: &DynMap) -> anyhow::Result<usize> {
+        self.bytes
+            .exec(dims)
+            .ok_or_else(|| anyhow::anyhow!("missing dimensions for profile input {:?}", self.id))
+    }
+}
+#[derive(Clone, Debug)]
+struct Binding {
+    schema: InputSchema,
+    storage: ProfileStorage,
+    range: Range<usize>,
+    mirror: bool,
+}
+
+/// Frozen input bindings for one sample. All supplied bytes are restored, even
+/// when a candidate aliases an output to an input. Omit large immutable inputs
+/// only by explicitly declaring them shared on `ProfileWorkload`.
+#[derive(Clone, Debug, Default)]
+pub struct ProfileInputs {
+    bindings: Vec<Binding>,
+}
+impl ProfileInputs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn input(self, tensor: GraphTensor, data: impl ToCudaInput) -> Self {
+        let storage = ProfileStorage::new(data);
+        let len = storage.0.len();
+        self.view(tensor, &storage, 0..len, false)
+    }
+    pub fn mirrored_input(self, tensor: GraphTensor, data: impl ToCudaInput) -> Self {
+        let storage = ProfileStorage::new(data);
+        let len = storage.0.len();
+        self.view(tensor, &storage, 0..len, true)
+    }
+    /// Bind an input to a physical byte range; graph views/strides remain in the
+    /// graph. Overlapping ranges must share the same `ProfileStorage` object.
+    pub fn view(
+        mut self,
+        tensor: GraphTensor,
+        storage: &ProfileStorage,
+        range: Range<usize>,
+        mirror: bool,
+    ) -> Self {
+        self.bindings.push(Binding {
+            schema: InputSchema::new(tensor),
+            storage: storage.clone(),
+            range,
+            mirror,
+        });
+        self
+    }
+    fn groups(&self) -> Vec<ProfileStorage> {
+        let mut groups: Vec<ProfileStorage> = vec![];
+        for b in self.bindings.iter().sorted_by_key(|b| b.schema.id) {
+            if !groups.iter().any(|s| Arc::ptr_eq(&s.0, &b.storage.0)) {
+                groups.push(b.storage.clone());
+            }
+        }
+        groups
+    }
+}
+
+/// An explicit workload for any supported graph. Case weights describe global
+/// invocation frequency. Shared inputs stay in the runtime and are never copied
+/// per case; candidates that mutate them are invalid for this replay contract.
+#[derive(Clone, Debug, Default)]
+pub struct ProfileWorkload {
+    cases: Vec<ProfileCase<ProfileInputs>>,
+    shared: Vec<InputSchema>,
+    timing_method: luminal::op::TimingMethod,
+    device_snapshots: bool,
+    space_token: Option<Arc<Box<dyn luminal::op::EgglogOp>>>,
+}
+impl ProfileWorkload {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Device timestamps measure launched device work; host timing includes
+    /// ordinary planning, parameter updates and dispatch through completion.
+    /// Both exclude snapshot loading and untimed warmup. This is steady repeated
+    /// invocation timing, not an application scheduler or multi-step trace metric.
+    pub fn timing_method(mut self, method: luminal::op::TimingMethod) -> Self {
+        self.timing_method = method;
+        self
+    }
+    /// Cache immutable sample backing on the device. Repeated resets use device
+    /// copies instead of host transfers, at the cost of extra device memory.
+    /// Shared backing objects are uploaded once across all cases.
+    pub fn device_snapshots(mut self, enabled: bool) -> Self {
+        self.device_snapshots = enabled;
+        self
+    }
+    pub fn cases(&self) -> &[ProfileCase<ProfileInputs>] {
+        &self.cases
+    }
+    pub fn shared_input(mut self, tensor: GraphTensor) -> Self {
+        self.shared.push(InputSchema::new(tensor));
+        self
+    }
+    pub fn case(
+        mut self,
+        id: impl Into<String>,
+        dims: DynMap,
+        inputs: ProfileInputs,
+        weight: f64,
+    ) -> Self {
+        self.cases.push(ProfileCase::new(id, dims, inputs, weight));
+        self
+    }
+}
+
+/// One candidate's complete per-case measurements (direct or graph execution).
+#[derive(Clone, Debug)]
+pub struct ProfileEvaluation {
+    pub bucket: usize,
+    pub cuda_graph: bool,
+    pub timing_method: luminal::op::TimingMethod,
+    pub cases: Vec<ProfileMeasurement>,
+    pub weighted_cost: Duration,
+}
+
+pub(super) struct ReplaySession {
+    assigned: Vec<Vec<usize>>,
+    slots: Vec<CudaSlice<u8>>,
+    snapshots: FxHashMap<usize, CudaSlice<u8>>,
+    active: Option<usize>,
+    host_states: Vec<Box<dyn crate::host::ProfileState>>,
+    saved_inputs: FxHashMap<NodeIndex, CudaInput>,
+    saved_mirrors: FxHashMap<NodeIndex, Vec<u8>>,
+    saved_external: FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
+    saved_outputs: FxHashMap<NodeIndex, (u64, usize)>,
+}
+
+impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
+    /// Validate and freeze a workload before `graph.search_with_rng`. Supplying
+    /// no workload preserves legacy runtime-bound/synthetic profiling behavior.
+    /// Each graph input must be declared in every case or explicitly shared.
+    pub fn set_profile_workload(
+        &mut self,
+        graph: &Graph,
+        mut workload: ProfileWorkload,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.profile_replay.is_none(),
+            "cannot replace workload during replay"
+        );
+        anyhow::ensure!(!workload.cases.is_empty(), "profile workload has no cases");
+        workload.space_token = graph
+            .search_space()
+            .ok_or_else(|| anyhow::anyhow!("build the search space before installing a workload"))?
+            .ops
+            .first()
+            .cloned();
+        anyhow::ensure!(
+            workload
+                .cases
+                .iter()
+                .map(|c| c.weight)
+                .sum::<f64>()
+                .is_finite(),
+            "profile weight sum overflows"
+        );
+        let expected: FxHashSet<_> = graph.input_meta.keys().copied().collect();
+        let mut shared = FxHashSet::default();
+        for s in &workload.shared {
+            s.validate(graph)?;
+            anyhow::ensure!(shared.insert(s.id), "duplicate shared profile input");
+        }
+        let mut ids = FxHashSet::default();
+        for case in &workload.cases {
+            anyhow::ensure!(
+                !case.id.is_empty() && ids.insert(&case.id),
+                "empty or duplicate profile case ID"
+            );
+            anyhow::ensure!(
+                case.weight.is_finite() && case.weight > 0.,
+                "invalid profile weight"
+            );
+            let mut seen = shared.clone();
+            for b in &case.inputs.bindings {
+                b.schema.validate(graph)?;
+                anyhow::ensure!(
+                    seen.insert(b.schema.id),
+                    "duplicate profile input {:?}",
+                    b.schema.id
+                );
+                anyhow::ensure!(
+                    b.range.start <= b.range.end && b.range.end <= b.storage.0.len(),
+                    "invalid profile storage view"
+                );
+                let bits = b.schema.dtype.bits();
+                anyhow::ensure!(
+                    bits % 8 != 0 || b.range.start % (bits / 8) == 0,
+                    "profile input view is not aligned to its dtype"
+                );
+                anyhow::ensure!(
+                    b.range.len() == b.schema.length(&case.dims)?,
+                    "case {} input {:?}: byte length does not match exact dimensions",
+                    case.id,
+                    b.schema.id
+                );
+            }
+            anyhow::ensure!(
+                seen == expected,
+                "case {} must bind every graph input or declare it shared",
+                case.id
+            );
+        }
+        self.profile_workload = Some(workload);
+        self.profile_evaluations.clear();
+        Ok(())
+    }
+    pub fn clear_profile_workload(&mut self) {
+        assert!(self.profile_replay.is_none());
+        self.profile_workload = None;
+    }
+    pub fn profile_evaluations(&self) -> &[ProfileEvaluation] {
+        &self.profile_evaluations
+    }
+
+    /// Snapshot selected boundary inputs using their current physical bindings.
+    /// Capture immediately before execution, after installing coherent metadata.
+    /// Overlapping device ranges are captured as one backing allocation. Explicit
+    /// tensor state (including RNG state) uses this same mechanism.
+    pub fn capture_profile_inputs(
+        &self,
+        tensors: &[GraphTensor],
+        dims: &DynMap,
+    ) -> anyhow::Result<ProfileInputs> {
+        self.cuda_stream.synchronize()?;
+        let mut ranges = vec![];
+        for &tensor in tensors {
+            let (ptr, len) = self
+                .current_hlir_device_binding(tensor.id)
+                .ok_or_else(|| anyhow::anyhow!("missing capture input {:?}", tensor.id))?;
+            anyhow::ensure!(
+                len == InputSchema::new(tensor).length(dims)?,
+                "capture input length does not match dimensions"
+            );
+            let end = ptr
+                .checked_add(len as u64)
+                .ok_or_else(|| anyhow::anyhow!("capture address overflow"))?;
+            ranges.push((ptr, end, tensor));
+        }
+        ranges.sort_by_key(|r| r.0);
+        let mut result_inputs = ProfileInputs::new();
+        let mut i = 0;
+        while i < ranges.len() {
+            let start = ranges[i].0;
+            let mut end = ranges[i].1;
+            let mut j = i + 1;
+            while j < ranges.len() && ranges[j].0 < end {
+                end = end.max(ranges[j].1);
+                j += 1;
+            }
+            let mut bytes = vec![0u8; (end - start) as usize];
+            if !bytes.is_empty() {
+                unsafe {
+                    result::memcpy_dtoh_sync(&mut bytes, start)?;
+                }
+            }
+            let storage = ProfileStorage(bytes.into());
+            for &(ptr, end, tensor) in &ranges[i..j] {
+                let range = (ptr - start) as usize..(end - start) as usize;
+                let mirror = self.hlir_host_mirrors.get(&tensor.id);
+                if let Some(mirror) = mirror {
+                    anyhow::ensure!(
+                        mirror.as_slice() == &storage.0[range.clone()],
+                        "capture host mirror disagrees with device input"
+                    );
+                }
+                result_inputs = result_inputs.view(tensor, &storage, range, mirror.is_some());
+            }
+            i = j;
+        }
+        Ok(result_inputs)
+    }
+
+    pub(crate) fn begin_profile_replay(
+        &mut self,
+        contexts: &[luminal::search::BucketContext<'_>],
+    ) -> anyhow::Result<()> {
+        let Some(workload) = &self.profile_workload else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            contexts.first().is_some_and(|c| c
+                .space
+                .ops
+                .first()
+                .zip(workload.space_token.as_ref())
+                .is_some_and(|(a, b)| Arc::ptr_eq(a, b))),
+            "profile workload belongs to another search space"
+        );
+        let assigned = assign_profile_cases(&workload.cases, contexts)?;
+        let mut capacities: Vec<usize> = vec![];
+        for case in &workload.cases {
+            for (i, group) in case.inputs.groups().iter().enumerate() {
+                if capacities.len() <= i {
+                    capacities.push(0);
+                }
+                capacities[i] = capacities[i].max(group.0.len().max(1));
+            }
+            for s in &workload.shared {
+                let (_, len) = self
+                    .current_hlir_device_binding(s.id)
+                    .ok_or_else(|| anyhow::anyhow!("missing shared input {:?}", s.id))?;
+                anyhow::ensure!(
+                    len == s.length(&case.dims)?,
+                    "shared input size varies or does not match sample dimensions"
+                );
+            }
+        }
+        // Allocate before altering caller bindings, so allocation failures leave
+        // the original runtime usable. Device capacity checks see these slots.
+        let slots = capacities
+            .into_iter()
+            .map(|n| self.cuda_stream.alloc_zeros(n))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut snapshots = FxHashMap::default();
+        if workload.device_snapshots {
+            for case in &workload.cases {
+                for group in case.inputs.groups() {
+                    let key = group.0.as_ptr() as usize;
+                    if let std::collections::hash_map::Entry::Vacant(entry) = snapshots.entry(key) {
+                        entry.insert(self.cuda_stream.clone_htod(group.0.as_ref())?);
+                    }
+                }
+            }
+        }
+        self.cuda_stream.synchronize()?;
+        let shared_ids: Vec<_> = workload.shared.iter().map(|s| s.id).collect();
+        self.release_all_bucket_cuda_graphs();
+        let shared_bindings: Vec<_> = shared_ids
+            .iter()
+            .map(|&id| {
+                let (ptr, len) = self.current_hlir_device_binding(id).unwrap();
+                (id, ptr, len, self.hlir_host_mirrors.get(&id).cloned())
+            })
+            .collect();
+        let session = ReplaySession {
+            assigned,
+            slots,
+            snapshots,
+            active: None,
+            host_states: vec![],
+            saved_inputs: std::mem::take(&mut self.hlir_buffers),
+            saved_mirrors: std::mem::take(&mut self.hlir_host_mirrors),
+            saved_external: std::mem::take(&mut self.external_buffers),
+            saved_outputs: std::mem::take(&mut self.output_ptr_registrations),
+        };
+        self.invalidate_output_registration_resolution();
+        self.profile_replay = Some(session);
+        for (id, ptr, len, mirror) in shared_bindings {
+            unsafe {
+                self.set_device_ptr(id, ptr, len);
+            }
+            if let Some(bytes) = mirror {
+                self.hlir_host_mirrors.insert(id, bytes);
+            }
+        }
+        self.profile_evaluations.clear();
+        Ok(())
+    }
+
+    pub(crate) fn finish_profile_replay(&mut self) {
+        if self.profile_replay.is_none() {
+            return;
+        }
+        self.release_profile_op_states()
+            .expect("profile operation state restoration failed");
+        self.cuda_stream
+            .synchronize()
+            .expect("profile replay synchronization failed");
+        self.release_all_bucket_cuda_graphs();
+        let session = self.profile_replay.take().unwrap();
+        self.hlir_buffers = session.saved_inputs;
+        self.hlir_host_mirrors = session.saved_mirrors;
+        self.external_buffers = session.saved_external;
+        self.output_ptr_registrations = session.saved_outputs;
+        self.invalidate_output_registration_resolution();
+        self.changed_hlir.extend(self.hlir_buffers.keys());
+        for bucket in &mut self.compiled_buckets {
+            bucket.hlir_synced = false;
+            bucket.materialization_fully_dirty = true;
+        }
+        self.cancel_search_profile();
+        // Slots drop only after graph releases and restoration of all bindings.
+    }
+
+    pub(crate) fn profile_case_indices(&self, bucket: usize) -> Option<Vec<usize>> {
+        self.profile_replay
+            .as_ref()
+            .map(|r| r.assigned[bucket].clone())
+    }
+    pub(crate) fn profile_case_dims(&self, case: usize) -> DynMap {
+        self.profile_workload.as_ref().unwrap().cases[case]
+            .dims
+            .clone()
+    }
+    pub(crate) fn activate_profile_case(&mut self, case: usize) -> anyhow::Result<()> {
+        self.profile_replay.as_mut().unwrap().active = Some(case);
+        self.restore_profile_inputs()
+    }
+    fn restore_profile_inputs(&mut self) -> anyhow::Result<()> {
+        let Some(session) = &mut self.profile_replay else {
+            return Ok(());
+        };
+        let Some(index) = session.active else {
+            return Ok(());
+        };
+        let inputs = &self.profile_workload.as_ref().unwrap().cases[index].inputs;
+        let groups = inputs.groups();
+        for (group, slot) in groups.iter().zip(&mut session.slots) {
+            if !group.0.is_empty() {
+                let mut destination = slot.slice_mut(..group.0.len());
+                if let Some(source) = session.snapshots.get(&(group.0.as_ptr() as usize)) {
+                    self.cuda_stream.memcpy_dtod(source, &mut destination)?;
+                } else {
+                    self.cuda_stream
+                        .memcpy_htod(group.0.as_ref(), &mut destination)?;
+                }
+            }
+        }
+        let bindings: Vec<_> = inputs
+            .bindings
+            .iter()
+            .map(|b| {
+                let group = groups
+                    .iter()
+                    .position(|g| Arc::ptr_eq(&g.0, &b.storage.0))
+                    .unwrap();
+                let ptr =
+                    session.slots[group].device_ptr(&self.cuda_stream).0 + b.range.start as u64;
+                (
+                    b.schema.id,
+                    ptr,
+                    b.range.len(),
+                    b.mirror.then(|| b.storage.0[b.range.clone()].to_vec()),
+                )
+            })
+            .collect();
+        for (id, ptr, len, mirror) in bindings {
+            unsafe {
+                self.set_device_ptr(id, ptr, len);
+            }
+            if let Some(bytes) = mirror {
+                self.hlir_host_mirrors.insert(id, bytes);
+            }
+        }
+        // End reset traffic before planning/timing (also supports borrowed streams).
+        self.cuda_stream.synchronize()?;
+        Ok(())
+    }
+
+    pub(crate) fn capture_profile_op_states(&mut self, llir: &LLIRGraph) -> anyhow::Result<()> {
+        for node in llir.node_weights() {
+            if let Some(host) = node.to_dialect::<dyn HostOp>() {
+                let state = host.capture_profile_state(&self.cuda_stream)?;
+                self.profile_replay
+                    .as_mut()
+                    .unwrap()
+                    .host_states
+                    .push(state);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn release_profile_op_states(&mut self) -> anyhow::Result<()> {
+        let Some(session) = &mut self.profile_replay else {
+            return Ok(());
+        };
+        // Keep snapshots alive if restoration fails, so outer cleanup can retry.
+        for state in &session.host_states {
+            state.restore(&self.cuda_stream)?;
+        }
+        self.cuda_stream.synchronize()?;
+        session.host_states.clear();
+        Ok(())
+    }
+    pub(crate) fn restore_profile_trial(&mut self) -> anyhow::Result<()> {
+        if self.profile_replay.is_none() {
+            return Ok(());
+        }
+        self.restore_profile_inputs()?;
+        for state in &self.profile_replay.as_ref().unwrap().host_states {
+            state.restore(&self.cuda_stream)?;
+        }
+        self.cuda_stream.synchronize()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_profile_effects(&self, llir: &LLIRGraph) -> anyhow::Result<()> {
+        let workload = self.profile_workload.as_ref().unwrap();
+        let shared: FxHashSet<_> = workload.shared.iter().map(|s| s.id).collect();
+        // Follow declared storage aliases, not op names or graph patterns.
+        let incoming = |node| {
+            llir.edges_directed(node, Direction::Incoming)
+                .sorted_by_key(|e| e.id())
+                .map(|e| e.source())
+                .collect::<Vec<_>>()
+        };
+        let root = |mut node: NodeIndex| {
+            for _ in 0..=llir.node_count() {
+                if let Some(input) = llir[node].to_op::<Input>() {
+                    return Some(NodeIndex::new(input.node));
+                }
+                let alias = llir[node]
+                    .to_dialect::<dyn KernelOp>()?
+                    .output_aliases_input()?;
+                node = *incoming(node).get(alias)?;
+            }
+            None
+        };
+        for node in llir.node_indices() {
+            let writes = if let Some(kernel) = llir[node].to_dialect::<dyn KernelOp>() {
+                kernel
+                    .output_aliases_input()
+                    .filter(|_| kernel.mutates_aliased_input())
+                    .into_iter()
+                    .collect()
+            } else if let Some(host) = llir[node].to_dialect::<dyn HostOp>() {
+                host.profile_mutated_inputs()
+            } else {
+                vec![]
+            };
+            let inputs = incoming(node);
+            for write in writes {
+                let source = inputs
+                    .get(write)
+                    .ok_or_else(|| anyhow::anyhow!("invalid profile effect input index"))?;
+                let Some(id) = root(*source) else {
+                    continue;
+                };
+                anyhow::ensure!(
+                    !shared.contains(&id),
+                    "candidate writes shared read-only profile input {id:?}"
+                );
+                // Cross-input storage aliasing is invisible to e-graph exclusive-
+                // use proofs. Reject destructive alternatives that would change
+                // another input's logical value; ordinary out-of-place ops remain
+                // legal. Views of a single graph input retain normal alias proofs.
+                for case in &workload.cases {
+                    if let Some(b) = case.inputs.bindings.iter().find(|b| b.schema.id == id) {
+                        for other in &case.inputs.bindings {
+                            anyhow::ensure!(
+                                other.schema.id == id
+                                    || !Arc::ptr_eq(&b.storage.0, &other.storage.0)
+                                    || b.range.end <= other.range.start
+                                    || other.range.end <= b.range.start,
+                                "candidate writes overlapping profile input aliases"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn profile_timing_method(&self) -> luminal::op::TimingMethod {
+        self.profile_workload
+            .as_ref()
+            .map(|w| w.timing_method)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record_profile_evaluation(
+        &mut self,
+        bucket: usize,
+        cuda_graph: bool,
+        timings: &[(usize, Duration)],
+    ) -> anyhow::Result<Duration> {
+        let workload = self.profile_workload.as_ref().unwrap();
+        let total = workload.cases.iter().map(|c| c.weight).sum();
+        let values: Vec<_> = timings
+            .iter()
+            .map(|&(i, time)| (workload.cases[i].weight, time))
+            .collect();
+        let cost = weighted_profile_cost(&values, total)?;
+        self.profile_evaluations.push(ProfileEvaluation {
+            bucket,
+            cuda_graph,
+            timing_method: workload.timing_method,
+            weighted_cost: cost,
+            cases: timings
+                .iter()
+                .map(|&(i, duration)| {
+                    let c = &workload.cases[i];
+                    ProfileMeasurement {
+                        case_id: c.id.clone(),
+                        dims: c.dims.clone(),
+                        weight: c.weight,
+                        duration,
+                    }
+                })
+                .collect(),
+        });
+        Ok(cost)
+    }
+}
+
+#[cfg(test)]
+#[path = "profile_tests.rs"]
+mod tests;

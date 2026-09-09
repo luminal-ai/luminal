@@ -1,5 +1,5 @@
 use crate::egglog_utils::{
-    hlir_to_egglog, log_channel_enabled, run_egglog_with_late_passes_interval_analysis_and_log,
+    OpTextParts, hlir_to_egglog, log_channel_enabled, run_egglog_with_report_parts_impl,
 };
 pub use crate::search::unroll::{collapse_loops_to_first_iter, unroll_loops_in_llir};
 use crate::search::{BucketSearchSpace, SearchSpace, bucket_index_combinations};
@@ -21,6 +21,7 @@ use std::{
 use tracing;
 
 mod artifact;
+mod parallel;
 
 pub use artifact::{ScheduleBucket, SelectedSchedule};
 
@@ -1601,30 +1602,43 @@ impl Graph {
         let extra_egglog = Rt::extra_egglog();
 
         let (program, root) = hlir_to_egglog(self);
-        let buckets = bucket_index_combinations(&dim_buckets)
+        // Materialize op-owned text before crossing thread boundaries: backend
+        // op trait objects need not be Send/Sync. Each bucket owns its EGraph.
+        let mut parts = OpTextParts::new_with_late_passes(&ops, Rt::CLEANUP_HLIR, &late_passes);
+        parts.extra_egglog = extra_egglog;
+        let jobs: Vec<_> = bucket_index_combinations(&dim_buckets)
             .into_iter()
             .map(|bucket_indices| {
                 let intervals = self.bucket_intervals(&dim_buckets, &bucket_indices);
                 let (contextual_program, use_interval_analysis) =
                     self.egglog_program_with_interval_facts(&program, &intervals);
-                let egraph = run_egglog_with_late_passes_interval_analysis_and_log(
-                    &contextual_program,
-                    &root,
-                    &ops,
-                    Rt::CLEANUP_HLIR,
-                    &late_passes,
-                    &extra_egglog,
+                (
+                    bucket_indices,
+                    intervals,
+                    contextual_program,
                     use_interval_analysis,
-                    options.egglog_log_enabled(),
+                )
+            })
+            .collect();
+        let log = options.egglog_log_enabled();
+        let buckets = parallel::map_buckets(
+            &jobs,
+            |(bucket_indices, intervals, contextual_program, use_interval_analysis)| {
+                let (egraph, _) = run_egglog_with_report_parts_impl(
+                    contextual_program,
+                    &root,
+                    &parts,
+                    *use_interval_analysis,
+                    log,
                 )
                 .unwrap();
                 BucketSearchSpace {
                     egraph,
-                    bucket_indices,
-                    intervals,
+                    bucket_indices: bucket_indices.clone(),
+                    intervals: intervals.clone(),
                 }
-            })
-            .collect();
+            },
+        );
         let custom_ops = self.custom_ops.iter().map(|op| op.to_llir_op()).collect();
         self.search_space = Some(SearchSpace {
             buckets,
