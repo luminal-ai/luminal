@@ -11,8 +11,8 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, cuda_f64_literal, cuda_type, numel};
-use anyhow::{Result, bail};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_f64_literal, cuda_type, numel};
+use anyhow::Result;
 
 /// `ConstantGeneric() -> out` — pure dataflow source form.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,6 +56,10 @@ impl OpSlotNames for ConstantDps {
 }
 
 impl BufferTensorIrOp for ConstantDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "ConstantGeneric"
     }
@@ -84,22 +88,21 @@ impl ToDps for ConstantDps {
 impl LayoutIrOp for ConstantDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    let Some(constant) = op.as_any().downcast_ref::<ConstantDps>() else {
-        bail!("constant codegen reached with a non-Constant op");
-    };
-    // Dest-only signature: the check that used to stand here was the
-    // write fence — see `kernels::CodegenCtx::from_descriptors`.
-    let to = cuda_type(ctx.dest_dtypes[0])?;
-    let n = numel(&ctx.dest_dims[0]);
-    let value = cuda_f64_literal(constant.value);
-    let source = format!(
-        r#"extern "C" __global__ void k({to}* out, unsigned long long n) {{
+impl KernelOp for ConstantDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        // Dest-only signature: the check that used to stand here was the
+        // write fence — see `kernels::CodegenCtx::from_descriptors`.
+        let to = cuda_type(ctx.dest_dtypes[0])?;
+        let n = numel(&ctx.dest_dims[0]);
+        let value = cuda_f64_literal(self.value);
+        let source = format!(
+            r#"extern "C" __global__ void k({to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = ({to}){value};
 }}"#
-    );
-    Ok(vec![KernelSource::plain(source, n)])
+        );
+        Ok(vec![KernelSource::plain(source, n)])
+    }
 }
 
 /// Matches `LayoutTensorOpConstantGeneric` and produces this runtime's
@@ -156,7 +159,9 @@ mod tests {
 
     fn source_for(value: f64) -> String {
         let op = ConstantDps { value };
-        let launches = codegen(&op, &f32_dest_ctx()).expect("constant codegen succeeds");
+        let launches = op
+            .codegen(&f32_dest_ctx())
+            .expect("constant codegen succeeds");
         assert_eq!(launches.len(), 1, "constant is a single-launch op");
         launches.into_iter().next().unwrap().source
     }

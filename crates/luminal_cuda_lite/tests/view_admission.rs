@@ -58,9 +58,9 @@ fn plan_for(
 ) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     // THE DECOMPOSED ROUTE ON PURPOSE: this file audits the NVRTC plan
     // SHAPE (materialize/copy/buffer counts, and `audit`'s standing
-    // requirement that every elected compute op have a codegen row). A
+    // requirement that every elected compute op have a kernel interface). A
     // cuBLASLt marker — default since 2026-09-04 — is a host library
-    // call with no codegen row, so the chained-matmul fixture would
+    // call with no kernel interface, so the chained-matmul fixture would
     // leave the audit rather than pass it.
     let mut rt =
         CudaRuntime::load_with_registry(cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
@@ -121,10 +121,10 @@ fn audit(
                     && (0..writes.len()).all(|r| !op.result_writes_memory(r) && derives(r));
                 assert!(!view_shaped, "unfolded view ({label}) reached the plan");
 
-                // Every kernel-bearing elected op has a codegen row.
+                // Every kernel-bearing elected op has a kernel interface.
                 assert!(
-                    luminal_cuda_lite::kernels::codegen_for(op.as_ref()).is_some(),
-                    "elected op {label} has no codegen row"
+                    luminal_cuda_lite::as_kernel_op(op.as_ref()).is_some(),
+                    "elected op {label} has no kernel interface"
                 );
 
                 for (slot, info) in operand_info.iter().enumerate() {

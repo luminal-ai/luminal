@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, binary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, binary};
 use anyhow::Result;
 
 /// `ModFunctionalGeneric(lhs, rhs) -> out` — pure dataflow form.
@@ -59,6 +59,10 @@ impl OpSlotNames for ModFunctionalDps {
 }
 
 impl BufferTensorIrOp for ModFunctionalDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "ModFunctionalGeneric"
     }
@@ -87,9 +91,11 @@ impl ToDps for ModFunctionalDps {
 impl LayoutIrOp for ModFunctionalDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(_op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    // Float mod mirrors the reference kernel's fmodf semantics.
-    binary(ctx, "fmodf(a[i], b[i])")
+impl KernelOp for ModFunctionalDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        // Float mod mirrors the reference kernel's fmodf semantics.
+        binary(ctx, "fmodf(a[i], b[i])")
+    }
 }
 
 /// Matches `LayoutTensorOpModFunctionalGeneric` and produces this

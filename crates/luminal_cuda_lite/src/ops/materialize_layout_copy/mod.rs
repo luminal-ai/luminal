@@ -11,7 +11,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary};
 use anyhow::Result;
 
 /// `CopyGeneric(input) -> out` — pure dataflow form.
@@ -58,6 +58,10 @@ impl OpSlotNames for MaterializeLayoutCopyDps {
 }
 
 impl BufferTensorIrOp for MaterializeLayoutCopyDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "CopyGeneric"
     }
@@ -86,8 +90,10 @@ impl ToDps for MaterializeLayoutCopyDps {
 impl LayoutIrOp for MaterializeLayoutCopyDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(_op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    unary(ctx, "a[i]")
+impl KernelOp for MaterializeLayoutCopyDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        unary(ctx, "a[i]")
+    }
 }
 
 /// Matches `LayoutTensorOpCopyGeneric` and produces this

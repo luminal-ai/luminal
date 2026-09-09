@@ -73,8 +73,8 @@ impl<T: BufferTensorIrOp + Clone + 'static> CloneBufferTensorIrOp for T {
 
 /// Blanket downcast access for kernel dispatch: the reference runtime's
 /// registry (`reference::kernels`) keys kernels by CONCRETE op type.
-/// Ops themselves carry no execution (ruling 2026-08-06) — a runtime that
-/// implements an op holds its kernel in that runtime's own folder.
+/// Backend-specific operations may also expose runtime-owned execution
+/// interfaces through `BufferTensorIrOp::runtime_interface`.
 pub trait AsAnyOp {
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -98,6 +98,14 @@ impl<T: 'static> AsAnyOp for T {
 pub trait BufferTensorIrOp: OpSlotNames + CloneBufferTensorIrOp + AsAnyOp + Debug {
     /// The op's IR name (see the label policy in `luminal_reference::ops`).
     fn label(&self) -> &str;
+
+    /// Optional runtime-owned interface adapter. Core transports the op without
+    /// interpreting this value; backends may use it to borrow their execution
+    /// traits from an erased plan operation. The adapter must describe this
+    /// concrete op type. Planner operations and non-executable ops return None.
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 
     /// Is this operand's buffer read? (Inputs are read.)
     fn operand_reads_memory(&self, _operand: usize) -> bool {
@@ -765,29 +773,29 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                         // nothing — the parent copy IS the view's
                         // initializing write, and view and copy must share
                         // storage).
-                        if let Some(root) = view_root.get(&operands[operand].value).cloned() {
-                            if op.op.result_writes_memory(result) {
-                                let id = BufferId::Allocated(next_alloc);
-                                next_alloc += 1;
-                                buffers.insert(
-                                    id.clone(),
-                                    Buffer {
-                                        id: id.clone(),
-                                        access: Access::ReadWrite,
-                                        freed_by: crate::layout_ir::FreedBy::Program,
-                                        owner: crate::bufferize::Owner::System,
-                                        label: "view-repair".to_string(),
-                                        lit: None,
-                                        // The base-storage copy lands the
-                                        // fold ROOT's bytes here: the
-                                        // buffer backs the root, whose
-                                        // layout sizes it (parent-shaped).
-                                        backs: root.clone(),
-                                        layout: layout_of(&root)?,
-                                    },
-                                );
-                                target = id;
-                            }
+                        if let Some(root) = view_root.get(&operands[operand].value).cloned()
+                            && op.op.result_writes_memory(result)
+                        {
+                            let id = BufferId::Allocated(next_alloc);
+                            next_alloc += 1;
+                            buffers.insert(
+                                id.clone(),
+                                Buffer {
+                                    id: id.clone(),
+                                    access: Access::ReadWrite,
+                                    freed_by: crate::layout_ir::FreedBy::Program,
+                                    owner: crate::bufferize::Owner::System,
+                                    label: "view-repair".to_string(),
+                                    lit: None,
+                                    // The base-storage copy lands the
+                                    // fold ROOT's bytes here: the
+                                    // buffer backs the root, whose
+                                    // layout sizes it (parent-shaped).
+                                    backs: root.clone(),
+                                    layout: layout_of(&root)?,
+                                },
+                            );
+                            target = id;
                         }
                         let src = operands[operand].clone();
                         let dst = BufferTensor {
@@ -1063,16 +1071,16 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                     // hangs off that copy (the view itself has no residence
                     // node in the escaping buffer; the fold re-roots at
                     // lowering).
-                    if let Some(root) = view_root.get(&tensor.value) {
-                        if let Some(&from) = producer.get(&(root.clone(), tensor.buffer.clone())) {
-                            dag.add_edge(
-                                from,
-                                out,
-                                BtEdge::Data {
-                                    value: tensor.value.clone(),
-                                },
-                            );
-                        }
+                    if let Some(root) = view_root.get(&tensor.value)
+                        && let Some(&from) = producer.get(&(root.clone(), tensor.buffer.clone()))
+                    {
+                        dag.add_edge(
+                            from,
+                            out,
+                            BtEdge::Data {
+                                value: tensor.value.clone(),
+                            },
+                        );
                     }
                 }
             }

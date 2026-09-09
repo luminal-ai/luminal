@@ -61,7 +61,7 @@ fn plan_for(
 }
 
 /// Render every compute node through the REAL dispatch path
-/// (descriptor ctx → codegen row). Returns
+/// (descriptor ctx → kernel interface). Returns
 /// (label, launch sources, composed operand slots).
 fn rendered(
     plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
@@ -81,8 +81,8 @@ fn rendered(
         if label == "BufferAlloc" || label == "BufferFree" {
             continue;
         }
-        let kernel = kernels::codegen_for(op.as_ref())
-            .unwrap_or_else(|| panic!("elected op {label} has no codegen row"));
+        let kernel = luminal_cuda_lite::as_kernel_op(op.as_ref())
+            .unwrap_or_else(|| panic!("elected op {label} has no kernel interface"));
         let ctx = kernels::CodegenCtx::from_descriptors(&label, operand_info, result_info)
             .unwrap_or_else(|e| panic!("descriptor ctx for {label}: {e}"));
         // "Folded" now means: the operand's own carried LAYOUT does not
@@ -101,7 +101,8 @@ fn rendered(
                 .is_ok_and(|(chain, idx)| chain.is_empty() && idx == "i")
             })
             .collect();
-        let sources: Vec<String> = (kernel.codegen)(op.as_ref(), &ctx)
+        let sources: Vec<String> = kernel
+            .codegen(&ctx)
             .unwrap_or_else(|e| panic!("codegen for {label}: {e}"))
             .into_iter()
             .map(|l| l.source)
@@ -572,7 +573,9 @@ fn materialize_lowers_a_folded_input_operand() {
             &[slot(rm(&[2, 2]))],
         )
         .expect("descriptor ctx builds");
-        (kernels::codegen_for(&op).expect("codegen row").codegen)(&op, &ctx)
+        luminal_cuda_lite::as_kernel_op(&op)
+            .expect("kernel interface")
+            .codegen(&ctx)
             .expect("materialize codegen")
             .into_iter()
             .map(|k| k.source)

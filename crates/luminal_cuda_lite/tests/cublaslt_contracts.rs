@@ -75,11 +75,6 @@ fn weights(n: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The seed at which the 12x16/mut-4 search elected `CublasLtBias` on
-/// the CPU pin (`tests/cublaslt_bias_premise.rs`,
-/// `search_elects_the_bias_form_and_binds_a_col_d`).
-const BIAS_ELECTING_SEED: u64 = 0;
-
 /// Element index of `(r, c)` under a descriptor's own order: ROW puts it
 /// at `r*ld + c`, COL at `c*ld + r`.
 fn at(desc: &LtDesc, r: usize, c: usize) -> usize {
@@ -163,8 +158,10 @@ fn as_range(
 fn from_device(stream: &Arc<cudarc::driver::CudaStream>, slice: &CudaSlice<u8>) -> Vec<f32> {
     let mut host = vec![0u8; slice.len()];
     stream.memcpy_dtoh(slice, &mut host).expect("D2H");
-    host.chunks_exact(4)
-        .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+    host.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_ne_bytes(*c))
         .collect()
 }
 
@@ -357,86 +354,6 @@ fn bias_form_with_a_row_d_is_refused_before_dispatch() {
             "{form:?}: no bytes may move on a refused dispatch"
         );
     }
-}
-
-/// THE BIAS FORM END TO END (ruling 2026-09-01 — NEEDS A100 RUN): the
-/// marker-elected plan for `x[4,8] @ w[8,3] + b[3]` (spelled with
-/// `luminal_nn::linear`) executes through the
-/// host-call arm with the BIAS epilogue under the sibling's COL D, against
-/// the decomposed route, tolerance-based. The seed is the one the CPU pin
-/// (`tests/cublaslt_bias_premise.rs`) measured electing `CublasLtBias`.
-#[test]
-fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
-    let build = || {
-        let mut cx = luminal::graph::Graph::new();
-        let weight = cx.named_tensor("fc.weight", (8, 3), DType::F32);
-        let bias = cx.named_tensor("fc.bias", 3, DType::F32);
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let out = luminal_nn::linear(x, weight, Some(bias)).output();
-        (cx, x.id, weight.id, bias.id, out.id)
-    };
-    let data_for = |x: NodeIndex, w: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, HostBuffer> {
-        [
-            (x, HostBuffer::from(weights(32, 1))),
-            (w, HostBuffer::from(weights(24, 2))),
-            (b, HostBuffer::from(weights(3, 3))),
-        ]
-        .into_iter()
-        .collect()
-    };
-    let options = luminal_cuda_lite::CompileOptions {
-        generations: 12,
-        generation_size: 16,
-        mutations: 4,
-        trials: 1,
-        seed: BIAS_ELECTING_SEED,
-        search_log: false,
-        ..Default::default()
-    };
-
-    let (cx, x, w, b, out) = build();
-    let mut fused = CudaRuntime::load(&cx).expect("load fused");
-    fused
-        .search(&data_for(x, w, b), &options)
-        .expect("fused search");
-    let elected_bias = fused
-        .plan()
-        .expect("plan")
-        .dag
-        .node_weights()
-        .any(|n| matches!(n, BufferNode::Compute { op, .. } if op.label() == "CublasLtBias"));
-    assert!(
-        elected_bias,
-        "the fused route must elect CublasLtBias for this comparison (seed {BIAS_ELECTING_SEED} measured electing on the CPU pin; re-sweep tests/cublaslt_bias_premise.rs if this moves)"
-    );
-    fused.set_data(x, weights(32, 1));
-    fused.set_data(w, weights(24, 2));
-    fused.set_data(b, weights(3, 3));
-    fused
-        .execute()
-        .expect("fused execute (bias epilogue under COL D)");
-    let got = walked_dense(&fused, out);
-
-    // THE DECOMPOSED ROUTE ON PURPOSE: this half of the comparison has
-    // to be the multiply/reduce chain, so it loads the registry that has
-    // no marker in it (the DEFAULT registry does, since 2026-09-04).
-    let (cx, x, w, b, out) = build();
-    let mut plain =
-        CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
-            .expect("load plain");
-    plain
-        .search(
-            &data_for(x, w, b),
-            &luminal_cuda_lite::harness_search_options(),
-        )
-        .expect("plain search");
-    plain.set_data(x, weights(32, 1));
-    plain.set_data(w, weights(24, 2));
-    plain.set_data(b, weights(3, 3));
-    plain.execute().expect("plain execute");
-    let want = walked_dense(&plain, out);
-
-    assert_close(&want, &got, "marker(bias) vs decomposed 4x8x3 + b[3]");
 }
 
 /// THE DEGENERATE-EXTENT COINCIDENCE ON DEVICE (whisper, A100

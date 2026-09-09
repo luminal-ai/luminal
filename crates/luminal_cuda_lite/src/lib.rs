@@ -27,7 +27,7 @@
 //!
 //! Stage discipline (M4 kickoff ruling, 2026-08-17: "just focus on
 //! getting cuda lite up and running"):
-//! - CL-1: plan-level runtime + codegen table, buildable and testable
+//! - CL-1: plan-level runtime + kernel codegen, buildable and testable
 //!   everywhere; device execution behind the `device` feature.
 //! - CL-2: bring-up on a real device; fidelity vs the reference over
 //!   the mini battery.
@@ -70,12 +70,14 @@ pub use luminal::extraction as extractor;
 /// genomes, re-materialized one at a time under a hard filter.
 pub mod finalists;
 pub mod heuristic;
+pub mod host;
 pub mod host_buffer;
 pub mod kernels;
 /// THE BUCKET LATTICE (Phase 5): best-first selection of ONE finalist
 /// per bucket under a coordinate-monotone aggregate.
 pub mod lattice;
 pub mod layouts;
+pub mod op;
 pub mod ops;
 pub mod runtime;
 pub mod search;
@@ -88,8 +90,11 @@ pub mod device;
 pub mod profile;
 
 pub use bindings::CudaBindings;
+pub use host::HostOp;
 pub use host_buffer::HostBuffer;
+pub use kernels::KernelOp;
 pub use layouts::CudaPlan;
+pub use op::{CudaOpInterface, as_host_op, as_kernel_op};
 pub use ops::{
     RegisteredOp, cuda_registry, cuda_registry_filtered, cuda_registry_without_cublaslt,
 };
@@ -121,7 +126,7 @@ pub fn plan_transparent(op: &dyn luminal::layout_ir::LayoutIrOp) -> bool {
 
 /// The op labels the DEFAULT registry preset claims — the CUDA analogue
 /// of `reference_allow_list()`: search may only elect ops the backend can
-/// actually EXECUTE (a codegen row in the kernel table) or provably
+/// actually EXECUTE (through `KernelOp` or `HostOp`) or provably
 /// FOLD (the plan-transparent class above). Labels follow house policy:
 /// the egglog constructor minus the `LayoutTensorOp` prefix, nothing
 /// else added or stripped.

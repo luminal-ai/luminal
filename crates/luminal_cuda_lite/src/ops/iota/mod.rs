@@ -12,7 +12,9 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, coord_prelude, cuda_type, lower_expr, numel};
+use crate::kernels::{
+    CodegenCtx, KernelOp, KernelSource, coord_prelude, cuda_type, lower_expr, numel,
+};
 use anyhow::{Result, bail};
 
 /// `IotaGeneric() -> out` — pure dataflow source form.
@@ -61,6 +63,10 @@ impl OpSlotNames for IotaDps {
 }
 
 impl BufferTensorIrOp for IotaDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "IotaGeneric"
     }
@@ -89,29 +95,28 @@ impl ToDps for IotaDps {
 impl LayoutIrOp for IotaDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    let Some(iota) = op.as_any().downcast_ref::<IotaDps>() else {
-        bail!("iota codegen reached with a non-Iota op");
-    };
-    // Iota has a dest-only signature: its operand slots ARE the DPS
-    // dest slots, so the check that used to stand here was the write
-    // fence — see the record in `kernels::CodegenCtx::from_descriptors`.
-    let Some(expr) = &iota.expr else {
-        bail!("iota beyond the parsed expression subset (fail-closed, as the reference)");
-    };
-    let out_dims = &ctx.dest_dims[0];
-    let to = cuda_type(ctx.dest_dtypes[0])?;
-    let n = numel(out_dims);
-    let prelude = coord_prelude(out_dims);
-    let value = lower_expr(expr, out_dims.len())?;
-    let source = format!(
-        r#"extern "C" __global__ void k({to}* out, unsigned long long n) {{
+impl KernelOp for IotaDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        // Iota has a dest-only signature: its operand slots ARE the DPS
+        // dest slots, so the check that used to stand here was the write
+        // fence — see the record in `kernels::CodegenCtx::from_descriptors`.
+        let Some(expr) = &self.expr else {
+            bail!("iota beyond the parsed expression subset (fail-closed, as the reference)");
+        };
+        let out_dims = &ctx.dest_dims[0];
+        let to = cuda_type(ctx.dest_dtypes[0])?;
+        let n = numel(out_dims);
+        let prelude = coord_prelude(out_dims);
+        let value = lower_expr(expr, out_dims.len())?;
+        let source = format!(
+            r#"extern "C" __global__ void k({to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 {prelude}    out[i] = ({to})({value});
 }}"#
-    );
-    Ok(vec![KernelSource::plain(source, n)])
+        );
+        Ok(vec![KernelSource::plain(source, n)])
+    }
 }
 
 /// Matches `LayoutTensorOpIotaGeneric` and produces this runtime's

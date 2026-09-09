@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary};
 use anyhow::Result;
 
 /// `ExpFunctionalGeneric(input) -> out` — pure dataflow form.
@@ -57,6 +57,10 @@ impl OpSlotNames for ExpFunctionalDps {
 }
 
 impl BufferTensorIrOp for ExpFunctionalDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "ExpFunctionalGeneric"
     }
@@ -85,8 +89,10 @@ impl ToDps for ExpFunctionalDps {
 impl LayoutIrOp for ExpFunctionalDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(_op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    unary(ctx, "expf(a[i])")
+impl KernelOp for ExpFunctionalDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        unary(ctx, "expf(a[i])")
+    }
 }
 
 /// Matches `LayoutTensorOpExpFunctionalGeneric` and produces this

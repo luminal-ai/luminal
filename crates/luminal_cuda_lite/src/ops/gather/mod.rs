@@ -14,7 +14,7 @@ use luminal::layout_ir::{
 };
 
 use crate::kernels::{
-    CodegenCtx, Coords, KernelSource, coord_prelude, cuda_type, layout_read_index, numel,
+    CodegenCtx, Coords, KernelOp, KernelSource, coord_prelude, cuda_type, layout_read_index, numel,
 };
 use anyhow::{Result, bail};
 
@@ -82,6 +82,10 @@ impl OpSlotNames for GatherDps {
 }
 
 impl BufferTensorIrOp for GatherDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "GatherGeneric"
     }
@@ -116,90 +120,89 @@ impl LayoutIrOp for GatherDps {}
 /// [`crate::kernels::layout_read_index`] does for the elementwise
 /// templates. The WRITE side (dest0) is no longer fenced here — see the
 /// write-fence record in [`crate::kernels::CodegenCtx::from_descriptors`].
-pub(crate) fn codegen(op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    let Some(gather) = op.as_any().downcast_ref::<GatherDps>() else {
-        bail!("gather codegen reached with a non-Gather op");
-    };
-    let rank = gather.rank;
-    // The dest operand slot is not fenced — see the write-fence record in
-    // `kernels::CodegenCtx::from_descriptors`.
-    let data_dims = &ctx.operand_dims[0];
-    if data_dims.len() != rank {
-        bail!("gather data rank {} vs op rank {rank}", data_dims.len());
-    }
-    let t = cuda_type(ctx.operand_dtypes[0])?;
-    let to = cuda_type(ctx.dest_dtypes[0])?;
-    let out_dims = &ctx.dest_dims[0];
-    let n = numel(out_dims);
-    let mut sig = format!("const {t}* data");
-    for axis in 0..rank {
-        sig.push_str(&format!(", const int* coord{axis}"));
-    }
-    // ONE body. A COORDINATE operand's value spans the out iteration
-    // space, so its read is evaluated at the OUT coordinates — which ARE
-    // `i` decomposed, hence `Coords::FlatIndex`, and a dense coordinate
-    // operand's expression simplifies straight back to `coord{k}[i]`.
-    //
-    // The DATA operand's value coordinates are the gathered coordinate
-    // VALUES: bound as `data_c{axis}` and read at THOSE, so they are
-    // `Coords::Bound` and never simplify to `i` (the gather's own
-    // indirection composes on top of the layout's chain). For a dense
-    // data layout the emitted expression is the row-major sum over
-    // `data_c*` — the same address the hand-written `flat` accumulator
-    // used to compute, now stated once by the layout itself.
-    let mut any_coord_chain = false;
-    let mut coord_reads = String::new();
-    for axis in 0..rank {
-        // The coordinate value's own extents must be the out extents for
-        // `c*` to be its coordinates: refuse a mismatch, never
-        // reinterpret (the elementwise contract). Asked of EVERY
-        // coordinate operand, whatever its layout spells.
-        if &ctx.operand_dims[axis + 1] != out_dims {
-            bail!(
-                "operand coord{axis} value extents {:?} differ from dest extents {:?} \
-                 — the gather iterates the dest",
-                ctx.operand_dims[axis + 1],
-                out_dims
-            );
+impl KernelOp for GatherDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        let rank = self.rank;
+        // The dest operand slot is not fenced — see the write-fence record in
+        // `kernels::CodegenCtx::from_descriptors`.
+        let data_dims = &ctx.operand_dims[0];
+        if data_dims.len() != rank {
+            bail!("gather data rank {} vs op rank {rank}", data_dims.len());
         }
-        let name = format!("coord{axis}");
-        let layout = ctx.operand_layout(axis + 1);
-        let (chain, idx) =
-            layout_read_index(&name, layout, out_dims, Coords::FlatIndex { prefix: "c" })?;
-        any_coord_chain |= !chain.is_empty();
-        coord_reads.push_str(&chain);
-        coord_reads.push_str(&format!("    coord = (long long){name}[{idx}];\n"));
-        // The gather once checked each coordinate against the data
-        // VALUE's extents here — a DATA-derived check, the coordinate
-        // coming from an index buffer. It is gone: an out-of-range index
-        // is UB at this layer (see the NO RUNTIME BOUNDS TRAPS note in
-        // `crate::kernels`).
-        coord_reads.push_str(&format!("    long long data_c{axis} = coord;\n"));
-    }
-    let mut body = String::new();
-    if any_coord_chain {
-        // Some coordinate read referenced a coordinate, so the prelude
-        // that binds them is live. Dead-code elimination, not a branch.
-        body.push_str(&coord_prelude(out_dims));
-    }
-    body.push_str("    long long coord;\n");
-    body.push_str(&coord_reads);
-    let (chain, idx) = layout_read_index(
-        "data",
-        ctx.operand_layout(0),
-        data_dims,
-        Coords::Bound { prefix: "data_c" },
-    )?;
-    body.push_str(&chain);
-    let read = format!("data[{idx}]");
-    let source = format!(
-        r#"extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
+        let t = cuda_type(ctx.operand_dtypes[0])?;
+        let to = cuda_type(ctx.dest_dtypes[0])?;
+        let out_dims = &ctx.dest_dims[0];
+        let n = numel(out_dims);
+        let mut sig = format!("const {t}* data");
+        for axis in 0..rank {
+            sig.push_str(&format!(", const int* coord{axis}"));
+        }
+        // ONE body. A COORDINATE operand's value spans the out iteration
+        // space, so its read is evaluated at the OUT coordinates — which ARE
+        // `i` decomposed, hence `Coords::FlatIndex`, and a dense coordinate
+        // operand's expression simplifies straight back to `coord{k}[i]`.
+        //
+        // The DATA operand's value coordinates are the gathered coordinate
+        // VALUES: bound as `data_c{axis}` and read at THOSE, so they are
+        // `Coords::Bound` and never simplify to `i` (the gather's own
+        // indirection composes on top of the layout's chain). For a dense
+        // data layout the emitted expression is the row-major sum over
+        // `data_c*` — the same address the hand-written `flat` accumulator
+        // used to compute, now stated once by the layout itself.
+        let mut any_coord_chain = false;
+        let mut coord_reads = String::new();
+        for axis in 0..rank {
+            // The coordinate value's own extents must be the out extents for
+            // `c*` to be its coordinates: refuse a mismatch, never
+            // reinterpret (the elementwise contract). Asked of EVERY
+            // coordinate operand, whatever its layout spells.
+            if &ctx.operand_dims[axis + 1] != out_dims {
+                bail!(
+                    "operand coord{axis} value extents {:?} differ from dest extents {:?} \
+                 — the gather iterates the dest",
+                    ctx.operand_dims[axis + 1],
+                    out_dims
+                );
+            }
+            let name = format!("coord{axis}");
+            let layout = ctx.operand_layout(axis + 1);
+            let (chain, idx) =
+                layout_read_index(&name, layout, out_dims, Coords::FlatIndex { prefix: "c" })?;
+            any_coord_chain |= !chain.is_empty();
+            coord_reads.push_str(&chain);
+            coord_reads.push_str(&format!("    coord = (long long){name}[{idx}];\n"));
+            // The gather once checked each coordinate against the data
+            // VALUE's extents here — a DATA-derived check, the coordinate
+            // coming from an index buffer. It is gone: an out-of-range index
+            // is UB at this layer (see the NO RUNTIME BOUNDS TRAPS note in
+            // `crate::kernels`).
+            coord_reads.push_str(&format!("    long long data_c{axis} = coord;\n"));
+        }
+        let mut body = String::new();
+        if any_coord_chain {
+            // Some coordinate read referenced a coordinate, so the prelude
+            // that binds them is live. Dead-code elimination, not a branch.
+            body.push_str(&coord_prelude(out_dims));
+        }
+        body.push_str("    long long coord;\n");
+        body.push_str(&coord_reads);
+        let (chain, idx) = layout_read_index(
+            "data",
+            ctx.operand_layout(0),
+            data_dims,
+            Coords::Bound { prefix: "data_c" },
+        )?;
+        body.push_str(&chain);
+        let read = format!("data[{idx}]");
+        let source = format!(
+            r#"extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 {body}    out[i] = {read};
 }}"#
-    );
-    Ok(vec![KernelSource::plain(source, n)])
+        );
+        Ok(vec![KernelSource::plain(source, n)])
+    }
 }
 
 /// Matches `LayoutTensorOpGatherGeneric` and produces this runtime's

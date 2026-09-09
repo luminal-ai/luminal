@@ -366,14 +366,11 @@ fn e1_orientation_lives_in_the_operation_not_the_layout() {
             let mut cur = chain.eclass.clone();
             let mut unit = 0usize;
             let mut total = 0usize;
-            loop {
-                let Some(cons) = s
-                    .nodes
-                    .values()
-                    .find(|n| n.eclass == cur && n.op == "IntAffineExprCons")
-                else {
-                    break;
-                };
+            while let Some(cons) = s
+                .nodes
+                .values()
+                .find(|n| n.eclass == cur && n.op == "IntAffineExprCons")
+            {
                 if let Some(entry) = cons.children.first().and_then(|id| s.nodes.get(id)) {
                     total += 1;
                     if class_has(&s, &entry.eclass, "CoordVar") {

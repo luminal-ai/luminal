@@ -4431,23 +4431,22 @@ pub fn chain_strides(egraph: &EGraph, layout: &ClassId) -> Option<Vec<Option<Cha
                 }
             } else if find(&summand, "CoordVar").is_some() {
                 Some(ChainStride::Unit)
-            } else if let Some(stride) = class_nodes.get(&summand).and_then(|nodes| {
-                nodes.iter().find_map(|node_id| {
-                    let candidate = egraph.nodes.get(node_id)?;
-                    if candidate.op != "IntMul" {
-                        return None;
-                    }
-                    let coord = child_class(egraph, candidate, 0)?;
-                    if find(&coord, "CoordVar").is_some() {
-                        child_class(egraph, candidate, 1)
-                    } else {
-                        None
-                    }
-                })
-            }) {
-                Some(ChainStride::Expr(stride))
             } else {
-                return None; // opaque slot: fail closed
+                let stride = class_nodes.get(&summand).and_then(|nodes| {
+                    nodes.iter().find_map(|node_id| {
+                        let candidate = egraph.nodes.get(node_id)?;
+                        if candidate.op != "IntMul" {
+                            return None;
+                        }
+                        let coord = child_class(egraph, candidate, 0)?;
+                        if find(&coord, "CoordVar").is_some() {
+                            child_class(egraph, candidate, 1)
+                        } else {
+                            None
+                        }
+                    })
+                })?;
+                Some(ChainStride::Expr(stride))
             };
             out.push(slot);
             axis += 1;

@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary};
 use anyhow::Result;
 
 /// `RecipFunctionalGeneric(input) -> out` — pure dataflow form.
@@ -57,6 +57,10 @@ impl OpSlotNames for RecipFunctionalDps {
 }
 
 impl BufferTensorIrOp for RecipFunctionalDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "RecipFunctionalGeneric"
     }
@@ -85,8 +89,10 @@ impl ToDps for RecipFunctionalDps {
 impl LayoutIrOp for RecipFunctionalDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(_op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    unary(ctx, "1.0f / a[i]")
+impl KernelOp for RecipFunctionalDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        unary(ctx, "1.0f / a[i]")
+    }
 }
 
 /// Matches `LayoutTensorOpRecipFunctionalGeneric` and produces this

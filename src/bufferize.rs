@@ -627,24 +627,22 @@ impl<L: PlanLayout> BufferIrGraph<L> {
                 )
             };
             if weight.kind == EdgeKind::Data {
-                if let BufferNode::Compute { op, reads, .. } = &self.dag[edge.target()] {
-                    if (0..reads.len()).any(|i| op.operand_name(i) == weight.port) {
-                        head = format!(":{}:w", crate::layout_ir::slot_port(&weight.port));
-                        label = dot_escape(&self.buffer_name(&weight.buffer));
-                    }
+                if let BufferNode::Compute { op, reads, .. } = &self.dag[edge.target()]
+                    && (0..reads.len()).any(|i| op.operand_name(i) == weight.port)
+                {
+                    head = format!(":{}:w", crate::layout_ir::slot_port(&weight.port));
+                    label = dot_escape(&self.buffer_name(&weight.buffer));
                 }
                 if let BufferNode::Compute {
                     op, writes, ties, ..
                 } = &self.dag[edge.source()]
+                    && let Some(result) = writes.iter().position(|b| b == &weight.buffer)
+                    && let Some(&(operand, _)) = ties.iter().find(|(_, r)| *r == result)
                 {
-                    if let Some(result) = writes.iter().position(|b| b == &weight.buffer) {
-                        if let Some(&(operand, _)) = ties.iter().find(|(_, r)| *r == result) {
-                            tail = format!(
-                                ":{}:e",
-                                crate::layout_ir::slot_port(&op.operand_name(operand))
-                            );
-                        }
-                    }
+                    tail = format!(
+                        ":{}:e",
+                        crate::layout_ir::slot_port(&op.operand_name(operand))
+                    );
                 }
             }
             out.push_str(&format!(
@@ -914,17 +912,17 @@ fn find_seeds(
                 hops.push((position, operand));
                 current = value.clone();
             };
-            if let Some(poison) = poison {
-                if seen_poisons.insert(poison.clone()) {
-                    seeds.push(Seed {
-                        poison,
-                        buffer_eclass: slot.buffer.id_eclass.clone(),
-                        access: slot.buffer.access(),
-                        freed_by: slot.buffer.freed_by(),
-                        buffer_label: slot.buffer.id_label.clone(),
-                        hops,
-                    });
-                }
+            if let Some(poison) = poison
+                && seen_poisons.insert(poison.clone())
+            {
+                seeds.push(Seed {
+                    poison,
+                    buffer_eclass: slot.buffer.id_eclass.clone(),
+                    access: slot.buffer.access(),
+                    freed_by: slot.buffer.freed_by(),
+                    buffer_label: slot.buffer.id_label.clone(),
+                    hops,
+                });
             }
         }
     }
@@ -1359,21 +1357,21 @@ impl<'a> Analyzer<'a> {
             if self.happens_before(read.site, op.position) {
                 continue; // Provably reads the old value before we overwrite it.
             }
-            if let Some((reader_op, read_idx)) = read.site {
-                if reader_op == op.position {
-                    // Same-op read through a DIFFERENT operand, of storage
-                    // aliasing the candidate. Excused only by the op's own
-                    // `isNotConflicting` assertion — an unconditional,
-                    // TRUSTED per-pair contract. The engine performs no
-                    // layout checking here: an op that can only tolerate the
-                    // aliasing under preconditions must discharge them where
-                    // it is matched (egglog), not declare the permit. The
-                    // permit is scoped to same-op reads ONLY — cross-op reads
-                    // stay governed by `happens_before` above (a blanket
-                    // weakening is a known miscompile).
-                    if permits_sharing(op.iface, read_idx, operand) {
-                        continue;
-                    }
+            if let Some((reader_op, read_idx)) = read.site
+                && reader_op == op.position
+            {
+                // Same-op read through a DIFFERENT operand, of storage
+                // aliasing the candidate. Excused only by the op's own
+                // `isNotConflicting` assertion — an unconditional,
+                // TRUSTED per-pair contract. The engine performs no
+                // layout checking here: an op that can only tolerate the
+                // aliasing under preconditions must discharge them where
+                // it is matched (egglog), not declare the permit. The
+                // permit is scoped to same-op reads ONLY — cross-op reads
+                // stay governed by `happens_before` above (a blanket
+                // weakening is a known miscompile).
+                if permits_sharing(op.iface, read_idx, operand) {
+                    continue;
                 }
             }
             return false;
@@ -1409,13 +1407,13 @@ impl<'a> Analyzer<'a> {
                         if self.happens_before(read.site, write.site.0) {
                             continue; // provably reads before the committed write
                         }
-                        if let Some((reader_op, read_idx)) = read.site {
-                            if reader_op == write.site.0 {
-                                // Same-op pair, judged by the WRITER's contract (the
-                                // same permit its own admission would apply).
-                                if permits_sharing(writer.iface, read_idx, write.site.1) {
-                                    continue;
-                                }
+                        if let Some((reader_op, read_idx)) = read.site
+                            && reader_op == write.site.0
+                        {
+                            // Same-op pair, judged by the WRITER's contract (the
+                            // same permit its own admission would apply).
+                            if permits_sharing(writer.iface, read_idx, write.site.1) {
+                                continue;
                             }
                         }
                         return false;
@@ -2329,19 +2327,18 @@ pub(crate) fn lower<L: PlanLayout>(
                 let is_alloc_shaped = operands.is_empty()
                     && !results.is_empty()
                     && (0..results.len()).all(|r| op.result_is_undefined(r));
-                if is_alloc_shaped {
-                    if let Some(tensor) = results
+                if is_alloc_shaped
+                    && let Some(tensor) = results
                         .iter()
                         .find(|t| matches!(t.buffer, BufferId::Boundary(_)))
-                    {
-                        anyhow::bail!(
-                            "lowering failed: alloc-shaped op ({}) produces \
+                {
+                    anyhow::bail!(
+                        "lowering failed: alloc-shaped op ({}) produces \
                              caller storage {:?} — caller buffers are never \
                              program-allocated (was `optimize` skipped?)",
-                            op.label(),
-                            tensor.buffer,
-                        );
-                    }
+                        op.label(),
+                        tensor.buffer,
+                    );
                 }
 
                 // FOLD metadata views: no bytes move, so no plan node and no

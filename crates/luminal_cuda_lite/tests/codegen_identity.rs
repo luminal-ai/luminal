@@ -87,8 +87,8 @@ fn sources_via_buffer_table(
         if label == "BufferAlloc" || label == "BufferFree" {
             continue;
         }
-        let kernel = kernels::codegen_for(op.as_ref())
-            .unwrap_or_else(|| panic!("elected op {label} has no codegen row"));
+        let kernel = luminal_cuda_lite::as_kernel_op(op.as_ref())
+            .unwrap_or_else(|| panic!("elected op {label} has no kernel interface"));
         let ctx = kernels::CodegenCtx {
             operand_dims: reads.iter().map(|id| geometry[id].0.clone()).collect(),
             operand_dtypes: reads.iter().map(|id| geometry[id].1).collect(),
@@ -105,7 +105,8 @@ fn sources_via_buffer_table(
         };
         out.push((
             label,
-            (kernel.codegen)(op.as_ref(), &ctx)
+            kernel
+                .codegen(&ctx)
                 .map(|ls| ls.into_iter().map(|l| l.source).collect())
                 .map_err(|e| e.to_string()),
         ));
@@ -125,8 +126,8 @@ fn searched_plan(
     let data = build(&mut cx);
     // THE DECOMPOSED ROUTE ON PURPOSE: these pins compare two ways of
     // deriving CUDA CODEGEN geometry, so every elected node must have a
-    // codegen row. A cuBLASLt marker (default since 2026-09-04) is a
-    // host library call with no codegen row at all — it would take the
+    // kernel interface. A cuBLASLt marker (default since 2026-09-04) is a
+    // host library call with no kernel interface at all — it would take the
     // matmul fixture out of the comparison entirely.
     let mut rt =
         CudaRuntime::load_with_registry(&cx, cuda_registry_without_cublaslt()).expect("load");
@@ -238,11 +239,12 @@ fn sources_via_descriptors(
             // fold.
             !reads_flat(&slot.layout, &dims)
         });
-        let kernel = kernels::codegen_for(op.as_ref())
-            .unwrap_or_else(|| panic!("elected op {label} has no codegen row"));
+        let kernel = luminal_cuda_lite::as_kernel_op(op.as_ref())
+            .unwrap_or_else(|| panic!("elected op {label} has no kernel interface"));
         let ctx = kernels::CodegenCtx::from_descriptors(&label, operand_info, result_info)
             .unwrap_or_else(|e| panic!("descriptor ctx for {label}: {e}"));
-        let sources: Vec<String> = (kernel.codegen)(op.as_ref(), &ctx)
+        let sources: Vec<String> = kernel
+            .codegen(&ctx)
             .unwrap_or_else(|e| panic!("codegen for {label}: {e}"))
             .into_iter()
             .map(|l| l.source)
@@ -342,7 +344,7 @@ mod strided {
     }
 
     /// Generate the single kernel source for `op` with the given
-    /// descriptors, through the table row (the real dispatch path).
+    /// descriptors, through KernelOp (the real dispatch path).
     fn generate(
         op: &dyn BufferTensorIrOp,
         operand_info: &[SlotDescriptor<DecodedLayout>],
@@ -350,8 +352,8 @@ mod strided {
     ) -> String {
         let ctx = kernels::CodegenCtx::from_descriptors(op.label(), operand_info, result_info)
             .expect("descriptor ctx builds");
-        let row = kernels::codegen_for(op).expect("codegen row");
-        let launches = (row.codegen)(op, &ctx).expect("codegen succeeds");
+        let row = luminal_cuda_lite::as_kernel_op(op).expect("kernel interface");
+        let launches = row.codegen(&ctx).expect("codegen succeeds");
         assert_eq!(launches.len(), 1, "single-launch op");
         launches.into_iter().next().unwrap().source
     }
@@ -593,7 +595,9 @@ mod strided {
                 &[slot(vec![3, 2])],
             )
             .expect("ctx builds");
-            let err = (kernels::codegen_for(&op).unwrap().codegen)(&op, &ctx)
+            let err = luminal_cuda_lite::as_kernel_op(&op)
+                .unwrap()
+                .codegen(&ctx)
                 .expect_err("a foreign-domain operand must refuse, whatever its spelling");
             assert!(
                 err.to_string().contains("differ from dest extents"),

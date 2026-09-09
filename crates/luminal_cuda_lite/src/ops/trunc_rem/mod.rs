@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, binary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, binary};
 use anyhow::Result;
 
 /// `TruncRemFunctionalGeneric(numerator, denominator) -> out` — pure dataflow form.
@@ -59,6 +59,10 @@ impl OpSlotNames for TruncRemFunctionalDps {
 }
 
 impl BufferTensorIrOp for TruncRemFunctionalDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "TruncRemFunctionalGeneric"
     }
@@ -87,8 +91,10 @@ impl ToDps for TruncRemFunctionalDps {
 impl LayoutIrOp for TruncRemFunctionalDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(_op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    binary(ctx, "a[i] % b[i]") // C remainder carries the dividend's sign
+impl KernelOp for TruncRemFunctionalDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        binary(ctx, "a[i] % b[i]") // C remainder carries the dividend's sign
+    }
 }
 
 /// Matches `LayoutTensorOpTruncRemFunctionalGeneric` and produces this

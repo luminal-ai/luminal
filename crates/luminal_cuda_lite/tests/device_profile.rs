@@ -39,16 +39,18 @@ fn weights(n: usize, seed: usize) -> Vec<f32> {
 const VOCAB: usize = 5;
 const D: usize = 8;
 
-/// The mini-llama3 decode step: embedding gather, QKV projections, the
-/// KV-cache scatter/gather, attention, the SwiGLU MLP and the output
-/// projection — the smallest graph in this crate's suite that exercises
-/// every kernel family the device executor has.
-fn mini_llama3_fixture() -> (
+type MiniLlama3Fixture = (
     Graph,
     Vec<(NodeIndex, Vec<f32>)>,
     Vec<(NodeIndex, Vec<i32>)>,
     NodeIndex,
-) {
+);
+
+/// The mini-llama3 decode step: embedding gather, QKV projections, the
+/// KV-cache scatter/gather, attention, the SwiGLU MLP and the output
+/// projection — the smallest graph in this crate's suite that exercises
+/// every kernel family the device executor has.
+fn mini_llama3_fixture() -> MiniLlama3Fixture {
     let mut cx = Graph::new();
     let model = MiniLlama3::new(VOCAB, D, 12, 4, 2, 1, &mut cx);
     let ids = cx.tensor(1, DType::Int);

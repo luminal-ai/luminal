@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, cuda_type, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_type, unary};
 use anyhow::Result;
 
 /// `CastGeneric(input) -> out` — pure dataflow form.
@@ -57,6 +57,10 @@ impl OpSlotNames for CastDps {
 }
 
 impl BufferTensorIrOp for CastDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "CastGeneric"
     }
@@ -87,9 +91,11 @@ impl LayoutIrOp for CastDps {}
 /// The CUDA lowering, colocated with its op. The conversion is driven
 /// by the buffer dtypes the plan annotated — the op carries no dtype
 /// field of its own.
-pub(crate) fn codegen(_op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    let to = cuda_type(ctx.dest_dtypes[0])?;
-    unary(ctx, &format!("({to})a[i]"))
+impl KernelOp for CastDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        let to = cuda_type(ctx.dest_dtypes[0])?;
+        unary(ctx, &format!("({to})a[i]"))
+    }
 }
 
 /// Matches `LayoutTensorOpCastGeneric` and produces this runtime's

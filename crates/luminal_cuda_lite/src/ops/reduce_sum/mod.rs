@@ -11,8 +11,8 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelSource, reduce};
-use anyhow::{Context, Result, bail};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, reduce};
+use anyhow::{Context, Result};
 
 /// `ReduceSumGeneric(input) -> out` — pure dataflow form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,10 @@ impl OpSlotNames for ReduceSumDps {
 }
 
 impl BufferTensorIrOp for ReduceSumDps {
+    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
+        Some(crate::CudaOpInterface::kernel::<Self>())
+    }
+
     fn label(&self) -> &str {
         "ReduceSumGeneric"
     }
@@ -92,12 +96,11 @@ impl ToDps for ReduceSumDps {
 impl LayoutIrOp for ReduceSumDps {}
 
 /// The CUDA lowering, colocated with its op.
-pub(crate) fn codegen(op: &dyn BufferTensorIrOp, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-    let Some(r) = op.as_any().downcast_ref::<ReduceSumDps>() else {
-        bail!("reduce_sum codegen reached with a non-ReduceSum op");
-    };
-    let axis = usize::try_from(r.axis).context("negative reduce axis")?;
-    reduce(ctx, axis, "0", "acc + v")
+impl KernelOp for ReduceSumDps {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
+        let axis = usize::try_from(self.axis).context("negative reduce axis")?;
+        reduce(ctx, axis, "0", "acc + v")
+    }
 }
 
 /// Matches `LayoutTensorOpReduceSumGeneric` and produces this

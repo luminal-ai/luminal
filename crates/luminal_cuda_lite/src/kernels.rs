@@ -1,7 +1,6 @@
-//! CUDA kernel registry and shared code generation helpers.
+//! CUDA kernel operation trait and shared code generation helpers.
 //!
-//! Entries are keyed by operation type because different types can share a label.
-//! Each operation's generator lives in `crate::ops` and produces CUDA source
+//! Each operation implements `KernelOp` and produces CUDA source
 //! with fixed dimensions. Generation needs no GPU; `device` compiles and runs it.
 
 use anyhow::{Result, bail};
@@ -14,7 +13,6 @@ use luminal::layouts::{
     LeftMajorContiguousElementLayout as LM, RightMajorContiguousElementLayout as RM,
     StridedElementLayout as ST,
 };
-use std::any::TypeId;
 
 /// Shapes, data types, and read layouts for one compute node.
 ///
@@ -439,21 +437,9 @@ impl KernelSource {
 
 /// An operation's code generator. Its kernels run in order on one stream;
 /// for example, scatter copies the input before writing updates.
-pub struct CudaKernel {
-    pub label: &'static str,
-    pub op_type: TypeId,
-    pub codegen: fn(&dyn BufferTensorIrOp, &CodegenCtx) -> Result<Vec<KernelSource>>,
-}
-
-fn row<T: 'static>(
-    label: &'static str,
-    codegen: fn(&dyn BufferTensorIrOp, &CodegenCtx) -> Result<Vec<KernelSource>>,
-) -> CudaKernel {
-    CudaKernel {
-        label,
-        op_type: TypeId::of::<T>(),
-        codegen,
-    }
+/// Generation needs no CUDA device and uses the op's own metadata directly.
+pub trait KernelOp: BufferTensorIrOp {
+    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>>;
 }
 
 /// Return the CUDA scalar type, or an error for unsupported data types.
@@ -698,56 +684,4 @@ pub(crate) fn strides_of(dims: &[usize]) -> Vec<usize> {
         strides[k] = strides[k + 1] * dims[k + 1];
     }
     strides
-}
-
-/// Return the CUDA kernel registry. The executor handles buffer allocation
-/// and freeing separately.
-pub fn cuda_kernels() -> &'static [CudaKernel] {
-    use crate::ops;
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<Vec<CudaKernel>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        vec![
-            row::<ops::add::AddFunctionalDps>("AddFunctional", ops::add::codegen),
-            row::<ops::mul::MulFunctionalDps>("MulFunctional", ops::mul::codegen),
-            row::<ops::div::DivFunctionalDps>("DivFunctional", ops::div::codegen),
-            row::<ops::trunc_div::TruncDivFunctionalDps>(
-                "TruncDivFunctional",
-                ops::trunc_div::codegen,
-            ),
-            row::<ops::trunc_rem::TruncRemFunctionalDps>(
-                "TruncRemFunctional",
-                ops::trunc_rem::codegen,
-            ),
-            row::<ops::modulo::ModFunctionalDps>("ModFunctional", ops::modulo::codegen),
-            row::<ops::less_than::LessThanDps>("LessThan", ops::less_than::codegen),
-            row::<ops::sqrt::SqrtFunctionalDps>("SqrtFunctional", ops::sqrt::codegen),
-            row::<ops::exp::ExpFunctionalDps>("ExpFunctional", ops::exp::codegen),
-            row::<ops::exp2::Exp2FunctionalDps>("Exp2Functional", ops::exp2::codegen),
-            row::<ops::log2::Log2FunctionalDps>("Log2Functional", ops::log2::codegen),
-            row::<ops::sin::SinFunctionalDps>("SinFunctional", ops::sin::codegen),
-            row::<ops::recip::RecipFunctionalDps>("RecipFunctional", ops::recip::codegen),
-            row::<ops::cast::CastDps>("Cast", ops::cast::codegen),
-            row::<ops::constant::ConstantDps>("Constant", ops::constant::codegen),
-            row::<ops::materialize_layout_copy::MaterializeLayoutCopyDps>(
-                "Copy",
-                ops::materialize_layout_copy::codegen,
-            ),
-            row::<ops::reduce_sum::ReduceSumDps>("ReduceSum", ops::reduce_sum::codegen),
-            row::<ops::reduce_max::ReduceMaxDps>("ReduceMax", ops::reduce_max::codegen),
-            row::<ops::iota::IotaDps>("Iota", ops::iota::codegen),
-            row::<ops::index_map_apply_materialize::IndexMapApplyMaterializeDps>(
-                "IndexMapApplyMaterialize",
-                ops::index_map_apply_materialize::codegen,
-            ),
-            row::<ops::gather::GatherDps>("Gather", ops::gather::codegen),
-            row::<ops::scatter::ScatterFunctionalDps>("ScatterFunctional", ops::scatter::codegen),
-        ]
-    })
-}
-
-/// Find a code generator by the operation's concrete Rust type.
-pub fn codegen_for(op: &dyn BufferTensorIrOp) -> Option<&'static CudaKernel> {
-    let ty = op.as_any().type_id();
-    cuda_kernels().iter().find(|k| k.op_type == ty)
 }
