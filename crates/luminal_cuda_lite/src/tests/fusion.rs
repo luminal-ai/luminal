@@ -500,7 +500,11 @@ struct FusedRegion {
 /// Helper: collect every distinct fused region reachable across many random
 /// extractions of the search space.
 fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
-    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    extract_fused_regions_with_options(cx, CompileOptions::default())
+}
+
+fn extract_fused_regions_with_options(cx: &mut Graph, options: CompileOptions) -> Vec<FusedRegion> {
+    cx.build_search_space::<CudaRuntime>(options);
     let egraph = cx.egraph().expect("egraph not built");
     let ops = cx.egglog_ops().expect("ops not built");
     let custom_ops = &cx.custom_ops;
@@ -1172,6 +1176,118 @@ extern "C" __global__ void fused_k(float* out, const float* a, const float* b, l
 // =========================================================================
 // Cast fusion: explicit HLIR Casts are the only dtype changes inside a region.
 // =========================================================================
+
+#[test]
+fn cast_roundtrip_fusion_with_dynamic_rows_and_fanout() {
+    use luminal::dtype::DType;
+    for dynamic in [false, true] {
+        for fanout in [false, true] {
+            let mut cx = Graph::new();
+            let a = if dynamic {
+                cx.tensor(('s', 2880))
+            } else {
+                cx.tensor((8, 2880))
+            }
+            .as_dtype(DType::Bf16);
+            cx.set_dim('s', 8);
+            let wide = a.cast(DType::F32);
+            if fanout {
+                wide.output();
+            }
+            wide.cast(DType::Bf16).output();
+            let regions = extract_fused_regions_with_options(
+                &mut cx,
+                CompileOptions::default().dim_buckets('s', &[DimBucket::new(2, 8)]),
+            );
+            assert!(
+                regions
+                    .iter()
+                    .any(|r| r.internal_ops_sorted == ["FusedCast", "FusedCast"]
+                        && r.start_count == 1
+                        && r.end_count == 1),
+                "dynamic={dynamic} fanout={fanout}: {regions:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn matrix_cast_and_elementwise_chain_fuses_across_flat_cast_shape() {
+    use luminal::dtype::DType;
+    for (dynamic, rank) in [(false, 2), (true, 2), (false, 3), (true, 3)] {
+        let mut cx = Graph::new();
+        let first = if dynamic { expr('s') } else { expr(8) };
+        let a = if rank == 2 {
+            cx.tensor([first, expr(2880)])
+        } else {
+            cx.tensor([first, expr(5), expr(7)])
+        };
+        cx.set_dim('s', 8);
+        a.sin().cast(DType::Bf16).cast(DType::F32).sqrt().output();
+        let regions = extract_fused_regions_with_options(
+            &mut cx,
+            CompileOptions::default().dim_buckets('s', &[DimBucket::new(2, 8)]),
+        );
+        let expected = sorted_names(&["FusedSin", "FusedCast", "FusedCast", "FusedSqrt"]);
+        assert!(
+            regions.iter().any(|r| r.internal_ops_sorted == expected
+                && r.start_count == 1
+                && r.end_count == 1),
+            "dynamic={dynamic} rank={rank}: {regions:#?}"
+        );
+    }
+}
+
+#[test]
+fn cast_grid_does_not_bridge_a_transpose() {
+    let mut cx = Graph::new();
+    cx.tensor((3, 7))
+        .sin()
+        .permute((1, 0))
+        .cast(luminal::dtype::DType::Bf16)
+        .cast(luminal::dtype::DType::F32)
+        .sqrt()
+        .output();
+    for r in extract_all_fused_regions(&mut cx) {
+        assert!(
+            !(r.internal_ops_sorted.contains(&"FusedSin".to_string())
+                && r.internal_ops_sorted.contains(&"FusedSqrt".to_string())),
+            "{r:#?}"
+        );
+    }
+}
+
+#[test]
+fn matrix_cast_fusion_preserves_rounding_and_layout() {
+    for permuted in [false, true] {
+        test_unary_cuda::<f32>(
+            (3, 5, 7),
+            |a| {
+                let a = a.sin();
+                let a = if permuted { a.permute((2, 0, 1)) } else { a };
+                a.cast(luminal::dtype::DType::Bf16)
+                    .cast(luminal::dtype::DType::F32)
+                    .sqrt()
+            },
+            |a| {
+                let a = a.sin().unwrap();
+                let a = if permuted {
+                    a.permute((2, 0, 1)).unwrap()
+                } else {
+                    a
+                };
+                a.to_dtype(candle_core::DType::BF16)
+                    .unwrap()
+                    .to_dtype(candle_core::DType::F32)
+                    .unwrap()
+                    .sqrt()
+                    .unwrap()
+            },
+            |n, seed| random_f32_vec(n, seed, 0.1, 0.9),
+            0xCA57_601D,
+        );
+    }
+}
 
 #[test]
 fn test_cast_after_unary_fuses() {

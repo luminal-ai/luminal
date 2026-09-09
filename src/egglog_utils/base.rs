@@ -808,6 +808,34 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
 
     if use_interval_analysis {
         // ---- Interval analysis and interval-guarded simplifications ----
+        for (name, bound) in [
+            ("lower", interval_lower as fn(Term) -> Term),
+            ("upper", interval_upper as fn(Term) -> Term),
+        ] {
+            p.add_rule(
+                Rule::new()
+                    .facts(vec![
+                        peq(v("?e"), mul(v("?a"), v("?b"))),
+                        peq(v("?a_bound"), bound(v("?a"))),
+                        peq(v("?b_bound"), bound(v("?b"))),
+                        peq(v("?a_min"), interval_lower(v("?a"))),
+                        peq(v("?b_min"), interval_lower(v("?b"))),
+                        pgte(v("?a_min"), i64(0)),
+                        pgte(v("?b_min"), i64(0)),
+                        pgte(v("?a_bound"), i64(0)),
+                        pgte(v("?b_bound"), i64(0)),
+                        // The divisor stays nonzero even before other guards
+                        // are evaluated. Multiply only after proving no overflow.
+                        pgte(
+                            pdiv(i64(i64::MAX), pmax(v("?a_bound"), i64(1))),
+                            v("?b_bound"),
+                        ),
+                    ])
+                    .set(bound(v("?e")), pmul(v("?a_bound"), v("?b_bound")))
+                    .ruleset("interval_expr")
+                    .name(&format!("interval-mul-{name}-nonnegative")),
+            );
+        }
         p.add_rule(
             Rule::new()
                 .fact(peq(v("?e"), num(v("?n"))))

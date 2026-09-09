@@ -1407,6 +1407,44 @@ mod tests {
     }
 
     #[test]
+    fn test_product_interval_proofs_require_nonnegative_safe_bounds() {
+        let product = expr('s') * expr('t');
+        let intervals = [
+            (sym("s"), DimInterval::new(2, 8)),
+            (sym("t"), DimInterval::new(3, 9)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(product.max(1).simplify_with_intervals(&intervals), product);
+        assert_eq!(product.lt(73).simplify_with_intervals(&intervals), expr(1));
+        assert_eq!(product.lt(6).simplify_with_intervals(&intervals), expr(0));
+
+        // Positive upper endpoints do not establish a product upper bound
+        // when both operands can also be negative: (-9)*(-7) exceeds 8*4.
+        let signed = [
+            (sym("s"), DimInterval::new(-9, 8)),
+            (sym("t"), DimInterval::new(-7, 4)),
+        ]
+        .into_iter()
+        .collect();
+        assert_ne!(product.lt(33).simplify_with_intervals(&signed), expr(1));
+        let overflow = [
+            (sym("s"), DimInterval::new(i64::MAX / 2 + 1, i64::MAX)),
+            (sym("t"), DimInterval::new(2, 3)),
+        ]
+        .into_iter()
+        .collect();
+        assert_ne!(product.gte(0).simplify_with_intervals(&overflow), expr(1));
+        let zero = [
+            (sym("s"), DimInterval::new(0, 0)),
+            (sym("t"), DimInterval::new(0, i64::MAX)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(product.simplify_with_intervals(&zero), expr(0));
+    }
+
+    #[test]
     fn test_add_num_does_not_fold_into_nested_num() {
         // Regression: adding an integer to `(a*b) + rest` must not fold the
         // integer into the `a` of the multiplication. `(11*16) + 15` is 191,
