@@ -731,4 +731,27 @@ pub(super) mod tests {
             );
         }
     }
+
+    /// `cumprod` builds on `prod`, so it inherited `prod`'s NaN on negative
+    /// inputs. `test_cumulative` did not catch it: `assert_close` compares with
+    /// `>`, which is false when either side is NaN.
+    #[test]
+    fn test_cumprod_signs() {
+        let input = vec![-1.0f32, 2.0, -3.0, 4.0];
+        let expected = [-1.0f32, -2.0, 6.0, 24.0];
+
+        let mut cx = Graph::new();
+        let a = cx.tensor(input.len());
+        let b = a.cumprod(0).output();
+
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
+        rt.set_data(a.id, input);
+        rt.execute(&cx.dyn_map);
+
+        crate::tests::assert_close_finite(rt.get_f32(b), &expected);
+    }
 }
