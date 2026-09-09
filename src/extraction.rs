@@ -28,6 +28,8 @@
 //! gave the CUDA-lite runtime. The runtime modules named `extractor`
 //! are now aliases for this one.
 
+use once_cell::unsync::Lazy;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -38,8 +40,8 @@ use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::layout_ir::{
     Access, BufferInfo, ExtractedDag, ExtractedEdge, ExtractedGraph, ExtractedNode, ExtractionSite,
-    FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText, LogicalInfo, OpInput,
-    OpMatcher, OpNode, OutputNode, OutputSlot, SerializedIndex,
+    FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LogicalInfo, OpInput, OpMatcher,
+    OpNode, OutputNode, OutputSlot, SerializedIndex,
 };
 use crate::logical_op::{LogicalRender, logical_op_for};
 
@@ -1892,9 +1894,12 @@ impl<'a> Extractor<'a> {
     /// visualizer reads the text long afterwards. `build` must be the
     /// SAME code the eager version ran, so the deferred string is the
     /// eager string.
-    fn lazy_text(&self, build: impl Fn(&ClassRenderer<'_>) -> String + 'static) -> LazyText {
+    fn lazy_text(
+        &self,
+        build: impl Fn(&ClassRenderer<'_>) -> String + 'static,
+    ) -> Rc<Lazy<String, Box<dyn FnOnce() -> String>>> {
         let ctx = Rc::clone(&self.render);
-        LazyText::deferred(move || build(&ctx.renderer()))
+        Rc::new(Lazy::new(Box::new(move || build(&ctx.renderer()))))
     }
 
     // ---- bytes-moved heuristic pricing (ruling 2026-08-10): the
@@ -3337,15 +3342,21 @@ impl<'a> Extractor<'a> {
             None => (
                 LogicalInfo {
                     eclass: class.clone(),
-                    label: LazyText::eager(class.to_string()),
-                    tooltip: LazyText::default(),
+                    label: {
+                        let text = class.to_string();
+                        Rc::new(Lazy::new(Box::new(move || text)))
+                    },
+                    tooltip: Rc::new(Lazy::new(Box::new(String::new))),
                     op: None,
                     children: Vec::new(),
                 },
                 LayoutInfo {
                     eclass: class.clone(),
-                    label: LazyText::eager(class.to_string()),
-                    tooltip: LazyText::default(),
+                    label: {
+                        let text = class.to_string();
+                        Rc::new(Lazy::new(Box::new(move || text)))
+                    },
+                    tooltip: Rc::new(Lazy::new(Box::new(String::new))),
                 },
             ),
         };

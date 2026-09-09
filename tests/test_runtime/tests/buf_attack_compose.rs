@@ -359,7 +359,7 @@ impl DimsGraph {
         LayoutTensorInfo {
             eclass: luminal::prelude::egraph_serialize::ClassId::from(format!("val${name}")),
             label: name.to_string(),
-            tooltip: Default::default(),
+            tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             shape: None,
             dtype: None,
             dtype_enum: Some(PlanDtype::F32),
@@ -369,8 +369,11 @@ impl DimsGraph {
                 eclass: luminal::prelude::egraph_serialize::ClassId::from(format!(
                     "logical${name}"
                 )),
-                label: name.to_string().into(),
-                tooltip: Default::default(),
+                label: {
+                    let text = name.to_owned();
+                    std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(move || text)))
+                },
+                tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
                 op: None,
                 children: Vec::new(),
             },
@@ -378,8 +381,11 @@ impl DimsGraph {
                 eclass: luminal::prelude::egraph_serialize::ClassId::from(format!(
                     "layout${layout}"
                 )),
-                label: layout.to_string().into(),
-                tooltip: Default::default(),
+                label: {
+                    let text = layout.to_owned();
+                    std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(move || text)))
+                },
+                tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             },
         }
     }
@@ -391,10 +397,10 @@ impl DimsGraph {
                 "buftensor${n}"
             )),
             tensor_label: name.to_string(),
-            tensor_tooltip: Default::default(),
+            tensor_tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             id_eclass: luminal::prelude::egraph_serialize::ClassId::from(format!("buf${name}")),
             id_label: name.to_string(),
-            id_tooltip: Default::default(),
+            id_tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             access: Some(Access::ReadWrite),
             freed_by: Some(FreedBy::Caller),
         }
@@ -434,7 +440,7 @@ impl DimsGraph {
             provenance: Provenance::Synthesized { id: n },
             inputs: op_inputs,
             outputs: vec![out.clone()],
-            tooltip: Default::default(),
+            tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
             heuristic_cost: 1,
         }));
         for (i, value) in inputs.iter().enumerate() {
