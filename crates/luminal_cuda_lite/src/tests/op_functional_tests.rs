@@ -9,6 +9,184 @@ use luminal::egglog_utils::{
 
 use crate::runtime::CudaRuntime;
 
+#[test]
+fn rolled_varying_inputs_and_iteration_outputs_match_cpu() {
+    const WIDTH: usize = 32;
+    const TRIPS: usize = 4;
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    let mut cx = Graph::default();
+    let input = cx.named_tensor("input", WIDTH);
+    let left_weights: Vec<_> = (0..TRIPS)
+        .map(|i| cx.named_tensor(format!("left.{i}"), WIDTH))
+        .collect();
+    let right_weights: Vec<_> = (0..TRIPS)
+        .map(|i| cx.named_tensor(format!("right.{i}"), WIDTH))
+        .collect();
+    let mut state = input;
+    let mut side_outputs = Vec::new();
+    for i in 0..TRIPS {
+        let left = (state * left_weights[i]).sin();
+        let right = (state * right_weights[i]).exp2();
+        side_outputs.push(left.output());
+        side_outputs.push(right.output());
+        state = left + right;
+    }
+    let output = state.output();
+
+    let input_data: Vec<f32> = (0..WIDTH).map(|i| (i as f32 - 11.0) / 32.0).collect();
+    let left_data: Vec<Vec<f32>> = (0..TRIPS)
+        .map(|trip| {
+            (0..WIDTH)
+                .map(|i| 0.2 + trip as f32 * 0.07 + i as f32 * 0.001)
+                .collect()
+        })
+        .collect();
+    let right_data: Vec<Vec<f32>> = (0..TRIPS)
+        .map(|trip| {
+            (0..WIDTH)
+                .map(|i| -0.1 + trip as f32 * 0.03 - i as f32 * 0.0005)
+                .collect()
+        })
+        .collect();
+    let mut expected_state = input_data.clone();
+    let mut expected_sides = Vec::new();
+    for trip in 0..TRIPS {
+        let left = expected_state
+            .iter()
+            .zip(&left_data[trip])
+            .map(|(state, weight)| (state * weight).sin())
+            .collect::<Vec<_>>();
+        let right = expected_state
+            .iter()
+            .zip(&right_data[trip])
+            .map(|(state, weight)| (state * weight).exp2())
+            .collect::<Vec<_>>();
+        expected_sides.push(left.clone());
+        expected_sides.push(right.clone());
+        expected_state = left.iter().zip(&right).map(|(a, b)| a + b).collect();
+    }
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        cx.graph
+            .node_weights()
+            .any(|op| op.as_any().is::<luminal::hlir::LoopStart>()),
+        "test graph did not exercise loop rolling"
+    );
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.set_data(input, input_data);
+    for (tensor, data) in left_weights.iter().zip(left_data) {
+        rt.set_data(*tensor, data);
+    }
+    for (tensor, data) in right_weights.iter().zip(right_data) {
+        rt.set_data(*tensor, data);
+    }
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(output.id), &expected_state, 1e-5, 1e-5);
+    for (output, expected) in side_outputs.iter().zip(&expected_sides) {
+        assert_close(&rt.get_f32(output.id), expected, 1e-5, 1e-5);
+    }
+}
+
+#[test]
+fn rolled_varying_scatter_state_and_iteration_outputs_match_cpu() {
+    const WIDTH: usize = 8;
+    const CACHE_LEN: usize = 16;
+    const TRIPS: usize = 4;
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    let mut cx = Graph::default();
+    let input = cx.named_tensor("input", WIDTH);
+    let indexes = cx
+        .named_tensor("indexes", WIDTH)
+        .as_dtype(DType::Int)
+        .persist();
+    let weights: Vec<_> = (0..TRIPS)
+        .map(|i| cx.named_tensor(format!("weight.{i}"), WIDTH))
+        .collect();
+    let caches: Vec<_> = (0..TRIPS)
+        .map(|i| cx.named_tensor(format!("cache.{i}"), CACHE_LEN).persist())
+        .collect();
+
+    let mut state = input;
+    let mut cache_outputs = Vec::new();
+    for i in 0..TRIPS {
+        let update = (state * weights[i]).sin();
+        let cache_out = update.scatter(indexes, caches[i]);
+        state = cache_out.gather(indexes) + weights[i];
+        cache_outputs.push(cache_out.output());
+    }
+    let output = state.output();
+
+    let input_data: Vec<f32> = (0..WIDTH).map(|i| (i as f32 - 3.0) / 8.0).collect();
+    let index_data = vec![13i32, 2, 15, 0, 9, 5, 7, 11];
+    let weight_data: Vec<Vec<f32>> = (0..TRIPS)
+        .map(|trip| {
+            (0..WIDTH)
+                .map(|i| 0.25 + trip as f32 * 0.08 + i as f32 * 0.01)
+                .collect()
+        })
+        .collect();
+    let cache_data: Vec<Vec<f32>> = (0..TRIPS)
+        .map(|trip| {
+            (0..CACHE_LEN)
+                .map(|i| -100.0 - trip as f32 * 20.0 - i as f32)
+                .collect()
+        })
+        .collect();
+
+    let mut expected_state = input_data.clone();
+    let mut expected_caches = Vec::new();
+    for trip in 0..TRIPS {
+        let update: Vec<f32> = expected_state
+            .iter()
+            .zip(&weight_data[trip])
+            .map(|(state, weight)| (state * weight).sin())
+            .collect();
+        let mut expected_cache = cache_data[trip].clone();
+        for (&index, &value) in index_data.iter().zip(&update) {
+            expected_cache[index as usize] = value;
+        }
+        expected_state = update
+            .iter()
+            .zip(&weight_data[trip])
+            .map(|(value, weight)| value + weight)
+            .collect();
+        expected_caches.push(expected_cache);
+    }
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        cx.graph
+            .node_weights()
+            .any(|op| op.as_any().is::<luminal::hlir::LoopStart>()),
+        "test graph did not exercise loop rolling"
+    );
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.set_data(input, input_data);
+    rt.set_data(indexes, index_data);
+    for (tensor, data) in weights.iter().zip(weight_data) {
+        rt.set_data(*tensor, data);
+    }
+    for (tensor, data) in caches.iter().zip(cache_data) {
+        rt.set_data(*tensor, data);
+    }
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(output.id), &expected_state, 1e-5, 1e-5);
+    for (output, expected) in cache_outputs.iter().zip(&expected_caches) {
+        assert_close(&rt.get_f32(output.id), expected, 1e-5, 1e-5);
+    }
+}
+
 #[allow(unused_imports)]
 use super::utilities::{
     ForcedExtractionConfig, GENOME_FUZZ_COUNT, TOLERANCE_SAFETY_FACTOR, assert_close,

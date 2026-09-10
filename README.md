@@ -153,7 +153,6 @@ off by default; set to `1` to enable unless noted.
 |---|---|
 | `LUMINAL_SEARCH_SEED` | Overrides the search RNG seed in the examples (integer). |
 | `SEARCH_MEMORY_MIB` | Overrides the search intermediate-memory cap in examples that support it (integer MiB). |
-| `LUMINAL_MAX_ROLL_BODY` | Caps the largest HLIR window probed by the loop-rolling prepass (default 8192 nodes). |
 | `LUMINAL_COMPUTE_MAJOR` | Overrides the detected CUDA compute capability major version. |
 | `LUMINAL_CUBLASLT_AUTOTUNE` | Enables cuBLASLt algorithm autotuning at prepare time. |
 | `FLASHINFER_CUDA_ARCH` / `LUMINAL_FLASHINFER_DIR` / `LUMINAL_FLASHINFER_DECODE_GRAPH_CAPACITY` | FlashInfer JIT: target arch, cache/library directory, and decode graph capacity override. |

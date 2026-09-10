@@ -1,5 +1,6 @@
 use crate::egglog_utils::{
-    hlir_to_egglog, log_channel_enabled, run_egglog_with_late_passes_interval_analysis_and_log,
+    OpTextParts, hlir_to_egglog, log_channel_enabled,
+    run_egglog_with_report_parts_interval_analysis_and_log,
 };
 pub use crate::search::unroll::{collapse_loops_to_first_iter, unroll_loops_in_llir};
 use crate::search::{BucketSearchSpace, SearchSpace, bucket_index_combinations};
@@ -12,6 +13,7 @@ use crate::{hlir::CustomOpKind, op::*, prelude::*};
 use colored::Colorize;
 use itertools::Itertools;
 use petgraph::{Direction, stable_graph::StableGraph, visit::EdgeRef};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     fmt::Debug,
@@ -46,6 +48,13 @@ struct RollingRun {
     occurrences: Vec<RollingOccurrence>,
     starts: Vec<usize>,
     window: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RollingSeedRun {
+    start: usize,
+    window: usize,
+    repetitions: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -434,15 +443,15 @@ impl Graph {
         // their own. Termination: every roll strictly deletes duplicate
         // body nodes, and marker ops are unique so they never form new
         // repeats.
-        let mut rolled = 0usize;
+        let mut rolled = 0;
         while self.auto_roll_loops_prepass_with_log(log) > 0 {
             rolled += 1;
         }
         if rolled == 0 {
             println!(
-                "   {:>6}  no loop regions found (max body={})",
+                "   {:>6}  no repeated loop regions found (nodes={})",
                 "Rolled".cyan().bold(),
-                before / 2,
+                before,
             );
         }
         if log {
@@ -994,19 +1003,17 @@ impl Graph {
     }
 
     fn auto_roll_loops_prepass_with_log(&mut self, log: bool) -> usize {
-        let max_region_size = self.graph.node_count() / 2;
-        if max_region_size < 1 {
+        if self.graph.node_count() < 2 {
             return 0;
         }
         if log {
             println!(
-                "   {:>6}  scanning {} HLIR nodes for loop regions (max body={})",
+                "   {:>6}  indexing {} HLIR nodes for repeated loop regions",
                 "Rolled".cyan().bold(),
                 self.graph.node_count(),
-                max_region_size,
             );
         }
-        let report = self.best_rolling_candidate(max_region_size);
+        let report = self.best_rolling_candidate();
         let Some(candidate) = report.candidate else {
             if log {
                 self.print_rolling_search_diagnostics(&report.diagnostics);
@@ -1155,7 +1162,7 @@ impl Graph {
             || self.try_get_op::<LoopOutputSelect>(n).is_some()
     }
 
-    fn best_rolling_candidate(&self, max_region_size: usize) -> RollingSearchReport {
+    fn best_rolling_candidate(&self) -> RollingSearchReport {
         // The signature memo is keyed by NodeIndex; clear it so entries from a
         // prior (now-mutated) graph state can't leak into this read-only search.
         clear_rolling_sig_cache();
@@ -1202,163 +1209,148 @@ impl Graph {
         };
         let topo_index: FxHashMap<NodeIndex, usize> =
             topo.iter().enumerate().map(|(i, &n)| (n, i)).collect();
-        // Cap the largest probed window. A useful rolling candidate is one
-        // repeating unit — a transformer layer (≈3.4k HLIR nodes for a gpt-oss
-        // MoE layer; ≈6.7k for a 2-minibatch dual-branch layer). With two
-        // structurally-similar branches (default + minibatch prefill share
-        // weights) the cheap rolling hash matches MANY large windows spanning
-        // both branches; each triggers an O(window) `canonicalize_occurrence`
-        // that ultimately fails the signature check. Probing windows all the way
-        // to `topo.len()/2` made those dead-end canonicalizes dominate (still
-        // minutes even after the externals-scan fix below). Capping the window
-        // comfortably above one layer skips them without changing the selected
-        // candidate (the per-layer roll has the best savings = window·(reps−1)
-        // and lives at a small window). A real body larger than the cap just
-        // isn't rolled (correctness preserved). Tunable via LUMINAL_MAX_ROLL_BODY.
-        let roll_body_cap = std::env::var("LUMINAL_MAX_ROLL_BODY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v >= 1)
-            .unwrap_or(8192);
-        let max_window = max_region_size.min(topo.len() / 2).min(roll_body_cap);
-        let probe_windows = rolling_probe_window_sizes(max_window);
         let node_hashes: Vec<u64> = topo
             .iter()
             .map(|&node| cheap_rolling_node_hash(&self.graph, node, &self.custom_ops))
             .collect();
         let rolling_hash = RollingHash64::new(&node_hashes);
+        let seed_runs = rolling_seed_runs(&node_hashes, &rolling_hash);
+        if crate::egglog_utils::log_channel_enabled(false, "ROLLING_LOG") {
+            println!(
+                "   {:>6}  repeat index produced {} candidate runs",
+                "Rolled".yellow().bold(),
+                seed_runs.len()
+            );
+        }
         let mut diagnostics = RollingSearchDiagnostics::default();
         let mut best_overall: Option<RollingCandidate> = None;
         let mut discovered_runs: Vec<RollingRun> = Vec::new();
 
-        // Search all window sizes down to 1, using cheap rolling hashes only as a
-        // gate for expensive canonicalization. Candidate selection remains purely
-        // based on valid HLIR-op reduction.
-        for window in probe_windows {
-            let mut start = 0usize;
-            while start + window * 2 <= topo.len() {
-                diagnostics.windows_probed += 1;
-                let first_hash = rolling_hash.window_hash(start, window);
-                let second_hash = rolling_hash.window_hash(start + window, window);
-                if first_hash != second_hash {
-                    start += 1;
-                    continue;
-                }
-                diagnostics.adjacent_hash_matches += 1;
+        // The suffix/LCP index yields only distances that are proven to begin
+        // with two adjacent, fingerprint-identical bodies. Full canonicalization
+        // below remains the authority for graph topology and carried state.
+        for seed in seed_runs {
+            let raw_savings = seed.window * (seed.repetitions - 1);
+            if best_overall.as_ref().is_some_and(|best| {
+                let best_net = rolling_net_savings(best);
+                best_net >= 0 && raw_savings <= best_net as usize
+            }) {
+                break;
+            }
+            let start = seed.start;
+            let window = seed.window;
+            diagnostics.windows_probed += 1;
+            diagnostics.adjacent_hash_matches += 1;
 
-                let mut occs = vec![];
-                let mut starts = vec![];
-                let first_nodes = topo[start..start + window].to_vec();
-                let Some((sig, first_boundary, first_outputs)) = canonicalize_occurrence(
+            let mut occs = vec![];
+            let mut starts = vec![];
+            let first_nodes = topo[start..start + window].to_vec();
+            let Some((sig, first_boundary, first_outputs)) = canonicalize_occurrence(
+                &self.graph,
+                &first_nodes,
+                &uses,
+                &topo_index,
+                &self.custom_ops,
+            ) else {
+                continue;
+            };
+            starts.push(start);
+            occs.push(RollingOccurrence {
+                nodes: first_nodes,
+                boundary_inputs: first_boundary,
+                output_nodes: first_outputs,
+            });
+
+            let first_hash = rolling_hash.window_hash(start, window);
+            let mut pos = start + window;
+            while pos + window <= topo.len() {
+                if rolling_hash.window_hash(pos, window) != first_hash {
+                    break;
+                }
+                let nodes = topo[pos..pos + window].to_vec();
+                let Some((next_sig, boundary_inputs, output_nodes)) = canonicalize_occurrence(
                     &self.graph,
-                    &first_nodes,
+                    &nodes,
                     &uses,
                     &topo_index,
                     &self.custom_ops,
                 ) else {
-                    start += 1;
-                    continue;
+                    break;
                 };
-                starts.push(start);
+                if next_sig != sig {
+                    break;
+                }
+                starts.push(pos);
                 occs.push(RollingOccurrence {
-                    nodes: first_nodes,
-                    boundary_inputs: first_boundary,
-                    output_nodes: first_outputs,
+                    nodes,
+                    boundary_inputs,
+                    output_nodes,
                 });
+                pos += window;
+            }
+            if occs.len() < 2 {
+                continue;
+            }
+            diagnostics.repeated_signature_runs += 1;
+            discovered_runs.push(RollingRun {
+                occurrences: occs.clone(),
+                starts: starts.clone(),
+                window,
+            });
+            let stride = starts
+                .windows(2)
+                .next()
+                .map(|w| w[1].saturating_sub(w[0]))
+                .unwrap_or(0);
+            let summary = format!(
+                "body={} trips={} stride={} boundary_inputs={} state_params={} starts={:?}",
+                window,
+                occs.len(),
+                stride,
+                occs[0].boundary_inputs.len(),
+                collect_state_params(&occs, &uses, &self.graph).len(),
+                starts.iter().copied().take(4).collect::<Vec<_>>()
+            );
+            if occs.len() >= 20 && diagnostics.top_runs.len() < 16 {
+                diagnostics.top_runs.push(summary);
+            }
 
-                let mut pos = start + window;
-                while pos + window <= topo.len() {
-                    if rolling_hash.window_hash(pos, window) != first_hash {
-                        break;
-                    }
-                    let nodes = topo[pos..pos + window].to_vec();
-                    let Some((next_sig, boundary_inputs, output_nodes)) = canonicalize_occurrence(
-                        &self.graph,
-                        &nodes,
-                        &uses,
-                        &topo_index,
-                        &self.custom_ops,
-                    ) else {
-                        break;
-                    };
-                    if next_sig != sig {
-                        break;
-                    }
-                    starts.push(pos);
-                    occs.push(RollingOccurrence {
-                        nodes,
-                        boundary_inputs,
-                        output_nodes,
-                    });
-                    pos += window;
-                }
-                if occs.len() < 2 {
-                    start += 1;
-                    continue;
-                }
-                diagnostics.repeated_signature_runs += 1;
-                discovered_runs.push(RollingRun {
-                    occurrences: occs.clone(),
-                    starts: starts.clone(),
+            let state_params = collect_state_params(&occs, &uses, &self.graph);
+            if state_params.is_empty()
+                || !candidate_is_rollable(&occs, &state_params)
+                || !scope_uniform(&occs)
+            {
+                let rejected = RollingRejectedCandidate {
                     window,
-                });
-                let stride = starts
-                    .windows(2)
-                    .next()
-                    .map(|w| w[1].saturating_sub(w[0]))
-                    .unwrap_or(0);
-                let summary = format!(
-                    "body={} trips={} stride={} boundary_inputs={} state_params={} starts={:?}",
-                    window,
-                    occs.len(),
-                    stride,
-                    occs[0].boundary_inputs.len(),
-                    collect_state_params(&occs, &uses, &self.graph).len(),
-                    starts.iter().copied().take(4).collect::<Vec<_>>()
-                );
-                if occs.len() >= 20 && diagnostics.top_runs.len() < 16 {
-                    diagnostics.top_runs.push(summary);
-                }
-
-                let state_params = collect_state_params(&occs, &uses, &self.graph);
-                if state_params.is_empty()
-                    || !candidate_is_rollable(&occs, &state_params)
-                    || !scope_uniform(&occs)
-                {
-                    let rejected = RollingRejectedCandidate {
-                        window,
-                        repetitions: occs.len(),
-                        boundary_inputs: occs[0].boundary_inputs.len(),
-                        state_params: state_params.len(),
-                        savings: window * (occs.len() - 1),
-                    };
-                    diagnostics.rejected_zero_state_params += 1;
-                    let replace = diagnostics.best_rejected.as_ref().is_none_or(|best| {
-                        (rejected.savings, rejected.repetitions, rejected.window)
-                            > (best.savings, best.repetitions, best.window)
-                    });
-                    if replace {
-                        diagnostics.best_rejected = Some(rejected);
-                    }
-                    start = pos.saturating_sub(window).max(start + 1);
-                    continue;
-                }
-
-                let savings = window * (occs.len() - 1);
-                let _ = sig;
-                let candidate = RollingCandidate {
-                    occurrences: occs,
-                    state_param_indices: state_params,
-                    savings,
+                    repetitions: occs.len(),
+                    boundary_inputs: occs[0].boundary_inputs.len(),
+                    state_params: state_params.len(),
+                    savings: window * (occs.len() - 1),
                 };
-                let replace = best_overall.as_ref().is_none_or(|b| {
-                    (rolling_net_savings(&candidate), candidate.occurrences.len())
-                        > (rolling_net_savings(b), b.occurrences.len())
+                diagnostics.rejected_zero_state_params += 1;
+                let replace = diagnostics.best_rejected.as_ref().is_none_or(|best| {
+                    (rejected.savings, rejected.repetitions, rejected.window)
+                        > (best.savings, best.repetitions, best.window)
                 });
                 if replace {
-                    best_overall = Some(candidate);
+                    diagnostics.best_rejected = Some(rejected);
                 }
-                start = pos.saturating_sub(window).max(start + 1);
+                continue;
+            }
+
+            let savings = window * (occs.len() - 1);
+            let _ = sig;
+            let candidate = RollingCandidate {
+                occurrences: occs,
+                state_param_indices: state_params,
+                savings,
+            };
+            let replace = best_overall.as_ref().is_none_or(|b| {
+                (rolling_net_savings(&candidate), candidate.occurrences.len())
+                    > (rolling_net_savings(b), b.occurrences.len())
+            });
+            if replace {
+                best_overall = Some(candidate);
             }
         }
         if crate::egglog_utils::log_channel_enabled(false, "ROLLING_LOG")
@@ -1598,32 +1590,48 @@ impl Graph {
         let dim_buckets = options.dim_buckets.clone();
         let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
-        let extra_egglog = Rt::extra_egglog();
+        let op_parts = OpTextParts::new_with_late_passes(&ops, Rt::CLEANUP_HLIR, &late_passes)
+            .with_extra_egglog(Rt::extra_egglog());
 
         let (program, root) = hlir_to_egglog(self);
-        let buckets = bucket_index_combinations(&dim_buckets)
+        // Build contextual programs before entering Rayon: this only borrows
+        // Graph, whose custom-op trait objects need not be Send or Sync. The
+        // expensive parse/saturate work below then shares immutable strings
+        // and precomputed op text across independent bucket jobs.
+        let bucket_programs = bucket_index_combinations(&dim_buckets)
             .into_iter()
             .map(|bucket_indices| {
                 let intervals = self.bucket_intervals(&dim_buckets, &bucket_indices);
                 let (contextual_program, use_interval_analysis) =
                     self.egglog_program_with_interval_facts(&program, &intervals);
-                let egraph = run_egglog_with_late_passes_interval_analysis_and_log(
-                    &contextual_program,
-                    &root,
-                    &ops,
-                    Rt::CLEANUP_HLIR,
-                    &late_passes,
-                    &extra_egglog,
-                    use_interval_analysis,
-                    options.egglog_log_enabled(),
-                )
-                .unwrap();
-                BucketSearchSpace {
-                    egraph,
+                (
                     bucket_indices,
                     intervals,
-                }
+                    contextual_program,
+                    use_interval_analysis,
+                )
             })
+            .collect_vec();
+        let egglog_log = options.egglog_log_enabled();
+        let buckets = bucket_programs
+            .into_par_iter()
+            .map(
+                |(bucket_indices, intervals, contextual_program, use_interval_analysis)| {
+                    let (egraph, _) = run_egglog_with_report_parts_interval_analysis_and_log(
+                        &contextual_program,
+                        &root,
+                        &op_parts,
+                        use_interval_analysis,
+                        egglog_log,
+                    )
+                    .unwrap();
+                    BucketSearchSpace {
+                        egraph,
+                        bucket_indices,
+                        intervals,
+                    }
+                },
+            )
             .collect();
         let custom_ops = self.custom_ops.iter().map(|op| op.to_llir_op()).collect();
         self.search_space = Some(SearchSpace {
@@ -1944,11 +1952,194 @@ fn rolling_op_signature_uncached(
     format!("{:?}", graph[node])
 }
 
-fn rolling_probe_window_sizes(max_window: usize) -> Vec<usize> {
-    if max_window == 0 {
+/// Discover tandem repetitions from the token sequence without guessing a
+/// maximum body size. Suffixes are joined from longest common prefix to
+/// shortest; when two components meet, neighboring source positions provide
+/// graph-derived candidate periods. At most two seeds are emitted per moved
+/// suffix before maximal equal-body runs are deduplicated.
+fn rolling_seed_runs(tokens: &[u64], rolling_hash: &RollingHash64) -> Vec<RollingSeedRun> {
+    if tokens.len() < 2 {
         return vec![];
     }
-    (1..=max_window).rev().collect()
+
+    let suffixes = suffix_array(tokens);
+    let lcp = suffix_lcp(tokens, &suffixes);
+    let mut edges: Vec<(usize, usize, usize)> = lcp
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, common)| (common > 0).then_some((common, suffixes[i], suffixes[i + 1])))
+        .collect();
+    edges.sort_unstable_by_key(|edge| std::cmp::Reverse(edge.0));
+
+    let mut parent: Vec<usize> = (0..tokens.len()).collect();
+    let mut positions: Vec<Option<std::collections::BTreeSet<usize>>> = (0..tokens.len())
+        .map(|position| Some(std::iter::once(position).collect()))
+        .collect();
+    let mut raw_seeds = Vec::with_capacity(tokens.len());
+
+    for (common, left, right) in edges {
+        let mut left_root = disjoint_set_root(&mut parent, left);
+        let mut right_root = disjoint_set_root(&mut parent, right);
+        if left_root == right_root {
+            continue;
+        }
+        if positions[left_root].as_ref().unwrap().len()
+            < positions[right_root].as_ref().unwrap().len()
+        {
+            std::mem::swap(&mut left_root, &mut right_root);
+        }
+
+        let smaller = positions[right_root].take().unwrap();
+        let larger = positions[left_root].as_mut().unwrap();
+        for position in smaller.iter().copied() {
+            let before = larger.range(..position).next_back().copied();
+            let after = larger
+                .range((
+                    std::ops::Bound::Excluded(position),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .copied();
+            for neighbor in before.into_iter().chain(after) {
+                let start = position.min(neighbor);
+                let window = position.abs_diff(neighbor);
+                if window <= common && start + window * 2 <= tokens.len() {
+                    raw_seeds.push((start, window));
+                }
+            }
+        }
+        larger.extend(smaller);
+        parent[right_root] = left_root;
+    }
+
+    let mut seen = FxHashSet::default();
+    let mut runs = Vec::new();
+    for (mut start, window) in raw_seeds {
+        let body_hash = rolling_hash.window_hash(start, window);
+        while start >= window && rolling_hash.window_hash(start - window, window) == body_hash {
+            start -= window;
+        }
+        if !seen.insert((start, window)) {
+            continue;
+        }
+        let mut repetitions = 1;
+        while start + (repetitions + 1) * window <= tokens.len()
+            && rolling_hash.window_hash(start + repetitions * window, window) == body_hash
+        {
+            repetitions += 1;
+        }
+        if repetitions >= 2 {
+            runs.push(RollingSeedRun {
+                start,
+                window,
+                repetitions,
+            });
+        }
+    }
+    runs.sort_unstable_by_key(|run| {
+        std::cmp::Reverse((
+            run.window * (run.repetitions - 1),
+            run.repetitions,
+            run.window,
+            std::cmp::Reverse(run.start),
+        ))
+    });
+    runs
+}
+
+fn disjoint_set_root(parent: &mut [usize], mut node: usize) -> usize {
+    let mut root = node;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    while parent[node] != node {
+        let next = parent[node];
+        parent[node] = root;
+        node = next;
+    }
+    root
+}
+
+fn suffix_array(tokens: &[u64]) -> Vec<usize> {
+    let mut suffixes: Vec<usize> = (0..tokens.len()).collect();
+    let mut sorted_tokens = tokens.to_vec();
+    sorted_tokens.sort_unstable();
+    sorted_tokens.dedup();
+    let mut rank: Vec<usize> = tokens
+        .iter()
+        .map(|token| sorted_tokens.binary_search(token).unwrap())
+        .collect();
+    let mut next_rank = vec![0; tokens.len()];
+    let mut width = 1usize;
+    while width < tokens.len() {
+        suffixes.sort_unstable_by_key(|&start| {
+            (
+                rank[start] + 1,
+                if start + width < tokens.len() {
+                    rank[start + width] + 1
+                } else {
+                    0
+                },
+            )
+        });
+        next_rank[suffixes[0]] = 0;
+        for pair in suffixes.windows(2) {
+            let previous = pair[0];
+            let current = pair[1];
+            let previous_key = (
+                rank[previous] + 1,
+                if previous + width < tokens.len() {
+                    rank[previous + width] + 1
+                } else {
+                    0
+                },
+            );
+            let current_key = (
+                rank[current] + 1,
+                if current + width < tokens.len() {
+                    rank[current + width] + 1
+                } else {
+                    0
+                },
+            );
+            next_rank[current] = next_rank[previous] + usize::from(current_key != previous_key);
+        }
+        std::mem::swap(&mut rank, &mut next_rank);
+        if rank[*suffixes.last().unwrap()] + 1 == tokens.len() {
+            break;
+        }
+        width = width.saturating_mul(2);
+    }
+    suffixes
+}
+
+fn suffix_lcp(tokens: &[u64], suffixes: &[usize]) -> Vec<usize> {
+    if suffixes.len() < 2 {
+        return vec![];
+    }
+    let mut inverse = vec![0; suffixes.len()];
+    for (rank, &start) in suffixes.iter().enumerate() {
+        inverse[start] = rank;
+    }
+    let mut lcp = vec![0; suffixes.len() - 1];
+    let mut common = 0usize;
+    for start in 0..tokens.len() {
+        let rank = inverse[start];
+        if rank + 1 == suffixes.len() {
+            common = 0;
+            continue;
+        }
+        let next = suffixes[rank + 1];
+        while start + common < tokens.len()
+            && next + common < tokens.len()
+            && tokens[start + common] == tokens[next + common]
+        {
+            common += 1;
+        }
+        lcp[rank] = common;
+        common = common.saturating_sub(1);
+    }
+    lcp
 }
 
 fn canonicalize_occurrence(
@@ -2278,6 +2469,61 @@ mod tests {
     use crate::egglog_utils::hash_egglog_normalized;
     use crate::hlir::{Input, LoopEnd, LoopInput, LoopStart, Output, ReferenceOp, Sin};
     use crate::search::unroll::materialize_unrolled_llir;
+
+    #[test]
+    fn rolling_seed_runs_discovers_large_non_power_of_two_period() {
+        const BODY: usize = 2817;
+        const TRIPS: usize = 13;
+        let tokens: Vec<u64> = (0..TRIPS)
+            .flat_map(|_| (0..BODY).map(|token| token as u64))
+            .collect();
+        let hash = RollingHash64::new(&tokens);
+        let runs = rolling_seed_runs(&tokens, &hash);
+
+        assert!(
+            runs.iter()
+                .any(|run| { run.start == 0 && run.window == BODY && run.repetitions == TRIPS }),
+            "expected the data-derived index to find the 2817-node period"
+        );
+    }
+
+    #[test]
+    fn rolling_seed_runs_discovers_nested_periods() {
+        const INNER: usize = 524;
+        const INNER_TRIPS: usize = 3;
+        const OUTER_TRIPS: usize = 13;
+        let inner: Vec<u64> = (0..INNER).map(|token| token as u64).collect();
+        let mut outer = Vec::new();
+        for _ in 0..INNER_TRIPS {
+            outer.extend(inner.iter().copied());
+        }
+        outer.push(u64::MAX);
+        let tokens: Vec<u64> = (0..OUTER_TRIPS)
+            .flat_map(|_| outer.iter().copied())
+            .collect();
+        let hash = RollingHash64::new(&tokens);
+        let runs = rolling_seed_runs(&tokens, &hash);
+
+        assert!(
+            runs.iter().any(|run| {
+                run.start == 0 && run.window == outer.len() && run.repetitions == OUTER_TRIPS
+            }),
+            "expected the outer periodic block"
+        );
+        assert!(
+            runs.iter().any(|run| {
+                run.start == 0 && run.window == INNER && run.repetitions == INNER_TRIPS
+            }),
+            "expected the repeated inner body"
+        );
+    }
+
+    #[test]
+    fn rolling_seed_runs_rejects_aperiodic_sequence() {
+        let tokens: Vec<u64> = (0..4096).map(|token| token as u64).collect();
+        let hash = RollingHash64::new(&tokens);
+        assert!(rolling_seed_runs(&tokens, &hash).is_empty());
+    }
 
     // A rolling candidate is only collapsible if every non-state boundary input
     // is fed from OUTSIDE the candidate's occurrences. A non-state input produced

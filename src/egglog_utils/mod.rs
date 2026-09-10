@@ -52,6 +52,13 @@ const EGGLOG_RULESETS: &[&str] = &[
     "kernel_fuse_late_pre_sink_attention_request",
     "kernel_fuse_late_pre_sink_attention_past",
     "kernel_fuse_late_pre_sink_attention_finish",
+    "kernel_fuse_late_sink_attention_qk",
+    "kernel_fuse_late_sink_attention_softmax_select",
+    "kernel_fuse_late_sink_attention_softmax_max",
+    "kernel_fuse_late_sink_attention_softmax_numerator",
+    "kernel_fuse_late_sink_attention_softmax_denominator",
+    "kernel_fuse_late_sink_attention_contexts",
+    "kernel_fuse_late_sink_attention_island",
     "kernel_fuse_late_pre_flashinfer",
     "kernel_fuse_late",
     // Expensive one-shot rules that consume facts produced by the earlier
@@ -274,6 +281,14 @@ impl OpTextParts {
                 .collect(),
         }
     }
+
+    /// Add backend-wide egglog declarations to these precomputed fragments.
+    /// Keeping this on the owned, Send + Sync text bundle lets bucket builds
+    /// share all op-derived setup without sharing the non-Send op trait objects.
+    pub fn with_extra_egglog(mut self, extra_egglog: impl Into<String>) -> Self {
+        self.extra_egglog = extra_egglog.into();
+        self
+    }
 }
 
 fn full_egglog_with(program: &str, parts: &OpTextParts) -> String {
@@ -325,10 +340,11 @@ fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> 
         // once here (dtype facts present, raw HLIR rows not yet deleted by
         // the cleanup phases) instead of inside the saturating main cycles
         // avoids re-evaluating tens-of-seconds joins on every iteration.
-        // `seq` so each ruleset's join runs exactly once: producer stages
-        // first, then the consumer rules.
+        // Keep the large structural stages separate so progress and rule-plan
+        // cost stay observable on model-sized graphs. Each ruleset still runs
+        // exactly once in dependency order.
         EgglogSchedulePhase {
-            name: "fuse late".to_string(),
+            name: "fuse late producers".to_string(),
             // The second `kernel_fuse_late` run consumes relation facts the
             // first run produced (e.g. rope_rotated); semi-naive evaluation
             // makes it a cheap delta join.
@@ -341,7 +357,40 @@ fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> 
                 kernel_fuse_late_pre_sink_attention_base
                 kernel_fuse_late_pre_sink_attention_request
                 kernel_fuse_late_pre_sink_attention_past
-                kernel_fuse_late_pre_sink_attention_finish
+                kernel_fuse_late_pre_sink_attention_finish)"
+                .to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "sink attention qk".to_string(),
+            schedule: "kernel_fuse_late_sink_attention_qk".to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "sink attention select".to_string(),
+            schedule: "kernel_fuse_late_sink_attention_softmax_select".to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "sink attention max".to_string(),
+            schedule: "kernel_fuse_late_sink_attention_softmax_max".to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "sink attention numerator".to_string(),
+            schedule: "kernel_fuse_late_sink_attention_softmax_numerator".to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "sink attention denominator".to_string(),
+            schedule: "kernel_fuse_late_sink_attention_softmax_denominator".to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "sink attention contexts".to_string(),
+            schedule: "kernel_fuse_late_sink_attention_contexts".to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "sink attention island".to_string(),
+            schedule: "kernel_fuse_late_sink_attention_island".to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "fuse late backends".to_string(),
+            schedule: "(seq
                 kernel_fuse_late_pre_flashinfer
                 kernel_fuse_late
                 kernel_fuse_late
@@ -1330,6 +1379,19 @@ pub fn run_egglog_with_report_parts(
     )
 }
 
+/// Run egglog from precomputed op text with the same interval-analysis and
+/// logging controls used by Runtime compilation. This is the parallel-safe
+/// bucket-build entry point: all arguments are immutable Send + Sync data.
+pub fn run_egglog_with_report_parts_interval_analysis_and_log(
+    program: &str,
+    root: &str,
+    op_parts: &OpTextParts,
+    use_interval_analysis: bool,
+    log: bool,
+) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
+    run_egglog_with_report_parts_impl(program, root, op_parts, use_interval_analysis, log)
+}
+
 fn run_egglog_with_report_parts_impl(
     program: &str,
     root: &str,
@@ -1917,7 +1979,7 @@ struct DenseNode {
 #[derive(Clone, Debug)]
 pub struct IndexedChoiceSet {
     choices: Vec<DenseIndex>,
-    hash: u64,
+    pub(crate) hash: u64,
 }
 
 struct IndexedEClass<'a> {
@@ -2235,6 +2297,138 @@ impl<'a> LlirExtractor<'a> {
     pub fn random_indexed_choice(&self, rng: &mut (impl Rng + ?Sized)) -> IndexedChoiceSet {
         let choices = random_initial_choice(self.egraph, rng);
         self.index_choice_set(&choices)
+    }
+
+    /// Deterministic first extraction seed using the smallest acyclic
+    /// derivation tree in the e-graph. Fused backend alternatives naturally
+    /// win because they replace multi-op reference expansions with one node;
+    /// no model- or operator-name preference is involved.
+    pub fn minimum_cost_indexed_choice(&mut self) -> IndexedChoiceSet {
+        #[derive(Clone, Copy)]
+        struct SeedNode {
+            class: DenseIndex,
+            slot: DenseIndex,
+            remaining_children: usize,
+            cost: u64,
+        }
+
+        let mut nodes = Vec::<SeedNode>::new();
+        let mut parents = vec![Vec::<usize>::new(); self.indexed_classes.len()];
+        for class in 0..self.indexed_classes.len() {
+            let class_index = DenseIndex::try_from(class).expect("too many e-classes to index");
+            let class_info = &self.indexed_classes[class];
+            let slots: Vec<DenseIndex> = if class_info.searchable {
+                let marker_free: Vec<DenseIndex> = class_info
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, node)| !enode_is_loop_input_marker(self.egraph, node))
+                    .map(|(slot, _)| DenseIndex::try_from(slot).unwrap())
+                    .collect();
+                let consistent: Vec<DenseIndex> = if class_info.label == "OpKind" {
+                    class_info
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, node)| opkind_metadata_consistent(self.egraph, node))
+                        .map(|(slot, _)| DenseIndex::try_from(slot).unwrap())
+                        .collect()
+                } else {
+                    vec![]
+                };
+                let synthesized: Vec<DenseIndex> = class_info
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, node)| node.as_ref().starts_with("synth_"))
+                    .map(|(slot, _)| DenseIndex::try_from(slot).unwrap())
+                    .collect();
+                let restrict_markers = |pool: Vec<DenseIndex>| {
+                    let filtered: Vec<DenseIndex> = pool
+                        .iter()
+                        .copied()
+                        .filter(|slot| marker_free.contains(slot))
+                        .collect();
+                    if filtered.is_empty() { pool } else { filtered }
+                };
+                if !consistent.is_empty() {
+                    restrict_markers(consistent)
+                } else if !synthesized.is_empty() {
+                    restrict_markers(synthesized)
+                } else if !marker_free.is_empty() {
+                    marker_free
+                } else {
+                    (0..class_info.nodes.len())
+                        .map(|slot| DenseIndex::try_from(slot).unwrap())
+                        .collect()
+                }
+            } else {
+                vec![0]
+            };
+
+            for slot in slots {
+                let node_id = &class_info.nodes[slot as usize];
+                let children = &self.egraph.enodes[node_id].1;
+                let node_index = nodes.len();
+                nodes.push(SeedNode {
+                    class: class_index,
+                    slot,
+                    remaining_children: children.len(),
+                    cost: 1,
+                });
+                for child in children {
+                    parents[self.class_to_index[child] as usize].push(node_index);
+                }
+            }
+        }
+
+        let mut ready = std::collections::BinaryHeap::new();
+        for (node_index, node) in nodes.iter().enumerate() {
+            if node.remaining_children == 0 {
+                ready.push(std::cmp::Reverse((
+                    node.cost, node.class, node.slot, node_index,
+                )));
+            }
+        }
+        let mut class_cost = vec![None::<u64>; self.indexed_classes.len()];
+        let mut selected = vec![NO_DENSE_INDEX; self.indexed_classes.len()];
+        while let Some(std::cmp::Reverse((cost, class, slot, _node_index))) = ready.pop() {
+            if class_cost[class as usize].is_some() {
+                continue;
+            }
+            class_cost[class as usize] = Some(cost);
+            selected[class as usize] = slot;
+            for &parent_index in &parents[class as usize] {
+                let parent = &mut nodes[parent_index];
+                parent.remaining_children -= 1;
+                parent.cost = parent.cost.saturating_add(cost);
+                if parent.remaining_children == 0 {
+                    ready.push(std::cmp::Reverse((
+                        parent.cost,
+                        parent.class,
+                        parent.slot,
+                        parent_index,
+                    )));
+                }
+            }
+        }
+
+        let mut hash = 0u64;
+        for (class, choice) in selected.iter_mut().enumerate() {
+            if !self.indexed_classes[class].searchable {
+                *choice = NO_DENSE_INDEX;
+                continue;
+            }
+            if *choice == NO_DENSE_INDEX {
+                *choice = self.mutation_pool(class as DenseIndex)[0];
+            }
+            let class_info = &self.indexed_classes[class];
+            hash ^= hash_choice_entry(class_info.id, &class_info.nodes[*choice as usize]);
+        }
+        IndexedChoiceSet {
+            choices: selected,
+            hash,
+        }
     }
 
     pub fn random_indexed_generation(
