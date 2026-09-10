@@ -1,0 +1,18 @@
+(rule
+  (
+    (= ?out_logical (LogicalIndexMapApply ?in_logical ?index_map ?out_shape))
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?in_layout (BitOffsetExpressionLayoutLit ?parent_bit_offset ?in_shape ?bit_width))
+    (= ?composed_bit_offset (int-subst-of ?parent_bit_offset ?index_map))
+    (= ?out_layout (BitOffsetExpressionLayoutLit ?composed_bit_offset ?out_shape ?bit_width))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpIndexMapApplyViewGeneric ?in_layout_tensor ?index_map ?out_shape ?out_layout))
+  )
+)

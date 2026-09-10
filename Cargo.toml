@@ -69,6 +69,7 @@ proptest = "1.9.0"
 # executable applications live under the corresponding runtime crate.
 members = [
     "crates/luminal_cuda_lite",
+    "crates/luminal_metal",
     "crates/luminal_reference",
     "crates/luminal_nn",
     "crates/luminal_tracing",

@@ -1,0 +1,16 @@
+(rule
+  (
+    (= ?out_logical (LogicalIota ?index_expression ?shape))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorNil)
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpIotaGeneric ?index_expression ?shape ?out_layout))
+  )
+)
