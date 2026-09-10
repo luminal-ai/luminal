@@ -1966,12 +1966,17 @@ pub struct LlirExtractor<'a> {
     class_to_index: FxHashMap<&'a ClassId, DenseIndex>,
     root_index: DenseIndex,
     indexed_extractions: Vec<Vec<(DenseIndex, Vec<CachedIndexedExtraction>)>>,
-    mutation_nodes: Vec<Option<Vec<DenseIndex>>>,
+    mutation_nodes: Vec<Option<MutationChoices>>,
     visit_epoch: u32,
     visited: Vec<u32>,
     reachable: Vec<DenseNode>,
     reachability_stack: Vec<DenseNode>,
     graph_nodes: Vec<(u32, usize)>,
+}
+
+struct MutationChoices {
+    nodes: Vec<DenseIndex>,
+    families: Vec<Vec<DenseIndex>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2179,9 +2184,14 @@ impl<'a> LlirExtractor<'a> {
             } else {
                 all()
             };
-            self.mutation_nodes[class as usize] = Some(pool);
+            let nodes = class_info.nodes;
+            let families = proposal_families(self.egraph, &pool, |slot| &nodes[slot as usize]);
+            self.mutation_nodes[class as usize] = Some(MutationChoices {
+                nodes: pool,
+                families,
+            });
         }
-        self.mutation_nodes[class as usize].as_deref().unwrap()
+        &self.mutation_nodes[class as usize].as_ref().unwrap().nodes
     }
 
     pub fn index_choice_set(&self, choices: &EGraphChoiceSet<'a>) -> IndexedChoiceSet {
@@ -2313,8 +2323,13 @@ impl<'a> LlirExtractor<'a> {
             for _ in 0..mutation_count {
                 let class = mutable_classes[rng.random_range(0..mutable_classes.len())];
                 let new_node = {
-                    let pool = self.mutation_pool(class);
-                    pool[rng.random_range(0..pool.len())]
+                    self.mutation_pool(class);
+                    let families = &self.mutation_nodes[class as usize]
+                        .as_ref()
+                        .unwrap()
+                        .families;
+                    let family = &families[rng.random_range(0..families.len())];
+                    family[rng.random_range(0..family.len())]
                 };
                 let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
                 let class_info = &self.indexed_classes[class as usize];
@@ -2987,6 +3002,39 @@ fn non_marker_enode_indices(egraph: &SerializedEGraph, enodes: &[NodeId]) -> Vec
         .collect()
 }
 
+/// Group legal proposals by constructor before sampling tuning variants. The
+/// generic IR `Op` wrapper carries its constructor in the OpKind child; no
+/// backend names, tensor dimensions, or preferred implementations enter the
+/// proposal policy. Pool filtering and measured fitness remain unchanged.
+fn proposal_families<'a, T: Copy>(
+    egraph: &'a SerializedEGraph,
+    pool: &[T],
+    node: impl Fn(T) -> &'a NodeId,
+) -> Vec<Vec<T>> {
+    let mut indices = FxHashMap::default();
+    let mut families: Vec<Vec<T>> = Vec::new();
+    for &choice in pool {
+        let (head, children) = &egraph.enodes[node(choice)];
+        let mut key = vec![head.as_str()];
+        if head == "Op"
+            && let Some((kind_sort, kinds)) = children.first().and_then(|c| egraph.eclasses.get(c))
+            && kind_sort == "OpKind"
+        {
+            let mut constructors: Vec<_> =
+                kinds.iter().map(|k| egraph.enodes[k].0.as_str()).collect();
+            constructors.sort_unstable();
+            constructors.dedup();
+            key.extend(constructors);
+        }
+        let index = *indices.entry(key).or_insert_with(|| {
+            families.push(Vec::new());
+            families.len() - 1
+        });
+        families[index].push(choice);
+    }
+    families
+}
+
 pub fn random_initial_choice<'a>(
     egraph: &'a SerializedEGraph,
     rng: &mut (impl Rng + ?Sized),
@@ -3039,15 +3087,18 @@ pub fn random_initial_choice<'a>(
         };
         let consistent_opkind_indices = restrict(consistent_opkind_indices);
         let synth_indices = restrict(synth_indices);
-        let pick_idx = if !consistent_opkind_indices.is_empty() {
-            consistent_opkind_indices[rng.random_range(0..consistent_opkind_indices.len())]
+        let pool = if !consistent_opkind_indices.is_empty() {
+            consistent_opkind_indices
         } else if !synth_indices.is_empty() {
-            synth_indices[rng.random_range(0..synth_indices.len())]
+            synth_indices
         } else if !marker_free.is_empty() {
-            marker_free[rng.random_range(0..marker_free.len())]
+            marker_free
         } else {
-            rng.random_range(0..enodes.len())
+            (0..enodes.len()).collect()
         };
+        let families = proposal_families(egraph, &pool, |index| &enodes[index]);
+        let family = &families[rng.random_range(0..families.len())];
+        let pick_idx = family[rng.random_range(0..family.len())];
         choices.insert(eclass, &enodes[pick_idx]);
     }
     repair_choice_cycles(egraph, &mut choices, rng);
@@ -3644,6 +3695,9 @@ fn egglog_to_llir_from_root_cached<'a>(
     // before it is loaded into the runtime.
     graph
 }
+
+#[cfg(test)]
+mod proposal_tests;
 
 #[cfg(test)]
 mod tests {
