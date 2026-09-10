@@ -2271,14 +2271,7 @@ impl<'a> LlirExtractor<'a> {
         generation
     }
 
-    pub fn extract_reachable_indexed_generation(
-        &mut self,
-        base: &IndexedChoiceSet,
-        generation_size: usize,
-        mutations_per_generation: usize,
-        prev_selected: &mut FxHashSet<u64>,
-        rng: &mut (impl Rng + ?Sized),
-    ) -> Vec<IndexedChoiceSet> {
+    fn reachable_mutation_classes(&mut self, choices: &IndexedChoiceSet) -> Vec<DenseIndex> {
         let mut seen_nodes = FxHashSet::default();
         let mut seen_classes = FxHashSet::default();
         let mut mutable_classes = Vec::new();
@@ -2288,7 +2281,7 @@ impl<'a> LlirExtractor<'a> {
             seen_classes.insert(root);
             mutable_classes.push(root);
         }
-        let mut stack = vec![self.indexed_selected(base, root)];
+        let mut stack = vec![self.indexed_selected(choices, root)];
         while let Some(node) = stack.pop() {
             if !seen_nodes.insert(node) {
                 continue;
@@ -2302,9 +2295,22 @@ impl<'a> LlirExtractor<'a> {
                 if class.nodes.len() > 1 && seen_classes.insert(child_class) {
                     mutable_classes.push(child_class);
                 }
-                stack.push(self.indexed_selected(base, child_class));
+                stack.push(self.indexed_selected(choices, child_class));
             }
         }
+
+        mutable_classes
+    }
+
+    pub fn extract_reachable_indexed_generation(
+        &mut self,
+        base: &IndexedChoiceSet,
+        generation_size: usize,
+        mutations_per_generation: usize,
+        prev_selected: &mut FxHashSet<u64>,
+        rng: &mut (impl Rng + ?Sized),
+    ) -> Vec<IndexedChoiceSet> {
+        let mutable_classes = self.reachable_mutation_classes(base);
 
         if mutable_classes.is_empty() {
             if prev_selected.insert(base.hash) {
@@ -2319,9 +2325,10 @@ impl<'a> LlirExtractor<'a> {
         while offspring.len() < generation_size && attempts < max_attempts {
             attempts += 1;
             let mut child = base.clone();
+            let mut active_classes = mutable_classes.clone();
             let mutation_count = rng.random_range(1..=mutations_per_generation.max(1));
-            for _ in 0..mutation_count {
-                let class = mutable_classes[rng.random_range(0..mutable_classes.len())];
+            for mutation in 0..mutation_count {
+                let class = active_classes[rng.random_range(0..active_classes.len())];
                 let new_node = {
                     self.mutation_pool(class);
                     let families = &self.mutation_nodes[class as usize]
@@ -2337,6 +2344,15 @@ impl<'a> LlirExtractor<'a> {
                     hash_choice_entry(class_info.id, &class_info.nodes[old_node as usize]);
                 child.hash ^=
                     hash_choice_entry(class_info.id, &class_info.nodes[new_node as usize]);
+                // A different implementation can expose previously inactive
+                // inputs. Later mutations must see the child's current graph,
+                // allowing a structural choice and its tuning to change together.
+                if old_node != new_node && mutation + 1 < mutation_count {
+                    active_classes = self.reachable_mutation_classes(&child);
+                    if active_classes.is_empty() {
+                        break;
+                    }
+                }
             }
             if prev_selected.insert(child.hash) {
                 offspring.push(child);

@@ -102,3 +102,98 @@ fn reachable_mutation_balances_families_and_preserves_every_variant() {
         check_distribution(&counts, variants);
     }
 }
+
+// A direct implementation hides the input of an equivalent wrapped form.
+// Switching to the wrapper must permit later mutations in this same child
+// to tune the newly activated input, without first retaining a worse parent.
+fn activated_input_fixture() -> SerializedEGraph {
+    let mut graph = SerializedEGraph {
+        enodes: FxHashMap::default(),
+        eclasses: FxHashMap::default(),
+        node_to_class: FxHashMap::default(),
+        roots: vec![ClassId::from("root")],
+    };
+    let mut add = |class: &str, sort: &str, nodes: &[(&str, &str, &[&str])]| {
+        let class = ClassId::from(class);
+        let mut ids = Vec::new();
+        for &(id, head, children) in nodes {
+            let id = NodeId::from(id);
+            graph.enodes.insert(
+                id.clone(),
+                (
+                    head.into(),
+                    children.iter().map(|&c| ClassId::from(c)).collect(),
+                ),
+            );
+            graph.node_to_class.insert(id.clone(), class.clone());
+            ids.push(id);
+        }
+        graph.eclasses.insert(class, (sort.into(), ids));
+    };
+    add("nil", "IList", &[("nil-node", "INil", &[])]);
+    add(
+        "inputs",
+        "IList",
+        &[("inputs-node", "ICons", &["hidden", "nil"])],
+    );
+    for name in ["Direct", "Wrapped", "Slow", "Fast"] {
+        add(name, "OpKind", &[(name, name, &[])]);
+    }
+    add(
+        "hidden",
+        "IR",
+        &[
+            ("slow", "Op", &["Slow", "nil"]),
+            ("fast", "Op", &["Fast", "nil"]),
+        ],
+    );
+    add(
+        "root",
+        "IR",
+        &[
+            ("direct", "Op", &["Direct", "nil"]),
+            ("wrapped", "Op", &["Wrapped", "inputs"]),
+        ],
+    );
+    graph
+}
+
+#[test]
+fn mutation_can_tune_an_input_activated_by_an_earlier_mutation() {
+    let graph = activated_input_fixture();
+    let root = ClassId::from("root");
+    let hidden = ClassId::from("hidden");
+    let mut rng = StdRng::seed_from_u64(1827);
+    let mut choices = random_initial_choice(&graph, &mut rng);
+    choices.insert(&graph.roots[0], &graph.eclasses[&root].1[0]);
+    choices.insert(
+        graph.eclasses.get_key_value(&hidden).unwrap().0,
+        &graph.eclasses[&hidden].1[0],
+    );
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let base = extractor.index_choice_set(&choices);
+    let mut composed = 0;
+    for _ in 0..1024 {
+        let children = extractor.extract_reachable_indexed_generation(
+            &base,
+            1,
+            8,
+            &mut FxHashSet::default(),
+            &mut rng,
+        );
+        assert_eq!(children.len(), 1);
+        let named = extractor.named_choices(&children[0]);
+        assert_eq!(extractor.index_named_choices(&named).hash, children[0].hash);
+        if named.contains(&("root".into(), "wrapped".into()))
+            && named.contains(&("hidden".into(), "fast".into()))
+        {
+            composed += 1;
+        }
+    }
+    assert!(
+        composed > 0,
+        "no child could tune an input exposed by its earlier mutation"
+    );
+    // Parents are immutable while children explore implementation changes.
+    assert_eq!(base.choices[extractor.class_to_index[&hidden] as usize], 0);
+}
