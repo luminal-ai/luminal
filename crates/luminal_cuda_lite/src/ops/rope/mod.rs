@@ -115,9 +115,13 @@ impl crate::host::HostOp for RopeDps {
         if n == 0 {
             return Ok(());
         }
-        let function =
-            crate::nvrtc_module::kernel_function(ctx.stream, &source_for(&spec), "rope_split_half")
-                .with_context(|| format!("{label}: kernel"))?;
+        let function = crate::nvrtc_module::kernel_function_keyed(
+            ctx.stream,
+            &format!("rope:{}:{}", spec.head_dim, u8::from(spec.out_bf16)),
+            "rope_split_half",
+            || source_for(&spec),
+        )
+        .with_context(|| format!("{label}: kernel"))?;
         let (x_ptr, c_ptr, s_ptr, dest) = (
             ctx.inputs[0].ptr,
             ctx.inputs[1].ptr,

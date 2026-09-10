@@ -73,9 +73,13 @@ impl crate::host::HostOp for RmsNormDps {
         if rows == 0 {
             return Ok(());
         }
-        let function =
-            crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "rms_norm_rows")
-                .with_context(|| format!("{label}: kernel"))?;
+        let function = crate::nvrtc_module::kernel_function_keyed(
+            ctx.stream,
+            "rms_norm",
+            "rms_norm_rows",
+            || KERNEL_SOURCE.to_string(),
+        )
+        .with_context(|| format!("{label}: kernel"))?;
         let (x_ptr, w_ptr, dest) = (ctx.inputs[0].ptr, ctx.inputs[1].ptr, ctx.dest.ptr);
         let (width_i, eps) = (width as i32, self.spec.eps as f32);
         let mut builder = ctx.stream.launch_builder(&function);

@@ -89,9 +89,13 @@ impl crate::host::HostOp for MoeTopkDps {
         if rows == 0 {
             return Ok(());
         }
-        let function =
-            crate::nvrtc_module::kernel_function(ctx.stream, &source_for(experts), "moe_topk_rows")
-                .with_context(|| format!("{label}: kernel"))?;
+        let function = crate::nvrtc_module::kernel_function_keyed(
+            ctx.stream,
+            &format!("moe_topk:{experts}"),
+            "moe_topk_rows",
+            || source_for(experts),
+        )
+        .with_context(|| format!("{label}: kernel"))?;
         let (src, dest) = (ctx.inputs[0].ptr, ctx.dest.ptr);
         let (rows_i, experts_i, k_i) = (rows as i32, experts as i32, k as i32);
         let mut builder = ctx.stream.launch_builder(&function);

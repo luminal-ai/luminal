@@ -71,9 +71,13 @@ impl crate::host::HostOp for ArgmaxRowsDps {
         if rows == 0 {
             return Ok(());
         }
-        let function =
-            crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "argmax_rows")
-                .with_context(|| format!("{label}: kernel"))?;
+        let function = crate::nvrtc_module::kernel_function_keyed(
+            ctx.stream,
+            "argmax_rows",
+            "argmax_rows",
+            || KERNEL_SOURCE.to_string(),
+        )
+        .with_context(|| format!("{label}: kernel"))?;
         let (src, dest) = (ctx.inputs[0].ptr, ctx.dest.ptr);
         let width_i = width as i32;
         let mut builder = ctx.stream.launch_builder(&function);

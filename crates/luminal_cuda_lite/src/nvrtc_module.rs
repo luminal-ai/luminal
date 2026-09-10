@@ -22,6 +22,42 @@ fn cache() -> &'static Cache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Functions by a caller-chosen KEY that determines the source (an op
+/// name plus whatever the op bakes into its kernel text): the per-launch
+/// cost is one short-string lookup, not a hash of the whole source.
+type KeyedCache = Mutex<HashMap<(String, String), CudaFunction>>;
+
+fn keyed_cache() -> &'static KeyedCache {
+    static CACHE: OnceLock<KeyedCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The entry `entry` of the kernel source `source()` builds, compiled
+/// once per `key` — the caller's promise is that equal keys mean equal
+/// sources. Host ops that launch every tick use this so a decode tick
+/// pays no source hashing or formatting per launch.
+pub fn kernel_function_keyed(
+    stream: &Arc<CudaStream>,
+    key: &str,
+    entry: &str,
+    source: impl FnOnce() -> String,
+) -> Result<CudaFunction> {
+    {
+        let cache = keyed_cache()
+            .lock()
+            .map_err(|_| anyhow!("keyed module cache poisoned"))?;
+        if let Some(function) = cache.get(&(key.to_string(), entry.to_string())) {
+            return Ok(function.clone());
+        }
+    }
+    let function = kernel_function(stream, &source(), entry)?;
+    keyed_cache()
+        .lock()
+        .map_err(|_| anyhow!("keyed module cache poisoned"))?
+        .insert((key.to_string(), entry.to_string()), function.clone());
+    Ok(function)
+}
+
 fn source_key(source: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();

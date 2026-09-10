@@ -167,9 +167,33 @@ pub(crate) fn dense_extents(
 
 /// The kernel source with the geometry and the cache dtype baked in as
 /// macros.
+/// The kernel's tile size (rows per shared-memory tile).
+const TILE: usize = 32;
+
+/// The block geometry for a group of `group` query heads per kv head:
+/// warps per chunk group, chunk groups per block (the intra-block
+/// context split), threads per block, and the dynamic shared memory
+/// the chunk groups' K/V tiles take.
+fn block_geometry(spec: &PagedAttentionSpec) -> (usize, usize, usize, usize) {
+    static MAX_CHUNKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // `LUMINAL_ATTN_CHUNKS` caps the split (a tuning probe).
+    let max_chunks = *MAX_CHUNKS.get_or_init(|| {
+        std::env::var("LUMINAL_ATTN_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+    });
+    let wpc = spec.group().min(4);
+    let chunks = max_chunks.min(1024 / (32 * wpc)).max(1);
+    let threads = chunks * wpc * 32;
+    let smem = chunks * (TILE * (spec.head_dim + 1) + TILE * spec.head_dim) * 4;
+    (wpc, chunks, threads, smem)
+}
+
 fn source_for(spec: &PagedAttentionSpec, kv_bf16: bool) -> String {
+    let (wpc, chunks, _, _) = block_geometry(spec);
     format!(
-        "#define D {}\n#define G {}\n#define W {}\n#define KV_BF16 {}\n{}",
+        "#define D {}\n#define G {}\n#define W {}\n#define KV_BF16 {}\n#define WPC {wpc}\n#define CHUNKS {chunks}\n{}",
         spec.head_dim,
         spec.group(),
         spec.window,
@@ -276,12 +300,26 @@ impl crate::host::HostOp for PagedAttentionDps {
         if s == 0 {
             return Ok(());
         }
-        let function = crate::nvrtc_module::kernel_function(
+        let function = crate::nvrtc_module::kernel_function_keyed(
             ctx.stream,
-            &source_for(&spec, kv_bf16),
+            &format!(
+                "paged_attention:{}:{}:{}:{}",
+                spec.head_dim,
+                spec.group(),
+                spec.window,
+                u8::from(kv_bf16)
+            ),
             "paged_attention_f32",
+            || source_for(&spec, kv_bf16),
         )
         .with_context(|| format!("{label}: kernel"))?;
+        let (_, _, threads, smem) = block_geometry(&spec);
+        function
+            .set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem as i32,
+            )
+            .with_context(|| format!("{label}: opting into {smem} bytes of shared memory"))?;
         let ptrs: Vec<u64> = ctx.inputs.iter().map(|b| b.ptr).collect();
         let dest = ctx.dest.ptr;
         let kv_heads = spec.kv_heads as i32;
@@ -289,8 +327,8 @@ impl crate::host::HostOp for PagedAttentionDps {
         let scale = spec.scale as f32;
         let cfg = LaunchConfig {
             grid_dim: ((s * spec.kv_heads) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
+            block_dim: (threads as u32, 1, 1),
+            shared_mem_bytes: smem as u32,
         };
         let mut builder = ctx.stream.launch_builder(&function);
         for ptr in &ptrs {

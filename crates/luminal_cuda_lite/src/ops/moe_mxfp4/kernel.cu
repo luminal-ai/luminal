@@ -9,7 +9,7 @@
 //            The per-route partials are summed over k by the graph.
 // Weights stay packed: fp4 e2m1 nibble pairs [E, N, K/2] (lo nibble =
 // even k), e8m0 scales [E, N, K/32], bf16 biases [E, N]. One warp per
-// task, R=4 output rows per warp.
+// task, R output rows per warp (R is chosen by the host op).
 //
 // KERNEL INVARIANT: every element of the destination is written by
 // exactly one warp lane 0; the destination is never read.
@@ -206,24 +206,28 @@ __device__ __forceinline__ void down_body(
     }
 }
 
-extern "C" __global__ void moe_gate_up_r4(
+// The instantiations the host op launches: GU_R gate/up row pairs and
+// DN_R down rows per warp task, MIN_BLOCKS resident blocks per SM (the
+// register cap that sets occupancy — a decode tick's MoE is a bandwidth
+// problem, and bandwidth needs warps with loads in flight).
+extern "C" __global__ void __launch_bounds__(256, MIN_BLOCKS) moe_gate_up(
     unsigned long long x_ptr, unsigned long long gu_q_ptr,
     unsigned long long gu_scale_ptr, unsigned long long gu_bias_ptr,
     unsigned long long topk_ids_ptr, unsigned long long hidden_ptr,
     int hidden_dim, int inter, int top_k, int seq,
     float alpha, float limit
 ) {
-    gate_up_body<4>(x_ptr, gu_q_ptr, gu_scale_ptr, gu_bias_ptr, topk_ids_ptr,
-                    hidden_ptr, hidden_dim, inter, top_k, seq, alpha, limit);
+    gate_up_body<GU_R>(x_ptr, gu_q_ptr, gu_scale_ptr, gu_bias_ptr, topk_ids_ptr,
+                       hidden_ptr, hidden_dim, inter, top_k, seq, alpha, limit);
 }
 
-extern "C" __global__ void moe_down_r4(
+extern "C" __global__ void __launch_bounds__(256, MIN_BLOCKS) moe_down(
     unsigned long long dn_q_ptr, unsigned long long dn_scale_ptr,
     unsigned long long dn_bias_ptr, unsigned long long topk_ids_ptr,
     unsigned long long logits_ptr, unsigned long long hidden_ptr,
     unsigned long long out_ptr,
     int hidden_dim, int inter, int top_k, int seq, int experts
 ) {
-    down_body<4>(dn_q_ptr, dn_scale_ptr, dn_bias_ptr, topk_ids_ptr,
-                 logits_ptr, hidden_ptr, out_ptr, hidden_dim, inter, top_k, seq, experts);
+    down_body<DN_R>(dn_q_ptr, dn_scale_ptr, dn_bias_ptr, topk_ids_ptr,
+                    logits_ptr, hidden_ptr, out_ptr, hidden_dim, inter, top_k, seq, experts);
 }

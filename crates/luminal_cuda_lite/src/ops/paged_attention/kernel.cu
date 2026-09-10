@@ -1,11 +1,18 @@
 // Paged multi-query attention with attention sinks and an optional
-// sliding window, F32 end to end. One BLOCK per (query row, kv head):
-// eight warps share the block's K/V tiles from shared memory and each
-// warp attends one (or more) of the query heads in that kv head's
-// group, so a GQA group reads its K/V rows from HBM exactly once.
+// sliding window, F32 end to end. One BLOCK per (query row, kv head).
+// The block's warps form CHUNKS groups of WPC warps: each group walks
+// its own slice of the query's context through its own shared-memory
+// K/V tiles (the tiles a GQA group shares, so a kv row is read from
+// HBM exactly once per query), each warp attending HPW of the group's
+// query heads, and the CHUNKS partial softmaxes are merged in shared
+// memory at the end. That intra-block split is what keeps a batch-1
+// decode step busy on a 2k-token context: one query, one kv head, and
+// still eight tile streams in flight. Tiles are prefetched into
+// registers a step ahead so HBM latency overlaps the dot products.
 //
 // Geometry baked at compile time: D (head dim, a multiple of 32), G
-// (query heads per kv head), W (sliding window; 0 = full attention).
+// (query heads per kv head), W (sliding window; 0 = full attention),
+// WPC (warps per chunk group), CHUNKS (chunk groups per block).
 //
 // Requests are CSR rows: query i belongs to request r with
 // qo_indptr[r] <= i < qo_indptr[r+1]; its context is the slot_table
@@ -19,8 +26,14 @@
 // every head the block owns; nothing reads out.
 
 #define TILE 32
-#define HPW ((G + 7) / 8)
+#define HPW ((G + WPC - 1) / WPC)
 #define DK (D / 32)
+#define CT (WPC * 32)
+#define THREADS (CHUNKS * CT)
+// Tile elements each chunk-group thread stages per operand (K and V).
+#define PF ((TILE * D + CT - 1) / CT)
+#define K_TILE_FLOATS (TILE * (D + 1))
+#define V_TILE_FLOATS (TILE * D)
 
 // The cache dtype: KV_BF16 = 1 reads bf16 bits, 0 reads f32.
 #if KV_BF16
@@ -43,7 +56,7 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-extern "C" __global__ void paged_attention_f32(
+extern "C" __global__ void __launch_bounds__(THREADS, 1) paged_attention_f32(
     unsigned long long q_ptr,
     unsigned long long k_cache_ptr,
     unsigned long long v_cache_ptr,
@@ -73,11 +86,18 @@ extern "C" __global__ void paged_attention_f32(
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
+    const int chunk = warp / WPC;
+    const int wc = warp % WPC;
+    const int ctid = tid % CT;
 
+    extern __shared__ float tiles[];
+    float* Ks = tiles + chunk * (K_TILE_FLOATS + V_TILE_FLOATS);
+    float* Vs = Ks + K_TILE_FLOATS;
     __shared__ float qs[G][D];
-    __shared__ float Ks[TILE][D + 1];
-    __shared__ float Vs[TILE][D];
     __shared__ int range_s[2];
+    __shared__ float cm[CHUNKS][G];
+    __shared__ float cl[CHUNKS][G];
+    __shared__ float cacc[CHUNKS][G][D];
 
     if (tid == 0) {
         int r = 0;
@@ -87,14 +107,23 @@ extern "C" __global__ void paged_attention_f32(
         range_s[0] = kv_indptr[r];
         range_s[1] = kv_indptr[r + 1];
     }
-    for (int e = tid; e < G * D; e += blockDim.x) {
+    for (int e = tid; e < G * D; e += THREADS) {
         const int h = e / D, d = e % D;
         qs[h][d] = q[(long long)i * H * D + (long long)(g * G + h) * D + d] * scale;
     }
     __syncthreads();
     const int kv_start = range_s[0];
-    const int kv_end = range_s[1];
     const int qpos = q_pos[i];
+    // The rows this query can see: positions (qpos - W, qpos], within the
+    // request's context.
+    int lo = kv_start;
+    int hi = min(range_s[1], kv_start + qpos + 1);
+    if (W > 0) lo = max(lo, kv_start + qpos - W + 1);
+    // This chunk group's slice, in whole tiles.
+    const int n_tiles = (hi - lo + TILE - 1) / TILE;
+    const int per_chunk = (n_tiles + CHUNKS - 1) / CHUNKS;
+    const int c_begin = lo + chunk * per_chunk * TILE;
+    const int c_end = min(hi, c_begin + per_chunk * TILE);
 
     float m[HPW], l[HPW], acc[HPW][DK];
 #pragma unroll
@@ -105,31 +134,53 @@ extern "C" __global__ void paged_attention_f32(
         for (int k = 0; k < DK; ++k) acc[hh][k] = 0.0f;
     }
 
-    for (int base = kv_start; base < kv_end; base += TILE) {
-        for (int e = tid; e < TILE * D; e += blockDim.x) {
-            const int row = e / D, d = e % D;
-            const int j = base + row;
-            float kval = 0.0f, vval = 0.0f;
-            if (j < kv_end) {
-                const long long slot = slot_table[j];
-                const long long off = slot * (long long)kv_heads * D + (long long)g * D + d;
-                kval = kv_load(k_cache[off]);
-                vval = kv_load(v_cache[off]);
+    // Register-staged tile loads: fetch tile t+1 while tile t is used.
+    kv_t kp[PF], vp[PF];
+    auto fetch = [&](int base) {
+#pragma unroll
+        for (int u = 0; u < PF; ++u) {
+            const int e = ctid + u * CT;
+            kv_t kval = (kv_t)0, vval = (kv_t)0;
+            if (e < TILE * D) {
+                const int row = e / D, d = e % D;
+                const int j = base + row;
+                if (j < c_end) {
+                    const long long slot = slot_table[j];
+                    const long long off = slot * (long long)kv_heads * D + (long long)g * D + d;
+                    kval = k_cache[off];
+                    vval = v_cache[off];
+                }
             }
-            Ks[row][d] = kval;
-            Vs[row][d] = vval;
+            kp[u] = kval;
+            vp[u] = vval;
         }
+    };
+    auto stage = [&]() {
+#pragma unroll
+        for (int u = 0; u < PF; ++u) {
+            const int e = ctid + u * CT;
+            if (e < TILE * D) {
+                const int row = e / D, d = e % D;
+                Ks[row * (D + 1) + d] = kv_load(kp[u]);
+                Vs[row * D + d] = kv_load(vp[u]);
+            }
+        }
+    };
+
+    if (c_begin < c_end) fetch(c_begin);
+    for (int base = c_begin; base < c_end; base += TILE) {
+        stage();
         __syncthreads();
+        if (base + TILE < c_end) fetch(base + TILE);
         const int j = base + lane;
-        const int p = j - kv_start;
-        const bool ok = (j < kv_end) && (p <= qpos) && (W == 0 || p > qpos - W);
+        const bool ok = j < c_end;
 #pragma unroll
         for (int hh = 0; hh < HPW; ++hh) {
-            const int h = warp + 8 * hh;
+            const int h = wc + WPC * hh;
             if (h < G) {
                 float sc = 0.0f;
 #pragma unroll 8
-                for (int d = 0; d < D; ++d) sc = fmaf(qs[h][d], Ks[lane][d], sc);
+                for (int d = 0; d < D; ++d) sc = fmaf(qs[h][d], Ks[lane * (D + 1) + d], sc);
                 sc = ok ? sc : -1e30f;
                 const float tmax = warp_max(sc);
                 const float m_new = fmaxf(m[hh], tmax);
@@ -141,7 +192,7 @@ extern "C" __global__ void paged_attention_f32(
                 for (int jj = 0; jj < TILE; ++jj) {
                     const float pp = __shfl_sync(0xffffffffu, pj, jj);
 #pragma unroll
-                    for (int k = 0; k < DK; ++k) acc[hh][k] = fmaf(pp, Vs[jj][lane + 32 * k], acc[hh][k]);
+                    for (int k = 0; k < DK; ++k) acc[hh][k] = fmaf(pp, Vs[jj * D + lane + 32 * k], acc[hh][k]);
                 }
                 m[hh] = m_new;
             }
@@ -149,18 +200,36 @@ extern "C" __global__ void paged_attention_f32(
         __syncthreads();
     }
 
+    // Each chunk group's partial softmax state, then the merge.
 #pragma unroll
     for (int hh = 0; hh < HPW; ++hh) {
-        const int h = warp + 8 * hh;
+        const int h = wc + WPC * hh;
         if (h < G) {
-            const float sink = sinks[g * G + h];
-            const float m_f = fmaxf(m[hh], sink);
-            const float alpha = expf(m[hh] - m_f);
-            const float denom = l[hh] * alpha + expf(sink - m_f);
-            const float f = alpha / denom;
-            float* o = out + (long long)i * H * D + (long long)(g * G + h) * D;
+            if (lane == 0) {
+                cm[chunk][h] = m[hh];
+                cl[chunk][h] = l[hh];
+            }
 #pragma unroll
-            for (int k = 0; k < DK; ++k) o[lane + 32 * k] = acc[hh][k] * f;
+            for (int k = 0; k < DK; ++k) cacc[chunk][h][lane + 32 * k] = acc[hh][k];
         }
+    }
+    __syncthreads();
+    for (int h = warp; h < G; h += THREADS / 32) {
+        const float sink = sinks[g * G + h];
+        float m_f = sink;
+        for (int c = 0; c < CHUNKS; ++c) m_f = fmaxf(m_f, cm[c][h]);
+        float denom = expf(sink - m_f);
+        float o[DK];
+#pragma unroll
+        for (int k = 0; k < DK; ++k) o[k] = 0.0f;
+        for (int c = 0; c < CHUNKS; ++c) {
+            const float a = expf(cm[c][h] - m_f);
+            denom += cl[c][h] * a;
+#pragma unroll
+            for (int k = 0; k < DK; ++k) o[k] = fmaf(a, cacc[c][h][lane + 32 * k], o[k]);
+        }
+        float* dst = out + (long long)i * H * D + (long long)(g * G + h) * D;
+#pragma unroll
+        for (int k = 0; k < DK; ++k) dst[lane + 32 * k] = o[k] / denom;
     }
 }

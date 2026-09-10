@@ -32,9 +32,34 @@ pub const DOWN_CONSTRUCTOR: &str = "LayoutTensorOpMoeDownMxfp4";
 
 const KERNEL_SOURCE: &str = include_str!("kernel.cu");
 const TENSOR_SOURCE: &str = include_str!("tensor_core.cu");
-/// Output rows per warp task; must match the kernels' instantiation.
+/// Output rows per warp task in the GEMV kernels (gate/up counts row
+/// PAIRS), and the resident-blocks-per-SM they are compiled for.
+const GEMV_ROWS_GATE_UP: usize = 2;
+const GEMV_ROWS_DOWN: usize = 4;
+const GEMV_MIN_BLOCKS: usize = 4;
+/// The packed dims must tile by the largest row count either kernel uses.
 const GEMV_ROWS: usize = 4;
 const BLOCK_THREADS: u32 = 256;
+
+/// The GEMV instantiation, read once (`LUMINAL_MOE_GEMV_{R_GU,R_DN,MIN_BLOCKS}`
+/// are tuning probes over the defaults).
+fn gemv_config() -> (usize, usize, usize) {
+    static CACHE: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        (
+            env_usize("LUMINAL_MOE_GEMV_R_GU", GEMV_ROWS_GATE_UP),
+            env_usize("LUMINAL_MOE_GEMV_R_DN", GEMV_ROWS_DOWN),
+            env_usize("LUMINAL_MOE_GEMV_MIN_BLOCKS", GEMV_MIN_BLOCKS),
+        )
+    })
+}
+
+fn gemv_source() -> String {
+    let (gu, dn, min_blocks) = gemv_config();
+    format!(
+        "#define GU_R {gu}\n#define DN_R {dn}\n#define MIN_BLOCKS {min_blocks}\n{KERNEL_SOURCE}"
+    )
+}
 /// The tensor-core kernel's tile: BN output rows per block (five n8
 /// tiles per warp), 64-k iterations, 128 threads.
 const TENSOR_BN: usize = 160;
@@ -132,8 +157,16 @@ fn tensor_function(
     k: usize,
 ) -> Result<(cudarc::driver::CudaFunction, u32)> {
     let smem = tensor_tiling().smem_bytes(k) as u32;
-    let function =
-        crate::nvrtc_module::kernel_function(stream, &tensor_source(gate_up), "moe_grouped")?;
+    let function = crate::nvrtc_module::kernel_function_keyed(
+        stream,
+        if gate_up {
+            "moe_tensor:gate_up"
+        } else {
+            "moe_tensor:down"
+        },
+        "moe_grouped",
+        || tensor_source(gate_up),
+    )?;
     function
         .set_attribute(
             cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -410,9 +443,13 @@ impl crate::host::HostOp for MoeGateUpDps {
                 .with_context(|| format!("{label}: tensor-core launch"))?;
             return Ok(());
         }
-        let function =
-            crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "moe_gate_up_r4")
-                .with_context(|| format!("{label}: kernel"))?;
+        let function = crate::nvrtc_module::kernel_function_keyed(
+            ctx.stream,
+            "moe_gemv",
+            "moe_gate_up",
+            gemv_source,
+        )
+        .with_context(|| format!("{label}: kernel"))?;
         let mut builder = ctx.stream.launch_builder(&function);
         builder
             .arg(&x_ptr)
@@ -427,7 +464,7 @@ impl crate::host::HostOp for MoeGateUpDps {
             .arg(&sq)
             .arg(&alpha)
             .arg(&limit);
-        unsafe { builder.launch(grid(s * spec.top_k * spec.inter / GEMV_ROWS)) }
+        unsafe { builder.launch(grid(s * spec.top_k * spec.inter / gemv_config().0)) }
             .with_context(|| format!("{label}: launch"))?;
         Ok(())
     }
@@ -680,9 +717,13 @@ impl crate::host::HostOp for MoeDownDps {
                 .with_context(|| format!("{label}: tensor-core launch"))?;
             return Ok(());
         }
-        let function =
-            crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "moe_down_r4")
-                .with_context(|| format!("{label}: kernel"))?;
+        let function = crate::nvrtc_module::kernel_function_keyed(
+            ctx.stream,
+            "moe_gemv",
+            "moe_down",
+            gemv_source,
+        )
+        .with_context(|| format!("{label}: kernel"))?;
         let mut builder = ctx.stream.launch_builder(&function);
         builder
             .arg(&blocks_ptr)
@@ -697,7 +738,7 @@ impl crate::host::HostOp for MoeDownDps {
             .arg(&tk)
             .arg(&sq)
             .arg(&ex);
-        unsafe { builder.launch(grid(s * spec.top_k * spec.hidden / GEMV_ROWS)) }
+        unsafe { builder.launch(grid(s * spec.top_k * spec.hidden / gemv_config().1)) }
             .with_context(|| format!("{label}: launch"))?;
         Ok(())
     }
