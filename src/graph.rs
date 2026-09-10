@@ -164,6 +164,10 @@ pub struct CompileOptions {
     pub seed_schedule: Option<std::sync::Arc<SelectedSchedule>>,
     /// Maximum number of graphs to evaluate during search.
     pub limit: usize,
+    /// Candidate-budget overrides by zero-based SearchSpace bucket index.
+    /// Unspecified buckets use `limit`; every bucket still needs a viable,
+    /// freshly measured candidate, including when seeded from a prior schedule.
+    pub bucket_limits: FxHashMap<usize, usize>,
     /// Maximum wall-clock time to spend searching.
     pub search_time_limit: std::time::Duration,
     /// Number of offspring per generation (default: 10)
@@ -239,6 +243,13 @@ impl CompileOptions {
     /// Set the maximum number of graphs to evaluate during search.
     pub fn search_graph_limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Override the candidate budget for one SearchSpace bucket. With a viable
+    /// seed, a limit of one revalidates and remeasures only that incumbent.
+    pub fn bucket_search_graph_limit(mut self, bucket: usize, limit: usize) -> Self {
+        self.bucket_limits.insert(bucket, limit);
         self
     }
 
@@ -367,6 +378,7 @@ impl Default for CompileOptions {
         Self {
             seed_schedule: None,
             limit: 100,
+            bucket_limits: FxHashMap::default(),
             search_time_limit: std::time::Duration::MAX,
             generation_size: 10,
             mutations: 10,

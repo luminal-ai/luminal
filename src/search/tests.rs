@@ -1469,3 +1469,28 @@ fn seeded_search_remeasures_and_can_replace_or_reject_the_incumbent() {
     );
     assert!(search.next_candidate(&mut rng).is_some());
 }
+
+#[test]
+fn bucket_candidate_budgets_override_only_the_requested_bucket() {
+    let mut graph = Graph::new();
+    let _ = graph.tensor('s').sin().sin().sin().output();
+    let options = CompileOptions::default()
+        .dim_buckets('s', &[DimBucket::new(1, 1), DimBucket::new(2, 2)])
+        .search_graph_limit(2)
+        .bucket_search_graph_limit(1, 1)
+        .search_log(false);
+    graph.build_search_space::<ExplicitLoopRuntime>(options.clone());
+    let space = graph.search_space().unwrap();
+    let contexts = space.bucket_contexts(&graph.dyn_map);
+    assert_eq!(contexts.len(), 2);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xB0D6E7);
+    for (ctx, expected) in contexts.iter().zip([2, 1]) {
+        let mut search =
+            super::GeneticSearch::<usize>::new(space, ctx, &options, std::time::Instant::now());
+        while let Some(candidate) = search.next_candidate(&mut rng) {
+            search.report(candidate, Outcome::Measured(1, "measured".into()));
+        }
+        assert_eq!(search.measured(), expected);
+        assert!(!search.into_ranked().is_empty());
+    }
+}

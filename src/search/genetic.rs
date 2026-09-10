@@ -157,8 +157,12 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                 );
             }
         }
-        let max_filter_fails = options
-            .limit
+        let limit = options
+            .bucket_limits
+            .get(&ctx.index)
+            .copied()
+            .unwrap_or(options.limit);
+        let max_filter_fails = limit
             .max(1)
             .saturating_mul(options.generation_size.max(1))
             .saturating_mul(100)
@@ -184,7 +188,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             options,
             extractor: LlirExtractor::new(ctx.egraph(), &space.ops),
             profile_dyn_map: ctx.profile_dyn_map(options),
-            search_limit: count_choice_sets_up_to(ctx.egraph(), options.limit),
+            search_limit: count_choice_sets_up_to(ctx.egraph(), limit),
             started_at: Instant::now(),
             search_started_at,
             search_log,
