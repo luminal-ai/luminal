@@ -1344,16 +1344,11 @@ fn metal_self_attention() {
 #[test]
 fn metal_self_attention_f16_weights() {
     let mut cx = Graph::default();
-    let input = cx
-        .tensor((TRANSFORMER_SEQ, TRANSFORMER_HIDDEN), DType::F16);
-    let wq = cx
-        .tensor((TRANSFORMER_HIDDEN, TRANSFORMER_HIDDEN), DType::F16);
-    let wk = cx
-        .tensor((TRANSFORMER_HIDDEN, TRANSFORMER_HIDDEN), DType::F16);
-    let wv = cx
-        .tensor((TRANSFORMER_HIDDEN, TRANSFORMER_HIDDEN), DType::F16);
-    let wo = cx
-        .tensor((TRANSFORMER_HIDDEN, TRANSFORMER_HIDDEN), DType::F16);
+    let input = cx.tensor((TRANSFORMER_SEQ, TRANSFORMER_HIDDEN), DType::F16);
+    let wq = cx.tensor((TRANSFORMER_HIDDEN, TRANSFORMER_HIDDEN), DType::F16);
+    let wk = cx.tensor((TRANSFORMER_HIDDEN, TRANSFORMER_HIDDEN), DType::F16);
+    let wv = cx.tensor((TRANSFORMER_HIDDEN, TRANSFORMER_HIDDEN), DType::F16);
+    let wo = cx.tensor((TRANSFORMER_HIDDEN, TRANSFORMER_HIDDEN), DType::F16);
     let output = self_attention(input, wq, wk, wv, wo)
         .cast(DType::F32)
         .output();

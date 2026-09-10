@@ -71,6 +71,8 @@ pub struct CudaRuntime {
     plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Host-staged input payloads by BufferLit id, H2D'd at execute.
     staged: FxHashMap<i64, HostBuffer>,
+    residents: crate::resident::ResidentBindings,
+    device_budget_bytes: Option<usize>,
     /// Host copies of each output slot's BACKING buffer plus its elected
     /// layout, filled by execute (D2H) — the escape-and-disclose fetch,
     /// keyed by slot index (an escaped slot's backing buffer is a minted
@@ -249,6 +251,10 @@ impl CudaRuntime {
         lower: u64,
         upper: u64,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "configure dimension bounds before residency"
+        );
         let name = var.into();
         let (lower, upper) = self
             .range_bound
@@ -300,6 +306,10 @@ impl CudaRuntime {
         dim: impl Into<shape::Symbol>,
         buckets: Vec<graph::DimBucket>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "configure dimension bounds before residency"
+        );
         let dim = dim.into();
         anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
         if let Some((lo, hi)) = self.range_bound.get(&dim) {
@@ -491,6 +501,10 @@ impl CudaRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "create a new runtime to re-search a resident program"
+        );
         self.invalidate_plans();
         let mut resolved_options = options.clone();
         resolved_options.shapes.bounds = self
@@ -684,6 +698,7 @@ impl CudaRuntime {
                 .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
             (first, None, plans)
         };
+        self.device_budget_bytes = options.device_budget_bytes;
         self.bucket_plans = searched_buckets;
         self.selected_bucket = None;
 
@@ -714,6 +729,59 @@ impl CudaRuntime {
             let _ = self.select_bucket_plan();
         }
         Ok(outcome)
+    }
+
+    /// Resolve public graph handles to this compiled program's boundary IDs.
+    pub fn input_buffer(&self, tensor: NodeIndex) -> Result<i64> {
+        self.input_buffers
+            .get(&tensor)
+            .copied()
+            .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))
+    }
+    pub fn output_slot_index(&self, tensor: NodeIndex) -> Result<usize> {
+        self.output_index
+            .get(&tensor)
+            .copied()
+            .ok_or_else(|| anyhow!("no output binding for {tensor:?}"))
+    }
+
+    /// Keep this input in the shared device arena between executions. Its
+    /// shape must be static and its boundary must be read-only. Call after
+    /// search and before the first execute; set_data uploads it only when changed.
+    pub fn retain_input(&mut self, tensor: NodeIndex) -> Result<()> {
+        #[cfg(feature = "device")]
+        anyhow::ensure!(
+            self.device.as_ref().is_none_or(|d| !d.is_installed()),
+            "configure residency before execution"
+        );
+        let lit = *self
+            .input_buffers
+            .get(&tensor)
+            .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))?;
+        self.residents.inputs.insert(lit);
+        Ok(())
+    }
+
+    /// Route an output into a resident input after each execution. Feedback
+    /// outputs stay on device and are unavailable through fetch. Their elected
+    /// layout must equal the static, contiguous input boundary layout.
+    pub fn bind_feedback(&mut self, input: NodeIndex, output: NodeIndex) -> Result<()> {
+        let slot = *self
+            .output_index
+            .get(&output)
+            .ok_or_else(|| anyhow!("no output binding for {output:?}"))?;
+        let lit = *self
+            .input_buffers
+            .get(&input)
+            .ok_or_else(|| anyhow!("no input binding for {input:?}"))?;
+        anyhow::ensure!(
+            !self.residents.feedback.contains_key(&slot)
+                && !self.residents.feedback.values().any(|v| *v == lit),
+            "duplicate feedback endpoint"
+        );
+        self.retain_input(input)?;
+        self.residents.feedback.insert(slot, lit);
+        Ok(())
     }
 
     /// Stage input payload for a bound tensor (host side; H2D happens
@@ -764,12 +832,18 @@ impl CudaRuntime {
                         })
                         .collect()
                 };
-                device.install(plans)?;
+                device.install_resident_with_budget(
+                    plans,
+                    self.residents.clone(),
+                    self.device_budget_bytes,
+                )?;
             }
             let bucket = self.selected_bucket.unwrap_or(0);
             let staged = self.staged.iter().map(|(lit, data)| (*lit, data)).collect();
             let outputs = device.execute(bucket, &staged, &self.dims)?;
             self.outputs_host = outputs;
+            self.staged
+                .retain(|lit, _| !self.residents.inputs.contains(lit));
             Ok(())
         }
         #[cfg(not(feature = "device"))]

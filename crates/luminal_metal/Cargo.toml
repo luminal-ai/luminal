@@ -5,10 +5,14 @@ edition = "2024"
 description = "Metal backend for luminal"
 license = "MIT OR Apache-2.0"
 
+[features]
+native = ["dep:luminal_cuda_lite", "dep:anyhow", "dep:regex"]
+
 [dependencies]
+luminal_cuda_lite = { path = "../luminal_cuda_lite", optional = true }
+anyhow = { version = "1", optional = true }
+regex = { version = "1", optional = true }
 luminal = { path = "../.." }
-metal = { version = "0.31", features = ["mps"] }
-objc = "0.2"
 as-any = "0.3.2"
 itertools = "0.12.1"
 half = { version = "2.7.1", features = ["bytemuck"] }
@@ -16,6 +20,10 @@ tracing = "0.1.43"
 safetensors = "0.7.0"
 memmap2 = "0.9.9"
 bytemuck = "1.24.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.31", features = ["mps"] }
+objc = "0.2"
 
 [dev-dependencies]
 model_zoo = { path = "../model_zoo" }

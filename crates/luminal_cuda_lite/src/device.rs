@@ -7,7 +7,6 @@ use crate::{
     host_buffer::HostBuffer,
     kernels::{CodegenCtx, KernelLaunch},
     layouts::CudaPlan,
-    storage,
     symbolic::{self, Bounds, Expr},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -34,6 +33,7 @@ const HOST_VARIANTS: usize = 8;
 /// Cumulative counters for inspecting replay, dynamic updates, and arena reuse.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GraphStats {
+    /// Execution-plan replays; resident initialization transfers are separate.
     pub launches: u64,
     pub instantiations: u64,
     pub graph_cache_hits: u64,
@@ -45,6 +45,7 @@ pub struct GraphStats {
     pub arena_base: u64,
     pub arena_bytes: usize,
     pub staging_bytes: usize,
+    pub resident_upload_bytes: u64,
 }
 struct Module {
     raw: cu::CUmodule,
@@ -65,6 +66,7 @@ struct Installed {
     bounds: Bounds,
     compiled: Option<CompiledPlan>,
 }
+use crate::resident::ResidentHome;
 pub struct CudaDevice {
     // Executables/resources must die before their arena or modules.
     installed: Vec<Installed>,
@@ -74,6 +76,9 @@ pub struct CudaDevice {
     stream: Arc<CudaStream>,
     ctx: Arc<CudaContext>,
     stats: GraphStats,
+    residents: BTreeMap<i64, ResidentHome>,
+    resident_initialized: BTreeSet<i64>,
+    feedback: BTreeMap<usize, i64>,
 }
 impl CudaDevice {
     pub fn new(ordinal: usize) -> Result<Self> {
@@ -87,6 +92,9 @@ impl CudaDevice {
             stream,
             ctx,
             stats: GraphStats::default(),
+            residents: BTreeMap::new(),
+            resident_initialized: BTreeSet::new(),
+            feedback: BTreeMap::new(),
         })
     }
     pub fn stats(&self) -> GraphStats {
@@ -98,30 +106,57 @@ impl CudaDevice {
     /// Validate all capacities first, then reserve their maximum once. Replacing
     /// the plan set invalidates every executable before any pointer can change.
     pub fn install(&mut self, plans: Vec<(CudaPlan, Bounds)>) -> Result<()> {
-        let installed = plans
+        self.install_resident(plans, Default::default())
+    }
+    pub fn install_resident(
+        &mut self,
+        plans: Vec<(CudaPlan, Bounds)>,
+        bindings: crate::resident::ResidentBindings,
+    ) -> Result<()> {
+        self.install_resident_with_budget(plans, bindings, None)
+    }
+    pub fn install_resident_with_budget(
+        &mut self,
+        plans: Vec<(CudaPlan, Bounds)>,
+        bindings: crate::resident::ResidentBindings,
+        budget: Option<usize>,
+    ) -> Result<()> {
+        let allocation = crate::resident::allocate(plans, bindings)?;
+        let bytes = allocation.bytes;
+        if let Some(budget) = budget {
+            ensure!(
+                bytes <= budget,
+                "resident CUDA arena requires {bytes} bytes, exceeding budget {budget}"
+            );
+        }
+        let installed: Vec<_> = allocation
+            .plans
             .into_iter()
-            .map(|(plan, bounds)| {
-                let storage = storage::plan(&plan, &bounds)?;
-                Ok(Installed {
-                    plan,
-                    storage,
-                    bounds,
-                    compiled: None,
-                })
+            .map(|p| Installed {
+                plan: p.plan,
+                storage: p.storage,
+                bounds: p.bounds,
+                compiled: None,
             })
-            .collect::<Result<Vec<_>>>()?;
-        let bytes = installed
-            .iter()
-            .map(|p| p.storage.slab_bytes)
-            .max()
-            .unwrap_or(1);
+            .collect();
         self.stream.synchronize()?;
         self.installed.clear();
+        self.residents = allocation.homes;
+        self.resident_initialized.clear();
+        self.feedback = allocation.feedback;
+
         let staging_bytes = installed
             .iter()
             .map(|p| p.storage.staging_bytes)
             .max()
-            .unwrap_or(1);
+            .unwrap_or(1)
+            .max(
+                self.residents
+                    .values()
+                    .map(|home| home.data.bytes.min(16 * 1024 * 1024))
+                    .max()
+                    .unwrap_or(1),
+            );
         if self
             .staging
             .as_ref()
@@ -147,6 +182,48 @@ impl CudaDevice {
         self.installed = installed;
         Ok(())
     }
+    fn upload_residents(&mut self, staged: &FxHashMap<i64, &HostBuffer>) -> Result<()> {
+        for (&lit, home) in &self.residents {
+            let Some(data) = staged.get(&lit) else {
+                ensure!(
+                    self.resident_initialized.contains(&lit),
+                    "set_data required for resident input {lit}"
+                );
+                continue;
+            };
+            ensure!(
+                data.dtype == home.dtype && data.bytes.len() == home.data.bytes,
+                "resident input {lit} dtype/size mismatch"
+            );
+            let pinned = self.staging.as_mut().unwrap();
+            let chunk_size = pinned.bytes().len().min(16 * 1024 * 1024);
+            let mut transfer = None;
+            for (i, chunk) in data.bytes.chunks(chunk_size).enumerate() {
+                pinned.bytes_mut()[..chunk.len()].copy_from_slice(chunk);
+                let params = copy_params(
+                    pinned.bytes().as_ptr() as u64,
+                    self.stats.arena_base + home.data.offset as u64 + (i * chunk_size) as u64,
+                    chunk.len(),
+                    CopyKind::HtoD,
+                );
+                if transfer.is_none() {
+                    let graph = Graph::new(&self.ctx)?;
+                    let node = graph.copy(&[], &params)?;
+                    let executable = graph.instantiate()?;
+                    transfer = Some((graph, node, executable));
+                }
+                let (_, node, executable) = transfer.as_ref().unwrap();
+                executable.copy(*node, &params)?;
+                let launched = executable.launch(&self.stream);
+                let completed = self.stream.synchronize();
+                launched?;
+                completed?;
+                self.stats.resident_upload_bytes += chunk.len() as u64;
+            }
+            self.resident_initialized.insert(lit);
+        }
+        Ok(())
+    }
     pub fn is_installed(&self) -> bool {
         !self.installed.is_empty()
     }
@@ -155,6 +232,9 @@ impl CudaDevice {
         // Every public launch is synchronous, including error paths.
         let _ = self.stream.synchronize();
         self.installed.clear();
+        self.residents.clear();
+        self.resident_initialized.clear();
+        self.feedback.clear();
         self.slab = None;
         self.staging = None;
         self.stats.staging_bytes = 0;
@@ -168,6 +248,7 @@ impl CudaDevice {
         dims: &DynMap,
     ) -> Result<Outputs> {
         self.ctx.bind_to_thread()?;
+        self.upload_residents(staged)?;
         let installed = self
             .installed
             .get_mut(bucket)
@@ -193,6 +274,8 @@ impl CudaDevice {
                 self.staging.as_ref().unwrap(),
                 &mut self.cache,
                 &mut self.stats,
+                &self.residents,
+                &self.feedback,
             )?);
         }
         // Move the executable out while updating it. An error or unwind drops
@@ -480,6 +563,8 @@ impl CompiledPlan {
         staging: &Pinned,
         cache: &mut HashMap<String, Module>,
         stats: &mut GraphStats,
+        residents: &BTreeMap<i64, ResidentHome>,
+        feedback: &BTreeMap<usize, i64>,
     ) -> Result<Self> {
         let schema: Vec<_> = bounds.keys().copied().collect();
         ensure!(
@@ -546,6 +631,27 @@ impl CompiledPlan {
                     let buffer = &plan.buffers[id];
                     let range = range(plan, storage, id, base, dims)?;
                     let size = size(&buffer.layout)?;
+                    for &i in indices {
+                        if let Some(lit) = feedback.get(&slots[i].index) {
+                            let next = residents[lit].next.unwrap();
+                            out.actions.push(Action::Copy {
+                                src: range.ptr,
+                                dst: base + next.offset as u64,
+                                kind: CopyKind::DtoD,
+                                size: size.clone(),
+                                other_size: None,
+                                bytes: range.bytes,
+                            });
+                        }
+                    }
+                    let host_indices: Vec<_> = indices
+                        .iter()
+                        .copied()
+                        .filter(|&i| !feedback.contains_key(&slots[i].index))
+                        .collect();
+                    if host_indices.is_empty() {
+                        continue;
+                    }
                     out.actions.push(Action::Copy {
                         src: range.ptr,
                         dst: pinned.ptr(staging),
@@ -554,7 +660,7 @@ impl CompiledPlan {
                         other_size: None,
                         bytes: range.bytes,
                     });
-                    for &i in indices {
+                    for &i in &host_indices {
                         let slot = &slots[i];
                         let mut resolved = slot.clone();
                         resolved.layout = symbolic::resolve_layout(&slot.layout, dims)?;
@@ -693,6 +799,18 @@ impl CompiledPlan {
                     }
                     _ => {}
                 },
+            }
+        }
+        for home in residents.values() {
+            if let Some(next) = home.next {
+                out.actions.push(Action::Copy {
+                    src: base + next.offset as u64,
+                    dst: base + home.data.offset as u64,
+                    kind: CopyKind::DtoD,
+                    size: home.data.bytes.into(),
+                    other_size: None,
+                    bytes: home.data.bytes,
+                });
             }
         }
         for (i, action) in out.actions.iter().enumerate() {

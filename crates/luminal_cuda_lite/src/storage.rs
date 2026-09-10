@@ -26,6 +26,31 @@ pub(crate) fn plan(plan: &CudaPlan, bounds: &Bounds) -> Result<ArenaPlan> {
     )
 }
 
+pub(crate) fn plan_resident(
+    plan: &CudaPlan,
+    bounds: &Bounds,
+    bindings: &crate::resident::ResidentBindings,
+) -> Result<ArenaPlan> {
+    crate::arena::plan_resident_over(
+        plan,
+        |buffer| capacity_bytes(&buffer.layout, bounds),
+        |node| match &plan.dag[node] {
+            luminal::bufferize::BufferNode::Compute { op, .. } => {
+                crate::as_host_op(op.as_ref()).map_or(Ok(0), |host| host.workspace_bytes(bounds))
+            }
+            _ => Ok(0),
+        },
+        bounds
+            .len()
+            .checked_mul(8)
+            .ok_or_else(|| anyhow!("parameter size overflow"))?
+            .max(8),
+        crate::arena::issue_order(plan)?,
+        &bindings.inputs,
+        &bindings.feedback.keys().copied().collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

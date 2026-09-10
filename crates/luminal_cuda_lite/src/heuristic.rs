@@ -43,13 +43,29 @@ use luminal::layout_ir::{ExtractedGraph, ExtractedNode};
 /// The summed bytes-moved estimate over an extracted graph's elected
 /// ops, plus one. Smaller wins, exactly as for a timed metric.
 pub fn heuristic_cost_of(graph: &ExtractedGraph) -> u128 {
-    let total: u64 = graph
-        .dag
-        .node_weights()
-        .map(|node| match node {
-            ExtractedNode::LayoutOp(op) => op.heuristic_cost,
-            _ => 0,
-        })
-        .sum();
-    u128::from(total).saturating_add(1)
+    sum_costs(graph.dag.node_weights().map(|node| match node {
+        ExtractedNode::LayoutOp(op) => op.heuristic_cost,
+        _ => 0,
+    }))
+}
+
+fn sum_costs(costs: impl Iterator<Item = u64>) -> u128 {
+    // Extractor subtree costs saturate at u64::MAX for deep shared graphs.
+    // Aggregate in the metric's u128 domain, before adding the positive floor.
+    // Summing u64 first panics in debug and wraps to a cheap score in release.
+    costs.fold(1u128, |total, cost| total.saturating_add(u128::from(cost)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn deep_graph_costs_remain_positive_and_ordered_past_u64() {
+        let one = sum_costs([u64::MAX].into_iter());
+        let two = sum_costs([u64::MAX, u64::MAX].into_iter());
+        assert_eq!(one, u128::from(u64::MAX) + 1);
+        assert_eq!(two, u128::from(u64::MAX) * 2 + 1);
+        assert!(two > one);
+        assert_eq!(sum_costs(std::iter::empty()), 1);
+    }
 }

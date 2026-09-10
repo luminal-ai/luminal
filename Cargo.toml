@@ -66,12 +66,13 @@ proptest = "1.9.0"
 [workspace]
 # Runtime crates are re-seated on the native ladder as they become ready.
 # The model_zoo crate contains backend-neutral graph definitions;
-# executable applications live under the corresponding runtime crate.
+# executable applications live in examples or under a runtime crate.
 members = [
     "crates/luminal_cuda_lite",
     "crates/luminal_reference",
     "crates/luminal_nn",
     "crates/model_zoo",
+    "examples/llm_chat",
     "crates/luminal_tracing",
     "tests/scalar_refs",
     "tests/test_runtime",
@@ -80,7 +81,7 @@ members = [
 # still builds standalone (`cargo build --manifest-path
 # crates/luminal_bench/Cargo.toml`); it reaches egglog through the prelude,
 # so its lock cannot drift the rev above.
-exclude = ["crates/luminal_bench"]
+exclude = ["crates/luminal_bench", "crates/luminal_metal"]
 
 # Dependencies compile optimized even in dev builds: egglog's saturation
 # engine at opt-level 0 is ~17x slower on search-heavy tests (mini_gemma3

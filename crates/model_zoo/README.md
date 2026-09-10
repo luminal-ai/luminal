@@ -28,6 +28,9 @@ The full model definitions correspond to these mini families:
 | `mini::conv` | `yolo_v11` | YOLO11n |
 | `mini::flux` | `flux2` | FLUX.2-dev transformer |
 
+The shared [LLM chat application](../../examples/llm_chat) owns model adapters,
+checkpoint-name mappings, and chat I/O, with Cargo features for CUDA Lite and Metal.
+
 Runnable, full-size CUDA Lite applications live in
 `crates/luminal_cuda_lite/examples`. The mini definitions remain the small
 execution-smoke fixtures used by runtime test suites.

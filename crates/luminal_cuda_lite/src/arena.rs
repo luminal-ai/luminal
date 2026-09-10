@@ -181,7 +181,7 @@ fn freed<L: PlanLayout>(node: &BufferNode<L>) -> Option<&BufferId> {
 /// Ties inside a queue break on node index, which is the bufferizer's
 /// own emission order, so equally-ready work runs in the order the
 /// planner wrote it.
-fn issue_order<L: PlanLayout>(plan: &BufferIrGraph<L>) -> Result<Vec<NodeIndex>> {
+pub(crate) fn issue_order<L: PlanLayout>(plan: &BufferIrGraph<L>) -> Result<Vec<NodeIndex>> {
     let bound = plan.dag.node_bound();
     let incoming = |index: NodeIndex| {
         plan.dag
@@ -435,6 +435,34 @@ fn plan_arena_over<L: PlanLayout>(
     parameter_bytes: usize,
     order: Vec<NodeIndex>,
 ) -> Result<ArenaPlan> {
+    plan_resident_over(
+        plan,
+        bytes_of,
+        scratch_of,
+        parameter_bytes,
+        order,
+        &Default::default(),
+        &Default::default(),
+    )
+}
+
+/// Reserve resident boundaries separately from the per-launch lifetimes. State
+/// readbacks retain their schedule position but need no pinned host allocation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_resident_over<L: PlanLayout>(
+    plan: &BufferIrGraph<L>,
+    bytes_of: impl Fn(&Buffer<L>) -> Result<usize>,
+    scratch_of: impl Fn(NodeIndex) -> Result<usize>,
+    parameter_bytes: usize,
+    order: Vec<NodeIndex>,
+    resident_inputs: &std::collections::BTreeSet<i64>,
+    device_outputs: &std::collections::BTreeSet<usize>,
+) -> Result<ArenaPlan> {
+    let is_resident = |id: &BufferId| {
+        plan.buffers[id]
+            .lit
+            .is_some_and(|lit| resident_inputs.contains(&lit))
+    };
     let mut allocs = FxHashMap::default();
     let mut frees = FxHashMap::default();
     for &node in &order {
@@ -488,7 +516,7 @@ fn plan_arena_over<L: PlanLayout>(
                 live.contains(id),
                 "node {node:?} touches non-live buffer {id:?}"
             );
-            if plan.buffers[id].lit.is_some() && uploaded.insert(id.clone()) {
+            if plan.buffers[id].lit.is_some() && !is_resident(id) && uploaded.insert(id.clone()) {
                 steps.push(ArenaStep::Upload {
                     buffer: id.clone(),
                     staging: ArenaSlice::default(),
@@ -536,6 +564,9 @@ fn plan_arena_over<L: PlanLayout>(
         0
     });
     let mut touch = |id: &BufferId, at: usize, intervals: &mut Vec<Lifetime>| -> Result<()> {
+        if is_resident(id) {
+            return Ok(());
+        }
         if let Some(&i) = buffers.get(id) {
             intervals[i].end = at + 1;
         } else {
@@ -602,14 +633,30 @@ fn plan_arena_over<L: PlanLayout>(
     for (at, step) in steps.iter().enumerate() {
         let (buffer, start, end) = match step {
             ArenaStep::Upload { buffer, .. } => (buffer, 0, at + 2),
-            ArenaStep::Download { buffer, .. } => (buffer, at + 1, steps.len() + 2),
+            ArenaStep::Download {
+                buffer,
+                node,
+                slots,
+                ..
+            } => {
+                let BufferNode::BufferOutput { slots: bindings } = &plan.dag[*node] else {
+                    unreachable!()
+                };
+                if slots
+                    .iter()
+                    .all(|&i| device_outputs.contains(&bindings[i].index))
+                {
+                    continue;
+                }
+                (buffer, at + 1, steps.len() + 2)
+            }
             ArenaStep::Node(_) => continue,
         };
         transfers.push((at, staging.len()));
         staging.push(Lifetime {
             start,
             end,
-            bytes: buffers[buffer].bytes,
+            bytes: bytes_of(&plan.buffers[buffer])?,
         });
     }
     let (staging_slices, staging_bytes, _) = pack(&staging, 1)?;
