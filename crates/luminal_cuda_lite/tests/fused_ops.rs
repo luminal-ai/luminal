@@ -625,3 +625,44 @@ fn argmax_rows_matches_reference() {
     let got = run_i32(&cx, vec![(x_t.id, x.into())], out.id);
     assert_eq!(want, got, "argmax rows");
 }
+
+/// `set_data_prefix`: a capacity-sized input whose first bytes changed
+/// is refreshed on the device in that prefix only; the graph reads just
+/// the bucket's rows, so the stale tail is never observed.
+#[test]
+fn prefix_uploads_refresh_only_the_bucket_rows() {
+    const CAP: usize = 64;
+    let mut cx = Graph::new();
+    let tokens = cx.tensor(CAP, DType::F32);
+    let rows = take_rows(tokens, 's');
+    let out = (rows * 3.0).output();
+    let first: Vec<f32> = (0..CAP).map(|v| v as f32).collect();
+    let data: FxHashMap<NodeIndex, HostBuffer> =
+        std::iter::once((tokens.id, HostBuffer::from(first.clone()))).collect();
+    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    let s_bucket = DimBucket::new(1, 8).representative(8);
+    rt.bind_dim_buckets('s', vec![s_bucket]).expect("bucket");
+    rt.search(&data, &luminal_cuda_lite::harness_search_options())
+        .unwrap_or_else(|e| panic!("cuda search: {e:#}"));
+    rt.set_dim('s', 8);
+    rt.set_data(tokens.id, first);
+    rt.execute().expect("execute");
+    let (got, _) = rt.fetch(out.id).expect("fetch");
+    assert_eq!(
+        got.as_f32().unwrap(),
+        (0..8).map(|v| v as f32 * 3.0).collect::<Vec<_>>()
+    );
+    // Only the first 8 entries are declared changed; the tail is garbage
+    // the device never receives.
+    let mut second: Vec<f32> = vec![-1000.0; CAP];
+    for (i, v) in second.iter_mut().enumerate().take(8) {
+        *v = 100.0 + i as f32;
+    }
+    rt.set_data_prefix(tokens.id, second, 8 * std::mem::size_of::<f32>());
+    rt.execute().expect("execute");
+    let (got, _) = rt.fetch(out.id).expect("fetch");
+    assert_eq!(
+        got.as_f32().unwrap(),
+        (0..8).map(|v| (100.0 + v as f32) * 3.0).collect::<Vec<_>>()
+    );
+}

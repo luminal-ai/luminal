@@ -34,9 +34,9 @@ const KERNEL_SOURCE: &str = include_str!("kernel.cu");
 const TENSOR_SOURCE: &str = include_str!("tensor_core.cu");
 /// Output rows per warp task in the GEMV kernels (gate/up counts row
 /// PAIRS), and the resident-blocks-per-SM they are compiled for.
-const GEMV_ROWS_GATE_UP: usize = 2;
+const GEMV_ROWS_GATE_UP: usize = 4;
 const GEMV_ROWS_DOWN: usize = 4;
-const GEMV_MIN_BLOCKS: usize = 4;
+const GEMV_MIN_BLOCKS: usize = 2;
 /// The packed dims must tile by the largest row count either kernel uses.
 const GEMV_ROWS: usize = 4;
 const BLOCK_THREADS: u32 = 256;

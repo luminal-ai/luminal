@@ -210,6 +210,9 @@ pub struct CudaDevice {
     resident: HashMap<i64, Resident>,
     /// Lits the runtime re-staged since their resident copy was taken.
     dirty: HashSet<i64>,
+    /// For a dirty lit, how many leading bytes changed: the re-upload
+    /// copies only those (the rest of the resident copy is kept as is).
+    dirty_prefix: HashMap<i64, usize>,
     /// Output buffers' persistent homes, by the home slot index.
     outputs: HashMap<usize, OutputHome>,
     /// What the last execute disclosed per output slot: where its bytes
@@ -283,6 +286,7 @@ impl CudaDevice {
             slab: None,
             resident: HashMap::new(),
             dirty: HashSet::new(),
+            dirty_prefix: HashMap::new(),
             outputs: HashMap::new(),
             slot_view: HashMap::new(),
             scratch: HashMap::new(),
@@ -360,12 +364,24 @@ impl CudaDevice {
     /// `set_data`.
     pub fn mark_dirty(&mut self, lit: i64) {
         self.dirty.insert(lit);
+        self.dirty_prefix.remove(&lit);
+    }
+
+    /// Mark a staged lit dirty in its first `bytes` bytes only (the
+    /// serving engine's per-tick vectors are declared at capacity but
+    /// change in a short prefix): the next execute uploads that prefix
+    /// into the existing resident copy. A lit with no resident copy yet
+    /// is uploaded whole.
+    pub fn mark_dirty_prefix(&mut self, lit: i64, bytes: usize) {
+        self.dirty.insert(lit);
+        self.dirty_prefix.insert(lit, bytes);
     }
 
     /// Drop a lit's resident copy (and any dirty mark).
     pub fn evict_input(&mut self, lit: i64) {
         self.resident.remove(&lit);
         self.dirty.remove(&lit);
+        self.dirty_prefix.remove(&lit);
     }
 
     /// Drop EVERY resident input. The search's staged map is borrowed
@@ -375,6 +391,7 @@ impl CudaDevice {
     pub fn evict_all_inputs(&mut self) {
         self.resident.clear();
         self.dirty.clear();
+        self.dirty_prefix.clear();
     }
 
     /// The device range a resident input currently occupies, if any.
@@ -495,6 +512,7 @@ impl CudaDevice {
         }
         let identity = (host.as_ptr() as usize, host.len());
         let dirty = self.dirty.remove(&lit);
+        let prefix = self.dirty_prefix.remove(&lit);
         let reuse_alloc = match self.resident.get(&lit) {
             Some(resident) if !dirty && (resident.host_ptr, resident.len) == identity => {
                 let (ptr, _record) = resident.slice.device_ptr(&self.stream);
@@ -510,8 +528,21 @@ impl CudaDevice {
             unsafe { self.stream.alloc::<u8>(bytes.max(1)) }
                 .with_context(|| format!("device alloc {bytes} bytes for input lit {lit}"))?
         };
-        if bytes > 0 {
-            self.stream.memcpy_htod(host, &mut slice).context("H2D")?;
+        // A prefix upload only makes sense into a copy that already holds
+        // the rest of the bytes.
+        let upload = match prefix {
+            Some(p) if reuse_alloc => p.min(bytes),
+            _ => bytes,
+        };
+        if upload > 0 {
+            if upload == bytes {
+                self.stream.memcpy_htod(host, &mut slice).context("H2D")?;
+            } else {
+                let mut view = slice.slice_mut(0..upload);
+                self.stream
+                    .memcpy_htod(&host[..upload], &mut view)
+                    .context("H2D prefix")?;
+            }
         }
         let ptr = {
             let (ptr, _record) = slice.device_ptr(&self.stream);

@@ -738,6 +738,31 @@ impl CudaRuntime {
         }
     }
 
+    /// Stage a tensor's payload of which only the first `prefix_bytes`
+    /// changed since the last stage: the payload is declared at capacity
+    /// (its full length must still match the plan) but the device copy
+    /// is refreshed in that prefix only. Bytes past the prefix on the
+    /// device keep whatever an earlier stage put there — the caller's
+    /// promise is that the graph never reads them (a serving graph reads
+    /// the bucket's rows and the descriptors' real entries).
+    pub fn set_data_prefix(
+        &mut self,
+        tensor: NodeIndex,
+        data: impl Into<HostBuffer>,
+        prefix_bytes: usize,
+    ) {
+        let Some(&buffer) = self.input_buffers.get(&tensor) else {
+            panic!("set_data_prefix on a tensor with no input binding");
+        };
+        self.staged.insert(buffer, data.into());
+        #[cfg(feature = "device")]
+        if let Some(device) = self.device.as_mut() {
+            device.mark_dirty_prefix(buffer, prefix_bytes);
+        }
+        #[cfg(not(feature = "device"))]
+        let _ = prefix_bytes;
+    }
+
     /// FEED AN OUTPUT BACK INTO AN INPUT ON THE DEVICE (the serving
     /// landing, 2026-09-10): one D2D memcpy from `output`'s backing
     /// bytes into `input`'s resident copy, no host round trip. The two
