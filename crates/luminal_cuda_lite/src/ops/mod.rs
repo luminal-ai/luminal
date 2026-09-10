@@ -43,6 +43,7 @@ pub mod index_map_apply_materialize;
 pub mod index_map_apply_view;
 pub mod iota;
 pub mod less_than;
+pub mod linear_bf16;
 pub mod log2;
 pub mod materialize_layout_copy;
 pub mod modulo;
@@ -236,6 +237,7 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(rope::RopeMatcher, rope::prototype()),
         reg(moe_topk::MoeTopkMatcher, moe_topk::prototype()),
         reg(argmax_rows::ArgmaxRowsMatcher, argmax_rows::prototype()),
+        reg(linear_bf16::LinearBf16Matcher, linear_bf16::prototype()),
     ]
 }
 

@@ -69,6 +69,9 @@ pub enum ShapeRule {
         operand: usize,
         tail: &'static [TailDim],
     },
+    /// `[leading of operand rows, leading of operand cols]` — a matmul-
+    /// shaped result.
+    LeadingPair { rows: usize, cols: usize },
 }
 
 /// The description one op module writes.
@@ -165,6 +168,12 @@ impl ExternSurface {
             ShapeRule::OfOperand(i) => (
                 format!("    (= ?shape (shape-of ?a{i}))\n"),
                 "?shape".to_string(),
+            ),
+            ShapeRule::LeadingPair { rows, cols } => (
+                format!(
+                    "    (= (shape-of ?a{rows}) (ShapeLit (IntExprCons ?lead_r ?rest_r)))\n    (= (shape-of ?a{cols}) (ShapeLit (IntExprCons ?lead_c ?rest_c)))\n"
+                ),
+                "(ShapeLit (IntExprCons ?lead_r (IntExprCons ?lead_c (IntExprNil))))".to_string(),
             ),
             ShapeRule::LeadingThen { operand, tail } => {
                 let mut list = "(IntExprNil)".to_string();

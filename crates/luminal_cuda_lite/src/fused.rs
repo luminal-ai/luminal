@@ -358,3 +358,30 @@ pub fn argmax_rows(x: GraphTensor) -> GraphTensor {
         DType::Int,
     )
 }
+
+/// Record a dense linear over bf16 weights: `x` `[s, k]` F32, `w` `[n, k]`
+/// Bf16 (the checkpoint's `[out, in]` layout, no transpose), `bias` `[n]`
+/// F32 (pass zeros for a bias-free layer); returns `x · wᵀ + bias`,
+/// `[s, n]` F32.
+pub fn linear_bf16(x: GraphTensor, w: GraphTensor, bias: GraphTensor) -> GraphTensor {
+    assert_eq!(x.dtype, DType::F32, "linear_bf16: x must be F32");
+    assert_eq!(x.rank(), 2, "linear_bf16: x must be [s, k]");
+    assert_eq!(w.dtype, DType::Bf16, "linear_bf16: w must be Bf16");
+    assert_eq!(w.rank(), 2, "linear_bf16: w must be [n, k]");
+    assert_eq!(bias.dtype, DType::F32, "linear_bf16: bias must be F32");
+    assert_eq!(bias.rank(), 1, "linear_bf16: bias must be [n]");
+    assert_eq!(x.dims()[1], w.dims()[1], "linear_bf16: k must match");
+    assert_eq!(
+        bias.dims()[0],
+        w.dims()[0],
+        "linear_bf16: bias width must be n"
+    );
+    let out_dims: Vec<IntExpr> = vec![x.dims()[0], w.dims()[0]];
+    x.graph().extern_op(
+        crate::ops::linear_bf16::LOGICAL_CONSTRUCTOR,
+        &[x, w, bias],
+        vec![],
+        out_dims,
+        DType::F32,
+    )
+}

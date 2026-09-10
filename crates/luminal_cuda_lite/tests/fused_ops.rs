@@ -666,3 +666,50 @@ fn prefix_uploads_refresh_only_the_bucket_rows() {
         (0..8).map(|v| (100.0 + v as f32) * 3.0).collect::<Vec<_>>()
     );
 }
+
+/// The bf16 dense linear: the GEMV path (few rows) and the tensor-core
+/// path (many rows, both column tiles) against a host reference with
+/// bf16-rounded activations where the MMA rounds them.
+#[test]
+fn linear_bf16_matches_reference() {
+    for (s, n, k) in [
+        (3usize, 96usize, 64usize),
+        (40, 192, 192),
+        (100, 256, 128),
+        (8, 130, 24),
+    ] {
+        let mut seed = 71u64 + s as u64;
+        let x: Vec<f32> = (0..s * k).map(|_| lcg(&mut seed)).collect();
+        let w_f: Vec<f32> = (0..n * k).map(|_| lcg(&mut seed)).collect();
+        let bias: Vec<f32> = (0..n).map(|_| lcg(&mut seed)).collect();
+        let bf = |v: f32| half::bf16::from_f32(v).to_f32();
+        let tensor_path = s > 8;
+        let act = |v: f32| if tensor_path { bf(v) } else { v };
+        let mut want = vec![0f32; s * n];
+        for t in 0..s {
+            for j in 0..n {
+                let dot: f32 = (0..k).map(|c| act(x[t * k + c]) * bf(w_f[j * k + c])).sum();
+                want[t * n + j] = dot + bias[j];
+            }
+        }
+        let mut cx = Graph::new();
+        let x_t = cx.tensor((s, k), DType::F32);
+        let w_t = cx.tensor((n, k), DType::Bf16);
+        let b_t = cx.tensor(n, DType::F32);
+        let out = luminal_cuda_lite::fused::linear_bf16(x_t, w_t, b_t).output();
+        let w_bytes: Vec<u8> = w_f
+            .iter()
+            .flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes())
+            .collect();
+        let got = run(
+            &cx,
+            vec![
+                (x_t.id, x.into()),
+                (w_t.id, HostBuffer::new(PlanDtype::Bf16, w_bytes).unwrap()),
+                (b_t.id, bias.into()),
+            ],
+            out.id,
+        );
+        assert_close(&want, &got, &format!("linear_bf16 s{s} n{n} k{k}"), 1e-3);
+    }
+}
