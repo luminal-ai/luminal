@@ -626,11 +626,19 @@ impl IntegerExpression {
             .collect();
         IntegerExpression::new(new_terms)
     }
+    /// Equality under the expression algebra. Structurally equal spellings
+    /// are equal without egglog; only differing spellings pay for a
+    /// saturation (a fresh e-graph per call).
+    pub fn egglog_equal(self, rhs: impl Into<IntegerExpression>) -> bool {
+        let rhs = rhs.into();
+        self == rhs || self.egglog_equal_saturating(rhs)
+    }
+
     /// Run proper equality check inside egglog
     #[tracing::instrument(skip_all)]
-    pub fn egglog_equal(self, rhs: impl Into<IntegerExpression>) -> bool {
+    fn egglog_equal_saturating(self, rhs: IntegerExpression) -> bool {
         let lhs_expr = self.to_egglog();
-        let rhs_expr = rhs.into().to_egglog();
+        let rhs_expr = rhs.to_egglog();
         let mut program = String::new();
         program.push_str(&egglog_utils::base::base_expression_egglog());
         program.push('\n');
