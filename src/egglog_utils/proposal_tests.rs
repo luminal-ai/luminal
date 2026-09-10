@@ -104,8 +104,8 @@ fn reachable_mutation_balances_families_and_preserves_every_variant() {
 }
 
 // A direct implementation hides the input of an equivalent wrapped form.
-// Switching to the wrapper must permit later mutations in this same child
-// to tune the newly activated input, without first retaining a worse parent.
+// Switching to the wrapper must initialize its newly activated input in the
+// same proposal, without first retaining a worse intermediate parent.
 fn activated_input_fixture() -> SerializedEGraph {
     let mut graph = SerializedEGraph {
         enodes: FxHashMap::default(),
@@ -159,41 +159,78 @@ fn activated_input_fixture() -> SerializedEGraph {
 }
 
 #[test]
-fn mutation_can_tune_an_input_activated_by_an_earlier_mutation() {
-    let graph = activated_input_fixture();
+fn structural_mutation_initializes_newly_exposed_choices() {
+    check_activated_input_mutation(false);
+}
+
+#[test]
+fn structural_mutation_preserves_already_active_shared_choices() {
+    check_activated_input_mutation(true);
+}
+
+fn check_activated_input_mutation(already_active: bool) {
+    let mut graph = activated_input_fixture();
     let root = ClassId::from("root");
     let hidden = ClassId::from("hidden");
+    if already_active {
+        let join = ClassId::from("join");
+        let node = NodeId::from("join-node");
+        graph.enodes.insert(
+            node.clone(),
+            ("OutputJoin".into(), vec![root.clone(), hidden.clone()]),
+        );
+        graph.node_to_class.insert(node.clone(), join.clone());
+        graph
+            .eclasses
+            .insert(join.clone(), ("IR".into(), vec![node]));
+        graph.roots = vec![join];
+    }
     let mut rng = StdRng::seed_from_u64(1827);
     let mut choices = random_initial_choice(&graph, &mut rng);
-    choices.insert(&graph.roots[0], &graph.eclasses[&root].1[0]);
+    choices.insert(
+        graph.eclasses.get_key_value(&root).unwrap().0,
+        &graph.eclasses[&root].1[0],
+    );
     choices.insert(
         graph.eclasses.get_key_value(&hidden).unwrap().0,
         &graph.eclasses[&hidden].1[0],
     );
     let mut extractor = LlirExtractor::new(&graph, &[]);
     let base = extractor.index_choice_set(&choices);
+    let mut wrapped = 0;
     let mut composed = 0;
     for _ in 0..1024 {
         let children = extractor.extract_reachable_indexed_generation(
             &base,
             1,
-            8,
+            1,
             &mut FxHashSet::default(),
             &mut rng,
         );
         assert_eq!(children.len(), 1);
         let named = extractor.named_choices(&children[0]);
         assert_eq!(extractor.index_named_choices(&named).hash, children[0].hash);
-        if named.contains(&("root".into(), "wrapped".into()))
-            && named.contains(&("hidden".into(), "fast".into()))
-        {
-            composed += 1;
+        if named.contains(&("root".into(), "wrapped".into())) {
+            wrapped += 1;
+            if named.contains(&("hidden".into(), "fast".into())) {
+                composed += 1;
+            }
         }
     }
-    assert!(
-        composed > 0,
-        "no child could tune an input exposed by its earlier mutation"
+    assert!(wrapped > 0, "structural alternatives remain searchable");
+    if already_active {
+        assert_eq!(
+            composed, 0,
+            "initializing a newly exposed branch must preserve already-active shared choices"
+        );
+    } else {
+        assert!(
+            composed > 0,
+            "a structural proposal must initialize the newly exposed input without retaining an intermediate parent"
+        );
+    }
+    assert_eq!(
+        base.choices[extractor.class_to_index[&hidden] as usize], 0,
+        "parent is immutable"
     );
-    // Parents are immutable while children explore implementation changes.
-    assert_eq!(base.choices[extractor.class_to_index[&hidden] as usize], 0);
 }

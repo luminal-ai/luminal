@@ -2302,6 +2302,26 @@ impl<'a> LlirExtractor<'a> {
         mutable_classes
     }
 
+    fn mutate_choice(
+        &mut self,
+        child: &mut IndexedChoiceSet,
+        class: DenseIndex,
+        rng: &mut (impl Rng + ?Sized),
+    ) -> bool {
+        self.mutation_pool(class);
+        let families = &self.mutation_nodes[class as usize]
+            .as_ref()
+            .unwrap()
+            .families;
+        let family = &families[rng.random_range(0..families.len())];
+        let new_node = family[rng.random_range(0..family.len())];
+        let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
+        let class_info = &self.indexed_classes[class as usize];
+        child.hash ^= hash_choice_entry(class_info.id, &class_info.nodes[old_node as usize]);
+        child.hash ^= hash_choice_entry(class_info.id, &class_info.nodes[new_node as usize]);
+        old_node != new_node
+    }
+
     pub fn extract_reachable_indexed_generation(
         &mut self,
         base: &IndexedChoiceSet,
@@ -2327,28 +2347,27 @@ impl<'a> LlirExtractor<'a> {
             let mut child = base.clone();
             let mut active_classes = mutable_classes.clone();
             let mutation_count = rng.random_range(1..=mutations_per_generation.max(1));
-            for mutation in 0..mutation_count {
+            for _ in 0..mutation_count {
                 let class = active_classes[rng.random_range(0..active_classes.len())];
-                let new_node = {
-                    self.mutation_pool(class);
-                    let families = &self.mutation_nodes[class as usize]
-                        .as_ref()
-                        .unwrap()
-                        .families;
-                    let family = &families[rng.random_range(0..families.len())];
-                    family[rng.random_range(0..family.len())]
-                };
-                let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
-                let class_info = &self.indexed_classes[class as usize];
-                child.hash ^=
-                    hash_choice_entry(class_info.id, &class_info.nodes[old_node as usize]);
-                child.hash ^=
-                    hash_choice_entry(class_info.id, &class_info.nodes[new_node as usize]);
-                // A different implementation can expose previously inactive
-                // inputs. Later mutations must see the child's current graph,
-                // allowing a structural choice and its tuning to change together.
-                if old_node != new_node && mutation + 1 < mutation_count {
-                    active_classes = self.reachable_mutation_classes(&child);
+                if self.mutate_choice(&mut child, class, rng) {
+                    // A structural choice can expose dormant genes left at an
+                    // unrelated implementation by an earlier genome. Initialize
+                    // the newly active subgraph in this same proposal, so a
+                    // wrapper change need not survive as a slower intermediate
+                    // parent before its underlying implementation can change.
+                    let mut initialized: FxHashSet<_> = active_classes.iter().copied().collect();
+                    loop {
+                        active_classes = self.reachable_mutation_classes(&child);
+                        let Some(new_class) = active_classes
+                            .iter()
+                            .find(|c| !initialized.contains(c))
+                            .copied()
+                        else {
+                            break;
+                        };
+                        initialized.insert(new_class);
+                        self.mutate_choice(&mut child, new_class, rng);
+                    }
                     if active_classes.is_empty() {
                         break;
                     }

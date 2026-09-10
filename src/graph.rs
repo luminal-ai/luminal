@@ -168,7 +168,8 @@ pub struct CompileOptions {
     pub search_time_limit: std::time::Duration,
     /// Number of offspring per generation (default: 10)
     pub generation_size: usize,
-    /// Number of mutations applied to each offspring (default: 10)
+    /// Maximum active-choice mutations per offspring (default: 10). Newly
+    /// exposed subgraphs are initialized within the same structural proposal.
     pub mutations: usize,
     /// Number of profiling trials per candidate (default: 3)
     pub trials: usize,
