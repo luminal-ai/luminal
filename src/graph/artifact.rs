@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 use super::{DimBucket, Graph, LLIRGraph};
 use crate::{
     dtype::DType,
-    egglog_utils::{LlirExtractor, SerializedEGraph},
+    egglog_utils::{ClassId, LlirExtractor, NodeId, SerializedEGraph},
     hlir::HLIROps,
     op::{IntoEgglogOp, Runtime},
     search::{SearchSpace, SelectedProgram, unroll_packed_llir},
@@ -88,8 +88,100 @@ pub struct SelectedSchedule {
     buckets: Vec<ScheduleBucket>,
 }
 
+// E-graph IDs are local to a saturation run. Recover their correspondence by
+// congruence (sort, constructor, ordered child classes), never by op preference.
+// Conservatively reject changed/ambiguous class structure; the extracted LLIR
+// fingerprint below also guards changes to lowering implementations.
+fn remap_choices(
+    source: &SerializedEGraph,
+    target: &SerializedEGraph,
+    choices: &[(String, String)],
+) -> Option<Vec<(String, String)>> {
+    let mut target_nodes = FxHashMap::default();
+    for (node, (op, children)) in &target.enodes {
+        let class = target.node_to_class.get(node)?;
+        let key = (
+            target.eclasses.get(class)?.0.clone(),
+            op.clone(),
+            children.clone(),
+        );
+        if let Some((previous, _)) = target_nodes.insert(key, (class, node))
+            && previous != class
+        {
+            return None;
+        }
+    }
+    let mut classes: FxHashMap<ClassId, ClassId> = FxHashMap::default();
+    let mut pending: Vec<_> = source
+        .enodes
+        .iter()
+        .map(|(node, (op, children))| (node, (op, children)))
+        .collect();
+    loop {
+        let before = classes.len();
+        let mut unresolved = Vec::new();
+        for (node, (op, children)) in pending {
+            let Some(children) = children
+                .iter()
+                .map(|c| classes.get(c).cloned())
+                .collect::<Option<Vec<_>>>()
+            else {
+                unresolved.push((node, (op, children)));
+                continue;
+            };
+            let class = source.node_to_class.get(node)?;
+            let key = (source.eclasses.get(class)?.0.clone(), op.clone(), children);
+            if let Some((target_class, _)) = target_nodes.get(&key)
+                && let Some(previous) = classes.insert(class.clone(), (*target_class).clone())
+                && previous != **target_class
+            {
+                return None;
+            }
+        }
+        pending = unresolved;
+        if classes.len() == before {
+            break;
+        }
+    }
+    // A complete bijection avoids importing incomplete genomes when a rewrite
+    // changes the search-space structure. New choices may still exist in the
+    // corresponding classes and remain available to ordinary mutation.
+    let mapped: rustc_hash::FxHashSet<_> = classes.values().collect();
+    if classes.len() != source.eclasses.len()
+        || mapped.len() != target.eclasses.len()
+        || classes.len() != mapped.len()
+        || source
+            .roots
+            .iter()
+            .map(|r| classes.get(r))
+            .collect::<Option<Vec<_>>>()?
+            != target.roots.iter().collect::<Vec<_>>()
+    {
+        return None;
+    }
+    choices
+        .iter()
+        .map(|(class, node)| {
+            let class = ClassId::from(class.as_str());
+            let node = NodeId::from(node.as_str());
+            if source.node_to_class.get(&node)? != &class {
+                return None;
+            }
+            let (op, children) = source.enodes.get(&node)?;
+            let children = children
+                .iter()
+                .map(|c| classes.get(c).cloned())
+                .collect::<Option<Vec<_>>>()?;
+            let key = (source.eclasses.get(&class)?.0.clone(), op.clone(), children);
+            let (target_class, target_node) = target_nodes.get(&key)?;
+            (classes.get(&class)? == *target_class)
+                .then(|| (target_class.to_string(), target_node.to_string()))
+        })
+        .collect()
+}
+
 impl SelectedSchedule {
-    /// Recover an incumbent only for the identical saturated search space.
+    /// Recover an incumbent across equivalent saturated spaces, including ID renumbering.
     /// The caller must revalidate and remeasure it under the current workload.
     pub(crate) fn seed_for_bucket(
         &self,
@@ -98,11 +190,17 @@ impl SelectedSchedule {
         if !ctx.space.custom_ops.is_empty() || self.dim_buckets != ctx.space.dim_buckets {
             return None;
         }
-        let bucket = self.buckets.iter().find(|bucket| {
-            bucket.bucket_indices == *ctx.bucket_indices() && bucket.egraph == *ctx.egraph()
-        })?;
+        let bucket = self
+            .buckets
+            .iter()
+            .find(|bucket| bucket.bucket_indices == *ctx.bucket_indices())?;
         let mut extractor = LlirExtractor::new(ctx.egraph(), &ctx.space.ops);
-        let genome = extractor.index_named_choices(&bucket.choices);
+        let choices = if bucket.egraph == *ctx.egraph() {
+            bucket.choices.clone()
+        } else {
+            remap_choices(&bucket.egraph, ctx.egraph(), &bucket.choices)?
+        };
+        let genome = extractor.index_named_choices(&choices);
         let llir = unroll_packed_llir(extractor.extract_indexed_packed(&genome, &[]));
         (fingerprint_llir(&llir) == bucket.unrolled_llir_fingerprint).then_some(genome)
     }
@@ -245,6 +343,88 @@ mod tests {
         };
         let schedule = SelectedSchedule::from_search(space, &[selected]).unwrap();
         (graph, schedule)
+    }
+
+    #[test]
+    fn search_seed_survives_egraph_renumbering_but_rejects_changed_structure() {
+        let (graph, mut schedule) = selected_schedule();
+        let bucket = &mut schedule.buckets[0];
+        let old = &bucket.egraph;
+        let classes: FxHashMap<_, _> = old
+            .eclasses
+            .keys()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), ClassId::from(format!("renamed-class-{i}"))))
+            .collect();
+        let nodes: FxHashMap<_, _> = old
+            .enodes
+            .keys()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), NodeId::from(format!("renamed-node-{i}"))))
+            .collect();
+        bucket.choices = bucket
+            .choices
+            .iter()
+            .map(|(c, n)| {
+                (
+                    classes[&ClassId::from(c.as_str())].to_string(),
+                    nodes[&NodeId::from(n.as_str())].to_string(),
+                )
+            })
+            .collect();
+        bucket.egraph = SerializedEGraph {
+            enodes: old
+                .enodes
+                .iter()
+                .map(|(n, (op, cs))| {
+                    (
+                        nodes[n].clone(),
+                        (op.clone(), cs.iter().map(|c| classes[c].clone()).collect()),
+                    )
+                })
+                .collect(),
+            eclasses: old
+                .eclasses
+                .iter()
+                .map(|(c, (sort, ns))| {
+                    (
+                        classes[c].clone(),
+                        (
+                            sort.clone(),
+                            ns.iter().rev().map(|n| nodes[n].clone()).collect(),
+                        ),
+                    )
+                })
+                .collect(),
+            node_to_class: old
+                .node_to_class
+                .iter()
+                .map(|(n, c)| (nodes[n].clone(), classes[c].clone()))
+                .collect(),
+            roots: old.roots.iter().map(|c| classes[c].clone()).collect(),
+        };
+        let contexts = graph
+            .search_space()
+            .unwrap()
+            .bucket_contexts(&graph.dyn_map);
+        assert_ne!(schedule.buckets[0].egraph, *contexts[0].egraph());
+        assert!(schedule.seed_for_bucket(&contexts[0]).is_some());
+        for change_sort in [false, true] {
+            let mut changed = schedule.clone();
+            let egraph = &mut changed.buckets[0].egraph;
+            if change_sort {
+                for (sort, _) in egraph.eclasses.values_mut() {
+                    *sort = format!("different-sort-{sort}");
+                }
+            } else {
+                for (op, children) in egraph.enodes.values_mut() {
+                    if children.is_empty() {
+                        *op = format!("different-leaf-{op}");
+                    }
+                }
+            }
+            assert!(changed.seed_for_bucket(&contexts[0]).is_none());
+        }
     }
 
     #[test]

@@ -1417,9 +1417,11 @@ fn seeded_search_remeasures_and_can_replace_or_reject_the_incumbent() {
     )
     .unwrap();
     for reject in [false, true] {
+        let options = options
+            .clone()
+            .seed_schedule(std::sync::Arc::new(schedule.clone()));
         let mut search =
             super::GeneticSearch::<usize>::new(space, ctx, &options, std::time::Instant::now());
-        assert!(search.seed_schedule(&schedule));
         assert_eq!(search.best(), None, "prior fitness must not be reused");
         assert_eq!(search.measured(), 0);
         let candidate = search.next_candidate(&mut rng).unwrap();

@@ -163,6 +163,21 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             .saturating_mul(options.generation_size.max(1))
             .saturating_mul(100)
             .max(10_000);
+        let initial_seed = options
+            .seed_schedule
+            .as_ref()
+            .and_then(|schedule| schedule.seed_for_bucket(ctx));
+        if search_log && options.seed_schedule.is_some() {
+            println!(
+                "Search seed bucket {}: {}",
+                ctx.index,
+                if initial_seed.is_some() {
+                    "accepted; revalidating and remeasuring"
+                } else {
+                    "incompatible; ordinary initialization"
+                }
+            );
+        }
         Self {
             space,
             ctx,
@@ -180,7 +195,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             phase: Phase::Initial,
             next_id: 0,
             outstanding: None,
-            initial_seed: None,
+            initial_seed,
             invalid_attempts: 0,
             filter_fails: 0,
             max_filter_fails,

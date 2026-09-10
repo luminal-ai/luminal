@@ -159,6 +159,9 @@ impl DimBucket {
 /// ```
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
+    /// Optional previously selected schedule to revalidate and remeasure as the
+    /// first candidate. Incompatible buckets fall back to ordinary search.
+    pub seed_schedule: Option<std::sync::Arc<SelectedSchedule>>,
     /// Maximum number of graphs to evaluate during search.
     pub limit: usize,
     /// Maximum wall-clock time to spend searching.
@@ -226,6 +229,12 @@ fn checked_dim(dimension: impl Into<Symbol>) -> Symbol {
 }
 
 impl CompileOptions {
+    /// Start search from a compatible prior program without reusing its timing.
+    pub fn seed_schedule(mut self, schedule: std::sync::Arc<SelectedSchedule>) -> Self {
+        self.seed_schedule = Some(schedule);
+        self
+    }
+
     /// Set the maximum number of graphs to evaluate during search.
     pub fn search_graph_limit(mut self, limit: usize) -> Self {
         self.limit = limit;
@@ -355,6 +364,7 @@ impl CompileOptions {
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
+            seed_schedule: None,
             limit: 100,
             search_time_limit: std::time::Duration::MAX,
             generation_size: 10,

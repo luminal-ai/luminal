@@ -33,7 +33,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             let bucket_started = Instant::now();
             let setup_started = Instant::now();
             let mut search = GeneticSearch::<Duration>::new(space, ctx, options, search_started_at);
-            if let Some(schedule) = &self.selected_schedule {
+            if options.seed_schedule.is_none()
+                && let Some(schedule) = &self.selected_schedule
+            {
                 search.seed_schedule(schedule);
             }
             log_search_phase(ctx.index, "graph-search", "search_init", setup_started);
