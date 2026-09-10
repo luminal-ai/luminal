@@ -112,6 +112,7 @@ pub struct GeneticSearch<'a, M> {
     outstanding: Option<(CandidateId, IndexedChoiceSet)>,
 
     // Initial phase.
+    initial_seed: Option<IndexedChoiceSet>,
     invalid_attempts: usize,
     filter_fails: usize,
     max_filter_fails: usize,
@@ -179,6 +180,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             phase: Phase::Initial,
             next_id: 0,
             outstanding: None,
+            initial_seed: None,
             invalid_attempts: 0,
             filter_fails: 0,
             max_filter_fails,
@@ -202,6 +204,24 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
 
     pub fn bucket_context(&self) -> &'a BucketContext<'a> {
         self.ctx
+    }
+
+    /// Start from a previously selected program when its e-graph and bucket
+    /// contracts match. It enters the ordinary validation/profiling path and
+    /// consumes one measured-candidate slot; no old fitness is reused. A
+    /// rejected seed falls back to random initialization, and mutation remains
+    /// free to replace any of its choices.
+    pub fn seed_schedule(&mut self, schedule: &crate::graph::SelectedSchedule) -> bool {
+        assert!(
+            self.phase == Phase::Initial
+                && self.outstanding.is_none()
+                && self.initial_seed.is_none()
+                && self.invalid_attempts == 0
+                && self.filter_fails == 0,
+            "seed a search only before requesting its first candidate"
+        );
+        self.initial_seed = schedule.seed_for_bucket(self.ctx);
+        self.initial_seed.is_some()
     }
 
     /// Dyn values candidates should be evaluated with.
@@ -235,10 +255,12 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             match self.phase {
                 Phase::Done => return None,
                 Phase::Initial => {
-                    let mut generation =
+                    let genome = self.initial_seed.take().or_else(|| {
                         self.extractor
-                            .random_indexed_generation(1, &mut self.prev_selected, rng);
-                    let Some(genome) = generation.pop() else {
+                            .random_indexed_generation(1, &mut self.prev_selected, rng)
+                            .pop()
+                    });
+                    let Some(genome) = genome else {
                         panic_initial_filter_limit(
                             self.filter_fails,
                             self.last_filter_rejection.as_deref(),

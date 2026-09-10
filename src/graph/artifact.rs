@@ -89,6 +89,24 @@ pub struct SelectedSchedule {
 }
 
 impl SelectedSchedule {
+    /// Recover an incumbent only for the identical saturated search space.
+    /// The caller must revalidate and remeasure it under the current workload.
+    pub(crate) fn seed_for_bucket(
+        &self,
+        ctx: &crate::search::BucketContext<'_>,
+    ) -> Option<crate::egglog_utils::IndexedChoiceSet> {
+        if !ctx.space.custom_ops.is_empty() || self.dim_buckets != ctx.space.dim_buckets {
+            return None;
+        }
+        let bucket = self.buckets.iter().find(|bucket| {
+            bucket.bucket_indices == *ctx.bucket_indices() && bucket.egraph == *ctx.egraph()
+        })?;
+        let mut extractor = LlirExtractor::new(ctx.egraph(), &ctx.space.ops);
+        let genome = extractor.index_named_choices(&bucket.choices);
+        let llir = unroll_packed_llir(extractor.extract_indexed_packed(&genome, &[]));
+        (fingerprint_llir(&llir) == bucket.unrolled_llir_fingerprint).then_some(genome)
+    }
+
     #[doc(hidden)]
     pub fn from_search(space: &SearchSpace, selected: &[SelectedProgram]) -> Option<Self> {
         if !space.custom_ops.is_empty() || selected.len() != space.buckets.len() {
@@ -248,11 +266,72 @@ mod tests {
     fn selected_schedule_rejects_changed_llir() {
         let (graph, mut schedule) = selected_schedule();
         schedule.buckets[0].unrolled_llir_fingerprint.0 ^= 1;
+        assert!(
+            schedule
+                .seed_for_bucket(
+                    &graph
+                        .search_space()
+                        .unwrap()
+                        .bucket_contexts(&graph.dyn_map)[0]
+                )
+                .is_none(),
+            "search seeding must also reject changed extraction semantics"
+        );
         let loaded = Graph::from_selected_schedule(graph.dyn_map, graph.input_meta, schedule);
         let error = loaded
             .load_selected_schedule(&mut ReferenceRuntime::initialize(()))
             .unwrap_err();
         assert!(error.contains("fingerprint mismatch"), "{error}");
+    }
+
+    #[test]
+    fn search_seeds_require_matching_bucket_contracts_and_egraphs() {
+        use rand::SeedableRng;
+        let mut graph = Graph::new();
+        let _ = graph.tensor('s').sin().output();
+        graph.build_search_space::<ReferenceRuntime>(CompileOptions::default().dim_buckets(
+            's',
+            &[DimBucket::new(1, 1), DimBucket::new(2, 8).representative(4)],
+        ));
+        let space = graph.search_space().unwrap();
+        let contexts = space.bucket_contexts(&graph.dyn_map);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xB0C0_2026);
+        let selected: Vec<_> = contexts
+            .iter()
+            .map(|ctx| {
+                let mut extractor = LlirExtractor::new(ctx.egraph(), &space.ops);
+                let genome = extractor.random_indexed_choice(&mut rng);
+                let llir = unroll_packed_llir(extractor.extract_indexed_packed(&genome, &[]));
+                SelectedProgram {
+                    bucket_indices: ctx.bucket_indices().clone(),
+                    representative_dyn_map: ctx.representative_dyn_map.clone(),
+                    genome,
+                    llir,
+                }
+            })
+            .collect();
+        let mut schedule = SelectedSchedule::from_search(space, &selected).unwrap();
+        schedule.buckets.reverse();
+        for ctx in &contexts {
+            assert!(schedule.seed_for_bucket(ctx).is_some());
+            let mut current = ctx.clone();
+            current
+                .representative_dyn_map
+                .insert('s'.into(), if ctx.index == 0 { 1 } else { 7 });
+            assert!(
+                schedule.seed_for_bucket(&current).is_some(),
+                "current tensor dimensions are reprofiled"
+            );
+        }
+        let mut changed = schedule.clone();
+        changed.dim_buckets.get_mut(&'s'.into()).unwrap()[1] = DimBucket::new(2, 16);
+        assert!(changed.seed_for_bucket(&contexts[1]).is_none());
+        let mut changed = schedule.clone();
+        for bucket in &mut changed.buckets {
+            bucket.egraph.roots.clear();
+        }
+        assert!(changed.seed_for_bucket(&contexts[0]).is_none());
+        assert!(changed.seed_for_bucket(&contexts[1]).is_none());
     }
 
     #[test]

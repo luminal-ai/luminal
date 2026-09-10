@@ -481,6 +481,56 @@ fn profile_supplied_data_and_weights_change_search_winner() {
 }
 
 #[test]
+fn profile_research_remeasures_the_saved_program() {
+    let mut graph = Graph::new();
+    let input = graph.tensor(32).persist();
+    let output = (input.sin() * input + 1.0).output();
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut rt = runtime();
+    rt.set_data(input, vec![2f32; 32]);
+    rt = graph.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(8).trials(2),
+        &mut SmallRng::seed_from_u64(20260910),
+    );
+    let previous = serde_json::to_value(rt.selected_schedule.as_ref().unwrap()).unwrap();
+    rt.set_profile_workload(
+        &graph,
+        ProfileWorkload::new().case(
+            "new-input",
+            DynMap::default(),
+            ProfileInputs::new().input(input, vec![3f32; 32]),
+            1.,
+        ),
+    )
+    .unwrap();
+    rt = graph.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(1).trials(2),
+        &mut SmallRng::seed_from_u64(9271),
+    );
+    assert_eq!(
+        serde_json::to_value(rt.selected_schedule.as_ref().unwrap()).unwrap(),
+        previous
+    );
+    let measurements = rt.profile_evaluations();
+    assert_eq!(
+        measurements.len(),
+        2,
+        "remeasure the seed and its deployment finalist"
+    );
+    assert!(measurements.iter().all(|m| m.cuda_graph
+        && m.cases.len() == 1
+        && m.cases[0].case_id == "new-input"
+        && m.cases[0].duration > Duration::ZERO));
+    rt.clear_profile_workload();
+    rt.execute(&DynMap::default());
+    for value in rt.get_f32(output) {
+        assert!((value - (2f32.sin() * 2. + 1.)).abs() < 1e-5);
+    }
+}
+
+#[test]
 fn profile_failure_restores_caller_inputs_outputs_and_hidden_state() {
     let mut cx = Graph::new();
     let state = cx.tensor(1).as_dtype(DType::Int).persist();
