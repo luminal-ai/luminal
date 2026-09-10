@@ -27,7 +27,7 @@
 (let folded_iota (LogicalIota (IntAdd (IntLit 2) (IntLit 3)) scalar_shape))
 (let literal_iota (LogicalIota (IntLit 5) scalar_shape))
 
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; Iota authoring contract: every constructed iota demands its expression's
 ; bounds — an absent entry fails the check loudly at the fixpoint.

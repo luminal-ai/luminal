@@ -14,4 +14,5 @@
     (set (dtype-of ?out_logical_tensor) ?init_dtype)
     (set (dtype-of ?out_logical_tensor) ?src_dtype)
   )
+  :ruleset prop
 )

@@ -112,7 +112,7 @@
 ; SOURCE SEAM rows for list-authored strided layouts (affine migration)
 (strided-lists stall_layout stall_shape (IntExprCons (IntLit 12) (IntExprCons (IntLit 4) (IntExprNil))) (IntExprCons maybe_empty_dim (IntExprCons (IntLit 1) (IntExprNil))) (bits-of (F32)))
 
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; --- the value route ---
 (check (provably-cannot-union-with-zero positive_literal))

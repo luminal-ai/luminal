@@ -21,7 +21,7 @@ pub struct ReferenceBindings;
 impl ReferenceBindings {
     /// The standard schedule tail shared by every assembled reference
     /// program.
-    pub const SCHEDULE: &'static str = "(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run cleanup)) (saturate (run fixpoint-invariants)))\n\n";
+    pub const SCHEDULE: &'static str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run cleanup)) (saturate (run fixpoint-invariants)))\n\n";
 }
 
 impl RuntimeBindingsGenerator for ReferenceBindings {

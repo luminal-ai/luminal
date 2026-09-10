@@ -89,7 +89,7 @@ fn e2_composition_canonicalization_probe() {
 (let x_buffer_tensor (BufferTensorLit x_lt x_buffer_id))
 (let out_buffer_tensor (BufferTensorLit probe_lt out_buffer_id))
 (let output (BufferOutputLit (BufferTensorCons out_buffer_tensor (BufferTensorNil))))
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 "#;
     let s = test_runtime::serialize_fixture(fx);
     let const_classes: std::collections::BTreeSet<_> = s

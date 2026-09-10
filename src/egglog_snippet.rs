@@ -218,4 +218,47 @@ mod tests {
             .parse_and_run_program(None, &assembled_program_for(&[]))
             .expect("assembled program loads");
     }
+
+    /// The `prop` ruleset holds exactly the shape-of / dtype-of / rank-of
+    /// propagation rules: every default-ruleset rule does something else,
+    /// and every `prop` rule does nothing else. The schedule runs `prop`
+    /// to saturation before the main loop and alongside `(run)` inside
+    /// it, so a propagation rule left in the default ruleset would lose
+    /// the pre-pass and a minting rule tagged `prop` would run in it.
+    #[test]
+    fn prop_ruleset_is_exactly_the_propagation_rules() {
+        use egglog::ast::{Command, GenericAction};
+        const PROP: [&str; 3] = ["shape-of", "dtype-of", "rank-of"];
+        let only_propagation = |rule: &egglog::ast::Rule| {
+            !rule.head.0.is_empty()
+                && rule.head.0.iter().all(|action| match action {
+                    GenericAction::Set(_, head, _, _) => PROP.contains(&head.as_str()),
+                    _ => false,
+                })
+        };
+        let commands = new_egraph()
+            .parse_program(None, &assembled_program_for(&[]))
+            .expect("assembled program parses");
+        let mut prop_rules = 0;
+        for command in &commands {
+            let Command::Rule { rule } = command else {
+                continue;
+            };
+            match rule.ruleset.as_str() {
+                "prop" => {
+                    prop_rules += 1;
+                    assert!(
+                        only_propagation(rule),
+                        "prop rule does more than propagate: {rule}"
+                    );
+                }
+                "" => assert!(
+                    !only_propagation(rule),
+                    "propagation rule missing `:ruleset prop`: {rule}"
+                ),
+                _ => {}
+            }
+        }
+        assert!(prop_rules > 0, "no prop rules found");
+    }
 }

@@ -9,4 +9,5 @@
     (set (dtype-of ?out_logical_tensor) ?in1_dtype) ; DUPLICATIVE This is to trigger no merge runtime errors
     (set (dtype-of ?out_logical_tensor) ?in2_dtype) ; DUPLICATIVE This is to trigger no merge runtime errors
   )
+  :ruleset prop
 )

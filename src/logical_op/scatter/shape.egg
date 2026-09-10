@@ -9,4 +9,5 @@
   (
     (set (shape-of ?out_logical) ?init_shape)
   )
+  :ruleset prop
 )

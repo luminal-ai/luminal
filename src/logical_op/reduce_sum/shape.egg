@@ -8,4 +8,5 @@
   (
     (set (shape-of ?out_logical) (ShapeLit ?out_dims))
   )
+  :ruleset prop
 )

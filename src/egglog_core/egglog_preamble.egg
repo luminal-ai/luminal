@@ -891,6 +891,16 @@
 ; Propagate thing-of functions from Literals
 
 ; Propagate rank-of
+; Propagation ruleset: the shape-of / dtype-of / rank-of analyses (this
+; rule, the input-literal rule below, and every op's shape.egg and
+; dtype.egg). These are pure derived-attribute rules that never mint
+; terms. They run to saturation BEFORE the main loop and again alongside
+; the default ruleset inside it, so a schedule that runs (run) must also
+; run (run prop); rules whose actions are only such sets belong here (a
+; test in egglog_snippet.rs pins both directions). Pre-saturating them
+; cut saturation wall time 2.5x at gemma3 depth: the tables stop churning,
+; so the wide match rules that read them are re-evaluated far less often.
+(ruleset prop)
 (rule
   (
     (= ?shape (ShapeLit ?expr_list))
@@ -899,6 +909,7 @@
   (
     (set (rank-of ?shape) ?rank)
   )
+  :ruleset prop
 )
 
 ; Propagate dtype-of , shape-of
@@ -910,6 +921,7 @@
     (set (dtype-of ?logical_tensor) ?dtype)
     (set (shape-of ?logical_tensor) ?shape)
   )
+  :ruleset prop
 )
 
 ; Eager bits-of entries: top-level SETS, not rules — fixture lets evaluate
@@ -3823,7 +3835,7 @@
 ; reason). The walk copies the reachable region under σ — every
 ; spelling at once, simultaneous by construction — from a :naive rule
 ; in the subst-walk ruleset. The schedule runs that ruleset as an
-; OUTER STRATUM ((saturate (saturate (run)) (run subst-walk))): the
+; OUTER STRATUM ((saturate (saturate (run) (run prop)) (run subst-walk))): the
 ; ring saturates between walk generations, so re-walks happen per
 ; GENERATION, not per round. Both halves are load-bearing: per-round
 ; re-walks cost 2-9x on model-scale searches, and per-generation
@@ -4530,7 +4542,7 @@
 ; every invariant lives in egglog; nothing is checked in the extractor).
 ;
 ; This ruleset runs to saturation ONLY AFTER the main run has saturated:
-;   (run-schedule (saturate (run)) ... (saturate (run fixpoint-invariants)))
+;   (run-schedule (saturate (run prop)) (saturate (run) (run prop)) ... (saturate (run fixpoint-invariants)))
 ; That ordering is what makes its optimistic rules LEGAL. The main
 ; stratum is the prover; by its fixpoint every provable equality has
 ; landed and every bound is final. Rules here may therefore do what

@@ -34,7 +34,7 @@
     (BufferTensorCons x_output_buffer_tensor
       (BufferTensorNil))))
 
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; The output is exactly the input buffer tensor.
 (check (= x_input_buffer_tensor x_output_buffer_tensor))
