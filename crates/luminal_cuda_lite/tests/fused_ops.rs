@@ -11,8 +11,9 @@ use luminal::dtype::{DType, PlanDtype};
 use luminal::graph::{DimBucket, Graph};
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::fused::{
-    DownSpec, GateUpSpec, Mxfp4Experts, PagedAttentionInputs, PagedAttentionSpec, moe_down_mxfp4,
-    moe_gate_up_mxfp4, paged_attention, take_rows,
+    DownSpec, GateUpSpec, Mxfp4Experts, PagedAttentionInputs, PagedAttentionSpec, argmax_rows,
+    moe_down_mxfp4, moe_gate_up_mxfp4, moe_topk_ids, paged_attention, rms_norm, rope_split_half,
+    take_rows,
 };
 use luminal_cuda_lite::{CudaRuntime, HostBuffer};
 
@@ -233,7 +234,20 @@ fn moe_mxfp4_matches_reference() {
     let mut seed = 11u64;
     let x: Vec<f32> = (0..S * HIDDEN).map(|_| lcg(&mut seed)).collect();
     let ids: Vec<i32> = vec![0, 2, 1, 1, 2, 0];
-    let weights: Vec<f32> = vec![0.7, 0.3, 0.5, 0.5, 0.9, 0.1];
+    // The router's raw logits; the down half softmaxes each token's
+    // SELECTED ones into its route weights.
+    let logits: Vec<f32> = (0..S * EXPERTS).map(|_| lcg(&mut seed) * 3.0).collect();
+    let mut weights = [0f32; S * TOP_K];
+    for t in 0..S {
+        let picked: Vec<f32> = (0..TOP_K)
+            .map(|kk| logits[t * EXPERTS + ids[t * TOP_K + kk] as usize])
+            .collect();
+        let m = picked.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let denom: f32 = picked.iter().map(|v| (v - m).exp()).sum();
+        for kk in 0..TOP_K {
+            weights[t * TOP_K + kk] = (picked[kk] - m).exp() / denom;
+        }
+    }
     let byte = |s: &mut u64| ((lcg(s) + 1.0) * 127.5) as u8;
     let gu_blocks: Vec<u8> = (0..EXPERTS * 2 * INTER * HIDDEN / 2)
         .map(|_| byte(&mut seed))
@@ -299,7 +313,7 @@ fn moe_mxfp4_matches_reference() {
     let mut cx = Graph::new();
     let x_t = cx.tensor((S, HIDDEN), DType::F32);
     let ids_t = cx.tensor((S, TOP_K), DType::Int);
-    let w_t = cx.tensor((S, TOP_K), DType::F32);
+    let w_t = cx.tensor((S, EXPERTS), DType::F32);
     let gu = Mxfp4Experts {
         blocks: cx.tensor((EXPERTS, 2 * INTER, HIDDEN / 2), DType::U8),
         scales: cx.tensor((EXPERTS, 2 * INTER, HIDDEN / 32), DType::F8UE8M0),
@@ -337,7 +351,7 @@ fn moe_mxfp4_matches_reference() {
         vec![
             (x_t.id, x.into()),
             (ids_t.id, ids.into()),
-            (w_t.id, weights.into()),
+            (w_t.id, logits.into()),
             (
                 gu.blocks.id,
                 HostBuffer::new(PlanDtype::U8, gu_blocks).unwrap(),
@@ -414,4 +428,167 @@ fn fixed_capacity_inputs_shrink_to_bucketed_rows() {
         let want: Vec<f32> = (0..s * 2).map(|i| data[i] * w[i % 2]).collect();
         assert_close(&want, &got, &format!("bucket s={s}"), 1e-6);
     }
+}
+
+fn run_i32(cx: &Graph, inputs: Vec<(NodeIndex, HostBuffer)>, out: NodeIndex) -> Vec<i32> {
+    let data: FxHashMap<NodeIndex, HostBuffer> = inputs.iter().cloned().collect();
+    let mut rt = CudaRuntime::load(cx).expect("cuda load");
+    rt.search(&data, &luminal_cuda_lite::harness_search_options())
+        .unwrap_or_else(|e| panic!("cuda search: {e:#}"));
+    for (id, v) in inputs {
+        rt.set_data(id, v);
+    }
+    rt.execute().expect("device execute");
+    let (data, binding) = rt.fetch(out).expect("fetch");
+    assert!(
+        binding
+            .layout
+            .has::<luminal::layouts::RightMajorContiguousElementLayout>(),
+        "int output must come back dense"
+    );
+    data.as_i32().unwrap()
+}
+
+/// The decode launch diet's norm: one launch, `luminal_nn::rms_norm`
+/// semantics.
+#[test]
+fn rms_norm_matches_reference() {
+    const S: usize = 5;
+    const W: usize = 96;
+    const EPS: f32 = 1e-5;
+    let mut seed = 31u64;
+    let x: Vec<f32> = (0..S * W).map(|_| lcg(&mut seed) * 4.0).collect();
+    let w: Vec<f32> = (0..W).map(|_| lcg(&mut seed) + 1.5).collect();
+    let mut want = vec![0f32; S * W];
+    for t in 0..S {
+        let mean: f32 = x[t * W..][..W].iter().map(|v| v * v).sum::<f32>() / W as f32;
+        let inv = 1.0 / (mean + EPS).sqrt();
+        for i in 0..W {
+            want[t * W + i] = x[t * W + i] * inv * w[i];
+        }
+    }
+    let mut cx = Graph::new();
+    let x_t = cx.tensor((S, W), DType::F32);
+    let w_t = cx.tensor(W, DType::F32);
+    let out = rms_norm(x_t, w_t, EPS).output();
+    let got = run(&cx, vec![(x_t.id, x.into()), (w_t.id, w.into())], out.id);
+    assert_close(&want, &got, "rms_norm", 1e-5);
+}
+
+/// The decode launch diet's rotary embedding: `rotary_apply` with the
+/// split-half pairing, f32 out and bf16 out.
+#[test]
+fn rope_split_half_matches_reference() {
+    const S: usize = 3;
+    const HEADS: usize = 2;
+    const HD: usize = 8;
+    let mut seed = 41u64;
+    let x: Vec<f32> = (0..S * HEADS * HD).map(|_| lcg(&mut seed)).collect();
+    let cos: Vec<f32> = (0..S * HD).map(|_| lcg(&mut seed)).collect();
+    let sin: Vec<f32> = (0..S * HD).map(|_| lcg(&mut seed)).collect();
+    let mut want = vec![0f32; S * HEADS * HD];
+    for t in 0..S {
+        for h in 0..HEADS {
+            for d in 0..HD {
+                let base = t * HEADS * HD + h * HD;
+                let rot = if d < HD / 2 {
+                    -x[base + d + HD / 2]
+                } else {
+                    x[base + d - HD / 2]
+                };
+                want[base + d] = x[base + d] * cos[t * HD + d] + rot * sin[t * HD + d];
+            }
+        }
+    }
+    for out_dtype in [DType::F32, DType::Bf16] {
+        let mut cx = Graph::new();
+        let x_t = cx.tensor((S, HEADS * HD), DType::F32);
+        let c_t = cx.tensor((S, HD), DType::F32);
+        let s_t = cx.tensor((S, HD), DType::F32);
+        let rope = rope_split_half(x_t, c_t, s_t, HD, out_dtype);
+        // Read back through f32 either way (a bf16 result widens).
+        let out = rope.cast(DType::F32).output();
+        let got = run(
+            &cx,
+            vec![
+                (x_t.id, x.clone().into()),
+                (c_t.id, cos.clone().into()),
+                (s_t.id, sin.clone().into()),
+            ],
+            out.id,
+        );
+        let want_here: Vec<f32> = if out_dtype == DType::Bf16 {
+            want.iter()
+                .map(|v| half::bf16::from_f32(*v).to_f32())
+                .collect()
+        } else {
+            want.clone()
+        };
+        assert_close(&want_here, &got, &format!("rope {out_dtype:?}"), 1e-6);
+    }
+}
+
+/// The decode launch diet's router: the stable descending argsort's
+/// first k, ties to the lower index — including exact ties.
+#[test]
+fn moe_topk_ids_match_stable_argsort() {
+    const S: usize = 6;
+    const E: usize = 128;
+    const K: usize = 4;
+    let mut seed = 51u64;
+    let mut logits: Vec<f32> = (0..S * E).map(|_| (lcg(&mut seed) * 8.0).round()).collect();
+    // Row 5: a fully tied row selects 0, 1, 2, 3.
+    for e in 0..E {
+        logits[5 * E + e] = 2.0;
+    }
+    let mut want = vec![0i32; S * K];
+    for t in 0..S {
+        let mut order: Vec<usize> = (0..E).collect();
+        order.sort_by(|&a, &b| {
+            logits[t * E + b]
+                .partial_cmp(&logits[t * E + a])
+                .unwrap()
+                .then(a.cmp(&b))
+        });
+        for kk in 0..K {
+            want[t * K + kk] = order[kk] as i32;
+        }
+    }
+    let mut cx = Graph::new();
+    let l_t = cx.tensor((S, E), DType::F32);
+    let out = moe_topk_ids(l_t, K).output();
+    let got = run_i32(&cx, vec![(l_t.id, logits.clone().into())], out.id);
+    assert_eq!(want, got, "top-k ids");
+    // And the same rows through the decomposed spelling agree.
+    let mut cx2 = Graph::new();
+    let l2 = cx2.tensor((S, E), DType::F32);
+    let out2 = l2.topk_indexes(K, 1).output();
+    let spelled = run_i32(&cx2, vec![(l2.id, logits.into())], out2.id);
+    assert_eq!(want, spelled, "topk_indexes spelling");
+}
+
+/// The decode launch diet's greedy sampler: `argmax(1)` semantics over a
+/// wide row, ties to the higher index.
+#[test]
+fn argmax_rows_matches_reference() {
+    const N: usize = 4;
+    const W: usize = 3000;
+    let mut seed = 61u64;
+    let mut x: Vec<f32> = (0..N * W).map(|_| lcg(&mut seed)).collect();
+    // Row 1: the maximum appears twice; the higher index wins.
+    x[W + 17] = 5.0;
+    x[W + 2900] = 5.0;
+    // Row 3: the maximum is the last element.
+    x[3 * W + W - 1] = 9.0;
+    let mut want = vec![0i32; N];
+    for t in 0..N {
+        let row = &x[t * W..][..W];
+        let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        want[t] = row.iter().rposition(|v| *v == m).unwrap() as i32;
+    }
+    let mut cx = Graph::new();
+    let x_t = cx.tensor((N, W), DType::F32);
+    let out = argmax_rows(x_t).output();
+    let got = run_i32(&cx, vec![(x_t.id, x.into())], out.id);
+    assert_eq!(want, got, "argmax rows");
 }

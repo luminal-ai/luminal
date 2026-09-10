@@ -34,12 +34,14 @@ const KERNEL_SOURCE: &str = include_str!("kernel.cu");
 /// Output rows per warp task; must match the kernels' instantiation.
 const GEMV_ROWS: usize = 4;
 const BLOCK_THREADS: u32 = 256;
+/// The down kernel's route-weight register file; must match `MAX_TOP_K` in kernel.cu.
+const MAX_TOP_K: usize = 8;
 
 const GATE_UP_OPERANDS: [&str; 5] = ["x", "expert_ids", "blocks", "scales", "bias"];
 const DOWN_OPERANDS: [&str; 6] = [
     "hidden",
     "expert_ids",
-    "weights",
+    "router_logits",
     "blocks",
     "scales",
     "bias",
@@ -56,7 +58,7 @@ fn operand_name(names: &[&str], dest: usize, operand: usize) -> String {
     }
 }
 
-fn check_dtype(
+pub(crate) fn check_dtype(
     label: &str,
     who: &str,
     slot: &luminal::bufferize::SlotDescriptor<luminal::layouts::DecodedLayout>,
@@ -371,7 +373,7 @@ pub struct DownSpec {
     pub top_k: usize,
 }
 
-/// `MoeDownMxfp4(hidden, expert_ids, weights, blocks, scales, bias) -> out`.
+/// `MoeDownMxfp4(hidden, expert_ids, router_logits, blocks, scales, bias) -> out`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeDown {
     pub spec: DownSpec,
@@ -459,11 +461,11 @@ impl crate::host::HostOp for MoeDownDps {
         }
         let hidden = dense_extents(label, "hidden", &ctx.operand_info[0])?;
         let ids = dense_extents(label, "expert_ids", &ctx.operand_info[1])?;
-        let weights = dense_extents(label, "weights", &ctx.operand_info[2])?;
+        let logits = dense_extents(label, "router_logits", &ctx.operand_info[2])?;
         let out = dense_extents(label, "out", &ctx.result_info[0])?;
         check_dtype(label, "hidden", &ctx.operand_info[0], PlanDtype::F32)?;
         check_dtype(label, "expert_ids", &ctx.operand_info[1], PlanDtype::Int)?;
-        check_dtype(label, "weights", &ctx.operand_info[2], PlanDtype::F32)?;
+        check_dtype(label, "router_logits", &ctx.operand_info[2], PlanDtype::F32)?;
         let (s, inter) = match hidden.as_slice() {
             [s, k, inter] if *k == spec.top_k => (*s, *inter),
             other => bail!(
@@ -477,23 +479,26 @@ impl crate::host::HostOp for MoeDownDps {
                 spec.top_k
             );
         }
-        if weights != [s, spec.top_k] {
-            bail!(
-                "{label}: weights must be [{s}, {}], got {weights:?}",
-                spec.top_k
-            );
-        }
         if out != [s, spec.hidden] {
             bail!("{label}: out must be [{s}, {}], got {out:?}", spec.hidden);
         }
-        let _experts = check_packed_weights(label, ctx, 3, &DOWN_OPERANDS, spec.hidden, inter)?;
+        let experts = check_packed_weights(label, ctx, 3, &DOWN_OPERANDS, spec.hidden, inter)?;
+        if logits != [s, experts] {
+            bail!("{label}: router_logits must be [{s}, {experts}], got {logits:?}");
+        }
+        if spec.top_k > MAX_TOP_K {
+            bail!(
+                "{label}: top_k {} exceeds the kernel's {MAX_TOP_K}",
+                spec.top_k
+            );
+        }
         if s == 0 {
             return Ok(());
         }
         let function =
             crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "moe_down_r4")
                 .with_context(|| format!("{label}: kernel"))?;
-        let (hidden_ptr, ids_ptr, weights_ptr, blocks_ptr, scales_ptr, bias_ptr) = (
+        let (hidden_ptr, ids_ptr, logits_ptr, blocks_ptr, scales_ptr, bias_ptr) = (
             ctx.inputs[0].ptr,
             ctx.inputs[1].ptr,
             ctx.inputs[2].ptr,
@@ -502,11 +507,12 @@ impl crate::host::HostOp for MoeDownDps {
             ctx.inputs[5].ptr,
         );
         let dest = ctx.dest.ptr;
-        let (h, i, tk, sq) = (
+        let (h, i, tk, sq, ex) = (
             spec.hidden as i32,
             inter as i32,
             spec.top_k as i32,
             s as i32,
+            experts as i32,
         );
         let mut builder = ctx.stream.launch_builder(&function);
         builder
@@ -514,13 +520,14 @@ impl crate::host::HostOp for MoeDownDps {
             .arg(&scales_ptr)
             .arg(&bias_ptr)
             .arg(&ids_ptr)
-            .arg(&weights_ptr)
+            .arg(&logits_ptr)
             .arg(&hidden_ptr)
             .arg(&dest)
             .arg(&h)
             .arg(&i)
             .arg(&tk)
-            .arg(&sq);
+            .arg(&sq)
+            .arg(&ex);
         unsafe { builder.launch(grid(s * spec.hidden / GEMV_ROWS)) }
             .with_context(|| format!("{label}: launch"))?;
         Ok(())

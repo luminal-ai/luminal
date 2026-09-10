@@ -30,12 +30,14 @@
 //! dispatch entry; a familiar label alone never makes an op executable.
 
 pub mod add;
+pub mod argmax_rows;
 pub mod cast;
 pub mod constant;
 pub mod cublaslt;
 pub mod div;
 pub mod exp;
 pub mod exp2;
+pub mod extern_surface;
 pub mod gather;
 pub mod index_map_apply_materialize;
 pub mod index_map_apply_view;
@@ -45,11 +47,14 @@ pub mod log2;
 pub mod materialize_layout_copy;
 pub mod modulo;
 pub mod moe_mxfp4;
+pub mod moe_topk;
 pub mod mul;
 pub mod paged_attention;
 pub mod recip;
 pub mod reduce_max;
 pub mod reduce_sum;
+pub mod rms_norm;
+pub mod rope;
 pub mod scatter;
 pub mod sin;
 pub mod sqrt;
@@ -224,6 +229,13 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         ),
         reg(moe_mxfp4::MoeGateUpMatcher, moe_mxfp4::gate_up_prototype()),
         reg(moe_mxfp4::MoeDownMatcher, moe_mxfp4::down_prototype()),
+        // The decode launch diet (2026-09-10): one launch each for the
+        // norm, the rotary embedding, the router's top-k and the greedy
+        // argmax, in place of their multi-launch spellings.
+        reg(rms_norm::RmsNormMatcher, rms_norm::prototype()),
+        reg(rope::RopeMatcher, rope::prototype()),
+        reg(moe_topk::MoeTopkMatcher, moe_topk::prototype()),
+        reg(argmax_rows::ArgmaxRowsMatcher, argmax_rows::prototype()),
     ]
 }
 

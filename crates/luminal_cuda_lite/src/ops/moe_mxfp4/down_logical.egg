@@ -1,9 +1,10 @@
 ; Logical MXFP4 MoE, down half (the serving landing, 2026-09-10):
 ;   out[t, :] = Σ_k w[t,k] · (W_dn[e(t,k)] · hidden[t,k,:] + b_dn[e(t,k)])
+;   w[t, :]   = softmax(logits[t, e(t, 0..k)])   (over the SELECTED logits)
 ; Operands, in order:
 ;   hidden  [s, top_k, inter]            F32   (the gate/up half's result)
 ;   ids     [s, top_k]                   Int
-;   weights [s, top_k]                   F32   (route weights)
+;   logits  [s, experts]                 F32   (the router's output)
 ;   blocks  [experts, hidden, inter/2]   U8
 ;   scales  [experts, hidden, inter/32]  F8UE8M0
 ;   bias    [experts, hidden]            Bf16

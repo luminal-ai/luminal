@@ -16,6 +16,7 @@ use luminal::shape::IntExpr;
 
 pub use crate::ops::moe_mxfp4::{DownSpec, GateUpSpec};
 pub use crate::ops::paged_attention::PagedAttentionSpec;
+pub use crate::ops::rope::RopeSpec;
 
 /// The operands of one paged attention step (see
 /// [`crate::ops::paged_attention`] for each tensor's shape and dtype).
@@ -156,13 +157,15 @@ pub fn moe_gate_up_mxfp4(
 }
 
 /// Record the down half of an MXFP4 MoE block. `hidden` is
-/// `[s, top_k, inter]` F32 (the gate/up result), `expert_ids` and
-/// `weights` `[s, top_k]`; returns `[s, hidden]` F32, the route-weighted
-/// sum over the selected experts.
+/// `[s, top_k, inter]` F32 (the gate/up result), `expert_ids` `[s, top_k]`
+/// Int, `router_logits` `[s, experts]` F32 (the router's raw output — the
+/// kernel softmaxes each token's SELECTED logits into its route weights);
+/// returns `[s, hidden]` F32, the route-weighted sum over the selected
+/// experts.
 pub fn moe_down_mxfp4(
     hidden: GraphTensor,
     expert_ids: GraphTensor,
-    weights: GraphTensor,
+    router_logits: GraphTensor,
     experts: Mxfp4Experts,
     spec: DownSpec,
 ) -> GraphTensor {
@@ -182,9 +185,14 @@ pub fn moe_down_mxfp4(
         "moe_down_mxfp4: expert_ids must be Int"
     );
     assert_eq!(
-        weights.dtype,
+        router_logits.dtype,
         DType::F32,
-        "moe_down_mxfp4: weights must be F32"
+        "moe_down_mxfp4: router_logits must be F32"
+    );
+    assert_eq!(
+        router_logits.rank(),
+        2,
+        "moe_down_mxfp4: router_logits must be [s, experts]"
     );
     experts.check("moe_down_mxfp4");
     let s = hidden.dims()[0];
@@ -194,7 +202,7 @@ pub fn moe_down_mxfp4(
         &[
             hidden,
             expert_ids,
-            weights,
+            router_logits,
             experts.blocks,
             experts.scales,
             experts.bias,
@@ -236,4 +244,113 @@ pub fn take_rows(tensor: GraphTensor, rows: impl Into<IntExpr>) -> GraphTensor {
             dtype,
         ),
     }
+}
+
+/// Record a fused RMS norm over the trailing axis: `x` `[s, width]` F32,
+/// `weight` `[width]` F32; returns `x / sqrt(mean(x²) + eps) * weight`
+/// (the `luminal_nn::rms_norm` semantics) as one launch.
+pub fn rms_norm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
+    assert_eq!(x.dtype, DType::F32, "rms_norm: x must be F32");
+    assert_eq!(x.rank(), 2, "rms_norm: x must be [s, width]");
+    assert_eq!(weight.dtype, DType::F32, "rms_norm: weight must be F32");
+    assert_eq!(weight.rank(), 1, "rms_norm: weight must be [width]");
+    assert_eq!(
+        weight.dims()[0],
+        x.dims()[1],
+        "rms_norm: weight width must match x"
+    );
+    let out_dims = x.dims();
+    x.graph().extern_op(
+        crate::ops::rms_norm::LOGICAL_CONSTRUCTOR,
+        &[x, weight],
+        vec![ExternParam::F64(eps as f64)],
+        out_dims,
+        DType::F32,
+    )
+}
+
+/// Record a fused split-half rotary embedding: `x` `[s, heads*head_dim]`
+/// F32, `cos`/`sin` `[s, head_dim]` F32 (full-width tables, each
+/// frequency at both halves, as `luminal_nn::rotary_apply` consumes);
+/// returns `x * cos + rot(x) * sin` with `rot(x) = [-x_hi || x_lo]`,
+/// stored as `out_dtype` (F32, or Bf16 for a key headed into a bf16 pool).
+pub fn rope_split_half(
+    x: GraphTensor,
+    cos: GraphTensor,
+    sin: GraphTensor,
+    head_dim: usize,
+    out_dtype: DType,
+) -> GraphTensor {
+    assert_eq!(x.dtype, DType::F32, "rope_split_half: x must be F32");
+    assert_eq!(
+        x.rank(),
+        2,
+        "rope_split_half: x must be [s, heads*head_dim]"
+    );
+    for (name, t) in [("cos", cos), ("sin", sin)] {
+        assert_eq!(t.dtype, DType::F32, "rope_split_half: {name} must be F32");
+        assert_eq!(t.rank(), 2, "rope_split_half: {name} must be [s, head_dim]");
+        assert_eq!(
+            t.dims()[1],
+            IntExpr::from(head_dim),
+            "rope_split_half: {name} width must be head_dim"
+        );
+    }
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "rope_split_half: head_dim must be even"
+    );
+    let out_bf16 = match out_dtype {
+        DType::F32 => 0,
+        DType::Bf16 => 1,
+        other => panic!("rope_split_half: out_dtype must be F32 or Bf16, got {other:?}"),
+    };
+    let out_dims = x.dims();
+    x.graph().extern_op(
+        crate::ops::rope::LOGICAL_CONSTRUCTOR,
+        &[x, cos, sin],
+        vec![
+            ExternParam::I64(head_dim as i64),
+            ExternParam::I64(out_bf16),
+        ],
+        out_dims,
+        out_dtype,
+    )
+}
+
+/// Record a fused top-k over the trailing axis: `logits` `[s, experts]`
+/// F32; returns `[s, k]` Int, the indices of each row's k largest entries
+/// in descending order, ties to the lower index (what
+/// `topk_indexes(k, 1)` spells).
+pub fn moe_topk_ids(logits: GraphTensor, k: usize) -> GraphTensor {
+    assert_eq!(logits.dtype, DType::F32, "moe_topk_ids: logits must be F32");
+    assert_eq!(
+        logits.rank(),
+        2,
+        "moe_topk_ids: logits must be [s, experts]"
+    );
+    assert!(k > 0, "moe_topk_ids: k must be positive");
+    let out_dims: Vec<IntExpr> = vec![logits.dims()[0], IntExpr::from(k)];
+    logits.graph().extern_op(
+        crate::ops::moe_topk::LOGICAL_CONSTRUCTOR,
+        &[logits],
+        vec![ExternParam::I64(k as i64)],
+        out_dims,
+        DType::Int,
+    )
+}
+
+/// Record a fused row argmax: `x` `[n, width]` F32; returns `[n]` Int,
+/// ties to the higher index (what `argmax(1)` spells).
+pub fn argmax_rows(x: GraphTensor) -> GraphTensor {
+    assert_eq!(x.dtype, DType::F32, "argmax_rows: x must be F32");
+    assert_eq!(x.rank(), 2, "argmax_rows: x must be [n, width]");
+    let out_dims: Vec<IntExpr> = vec![x.dims()[0]];
+    x.graph().extern_op(
+        crate::ops::argmax_rows::LOGICAL_CONSTRUCTOR,
+        &[x],
+        vec![],
+        out_dims,
+        DType::Int,
+    )
 }

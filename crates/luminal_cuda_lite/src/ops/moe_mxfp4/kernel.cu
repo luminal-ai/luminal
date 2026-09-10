@@ -3,6 +3,9 @@
 // removed):
 //   gate_up: hidden[t, k, j] = swiglu(W_gu[e(t,k)] · x[t] + b_gu[e])   (clamped, interleaved)
 //   down:    out[t, :]       = Σ_k w[t,k] · (W_dn[e(t,k)] · hidden[t,k] + b_dn[e])
+//            with w[t, :] = softmax over the selected router logits
+//            logits[t, e(t, 0..k)] — computed in-kernel from the router's
+//            [s, experts] output, so no gather/softmax chain precedes it.
 // Weights stay packed: fp4 e2m1 nibble pairs [E, N, K/2] (lo nibble =
 // even k), e8m0 scales [E, N, K/32], bf16 biases [E, N]. One warp per
 // task, R=4 output rows per warp.
@@ -141,19 +144,20 @@ __device__ __forceinline__ void gate_up_body(
 }
 
 // down: R output rows per warp task; the top_k expert loop is inside.
+#define MAX_TOP_K 8
 template <int R>
 __device__ __forceinline__ void down_body(
     unsigned long long dn_q_ptr, unsigned long long dn_scale_ptr,
     unsigned long long dn_bias_ptr, unsigned long long topk_ids_ptr,
-    unsigned long long topk_w_ptr, unsigned long long hidden_ptr,
+    unsigned long long logits_ptr, unsigned long long hidden_ptr,
     unsigned long long out_ptr,
-    int hidden_dim, int inter, int top_k, int seq
+    int hidden_dim, int inter, int top_k, int seq, int experts
 ) {
     const unsigned char* dn_q = (const unsigned char*)dn_q_ptr;
     const unsigned char* dn_scale = (const unsigned char*)dn_scale_ptr;
     const unsigned short* dn_bias = (const unsigned short*)dn_bias_ptr;
     const int* topk_ids = (const int*)topk_ids_ptr;
-    const float* topk_w = (const float*)topk_w_ptr;
+    const float* logits = (const float*)logits_ptr;
     const float* hidden = (const float*)hidden_ptr;
     float* out = (float*)out_ptr;
     STAGE_LUT(slut)
@@ -170,6 +174,22 @@ __device__ __forceinline__ void down_body(
 #pragma unroll
         for (int r = 0; r < R; ++r) mix[r] = 0.0f;
 
+        // The route weights: softmax over this token's selected logits
+        // (every lane computes them; top_k loads from a hot row).
+        float route_w[MAX_TOP_K];
+        float route_max = (-__int_as_float(0x7f800000));
+        for (int kk = 0; kk < top_k; ++kk) {
+            const long long e = topk_ids[(long long)t * top_k + kk];
+            route_w[kk] = logits[(long long)t * experts + e];
+            route_max = fmaxf(route_max, route_w[kk]);
+        }
+        float route_denom = 0.0f;
+        for (int kk = 0; kk < top_k; ++kk) {
+            route_w[kk] = expf(route_w[kk] - route_max);
+            route_denom += route_w[kk];
+        }
+        const float route_inv = 1.0f / route_denom;
+
         for (int kk = 0; kk < top_k; ++kk) {
             const long long e = topk_ids[(long long)t * top_k + kk];
             const int pair = t * top_k + kk;
@@ -185,7 +205,7 @@ __device__ __forceinline__ void down_body(
             for (int r = 0; r < R; ++r) acc[r] = warp_reduce_sum(acc[r]);
 
             if (lane == 0) {
-                const float w = topk_w[(long long)t * top_k + kk];
+                const float w = route_w[kk] * route_inv;
 #pragma unroll
                 for (int r = 0; r < R; ++r)
                     mix[r] = fmaf(w, acc[r] + bf16_to_f32(dn_bias[e * hidden_dim + r0 + r]), mix[r]);
@@ -213,10 +233,10 @@ extern "C" __global__ void moe_gate_up_r4(
 extern "C" __global__ void moe_down_r4(
     unsigned long long dn_q_ptr, unsigned long long dn_scale_ptr,
     unsigned long long dn_bias_ptr, unsigned long long topk_ids_ptr,
-    unsigned long long topk_w_ptr, unsigned long long hidden_ptr,
+    unsigned long long logits_ptr, unsigned long long hidden_ptr,
     unsigned long long out_ptr,
-    int hidden_dim, int inter, int top_k, int seq
+    int hidden_dim, int inter, int top_k, int seq, int experts
 ) {
     down_body<4>(dn_q_ptr, dn_scale_ptr, dn_bias_ptr, topk_ids_ptr,
-                 topk_w_ptr, hidden_ptr, out_ptr, hidden_dim, inter, top_k, seq);
+                 logits_ptr, hidden_ptr, out_ptr, hidden_dim, inter, top_k, seq, experts);
 }
