@@ -870,3 +870,150 @@ fn profile_replay_reclaims_previous_arena_and_rematerializes_original_program() 
     rt.execute(&graph.dyn_map);
     assert_eq!(rt.get_f32(output), vec![5.; 256]);
 }
+
+#[derive(Debug, Clone, Default)]
+struct WorkspaceCopy {
+    metadata: MetadataCopy,
+    cache: Arc<crate::host::workspace::WorkspaceCache>,
+    owners: Arc<Mutex<Vec<std::sync::Weak<crate::host::workspace::Workspace>>>>,
+}
+impl EgglogOp for WorkspaceCopy {
+    fn sort(&self) -> luminal::egglog_utils::api::SortDef {
+        luminal::egglog_utils::api::sort(luminal::egglog_utils::base::OP_KIND, "WorkspaceCopy", &[])
+    }
+    fn cleanup(&self) -> bool {
+        false
+    }
+    fn n_inputs(&self) -> usize {
+        2
+    }
+}
+impl CustomOp for WorkspaceCopy {
+    fn to_llir_op(&self) -> LLIROp {
+        LLIROp::new(Box::new(self.clone()) as Box<dyn HostOp>)
+    }
+}
+impl HostOp for WorkspaceCopy {
+    fn output_size(&self) -> Expression {
+        's'.into()
+    }
+    fn output_bytes(&self) -> Expression {
+        Expression::from('s') * 4
+    }
+    fn output_dtype(&self) -> DType {
+        DType::Int
+    }
+    fn cuda_graph_capture_arity(&self) -> Option<usize> {
+        Some(2)
+    }
+    fn cuda_graph_capture_dyn_dims(&self) -> Vec<Symbol> {
+        vec!['s'.into()]
+    }
+    fn prepare_cuda_graph_capture_resources(
+        &self,
+        capture: &Arc<CudaStream>,
+        execution: &Arc<CudaStream>,
+        node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dims: &DynMap,
+    ) -> anyhow::Result<crate::host::CudaGraphCaptureResources> {
+        self.metadata
+            .prepare_cuda_graph_capture(capture, node, inputs, buffers, dims)?;
+        let owner = self
+            .cache
+            .acquire(capture, execution, dims[&'s'.into()] * 4)?;
+        self.owners.lock().unwrap().push(Arc::downgrade(&owner));
+        Ok(vec![owner])
+    }
+    fn execute(
+        &self,
+        stream: &Arc<CudaStream>,
+        node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dims: &DynMap,
+    ) -> anyhow::Result<()> {
+        let bytes = dims[&'s'.into()] * 4;
+        let owner = if stream.capture_status()?
+            != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+        {
+            self.cache.prepared(stream, bytes)?
+        } else {
+            self.cache.acquire(stream, stream, bytes)?
+        };
+        unsafe {
+            result::memcpy_dtod_async(
+                owner.ptr(),
+                buffers[&inputs[0]].ptr(),
+                bytes,
+                stream.cu_stream(),
+            )?;
+            result::memcpy_dtod_async(
+                buffers[&node].ptr(),
+                owner.ptr(),
+                bytes,
+                stream.cu_stream(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn captured_workspace_owners_follow_resident_graph_lifetimes() {
+    let mut graph = Graph::new();
+    let input = graph.tensor('s').as_dtype(DType::Int).persist();
+    let metadata = graph.tensor(1).as_dtype(DType::Int).persist();
+    let copy = WorkspaceCopy::default();
+    let owners = copy.owners.clone();
+    let output = graph
+        .custom_op(copy, (input.id, metadata.id), 's', DType::Int)
+        .output();
+    graph.set_dim('s', 1);
+    graph.build_search_space::<CudaRuntime>(
+        CompileOptions::default().dim_buckets('s', &[DimBucket::new(1, 8).representative(1)]),
+    );
+    let mut rt = runtime();
+    rt.set_data_with_capacity(input, vec![19i32; 1], 32);
+    rt.set_data_with_host_mirror(metadata, vec![1i32]);
+    rt = graph.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(1).trials(1),
+        &mut SmallRng::seed_from_u64(221),
+    );
+    // Keep the generic output arena stable while the private workspace grows;
+    // arena relocation deliberately retires every resident graph generation.
+    rt.ensure_shared_arena_capacity(16 * 1024 * 1024);
+    rt.begin_cuda_graph_warmup(&['s'.into()]);
+    for s in [2, 7, 3, 2, 7, 3] {
+        graph.set_dim('s', s);
+        rt.set_data(input, vec![s as i32; s]);
+        rt.set_data_with_host_mirror(metadata, vec![s as i32]);
+        rt.execute(&graph.dyn_map);
+        assert_eq!(rt.get_i32(output), vec![s as i32; s]);
+    }
+    let live_allocations: FxHashSet<_> = owners
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .map(|w| w.ptr())
+        .collect();
+    assert!(
+        live_allocations.len() >= 2,
+        "test must retain multiple allocation generations"
+    );
+    rt.release_all_bucket_cuda_graphs();
+    assert!(
+        owners.lock().unwrap().iter().all(|w| w.upgrade().is_none()),
+        "retired graphs retain workspace owners"
+    );
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_i32(output), vec![3; 3]);
+    drop(rt);
+    assert!(
+        owners.lock().unwrap().iter().all(|w| w.upgrade().is_none()),
+        "dropping runtime retains workspace owners"
+    );
+}

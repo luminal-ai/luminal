@@ -9,6 +9,7 @@ use luminal::{op::EgglogOp, prelude::*};
 pub(crate) mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
+pub mod workspace;
 
 /// Generic host operations shared unchanged by Lite and CUDA supersets.
 /// Hardware- or model-specialized attention operations belong to the
@@ -192,6 +193,11 @@ impl ProfileState for () {
     }
 }
 
+/// Allocation owners pinned by one captured graph generation. Implementations
+/// allocate on the supplied execution stream (not a temporary capture stream)
+/// and return every owner whose raw address is recorded in the graph.
+pub type CudaGraphCaptureResources = Vec<Arc<dyn std::any::Any + Send + Sync>>;
+
 pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
     /// Snapshot semantic state hidden outside graph buffers before representative
     /// profiling. The snapshot restores identical state before each trial and
@@ -319,6 +325,22 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         _dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         anyhow::bail!("HostOp did not implement CUDA graph capture preparation")
+    }
+
+    /// Prepare a child capture and transfer ownership of its scratch to that
+    /// graph generation. Resident variants retain independent owners, including
+    /// old allocations after growth. The default preserves existing HostOps.
+    fn prepare_cuda_graph_capture_resources(
+        &self,
+        capture_stream: &Arc<CudaStream>,
+        _execution_stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dyn_map: &DynMap,
+    ) -> anyhow::Result<CudaGraphCaptureResources> {
+        self.prepare_cuda_graph_capture(capture_stream, self_node, inputs, buffers, dyn_map)?;
+        Ok(vec![])
     }
 
     /// Refresh execution-specific metadata immediately before launching a

@@ -30,7 +30,7 @@ use tracing::{Level, enabled, span};
 
 use crate::{
     host::{
-        DeviceBuffer, HostOp,
+        CudaGraphCaptureResources, DeviceBuffer, HostOp,
         cublaslt::{
             CuBlasLt, CuBlasLtCaptureSignature, CuBlasLtPrepareKey, LtMatmulPointers,
             PreparedCuBlasLtMatmul,
@@ -219,6 +219,7 @@ struct CompiledCapturedHost {
     host_op: Arc<Box<dyn HostOp>>,
     child_graph: Option<CudaGraphHandle>,
     graph_node: Option<CUgraphNode>,
+    resources: CudaGraphCaptureResources,
 }
 
 impl CompiledCapturedHost {
@@ -233,13 +234,21 @@ impl CompiledCapturedHost {
     }
 
     fn prepare_graph_capture(
-        &self,
-        stream: &Arc<CudaStream>,
+        &mut self,
+        capture_stream: &Arc<CudaStream>,
+        execution_stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
-        let host = self.host_op.as_ref().as_ref();
-        host.prepare_cuda_graph_capture(stream, self.node, &self.inputs, buffers, dyn_map)
+        self.resources = self.host_op.prepare_cuda_graph_capture_resources(
+            capture_stream,
+            execution_stream,
+            self.node,
+            &self.inputs,
+            buffers,
+            dyn_map,
+        )?;
+        Ok(())
     }
 }
 
@@ -811,6 +820,7 @@ impl ResidentGraphVariant {
                 host_op: op.host_op.clone(),
                 child_graph: None,
                 graph_node: None,
+                resources: vec![],
             })
             .collect();
         variant.kernel_nodes = vec![None; state.kernels.len()];
@@ -2448,6 +2458,7 @@ impl CudaGraphOp {
         for op in &mut state.captured_host_ops {
             op.child_graph = None;
             op.graph_node = None;
+            op.resources.clear();
         }
         state.dyn_dims_buffer = None;
     }
@@ -4085,6 +4096,11 @@ impl CudaGraphOp {
         let ctx = stream.context().clone();
         let mut graph = CudaGraphHandle::new(ctx.clone())?;
         let old_exec = state.cuda_graph_exec.take();
+        let old_resources: Vec<_> = state
+            .captured_host_ops
+            .iter_mut()
+            .flat_map(|op| std::mem::take(&mut op.resources))
+            .collect();
 
         let num_kernels = state.kernels.len();
         state.kernel_params.clear();
@@ -4393,8 +4409,8 @@ impl CudaGraphOp {
                 CompiledStep::CapturedHost(idx) => {
                     let capture_stream = self.capture_stream()?;
                     {
-                        let op = &state.captured_host_ops[idx];
-                        op.prepare_graph_capture(&capture_stream, buffers, dyn_map)?;
+                        let op = &mut state.captured_host_ops[idx];
+                        op.prepare_graph_capture(&capture_stream, stream, buffers, dyn_map)?;
                     }
                     CudaGraphHandle::begin_standalone_capture(&capture_stream)?;
                     {
@@ -4445,6 +4461,7 @@ impl CudaGraphOp {
 
         state.cuda_graph = Some(graph);
         state.cuda_graph_exec = Some(exec);
+        drop(old_resources);
         state.cublaslt_prepare_cache = prepared_cache_plan;
         state.cublaslt_workspace_pool = workspace_pool_plan;
         state.flashinfer_prepare_cache = flashinfer_prepare_cache_plan;
@@ -5063,6 +5080,7 @@ pub(crate) fn kernel_to_host_with_prepared(
                     host_op: Arc::clone(host_op),
                     child_graph: None,
                     graph_node: None,
+                    resources: vec![],
                 });
                 captured_host_step_by_node.insert(*node, idx);
             }
