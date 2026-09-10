@@ -236,7 +236,7 @@ fn canonical_2d_matmul_elects_the_marker() {
 
 #[test]
 fn election_row_conv() {
-    use mini_conv::MiniConvNet;
+    use model_zoo::mini::conv::MiniConvNet;
     let mut cx = Graph::new();
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
     let x = cx.tensor((1, 1, 5, 5), DType::F32);
@@ -254,7 +254,7 @@ fn election_row_conv() {
 fn election_row_llama3() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
-    use mini_llama3::MiniLlama3;
+    use model_zoo::mini::llama3::MiniLlama3;
 
     const VOCAB: usize = 5;
     const D: usize = 8;
@@ -293,7 +293,7 @@ fn election_row_llama3() {
 fn election_row_qwen3() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
-    use mini_qwen3::MiniQwen3;
+    use model_zoo::mini::qwen3::MiniQwen3;
 
     const VOCAB: usize = 5;
     const D: usize = 8;
@@ -334,7 +334,7 @@ fn election_row_qwen3() {
 
 #[test]
 fn election_row_whisper() {
-    use mini_whisper::MiniWhisper;
+    use model_zoo::mini::whisper::MiniWhisper;
 
     const D: usize = 4;
     const FF: usize = 6;
@@ -366,7 +366,7 @@ fn election_row_whisper() {
 fn election_row_qwen3_moe() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
-    use mini_qwen3_moe::MiniQwen3Moe;
+    use model_zoo::mini::qwen3_moe::MiniQwen3Moe;
 
     const VOCAB: usize = 5;
     const D: usize = 4;
@@ -404,7 +404,7 @@ fn election_row_qwen3_moe() {
 fn election_row_gemma4_moe() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
-    use mini_gemma4_moe::MiniGemma4Moe;
+    use model_zoo::mini::gemma4_moe::MiniGemma4Moe;
 
     const VOCAB: usize = 5;
     const D: usize = 4;
@@ -443,7 +443,7 @@ fn election_row_gemma3() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
     use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};
-    use mini_gemma3::MiniGemma3;
+    use model_zoo::mini::gemma3::MiniGemma3;
 
     const VOCAB: usize = 5;
     const D: usize = 6;

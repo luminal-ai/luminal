@@ -23,7 +23,7 @@ fn main() {
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
     use luminal::prelude::*;
-    use yolo_v11::model::{IMG_SIZE, YoloV11};
+    use model_zoo::yolo_v11::model::{IMG_SIZE, YoloV11};
 
     let mut cx = Graph::new();
     let image = cx.named_tensor(

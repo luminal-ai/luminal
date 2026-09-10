@@ -1,8 +1,5 @@
 use hf_hub::api::sync::Api;
 
-#[path = "../../../examples/common/model_support.rs"]
-mod model_support;
-use crate::model_support::{LayerNorm, Namespace, gather_rows, scatter_rows};
 use luminal::{
     dtype::DType,
     graph::{CompileOptions, DimBucket, Graph},
@@ -10,6 +7,7 @@ use luminal::{
 };
 use luminal_metal::MetalRuntime;
 use luminal_tracing::luminal_filter;
+use model_zoo::model_support::{LayerNorm, Namespace, gather_rows, scatter_rows};
 use rustc_hash::FxHashSet;
 use std::{
     error::Error,

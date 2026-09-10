@@ -29,11 +29,5 @@ float8 = { version = "0.7", features = ["bytemuck", "num-traits"] }
 # The extractor copy's render-memo board hand-builds serialized e-nodes.
 ordered-float = "5.1.0"
 luminal_nn = { path = "../luminal_nn" }
-mini_conv = { path = "../../examples/mini/conv" }
-mini_flux = { path = "../../examples/mini/flux" }
-mini_gemma3 = { path = "../../examples/mini/gemma3" }
-mini_gemma4_moe = { path = "../../examples/mini/gemma4_moe" }
-mini_llama3 = { path = "../../examples/mini/llama3" }
-mini_qwen3 = { path = "../../examples/mini/qwen3" }
-mini_qwen3_moe = { path = "../../examples/mini/qwen3_moe" }
-mini_whisper = { path = "../../examples/mini/whisper" }
+# Logical model definitions and mini execution-smoke fixtures.
+model_zoo = { path = "../model_zoo" }

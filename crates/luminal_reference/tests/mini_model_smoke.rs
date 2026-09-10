@@ -74,7 +74,7 @@ fn run(
 
 #[test]
 fn mini_conv_runs() {
-    use mini_conv::MiniConvNet;
+    use model_zoo::mini::conv::MiniConvNet;
 
     let mut cx = Graph::new();
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
@@ -85,7 +85,7 @@ fn mini_conv_runs() {
 
 #[test]
 fn mini_llama3_runs() {
-    use mini_llama3::MiniLlama3;
+    use model_zoo::mini::llama3::MiniLlama3;
 
     let mut cx = Graph::new();
     let model = MiniLlama3::new(5, 8, 12, 4, 2, 1, &mut cx);
@@ -114,7 +114,7 @@ fn mini_llama3_runs() {
 
 #[test]
 fn mini_qwen3_runs() {
-    use mini_qwen3::MiniQwen3;
+    use model_zoo::mini::qwen3::MiniQwen3;
 
     let mut cx = Graph::new();
     let model = MiniQwen3::new(5, 8, 12, 4, 2, 1, &mut cx);
@@ -143,7 +143,7 @@ fn mini_qwen3_runs() {
 
 #[test]
 fn mini_gemma3_runs() {
-    use mini_gemma3::MiniGemma3;
+    use model_zoo::mini::gemma3::MiniGemma3;
 
     const LAYERS: usize = 2;
     const HEAD_DIM: usize = 4;
@@ -213,7 +213,7 @@ fn mini_moe<M>(
 
 #[test]
 fn mini_qwen3_moe_runs() {
-    use mini_qwen3_moe::MiniQwen3Moe;
+    use model_zoo::mini::qwen3_moe::MiniQwen3Moe;
 
     mini_moe(
         |cx| MiniQwen3Moe::new(5, 4, 2, 1, 2, 1, cx),
@@ -229,7 +229,7 @@ fn mini_qwen3_moe_runs() {
 
 #[test]
 fn mini_gemma4_moe_runs() {
-    use mini_gemma4_moe::MiniGemma4Moe;
+    use model_zoo::mini::gemma4_moe::MiniGemma4Moe;
 
     mini_moe(
         |cx| MiniGemma4Moe::new(5, 4, 2, 1, 2, 1, cx),
@@ -245,7 +245,7 @@ fn mini_gemma4_moe_runs() {
 
 #[test]
 fn mini_whisper_runs() {
-    use mini_whisper::MiniWhisper;
+    use model_zoo::mini::whisper::MiniWhisper;
 
     let mut cx = Graph::new();
     let model = MiniWhisper::new(4, 6, 2, &mut cx);
@@ -258,7 +258,7 @@ fn mini_whisper_runs() {
 #[test]
 #[ignore = "blocked by the known adaLN rejoin-divergence search issue"]
 fn mini_flux_runs() {
-    use mini_flux::MiniDit;
+    use model_zoo::mini::flux::MiniDit;
 
     const TEXT_TOKENS: usize = 2;
     const IMAGE_TOKENS: usize = 4;

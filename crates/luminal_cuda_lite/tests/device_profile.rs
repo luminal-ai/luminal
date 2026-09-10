@@ -27,7 +27,7 @@ use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal::shape::IntExpr;
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer};
 use luminal_reference::TypedBuffer;
-use mini_llama3::MiniLlama3;
+use model_zoo::mini::llama3::MiniLlama3;
 
 /// The examples' seeding discipline, verbatim.
 fn weights(n: usize, seed: usize) -> Vec<f32> {

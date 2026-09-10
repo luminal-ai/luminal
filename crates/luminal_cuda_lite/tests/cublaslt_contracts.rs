@@ -385,7 +385,7 @@ fn bias_form_with_a_row_d_is_refused_before_dispatch() {
 /// `tests/cublaslt_contracts_cpu.rs`.
 #[test]
 fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
-    // whisper tiny.en's `state` (examples/whisper/src/model.rs), and its
+    // whisper tiny.en's `state` (crates/model_zoo/src/whisper/model.rs), and its
     // decode step's single token row.
     const STATE: usize = 384;
     let build = || {

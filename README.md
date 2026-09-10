@@ -40,8 +40,7 @@ println!("Result: {:?}", rt.get_f32(c));
 
 Here's a quick example of how you can run Llama 3 8B locally using Luminal on CUDA:
 ```bash
-cd ./examples/llama
-cargo run --release
+cargo run --release -p luminal_cuda_lite --example llama3 --features device
 ```
 
 ## Features
@@ -116,7 +115,7 @@ Now we can do:
 
 - Native PyTorch support
 - Many kernel libraries supported in the search space (FlashInfer, cuBLASLt, etc.)
-- Many models implemented in our Rust tensor API in `examples/`.
+- Logical model definitions in [`model_zoo`](crates/model_zoo), built with our Rust tensor API.
 - We have a small library of NN modules in `luminal_nn`, including transformers.
 - A significant amount of high-level ops are implemented in `hl_ops`. We are aiming to match the most used ~80% of the pytorch api.
 

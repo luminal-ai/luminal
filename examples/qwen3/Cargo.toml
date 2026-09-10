@@ -1,8 +1,0 @@
-[package]
-name = "qwen3"
-version = "0.2.0"
-edition.workspace = true
-
-[dependencies]
-luminal = { path = "../.." }
-luminal_nn = { path = "../../crates/luminal_nn" }

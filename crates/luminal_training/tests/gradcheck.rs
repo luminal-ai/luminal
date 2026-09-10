@@ -2,11 +2,9 @@
 //! with `backward`, compile to the reference runtime, and compare every
 //! analytic gradient element against a central-difference estimate.
 
-#[path = "../../../examples/common/model_support.rs"]
-mod model_support;
-
 use luminal::prelude::*;
 use luminal_training::Backward;
+use model_zoo::model_support;
 
 const EPS: f32 = 1e-2;
 const TOL: f32 = 2e-2;

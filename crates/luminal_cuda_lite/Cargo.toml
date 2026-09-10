@@ -41,24 +41,5 @@ luminal_reference = { path = "../luminal_reference" }
 # discipline) runs the nn llama-block graphs through THIS runtime's
 # search with views admitted.
 luminal_nn = { path = "../luminal_nn" }
-# Mini model crates are execution-smoke fixtures for this crate's test suite;
-# CUDA Lite applications themselves use only the full model definitions below.
-mini_conv = { path = "../../examples/mini/conv" }
-mini_llama3 = { path = "../../examples/mini/llama3" }
-mini_qwen3 = { path = "../../examples/mini/qwen3" }
-mini_qwen3_moe = { path = "../../examples/mini/qwen3_moe" }
-mini_whisper = { path = "../../examples/mini/whisper" }
-mini_gemma3 = { path = "../../examples/mini/gemma3" }
-mini_gemma4_moe = { path = "../../examples/mini/gemma4_moe" }
-mini_flux = { path = "../../examples/mini/flux" }
-
-# Full logical model definitions. Runtime-specific examples below this crate's
-# examples/ directory bind and execute these backend-neutral graphs.
-llama3 = { path = "../../examples/llama3" }
-qwen3 = { path = "../../examples/qwen3" }
-gemma3 = { path = "../../examples/gemma3" }
-qwen3_moe = { path = "../../examples/qwen3_moe" }
-gemma4_moe = { path = "../../examples/gemma4_moe" }
-whisper = { path = "../../examples/whisper" }
-yolo_v11 = { path = "../../examples/yolo_v11" }
-flux2 = { path = "../../examples/flux2" }
+# Logical model definitions and mini execution-smoke fixtures.
+model_zoo = { path = "../model_zoo" }

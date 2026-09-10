@@ -65,31 +65,14 @@ proptest = "1.9.0"
 
 [workspace]
 # Runtime crates are re-seated on the native ladder as they become ready.
-# Model-zoo members in this workspace are backend-neutral graph definitions;
+# The model_zoo crate contains backend-neutral graph definitions;
 # executable applications live under the corresponding runtime crate.
 members = [
     "crates/luminal_cuda_lite",
     "crates/luminal_reference",
     "crates/luminal_nn",
+    "crates/model_zoo",
     "crates/luminal_tracing",
-    "examples/qwen3",
-    "examples/llama3",
-    "examples/paged_llama3",
-    "examples/llama3_1_fp8",
-    "examples/gemma3",
-    "examples/qwen3_moe",
-    "examples/gemma4_moe",
-    "examples/whisper",
-    "examples/yolo_v11",
-    "examples/flux2",
-    "examples/mini/llama3",
-    "examples/mini/qwen3",
-    "examples/mini/gemma3",
-    "examples/mini/qwen3_moe",
-    "examples/mini/gemma4_moe",
-    "examples/mini/whisper",
-    "examples/mini/conv",
-    "examples/mini/flux",
     "tests/scalar_refs",
     "tests/test_runtime",
 ]
@@ -98,9 +81,6 @@ members = [
 # crates/luminal_bench/Cargo.toml`); it reaches egglog through the prelude,
 # so its lock cannot drift the rev above.
 exclude = ["crates/luminal_bench"]
-
-# Model examples are logical definitions only. Executable applications
-# belong to runtime crates, which bind and run these backend-neutral graphs.
 
 # Dependencies compile optimized even in dev builds: egglog's saturation
 # engine at opt-level 0 is ~17x slower on search-heavy tests (mini_gemma3

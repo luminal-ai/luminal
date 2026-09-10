@@ -20,10 +20,8 @@ fn main() {
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
     use luminal::prelude::*;
-    use whisper::{
-        Whisper, WhisperDims,
-        model_support::{Namespace, named_kv_cache_pool},
-    };
+    use model_zoo::model_support::{Namespace, named_kv_cache_pool};
+    use model_zoo::whisper::{Whisper, WhisperDims};
 
     let dims = WhisperDims::whisper_tiny_en();
     let mut cx = Graph::new();

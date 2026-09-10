@@ -1,12 +1,9 @@
 //! Train a small conv net on MNIST end-to-end in one compiled luminal graph
 
-#[path = "../../../examples/common/model_support.rs"]
-mod model_support;
-
-use crate::model_support::{ConvND, Linear, Namespace};
 use itertools::Itertools;
 use luminal::prelude::*;
 use luminal_training::{AdamW, Trainer};
+use model_zoo::model_support::{ConvND, Linear, Namespace};
 use rand::{Rng, SeedableRng, distr::Uniform, rngs::StdRng, seq::SliceRandom};
 
 const IMG: usize = 12; // 28x28 inputs center-cropped to 24x24, then 2x2 average-pooled
