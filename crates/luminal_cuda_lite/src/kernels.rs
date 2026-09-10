@@ -3,6 +3,7 @@
 //! Each operation implements `KernelOp` and produces CUDA source
 //! with fixed dimensions. Generation needs no GPU; `device` compiles and runs it.
 
+use crate::symbolic::Expr;
 use anyhow::{Result, bail};
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use luminal::bufferize::SlotDescriptor;
@@ -21,9 +22,9 @@ use luminal::layouts::{
 /// layouts, and all reads use [`layout_read_index`].
 #[derive(Debug)]
 pub struct CodegenCtx {
-    pub operand_dims: Vec<Vec<usize>>,
+    pub operand_dims: Vec<Vec<Expr>>,
     pub operand_dtypes: Vec<PlanDtype>,
-    pub dest_dims: Vec<Vec<usize>>,
+    pub dest_dims: Vec<Vec<Expr>>,
     pub dest_dtypes: Vec<PlanDtype>,
     /// Read layouts in the same order as `operand_dims`.
     /// View layouts include the full mapping to the underlying buffer.
@@ -32,23 +33,21 @@ pub struct CodegenCtx {
 
 impl CodegenCtx {
     /// Read shapes and data types from the node's slot layouts.
-    /// Return an error for symbolic dimensions or missing data types.
+    /// Preserve symbolic dimensions; refuse missing data types.
     pub fn from_descriptors(
         label: &str,
         operand_info: &[SlotDescriptor<DecodedLayout>],
         result_info: &[SlotDescriptor<DecodedLayout>],
     ) -> Result<Self> {
-        let dims_of = |slot: &SlotDescriptor<DecodedLayout>, role: &str| -> Result<Vec<usize>> {
-            slot.layout.literal_extents().ok_or_else(|| {
-                anyhow::anyhow!("{label} {role} has symbolic layout extents (no numeric codegen)")
-            })
+        let dims_of = |slot: &SlotDescriptor<DecodedLayout>, _role: &str| -> Result<Vec<Expr>> {
+            Ok(slot.layout.shape().0.iter().cloned().map(Expr).collect())
         };
         let dtype_of = |slot: &SlotDescriptor<DecodedLayout>, role: &str| -> Result<PlanDtype> {
             slot.layout
                 .dtype
                 .ok_or_else(|| anyhow::anyhow!("{label} {role} carries no dtype fact"))
         };
-        let dest_dims: Vec<Vec<usize>> = result_info
+        let dest_dims: Vec<Vec<Expr>> = result_info
             .iter()
             .map(|s| dims_of(s, "dest"))
             .collect::<Result<_>>()?;
@@ -223,7 +222,7 @@ fn read_affine(layout: &DecodedLayout, dims: &[usize]) -> Option<Affine> {
     }
     // Contiguous layouts provide strides directly.
     if layout.has::<RM>() {
-        Affine::from_strides(&strides_of(dims))
+        Affine::from_strides(&literal_strides(dims))
     } else if layout.has::<LM>() {
         let mut strides = vec![1usize; rank];
         for axis in 1..rank {
@@ -246,7 +245,7 @@ fn read_affine(layout: &DecodedLayout, dims: &[usize]) -> Option<Affine> {
 
 /// Convert a layout integer expression to C using `long long`.
 /// Coordinates use `{prefix}{axis}`, numbered from the first dimension.
-/// Return an error for symbolic variables or invalid coordinate axes.
+/// Lower runtime variables; refuse invalid coordinate axes.
 fn lower_layout_term(
     expr: &luminal::layouts::IntExprTerm,
     rank: usize,
@@ -255,8 +254,8 @@ fn lower_layout_term(
     use luminal::layouts::IntExprTerm as T;
     let rec = |e: &T| lower_layout_term(e, rank, prefix);
     Ok(match expr {
-        T::Lit(v) => format!("{v}LL"),
-        T::Var(name) => bail!("layout read: symbolic dim `{name}` has no numeric codegen"),
+        T::Lit(v) => crate::symbolic::integer_literal(*v),
+        T::Var(name) => crate::symbolic::variable(name),
         T::Coord { axis_from_end } => {
             let axis = usize::try_from(*axis_from_end)
                 .ok()
@@ -272,11 +271,7 @@ fn lower_layout_term(
         T::Mul(a, b) => format!("({} * {})", rec(a)?, rec(b)?),
         T::TruncDiv(a, b) => format!("({} / {})", rec(a)?, rec(b)?),
         T::TruncRem(a, b) => format!("({} % {})", rec(a)?, rec(b)?),
-        T::CeilDiv(a, b) => {
-            // CeilDiv is unsupported until its behavior for negative operands is defined.
-            let (_, _) = (rec(a)?, rec(b)?);
-            bail!("layout read: IntCeilDiv lowering not implemented (fail-closed)")
-        }
+        T::CeilDiv(a, b) => format!("luminal_ceil_div({}, {})", rec(a)?, rec(b)?),
         T::Min(a, b) => {
             let (a, b) = (rec(a)?, rec(b)?);
             format!("(({a}) < ({b}) ? ({a}) : ({b}))")
@@ -319,20 +314,30 @@ impl<'a> Coords<'a> {
 pub fn layout_read_index(
     operand: &str,
     layout: &DecodedLayout,
-    slot_dims: &[usize],
+    slot_dims: &[Expr],
     coords: Coords<'_>,
 ) -> Result<(String, String)> {
+    if matches!(coords, Coords::FlatIndex { .. })
+        && layout.has::<RM>()
+        && layout.shape().0 == slot_dims.iter().map(|e| e.0.clone()).collect::<Vec<_>>()
+    {
+        return Ok((String::new(), "i".into()));
+    }
     // If the offset equals the row-major index used to compute these
     // coordinates, replace it with `i`.
     if let Coords::FlatIndex { .. } = coords
-        && let Some(affine) = read_affine(layout, slot_dims)
+        && let Some(literals) = slot_dims
+            .iter()
+            .map(Expr::literal)
+            .collect::<Option<Vec<_>>>()
+        && let Some(affine) = read_affine(layout, &literals)
     {
-        let strides = strides_of(slot_dims);
+        let strides = literal_strides(&literals);
         let is_flat_index = affine.constant == 0
             && (0..slot_dims.len()).all(|axis| {
                 // A size-one axis always has coordinate zero, so its coefficient
                 // can be ignored.
-                slot_dims[axis] == 1 || i64::try_from(strides[axis]) == Ok(affine.coeffs[axis])
+                literals[axis] == 1 || i64::try_from(strides[axis]) == Ok(affine.coeffs[axis])
             });
         if is_flat_index {
             return Ok((String::new(), "i".to_string()));
@@ -342,14 +347,7 @@ pub fn layout_read_index(
     let rank = slot_dims.len();
     let idx = format!("{operand}_idx");
     let check_domain = |shape: &luminal::layouts::ShapeTerm| -> Result<()> {
-        let extents: Option<Vec<usize>> = shape
-            .0
-            .iter()
-            .map(|e| e.eval_literal().and_then(|v| usize::try_from(v).ok()))
-            .collect();
-        let Some(extents) = extents else {
-            bail!("operand {operand}: layout has symbolic extents (no numeric codegen)");
-        };
+        let extents: Vec<Expr> = shape.0.iter().cloned().map(Expr).collect();
         if extents != slot_dims {
             bail!(
                 "operand {operand}: layout domain {extents:?} differs from the slot's \
@@ -367,21 +365,21 @@ pub fn layout_read_index(
             "0LL".to_string()
         } else {
             (0..rank)
-                .map(|axis| format!("{in_prefix}{axis} * {}LL", strides[axis]))
+                .map(|axis| format!("{in_prefix}{axis} * {}", strides[axis]))
                 .collect::<Vec<_>>()
                 .join(" + ")
         }
     } else if let Some(lm) = layout.first::<LM>() {
         check_domain(&lm.shape)?;
-        let mut strides = vec![1usize; rank];
+        let mut strides = vec![Expr::from(1usize); rank];
         for axis in 1..rank {
-            strides[axis] = strides[axis - 1] * slot_dims[axis - 1];
+            strides[axis] = strides[axis - 1].clone() * slot_dims[axis - 1].clone();
         }
         if rank == 0 {
             "0LL".to_string()
         } else {
             (0..rank)
-                .map(|axis| format!("{in_prefix}{axis} * {}LL", strides[axis]))
+                .map(|axis| format!("{in_prefix}{axis} * {}", strides[axis]))
                 .collect::<Vec<_>>()
                 .join(" + ")
         }
@@ -408,7 +406,7 @@ pub fn layout_read_index(
         // ensure the offset is divisible by the element width.
         let bits_var = format!("{operand}_bits");
         let code = format!(
-            "    long long {bits_var} = {bits};\n    long long {idx} = {bits_var} / {width}LL;\n"
+            "    long long {bits_var} = {bits};\n    long long {idx} = {bits_var} / {width};\n"
         );
         return Ok((code, idx));
     } else {
@@ -422,16 +420,56 @@ pub fn layout_read_index(
 }
 
 /// CUDA source for one launch of kernel `k`, with `n` threads.
-/// Arguments are the operation's inputs, followed by `out` and `n`.
+/// ABI: input pointers, output pointer, then `const long long* params`.
+/// The runtime defines each dimension's identifier (`symbolic::variable`) as
+/// params[index]. Default launches cover the bucket capacity; the kernel must
+/// guard threads against its live `n`. Custom geometry can depend on dimensions.
 #[derive(Debug)]
 pub struct KernelSource {
     pub source: String,
-    pub n: usize,
+    pub n: Expr,
+    pub launch: Option<KernelLaunch>,
 }
 
 impl KernelSource {
-    pub(crate) fn plain(source: String, n: usize) -> Self {
-        Self { source, n }
+    pub fn plain(source: String, n: Expr) -> Self {
+        Self {
+            source,
+            n,
+            launch: None,
+        }
+    }
+}
+
+/// Optional live launch geometry. Only nodes depending on changed dimensions
+/// are patched. Zero grids disable a node; block extents must stay positive.
+#[derive(Debug, Clone)]
+pub struct KernelLaunch {
+    pub grid: [Expr; 3],
+    pub block: [Expr; 3],
+    pub shared_bytes: Expr,
+}
+impl KernelLaunch {
+    pub fn linear(n: Expr, block: usize) -> Self {
+        Self {
+            grid: [
+                Expr(luminal::layouts::IntExprTerm::CeilDiv(
+                    Box::new(n.0),
+                    Box::new(Expr::from(block).0),
+                )),
+                1usize.into(),
+                1usize.into(),
+            ],
+            block: [block.into(), 1usize.into(), 1usize.into()],
+            shared_bytes: 0usize.into(),
+        }
+    }
+    #[cfg(feature = "device")]
+    pub(crate) fn expressions(&self) -> impl Iterator<Item = &Expr> {
+        self.grid
+            .iter()
+            .chain(&self.block)
+            .chain(std::iter::once(&self.shared_bytes))
     }
 }
 
@@ -471,7 +509,7 @@ pub(crate) fn cuda_f64_literal(v: f64) -> String {
     format!("{v:e}")
 }
 
-pub(crate) fn numel(dims: &[usize]) -> usize {
+pub(crate) fn numel(dims: &[Expr]) -> Expr {
     dims.iter().product()
 }
 
@@ -546,7 +584,8 @@ fn elementwise(
     if chains.is_empty() {
         // All reads use `i`, so no coordinate calculations are needed.
         let source = format!(
-            r#"extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
+            r#"extern "C" __global__ void k({sig}, {to}* out, const long long* params) {{
+    const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = {rendered};
 }}"#
@@ -555,7 +594,8 @@ fn elementwise(
     }
     let prelude = coord_prelude(out_dims);
     let source = format!(
-        r#"extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
+        r#"extern "C" __global__ void k({sig}, {to}* out, const long long* params) {{
+    const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 {prelude}{chains}    out[i] = {rendered};
@@ -579,11 +619,11 @@ pub(crate) fn reduce(
         bail!("reduce axis {axis_from_end} out of rank {}", in_dims.len());
     }
     let axis = in_dims.len() - 1 - axis_from_end;
-    let extent = in_dims[axis];
+    let extent = in_dims[axis].clone();
     // Count the input elements before and after the reduced axis.
-    let inner: usize = in_dims[axis + 1..].iter().product();
-    let outer: usize = in_dims[..axis].iter().product();
-    let n = outer * inner;
+    let inner: Expr = in_dims[axis + 1..].iter().product();
+    let outer: Expr = in_dims[..axis].iter().product();
+    let n = outer * inner.clone();
     // Input coordinates combine the output position with the reduction
     // loop index. Use `Coords::Bound`: the input offset cannot simplify
     // to `i`, which indexes the smaller output shape.
@@ -593,14 +633,14 @@ pub(crate) fn reduce(
     let mut coords = String::from("    unsigned long long rem = inner;\n");
     for ax in ((axis + 1)..in_dims.len()).rev() {
         coords.push_str(&format!(
-            "    long long c{ax} = (long long)(rem % {d}ULL); rem /= {d}ULL;\n",
+            "    long long c{ax} = (long long)(rem % {d}); rem /= {d};\n",
             d = in_dims[ax]
         ));
     }
     coords.push_str("    rem = outer;\n");
     for ax in (0..axis).rev() {
         coords.push_str(&format!(
-            "    long long c{ax} = (long long)(rem % {d}ULL); rem /= {d}ULL;\n",
+            "    long long c{ax} = (long long)(rem % {d}); rem /= {d};\n",
             d = in_dims[ax]
         ));
     }
@@ -608,13 +648,14 @@ pub(crate) fn reduce(
     // Indent the generated index code inside the loop.
     let chain = chain.replace("    ", "        ");
     let source = format!(
-        r#"extern "C" __global__ void k(const {ta}* a, {to}* out, unsigned long long n) {{
+        r#"extern "C" __global__ void k(const {ta}* a, {to}* out, const long long* params) {{
+    const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    unsigned long long outer = i / {inner}ULL;
-    unsigned long long inner = i % {inner}ULL;
+    unsigned long long outer = i / {inner};
+    unsigned long long inner = i % {inner};
 {coords}    {ta} acc = {init};
-    for (unsigned long long r = 0; r < {extent}ULL; ++r) {{
+    for (unsigned long long r = 0; r < {extent}; ++r) {{
         long long c{axis} = (long long)r;
 {chain}        {ta} v = a[{idx}];
         acc = {fold};
@@ -636,7 +677,8 @@ pub(crate) fn lower_expr(expr: &IotaExpr, rank: usize) -> Result<String> {
 pub(crate) fn lower_expr_pref(expr: &IotaExpr, rank: usize, prefix: &str) -> Result<String> {
     let rec = |e: &IotaExpr| lower_expr_pref(e, rank, prefix);
     Ok(match expr {
-        IotaExpr::Lit(v) => format!("{v}LL"),
+        IotaExpr::Lit(v) => crate::symbolic::integer_literal(*v),
+        IotaExpr::Var(name) => crate::symbolic::variable(name),
         IotaExpr::Coord(axis_from_end) => {
             if *axis_from_end >= rank {
                 bail!("coordinate axis {axis_from_end} out of rank {rank}");
@@ -651,6 +693,7 @@ pub(crate) fn lower_expr_pref(expr: &IotaExpr, rank: usize, prefix: &str) -> Res
         IotaExpr::TruncRem(a, b) => {
             format!("({} % {})", rec(a)?, rec(b)?)
         }
+        IotaExpr::CeilDiv(a, b) => format!("luminal_ceil_div({}, {})", rec(a)?, rec(b)?),
         IotaExpr::Min(a, b) => {
             let (a, b) = (rec(a)?, rec(b)?);
             format!("(({a}) < ({b}) ? ({a}) : ({b}))")
@@ -666,11 +709,11 @@ pub(crate) fn lower_expr_pref(expr: &IotaExpr, rank: usize, prefix: &str) -> Res
 }
 
 /// Generate row-major coordinates `c0..c{rank-1}` from flat index `i`.
-pub(crate) fn coord_prelude(dims: &[usize]) -> String {
+pub(crate) fn coord_prelude(dims: &[Expr]) -> String {
     let mut out = String::from("    unsigned long long rem = i;\n");
     for axis in (0..dims.len()).rev() {
         out.push_str(&format!(
-            "    long long c{axis} = (long long)(rem % {}ULL); rem /= {}ULL;\n",
+            "    long long c{axis} = (long long)(rem % {}); rem /= {};\n",
             dims[axis], dims[axis]
         ));
     }
@@ -678,10 +721,18 @@ pub(crate) fn coord_prelude(dims: &[usize]) -> String {
 }
 
 /// Return row-major strides for `dims`.
-pub(crate) fn strides_of(dims: &[usize]) -> Vec<usize> {
+fn literal_strides(dims: &[usize]) -> Vec<usize> {
     let mut strides = vec![1usize; dims.len()];
     for k in (0..dims.len().saturating_sub(1)).rev() {
         strides[k] = strides[k + 1] * dims[k + 1];
+    }
+    strides
+}
+
+pub(crate) fn strides_of(dims: &[Expr]) -> Vec<Expr> {
+    let mut strides = vec![Expr::from(1usize); dims.len()];
+    for k in (0..dims.len().saturating_sub(1)).rev() {
+        strides[k] = strides[k + 1].clone() * dims[k + 1].clone();
     }
     strides
 }

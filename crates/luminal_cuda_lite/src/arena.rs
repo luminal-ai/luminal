@@ -1,64 +1,10 @@
-//! THE ARENA: one runtime-owned slab of device bytes, and the
-//! DEVICE-FREE pass that decides who lives where in it.
-//!
-//! # Why this module exists (#422, superseding #401)
-//!
-//! CL-2's executor materialized EVERY plan buffer up front — one
-//! `alloc_zeros` per `BufferId`, all of them live for the whole call.
-//! That is the sum of every buffer the plan ever names, whether or not
-//! two of them are ever live at the same instant. The bufferizer
-//! already computes the lifetimes (`BufferAlloc` brings storage into
-//! existence, `BufferFree` ends it, and the containment certificate
-//! guarantees every toucher sits between the two); nothing consumed
-//! them. This pass does.
-//!
-//! Austin's division of labour (2026-09-03): "first produce the
-//! bufferizer, this will do the allocations / frees. Then a separate
-//! thing will map those allocation / frees to slices on memory in the
-//! arena allocator." This IS the separate thing. It reads a bufferized
-//! plan and answers two questions:
-//!
-//!  1. **In what order should the runtime issue the plan's nodes?**
-//!     Any topological order is legal (the plan supplies dependency
-//!     structure only — see the BufferCopy contract); the order chosen
-//!     here is LIVENESS-AWARE, because the order is what sets the
-//!     high-water mark.
-//!  2. **Which slab range backs each buffer, over that order?** A
-//!     first-fit free-list walk of the alloc/free events.
-//!
-//! # The three ownership rows (`Owner` × `FreedBy`), and why only one is in the slab
-//!
-//! | row | `Owner` | `FreedBy` | alloc? | free? | arena treatment |
-//! |---|---|---|---|---|---|
-//! | BOUNDARY | `Caller` | `Caller` | no | no | `standalone` |
-//! | DONATED | `Caller` | `Program` | no | yes | `donated` |
-//! | ESCAPING | `System` | `Caller` | yes | no | `standalone` |
-//! | INTERIOR | `System` | `Program` | yes | yes | **slab member** |
-//!
-//! Only the INTERIOR row has BOTH ends of a lifetime inside the
-//! program, which is exactly the precondition for handing its bytes to
-//! a later buffer. An ESCAPING buffer's bytes are the caller's from
-//! return on — recycling them would hand the caller a range the next
-//! call overwrites. A DONATED buffer's storage came from the caller;
-//! the program's free RELEASES it, it does not license the arena to
-//! re-let it. BOUNDARY storage is never the program's at all.
-//!
-//! # Sizing
-//!
-//! `bytes_of` is the caller's, so tests can plan with mock sizes and
-//! the executor can pass the one real rule (`literal_span_elements() *
-//! dtype_bytes(dtype)` — see `crate::device`). Symbolic extents are the
-//! caller's error to raise. Buckets are always concrete (D7), so the
-//! slab is always a number.
-//!
-//! # What is NOT here
-//!
-//! No device types, no cudarc: this file compiles and its tests run on
-//! a laptop. Search-time slab policy (sizing the slab across the
-//! candidate plans a search evaluates) is Phase 4's; this pass sizes
-//! ONE installed plan.
+//! Physical storage planning for graph execution. One schedule places uploads,
+//! bufferized nodes, and readbacks; one interval allocator packs device tensors,
+//! operation scratch, parameters, and pinned staging. Logical ownership remains
+//! in the bufferized plan: the arena holds private device copies, and returned
+//! outputs own their host bytes.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use luminal::bufferize::{Buffer, BufferId, BufferIrGraph, BufferNode, Owner, PlanLayout};
 use luminal::layout_ir::FreedBy;
 use luminal::prelude::{FxHashMap, NodeIndex, petgraph};
@@ -108,7 +54,7 @@ fn align_up(bytes: usize) -> usize {
 /// One buffer's home in the slab. `bytes` is the buffer's TRUE size
 /// (what a memcpy of it moves); the range RESERVED is `align_up(bytes)`,
 /// which is what disjointness is checked over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArenaSlice {
     pub offset: usize,
     pub bytes: usize,
@@ -118,44 +64,42 @@ impl ArenaSlice {
     /// The reserved (aligned) extent — `bytes` rounded up to
     /// [`ARENA_ALIGN`].
     pub fn reserved(&self) -> usize {
-        align_up(self.bytes)
+        align_up(self.bytes.max(1))
     }
 }
 
-/// The answer: an issue order, a slab size, and who sits where.
-#[derive(Debug, Clone, Default)]
-pub struct ArenaPlan {
-    /// The order the runtime issues plan nodes in — a topological order
-    /// of the dag (Data and Anti edges alike), chosen for a small
-    /// high-water mark. Every node of the dag appears exactly once.
-    pub order: Vec<NodeIndex>,
-    /// The high-water mark: how many bytes the slab must hold for this
-    /// plan under this order.
-    pub slab_bytes: usize,
-    /// The FRAGMENTATION-FREE lower bound: the largest total of
-    /// simultaneously-live reservations over the same order. A perfect
-    /// allocator would need exactly this; `slab_bytes - peak_live_bytes`
-    /// is what first-fit's holes cost. Diagnostic only — nothing binds
-    /// to it.
-    pub peak_live_bytes: usize,
-    /// Slab members (the INTERIOR row) and their ranges.
-    pub slices: FxHashMap<BufferId, ArenaSlice>,
-    /// Buffers that live OUTSIDE the slab in their own allocations: the
-    /// BOUNDARY row (inputs and caller-bound outputs) and the ESCAPING
-    /// row (minted storage handed to the caller).
-    pub standalone: Vec<BufferId>,
-    /// The DONATED row: caller storage the program frees. Its bytes are
-    /// the caller's staged storage; it gets no slab range, and its free
-    /// releases rather than recycles.
-    pub donated: Vec<BufferId>,
+/// The exact schedule consumed by graph construction. Transfers of multiple
+/// output views sharing a buffer are grouped within each output boundary.
+#[derive(Debug, Clone)]
+pub enum ArenaStep {
+    Upload {
+        buffer: BufferId,
+        staging: ArenaSlice,
+    },
+    Node(NodeIndex),
+    Download {
+        buffer: BufferId,
+        node: NodeIndex,
+        slots: Vec<usize>,
+        staging: ArenaSlice,
+    },
 }
 
-/// Which of the four rows a buffer is in, as the arena treats it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Row {
-    Slab,
-    Standalone,
-    Donated,
+#[derive(Debug, Clone, Default)]
+pub struct ArenaPlan {
+    /// A topological order respecting data and anti-dependencies, with late
+    /// allocations and eager frees. `steps` expands this order with transfers.
+    pub order: Vec<NodeIndex>,
+    pub steps: Vec<ArenaStep>,
+    pub slab_bytes: usize,
+    /// Peak simultaneous reservations, including parameters and scratch.
+    pub peak_live_bytes: usize,
+    pub slices: FxHashMap<BufferId, ArenaSlice>,
+    /// Scratch is live only during its owning operation's child graph.
+    pub workspaces: FxHashMap<NodeIndex, ArenaSlice>,
+    pub parameters: ArenaSlice,
+    pub staging_parameters: ArenaSlice,
+    pub staging_bytes: usize,
 }
 
 /// Node kinds, for the order policy.
@@ -333,7 +277,7 @@ struct FreeList {
 }
 
 impl FreeList {
-    fn alloc(&mut self, need: usize) -> usize {
+    fn alloc(&mut self, need: usize) -> Result<usize> {
         // FIRST fit, in offset order — MEASURED against the obvious
         // alternative and kept. First fit leaves about a fifth of the
         // slab in holes on the two-layer mini-llama block (596480 B
@@ -351,7 +295,7 @@ impl FreeList {
             if len > need {
                 self.holes.insert(offset + need, len - need);
             }
-            return offset;
+            return Ok(offset);
         }
         // No hole fits. If the LAST hole runs right up to the top, grow
         // through it instead of stranding it (coalescing with the
@@ -360,12 +304,17 @@ impl FreeList {
             && offset + len == self.top
         {
             self.holes.remove(&offset);
-            self.top = offset + need;
-            return offset;
+            self.top = offset
+                .checked_add(need)
+                .ok_or_else(|| anyhow!("arena size overflow"))?;
+            return Ok(offset);
         }
         let offset = self.top;
-        self.top += need;
-        offset
+        self.top = self
+            .top
+            .checked_add(need)
+            .ok_or_else(|| anyhow!("arena size overflow"))?;
+        Ok(offset)
     }
 
     fn free(&mut self, offset: usize, len: usize) {
@@ -390,160 +339,301 @@ impl FreeList {
     }
 }
 
-/// Plan the arena for one bufferized plan.
-///
-/// `bytes_of` sizes a buffer (the executor passes the span-of-layout
-/// rule; tests pass whatever they like). It is called for SLAB MEMBERS
-/// only — standalone and donated buffers are the executor's to size, in
-/// its own allocation phase, exactly as before.
+/// Half-open lifetime in the execution schedule. Requests alive at the same
+/// step must be disjoint, including a copy's source and destination.
+#[derive(Debug, Clone, Copy)]
+struct Lifetime {
+    start: usize,
+    end: usize,
+    bytes: usize,
+}
+
+/// The same allocator serves device memory and pinned host memory. Only their
+/// alignment and lifetimes differ. Returned slices follow request order.
+fn pack(lifetimes: &[Lifetime], alignment: usize) -> Result<(Vec<ArenaSlice>, usize, usize)> {
+    let mut events = Vec::with_capacity(lifetimes.len() * 2);
+    for (id, life) in lifetimes.iter().enumerate() {
+        ensure!(life.start < life.end, "empty physical lifetime");
+        events.push((life.start, true, id));
+        events.push((life.end, false, id));
+    }
+    events.sort_unstable(); // releases before allocations at the same boundary
+    let mut slices = vec![ArenaSlice::default(); lifetimes.len()];
+    let mut free_list = FreeList::default();
+    let mut live = BTreeMap::<usize, usize>::new();
+    let mut live_bytes = 0usize;
+    let mut peak = 0;
+    for (_, alloc, id) in events {
+        let bytes = lifetimes[id].bytes;
+        let need = bytes
+            .max(1)
+            .checked_add(alignment - 1)
+            .map(|v| v / alignment * alignment)
+            .ok_or_else(|| anyhow!("arena alignment overflow"))?;
+        if alloc {
+            let offset = free_list.alloc(need)?;
+            ensure!(
+                live.range(..=offset)
+                    .next_back()
+                    .is_none_or(|(&p, &n)| p + n <= offset),
+                "arena overlaps a live predecessor"
+            );
+            ensure!(
+                live.range(offset..)
+                    .next()
+                    .is_none_or(|(&p, _)| offset + need <= p),
+                "arena overlaps a live successor"
+            );
+            live.insert(offset, need);
+            live_bytes = live_bytes
+                .checked_add(need)
+                .ok_or_else(|| anyhow!("live size overflow"))?;
+            peak = peak.max(live_bytes);
+            slices[id] = ArenaSlice { offset, bytes };
+        } else {
+            let offset = slices[id].offset;
+            ensure!(
+                live.remove(&offset) == Some(need),
+                "release of non-live range"
+            );
+            live_bytes -= need;
+            free_list.free(offset, need);
+        }
+    }
+    Ok((slices, free_list.top, peak))
+}
+
+/// Plan private device copies of a bufferized program. Unlike logical caller
+/// storage, these ranges only need to survive through their GPU uses/readbacks.
+/// The CUDA adapter also supplies parameter and per-operation scratch sizes.
 pub fn plan_arena<L: PlanLayout>(
     plan: &BufferIrGraph<L>,
     bytes_of: impl Fn(&Buffer<L>) -> Result<usize>,
 ) -> Result<ArenaPlan> {
-    plan_arena_over(plan, bytes_of, issue_order(plan)?)
+    plan_arena_over(plan, bytes_of, |_| Ok(0), 0, issue_order(plan)?)
 }
 
-/// [`plan_arena`] over a CALLER-SUPPLIED issue order — the seam the
-/// order-policy comparison test uses to price one order against
-/// another. The order must be a topological order of `plan.dag`
-/// covering every node; nothing here re-checks that.
-pub(crate) fn plan_arena_over<L: PlanLayout>(
+pub(crate) fn plan_with_workspace<L: PlanLayout>(
     plan: &BufferIrGraph<L>,
     bytes_of: impl Fn(&Buffer<L>) -> Result<usize>,
+    scratch_of: impl Fn(NodeIndex) -> Result<usize>,
+    parameter_bytes: usize,
+) -> Result<ArenaPlan> {
+    plan_arena_over(
+        plan,
+        bytes_of,
+        scratch_of,
+        parameter_bytes,
+        issue_order(plan)?,
+    )
+}
+
+fn plan_arena_over<L: PlanLayout>(
+    plan: &BufferIrGraph<L>,
+    bytes_of: impl Fn(&Buffer<L>) -> Result<usize>,
+    scratch_of: impl Fn(NodeIndex) -> Result<usize>,
+    parameter_bytes: usize,
     order: Vec<NodeIndex>,
 ) -> Result<ArenaPlan> {
-    // ---- classification: the ownership rows -------------------------
-    //
-    // A slab member needs BOTH ends of its lifetime in the program. The
-    // rows say which buffers those are; the dag says whether the nodes
-    // that mark the ends are actually there. A plan built by hand (or
-    // an older plan loaded from disk) may carry an INTERIOR buffer with
-    // no alloc/free pair — bufferize's `optimize` always mints them,
-    // but nothing here re-derives them. Such a buffer is DEMOTED to
-    // standalone: it gets its own allocation for the whole call, which
-    // is precisely CL-2's pre-arena behaviour, and the plan still runs.
-    let mut alloc_node: FxHashMap<BufferId, NodeIndex> = FxHashMap::default();
-    let mut free_node: FxHashMap<BufferId, NodeIndex> = FxHashMap::default();
-    for index in plan.dag.node_indices() {
-        if let Some(buffer) = allocated(&plan.dag[index])
-            && alloc_node.insert(buffer.clone(), index).is_some()
-        {
-            bail!(
-                "arena: buffer {buffer:?} is allocated twice — one \
-                     BufferAlloc per buffer is the plan's invariant, and a \
-                     second one would re-let a live range"
+    let mut allocs = FxHashMap::default();
+    let mut frees = FxHashMap::default();
+    for &node in &order {
+        if let Some(id) = allocated(&plan.dag[node]) {
+            ensure!(
+                allocs.insert(id.clone(), node).is_none(),
+                "buffer {id:?} allocated twice"
+            );
+            ensure!(
+                plan.buffers[id].owner == Owner::System,
+                "caller buffer {id:?} has an alloc"
             );
         }
-        if let Some(buffer) = freed(&plan.dag[index])
-            && free_node.insert(buffer.clone(), index).is_some()
-        {
-            bail!(
-                "arena: buffer {buffer:?} is freed twice — one BufferFree \
-                     per buffer is the plan's invariant, and a second one \
-                     would hand a live range to the next allocation"
+        if let Some(id) = freed(&plan.dag[node]) {
+            ensure!(
+                frees.insert(id.clone(), node).is_none(),
+                "buffer {id:?} freed twice"
+            );
+            ensure!(
+                plan.buffers[id].freed_by == FreedBy::Program,
+                "caller-freed buffer {id:?} has a free"
             );
         }
     }
-
-    let mut rows: Vec<(BufferId, Row)> = Vec::with_capacity(plan.buffers.len());
-    for (id, buffer) in &plan.buffers {
-        let row = match (buffer.owner, buffer.freed_by) {
-            // INTERIOR — the only recyclable row, and only with both
-            // lifetime ends present in the dag.
-            (Owner::System, FreedBy::Program)
-                if alloc_node.contains_key(id) && free_node.contains_key(id) =>
-            {
-                Row::Slab
-            }
-            (Owner::System, FreedBy::Program) => Row::Standalone,
-            // DONATED — caller storage the program frees.
-            (Owner::Caller, FreedBy::Program) => Row::Donated,
-            // BOUNDARY and ESCAPING — the caller's bytes after the call.
-            (_, FreedBy::Caller) => Row::Standalone,
+    // Hand-built plans without alloc/free markers keep their existing implicit
+    // bindings. Explicit markers are authoritative and checked for containment.
+    let mut live: std::collections::HashSet<_> = plan
+        .buffers
+        .keys()
+        .filter(|id| !allocs.contains_key(*id))
+        .cloned()
+        .collect();
+    let mut uploaded = std::collections::HashSet::new();
+    let mut steps = vec![];
+    for &node in &order {
+        let op = &plan.dag[node];
+        if let Some(id) = allocated(op) {
+            ensure!(live.insert(id.clone()), "alloc of live buffer {id:?}");
+        }
+        let mut touched: Vec<&BufferId> = match op {
+            BufferNode::Compute { reads, writes, .. } => reads.iter().chain(writes).collect(),
+            BufferNode::BufferCopy { src, dst } => vec![src, dst],
+            BufferNode::BufferOutput { slots } => slots.iter().map(|s| &s.buffer).collect(),
+            BufferNode::BufferInput { .. } => vec![],
         };
-        rows.push((id.clone(), row));
+        // Preserve operand order, deduplicating tied operands/results.
+        let mut seen = std::collections::HashSet::new();
+        touched.retain(|id| seen.insert((*id).clone()));
+        for id in touched {
+            ensure!(
+                live.contains(id),
+                "node {node:?} touches non-live buffer {id:?}"
+            );
+            if plan.buffers[id].lit.is_some() && uploaded.insert(id.clone()) {
+                steps.push(ArenaStep::Upload {
+                    buffer: id.clone(),
+                    staging: ArenaSlice::default(),
+                });
+            }
+        }
+        steps.push(ArenaStep::Node(node));
+        if let BufferNode::BufferOutput { slots } = op {
+            let mut groups: Vec<(BufferId, Vec<usize>)> = vec![];
+            for (i, slot) in slots.iter().enumerate() {
+                ensure!(
+                    plan.buffers[&slot.buffer].freed_by == FreedBy::Caller,
+                    "output slot {} has NON-ESCAPING buffer",
+                    slot.index
+                );
+                if let Some((_, indices)) = groups.iter_mut().find(|(id, _)| id == &slot.buffer) {
+                    indices.push(i);
+                } else {
+                    groups.push((slot.buffer.clone(), vec![i]));
+                }
+            }
+            for (buffer, slots) in groups {
+                steps.push(ArenaStep::Download {
+                    buffer,
+                    node,
+                    slots,
+                    staging: ArenaSlice::default(),
+                });
+            }
+        }
+        if let Some(id) = freed(op) {
+            ensure!(live.remove(id), "free of non-live buffer {id:?}");
+        }
     }
-    // `plan.buffers` is a hash map; sort so the reported vectors read
-    // the same on every run (the slab LAYOUT is already deterministic —
-    // it follows `order`, not this iteration).
-    rows.sort_by_key(|(id, _)| format!("{id:?}"));
 
-    let mut arena = ArenaPlan {
-        order,
-        ..Default::default()
+    let mut intervals = vec![];
+    let mut buffers = FxHashMap::<BufferId, usize>::default();
+    let mut workspaces = FxHashMap::default();
+    let parameter = (parameter_bytes > 0).then(|| {
+        intervals.push(Lifetime {
+            start: 0,
+            end: steps.len().max(1),
+            bytes: parameter_bytes,
+        });
+        0
+    });
+    let mut touch = |id: &BufferId, at: usize, intervals: &mut Vec<Lifetime>| -> Result<()> {
+        if let Some(&i) = buffers.get(id) {
+            intervals[i].end = at + 1;
+        } else {
+            buffers.insert(id.clone(), intervals.len());
+            intervals.push(Lifetime {
+                start: at,
+                end: at + 1,
+                bytes: bytes_of(&plan.buffers[id])?,
+            });
+        }
+        Ok(())
     };
-    let mut sizes: FxHashMap<BufferId, usize> = FxHashMap::default();
-    for (id, row) in &rows {
-        match row {
-            Row::Slab => {
-                let buffer = &plan.buffers[id];
-                sizes.insert(id.clone(), bytes_of(buffer)?);
+    for (at, step) in steps.iter().enumerate() {
+        match step {
+            ArenaStep::Upload { buffer, .. } | ArenaStep::Download { buffer, .. } => {
+                touch(buffer, at, &mut intervals)?
             }
-            Row::Standalone => arena.standalone.push(id.clone()),
-            Row::Donated => arena.donated.push(id.clone()),
+            ArenaStep::Node(node) => {
+                match &plan.dag[*node] {
+                    BufferNode::Compute { reads, writes, .. } => {
+                        for id in reads.iter().chain(writes) {
+                            touch(id, at, &mut intervals)?;
+                        }
+                    }
+                    BufferNode::BufferCopy { src, dst } => {
+                        touch(src, at, &mut intervals)?;
+                        touch(dst, at, &mut intervals)?;
+                    }
+                    _ => {}
+                }
+                let scratch = scratch_of(*node)?;
+                if scratch > 0 {
+                    workspaces.insert(*node, intervals.len());
+                    intervals.push(Lifetime {
+                        start: at,
+                        end: at + 1,
+                        bytes: scratch,
+                    });
+                }
+            }
         }
     }
+    let (slices, slab_bytes, peak_live_bytes) = pack(&intervals, ARENA_ALIGN)?;
+    let parameters = parameter.map(|i| slices[i]).unwrap_or_default();
+    let buffers: FxHashMap<_, _> = buffers.into_iter().map(|(id, i)| (id, slices[i])).collect();
+    let workspaces = workspaces
+        .into_iter()
+        .map(|(node, i)| (node, slices[i]))
+        .collect();
 
-    // ---- the walk: first-fit over the issue order -------------------
-    let mut free_list = FreeList::default();
-    // CONTRACT-1, LIVE-RANGE FORM. The whole-plan disjointness assert
-    // the executor used to run at bind time is vacuous under a slab
-    // (every range is a sub-range of one allocation) — and it was never
-    // the right question anyway: what folded-view reads and WAR
-    // ordering need is that two SIMULTANEOUSLY BOUND BufferIds do not
-    // share a byte. That is a property of THIS walk, so it is checked
-    // here, once per allocation, against the live set's neighbours (a
-    // sorted disjoint set stays disjoint iff each insertion clears its
-    // two neighbours). The executor keeps `binding_check::assert_disjoint`
-    // for the allocations it makes itself.
-    let mut live: BTreeMap<usize, (usize, BufferId)> = BTreeMap::new();
-    let mut live_bytes = 0usize;
-    for &index in &arena.order {
-        if let Some(buffer) = allocated(&plan.dag[index]) {
-            let Some(&bytes) = sizes.get(buffer) else {
-                continue; // not a slab member (demoted, escaping, …)
-            };
-            let need = align_up(bytes.max(1));
-            let offset = free_list.alloc(need);
-            if let Some((&prev, (prev_len, prev_id))) = live.range(..offset).next_back()
-                && prev + prev_len > offset
-            {
-                bail!(
-                    "CONTRACT-1 violation (arena): {prev_id:?} holds \
-                         [{prev}, {}) and {buffer:?} was given [{offset}, {}) \
-                         — simultaneously bound BufferIds must be disjoint",
-                    prev + prev_len,
-                    offset + need
-                );
+    // All host inputs are populated before launch and must survive until their
+    // upload; each output survives from readback through host result collection.
+    // A separate time 0 represents the parameter upload preceding `steps`.
+    let mut staging = vec![];
+    let staging_parameter = parameter.map(|_| {
+        staging.push(Lifetime {
+            start: 0,
+            end: 1,
+            bytes: parameter_bytes,
+        });
+        0
+    });
+    let mut transfers = vec![];
+    for (at, step) in steps.iter().enumerate() {
+        let (buffer, start, end) = match step {
+            ArenaStep::Upload { buffer, .. } => (buffer, 0, at + 2),
+            ArenaStep::Download { buffer, .. } => (buffer, at + 1, steps.len() + 2),
+            ArenaStep::Node(_) => continue,
+        };
+        transfers.push((at, staging.len()));
+        staging.push(Lifetime {
+            start,
+            end,
+            bytes: buffers[buffer].bytes,
+        });
+    }
+    let (staging_slices, staging_bytes, _) = pack(&staging, 1)?;
+    for (at, i) in transfers {
+        match &mut steps[at] {
+            ArenaStep::Upload { staging, .. } | ArenaStep::Download { staging, .. } => {
+                *staging = staging_slices[i]
             }
-            if let Some((&next, (_, next_id))) = live.range(offset..).next()
-                && offset + need > next
-            {
-                bail!(
-                    "CONTRACT-1 violation (arena): {buffer:?} was given \
-                         [{offset}, {}) and {next_id:?} holds [{next}, …) — \
-                         simultaneously bound BufferIds must be disjoint",
-                    offset + need
-                );
-            }
-            live.insert(offset, (need, buffer.clone()));
-            live_bytes += need;
-            arena.peak_live_bytes = arena.peak_live_bytes.max(live_bytes);
-            arena
-                .slices
-                .insert(buffer.clone(), ArenaSlice { offset, bytes });
-        }
-        if let Some(buffer) = freed(&plan.dag[index])
-            && let Some(slice) = arena.slices.get(buffer)
-        {
-            let need = align_up(slice.bytes.max(1));
-            live.remove(&slice.offset);
-            live_bytes -= need;
-            free_list.free(slice.offset, need);
+            ArenaStep::Node(_) => unreachable!(),
         }
     }
-    arena.slab_bytes = free_list.top;
-    Ok(arena)
+    Ok(ArenaPlan {
+        order,
+        steps,
+        slab_bytes,
+        peak_live_bytes,
+        slices: buffers,
+        workspaces,
+        parameters,
+        staging_parameters: staging_parameter
+            .map(|i| staging_slices[i])
+            .unwrap_or_default(),
+        staging_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -647,12 +737,16 @@ mod tests {
         let by_index = plan_arena_over(
             &plan,
             unit_bytes,
+            |_| Ok(0),
+            0,
             plan.dag.node_indices().collect::<Vec<_>>(),
         )
         .expect("node-index order plans");
         let raw = plan_arena_over(
             &plan,
             unit_bytes,
+            |_| Ok(0),
+            0,
             petgraph::algo::toposort(&plan.dag, None).expect("acyclic"),
         )
         .expect("raw toposort plans");
@@ -665,17 +759,16 @@ mod tests {
             arena.slab_bytes <= by_index.slab_bytes,
             "the liveness-aware order is never worse than emission order"
         );
-        assert_eq!(
-            raw.slab_bytes, sum,
-            "a raw toposort really does pay the sum"
+        assert!(
+            raw.slab_bytes > arena.slab_bytes,
+            "hoisted allocations cost more"
         );
     }
 
-    /// t2 — ESCAPING (`Owner::System` + `FreedBy::Caller`): minted
-    /// storage the caller receives. It has an alloc and NO free, so its
-    /// bytes must outlive the call: outside the slab.
+    /// Escaping storage keeps its logical ownership, while its private device
+    /// copy participates in physical packing through the output readback.
     #[test]
-    fn escaping_minted_storage_stays_out_of_the_slab() {
+    fn escaping_minted_storage_is_packed_without_a_logical_free() {
         let mut g = TestGraph::new();
         let x = g.input("x", "B", Access::ReadWrite, "rm");
         let p = g.op(
@@ -704,23 +797,16 @@ mod tests {
             .map(|(id, _)| id.clone())
             .unwrap_or_else(|| panic!("no escaping buffer:\n{}", plan.summary()));
         let arena = plan_arena(&plan, unit_bytes).expect("arena plans");
-        assert!(
-            !arena.slices.contains_key(&escaping),
-            "escaping storage must not be a slab member:\n{}",
-            plan.summary()
-        );
-        assert!(
-            arena.standalone.contains(&escaping),
-            "escaping storage is standalone:\n{}",
-            plan.summary()
-        );
+        assert!(arena.slices.contains_key(&escaping));
+        assert!(plan.dag.node_weights().all(|n| freed(n) != Some(&escaping)));
+        assert!(arena.steps.iter().any(|step| matches!(step,
+            ArenaStep::Download { buffer, .. } if buffer == &escaping)));
     }
 
-    /// t3 — DONATED (`Owner::Caller` + `FreedBy::Program`): the caller's
-    /// bytes, released by the program. No slab range; the free lands
-    /// after every toucher.
+    /// Donation's explicit free remains authoritative, and the private copy
+    /// receives an ordinary arena range.
     #[test]
-    fn donated_caller_storage_gets_no_slab_range_and_frees_last() {
+    fn donated_device_copy_is_packed_and_frees_after_all_uses() {
         let mut g = TestGraph::new();
         let x = g.input_binding(
             "x",
@@ -747,16 +833,7 @@ mod tests {
             .map(|(id, _)| id.clone())
             .unwrap_or_else(|| panic!("no donated buffer:\n{}", plan.summary()));
         let arena = plan_arena(&plan, unit_bytes).expect("arena plans");
-        assert!(
-            arena.donated.contains(&donated),
-            "donated storage is its own row:\n{}",
-            plan.summary()
-        );
-        assert!(
-            !arena.slices.contains_key(&donated),
-            "donated storage gets no slab range:\n{}",
-            plan.summary()
-        );
+        assert!(arena.slices.contains_key(&donated));
         let at = positions(&arena);
         let free = plan
             .dag
@@ -780,45 +857,43 @@ mod tests {
     fn a_recycled_range_is_only_re_let_after_its_occupant_is_finished() {
         let plan = chain(5);
         let arena = plan_arena(&plan, unit_bytes).expect("arena plans");
-        let at = positions(&arena);
         let mut sharing = 0usize;
-        let members: Vec<(&BufferId, &ArenaSlice)> = arena.slices.iter().collect();
-        for (a, sa) in &members {
-            for (b, sb) in &members {
-                if a == b || sa.offset != sb.offset {
+        let lifetime = |id: &BufferId| {
+            let uses: Vec<_> = arena
+                .steps
+                .iter()
+                .enumerate()
+                .filter_map(|(i, step)| {
+                    let touches = match step {
+                        ArenaStep::Upload { buffer, .. } | ArenaStep::Download { buffer, .. } => {
+                            buffer == id
+                        }
+                        ArenaStep::Node(node) => match &plan.dag[*node] {
+                            BufferNode::Compute { reads, writes, .. } => {
+                                reads.contains(id) || writes.contains(id)
+                            }
+                            BufferNode::BufferCopy { src, dst } => src == id || dst == id,
+                            _ => false,
+                        },
+                    };
+                    touches.then_some(i)
+                })
+                .collect();
+            (*uses.first().unwrap(), *uses.last().unwrap())
+        };
+        let members: Vec<_> = arena.slices.iter().collect();
+        for (i, (a, sa)) in members.iter().enumerate() {
+            for (b, sb) in &members[i + 1..] {
+                if sa.offset >= sb.offset + sb.reserved() || sb.offset >= sa.offset + sa.reserved()
+                {
                     continue;
                 }
-                // Same range, two buffers: order them by their allocs.
-                let alloc_a = plan
-                    .dag
-                    .node_indices()
-                    .find(|&i| allocated(&plan.dag[i]) == Some(a))
-                    .expect("slab member has an alloc");
-                let alloc_b = plan
-                    .dag
-                    .node_indices()
-                    .find(|&i| allocated(&plan.dag[i]) == Some(b))
-                    .expect("slab member has an alloc");
-                if at[&alloc_a] > at[&alloc_b] {
-                    continue; // handled from the other side
-                }
                 sharing += 1;
-                let last_old = touchers(&plan, a)
-                    .into_iter()
-                    .map(|n| at[&n])
-                    .max()
-                    .expect("an occupant is touched");
-                let first_new = touchers(&plan, b)
-                    .into_iter()
-                    .map(|n| at[&n])
-                    .min()
-                    .expect("an occupant is touched");
+                let (start_a, end_a) = lifetime(a);
+                let (start_b, end_b) = lifetime(b);
                 assert!(
-                    last_old < first_new,
-                    "range {} was re-let to {b:?} at position {first_new} while \
-                     {a:?} was still touching it at {last_old}:\n{}",
-                    sa.offset,
-                    plan.summary()
+                    end_a < start_b || end_b < start_a,
+                    "overlapping ranges have intersecting lifetimes: {a:?}, {b:?}"
                 );
             }
         }
@@ -856,5 +931,134 @@ mod tests {
             );
         }
         println!("{} anti edges honoured", anti);
+    }
+    #[test]
+    fn interval_packing_checks_all_live_ranges_with_fixed_seed() {
+        // Vary sizes, lifetimes, and alignment independently of bufferization.
+        let mut seed = 42u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed as usize
+        };
+        for alignment in [1, ARENA_ALIGN] {
+            for _ in 0..30 {
+                let lives: Vec<_> = (0..80)
+                    .map(|_| {
+                        let start = next() % 40;
+                        Lifetime {
+                            start,
+                            end: start + 1 + next() % 15,
+                            bytes: next() % 2049,
+                        }
+                    })
+                    .collect();
+                let (slices, total, peak) = pack(&lives, alignment).unwrap();
+                let reservation = |bytes: usize| bytes.max(1).div_ceil(alignment) * alignment;
+                let expected_peak = (0..55)
+                    .map(|t| {
+                        lives
+                            .iter()
+                            .filter(|l| l.start <= t && t < l.end)
+                            .map(|l| reservation(l.bytes))
+                            .sum::<usize>()
+                    })
+                    .max()
+                    .unwrap();
+                assert_eq!(peak, expected_peak);
+                assert!(total >= peak);
+                for (i, a) in lives.iter().enumerate() {
+                    let sa = slices[i];
+                    assert_eq!(sa.offset % alignment, 0);
+                    assert!(sa.offset + reservation(sa.bytes) <= total);
+                    for (j, b) in lives.iter().enumerate().skip(i + 1) {
+                        if a.start < b.end && b.start < a.end {
+                            let sb = slices[j];
+                            assert!(
+                                sa.offset + reservation(sa.bytes) <= sb.offset
+                                    || sb.offset + reservation(sb.bytes) <= sa.offset
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_reuses_tensor_storage_and_staging_reuses_uploaded_inputs() {
+        let plan = chain(6);
+        let nodes: Vec<_> = plan
+            .dag
+            .node_indices()
+            .filter(|&n| {
+                matches!(&plan.dag[n],
+            BufferNode::Compute { op, .. } if !matches!(op.label(), "BufferAlloc" | "BufferFree"))
+            })
+            .collect();
+        let BufferNode::Compute { writes, .. } = &plan.dag[nodes[0]] else {
+            unreachable!()
+        };
+        let large = &writes[0];
+        let bytes = |b: &Buffer<MockLayout>| Ok(if &b.id == large { 8 * RESERVED } else { UNIT });
+        let baseline = plan_with_workspace(&plan, bytes, |_| Ok(0), 8).unwrap();
+        let host = *nodes.last().unwrap();
+        let arena = plan_with_workspace(
+            &plan,
+            bytes,
+            |n| Ok(if n == host { 4 * RESERVED } else { 0 }),
+            8,
+        )
+        .unwrap();
+        let scratch = arena.workspaces[&host];
+        let early = arena.slices[large];
+        assert!(
+            scratch.offset < early.offset + early.reserved()
+                && early.offset < scratch.offset + scratch.reserved(),
+            "scratch must reuse the dead large tensor's range"
+        );
+        assert_eq!(
+            arena.slab_bytes, baseline.slab_bytes,
+            "scratch fits inside the existing high-water mark"
+        );
+        let staging_sum: usize = arena
+            .steps
+            .iter()
+            .map(|s| match s {
+                ArenaStep::Upload { staging, .. } | ArenaStep::Download { staging, .. } => {
+                    staging.bytes
+                }
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            arena.staging_bytes < staging_sum + 8,
+            "staging must reuse completed uploads"
+        );
+    }
+
+    #[test]
+    fn packing_rejects_overflow_and_invalid_lifetimes() {
+        assert!(
+            pack(
+                &[Lifetime {
+                    start: 0,
+                    end: 1,
+                    bytes: usize::MAX
+                }],
+                ARENA_ALIGN
+            )
+            .is_err()
+        );
+        assert!(
+            pack(
+                &[Lifetime {
+                    start: 2,
+                    end: 2,
+                    bytes: 1
+                }],
+                1
+            )
+            .is_err()
+        );
     }
 }

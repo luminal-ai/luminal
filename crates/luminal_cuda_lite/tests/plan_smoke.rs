@@ -87,9 +87,13 @@ fn codegen_emits_wellformed_sources() {
         )
     }
     let ctx = kernels::CodegenCtx {
-        operand_dims: vec![vec![2, 3], vec![2, 3], vec![2, 3]],
+        operand_dims: vec![
+            vec![2usize.into(), 3usize.into()],
+            vec![2usize.into(), 3usize.into()],
+            vec![2usize.into(), 3usize.into()],
+        ],
         operand_dtypes: vec![PlanDtype::F32, PlanDtype::F32, PlanDtype::F32],
-        dest_dims: vec![vec![2, 3]],
+        dest_dims: vec![vec![2usize.into(), 3usize.into()]],
         dest_dtypes: vec![PlanDtype::F32],
         // The slot layouts ARE the read paths (the hop chain is retired):
         // all three are dense row-major, so every read simplifies to the
@@ -100,7 +104,7 @@ fn codegen_emits_wellformed_sources() {
     let kernel = luminal_cuda_lite::as_kernel_op(&add).expect("add implements KernelOp");
     let launches = kernel.codegen(&ctx).expect("codegen");
     assert_eq!(launches.len(), 1);
-    assert_eq!(launches[0].n, 6);
+    assert_eq!(launches[0].n.literal(), Some(6));
     assert!(launches[0].source.contains("__global__ void k("));
     assert!(launches[0].source.contains("a[i] + b[i]"));
 }

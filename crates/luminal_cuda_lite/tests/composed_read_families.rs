@@ -248,12 +248,13 @@ fn gather_lowers_a_folded_coordinate_operand() {
     // one statement of it instead of two.
     assert_eq!(
         sources[0],
-        r#"extern "C" __global__ void k(const float* data, const int* coord0, const int* coord1, float* out, unsigned long long n) {
+        r#"extern "C" __global__ void k(const float* data, const int* coord0, const int* coord1, float* out, const long long* params) {
+    const unsigned long long n = 6LL;
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     unsigned long long rem = i;
-    long long c1 = (long long)(rem % 3ULL); rem /= 3ULL;
-    long long c0 = (long long)(rem % 2ULL); rem /= 2ULL;
+    long long c1 = (long long)(rem % 3LL); rem /= 3LL;
+    long long c0 = (long long)(rem % 2LL); rem /= 2LL;
     long long coord;
     long long coord0_idx = c0 + 0LL;
     coord = (long long)coord0[coord0_idx];
@@ -382,8 +383,8 @@ fn scatter_lowers_a_folded_coordinate_operand() {
         &sources[1],
         &[
             // src-coordinate prelude over (2,3)
-            "long long c1 = (long long)(rem % 3ULL); rem /= 3ULL;",
-            "long long c0 = (long long)(rem % 2ULL); rem /= 2ULL;",
+            "long long c1 = (long long)(rem % 3LL); rem /= 3LL;",
+            "long long c0 = (long long)(rem % 2LL); rem /= 2LL;",
             // the broadcast LAYOUT, lowered once
             "long long coord0_idx = c0 + 0LL;",
             "coord = (long long)coord0[coord0_idx];",

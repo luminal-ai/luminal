@@ -84,6 +84,7 @@ pub struct CudaRuntime {
     dim_buckets: std::collections::BTreeMap<shape::Symbol, Vec<graph::DimBucket>>,
     /// One finished plan per Cartesian bucket combination.
     bucket_plans: Vec<crate::search::BucketPlan>,
+    selected_bucket: Option<usize>,
     /// The dim values this runtime currently holds — every `[n, n]`
     /// `bind_dyn_range` pin plus whatever [`Self::set_dim`] sets. With
     /// buckets bound this is what picks the plan at execute time.
@@ -229,6 +230,17 @@ impl CudaRuntime {
         &self.allow
     }
 
+    fn invalidate_plans(&mut self) {
+        self.plan = None;
+        self.bucket_plans.clear();
+        self.selected_bucket = None;
+        self.outputs_host.clear();
+        #[cfg(feature = "device")]
+        if let Some(device) = &mut self.device {
+            device.release_slab();
+        }
+    }
+
     /// Seed interval bounds for a dynamic dimension (facts, never pins:
     /// `[n, n]` is how a caller pins).
     pub fn bind_dyn_range(
@@ -238,6 +250,16 @@ impl CudaRuntime {
         upper: u64,
     ) -> Result<()> {
         let name = var.into();
+        let (lower, upper) = self
+            .range_bound
+            .get(&name)
+            .map(|(lo, hi)| (lower.max(*lo), upper.min(*hi)))
+            .unwrap_or((lower, upper));
+        anyhow::ensure!(
+            lower <= upper,
+            "empty dimension range for `{name}`: [{lower}, {upper}]"
+        );
+        anyhow::ensure!(upper <= i64::MAX as u64, "dimension range exceeds i64");
         anyhow::ensure!(
             !self.dim_buckets.contains_key(&name),
             "dim `{name}` has buckets bound; a bucketed dim is seeded per bucket \
@@ -259,6 +281,7 @@ impl CudaRuntime {
         if lower == upper {
             self.dims.insert(name, lower as usize);
         }
+        self.invalidate_plans();
         Ok(())
     }
 
@@ -303,6 +326,7 @@ impl CudaRuntime {
             );
         }
         self.dim_buckets.insert(dim, buckets);
+        self.invalidate_plans();
         Ok(())
     }
 
@@ -317,40 +341,25 @@ impl CudaRuntime {
         &self.bucket_plans
     }
 
-    /// Pick and load the bucket plan covering the current dims.
-    ///
-    /// THE STATIC-PLAN REFUSAL (the Phase 1 limitation, stated rather
-    /// than solved): a bucket's winning plan was searched at ONE pin and
-    /// carries LITERAL spans, so it allocates and indexes for that pin
-    /// and nothing else. Executing it at another value inside the same
-    /// bucket would silently run the representative's geometry over the
-    /// caller's data, so it is refused by name. Lifting this needs
-    /// symbolic plans (spans as expressions) and the capacity contract
-    /// that goes with them.
+    /// Pick the range-valid plan covering the current dimensions.
     fn select_bucket_plan(&mut self) -> Result<()> {
-        let Some(plan) = crate::search::select_bucket(&self.bucket_plans, &self.dims) else {
-            let covered: Vec<_> = self.bucket_plans.iter().map(|p| p.ranges.clone()).collect();
-            bail!(
-                "no bucket covers dims {:?}; the searched buckets are {covered:?}",
-                self.dims
-            );
-        };
-        for (dim, representative) in &plan.representative {
-            if let Some(value) = self.dims.get(dim) {
-                anyhow::ensure!(
-                    value == representative,
-                    "bucket {:?} was searched at `{dim} = {representative}` and its plan is \
-                     STATIC at that pin (plan spans are literals), but this runtime is set \
-                     to `{dim} = {value}`. Re-search at this pin, or pick a bucket whose \
-                     representative is it. Running the representative's plan here would \
-                     silently use the wrong geometry — the open item is symbolic plans \
-                     (spans as expressions) and the capacity contract that goes with them.",
-                    plan.ranges
-                );
-            }
-        }
-        self.plan = Some(plan.plan.clone());
+        let index = self
+            .bucket_plans
+            .iter()
+            .position(|p| {
+                p.ranges
+                    .iter()
+                    .all(|(s, (lo, hi))| self.dims.get(s).is_some_and(|v| v >= lo && v <= hi))
+            })
+            .ok_or_else(|| anyhow!("no bucket covers dims {:?}", self.dims))?;
+        self.selected_bucket = Some(index);
         Ok(())
+    }
+
+    /// Cumulative graph/arena counters, available after first device use.
+    #[cfg(feature = "device")]
+    pub fn graph_stats(&self) -> Option<crate::device::GraphStats> {
+        self.device.as_ref().map(|d| d.stats())
     }
 
     /// The ops this runtime claims: the CUDA analogue of
@@ -482,6 +491,22 @@ impl CudaRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
+        self.invalidate_plans();
+        let mut resolved_options = options.clone();
+        resolved_options.shapes.bounds = self
+            .range_bound
+            .iter()
+            .map(|(s, (lo, hi))| Ok((*s, (usize::try_from(*lo)?, usize::try_from(*hi)?))))
+            .collect::<Result<_>>()?;
+        resolved_options.shapes.values = self.dims.clone();
+        for (s, (lo, hi)) in &resolved_options.shapes.bounds {
+            resolved_options
+                .shapes
+                .values
+                .entry(*s)
+                .or_insert(lo + (hi - lo) / 2);
+        }
+        let options = &resolved_options;
         let native = self
             .native
             .as_ref()
@@ -610,14 +635,17 @@ impl CudaRuntime {
             // installed plan fits the caller's device budget is a
             // property of what is installed, and an unbucketed install is
             // a set of one.
-            let finalists = vec![crate::finalists::Finalists::new(
-                "the search",
-                &serialized,
-                Some(allow.clone()),
-                matchers,
-                outcome.ranked.clone(),
-                Some(outcome.best_plan.clone()),
-            )];
+            let finalists = vec![
+                crate::finalists::Finalists::new(
+                    "the search",
+                    &serialized,
+                    Some(allow.clone()),
+                    matchers,
+                    outcome.ranked.clone(),
+                    Some(outcome.best_plan.clone()),
+                )
+                .with_shapes(options.shapes.clone()),
+            ];
             let (selected, rejections) =
                 crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
             outcome.lattice_rejections = rejections;
@@ -628,8 +656,7 @@ impl CudaRuntime {
             (outcome, Some(finalist.plan), Vec::new())
         } else {
             // BUCKETED (D7): one search per Cartesian combination, each
-            // validated bucket-wide before its representative is
-            // searched. The caller's data is staged ONCE and every
+            // searched and validated over the complete interval. The caller's data is staged ONCE and every
             // bucket's search borrows the same map — a bucket only
             // changes the dim seeds, never the payloads.
             let assembly = crate::search::BucketAssembly {
@@ -640,7 +667,7 @@ impl CudaRuntime {
                 post_checks: &native.post_checks,
                 input_slots: &native.input_slots,
                 output_slots: &native.output_slots,
-                base_dims: &self.dims,
+                base_dims: &options.shapes.values,
                 decoders: &self.decoders,
             };
             let plans = crate::search::bucketed_search_implementations(
@@ -657,9 +684,8 @@ impl CudaRuntime {
                 .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
             (first, None, plans)
         };
-        if !searched_buckets.is_empty() {
-            self.bucket_plans = searched_buckets;
-        }
+        self.bucket_plans = searched_buckets;
+        self.selected_bucket = None;
 
         let native = self
             .native
@@ -702,9 +728,7 @@ impl CudaRuntime {
     /// Run the plan on the CUDA device. Requires the `device` feature
     /// and an available device; refuses loudly otherwise.
     pub fn execute(&mut self) -> Result<()> {
-        // With buckets bound, the plan is chosen HERE, from the current
-        // dims (see [`Self::select_bucket_plan`] for the static-plan
-        // refusal). Without them nothing changes.
+        // Select a range-valid plan using the current dimensions.
         if !self.bucket_plans.is_empty() {
             self.select_bucket_plan()?;
         }
@@ -716,28 +740,42 @@ impl CudaRuntime {
             if self.device.is_none() {
                 self.device = Some(crate::device::CudaDevice::new(0)?);
             }
-            let plan = self
-                .plan
-                .as_ref()
-                .ok_or_else(|| anyhow!("search before execute"))?;
-            // SERVING KEEPS THE SLAB (#422 policy, Phase 4): nothing
-            // here releases it — only the search does, between
-            // candidates.
-            let staged: FxHashMap<i64, &HostBuffer> =
-                self.staged.iter().map(|(lit, data)| (*lit, data)).collect();
-            let device = self
-                .device
-                .as_mut()
-                .expect("the device was just created if it was missing");
-            let outputs = crate::device::execute_plan(device, plan, &staged)?;
+            anyhow::ensure!(
+                self.plan.is_some() || !self.bucket_plans.is_empty(),
+                "search before execute"
+            );
+            let device = self.device.as_mut().unwrap();
+            if !device.is_installed() {
+                let base_bounds: crate::symbolic::Bounds = self
+                    .range_bound
+                    .iter()
+                    .map(|(s, (lo, hi))| Ok((*s, (usize::try_from(*lo)?, usize::try_from(*hi)?))))
+                    .collect::<Result<_>>()?;
+
+                let plans = if self.bucket_plans.is_empty() {
+                    vec![(self.plan.as_ref().unwrap().clone(), base_bounds)]
+                } else {
+                    self.bucket_plans
+                        .iter()
+                        .map(|p| {
+                            let mut bounds = base_bounds.clone();
+                            bounds.extend(p.ranges.iter().map(|(k, v)| (*k, *v)));
+                            (p.plan.clone(), bounds)
+                        })
+                        .collect()
+                };
+                device.install(plans)?;
+            }
+            let bucket = self.selected_bucket.unwrap_or(0);
+            let staged = self.staged.iter().map(|(lit, data)| (*lit, data)).collect();
+            let outputs = device.execute(bucket, &staged, &self.dims)?;
             self.outputs_host = outputs;
             Ok(())
         }
         #[cfg(not(feature = "device"))]
         {
             let _ = self
-                .plan
-                .as_ref()
+                .plan()
                 .ok_or_else(|| anyhow!("search before execute"))?;
             bail!(
                 "cuda-lite built without the `device` feature: plans can be \
@@ -828,6 +866,9 @@ impl CudaRuntime {
 
     /// The searched plan, for inspection and tests.
     pub fn plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
-        self.plan.as_ref()
+        self.selected_bucket
+            .and_then(|i| self.bucket_plans.get(i))
+            .map(|p| &p.plan)
+            .or(self.plan.as_ref())
     }
 }

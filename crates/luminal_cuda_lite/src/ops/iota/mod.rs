@@ -109,7 +109,8 @@ impl KernelOp for IotaDps {
         let prelude = coord_prelude(out_dims);
         let value = lower_expr(expr, out_dims.len())?;
         let source = format!(
-            r#"extern "C" __global__ void k({to}* out, unsigned long long n) {{
+            r#"extern "C" __global__ void k({to}* out, const long long* params) {{
+    const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 {prelude}    out[i] = ({to})({value});

@@ -447,6 +447,33 @@ pub fn plan_call(op: &CublasLt) -> Result<LtCall> {
     plan_call_from_spec(spec)
 }
 
+/// Bind symbolic dimensions before constructing the library descriptors.
+pub fn plan_call_at(op: &CublasLt, dims: &luminal::shape::DynMap) -> Result<LtCall> {
+    let mut bound = op.clone();
+    let spec = bound
+        .spec
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("cuBLASLt has no spec"))?;
+    for dim in [
+        &mut spec.m,
+        &mut spec.n,
+        &mut spec.k,
+        &mut spec.lda,
+        &mut spec.ldb,
+        &mut spec.ldc,
+        &mut spec.ldd,
+    ] {
+        if let CuDim::Symbolic(class) = dim {
+            let expr = spec
+                .dim_exprs
+                .get(class)
+                .ok_or_else(|| anyhow::anyhow!("unresolved cuBLASLt dimension {class:?}"))?;
+            *dim = CuDim::Literal(crate::symbolic::eval(expr, dims)?);
+        }
+    }
+    plan_call(&bound)
+}
+
 /// [`plan_call`] over the spec alone (test seam).
 pub fn plan_call_from_spec(spec: &LtMatmulSpec) -> Result<LtCall> {
     // NO BIAS REFUSAL HERE (ruling 2026-09-01). The unconditional

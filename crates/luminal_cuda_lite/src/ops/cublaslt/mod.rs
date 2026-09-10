@@ -207,6 +207,8 @@ impl std::fmt::Display for CuDim {
 /// The single Rust endpoint: one struct, every contract and decoration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LtMatmulSpec {
+    /// Symbolic geometry decoded before the extraction e-graph is released.
+    pub dim_exprs: std::collections::BTreeMap<ClassId, luminal::layouts::IntExprTerm>,
     pub form: CublasLtForm,
     pub m: CuDim,
     pub n: CuDim,
@@ -753,7 +755,15 @@ pub fn parse_spec(site: &ExtractionSite<'_>, form: CublasLtForm) -> Option<LtMat
         (true, true) => CuEpilogue::ReluBias,
     };
 
+    let mut dim_exprs = std::collections::BTreeMap::new();
+    for dim in [&m, &n, &k, &lda, &ldb, &ldd] {
+        if let CuDim::Symbolic(class) = dim {
+            let expr = luminal::index_expr::parse_int_expr(site, class, 64, None)?;
+            dim_exprs.insert(class.clone(), crate::symbolic::iota_term(&expr)?);
+        }
+    }
     let spec = LtMatmulSpec {
+        dim_exprs,
         form,
         m,
         n,
@@ -896,12 +906,27 @@ impl ToDps for CublasLtDps {
 impl LayoutIrOp for CublasLtDps {}
 
 impl crate::host::HostOp for CublasLtDps {
+    fn workspace_bytes(&self, _: &crate::symbolic::Bounds) -> anyhow::Result<usize> {
+        Ok(32 * 1024 * 1024)
+    }
+    fn capture_dims(&self) -> Option<Vec<luminal::shape::Symbol>> {
+        let mut vars = std::collections::BTreeSet::new();
+        if let Some(spec) = &self.op.spec {
+            for expr in spec.dim_exprs.values() {
+                crate::symbolic::vars(expr, &mut vars);
+            }
+        }
+        Some(vars.into_iter().collect())
+    }
     #[cfg(feature = "device")]
-    unsafe fn execute(&self, ctx: &crate::host::HostOpContext<'_>) -> anyhow::Result<()> {
+    unsafe fn prepare(
+        &self,
+        ctx: &crate::host::HostOpContext<'_>,
+    ) -> anyhow::Result<Box<dyn crate::host::PreparedHostOp>> {
         use anyhow::{Context, anyhow};
 
         let label = self.label();
-        let mut call = exec::plan_call(&self.op)
+        let mut call = exec::plan_call_at(&self.op, ctx.dims)
             .with_context(|| format!("cuBLASLt call planning for {label}"))?;
         // The elected destination layout is authoritative. Reconcile it with
         // the library call frame before dispatch, including its storage order.
@@ -912,8 +937,9 @@ impl crate::host::HostOp for CublasLtDps {
             .ok_or_else(|| anyhow!("{label}: host-call node carries no result descriptor"))?;
         exec::bind_destination(&mut call, &dest_slot.layout, label)
             .with_context(|| format!("cuBLASLt destination frame binding for {label}"))?;
-        device_call::dispatch(&call, ctx.inputs, ctx.dest, ctx.stream)
-            .with_context(|| format!("cuBLASLt dispatch for {label}"))
+        device_call::prepare(&call, ctx.inputs, ctx.dest, ctx.workspace)
+            .map(|p| Box::new(p) as Box<dyn crate::host::PreparedHostOp>)
+            .with_context(|| format!("cuBLASLt preparation for {label}"))
     }
 }
 

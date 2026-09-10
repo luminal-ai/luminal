@@ -48,16 +48,17 @@
 //!   the arena slab the runtime will hold. Unconstrained (the default)
 //!   the walk installs the search's own winner and costs nothing.
 //!
-//! Out-of-place by design: kernels read operand buffers and write a
-//! destination that shares no byte with any simultaneously bound buffer
-//! — the same alias-safety PROPERTY as the reference executor, by a
-//! different mechanism. Since Phase 3 (#420/#422 rejoin) the destination
-//! is a recycled slab range assigned by [`arena`] (its CONTRACT-1
-//! live-range check; [`binding_check`] covers the standalone rows), NOT
-//! a fresh zeroed slice: nothing is zeroed, so every kernel must write
-//! every element it owns and never read its destination — the KERNEL
-//! INVARIANT recorded at the top of `device.rs`. `ties` and `Anti` edges
-//! are honored in the toposort order but no in-place claim is made.
+//! Execution always launches CUDA graphs. Owned kernels and copies are parent
+//! graph nodes; HostOps prepare library calls and capture opaque child graphs.
+//! Dynamic dimensions live in an arena-resident parameter block. Buckets overlay
+//! one capacity-sized arena, including boundary device copies and host-op scratch.
+//! Input staging and output readback are graph nodes backed by one shared pinned
+//! host allocation. Returned outputs own their host bytes.
+//!
+//! Bufferization supplies alias/lifetime contracts and dependency edges. The
+//! arena preserves them in a serial issue order; generated kernels must fully
+//! initialize their destinations, since temporary ranges are reused without
+//! clearing. cuBLASLt's accumulate forms follow their declared alias contracts.
 
 pub mod arena;
 pub mod binding_check;
@@ -66,6 +67,8 @@ pub mod bindings;
 /// calls it with its own matcher list and it names no runtime type.
 /// Kept under this crate's old module name so call sites read the same.
 pub use luminal::extraction as extractor;
+#[cfg(feature = "device")]
+mod cuda_graph;
 /// FINALISTS (Phase 5 of the #420/#422 rejoin): a bucket's ranked
 /// genomes, re-materialized one at a time under a hard filter.
 pub mod finalists;
@@ -81,6 +84,8 @@ pub mod op;
 pub mod ops;
 pub mod runtime;
 pub mod search;
+mod storage;
+pub mod symbolic;
 
 #[cfg(feature = "device")]
 pub mod device;

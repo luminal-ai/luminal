@@ -33,8 +33,13 @@ use std::collections::HashMap;
 /// An unlowerable layout answers `false` — it is certainly not a flat
 /// read.
 fn reads_flat(layout: &luminal_cuda_lite::layouts::DecodedLayout, dims: &[usize]) -> bool {
-    kernels::layout_read_index("probe", layout, dims, Coords::FlatIndex { prefix: "c" })
-        .is_ok_and(|(chain, idx)| chain.is_empty() && idx == "i")
+    kernels::layout_read_index(
+        "probe",
+        layout,
+        &dims.iter().copied().map(Into::into).collect::<Vec<_>>(),
+        Coords::FlatIndex { prefix: "c" },
+    )
+    .is_ok_and(|(chain, idx)| chain.is_empty() && idx == "i")
 }
 
 /// The PRE-Phase-3 construction, restated for the corrected contract:
@@ -90,9 +95,15 @@ fn sources_via_buffer_table(
         let kernel = luminal_cuda_lite::as_kernel_op(op.as_ref())
             .unwrap_or_else(|| panic!("elected op {label} has no kernel interface"));
         let ctx = kernels::CodegenCtx {
-            operand_dims: reads.iter().map(|id| geometry[id].0.clone()).collect(),
+            operand_dims: reads
+                .iter()
+                .map(|id| geometry[id].0.iter().copied().map(Into::into).collect())
+                .collect(),
             operand_dtypes: reads.iter().map(|id| geometry[id].1).collect(),
-            dest_dims: writes.iter().map(|id| geometry[id].0.clone()).collect(),
+            dest_dims: writes
+                .iter()
+                .map(|id| geometry[id].0.iter().copied().map(Into::into).collect())
+                .collect(),
             dest_dtypes: writes.iter().map(|id| geometry[id].1).collect(),
             // PROTOTYPE (Option B): the buffer table's layout is the
             // WRITER's (resident) layout — for a folded operand that is
@@ -397,8 +408,8 @@ mod strided {
             &source,
             &[
                 // out-coordinate prelude over [3,2]
-                "long long c1 = (long long)(rem % 2ULL); rem /= 2ULL;",
-                "long long c0 = (long long)(rem % 3ULL); rem /= 3ULL;",
+                "long long c1 = (long long)(rem % 2LL); rem /= 2LL;",
+                "long long c0 = (long long)(rem % 3LL); rem /= 3LL;",
                 // the layout's offset expression, lowered directly
                 "long long a_idx = (c1 * 3LL) + c0;",
                 "out[i] = a[a_idx];",
@@ -514,7 +525,7 @@ mod strided {
             &source,
             &[
                 // c0 (outside the reduced axis) rebuilt before the loop
-                "long long c0 = (long long)(rem % 2ULL); rem /= 2ULL;",
+                "long long c0 = (long long)(rem % 2LL); rem /= 2LL;",
                 // the reduced coordinate is the loop variable
                 "long long c1 = (long long)r;",
                 // the layout's expression, lowered directly
@@ -561,15 +572,19 @@ mod strided {
             chain: vec![coord(0), mul(coord(1), lit(2))],
             width: BitWidthTerm(32),
         });
-        let err = kernels::CodegenCtx::from_descriptors(
+        let ctx = kernels::CodegenCtx::from_descriptors(
             "Copy",
             &[slot_l(layout), slot(vec![3, 2])],
             &[slot(vec![3, 2])],
         )
-        .expect_err("symbolic layout extents must refuse");
+        .expect("symbolic domains are retained");
+        let err = luminal_cuda_lite::as_kernel_op(&op)
+            .unwrap()
+            .codegen(&ctx)
+            .unwrap_err();
         assert!(
-            err.to_string().contains("symbolic layout extents"),
-            "got: {err}"
+            err.to_string().contains("differ from dest extents"),
+            "{err}"
         );
         // An operand layout whose DOMAIN is not the destination's: the
         // template reads at the dest's coordinates, so this is a real
@@ -659,7 +674,8 @@ mod strided {
         );
         assert_eq!(
             source,
-            r#"extern "C" __global__ void k(const float* a, const float* b, float* out, unsigned long long n) {
+            r#"extern "C" __global__ void k(const float* a, const float* b, float* out, const long long* params) {
+    const unsigned long long n = 6LL;
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
 }"#
@@ -774,7 +790,8 @@ mod strided {
         // (b) THEREFORE: identical emitted source, and it is the flat
         //     read — the simplifier recognizes all five.
         let op = ops::materialize_layout_copy::MaterializeLayoutCopyDps;
-        let want = r#"extern "C" __global__ void k(const float* a, float* out, unsigned long long n) {
+        let want = r#"extern "C" __global__ void k(const float* a, float* out, const long long* params) {
+    const unsigned long long n = 6LL;
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i];
 }"#;
@@ -809,7 +826,8 @@ mod strided {
         );
         assert_eq!(
             source,
-            r#"extern "C" __global__ void k(const float* a, float* out, unsigned long long n) {
+            r#"extern "C" __global__ void k(const float* a, float* out, const long long* params) {
+    const unsigned long long n = 6LL;
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i];
 }"#
@@ -944,16 +962,13 @@ fn descriptor_ctx_bails_loudly_on_unusable_layouts() {
         ),
         ..filled.clone()
     };
-    let err = kernels::CodegenCtx::from_descriptors(
+    let symbolic_ctx = kernels::CodegenCtx::from_descriptors(
         "ProbeOp",
         &[symbolic],
         std::slice::from_ref(&filled),
     )
-    .expect_err("symbolic layout extents must refuse");
-    assert!(
-        err.to_string().contains("symbolic layout extents"),
-        "got: {err}"
-    );
+    .expect("symbolic layouts survive codegen");
+    assert!(symbolic_ctx.operand_dims[0][0].literal().is_none());
     let untyped = SlotDescriptor {
         layout: DecodedLayout::of(rm(lit_shape), None),
         ..filled.clone()
@@ -971,9 +986,9 @@ fn descriptor_ctx_bails_loudly_on_unusable_layouts() {
         std::slice::from_ref(&filled),
     )
     .expect("filled descriptors build");
-    assert_eq!(ok.operand_dims, vec![vec![2, 3]]);
+    assert_eq!(ok.operand_dims, vec![vec![2usize.into(), 3usize.into()]]);
     assert!(
-        reads_flat(ok.operand_layout(0), &ok.operand_dims[0]),
+        reads_flat(ok.operand_layout(0), &[2, 3]),
         "a dense layout's read simplifies to the bare `i` — no chain is emitted"
     );
 }
