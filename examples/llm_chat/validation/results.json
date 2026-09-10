@@ -1,0 +1,1157 @@
+{
+  "date_utc": "2026-09-10",
+  "code_base": "311e4bb3 plus the Gemma tied-embedding default fix and validation tooling in this commit",
+  "environment": {
+    "gpu": "NVIDIA H200",
+    "driver": "580.126.09",
+    "os": "Linux",
+    "rustc": "1.98.1 (48a229cea 2026-09-01)",
+    "accelerate": "1.10.1",
+    "build": "dev opt-level=2, llm_chat opt-level=3, debug=0, incremental=false"
+  },
+  "models": [
+    {
+      "checkpoint_repository": "Qwen/Qwen3-0.6B",
+      "reference": {
+        "model": "qwen3",
+        "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "versions": {
+          "torch": "2.13.0+cu129",
+          "transformers": "5.16.1",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "float32",
+        "attention": "eager",
+        "tf32": false,
+        "max_new_tokens": 24,
+        "stop_tokens": [
+          151643,
+          151645
+        ],
+        "cases": [
+          {
+            "name": "arithmetic_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              }
+            ],
+            "text": "2 + 2 = 4"
+          },
+          {
+            "name": "arithmetic_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              },
+              {
+                "role": "assistant",
+                "content": "2 + 2 = 4"
+              },
+              {
+                "role": "user",
+                "content": "Now multiply that result by 3. Answer with the number only."
+              }
+            ],
+            "text": "4 × 3 = 12"
+          },
+          {
+            "name": "memory_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "My dog's name is Pixel. Remember it. Reply briefly."
+              }
+            ],
+            "text": "Pixel is a great name for your dog! 🐾"
+          },
+          {
+            "name": "memory_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "My dog's name is Pixel. Remember it. Reply briefly."
+              },
+              {
+                "role": "assistant",
+                "content": "Pixel is a great name for your dog! 🐾"
+              },
+              {
+                "role": "user",
+                "content": "What is my dog's name? Reply with the name only."
+              }
+            ],
+            "text": "Pixel"
+          },
+          {
+            "name": "translation_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Translate 'good morning' into French. Reply briefly."
+              }
+            ],
+            "text": "Bonjour!"
+          },
+          {
+            "name": "translation_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Translate 'good morning' into French. Reply briefly."
+              },
+              {
+                "role": "assistant",
+                "content": "Bonjour!"
+              },
+              {
+                "role": "user",
+                "content": "Now translate 'thank you' into French. Reply briefly."
+              }
+            ],
+            "text": "Bonjour!"
+          },
+          {
+            "name": "reset_replay_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              }
+            ],
+            "text": "2 + 2 = 4"
+          }
+        ],
+        "max_context": 74
+      },
+      "runs": [
+        {
+          "model": "qwen3",
+          "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+          "backend": "cuda_lite",
+          "prefill_chunk": 1,
+          "max_context": 74,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "2 + 2 = 4",
+              "error": null,
+              "steps": 34,
+              "resets": 1,
+              "max_abs_error": 0.0001430511474609375,
+              "max_tolerance_ratio": 0.017917074263095856
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "4 × 3 = 12",
+              "error": null,
+              "steps": 66,
+              "resets": 1,
+              "max_abs_error": 0.00011110305786132812,
+              "max_tolerance_ratio": 0.019742166623473167
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Pixel is a great name for your dog! 🐾",
+              "error": null,
+              "steps": 38,
+              "resets": 1,
+              "max_abs_error": 0.00013780593872070312,
+              "max_tolerance_ratio": 0.018230579793453217
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 62,
+              "resets": 1,
+              "max_abs_error": 0.00013780593872070312,
+              "max_tolerance_ratio": 0.018230579793453217
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "Bonjour!",
+              "error": null,
+              "steps": 26,
+              "resets": 1,
+              "max_abs_error": 0.00010538101196289062,
+              "max_tolerance_ratio": 0.019587881863117218
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "Bonjour!",
+              "error": null,
+              "steps": 50,
+              "resets": 1,
+              "max_abs_error": 0.00012028217315673828,
+              "max_tolerance_ratio": 0.020565537735819817
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "2 + 2 = 4",
+              "error": null,
+              "steps": 34,
+              "resets": 1,
+              "max_abs_error": 0.0001430511474609375,
+              "max_tolerance_ratio": 0.017917074263095856
+            }
+          ]
+        },
+        {
+          "model": "qwen3",
+          "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+          "backend": "cuda_lite",
+          "prefill_chunk": 4,
+          "max_context": 74,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "2 + 2 = 4",
+              "error": null,
+              "steps": 15,
+              "resets": 1,
+              "max_abs_error": 0.0001392364501953125,
+              "max_tolerance_ratio": 0.026747239753603935
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "4 × 3 = 12",
+              "error": null,
+              "steps": 24,
+              "resets": 1,
+              "max_abs_error": 0.00010395050048828125,
+              "max_tolerance_ratio": 0.017072467133402824
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Pixel is a great name for your dog! 🐾",
+              "error": null,
+              "steps": 20,
+              "resets": 1,
+              "max_abs_error": 9.918212890625e-05,
+              "max_tolerance_ratio": 0.014144673012197018
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 17,
+              "resets": 1,
+              "max_abs_error": 0.0001468658447265625,
+              "max_tolerance_ratio": 0.020905058830976486
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "Bonjour!",
+              "error": null,
+              "steps": 9,
+              "resets": 1,
+              "max_abs_error": 8.749961853027344e-05,
+              "max_tolerance_ratio": 0.015313473530113697
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "Bonjour!",
+              "error": null,
+              "steps": 15,
+              "resets": 1,
+              "max_abs_error": 0.00010603666305541992,
+              "max_tolerance_ratio": 0.019616156816482544
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "2 + 2 = 4",
+              "error": null,
+              "steps": 15,
+              "resets": 1,
+              "max_abs_error": 0.0001392364501953125,
+              "max_tolerance_ratio": 0.026747239753603935
+            }
+          ]
+        },
+        {
+          "model": "qwen3",
+          "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+          "backend": "cuda_lite",
+          "prefill_chunk": 8,
+          "max_context": 74,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "2 + 2 = 4",
+              "error": null,
+              "steps": 12,
+              "resets": 1,
+              "max_abs_error": 0.0001087188720703125,
+              "max_tolerance_ratio": 0.020614180713891983
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "4 × 3 = 12",
+              "error": null,
+              "steps": 17,
+              "resets": 1,
+              "max_abs_error": 0.00011444091796875,
+              "max_tolerance_ratio": 0.013357446528971195
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Pixel is a great name for your dog! 🐾",
+              "error": null,
+              "steps": 17,
+              "resets": 1,
+              "max_abs_error": 0.0001239776611328125,
+              "max_tolerance_ratio": 0.01619691774249077
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 10,
+              "resets": 1,
+              "max_abs_error": 8.356571197509766e-05,
+              "max_tolerance_ratio": 0.0159718357026577
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "Bonjour!",
+              "error": null,
+              "steps": 6,
+              "resets": 1,
+              "max_abs_error": 7.43865966796875e-05,
+              "max_tolerance_ratio": 0.012458582408726215
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "Bonjour!",
+              "error": null,
+              "steps": 9,
+              "resets": 1,
+              "max_abs_error": 0.0001010894775390625,
+              "max_tolerance_ratio": 0.016121627762913704
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "2 + 2 = 4",
+              "error": null,
+              "steps": 12,
+              "resets": 1,
+              "max_abs_error": 0.0001087188720703125,
+              "max_tolerance_ratio": 0.020614180713891983
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "checkpoint_repository": "NousResearch/Meta-Llama-3-8B-Instruct",
+      "reference": {
+        "model": "llama3",
+        "checkpoint_revision": "53346005fb0ef11d3b6a83b12c895cca40156b6c",
+        "versions": {
+          "torch": "2.13.0+cu129",
+          "transformers": "5.16.1",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "float32",
+        "attention": "eager",
+        "tf32": false,
+        "max_new_tokens": 24,
+        "stop_tokens": [
+          128001,
+          128009
+        ],
+        "cases": [
+          {
+            "name": "arithmetic_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              }
+            ],
+            "text": "4"
+          },
+          {
+            "name": "arithmetic_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              },
+              {
+                "role": "assistant",
+                "content": "4"
+              },
+              {
+                "role": "user",
+                "content": "Now multiply that result by 3. Answer with the number only."
+              }
+            ],
+            "text": "12"
+          },
+          {
+            "name": "memory_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "My dog's name is Pixel. Remember it. Reply briefly."
+              }
+            ],
+            "text": "Pixel!"
+          },
+          {
+            "name": "memory_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "My dog's name is Pixel. Remember it. Reply briefly."
+              },
+              {
+                "role": "assistant",
+                "content": "Pixel!"
+              },
+              {
+                "role": "user",
+                "content": "What is my dog's name? Reply with the name only."
+              }
+            ],
+            "text": "Pixel"
+          },
+          {
+            "name": "translation_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Translate 'good morning' into French. Reply briefly."
+              }
+            ],
+            "text": "\"Bonne journée\""
+          },
+          {
+            "name": "translation_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Translate 'good morning' into French. Reply briefly."
+              },
+              {
+                "role": "assistant",
+                "content": "\"Bonne journée\""
+              },
+              {
+                "role": "user",
+                "content": "Now translate 'thank you' into French. Reply briefly."
+              }
+            ],
+            "text": "\"Merci\""
+          },
+          {
+            "name": "reset_replay_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              }
+            ],
+            "text": "4"
+          }
+        ],
+        "max_context": 60
+      },
+      "runs": [
+        {
+          "model": "llama3",
+          "checkpoint_revision": "53346005fb0ef11d3b6a83b12c895cca40156b6c",
+          "backend": "cuda_lite",
+          "prefill_chunk": 1,
+          "max_context": 60,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "4",
+              "error": null,
+              "steps": 26,
+              "resets": 1,
+              "max_abs_error": 0.000607609748840332,
+              "max_tolerance_ratio": 0.10714805871248245
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "12",
+              "error": null,
+              "steps": 25,
+              "resets": 0,
+              "max_abs_error": 0.000110626220703125,
+              "max_tolerance_ratio": 0.016039570793509483
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Pixel!",
+              "error": null,
+              "steps": 26,
+              "resets": 1,
+              "max_abs_error": 0.000607609748840332,
+              "max_tolerance_ratio": 0.10714805871248245
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 24,
+              "resets": 0,
+              "max_abs_error": 0.000148773193359375,
+              "max_tolerance_ratio": 0.020684508606791496
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "\"Bonne journée\"",
+              "error": null,
+              "steps": 26,
+              "resets": 1,
+              "max_abs_error": 0.000607609748840332,
+              "max_tolerance_ratio": 0.10714805871248245
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "\"Merci\"",
+              "error": null,
+              "steps": 26,
+              "resets": 0,
+              "max_abs_error": 0.00016880035400390625,
+              "max_tolerance_ratio": 0.027790339663624763
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "4",
+              "error": null,
+              "steps": 26,
+              "resets": 1,
+              "max_abs_error": 0.000607609748840332,
+              "max_tolerance_ratio": 0.10714805871248245
+            }
+          ]
+        },
+        {
+          "model": "llama3",
+          "checkpoint_revision": "53346005fb0ef11d3b6a83b12c895cca40156b6c",
+          "backend": "cuda_lite",
+          "prefill_chunk": 4,
+          "max_context": 60,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "4",
+              "error": null,
+              "steps": 8,
+              "resets": 1,
+              "max_abs_error": 0.0003108978271484375,
+              "max_tolerance_ratio": 0.035403285175561905
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "12",
+              "error": null,
+              "steps": 8,
+              "resets": 0,
+              "max_abs_error": 0.00011444091796875,
+              "max_tolerance_ratio": 0.019746199250221252
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Pixel!",
+              "error": null,
+              "steps": 9,
+              "resets": 1,
+              "max_abs_error": 0.00026226043701171875,
+              "max_tolerance_ratio": 0.035403285175561905
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 8,
+              "resets": 0,
+              "max_abs_error": 0.0001544952392578125,
+              "max_tolerance_ratio": 0.016177231445908546
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "\"Bonne journée\"",
+              "error": null,
+              "steps": 11,
+              "resets": 1,
+              "max_abs_error": 0.00026226043701171875,
+              "max_tolerance_ratio": 0.035403285175561905
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "\"Merci\"",
+              "error": null,
+              "steps": 11,
+              "resets": 0,
+              "max_abs_error": 0.00018644332885742188,
+              "max_tolerance_ratio": 0.0319945365190506
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "4",
+              "error": null,
+              "steps": 8,
+              "resets": 1,
+              "max_abs_error": 0.0003108978271484375,
+              "max_tolerance_ratio": 0.035403285175561905
+            }
+          ]
+        },
+        {
+          "model": "llama3",
+          "checkpoint_revision": "53346005fb0ef11d3b6a83b12c895cca40156b6c",
+          "backend": "cuda_lite",
+          "prefill_chunk": 8,
+          "max_context": 60,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "4",
+              "error": null,
+              "steps": 5,
+              "resets": 1,
+              "max_abs_error": 0.000141143798828125,
+              "max_tolerance_ratio": 0.017708100378513336
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "12",
+              "error": null,
+              "steps": 5,
+              "resets": 0,
+              "max_abs_error": 0.00012969970703125,
+              "max_tolerance_ratio": 0.01750284433364868
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Pixel!",
+              "error": null,
+              "steps": 6,
+              "resets": 1,
+              "max_abs_error": 7.534027099609375e-05,
+              "max_tolerance_ratio": 0.01071062870323658
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 5,
+              "resets": 0,
+              "max_abs_error": 0.000156402587890625,
+              "max_tolerance_ratio": 0.01601722091436386
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "\"Bonne journée\"",
+              "error": null,
+              "steps": 8,
+              "resets": 1,
+              "max_abs_error": 9.918212890625e-05,
+              "max_tolerance_ratio": 0.014406204223632812
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "\"Merci\"",
+              "error": null,
+              "steps": 8,
+              "resets": 0,
+              "max_abs_error": 8.7738037109375e-05,
+              "max_tolerance_ratio": 0.014922798611223698
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "4",
+              "error": null,
+              "steps": 5,
+              "resets": 1,
+              "max_abs_error": 0.000141143798828125,
+              "max_tolerance_ratio": 0.017708100378513336
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "checkpoint_repository": "unsloth/gemma-3-4b-it",
+      "reference": {
+        "model": "gemma3",
+        "checkpoint_revision": "bf46152c47f5dd20b896357cb51abc4c03b8ee8c",
+        "versions": {
+          "torch": "2.13.0+cu129",
+          "transformers": "5.16.1",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "float32",
+        "attention": "eager",
+        "tf32": false,
+        "max_new_tokens": 24,
+        "stop_tokens": [
+          1,
+          106
+        ],
+        "cases": [
+          {
+            "name": "arithmetic_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              }
+            ],
+            "text": "4\n"
+          },
+          {
+            "name": "arithmetic_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              },
+              {
+                "role": "assistant",
+                "content": "4\n"
+              },
+              {
+                "role": "user",
+                "content": "Now multiply that result by 3. Answer with the number only."
+              }
+            ],
+            "text": "12\n"
+          },
+          {
+            "name": "memory_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "My dog's name is Pixel. Remember it. Reply briefly."
+              }
+            ],
+            "text": "Okay, Pixel! 😊"
+          },
+          {
+            "name": "memory_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "My dog's name is Pixel. Remember it. Reply briefly."
+              },
+              {
+                "role": "assistant",
+                "content": "Okay, Pixel! 😊"
+              },
+              {
+                "role": "user",
+                "content": "What is my dog's name? Reply with the name only."
+              }
+            ],
+            "text": "Pixel"
+          },
+          {
+            "name": "translation_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Translate 'good morning' into French. Reply briefly."
+              }
+            ],
+            "text": "Bonjour !"
+          },
+          {
+            "name": "translation_2",
+            "reset": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Translate 'good morning' into French. Reply briefly."
+              },
+              {
+                "role": "assistant",
+                "content": "Bonjour !"
+              },
+              {
+                "role": "user",
+                "content": "Now translate 'thank you' into French. Reply briefly."
+              }
+            ],
+            "text": "Merci !"
+          },
+          {
+            "name": "reset_replay_1",
+            "reset": true,
+            "messages": [
+              {
+                "role": "user",
+                "content": "What is 2 + 2? Answer with the number only."
+              }
+            ],
+            "text": "4\n"
+          }
+        ],
+        "max_context": 62
+      },
+      "runs": [
+        {
+          "model": "gemma3",
+          "checkpoint_revision": "bf46152c47f5dd20b896357cb51abc4c03b8ee8c",
+          "backend": "cuda_lite",
+          "prefill_chunk": 1,
+          "max_context": 62,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "4\n",
+              "error": null,
+              "steps": 26,
+              "resets": 1,
+              "max_abs_error": 0.0003821849822998047,
+              "max_tolerance_ratio": 0.06529434025287628
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "12\n",
+              "error": null,
+              "steps": 52,
+              "resets": 1,
+              "max_abs_error": 0.0004217177629470825,
+              "max_tolerance_ratio": 0.08353962004184723
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Okay, Pixel! 😊",
+              "error": null,
+              "steps": 29,
+              "resets": 1,
+              "max_abs_error": 0.0004119873046875,
+              "max_tolerance_ratio": 0.06039819121360779
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 25,
+              "resets": 0,
+              "max_abs_error": 0.000476837158203125,
+              "max_tolerance_ratio": 0.07564245164394379
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "Bonjour !",
+              "error": null,
+              "steps": 23,
+              "resets": 1,
+              "max_abs_error": 0.00033792853355407715,
+              "max_tolerance_ratio": 0.06500357389450073
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "Merci !",
+              "error": null,
+              "steps": 24,
+              "resets": 0,
+              "max_abs_error": 0.0004405975341796875,
+              "max_tolerance_ratio": 0.06908556818962097
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "4\n",
+              "error": null,
+              "steps": 26,
+              "resets": 1,
+              "max_abs_error": 0.0003821849822998047,
+              "max_tolerance_ratio": 0.06529434025287628
+            }
+          ]
+        },
+        {
+          "model": "gemma3",
+          "checkpoint_revision": "bf46152c47f5dd20b896357cb51abc4c03b8ee8c",
+          "backend": "cuda_lite",
+          "prefill_chunk": 4,
+          "max_context": 62,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "4\n",
+              "error": null,
+              "steps": 9,
+              "resets": 1,
+              "max_abs_error": 0.0004138946533203125,
+              "max_tolerance_ratio": 0.06429946422576904
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "12\n",
+              "error": null,
+              "steps": 16,
+              "resets": 1,
+              "max_abs_error": 0.00045013427734375,
+              "max_tolerance_ratio": 0.0806160718202591
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Okay, Pixel! 😊",
+              "error": null,
+              "steps": 12,
+              "resets": 1,
+              "max_abs_error": 0.0004119873046875,
+              "max_tolerance_ratio": 0.06264172494411469
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 8,
+              "resets": 0,
+              "max_abs_error": 0.00077056884765625,
+              "max_tolerance_ratio": 0.06349891424179077
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "Bonjour !",
+              "error": null,
+              "steps": 8,
+              "resets": 1,
+              "max_abs_error": 0.00038242340087890625,
+              "max_tolerance_ratio": 0.060609158128499985
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "Merci !",
+              "error": null,
+              "steps": 9,
+              "resets": 0,
+              "max_abs_error": 0.000354766845703125,
+              "max_tolerance_ratio": 0.057238128036260605
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "4\n",
+              "error": null,
+              "steps": 9,
+              "resets": 1,
+              "max_abs_error": 0.0004138946533203125,
+              "max_tolerance_ratio": 0.06429946422576904
+            }
+          ]
+        },
+        {
+          "model": "gemma3",
+          "checkpoint_revision": "bf46152c47f5dd20b896357cb51abc4c03b8ee8c",
+          "backend": "cuda_lite",
+          "prefill_chunk": 8,
+          "max_context": 62,
+          "atol": 0.004999999888241291,
+          "rtol": 0.0005000000237487257,
+          "search_generations": 2,
+          "search_population": 4,
+          "seed": 0,
+          "passed": true,
+          "cases": [
+            {
+              "case": "arithmetic_1",
+              "passed": true,
+              "text": "4\n",
+              "error": null,
+              "steps": 6,
+              "resets": 1,
+              "max_abs_error": 0.0004215240478515625,
+              "max_tolerance_ratio": 0.08185229450464249
+            },
+            {
+              "case": "arithmetic_2",
+              "passed": true,
+              "text": "12\n",
+              "error": null,
+              "steps": 10,
+              "resets": 1,
+              "max_abs_error": 0.000385284423828125,
+              "max_tolerance_ratio": 0.06341955065727234
+            },
+            {
+              "case": "memory_1",
+              "passed": true,
+              "text": "Okay, Pixel! 😊",
+              "error": null,
+              "steps": 9,
+              "resets": 1,
+              "max_abs_error": 0.0003414154052734375,
+              "max_tolerance_ratio": 0.06148240715265274
+            },
+            {
+              "case": "memory_2",
+              "passed": true,
+              "text": "Pixel",
+              "error": null,
+              "steps": 5,
+              "resets": 0,
+              "max_abs_error": 0.00032806396484375,
+              "max_tolerance_ratio": 0.04934658855199814
+            },
+            {
+              "case": "translation_1",
+              "passed": true,
+              "text": "Bonjour !",
+              "error": null,
+              "steps": 6,
+              "resets": 1,
+              "max_abs_error": 0.0003452301025390625,
+              "max_tolerance_ratio": 0.059154950082302094
+            },
+            {
+              "case": "translation_2",
+              "passed": true,
+              "text": "Merci !",
+              "error": null,
+              "steps": 6,
+              "resets": 0,
+              "max_abs_error": 0.0003757476806640625,
+              "max_tolerance_ratio": 0.06144322082400322
+            },
+            {
+              "case": "reset_replay_1",
+              "passed": true,
+              "text": "4\n",
+              "error": null,
+              "steps": 6,
+              "resets": 1,
+              "max_abs_error": 0.0004215240478515625,
+              "max_tolerance_ratio": 0.08185229450464249
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

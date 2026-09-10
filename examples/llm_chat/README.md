@@ -119,7 +119,10 @@ using a small zoo model. Other tests cover namespace mappings, sharded
 checkpoints, dtype/layout conversion, templates, sampling, prefix reuse, and
 cache reset. Both runtime suites check resident feedback across buckets.
 
-The CUDA path has also been exercised with the real `Qwen/Qwen3-0.6B`
-checkpoint (revision `c1899de289a04d12100db370d81485cdf75e47ca`), including
-safetensors loading, chat-template rendering, and text generation. Metal planning and its shared chat adapter can be checked on Linux. Metal
+For real-checkpoint comparisons against Transformers across prompts, follow-ups,
+prefill chunk sizes, and resets, see the [validation tools](validation/README.md).
+
+Real CUDA checkpoint results for Qwen3-0.6B, Llama3-8B-Instruct, and the
+Gemma3-4B-IT text tower are recorded in the [validation report](validation/RESULTS.md).
+Metal planning and its shared chat adapter can be checked on Linux. Metal
 shader compilation and GPU execution require the macOS CI job or a local Mac.

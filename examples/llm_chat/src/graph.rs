@@ -170,7 +170,9 @@ impl ModelConfig {
                     config["tie_word_embeddings"]
                         .as_bool()
                         .or_else(|| root["tie_word_embeddings"].as_bool())
-                        == Some(true),
+                        // Gemma3TextConfig defaults to tied embeddings. The
+                        // published 4B checkpoint omits this default field.
+                        .unwrap_or(true),
                     "Gemma3 requires tied embeddings"
                 );
                 ensure!(
@@ -504,5 +506,23 @@ mod tests {
         let config = serde_json::json!({"model_type":"llama","hidden_size":16,"num_attention_heads":4,"num_key_value_heads":2,"vocab_size":29,"num_hidden_layers":2,"hidden_act":"silu","intermediate_size":24,"rope_theta":10000.,"rms_norm_eps":1e-5,"rope_scaling":{"factor":8.}});
         assert!(ModelConfig::from_checkpoint(ModelType::Llama3, &config).is_err());
         assert!(ModelConfig::from_checkpoint(ModelType::Qwen3, &config).is_err());
+    }
+
+    #[test]
+    fn gemma_checkpoint_uses_its_default_tied_embeddings_and_rejects_untied() {
+        let mut root = serde_json::json!({"model_type":"gemma3", "text_config": {
+            "model_type":"gemma3_text", "hidden_size":2560, "vocab_size":262208,
+            "num_hidden_layers":34, "intermediate_size":10240,
+            "num_attention_heads":8, "num_key_value_heads":4, "head_dim":256,
+            "sliding_window":1024, "rope_theta":1000000., "rope_local_base_freq":10000.,
+            "rope_scaling":{"factor":8., "rope_type":"linear"}, "rms_norm_eps":1e-6,
+            "query_pre_attn_scalar":256, "hidden_activation":"gelu_pytorch_tanh"
+        }});
+        assert!(ModelConfig::from_checkpoint(ModelType::Gemma3, &root).is_ok());
+        root["tie_word_embeddings"] = false.into();
+        assert!(ModelConfig::from_checkpoint(ModelType::Gemma3, &root).is_err());
+        root["tie_word_embeddings"] = true.into();
+        root["text_config"]["tie_word_embeddings"] = false.into();
+        assert!(ModelConfig::from_checkpoint(ModelType::Gemma3, &root).is_err());
     }
 }
