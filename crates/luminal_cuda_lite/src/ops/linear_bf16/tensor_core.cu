@@ -7,11 +7,16 @@
 // B row per 64-k iteration (a 32-byte cp.async), and the mma's k slots
 // are mapped so the same thread supplies them for A and B.
 //
-// One block per (BN output columns, BM rows of x); NSTAGE-deep cp.async
-// ring for both operands.
+// One block per (BN output columns, BM rows of x, K split); NSTAGE-deep
+// cp.async ring for both operands. A narrow projection (N = 4096) on a
+// few rows makes too few (columns x rows) tiles to fill the device, so
+// the K loop is split across gridDim.z blocks: with one split the block
+// stores acc + bias; with more, `linear_bias_init` has seeded out with
+// the bias and every split adds its partial with atomics.
 //
-// KERNEL INVARIANT: every element of out is written exactly once;
-// nothing reads out.
+// KERNEL INVARIANT (one split): every element of out is written exactly
+// once; nothing reads out. (Several splits): out is seeded by the init
+// kernel on the same stream and then only accumulated into.
 
 #define BM 64
 #define BK 64
@@ -20,7 +25,10 @@
 #define MT (BM / 16)
 #define RPT (BM / 32)
 #define A_STAGE_BYTES (BM * BK * 4)
-#define B_STAGE_BYTES (BN * BK * 2)
+// B rows are padded from 128 to 144 bytes so a warp's 16-byte fragment
+// reads (8 rows x 4 k-quads) spread over all 32 banks.
+#define B_ROW_BYTES (BK * 2 + 16)
+#define B_STAGE_BYTES (BN * B_ROW_BYTES)
 
 __device__ __forceinline__ unsigned int pack_bf16(float lo, float hi) {
     unsigned int r;
@@ -93,7 +101,13 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) linear_bf16_tc(
 #pragma unroll
             for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.0f;
 
-    const int iters = k_dim / BK;
+    const int total_iters = k_dim / BK;
+    // This split's slice of the K loop.
+    const int ksplit = gridDim.z;
+    const int per_split = (total_iters + ksplit - 1) / ksplit;
+    const int it_begin = blockIdx.z * per_split;
+    const int iters = min(per_split, total_iters - it_begin);
+    if (iters <= 0) return;
     auto issue = [&](int it, int slot) {
         unsigned char* a_dst = a_stages + slot * A_STAGE_BYTES;
         unsigned char* b_dst = b_stages + slot * B_STAGE_BYTES;
@@ -104,15 +118,15 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) linear_bf16_tc(
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int chunk = 4 * q4 + i;
-                cp_async16(a_dst + row * (BK * 4) + ((chunk ^ (row & 7)) * 16), a_rows[r] + it * BK + 4 * i);
+                cp_async16(a_dst + row * (BK * 4) + ((chunk ^ (row & 7)) * 16), a_rows[r] + (it_begin + it) * BK + 4 * i);
             }
         }
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
             const int n = wn + 8 * j + lane / 4;
-            const unsigned short* src = w_tile + (long long)n * k_dim + it * BK + 16 * q;
-            cp_async16(b_dst + n * (BK * 2) + 32 * q, src);
-            cp_async16(b_dst + n * (BK * 2) + 32 * q + 16, src + 8);
+            const unsigned short* src = w_tile + (long long)n * k_dim + (it_begin + it) * BK + 16 * q;
+            cp_async16(b_dst + n * B_ROW_BYTES + 32 * q, src);
+            cp_async16(b_dst + n * B_ROW_BYTES + 32 * q + 16, src + 8);
         }
     };
 #pragma unroll
@@ -135,8 +149,8 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) linear_bf16_tc(
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
             const int n = wn + 8 * j + lane / 4;
-            bw[j][0] = *reinterpret_cast<const uint4*>(b_buf + n * (BK * 2) + 32 * q);
-            bw[j][1] = *reinterpret_cast<const uint4*>(b_buf + n * (BK * 2) + 32 * q + 16);
+            bw[j][0] = *reinterpret_cast<const uint4*>(b_buf + n * B_ROW_BYTES + 32 * q);
+            bw[j][1] = *reinterpret_cast<const uint4*>(b_buf + n * B_ROW_BYTES + 32 * q + 16);
         }
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
@@ -179,12 +193,33 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) linear_bf16_tc(
             const int row = 16 * i + lane / 4 + 8 * half;
             if (row >= rows) continue;
             float* dst = out + (long long)(m0 + row) * n_dim;
+            if (ksplit == 1) {
 #pragma unroll
-            for (int j = 0; j < NT; ++j) {
-                const int n = n0 + wn + 8 * j + 2 * q;
-                dst[n] = acc[i][j][2 * half] + bias[n];
-                dst[n + 1] = acc[i][j][2 * half + 1] + bias[n + 1];
+                for (int j = 0; j < NT; ++j) {
+                    const int n = n0 + wn + 8 * j + 2 * q;
+                    dst[n] = acc[i][j][2 * half] + bias[n];
+                    dst[n + 1] = acc[i][j][2 * half + 1] + bias[n + 1];
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    const int n = n0 + wn + 8 * j + 2 * q;
+                    atomicAdd(dst + n, acc[i][j][2 * half]);
+                    atomicAdd(dst + n + 1, acc[i][j][2 * half + 1]);
+                }
             }
         }
     }
+}
+
+// out[t, n] = bias[n]: the seed for a split-K accumulation.
+extern "C" __global__ void linear_bias_init(
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int s,
+    int n_dim
+) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)s * n_dim;
+    if (i < total) out[i] = bias[i % n_dim];
 }

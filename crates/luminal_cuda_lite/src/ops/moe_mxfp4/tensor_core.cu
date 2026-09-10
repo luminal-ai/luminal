@@ -38,7 +38,9 @@
 
 #define BK 64
 #define THREADS 128
+#ifndef WINDOW
 #define WINDOW 4096
+#endif
 #define NT (BN / 32)
 #define MT (BM / 16)
 #define RPT (BM / 32)

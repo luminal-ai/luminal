@@ -125,13 +125,13 @@ fn moe_gpt_oss_geometry_timing() {
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
             rt.execute().expect("execute");
-            let _ = rt.fetch(out.id).expect("fetch");
         }
+        let _ = rt.fetch(out.id).expect("fetch");
         let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
         // Expert traffic if every routed expert were read once per token.
         let bytes_per_pair = (2 * INTER * HIDDEN / 2 + HIDDEN * INTER / 2) as f64;
         println!(
-            "s {s:>5}: {ms:>9.3} ms per tick (topk + gate_up + down + fetch); \
+            "s {s:>5}: {ms:>9.3} ms per tick (topk + gate_up + down + sum); \
              pair-major traffic {:.1} GB, per-tick effective {:.2} TB/s",
             s as f64 * TOP_K as f64 * bytes_per_pair / 1e9,
             s as f64 * TOP_K as f64 * bytes_per_pair / (ms * 1e-3) / 1e12

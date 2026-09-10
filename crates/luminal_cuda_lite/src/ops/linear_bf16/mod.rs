@@ -60,6 +60,22 @@ fn tensor_bn(n: usize) -> Option<usize> {
     [128usize, 64].into_iter().find(|bn| n.is_multiple_of(*bn))
 }
 
+/// The device's SM count, read once.
+#[cfg(feature = "device")]
+fn sm_count(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<usize> {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(n) = CACHE.get() {
+        return Ok(*n);
+    }
+    let n = stream
+        .context()
+        .attribute(
+            cudarc::driver::sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )
+        .context("querying the SM count")? as usize;
+    Ok(*CACHE.get_or_init(|| n.max(1)))
+}
+
 #[cfg(feature = "device")]
 fn opt_in_smem(function: &cudarc::driver::CudaFunction, bytes: usize, label: &str) -> Result<()> {
     function
@@ -151,8 +167,33 @@ impl crate::host::HostOp for LinearBf16Dps {
             || format!("#define BN {bn}\n#define NSTAGE {TENSOR_STAGES}\n{TENSOR_SOURCE}"),
         )
         .with_context(|| format!("{label}: tensor-core kernel"))?;
-        let smem = TENSOR_STAGES * (TENSOR_BM * TENSOR_BK * 4 + bn * TENSOR_BK * 2);
+        // B rows are padded to 144 bytes in shared memory (see tensor_core.cu).
+        let smem = TENSOR_STAGES * (TENSOR_BM * TENSOR_BK * 4 + bn * (TENSOR_BK * 2 + 16));
         opt_in_smem(&function, smem, label)?;
+        // Split K until the tile grid covers the device twice over (or the
+        // K loop runs out): a narrow projection on a few rows is otherwise a
+        // few dozen blocks streaming their weights serially.
+        let tiles = (n / bn) * s.div_ceil(TENSOR_BM);
+        let iters = k / TENSOR_BK;
+        let ksplit = (2 * sm_count(ctx.stream)?).div_ceil(tiles).clamp(1, iters);
+        if ksplit > 1 {
+            let init = crate::nvrtc_module::kernel_function_keyed(
+                ctx.stream,
+                &format!("linear_bf16_tc:{bn}"),
+                "linear_bias_init",
+                || format!("#define BN {bn}\n#define NSTAGE {TENSOR_STAGES}\n{TENSOR_SOURCE}"),
+            )
+            .with_context(|| format!("{label}: bias init kernel"))?;
+            let total = s * n;
+            let mut builder = ctx.stream.launch_builder(&init);
+            builder.arg(&b_ptr).arg(&dest).arg(&s_i).arg(&n_i);
+            let cfg = LaunchConfig {
+                grid_dim: (total.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { builder.launch(cfg) }.with_context(|| format!("{label}: bias init launch"))?;
+        }
         let mut builder = ctx.stream.launch_builder(&function);
         builder
             .arg(&x_ptr)
@@ -163,7 +204,7 @@ impl crate::host::HostOp for LinearBf16Dps {
             .arg(&n_i)
             .arg(&k_i);
         let cfg = LaunchConfig {
-            grid_dim: ((n / bn) as u32, s.div_ceil(TENSOR_BM) as u32, 1),
+            grid_dim: ((n / bn) as u32, s.div_ceil(TENSOR_BM) as u32, ksplit as u32),
             block_dim: (128, 1, 1),
             shared_mem_bytes: smem as u32,
         };

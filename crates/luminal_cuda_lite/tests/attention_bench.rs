@@ -111,11 +111,11 @@ fn paged_attention_decode_context_timing() {
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
             rt.execute().expect("execute");
-            let _ = rt.fetch(out.id).expect("fetch");
         }
+        let _ = rt.fetch(out.id).expect("fetch");
         let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
         println!(
-            "s {s:>3} context {context:>5} qpos {qpos:>5} window {window:>3}: {ms:>8.3} ms per tick (attention + fetch)"
+            "s {s:>3} context {context:>5} qpos {qpos:>5} window {window:>3}: {ms:>8.3} ms per tick (attention)"
         );
     }
 }

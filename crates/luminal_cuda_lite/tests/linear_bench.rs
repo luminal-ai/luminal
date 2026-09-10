@@ -59,12 +59,12 @@ fn linear_bf16_gpt_oss_shapes() {
             let t0 = std::time::Instant::now();
             for _ in 0..iters {
                 rt.execute().expect("execute");
-                let _ = rt.fetch(out.id).expect("fetch");
             }
+            let _ = rt.fetch(out.id).expect("fetch");
             let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
             let gb = (n * k * 2) as f64 / 1e9;
             println!(
-                "{name:>8} s {s:>5}: {ms:>8.3} ms (weights {gb:.2} GB -> {:.2} TB/s incl. fetch)",
+                "{name:>8} s {s:>5}: {ms:>8.3} ms (weights {gb:.2} GB -> {:.2} TB/s )",
                 gb / (ms * 1e-3) / 1e3
             );
         }

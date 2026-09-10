@@ -50,12 +50,19 @@ extern "C" __global__ void __launch_bounds__(THREADS) linear_bf16_gemv(
     for (int r = 0; r < RW; ++r) {
         wrow[r] = reinterpret_cast<const uint4*>(w + (long long)(n0 + r) * k_dim);
     }
-#pragma unroll 4
+    // Two chunks of weights in flight per lane: the next chunk's loads are
+    // issued before the current one's dot products.
+    uint4 cur[RW], nxt[RW];
+#pragma unroll
+    for (int r = 0; r < RW; ++r) cur[r] = (lane < chunks) ? wrow[r][lane] : make_uint4(0, 0, 0, 0);
     for (int c = lane; c < chunks; c += 32) {
+        const int cn = c + 32;
+#pragma unroll
+        for (int r = 0; r < RW; ++r) nxt[r] = (cn < chunks) ? wrow[r][cn] : make_uint4(0, 0, 0, 0);
         float wv[RW][8];
 #pragma unroll
         for (int r = 0; r < RW; ++r) {
-            const uint4 raw = wrow[r][c];
+            const uint4 raw = cur[r];
             wv[r][0] = bf16_lo(raw.x); wv[r][1] = bf16_hi(raw.x);
             wv[r][2] = bf16_lo(raw.y); wv[r][3] = bf16_hi(raw.y);
             wv[r][4] = bf16_lo(raw.z); wv[r][5] = bf16_hi(raw.z);
@@ -81,6 +88,8 @@ extern "C" __global__ void __launch_bounds__(THREADS) linear_bf16_gemv(
                 }
             }
         }
+#pragma unroll
+        for (int r = 0; r < RW; ++r) cur[r] = nxt[r];
     }
 #pragma unroll
     for (int t = 0; t < S_MAX; ++t) {

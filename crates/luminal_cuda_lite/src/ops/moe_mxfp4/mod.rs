@@ -70,7 +70,7 @@ const TENSOR_THREADS: u32 = 128;
 const TENSOR_MIN_BLOCKS: usize = 2;
 /// cp.async ring depth.
 const TENSOR_STAGES: usize = 3;
-/// Routes one shared-memory window holds; must match `WINDOW` in the kernel.
+/// Routes one shared-memory window holds (the kernel's `WINDOW`).
 const TENSOR_WINDOW: usize = 4096;
 /// Routes (token, k) at or above which a tick takes the expert-major
 /// tensor-core kernel; below it the warp-per-route GEMV reads no more
@@ -93,6 +93,7 @@ struct TensorTiling {
     bm: usize,
     min_blocks: usize,
     stages: usize,
+    window: usize,
 }
 
 impl TensorTiling {
@@ -100,7 +101,7 @@ impl TensorTiling {
     /// tile's scale rows.
     fn smem_bytes(&self, k: usize) -> usize {
         self.stages * (self.bm * TENSOR_BK * 4 + self.bn * 32)
-            + TENSOR_WINDOW * 4
+            + self.window * 4
             + self.bn * (k / 32)
     }
 }
@@ -112,6 +113,7 @@ fn tensor_tiling() -> TensorTiling {
         bm: env_usize("LUMINAL_MOE_TENSOR_BM", TENSOR_BM),
         min_blocks: env_usize("LUMINAL_MOE_TENSOR_MIN_BLOCKS", TENSOR_MIN_BLOCKS),
         stages: env_usize("LUMINAL_MOE_TENSOR_STAGES", TENSOR_STAGES),
+        window: env_usize("LUMINAL_MOE_TENSOR_WINDOW", TENSOR_WINDOW),
     })
 }
 
@@ -139,12 +141,13 @@ fn tensor_path(pairs: usize, n: usize, k: usize, experts: usize) -> bool {
 fn tensor_source(gate_up: bool) -> String {
     let tiling = tensor_tiling();
     format!(
-        "#define MODE_GATE_UP {}\n#define BN {}\n#define BM {}\n#define MIN_BLOCKS {}\n#define NSTAGE {}\n{}",
+        "#define MODE_GATE_UP {}\n#define BN {}\n#define BM {}\n#define MIN_BLOCKS {}\n#define NSTAGE {}\n#define WINDOW {}\n{}",
         u8::from(gate_up),
         tiling.bn,
         tiling.bm,
         tiling.min_blocks,
         tiling.stages,
+        tiling.window,
         TENSOR_SOURCE
     )
 }
