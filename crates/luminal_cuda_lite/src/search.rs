@@ -272,7 +272,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 .map_err(|e| e.to_string());
         }
         let candidate =
-            self.compile_and_validate_finalist_candidate(&pending.llir, &pending.dyn_map, ctx)?;
+            self.compile_and_validate_profile_candidate(&pending.llir, &pending.dyn_map, ctx)?;
         self.install_validated_bucket_set(ctx.dim_buckets(), candidate.buckets)
             .map_err(|error| format!("deployment CUDA-graph load reject: {error}"))?;
         let (metric, _) = self.profile_loaded_cuda_graph(
@@ -329,7 +329,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let compile_started = Instant::now();
         if finalist {
             let prepared = self
-                .compile_and_validate_finalist_candidate(llir, &dims, ctx)
+                .compile_and_validate_profile_candidate(llir, &dims, ctx)
                 .map_err(anyhow::Error::msg)?;
             self.install_validated_bucket_set(ctx.dim_buckets(), prepared.buckets)?;
         } else {
@@ -385,11 +385,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         pending: &PendingFinalist<Duration>,
         ctx: &BucketContext<'_>,
     ) -> Result<(), String> {
-        // This genome was already compiled and timed during search. Re-run the
-        // exact CUDA/resource checks for deployment, but do not apply the
-        // cheap candidate-planning node guard: that guard bounds exploration
-        // work and is not a property of the measured graph.
-        self.compile_and_validate_finalist_candidate(&pending.llir, &pending.dyn_map, ctx)
+        // Revalidate the measured genome with the same CUDA/resource checks
+        // used during search before installing the deployment bucket set.
+        self.compile_and_validate_profile_candidate(&pending.llir, &pending.dyn_map, ctx)
             .map(|_| ())
     }
 }

@@ -4971,24 +4971,6 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         dyn_map: &DynMap,
         ctx: &luminal::search::BucketContext<'_>,
     ) -> Result<ValidatedProfileCandidate, String> {
-        self.compile_and_validate_profile_candidate_inner(llir_graph, dyn_map, ctx)
-    }
-
-    pub(crate) fn compile_and_validate_finalist_candidate(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        ctx: &luminal::search::BucketContext<'_>,
-    ) -> Result<ValidatedProfileCandidate, String> {
-        self.compile_and_validate_profile_candidate_inner(llir_graph, dyn_map, ctx)
-    }
-
-    fn compile_and_validate_profile_candidate_inner(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        ctx: &luminal::search::BucketContext<'_>,
-    ) -> Result<ValidatedProfileCandidate, String> {
         let allocation_dyn_map = Self::candidate_allocation_dyn_map(dyn_map, ctx);
         let caps = self.search_candidate_resource_caps();
         let static_plan = match prepare_static_llir_resources(
