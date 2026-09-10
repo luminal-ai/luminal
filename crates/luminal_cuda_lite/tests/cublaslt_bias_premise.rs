@@ -240,6 +240,9 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
             trials: 1,
             seed,
             search_log: false,
+            // This test sweeps SEEDS for an election fact; the cost-based
+            // seed genome would decide it deterministically instead.
+            greedy_seed: false,
             ..Default::default()
         };
         let mut rt = CudaRuntime::load(&cx).expect("load");
@@ -460,6 +463,9 @@ fn a_degenerate_extent_bias_election_binds_col_and_is_not_refused() {
             trials: 1,
             seed,
             search_log: false,
+            // This test sweeps SEEDS for an election fact; the cost-based
+            // seed genome would decide it deterministically instead.
+            greedy_seed: false,
             ..Default::default()
         };
         let mut rt = CudaRuntime::load(&cx).expect("load");

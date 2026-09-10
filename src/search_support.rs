@@ -522,13 +522,22 @@ pub fn sample_genome_reporting(
     (genome, fallbacks)
 }
 
-/// THE GREEDY SEED (serving landing, 2026-09-10): [`sample_genome`]'s
-/// admissibility walk with every random pick replaced by a deterministic
-/// one — the member with the smallest sorted position among those that
-/// can still choose admissibly, and, per member, the admissible
-/// candidate with the LOWEST `cost`. The result is the genome a
-/// bytes-moved prior would build one class at a time: a library matmul
-/// over its decomposed spelling, a view over a copy, and so on.
+/// THE PREFERRED-CHOICE WALK (serving landing, 2026-09-10):
+/// [`sample_genome`]'s admissibility walk with every random pick
+/// replaced by a deterministic one. Per member the PREFERRED candidate
+/// (`prefer`, typically the cost-based extraction's own election) is
+/// taken whenever it is admissible; otherwise the admissible candidate
+/// with the lowest `cost`. Members whose preferred candidate is
+/// admissible are assigned first, so a preference is honoured unless
+/// honouring it would close a cycle.
+///
+/// WHY NOT READ THE COST-BASED MEMO STRAIGHT INTO A GENOME. The
+/// relaxation re-plans a class at EQUAL cost on a label tie-break, and
+/// two zero-cost views of each other can end up each planned through
+/// the other — a memo cycle the plain extraction tolerates but a genome
+/// (the ONLY authority under genome extraction) cannot. Routing the
+/// preference through the sampler's admissibility keeps the genome
+/// acyclic by construction, exactly as a sampled one is.
 ///
 /// WHY IT EXISTS. Uniform sampling picks each of a graph's producer
 /// classes independently; on a serving graph with hundreds of matmul
@@ -539,17 +548,16 @@ pub fn sample_genome_reporting(
 /// viable incumbent to improve on; nothing else about the search changes
 /// (the seed is measured like any other candidate and loses if a
 /// mutation beats it).
-///
-/// The same cycle invariant as the sampler: the chosen-edge graph is
-/// acyclic unless a member had no admissible option, in which case the
-/// full-list fallback is taken and the class reported, exactly as
-/// [`sample_genome_reporting`] does.
 pub fn greedy_genome(
     index: &ProducerIndex,
     space: &SamplingSpace,
+    prefer: &dyn Fn(&ClassId) -> Option<ProducerChoice>,
     cost: &dyn Fn(&ClassId, &ProducerChoice) -> u64,
 ) -> Genome {
     let mut genome = Genome::default();
+    let position_of = |class: &ClassId, choice: &ProducerChoice| -> Option<usize> {
+        index[class].iter().position(|(_, c)| c == choice)
+    };
     for members in &space.components {
         let mut pending: Vec<Vec<usize>> = members
             .iter()
@@ -576,6 +584,10 @@ pub fn greedy_genome(
                 }
             }
         }
+        let preferred: Vec<Option<usize>> = members
+            .iter()
+            .map(|class| prefer(class).and_then(|choice| position_of(class, &choice)))
+            .collect();
         let mut assigned = vec![false; members.len()];
         for _ in 0..members.len() {
             let mut pool: Vec<usize> = (0..members.len())
@@ -587,7 +599,15 @@ pub fn greedy_genome(
                     .filter(|member| !assigned[*member])
                     .collect();
             }
-            let member = pool[0];
+            // A member whose PREFERRED candidate is admissible right now
+            // goes first; otherwise the first member that can choose.
+            let member = pool
+                .iter()
+                .copied()
+                .find(|member| {
+                    preferred[*member].is_some_and(|position| pending[*member][position] == 0)
+                })
+                .unwrap_or(pool[0]);
             let class = &members[member];
             let candidates = &index[class];
             let allowed: Vec<usize> = (0..candidates.len())
@@ -598,11 +618,14 @@ pub fn greedy_genome(
             } else {
                 allowed
             };
-            let position = choices
-                .iter()
-                .copied()
-                .min_by_key(|position| (cost(class, &candidates[*position].1), *position))
-                .expect("a class in the producer index has at least one candidate");
+            let position = match preferred[member] {
+                Some(position) if choices.contains(&position) => position,
+                _ => choices
+                    .iter()
+                    .copied()
+                    .min_by_key(|position| (cost(class, &candidates[*position].1), *position))
+                    .expect("a class in the producer index has at least one candidate"),
+            };
             genome
                 .choices
                 .insert(class.clone(), candidates[position].1.clone());
@@ -619,9 +642,12 @@ pub fn greedy_genome(
         if genome.choices.contains_key(class) {
             continue;
         }
-        let position = (0..candidates.len())
-            .min_by_key(|position| (cost(class, &candidates[*position].1), *position))
-            .expect("a class in the producer index has at least one candidate");
+        let position = match prefer(class).and_then(|choice| position_of(class, &choice)) {
+            Some(position) => position,
+            None => (0..candidates.len())
+                .min_by_key(|position| (cost(class, &candidates[*position].1), *position))
+                .expect("a class in the producer index has at least one candidate"),
+        };
         genome
             .choices
             .insert(class.clone(), candidates[position].1.clone());

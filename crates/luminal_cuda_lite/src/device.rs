@@ -109,7 +109,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::compile_ptx;
 use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode, EdgeKind, OutputBinding};
 use luminal::dtype::PlanDtype;
-use luminal::prelude::FxHashMap;
+use luminal::prelude::{FxHashMap, NodeIndex};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -219,6 +219,53 @@ pub struct CudaDevice {
     /// interior buffer demoted for want of a lifetime pair), keyed by the
     /// plan's own buffer id text and size.
     scratch: HashMap<(String, usize), CudaSlice<u8>>,
+    /// PREPARED DISPATCH (serving landing, 2026-09-10): a plan's arena
+    /// walk and compiled launches, keyed by the caller's plan key. A
+    /// serving tick re-derives none of it — codegen, NVRTC lookup and the
+    /// topological walk are paid once per installed plan.
+    prepared: HashMap<u64, PreparedPlan>,
+}
+
+/// One compiled launch of a codegen'd kernel.
+struct PreparedLaunch {
+    func: CudaFunction,
+    n: u64,
+    grid: u32,
+    block: u32,
+    skip_when_dest_is_operand: Option<usize>,
+}
+
+/// One dispatch step of a prepared plan, in arena issue order.
+enum PreparedStep {
+    Copy {
+        src: BufferId,
+        dst: BufferId,
+    },
+    /// Bind a slab member to its range (a standalone buffer's alloc is a no-op).
+    Alloc(Option<BufferId>),
+    Free(Option<BufferId>),
+    Host {
+        node: NodeIndex,
+        reads: Vec<BufferId>,
+        dest: BufferId,
+        input_count: usize,
+    },
+    Kernel {
+        reads: Vec<BufferId>,
+        dest: BufferId,
+        input_count: usize,
+        launches: Vec<PreparedLaunch>,
+    },
+}
+
+/// A plan's dispatch, derived once from the plan: everything that does
+/// not depend on where the buffers happen to live this call.
+pub struct PreparedPlan {
+    arena: ArenaPlan,
+    slot_of_buffer: FxHashMap<BufferId, usize>,
+    slot_bindings: Vec<OutputBinding<luminal::layouts::DecodedLayout>>,
+    geometry: FxHashMap<BufferId, PlanDtype>,
+    steps: Vec<PreparedStep>,
 }
 
 impl CudaDevice {
@@ -239,6 +286,7 @@ impl CudaDevice {
             outputs: HashMap::new(),
             slot_view: HashMap::new(),
             scratch: HashMap::new(),
+            prepared: HashMap::new(),
         })
     }
 
@@ -300,6 +348,11 @@ impl CudaDevice {
     /// search.
     pub fn release_slab(&mut self) {
         self.slab = None;
+    }
+
+    /// Drop every prepared plan (a new search installs new plans).
+    pub fn forget_prepared(&mut self) {
+        self.prepared.clear();
     }
 
     /// Mark a staged lit DIRTY: its next execute re-uploads it whatever
@@ -543,11 +596,48 @@ fn bound_of(bindings: &FxHashMap<BufferId, Bound>, id: &BufferId, who: &str) -> 
 /// full-size model is gigabytes of weights: a map of references costs
 /// one pointer per input and no copy at all — and since the serving
 /// landing, no H2D either once a lit is resident and clean.
+///
+/// This entry prepares the plan's dispatch afresh (the search's transient
+/// candidates); serving goes through [`execute_plan_keyed`], which keeps
+/// the prepared dispatch across calls.
 pub fn execute_plan(
     device: &mut CudaDevice,
     plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
     staged: &FxHashMap<i64, &HostBuffer>,
 ) -> Result<FxHashMap<usize, OutputBinding<luminal::layouts::DecodedLayout>>> {
+    let prepared = prepare_plan(device, plan)?;
+    run_prepared(device, &prepared, plan, staged)
+}
+
+/// [`execute_plan`] with the plan's dispatch PREPARED ONCE under `key`
+/// and reused by every later call with the same key: the arena walk, the
+/// codegen and the NVRTC module lookups are paid on the first call only.
+/// The caller owns the key's meaning (the runtime keys by search epoch and
+/// bucket) and must not reuse a key for a different plan.
+pub fn execute_plan_keyed(
+    device: &mut CudaDevice,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+    staged: &FxHashMap<i64, &HostBuffer>,
+    key: u64,
+) -> Result<FxHashMap<usize, OutputBinding<luminal::layouts::DecodedLayout>>> {
+    if !device.prepared.contains_key(&key) {
+        let prepared = prepare_plan(device, plan)?;
+        device.prepared.insert(key, prepared);
+    }
+    // The prepared plan is borrowed out of the device for the run: take
+    // it, run, put it back (a run touches the device's other fields).
+    let prepared = device.prepared.remove(&key).expect("inserted above");
+    let result = run_prepared(device, &prepared, plan, staged);
+    device.prepared.insert(key, prepared);
+    result
+}
+
+/// Derive a plan's dispatch: validate the output boundary, plan the
+/// arena, and compile every codegen'd kernel through the module cache.
+fn prepare_plan(
+    device: &mut CudaDevice,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+) -> Result<PreparedPlan> {
     // ESCAPE GUARD (ruling 2026-08-27): an output slot's backing storage
     // must SURVIVE the call — FreedBy::Caller, whatever the owner.
     // FreedBy::Program backing an output hands the caller bytes the
@@ -596,6 +686,134 @@ pub fn execute_plan(
             .edge_weights()
             .all(|e| matches!(e.kind, EdgeKind::Data | EdgeKind::Anti))
     );
+    let mut geometry: FxHashMap<BufferId, PlanDtype> = FxHashMap::default();
+    for (id, buffer) in &plan.buffers {
+        let dtype = buffer.layout.dtype.ok_or_else(|| {
+            anyhow!(
+                "buffer {:?} (backing {}) carries no dtype fact",
+                buffer.label,
+                buffer.backs
+            )
+        })?;
+        geometry.insert(id.clone(), dtype);
+    }
+
+    // The dispatch steps: codegen and compile every kernel now.
+    let mut steps = Vec::with_capacity(arena.order.len());
+    for node in arena.order.iter().copied() {
+        let step = match &plan.dag[node] {
+            BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. } => continue,
+            BufferNode::BufferCopy { src, dst } => PreparedStep::Copy {
+                src: src.clone(),
+                dst: dst.clone(),
+            },
+            BufferNode::Compute {
+                op,
+                reads,
+                writes,
+                operand_info,
+                result_info,
+                ..
+            } => {
+                let label = op.label();
+                if label == "BufferAlloc" {
+                    PreparedStep::Alloc(
+                        writes
+                            .first()
+                            .filter(|buffer| arena.slices.contains_key(*buffer))
+                            .cloned(),
+                    )
+                } else if label == "BufferFree" {
+                    PreparedStep::Free(
+                        reads
+                            .first()
+                            .filter(|buffer| arena.slices.contains_key(*buffer))
+                            .cloned(),
+                    )
+                } else {
+                    if writes.len() != 1 {
+                        bail!(
+                            "{label}: CL handles single-destination ops, got {}",
+                            writes.len()
+                        );
+                    }
+                    // Codegen geometry comes from the node's OWN slot
+                    // descriptors, never the shared buffer table — the buffer
+                    // table sizes ALLOCATIONS and nothing else. A compute node
+                    // arriving without its descriptors is malformed: bail
+                    // loudly (mirror of the None-dims bail).
+                    if operand_info.len() != reads.len() || result_info.len() != writes.len() {
+                        bail!(
+                            "{label}: compute node lacks slot descriptors \
+                             (operand_info {}/{}, result_info {}/{})",
+                            operand_info.len(),
+                            reads.len(),
+                            result_info.len(),
+                            writes.len()
+                        );
+                    }
+                    let input_count = reads.len().saturating_sub(writes.len());
+                    if as_host_op(op.as_ref()).is_some() {
+                        PreparedStep::Host {
+                            node,
+                            reads: reads.clone(),
+                            dest: writes[0].clone(),
+                            input_count,
+                        }
+                    } else {
+                        let Some(kernel) = as_kernel_op(op.as_ref()) else {
+                            bail!("no CUDA execution interface for {label}");
+                        };
+                        let ctxinfo =
+                            CodegenCtx::from_descriptors(label, operand_info, result_info)?;
+                        let generated = kernel
+                            .codegen(&ctxinfo)
+                            .with_context(|| format!("codegen for {label}"))?;
+                        let mut launches = Vec::with_capacity(generated.len());
+                        for source in generated {
+                            let func = device.cache.function(&source.source)?;
+                            let (grid, block) = match source.launch {
+                                Some(geometry) => (geometry.grid.max(1), geometry.block.max(1)),
+                                None => ((source.n as u32).max(1).div_ceil(256), 256),
+                            };
+                            launches.push(PreparedLaunch {
+                                func,
+                                n: source.n as u64,
+                                grid,
+                                block,
+                                skip_when_dest_is_operand: source.skip_when_dest_is_operand,
+                            });
+                        }
+                        PreparedStep::Kernel {
+                            reads: reads.clone(),
+                            dest: writes[0].clone(),
+                            input_count,
+                            launches,
+                        }
+                    }
+                }
+            }
+        };
+        steps.push(step);
+    }
+    Ok(PreparedPlan {
+        arena,
+        slot_of_buffer,
+        slot_bindings,
+        geometry,
+        steps,
+    })
+}
+
+/// Run a prepared plan: bind this call's storage, issue the steps, record
+/// the output slots.
+fn run_prepared(
+    device: &mut CudaDevice,
+    prepared: &PreparedPlan,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+    staged: &FxHashMap<i64, &HostBuffer>,
+) -> Result<FxHashMap<usize, OutputBinding<luminal::layouts::DecodedLayout>>> {
+    let arena = &prepared.arena;
     device.ensure_slab(arena.slab_bytes)?;
     let stream = device.stream.clone();
     let slab_base = match &device.slab {
@@ -612,20 +830,9 @@ pub fn execute_plan(
     // means the staged payload's resident copy). Slab members stay
     // unbound until their `BufferAlloc` is issued.
     let mut bindings: FxHashMap<BufferId, Bound> = FxHashMap::default();
-    let mut geometry: FxHashMap<BufferId, PlanDtype> = FxHashMap::default();
     // Per HOME slot (the first slot naming a buffer): where its bytes
     // live — a pooled output home or a resident input.
     let mut home_of: FxHashMap<usize, Home> = FxHashMap::default();
-    for (id, buffer) in &plan.buffers {
-        let dtype = buffer.layout.dtype.ok_or_else(|| {
-            anyhow!(
-                "buffer {:?} (backing {}) carries no dtype fact",
-                buffer.label,
-                buffer.backs
-            )
-        })?;
-        geometry.insert(id.clone(), dtype);
-    }
     for id in arena.standalone.iter().chain(arena.donated.iter()) {
         let buffer = &plan.buffers[id];
         let bytes = buffer_bytes(buffer)?;
@@ -633,16 +840,17 @@ pub fn execute_plan(
         let bound = if let Some(lit) = staged_lit {
             // A STAGED input: resident on the device. It may ALSO back an
             // output slot (an escaped view election over an input's own
-            // bytes); the slot then reads the resident copy.
-            if let Some(&slot) = slot_of_buffer.get(id) {
+            // bytes, or an in-place output delivered into it); the slot
+            // then reads the resident copy.
+            if let Some(&slot) = prepared.slot_of_buffer.get(id) {
                 home_of.insert(slot, Home::Input(lit));
             }
             device
                 .stage_input(lit, staged[&lit], bytes)
                 .with_context(|| format!("staging {:?}", buffer.label))?
-        } else if let Some(&slot) = slot_of_buffer.get(id) {
+        } else if let Some(&slot) = prepared.slot_of_buffer.get(id) {
             home_of.insert(slot, Home::Output(slot));
-            device.output_home(slot, bytes, geometry[id])?
+            device.output_home(slot, bytes, prepared.geometry[id])?
         } else if let Some(lit) = buffer.lit {
             // A lit-bearing standalone buffer that backs no output slot
             // is an INPUT (boundary or donated): it must be staged. It
@@ -669,50 +877,68 @@ pub fn execute_plan(
     // SIMULTANEOUSLY LIVE ranges overlap, which is decidable at
     // planning time and is checked there (see the CONTRACT-1 live-range
     // note in `crate::arena`).
+    //
+    // TWO BufferIds MAY share a range on purpose: an in-place output
+    // delivered into its input (`output_into`) binds both to one lit —
+    // the same `Bound` — and is exactly the sharing CONTRACT 1 licenses
+    // (same storage, same BufferLit). Deduplicate by range before the
+    // check.
     {
-        let bound: Vec<crate::binding_check::BoundRange> = bindings
+        let mut by_range: FxHashMap<(u64, usize), BufferId> = FxHashMap::default();
+        for (id, b) in bindings.iter().filter(|(_, b)| b.bytes > 0) {
+            by_range.entry((b.ptr, b.bytes)).or_insert_with(|| id.clone());
+        }
+        let bound: Vec<crate::binding_check::BoundRange> = by_range
             .iter()
-            .filter(|(_, b)| b.bytes > 0)
-            .map(|(id, b)| crate::binding_check::BoundRange {
+            .map(|((ptr, bytes), id)| crate::binding_check::BoundRange {
                 buffer: format!("{id:?}"),
-                base: b.ptr,
-                bytes: b.bytes as u64,
+                base: *ptr,
+                bytes: *bytes as u64,
             })
             .collect();
         crate::binding_check::assert_disjoint(&bound).context("CONTRACT-1 bind-time check")?;
     }
 
     if std::env::var_os("LUMINAL_CL_ARENA").is_some() {
-        arena_report(plan, &arena, device.slab_bytes());
+        arena_report(plan, arena, device.slab_bytes());
     }
 
+    // `LUMINAL_CL_PROFILE_OPS=1`: synchronize after every node and
+    // attribute wall time per op label — a development probe for finding
+    // the hot ops of a plan, never on in serving (the syncs serialize
+    // the stream).
+    let profile_ops = std::env::var_os("LUMINAL_CL_PROFILE_OPS").is_some();
+    let mut op_times: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
+    let mut op_clock = std::time::Instant::now();
+
     // Phase 3: dispatch, in the arena's issue order.
-    for node in arena.order.iter().copied() {
-        match &plan.dag[node] {
-            BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. } => {}
-            BufferNode::BufferCopy { src, dst } => {
+    for step in &prepared.steps {
+        if profile_ops {
+            op_clock = std::time::Instant::now();
+        }
+        let profile_label: Option<String> = match step {
+            PreparedStep::Alloc(Some(buffer)) => {
+                let slice = &arena.slices[buffer];
+                bindings.insert(
+                    buffer.clone(),
+                    Bound {
+                        ptr: slab_base + slice.offset as u64,
+                        bytes: slice.bytes,
+                    },
+                );
+                None
+            }
+            PreparedStep::Alloc(None) => None,
+            PreparedStep::Free(Some(buffer)) => {
+                bindings.remove(buffer);
+                None
+            }
+            PreparedStep::Free(None) => None,
+            PreparedStep::Copy { src, dst } => {
                 // THE BUFFERCOPY CONTRACT, executor side (Austin, ruled
                 // 2026-08-31 — see `bufferize::BufferNode::BufferCopy`):
-                //
-                // * The node carries ONLY {src, dst}.
-                // * Semantics: a DUMB EXACT-SIZE WHOLE-BUFFER copy — one
-                //   `memcpy_dtod` of the whole slice, no layout awareness,
-                //   no element walk. "If a runtime chooses to do resource
-                //   reuse and do unequal sized buffer that is an entirely
-                //   runtime owned choice"; CL sizes both ends from the same
-                //   span-of-layout rule and makes no such choice, so
-                //   unequal lengths are a bug HERE and bail loudly (this is
-                //   the executor's own discipline over bufferizer-authored
-                //   nodes, NOT a type fence re-checking an e-graph premise).
-                // * ORDERING IS THIS RUNTIME'S OBLIGATION. The plan supplied
-                //   dependency structure only (data + WAR anti-edges); we
-                //   discharge it by issuing in the arena's topological order
-                //   onto ONE stream, which serializes the copy against every
-                //   op that depends on it and every prior reader of `dst`. A
-                //   multi-stream executor would owe events/barriers here.
-                // * The three causes (conflict repair, boundary placement,
-                //   lifetime repair) are the bufferizer's business; all
-                //   three execute identically.
+                // a DUMB EXACT-SIZE WHOLE-BUFFER copy, one `memcpy_dtod`,
+                // ordered by issue on the one stream.
                 let from = bound_of(&bindings, src, "copy src")?;
                 let to = bound_of(&bindings, dst, "copy dst")?;
                 if from.bytes != to.bytes {
@@ -720,138 +946,116 @@ pub fn execute_plan(
                 }
                 unsafe { cu::memcpy_dtod_async(to.ptr, from.ptr, from.bytes, stream.cu_stream()) }
                     .context("D2D copy")?;
+                profile_ops.then(|| "BufferCopy".to_string())
             }
-            BufferNode::Compute {
-                op,
+            PreparedStep::Host {
+                node,
                 reads,
-                writes,
-                operand_info,
-                result_info,
-                ..
+                dest,
+                input_count,
             } => {
+                let BufferNode::Compute {
+                    op,
+                    operand_info,
+                    result_info,
+                    ..
+                } = &plan.dag[*node]
+                else {
+                    unreachable!("a prepared host step names a compute node")
+                };
                 let label = op.label();
-                // THE ARENA'S TWO EVENTS. An alloc binds its buffer to
-                // the range the planner assigned it (nothing is zeroed —
-                // see the KERNEL INVARIANT note at the top of this
-                // module); a free drops the binding, and the range is
-                // already back on the planner's free list, waiting for
-                // the next alloc that fits. A buffer the planner did not
-                // put in the slab (standalone, donated, or an interior
-                // buffer demoted for want of a lifetime pair) is bound
-                // from Phase 1 and its alloc is a no-op.
-                if label == "BufferAlloc" {
-                    if let Some(buffer) = writes.first()
-                        && let Some(slice) = arena.slices.get(buffer)
-                    {
-                        bindings.insert(
-                            buffer.clone(),
-                            Bound {
-                                ptr: slab_base + slice.offset as u64,
-                                bytes: slice.bytes,
-                            },
-                        );
-                    }
-                    continue;
-                }
-                if label == "BufferFree" {
-                    if let Some(buffer) = reads.first()
-                        && arena.slices.contains_key(buffer)
-                    {
-                        bindings.remove(buffer);
-                    }
-                    continue;
-                }
-                if writes.len() != 1 {
-                    bail!(
-                        "{label}: CL handles single-destination ops, got {}",
-                        writes.len()
-                    );
-                }
-                let dest = bound_of(&bindings, &writes[0], label)?;
-                let input_count = reads.len().saturating_sub(writes.len());
-                let inputs: Vec<Bound> = reads[..input_count]
+                let dest = bound_of(&bindings, dest, label)?;
+                let inputs: Vec<Bound> = reads[..*input_count]
                     .iter()
                     .map(|id| bound_of(&bindings, id, label))
                     .collect::<Result<_>>()?;
-
-                // Phase 3: codegen geometry comes from the node's OWN slot
-                // descriptors, never the shared buffer table — the buffer
-                // table sizes ALLOCATIONS and nothing else. A compute node
-                // arriving without its descriptors is malformed: bail
-                // loudly (mirror of the None-dims bail).
-                if operand_info.len() != reads.len() || result_info.len() != writes.len() {
-                    bail!(
-                        "{label}: compute node lacks slot descriptors \
-                         (operand_info {}/{}, result_info {}/{})",
-                        operand_info.len(),
-                        reads.len(),
-                        result_info.len(),
-                        writes.len()
-                    );
-                }
-                if let Some(host) = as_host_op(op.as_ref()) {
-                    let ctx = HostOpContext {
-                        stream: &stream,
-                        inputs: &inputs,
-                        dest,
-                        operand_info,
-                        result_info,
-                    };
-                    // SAFETY: the plan's arena bindings are live through the
-                    // stream synchronization below; bufferization enforces the
-                    // op's alias and memory-effect contract.
-                    unsafe { host.execute(&ctx) }
-                        .with_context(|| format!("host execution for {label}"))?;
-                    continue;
-                }
-                let Some(kernel) = as_kernel_op(op.as_ref()) else {
-                    bail!("no CUDA execution interface for {label}");
+                let host = as_host_op(op.as_ref()).expect("prepared as a host op");
+                let ctx = HostOpContext {
+                    stream: &stream,
+                    inputs: &inputs,
+                    dest,
+                    operand_info,
+                    result_info,
                 };
-                let ctxinfo = CodegenCtx::from_descriptors(label, operand_info, result_info)?;
-                let launches = kernel
-                    .codegen(&ctxinfo)
-                    .with_context(|| format!("codegen for {label}"))?;
-
+                // SAFETY: the plan's arena bindings are live through the
+                // stream synchronization below; bufferization enforces the
+                // op's alias and memory-effect contract.
+                unsafe { host.execute(&ctx) }
+                    .with_context(|| format!("host execution for {label}"))?;
+                profile_ops.then(|| profile_name(label, result_info))
+            }
+            PreparedStep::Kernel {
+                reads,
+                dest,
+                input_count,
+                launches,
+            } => {
+                let dest_bound = bound_of(&bindings, dest, "kernel dest")?;
+                let inputs: Vec<Bound> = reads[..*input_count]
+                    .iter()
+                    .map(|id| bound_of(&bindings, id, "kernel operand"))
+                    .collect::<Result<_>>()?;
                 // Kernel inputs are the non-destination operands; the
                 // destination is the buffer the planner assigned, in
                 // place. Launches in one sequence share the stream, so
                 // phase ordering (e.g. scatter's init-copy then writes)
                 // is free.
                 let input_ptrs: Vec<u64> = inputs.iter().map(|b| b.ptr).collect();
-                let dest_ptr = dest.ptr;
-                for generated in &launches {
-                    let func = device.cache.function(&generated.source)?;
-                    let n = generated.n as u64;
+                let dest_ptr = dest_bound.ptr;
+                for launch in launches {
+                    if let Some(k) = launch.skip_when_dest_is_operand
+                        && inputs.get(k).is_some_and(|b| b.ptr == dest_ptr)
+                    {
+                        continue;
+                    }
                     let cfg = LaunchConfig {
-                        grid_dim: ((generated.n as u32).max(1).div_ceil(256), 1, 1),
-                        block_dim: (256, 1, 1),
+                        grid_dim: (launch.grid, 1, 1),
+                        block_dim: (launch.block, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    let mut builder = stream.launch_builder(&func);
+                    let mut builder = stream.launch_builder(&launch.func);
                     for ptr in &input_ptrs {
                         builder.arg(ptr);
                     }
                     builder.arg(&dest_ptr);
-                    builder.arg(&n);
-                    unsafe { builder.launch(cfg) }.with_context(|| format!("launch {label}"))?;
+                    builder.arg(&launch.n);
+                    unsafe { builder.launch(cfg) }.context("kernel launch")?;
                 }
+                profile_ops.then(|| {
+                    let label = match &prepared_label(plan, reads, dest) {
+                        Some(label) => label.clone(),
+                        None => "kernel".to_string(),
+                    };
+                    label
+                })
             }
+        };
+        if let Some(label) = profile_label {
+            stream.synchronize().context("profile sync")?;
+            let entry = op_times.entry(label).or_default();
+            entry.0 += 1;
+            entry.1 += op_clock.elapsed().as_secs_f64() * 1e3;
         }
     }
     stream.synchronize().context("stream sync")?;
+    if profile_ops {
+        let mut rows: Vec<_> = op_times.into_iter().collect();
+        rows.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
+        let total: f64 = rows.iter().map(|r| r.1.1).sum();
+        eprintln!("[cl-profile] {total:.2} ms over {} node kinds", rows.len());
+        for (label, (count, ms)) in rows.iter().take(25) {
+            eprintln!("[cl-profile] {ms:>9.3} ms  {count:>5} x  {label}");
+        }
+    }
 
     // Phase 4: record each output SLOT's disclosed binding against the
     // home whose bytes back it — the escaped buffer for a view election,
     // the boundary buffer for a dense one — keyed by slot index. The
-    // bytes stay on the device until `read_output` asks for them. (The
-    // declared-but-unused Boundary buffer of an escaped slot never
-    // reaches this plan: buffer DCE dropped it, so Phase 1 never bound
-    // it; and no free node exists for an escaping buffer, so every
-    // output slot is still bound here.)
+    // bytes stay on the device until `read_output` asks for them.
     device.slot_view.clear();
     let mut outputs = FxHashMap::default();
-    for slot in slot_bindings {
-        let home_slot = slot_of_buffer[&slot.buffer];
+    for slot in &prepared.slot_bindings {
+        let home_slot = prepared.slot_of_buffer[&slot.buffer];
         let home = *home_of.get(&home_slot).ok_or_else(|| {
             anyhow!(
                 "output slot {} names buffer {:?}, which Phase 1 never bound",
@@ -860,9 +1064,56 @@ pub fn execute_plan(
             )
         })?;
         device.slot_view.insert(slot.index, (home, slot.clone()));
-        outputs.insert(slot.index, slot);
+        outputs.insert(slot.index, slot.clone());
     }
     Ok(outputs)
+}
+
+/// The profiler's row label for a compute node: the op label, with the
+/// result size when it is large.
+fn profile_name(
+    label: &str,
+    result_info: &[luminal::bufferize::SlotDescriptor<luminal::layouts::DecodedLayout>],
+) -> String {
+    let bytes: usize = result_info
+        .iter()
+        .filter_map(|slot| {
+            let numel = slot.layout.literal_span_elements()?;
+            let width = slot
+                .layout
+                .dtype
+                .and_then(|d| crate::host_buffer::dtype_bytes(d).ok())?;
+            Some(numel * width)
+        })
+        .sum();
+    if bytes >= 64 << 20 {
+        format!("{label} [{} MiB out]", bytes >> 20)
+    } else {
+        label.to_string()
+    }
+}
+
+/// The profiler's label for a prepared kernel step: found by its
+/// destination buffer (each compute node writes exactly one).
+fn prepared_label(
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+    _reads: &[BufferId],
+    dest: &BufferId,
+) -> Option<String> {
+    plan.dag.node_weights().find_map(|node| match node {
+        BufferNode::Compute {
+            op,
+            writes,
+            result_info,
+            ..
+        } if writes.first() == Some(dest)
+            && op.label() != "BufferAlloc"
+            && op.label() != "BufferFree" =>
+        {
+            Some(profile_name(op.label(), result_info))
+        }
+        _ => None,
+    })
 }
 
 /// The arena's cost, on demand (`LUMINAL_CL_ARENA=1`): the high-water

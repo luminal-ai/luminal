@@ -46,12 +46,14 @@ impl RuntimeBindingsGenerator for CudaBindings {
         logical_name: &str,
         shape: &str,
         width: &str,
+        mutable: bool,
     ) -> String {
+        let access = if mutable { "ReadWrite" } else { "ReadOnly" };
         format!(
             "(let {stem}_layout (RightMajorContiguousElementLayoutLit {shape} {width}))\n\
              (let {stem}_layout_tensor (LayoutTensorLit {logical_name} {stem}_layout))\n\
              (let {stem}_buffer_id (BufferLit {idx}))\n\
-             (set (buffer-access-of {stem}_buffer_id) (ReadOnly))\n\
+             (set (buffer-access-of {stem}_buffer_id) ({access}))\n\
              (set (buffer-freed-by {stem}_buffer_id) (CallerFrees))\n\
              (let {stem}_buffer_tensor (BufferTensorLit {stem}_layout_tensor {stem}_buffer_id))\n\n"
         )

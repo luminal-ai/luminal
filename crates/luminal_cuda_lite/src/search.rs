@@ -60,9 +60,9 @@ use luminal::prelude::egraph_serialize;
 // outcome).
 pub use luminal::search_support::{
     CaptureAwareStderr, ProducerIndex, RefusalBreakdown, SearchProgress, SearchTimings,
-    bufferize_cycle_tripwire, early_stop_exceeded, greedy_genome, log_channel_enabled,
-    mutate_genome, mutate_genome_reporting, mutate_genome_with_seed, sample_genome,
-    sample_genome_reporting, sample_genome_with_seed,
+    bufferize_cycle_tripwire, early_stop_exceeded, log_channel_enabled, mutate_genome,
+    mutate_genome_reporting, mutate_genome_with_seed, sample_genome, sample_genome_reporting,
+    sample_genome_with_seed,
 };
 
 #[derive(Debug, Clone)]
@@ -114,12 +114,13 @@ pub struct CompileOptions {
     /// It costs NOTHING when nothing refuses: finalists past rank 0 are
     /// extracted only if the walk reaches them.
     pub keep_finalists: usize,
-    /// SEED GENERATION 0 WITH THE GREEDY GENOME (serving landing,
-    /// 2026-09-10): the bytes-moved prior's own per-class choice joins
-    /// the first generation's random samples. ON by default — it costs
-    /// one candidate slot and is what makes the library-call route
-    /// reachable on graphs with many independent sites. Off reproduces
-    /// the pre-landing trajectory exactly.
+    /// SEED GENERATION 0 WITH THE HEURISTIC GENOME (serving landing,
+    /// 2026-09-10): the extractor's own cost-based election — the plan
+    /// that moves the fewest bytes, whole subtrees priced — joins the
+    /// first generation's random samples. ON by default — it costs one
+    /// candidate slot and is what makes the library-call route reachable
+    /// on graphs with many independent sites. Off reproduces the
+    /// pre-landing trajectory exactly.
     pub greedy_seed: bool,
     /// THE AGGREGATE DEVICE BUDGET (Phase 5): an upper bound, in bytes,
     /// on the arena slab the installed plan set will need. `None` (the
@@ -437,11 +438,7 @@ pub fn search_implementations(
                 // everywhere ever reaches the device; it is measured
                 // like any other candidate and improved on by mutation.
                 if options.greedy_seed {
-                    let cost = |class: &egraph_serialize::ClassId,
-                                choice: &extractor::ProducerChoice| {
-                        session.choice_heuristic_cost(class, choice)
-                    };
-                    candidates.push(greedy_genome(&index, &space, &cost));
+                    candidates.push(session.heuristic_genome());
                 }
                 while candidates.len() < options.generation_size {
                     candidates.push(random_genome(&mut rng));
@@ -545,6 +542,9 @@ pub fn search_implementations(
                             // genome is a sampler bug, not a refusal.
                             bufferize_cycle_tripwire(&err, &index, &space, &genome)?;
                             breakdown.plan_build_refusals += 1;
+                            if options.search_log_enabled() {
+                                eprintln!("   {} bufferize: {err:#}", "Refused".yellow());
+                            }
                             if refusals.len() < 8 {
                                 refusals.push(format!("bufferize: {err:#}"));
                             }
@@ -637,6 +637,9 @@ pub fn search_implementations(
                             // candidate — accounted with the other
                             // plan-build refusals, never fatal.
                             breakdown.plan_build_refusals += 1;
+                            if options.search_log_enabled() {
+                                eprintln!("   {} device prepare: {note}", "Refused".yellow());
+                            }
                             if refusals.len() < 8 {
                                 refusals.push(format!("device prepare: {note}"));
                             }
@@ -644,6 +647,9 @@ pub fn search_implementations(
                         }
                         Priced::ExecuteFailed(note) => {
                             breakdown.execute_refusals += 1;
+                            if options.search_log_enabled() {
+                                eprintln!("   {} execute: {note}", "Refused".yellow());
+                            }
                             if refusals.len() < 8 {
                                 refusals.push(format!("execute: {note}"));
                             }

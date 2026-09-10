@@ -22,7 +22,12 @@ pub trait RuntimeBindingsGenerator {
     fn width_term(&self, dtype: DType) -> String;
 
     /// Input boundary text. `stem` namespaces the lets; the produced
-    /// buffer-tensor let must be named `{stem}_buffer_tensor`.
+    /// buffer-tensor let must be named `{stem}_buffer_tensor`. `mutable`
+    /// binds the buffer `ReadWrite` (the serving landing, 2026-09-10): the
+    /// program may consume it in place — a paged KV cache advances by
+    /// scattering new rows straight into the caller's resident buffer —
+    /// under CONTRACT 2 of `crate::layout_ir::Access` (exclusive for the
+    /// plan's duration; the prior contents are the program's to destroy).
     fn input_binding(
         &self,
         stem: &str,
@@ -30,6 +35,7 @@ pub trait RuntimeBindingsGenerator {
         logical_name: &str,
         shape: &str,
         width: &str,
+        mutable: bool,
     ) -> String;
 
     /// Output boundary text. Same `{stem}_buffer_tensor` naming

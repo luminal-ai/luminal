@@ -419,6 +419,9 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
             trials: 1,
             seed,
             search_log: false,
+            // This test sweeps SEEDS for an election fact; the cost-based
+            // seed genome would decide it deterministically instead.
+            greedy_seed: false,
             ..Default::default()
         };
         let (cx, x, w, b, out) = build();
@@ -506,6 +509,9 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
         trials: 1,
         seed: 0,
         search_log: false,
+        // This test sweeps SEEDS for an election fact; the cost-based
+        // seed genome would decide it deterministically instead.
+        greedy_seed: false,
         ..Default::default()
     };
 

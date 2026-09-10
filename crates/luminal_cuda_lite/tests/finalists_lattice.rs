@@ -156,6 +156,9 @@ fn bucketed_options(budget: Option<usize>) -> CompileOptions {
         search_log: false,
         keep_finalists: 8,
         device_budget_bytes: budget,
+        // A budget-fallback test wants a DIVERSE ranked population: the
+        // cost-based seed would make every bucket's finalists near-identical.
+        greedy_seed: false,
         ..Default::default()
     }
 }

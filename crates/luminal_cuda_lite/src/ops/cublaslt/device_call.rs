@@ -259,6 +259,126 @@ pub fn dispatch(
         .lock()
         .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
 
+    // THE CALL CACHE (serving landing, 2026-09-10): descriptors and the
+    // heuristic's algorithm choice depend on the call's SHAPE only, and a
+    // serving tick issues hundreds of calls at a few dozen shapes — so
+    // they are built once per distinct `LtCall` and kept. Pointers
+    // (operands, bias, workspace) are per call and never cached.
+    let cached = {
+        let mut cache = call_cache()
+            .lock()
+            .map_err(|_| anyhow!("cuBLASLt call cache mutex poisoned"))?;
+        match cache.get(call) {
+            Some(entry) => entry.clone(),
+            None => {
+                let entry = Arc::new(prepare_call(&guard, call)?);
+                cache.insert(call.clone(), entry.clone());
+                entry
+            }
+        }
+    };
+    if let Some(bias_idx) = call.bias_operand {
+        let bias_ptr = operands
+            .get(bias_idx)
+            .ok_or_else(|| anyhow!("bias operand {bias_idx} missing"))?
+            .ptr;
+        unsafe {
+            lt::set_matmul_desc_attribute(
+                cached.desc.raw,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                (&bias_ptr) as *const _ as *const _,
+                std::mem::size_of::<u64>(),
+            )
+        }
+        .map_err(|e| anyhow!("cublasLtMatmulDescSetAttribute(BIAS_POINTER): {e:?}"))?;
+    }
+    let desc = &cached.desc;
+    let (a_layout, b_layout, c_layout, d_layout) =
+        (&cached.a, &cached.b, &cached.c, &cached.d);
+    let heuristic_algo = &cached.algo;
+
+    // Workspace: OURS, explicitly, sized into the preference so the
+    // heuristic can only pick algos that fit it.
+    //
+    // Allocated ONCE per CUDA context and reused by every dispatch (see
+    // `workspace_slab`), never per call — a per-call 32 MiB alloc priced
+    // the marker out of its own search. Zeroed only at creation:
+    // cuBLASLt treats the workspace as scratch and neither reads it
+    // before writing nor requires it clean between calls.
+    let mut workspaces = workspace_slab()
+        .lock()
+        .map_err(|_| anyhow!("cuBLASLt workspace mutex poisoned"))?;
+    let workspace = match workspaces.entry(stream.context().cu_ctx() as usize) {
+        Entry::Occupied(slot) => slot.into_mut(),
+        Entry::Vacant(slot) => slot.insert(
+            stream
+                .alloc_zeros::<u8>(WORKSPACE_BYTES)
+                .context("cuBLASLt workspace alloc")?,
+        ),
+    };
+
+    // Pointers. Literal HOST scalars (contract 2): alpha = 1.0f const;
+    // beta structural. C pointer: the c operand on the C-fold forms,
+    // the D pointer otherwise (beta = 0.0f, C never read — contract 3).
+    let a_ptr = operands[0].ptr;
+    let b_ptr = operands[1].ptr;
+    let d_ptr = dest.ptr;
+    let (c_ptr, beta): (u64, &'static f32) = match call.c_source {
+        CSource::AliasD => (d_ptr, &BETA_ZERO),
+        CSource::Operand(i) => {
+            debug_assert!(call.beta_is_one);
+            (operands[i].ptr, &BETA_ONE)
+        }
+    };
+    let (w_ptr, _rw) = workspace.device_ptr(stream);
+
+    unsafe {
+        lt::matmul(
+            guard.raw,
+            desc.raw,
+            (&ALPHA) as *const f32 as *const _,
+            beta as *const f32 as *const _,
+            a_ptr as *const _,
+            a_layout.raw,
+            b_ptr as *const _,
+            b_layout.raw,
+            c_ptr as *const _,
+            c_layout.raw,
+            d_ptr as *mut _,
+            d_layout.raw,
+            heuristic_algo as *const _,
+            w_ptr as *mut _,
+            WORKSPACE_BYTES,
+            stream.cu_stream() as *mut _,
+        )
+    }
+    .map_err(|e| anyhow!("cublasLtMatmul failed: {e:?}"))?;
+    Ok(())
+}
+
+/// A call shape's prepared descriptors and elected algorithm.
+struct PreparedCall {
+    desc: Desc,
+    a: Layout,
+    b: Layout,
+    c: Layout,
+    d: Layout,
+    algo: sys::cublasLtMatmulAlgo_t,
+}
+
+// The raw handles are process-wide library objects used under the
+// handle mutex; nothing about them is thread-affine.
+unsafe impl Send for PreparedCall {}
+unsafe impl Sync for PreparedCall {}
+
+fn call_cache() -> &'static Mutex<HashMap<LtCall, Arc<PreparedCall>>> {
+    static CACHE: OnceLock<Mutex<HashMap<LtCall, Arc<PreparedCall>>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Build one call shape's descriptors and run the heuristic once. Called
+/// under the handle mutex, which the caller holds as `guard`.
+fn prepare_call(guard: &LtHandle, call: &LtCall) -> Result<PreparedCall> {
     // Matmul descriptor: strict F32 compute (contract 1/5), HOST
     // pointer mode (contract 2), transposes, epilogue.
     let desc = Desc {
@@ -307,18 +427,7 @@ pub fn dispatch(
         (&epilogue) as *const _ as *const _,
         std::mem::size_of::<sys::cublasLtEpilogue_t>(),
     )?;
-    if let Some(bias_idx) = call.bias_operand {
-        let bias_ptr = operands
-            .get(bias_idx)
-            .ok_or_else(|| anyhow!("bias operand {bias_idx} missing"))?
-            .ptr;
-        set_desc(
-            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-            (&bias_ptr) as *const _ as *const _,
-            std::mem::size_of::<u64>(),
-        )?;
-    }
-
+    // The bias POINTER is per call; the epilogue itself is shape.
     // Layouts: A, B, and a VALID Cdesc on EVERY call (contract 3 — a
     // NULL Cdesc segfaults), plus D.
     let a_layout = Layout::new(&call.a)?;
@@ -326,26 +435,6 @@ pub fn dispatch(
     let c_layout = Layout::new(&call.c)?;
     let d_layout = Layout::new(&call.d)?;
 
-    // Workspace: OURS, explicitly, sized into the preference so the
-    // heuristic can only pick algos that fit it. Zero heuristic hits is
-    // a loud bail (the result layer maps that to NOT_SUPPORTED).
-    //
-    // Allocated ONCE per CUDA context and reused by every dispatch (see
-    // `workspace_slab`), never per call — a per-call 32 MiB alloc priced
-    // the marker out of its own search. Zeroed only at creation:
-    // cuBLASLt treats the workspace as scratch and neither reads it
-    // before writing nor requires it clean between calls.
-    let mut workspaces = workspace_slab()
-        .lock()
-        .map_err(|_| anyhow!("cuBLASLt workspace mutex poisoned"))?;
-    let workspace = match workspaces.entry(stream.context().cu_ctx() as usize) {
-        Entry::Occupied(slot) => slot.into_mut(),
-        Entry::Vacant(slot) => slot.insert(
-            stream
-                .alloc_zeros::<u8>(WORKSPACE_BYTES)
-                .context("cuBLASLt workspace alloc")?,
-        ),
-    };
     let pref =
         lt::create_matmul_pref().map_err(|e| anyhow!("cublasLtMatmulPreferenceCreate: {e:?}"))?;
     struct Pref {
@@ -396,42 +485,12 @@ pub fn dispatch(
             call.d.ld
         )
     })?;
-
-    // Pointers. Literal HOST scalars (contract 2): alpha = 1.0f const;
-    // beta structural. C pointer: the c operand on the C-fold forms,
-    // the D pointer otherwise (beta = 0.0f, C never read — contract 3).
-    let a_ptr = operands[0].ptr;
-    let b_ptr = operands[1].ptr;
-    let d_ptr = dest.ptr;
-    let (c_ptr, beta): (u64, &'static f32) = match call.c_source {
-        CSource::AliasD => (d_ptr, &BETA_ZERO),
-        CSource::Operand(i) => {
-            debug_assert!(call.beta_is_one);
-            (operands[i].ptr, &BETA_ONE)
-        }
-    };
-    let (w_ptr, _rw) = workspace.device_ptr(stream);
-
-    unsafe {
-        lt::matmul(
-            guard.raw,
-            desc.raw,
-            (&ALPHA) as *const f32 as *const _,
-            beta as *const f32 as *const _,
-            a_ptr as *const _,
-            a_layout.raw,
-            b_ptr as *const _,
-            b_layout.raw,
-            c_ptr as *const _,
-            c_layout.raw,
-            d_ptr as *mut _,
-            d_layout.raw,
-            (&heuristic.algo) as *const _,
-            w_ptr as *mut _,
-            WORKSPACE_BYTES,
-            stream.cu_stream() as *mut _,
-        )
-    }
-    .map_err(|e| anyhow!("cublasLtMatmul failed: {e:?}"))?;
-    Ok(())
+    Ok(PreparedCall {
+        desc,
+        a: a_layout,
+        b: b_layout,
+        c: c_layout,
+        d: d_layout,
+        algo: heuristic.algo,
+    })
 }

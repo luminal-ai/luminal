@@ -94,7 +94,7 @@ type ClassId = luminal::prelude::egraph_serialize::ClassId;
 // The four runtime contracts
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CublasLtForm {
     Base,
     Bias,

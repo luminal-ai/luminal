@@ -409,6 +409,12 @@ pub struct LogicalNode {
 struct OutputRecord {
     value: ValueId,
     label: Option<String>,
+    /// IN-PLACE OUTPUT (the serving landing, 2026-09-10): the slot binds
+    /// to this mutable INPUT's own buffer (CONTRACT 1: same storage, same
+    /// `BufferLit`), so the bufferizer seeds the value's destination chain
+    /// onto that buffer and the program updates the caller's storage in
+    /// place — a paged KV cache advancing without a copy.
+    in_place_input: Option<ValueId>,
 }
 
 /// One bound input of the recorded model: the pristine label, the
@@ -445,9 +451,25 @@ pub struct LogicalGraph {
     /// "native saturation failed").
     labeled_checks: Vec<(String, String)>,
     poisoned: Option<String>,
+    /// Inputs bound `ReadWrite` (the serving landing, 2026-09-10): the
+    /// program may write them in place. See
+    /// [`RuntimeBindingsGenerator::input_binding`](crate::runtime_binding::RuntimeBindingsGenerator::input_binding).
+    mutable_inputs: std::collections::HashSet<ValueId>,
 }
 
 impl LogicalGraph {
+    /// Bind an input `ReadWrite`: the program may consume its buffer in
+    /// place (an in-place scatter into a resident KV cache). The caller
+    /// keeps the buffer's ownership and must not touch it mid-execution.
+    pub fn mark_input_mutable(&mut self, value: ValueId) {
+        self.mutable_inputs.insert(value);
+    }
+
+    /// Is this input bound `ReadWrite`?
+    pub fn input_is_mutable(&self, value: ValueId) -> bool {
+        self.mutable_inputs.contains(&value)
+    }
+
     /// First poison reason wins; everything after is a no-op.
     pub fn poison(&mut self, reason: impl Into<String>) {
         if self.poisoned.is_none() {
@@ -1320,6 +1342,58 @@ impl LogicalGraph {
         self.outputs.push(OutputRecord {
             value: id,
             label: label.map(str::to_string),
+            in_place_input: None,
+        });
+    }
+
+    /// Designate `operand` an output delivered INTO `input`'s own buffer:
+    /// the two bind to one `BufferLit`, so the program computes the value
+    /// where the input lives (an in-place update the caller observes in
+    /// its resident storage). `input` must have been marked mutable
+    /// ([`Self::mark_input_mutable`]); the value must have the input's
+    /// shape and dtype, which the binding's shape term enforces.
+    pub fn output_in_place(&mut self, operand: &Operand, input: ValueId, label: Option<&str>) {
+        if self.poisoned.is_some() {
+            return;
+        }
+        if !self.mutable_inputs.contains(&input) {
+            return self.poison(format!(
+                "output_in_place: input {input:?} is not mutable — mark_input_mutable it first"
+            ));
+        }
+        if !matches!(
+            self.graph.node_weight(input).map(|node| &node.op),
+            Some(LogicalOp::Input { .. })
+        ) {
+            return self.poison(format!("output_in_place: {input:?} is not an input"));
+        }
+        if let Some(name) = label
+            && self
+                .outputs
+                .iter()
+                .any(|record| record.label.as_deref() == Some(name))
+        {
+            return self.poison(format!("duplicate output name \"{name}\""));
+        }
+        let id = match self.resolve(operand, "output_in_place") {
+            Ok(id) => id,
+            Err(reason) => return self.poison(reason),
+        };
+        let (value_dims, value_dtype) = {
+            let node = &self.graph[id];
+            (node.dims.clone(), node.dtype)
+        };
+        let input_node = &self.graph[input];
+        if input_node.dims != value_dims || input_node.dtype != value_dtype {
+            return self.poison(format!(
+                "output_in_place: value {:?}/{:?} does not match input {:?}/{:?}",
+                value_dims, value_dtype, input_node.dims, input_node.dtype
+            ));
+        }
+        self.outputs.push(OutputRecord {
+            value: id,
+            label: label.map(str::to_string),
+            in_place_input: Some(input),
         });
     }
 
@@ -1495,6 +1569,7 @@ impl LogicalGraph {
         let mut input_slots = Vec::new();
         let mut input_buffer_tensors = Vec::new();
         let mut next_buffer: i64 = 0;
+        let mut input_buffer_of: rustc_hash::FxHashMap<ValueId, i64> = rustc_hash::FxHashMap::default();
         for id in self.graph.node_indices() {
             let value = &self.graph[id];
             let LogicalOp::Input { .. } = &value.op else {
@@ -1516,8 +1591,10 @@ impl LogicalGraph {
                 &value_name,
                 &shape,
                 &bindings.width_term(value.dtype),
+                self.mutable_inputs.contains(&id),
             ));
             input_buffer_tensors.push(format!("{stem}_buffer_tensor"));
+            input_buffer_of.insert(id, buffer);
             input_slots.push(InputSlot {
                 tensor: id,
                 buffer,
@@ -1533,8 +1610,18 @@ impl LogicalGraph {
             let value = &self.graph[id];
             let shape = Self::shape_term(&value.dims)?;
             let stem = format!("natout{key}");
-            let buffer = next_buffer;
-            next_buffer += 1;
+            // An in-place output shares its input's BufferLit (CONTRACT 1);
+            // an ordinary one gets a fresh id.
+            let buffer = match record.in_place_input {
+                Some(input) => *input_buffer_of
+                    .get(&input)
+                    .ok_or_else(|| format!("output_in_place: input {input:?} has no binding"))?,
+                None => {
+                    let buffer = next_buffer;
+                    next_buffer += 1;
+                    buffer
+                }
+            };
             text.push_str(&bindings.output_binding(
                 &stem,
                 buffer as usize,

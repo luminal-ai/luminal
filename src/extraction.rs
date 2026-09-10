@@ -279,6 +279,115 @@ impl<'a> ExtractionSession<'a> {
         Self { extractor }
     }
 
+    /// THE HEURISTIC GENOME (serving landing, 2026-09-10): the genome the
+    /// extractor's OWN cost-based extraction elects — per class, the
+    /// producer whose subtree moves the fewest bytes, relaxed to a
+    /// fixpoint from the outputs — read back as a genome so the search
+    /// can seed generation 0 with it and mutate from there. Unlike a
+    /// per-class greedy walk this prices whole subtrees: a library matmul
+    /// that would need its operands re-materialized loses to the variant
+    /// that reads them through views.
+    ///
+    /// The memo's choices are the PREFERENCES of a
+    /// [`crate::search_support::greedy_genome`] walk, not the genome
+    /// itself: the relaxation's equal-cost re-plans can leave two views
+    /// planned through each other, and the walk's admissibility is what
+    /// keeps the genome acyclic (it falls back to the cheapest
+    /// admissible candidate exactly where a preference would close a
+    /// cycle). Rows the relaxation never reached take the cheapest
+    /// candidate.
+    pub fn heuristic_genome(&mut self) -> Genome {
+        self.heuristic_genome_report().0
+    }
+
+    /// [`Self::heuristic_genome`] plus the cost-based plan's own choice
+    /// per producer-index class (`None` = the relaxation never planned
+    /// it), for diagnosis.
+    pub fn heuristic_genome_report(
+        &mut self,
+    ) -> (
+        Genome,
+        std::collections::BTreeMap<ClassId, Option<(String, Option<NodeId>, Option<usize>)>>,
+    ) {
+        self.extractor.genome = None;
+        self.extractor.memo.clear();
+        self.extractor.blocked.clear();
+        self.extractor.no_candidates.clear();
+        let roots = output_root_classes(self.extractor.egraph);
+        if !roots.is_empty() {
+            self.extractor.relax_to_fixpoint(&roots);
+        }
+        let index = self.producer_index();
+        let mut report = std::collections::BTreeMap::new();
+        let mut memo_choice: HashMap<ClassId, ProducerChoice> = HashMap::new();
+        for class in index.keys() {
+            let memo = self.extractor.memo.get(class).and_then(|plan| plan.as_ref());
+            report.insert(
+                class.clone(),
+                memo.map(|plan| {
+                    (
+                        format!("{:?}", plan.kind).chars().take(40).collect::<String>(),
+                        plan.source_enode.clone(),
+                        plan.selected_output_index,
+                    )
+                }),
+            );
+            if let Some((enode, output_index)) =
+                memo.and_then(|plan| Some((plan.source_enode.clone()?, plan.selected_output_index?)))
+            {
+                memo_choice.insert(class.clone(), ProducerChoice { enode, output_index });
+            }
+        }
+        // Leave the session as `extract_with_genome` expects to find it
+        // BEFORE the walk: the cost closure builds candidates through
+        // the session, which reads the (now cleared) memo for nothing.
+        self.extractor.memo.clear();
+        self.extractor.blocked.clear();
+        self.extractor.no_candidates.clear();
+        let space = self.sampling_space(&index);
+        let prefer = |class: &ClassId| memo_choice.get(class).cloned();
+        let cost = |class: &ClassId, choice: &ProducerChoice| self.choice_heuristic_cost(class, choice);
+        let genome = crate::search_support::greedy_genome(&index, &space, &prefer, &cost);
+        (genome, report)
+    }
+
+    /// DEBUG SEAM: the input classes one genome choice's candidates read
+    /// (what the sampler's edges are built from).
+    pub fn choice_inputs(&self, class: &ClassId, choice: &ProducerChoice) -> Vec<ClassId> {
+        self.extractor.choice_input_classes(class, choice)
+    }
+
+    /// DEBUG SEAM: after a failed genome extraction, the unplanned
+    /// classes with the children that blocked them, and the op names the
+    /// class holds.
+    pub fn blocked_classes(&self) -> Vec<(ClassId, Vec<ClassId>, Vec<String>)> {
+        let mut rows: Vec<_> = self
+            .extractor
+            .blocked
+            .iter()
+            .map(|(class, blockers)| {
+                let ops: Vec<String> = self
+                    .extractor
+                    .class_nodes
+                    .get(class)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| self.extractor.egraph.nodes.get(id))
+                    .filter(|node| !node.subsumed)
+                    .map(|node| node.op.clone())
+                    .collect();
+                (class.clone(), blockers.clone(), ops)
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// DEBUG SEAM: the op name of an enode.
+    pub fn enode_op(&self, enode: &NodeId) -> Option<String> {
+        self.extractor.egraph.nodes.get(enode).map(|node| node.op.clone())
+    }
+
     /// THE BYTES-MOVED PRICE OF ONE GENOME CHOICE (serving landing,
     /// 2026-09-10): the candidate's own `heuristic_cost` — operand bytes
     /// read plus result bytes written by the chosen producer, children

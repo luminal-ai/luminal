@@ -106,6 +106,19 @@ impl GraphTensor {
         source
     }
 
+    /// Designate this value an output delivered INTO `input`'s own buffer
+    /// (see `LogicalGraph::output_in_place`): the input must be mutable and
+    /// the same shape/dtype, and the program then updates the caller's
+    /// resident storage in place.
+    pub fn output_into(&self, input: GraphTensor, name: &str) -> GraphTensor {
+        let source = *self;
+        let dims = source.dims();
+        self.graph()
+            .logical
+            .output_in_place(&(source.id, dims), input.id, Some(name));
+        source
+    }
+
     pub fn dims(&self) -> Vec<IntExpr> {
         self.dims.to_vec()
     }

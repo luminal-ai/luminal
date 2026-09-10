@@ -130,7 +130,7 @@ use super::{CuDim, CuEpilogue, CublasLt, CublasLtForm, LtMatmulSpec};
 /// bugs (Train-3's orientation bug and the Option-B destination-frame
 /// regression) both had the same shape: an order convention that lived
 /// only in prose while the bytes said otherwise. It is data now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LtOrder {
     /// `CUBLASLT_ORDER_ROW`: element `(r, c)` at `r*ld + c`; `ld` is the
     /// ROW pitch and the descriptor reaches `ld*(rows-1) + cols`.
@@ -146,7 +146,7 @@ pub enum LtOrder {
 /// COL readings re-expressed, see the module doc's ROW CONVENTION; C
 /// and D carry whatever the plan's elected destination layout says
 /// (see [`bind_destination`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LtDesc {
     pub rows: i64,
     pub cols: i64,
@@ -190,7 +190,7 @@ impl LtDesc {
 
 /// Where the C pointer comes from. The C DESCRIPTOR always exists
 /// (contract 3); only the pointer source varies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CSource {
     /// No-C forms: pass the D pointer as C (beta = 0.0f, C never read).
     AliasD,
@@ -202,7 +202,7 @@ pub enum CSource {
 /// The fully-resolved host call: every number the dispatch needs,
 /// nothing the dispatch may reinterpret. NO scalar fields beyond the
 /// structural `beta_is_one` — see module doc contract 2.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LtCall {
     pub form: CublasLtForm,
     pub m: i64,

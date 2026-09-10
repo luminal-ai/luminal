@@ -90,6 +90,13 @@ pub struct CudaRuntime {
     dim_buckets: std::collections::BTreeMap<shape::Symbol, Vec<graph::DimBucket>>,
     /// One finished plan per Cartesian bucket combination.
     bucket_plans: Vec<crate::search::BucketPlan>,
+    /// The bucket plan `execute` runs (chosen from `dims`), by index —
+    /// borrowed from `bucket_plans`, never cloned per call.
+    selected_bucket: Option<usize>,
+    /// Bumped by every `search`: with the bucket index it keys the
+    /// device's prepared dispatch, so a re-search never reuses a stale
+    /// preparation.
+    plan_epoch: u64,
     /// The dim values this runtime currently holds — every `[n, n]`
     /// `bind_dyn_range` pin plus whatever [`Self::set_dim`] sets. With
     /// buckets bound this is what picks the plan at execute time.
@@ -355,8 +362,22 @@ impl CudaRuntime {
                 );
             }
         }
-        self.plan = Some(plan.plan.clone());
+        let index = self
+            .bucket_plans
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, plan))
+            .expect("the selected plan is one of the bucket plans");
+        self.selected_bucket = Some(index);
         Ok(())
+    }
+
+    /// The installed plan `execute` runs: the single-pin plan, or the
+    /// selected bucket's.
+    fn installed_plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
+        match self.selected_bucket {
+            Some(index) => self.bucket_plans.get(index).map(|plan| &plan.plan),
+            None => self.plan.as_ref(),
+        }
     }
 
     /// The ops this runtime claims: the CUDA analogue of
@@ -666,6 +687,12 @@ impl CudaRuntime {
         if !searched_buckets.is_empty() {
             self.bucket_plans = searched_buckets;
         }
+        self.selected_bucket = None;
+        self.plan_epoch += 1;
+        #[cfg(feature = "device")]
+        if let Some(device) = self.device.as_mut() {
+            device.forget_prepared();
+        }
 
         let native = self
             .native
@@ -771,10 +798,15 @@ impl CudaRuntime {
             if self.device.is_none() {
                 self.device = Some(crate::device::CudaDevice::new(0)?);
             }
-            let plan = self
-                .plan
-                .as_ref()
-                .ok_or_else(|| anyhow!("search before execute"))?;
+            let key = (self.plan_epoch << 32)
+                | self.selected_bucket.map(|i| i as u64 + 1).unwrap_or(0);
+            let plan = match self.selected_bucket {
+                Some(index) => &self.bucket_plans[index].plan,
+                None => self
+                    .plan
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("search before execute"))?,
+            };
             // SERVING KEEPS THE SLAB (#422 policy, Phase 4): nothing
             // here releases it — only the search does, between
             // candidates.
@@ -784,7 +816,7 @@ impl CudaRuntime {
                 .device
                 .as_mut()
                 .expect("the device was just created if it was missing");
-            let outputs = crate::device::execute_plan(device, plan, &staged)?;
+            let outputs = crate::device::execute_plan_keyed(device, plan, &staged, key)?;
             self.outputs_host = outputs
                 .keys()
                 .map(|slot| (*slot, std::cell::OnceCell::new()))
@@ -795,8 +827,7 @@ impl CudaRuntime {
         #[cfg(not(feature = "device"))]
         {
             let _ = self
-                .plan
-                .as_ref()
+                .installed_plan()
                 .ok_or_else(|| anyhow!("search before execute"))?;
             bail!(
                 "cuda-lite built without the `device` feature: plans can be \
@@ -909,8 +940,10 @@ impl CudaRuntime {
             .ok_or_else(|| anyhow!("execute before fetch"))
     }
 
-    /// The searched plan, for inspection and tests.
+    /// The installed plan, for inspection and tests: the single-pin plan,
+    /// or — with buckets bound and a covering pin set — the selected
+    /// bucket's.
     pub fn plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
-        self.plan.as_ref()
+        self.installed_plan()
     }
 }

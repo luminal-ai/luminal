@@ -423,17 +423,56 @@ pub fn layout_read_index(
 
 /// CUDA source for one launch of kernel `k`, with `n` threads.
 /// Arguments are the operation's inputs, followed by `out` and `n`.
+///
+/// `launch` overrides the executor's default geometry (one thread per
+/// element in 256-thread blocks): a kernel that organizes its own
+/// cooperation — the block-per-output reductions — names its grid and
+/// block, and `n` is then whatever the kernel's `n` argument means to it.
 #[derive(Debug)]
 pub struct KernelSource {
     pub source: String,
     pub n: usize,
+    pub launch: Option<LaunchGeometry>,
+    /// Skip this launch when the destination IS operand `k`'s storage —
+    /// an in-place op whose first launch would copy a buffer onto
+    /// itself (scatter's init→dest copy).
+    pub skip_when_dest_is_operand: Option<usize>,
+}
+
+/// An explicit 1-D launch geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchGeometry {
+    pub grid: u32,
+    pub block: u32,
 }
 
 impl KernelSource {
     pub(crate) fn plain(source: String, n: usize) -> Self {
-        Self { source, n }
+        Self {
+            source,
+            n,
+            launch: None,
+            skip_when_dest_is_operand: None,
+        }
+    }
+
+    pub(crate) fn with_launch(source: String, n: usize, grid: u32, block: u32) -> Self {
+        Self {
+            source,
+            n,
+            launch: Some(LaunchGeometry { grid, block }),
+            skip_when_dest_is_operand: None,
+        }
     }
 }
+
+/// Reductions whose reduced extent is at least this long and whose
+/// outputs are few run one BLOCK per output element (256 threads striding
+/// the axis, then a tree reduction) instead of one thread per output
+/// looping the whole axis — the difference between a 20 ms and a 20 µs
+/// argmax over a 200k-token vocabulary.
+const BLOCK_REDUCE_MIN_EXTENT: usize = 512;
+const BLOCK_REDUCE_THREADS: usize = 256;
 
 /// An operation's code generator. Its kernels run in order on one stream;
 /// for example, scatter copies the input before writing updates.
@@ -607,6 +646,44 @@ pub(crate) fn reduce(
     let (chain, idx) = layout_read_index("a", layout, in_dims, Coords::Bound { prefix: "c" })?;
     // Indent the generated index code inside the loop.
     let chain = chain.replace("    ", "        ");
+    if inner == 1 && extent >= BLOCK_REDUCE_MIN_EXTENT && n <= 1 << 20 {
+        // BLOCK-PER-OUTPUT: block i owns output i; its threads stride the
+        // reduced axis, then fold their partials through shared memory.
+        // The fold template is applied to (acc, v) exactly as in the loop.
+        let threads = BLOCK_REDUCE_THREADS;
+        let source = format!(
+            r#"extern "C" __global__ void k(const {ta}* a, {to}* out, unsigned long long n) {{
+    __shared__ {ta} partial[{threads}];
+    unsigned long long i = blockIdx.x;
+    if (i >= n) return;
+    unsigned long long outer = i / {inner}ULL;
+    unsigned long long inner = i % {inner}ULL;
+{coords}    {ta} acc = {init};
+    for (unsigned long long r = threadIdx.x; r < {extent}ULL; r += {threads}ULL) {{
+        long long c{axis} = (long long)r;
+{chain}        {ta} v = a[{idx}];
+        acc = {fold};
+    }}
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (unsigned int stride = {threads} / 2; stride > 0; stride >>= 1) {{
+        if (threadIdx.x < stride) {{
+            {ta} v = partial[threadIdx.x + stride];
+            acc = {fold};
+            partial[threadIdx.x] = acc;
+        }}
+        __syncthreads();
+    }}
+    if (threadIdx.x == 0) out[i] = partial[0];
+}}"#
+        );
+        return Ok(vec![KernelSource::with_launch(
+            source,
+            n,
+            n.max(1) as u32,
+            threads as u32,
+        )]);
+    }
     let source = format!(
         r#"extern "C" __global__ void k(const {ta}* a, {to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;

@@ -132,12 +132,26 @@ impl BufferTensorIrOp for ScatterFunctionalDps {
 }
 
 impl Bufferizable for ScatterFunctionalDps {
+    /// The destination is the result (Must); the INIT operand MAY be
+    /// that same storage (the serving landing, 2026-09-10): a scatter
+    /// whose init is a `ReadWrite` input with no later reader — a paged
+    /// KV cache — writes its rows straight into the resident buffer, and
+    /// the executor skips the init→dest copy when the two coincide. The
+    /// bufferizer grants the permit only where its read-after-write and
+    /// writability checks pass; every other scatter stays out of place.
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo {
-            operand: self.dest_index(),
-            result: 0,
-            sharing: Sharing::Must,
-        }]
+        vec![
+            AliasInfo {
+                operand: self.dest_index(),
+                result: 0,
+                sharing: Sharing::Must,
+            },
+            AliasInfo {
+                operand: 0,
+                result: 0,
+                sharing: Sharing::May,
+            },
+        ]
     }
 }
 
@@ -288,10 +302,10 @@ impl KernelOp for ScatterFunctionalDps {
 {body}    out[flat] = {src_read};
 }}"#
         );
-        Ok(vec![
-            KernelSource::plain(copy_src, dest_n),
-            KernelSource::plain(scatter_src, src_n),
-        ])
+        // In place (init IS dest), the copy is the identity: skip it.
+        let mut copy = KernelSource::plain(copy_src, dest_n);
+        copy.skip_when_dest_is_operand = Some(0);
+        Ok(vec![copy, KernelSource::plain(scatter_src, src_n)])
     }
 }
 
