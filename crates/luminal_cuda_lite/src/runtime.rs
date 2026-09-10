@@ -57,7 +57,6 @@ const MIN_SEARCH_DEVICE_HEADROOM_BYTES: usize = 512 * 1024 * 1024;
 const SEARCH_DEVICE_HEADROOM_DIVISOR: usize = 200;
 const MIN_SEARCH_CACHE_EVICTION_HEADROOM_BYTES: usize = 1024 * 1024 * 1024;
 const SEARCH_CACHE_EVICTION_HEADROOM_DIVISOR: usize = 50;
-const MIN_SEARCH_CANDIDATE_NODE_ALLOWANCE: usize = 1024;
 
 fn materialized_bucket_evictions(
     materialized: &[bool],
@@ -83,10 +82,6 @@ fn materialized_bucket_evictions(
         }
     }
     evictions
-}
-
-fn search_candidate_node_limit(baseline_nodes: usize) -> usize {
-    baseline_nodes.saturating_add(MIN_SEARCH_CANDIDATE_NODE_ALLOWANCE)
 }
 
 fn bounded_search_intermediate_bytes(
@@ -490,9 +485,6 @@ pub struct CudaRuntimeImpl<O> {
     next_execution_id: u64,
     max_intermediate_memory_bytes: Option<usize>,
     max_kernel_source_bytes: Option<usize>,
-    /// Cheap pre-codegen limit derived from the first viable candidate in the
-    /// current bucket. Reset together with bucket-local compilation state.
-    search_candidate_node_limit: Option<usize>,
     device_resource_limits: Option<CudaDeviceResourceLimits>,
     /// Resource-relevant input state covered by the most recent aggregate
     /// retained-bucket validation.
@@ -864,7 +856,6 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let _ = self.cuda_stream.synchronize();
         self.release_all_arenas();
         self.compiled_buckets.clear();
-        self.search_candidate_node_limit = None;
         self.active_bucket = 0;
         self.validated_resource_signatures.clear();
         self.resource_length_sensitive_hlir.clear();
@@ -4980,7 +4971,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         dyn_map: &DynMap,
         ctx: &luminal::search::BucketContext<'_>,
     ) -> Result<ValidatedProfileCandidate, String> {
-        self.compile_and_validate_profile_candidate_inner(llir_graph, dyn_map, ctx, true)
+        self.compile_and_validate_profile_candidate_inner(llir_graph, dyn_map, ctx)
     }
 
     pub(crate) fn compile_and_validate_finalist_candidate(
@@ -4989,7 +4980,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         dyn_map: &DynMap,
         ctx: &luminal::search::BucketContext<'_>,
     ) -> Result<ValidatedProfileCandidate, String> {
-        self.compile_and_validate_profile_candidate_inner(llir_graph, dyn_map, ctx, false)
+        self.compile_and_validate_profile_candidate_inner(llir_graph, dyn_map, ctx)
     }
 
     fn compile_and_validate_profile_candidate_inner(
@@ -4997,16 +4988,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         llir_graph: &LLIRGraph,
         dyn_map: &DynMap,
         ctx: &luminal::search::BucketContext<'_>,
-        enforce_search_planning_limit: bool,
     ) -> Result<ValidatedProfileCandidate, String> {
-        if enforce_search_planning_limit && let Some(limit) = self.search_candidate_node_limit {
-            let required = llir_graph.node_count();
-            if required > limit {
-                let violation = ResourceViolation::CandidatePlanningNodes { required, limit };
-                luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
-                return Err(format!("resource reject: {violation}"));
-            }
-        }
         let allocation_dyn_map = Self::candidate_allocation_dyn_map(dyn_map, ctx);
         let caps = self.search_candidate_resource_caps();
         let static_plan = match prepare_static_llir_resources(
@@ -5082,10 +5064,6 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 caps,
             )
             .map_err(|error| format!("resource reject: {error}"))?;
-        if enforce_search_planning_limit {
-            self.search_candidate_node_limit
-                .get_or_insert_with(|| search_candidate_node_limit(llir_graph.node_count()));
-        }
         let display = format!(
             "{}; generated CUDA source max {}, total {}; novel fusion compile {} / {}",
             format_memory_bytes(Self::peak_planned_arena_bytes(&validated.compiled_buckets)),
@@ -5160,7 +5138,6 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             next_execution_id: 0,
             max_intermediate_memory_bytes: None,
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
-            search_candidate_node_limit: None,
             device_resource_limits,
             last_resource_input_signature: FxHashMap::default(),
             synchronize_stream: true,
@@ -6564,13 +6541,6 @@ mod arena_plan_tests {
             materialized_bucket_evictions(&materialized, &lru, 1, 1),
             vec![0]
         );
-    }
-
-    #[test]
-    fn search_planning_node_limit_allows_growth_but_rejects_graph_explosion() {
-        assert_eq!(search_candidate_node_limit(3_500), 4_524);
-        assert!(10_311 > search_candidate_node_limit(3_500));
-        assert_eq!(search_candidate_node_limit(10), 1_034);
     }
 
     #[test]

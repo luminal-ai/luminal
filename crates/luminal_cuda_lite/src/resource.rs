@@ -235,10 +235,6 @@ impl CandidateResourcePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceViolation {
-    CandidatePlanningNodes {
-        required: usize,
-        limit: usize,
-    },
     IntermediateMemory {
         required: usize,
         limit: usize,
@@ -307,10 +303,6 @@ pub enum ResourceViolation {
 impl std::fmt::Display for ResourceViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CandidatePlanningNodes { required, limit } => write!(
-                f,
-                "candidate LLIR has {required} nodes, search planning limit is {limit} nodes"
-            ),
             Self::IntermediateMemory { required, limit } => write!(
                 f,
                 "intermediate memory requires {required} bytes, hard limit is {limit} bytes"

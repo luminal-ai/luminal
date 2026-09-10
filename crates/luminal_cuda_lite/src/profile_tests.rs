@@ -798,6 +798,71 @@ fn profile_capture_preparation_uses_exact_metadata() {
 }
 
 #[test]
+fn search_accepts_larger_equivalent_graph_after_small_candidate() {
+    let mut graph = Graph::new();
+    let input = graph.tensor('s').as_dtype(DType::Int).persist();
+    let metadata = graph.tensor(1).as_dtype(DType::Int).persist();
+    let output = graph
+        .custom_op(
+            MetadataCopy::default(),
+            (input.id, metadata.id),
+            's',
+            DType::Int,
+        )
+        .output();
+    graph.set_dim('s', 4);
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let space = graph.search_space().unwrap();
+    let contexts = space.bucket_contexts(&graph.dyn_map);
+    let mut llir =
+        luminal::search::extract_one(space, &contexts[0], &mut SmallRng::seed_from_u64(17));
+    let copy = llir
+        .node_indices()
+        .find(|&n| {
+            llir[n]
+                .to_dialect::<dyn HostOp>()
+                .is_some_and(|op| op.as_any().is::<MetadataCopy>())
+        })
+        .unwrap();
+    let mut rt = runtime();
+    rt.set_data(input, vec![19i32; 4]);
+    rt.set_data_with_host_mirror(metadata, vec![4i32]);
+    drop(
+        rt.compile_and_validate_profile_candidate(&llir, &graph.dyn_map, &contexts[0])
+            .unwrap(),
+    );
+    let metadata_node = llir
+        .edges_directed(copy, petgraph::Direction::Incoming)
+        .max_by_key(|edge| edge.id())
+        .unwrap()
+        .source();
+    let consumers: Vec<_> = llir
+        .edges_directed(copy, petgraph::Direction::Outgoing)
+        .map(|edge| (edge.id(), edge.target()))
+        .collect();
+    let mut previous = copy;
+    // Identity copies keep the program's result unchanged while exercising a
+    // larger valid candidate, independent of the first candidate's node count.
+    for _ in 0..1025 {
+        let next = llir.add_node(llir[copy].clone());
+        llir.add_edge(previous, next, ());
+        llir.add_edge(metadata_node, next, ());
+        previous = next;
+    }
+    for (edge, target) in consumers {
+        llir.remove_edge(edge);
+        llir.add_edge(previous, target, ());
+    }
+    let compiled = rt
+        .compile_and_validate_profile_candidate(&llir, &graph.dyn_map, &contexts[0])
+        .expect("valid graph growth must not be rejected based on an earlier candidate's size");
+    rt.install_validated_bucket_set(&space.dim_buckets, compiled.buckets)
+        .unwrap();
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_i32(output), vec![19; 4]);
+}
+
+#[test]
 fn synthetic_search_profiles_materialized_graphs() {
     let mut graph = Graph::new();
     let input = graph.tensor('s').as_dtype(DType::Int).persist();
