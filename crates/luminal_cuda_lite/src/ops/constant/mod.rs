@@ -93,12 +93,15 @@ impl KernelOp for ConstantDps {
         // Dest-only signature: the check that used to stand here was the
         // write fence — see `kernels::CodegenCtx::from_descriptors`.
         let to = cuda_type(ctx.dest_dtypes[0])?;
+        let tc = crate::kernels::compute_type(ctx.dest_dtypes[0])?;
         let n = numel(&ctx.dest_dims[0]);
         let value = cuda_f64_literal(self.value);
+        let write = crate::kernels::write_expr(ctx.dest_dtypes[0], &format!("({tc}){value}"));
+        let helpers = crate::kernels::helpers_for([ctx.dest_dtypes[0]]);
         let source = format!(
-            r#"extern "C" __global__ void k({to}* out, unsigned long long n) {{
+            r#"{helpers}extern "C" __global__ void k({to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = ({to}){value};
+    if (i < n) out[i] = {write};
 }}"#
         );
         Ok(vec![KernelSource::plain(source, n)])

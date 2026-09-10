@@ -481,15 +481,69 @@ pub trait KernelOp: BufferTensorIrOp {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>>;
 }
 
-/// Return the CUDA scalar type, or an error for unsupported data types.
+/// Return the CUDA STORAGE type, or an error for unsupported data types.
+/// bf16 is stored as its 16 bits (`unsigned short`); arithmetic on it
+/// goes through [`compute_type`] and the conversion helpers
+/// ([`read_expr`] / [`write_expr`]) — a bf16 value is never operated on
+/// as an integer.
 pub(crate) fn cuda_type(dtype: PlanDtype) -> Result<&'static str> {
     Ok(match dtype {
         PlanDtype::F32 => "float",
         PlanDtype::Int => "int",
         PlanDtype::Int64 => "long long",
         PlanDtype::Bool | PlanDtype::Bool8 => "unsigned char",
+        PlanDtype::Bf16 => "unsigned short",
         other => bail!("cuda-lite CL-1 has no device type for {other:?}"),
     })
+}
+
+/// The type a value of `dtype` is COMPUTED in: f32 for bf16 storage,
+/// otherwise the storage type itself.
+pub(crate) fn compute_type(dtype: PlanDtype) -> Result<&'static str> {
+    Ok(match dtype {
+        PlanDtype::Bf16 => "float",
+        other => cuda_type(other)?,
+    })
+}
+
+/// The bf16 <-> f32 conversions, defined in every kernel that touches a
+/// bf16 operand or destination (NVRTC has no `cuda_bf16.h` without an
+/// include path; these are the same bit operations). Round-to-nearest-
+/// even on the way down, NaN preserved.
+pub(crate) const BF16_HELPERS: &str = r#"__device__ __forceinline__ float __luminal_bf2f(unsigned short h) {
+    return __uint_as_float(((unsigned int)h) << 16);
+}
+__device__ __forceinline__ unsigned short __luminal_f2bf(float f) {
+    unsigned int u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (unsigned short)((u >> 16) | 0x40u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+}
+"#;
+
+/// Wrap a storage read as a compute-typed value.
+pub(crate) fn read_expr(dtype: PlanDtype, storage_read: &str) -> String {
+    match dtype {
+        PlanDtype::Bf16 => format!("__luminal_bf2f({storage_read})"),
+        _ => storage_read.to_string(),
+    }
+}
+
+/// Wrap a compute-typed value for a storage write.
+pub(crate) fn write_expr(dtype: PlanDtype, value: &str) -> String {
+    match dtype {
+        PlanDtype::Bf16 => format!("__luminal_f2bf((float)({value}))"),
+        _ => value.to_string(),
+    }
+}
+
+/// The helper preamble when any of `dtypes` is bf16, else nothing.
+pub(crate) fn helpers_for(dtypes: impl IntoIterator<Item = PlanDtype>) -> &'static str {
+    if dtypes.into_iter().any(|d| d == PlanDtype::Bf16) {
+        BF16_HELPERS
+    } else {
+        ""
+    }
 }
 
 /// Format a number as a CUDA expression accepted by NVRTC.
@@ -571,7 +625,8 @@ fn elementwise(
     let mut rendered = expr.to_string();
     for (k, name) in names.iter().enumerate() {
         // Replace each input read with its layout index. When the index
-        // simplifies to `i`, the read stays unchanged.
+        // simplifies to `i`, the read stays unchanged. A bf16 operand is
+        // read through its conversion.
         let layout = ctx.operand_layout(k);
         let (code, idx) =
             layout_read_index(name, layout, out_dims, Coords::FlatIndex { prefix: "c" })?;
@@ -580,24 +635,33 @@ fn elementwise(
         if !rendered.contains(&flat) {
             bail!("template expr `{expr}` has no `{flat}` token to rewrite for a composed operand");
         }
-        rendered = rendered.replace(&flat, &format!("{name}[{idx}]"));
+        let read = read_expr(ctx.operand_dtypes[k], &format!("{name}[{idx}]"));
+        rendered = rendered.replace(&flat, &read);
     }
+    let dest_dtype = ctx.dest_dtypes[0];
+    let write = write_expr(dest_dtype, &rendered);
+    let helpers = helpers_for(
+        ctx.operand_dtypes
+            .iter()
+            .copied()
+            .chain(std::iter::once(dest_dtype)),
+    );
     if chains.is_empty() {
         // All reads use `i`, so no coordinate calculations are needed.
         let source = format!(
-            r#"extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
+            r#"{helpers}extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = {rendered};
+    if (i < n) out[i] = {write};
 }}"#
         );
         return Ok(vec![KernelSource::plain(source, n)]);
     }
     let prelude = coord_prelude(out_dims);
     let source = format!(
-        r#"extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
+        r#"{helpers}extern "C" __global__ void k({sig}, {to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-{prelude}{chains}    out[i] = {rendered};
+{prelude}{chains}    out[i] = {write};
 }}"#
     );
     Ok(vec![KernelSource::plain(source, n)])
@@ -614,6 +678,13 @@ pub(crate) fn reduce(
     let in_dims = &ctx.operand_dims[0];
     let ta = cuda_type(ctx.operand_dtypes[0])?;
     let to = cuda_type(ctx.dest_dtypes[0])?;
+    // The accumulator runs in the COMPUTE type; bf16 storage is read and
+    // written through its conversions.
+    let tc = compute_type(ctx.operand_dtypes[0])?;
+    let read = read_expr(ctx.operand_dtypes[0], "a[IDX]");
+    let write_acc = write_expr(ctx.dest_dtypes[0], "acc");
+    let write_partial = write_expr(ctx.dest_dtypes[0], "partial[0]");
+    let helpers = helpers_for([ctx.operand_dtypes[0], ctx.dest_dtypes[0]]);
     if axis_from_end >= in_dims.len() {
         bail!("reduce axis {axis_from_end} out of rank {}", in_dims.len());
     }
@@ -651,30 +722,31 @@ pub(crate) fn reduce(
         // reduced axis, then fold their partials through shared memory.
         // The fold template is applied to (acc, v) exactly as in the loop.
         let threads = BLOCK_REDUCE_THREADS;
+        let read = read.replace("IDX", &idx);
         let source = format!(
-            r#"extern "C" __global__ void k(const {ta}* a, {to}* out, unsigned long long n) {{
-    __shared__ {ta} partial[{threads}];
+            r#"{helpers}extern "C" __global__ void k(const {ta}* a, {to}* out, unsigned long long n) {{
+    __shared__ {tc} partial[{threads}];
     unsigned long long i = blockIdx.x;
     if (i >= n) return;
     unsigned long long outer = i / {inner}ULL;
     unsigned long long inner = i % {inner}ULL;
-{coords}    {ta} acc = {init};
+{coords}    {tc} acc = {init};
     for (unsigned long long r = threadIdx.x; r < {extent}ULL; r += {threads}ULL) {{
         long long c{axis} = (long long)r;
-{chain}        {ta} v = a[{idx}];
+{chain}        {tc} v = {read};
         acc = {fold};
     }}
     partial[threadIdx.x] = acc;
     __syncthreads();
     for (unsigned int stride = {threads} / 2; stride > 0; stride >>= 1) {{
         if (threadIdx.x < stride) {{
-            {ta} v = partial[threadIdx.x + stride];
+            {tc} v = partial[threadIdx.x + stride];
             acc = {fold};
             partial[threadIdx.x] = acc;
         }}
         __syncthreads();
     }}
-    if (threadIdx.x == 0) out[i] = partial[0];
+    if (threadIdx.x == 0) out[i] = {write_partial};
 }}"#
         );
         return Ok(vec![KernelSource::with_launch(
@@ -684,19 +756,20 @@ pub(crate) fn reduce(
             threads as u32,
         )]);
     }
+    let read = read.replace("IDX", &idx);
     let source = format!(
-        r#"extern "C" __global__ void k(const {ta}* a, {to}* out, unsigned long long n) {{
+        r#"{helpers}extern "C" __global__ void k(const {ta}* a, {to}* out, unsigned long long n) {{
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     unsigned long long outer = i / {inner}ULL;
     unsigned long long inner = i % {inner}ULL;
-{coords}    {ta} acc = {init};
+{coords}    {tc} acc = {init};
     for (unsigned long long r = 0; r < {extent}ULL; ++r) {{
         long long c{axis} = (long long)r;
-{chain}        {ta} v = a[{idx}];
+{chain}        {tc} v = {read};
         acc = {fold};
     }}
-    out[i] = acc;
+    out[i] = {write_acc};
 }}"#
     );
     Ok(vec![KernelSource::plain(source, n)])

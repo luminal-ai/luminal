@@ -963,16 +963,49 @@ pub fn bucketed_search_implementations(
     // a real model is large, and nothing after selection reads it.
     let mut egraphs: Vec<egraph_serialize::EGraph> = Vec::new();
     let mut searched: Vec<SearchedBucket> = Vec::new();
-    for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
-        let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
-        let mut egraph = luminal::egglog_snippet::new_egraph();
-        egraph
-            .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
-        assembly.decoders.check(&egraph)?;
-        let serialized = egraph
-            .serialize(luminal::prelude::egglog::SerializeConfig::default())
-            .egraph;
+    // SATURATE EVERY BUCKET IN PARALLEL (serving landing, 2026-09-10):
+    // a bucket's two renders — the bucket-wide validation fixpoint and
+    // the pinned representative — are independent CPU-bound egglog runs
+    // over the same model text, so they run on their own threads and
+    // only the serialized e-graphs come back. The searches that follow
+    // share one device and stay sequential.
+    let renders = bucket_renders(assembly, dim_buckets)?;
+    let saturated: Vec<Result<egraph_serialize::EGraph>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = renders
+            .iter()
+            .map(|(ranges, _, program, validation)| {
+                scope.spawn(move || -> Result<egraph_serialize::EGraph> {
+                    let text = format!("{}\n\n{}", assembly.assembled_program, validation.text);
+                    luminal::egglog_snippet::new_egraph()
+                        .parse_and_run_program(None, &text)
+                        .map_err(|err| {
+                            anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}")
+                        })?;
+                    let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
+                    let mut egraph = luminal::egglog_snippet::new_egraph();
+                    egraph.parse_and_run_program(None, &text).map_err(|err| {
+                        anyhow!("bucket {ranges:?} representative render fails: {err}")
+                    })?;
+                    assembly.decoders.check(&egraph)?;
+                    Ok(egraph
+                        .serialize(luminal::prelude::egglog::SerializeConfig::default())
+                        .egraph)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow!("a bucket saturation thread panicked")))
+            })
+            .collect()
+    });
+    for ((ranges, representative, program, _validation), serialized) in
+        renders.into_iter().zip(saturated)
+    {
+        let serialized = serialized?;
         let outcome = search_implementations(
             &serialized,
             &program,
@@ -1066,6 +1099,7 @@ type BucketRender = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
     LogicalProgram,
+    LogicalProgram,
 );
 
 fn bucket_renders(
@@ -1123,7 +1157,8 @@ fn bucket_renders(
         }
 
         // BUCKET-WIDE SOUNDNESS: the range-seeded render must run its
-        // whole fixpoint over the interval.
+        // whole fixpoint over the interval. Rendered here, RUN by the
+        // caller (in parallel with the other buckets').
         let mut validation_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
         for (dim, value) in &representative {
             validation_seeds.insert(*dim, (*value as u64, *value as u64));
@@ -1132,17 +1167,13 @@ fn bucket_renders(
             validation_seeds.insert(*dim, (*min as u64, *max as u64));
         }
         let validation = assemble(&validation_seeds);
-        let text = format!("{}\n\n{}", assembly.assembled_program, validation.text);
-        luminal::egglog_snippet::new_egraph()
-            .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
 
         // Representative render: pinned via tight bounds.
         let mut pin_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
         for (dim, value) in &representative {
             pin_seeds.insert(*dim, (*value as u64, *value as u64));
         }
-        renders.push((ranges, representative, assemble(&pin_seeds)));
+        renders.push((ranges, representative, assemble(&pin_seeds), validation));
     }
     Ok(renders)
 }

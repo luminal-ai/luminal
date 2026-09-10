@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_type, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary};
 use anyhow::Result;
 
 /// `CastGeneric(input) -> out` — pure dataflow form.
@@ -93,7 +93,10 @@ impl LayoutIrOp for CastDps {}
 /// field of its own.
 impl KernelOp for CastDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-        let to = cuda_type(ctx.dest_dtypes[0])?;
+        // The conversion happens in the COMPUTE type; a bf16 destination
+        // is then written through its rounding conversion (and a bf16
+        // source read through its widening one) by `unary` itself.
+        let to = crate::kernels::compute_type(ctx.dest_dtypes[0])?;
         unary(ctx, &format!("({to})a[i]"))
     }
 }

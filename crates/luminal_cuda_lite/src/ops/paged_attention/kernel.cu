@@ -22,6 +22,15 @@
 #define HPW ((G + 7) / 8)
 #define DK (D / 32)
 
+// The cache dtype: KV_BF16 = 1 reads bf16 bits, 0 reads f32.
+#if KV_BF16
+typedef unsigned short kv_t;
+__device__ __forceinline__ float kv_load(kv_t v) { return __uint_as_float(((unsigned int)v) << 16); }
+#else
+typedef float kv_t;
+__device__ __forceinline__ float kv_load(kv_t v) { return v; }
+#endif
+
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -49,8 +58,8 @@ extern "C" __global__ void paged_attention_f32(
     float scale
 ) {
     const float* q = (const float*)q_ptr;
-    const float* k_cache = (const float*)k_cache_ptr;
-    const float* v_cache = (const float*)v_cache_ptr;
+    const kv_t* k_cache = (const kv_t*)k_cache_ptr;
+    const kv_t* v_cache = (const kv_t*)v_cache_ptr;
     const int* slot_table = (const int*)slot_table_ptr;
     const int* qo_indptr = (const int*)qo_indptr_ptr;
     const int* kv_indptr = (const int*)kv_indptr_ptr;
@@ -104,8 +113,8 @@ extern "C" __global__ void paged_attention_f32(
             if (j < kv_end) {
                 const long long slot = slot_table[j];
                 const long long off = slot * (long long)kv_heads * D + (long long)g * D + d;
-                kval = k_cache[off];
-                vval = v_cache[off];
+                kval = kv_load(k_cache[off]);
+                vval = kv_load(v_cache[off]);
             }
             Ks[row][d] = kval;
             Vs[row][d] = vval;

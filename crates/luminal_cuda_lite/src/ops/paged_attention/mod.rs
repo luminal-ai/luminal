@@ -165,13 +165,15 @@ pub(crate) fn dense_extents(
         .ok_or_else(|| anyhow::anyhow!("{label}: operand {who} has symbolic extents"))
 }
 
-/// The kernel source with the geometry baked in as macros.
-fn source_for(spec: &PagedAttentionSpec) -> String {
+/// The kernel source with the geometry and the cache dtype baked in as
+/// macros.
+fn source_for(spec: &PagedAttentionSpec, kv_bf16: bool) -> String {
     format!(
-        "#define D {}\n#define G {}\n#define W {}\n{}",
+        "#define D {}\n#define G {}\n#define W {}\n#define KV_BF16 {}\n{}",
         spec.head_dim,
         spec.group(),
         spec.window,
+        u8::from(kv_bf16),
         KERNEL_SOURCE
     )
 }
@@ -234,8 +236,6 @@ impl crate::host::HostOp for PagedAttentionDps {
         }
         for (k, dtype) in [
             (0, luminal::dtype::PlanDtype::F32),
-            (1, luminal::dtype::PlanDtype::F32),
-            (2, luminal::dtype::PlanDtype::F32),
             (3, luminal::dtype::PlanDtype::Int),
             (4, luminal::dtype::PlanDtype::Int),
             (5, luminal::dtype::PlanDtype::Int),
@@ -247,12 +247,22 @@ impl crate::host::HostOp for PagedAttentionDps {
                 bail!("{label}: operand {} must be {dtype:?}, got {got:?}", OPERANDS[k]);
             }
         }
+        // The cache pool is f32 or bf16 (both halves alike).
+        let kv_dtype = ctx.operand_info[1].layout.dtype;
+        if ctx.operand_info[2].layout.dtype != kv_dtype {
+            bail!("{label}: k_cache and v_cache dtypes differ");
+        }
+        let kv_bf16 = match kv_dtype {
+            Some(luminal::dtype::PlanDtype::F32) => false,
+            Some(luminal::dtype::PlanDtype::Bf16) => true,
+            other => bail!("{label}: the cache pool must be F32 or Bf16, got {other:?}"),
+        };
         if s == 0 {
             return Ok(());
         }
         let function = crate::nvrtc_module::kernel_function(
             ctx.stream,
-            &source_for(&spec),
+            &source_for(&spec, kv_bf16),
             "paged_attention_f32",
         )
         .with_context(|| format!("{label}: kernel"))?;
