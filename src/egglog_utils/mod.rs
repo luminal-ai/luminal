@@ -1967,6 +1967,8 @@ pub struct LlirExtractor<'a> {
     root_index: DenseIndex,
     indexed_extractions: Vec<Vec<(DenseIndex, Vec<CachedIndexedExtraction>)>>,
     mutation_nodes: Vec<Option<MutationChoices>>,
+    cover_next_proposal: bool,
+    constructor_alternatives: Vec<(DenseIndex, usize)>,
     visit_epoch: u32,
     visited: Vec<u32>,
     reachable: Vec<DenseNode>,
@@ -2054,6 +2056,8 @@ impl<'a> LlirExtractor<'a> {
             root_index,
             indexed_extractions,
             mutation_nodes,
+            cover_next_proposal: true,
+            constructor_alternatives: Vec::new(),
             visit_epoch: 0,
             visited: vec![0; indexed_class_count],
             reachable: Vec::new(),
@@ -2302,10 +2306,41 @@ impl<'a> LlirExtractor<'a> {
         mutable_classes
     }
 
+    fn next_constructor_alternative(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        active_classes: &[DenseIndex],
+    ) -> Option<(DenseIndex, usize)> {
+        while let Some(alternative) = self.constructor_alternatives.pop() {
+            if active_classes.contains(&alternative.0) {
+                return Some(alternative);
+            }
+        }
+        // One cycle offers each other constructor at every active site. Avoid
+        // spending this coverage budget revisiting the incumbent constructor's
+        // tuning variants; random proposals continue to explore those variants.
+        let mut classes = active_classes.to_vec();
+        classes.sort_unstable();
+        for class in classes.into_iter().rev() {
+            self.mutation_pool(class);
+            let families = &self.mutation_nodes[class as usize]
+                .as_ref()
+                .unwrap()
+                .families;
+            for (index, family) in families.iter().enumerate().rev() {
+                if !family.contains(&choices.choices[class as usize]) {
+                    self.constructor_alternatives.push((class, index));
+                }
+            }
+        }
+        self.constructor_alternatives.pop()
+    }
+
     fn mutate_choice(
         &mut self,
         child: &mut IndexedChoiceSet,
         class: DenseIndex,
+        family_index: Option<usize>,
         rng: &mut (impl Rng + ?Sized),
     ) -> bool {
         self.mutation_pool(class);
@@ -2313,7 +2348,8 @@ impl<'a> LlirExtractor<'a> {
             .as_ref()
             .unwrap()
             .families;
-        let family = &families[rng.random_range(0..families.len())];
+        let family_index = family_index.unwrap_or_else(|| rng.random_range(0..families.len()));
+        let family = &families[family_index];
         let new_node = family[rng.random_range(0..family.len())];
         let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
         let class_info = &self.indexed_classes[class as usize];
@@ -2345,11 +2381,28 @@ impl<'a> LlirExtractor<'a> {
         while offspring.len() < generation_size && attempts < max_attempts {
             attempts += 1;
             let mut child = base.clone();
+            let cover_constructor = self.cover_next_proposal;
+            self.cover_next_proposal = !self.cover_next_proposal;
             let mut active_classes = mutable_classes.clone();
             let mutation_count = rng.random_range(1..=mutations_per_generation.max(1));
+            // Measure direct alternatives independently; the random half keeps
+            // the caller's full joint-mutation budget for escaping local minima.
+            let mutation_count = if cover_constructor { 1 } else { mutation_count };
             for _ in 0..mutation_count {
-                let class = active_classes[rng.random_range(0..active_classes.len())];
-                if self.mutate_choice(&mut child, class, rng) {
+                // Cover alternate constructors between unrestricted random
+                // proposals, which continue exploring every tuning/joint choice.
+                let alternative = cover_constructor
+                    .then(|| self.next_constructor_alternative(&child, &active_classes))
+                    .flatten();
+                let class = alternative
+                    .map(|(class, _)| class)
+                    .unwrap_or_else(|| active_classes[rng.random_range(0..active_classes.len())]);
+                if self.mutate_choice(
+                    &mut child,
+                    class,
+                    alternative.map(|(_, family)| family),
+                    rng,
+                ) {
                     // A structural choice can expose dormant genes left at an
                     // unrelated implementation by an earlier genome. Initialize
                     // the newly active subgraph in this same proposal, so a
@@ -2366,7 +2419,7 @@ impl<'a> LlirExtractor<'a> {
                             break;
                         };
                         initialized.insert(new_class);
-                        self.mutate_choice(&mut child, new_class, rng);
+                        self.mutate_choice(&mut child, new_class, None, rng);
                     }
                     if active_classes.is_empty() {
                         break;

@@ -51,10 +51,14 @@ fn choices_fixture(variants: usize) -> SerializedEGraph {
     graph
 }
 
-fn check_distribution(counts: &FxHashMap<NodeId, usize>, variants: usize) {
+fn check_distribution(
+    counts: &FxHashMap<NodeId, usize>,
+    variants: usize,
+    range: std::ops::Range<usize>,
+) {
     let untuned = counts[&NodeId::from("op-0")];
     assert!(
-        (1800..2300).contains(&untuned),
+        range.contains(&untuned),
         "untuned proposals: {untuned}/4096"
     );
     // Balancing must not remove any of the tuning configurations.
@@ -71,7 +75,7 @@ fn initial_proposals_balance_families_independent_of_tuning_cardinality() {
             let choices = random_initial_choice(&graph, &mut rng);
             *counts.entry(choices[&graph.roots[0]].clone()).or_default() += 1;
         }
-        check_distribution(&counts, variants);
+        check_distribution(&counts, variants, 1800..2300);
     }
 }
 
@@ -99,7 +103,9 @@ fn reachable_mutation_balances_families_and_preserves_every_variant() {
                 .entry(extractor.indexed_node_id(selected).clone())
                 .or_default() += 1;
         }
-        check_distribution(&counts, variants);
+        // Coverage proposes the alternate family; the random half still
+        // selects both families equally, independently of variant cardinality.
+        check_distribution(&counts, variants, 850..1200);
     }
 }
 
@@ -233,4 +239,146 @@ fn check_activated_input_mutation(already_active: bool) {
         base.choices[extractor.class_to_index[&hidden] as usize], 0,
         "parent is immutable"
     );
+}
+
+fn independent_choices_fixture(
+    classes: usize,
+    variants: usize,
+) -> (SerializedEGraph, Vec<ClassId>) {
+    let mut graph = choices_fixture(variants);
+    let template = graph.eclasses[&ClassId::from("root")].1.clone();
+    let mut roots = Vec::new();
+    for i in 0..classes {
+        let class = ClassId::from(format!("value-class-{i}"));
+        let nodes: Vec<_> = template
+            .iter()
+            .enumerate()
+            .map(|(j, node)| {
+                let id = NodeId::from(format!("value-{i}-variant-{j}"));
+                graph.enodes.insert(id.clone(), graph.enodes[node].clone());
+                graph.node_to_class.insert(id.clone(), class.clone());
+                id
+            })
+            .collect();
+        graph.eclasses.insert(class.clone(), ("IR".into(), nodes));
+        roots.push(class);
+    }
+    let join = ClassId::from("joined-values");
+    let node = NodeId::from("joined-values-node");
+    graph
+        .enodes
+        .insert(node.clone(), ("OutputJoin".into(), roots.clone()));
+    graph.node_to_class.insert(node.clone(), join.clone());
+    graph
+        .eclasses
+        .insert(join.clone(), ("IR".into(), vec![node]));
+    graph.roots = vec![join];
+    (graph, roots)
+}
+
+#[test]
+fn mutation_covers_each_active_constructor_within_bounded_proposals() {
+    const CLASSES: usize = 48;
+    let (graph, roots) = independent_choices_fixture(CLASSES, 70);
+    let mut rng = StdRng::seed_from_u64(937);
+    let mut choices = random_initial_choice(&graph, &mut rng);
+    for root in &roots {
+        let (class, (_, nodes)) = graph.eclasses.get_key_value(root).unwrap();
+        choices.insert(class, &nodes[1]);
+    }
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let base = extractor.index_choice_set(&choices);
+    let mut covered = FxHashSet::default();
+    for _ in 0..CLASSES * 2 {
+        let child = extractor
+            .extract_reachable_indexed_generation(&base, 1, 1, &mut FxHashSet::default(), &mut rng)
+            .pop()
+            .unwrap();
+        for root in &roots {
+            let selected = extractor.indexed_selected(&child, extractor.class_to_index[root]);
+            if extractor.indexed_node_id(selected) == &graph.eclasses[root].1[0] {
+                covered.insert(root);
+            }
+        }
+    }
+    assert_eq!(
+        covered.len(),
+        CLASSES,
+        "every active value must be offered its alternate constructor within one coverage cycle"
+    );
+}
+
+#[test]
+fn coverage_preserves_nonadjacent_joint_mutations() {
+    let (graph, roots) = independent_choices_fixture(4, 1);
+    let mut rng = StdRng::seed_from_u64(947);
+    let mut choices = random_initial_choice(&graph, &mut rng);
+    for root in &roots {
+        let (class, (_, nodes)) = graph.eclasses.get_key_value(root).unwrap();
+        choices.insert(class, &nodes[1]);
+    }
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let base = extractor.index_choice_set(&choices);
+    let mut classes: Vec<_> = roots
+        .iter()
+        .map(|root| extractor.class_to_index[root])
+        .collect();
+    classes.sort_unstable();
+    let targets = [classes[0], classes[2]];
+    assert!(
+        (0..1024).any(|_| {
+            let child = extractor
+                .extract_reachable_indexed_generation(
+                    &base,
+                    1,
+                    2,
+                    &mut FxHashSet::default(),
+                    &mut rng,
+                )
+                .pop()
+                .unwrap();
+            targets.iter().all(|&class| {
+                let selected = extractor.indexed_selected(&child, class);
+                let root = roots
+                    .iter()
+                    .find(|root| extractor.class_to_index[*root] == class)
+                    .unwrap();
+                extractor.indexed_node_id(selected) == &graph.eclasses[root].1[0]
+            })
+        }),
+        "coverage must retain random proposals that jointly mutate nonadjacent active values"
+    );
+}
+
+#[test]
+fn constructor_coverage_tests_direct_alternatives_with_large_mutation_limits() {
+    let (graph, roots) = independent_choices_fixture(8, 1);
+    let mut rng = StdRng::seed_from_u64(953);
+    let mut choices = random_initial_choice(&graph, &mut rng);
+    for root in &roots {
+        let (class, (_, nodes)) = graph.eclasses.get_key_value(root).unwrap();
+        choices.insert(class, &nodes[1]);
+    }
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let base = extractor.index_choice_set(&choices);
+    for proposal in 0..32 {
+        let child = extractor
+            .extract_reachable_indexed_generation(&base, 1, 8, &mut FxHashSet::default(), &mut rng)
+            .pop()
+            .unwrap();
+        if proposal % 2 == 0 {
+            let changed = roots
+                .iter()
+                .filter(|root| {
+                    let class = extractor.class_to_index[*root];
+                    extractor.indexed_selected(&child, class)
+                        != extractor.indexed_selected(&base, class)
+                })
+                .count();
+            assert_eq!(
+                changed, 1,
+                "coverage must evaluate a direct alternative without unrelated active-site mutations"
+            );
+        }
+    }
 }
