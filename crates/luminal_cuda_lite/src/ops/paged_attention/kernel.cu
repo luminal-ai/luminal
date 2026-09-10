@@ -167,17 +167,22 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) paged_attention_f32(
         }
     };
 
+    // Every chunk group runs the same `per_chunk` iterations (a group
+    // whose slice is empty just does no work in them): the block-wide
+    // barriers inside must be reached by every warp, every time.
     if (c_begin < c_end) fetch(c_begin);
-    for (int base = c_begin; base < c_end; base += TILE) {
-        stage();
+    for (int t = 0; t < per_chunk; ++t) {
+        const int base = c_begin + t * TILE;
+        const bool active = base < c_end;
+        if (active) stage();
         __syncthreads();
-        if (base + TILE < c_end) fetch(base + TILE);
+        if (active && base + TILE < c_end) fetch(base + TILE);
         const int j = base + lane;
-        const bool ok = j < c_end;
+        const bool ok = active && j < c_end;
 #pragma unroll
         for (int hh = 0; hh < HPW; ++hh) {
             const int h = wc + WPC * hh;
-            if (h < G) {
+            if (h < G && active) {
                 float sc = 0.0f;
 #pragma unroll 8
                 for (int d = 0; d < D; ++d) sc = fmaf(qs[h][d], Ks[lane * (D + 1) + d], sc);

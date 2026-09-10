@@ -24,7 +24,7 @@ fn lcg(seed: &mut u64) -> f32 {
 #[ignore]
 fn moe_gpt_oss_geometry_timing() {
     const HIDDEN: usize = 2880;
-    const INTER: usize = 5760;
+    const INTER: usize = 2880;
     const EXPERTS: usize = 128;
     const TOP_K: usize = 4;
     let mut seed = 7u64;

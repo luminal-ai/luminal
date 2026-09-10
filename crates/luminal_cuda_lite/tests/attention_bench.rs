@@ -34,13 +34,20 @@ fn paged_attention_decode_context_timing() {
     let pool: Vec<u8> = (0..SLOTS * kv_dim)
         .flat_map(|_| half::bf16::from_f32(lcg(&mut seed)).to_bits().to_le_bytes())
         .collect();
-    for (s, context) in [
-        (1usize, 128usize),
-        (1, 1024),
-        (1, 2048),
-        (8, 1536),
-        (64, 1536),
+    // (s, context rows, visible position, window): the last cases are the
+    // serving warmup's shape — one query at position 0 over a 1024-row
+    // context — for the full and the windowed kernel.
+    for (s, context, qpos, window) in [
+        (1usize, 128usize, 127i32, 0usize),
+        (1, 1024, 1023, 0),
+        (1, 2048, 2047, 0),
+        (8, 1536, 1535, 0),
+        (64, 1536, 1535, 0),
+        (1, 1024, 0, 0),
+        (1, 1024, 0, 128),
+        (1, 1024, 1023, 128),
     ] {
+        let spec = PagedAttentionSpec { window, ..spec };
         let mut cx = Graph::new();
         let q_t = cx.tensor((s, spec.heads * spec.head_dim), DType::F32);
         let kc_t = cx.tensor((SLOTS, kv_dim), DType::Bf16);
@@ -71,7 +78,7 @@ fn paged_attention_decode_context_timing() {
         let slot_table: Vec<i32> = (0..s * context).map(|j| ((j * 7) % SLOTS) as i32).collect();
         let qo: Vec<i32> = (0..=s as i32).collect();
         let kv: Vec<i32> = (0..=s as i32).map(|r| r * context as i32).collect();
-        let q_pos = vec![(context - 1) as i32; s];
+        let q_pos = vec![qpos; s];
         let sinks: Vec<f32> = (0..spec.heads).map(|_| lcg(&mut seed)).collect();
         let inputs: Vec<(_, HostBuffer)> = vec![
             (q_t.id, q.into()),
@@ -107,6 +114,8 @@ fn paged_attention_decode_context_timing() {
             let _ = rt.fetch(out.id).expect("fetch");
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        println!("s {s:>3} context {context:>5}: {ms:>8.3} ms per tick (attention + fetch)");
+        println!(
+            "s {s:>3} context {context:>5} qpos {qpos:>5} window {window:>3}: {ms:>8.3} ms per tick (attention + fetch)"
+        );
     }
 }
