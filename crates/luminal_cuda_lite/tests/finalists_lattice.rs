@@ -140,14 +140,19 @@ fn bucketed_fixture() -> Graph {
 }
 
 /// The bucketed search's options: enough sampling that each bucket ranks
-/// several distinct genomes, seeded (seed 2) for a deterministic walk.
+/// several distinct genomes, seeded for a deterministic walk. The seed
+/// is a trajectory pin: whether the eight finalists of bucket 1 include a
+/// smaller-slab plan depends on the GA's sample order, which follows the
+/// saturated e-graph's enumeration order. Seed 2 stopped covering it when
+/// propagation moved to its own ruleset (same e-graph, different order);
+/// seeds 0, 3, 4, 5, 7 cover it, 1, 2, 6 do not.
 fn bucketed_options(budget: Option<usize>) -> CompileOptions {
     CompileOptions {
         generations: 4,
         generation_size: 8,
         mutations: 3,
         trials: 1,
-        seed: 2,
+        seed: 0,
         search_log: false,
         keep_finalists: 8,
         device_budget_bytes: budget,

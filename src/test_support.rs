@@ -2243,7 +2243,7 @@ mod stage4b_probes {
             for round in 1..=150 {
                 let start = std::time::Instant::now();
                 let round_out = egraph
-                    .parse_and_run_program(None, "(run 1)")
+                    .parse_and_run_program(None, "(run-schedule (run) (run prop))")
                     .expect("round runs");
                 // Name the firing rules once the mint turns geometric.
                 for chunk in &round_out {
