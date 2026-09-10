@@ -1,934 +1,642 @@
-use crate::kernel::{MetalEncodeContext, MetalKernelOp, MpsKernelCache, clear_dyn_dims_order};
-use half::{bf16, f16};
-use itertools::Itertools;
-use luminal::{
-    dtype::DType,
-    graph::{BucketLLIR, DimBucket, Graph, LLIRGraph},
-    hlir::{Input, Output, ReferenceData},
-    op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
-    prelude::{
-        DynMap, FxHashMap, NodeIndex, Symbol, ToId,
-        petgraph::{Direction, algo::toposort, prelude::StableGraph, visit::EdgeRef},
-    },
-};
-use memmap2::MmapOptions;
-use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions};
-use objc::rc::autoreleasepool;
-use objc::runtime::Object;
-use safetensors::{Dtype, SafeTensors};
-use std::{cell::RefCell, fs::File, time::Duration};
+//! The native Metal runtime: load, bind, search, stage, execute, fetch.
+//! Registry and search state belong to the runtime; core supplies the IR.
 
-/// LOCAL STUB: `luminal::op` does not exist on this branch (`src/op.rs`
-/// is deleted); the parks track main's spelling, so main's shared
-/// predicate is copied here verbatim from its `src/op.rs` at 499d0779
-/// instead of depending on a core symbol this branch does not have.
-///
-/// Shared early-stop predicate for duration-metric runtimes: true once a
-/// candidate's running mean trial time exceeds `best * factor`, i.e. the
-/// candidate has already lost by at least the configured margin and further
-/// trials can only refine a metric that is out of contention.
-pub fn early_stop_exceeded(
-    mean: std::time::Duration,
-    best: std::time::Duration,
-    factor: f64,
-) -> bool {
-    mean.as_secs_f64() > best.as_secs_f64() * factor
+use crate::host_buffer::HostBuffer;
+use anyhow::{Context, Result, anyhow, bail};
+use luminal::bufferize::BufferIrGraph;
+
+use crate::search::{CompileOptions, SearchOutcome};
+use luminal::graph;
+use luminal::layouts::DecodedLayout;
+use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal::shape;
+
+struct NativeParts {
+    pre_schedule: String,
+    input_slots: Vec<graph::InputSlot>,
+    output_slots: Vec<graph::OutputSlot>,
+    post_checks: String,
+    labeled_checks: Vec<(String, String)>,
+    binding_seeds: String,
 }
 
-#[derive(Clone)]
-struct MetalExecutionStep {
-    node: NodeIndex,
-    input_nodes: Vec<NodeIndex>,
-    input_dtypes: Vec<DType>,
-    output_dtype: DType,
-}
-
-#[derive(Clone)]
-struct MetalCompiledBucket {
-    bucket_indices: DynMap,
-    llir_graph: LLIRGraph,
-    llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
-    node_dtypes: FxHashMap<NodeIndex, DType>,
-    pipelines: FxHashMap<NodeIndex, ComputePipelineState>,
-    output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
-    output_data_map: FxHashMap<NodeIndex, NodeIndex>,
-    execution_plan: Vec<MetalExecutionStep>,
-}
-
+#[derive(Default)]
 pub struct MetalRuntime {
-    device: Device,
-    command_queue: CommandQueue,
-    /// Host-side input tensors provided by the user.
-    input_data: FxHashMap<NodeIndex, ReferenceData>,
-    /// Buffers for HLIR input tensors (set by user)
-    pub hlir_buffers: FxHashMap<NodeIndex, Buffer>,
-    /// Buffers for LLIR intermediate/output tensors
-    pub buffers: FxHashMap<NodeIndex, Buffer>,
-    /// Logical byte length for each active LLIR buffer.
-    buffer_lengths: FxHashMap<NodeIndex, u64>,
-    /// Dynamic dimension sizes, shared across all kernels. Slot `i` holds
-    /// `dyn_dims_order[i]`.
-    dyn_buffer: Buffer,
-    /// Layout of `dyn_buffer`. Duplicated from the codegen thread-local so an
-    /// upload on another thread still sees this runtime's layout.
-    dyn_dims_order: Vec<Symbol>,
-    /// Retained MPS descriptors/kernels reused across command encodes.
-    mps_cache: RefCell<MpsKernelCache>,
-    /// The current LLIR graph
-    llir_graph: LLIRGraph,
-    /// LLIR input node -> HLIR input node.
-    llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
-    /// Inferred runtime dtype for each LLIR node.
-    node_dtypes: FxHashMap<NodeIndex, DType>,
-    /// Compiled pipeline states for each kernel node
-    pipelines: FxHashMap<NodeIndex, ComputePipelineState>,
-    /// LLIR output node -> input node whose buffer contains the output.
-    output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
-    /// HLIR output id -> LLIR node whose data feeds the output.
-    output_data_map: FxHashMap<NodeIndex, NodeIndex>,
-    /// Precomputed executable nodes and input metadata for the active LLIR graph.
-    execution_plan: Vec<MetalExecutionStep>,
-    /// Bucket definitions for dynamic dimensions.
-    dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
-    /// Compiled LLIR variants, one per bucket combination.
-    compiled_buckets: Vec<MetalCompiledBucket>,
-    /// Currently active compiled bucket.
-    active_bucket: usize,
+    native: Option<NativeParts>,
+    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    allow: Vec<&'static str>,
+    decoders: luminal::egglog_utils::eclass::ConstructorRegistry,
+    plan: Option<BufferIrGraph<DecodedLayout>>,
+    staged: FxHashMap<i64, HostBuffer>,
+    residents: luminal::resident::ResidentBindings,
+    device_budget_bytes: Option<usize>,
+    outputs_host: FxHashMap<usize, (HostBuffer, luminal::bufferize::OutputBinding<DecodedLayout>)>,
+    input_buffers: FxHashMap<NodeIndex, i64>,
+    output_index: FxHashMap<NodeIndex, usize>,
+    dim_buckets: std::collections::BTreeMap<shape::Symbol, Vec<graph::DimBucket>>,
+    bucket_plans: Vec<crate::search::BucketPlan>,
+    selected_bucket: Option<usize>,
+    dims: shape::DynMap,
+    range_bound: std::collections::BTreeMap<shape::Symbol, (u64, u64)>,
+    #[cfg(target_os = "macos")]
+    device: Option<crate::device::MetalDevice>,
 }
 
 impl MetalRuntime {
-    fn input_dtype(&self, id: NodeIndex) -> Option<DType> {
-        self.llir_graph.node_indices().find_map(|node| {
-            self.llir_graph[node]
-                .to_op::<Input>()
-                .and_then(|input| (input.node == id.index()).then_some(input.dtype))
+    pub fn load(graph: &graph::Graph) -> Result<Self> {
+        Self::load_with_registry(graph, crate::ops::metal_registry())
+    }
+
+    pub fn load_with_registry(
+        graph: &graph::Graph,
+        registry: Vec<crate::ops::RegisteredOp>,
+    ) -> Result<Self> {
+        let (pre_schedule, input_slots, output_slots, post_checks, labeled_checks) = graph
+            .logical
+            .bound_parts(&crate::bindings::MetalBindings)
+            .map_err(|e| anyhow!(e))?;
+        let allow = Self::allow_list_over(&registry);
+        let matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>> =
+            registry.into_iter().map(|entry| entry.matcher).collect();
+        let decoders = luminal::egglog_snippet::decoder_registry_for(&matchers)?;
+        Ok(Self {
+            native: Some(NativeParts {
+                pre_schedule,
+                input_slots,
+                output_slots,
+                post_checks,
+                labeled_checks,
+                binding_seeds: String::new(),
+            }),
+            matchers,
+            allow,
+            decoders,
+            ..Self::default()
         })
     }
 
-    fn output_data_node(&self, id: NodeIndex) -> NodeIndex {
-        self.output_data_map
-            .get(&id)
-            .copied()
-            .unwrap_or_else(|| panic!("Cannot find output tensor {id:?}!"))
+    fn matchers(&self) -> &[Box<dyn luminal::layout_ir::OpMatcher>] {
+        &self.matchers
     }
 
-    fn follow_aliases(&self, mut node: NodeIndex) -> NodeIndex {
-        while let Some(target) = self.output_alias_map.get(&node) {
-            node = *target;
-        }
-        node
+    pub fn decoders(&self) -> &luminal::egglog_utils::eclass::ConstructorRegistry {
+        &self.decoders
     }
 
-    fn buffer_for_llir_node<'a>(
-        &'a self,
-        node: NodeIndex,
-        llir_to_hlir: &FxHashMap<NodeIndex, NodeIndex>,
-    ) -> &'a Buffer {
-        let data_node = self.follow_aliases(node);
-        if let Some(hlir_node) = llir_to_hlir.get(&data_node) {
-            self.hlir_buffers
-                .get(hlir_node)
-                .expect("Input buffer not set!")
-        } else {
-            self.buffers
-                .get(&data_node)
-                .expect("Intermediate buffer not found!")
+    pub fn active_allow_list(&self) -> &[&'static str] {
+        &self.allow
+    }
+
+    fn invalidate_plans(&mut self) {
+        self.plan = None;
+        self.bucket_plans.clear();
+        self.selected_bucket = None;
+        self.outputs_host.clear();
+        #[cfg(target_os = "macos")]
+        if let Some(device) = &mut self.device {
+            device.release_slab();
         }
     }
 
-    fn buffer_from_slice<T>(&self, values: &[T]) -> Buffer {
-        self.device.new_buffer_with_data(
-            values.as_ptr() as *const _,
-            std::mem::size_of_val(values) as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-
-    fn buffer_from_safetensor(
-        &self,
-        tensor: &safetensors::tensor::TensorView<'_>,
-        dtype: DType,
-    ) -> Buffer {
-        match (tensor.dtype(), dtype) {
-            (Dtype::F32, DType::F32) | (Dtype::F16, DType::F16) => {
-                let data = tensor.data();
-                self.device.new_buffer_with_data(
-                    data.as_ptr() as *const _,
-                    data.len() as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            (Dtype::F16, DType::F32) => {
-                let values: Vec<f32> = bytemuck::cast_slice::<u8, f16>(tensor.data())
-                    .iter()
-                    .map(|v| v.to_f32())
-                    .collect();
-                self.buffer_from_slice(&values)
-            }
-            (Dtype::BF16, DType::F32) => {
-                let values: Vec<f32> = bytemuck::cast_slice::<u8, bf16>(tensor.data())
-                    .iter()
-                    .map(|v| v.to_f32())
-                    .collect();
-                self.buffer_from_slice(&values)
-            }
-            (Dtype::F32, DType::F16) => {
-                let values: Vec<f16> = bytemuck::cast_slice::<u8, f32>(tensor.data())
-                    .iter()
-                    .map(|v| f16::from_f32(*v))
-                    .collect();
-                self.buffer_from_slice(&values)
-            }
-            (Dtype::BF16, DType::F16) => {
-                let values: Vec<f16> = bytemuck::cast_slice::<u8, bf16>(tensor.data())
-                    .iter()
-                    .map(|v| f16::from_f32(v.to_f32()))
-                    .collect();
-                self.buffer_from_slice(&values)
-            }
-            (tensor_dtype, dtype) => {
-                panic!("Cannot load safetensor dtype {tensor_dtype:?} into Metal dtype {dtype:?}")
-            }
+    pub fn bind_dyn_range(
+        &mut self,
+        var: impl Into<shape::Symbol>,
+        lower: u64,
+        upper: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "configure dimension bounds before residency"
+        );
+        let name = var.into();
+        let (lower, upper) = self
+            .range_bound
+            .get(&name)
+            .map(|(lo, hi)| (lower.max(*lo), upper.min(*hi)))
+            .unwrap_or((lower, upper));
+        anyhow::ensure!(
+            lower <= upper,
+            "empty dimension range for `{name}`: [{lower}, {upper}]"
+        );
+        anyhow::ensure!(upper <= i64::MAX as u64, "dimension range exceeds i64");
+        anyhow::ensure!(
+            !self.dim_buckets.contains_key(&name),
+            "dim `{name}` has buckets bound; a bucketed dim is seeded per bucket \
+             and must not carry a second range binding"
+        );
+        let native = self
+            .native
+            .as_mut()
+            .ok_or_else(|| anyhow!("load before bind"))?;
+        native.binding_seeds.push_str(&format!(
+            "(set (lower-bound-of (IntVar \"{name}\")) (bigint {lower}))\n\
+             (set (upper-bound-of (IntVar \"{name}\")) (bigint {upper}))\n"
+        ));
+        self.range_bound.insert(name, (lower, upper));
+        if lower == upper {
+            self.dims.insert(name, lower as usize);
         }
+        self.invalidate_plans();
+        Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn contains_matmul(&self) -> bool {
-        self.llir_graph.node_indices().any(|node| {
-            self.llir_graph[node]
-                .to_dialect::<dyn MetalKernelOp>()
-                .is_some_and(|op| op.is_matmul())
-        })
+    pub fn bind_dim_buckets(
+        &mut self,
+        dim: impl Into<shape::Symbol>,
+        buckets: Vec<graph::DimBucket>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "configure dimension buckets before residency"
+        );
+        let dim = dim.into();
+        anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
+        if let Some((lo, hi)) = self.range_bound.get(&dim) {
+            anyhow::bail!(
+                "dim `{dim}` already carries a range binding [{lo}, {hi}] from \
+                 bind_dyn_range; a bucketed dim is seeded per bucket and must not \
+                 carry a second range binding"
+            );
+        }
+        anyhow::ensure!(
+            !self.dims.contains_key(&dim),
+            "dim `{dim}` already has a value from set_dim; bind buckets before \
+             setting the execution dim"
+        );
+        for pair in buckets.windows(2) {
+            anyhow::ensure!(
+                pair[0].max < pair[1].min,
+                "dim `{dim}` buckets must be sorted and disjoint, but [{}, {}] and \
+                 [{}, {}] are not",
+                pair[0].min,
+                pair[0].max,
+                pair[1].min,
+                pair[1].max
+            );
+        }
+        self.dim_buckets.insert(dim, buckets);
+        self.invalidate_plans();
+        Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn debug_kernel_ops(&self) -> Vec<String> {
-        self.llir_graph
-            .node_indices()
-            .filter_map(|node| {
-                self.llir_graph[node]
-                    .to_dialect::<dyn MetalKernelOp>()
-                    .map(|op| format!("{op:?}"))
+    pub fn set_dim(&mut self, dim: impl Into<shape::Symbol>, value: usize) {
+        self.dims.insert(dim.into(), value);
+    }
+
+    pub fn bucket_plans(&self) -> &[crate::search::BucketPlan] {
+        &self.bucket_plans
+    }
+
+    fn select_bucket_plan(&mut self) -> Result<()> {
+        let index = self
+            .bucket_plans
+            .iter()
+            .position(|p| {
+                p.ranges
+                    .iter()
+                    .all(|(s, (lo, hi))| self.dims.get(s).is_some_and(|v| v >= lo && v <= hi))
             })
+            .ok_or_else(|| anyhow!("no bucket covers dims {:?}", self.dims))?;
+        self.selected_bucket = Some(index);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn graph_stats(&self) -> Option<crate::device::GraphStats> {
+        self.device.as_ref().map(|d| d.stats())
+    }
+
+    pub fn allow_list() -> Vec<&'static str> {
+        Self::allow_list_over(&crate::ops::metal_registry())
+    }
+
+    fn allow_list_over(registry: &[crate::ops::RegisteredOp]) -> Vec<&'static str> {
+        registry
+            .iter()
+            .filter(|entry| {
+                let prototype = entry.prototype.as_ref();
+                if crate::plan_transparent(prototype) {
+                    return true;
+                }
+                let dps = prototype.to_dps();
+                let executable = dps.as_deref().unwrap_or(prototype);
+                crate::as_kernel_op(executable).is_some()
+            })
+            .map(|entry| entry.matcher.egglog_constructor())
             .collect()
     }
 
-    pub fn load_safetensors(&mut self, cx: &Graph, file_path: &str) {
-        let f = File::open(file_path).unwrap();
-        let mmap = unsafe { MmapOptions::new().map(&f).unwrap() };
-        let st = SafeTensors::deserialize(&mmap).unwrap();
+    pub fn saturated_egraph(&self) -> Result<luminal::prelude::egraph_serialize::EGraph> {
+        let (serialized, _program) =
+            self.assemble_and_saturate(Some(crate::saturation::DEFAULT_ALGEBRA_MATCH_BUDGET))?;
+        Ok(serialized)
+    }
 
-        for node in cx.graph.node_indices() {
-            if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>()
-                && let Ok(tensor) = st.tensor(&input.label, DType::F32)
+    fn assemble_and_saturate(
+        &self,
+        algebra_match_budget: Option<usize>,
+    ) -> Result<(
+        luminal::prelude::egraph_serialize::EGraph,
+        graph::LogicalProgram,
+    )> {
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("load before search"))?;
+        let program = graph::LogicalProgram {
+            text: format!(
+                "{}{}{}{}",
+                native.pre_schedule,
+                native.binding_seeds,
+                crate::bindings::MetalBindings::SCHEDULE,
+                native.post_checks
+            ),
+            input_slots: native.input_slots.clone(),
+            output_slots: native.output_slots.clone(),
+        };
+        let full = format!(
+            "{}\n\n{}",
+            luminal::egglog_snippet::assembled_program_for(self.matchers()),
+            program.text
+        );
+        let mut egraph = luminal::egglog_snippet::new_egraph();
+        if let Err(err) = crate::saturation::run_program(&mut egraph, &full, algebra_match_budget) {
+            let mut doors = Vec::new();
+            let unchecked = format!(
+                "{}\n\n{}\n{}\n{}",
+                luminal::egglog_snippet::assembled_program_for(self.matchers()),
+                native.pre_schedule,
+                native.binding_seeds,
+                crate::bindings::MetalBindings::SCHEDULE
+            );
+            let mut probe = luminal::egglog_snippet::new_egraph();
+            if crate::saturation::run_program(&mut probe, &unchecked, algebra_match_budget).is_ok()
             {
-                let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
-                self.input_data.remove(&node);
-                self.hlir_buffers.insert(node, buffer);
-            }
-        }
-    }
-
-    pub fn set_data(&mut self, id: impl ToId, data: impl Into<ReferenceData>) {
-        let id = id.to_id();
-        let data = data.into();
-        if let Some(dtype) = self.input_dtype(id) {
-            let buffer = self.create_input_buffer(&data, dtype);
-            self.hlir_buffers.insert(id, buffer);
-        }
-        self.input_data.insert(id, data);
-    }
-
-    pub fn set_zeros(&mut self, id: impl ToId, num_bytes: usize) {
-        let id = id.to_id();
-        let buffer = self
-            .device
-            .new_buffer(num_bytes as u64, MTLResourceOptions::StorageModeShared);
-        unsafe {
-            std::ptr::write_bytes(buffer.contents(), 0, num_bytes);
-        }
-        self.input_data.remove(&id);
-        self.hlir_buffers.insert(id, buffer);
-    }
-
-    pub fn remove_buffer(&mut self, id: impl ToId) -> Buffer {
-        let data_id = self.follow_aliases(self.output_data_node(id.to_id()));
-
-        if let Some(buffer) = self.buffers.remove(&data_id) {
-            self.buffer_lengths.remove(&data_id);
-            return buffer;
-        }
-
-        if let Some(Input { node, .. }) = self.llir_graph[data_id].to_op::<Input>() {
-            return self
-                .hlir_buffers
-                .remove(&NodeIndex::new(*node))
-                .expect("Cannot find input tensor in runtime!");
-        }
-
-        panic!("Cannot find tensor in runtime!");
-    }
-
-    pub fn set_buffer(&mut self, id: impl ToId, buffer: Buffer) {
-        let id = id.to_id();
-        self.input_data.remove(&id);
-        self.hlir_buffers.insert(id, buffer);
-    }
-
-    pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
-        let data_id = self.follow_aliases(self.output_data_node(id.to_id()));
-
-        let buffer = self
-            .buffers
-            .get(&data_id)
-            .or_else(|| {
-                // If data_id is an Input node, get from hlir_buffers
-                if let Some(Input { node, .. }) = self.llir_graph[data_id].to_op::<Input>() {
-                    self.hlir_buffers.get(&NodeIndex::new(*node))
-                } else {
-                    None
-                }
-            })
-            .expect("Cannot find tensor in runtime!");
-        let dtype = self
-            .node_dtypes
-            .get(&data_id)
-            .copied()
-            .or_else(|| {
-                self.llir_graph[data_id]
-                    .to_op::<Input>()
-                    .map(|inp| inp.dtype)
-            })
-            .unwrap_or(DType::F32);
-        let logical_bytes = self
-            .buffer_lengths
-            .get(&data_id)
-            .copied()
-            .unwrap_or_else(|| buffer.length());
-        assert!(
-            logical_bytes <= buffer.length(),
-            "Logical buffer size exceeds allocated Metal buffer size"
-        );
-
-        unsafe {
-            match dtype {
-                DType::F16 => {
-                    let ptr = buffer.contents() as *const f16;
-                    let len = logical_bytes as usize / std::mem::size_of::<f16>();
-                    std::slice::from_raw_parts(ptr, len)
-                        .iter()
-                        .map(|v| v.to_f32())
-                        .collect()
-                }
-                DType::Int => {
-                    let ptr = buffer.contents() as *const i32;
-                    let len = logical_bytes as usize / std::mem::size_of::<i32>();
-                    std::slice::from_raw_parts(ptr, len)
-                        .iter()
-                        .map(|v| *v as f32)
-                        .collect()
-                }
-                _ => {
-                    let ptr = buffer.contents() as *const f32;
-                    let len = logical_bytes as usize / std::mem::size_of::<f32>();
-                    std::slice::from_raw_parts(ptr, len).to_vec()
+                for (label, text) in &native.labeled_checks {
+                    if probe.parse_and_run_program(None, text).is_err() {
+                        doors.push(label.clone());
+                    }
                 }
             }
+            if doors.is_empty() {
+                return Err(err).context("Metal saturation failed");
+            }
+            bail!("shape contracts failed:\n  - {}", doors.join("\n  - "));
         }
-    }
-}
-
-impl Runtime for MetalRuntime {
-    type Ops = crate::kernel::MetalOps;
-    type CompileArg = ();
-    type ExecReturn = ();
-
-    fn late_egglog_passes(
-        ops: &[std::sync::Arc<Box<dyn luminal::op::EgglogOp>>],
-        _options: &luminal::graph::CompileOptions,
-        dyn_map: &DynMap,
-    ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
-        vec![crate::memory_analysis::metal_memory_analysis_pass(
-            ops, None, dyn_map,
-        )]
+        self.decoders.check(&egraph)?;
+        let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
+        Ok((serialized.egraph, program))
     }
 
-    fn initialize(_: Self::CompileArg) -> Self {
-        let device = Device::system_default().expect("No Metal device found!");
-        let command_queue = device.new_command_queue();
-        // Resized in finish_dyn_dims_layout once the dim set is known.
-        let dyn_buffer = device.new_buffer(
-            std::mem::size_of::<i32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        Self {
-            device,
-            command_queue,
-            input_data: FxHashMap::default(),
-            hlir_buffers: FxHashMap::default(),
-            buffers: FxHashMap::default(),
-            buffer_lengths: FxHashMap::default(),
-            dyn_buffer,
-            dyn_dims_order: Vec::new(),
-            mps_cache: RefCell::new(MpsKernelCache::default()),
-            llir_graph: StableGraph::default(),
-            llir_to_hlir: FxHashMap::default(),
-            node_dtypes: FxHashMap::default(),
-            pipelines: FxHashMap::default(),
-            output_alias_map: FxHashMap::default(),
-            output_data_map: FxHashMap::default(),
-            execution_plan: vec![],
-            dim_buckets: FxHashMap::default(),
-            compiled_buckets: vec![],
-            active_bucket: 0,
-        }
-    }
-
-    /// Luminal's stock genetic search, profiled on this device.
-    fn compile(
+    pub fn search(
         &mut self,
-        space: &luminal::search::SearchSpace,
-        dyn_map: &DynMap,
-        options: &luminal::graph::CompileOptions,
-        rng: &mut dyn luminal::prelude::RngCore,
-    ) {
-        let trials = options.trials;
-        let timeout = options.execution_timeout;
-        let selected = luminal::search::genetic_search(
-            space,
-            dyn_map,
-            options,
-            rng,
-            self,
-            |rt, candidate: &mut luminal::search::Candidate<Duration>, _| {
-                let (duration, display) = rt.profile_llir(
-                    &candidate.llir,
-                    &candidate.profile_dyn_map,
-                    trials,
-                    timeout,
-                    candidate.early_stop,
-                );
-                luminal::search::Outcome::Measured(duration, display)
-            },
-            |_, _: &luminal::search::PendingFinalist<Duration>, _| Ok(()),
-            |_, _| Ok(()),
-            |metrics| metrics.iter().copied().sum(),
+        input_data: &FxHashMap<NodeIndex, HostBuffer>,
+        options: &CompileOptions,
+    ) -> Result<SearchOutcome> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "create a new runtime to re-search a resident program"
         );
-        self.clear_intermediate_buffers();
-        self.load_llir_buckets(&space.dim_buckets, &selected);
-    }
-
-    #[tracing::instrument(skip_all)]
-    fn load_llir(&mut self, llir_graph: &LLIRGraph) {
-        self.buffers.clear();
-        self.buffer_lengths.clear();
-        self.dim_buckets.clear();
-        clear_dyn_dims_order();
-        self.compiled_buckets = vec![self.compile_bucket(FxHashMap::default(), llir_graph)];
-        self.finish_dyn_dims_layout();
-        self.activate_bucket(0);
-    }
-
-    #[tracing::instrument(skip_all)]
-    fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
-        autoreleasepool(|| {
-            self.select_bucket(dyn_map);
-            self.allocate_active_intermediate_buffers(dyn_map);
-
-            self.update_dyn_buffer(dyn_map);
-            let command_buffer = self.command_queue.new_command_buffer();
-            let mut encode_context = MetalEncodeContext {
-                command_buffer,
-                dyn_buffer: &self.dyn_buffer,
-                mps_cache: &self.mps_cache,
-            };
-
-            for step in &self.execution_plan {
-                let kernel_op = self.llir_graph[step.node]
-                    .to_dialect::<dyn MetalKernelOp>()
-                    .expect("Execution plan referenced a non-Metal op");
-                let pipeline = self.pipelines.get(&step.node);
-
-                let input_buffers: Vec<&Buffer> = step
-                    .input_nodes
-                    .iter()
-                    .map(|&n| self.buffer_for_llir_node(n, &self.llir_to_hlir))
-                    .collect();
-
-                let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
-                    input_buffers[alias_idx]
-                } else {
-                    self.buffers
-                        .get(&step.node)
-                        .expect("Output buffer not allocated!")
-                };
-
-                kernel_op.encode(
-                    &mut encode_context,
-                    pipeline,
-                    &input_buffers,
-                    output_buffer,
-                    dyn_map,
-                    &step.input_dtypes,
-                    step.output_dtype,
-                );
-            }
-
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
-        });
-    }
-}
-
-impl MetalRuntime {
-    /// Load `llir_graph` and time `trials` executions at `dyn_map`, stopping
-    /// early on `timeout` or once the running mean has lost to `early_stop`.
-    #[tracing::instrument(skip_all)]
-    fn profile_llir(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Duration, f64)>,
-    ) -> (Duration, String) {
-        self.clear_intermediate_buffers();
-        self.load_llir(llir_graph);
-        self.allocate_intermediate_buffers(dyn_map);
-
-        let trials = trials.max(1);
-        let profile_start = std::time::Instant::now();
-        let mut duration = Duration::default();
-        let mut completed_trials = 0;
-        for _ in 0..trials {
-            let start = std::time::Instant::now();
-            self.execute(dyn_map);
-            duration += start.elapsed();
-            completed_trials += 1;
-            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
-                break;
-            }
-            // A candidate whose running mean has already lost by the
-            // early-stop margin keeps its partial mean; further trials
-            // can only refine a metric that is out of contention.
-            if early_stop.is_some_and(|(best, factor)| {
-                early_stop_exceeded(duration / completed_trials as u32, best, factor)
-            }) {
-                break;
-            }
+        self.invalidate_plans();
+        let mut resolved_options = options.clone();
+        #[cfg(target_os = "macos")]
+        if let Some(device) = metal::Device::system_default() {
+            let limit = usize::try_from(device.max_buffer_length())?;
+            resolved_options.device_budget_bytes = Some(
+                resolved_options
+                    .device_budget_bytes
+                    .map_or(limit, |requested| requested.min(limit)),
+            );
         }
-        duration /= completed_trials as u32;
 
-        (duration, format!("{:.2?}", duration))
-    }
-
-    /// Drop every intermediate buffer.
-    pub fn clear_intermediate_buffers(&mut self) {
-        self.buffers.clear();
-        self.buffer_lengths.clear();
-    }
-
-    /// Total bytes of intermediate buffers currently allocated.
-    pub fn intermediate_buffer_bytes(&self) -> usize {
-        self.buffers
-            .values()
-            .map(|buffer| buffer.length() as usize)
-            .sum()
-    }
-
-    /// Load one compiled LLIR per bucket combination; `execute` dispatches
-    /// between them by the dyn map.
-    pub fn load_llir_buckets(
-        &mut self,
-        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
-        bucket_llirs: &[BucketLLIR],
-    ) {
-        self.buffers.clear();
-        self.buffer_lengths.clear();
-        self.dim_buckets = dim_buckets.clone();
-        // Every bucket encodes against the same dyn_buffer, so one layout covers
-        // all of them; compiling in sequence accumulates into it.
-        clear_dyn_dims_order();
-        self.compiled_buckets = bucket_llirs
+        resolved_options.shapes.bounds = self
+            .range_bound
             .iter()
-            .map(|(bucket_indices, _, llir)| self.compile_bucket(bucket_indices.clone(), llir))
-            .collect();
-        assert!(
-            !self.compiled_buckets.is_empty(),
-            "Metal runtime received no bucketed LLIRs"
+            .map(|(s, (lo, hi))| Ok((*s, (usize::try_from(*lo)?, usize::try_from(*hi)?))))
+            .collect::<Result<_>>()?;
+        resolved_options.shapes.values = self.dims.clone();
+        for (s, (lo, hi)) in &resolved_options.shapes.bounds {
+            resolved_options
+                .shapes
+                .values
+                .entry(*s)
+                .or_insert(lo + (hi - lo) / 2);
+        }
+        let options = &resolved_options;
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("load before search"))?;
+
+        for tensor in input_data.keys() {
+            assert!(
+                native.input_slots.iter().any(|slot| slot.tensor == *tensor),
+                "tensor {tensor:?} is not a bound input"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        anyhow::ensure!(
+            !options.profile_on_device,
+            "device profiling requires macOS: this host can search by the heuristic, but a request to MEASURE \
+             must not be answered with a prior"
         );
-        self.finish_dyn_dims_layout();
-        self.activate_bucket(0);
-    }
-}
 
-impl RuntimeStats for MetalRuntime {
-    fn execute_with_stats(&mut self, dyn_map: &DynMap) -> Option<ExecutionStats> {
-        let mut total_bytes_loaded = 0usize;
-        let mut total_bytes_stored = 0usize;
-        let mut total_flops = 0usize;
-
-        for node in self.llir_graph.node_indices() {
-            if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                total_bytes_loaded += kernel_op.bytes_loaded(dyn_map);
-                total_bytes_stored += kernel_op.bytes_stored(dyn_map);
-                total_flops += kernel_op.flops(dyn_map);
-            }
-        }
-        let (time_us, timing_method) = self.execute_timed(dyn_map);
-
-        Some(ExecutionStats::with_timing_method(
-            time_us,
-            total_bytes_loaded,
-            total_bytes_stored,
-            total_flops,
-            timing_method,
-        ))
-    }
-}
-
-impl MetalRuntime {
-    fn create_input_buffer(&self, data: &ReferenceData, dtype: DType) -> Buffer {
-        match dtype {
-            DType::F32 => {
-                let values = data.to_f32_vec();
-                self.device.new_buffer_with_data(
-                    values.as_ptr() as *const _,
-                    std::mem::size_of_val(values.as_slice()) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            DType::F16 => {
-                let values = data.to_f16_vec();
-                self.device.new_buffer_with_data(
-                    values.as_ptr() as *const _,
-                    std::mem::size_of_val(values.as_slice()) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            DType::Int => {
-                let values = data.to_i32_vec();
-                self.device.new_buffer_with_data(
-                    values.as_ptr() as *const _,
-                    std::mem::size_of_val(values.as_slice()) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            unsupported => panic!("Metal input dtype {unsupported:?} is not supported yet"),
-        }
-    }
-
-    pub fn allocate_intermediate_buffers(&mut self, dyn_map: &DynMap) {
-        self.select_bucket(dyn_map);
-        self.allocate_active_intermediate_buffers(dyn_map);
-    }
-
-    fn allocate_active_intermediate_buffers(&mut self, dyn_map: &DynMap) {
-        let mut planned = Vec::new();
-        let capacity_dyn_map = self.active_capacity_dyn_map(dyn_map);
-
-        for node in self.llir_graph.node_indices() {
-            if self.llir_graph[node].to_op::<Input>().is_some() {
-                continue;
-            }
-
-            if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                if kernel_op.output_aliases_input().is_some() {
-                    continue;
-                }
-                let dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-                let requested_bytes =
-                    Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, dyn_map);
-                let allocation_bytes =
-                    Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, &capacity_dyn_map)
-                        .max(requested_bytes);
-                let needs_buffer = self
-                    .buffers
-                    .get(&node)
-                    .is_none_or(|buffer| requested_bytes > buffer.length());
-
-                planned.push((node, requested_bytes, allocation_bytes, needs_buffer));
-            }
+        #[cfg(target_os = "macos")]
+        let staged_for_search: FxHashMap<i64, &HostBuffer> = if options.profile_on_device {
+            native
+                .input_slots
+                .iter()
+                .filter_map(|slot| input_data.get(&slot.tensor).map(|data| (slot.buffer, data)))
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
+        #[cfg(target_os = "macos")]
+        if options.profile_on_device && self.device.is_none() {
+            self.device = Some(crate::device::MetalDevice::new()?);
         }
 
-        for (node, requested_bytes, allocation_bytes, needs_buffer) in planned {
-            self.buffer_lengths.insert(node, requested_bytes);
-            if needs_buffer {
-                let buffer = self
-                    .device
-                    .new_buffer(allocation_bytes, MTLResourceOptions::StorageModeShared);
-                self.buffers.insert(node, buffer);
-            }
-        }
-    }
-
-    fn output_bytes(kernel_op: &dyn MetalKernelOp, dtype: DType, dyn_map: &DynMap) -> u64 {
-        let size = kernel_op.output_size().exec(dyn_map).unwrap();
-        (size * dtype.bits().div_ceil(8)) as u64
-    }
-
-    fn active_capacity_dyn_map(&self, dyn_map: &DynMap) -> DynMap {
-        let mut capacity_dyn_map = dyn_map.clone();
-        let Some(active_bucket) = self.compiled_buckets.get(self.active_bucket) else {
-            return capacity_dyn_map;
+        let base = if self.dim_buckets.is_empty() {
+            Some(self.assemble_and_saturate(options.algebra_match_budget)?)
+        } else {
+            None
         };
 
-        for (&dim, buckets) in &self.dim_buckets {
-            if let Some(&bucket_index) = active_bucket.bucket_indices.get(&dim)
-                && let Some(bucket) = buckets.get(bucket_index)
+        let allow = self.allow.clone();
+        let matchers = &self.matchers;
+        let mut evaluator = {
+            #[cfg(target_os = "macos")]
             {
-                capacity_dyn_map.insert(dim, bucket.max);
-            }
-        }
-
-        capacity_dyn_map
-    }
-
-    fn compile_bucket(
-        &self,
-        bucket_indices: DynMap,
-        llir_graph: &LLIRGraph,
-    ) -> MetalCompiledBucket {
-        let mut node_dtypes = FxHashMap::default();
-        let mut pipelines = FxHashMap::default();
-        let mut output_alias_map = FxHashMap::default();
-        let mut output_data_map = FxHashMap::default();
-        let mut execution_plan = Vec::new();
-        let mut llir_to_hlir = FxHashMap::default();
-        let llir_graph = llir_graph.clone();
-
-        let topo_order = toposort(&llir_graph, None).expect("Graph has cycles!");
-        for node in &topo_order {
-            let node = *node;
-            if let Some(input) = llir_graph[node].to_op::<Input>() {
-                node_dtypes.insert(node, input.dtype);
-                llir_to_hlir.insert(node, NodeIndex::new(input.node));
-                continue;
-            }
-
-            if llir_graph[node].to_op::<Output>().is_some() {
-                continue;
-            }
-
-            if let Some(kernel_op) = llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                let input_nodes: Vec<NodeIndex> = llir_graph
-                    .edges_directed(node, Direction::Incoming)
-                    .sorted_by_key(|e| e.id())
-                    .map(|e| e.source())
-                    .collect();
-                let input_dtypes: Vec<DType> = input_nodes
-                    .iter()
-                    .map(|n| {
-                        node_dtypes
-                            .get(n)
-                            .copied()
-                            .unwrap_or_else(|| panic!("Missing inferred dtype for node {n:?}"))
-                    })
-                    .collect();
-                let output_dtype = kernel_op.infer_output_dtype(&input_dtypes);
-                let pipeline = kernel_op.compile(&self.device, &input_dtypes, output_dtype);
-                node_dtypes.insert(node, output_dtype);
-                if let Some(pipeline) = pipeline {
-                    pipelines.insert(node, pipeline);
-                }
-                if let Some(input_idx) = kernel_op.output_aliases_input()
-                    && let Some(target) = input_nodes.get(input_idx).copied()
-                {
-                    output_alias_map.insert(node, target);
-                }
-                execution_plan.push(MetalExecutionStep {
-                    node,
-                    input_nodes,
-                    input_dtypes,
-                    output_dtype,
-                });
-            } else {
-                panic!("Metal runtime cannot execute unlowered LLIR node {node:?}");
-            }
-        }
-
-        for node in topo_order {
-            if let Some(Output {
-                node: hlir_node, ..
-            }) = llir_graph[node].to_op::<Output>()
-                && let Some(data_node) = llir_graph
-                    .edges_directed(node, Direction::Incoming)
-                    .sorted_by_key(|e| e.id())
-                    .next()
-                    .map(|e| e.source())
-            {
-                output_data_map.insert(NodeIndex::new(*hlir_node), data_node);
-            }
-        }
-
-        MetalCompiledBucket {
-            bucket_indices,
-            llir_graph,
-            llir_to_hlir,
-            node_dtypes,
-            pipelines,
-            output_alias_map,
-            output_data_map,
-            execution_plan,
-        }
-    }
-
-    fn activate_bucket(&mut self, index: usize) {
-        let bucket = self
-            .compiled_buckets
-            .get(index)
-            .unwrap_or_else(|| panic!("Metal bucket index {index} is not compiled"))
-            .clone();
-        self.active_bucket = index;
-        self.llir_graph = bucket.llir_graph;
-        self.llir_to_hlir = bucket.llir_to_hlir;
-        self.node_dtypes = bucket.node_dtypes;
-        self.pipelines = bucket.pipelines;
-        self.output_alias_map = bucket.output_alias_map;
-        self.output_data_map = bucket.output_data_map;
-        self.execution_plan = bucket.execution_plan;
-        self.refresh_input_data_buffers();
-        self.buffers.clear();
-        self.buffer_lengths.clear();
-    }
-
-    fn refresh_input_data_buffers(&mut self) {
-        for node in self.llir_graph.node_indices() {
-            if let Some(input) = self.llir_graph[node].to_op::<Input>() {
-                let hlir_id = NodeIndex::new(input.node);
-                if let Some(data) = self.input_data.get(&hlir_id) {
-                    let buffer = self.create_input_buffer(data, input.dtype);
-                    self.hlir_buffers.insert(hlir_id, buffer);
-                }
-            }
-        }
-    }
-
-    fn select_bucket(&mut self, dyn_map: &DynMap) {
-        if self.compiled_buckets.len() <= 1 {
-            return;
-        }
-
-        let index = self.resolve_bucket(dyn_map);
-        if index != self.active_bucket {
-            self.activate_bucket(index);
-        }
-    }
-
-    fn resolve_bucket(&self, dyn_map: &DynMap) -> usize {
-        self.compiled_buckets
-            .iter()
-            .position(|bucket| {
-                self.dim_buckets.iter().all(|(dim, buckets)| {
-                    let value = dyn_map.get(dim).copied().unwrap_or(0);
-                    let bucket_index = bucket.bucket_indices.get(dim).copied().unwrap_or(0);
-                    buckets
-                        .get(bucket_index)
-                        .map(|bucket| bucket.contains(value))
-                        .unwrap_or(true)
-                })
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "No Metal bucket matches dyn_map {:?}. Defined buckets: {:?}",
-                    dyn_map, self.dim_buckets
-                )
-            })
-    }
-
-    /// Adopt the layout codegen built and size the buffer to it. Runs *after*
-    /// compiling, since that is when the dims are discovered.
-    fn finish_dyn_dims_layout(&mut self) {
-        self.dyn_dims_order = crate::kernel::dyn_dims_order();
-        // Metal rejects a zero-length buffer; a graph with no dynamic dims
-        // still binds this argument but never reads it.
-        self.dyn_buffer = self.device.new_buffer(
-            (self.dyn_dims_order.len().max(1) * std::mem::size_of::<i32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-    }
-
-    fn update_dyn_buffer(&mut self, dyn_map: &DynMap) {
-        let ptr = self.dyn_buffer.contents() as *mut i32;
-        // By layout position, not by iterating dyn_map: every slot the kernels
-        // can read gets a value, and unreferenced dims are ignored.
-        for (slot, symbol) in self.dyn_dims_order.iter().enumerate() {
-            let value = dyn_map.get(symbol).copied().unwrap_or_else(|| {
-                panic!(
-                    "Metal has no value for dim {symbol}, which its kernels read \
-                     from dyn[{slot}]. Bound dims: {:?}",
-                    dyn_map.keys().collect::<Vec<_>>(),
-                )
-            });
-            unsafe { *ptr.add(slot) = value as i32 };
-        }
-    }
-
-    /// Execute and return GPU-side execution time in microseconds.
-    fn execute_timed(&mut self, dyn_map: &DynMap) -> (f64, TimingMethod) {
-        autoreleasepool(|| {
-            self.select_bucket(dyn_map);
-            self.allocate_active_intermediate_buffers(dyn_map);
-
-            self.update_dyn_buffer(dyn_map);
-            let command_buffer = self.command_queue.new_command_buffer();
-            let mut encode_context = MetalEncodeContext {
-                command_buffer,
-                dyn_buffer: &self.dyn_buffer,
-                mps_cache: &self.mps_cache,
-            };
-
-            for step in &self.execution_plan {
-                let kernel_op = self.llir_graph[step.node]
-                    .to_dialect::<dyn MetalKernelOp>()
-                    .expect("Execution plan referenced a non-Metal op");
-                let pipeline = self.pipelines.get(&step.node);
-
-                let input_buffers: Vec<&Buffer> = step
-                    .input_nodes
-                    .iter()
-                    .map(|&n| self.buffer_for_llir_node(n, &self.llir_to_hlir))
-                    .collect();
-
-                let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
-                    input_buffers[alias_idx]
+                if options.profile_on_device {
+                    crate::search::Evaluator::Device {
+                        device: self
+                            .device
+                            .as_mut()
+                            .expect("the device was just created if it was missing"),
+                        staged: &staged_for_search,
+                    }
                 } else {
-                    self.buffers
-                        .get(&step.node)
-                        .expect("Output buffer not allocated!")
-                };
-
-                kernel_op.encode(
-                    &mut encode_context,
-                    pipeline,
-                    &input_buffers,
-                    output_buffer,
-                    dyn_map,
-                    &step.input_dtypes,
-                    step.output_dtype,
-                );
+                    crate::search::Evaluator::Heuristic
+                }
             }
+            #[cfg(not(target_os = "macos"))]
+            {
+                crate::search::Evaluator::Heuristic
+            }
+        };
 
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
-
-            // gpuStartTime and gpuEndTime are available on macOS 10.15+
-            let gpu_start: f64 = unsafe {
-                use objc::{msg_send, sel, sel_impl};
-                let ptr = command_buffer as *const _ as *mut Object;
-                msg_send![ptr, GPUStartTime]
+        let (outcome, unbucketed_plan, searched_buckets) = if let Some((serialized, program)) = base
+        {
+            let mut outcome = crate::search::search_implementations(
+                &serialized,
+                &program,
+                options,
+                Some(allow.clone()),
+                matchers,
+                evaluator.reborrow(),
+            )?;
+            let finalists = vec![
+                crate::finalists::Finalists::new(
+                    "the search",
+                    &serialized,
+                    Some(allow.clone()),
+                    matchers,
+                    outcome.ranked.clone(),
+                    Some(outcome.best_plan.clone()),
+                )
+                .with_shapes(options.shapes.clone()),
+            ];
+            let (selected, rejections) =
+                crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
+            outcome.lattice_rejections = rejections;
+            let (_, finalist) = selected
+                .into_iter()
+                .next()
+                .expect("a one-bucket lattice selects exactly one finalist");
+            (outcome, Some(finalist.plan), Vec::new())
+        } else {
+            let assembly = crate::search::BucketAssembly {
+                assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
+                pre_schedule: &native.pre_schedule,
+                binding_seeds: &native.binding_seeds,
+                schedule: crate::bindings::MetalBindings::SCHEDULE,
+                post_checks: &native.post_checks,
+                input_slots: &native.input_slots,
+                output_slots: &native.output_slots,
+                base_dims: &options.shapes.values,
+                decoders: &self.decoders,
             };
-            let gpu_end: f64 = unsafe {
-                use objc::{msg_send, sel, sel_impl};
-                let ptr = command_buffer as *const _ as *mut Object;
-                msg_send![ptr, GPUEndTime]
-            };
+            let plans = crate::search::bucketed_search_implementations(
+                &assembly,
+                &self.dim_buckets,
+                options,
+                Some(allow),
+                matchers,
+                evaluator,
+            )?;
+            let first = plans
+                .first()
+                .map(|plan| plan.outcome.clone())
+                .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
+            (first, None, plans)
+        };
+        self.device_budget_bytes = options.device_budget_bytes;
+        self.bucket_plans = searched_buckets;
+        self.selected_bucket = None;
 
-            let gpu_time_seconds = gpu_end - gpu_start;
-            let gpu_time_us = gpu_time_seconds * 1_000_000.0;
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("load before search"))?;
+        self.input_buffers = native
+            .input_slots
+            .iter()
+            .map(|slot| (slot.tensor, slot.buffer))
+            .collect();
+        self.output_index = native
+            .output_slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| (slot.tensor, index))
+            .collect();
+        if let Some(plan) = unbucketed_plan {
+            self.plan = Some(plan);
+        } else {
+            let _ = self.select_bucket_plan();
+        }
+        Ok(outcome)
+    }
 
-            (gpu_time_us, TimingMethod::DeviceTimestamp)
-        })
+    /// Resolve public graph handles to this compiled program's boundary IDs.
+    pub fn input_buffer(&self, tensor: NodeIndex) -> Result<i64> {
+        self.input_buffers
+            .get(&tensor)
+            .copied()
+            .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))
+    }
+    pub fn output_slot_index(&self, tensor: NodeIndex) -> Result<usize> {
+        self.output_index
+            .get(&tensor)
+            .copied()
+            .ok_or_else(|| anyhow!("no output binding for {tensor:?}"))
+    }
+
+    /// Keep this input in the shared device arena between executions. Its
+    /// shape must be static and its boundary must be read-only. Call after
+    /// search and before the first execute; set_data uploads it only when changed.
+    pub fn retain_input(&mut self, tensor: NodeIndex) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        anyhow::ensure!(
+            self.device.as_ref().is_none_or(|d| !d.is_installed()),
+            "configure residency before execution"
+        );
+        let lit = *self
+            .input_buffers
+            .get(&tensor)
+            .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))?;
+        self.residents.inputs.insert(lit);
+        Ok(())
+    }
+
+    /// Route an output into a resident input after each execution. Feedback
+    /// outputs stay on device and are unavailable through fetch. Their elected
+    /// layout must equal the static, contiguous input boundary layout.
+    pub fn bind_feedback(&mut self, input: NodeIndex, output: NodeIndex) -> Result<()> {
+        let slot = *self
+            .output_index
+            .get(&output)
+            .ok_or_else(|| anyhow!("no output binding for {output:?}"))?;
+        let lit = *self
+            .input_buffers
+            .get(&input)
+            .ok_or_else(|| anyhow!("no input binding for {input:?}"))?;
+        anyhow::ensure!(
+            !self.residents.feedback.contains_key(&slot)
+                && !self.residents.feedback.values().any(|v| *v == lit),
+            "duplicate feedback endpoint"
+        );
+        self.retain_input(input)?;
+        self.residents.feedback.insert(slot, lit);
+        Ok(())
+    }
+
+    pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) {
+        let Some(&buffer) = self.input_buffers.get(&tensor) else {
+            panic!("set_data on a tensor with no input binding");
+        };
+        self.staged.insert(buffer, data.into());
+    }
+
+    pub fn execute(&mut self) -> Result<()> {
+        self.outputs_host.clear();
+        if !self.bucket_plans.is_empty() {
+            self.select_bucket_plan()?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if self.device.is_none() {
+                self.device = Some(crate::device::MetalDevice::new()?);
+            }
+            anyhow::ensure!(
+                self.plan.is_some() || !self.bucket_plans.is_empty(),
+                "search before execute"
+            );
+            let device = self.device.as_mut().unwrap();
+            if !device.is_installed() {
+                let base_bounds: crate::symbolic::Bounds = self
+                    .range_bound
+                    .iter()
+                    .map(|(s, (lo, hi))| Ok((*s, (usize::try_from(*lo)?, usize::try_from(*hi)?))))
+                    .collect::<Result<_>>()?;
+
+                let plans = if self.bucket_plans.is_empty() {
+                    vec![(self.plan.as_ref().unwrap().clone(), base_bounds)]
+                } else {
+                    self.bucket_plans
+                        .iter()
+                        .map(|p| {
+                            let mut bounds = base_bounds.clone();
+                            bounds.extend(p.ranges.iter().map(|(k, v)| (*k, *v)));
+                            (p.plan.clone(), bounds)
+                        })
+                        .collect()
+                };
+                device.install_resident_with_budget(
+                    plans,
+                    self.residents.clone(),
+                    self.device_budget_bytes,
+                )?;
+            }
+            let bucket = self.selected_bucket.unwrap_or(0);
+            let staged = self.staged.iter().map(|(lit, data)| (*lit, data)).collect();
+            let outputs = device.execute(bucket, &staged, &self.dims)?;
+            self.outputs_host = outputs;
+            self.staged
+                .retain(|lit, _| !self.residents.inputs.contains(lit));
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = self
+                .plan()
+                .ok_or_else(|| anyhow!("search before execute"))?;
+            bail!(
+                "Metal device execution is only available on macOS: plans can be \
+                 searched and inspected but not executed on this host"
+            )
+        }
+    }
+
+    /// Return the backing bytes as f32. Use `fetch` and `layouts::dense_f32`
+    /// to interpret a non-dense output through its returned layout.
+    pub fn get_f32(&self, tensor: NodeIndex) -> Result<Vec<f32>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_f32()
+    }
+
+    pub fn get_i32(&self, tensor: NodeIndex) -> Result<Vec<i32>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_i32()
+    }
+
+    pub fn get_i64(&self, tensor: NodeIndex) -> Result<Vec<i64>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_i64()
+    }
+
+    pub fn get_bool8(&self, tensor: NodeIndex) -> Result<&[u8]> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_bool8()
+    }
+
+    pub fn fetch(
+        &self,
+        tensor: NodeIndex,
+    ) -> Result<(
+        &HostBuffer,
+        &luminal::bufferize::OutputBinding<DecodedLayout>,
+    )> {
+        let index = self
+            .output_index
+            .get(&tensor)
+            .ok_or_else(|| anyhow!("tensor has no output binding"))?;
+        match self.outputs_host.get(index) {
+            Some((data, binding)) => Ok((data, binding)),
+            None => bail!("execute before fetch"),
+        }
+    }
+
+    pub fn output_layout(
+        &self,
+        tensor: NodeIndex,
+    ) -> Result<&luminal::bufferize::OutputBinding<DecodedLayout>> {
+        Ok(self.fetch(tensor)?.1)
+    }
+
+    pub fn plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
+        self.selected_bucket
+            .and_then(|i| self.bucket_plans.get(i))
+            .map(|p| &p.plan)
+            .or(self.plan.as_ref())
     }
 }

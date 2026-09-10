@@ -44,6 +44,7 @@ pub mod shape;
 // "describes vs decides". A genome is drawn the same way everywhere; a
 // genome is PRICED differently everywhere, and pricing happens in the
 // middle of the loop — which is why the loop is not here.
+pub mod arena;
 pub mod buffer_tensor_ir;
 pub mod bufferize;
 pub mod dps;
@@ -52,6 +53,7 @@ pub mod extraction;
 pub mod index_expr;
 pub mod layout_ir;
 pub mod poison;
+pub mod resident;
 pub mod subst_primitive;
 // The `Layout` sort's constructor structs, `LayoutFacts`, `DecodedLayout`
 // and the value-keyed table, for runtimes to pull from one place. THE

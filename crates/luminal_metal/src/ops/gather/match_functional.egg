@@ -1,0 +1,18 @@
+(rule
+  (
+    (= ?out_logical (LogicalGather ?data_logical ?coordinate_list))
+    (= ?data_layout_tensor (LayoutTensorLit ?data_logical ?data_layout))
+    (coordinate-layout-tensors ?coordinate_list ?coordinate_layout_tensors)
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?data_layout_tensor ?coordinate_layout_tensors)
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpGatherGeneric ?data_layout_tensor ?coordinate_layout_tensors ?out_layout))
+  )
+)

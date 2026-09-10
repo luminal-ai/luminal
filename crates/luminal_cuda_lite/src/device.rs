@@ -2,7 +2,7 @@
 //! (including staging/readback) is submitted by the same graph launch path.
 use crate::{
     arena::{ArenaPlan, ArenaSlice, ArenaStep},
-    cuda_graph::{CopyKind, Executable, Graph, Node, Pinned, copy_params},
+    cuda_graph::{CopyKind, Executable, Graph, Node, Pinned, PinnedRange, copy_params},
     host::{DeviceRange, HostOpContext, PreparedHostOp},
     host_buffer::HostBuffer,
     kernels::{CodegenCtx, KernelLaunch},

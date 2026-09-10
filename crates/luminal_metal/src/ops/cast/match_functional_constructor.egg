@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpCastGeneric (LayoutTensor Dtype Layout) LayoutTensorOp)

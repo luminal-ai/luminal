@@ -1,0 +1,18 @@
+; Avoid materializing the broadcast product in matmul and other dot reductions.
+; F32 only: multiplication and sequential addition use the same rounding as
+; the decomposed kernels. No reassociation or contraction is requested.
+(rule
+  ((= ?out_lt (LayoutTensorLit ?out ?out_layout))
+   (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_shape ?bits))
+   (= ?out (LogicalReduceSum ?product ?axis))
+   (= ?product (LogicalMul ?a ?b))
+   (= ?a_lt (LayoutTensorLit ?a ?a_layout))
+   (= ?b_lt (LayoutTensorLit ?b ?b_layout))
+   (= (dtype-of ?a) (F32))
+   (= (dtype-of ?b) (F32))
+   (= (dtype-of ?out) (F32))
+   (= (injectivity-of ?out_lt) (Injective)))
+  ((let ?op (LayoutTensorOpLit
+     (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorNil)))
+     (LayoutTensorCons ?out_lt (LayoutTensorNil))))
+   (union ?op (LayoutTensorOpMulReduceSumGeneric ?a_lt ?b_lt ?axis ?out_layout))))

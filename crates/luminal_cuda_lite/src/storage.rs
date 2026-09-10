@@ -1,29 +1,14 @@
 //! CUDA sizing adapter for the shared physical-lifetime planner. Finalist
 //! budgets and installed graphs use exactly the same schedule and offsets.
 use crate::{
-    arena::{ArenaPlan, plan_with_workspace},
+    arena::ArenaPlan,
     layouts::CudaPlan,
     symbolic::{Bounds, capacity_bytes},
 };
 use anyhow::{Result, anyhow};
 
 pub(crate) fn plan(plan: &CudaPlan, bounds: &Bounds) -> Result<ArenaPlan> {
-    let parameter_bytes = bounds
-        .len()
-        .checked_mul(8)
-        .ok_or_else(|| anyhow!("parameter size overflow"))?
-        .max(8);
-    plan_with_workspace(
-        plan,
-        |buffer| capacity_bytes(&buffer.layout, bounds),
-        |node| match &plan.dag[node] {
-            luminal::bufferize::BufferNode::Compute { op, .. } => {
-                crate::as_host_op(op.as_ref()).map_or(Ok(0), |host| host.workspace_bytes(bounds))
-            }
-            _ => Ok(0),
-        },
-        parameter_bytes,
-    )
+    plan_resident(plan, bounds, &Default::default())
 }
 
 pub(crate) fn plan_resident(

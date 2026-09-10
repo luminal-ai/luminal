@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpReduceMaxGeneric (LayoutTensor i64 Layout) LayoutTensorOp)

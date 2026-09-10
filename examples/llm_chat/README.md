@@ -75,13 +75,14 @@ read. Only the last query token's logits are downloaded. CUDA submits kernels,
 state copies, and weight uploads through CUDA graphs, and bucket graphs share
 the resident ranges. Explicit weight/state changes trigger new uploads.
 
-The native Metal implementation shares the generic operation inventory, search,
-and arena planning code with CUDA Lite. It emits MSL and executes Metal command
-buffers, with shared-memory resident inputs. Its current matrix multiplications
-use the decomposed generic kernels; it does not provide an MPS matmul path.
-The `native` feature selects this implementation while the older HLIR Metal
-implementation remains parked. Device maximum buffer size also bounds the
-single Metal arena.
+The Metal feature uses `luminal_metal`'s native runtime, egglog matchers, search,
+and MSL kernels, including its fused multiply/reduce operation. It has no CUDA
+dependency. Both runtimes use the core physical arena and resident allocation
+planner, and the example uses one adapter for their common runtime API.
+Metal encodes command buffers for each execution and copies resident updates
+through bounded shared staging. Its device maximum buffer size also bounds the
+single arena. Neither backend recompiles kernels just to change query/context
+lengths within the compiled bounds.
 
 The runner renders the checkpoint chat template for every turn and compares
 **token prefixes** against the cached history. It resets and prefills when the
@@ -101,7 +102,7 @@ Useful options:
 --enable-thinking       pass enable_thinking=true to the chat template
 --search-generations 2  compiler search budget
 --search-population 4   candidates per generation
---profile               rank candidates on the CUDA device
+--profile               rank candidates on the selected device
 ```
 
 ## Validation
@@ -116,10 +117,9 @@ cargo test -p llm_chat --features metal
 The shared device test compares prefill and decode against ReferenceRuntime
 using a small zoo model. Other tests cover namespace mappings, sharded
 checkpoints, dtype/layout conversion, templates, sampling, prefix reuse, and
-cache reset. CUDA's runtime suite also checks resident feedback across buckets.
+cache reset. Both runtime suites check resident feedback across buckets.
 
 The CUDA path has also been exercised with the real `Qwen/Qwen3-0.6B`
 checkpoint (revision `c1899de289a04d12100db370d81485cdf75e47ca`), including
-safetensors loading, chat-template rendering, and text generation. Metal's Rust
-implementation and source emitter were checked on Linux; shader compilation and
-GPU execution require the macOS CI job or a local Mac.
+safetensors loading, chat-template rendering, and text generation. Metal planning and its shared chat adapter can be checked on Linux. Metal
+shader compilation and GPU execution require the macOS CI job or a local Mac.

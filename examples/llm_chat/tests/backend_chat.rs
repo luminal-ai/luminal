@@ -1,18 +1,16 @@
-#![cfg(any(feature = "cuda_lite", all(feature = "metal", target_os = "macos")))]
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-use llm_chat::backend::CudaBackend as SelectedBackend;
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use llm_chat::backend::MetalBackend as SelectedBackend;
+#![cfg(any(feature = "cuda_lite", feature = "metal"))]
+#[cfg(any(not(feature = "metal"), target_os = "macos"))]
+use llm_chat::backend::Backend;
 use llm_chat::{
     Inputs, TensorData,
-    backend::Backend,
+    backend::{GpuBackend, harness_search_options},
     graph::{LlmGraph, ModelConfig},
 };
+#[cfg(any(not(feature = "metal"), target_os = "macos"))]
 use luminal::prelude::*;
 use model_zoo::llama3::Llama3Dims;
 
-#[test]
-fn prefill_and_decode_use_resident_state_and_match_reference() {
+fn fixture() -> (LlmGraph, Inputs) {
     let dims = Llama3Dims {
         vocab: 11,
         hidden: 8,
@@ -43,12 +41,23 @@ fn prefill_and_decode_use_resident_state_and_match_reference() {
             (p.input, TensorData::F32(values))
         })
         .collect();
-    let mut backend = SelectedBackend::compile(
-        &graph,
-        weights.clone(),
-        &luminal_cuda_lite::harness_search_options(),
-    )
-    .unwrap();
+    (graph, weights)
+}
+
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+#[test]
+fn metal_compiles_the_shared_chat_graph_without_a_device() {
+    let (graph, weights) = fixture();
+    GpuBackend::compile(&graph, weights, &harness_search_options()).unwrap();
+}
+
+#[cfg(any(not(feature = "metal"), target_os = "macos"))]
+#[test]
+fn prefill_and_decode_use_resident_state_and_match_reference() {
+    let (graph, weights) = fixture();
+    let mut backend =
+        GpuBackend::compile(&graph, weights.clone(), &harness_search_options()).unwrap();
+    let mut first_logits = None;
     let mut reference_state = graph.initial_inputs();
     for (tokens, offset) in [(vec![1, 2], 0), (vec![3], 2)] {
         let step = graph.step_inputs(&tokens, offset).unwrap();
@@ -89,6 +98,10 @@ fn prefill_and_decode_use_resident_state_and_match_reference() {
         let actual = backend
             .step(step, tokens.len(), offset + tokens.len())
             .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        if first_logits.is_none() {
+            first_logits = Some(expected.clone());
+        }
         for (&a, &b) in actual.iter().zip(expected) {
             assert!((a - b).abs() < 1e-4, "GPU {a} != reference {b}");
         }
@@ -103,5 +116,12 @@ fn prefill_and_decode_use_resident_state_and_match_reference() {
     let restarted = backend
         .step(graph.step_inputs(&[1, 2], 0).unwrap(), 2, 2)
         .unwrap();
-    assert!(restarted.iter().all(|v| v.is_finite()));
+    let first = first_logits.unwrap();
+    assert_eq!(restarted.len(), first.len());
+    for (&a, &b) in restarted.iter().zip(&first) {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "reset GPU {a} != initial reference {b}"
+        );
+    }
 }
