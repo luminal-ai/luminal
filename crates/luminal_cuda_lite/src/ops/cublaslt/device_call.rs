@@ -293,8 +293,7 @@ pub fn dispatch(
         .map_err(|e| anyhow!("cublasLtMatmulDescSetAttribute(BIAS_POINTER): {e:?}"))?;
     }
     let desc = &cached.desc;
-    let (a_layout, b_layout, c_layout, d_layout) =
-        (&cached.a, &cached.b, &cached.c, &cached.d);
+    let (a_layout, b_layout, c_layout, d_layout) = (&cached.a, &cached.b, &cached.c, &cached.d);
     let heuristic_algo = &cached.algo;
 
     // Workspace: OURS, explicitly, sized into the preference so the

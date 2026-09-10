@@ -254,9 +254,13 @@ pub type Operand = (ValueId, Vec<IntExpr>);
 /// vocabulary rather than free-form constructor strings.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOp {
-    Input { label: String },
+    Input {
+        label: String,
+    },
     Constant(f64),
-    Iota { value_expr: String },
+    Iota {
+        value_expr: String,
+    },
     Cast(DType),
     Sqrt,
     Exp,
@@ -271,11 +275,17 @@ pub enum LogicalOp {
     LessThan,
     TruncDiv,
     TruncRem,
-    ReduceSum { axis_from_end: usize },
-    ReduceMax { axis_from_end: usize },
+    ReduceSum {
+        axis_from_end: usize,
+    },
+    ReduceMax {
+        axis_from_end: usize,
+    },
     Gather,
     Scatter,
-    IndexMapApply { entries: Vec<MapEntry> },
+    IndexMapApply {
+        entries: Vec<MapEntry>,
+    },
     /// An EXTERN op: a fused/opaque operation whose egglog surface
     /// (constructor, dtype/shape rules, implementation match) is supplied
     /// by a runtime's registered op rather than by core. The recorder only
@@ -1569,7 +1579,8 @@ impl LogicalGraph {
         let mut input_slots = Vec::new();
         let mut input_buffer_tensors = Vec::new();
         let mut next_buffer: i64 = 0;
-        let mut input_buffer_of: rustc_hash::FxHashMap<ValueId, i64> = rustc_hash::FxHashMap::default();
+        let mut input_buffer_of: rustc_hash::FxHashMap<ValueId, i64> =
+            rustc_hash::FxHashMap::default();
         for id in self.graph.node_indices() {
             let value = &self.graph[id];
             let LogicalOp::Input { .. } = &value.op else {

@@ -184,14 +184,25 @@ impl crate::host::HostOp for PagedAttentionDps {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         let label = "PagedAttention";
         let spec = self.spec;
-        if spec.kv_heads == 0 || spec.heads % spec.kv_heads != 0 {
-            bail!("{label}: heads {} must be a multiple of kv_heads {}", spec.heads, spec.kv_heads);
+        if spec.kv_heads == 0 || !spec.heads.is_multiple_of(spec.kv_heads) {
+            bail!(
+                "{label}: heads {} must be a multiple of kv_heads {}",
+                spec.heads,
+                spec.kv_heads
+            );
         }
-        if spec.head_dim == 0 || spec.head_dim % 32 != 0 {
-            bail!("{label}: head_dim {} must be a multiple of 32", spec.head_dim);
+        if spec.head_dim == 0 || !spec.head_dim.is_multiple_of(32) {
+            bail!(
+                "{label}: head_dim {} must be a multiple of 32",
+                spec.head_dim
+            );
         }
         if ctx.inputs.len() != OPERANDS.len() {
-            bail!("{label}: expected {} operands, got {}", OPERANDS.len(), ctx.inputs.len());
+            bail!(
+                "{label}: expected {} operands, got {}",
+                OPERANDS.len(),
+                ctx.inputs.len()
+            );
         }
         let extents = |k: usize| dense_extents(label, OPERANDS[k], &ctx.operand_info[k]);
         let q = extents(0)?;
@@ -226,7 +237,9 @@ impl crate::host::HostOp for PagedAttentionDps {
         }
         let request_rows = match (qo.as_slice(), kv.as_slice()) {
             ([r], [r2]) if r == r2 && *r >= 2 => *r,
-            other => bail!("{label}: qo_indptr/kv_indptr must be equal rank-1 with >= 2 rows, got {other:?}"),
+            other => bail!(
+                "{label}: qo_indptr/kv_indptr must be equal rank-1 with >= 2 rows, got {other:?}"
+            ),
         };
         if qp != [s] {
             bail!("{label}: q_pos must be [{s}], got {qp:?}");
@@ -244,7 +257,10 @@ impl crate::host::HostOp for PagedAttentionDps {
         ] {
             let got = ctx.operand_info[k].layout.dtype;
             if got != Some(dtype) {
-                bail!("{label}: operand {} must be {dtype:?}, got {got:?}", OPERANDS[k]);
+                bail!(
+                    "{label}: operand {} must be {dtype:?}, got {got:?}",
+                    OPERANDS[k]
+                );
             }
         }
         // The cache pool is f32 or bf16 (both halves alike).

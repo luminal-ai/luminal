@@ -798,8 +798,8 @@ impl CudaRuntime {
             if self.device.is_none() {
                 self.device = Some(crate::device::CudaDevice::new(0)?);
             }
-            let key = (self.plan_epoch << 32)
-                | self.selected_bucket.map(|i| i as u64 + 1).unwrap_or(0);
+            let key =
+                (self.plan_epoch << 32) | self.selected_bucket.map(|i| i as u64 + 1).unwrap_or(0);
             let plan = match self.selected_bucket {
                 Some(index) => &self.bucket_plans[index].plan,
                 None => self

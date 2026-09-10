@@ -77,14 +77,14 @@ pub mod heuristic;
 pub mod host;
 pub mod host_buffer;
 pub mod kernels;
-/// The process-wide NVRTC module cache host ops compile their own
-/// kernels through.
-#[cfg(feature = "device")]
-pub mod nvrtc_module;
 /// THE BUCKET LATTICE (Phase 5): best-first selection of ONE finalist
 /// per bucket under a coordinate-monotone aggregate.
 pub mod lattice;
 pub mod layouts;
+/// The process-wide NVRTC module cache host ops compile their own
+/// kernels through.
+#[cfg(feature = "device")]
+pub mod nvrtc_module;
 pub mod op;
 pub mod ops;
 pub mod runtime;

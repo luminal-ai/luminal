@@ -57,7 +57,9 @@ pub fn kernel_function(
     entry: &str,
 ) -> Result<CudaFunction> {
     let key = (source_key(source), entry.to_string());
-    let mut cache = cache().lock().map_err(|_| anyhow!("module cache poisoned"))?;
+    let mut cache = cache()
+        .lock()
+        .map_err(|_| anyhow!("module cache poisoned"))?;
     if let Some((_, function)) = cache.get(&key) {
         return Ok(function.clone());
     }

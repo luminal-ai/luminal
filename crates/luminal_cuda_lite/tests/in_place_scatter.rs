@@ -40,7 +40,11 @@ fn scatter_writes_its_own_init(rt: &CudaRuntime, cache: NodeIndex) -> bool {
     let cache_lit = plan
         .buffers
         .values()
-        .find(|b| b.label.contains("nat") && b.lit.is_some() && b.owner == luminal::bufferize::Owner::Caller)
+        .find(|b| {
+            b.label.contains("nat")
+                && b.lit.is_some()
+                && b.owner == luminal::bufferize::Owner::Caller
+        })
         .map(|_| ());
     let _ = (cache, cache_lit);
     plan.dag.node_weights().any(|node| {

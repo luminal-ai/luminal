@@ -36,7 +36,14 @@ const GEMV_ROWS: usize = 4;
 const BLOCK_THREADS: u32 = 256;
 
 const GATE_UP_OPERANDS: [&str; 5] = ["x", "expert_ids", "blocks", "scales", "bias"];
-const DOWN_OPERANDS: [&str; 6] = ["hidden", "expert_ids", "weights", "blocks", "scales", "bias"];
+const DOWN_OPERANDS: [&str; 6] = [
+    "hidden",
+    "expert_ids",
+    "weights",
+    "blocks",
+    "scales",
+    "bias",
+];
 
 fn operand_name(names: &[&str], dest: usize, operand: usize) -> String {
     if operand == dest {
@@ -73,7 +80,7 @@ fn check_packed_weights(
     n: usize,
     k: usize,
 ) -> Result<usize> {
-    if k % 32 != 0 || n % GEMV_ROWS != 0 {
+    if !k.is_multiple_of(32) || !n.is_multiple_of(GEMV_ROWS) {
         bail!("{label}: the packed dims need k % 32 == 0 and n % {GEMV_ROWS} == 0 (n {n}, k {k})");
     }
     let blocks = dense_extents(label, names[first], &ctx.operand_info[first])?;
@@ -97,7 +104,10 @@ fn check_packed_weights(
         other => bail!("{label}: blocks must be [E, {n}, {}], got {other:?}", k / 2),
     };
     if scales != [experts, n, k / 32] {
-        bail!("{label}: scales must be [{experts}, {n}, {}], got {scales:?}", k / 32);
+        bail!(
+            "{label}: scales must be [{experts}, {n}, {}], got {scales:?}",
+            k / 32
+        );
     }
     if bias != [experts, n] {
         bail!("{label}: bias must be [{experts}, {n}], got {bias:?}");
@@ -209,7 +219,11 @@ impl crate::host::HostOp for MoeGateUpDps {
         let label = "MoeGateUpMxfp4";
         let spec = self.spec;
         if ctx.inputs.len() != GATE_UP_OPERANDS.len() {
-            bail!("{label}: expected {} operands, got {}", GATE_UP_OPERANDS.len(), ctx.inputs.len());
+            bail!(
+                "{label}: expected {} operands, got {}",
+                GATE_UP_OPERANDS.len(),
+                ctx.inputs.len()
+            );
         }
         let x = dense_extents(label, "x", &ctx.operand_info[0])?;
         let ids = dense_extents(label, "expert_ids", &ctx.operand_info[1])?;
@@ -221,10 +235,17 @@ impl crate::host::HostOp for MoeGateUpDps {
             other => bail!("{label}: x must be [s, hidden], got {other:?}"),
         };
         if ids != [s, spec.top_k] {
-            bail!("{label}: expert_ids must be [{s}, {}], got {ids:?}", spec.top_k);
+            bail!(
+                "{label}: expert_ids must be [{s}, {}], got {ids:?}",
+                spec.top_k
+            );
         }
         if out != [s, spec.top_k, spec.inter] {
-            bail!("{label}: hidden must be [{s}, {}, {}], got {out:?}", spec.top_k, spec.inter);
+            bail!(
+                "{label}: hidden must be [{s}, {}, {}], got {out:?}",
+                spec.top_k,
+                spec.inter
+            );
         }
         let _experts =
             check_packed_weights(label, ctx, 2, &GATE_UP_OPERANDS, 2 * spec.inter, hidden_dim)?;
@@ -430,7 +451,11 @@ impl crate::host::HostOp for MoeDownDps {
         let label = "MoeDownMxfp4";
         let spec = self.spec;
         if ctx.inputs.len() != DOWN_OPERANDS.len() {
-            bail!("{label}: expected {} operands, got {}", DOWN_OPERANDS.len(), ctx.inputs.len());
+            bail!(
+                "{label}: expected {} operands, got {}",
+                DOWN_OPERANDS.len(),
+                ctx.inputs.len()
+            );
         }
         let hidden = dense_extents(label, "hidden", &ctx.operand_info[0])?;
         let ids = dense_extents(label, "expert_ids", &ctx.operand_info[1])?;
@@ -441,13 +466,22 @@ impl crate::host::HostOp for MoeDownDps {
         check_dtype(label, "weights", &ctx.operand_info[2], PlanDtype::F32)?;
         let (s, inter) = match hidden.as_slice() {
             [s, k, inter] if *k == spec.top_k => (*s, *inter),
-            other => bail!("{label}: hidden must be [s, {}, inter], got {other:?}", spec.top_k),
+            other => bail!(
+                "{label}: hidden must be [s, {}, inter], got {other:?}",
+                spec.top_k
+            ),
         };
         if ids != [s, spec.top_k] {
-            bail!("{label}: expert_ids must be [{s}, {}], got {ids:?}", spec.top_k);
+            bail!(
+                "{label}: expert_ids must be [{s}, {}], got {ids:?}",
+                spec.top_k
+            );
         }
         if weights != [s, spec.top_k] {
-            bail!("{label}: weights must be [{s}, {}], got {weights:?}", spec.top_k);
+            bail!(
+                "{label}: weights must be [{s}, {}], got {weights:?}",
+                spec.top_k
+            );
         }
         if out != [s, spec.hidden] {
             bail!("{label}: out must be [{s}, {}], got {out:?}", spec.hidden);
@@ -468,7 +502,12 @@ impl crate::host::HostOp for MoeDownDps {
             ctx.inputs[5].ptr,
         );
         let dest = ctx.dest.ptr;
-        let (h, i, tk, sq) = (spec.hidden as i32, inter as i32, spec.top_k as i32, s as i32);
+        let (h, i, tk, sq) = (
+            spec.hidden as i32,
+            inter as i32,
+            spec.top_k as i32,
+            s as i32,
+        );
         let mut builder = ctx.stream.launch_builder(&function);
         builder
             .arg(&blocks_ptr)

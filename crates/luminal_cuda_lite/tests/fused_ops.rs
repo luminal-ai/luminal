@@ -5,18 +5,21 @@
 //! references. Plus the serving graph's shape trick: fixed-capacity
 //! per-tick inputs shrunk to a bucketed `s`.
 #![cfg(feature = "device")]
+#![allow(clippy::needless_range_loop)]
 
 use luminal::dtype::{DType, PlanDtype};
 use luminal::graph::{DimBucket, Graph};
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::fused::{
-    DownSpec, GateUpSpec, Mxfp4Experts, PagedAttentionInputs, PagedAttentionSpec,
-    moe_down_mxfp4, moe_gate_up_mxfp4, paged_attention, take_rows,
+    DownSpec, GateUpSpec, Mxfp4Experts, PagedAttentionInputs, PagedAttentionSpec, moe_down_mxfp4,
+    moe_gate_up_mxfp4, paged_attention, take_rows,
 };
 use luminal_cuda_lite::{CudaRuntime, HostBuffer};
 
 fn lcg(seed: &mut u64) -> f32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((*seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
 }
 
@@ -28,7 +31,11 @@ fn run(cx: &Graph, inputs: Vec<(NodeIndex, HostBuffer)>, out: NodeIndex) -> Vec<
         .unwrap_or_else(|e| panic!("cuda search: {e:#}"));
     let b = &outcome.refusal_breakdown;
     assert_eq!(
-        (b.extract_refusals, b.plan_build_refusals, b.execute_refusals),
+        (
+            b.extract_refusals,
+            b.plan_build_refusals,
+            b.execute_refusals
+        ),
         (0, 0, 0),
         "refusals: {}",
         b.summary()
@@ -92,10 +99,7 @@ fn reference_attention(
                 }
                 scores.push((slot, dot * spec.scale as f32));
             }
-            let m = scores
-                .iter()
-                .map(|(_, sc)| *sc)
-                .fold(sinks[h], f32::max);
+            let m = scores.iter().map(|(_, sc)| *sc).fold(sinks[h], f32::max);
             let mut denom = (sinks[h] - m).exp();
             let mut acc = vec![0f32; d];
             for (slot, sc) in &scores {
@@ -140,18 +144,7 @@ fn attention_case(window: usize) {
         .map(|_| lcg(&mut seed))
         .collect();
     let sinks: Vec<f32> = (0..spec.heads).map(|_| lcg(&mut seed) * 2.0).collect();
-    let want = reference_attention(
-        &q,
-        &kc,
-        &vc,
-        &slot_table,
-        &qo,
-        &kv,
-        &q_pos,
-        &sinks,
-        spec,
-        s,
-    );
+    let want = reference_attention(&q, &kc, &vc, &slot_table, &qo, &kv, &q_pos, &sinks, spec, s);
 
     let mut cx = Graph::new();
     let q_t = cx.tensor((s, spec.heads * spec.head_dim), DType::F32);
@@ -190,7 +183,12 @@ fn attention_case(window: usize) {
         ],
         out.id,
     );
-    assert_close(&want, &got, &format!("paged attention (window {window})"), 1e-4);
+    assert_close(
+        &want,
+        &got,
+        &format!("paged attention (window {window})"),
+        1e-4,
+    );
 }
 
 #[test]
@@ -236,7 +234,7 @@ fn moe_mxfp4_matches_reference() {
     let x: Vec<f32> = (0..S * HIDDEN).map(|_| lcg(&mut seed)).collect();
     let ids: Vec<i32> = vec![0, 2, 1, 1, 2, 0];
     let weights: Vec<f32> = vec![0.7, 0.3, 0.5, 0.5, 0.9, 0.1];
-    let mut byte = |s: &mut u64| ((lcg(s) + 1.0) * 127.5) as u8;
+    let byte = |s: &mut u64| ((lcg(s) + 1.0) * 127.5) as u8;
     let gu_blocks: Vec<u8> = (0..EXPERTS * 2 * INTER * HIDDEN / 2)
         .map(|_| byte(&mut seed))
         .collect();
@@ -267,7 +265,7 @@ fn moe_mxfp4_matches_reference() {
     for t in 0..S {
         for kk in 0..TOP_K {
             let e = ids[t * TOP_K + kk] as usize;
-            let mut hidden = vec![0f32; INTER];
+            let mut hidden = [0f32; INTER];
             for j in 0..INTER {
                 let mut gu = [0f32; 2];
                 for (which, g) in gu.iter_mut().enumerate() {
@@ -340,18 +338,30 @@ fn moe_mxfp4_matches_reference() {
             (x_t.id, x.into()),
             (ids_t.id, ids.into()),
             (w_t.id, weights.into()),
-            (gu.blocks.id, HostBuffer::new(PlanDtype::U8, gu_blocks).unwrap()),
+            (
+                gu.blocks.id,
+                HostBuffer::new(PlanDtype::U8, gu_blocks).unwrap(),
+            ),
             (
                 gu.scales.id,
                 HostBuffer::new(PlanDtype::F8UE8M0, gu_scales).unwrap(),
             ),
-            (gu.bias.id, HostBuffer::new(PlanDtype::Bf16, gu_bias).unwrap()),
-            (dn.blocks.id, HostBuffer::new(PlanDtype::U8, dn_blocks).unwrap()),
+            (
+                gu.bias.id,
+                HostBuffer::new(PlanDtype::Bf16, gu_bias).unwrap(),
+            ),
+            (
+                dn.blocks.id,
+                HostBuffer::new(PlanDtype::U8, dn_blocks).unwrap(),
+            ),
             (
                 dn.scales.id,
                 HostBuffer::new(PlanDtype::F8UE8M0, dn_scales).unwrap(),
             ),
-            (dn.bias.id, HostBuffer::new(PlanDtype::Bf16, dn_bias).unwrap()),
+            (
+                dn.bias.id,
+                HostBuffer::new(PlanDtype::Bf16, dn_bias).unwrap(),
+            ),
         ],
         out.id,
     );
@@ -369,7 +379,7 @@ fn fixed_capacity_inputs_shrink_to_bucketed_rows() {
     let tokens = cx.tensor((CAP, 2), DType::F32);
     let weight = cx.tensor(2, DType::F32);
     let rows = take_rows(tokens, 's');
-    let out = (rows * weight.expand_lhs(&[luminal::shape::IntExpr::from('s')])).output();
+    let out = (rows * weight.expand_lhs([luminal::shape::IntExpr::from('s')])).output();
 
     let data: Vec<f32> = (0..CAP * 2).map(|i| i as f32).collect();
     let w = vec![2.0f32, 3.0];

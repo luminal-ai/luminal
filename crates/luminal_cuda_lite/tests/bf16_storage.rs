@@ -5,6 +5,7 @@
 //! bf16 scatter (a pure 16-bit move) and the fused attention over a bf16
 //! cache against host references computed with `half`.
 #![cfg(feature = "device")]
+#![allow(clippy::needless_range_loop)]
 
 use luminal::dtype::{DType, PlanDtype};
 use luminal::graph::Graph;
@@ -13,7 +14,9 @@ use luminal_cuda_lite::fused::{PagedAttentionInputs, PagedAttentionSpec, paged_a
 use luminal_cuda_lite::{CudaRuntime, HostBuffer};
 
 fn lcg(seed: &mut u64) -> f32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((*seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
 }
 
@@ -71,7 +74,8 @@ fn bf16_rows_scatter_into_a_bf16_pool_and_sum_in_f32() {
         .collect();
     for (r, slot) in [3usize, 6].iter().enumerate() {
         for c in 0..WIDTH {
-            expected_pool[slot * WIDTH + c] = half::bf16::from_f32(row_values[r * WIDTH + c]).to_f32();
+            expected_pool[slot * WIDTH + c] =
+                half::bf16::from_f32(row_values[r * WIDTH + c]).to_f32();
         }
     }
     let want: Vec<f32> = (0..WIDTH)
@@ -80,14 +84,20 @@ fn bf16_rows_scatter_into_a_bf16_pool_and_sum_in_f32() {
     let got = run(
         &cx,
         vec![
-            (pool.id, HostBuffer::new(PlanDtype::Bf16, bf16_bytes(&pool_values)).unwrap()),
+            (
+                pool.id,
+                HostBuffer::new(PlanDtype::Bf16, bf16_bytes(&pool_values)).unwrap(),
+            ),
             (rows.id, row_values.into()),
             (slots.id, vec![3i32, 6].into()),
         ],
         out.id,
     );
     for (i, (w, g)) in want.iter().zip(&got).enumerate() {
-        assert!((w - g).abs() <= 1e-4 * w.abs().max(1.0), "column {i}: {w} vs {g}");
+        assert!(
+            (w - g).abs() <= 1e-4 * w.abs().max(1.0),
+            "column {i}: {w} vs {g}"
+        );
     }
 }
 
@@ -118,7 +128,11 @@ fn paged_attention_reads_a_bf16_cache() {
         .collect();
     let sinks: Vec<f32> = (0..spec.heads).map(|_| lcg(&mut seed)).collect();
     // The reference sees the cache as the device does: bf16-rounded.
-    let round = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| half::bf16::from_f32(*x).to_f32()).collect() };
+    let round = |v: &[f32]| -> Vec<f32> {
+        v.iter()
+            .map(|x| half::bf16::from_f32(*x).to_f32())
+            .collect()
+    };
     let (kc_r, vc_r) = (round(&kc), round(&vc));
     let d = spec.head_dim;
     let (q_dim, kv_dim) = (spec.heads * d, spec.kv_heads * d);
@@ -183,8 +197,14 @@ fn paged_attention_reads_a_bf16_cache() {
         &cx,
         vec![
             (q_t.id, q.into()),
-            (kc_t.id, HostBuffer::new(PlanDtype::Bf16, bf16_bytes(&kc)).unwrap()),
-            (vc_t.id, HostBuffer::new(PlanDtype::Bf16, bf16_bytes(&vc)).unwrap()),
+            (
+                kc_t.id,
+                HostBuffer::new(PlanDtype::Bf16, bf16_bytes(&kc)).unwrap(),
+            ),
+            (
+                vc_t.id,
+                HostBuffer::new(PlanDtype::Bf16, bf16_bytes(&vc)).unwrap(),
+            ),
             (st_t.id, slot_table.into()),
             (qo_t.id, qo.into()),
             (kv_t.id, kv.into()),
@@ -194,6 +214,9 @@ fn paged_attention_reads_a_bf16_cache() {
         out.id,
     );
     for (i, (w, g)) in want.iter().zip(&got).enumerate() {
-        assert!((w - g).abs() <= 1e-4 * w.abs().max(1.0), "element {i}: {w} vs {g}");
+        assert!(
+            (w - g).abs() <= 1e-4 * w.abs().max(1.0),
+            "element {i}: {w} vs {g}"
+        );
     }
 }

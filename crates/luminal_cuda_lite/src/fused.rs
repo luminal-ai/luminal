@@ -46,7 +46,11 @@ pub struct PagedAttentionInputs {
 pub fn paged_attention(inputs: PagedAttentionInputs, spec: PagedAttentionSpec) -> GraphTensor {
     let q = inputs.q;
     assert_eq!(q.dtype, DType::F32, "paged_attention: q must be F32");
-    assert_eq!(q.rank(), 2, "paged_attention: q must be [s, heads*head_dim]");
+    assert_eq!(
+        q.rank(),
+        2,
+        "paged_attention: q must be [s, heads*head_dim]"
+    );
     for (name, t) in [
         ("slot_table", inputs.slot_table),
         ("qo_indptr", inputs.qo_indptr),
@@ -101,7 +105,11 @@ pub struct Mxfp4Experts {
 impl Mxfp4Experts {
     fn check(&self, who: &str) {
         assert_eq!(self.blocks.dtype, DType::U8, "{who}: blocks must be U8");
-        assert_eq!(self.scales.dtype, DType::F8UE8M0, "{who}: scales must be F8UE8M0");
+        assert_eq!(
+            self.scales.dtype,
+            DType::F8UE8M0,
+            "{who}: scales must be F8UE8M0"
+        );
         assert_eq!(self.bias.dtype, DType::Bf16, "{who}: bias must be Bf16");
         assert_eq!(self.blocks.rank(), 3, "{who}: blocks must be [E, n, k/2]");
         assert_eq!(self.scales.rank(), 3, "{who}: scales must be [E, n, k/32]");
@@ -120,8 +128,16 @@ pub fn moe_gate_up_mxfp4(
 ) -> GraphTensor {
     assert_eq!(x.dtype, DType::F32, "moe_gate_up_mxfp4: x must be F32");
     assert_eq!(x.rank(), 2, "moe_gate_up_mxfp4: x must be [s, hidden]");
-    assert_eq!(expert_ids.dtype, DType::Int, "moe_gate_up_mxfp4: expert_ids must be Int");
-    assert_eq!(expert_ids.rank(), 2, "moe_gate_up_mxfp4: expert_ids must be [s, top_k]");
+    assert_eq!(
+        expert_ids.dtype,
+        DType::Int,
+        "moe_gate_up_mxfp4: expert_ids must be Int"
+    );
+    assert_eq!(
+        expert_ids.rank(),
+        2,
+        "moe_gate_up_mxfp4: expert_ids must be [s, top_k]"
+    );
     experts.check("moe_gate_up_mxfp4");
     let s = x.dims()[0];
     let out_dims: Vec<IntExpr> = vec![s, IntExpr::from(spec.top_k), IntExpr::from(spec.inter)];
@@ -150,10 +166,26 @@ pub fn moe_down_mxfp4(
     experts: Mxfp4Experts,
     spec: DownSpec,
 ) -> GraphTensor {
-    assert_eq!(hidden.dtype, DType::F32, "moe_down_mxfp4: hidden must be F32");
-    assert_eq!(hidden.rank(), 3, "moe_down_mxfp4: hidden must be [s, top_k, inter]");
-    assert_eq!(expert_ids.dtype, DType::Int, "moe_down_mxfp4: expert_ids must be Int");
-    assert_eq!(weights.dtype, DType::F32, "moe_down_mxfp4: weights must be F32");
+    assert_eq!(
+        hidden.dtype,
+        DType::F32,
+        "moe_down_mxfp4: hidden must be F32"
+    );
+    assert_eq!(
+        hidden.rank(),
+        3,
+        "moe_down_mxfp4: hidden must be [s, top_k, inter]"
+    );
+    assert_eq!(
+        expert_ids.dtype,
+        DType::Int,
+        "moe_down_mxfp4: expert_ids must be Int"
+    );
+    assert_eq!(
+        weights.dtype,
+        DType::F32,
+        "moe_down_mxfp4: weights must be F32"
+    );
     experts.check("moe_down_mxfp4");
     let s = hidden.dims()[0];
     let out_dims: Vec<IntExpr> = vec![s, IntExpr::from(spec.hidden)];
@@ -182,7 +214,10 @@ pub fn moe_down_mxfp4(
 /// fixed-capacity per-tick input into the bucket's `s` rows.
 pub fn take_rows(tensor: GraphTensor, rows: impl Into<IntExpr>) -> GraphTensor {
     let mut new_dims = tensor.dims();
-    assert!(!new_dims.is_empty(), "take_rows: tensor must have a leading axis");
+    assert!(
+        !new_dims.is_empty(),
+        "take_rows: tensor must have a leading axis"
+    );
     new_dims[0] = rows.into();
     let operand = (tensor.id, tensor.dims());
     let dtype = tensor.dtype;

@@ -265,6 +265,12 @@ pub struct ExtractionSession<'a> {
     extractor: Extractor<'a>,
 }
 
+/// Per-class heuristic choice for `heuristic_genome_report`: the chosen
+/// producer's op name, e-node and operand index, or `None` where the walk
+/// had no admissible preference.
+pub type HeuristicChoiceReport =
+    std::collections::BTreeMap<ClassId, Option<(String, Option<NodeId>, Option<usize>)>>;
+
 impl<'a> ExtractionSession<'a> {
     /// The runtime-owned constructor (ruling 2026-08-17): extraction
     /// over the CALLER's matcher set, intersected with its allow list.
@@ -303,12 +309,7 @@ impl<'a> ExtractionSession<'a> {
     /// [`Self::heuristic_genome`] plus the cost-based plan's own choice
     /// per producer-index class (`None` = the relaxation never planned
     /// it), for diagnosis.
-    pub fn heuristic_genome_report(
-        &mut self,
-    ) -> (
-        Genome,
-        std::collections::BTreeMap<ClassId, Option<(String, Option<NodeId>, Option<usize>)>>,
-    ) {
+    pub fn heuristic_genome_report(&mut self) -> (Genome, HeuristicChoiceReport) {
         self.extractor.genome = None;
         self.extractor.memo.clear();
         self.extractor.blocked.clear();
@@ -321,21 +322,34 @@ impl<'a> ExtractionSession<'a> {
         let mut report = std::collections::BTreeMap::new();
         let mut memo_choice: HashMap<ClassId, ProducerChoice> = HashMap::new();
         for class in index.keys() {
-            let memo = self.extractor.memo.get(class).and_then(|plan| plan.as_ref());
+            let memo = self
+                .extractor
+                .memo
+                .get(class)
+                .and_then(|plan| plan.as_ref());
             report.insert(
                 class.clone(),
                 memo.map(|plan| {
                     (
-                        format!("{:?}", plan.kind).chars().take(40).collect::<String>(),
+                        format!("{:?}", plan.kind)
+                            .chars()
+                            .take(40)
+                            .collect::<String>(),
                         plan.source_enode.clone(),
                         plan.selected_output_index,
                     )
                 }),
             );
-            if let Some((enode, output_index)) =
-                memo.and_then(|plan| Some((plan.source_enode.clone()?, plan.selected_output_index?)))
+            if let Some((enode, output_index)) = memo
+                .and_then(|plan| Some((plan.source_enode.clone()?, plan.selected_output_index?)))
             {
-                memo_choice.insert(class.clone(), ProducerChoice { enode, output_index });
+                memo_choice.insert(
+                    class.clone(),
+                    ProducerChoice {
+                        enode,
+                        output_index,
+                    },
+                );
             }
         }
         // Leave the session as `extract_with_genome` expects to find it
@@ -346,7 +360,8 @@ impl<'a> ExtractionSession<'a> {
         self.extractor.no_candidates.clear();
         let space = self.sampling_space(&index);
         let prefer = |class: &ClassId| memo_choice.get(class).cloned();
-        let cost = |class: &ClassId, choice: &ProducerChoice| self.choice_heuristic_cost(class, choice);
+        let cost =
+            |class: &ClassId, choice: &ProducerChoice| self.choice_heuristic_cost(class, choice);
         let genome = crate::search_support::greedy_genome(&index, &space, &prefer, &cost);
         (genome, report)
     }
@@ -385,7 +400,11 @@ impl<'a> ExtractionSession<'a> {
 
     /// DEBUG SEAM: the op name of an enode.
     pub fn enode_op(&self, enode: &NodeId) -> Option<String> {
-        self.extractor.egraph.nodes.get(enode).map(|node| node.op.clone())
+        self.extractor
+            .egraph
+            .nodes
+            .get(enode)
+            .map(|node| node.op.clone())
     }
 
     /// THE BYTES-MOVED PRICE OF ONE GENOME CHOICE (serving landing,

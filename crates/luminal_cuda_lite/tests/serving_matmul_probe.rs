@@ -20,12 +20,7 @@ fn histogram(plan: &luminal_cuda_lite::CudaPlan) -> std::collections::BTreeMap<S
             .dtype
             .and_then(|d| luminal_cuda_lite::host_buffer::dtype_bytes(d).ok())
             .unwrap_or(0);
-        format!(
-            "{}x{}B {:?}",
-            numel,
-            width,
-            slot.layout.present()
-        )
+        format!("{}x{}B {:?}", numel, width, slot.layout.present())
     };
     for node in plan.dag.node_weights() {
         if let BufferNode::Compute {
@@ -47,7 +42,12 @@ fn histogram(plan: &luminal_cuda_lite::CudaPlan) -> std::collections::BTreeMap<S
     ops
 }
 
-fn probe(s: usize, inp: usize, out: usize, bias: bool) -> std::collections::BTreeMap<String, usize> {
+fn probe(
+    s: usize,
+    inp: usize,
+    out: usize,
+    bias: bool,
+) -> std::collections::BTreeMap<String, usize> {
     let mut cx = Graph::new();
     let x = cx.tensor((s, inp), DType::F32);
     let w = cx.tensor((inp, out), DType::F32);
@@ -69,7 +69,10 @@ fn probe(s: usize, inp: usize, out: usize, bias: bool) -> std::collections::BTre
     rt.search(&data, &options)
         .unwrap_or_else(|e| panic!("search: {e:#}"));
     let ops = histogram(rt.plan().expect("plan"));
-    eprintln!("[{s}x{inp}] @ [{inp}x{out}] bias={bias}: {ops:?}  ({} ms)", 0);
+    eprintln!(
+        "[{s}x{inp}] @ [{inp}x{out}] bias={bias}: {ops:?}  ({} ms)",
+        0
+    );
     let _ = y;
     ops
 }

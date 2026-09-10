@@ -17,7 +17,14 @@ fn heuristic_genome_extracts_on_l1_d8() {
     const SLOTS: usize = 4;
     const CTX: usize = 2;
     let mut cx = Graph::new();
-    let block = MiniLlama3Layer::new(d, ff, n_heads, n_kv, &Namespace::root().child("layers").index(0), &mut cx);
+    let block = MiniLlama3Layer::new(
+        d,
+        ff,
+        n_heads,
+        n_kv,
+        &Namespace::root().child("layers").index(0),
+        &mut cx,
+    );
     let k_cache = cx.tensor((SLOTS, kv_dim), DType::F32);
     let v_cache = cx.tensor((SLOTS, kv_dim), DType::F32);
     let x = cx.tensor((1, d), DType::F32);
@@ -55,7 +62,11 @@ fn heuristic_genome_extracts_on_l1_d8() {
         .filter(|(class, choice)| base.choices.get(*class) != Some(*choice))
         .map(|(class, _)| class.clone())
         .collect();
-    eprintln!("heuristic genome overrides {} of {} rows", changed.len(), genome.choices.len());
+    eprintln!(
+        "heuristic genome overrides {} of {} rows",
+        changed.len(),
+        genome.choices.len()
+    );
     match session.extract_with_genome(&genome) {
         Ok(Some(_)) => eprintln!("heuristic genome extracts"),
         other => {

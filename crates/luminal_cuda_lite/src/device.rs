@@ -417,10 +417,9 @@ impl CudaDevice {
                 ))
             }
             Home::Input(lit) => {
-                let resident = self
-                    .resident
-                    .get(&lit)
-                    .ok_or_else(|| anyhow!("input lit {lit} backs an output but is not resident"))?;
+                let resident = self.resident.get(&lit).ok_or_else(|| {
+                    anyhow!("input lit {lit} backs an output but is not resident")
+                })?;
                 let (ptr, _record) = resident.slice.device_ptr(&self.stream);
                 Ok((
                     Bound {
@@ -497,9 +496,7 @@ impl CudaDevice {
         let identity = (host.as_ptr() as usize, host.len());
         let dirty = self.dirty.remove(&lit);
         let reuse_alloc = match self.resident.get(&lit) {
-            Some(resident)
-                if !dirty && (resident.host_ptr, resident.len) == identity =>
-            {
+            Some(resident) if !dirty && (resident.host_ptr, resident.len) == identity => {
                 let (ptr, _record) = resident.slice.device_ptr(&self.stream);
                 return Ok(Bound { ptr, bytes });
             }
@@ -670,7 +667,9 @@ fn prepare_plan(
                         buffer.owner,
                     );
                 }
-                slot_of_buffer.entry(slot.buffer.clone()).or_insert(slot.index);
+                slot_of_buffer
+                    .entry(slot.buffer.clone())
+                    .or_insert(slot.index);
                 slot_bindings.push(slot.clone());
             }
         }
@@ -886,7 +885,9 @@ fn run_prepared(
     {
         let mut by_range: FxHashMap<(u64, usize), BufferId> = FxHashMap::default();
         for (id, b) in bindings.iter().filter(|(_, b)| b.bytes > 0) {
-            by_range.entry((b.ptr, b.bytes)).or_insert_with(|| id.clone());
+            by_range
+                .entry((b.ptr, b.bytes))
+                .or_insert_with(|| id.clone());
         }
         let bound: Vec<crate::binding_check::BoundRange> = by_range
             .iter()
@@ -1022,11 +1023,7 @@ fn run_prepared(
                     unsafe { builder.launch(cfg) }.context("kernel launch")?;
                 }
                 profile_ops.then(|| {
-                    let label = match &prepared_label(plan, reads, dest) {
-                        Some(label) => label.clone(),
-                        None => "kernel".to_string(),
-                    };
-                    label
+                    prepared_label(plan, reads, dest).unwrap_or_else(|| "kernel".to_string())
                 })
             }
         };
