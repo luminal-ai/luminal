@@ -7,4 +7,5 @@
   (
     (set (shape-of ?out_logical) ?shape)
   )
+  :ruleset prop
 )

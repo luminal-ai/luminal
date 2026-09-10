@@ -31,7 +31,7 @@
 ; --- scalar elementwise: rank-0 Add of the constant with the total ---
 (let shifted_total_logical (LogicalAdd total_logical bias_constant))
 
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; --- the constant: rank 0, F32, congruence-deduped ---
 (check (= (shape-of bias_constant) scalar_shape))

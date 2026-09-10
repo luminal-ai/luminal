@@ -56,7 +56,7 @@
   (IndexMapLit (IntExprCons tile_coordinate (IntExprNil)) minmax_source_shape))
 (int-subst-demand coordinate_minimum identity_rank1_map)
 
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; --- folds ---
 (check (= fold_min_mixed (IntLit -3)))

@@ -49,7 +49,7 @@
 (let uncertifiable_inner (IntAdd maybe_empty_dim (IntLit -3)))
 (let blocked_regroup (IntAdd uncertifiable_inner (IntLit 5)))
 
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; POSITIVE: the certified inner (5 + v0) regroups — both association
 ; orders land in one class...

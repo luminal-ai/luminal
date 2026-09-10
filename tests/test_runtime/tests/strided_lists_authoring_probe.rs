@@ -12,7 +12,7 @@
 //! If YES: the creator-pitched population is unblocked by a fixture/creator
 //! convention change (no preamble edit); only genuinely list-less layouts
 //! (chain-walk-composed views used as parents) need the chain-walk seed fix.
-const SCHEDULE: &str = "(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 #[test]
 fn strided_lists_authored_pitch_climbs_the_ladder() {

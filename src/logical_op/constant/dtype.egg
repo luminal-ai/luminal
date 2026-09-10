@@ -7,4 +7,5 @@
   (
     (set (dtype-of ?out_logical_tensor) (F32))
   )
+  :ruleset prop
 )

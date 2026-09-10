@@ -159,7 +159,7 @@
 ; SOURCE SEAM rows for list-authored strided layouts (affine migration)
 (strided-lists x_input_layout x_shape (IntExprCons (IntLit 4) (IntExprCons (IntLit 2) (IntExprNil))) x_input_strides (bits-of x_dtype))
 
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; The transpose substitution swaps both variables SIMULTANEOUSLY:
 ; x offset v1*8 + v0*2 over x's coords becomes 8*z_v0 + 2*z_v1 over z's

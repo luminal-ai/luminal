@@ -37,7 +37,7 @@
     (BufferTensorCons z_output_buffer_tensor
       (BufferTensorNil))))
 
-(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; In-place accumulation is represented by storage identity across the boundary.
 (check (= (buffer-id-of x_input_buffer_tensor)

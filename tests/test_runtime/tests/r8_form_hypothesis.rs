@@ -17,7 +17,7 @@ use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 
-const SCHEDULE: &str = "(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 fn class_has(s: &EGraph, class: &ClassId, op: &str) -> bool {
     s.nodes.values().any(|n| &n.eclass == class && n.op == op)
