@@ -1,0 +1,13 @@
+; Forward LayoutTensor Propagation : LogicalMoeGateUpMxfp4 — a fresh
+; materialized result in the canonical right-major layout.
+(rule
+  (
+    (= ?out (LogicalMoeGateUpMxfp4 ?x ?ids ?blocks ?scales ?bias ?inter ?top_k ?alpha ?limit))
+    (= ?x_layout_tensor (LayoutTensorLit ?x ?x_layout))
+    (= ?bits (bits-of (dtype-of ?out)))
+    (= ?shape (shape-of ?out))
+  )
+  (
+    (let out_layout_tensor (LayoutTensorLit ?out (RightMajorContiguousElementLayoutLit ?shape ?bits)))
+  )
+)

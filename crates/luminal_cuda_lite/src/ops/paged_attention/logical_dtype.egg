@@ -1,0 +1,11 @@
+; Dtype Propagation : LogicalPagedAttention — the query's dtype.
+(rule
+  (
+    (= ?out (LogicalPagedAttention ?q ?kc ?vc ?st ?qo ?kv ?qp ?sk ?heads ?kvh ?hd ?w ?scale))
+    (= ?q_dtype (dtype-of ?q))
+  )
+  (
+    (set (dtype-of ?out) ?q_dtype)
+  )
+  :ruleset prop
+)

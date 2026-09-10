@@ -1,0 +1,12 @@
+; Logical MXFP4 MoE, down half (the serving landing, 2026-09-10):
+;   out[t, :] = Σ_k w[t,k] · (W_dn[e(t,k)] · hidden[t,k,:] + b_dn[e(t,k)])
+; Operands, in order:
+;   hidden  [s, top_k, inter]            F32   (the gate/up half's result)
+;   ids     [s, top_k]                   Int
+;   weights [s, top_k]                   F32   (route weights)
+;   blocks  [experts, hidden, inter/2]   U8
+;   scales  [experts, hidden, inter/32]  F8UE8M0
+;   bias    [experts, hidden]            Bf16
+; Metadata: hidden, top_k.
+; Result: [s, hidden] F32.
+(constructor LogicalMoeDownMxfp4 (LogicalTensor LogicalTensor LogicalTensor LogicalTensor LogicalTensor LogicalTensor i64 i64) LogicalTensor)

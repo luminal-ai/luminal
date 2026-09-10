@@ -44,7 +44,9 @@ pub mod less_than;
 pub mod log2;
 pub mod materialize_layout_copy;
 pub mod modulo;
+pub mod moe_mxfp4;
 pub mod mul;
+pub mod paged_attention;
 pub mod recip;
 pub mod reduce_max;
 pub mod reduce_sum;
@@ -212,6 +214,16 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
             index_map_apply_view::IndexMapApplyViewMatcher,
             index_map_apply_view::IndexMapApplyView { entries: None },
         ),
+        // THE FUSED SERVING OPS (2026-09-10): host-call rows whose
+        // logical constructors are EXTERN terms the model spells through
+        // `crate::fused`. Their egglog surface rides these rows, so a
+        // registry without them simply never declares the constructors.
+        reg(
+            paged_attention::PagedAttentionMatcher,
+            paged_attention::prototype(),
+        ),
+        reg(moe_mxfp4::MoeGateUpMatcher, moe_mxfp4::gate_up_prototype()),
+        reg(moe_mxfp4::MoeDownMatcher, moe_mxfp4::down_prototype()),
     ]
 }
 

@@ -1,0 +1,43 @@
+; Layout Tensor Op Paged Attention — the host kernel reads every operand
+; DENSE (right-major contiguous) and writes a dense output, so the
+; rewrite fires only on those spellings. A view-shaped operand reaches
+; the op through the materializing copy the e-graph mints for it.
+(rule
+  (
+    (= ?out_logical (LogicalPagedAttention ?q ?kc ?vc ?st ?qo ?kv ?qp ?sk ?heads ?kvh ?hd ?w ?scale))
+    (= ?q_lt (LayoutTensorLit ?q ?q_layout))
+    (= ?q_layout (RightMajorContiguousElementLayoutLit ?q_shape ?q_bits))
+    (= ?kc_lt (LayoutTensorLit ?kc ?kc_layout))
+    (= ?kc_layout (RightMajorContiguousElementLayoutLit ?kc_shape ?kc_bits))
+    (= ?vc_lt (LayoutTensorLit ?vc ?vc_layout))
+    (= ?vc_layout (RightMajorContiguousElementLayoutLit ?vc_shape ?vc_bits))
+    (= ?st_lt (LayoutTensorLit ?st ?st_layout))
+    (= ?st_layout (RightMajorContiguousElementLayoutLit ?st_shape ?st_bits))
+    (= ?qo_lt (LayoutTensorLit ?qo ?qo_layout))
+    (= ?qo_layout (RightMajorContiguousElementLayoutLit ?qo_shape ?qo_bits))
+    (= ?kv_lt (LayoutTensorLit ?kv ?kv_layout))
+    (= ?kv_layout (RightMajorContiguousElementLayoutLit ?kv_shape ?kv_bits))
+    (= ?qp_lt (LayoutTensorLit ?qp ?qp_layout))
+    (= ?qp_layout (RightMajorContiguousElementLayoutLit ?qp_shape ?qp_bits))
+    (= ?sk_lt (LayoutTensorLit ?sk ?sk_layout))
+    (= ?sk_layout (RightMajorContiguousElementLayoutLit ?sk_shape ?sk_bits))
+    (= ?out_lt (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_shape ?out_bits))
+    (= (injectivity-of ?out_lt) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?q_lt
+          (LayoutTensorCons ?kc_lt
+            (LayoutTensorCons ?vc_lt
+              (LayoutTensorCons ?st_lt
+                (LayoutTensorCons ?qo_lt
+                  (LayoutTensorCons ?kv_lt
+                    (LayoutTensorCons ?qp_lt
+                      (LayoutTensorCons ?sk_lt (LayoutTensorNil)))))))))
+        (LayoutTensorCons ?out_lt (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpPagedAttention ?q_lt ?kc_lt ?vc_lt ?st_lt ?qo_lt ?kv_lt ?qp_lt ?sk_lt ?heads ?kvh ?hd ?w ?scale ?out_layout))
+  )
+)

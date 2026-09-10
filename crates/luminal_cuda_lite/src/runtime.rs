@@ -69,13 +69,19 @@ pub struct CudaRuntime {
     /// `Default` runtime carries an empty registry, like `matchers`.
     decoders: luminal::egglog_utils::eclass::ConstructorRegistry,
     plan: Option<BufferIrGraph<DecodedLayout>>,
-    /// Host-staged input payloads by BufferLit id, H2D'd at execute.
+    /// Host-staged input payloads by BufferLit id, H2D'd at the first
+    /// execute after each `set_data` and RESIDENT on the device after
+    /// that (the serving landing, 2026-09-10: see `device.rs`).
     staged: FxHashMap<i64, HostBuffer>,
-    /// Host copies of each output slot's BACKING buffer plus its elected
-    /// layout, filled by execute (D2H) — the escape-and-disclose fetch,
-    /// keyed by slot index (an escaped slot's backing buffer is a minted
-    /// allocation with no BufferLit, so slot order is the stable key).
-    outputs_host: FxHashMap<usize, (HostBuffer, luminal::bufferize::OutputBinding<DecodedLayout>)>,
+    /// Each output slot's elected layout, disclosed by the last execute
+    /// — the escape-and-disclose fetch's binding half, keyed by slot
+    /// index (an escaped slot's backing buffer is a minted allocation
+    /// with no BufferLit, so slot order is the stable key).
+    output_bindings: FxHashMap<usize, luminal::bufferize::OutputBinding<DecodedLayout>>,
+    /// Host copies of each output slot's BACKING buffer, read back from
+    /// the device LAZILY on the first `fetch` after an execute. A slot
+    /// nobody reads never crosses the link.
+    outputs_host: FxHashMap<usize, std::cell::OnceCell<HostBuffer>>,
     input_buffers: FxHashMap<NodeIndex, i64>,
     /// Bound output tensor → its slot index (program slot order).
     output_index: FxHashMap<NodeIndex, usize>,
@@ -697,6 +703,55 @@ impl CudaRuntime {
             panic!("set_data on a tensor with no input binding");
         };
         self.staged.insert(buffer, data.into());
+        // A re-staged lit is DIRTY: its resident device copy (if any) is
+        // re-uploaded at the next execute whatever its identity says.
+        #[cfg(feature = "device")]
+        if let Some(device) = self.device.as_mut() {
+            device.mark_dirty(buffer);
+        }
+    }
+
+    /// FEED AN OUTPUT BACK INTO AN INPUT ON THE DEVICE (the serving
+    /// landing, 2026-09-10): one D2D memcpy from `output`'s backing
+    /// bytes into `input`'s resident copy, no host round trip. The two
+    /// must have the same byte size. After this the input's resident
+    /// copy is device-authoritative — the host payload staged for it is
+    /// stale and is never re-uploaded unless `set_data` is called again.
+    ///
+    /// This is how a paged KV cache advances between serving ticks:
+    /// the step's cache OUTPUT becomes the next step's cache INPUT
+    /// without leaving the device.
+    #[cfg(feature = "device")]
+    pub fn copy_output_to_input(&mut self, output: NodeIndex, input: NodeIndex) -> Result<()> {
+        let slot = *self
+            .output_index
+            .get(&output)
+            .ok_or_else(|| anyhow!("copy_output_to_input: source tensor has no output binding"))?;
+        let lit = *self
+            .input_buffers
+            .get(&input)
+            .ok_or_else(|| anyhow!("copy_output_to_input: target tensor has no input binding"))?;
+        let device = self
+            .device
+            .as_mut()
+            .ok_or_else(|| anyhow!("copy_output_to_input before the first execute"))?;
+        device.copy_output_to_input(slot, lit)?;
+        // The host copy of the OUTPUT (if one was read) is still valid;
+        // nothing else changes on the host side.
+        Ok(())
+    }
+
+    /// The persistent device, once one exists (after a device-profiled
+    /// search or the first execute).
+    #[cfg(feature = "device")]
+    pub fn device(&self) -> Option<&crate::device::CudaDevice> {
+        self.device.as_ref()
+    }
+
+    /// Mutable access to the persistent device.
+    #[cfg(feature = "device")]
+    pub fn device_mut(&mut self) -> Option<&mut crate::device::CudaDevice> {
+        self.device.as_mut()
     }
 
     /// Run the plan on the CUDA device. Requires the `device` feature
@@ -730,7 +785,11 @@ impl CudaRuntime {
                 .as_mut()
                 .expect("the device was just created if it was missing");
             let outputs = crate::device::execute_plan(device, plan, &staged)?;
-            self.outputs_host = outputs;
+            self.outputs_host = outputs
+                .keys()
+                .map(|slot| (*slot, std::cell::OnceCell::new()))
+                .collect();
+            self.output_bindings = outputs;
             Ok(())
         }
         #[cfg(not(feature = "device"))]
@@ -800,7 +859,8 @@ impl CudaRuntime {
 
     /// The universal escape-and-disclose fetch: the output slot's backing
     /// bytes plus its [`luminal::bufferize::OutputBinding`] (the elected
-    /// layout).
+    /// layout). The bytes are read back from the device on the FIRST
+    /// fetch after an execute and cached until the next execute.
     pub fn fetch(
         &self,
         tensor: NodeIndex,
@@ -812,10 +872,27 @@ impl CudaRuntime {
             .output_index
             .get(&tensor)
             .ok_or_else(|| anyhow!("tensor has no output binding"))?;
-        match self.outputs_host.get(index) {
-            Some((data, binding)) => Ok((data, binding)),
-            None => bail!("execute before fetch"),
+        let Some(binding) = self.output_bindings.get(index) else {
+            bail!("execute before fetch");
+        };
+        let cell = self
+            .outputs_host
+            .get(index)
+            .ok_or_else(|| anyhow!("execute before fetch"))?;
+        if cell.get().is_none() {
+            #[cfg(feature = "device")]
+            {
+                let device = self
+                    .device
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("execute before fetch"))?;
+                let host = device.read_output(*index)?;
+                let _ = cell.set(host);
+            }
+            #[cfg(not(feature = "device"))]
+            bail!("execute before fetch");
         }
+        Ok((cell.get().expect("filled above"), binding))
     }
 
     /// The slot's elected layout alone (see [`Self::fetch`]).
@@ -823,7 +900,13 @@ impl CudaRuntime {
         &self,
         tensor: NodeIndex,
     ) -> Result<&luminal::bufferize::OutputBinding<DecodedLayout>> {
-        Ok(self.fetch(tensor)?.1)
+        let index = self
+            .output_index
+            .get(&tensor)
+            .ok_or_else(|| anyhow!("tensor has no output binding"))?;
+        self.output_bindings
+            .get(index)
+            .ok_or_else(|| anyhow!("execute before fetch"))
     }
 
     /// The searched plan, for inspection and tests.

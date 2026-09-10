@@ -37,7 +37,16 @@ pub fn dtype_bytes(dtype: PlanDtype) -> Result<usize> {
         PlanDtype::F32 => 4,
         PlanDtype::Int => 4,
         PlanDtype::Int64 => 8,
+        PlanDtype::F64 => 8,
         PlanDtype::Bool | PlanDtype::Bool8 => 1,
+        // BYTE-WIDE AND HALF-WIDE STORAGE dtypes (serving landing,
+        // 2026-09-10): these stage and move as raw bytes — the packed
+        // MXFP4 expert weights (U8 codes + F8UE8M0 scales) and bf16
+        // biases a fused host op consumes directly. The NVRTC codegen
+        // still refuses to compute on them (`kernels::cuda_type`); only
+        // host ops that declare the layout read them.
+        PlanDtype::Bf16 | PlanDtype::F16 | PlanDtype::I16 | PlanDtype::U16 => 2,
+        PlanDtype::I8 | PlanDtype::U8 | PlanDtype::F8UE8M0 | PlanDtype::F8E4M3 | PlanDtype::F8E5M2 => 1,
         other => bail!("cuda-lite has no device representation for {other:?}"),
     })
 }

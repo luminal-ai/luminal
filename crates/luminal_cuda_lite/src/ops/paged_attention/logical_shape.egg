@@ -1,0 +1,11 @@
+; Shape Propagation : LogicalPagedAttention — the query's shape.
+(rule
+  (
+    (= ?out (LogicalPagedAttention ?q ?kc ?vc ?st ?qo ?kv ?qp ?sk ?heads ?kvh ?hd ?w ?scale))
+    (= ?shape (shape-of ?q))
+  )
+  (
+    (set (shape-of ?out) ?shape)
+  )
+  :ruleset prop
+)

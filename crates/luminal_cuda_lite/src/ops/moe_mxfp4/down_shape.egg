@@ -1,0 +1,12 @@
+; Shape Propagation : LogicalMoeDownMxfp4 — [s, hidden], s from the
+; hidden activations' leading axis, hidden from the term.
+(rule
+  (
+    (= ?out (LogicalMoeDownMxfp4 ?hidden ?ids ?weights ?blocks ?scales ?bias ?hidden_dim ?top_k))
+    (= (shape-of ?hidden) (ShapeLit (IntExprCons ?s ?hidden_rest)))
+  )
+  (
+    (set (shape-of ?out) (ShapeLit (IntExprCons ?s (IntExprCons (IntLit ?hidden_dim) (IntExprNil)))))
+  )
+  :ruleset prop
+)

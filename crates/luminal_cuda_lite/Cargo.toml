@@ -34,6 +34,7 @@ colored = "2.0.4"
 cudarc = { version = "0.19.8", optional = true, features = ["cuda-version-from-build-system", "fallback-latest"] }
 
 [dev-dependencies]
+half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
 # Step B: the reference inventory the subset test pins against now lives
 # in its own crate.
 luminal_reference = { path = "../luminal_reference" }

@@ -1,0 +1,11 @@
+; Dtype Propagation : LogicalMoeGateUpMxfp4 — F32 always (the kernel
+; accumulates and stores f32).
+(rule
+  (
+    (= ?out (LogicalMoeGateUpMxfp4 ?x ?ids ?blocks ?scales ?bias ?inter ?top_k ?alpha ?limit))
+  )
+  (
+    (set (dtype-of ?out) (F32))
+  )
+  :ruleset prop
+)

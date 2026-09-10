@@ -279,6 +279,21 @@ impl<'a> ExtractionSession<'a> {
         Self { extractor }
     }
 
+    /// THE BYTES-MOVED PRICE OF ONE GENOME CHOICE (serving landing,
+    /// 2026-09-10): the candidate's own `heuristic_cost` — operand bytes
+    /// read plus result bytes written by the chosen producer, children
+    /// excluded. What a greedy seed genome ranks alternatives by (see
+    /// `search_support::greedy_genome`): a library matmul that reads
+    /// two matrices and writes one prices far under the decomposed
+    /// broadcast-multiply-then-reduce that materializes their product.
+    pub fn choice_heuristic_cost(&self, class: &ClassId, choice: &ProducerChoice) -> u64 {
+        self.extractor
+            .producer_candidates_for_choice(class, choice)
+            .iter()
+            .map(|candidate| self.extractor.candidate_heuristic_cost(candidate))
+            .fold(0u64, u64::saturating_add)
+    }
+
     /// The genome sampling index over this session's matcher set —
     /// derivable without consuming the session, so runtime callers
     /// need not supply their matchers twice.

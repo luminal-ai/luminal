@@ -233,6 +233,14 @@ pub(crate) fn unrecorded_value() -> ValueId {
     ValueId::end()
 }
 
+/// [`unrecorded_value`] for out-of-crate frontends (a runtime's own
+/// extern-op helpers) that record through the public `LogicalGraph`
+/// seams and must keep the poison-door discipline: a refused record
+/// yields this sentinel, never a panic.
+pub fn unrecorded_value_pub() -> ValueId {
+    unrecorded_value()
+}
+
 /// An operand as a record call sees it: the handle's value plus its
 /// dims. The dims payload is VESTIGIAL (R-D ruling 2026-08-26,
 /// reasserted 2026-09-01: handle dims are derived from the recorded
@@ -268,6 +276,44 @@ pub enum LogicalOp {
     Gather,
     Scatter,
     IndexMapApply { entries: Vec<MapEntry> },
+    /// An EXTERN op: a fused/opaque operation whose egglog surface
+    /// (constructor, dtype/shape rules, implementation match) is supplied
+    /// by a runtime's registered op rather than by core. The recorder only
+    /// spells it — `({constructor} operands... params...)` — so a runtime
+    /// can add a fused kernel (paged attention, an MoE block) without
+    /// touching this enum again. `params` are the trailing literal
+    /// metadata children, rendered in order after the tensor operands.
+    Extern {
+        constructor: &'static str,
+        params: Vec<ExternParam>,
+    },
+}
+
+/// A literal metadata child of an [`LogicalOp::Extern`] term.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExternParam {
+    I64(i64),
+    F64(f64),
+}
+
+impl ExternParam {
+    /// The egglog literal spelling. Floats always carry a decimal point
+    /// (egglog's f64 lexer needs one), integers never do.
+    pub fn render(&self) -> String {
+        match self {
+            ExternParam::I64(value) => value.to_string(),
+            ExternParam::F64(value) => {
+                let text = format!("{value:?}");
+                if text.contains('.') || text.contains("inf") || text.contains("NaN") {
+                    text
+                } else if let Some((mantissa, exponent)) = text.split_once('e') {
+                    format!("{mantissa}.0e{exponent}")
+                } else {
+                    format!("{text}.0")
+                }
+            }
+        }
+    }
 }
 
 impl LogicalOp {
@@ -295,6 +341,7 @@ impl LogicalOp {
             Self::Gather => "LogicalGather",
             Self::Scatter => "LogicalScatter",
             Self::IndexMapApply { .. } => "LogicalIndexMapApply",
+            Self::Extern { constructor, .. } => constructor,
         }
     }
 
@@ -326,7 +373,7 @@ impl LogicalOp {
             | Self::LessThan
             | Self::TruncDiv
             | Self::TruncRem => 2,
-            Self::Gather | Self::Scatter => return None,
+            Self::Gather | Self::Scatter | Self::Extern { .. } => return None,
         })
     }
 }
@@ -1334,6 +1381,9 @@ impl LogicalGraph {
                     LogicalOp::ReduceSum { axis_from_end }
                     | LogicalOp::ReduceMax { axis_from_end } => {
                         parts.push(axis_from_end.to_string());
+                    }
+                    LogicalOp::Extern { params, .. } => {
+                        parts.extend(params.iter().map(ExternParam::render));
                     }
                     LogicalOp::IndexMapApply { entries } => {
                         let source_shape = Self::shape_term(&self.graph[operands[0]].dims)?;

@@ -34,6 +34,51 @@ impl Graph {
         result
     }
 
+    /// Record an EXTERN op: an opaque/fused operation whose egglog
+    /// surface (constructor declaration, dtype and shape propagation, and
+    /// the implementation match) is contributed by a RUNTIME's registered
+    /// op (see `luminal_cuda_lite::ops::RegisteredOp`), not by core. The
+    /// recorder spells `({constructor} operand... param...)` and trusts
+    /// the caller's `out_dims`/`out_dtype` for the handle; the e-graph's
+    /// own propagation must agree, or saturation refuses loudly.
+    ///
+    /// Every operand must belong to this graph. `params` render in order
+    /// after the tensor operands, as egglog `i64` / `f64` literals.
+    pub fn extern_op(
+        &mut self,
+        constructor: &'static str,
+        operands: &[GraphTensor],
+        params: Vec<crate::graph::ExternParam>,
+        out_dims: impl ToShape,
+        out_dtype: DType,
+    ) -> GraphTensor {
+        let dims = out_dims.to_shape();
+        let self_ptr: *mut Graph = self;
+        for operand in operands {
+            assert!(
+                operand.graph_ref == self_ptr,
+                "extern op {constructor}: every operand must belong to the same graph"
+            );
+        }
+        let recorded: Vec<crate::graph::Operand> = operands
+            .iter()
+            .map(|operand| (operand.id, operand.dims()))
+            .collect();
+        let id = self
+            .logical
+            .op(
+                LogicalOp::Extern {
+                    constructor,
+                    params,
+                },
+                &recorded,
+                dims.clone(),
+                out_dtype,
+            )
+            .unwrap_or_else(crate::graph::unrecorded_value);
+        GraphTensor::from_id(id, dims, self, out_dtype)
+    }
+
     /// A scalar float constant
     pub fn constant_float(&mut self, i: f32) -> GraphTensor {
         let id = self

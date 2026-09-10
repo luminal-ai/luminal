@@ -1,0 +1,3 @@
+; Paged attention host op: eight read operands, the five metadata
+; literals, one fresh written output.
+(constructor LayoutTensorOpPagedAttention (LayoutTensor LayoutTensor LayoutTensor LayoutTensor LayoutTensor LayoutTensor LayoutTensor LayoutTensor i64 i64 i64 i64 f64 Layout) LayoutTensorOp)

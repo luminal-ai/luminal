@@ -1,0 +1,14 @@
+; Logical Paged Attention (the serving landing, 2026-09-10): one fused
+; attention step over a slot-paged KV cache, with attention sinks and an
+; optional sliding window. Operands, in order:
+;   q          [s, heads*head_dim]        F32
+;   k_cache    [slots, kv_heads*head_dim]  F32  (post-write)
+;   v_cache    [slots, kv_heads*head_dim]  F32  (post-write)
+;   slot_table [c]                         Int  (per-request slot lists, concatenated)
+;   qo_indptr  [r]                         Int  (CSR query rows per request)
+;   kv_indptr  [r]                         Int  (CSR context rows per request)
+;   q_pos      [s]                         Int  (absolute position of each query)
+;   sinks      [heads]                     F32
+; Metadata: heads, kv_heads, head_dim, window (0 = full), scale.
+; Result: [s, heads*head_dim] F32.
+(constructor LogicalPagedAttention (LogicalTensor LogicalTensor LogicalTensor LogicalTensor LogicalTensor LogicalTensor LogicalTensor LogicalTensor i64 i64 i64 i64 f64) LogicalTensor)

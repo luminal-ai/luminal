@@ -1,0 +1,37 @@
+; MoE gate/up host op: five dense read operands, four metadata literals,
+; one fresh written output.
+(constructor LayoutTensorOpMoeGateUpMxfp4 (LayoutTensor LayoutTensor LayoutTensor LayoutTensor LayoutTensor i64 i64 f64 f64 Layout) LayoutTensorOp)
+
+; Layout Tensor Op MoE Gate/Up — every operand DENSE (right-major
+; contiguous); a view-shaped route table reaches the op through the
+; materializing copy the e-graph mints for it.
+(rule
+  (
+    (= ?out_logical (LogicalMoeGateUpMxfp4 ?x ?ids ?blocks ?scales ?bias ?inter ?top_k ?alpha ?limit))
+    (= ?x_lt (LayoutTensorLit ?x ?x_layout))
+    (= ?x_layout (RightMajorContiguousElementLayoutLit ?x_shape ?x_bits))
+    (= ?ids_lt (LayoutTensorLit ?ids ?ids_layout))
+    (= ?ids_layout (RightMajorContiguousElementLayoutLit ?ids_shape ?ids_bits))
+    (= ?blocks_lt (LayoutTensorLit ?blocks ?blocks_layout))
+    (= ?blocks_layout (RightMajorContiguousElementLayoutLit ?blocks_shape ?blocks_bits))
+    (= ?scales_lt (LayoutTensorLit ?scales ?scales_layout))
+    (= ?scales_layout (RightMajorContiguousElementLayoutLit ?scales_shape ?scales_bits))
+    (= ?bias_lt (LayoutTensorLit ?bias ?bias_layout))
+    (= ?bias_layout (RightMajorContiguousElementLayoutLit ?bias_shape ?bias_bits))
+    (= ?out_lt (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_shape ?out_bits))
+    (= (injectivity-of ?out_lt) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?x_lt
+          (LayoutTensorCons ?ids_lt
+            (LayoutTensorCons ?blocks_lt
+              (LayoutTensorCons ?scales_lt
+                (LayoutTensorCons ?bias_lt (LayoutTensorNil))))))
+        (LayoutTensorCons ?out_lt (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpMoeGateUpMxfp4 ?x_lt ?ids_lt ?blocks_lt ?scales_lt ?bias_lt ?inter ?top_k ?alpha ?limit ?out_layout))
+  )
+)

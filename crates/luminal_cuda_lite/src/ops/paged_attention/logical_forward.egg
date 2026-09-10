@@ -1,0 +1,14 @@
+; Forward LayoutTensor Propagation : LogicalPagedAttention — a fresh
+; materialized result: the canonical right-major contiguous layout
+; tensor is minted from the output's own shape and dtype.
+(rule
+  (
+    (= ?out (LogicalPagedAttention ?q ?kc ?vc ?st ?qo ?kv ?qp ?sk ?heads ?kvh ?hd ?w ?scale))
+    (= ?q_layout_tensor (LayoutTensorLit ?q ?q_layout))
+    (= ?bits (bits-of (dtype-of ?out)))
+    (= ?shape (shape-of ?out))
+  )
+  (
+    (let out_layout_tensor (LayoutTensorLit ?out (RightMajorContiguousElementLayoutLit ?shape ?bits)))
+  )
+)

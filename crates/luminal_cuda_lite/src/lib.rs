@@ -69,10 +69,18 @@ pub use luminal::extraction as extractor;
 /// FINALISTS (Phase 5 of the #420/#422 rejoin): a bucket's ranked
 /// genomes, re-materialized one at a time under a hard filter.
 pub mod finalists;
+/// THE FUSED SERVING OPS' FRONTEND (2026-09-10): how a model spells the
+/// extern logical ops this runtime implements (paged attention, the
+/// MXFP4 MoE halves).
+pub mod fused;
 pub mod heuristic;
 pub mod host;
 pub mod host_buffer;
 pub mod kernels;
+/// The process-wide NVRTC module cache host ops compile their own
+/// kernels through.
+#[cfg(feature = "device")]
+pub mod nvrtc_module;
 /// THE BUCKET LATTICE (Phase 5): best-first selection of ONE finalist
 /// per bucket under a coordinate-monotone aggregate.
 pub mod lattice;

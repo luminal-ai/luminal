@@ -1,0 +1,14 @@
+; Shape Propagation : LogicalMoeGateUpMxfp4 — [s, top_k, inter], s from
+; x's leading axis, top_k from the route table's trailing axis, inter
+; from the term.
+(rule
+  (
+    (= ?out (LogicalMoeGateUpMxfp4 ?x ?ids ?blocks ?scales ?bias ?inter ?top_k ?alpha ?limit))
+    (= (shape-of ?x) (ShapeLit (IntExprCons ?s ?x_rest)))
+    (= (shape-of ?ids) (ShapeLit (IntExprCons ?s_ids (IntExprCons ?k (IntExprNil)))))
+  )
+  (
+    (set (shape-of ?out) (ShapeLit (IntExprCons ?s (IntExprCons ?k (IntExprCons (IntLit ?inter) (IntExprNil))))))
+  )
+  :ruleset prop
+)

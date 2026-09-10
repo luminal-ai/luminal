@@ -1,0 +1,11 @@
+; Dtype Propagation : LogicalMoeDownMxfp4 — F32 always (the kernel
+; accumulates and stores f32).
+(rule
+  (
+    (= ?out (LogicalMoeDownMxfp4 ?hidden ?ids ?weights ?blocks ?scales ?bias ?hidden_dim ?top_k))
+  )
+  (
+    (set (dtype-of ?out) (F32))
+  )
+  :ruleset prop
+)

@@ -20,18 +20,40 @@
 //!   escaping and donated storage keep their own allocations — see the
 //!   ownership-row table on [`crate::arena`].
 //!
-//! The phases themselves are unchanged in kind. Phase 1 materializes
-//! the standalone rows and stages inputs (loud on missing
-//! geometry/dtype, exactly like the reference). Phase 2 is the arena's
-//! issue order — a topological order over Data AND Anti edges, so WAR
-//! ordering is enforced by construction, chosen for a small high-water
-//! mark. Phase 3 dispatches: `BufferAlloc` binds its buffer to its slab
-//! range, `BufferFree` drops the binding, D2D for copies,
-//! NVRTC-compiled launches for compute (the destination is the range
-//! the planner assigned — no longer a fresh zeroed slice; every CL
+//! THE SERVING LANDING (2026-09-10) made the BOUNDARY storage persistent
+//! too, in three pieces:
+//!
+//! * RESIDENT INPUTS. A staged payload is copied to the device ONCE and
+//!   kept, keyed by its `BufferLit` id. Later executes re-upload a lit
+//!   only when the runtime marked it DIRTY (a new `set_data`) or the
+//!   staged bytes are a different host allocation than the resident copy
+//!   was taken from. A 60 GB model's weights therefore cross the link
+//!   once — at the first profiled candidate of the search — and every
+//!   later candidate and every serving tick reuses the same device
+//!   bytes. (Before: every `execute_plan` allocated, zeroed and re-copied
+//!   every input, which priced a serving tick at the model size.)
+//! * POOLED OUTPUTS. Each output SLOT keeps one device allocation across
+//!   calls, resized only when a plan sizes the slot differently. Slot
+//!   index is the key, so the bucket plans of one program share their
+//!   output homes.
+//! * LAZY READBACK. `execute_plan` leaves outputs on the device and
+//!   returns only their bindings; [`CudaDevice::read_output`] does the
+//!   D2H when a caller actually asks for the bytes. A serving tick that
+//!   reads one `i32` per row no longer pays for a D2H of every KV cache
+//!   output — and [`CudaDevice::copy_output_to_input`] feeds such an
+//!   output back into its input's resident copy with one D2D memcpy.
+//!
+//! The phases themselves are unchanged in kind. Phase 1 binds the
+//! standalone rows (resident, pooled, or scratch) and stages what is
+//! dirty (loud on missing geometry/dtype, exactly like the reference).
+//! Phase 2 is the arena's issue order — a topological order over Data
+//! AND Anti edges, so WAR ordering is enforced by construction, chosen
+//! for a small high-water mark. Phase 3 dispatches: `BufferAlloc` binds
+//! its buffer to its slab range, `BufferFree` drops the binding, D2D for
+//! copies, NVRTC-compiled launches for compute (the destination is the
+//! range the planner assigned — no longer a fresh zeroed slice; every CL
 //! kernel writes every element it owns, see the KERNEL INVARIANT note
-//! below). Phase 4 copies each output SLOT's backing buffer back to a
-//! host `HostBuffer`, keyed by slot index and paired with the slot's
+//! below). Phase 4 records each output SLOT's device home and its
 //! [`OutputBinding`] — the escape-and-disclose contract (ruling
 //! 2026-08-27): the caller gets the backing bytes (possibly
 //! parent-sized, for an escaped view election) plus the layout to
@@ -63,6 +85,9 @@
 //!   resident — a distinct buffer, or D's own range when the bufferizer
 //!   seeded D onto C's ReadWrite caller buffer through the May permit —
 //!   never an undefined recycled range.
+//! * THE FUSED HOST OPS (paged attention, the MXFP4 MoE halves): each
+//!   writes every element of its destination in one pass and reads no
+//!   destination byte.
 //!
 //! So no memset is emitted anywhere. The one standing assumption is
 //! that a destination's `numel(dest_dims)` covers its buffer's SPAN:
@@ -85,21 +110,12 @@ use cudarc::nvrtc::compile_ptx;
 use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode, EdgeKind, OutputBinding};
 use luminal::dtype::PlanDtype;
 use luminal::prelude::FxHashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::host::{DeviceRange as Bound, HostOpContext};
 use crate::kernels::CodegenCtx;
 use crate::{as_host_op, as_kernel_op};
-
-/// STAGING AND READBACK are memcpys now (ruling D4, 2026-09-03): a
-/// [`HostBuffer`] IS bytes plus a dtype tag, which is exactly what an
-/// H2D/D2H copy wants. The eleven-variant match these two used to be
-/// went with `TypedBuffer` to the reference runtime, where kernels
-/// really do need typed Rust slices.
-fn typed_to_bytes(data: &HostBuffer) -> &[u8] {
-    &data.bytes
-}
 
 /// D2H: the device's bytes under the plan's dtype. Boolean readback
 /// still passes the VALIDATED door — a device that wrote a byte other
@@ -135,9 +151,43 @@ impl KernelCache {
     }
 }
 
+/// A staged input's device copy, plus the identity of the host bytes it
+/// was taken from (allocation address + length). A staged payload whose
+/// bytes live at a different address is a different payload and is
+/// re-uploaded; one at the same address is trusted unless the runtime
+/// marked its lit dirty.
+struct Resident {
+    slice: CudaSlice<u8>,
+    host_ptr: usize,
+    len: usize,
+    dtype: PlanDtype,
+}
+
+/// Where an output slot's bytes live after an execute: a pooled output
+/// home (the ordinary case — a fresh escaping/boundary buffer the plan
+/// wrote), or a RESIDENT INPUT (an escaped view election whose backing
+/// buffer is a staged input: the slot discloses a layout over the
+/// input's own bytes).
+#[derive(Debug, Clone, Copy)]
+enum Home {
+    Output(usize),
+    Input(i64),
+}
+
+/// One output buffer's persistent device home: the allocation and the
+/// dtype the plan gave it. Keyed by the FIRST slot index that names the
+/// buffer (slots may legally share one escaping buffer); each slot's own
+/// disclosed binding rides `CudaDevice::slot_view`.
+struct OutputHome {
+    slice: CudaSlice<u8>,
+    bytes: usize,
+    dtype: PlanDtype,
+}
+
 /// THE PERSISTENT DEVICE: everything an execution needs that should
 /// outlive one call — the context, the one stream every kernel and
-/// copy is issued on, the compiled-module cache, and the arena slab.
+/// copy is issued on, the compiled-module cache, the arena slab, and
+/// (since the serving landing) the resident inputs and pooled outputs.
 /// The runtime owns exactly one of these and hands it to
 /// [`execute_plan`] by `&mut`.
 ///
@@ -156,6 +206,19 @@ pub struct CudaDevice {
     stream: Arc<CudaStream>,
     cache: KernelCache,
     slab: Option<CudaSlice<u8>>,
+    /// Device-resident staged inputs, by `BufferLit` id.
+    resident: HashMap<i64, Resident>,
+    /// Lits the runtime re-staged since their resident copy was taken.
+    dirty: HashSet<i64>,
+    /// Output buffers' persistent homes, by the home slot index.
+    outputs: HashMap<usize, OutputHome>,
+    /// What the last execute disclosed per output slot: where its bytes
+    /// live, and the slot's elected layout.
+    slot_view: HashMap<usize, (Home, OutputBinding<luminal::layouts::DecodedLayout>)>,
+    /// Standalone buffers that are neither inputs nor output slots (an
+    /// interior buffer demoted for want of a lifetime pair), keyed by the
+    /// plan's own buffer id text and size.
+    scratch: HashMap<(String, usize), CudaSlice<u8>>,
 }
 
 impl CudaDevice {
@@ -171,7 +234,22 @@ impl CudaDevice {
             ctx,
             stream,
             slab: None,
+            resident: HashMap::new(),
+            dirty: HashSet::new(),
+            outputs: HashMap::new(),
+            slot_view: HashMap::new(),
+            scratch: HashMap::new(),
         })
+    }
+
+    /// The stream every launch and copy of this device is issued on.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// The CUDA context this device runs in.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
     }
 
     /// Grow the slab to at least `bytes`. The old slab is released
@@ -190,9 +268,19 @@ impl CudaDevice {
     }
 
     /// The slab's current size in bytes (0 before the first plan needs
-    /// one) — the runtime's resident device footprint.
+    /// one) — the runtime's resident arena footprint.
     pub fn slab_bytes(&self) -> usize {
         self.slab.as_ref().map(|slab| slab.len()).unwrap_or(0)
+    }
+
+    /// Bytes held by the resident inputs — the model's device footprint.
+    pub fn resident_bytes(&self) -> usize {
+        self.resident.values().map(|r| r.slice.len()).sum()
+    }
+
+    /// Bytes held by the pooled output homes.
+    pub fn output_bytes(&self) -> usize {
+        self.outputs.values().map(|o| o.slice.len()).sum()
     }
 
     /// RELEASE THE SLAB — the SEARCH-TIME hygiene (#422 policy, Phase
@@ -205,11 +293,231 @@ impl CudaDevice {
     /// SERVING NEVER CALLS IT. `CudaRuntime::execute` keeps the slab
     /// exactly as Phase 3 landed it: one grow-only allocation for the
     /// runtime's life, which is the point of the persistent device.
-    /// Nothing else is released here — the context, the stream and the
-    /// NVRTC module cache all survive, which is what keeps kernel
-    /// compilation a once-per-source cost across a whole search.
+    /// Nothing else is released here — the context, the stream, the
+    /// NVRTC module cache, the resident inputs and the output homes all
+    /// survive, which is what keeps kernel compilation a once-per-source
+    /// cost and weight staging a once-per-search cost across a whole
+    /// search.
     pub fn release_slab(&mut self) {
         self.slab = None;
+    }
+
+    /// Mark a staged lit DIRTY: its next execute re-uploads it whatever
+    /// the resident copy's identity says. The runtime calls this from
+    /// `set_data`.
+    pub fn mark_dirty(&mut self, lit: i64) {
+        self.dirty.insert(lit);
+    }
+
+    /// Drop a lit's resident copy (and any dirty mark).
+    pub fn evict_input(&mut self, lit: i64) {
+        self.resident.remove(&lit);
+        self.dirty.remove(&lit);
+    }
+
+    /// Drop EVERY resident input. The search's staged map is borrowed
+    /// from the caller; a runtime whose staged payloads are replaced
+    /// wholesale (a new search over new data) evicts first so no stale
+    /// address identity can be trusted.
+    pub fn evict_all_inputs(&mut self) {
+        self.resident.clear();
+        self.dirty.clear();
+    }
+
+    /// The device range a resident input currently occupies, if any.
+    pub fn resident_input(&self, lit: i64) -> Option<Bound> {
+        self.resident.get(&lit).map(|r| Bound {
+            ptr: {
+                let (ptr, _record) = r.slice.device_ptr(&self.stream);
+                ptr
+            },
+            bytes: r.slice.len(),
+        })
+    }
+
+    /// The device range backing an output slot after the last execute,
+    /// with the slot's disclosed binding.
+    pub fn output_slot(
+        &self,
+        slot: usize,
+    ) -> Option<(Bound, &OutputBinding<luminal::layouts::DecodedLayout>)> {
+        let (home, binding) = self.slot_view.get(&slot)?;
+        let (bound, _) = self.home_range(*home).ok()?;
+        Some((bound, binding))
+    }
+
+    /// The device range and dtype of a slot home.
+    fn home_range(&self, home: Home) -> Result<(Bound, PlanDtype)> {
+        match home {
+            Home::Output(home_slot) => {
+                let home = self
+                    .outputs
+                    .get(&home_slot)
+                    .ok_or_else(|| anyhow!("output home {home_slot} was never bound"))?;
+                let (ptr, _record) = home.slice.device_ptr(&self.stream);
+                Ok((
+                    Bound {
+                        ptr,
+                        bytes: home.bytes,
+                    },
+                    home.dtype,
+                ))
+            }
+            Home::Input(lit) => {
+                let resident = self
+                    .resident
+                    .get(&lit)
+                    .ok_or_else(|| anyhow!("input lit {lit} backs an output but is not resident"))?;
+                let (ptr, _record) = resident.slice.device_ptr(&self.stream);
+                Ok((
+                    Bound {
+                        ptr,
+                        bytes: resident.slice.len(),
+                    },
+                    resident.dtype,
+                ))
+            }
+        }
+    }
+
+    fn slot_home(&self, slot: usize) -> Result<(Bound, PlanDtype)> {
+        let (home, _) = self
+            .slot_view
+            .get(&slot)
+            .ok_or_else(|| anyhow!("output slot {slot} has not been executed"))?;
+        self.home_range(*home)
+    }
+
+    /// D2H one output slot's backing bytes (synchronous). The escape-
+    /// and-disclose fetch's byte half; the binding rides
+    /// [`Self::output_slot`].
+    pub fn read_output(&self, slot: usize) -> Result<HostBuffer> {
+        let (bound, dtype) = self.slot_home(slot)?;
+        let mut host = vec![0u8; bound.bytes];
+        if bound.bytes > 0 {
+            unsafe { cu::memcpy_dtoh_async(&mut host, bound.ptr, self.stream.cu_stream()) }
+                .context("D2H")?;
+            self.stream.synchronize().context("D2H sync")?;
+        }
+        bytes_to_typed(&host, dtype)
+    }
+
+    /// FEED AN OUTPUT BACK INTO AN INPUT: one D2D memcpy from the slot's
+    /// backing bytes into the lit's resident copy. Sizes must agree. The
+    /// resident copy becomes DEVICE-AUTHORITATIVE — the runtime's staged
+    /// host bytes for that lit are stale from here on, and are never
+    /// re-uploaded unless the lit is marked dirty again.
+    pub fn copy_output_to_input(&mut self, slot: usize, lit: i64) -> Result<()> {
+        let (src, bytes) = {
+            let (bound, _) = self.slot_home(slot)?;
+            (bound.ptr, bound.bytes)
+        };
+        let dst = self
+            .resident
+            .get(&lit)
+            .ok_or_else(|| anyhow!("input lit {lit} has no resident copy to feed back into"))?;
+        if dst.slice.len() != bytes {
+            bail!(
+                "copy_output_to_input: output slot {slot} is {bytes} bytes, input lit {lit} \
+                 is {} bytes",
+                dst.slice.len()
+            );
+        }
+        let (dst_ptr, _record) = dst.slice.device_ptr(&self.stream);
+        unsafe { cu::memcpy_dtod_async(dst_ptr, src, bytes, self.stream.cu_stream()) }
+            .context("D2D feedback copy")?;
+        self.dirty.remove(&lit);
+        Ok(())
+    }
+
+    /// Stage one lit: reuse the resident copy when it is clean and was
+    /// taken from these very bytes, else (re)upload — into the existing
+    /// allocation when the size still fits exactly, else a fresh one.
+    fn stage_input(&mut self, lit: i64, data: &HostBuffer, bytes: usize) -> Result<Bound> {
+        let host = &data.bytes;
+        if host.len() != bytes {
+            bail!(
+                "staged buffer {lit} is {} bytes, plan expects {bytes}",
+                host.len()
+            );
+        }
+        let identity = (host.as_ptr() as usize, host.len());
+        let dirty = self.dirty.remove(&lit);
+        let reuse_alloc = match self.resident.get(&lit) {
+            Some(resident)
+                if !dirty && (resident.host_ptr, resident.len) == identity =>
+            {
+                let (ptr, _record) = resident.slice.device_ptr(&self.stream);
+                return Ok(Bound { ptr, bytes });
+            }
+            Some(resident) => resident.slice.len() == bytes,
+            None => false,
+        };
+        let mut slice = if reuse_alloc {
+            self.resident.remove(&lit).expect("checked above").slice
+        } else {
+            self.resident.remove(&lit);
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }
+                .with_context(|| format!("device alloc {bytes} bytes for input lit {lit}"))?
+        };
+        if bytes > 0 {
+            self.stream.memcpy_htod(host, &mut slice).context("H2D")?;
+        }
+        let ptr = {
+            let (ptr, _record) = slice.device_ptr(&self.stream);
+            ptr
+        };
+        self.resident.insert(
+            lit,
+            Resident {
+                slice,
+                host_ptr: identity.0,
+                len: identity.1,
+                dtype: data.dtype,
+            },
+        );
+        Ok(Bound { ptr, bytes })
+    }
+
+    /// Bind an output slot's home, resizing when the plan sizes it
+    /// differently than the last one did.
+    fn output_home(&mut self, slot: usize, bytes: usize, dtype: PlanDtype) -> Result<Bound> {
+        let fits = self
+            .outputs
+            .get(&slot)
+            .is_some_and(|home| home.slice.len() == bytes.max(1));
+        if !fits {
+            self.outputs.remove(&slot);
+            let slice = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }
+                .with_context(|| format!("device alloc {bytes} bytes for output slot {slot}"))?;
+            self.outputs.insert(
+                slot,
+                OutputHome {
+                    slice,
+                    bytes,
+                    dtype,
+                },
+            );
+        }
+        let home = self.outputs.get_mut(&slot).expect("inserted above");
+        home.bytes = bytes;
+        home.dtype = dtype;
+        let (ptr, _record) = home.slice.device_ptr(&self.stream);
+        Ok(Bound { ptr, bytes })
+    }
+
+    fn scratch_home(&mut self, key: String, bytes: usize) -> Result<Bound> {
+        let entry = self.scratch.entry((key.clone(), bytes));
+        let slice = match entry {
+            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let slice = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }
+                    .with_context(|| format!("device alloc {bytes} bytes for {key}"))?;
+                vacant.insert(slice)
+            }
+        };
+        let (ptr, _record) = slice.device_ptr(&self.stream);
+        Ok(Bound { ptr, bytes })
     }
 }
 
@@ -223,21 +531,23 @@ fn bound_of(bindings: &FxHashMap<BufferId, Bound>, id: &BufferId, who: &str) -> 
 }
 
 /// Execute a bufferized plan on `device`. Returns, per output slot
-/// index, a host copy of the slot's BACKING buffer plus its
-/// [`OutputBinding`] (the elected layout) — the escape-and-disclose
-/// fetch, universal over dense and view elections.
+/// index, the slot's [`OutputBinding`] (the elected layout); the bytes
+/// stay on the device until [`CudaDevice::read_output`] asks for them —
+/// the escape-and-disclose fetch, universal over dense and view
+/// elections, now lazy.
 ///
 /// `staged` is a map of BORROWED payloads by BufferLit id (Phase 4). It
 /// used to hold the payloads themselves, which was fine while the only
 /// caller was the serving ladder — the runtime already owns them. The
 /// search now stages too, and it stages the CALLER's map, which for a
 /// full-size model is gigabytes of weights: a map of references costs
-/// one pointer per input and no copy at all.
+/// one pointer per input and no copy at all — and since the serving
+/// landing, no H2D either once a lit is resident and clean.
 pub fn execute_plan(
     device: &mut CudaDevice,
     plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
     staged: &FxHashMap<i64, &HostBuffer>,
-) -> Result<FxHashMap<usize, (HostBuffer, OutputBinding<luminal::layouts::DecodedLayout>)>> {
+) -> Result<FxHashMap<usize, OutputBinding<luminal::layouts::DecodedLayout>>> {
     // ESCAPE GUARD (ruling 2026-08-27): an output slot's backing storage
     // must SURVIVE the call — FreedBy::Caller, whatever the owner.
     // FreedBy::Program backing an output hands the caller bytes the
@@ -247,6 +557,11 @@ pub fn execute_plan(
     // certificate enforces this for planner-built plans; hand-built /
     // externally loaded plans never met it — re-check here, loudly,
     // before any bytes move.
+    //
+    // The same walk records which buffer each output slot names, so
+    // Phase 1 can give it the slot's pooled home.
+    let mut slot_of_buffer: FxHashMap<BufferId, usize> = FxHashMap::default();
+    let mut slot_bindings: Vec<OutputBinding<luminal::layouts::DecodedLayout>> = Vec::new();
     for node in plan.dag.node_weights() {
         if let BufferNode::BufferOutput { slots } = node {
             for slot in slots {
@@ -265,6 +580,8 @@ pub fn execute_plan(
                         buffer.owner,
                     );
                 }
+                slot_of_buffer.entry(slot.buffer.clone()).or_insert(slot.index);
+                slot_bindings.push(slot.clone());
             }
         }
     }
@@ -289,14 +606,16 @@ pub fn execute_plan(
         None => 0,
     };
 
-    // Phase 1: materialize the buffers that do NOT come from the slab —
-    // the BOUNDARY and ESCAPING rows (their bytes are the caller's after
+    // Phase 1: bind the buffers that do NOT come from the slab — the
+    // BOUNDARY and ESCAPING rows (their bytes are the caller's after
     // the call) and the DONATED row (the caller's bytes, which in CL
-    // means the staged payload's device copy). Slab members stay unbound
-    // until their `BufferAlloc` is issued.
-    let mut owned: FxHashMap<BufferId, CudaSlice<u8>> = FxHashMap::default();
+    // means the staged payload's resident copy). Slab members stay
+    // unbound until their `BufferAlloc` is issued.
     let mut bindings: FxHashMap<BufferId, Bound> = FxHashMap::default();
     let mut geometry: FxHashMap<BufferId, PlanDtype> = FxHashMap::default();
+    // Per HOME slot (the first slot naming a buffer): where its bytes
+    // live — a pooled output home or a resident input.
+    let mut home_of: FxHashMap<usize, Home> = FxHashMap::default();
     for (id, buffer) in &plan.buffers {
         let dtype = buffer.layout.dtype.ok_or_else(|| {
             anyhow!(
@@ -310,28 +629,33 @@ pub fn execute_plan(
     for id in arena.standalone.iter().chain(arena.donated.iter()) {
         let buffer = &plan.buffers[id];
         let bytes = buffer_bytes(buffer)?;
-        let mut slice = stream
-            .alloc_zeros::<u8>(bytes.max(1))
-            .with_context(|| format!("device alloc {} bytes for {:?}", bytes, buffer.label))?;
-        if let Some(lit) = buffer.lit
-            && let Some(data) = staged.get(&lit)
-        {
-            let host = typed_to_bytes(data);
-            if host.len() != bytes {
-                bail!(
-                    "staged buffer {lit} is {} bytes, plan expects {bytes} for {:?}",
-                    host.len(),
-                    buffer.label
-                );
+        let staged_lit = buffer.lit.filter(|lit| staged.contains_key(lit));
+        let bound = if let Some(lit) = staged_lit {
+            // A STAGED input: resident on the device. It may ALSO back an
+            // output slot (an escaped view election over an input's own
+            // bytes); the slot then reads the resident copy.
+            if let Some(&slot) = slot_of_buffer.get(id) {
+                home_of.insert(slot, Home::Input(lit));
             }
-            stream.memcpy_htod(host, &mut slice).context("H2D")?;
-        }
-        let ptr = {
-            let (ptr, _record) = slice.device_ptr(&stream);
-            ptr
+            device
+                .stage_input(lit, staged[&lit], bytes)
+                .with_context(|| format!("staging {:?}", buffer.label))?
+        } else if let Some(&slot) = slot_of_buffer.get(id) {
+            home_of.insert(slot, Home::Output(slot));
+            device.output_home(slot, bytes, geometry[id])?
+        } else if let Some(lit) = buffer.lit {
+            // A lit-bearing standalone buffer that backs no output slot
+            // is an INPUT (boundary or donated): it must be staged. It
+            // used to be zero-filled silently, which is how a missing
+            // `set_data` became a wrong answer instead of an error.
+            bail!(
+                "input {:?} (lit {lit}) has no staged payload — set_data it before execute",
+                buffer.label
+            );
+        } else {
+            device.scratch_home(format!("{id:?}"), bytes)?
         };
-        bindings.insert(id.clone(), Bound { ptr, bytes });
-        owned.insert(id.clone(), slice);
+        bindings.insert(id.clone(), bound);
     }
 
     // CONTRACT-1 (bind-time), NARROWED. Distinct BufferIds must be
@@ -346,12 +670,13 @@ pub fn execute_plan(
     // planning time and is checked there (see the CONTRACT-1 live-range
     // note in `crate::arena`).
     {
-        let bound: Vec<crate::binding_check::BoundRange> = owned
+        let bound: Vec<crate::binding_check::BoundRange> = bindings
             .iter()
-            .map(|(id, slice)| crate::binding_check::BoundRange {
+            .filter(|(_, b)| b.bytes > 0)
+            .map(|(id, b)| crate::binding_check::BoundRange {
                 buffer: format!("{id:?}"),
-                base: bindings[id].ptr,
-                bytes: slice.len() as u64,
+                base: b.ptr,
+                bytes: b.bytes as u64,
             })
             .collect();
         crate::binding_check::assert_disjoint(&bound).context("CONTRACT-1 bind-time check")?;
@@ -429,7 +754,9 @@ pub fn execute_plan(
                     continue;
                 }
                 if label == "BufferFree" {
-                    if let Some(buffer) = reads.first() {
+                    if let Some(buffer) = reads.first()
+                        && arena.slices.contains_key(buffer)
+                    {
                         bindings.remove(buffer);
                     }
                     continue;
@@ -513,25 +840,27 @@ pub fn execute_plan(
     }
     stream.synchronize().context("stream sync")?;
 
-    // Phase 4: D2H each output SLOT's backing buffer — the escaped
-    // buffer for a view election, the boundary buffer for a dense one —
-    // keyed by slot index and paired with the binding's layout. (The
+    // Phase 4: record each output SLOT's disclosed binding against the
+    // home whose bytes back it — the escaped buffer for a view election,
+    // the boundary buffer for a dense one — keyed by slot index. The
+    // bytes stay on the device until `read_output` asks for them. (The
     // declared-but-unused Boundary buffer of an escaped slot never
-    // reaches this plan: buffer DCE dropped it, so Phase 1 never
-    // allocated it; and no free node exists for an escaping buffer, so
-    // every output slot is still bound here.)
+    // reaches this plan: buffer DCE dropped it, so Phase 1 never bound
+    // it; and no free node exists for an escaping buffer, so every
+    // output slot is still bound here.)
+    device.slot_view.clear();
     let mut outputs = FxHashMap::default();
-    for node in plan.dag.node_weights() {
-        if let BufferNode::BufferOutput { slots } = node {
-            for slot in slots {
-                let bound = bound_of(&bindings, &slot.buffer, "output slot")?;
-                let mut host = vec![0u8; bound.bytes];
-                unsafe { cu::memcpy_dtoh_async(&mut host, bound.ptr, stream.cu_stream()) }
-                    .context("D2H")?;
-                let dtype = geometry[&slot.buffer];
-                outputs.insert(slot.index, (bytes_to_typed(&host, dtype)?, slot.clone()));
-            }
-        }
+    for slot in slot_bindings {
+        let home_slot = slot_of_buffer[&slot.buffer];
+        let home = *home_of.get(&home_slot).ok_or_else(|| {
+            anyhow!(
+                "output slot {} names buffer {:?}, which Phase 1 never bound",
+                slot.index,
+                slot.buffer
+            )
+        })?;
+        device.slot_view.insert(slot.index, (home, slot.clone()));
+        outputs.insert(slot.index, slot);
     }
     Ok(outputs)
 }

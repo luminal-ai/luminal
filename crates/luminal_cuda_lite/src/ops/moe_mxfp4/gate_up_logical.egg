@@ -1,0 +1,11 @@
+; Logical MXFP4 MoE, gate/up half (the serving landing, 2026-09-10):
+;   hidden[t, k, :] = swiglu(W_gu[e(t,k)] · x[t] + b_gu[e(t,k)])
+; over PACKED expert weights. Operands, in order:
+;   x       [s, hidden]                F32
+;   ids     [s, top_k]                 Int      (selected expert per route slot)
+;   blocks  [experts, 2*inter, hidden/2]  U8    (fp4 e2m1 nibble pairs)
+;   scales  [experts, 2*inter, hidden/32] F8UE8M0
+;   bias    [experts, 2*inter]         Bf16
+; Metadata: inter, top_k, alpha (swiglu), limit (clamp).
+; Result: [s, top_k, inter] F32.
+(constructor LogicalMoeGateUpMxfp4 (LogicalTensor LogicalTensor LogicalTensor LogicalTensor LogicalTensor i64 i64 f64 f64) LogicalTensor)

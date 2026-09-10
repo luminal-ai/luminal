@@ -522,6 +522,113 @@ pub fn sample_genome_reporting(
     (genome, fallbacks)
 }
 
+/// THE GREEDY SEED (serving landing, 2026-09-10): [`sample_genome`]'s
+/// admissibility walk with every random pick replaced by a deterministic
+/// one — the member with the smallest sorted position among those that
+/// can still choose admissibly, and, per member, the admissible
+/// candidate with the LOWEST `cost`. The result is the genome a
+/// bytes-moved prior would build one class at a time: a library matmul
+/// over its decomposed spelling, a view over a copy, and so on.
+///
+/// WHY IT EXISTS. Uniform sampling picks each of a graph's producer
+/// classes independently; on a serving graph with hundreds of matmul
+/// sites the all-library genome has probability ~2^-N, so a random
+/// generation 0 never contains a plan that fits a device at prefill
+/// widths, and mutation cannot walk there in a few generations. Seeding
+/// generation 0 with this genome gives the device-profiled search a
+/// viable incumbent to improve on; nothing else about the search changes
+/// (the seed is measured like any other candidate and loses if a
+/// mutation beats it).
+///
+/// The same cycle invariant as the sampler: the chosen-edge graph is
+/// acyclic unless a member had no admissible option, in which case the
+/// full-list fallback is taken and the class reported, exactly as
+/// [`sample_genome_reporting`] does.
+pub fn greedy_genome(
+    index: &ProducerIndex,
+    space: &SamplingSpace,
+    cost: &dyn Fn(&ClassId, &ProducerChoice) -> u64,
+) -> Genome {
+    let mut genome = Genome::default();
+    for members in &space.components {
+        let mut pending: Vec<Vec<usize>> = members
+            .iter()
+            .map(|class| {
+                space.intra_sources[class]
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<usize>>()
+            })
+            .collect();
+        let mut admissible: Vec<usize> = pending
+            .iter()
+            .map(|per_candidate| per_candidate.iter().filter(|left| **left == 0).count())
+            .collect();
+        let mut dependents: std::collections::BTreeMap<&ClassId, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
+        for (member, class) in members.iter().enumerate() {
+            for (candidate, sources) in space.intra_sources[class].iter().enumerate() {
+                for source in sources {
+                    dependents
+                        .entry(source)
+                        .or_default()
+                        .push((member, candidate));
+                }
+            }
+        }
+        let mut assigned = vec![false; members.len()];
+        for _ in 0..members.len() {
+            let mut pool: Vec<usize> = (0..members.len())
+                .filter(|member| !assigned[*member] && admissible[*member] > 0)
+                .collect();
+            let forced = pool.is_empty();
+            if forced {
+                pool = (0..members.len())
+                    .filter(|member| !assigned[*member])
+                    .collect();
+            }
+            let member = pool[0];
+            let class = &members[member];
+            let candidates = &index[class];
+            let allowed: Vec<usize> = (0..candidates.len())
+                .filter(|position| pending[member][*position] == 0)
+                .collect();
+            let choices: Vec<usize> = if allowed.is_empty() {
+                (0..candidates.len()).collect()
+            } else {
+                allowed
+            };
+            let position = choices
+                .iter()
+                .copied()
+                .min_by_key(|position| (cost(class, &candidates[*position].1), *position))
+                .expect("a class in the producer index has at least one candidate");
+            genome
+                .choices
+                .insert(class.clone(), candidates[position].1.clone());
+            assigned[member] = true;
+            for (other, candidate) in dependents.get(class).into_iter().flatten() {
+                pending[*other][*candidate] -= 1;
+                if pending[*other][*candidate] == 0 {
+                    admissible[*other] += 1;
+                }
+            }
+        }
+    }
+    for (class, candidates) in index {
+        if genome.choices.contains_key(class) {
+            continue;
+        }
+        let position = (0..candidates.len())
+            .min_by_key(|position| (cost(class, &candidates[*position].1), *position))
+            .expect("a class in the producer index has at least one candidate");
+        genome
+            .choices
+            .insert(class.clone(), candidates[position].1.clone());
+    }
+    genome
+}
+
 /// Would routing `class` through `sources` close a cycle in the genome's
 /// chosen intra-component edge graph? A DFS from each source over the
 /// OTHER members' current choices; reaching `class` again — or a source
