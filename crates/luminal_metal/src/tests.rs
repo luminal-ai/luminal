@@ -1977,3 +1977,66 @@ fn metal_constant_negative_infinity_mask_matches_reference() {
         "expected all -inf, got {metal:?}"
     );
 }
+/// Compile `build`'s graph through the `DynBackend` factory, returning the
+/// factory's error if it rejected the graph.
+fn metal_factory_error(build: impl Fn(&mut Graph)) -> Option<String> {
+    use luminal::dyn_backend::BackendCompileArgs;
+    let mut cx = Graph::default();
+    build(&mut cx);
+    let args = BackendCompileArgs {
+        search_iters: 1,
+        weights: Vec::new(),
+        tensor_sizes: HashMap::new(),
+        device_ptrs: HashMap::new(),
+    };
+    crate::dyn_backend::metal_factory(&mut cx, args).err()
+}
+
+#[test]
+fn metal_factory_rejects_i64_introduced_by_cast() {
+    // `constant_i64` builds its value from Iota limbs cast to I64. The graph
+    // has no I64 `Input`, so the dtype comes only from the casts. Reaching
+    // codegen panics with "Metal dtype Int64 is not supported yet".
+    let err = metal_factory_error(|cx| {
+        let c = cx.constant_i64(1_234_567_890_123);
+        c.cast(DType::F32).output();
+    })
+    .expect("expected the factory to reject an I64 graph");
+    assert!(
+        err.contains(&format!("{:?}", DType::I64)),
+        "error should name the offending dtype, got: {err}"
+    );
+}
+
+#[test]
+fn metal_factory_rejects_f64_constant() {
+    // `ConstantF64` introduces F64 with no input node and has no Metal
+    // rewrite, so it otherwise survives to the runtime as an unlowered node.
+    let err = metal_factory_error(|cx| {
+        let c = cx.constant_float64(1.5);
+        c.cast(DType::F32).output();
+    })
+    .expect("expected the factory to reject an F64 graph");
+    assert!(
+        err.contains(&format!("{:?}", DType::F64)),
+        "error should name the offending dtype, got: {err}"
+    );
+}
+
+#[test]
+fn metal_dtype_guard_accepts_supported_dtypes() {
+    // The guard must not reject dtypes Metal does emit. This calls the guard
+    // directly, not the factory, because the factory would go on to compile
+    // and execute the graph, which needs input data this test does not supply.
+    let mut cx = Graph::default();
+    let a = cx.named_tensor("a", 4);
+    let b = cx.named_tensor("b", 4).cast(DType::F16).cast(DType::F32);
+    let c = cx.constant(3);
+    (a + b + c.cast(DType::F32).expand_dim(0, 4)).output();
+
+    assert_eq!(
+        crate::dyn_backend::reject_unsupported_dtype(&cx),
+        Ok(()),
+        "guard rejected a graph using only Metal-supported dtypes"
+    );
+}
