@@ -101,11 +101,17 @@ __device__ __forceinline__ void gate_up_body(
     const int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int jblocks = inter / R;
     const int gate_up_n = 2 * inter;
-    const long long total = (long long)seq * top_k * jblocks;
+    const int pairs = seq * top_k;
+    const long long total = (long long)pairs * jblocks;
     const long long task = warp_global;
     if (task < total) {
-        const int pair = (int)(task / jblocks);
-        const int j0 = (int)(task % jblocks) * R;
+        // ROW TILE OUTER, PAIR INNER: consecutive warps (in flight
+        // together) walk the same rows of whichever experts the batch
+        // routed to, so a tile is read from HBM once and served from
+        // L2 for every token sharing its expert. The full expert set is
+        // ~2 GB but one tile across all experts is ~1.5 MB.
+        const int j0 = (int)(task / pairs) * R;
+        const int pair = (int)(task % pairs);
         const int t = pair / top_k;
         const long long e = topk_ids[(long long)t * top_k + pair % top_k];
         const float* xt = x + (long long)t * hidden_dim;
@@ -157,8 +163,9 @@ __device__ __forceinline__ void down_body(
     const long long total = (long long)seq * rblocks;
     const long long task = warp_global;
     if (task < total) {
-        const int t = (int)(task / rblocks);
-        const int r0 = (int)(task % rblocks) * R;
+        // Row tile outer, token inner (see gate_up_body).
+        const int r0 = (int)(task / seq) * R;
+        const int t = (int)(task % seq);
         float mix[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) mix[r] = 0.0f;

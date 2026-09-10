@@ -908,9 +908,14 @@ fn run_prepared(
     // attribute wall time per op label — a development probe for finding
     // the hot ops of a plan, never on in serving (the syncs serialize
     // the stream).
-    let profile_ops = std::env::var_os("LUMINAL_CL_PROFILE_OPS").is_some();
+    // `=trace` additionally lists every step in issue order — the
+    // launch-count view a decode tick lives or dies by.
+    let profile_mode = std::env::var("LUMINAL_CL_PROFILE_OPS").ok();
+    let profile_ops = profile_mode.is_some();
+    let profile_trace = profile_mode.as_deref() == Some("trace");
     let mut op_times: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
     let mut op_clock = std::time::Instant::now();
+    let mut step_index = 0usize;
 
     // Phase 3: dispatch, in the arena's issue order.
     for step in &prepared.steps {
@@ -1029,9 +1034,14 @@ fn run_prepared(
         };
         if let Some(label) = profile_label {
             stream.synchronize().context("profile sync")?;
+            let ms = op_clock.elapsed().as_secs_f64() * 1e3;
+            if profile_trace {
+                eprintln!("[cl-trace] {step_index:>5} {ms:>8.3} ms  {label}");
+            }
+            step_index += 1;
             let entry = op_times.entry(label).or_default();
             entry.0 += 1;
-            entry.1 += op_clock.elapsed().as_secs_f64() * 1e3;
+            entry.1 += ms;
         }
     }
     stream.synchronize().context("stream sync")?;
