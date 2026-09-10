@@ -96,7 +96,8 @@ impl KernelOp for ConstantDps {
         let n = numel(&ctx.dest_dims[0]);
         let value = cuda_f64_literal(self.value);
         let source = format!(
-            r#"extern "C" __global__ void k({to}* out, unsigned long long n) {{
+            r#"extern "C" __global__ void k({to}* out, const long long* params) {{
+    const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = ({to}){value};
 }}"#
@@ -151,7 +152,7 @@ mod tests {
         CodegenCtx {
             operand_dims: vec![],
             operand_dtypes: vec![],
-            dest_dims: vec![vec![4]],
+            dest_dims: vec![vec![4usize.into()]],
             dest_dtypes: vec![PlanDtype::F32],
             operand_layouts: vec![],
         }
@@ -246,7 +247,8 @@ mod tests {
     fn constant_kernel_text_is_otherwise_unchanged() {
         assert_eq!(
             source_for(3.0),
-            r#"extern "C" __global__ void k(float* out, unsigned long long n) {
+            r#"extern "C" __global__ void k(float* out, const long long* params) {
+    const unsigned long long n = 4LL;
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = (float)3e0;
 }"#

@@ -139,7 +139,7 @@ fn audit(
                     let flat = luminal_cuda_lite::kernels::layout_read_index(
                         "probe",
                         &info.layout,
-                        &dims,
+                        &dims.into_iter().map(Into::into).collect::<Vec<_>>(),
                         luminal_cuda_lite::kernels::Coords::FlatIndex { prefix: "c" },
                     )
                     .is_ok_and(|(chain, idx)| chain.is_empty() && idx == "i");
@@ -165,7 +165,7 @@ fn audit(
                     let flat = luminal_cuda_lite::kernels::layout_read_index(
                         "probe",
                         &info.layout,
-                        &dims,
+                        &dims.into_iter().map(Into::into).collect::<Vec<_>>(),
                         luminal_cuda_lite::kernels::Coords::FlatIndex { prefix: "c" },
                     )
                     .is_ok_and(|(chain, idx)| chain.is_empty() && idx == "i");

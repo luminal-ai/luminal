@@ -35,6 +35,10 @@
 //! | ESCAPING | `System` | `Caller` | yes | no | `standalone` |
 //! | INTERIOR | `System` | `Program` | yes | yes | **slab member** |
 //!
+//! This pass recycles only the INTERIOR row. storage::plan subsequently places
+//! the other rows in disjoint regions of the same runtime allocation.
+//! Their device storage holds private copies of host-owned boundary values.
+//!
 //! Only the INTERIOR row has BOTH ends of a lifetime inside the
 //! program, which is exactly the precondition for handing its bytes to
 //! a later buffer. An ESCAPING buffer's bytes are the caller's from
@@ -48,8 +52,8 @@
 //! `bytes_of` is the caller's, so tests can plan with mock sizes and
 //! the executor can pass the one real rule (`literal_span_elements() *
 //! dtype_bytes(dtype)` — see `crate::device`). Symbolic extents are the
-//! caller's error to raise. Buckets are always concrete (D7), so the
-//! slab is always a number.
+//! caller's responsibility: storage::plan evaluates conservative interval
+//! capacities for symbolic buffers.
 //!
 //! # What is NOT here
 //!
@@ -333,7 +337,7 @@ struct FreeList {
 }
 
 impl FreeList {
-    fn alloc(&mut self, need: usize) -> usize {
+    fn alloc(&mut self, need: usize) -> Result<usize> {
         // FIRST fit, in offset order — MEASURED against the obvious
         // alternative and kept. First fit leaves about a fifth of the
         // slab in holes on the two-layer mini-llama block (596480 B
@@ -351,7 +355,7 @@ impl FreeList {
             if len > need {
                 self.holes.insert(offset + need, len - need);
             }
-            return offset;
+            return Ok(offset);
         }
         // No hole fits. If the LAST hole runs right up to the top, grow
         // through it instead of stranding it (coalescing with the
@@ -360,12 +364,17 @@ impl FreeList {
             && offset + len == self.top
         {
             self.holes.remove(&offset);
-            self.top = offset + need;
-            return offset;
+            self.top = offset
+                .checked_add(need)
+                .ok_or_else(|| anyhow!("arena size overflow"))?;
+            return Ok(offset);
         }
         let offset = self.top;
-        self.top += need;
-        offset
+        self.top = self
+            .top
+            .checked_add(need)
+            .ok_or_else(|| anyhow!("arena size overflow"))?;
+        Ok(offset)
     }
 
     fn free(&mut self, offset: usize, len: usize) {
@@ -503,8 +512,12 @@ pub(crate) fn plan_arena_over<L: PlanLayout>(
             let Some(&bytes) = sizes.get(buffer) else {
                 continue; // not a slab member (demoted, escaping, …)
             };
-            let need = align_up(bytes.max(1));
-            let offset = free_list.alloc(need);
+            let need = bytes
+                .max(1)
+                .checked_add(ARENA_ALIGN - 1)
+                .map(|n| n / ARENA_ALIGN * ARENA_ALIGN)
+                .ok_or_else(|| anyhow!("arena alignment overflow"))?;
+            let offset = free_list.alloc(need)?;
             if let Some((&prev, (prev_len, prev_id))) = live.range(..offset).next_back()
                 && prev + prev_len > offset
             {

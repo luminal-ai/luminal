@@ -13,6 +13,8 @@ type BinaryIotaBuilder = fn(Box<IotaExpr>, Box<IotaExpr>) -> IotaExpr;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IotaExpr {
     Lit(i64),
+    /// A runtime dimension, retained when extraction uses interval bounds.
+    Var(String),
     /// CoordVar axis, zero-based from the END over the OUT coordinates.
     Coord(usize),
     Add(Box<IotaExpr>, Box<IotaExpr>),
@@ -21,6 +23,8 @@ pub enum IotaExpr {
     TruncDiv(Box<IotaExpr>, Box<IotaExpr>),
     /// Truncated remainder — the preamble's IntTruncRem.
     TruncRem(Box<IotaExpr>, Box<IotaExpr>),
+    /// Ceiling division, including symbolic shape arithmetic.
+    CeilDiv(Box<IotaExpr>, Box<IotaExpr>),
     Min(Box<IotaExpr>, Box<IotaExpr>),
     Max(Box<IotaExpr>, Box<IotaExpr>),
     /// The bool bridge's indicator: `(a < b) as i64` — IntCastFromBool
@@ -31,18 +35,34 @@ pub enum IotaExpr {
 impl IotaExpr {
     /// Evaluate at the given OUT coordinates (front-indexed).
     pub fn eval(&self, coords: &[usize]) -> i64 {
+        self.eval_with_dims(coords, &Default::default())
+    }
+
+    /// Evaluate coordinates and runtime dimension variables.
+    pub fn eval_with_dims(&self, coords: &[usize], dims: &crate::shape::DynMap) -> i64 {
+        let eval = |expr: &Self| expr.eval_with_dims(coords, dims);
         match self {
             IotaExpr::Lit(value) => *value,
+            IotaExpr::Var(name) => i64::try_from(
+                *dims
+                    .get(&crate::shape::Symbol::from(name.as_str()))
+                    .unwrap_or_else(|| panic!("unbound index-expression dimension `{name}`")),
+            )
+            .expect("dimension exceeds i64"),
             IotaExpr::Coord(axis_from_end) => coords[coords.len() - 1 - axis_from_end] as i64,
-            IotaExpr::Add(a, b) => a.eval(coords) + b.eval(coords),
-            IotaExpr::Mul(a, b) => a.eval(coords) * b.eval(coords),
+            IotaExpr::Add(a, b) => eval(a) + eval(b),
+            IotaExpr::Mul(a, b) => eval(a) * eval(b),
             // Divisors are literal strides/extents (>= 1 by construction);
             // a zero here is a translator bug and deserves the loud panic.
-            IotaExpr::TruncDiv(a, b) => a.eval(coords) / b.eval(coords),
-            IotaExpr::TruncRem(a, b) => a.eval(coords) % b.eval(coords),
-            IotaExpr::Min(a, b) => a.eval(coords).min(b.eval(coords)),
-            IotaExpr::Max(a, b) => a.eval(coords).max(b.eval(coords)),
-            IotaExpr::LessThanCast(a, b) => (a.eval(coords) < b.eval(coords)) as i64,
+            IotaExpr::TruncDiv(a, b) => eval(a) / eval(b),
+            IotaExpr::TruncRem(a, b) => eval(a) % eval(b),
+            IotaExpr::CeilDiv(a, b) => {
+                let (a, b) = (eval(a), eval(b));
+                a / b + i64::from(a % b != 0 && ((a > 0) == (b > 0)))
+            }
+            IotaExpr::Min(a, b) => eval(a).min(eval(b)),
+            IotaExpr::Max(a, b) => eval(a).max(eval(b)),
+            IotaExpr::LessThanCast(a, b) => (eval(a) < eval(b)) as i64,
         }
     }
 }
@@ -142,6 +162,18 @@ fn parse_int_expr_uncached(
         let value_class = site.class_of_child(lit, 0)?;
         return Some(IotaExpr::Lit(site.node_in_class_parse_i64(&value_class)?));
     }
+    for var in site.nodes_in_class_value(class, "IntVar") {
+        let name_class = site.class_of_child(var, 0)?;
+        if let Some(name) = site
+            .index
+            .nodes_of(&name_class)
+            .iter()
+            .filter_map(|id| site.egraph.nodes.get(id))
+            .find_map(|n| n.op.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        {
+            return Some(IotaExpr::Var(name.to_string()));
+        }
+    }
     for coord in site.nodes_in_class_value(class, "CoordVar") {
         // Scoped coordinates: child 0 is the owner Shape, child 1 the
         // axis. The owner-shape guard: when the caller names its out
@@ -167,11 +199,12 @@ fn parse_int_expr_uncached(
     // a saturated class holds many equal spellings, and the first node of
     // a kind may have children outside the parsed subset while a sibling
     // spelling parses fine.
-    let binary_kinds: [(&str, BinaryIotaBuilder); 6] = [
+    let binary_kinds: [(&str, BinaryIotaBuilder); 7] = [
         ("IntAdd", |a, b| IotaExpr::Add(a, b)),
         ("IntMul", |a, b| IotaExpr::Mul(a, b)),
         ("IntTruncDiv", |a, b| IotaExpr::TruncDiv(a, b)),
         ("IntTruncRem", |a, b| IotaExpr::TruncRem(a, b)),
+        ("IntCeilDiv", |a, b| IotaExpr::CeilDiv(a, b)),
         ("IntMin", |a, b| IotaExpr::Min(a, b)),
         ("IntMax", |a, b| IotaExpr::Max(a, b)),
     ];

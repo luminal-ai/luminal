@@ -1,35 +1,9 @@
-//! The device half of the cuBLASLt host call: cudarc **result layer**
-//! dispatch of a resolved [`LtCall`].
-//!
-//! LAYER CHOICE (Train 3, documented decision): cudarc's SAFE layer
-//! (`cudarc::cublaslt::safe`) routes ONE `c_layout` handle into both
-//! the C and D descriptor arguments and hands `cublasLtMatmul` the same
-//! pointer for C and D unconditionally — it cannot express contract 3
-//! (a VALID standalone Cdesc with C=D aliasing under our control), a
-//! separate ldc/ldd, or an explicit POINTER_MODE attribute. The RESULT
-//! layer (`cudarc::cublaslt::result`) exposes exactly the descriptor
-//! calls we need (`create_matrix_layout`, `create_matmul_desc`,
-//! `set_matmul_desc_attribute`, `get_matmul_algo_heuristic`, `matmul`)
-//! with error-code handling, so nothing is taken from raw `sys` except
-//! enum values and the one GetAttribute the TF32 detector reads back.
-//!
-//! Contracts implemented here (see `exec.rs` module doc for the list):
-//! POINTER_MODE_HOST set explicitly with compile-time literal scalars
-//! (alpha = 1.0f const; beta in {0.0f, 1.0f} structural); strict
-//! CUBLAS_COMPUTE_32F with a startup detector at handle creation; a
-//! valid Cdesc on every call; workspace OWNED explicitly (allocated by
-//! us ONCE per CUDA context and reused by every dispatch — see
-//! [`workspace_slab`] — sized into the heuristic preference; no silent
-//! fallback: zero heuristic results is a loud bail); stream-ordered on
-//! the CALLER's stream (the same stream the surrounding NVRTC kernels
-//! run on).
-
+//! Prepared cuBLASLt calls recorded into opaque CUDA child graphs.
+use crate::host::{CaptureCtx, PreparedHostOp};
 use anyhow::{Context, Result, anyhow};
 use cudarc::cublaslt::result as lt;
 use cudarc::cublaslt::sys;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::exec::{CSource, LtCall, LtDesc, LtOrder};
@@ -124,47 +98,6 @@ pub fn assert_compute_strictness() -> Result<()> {
     handle().map(|_| ())
 }
 
-/// THE cuBLASLt WORKSPACE SLAB: [`WORKSPACE_BYTES`] allocated ONCE per
-/// CUDA context and held for the life of the process, reached the same
-/// way [`handle`] is (a `static OnceLock` behind a `Mutex`).
-///
-/// WHY ONCE — SEARCH-TIME ELECTION BIAS. This used to be an
-/// `alloc_zeros` on EVERY dispatch. The search calls dispatch once per
-/// candidate genome per profiling round, so a 32 MiB allocation was
-/// charged to the marker on every measurement while the decomposed
-/// route it competes against pays nothing of the kind: the op is then
-/// ranked on its allocator cost, not its matmul. That is exactly the
-/// failure main's FlashInfer host op documents — "global workspaces
-/// (`static OnceLock`) are shared across all instances ... without this,
-/// the GA never selects FlashInfer because the first-run allocation cost
-/// dwarfs the kernel time" — and main's cuBLASLt handle cache
-/// (`try_create_cublaslt`) is the same shape for the same reason.
-///
-/// WHY KEYED BY CONTEXT, NOT BY STREAM. A `CudaSlice` is memory in the
-/// context its stream belongs to, so the key has to separate contexts.
-/// Main keys its handle cache by `stream.cu_stream()`, which cannot work
-/// here: `CudaDevice::new` takes `ctx.default_stream()`, whose
-/// `cu_stream` is the NULL stream for every ordinal, so a stream key
-/// would hand a context-A allocation to a context-B dispatch. Keying on
-/// `cu_ctx` is the faithful adaptation. Within one context CL issues
-/// everything on that one NULL stream (see `device.rs`), so a shared
-/// slab cannot be touched by two overlapping matmuls.
-///
-/// The map holds each slice PERMANENTLY and a `CudaSlice` owns an
-/// `Arc<CudaStream>`, which owns its `Arc<CudaContext>` — so a live
-/// entry pins its own context and the `cu_ctx` address behind a key can
-/// never be recycled by a different context. The cost of that is 32 MiB
-/// per context, never freed; main accepts the same trade for the same
-/// reason.
-///
-/// LOCK ORDER: [`dispatch`] takes the handle mutex and then this one,
-/// and it is the only site that holds both. Nothing takes them the other
-/// way round.
-fn workspace_slab() -> &'static Mutex<HashMap<usize, CudaSlice<u8>>> {
-    static WORKSPACES: OnceLock<Mutex<HashMap<usize, CudaSlice<u8>>>> = OnceLock::new();
-    WORKSPACES.get_or_init(Default::default)
-}
-
 /// RAII matrix layout. CUBLASLT_MATRIX_LAYOUT_ORDER is ALWAYS declared
 /// explicitly and ALWAYS read off the [`LtDesc`] — never a constant
 /// here, and never the library default. The library default is COL;
@@ -234,12 +167,12 @@ pub use crate::host::DeviceRange;
 /// arena assigned it. The caller has ALREADY run
 /// `call.validate_against` — this function re-checks (defense in depth)
 /// and then never re-derives a number the `LtCall` carries.
-pub fn dispatch(
+pub fn prepare(
     call: &LtCall,
     operands: &[DeviceRange],
     dest: DeviceRange,
-    stream: &Arc<CudaStream>,
-) -> Result<()> {
+    workspace: DeviceRange,
+) -> Result<PreparedCall> {
     // BIAS/ORDER TRIPWIRE, DEFENSE IN DEPTH (ruling 2026-09-01): a
     // planned bias form arrives with a COL D — the estate's bias
     // decorators require a LeftMajor D and `exec::bind_destination`
@@ -326,26 +259,6 @@ pub fn dispatch(
     let c_layout = Layout::new(&call.c)?;
     let d_layout = Layout::new(&call.d)?;
 
-    // Workspace: OURS, explicitly, sized into the preference so the
-    // heuristic can only pick algos that fit it. Zero heuristic hits is
-    // a loud bail (the result layer maps that to NOT_SUPPORTED).
-    //
-    // Allocated ONCE per CUDA context and reused by every dispatch (see
-    // `workspace_slab`), never per call — a per-call 32 MiB alloc priced
-    // the marker out of its own search. Zeroed only at creation:
-    // cuBLASLt treats the workspace as scratch and neither reads it
-    // before writing nor requires it clean between calls.
-    let mut workspaces = workspace_slab()
-        .lock()
-        .map_err(|_| anyhow!("cuBLASLt workspace mutex poisoned"))?;
-    let workspace = match workspaces.entry(stream.context().cu_ctx() as usize) {
-        Entry::Occupied(slot) => slot.into_mut(),
-        Entry::Vacant(slot) => slot.insert(
-            stream
-                .alloc_zeros::<u8>(WORKSPACE_BYTES)
-                .context("cuBLASLt workspace alloc")?,
-        ),
-    };
     let pref =
         lt::create_matmul_pref().map_err(|e| anyhow!("cublasLtMatmulPreferenceCreate: {e:?}"))?;
     struct Pref {
@@ -359,7 +272,7 @@ pub fn dispatch(
         }
     }
     let pref = Pref { raw: pref };
-    let ws_size: usize = WORKSPACE_BYTES;
+    let ws_size = workspace.bytes;
     unsafe {
         lt::set_matmul_pref_attribute(
             pref.raw,
@@ -410,28 +323,91 @@ pub fn dispatch(
             (operands[i].ptr, &BETA_ONE)
         }
     };
-    let (w_ptr, _rw) = workspace.device_ptr(stream);
+    Ok(PreparedCall {
+        desc,
+        a_layout,
+        b_layout,
+        c_layout,
+        d_layout,
+        algo: heuristic.algo,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        d_ptr,
+        beta,
+        workspace,
+    })
+}
 
-    unsafe {
-        lt::matmul(
-            guard.raw,
-            desc.raw,
-            (&ALPHA) as *const f32 as *const _,
-            beta as *const f32 as *const _,
-            a_ptr as *const _,
-            a_layout.raw,
-            b_ptr as *const _,
-            b_layout.raw,
-            c_ptr as *const _,
-            c_layout.raw,
-            d_ptr as *mut _,
-            d_layout.raw,
-            (&heuristic.algo) as *const _,
-            w_ptr as *mut _,
-            WORKSPACE_BYTES,
-            stream.cu_stream() as *mut _,
-        )
+/// Descriptors and selected algorithm remain alive alongside their captured graph.
+pub struct PreparedCall {
+    desc: Desc,
+    a_layout: Layout,
+    b_layout: Layout,
+    c_layout: Layout,
+    d_layout: Layout,
+    algo: sys::cublasLtMatmulAlgo_t,
+    a_ptr: u64,
+    b_ptr: u64,
+    c_ptr: u64,
+    d_ptr: u64,
+    beta: &'static f32,
+    workspace: DeviceRange,
+}
+impl PreparedHostOp for PreparedCall {
+    unsafe fn record(&self, capture: &CaptureCtx<'_>) -> Result<()> {
+        let guard = handle()?
+            .lock()
+            .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
+        unsafe {
+            lt::matmul(
+                guard.raw,
+                self.desc.raw,
+                (&ALPHA) as *const f32 as *const _,
+                self.beta as *const f32 as *const _,
+                self.a_ptr as *const _,
+                self.a_layout.raw,
+                self.b_ptr as *const _,
+                self.b_layout.raw,
+                self.c_ptr as *const _,
+                self.c_layout.raw,
+                self.d_ptr as *mut _,
+                self.d_layout.raw,
+                &self.algo,
+                self.workspace.ptr as *mut _,
+                self.workspace.bytes,
+                capture.stream().cu_stream() as *mut _,
+            )
+        }
+        .map_err(|e| anyhow!("cublasLtMatmul capture failed: {e:?}"))
     }
-    .map_err(|e| anyhow!("cublasLtMatmul failed: {e:?}"))?;
+}
+
+/// Standalone contract-test convenience; execution uses a CUDA graph too.
+pub fn dispatch(
+    call: &LtCall,
+    operands: &[DeviceRange],
+    dest: DeviceRange,
+    stream: &Arc<CudaStream>,
+) -> Result<()> {
+    // A private nonblocking stream supports capture even if the caller uses the
+    // legacy default stream. Complete caller uploads before recording/launching.
+    stream.synchronize()?;
+    let capture_stream = stream.context().new_stream()?;
+    let workspace = capture_stream.alloc_zeros::<u8>(WORKSPACE_BYTES)?;
+    let ptr = workspace.device_ptr(&capture_stream).0;
+    let prepared = prepare(
+        call,
+        operands,
+        dest,
+        DeviceRange {
+            ptr,
+            bytes: WORKSPACE_BYTES,
+        },
+    )?;
+    let graph = crate::cuda_graph::Graph::capture(&capture_stream, &prepared)?;
+    let exec = graph.instantiate()?;
+    exec.launch(&capture_stream)?;
+    capture_stream.synchronize()?;
     Ok(())
 }

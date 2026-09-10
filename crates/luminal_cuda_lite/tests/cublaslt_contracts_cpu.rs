@@ -25,6 +25,7 @@ fn cid(s: &str) -> ClassId {
 /// see `exec.rs`'s ROW CONVENTION), no decoration.
 fn base_spec(m: i64, n: i64, k: i64) -> LtMatmulSpec {
     LtMatmulSpec {
+        dim_exprs: Default::default(),
         form: CublasLtForm::Base,
         m: CuDim::Literal(m),
         n: CuDim::Literal(n),

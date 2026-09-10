@@ -201,7 +201,8 @@ impl KernelOp for ScatterFunctionalDps {
         )?;
         let copy_src = if init_chain.is_empty() {
             format!(
-                r#"extern "C" __global__ void k({sig}, {t}* out, unsigned long long n) {{
+                r#"extern "C" __global__ void k({sig}, {t}* out, const long long* params) {{
+    const unsigned long long n = {dest_n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = init[{init_idx}];
 }}"#
@@ -209,7 +210,8 @@ impl KernelOp for ScatterFunctionalDps {
         } else {
             let prelude = coord_prelude(dest_dims);
             format!(
-                r#"extern "C" __global__ void k({sig}, {t}* out, unsigned long long n) {{
+                r#"extern "C" __global__ void k({sig}, {t}* out, const long long* params) {{
+    const unsigned long long n = {dest_n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 {prelude}{init_chain}    out[i] = init[{init_idx}];
@@ -264,7 +266,7 @@ impl KernelOp for ScatterFunctionalDps {
             any_chain |= !chain.is_empty();
             reads.push_str(&chain);
             reads.push_str(&format!("    coord = (long long){name}[{idx}];\n"));
-            reads.push_str(&format!("    flat += coord * {stride}LL;\n"));
+            reads.push_str(&format!("    flat += coord * {stride};\n"));
         }
         let (src_chain, src_idx) = layout_read_index(
             "src",
@@ -282,7 +284,8 @@ impl KernelOp for ScatterFunctionalDps {
         body.push_str(&src_chain);
         let src_read = format!("src[{src_idx}]");
         let scatter_src = format!(
-            r#"extern "C" __global__ void k({sig}, {t}* out, unsigned long long n) {{
+            r#"extern "C" __global__ void k({sig}, {t}* out, const long long* params) {{
+    const unsigned long long n = {src_n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 {body}    out[flat] = {src_read};

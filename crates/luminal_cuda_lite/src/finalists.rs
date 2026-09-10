@@ -52,7 +52,7 @@
 
 use anyhow::Result;
 
-use crate::arena::{ArenaPlan, buffer_bytes, plan_arena};
+use crate::arena::ArenaPlan;
 use crate::extractor::{self, Genome};
 use crate::layouts::CudaPlan;
 use luminal::prelude::egraph_serialize;
@@ -74,10 +74,12 @@ pub struct PendingFinalist {
     /// The arena plan for `plan` — the issue order and the slab layout.
     /// `slab_bytes` is what the aggregate device-budget check reads.
     pub arena: ArenaPlan,
+    pub shapes: crate::symbolic::ShapeEnv,
 }
 
 /// The ranked finalists of one bucket, materialized lazily.
 pub struct Finalists<'a> {
+    shapes: crate::symbolic::ShapeEnv,
     /// How this bucket names itself in a failure message (`"bucket 0
     /// (a in [2, 4])"`, or `"the search"` when unbucketed).
     label: String,
@@ -135,6 +137,7 @@ impl<'a> Finalists<'a> {
         winner_plan: Option<CudaPlan>,
     ) -> Self {
         Self {
+            shapes: Default::default(),
             label: label.into(),
             egraph,
             session: None,
@@ -148,6 +151,11 @@ impl<'a> Finalists<'a> {
             last_rejection: None,
             layout_cache: luminal::layouts::LayoutDecodeCache::new(),
         }
+    }
+
+    pub fn with_shapes(mut self, shapes: crate::symbolic::ShapeEnv) -> Self {
+        self.shapes = shapes;
+        self
     }
 
     /// This bucket's label, as failure messages spell it.
@@ -216,8 +224,11 @@ impl<'a> Finalists<'a> {
                 self.build_plan(genome)?
             }
         };
-        let arena = plan_arena(&plan, buffer_bytes).map_err(|err| format!("arena: {err:#}"))?;
+        let arena = crate::storage::plan(&plan, &self.shapes.bounds)
+            .map_err(|err| format!("arena: {err:#}"))?
+            .arena;
         Ok(PendingFinalist {
+            shapes: self.shapes.clone(),
             rank,
             metric,
             genome: genome.clone(),

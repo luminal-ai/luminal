@@ -162,7 +162,8 @@ impl KernelOp for IndexMapApplyMaterializeDps {
         )?;
         body.push_str(&chain);
         let source = format!(
-            r#"extern "C" __global__ void k(const {t}* parent, {to}* out, unsigned long long n) {{
+            r#"extern "C" __global__ void k(const {t}* parent, {to}* out, const long long* params) {{
+    const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 {prelude}{body}    out[i] = parent[{pidx}];

@@ -1,54 +1,12 @@
-//! THE DEVICE EVALUATOR — this runtime's price for one candidate plan,
-//! measured on the GPU.
-//!
-//! PHASE 4 OF THE #420/#422 REJOIN (2026-09-03), discharging the debt
-//! `lib.rs` has carried since CL-1 ("STILL OWED: profiling ON DEVICE")
-//! and ruling 4 on #386: CL must profile on device *"just like the
-//! existing profiler actually does. we need to mirror that design"*.
-//! The template is `luminal_reference::search`'s
-//! `profile_on_reference_runtime`: stage, warm up once, time `trials`
-//! executes, take the MEAN, and stop early once the candidate has
-//! provably lost.
-//!
-//! # What is mirrored, and the two places this differs
-//!
-//! MIRRORED. One warmup execution (validity + first-touch costs), then
-//! `trials` timed executions; the metric is the MEAN over trials (ruling
-//! 2, 2026-09-02 — a mean only rises as trials accumulate, which is what
-//! makes the early stop an exact argument rather than a guess); the
-//! early stop applies [`crate::search::early_stop_exceeded`] at factor
-//! 1.0 to a LOWER BOUND on the final mean.
-//!
-//! DIFFERENCE 1 — THE DEVICE IS PERSISTENT, the runtime is not rebuilt.
-//! The reference evaluator builds a FRESH `ReferenceRuntime` per
-//! candidate because its runtime is a cheap host object. Here the
-//! equivalent would throw away the CUDA context and the NVRTC module
-//! cache between candidates and recompile every kernel, which is most of
-//! a CUDA search's wall time. So the caller's [`crate::device::CudaDevice`]
-//! is reused: compilation is paid ONCE PER DISTINCT KERNEL SOURCE across
-//! the whole search. What is NOT carried between candidates is the arena
-//! slab — see the slab note on [`profile_candidate`].
-//!
-//! DIFFERENCE 2 — THE TIMED REGION INCLUDES STAGING AND READBACK.
-//! [`crate::device::execute_plan`] is one call that allocates, H2Ds the
-//! staged inputs, launches, synchronizes and D2Hs the outputs; the
-//! reference's `execute()` runs only the kernels, because its
-//! `set_data_buffer` is a separate ladder step. Splitting CL's execute
-//! into stage-once/run-many is real surgery on the executor and is NOT
-//! done here. The consequence is stated rather than hidden: a candidate's
-//! measured mean carries a per-call H2D/D2H term that is essentially the
-//! same for every candidate (same inputs, same outputs), so the RANKING
-//! is preserved while the absolute numbers are inflated — read a CL
-//! device measurement as "the cost of one whole `execute` call", which
-//! is exactly what the serving ladder pays anyway.
-
+//! Search profiling uses the serving graph path. Preparation/instantiation is
+//! outside the timed trials; staging, graph replay, and readback are timed.
 use std::time::{Duration, Instant};
 
 use luminal::bufferize::BufferIrGraph;
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::FxHashMap;
 
-use crate::device::{CudaDevice, execute_plan};
+use crate::device::CudaDevice;
 use crate::host_buffer::HostBuffer;
 use crate::search::early_stop_exceeded;
 
@@ -100,50 +58,27 @@ impl std::fmt::Display for ProfileFailure {
     }
 }
 
-/// PRICE ONE CANDIDATE ON THE DEVICE.
-///
-/// Phases, in order:
-///
-/// 1. PREPARE — one untimed `execute_plan`. This compiles every kernel
-///    the plan needs through the device's persistent module cache, grows
-///    the slab, stages the inputs and runs once, so it doubles as the
-///    validity check the reference evaluator's warmup is. A failure here
-///    is [`ProfileFailure::Prepare`].
-/// 2. TIMED RUN — `trials.max(1)` executions, each timed host-side
-///    around `execute_plan`, which synchronizes the stream before it
-///    returns. (CUDA events would measure the same interval minus the
-///    host-side launch overhead; host timers are used because the whole
-///    call — allocation, H2D, launches, D2H — is what is being priced,
-///    and the synchronize makes the host clock honest about the device
-///    work. Events are the deferred refinement, not a correction.)
-/// 3. EARLY STOP — after each trial, if even the LOWER BOUND on this
-///    candidate's final mean (sum so far divided by ALL trials) already
-///    exceeds `best_so_far`, the remaining trials cannot change the
-///    outcome and are skipped.
-///
-/// THE TIMEOUT COVERS THE TIMED RUN AND NOTHING ELSE (Austin, ambiguity
-/// 1: *"timeout should just cover run"*). The clock starts at the first
-/// timed trial — after compilation — and is read BETWEEN trials, so a
-/// budget is never charged for NVRTC work that the next candidate gets
-/// for free from the module cache, and a trial in flight is never
-/// interrupted (there is no cancel for a launched kernel; the honest
-/// thing is to finish the trial and then stop).
-///
-/// THE SLAB IS THE CALLER'S TO RELEASE. This function grows it through
-/// `execute_plan` and leaves it; `crate::search` releases it after each
-/// candidate (#422 reversing #401's search-time retention), so one
-/// outsized candidate cannot hold device memory hostage for the rest of
-/// the search. Serving never releases it.
-pub fn profile_candidate(
+/// Compile and instantiate once, warm up once, then time the same execution
+/// path used for serving: host staging, graph launch, synchronization, readback.
+/// Timeouts cover timed trials only. The caller releases candidate graphs and
+/// arena afterwards, retaining the shared context and compiled module cache.
+#[allow(clippy::too_many_arguments)]
+pub fn profile_candidate_at(
     device: &mut CudaDevice,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &HostBuffer>,
     trials: usize,
     best_so_far: Option<u128>,
     candidate_timeout: Option<Duration>,
+    shapes: &crate::symbolic::ShapeEnv,
 ) -> Result<Measurement, ProfileFailure> {
     // 1. PREPARE: compile + stage + one untimed run (warmup + validity).
-    execute_plan(device, plan, staged).map_err(ProfileFailure::Prepare)?;
+    let staged =
+        prepare_candidate(device, plan, staged, shapes).map_err(ProfileFailure::Prepare)?;
+    let staged = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+    device
+        .execute(0, &staged, &shapes.values)
+        .map_err(ProfileFailure::Prepare)?;
 
     // 2. THE TIMED RUN. The budget's clock starts HERE.
     let total = trials.max(1);
@@ -151,7 +86,9 @@ pub fn profile_candidate(
     let mut sum = 0u128;
     for trial in 0..total {
         let start = Instant::now();
-        execute_plan(device, plan, staged).map_err(ProfileFailure::Execute)?;
+        device
+            .execute(0, &staged, &shapes.values)
+            .map_err(ProfileFailure::Execute)?;
         sum += start.elapsed().as_nanos();
         let completed = trial + 1;
         if completed == total {
@@ -185,4 +122,57 @@ pub fn profile_candidate(
         mean_nanos: sum / total as u128,
         completed_trials: total,
     })
+}
+
+/// Static-plan entry point retained for lower-level callers.
+pub fn profile_candidate(
+    device: &mut CudaDevice,
+    plan: &BufferIrGraph<DecodedLayout>,
+    staged: &FxHashMap<i64, &HostBuffer>,
+    trials: usize,
+    best: Option<u128>,
+    timeout: Option<Duration>,
+) -> Result<Measurement, ProfileFailure> {
+    profile_candidate_at(
+        device,
+        plan,
+        staged,
+        trials,
+        best,
+        timeout,
+        &Default::default(),
+    )
+}
+
+/// Search probes geometry at a bucket's representative. If supplied dynamic
+/// input data belongs to another size, preserve its prefix and zero-fill the
+/// rest for timing. Serving always requires exact payload sizes.
+pub(crate) fn prepare_candidate<'a>(
+    device: &mut CudaDevice,
+    plan: &BufferIrGraph<DecodedLayout>,
+    staged: &FxHashMap<i64, &'a HostBuffer>,
+    shapes: &crate::symbolic::ShapeEnv,
+) -> anyhow::Result<FxHashMap<i64, std::borrow::Cow<'a, HostBuffer>>> {
+    let mut owned = FxHashMap::default();
+    for buffer in plan.buffers.values() {
+        if let Some(lit) = buffer.lit
+            && let Some(data) = staged.get(&lit)
+        {
+            let mut data = std::borrow::Cow::Borrowed(*data);
+            let mut vars = std::collections::BTreeSet::new();
+            crate::symbolic::vars(&crate::symbolic::span(&buffer.layout)?.0, &mut vars);
+            if vars
+                .iter()
+                .any(|s| shapes.bounds.get(s).is_some_and(|(lo, hi)| lo != hi))
+            {
+                let bytes = crate::symbolic::bytes(&buffer.layout, &shapes.values)?;
+                if bytes != data.bytes.len() {
+                    data.to_mut().bytes.resize(bytes, 0);
+                }
+            }
+            owned.insert(lit, data);
+        }
+    }
+    device.install(vec![(plan.clone(), shapes.bounds.clone())])?;
+    Ok(owned)
 }

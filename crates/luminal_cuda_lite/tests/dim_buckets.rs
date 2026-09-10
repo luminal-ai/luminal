@@ -1,16 +1,4 @@
-//! BUCKETS ON THE CUDA LADDER (D7, 2026-09-03), CPU-side.
-//!
-//! The same bucket model as the reference runtime's
-//! (`luminal_reference::runtime::tests::bucketed_search_validates_searches_and_selects`),
-//! duplicated here because the ladders are duplicated: bind disjoint
-//! intervals per dim, search one Cartesian combination at a time — each
-//! validated bucket-wide over its whole range before its representative
-//! is searched — and select the covering plan from the runtime's dims.
-//!
-//! Everything here is device-free: this runtime ranks candidates with
-//! `luminal_cuda_lite::heuristic`, so a bucketed search needs no data and
-//! no device. Only `execute` would, and the static-plan refusal below
-//! fires before any of that.
+//! Bucket selection and range-valid compilation without a device.
 
 use luminal::dtype::DType;
 use luminal::graph::{DimBucket, Graph};
@@ -80,35 +68,23 @@ fn bucketed_search_validates_searches_and_selects() {
     }
 }
 
-/// THE PHASE 1 LIMITATION, pinned: each bucket's plan is STATIC at its
-/// representative (plan spans are literals), so executing it at another
-/// value inside the same bucket refuses by name and points at the
-/// symbolic-plan open item. This runtime cannot execute at all without a
-/// device, but the refusal is raised by plan SELECTION, before any
-/// device work — which is exactly the point: the wrong-geometry run is
-/// never even attempted.
+/// The selected physical plan retains the range variable instead of freezing
+/// geometry to the representative. GPU replay is covered in dynamic_graphs.
 #[test]
-fn a_non_representative_pin_refuses_loudly() {
-    let (cx, _out) = elementwise_graph();
-    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+fn bucket_plan_keeps_symbolic_capacity() {
+    let (cx, _) = elementwise_graph();
+    let mut rt = CudaRuntime::load(&cx).unwrap();
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4)])
-        .expect("buckets bind");
+        .unwrap();
     rt.search(&Default::default(), &harness_search_options())
-        .expect("bucketed search completes");
-
-    // 3 is the representative of [2, 4]; 4 is inside the bucket and is
-    // NOT the pin the plan was searched at.
-    rt.set_dim('a', 4);
-    let err = rt
-        .execute()
-        .expect_err("a non-representative pin must refuse");
-    let text = format!("{err:#}");
-    assert!(text.contains("STATIC at that pin"), "{text}");
+        .unwrap();
     assert!(
-        text.contains("a = 3"),
-        "the message names the representative: {text}"
+        rt.bucket_plans()[0]
+            .plan
+            .buffers
+            .values()
+            .any(|b| b.layout.literal_extents().is_none())
     );
-    assert!(text.contains("symbolic plans"), "{text}");
 }
 
 /// Buckets must partition: overlap is refused, not resolved first-wins.

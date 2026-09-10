@@ -124,6 +124,8 @@ pub struct CompileOptions {
     /// has to fit is `max` over the buckets, and no single bucket's
     /// search can see that number.
     pub device_budget_bytes: Option<usize>,
+    /// Shape environment for lower-level search callers. The runtime fills this from bindings.
+    pub shapes: crate::symbolic::ShapeEnv,
 }
 
 impl Default for CompileOptions {
@@ -139,6 +141,7 @@ impl Default for CompileOptions {
             candidate_timeout: None,
             keep_finalists: 4,
             device_budget_bytes: None,
+            shapes: Default::default(),
         }
     }
 }
@@ -551,13 +554,14 @@ pub fn search_implementations(
                                      before the loop"
                                 )
                             };
-                            let measured = crate::profile::profile_candidate(
+                            let measured = crate::profile::profile_candidate_at(
                                 device,
                                 &plan,
                                 staged,
                                 options.trials,
                                 best.as_ref().map(|incumbent| incumbent.nanos),
                                 options.candidate_timeout,
+                                &options.shapes,
                             );
                             device.release_slab();
                             match measured {
@@ -729,7 +733,7 @@ pub fn search_implementations(
 ///   already extracted, bufferized and arena-planned, and there is
 ///   nothing further a host with no GPU can check. The filter passes.
 /// * ON DEVICE (`profile_on_device` with a live evaluator): ONE warmup
-///   `execute_plan` — NVRTC compile, stage, launch, synchronize — which
+///   graph preparation and execution — compile, stage, launch, synchronize — which
 ///   is exactly the viability check the profiler's prepare phase is. The
 ///   slab is released afterwards, matching the search's own per-candidate
 ///   hygiene (#422): finalist validation must not leave an outsized
@@ -748,7 +752,12 @@ pub fn finalist_validate(
         if options.profile_on_device
             && let Evaluator::Device { device, staged } = evaluator
         {
-            let ran = crate::device::execute_plan(device, &pending.plan, staged);
+            let ran =
+                crate::profile::prepare_candidate(device, &pending.plan, staged, &pending.shapes)
+                    .and_then(|staged| {
+                        let borrowed = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+                        device.execute(0, &borrowed, &pending.shapes.values)
+                    });
             device.release_slab();
             ran.map_err(|err| format!("device warmup of ranked #{}: {err:#}", pending.rank))?;
         }
@@ -760,26 +769,9 @@ pub fn finalist_validate(
     Ok(())
 }
 
-/// THE SET CONSTRAINT — the aggregate half of the Phase 5 gate, and the
-/// whole reason a lattice exists on this runtime.
-///
-/// WHAT IS AGGREGATE HERE. This runtime's one resource that spans bucket
-/// plans is the ARENA SLAB: [`crate::device::CudaDevice`] keeps a single
-/// grow-only slab for its whole life and `ensure_slab` grows it to
-/// whatever the plan being executed needs, so a runtime serving several
-/// bucket plans ends up holding `max` over their `slab_bytes`. That
-/// maximum is what a device budget has to bound, and no single bucket's
-/// search can see it — which is precisely a set-level constraint.
-///
-/// WHY `max` AND NOT A SUM. The alternative reading — add each plan's
-/// standalone (boundary + escaping) allocations to the slab — was
-/// considered and rejected: those buffers are allocated inside one
-/// `execute_plan` call and dropped at its end, so they are never
-/// resident across buckets and adding them would charge a budget for
-/// memory that is never simultaneously held. The slab IS the retained
-/// footprint; everything else is per-execution.
-///
-/// `None` budget = unconstrained, which is every pre-Phase-5 caller.
+/// Bound the maximum resident arena across the installed bucket set. Each
+/// bucket includes temporaries, boundary device copies, metadata, and HostOp
+/// scratch. Their offsets overlay one allocation because launches are serial.
 fn validate_set(slab_bytes: &[usize], options: &CompileOptions) -> Result<(), String> {
     let Some(budget) = options.device_budget_bytes else {
         return Ok(());
@@ -892,9 +884,8 @@ pub struct BucketAssembly<'a> {
     pub post_checks: &'a str,
     pub input_slots: &'a [luminal::graph::InputSlot],
     pub output_slots: &'a [luminal::graph::OutputSlot],
-    /// Dim values the runtime already holds, carried into every bucket's
-    /// representative map so a plan records the full pin it was searched
-    /// at.
+    /// Values for profiling non-bucket dimensions. These never narrow the
+    /// range facts already present in binding_seeds.
     pub base_dims: &'a luminal::shape::DynMap,
     /// The runtime's `(sort, constructor)` decoders — what every
     /// bucket's saturated program is checked against by the assembly
@@ -902,21 +893,10 @@ pub struct BucketAssembly<'a> {
     pub decoders: &'a luminal::egglog_utils::eclass::ConstructorRegistry,
 }
 
-/// Range-seeded bucketed search: one Cartesian combination of
-/// `DimBucket`s per search, each combination run TWICE — a bucket-wide
-/// RANGE-seeded render whose WHOLE FIXPOINT (authoring checks included)
-/// must pass, proving the base logical program valid over the entire
-/// interval, then a representative-pinned render that is searched.
-/// [`select_bucket`] picks the covering plan at execute time.
-///
-/// THE LIMITATION, stated rather than solved (Phase 1 scope): each
-/// winning plan is STATIC at its representative — plans carry LITERAL
-/// spans, so a plan searched at `a = 3` allocates and indexes for `a =
-/// 3` and nothing else. Executing a bucket's plan at any OTHER value
-/// inside that bucket is REFUSED loudly by the runtime, naming the
-/// representative; it is never silently run. Lifting this needs symbolic
-/// plans (spans as expressions) and the capacity contract that goes with
-/// them — the open item this note points at.
+/// Search one range-seeded e-graph per Cartesian bucket combination. Both
+/// authoring checks and implementation selection use the entire interval.
+/// Representatives are used only to measure candidates; the installed plans
+/// retain symbolic geometry and are capacity-planned over their full bounds.
 pub fn bucketed_search_implementations(
     assembly: &BucketAssembly<'_>,
     dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
@@ -935,11 +915,17 @@ pub fn bucketed_search_implementations(
     let mut egraphs: Vec<egraph_serialize::EGraph> = Vec::new();
     let mut searched: Vec<SearchedBucket> = Vec::new();
     for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
+        let mut bucket_options = options.clone();
+        bucket_options.shapes.values = representative.clone();
+        bucket_options
+            .shapes
+            .bounds
+            .extend(ranges.iter().map(|(k, v)| (*k, *v)));
         let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
         egraph
             .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
+            .map_err(|err| anyhow!("bucket {ranges:?} range render fails: {err}"))?;
         assembly.decoders.check(&egraph)?;
         let serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
@@ -947,7 +933,7 @@ pub fn bucketed_search_implementations(
         let outcome = search_implementations(
             &serialized,
             &program,
-            options,
+            &bucket_options,
             allow_override.clone(),
             matchers,
             // Every bucket's search prices on the SAME device: the
@@ -966,7 +952,10 @@ pub fn bucketed_search_implementations(
             .iter()
             .zip(&egraphs)
             .enumerate()
-            .map(|(index, ((ranges, _, _, outcome), egraph))| {
+            .map(|(index, ((ranges, representative, _, outcome), egraph))| {
+                let mut shapes = options.shapes.clone();
+                shapes.bounds.extend(ranges.iter().map(|(k, v)| (*k, *v)));
+                shapes.values = representative.clone();
                 crate::finalists::Finalists::new(
                     bucket_label(index, ranges),
                     egraph,
@@ -975,6 +964,7 @@ pub fn bucketed_search_implementations(
                     outcome.ranked.clone(),
                     Some(outcome.best_plan.clone()),
                 )
+                .with_shapes(shapes)
             })
             .collect();
         select_finalist_set(buckets, options, &mut evaluator)?
@@ -1004,7 +994,7 @@ pub fn bucketed_search_implementations(
 
 /// One combination after its genetic search, before the lattice has
 /// chosen which of its finalists to install: `(ranges, representative,
-/// pinned render, the search's report)`.
+/// range-valid render, the search's report)`.
 type SearchedBucket = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
@@ -1025,14 +1015,7 @@ pub(crate) fn bucket_label(
     format!("bucket {index} ({})", dims.join(", "))
 }
 
-/// One bucket combination's `(ranges, representative pins, pinned
-/// render)`, in sorted-dim Cartesian order. Each combination's
-/// BUCKET-WIDE VALIDATION render runs here, before its pinned render is
-/// handed back to be searched: the range-seeded program's whole fixpoint
-/// — authoring-contract checks included — must pass, which is what makes
-/// "the base logical program is valid over the whole bucket" a checked
-/// claim rather than an assumption. Ranges are seeded as intervals and
-/// do NOT collapse; only the representative render pins `[n, n]`.
+/// One combination's ranges, profiling dimensions, and range-valid program.
 type BucketRender = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
@@ -1096,9 +1079,6 @@ fn bucket_renders(
         // BUCKET-WIDE SOUNDNESS: the range-seeded render must run its
         // whole fixpoint over the interval.
         let mut validation_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
-        for (dim, value) in &representative {
-            validation_seeds.insert(*dim, (*value as u64, *value as u64));
-        }
         for (dim, (min, max)) in &ranges {
             validation_seeds.insert(*dim, (*min as u64, *max as u64));
         }
@@ -1108,12 +1088,9 @@ fn bucket_renders(
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
 
-        // Representative render: pinned via tight bounds.
-        let mut pin_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
-        for (dim, value) in &representative {
-            pin_seeds.insert(*dim, (*value as u64, *value as u64));
-        }
-        renders.push((ranges, representative, assemble(&pin_seeds)));
+        // Extract from the range-valid fixpoint; pinning here can select an
+        // implementation whose guards do not hold at other bucket dimensions.
+        renders.push((ranges, representative, validation));
     }
     Ok(renders)
 }
