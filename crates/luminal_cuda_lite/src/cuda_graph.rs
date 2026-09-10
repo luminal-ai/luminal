@@ -256,19 +256,14 @@ pub(crate) enum CopyKind {
 
 /// A bucket's view into the runtime's shared pinned staging allocation.
 /// The runtime serializes launches and completes readback before reusing it.
-#[derive(Clone, Copy)]
-pub(crate) struct StagingRange {
-    pub offset: usize,
-    pub len: usize,
-}
-impl StagingRange {
-    pub fn ptr(self, staging: &Pinned) -> u64 {
+impl crate::arena::ArenaSlice {
+    pub(crate) fn ptr(self, staging: &Pinned) -> u64 {
         staging.ptr() as u64 + self.offset as u64
     }
-    pub fn bytes(self, staging: &Pinned) -> &[u8] {
-        &staging.bytes()[self.offset..self.offset + self.len]
+    pub(crate) fn bytes(self, staging: &Pinned) -> &[u8] {
+        &staging.bytes()[self.offset..self.offset + self.bytes]
     }
-    pub fn bytes_mut(self, staging: &mut Pinned) -> &mut [u8] {
-        &mut staging.bytes_mut()[self.offset..self.offset + self.len]
+    pub(crate) fn bytes_mut(self, staging: &mut Pinned) -> &mut [u8] {
+        &mut staging.bytes_mut()[self.offset..self.offset + self.bytes]
     }
 }

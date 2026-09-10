@@ -1,12 +1,13 @@
 //! Persistent graph-only executor. Buckets overlay one arena, and all GPU work
 //! (including staging/readback) is submitted by the same graph launch path.
 use crate::{
-    cuda_graph::{CopyKind, Executable, Graph, Node, Pinned, StagingRange, copy_params},
+    arena::{ArenaPlan, ArenaSlice, ArenaStep},
+    cuda_graph::{CopyKind, Executable, Graph, Node, Pinned, copy_params},
     host::{DeviceRange, HostOpContext, PreparedHostOp},
     host_buffer::HostBuffer,
     kernels::{CodegenCtx, KernelLaunch},
     layouts::CudaPlan,
-    storage::{self, StoragePlan},
+    storage,
     symbolic::{self, Bounds, Expr},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -60,7 +61,7 @@ impl Drop for Module {
 }
 struct Installed {
     plan: CudaPlan,
-    storage: StoragePlan,
+    storage: ArenaPlan,
     bounds: Bounds,
     compiled: Option<CompiledPlan>,
 }
@@ -111,7 +112,7 @@ impl CudaDevice {
             .collect::<Result<Vec<_>>>()?;
         let bytes = installed
             .iter()
-            .map(|p| p.storage.arena.slab_bytes)
+            .map(|p| p.storage.slab_bytes)
             .max()
             .unwrap_or(1);
         self.stream.synchronize()?;
@@ -319,14 +320,14 @@ struct CachedGraph {
 }
 struct Input {
     lit: i64,
-    pinned: StagingRange,
+    pinned: ArenaSlice,
     size: Expr,
     dtype: luminal::dtype::PlanDtype,
 }
 struct Output {
     slot: OutputBinding<DecodedLayout>,
     resolved: OutputBinding<DecodedLayout>,
-    pinned: StagingRange,
+    pinned: ArenaSlice,
     size: Expr,
     bytes: usize,
     dtype: luminal::dtype::PlanDtype,
@@ -342,7 +343,7 @@ struct CompiledPlan {
     actions: Vec<Action>,
     inputs: Vec<Input>,
     outputs: Vec<Output>,
-    params: StagingRange,
+    params: ArenaSlice,
     schema: Vec<Symbol>,
     deps: BTreeMap<Symbol, Vec<usize>>,
     all_dim_hosts: Vec<usize>,
@@ -356,13 +357,12 @@ fn size(layout: &DecodedLayout) -> Result<Expr> {
 }
 fn range(
     plan: &CudaPlan,
-    storage: &StoragePlan,
+    storage: &ArenaPlan,
     id: &BufferId,
     base: u64,
     dims: &DynMap,
 ) -> Result<DeviceRange> {
     let slice = storage
-        .arena
         .slices
         .get(id)
         .ok_or_else(|| anyhow!("unbound buffer {id:?}"))?;
@@ -390,7 +390,7 @@ impl HostNode {
     fn select(
         &mut self,
         plan: &CudaPlan,
-        storage: &StoragePlan,
+        storage: &ArenaPlan,
         dims: &DynMap,
         base: u64,
         stream: &Arc<CudaStream>,
@@ -436,13 +436,18 @@ impl HostNode {
             .iter()
             .map(|id| range(plan, storage, id, base, dims))
             .collect::<Result<Vec<_>>>()?;
+        let workspace = storage
+            .workspaces
+            .get(&self.source)
+            .copied()
+            .unwrap_or_default();
         let ctx = HostOpContext {
             stream,
             inputs: &inputs,
             dest: range(plan, storage, &writes[0], base, dims)?,
             workspace: DeviceRange {
-                ptr: base + storage.workspace.offset as u64,
-                bytes: storage.workspace.bytes,
+                ptr: base + workspace.offset as u64,
+                bytes: workspace.bytes,
             },
             dims,
             operand_info: &resolve_slots(operand_info, dims)?,
@@ -466,7 +471,7 @@ impl CompiledPlan {
     #[allow(clippy::too_many_arguments)]
     fn compile(
         plan: &CudaPlan,
-        storage: &StoragePlan,
+        storage: &ArenaPlan,
         bounds: &Bounds,
         dims: &DynMap,
         base: u64,
@@ -477,19 +482,11 @@ impl CompiledPlan {
         stats: &mut GraphStats,
     ) -> Result<Self> {
         let schema: Vec<_> = bounds.keys().copied().collect();
-        let mut cursor = 0usize;
-        let mut reserve = |len: usize| -> Result<StagingRange> {
-            let range = StagingRange {
-                offset: cursor,
-                len: len.max(1),
-            };
-            cursor = cursor
-                .checked_add(range.len)
-                .ok_or_else(|| anyhow!("staging offset overflow"))?;
-            ensure!(cursor <= staging.bytes().len(), "staging capacity exceeded");
-            Ok(range)
-        };
-        let params = reserve((schema.len() * 8).max(8))?;
+        ensure!(
+            storage.staging_bytes <= staging.bytes().len(),
+            "staging capacity exceeded"
+        );
+        let params = storage.staging_parameters;
         let mut out = Self {
             executable: None,
             graph: None,
@@ -508,191 +505,46 @@ impl CompiledPlan {
         };
         out.actions.push(Action::Copy {
             src: out.params.ptr(staging),
-            dst: base,
+            dst: base + storage.parameters.offset as u64,
             kind: CopyKind::HtoD,
-            size: Expr::from(out.params.len),
+            size: Expr::from(out.params.bytes),
             other_size: None,
-            bytes: out.params.len,
+            bytes: out.params.bytes,
         });
-        let mut ids: Vec<_> = plan.buffers.keys().collect();
-        ids.sort_by_key(|id| format!("{id:?}"));
-        for id in ids {
-            let buffer = &plan.buffers[id];
-            if let Some(lit) = buffer.lit {
-                let pinned = reserve(storage.arena.slices[id].bytes)?;
-                let size = size(&buffer.layout)?;
-                out.actions.push(Action::Copy {
-                    src: pinned.ptr(staging),
-                    dst: range(plan, storage, id, base, dims)?.ptr,
-                    kind: CopyKind::HtoD,
-                    bytes: size.eval(dims)?,
-                    size: size.clone(),
-                    other_size: None,
-                });
-                out.inputs.push(Input {
-                    lit,
-                    pinned,
-                    size,
-                    dtype: buffer.layout.dtype.unwrap(),
-                });
-            }
-        }
-        let mut live: std::collections::HashSet<_> = storage
-            .arena
-            .standalone
-            .iter()
-            .chain(&storage.arena.donated)
-            .cloned()
-            .collect();
-        for node in &storage.arena.order {
-            match &plan.dag[*node] {
-                BufferNode::Compute {
-                    op,
-                    reads,
-                    writes,
-                    operand_info,
-                    result_info,
-                    ..
+        for step in &storage.steps {
+            match step {
+                ArenaStep::Upload {
+                    buffer: id,
+                    staging: pinned,
                 } => {
-                    let label = op.label();
-                    if label == "BufferAlloc" {
-                        live.extend(writes.iter().cloned());
-                        continue;
-                    }
-                    if label == "BufferFree" {
-                        for id in reads {
-                            live.remove(id);
-                        }
-                        continue;
-                    }
-                    ensure!(
-                        writes.len() == 1,
-                        "{label}: CUDA requires a single destination"
-                    );
-                    ensure!(
-                        operand_info.len() == reads.len() && result_info.len() == writes.len(),
-                        "{label}: missing slot descriptors"
-                    );
-                    for id in reads.iter().chain(writes) {
-                        ensure!(
-                            live.contains(id),
-                            "{label}: buffer {id:?} has no live binding"
-                        );
-                    }
-                    if let Some(host) = crate::as_host_op(op.as_ref()) {
-                        let dependencies = host.capture_dims();
-                        let mut host = HostNode {
-                            source: *node,
-                            all_dims: dependencies.is_none(),
-                            dims: dependencies.unwrap_or_default(),
-                            variants: VecDeque::new(),
-                            resource_slot: out.live_resources.len(),
-                        };
-                        host.select(plan, storage, dims, base, stream, stats)?;
-                        out.live_resources
-                            .push(host.variants.front().unwrap().clone());
-                        out.actions.push(Action::Host(host));
-                    } else if let Some(kernel) = crate::as_kernel_op(op.as_ref()) {
-                        let codegen =
-                            CodegenCtx::from_descriptors(label, operand_info, result_info)?;
-                        let mut args = reads[..reads.len() - writes.len()]
-                            .iter()
-                            .map(|id| range(plan, storage, id, base, dims).map(|r| r.ptr))
-                            .collect::<Result<Vec<_>>>()?;
-                        args.push(range(plan, storage, &writes[0], base, dims)?.ptr);
-                        args.push(base);
-                        for generated in kernel.codegen(&codegen)? {
-                            let mut source = symbolic::CUDA_HELPERS.to_owned();
-                            for (i, s) in out.schema.iter().enumerate() {
-                                source.push_str(&format!(
-                                    "#define {} params[{i}]\n",
-                                    symbolic::variable(&s.to_string())
-                                ));
-                            }
-                            source.push_str(&generated.source);
-                            let func = if let Some(module) = cache.get(&source) {
-                                module.func
-                            } else {
-                                let ptx = compile_ptx(&source)
-                                    .map_err(|e| anyhow!("NVRTC {label}: {e:?}\n{source}"))?;
-                                let image = CString::new(ptx.to_src())?;
-                                let raw =
-                                    unsafe { result::module::load_data(image.as_ptr().cast()) }?;
-                                let mut module = Module {
-                                    raw,
-                                    func: std::ptr::null_mut(),
-                                    ctx: ctx.clone(),
-                                };
-                                module.func = unsafe {
-                                    result::module::get_function(raw, CString::new("k")?)
-                                }?;
-                                let func = module.func;
-                                cache.insert(source, module);
-                                stats.kernel_compilations += 1;
-                                func
-                            };
-                            let grid =
-                                u32::try_from(generated.n.capacity(bounds)?.max(1).div_ceil(256))?;
-                            ensure!(
-                                grid <= i32::MAX as u32,
-                                "kernel capacity exceeds CUDA grid limit"
-                            );
-                            let launch = if let Some(spec) = &generated.launch {
-                                for expr in spec.expressions() {
-                                    expr.capacity(bounds)?;
-                                }
-                                let shared = spec.shared_bytes.capacity(bounds)?;
-                                if shared > 48 * 1024 {
-                                    unsafe {
-                                        result::function::set_function_attribute(func,cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,i32::try_from(shared)?)
-                                    }?;
-                                }
-                                Launch::eval(spec, dims)?
-                            } else {
-                                Launch {
-                                    grid: [grid, 1, 1],
-                                    block: [256, 1, 1],
-                                    shared: 0,
-                                }
-                            };
-                            out.actions.push(Action::Kernel {
-                                func,
-                                args: args.clone(),
-                                geometry: generated.launch,
-                                launch,
-                            });
-                        }
-                    } else {
-                        bail!("no CUDA execution interface for {label}");
-                    }
-                }
-                BufferNode::BufferCopy { src, dst } => {
-                    ensure!(
-                        live.contains(src) && live.contains(dst),
-                        "copy touches a dead buffer"
-                    );
-                    let from = range(plan, storage, src, base, dims)?;
-                    let to = range(plan, storage, dst, base, dims)?;
-                    ensure!(from.bytes == to.bytes, "copy length mismatch");
+                    let buffer = &plan.buffers[id];
+                    let size = size(&buffer.layout)?;
                     out.actions.push(Action::Copy {
-                        src: from.ptr,
-                        dst: to.ptr,
-                        kind: CopyKind::DtoD,
-                        size: size(&plan.buffers[src].layout)?,
-                        other_size: Some(size(&plan.buffers[dst].layout)?),
-                        bytes: from.bytes,
+                        src: pinned.ptr(staging),
+                        dst: range(plan, storage, id, base, dims)?.ptr,
+                        kind: CopyKind::HtoD,
+                        bytes: size.eval(dims)?,
+                        size: size.clone(),
+                        other_size: None,
+                    });
+                    out.inputs.push(Input {
+                        lit: buffer.lit.unwrap(),
+                        pinned: *pinned,
+                        size,
+                        dtype: buffer.layout.dtype.unwrap(),
                     });
                 }
-                _ => {}
-            }
-        }
-        for node in plan.dag.node_weights() {
-            if let BufferNode::BufferOutput { slots } = node {
-                for slot in slots {
-                    ensure!(live.contains(&slot.buffer), "output has no live binding");
-                    let buffer = &plan.buffers[&slot.buffer];
-                    let range = range(plan, storage, &slot.buffer, base, dims)?;
-                    let pinned = reserve(storage.arena.slices[&slot.buffer].bytes)?;
+                ArenaStep::Download {
+                    buffer: id,
+                    node,
+                    slots: indices,
+                    staging: pinned,
+                } => {
+                    let BufferNode::BufferOutput { slots } = &plan.dag[*node] else {
+                        unreachable!()
+                    };
+                    let buffer = &plan.buffers[id];
+                    let range = range(plan, storage, id, base, dims)?;
                     let size = size(&buffer.layout)?;
                     out.actions.push(Action::Copy {
                         src: range.ptr,
@@ -702,17 +554,145 @@ impl CompiledPlan {
                         other_size: None,
                         bytes: range.bytes,
                     });
-                    let mut resolved = slot.clone();
-                    resolved.layout = symbolic::resolve_layout(&slot.layout, dims)?;
-                    out.outputs.push(Output {
-                        slot: slot.clone(),
-                        resolved,
-                        pinned,
-                        size,
-                        bytes: range.bytes,
-                        dtype: buffer.layout.dtype.unwrap(),
-                    });
+                    for &i in indices {
+                        let slot = &slots[i];
+                        let mut resolved = slot.clone();
+                        resolved.layout = symbolic::resolve_layout(&slot.layout, dims)?;
+                        out.outputs.push(Output {
+                            slot: slot.clone(),
+                            resolved,
+                            pinned: *pinned,
+                            size: size.clone(),
+                            bytes: range.bytes,
+                            dtype: buffer.layout.dtype.unwrap(),
+                        });
+                    }
                 }
+                ArenaStep::Node(node) => match &plan.dag[*node] {
+                    BufferNode::Compute {
+                        op,
+                        reads,
+                        writes,
+                        operand_info,
+                        result_info,
+                        ..
+                    } => {
+                        let label = op.label();
+                        if matches!(label, "BufferAlloc" | "BufferFree") {
+                            continue;
+                        }
+                        ensure!(
+                            writes.len() == 1,
+                            "{label}: CUDA requires a single destination"
+                        );
+                        ensure!(
+                            operand_info.len() == reads.len() && result_info.len() == writes.len(),
+                            "{label}: missing slot descriptors"
+                        );
+                        if let Some(host) = crate::as_host_op(op.as_ref()) {
+                            let dependencies = host.capture_dims();
+                            let mut host = HostNode {
+                                source: *node,
+                                all_dims: dependencies.is_none(),
+                                dims: dependencies.unwrap_or_default(),
+                                variants: VecDeque::new(),
+                                resource_slot: out.live_resources.len(),
+                            };
+                            host.select(plan, storage, dims, base, stream, stats)?;
+                            out.live_resources
+                                .push(host.variants.front().unwrap().clone());
+                            out.actions.push(Action::Host(host));
+                        } else if let Some(kernel) = crate::as_kernel_op(op.as_ref()) {
+                            let codegen =
+                                CodegenCtx::from_descriptors(label, operand_info, result_info)?;
+                            let mut args = reads[..reads.len() - writes.len()]
+                                .iter()
+                                .map(|id| range(plan, storage, id, base, dims).map(|r| r.ptr))
+                                .collect::<Result<Vec<_>>>()?;
+                            args.push(range(plan, storage, &writes[0], base, dims)?.ptr);
+                            args.push(base + storage.parameters.offset as u64);
+                            for generated in kernel.codegen(&codegen)? {
+                                let mut source = symbolic::CUDA_HELPERS.to_owned();
+                                for (i, s) in out.schema.iter().enumerate() {
+                                    source.push_str(&format!(
+                                        "#define {} params[{i}]\n",
+                                        symbolic::variable(&s.to_string())
+                                    ));
+                                }
+                                source.push_str(&generated.source);
+                                let func = if let Some(module) = cache.get(&source) {
+                                    module.func
+                                } else {
+                                    let ptx = compile_ptx(&source)
+                                        .map_err(|e| anyhow!("NVRTC {label}: {e:?}\n{source}"))?;
+                                    let image = CString::new(ptx.to_src())?;
+                                    let raw = unsafe {
+                                        result::module::load_data(image.as_ptr().cast())
+                                    }?;
+                                    let mut module = Module {
+                                        raw,
+                                        func: std::ptr::null_mut(),
+                                        ctx: ctx.clone(),
+                                    };
+                                    module.func = unsafe {
+                                        result::module::get_function(raw, CString::new("k")?)
+                                    }?;
+                                    let func = module.func;
+                                    cache.insert(source, module);
+                                    stats.kernel_compilations += 1;
+                                    func
+                                };
+                                let grid = u32::try_from(
+                                    generated.n.capacity(bounds)?.max(1).div_ceil(256),
+                                )?;
+                                ensure!(
+                                    grid <= i32::MAX as u32,
+                                    "kernel capacity exceeds CUDA grid limit"
+                                );
+                                let launch = if let Some(spec) = &generated.launch {
+                                    for expr in spec.expressions() {
+                                        expr.capacity(bounds)?;
+                                    }
+                                    let shared = spec.shared_bytes.capacity(bounds)?;
+                                    if shared > 48 * 1024 {
+                                        unsafe {
+                                            result::function::set_function_attribute(func,cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,i32::try_from(shared)?)
+                                        }?;
+                                    }
+                                    Launch::eval(spec, dims)?
+                                } else {
+                                    Launch {
+                                        grid: [grid, 1, 1],
+                                        block: [256, 1, 1],
+                                        shared: 0,
+                                    }
+                                };
+                                out.actions.push(Action::Kernel {
+                                    func,
+                                    args: args.clone(),
+                                    geometry: generated.launch,
+                                    launch,
+                                });
+                            }
+                        } else {
+                            bail!("no CUDA execution interface for {label}");
+                        }
+                    }
+                    BufferNode::BufferCopy { src, dst } => {
+                        let from = range(plan, storage, src, base, dims)?;
+                        let to = range(plan, storage, dst, base, dims)?;
+                        ensure!(from.bytes == to.bytes, "copy length mismatch");
+                        out.actions.push(Action::Copy {
+                            src: from.ptr,
+                            dst: to.ptr,
+                            kind: CopyKind::DtoD,
+                            size: size(&plan.buffers[src].layout)?,
+                            other_size: Some(size(&plan.buffers[dst].layout)?),
+                            bytes: from.bytes,
+                        });
+                    }
+                    _ => {}
+                },
             }
         }
         for (i, action) in out.actions.iter().enumerate() {
@@ -870,7 +850,7 @@ impl CompiledPlan {
     fn update(
         &mut self,
         plan: &CudaPlan,
-        storage: &StoragePlan,
+        storage: &ArenaPlan,
         dims: &DynMap,
         base: u64,
         stream: &Arc<CudaStream>,

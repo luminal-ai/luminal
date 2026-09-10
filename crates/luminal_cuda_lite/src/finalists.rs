@@ -225,8 +225,7 @@ impl<'a> Finalists<'a> {
             }
         };
         let arena = crate::storage::plan(&plan, &self.shapes.bounds)
-            .map_err(|err| format!("arena: {err:#}"))?
-            .arena;
+            .map_err(|err| format!("arena: {err:#}"))?;
         Ok(PendingFinalist {
             shapes: self.shapes.clone(),
             rank,

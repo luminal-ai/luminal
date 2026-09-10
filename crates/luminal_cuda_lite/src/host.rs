@@ -35,14 +35,17 @@ pub trait PreparedHostOp {
     /// Record GPU work into the active capture. Preparation must already have
     /// loaded modules and resolved host-side descriptors/algorithms.
     /// # Safety
-    /// Bound device ranges must remain live until the last graph replay finishes.
+    /// Bound allocations and addresses must remain valid until the last graph
+    /// replay finishes. Their contents are only live during this operation:
+    /// other graph nodes may use the same ranges at different times.
     unsafe fn record(&self, capture: &CaptureCtx<'_>) -> anyhow::Result<()>;
 }
 
 pub trait HostOp: BufferTensorIrOp {
-    /// Scratch reserved in the runtime's shared arena. A host op must not retain
-    /// invocation state in scratch across graph launches or bucket switches.
-    /// All device scratch must come from this reservation.
+    /// Scratch reserved in the runtime's shared arena, exclusively for this
+    /// operation's captured GPU work. Its contents must not be read or written
+    /// during preparation or retained after that work completes. Other nodes
+    /// and buckets may reuse the same bytes. All device scratch comes from here.
     fn workspace_bytes(&self, _bounds: &crate::symbolic::Bounds) -> anyhow::Result<usize> {
         Ok(0)
     }

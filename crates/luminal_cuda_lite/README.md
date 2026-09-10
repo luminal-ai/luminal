@@ -13,13 +13,28 @@ shapes are used for timing, without freezing the installed plan's geometry.
 
 The storage planner evaluates conservative interval capacities for each buffer.
 It respects the bufferizer's allocation/free events and data/anti-dependencies.
-Each bucket has fixed offsets into one runtime-owned device arena containing:
+One schedule places input uploads immediately before their first device use,
+then bufferized operations and output readbacks at their output boundaries.
+Graph construction consumes this schedule directly.
 
-- The dynamic-dimension parameter block.
-- Temporary buffers, with reuse after their last access.
-- Private device copies of boundary inputs and escaping outputs.
-- Shared HostOp scratch, sized to the largest host operation's requirement.
+One interval allocator packs every physical resource:
 
+- The dynamic-dimension parameter block remains live throughout execution.
+- Interior tensors follow their bufferizer alloc/free markers.
+- Donated device copies end at their explicit free; other boundary copies end
+  at their final device use, including any required readback.
+- Escaping device outputs start at their allocation and end after their final
+  use/readback. Returned host bytes keep the caller's output alive separately.
+- Each HostOp's scratch is live only during that operation's child graph, and
+  can reuse storage occupied by tensors or other HostOps at different times.
+
+Pinned staging uses the same allocator with byte alignment. All input payloads
+remain live from host preparation through their upload; each output remains live
+from readback through host result collection. Completed uploads can therefore
+provide space for outputs, while late inputs remain protected. Multiple output
+slots sharing a buffer at one boundary share a single readback and staging range.
+
+Each bucket keeps its capacity-sized offsets fixed as live dimensions change.
 The arena allocation is the **maximum** requirement across installed buckets.
 Pinned host staging is shared across buckets too. Execution is serialized on one
 nonblocking stream; buckets cannot run concurrently against these shared ranges.
@@ -60,7 +75,9 @@ shared-memory geometry through `KernelLaunch`.
 `HostOp::prepare` resolves host descriptors and algorithms outside capture.
 `PreparedHostOp::record` submits GPU work during capture; its Rust body is not
 called on replay. The executor treats the resulting child graph as opaque.
-`workspace_bytes` reserves device scratch in the shared arena. `capture_dims`
+`workspace_bytes` reserves operation-local device scratch in the shared arena;
+preparation must not access scratch contents or preserve them beyond that
+operation's captured work. `capture_dims`
 may narrow invalidation to the dimensions that affect captured work; its default
 conservatively depends on all dimensions.
 
