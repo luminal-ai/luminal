@@ -143,12 +143,11 @@ fn remap_choices(
             break;
         }
     }
-    // A complete bijection avoids importing incomplete genomes when a rewrite
-    // changes the search-space structure. New choices may still exist in the
-    // corresponding classes and remain available to ordinary mutation.
+    // Embed every old class injectively, while allowing new target classes
+    // introduced by additional alternatives. The old choices still define a
+    // complete incumbent; extraction below verifies its exact LLIR fingerprint.
     let mapped: rustc_hash::FxHashSet<_> = classes.values().collect();
     if classes.len() != source.eclasses.len()
-        || mapped.len() != target.eclasses.len()
         || classes.len() != mapped.len()
         || source
             .roots
@@ -425,6 +424,62 @@ mod tests {
             }
             assert!(changed.seed_for_bucket(&contexts[0]).is_none());
         }
+    }
+
+    #[test]
+    fn search_seed_survives_new_equivalent_alternatives_with_new_classes() {
+        let (mut graph, schedule) = selected_schedule();
+        let egraph = &mut graph.search_space.as_mut().unwrap().buckets[0].egraph;
+        let four = egraph
+            .enodes
+            .iter()
+            .find_map(|(node, (op, children))| {
+                (op == "MNum"
+                    && egraph.eclasses[&children[0]]
+                        .1
+                        .iter()
+                        .any(|n| egraph.enodes[n].0 == "4"))
+                .then(|| egraph.node_to_class[node].clone())
+            })
+            .expect("the input extent is four");
+        let mut expressions = Vec::new();
+        for value in [127, 123] {
+            let literal = ClassId::from(format!("new-i64-{value}"));
+            let expression = ClassId::from(format!("new-expression-{value}"));
+            for (class, sort, op, children) in [
+                (literal.clone(), "i64", value.to_string(), vec![]),
+                (
+                    expression.clone(),
+                    "Expression",
+                    "MNum".to_string(),
+                    vec![literal],
+                ),
+            ] {
+                let node = NodeId::from(format!("node-{class}"));
+                assert!(egraph.enodes.insert(node.clone(), (op, children)).is_none());
+                egraph.node_to_class.insert(node.clone(), class.clone());
+                egraph
+                    .eclasses
+                    .insert(class, (sort.to_string(), vec![node]));
+            }
+            expressions.push(expression);
+        }
+        // The old program remains selectable; the new spelling needs classes
+        // which did not exist when the incumbent was saved.
+        let node = NodeId::from("new-equivalent-subtraction");
+        egraph
+            .enodes
+            .insert(node.clone(), ("MSub".to_string(), expressions));
+        egraph.node_to_class.insert(node.clone(), four.clone());
+        egraph.eclasses.get_mut(&four).unwrap().1.push(node);
+        let contexts = graph
+            .search_space()
+            .unwrap()
+            .bucket_contexts(&graph.dyn_map);
+        assert!(
+            schedule.seed_for_bucket(&contexts[0]).is_some(),
+            "additional legal alternatives must not invalidate an unchanged incumbent"
+        );
     }
 
     #[test]
