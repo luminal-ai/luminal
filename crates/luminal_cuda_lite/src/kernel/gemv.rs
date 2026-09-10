@@ -1,14 +1,11 @@
-//! Warp-per-row GEMV for M=1 decode matmuls.
+//! Cooperative GEMV for single-row matmuls.
 //!
 //! Matches the same row-major × column-major `GenericMatmul` pattern as the
 //! cuBLASLt RmCm rewrite, restricted to m == 1 and 16-bit dtypes, and unions
 //! a lean kernel into the same eclass — measured search then chooses among
 //! cuBLASLt, GenericMatmul, the lowered reduction, and this kernel per shape.
-//! Rationale (measured on Llama 3 8B decode): the nvjet GEMV
-//! kernels carry ~5µs of fixed launch/tail cost per call, which dominates the
-//! small projections (o-proj: 13.2µs vs an 8.3µs traffic floor). One warp per
-//! output row with vectorized 16-byte loads and F32 accumulation has ~1µs of
-//! fixed cost and no splitK reduction pass.
+//! Search varies rows per block and cooperative warps per output row. Each
+//! choice reduces locally in F32 without a separate reduction kernel.
 
 use std::sync::Arc;
 
@@ -29,12 +26,90 @@ use luminal::{
     prelude::*,
 };
 
+/// Searchable (output rows per block, cooperative warps per row) geometries.
+pub fn gemv_launch_choices() -> impl Iterator<Item = (usize, usize)> {
+    [1, 2, 4, 8].into_iter().flat_map(|rows| {
+        [1, 2, 4, 8]
+            .into_iter()
+            .filter_map(move |warps| (rows * warps <= 32).then_some((rows, warps)))
+    })
+}
+
+/// Shared single-row matrix product codegen. `store` consumes F32 `acc` and
+/// valid `row` on one lane; callers supply the graph's output rounding/epilogue.
+pub fn gemv_body(
+    n: Expression,
+    k: Expression,
+    dtype: DType,
+    rows: usize,
+    warps: usize,
+    store: &str,
+) -> String {
+    assert!(matches!(dtype, DType::Bf16 | DType::F16));
+    assert!(gemv_launch_choices().any(|choice| choice == (rows, warps)));
+    let ty = cuda_dtype(dtype);
+    let vectorized = k.to_usize().is_some_and(|k| k % 8 == 0);
+    let (n, k) = (n.to_kernel(), k.to_kernel());
+    let dot = if vectorized {
+        format!(
+            r#"
+            const uint4* xr = (const uint4*)x;
+            const uint4* wr = (const uint4*)(w + row * ({k}));
+            for (long long c = split * 32 + lane; c < ({k}) / 8; c += 32 * {warps}) {{
+                uint4 xv = xr[c], wv = wr[c];
+                const {ty}* xe = (const {ty}*)&xv;
+                const {ty}* we = (const {ty}*)&wv;
+                #pragma unroll
+                for (int e = 0; e < 8; e++) acc += (float)xe[e] * (float)we[e];
+            }}"#
+        )
+    } else {
+        format!(
+            r#"
+            const {ty}* wr = w + row * ({k});
+            for (long long i = split * 32 + lane; i < ({k}); i += 32 * {warps}) {{
+                acc += (float)x[i] * (float)wr[i];
+            }}"#
+        )
+    };
+    let reduce_store = if warps == 1 {
+        format!("if (lane == 0 && row < ({n})) {{ {store} }}")
+    } else {
+        format!(
+            r#"
+        __shared__ float partial[{rows} * {warps}];
+        if (lane == 0) partial[warp] = acc;
+        // Tail rows must reach this barrier too, even when they have no dot.
+        __syncthreads();
+        if (split == 0 && lane == 0 && row < ({n})) {{
+            acc = partial[(warp / {warps}) * {warps}];
+            #pragma unroll
+            for (int i = 1; i < {warps}; i++) acc += partial[(warp / {warps}) * {warps} + i];
+            {store}
+        }}"#
+        )
+    };
+    format!(
+        r#"
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        int split = warp % {warps};
+        long long row = (long long)blockIdx.x * {rows} + warp / {warps};
+        float acc = 0.0f;
+        if (row < ({n})) {{ {dot} }}
+        #pragma unroll
+        for (int s = 16; s > 0; s /= 2) acc += __shfl_down_sync(0xffffffff, acc, s);
+        {reduce_store}"#
+    )
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct KernelGemv {
     n: Expression,
     k: Expression,
     dtype: DType,
-    warps_per_block: usize,
+    rows_per_block: usize,
+    warps_per_row: usize,
 }
 
 impl EgglogOp for KernelGemv {
@@ -46,7 +121,8 @@ impl EgglogOp for KernelGemv {
                 ("n", EXPRESSION),
                 ("k", EXPRESSION),
                 ("dtype", DTYPE),
-                ("warps_per_block", EXPRESSION),
+                ("rows_per_block", EXPRESSION),
+                ("warps_per_row", EXPRESSION),
             ],
         )
     }
@@ -124,7 +200,7 @@ impl EgglogOp for KernelGemv {
                             (= ?dt ({dt}))
                         )
                         (
-                            (let ?gemv (Op (KernelGemv ?n ?k ({dt}) (MNum 8)) (ICons ?a (ICons ?b (INil)))))
+                            (let ?gemv (Op (KernelGemv ?n ?k ({dt}) (MNum 8) (MNum 1)) (ICons ?a (ICons ?b (INil)))))
                             (union ?sum ?gemv)
                             (set (dtype ?gemv) ({dt}))
                         )
@@ -133,16 +209,16 @@ impl EgglogOp for KernelGemv {
                     )"
                 ))
             })
-            .chain([1, 2, 4].map(|warps| Rule::raw(format!(
+            .chain(gemv_launch_choices().filter(|&(rows, warps)| (rows, warps) != (8, 1)).map(|(rows, warps)| Rule::raw(format!(
                 "(rule
-                    ((= ?out (Op (KernelGemv ?n ?k ?dt (MNum 8)) ?inputs)))
+                    ((= ?out (Op (KernelGemv ?n ?k ?dt (MNum 8) (MNum 1)) ?inputs)))
                     (
-                        (let ?tuned (Op (KernelGemv ?n ?k ?dt (MNum {warps})) ?inputs))
+                        (let ?tuned (Op (KernelGemv ?n ?k ?dt (MNum {rows}) (MNum {warps})) ?inputs))
                         (union ?out ?tuned)
                         (set (dtype ?tuned) ?dt)
                     )
                     :ruleset matmul_backend
-                    :name \"kernel gemv {warps} warps per block\"
+                    :name \"kernel gemv {rows} rows per block {warps} warps per row\"
                 )"
             ))))
             .collect()
@@ -165,7 +241,11 @@ impl EgglogOp for KernelGemv {
                 n: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
                 k: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
                 dtype: extract_dtype(egraph, kind_children[2]),
-                warps_per_block: extract_expr(egraph, kind_children[3], expr_cache)
+                rows_per_block: extract_expr(egraph, kind_children[3], expr_cache)
+                    .unwrap()
+                    .to_usize()
+                    .expect("GEMV row count must be constant"),
+                warps_per_row: extract_expr(egraph, kind_children[4], expr_cache)
                     .unwrap()
                     .to_usize()
                     .expect("GEMV warp count must be constant"),
@@ -189,8 +269,8 @@ impl KernelOp for KernelGemv {
         Expression,
         FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
-        let warps_per_block = self.warps_per_block;
-        assert!(matches!(warps_per_block, 1 | 2 | 4 | 8));
+        let rows_per_block = self.rows_per_block;
+        let warps_per_row = self.warps_per_row;
         let vars = self
             .n
             .dyn_vars()
@@ -205,40 +285,14 @@ impl KernelOp for KernelGemv {
         } else {
             ", const int* dyn_dims"
         };
-        let n = self.n.to_kernel();
-        let k = self.k.to_kernel();
-
-        // 16-byte vectorized lane loads (8 × 16-bit) when K is statically a
-        // multiple of 8; scalar loop otherwise. F32 accumulation throughout.
-        let vectorized = self.k.to_usize().map(|k| k % 8 == 0).unwrap_or(false);
-        let body = if vectorized {
-            format!(
-                r#"
-        const uint4* xr = (const uint4*)x;
-        const uint4* wr = (const uint4*)(w + row * ({k}));
-        long long chunks = ({k}) / 8;
-        float acc = 0.0f;
-        for (long long c = lane; c < chunks; c += 32) {{
-            uint4 xv = xr[c];
-            uint4 wv = wr[c];
-            const {ty}* xe = (const {ty}*)&xv;
-            const {ty}* we = (const {ty}*)&wv;
-            #pragma unroll
-            for (int e = 0; e < 8; e++) {{
-                acc += (float)xe[e] * (float)we[e];
-            }}
-        }}"#
-            )
-        } else {
-            format!(
-                r#"
-        const {ty}* wr = w + row * ({k});
-        float acc = 0.0f;
-        for (long long i = lane; i < ({k}); i += 32) {{
-            acc += (float)x[i] * (float)wr[i];
-        }}"#
-            )
-        };
+        let body = gemv_body(
+            self.n,
+            self.k,
+            self.dtype,
+            rows_per_block,
+            warps_per_row,
+            &format!("out[row] = ({ty})acc;"),
+        );
 
         let kernel = format!(
             "{includes}
@@ -246,18 +300,7 @@ impl KernelOp for KernelGemv {
 {dyn_defines}
 extern \"C\" {{
     __global__ void gemv_k({ty} *out, const {ty} *x, const {ty} *w{dyn_dims_param}) {{
-        long long row = (long long)blockIdx.x * {warps_per_block} + (threadIdx.x >> 5);
-        if (row >= ({n})) return;
-        int lane = threadIdx.x & 31;
 {body}
-
-        #pragma unroll
-        for (int s = 16; s > 0; s /= 2) {{
-            acc += __shfl_down_sync(FULL_MASK, acc, s);
-        }}
-        if (lane == 0) {{
-            out[row] = ({ty})acc;
-        }}
     }}
 }}"
         );
@@ -276,8 +319,12 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (self.n.ceil_div(warps_per_block), 1.into(), 1.into()),
-            ((warps_per_block * 32).into(), 1.into(), 1.into()),
+            (self.n.ceil_div(rows_per_block), 1.into(), 1.into()),
+            (
+                (rows_per_block * warps_per_row * 32).into(),
+                1.into(),
+                1.into(),
+            ),
             0.into(),
             FxHashMap::default(),
         )
