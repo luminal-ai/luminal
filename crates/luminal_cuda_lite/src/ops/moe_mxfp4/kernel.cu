@@ -2,10 +2,11 @@
 // decode.cu, rehomed as CL host ops with the bf16 header dependency
 // removed):
 //   gate_up: hidden[t, k, j] = swiglu(W_gu[e(t,k)] · x[t] + b_gu[e])   (clamped, interleaved)
-//   down:    out[t, :]       = Σ_k w[t,k] · (W_dn[e(t,k)] · hidden[t,k] + b_dn[e])
+//   down:    out[t, k, :]    = w[t,k] · (W_dn[e(t,k)] · hidden[t,k] + b_dn[e])
 //            with w[t, :] = softmax over the selected router logits
 //            logits[t, e(t, 0..k)] — computed in-kernel from the router's
 //            [s, experts] output, so no gather/softmax chain precedes it.
+//            The per-route partials are summed over k by the graph.
 // Weights stay packed: fp4 e2m1 nibble pairs [E, N, K/2] (lo nibble =
 // even k), e8m0 scales [E, N, K/32], bf16 biases [E, N]. One warp per
 // task, R=4 output rows per warp.
@@ -143,7 +144,8 @@ __device__ __forceinline__ void gate_up_body(
     }
 }
 
-// down: R output rows per warp task; the top_k expert loop is inside.
+// down: R output rows of ONE route per warp task (route inner, row tile
+// outer, as gate_up).
 #define MAX_TOP_K 8
 template <int R>
 __device__ __forceinline__ void down_body(
@@ -164,57 +166,42 @@ __device__ __forceinline__ void down_body(
     const int lane = threadIdx.x % 32;
     const int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int rblocks = hidden_dim / R;
-    const long long total = (long long)seq * rblocks;
+    const int pairs = seq * top_k;
+    const long long total = (long long)pairs * rblocks;
     const long long task = warp_global;
     if (task < total) {
-        // Row tile outer, token inner (see gate_up_body).
-        const int r0 = (int)(task / seq) * R;
-        const int t = (int)(task % seq);
-        float mix[R];
-#pragma unroll
-        for (int r = 0; r < R; ++r) mix[r] = 0.0f;
+        const int r0 = (int)(task / pairs) * R;
+        const int pair = (int)(task % pairs);
+        const int t = pair / top_k;
+        const int kk = pair % top_k;
+        const long long e = topk_ids[pair];
+        const float* hv = hidden + (long long)pair * inter;
 
-        // The route weights: softmax over this token's selected logits
-        // (every lane computes them; top_k loads from a hot row).
-        float route_w[MAX_TOP_K];
-        float route_max = (-__int_as_float(0x7f800000));
-        for (int kk = 0; kk < top_k; ++kk) {
-            const long long e = topk_ids[(long long)t * top_k + kk];
-            route_w[kk] = logits[(long long)t * experts + e];
-            route_max = fmaxf(route_max, route_w[kk]);
+        float acc[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+        for (int g = lane; g < inter / 32; g += 32) {
+            mxfp4_group_dot_rows<R>(dn_q, dn_scale, e, hidden_dim, inter, r0, g, hv, slut, acc);
         }
-        float route_denom = 0.0f;
-        for (int kk = 0; kk < top_k; ++kk) {
-            route_w[kk] = expf(route_w[kk] - route_max);
-            route_denom += route_w[kk];
-        }
-        const float route_inv = 1.0f / route_denom;
-
-        for (int kk = 0; kk < top_k; ++kk) {
-            const long long e = topk_ids[(long long)t * top_k + kk];
-            const int pair = t * top_k + kk;
-            const float* hv = hidden + (long long)pair * inter;
-
-            float acc[R];
 #pragma unroll
-            for (int r = 0; r < R; ++r) acc[r] = 0.0f;
-            for (int g = lane; g < inter / 32; g += 32) {
-                mxfp4_group_dot_rows<R>(dn_q, dn_scale, e, hidden_dim, inter, r0, g, hv, slut, acc);
-            }
-#pragma unroll
-            for (int r = 0; r < R; ++r) acc[r] = warp_reduce_sum(acc[r]);
-
-            if (lane == 0) {
-                const float w = route_w[kk] * route_inv;
-#pragma unroll
-                for (int r = 0; r < R; ++r)
-                    mix[r] = fmaf(w, acc[r] + bf16_to_f32(dn_bias[e * hidden_dim + r0 + r]), mix[r]);
-            }
-        }
+        for (int r = 0; r < R; ++r) acc[r] = warp_reduce_sum(acc[r]);
 
         if (lane == 0) {
+            // The route weight: softmax over this token's selected logits.
+            float route_max = -__int_as_float(0x7f800000);
+            float lw[MAX_TOP_K];
+            for (int r = 0; r < top_k; ++r) {
+                lw[r] = logits[(long long)t * experts + topk_ids[(long long)t * top_k + r]];
+                route_max = fmaxf(route_max, lw[r]);
+            }
+            float denom = 0.0f;
+            for (int r = 0; r < top_k; ++r) denom += expf(lw[r] - route_max);
+            const float w = expf(lw[kk] - route_max) / denom;
 #pragma unroll
-            for (int r = 0; r < R; ++r) out[(long long)t * hidden_dim + r0 + r] = mix[r];
+            for (int r = 0; r < R; ++r) {
+                out[(long long)pair * hidden_dim + r0 + r] =
+                    w * (acc[r] + bf16_to_f32(dn_bias[e * hidden_dim + r0 + r]));
+            }
         }
     }
 }

@@ -31,9 +31,126 @@ pub const DOWN_LOGICAL_CONSTRUCTOR: &str = "LogicalMoeDownMxfp4";
 pub const DOWN_CONSTRUCTOR: &str = "LayoutTensorOpMoeDownMxfp4";
 
 const KERNEL_SOURCE: &str = include_str!("kernel.cu");
+const TENSOR_SOURCE: &str = include_str!("tensor_core.cu");
 /// Output rows per warp task; must match the kernels' instantiation.
 const GEMV_ROWS: usize = 4;
 const BLOCK_THREADS: u32 = 256;
+/// The tensor-core kernel's tile: BN output rows per block (five n8
+/// tiles per warp), 64-k iterations, 128 threads.
+const TENSOR_BN: usize = 160;
+const TENSOR_BM: usize = 64;
+const TENSOR_BK: usize = 64;
+const TENSOR_THREADS: u32 = 128;
+/// Resident blocks per SM the kernel is compiled for (its register cap).
+const TENSOR_MIN_BLOCKS: usize = 2;
+/// cp.async ring depth.
+const TENSOR_STAGES: usize = 3;
+/// Routes one shared-memory window holds; must match `WINDOW` in the kernel.
+const TENSOR_WINDOW: usize = 4096;
+/// Routes (token, k) at or above which a tick takes the expert-major
+/// tensor-core kernel; below it the warp-per-route GEMV reads no more
+/// weight bytes and has less setup. `LUMINAL_MOE_TENSOR_MIN_PAIRS`
+/// overrides (a tuning probe).
+const TENSOR_MIN_PAIRS: usize = 128;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The tensor-core kernel's tiling, read once (`LUMINAL_MOE_TENSOR_BN`,
+/// `_BM`, `_MIN_BLOCKS`, `_STAGES` are tuning probes over the defaults).
+#[derive(Clone, Copy)]
+struct TensorTiling {
+    bn: usize,
+    bm: usize,
+    min_blocks: usize,
+    stages: usize,
+}
+
+impl TensorTiling {
+    /// Dynamic shared memory: the A and B rings, the route window, the
+    /// tile's scale rows.
+    fn smem_bytes(&self, k: usize) -> usize {
+        self.stages * (self.bm * TENSOR_BK * 4 + self.bn * 32)
+            + TENSOR_WINDOW * 4
+            + self.bn * (k / 32)
+    }
+}
+
+fn tensor_tiling() -> TensorTiling {
+    static CACHE: std::sync::OnceLock<TensorTiling> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| TensorTiling {
+        bn: env_usize("LUMINAL_MOE_TENSOR_BN", TENSOR_BN),
+        bm: env_usize("LUMINAL_MOE_TENSOR_BM", TENSOR_BM),
+        min_blocks: env_usize("LUMINAL_MOE_TENSOR_MIN_BLOCKS", TENSOR_MIN_BLOCKS),
+        stages: env_usize("LUMINAL_MOE_TENSOR_STAGES", TENSOR_STAGES),
+    })
+}
+
+fn tensor_min_pairs() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| env_usize("LUMINAL_MOE_TENSOR_MIN_PAIRS", TENSOR_MIN_PAIRS))
+}
+
+/// Whether a call's geometry takes the tensor-core kernel.
+fn tensor_path(pairs: usize, n: usize, k: usize, experts: usize) -> bool {
+    let tiling = tensor_tiling();
+    // The scale slab of a tile ([bn rows, k/32] bytes, contiguous) is
+    // staged in 16-byte chunks: every tile's slab must start and end on
+    // a 16-byte boundary.
+    let slab_aligned =
+        (tiling.bn * (k / 32)).is_multiple_of(16) && (n * (k / 32)).is_multiple_of(16);
+    pairs >= tensor_min_pairs()
+        && n.is_multiple_of(tiling.bn)
+        && k.is_multiple_of(TENSOR_BK)
+        && slab_aligned
+        && experts <= u16::MAX as usize
+        && tiling.smem_bytes(k) <= 200 * 1024
+}
+
+fn tensor_source(gate_up: bool) -> String {
+    let tiling = tensor_tiling();
+    format!(
+        "#define MODE_GATE_UP {}\n#define BN {}\n#define BM {}\n#define MIN_BLOCKS {}\n#define NSTAGE {}\n{}",
+        u8::from(gate_up),
+        tiling.bn,
+        tiling.bm,
+        tiling.min_blocks,
+        tiling.stages,
+        TENSOR_SOURCE
+    )
+}
+
+/// The tensor-core kernel with its dynamic shared memory opted in.
+#[cfg(feature = "device")]
+fn tensor_function(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    gate_up: bool,
+    k: usize,
+) -> Result<(cudarc::driver::CudaFunction, u32)> {
+    let smem = tensor_tiling().smem_bytes(k) as u32;
+    let function =
+        crate::nvrtc_module::kernel_function(stream, &tensor_source(gate_up), "moe_grouped")?;
+    function
+        .set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem as i32,
+        )
+        .context("opting the MoE tensor-core kernel into its shared memory")?;
+    Ok((function, smem))
+}
+
+#[cfg(feature = "device")]
+fn tensor_grid(n: usize, experts: usize, smem: u32) -> cudarc::driver::LaunchConfig {
+    cudarc::driver::LaunchConfig {
+        grid_dim: ((n / tensor_tiling().bn) as u32, experts as u32, 1),
+        block_dim: (TENSOR_THREADS, 1, 1),
+        shared_mem_bytes: smem,
+    }
+}
 /// The down kernel's route-weight register file; must match `MAX_TOP_K` in kernel.cu.
 const MAX_TOP_K: usize = 8;
 
@@ -249,14 +366,11 @@ impl crate::host::HostOp for MoeGateUpDps {
                 spec.inter
             );
         }
-        let _experts =
+        let experts =
             check_packed_weights(label, ctx, 2, &GATE_UP_OPERANDS, 2 * spec.inter, hidden_dim)?;
         if s == 0 || spec.top_k == 0 {
             return Ok(());
         }
-        let function =
-            crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "moe_gate_up_r4")
-                .with_context(|| format!("{label}: kernel"))?;
         let (x_ptr, ids_ptr, blocks_ptr, scales_ptr, bias_ptr) = (
             ctx.inputs[0].ptr,
             ctx.inputs[1].ptr,
@@ -272,6 +386,33 @@ impl crate::host::HostOp for MoeGateUpDps {
             s as i32,
         );
         let (alpha, limit) = (spec.alpha as f32, spec.limit as f32);
+        if tensor_path(s * spec.top_k, 2 * spec.inter, hidden_dim, experts) {
+            let (function, smem) = tensor_function(ctx.stream, true, hidden_dim)
+                .with_context(|| format!("{label}: tensor-core kernel"))?;
+            let (n, ex) = ((2 * spec.inter) as i32, experts as i32);
+            let mut builder = ctx.stream.launch_builder(&function);
+            builder
+                .arg(&x_ptr)
+                .arg(&blocks_ptr)
+                .arg(&scales_ptr)
+                .arg(&bias_ptr)
+                .arg(&ids_ptr)
+                .arg(&ids_ptr)
+                .arg(&dest)
+                .arg(&n)
+                .arg(&h)
+                .arg(&tk)
+                .arg(&sq)
+                .arg(&ex)
+                .arg(&alpha)
+                .arg(&limit);
+            unsafe { builder.launch(tensor_grid(2 * spec.inter, experts, smem)) }
+                .with_context(|| format!("{label}: tensor-core launch"))?;
+            return Ok(());
+        }
+        let function =
+            crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "moe_gate_up_r4")
+                .with_context(|| format!("{label}: kernel"))?;
         let mut builder = ctx.stream.launch_builder(&function);
         builder
             .arg(&x_ptr)
@@ -373,7 +514,7 @@ pub struct DownSpec {
     pub top_k: usize,
 }
 
-/// `MoeDownMxfp4(hidden, expert_ids, router_logits, blocks, scales, bias) -> out`.
+/// `MoeDownMxfp4(hidden, expert_ids, router_logits, blocks, scales, bias) -> partials`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeDown {
     pub spec: DownSpec,
@@ -479,8 +620,12 @@ impl crate::host::HostOp for MoeDownDps {
                 spec.top_k
             );
         }
-        if out != [s, spec.hidden] {
-            bail!("{label}: out must be [{s}, {}], got {out:?}", spec.hidden);
+        if out != [s, spec.top_k, spec.hidden] {
+            bail!(
+                "{label}: out must be [{s}, {}, {}], got {out:?}",
+                spec.top_k,
+                spec.hidden
+            );
         }
         let experts = check_packed_weights(label, ctx, 3, &DOWN_OPERANDS, spec.hidden, inter)?;
         if logits != [s, experts] {
@@ -495,9 +640,6 @@ impl crate::host::HostOp for MoeDownDps {
         if s == 0 {
             return Ok(());
         }
-        let function =
-            crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "moe_down_r4")
-                .with_context(|| format!("{label}: kernel"))?;
         let (hidden_ptr, ids_ptr, logits_ptr, blocks_ptr, scales_ptr, bias_ptr) = (
             ctx.inputs[0].ptr,
             ctx.inputs[1].ptr,
@@ -514,6 +656,33 @@ impl crate::host::HostOp for MoeDownDps {
             s as i32,
             experts as i32,
         );
+        if tensor_path(s * spec.top_k, spec.hidden, inter, experts) {
+            let (function, smem) = tensor_function(ctx.stream, false, inter)
+                .with_context(|| format!("{label}: tensor-core kernel"))?;
+            let (alpha, limit) = (0f32, 0f32);
+            let mut builder = ctx.stream.launch_builder(&function);
+            builder
+                .arg(&hidden_ptr)
+                .arg(&blocks_ptr)
+                .arg(&scales_ptr)
+                .arg(&bias_ptr)
+                .arg(&ids_ptr)
+                .arg(&logits_ptr)
+                .arg(&dest)
+                .arg(&h)
+                .arg(&i)
+                .arg(&tk)
+                .arg(&sq)
+                .arg(&ex)
+                .arg(&alpha)
+                .arg(&limit);
+            unsafe { builder.launch(tensor_grid(spec.hidden, experts, smem)) }
+                .with_context(|| format!("{label}: tensor-core launch"))?;
+            return Ok(());
+        }
+        let function =
+            crate::nvrtc_module::kernel_function(ctx.stream, KERNEL_SOURCE, "moe_down_r4")
+                .with_context(|| format!("{label}: kernel"))?;
         let mut builder = ctx.stream.launch_builder(&function);
         builder
             .arg(&blocks_ptr)
@@ -528,7 +697,7 @@ impl crate::host::HostOp for MoeDownDps {
             .arg(&tk)
             .arg(&sq)
             .arg(&ex);
-        unsafe { builder.launch(grid(s * spec.hidden / GEMV_ROWS)) }
+        unsafe { builder.launch(grid(s * spec.top_k * spec.hidden / GEMV_ROWS)) }
             .with_context(|| format!("{label}: launch"))?;
         Ok(())
     }

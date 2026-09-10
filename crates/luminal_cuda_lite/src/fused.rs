@@ -161,7 +161,10 @@ pub fn moe_gate_up_mxfp4(
 /// Int, `router_logits` `[s, experts]` F32 (the router's raw output — the
 /// kernel softmaxes each token's SELECTED logits into its route weights);
 /// returns `[s, hidden]` F32, the route-weighted sum over the selected
-/// experts.
+/// experts. (The op itself yields the `[s, top_k, hidden]` per-route
+/// partials — each written by exactly one expert's kernel — and the sum
+/// over routes is one ordinary reduction, which keeps the expert-major
+/// kernel deterministic and atomics-free.)
 pub fn moe_down_mxfp4(
     hidden: GraphTensor,
     expert_ids: GraphTensor,
@@ -196,8 +199,8 @@ pub fn moe_down_mxfp4(
     );
     experts.check("moe_down_mxfp4");
     let s = hidden.dims()[0];
-    let out_dims: Vec<IntExpr> = vec![s, IntExpr::from(spec.hidden)];
-    hidden.graph().extern_op(
+    let out_dims: Vec<IntExpr> = vec![s, IntExpr::from(spec.top_k), IntExpr::from(spec.hidden)];
+    let partials = hidden.graph().extern_op(
         crate::ops::moe_mxfp4::DOWN_LOGICAL_CONSTRUCTOR,
         &[
             hidden,
@@ -213,7 +216,8 @@ pub fn moe_down_mxfp4(
         ],
         out_dims,
         DType::F32,
-    )
+    );
+    partials.sum(1)
 }
 
 /// Shrink a tensor's leading axis to `rows` (a zero-start slice recorded

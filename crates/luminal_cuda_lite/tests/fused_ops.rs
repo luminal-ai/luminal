@@ -222,22 +222,45 @@ fn bf16_bits(v: f32) -> u16 {
     half::bf16::from_f32(v).to_bits()
 }
 
+/// Warp-per-route GEMV path (few routes, tile-unfriendly dims).
 #[test]
 fn moe_mxfp4_matches_reference() {
-    const HIDDEN: usize = 64;
-    const INTER: usize = 32;
-    const EXPERTS: usize = 3;
-    const TOP_K: usize = 2;
-    const S: usize = 3;
+    moe_reference_case(64, 32, 3, 2, 3);
+}
+
+/// Expert-major tensor-core path: 128+ routes over tile-aligned dims
+/// (n % 160 == 0, k % 64 == 0), with more routes to one expert than an
+/// M tile holds and an expert nobody routes to.
+#[test]
+fn moe_mxfp4_tensor_core_matches_reference() {
+    moe_reference_case(320, 320, 3, 2, 64);
+    moe_reference_case(320, 320, 3, 2, 100);
+}
+
+fn moe_reference_case(hidden: usize, inter: usize, experts: usize, top_k: usize, s: usize) {
+    #![allow(non_snake_case)]
+    let (HIDDEN, INTER, EXPERTS, TOP_K, S) = (hidden, inter, experts, top_k, s);
     const ALPHA: f32 = 1.702;
     const LIMIT: f32 = 7.0;
-    let mut seed = 11u64;
+    let mut seed = 11u64 + s as u64;
     let x: Vec<f32> = (0..S * HIDDEN).map(|_| lcg(&mut seed)).collect();
-    let ids: Vec<i32> = vec![0, 2, 1, 1, 2, 0];
+    // Routes: expert 2 is never chosen once s > 3 (a zero-route expert
+    // for the grouped kernel); expert 0 takes most of the rest.
+    let ids: Vec<i32> = (0..S * TOP_K)
+        .map(|p| {
+            if S <= 3 {
+                [0, 2, 1, 1, 2, 0][p]
+            } else if p % 5 == 0 {
+                1
+            } else {
+                0
+            }
+        })
+        .collect();
     // The router's raw logits; the down half softmaxes each token's
     // SELECTED ones into its route weights.
     let logits: Vec<f32> = (0..S * EXPERTS).map(|_| lcg(&mut seed) * 3.0).collect();
-    let mut weights = [0f32; S * TOP_K];
+    let mut weights = vec![0f32; S * TOP_K];
     for t in 0..S {
         let picked: Vec<f32> = (0..TOP_K)
             .map(|kk| logits[t * EXPERTS + ids[t * TOP_K + kk] as usize])
@@ -273,13 +296,21 @@ fn moe_mxfp4_matches_reference() {
         .flat_map(|v| bf16_bits(*v).to_le_bytes())
         .collect();
     let bf = |v: f32| half::bf16::from_f32(v).to_f32();
+    // The tensor-core path (64+ routes over tile-aligned dims) feeds the
+    // MMA bf16 activations; the reference rounds at the same two points.
+    let tensor_path = S * TOP_K >= 128
+        && (2 * INTER).is_multiple_of(160)
+        && HIDDEN.is_multiple_of(160)
+        && HIDDEN.is_multiple_of(64)
+        && INTER.is_multiple_of(64);
+    let act = |v: f32| if tensor_path { bf(v) } else { v };
 
     // Reference.
     let mut want = vec![0f32; S * HIDDEN];
     for t in 0..S {
         for kk in 0..TOP_K {
             let e = ids[t * TOP_K + kk] as usize;
-            let mut hidden = [0f32; INTER];
+            let mut hidden = vec![0f32; INTER];
             for j in 0..INTER {
                 let mut gu = [0f32; 2];
                 for (which, g) in gu.iter_mut().enumerate() {
@@ -289,7 +320,9 @@ fn moe_mxfp4_matches_reference() {
                         &gu_scales[(e * 2 * INTER + row) * HIDDEN / 32..][..HIDDEN / 32],
                         HIDDEN,
                     );
-                    *g = (0..HIDDEN).map(|c| w[c] * x[t * HIDDEN + c]).sum::<f32>()
+                    *g = (0..HIDDEN)
+                        .map(|c| w[c] * act(x[t * HIDDEN + c]))
+                        .sum::<f32>()
                         + bf(gu_bias_f[e * 2 * INTER + row]);
                 }
                 let gate = gu[0].min(LIMIT);
@@ -303,7 +336,7 @@ fn moe_mxfp4_matches_reference() {
                     &dn_scales[(e * HIDDEN + r) * INTER / 32..][..INTER / 32],
                     INTER,
                 );
-                let dot = (0..INTER).map(|c| w[c] * hidden[c]).sum::<f32>()
+                let dot = (0..INTER).map(|c| w[c] * act(hidden[c])).sum::<f32>()
                     + bf(dn_bias_f[e * HIDDEN + r]);
                 want[t * HIDDEN + r] += weights[t * TOP_K + kk] * dot;
             }
