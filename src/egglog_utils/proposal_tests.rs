@@ -382,3 +382,126 @@ fn constructor_coverage_tests_direct_alternatives_with_large_mutation_limits() {
         }
     }
 }
+
+fn paired_arguments_fixture(width: usize, coupled: bool) -> SerializedEGraph {
+    let mut graph = choices_fixture(0);
+    graph.enodes.remove(&NodeId::from("op-0"));
+    graph.node_to_class.remove(&NodeId::from("op-0"));
+    let mut parameters = Vec::new();
+    for i in 0..width {
+        let class = ClassId::from(format!("knob-{i}"));
+        let node = NodeId::from(format!("knob-node-{i}"));
+        graph.enodes.insert(node.clone(), (i.to_string(), vec![]));
+        graph.node_to_class.insert(node.clone(), class.clone());
+        graph
+            .eclasses
+            .insert(class.clone(), ("i64".into(), vec![node]));
+        parameters.push(class);
+    }
+    let root = ClassId::from("root");
+    let mut alternatives = Vec::new();
+    for x in 0..width {
+        for y in 0..width {
+            if coupled && x != y {
+                continue;
+            }
+            let class = ClassId::from(format!("pair-kind-{x}-{y}"));
+            let kind = NodeId::from(format!("pair-kind-node-{x}-{y}"));
+            graph.enodes.insert(
+                kind.clone(),
+                (
+                    "Tunable".into(),
+                    vec![parameters[x].clone(), parameters[y].clone()],
+                ),
+            );
+            graph.node_to_class.insert(kind.clone(), class.clone());
+            graph
+                .eclasses
+                .insert(class.clone(), ("OpKind".into(), vec![kind]));
+            let node = NodeId::from(format!("pair-{x}-{y}"));
+            graph.enodes.insert(
+                node.clone(),
+                ("Op".into(), vec![class, ClassId::from("sources")]),
+            );
+            graph.node_to_class.insert(node.clone(), root.clone());
+            alternatives.push(node);
+        }
+    }
+    graph.eclasses.insert(root, ("IR".into(), alternatives));
+    graph
+}
+
+#[test]
+fn coverage_explores_each_constructor_argument_independently() {
+    let graph = paired_arguments_fixture(16, false);
+    let mut rng = StdRng::seed_from_u64(967);
+    let root = &graph.roots[0];
+    let mut choices = random_initial_choice(&graph, &mut rng);
+    choices.insert(root, &graph.eclasses[root].1[0]);
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let base = extractor.index_choice_set(&choices);
+    let arguments = |node: &NodeId| {
+        let kind_class = &graph.enodes[node].1[0];
+        &graph.enodes[&graph.eclasses[kind_class].1[0]].1
+    };
+    let original = arguments(&graph.eclasses[root].1[0]);
+    let mut covered = FxHashSet::default();
+    for proposal in 0..4 {
+        let child = extractor
+            .extract_reachable_indexed_generation(&base, 1, 8, &mut FxHashSet::default(), &mut rng)
+            .pop()
+            .unwrap();
+        if proposal % 2 == 0 {
+            let node =
+                extractor.indexed_node_id(extractor.indexed_selected(&child, extractor.root_index));
+            let changed: Vec<_> = arguments(node)
+                .iter()
+                .zip(original)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                changed.len(),
+                1,
+                "tuning coverage must isolate one constructor argument"
+            );
+            covered.insert(changed[0]);
+        }
+    }
+    assert_eq!(
+        covered.len(),
+        2,
+        "every independently mutable argument gets a proposal"
+    );
+}
+
+#[test]
+fn argument_coverage_retains_coupled_tuning_choices() {
+    for coupled in [false, true] {
+        let graph = paired_arguments_fixture(16, coupled);
+        let mut rng = StdRng::seed_from_u64(971);
+        let root = &graph.roots[0];
+        let mut choices = random_initial_choice(&graph, &mut rng);
+        choices.insert(root, &graph.eclasses[root].1[0]);
+        let mut extractor = LlirExtractor::new(&graph, &[]);
+        let base = extractor.index_choice_set(&choices);
+        assert!(
+            (0..8192).any(|_| {
+                let child = extractor
+                    .extract_reachable_indexed_generation(
+                        &base,
+                        1,
+                        1,
+                        &mut FxHashSet::default(),
+                        &mut rng,
+                    )
+                    .pop()
+                    .unwrap();
+                extractor.indexed_node_id(extractor.indexed_selected(&child, extractor.root_index))
+                    == &NodeId::from("pair-15-15")
+            }),
+            "valid coupled choices remain reachable, including when no single-argument neighbor exists"
+        );
+    }
+}

@@ -1968,12 +1968,18 @@ pub struct LlirExtractor<'a> {
     indexed_extractions: Vec<Vec<(DenseIndex, Vec<CachedIndexedExtraction>)>>,
     mutation_nodes: Vec<Option<MutationChoices>>,
     cover_next_proposal: bool,
-    constructor_alternatives: Vec<(DenseIndex, usize)>,
+    covered_alternatives: Vec<(DenseIndex, CoverageTarget)>,
+    cover_arguments_next: bool,
     visit_epoch: u32,
     visited: Vec<u32>,
     reachable: Vec<DenseNode>,
     reachability_stack: Vec<DenseNode>,
     graph_nodes: Vec<(u32, usize)>,
+}
+
+enum CoverageTarget {
+    Constructor(usize),
+    Argument(usize),
 }
 
 struct MutationChoices {
@@ -2057,7 +2063,8 @@ impl<'a> LlirExtractor<'a> {
             indexed_extractions,
             mutation_nodes,
             cover_next_proposal: true,
-            constructor_alternatives: Vec::new(),
+            covered_alternatives: Vec::new(),
+            cover_arguments_next: false,
             visit_epoch: 0,
             visited: vec![0; indexed_class_count],
             reachable: Vec::new(),
@@ -2306,51 +2313,103 @@ impl<'a> LlirExtractor<'a> {
         mutable_classes
     }
 
-    fn next_constructor_alternative(
+    fn argument_pools(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        class: DenseIndex,
+    ) -> std::collections::BTreeMap<usize, Vec<DenseIndex>> {
+        let pool = self.mutation_pool(class).to_vec();
+        let nodes = self.indexed_classes[class as usize].nodes;
+        let current = &nodes[choices.choices[class as usize] as usize];
+        let mut arguments = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for slot in pool {
+            if let Some(argument) =
+                single_argument_change(self.egraph, current, &nodes[slot as usize])
+            {
+                arguments.entry(argument).or_default().push(slot);
+            }
+        }
+        arguments
+    }
+
+    fn next_covered_choice(
         &mut self,
         choices: &IndexedChoiceSet,
         active_classes: &[DenseIndex],
-    ) -> Option<(DenseIndex, usize)> {
-        while let Some(alternative) = self.constructor_alternatives.pop() {
-            if active_classes.contains(&alternative.0) {
-                return Some(alternative);
+        rng: &mut (impl Rng + ?Sized),
+    ) -> Option<(DenseIndex, DenseIndex)> {
+        // Alternate full constructor and argument passes. Starting with the
+        // constructor pass preserves coverage before revisiting tuning variants.
+        for refill in 0..=2 {
+            while let Some((class, target)) = self.covered_alternatives.pop() {
+                if !active_classes.contains(&class) {
+                    continue;
+                }
+                let pool = match target {
+                    CoverageTarget::Constructor(family) => self.mutation_nodes[class as usize]
+                        .as_ref()
+                        .unwrap()
+                        .families[family]
+                        .clone(),
+                    // Parents can change while a pass is pending. Recompute
+                    // neighbors so the proposal still changes exactly one argument.
+                    CoverageTarget::Argument(argument) => {
+                        let Some(pool) = self.argument_pools(choices, class).remove(&argument)
+                        else {
+                            continue;
+                        };
+                        pool
+                    }
+                };
+                return Some((class, pool[rng.random_range(0..pool.len())]));
             }
-        }
-        // One cycle offers each other constructor at every active site. Avoid
-        // spending this coverage budget revisiting the incumbent constructor's
-        // tuning variants; random proposals continue to explore those variants.
-        let mut classes = active_classes.to_vec();
-        classes.sort_unstable();
-        for class in classes.into_iter().rev() {
-            self.mutation_pool(class);
-            let families = &self.mutation_nodes[class as usize]
-                .as_ref()
-                .unwrap()
-                .families;
-            for (index, family) in families.iter().enumerate().rev() {
-                if !family.contains(&choices.choices[class as usize]) {
-                    self.constructor_alternatives.push((class, index));
+            if refill == 2 {
+                break;
+            }
+            let arguments = self.cover_arguments_next;
+            self.cover_arguments_next = !arguments;
+            let mut classes = active_classes.to_vec();
+            classes.sort_unstable();
+            for class in classes.into_iter().rev() {
+                if arguments {
+                    for argument in self.argument_pools(choices, class).into_keys().rev() {
+                        self.covered_alternatives
+                            .push((class, CoverageTarget::Argument(argument)));
+                    }
+                } else {
+                    self.mutation_pool(class);
+                    let families = &self.mutation_nodes[class as usize]
+                        .as_ref()
+                        .unwrap()
+                        .families;
+                    for (index, family) in families.iter().enumerate().rev() {
+                        if !family.contains(&choices.choices[class as usize]) {
+                            self.covered_alternatives
+                                .push((class, CoverageTarget::Constructor(index)));
+                        }
+                    }
                 }
             }
         }
-        self.constructor_alternatives.pop()
+        None
     }
 
     fn mutate_choice(
         &mut self,
         child: &mut IndexedChoiceSet,
         class: DenseIndex,
-        family_index: Option<usize>,
+        selected: Option<DenseIndex>,
         rng: &mut (impl Rng + ?Sized),
     ) -> bool {
-        self.mutation_pool(class);
-        let families = &self.mutation_nodes[class as usize]
-            .as_ref()
-            .unwrap()
-            .families;
-        let family_index = family_index.unwrap_or_else(|| rng.random_range(0..families.len()));
-        let family = &families[family_index];
-        let new_node = family[rng.random_range(0..family.len())];
+        let new_node = selected.unwrap_or_else(|| {
+            self.mutation_pool(class);
+            let families = &self.mutation_nodes[class as usize]
+                .as_ref()
+                .unwrap()
+                .families;
+            let family = &families[rng.random_range(0..families.len())];
+            family[rng.random_range(0..family.len())]
+        });
         let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
         let class_info = &self.indexed_classes[class as usize];
         child.hash ^= hash_choice_entry(class_info.id, &class_info.nodes[old_node as usize]);
@@ -2381,28 +2440,23 @@ impl<'a> LlirExtractor<'a> {
         while offspring.len() < generation_size && attempts < max_attempts {
             attempts += 1;
             let mut child = base.clone();
-            let cover_constructor = self.cover_next_proposal;
+            let cover_proposal = self.cover_next_proposal;
             self.cover_next_proposal = !self.cover_next_proposal;
             let mut active_classes = mutable_classes.clone();
             let mutation_count = rng.random_range(1..=mutations_per_generation.max(1));
             // Measure direct alternatives independently; the random half keeps
             // the caller's full joint-mutation budget for escaping local minima.
-            let mutation_count = if cover_constructor { 1 } else { mutation_count };
+            let mutation_count = if cover_proposal { 1 } else { mutation_count };
             for _ in 0..mutation_count {
                 // Cover alternate constructors between unrestricted random
                 // proposals, which continue exploring every tuning/joint choice.
-                let alternative = cover_constructor
-                    .then(|| self.next_constructor_alternative(&child, &active_classes))
+                let alternative = cover_proposal
+                    .then(|| self.next_covered_choice(&child, &active_classes, rng))
                     .flatten();
                 let class = alternative
                     .map(|(class, _)| class)
                     .unwrap_or_else(|| active_classes[rng.random_range(0..active_classes.len())]);
-                if self.mutate_choice(
-                    &mut child,
-                    class,
-                    alternative.map(|(_, family)| family),
-                    rng,
-                ) {
+                if self.mutate_choice(&mut child, class, alternative.map(|(_, node)| node), rng) {
                     // A structural choice can expose dormant genes left at an
                     // unrelated implementation by an earlier genome. Initialize
                     // the newly active subgraph in this same proposal, so a
@@ -3088,6 +3142,46 @@ fn non_marker_enode_indices(egraph: &SerializedEGraph, enodes: &[NodeId]) -> Vec
         .filter(|(_, n)| !enode_is_loop_input_marker(egraph, n))
         .map(|(i, _)| i)
         .collect()
+}
+
+// Compare existing terms, without inventing parameter combinations. For the
+// generic Op wrapper, require identical inputs and an unambiguous OpKind so a
+// constructor-argument proposal cannot silently change its data dependencies.
+fn single_argument_change(
+    egraph: &SerializedEGraph,
+    before: &NodeId,
+    after: &NodeId,
+) -> Option<usize> {
+    let (mut left, mut right) = (&egraph.enodes[before], &egraph.enodes[after]);
+    if left.0 == "Op" && right.0 == "Op" {
+        if left.1.get(1..) != right.1.get(1..) {
+            return None;
+        }
+        let (left_sort, left_kinds) = &egraph.eclasses[left.1.first()?];
+        let (right_sort, right_kinds) = &egraph.eclasses[right.1.first()?];
+        if left_sort != "OpKind"
+            || right_sort != "OpKind"
+            || left_kinds.len() != 1
+            || right_kinds.len() != 1
+        {
+            return None;
+        }
+        left = &egraph.enodes[&left_kinds[0]];
+        right = &egraph.enodes[&right_kinds[0]];
+    }
+    if left.0 != right.0 || left.1.len() != right.1.len() {
+        return None;
+    }
+    let mut changed = None;
+    for (index, (a, b)) in left.1.iter().zip(&right.1).enumerate() {
+        if a != b {
+            if changed.is_some() {
+                return None;
+            }
+            changed = Some(index);
+        }
+    }
+    changed
 }
 
 /// Group legal proposals by constructor before sampling tuning variants. The
