@@ -2313,6 +2313,9 @@ impl<'a> LlirExtractor<'a> {
         mutable_classes
     }
 
+    // For each argument value, keep existing alternatives requiring the fewest
+    // companion changes. Independent knobs still move alone; coupled legal
+    // configurations remain reachable without inventing invalid combinations.
     fn argument_pools(
         &mut self,
         choices: &IndexedChoiceSet,
@@ -2321,13 +2324,28 @@ impl<'a> LlirExtractor<'a> {
         let pool = self.mutation_pool(class).to_vec();
         let nodes = self.indexed_classes[class as usize].nodes;
         let current = &nodes[choices.choices[class as usize] as usize];
-        let mut arguments = std::collections::BTreeMap::<_, Vec<_>>::new();
+        let mut nearest = std::collections::BTreeMap::<_, (usize, Vec<_>)>::new();
         for slot in pool {
-            if let Some(argument) =
-                single_argument_change(self.egraph, current, &nodes[slot as usize])
-            {
-                arguments.entry(argument).or_default().push(slot);
+            let Some(changes) =
+                changed_constructor_arguments(self.egraph, current, &nodes[slot as usize])
+            else {
+                continue;
+            };
+            let distance = changes.len();
+            for target in changes {
+                let (best, candidates) = nearest.entry(target).or_insert((distance, Vec::new()));
+                if distance < *best {
+                    *best = distance;
+                    candidates.clear();
+                }
+                if distance == *best {
+                    candidates.push(slot);
+                }
             }
+        }
+        let mut arguments = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for ((argument, _), (_, candidates)) in nearest {
+            arguments.entry(argument).or_default().extend(candidates);
         }
         arguments
     }
@@ -2352,7 +2370,7 @@ impl<'a> LlirExtractor<'a> {
                         .families[family]
                         .clone(),
                     // Parents can change while a pass is pending. Recompute
-                    // neighbors so the proposal still changes exactly one argument.
+                    // neighbors so companion changes remain minimal for this parent.
                     CoverageTarget::Argument(argument) => {
                         let Some(pool) = self.argument_pools(choices, class).remove(&argument)
                         else {
@@ -3147,11 +3165,11 @@ fn non_marker_enode_indices(egraph: &SerializedEGraph, enodes: &[NodeId]) -> Vec
 // Compare existing terms, without inventing parameter combinations. For the
 // generic Op wrapper, require identical inputs and an unambiguous OpKind so a
 // constructor-argument proposal cannot silently change its data dependencies.
-fn single_argument_change(
+fn changed_constructor_arguments(
     egraph: &SerializedEGraph,
     before: &NodeId,
     after: &NodeId,
-) -> Option<usize> {
+) -> Option<Vec<(usize, ClassId)>> {
     let (mut left, mut right) = (&egraph.enodes[before], &egraph.enodes[after]);
     if left.0 == "Op" && right.0 == "Op" {
         if left.1.get(1..) != right.1.get(1..) {
@@ -3172,16 +3190,15 @@ fn single_argument_change(
     if left.0 != right.0 || left.1.len() != right.1.len() {
         return None;
     }
-    let mut changed = None;
-    for (index, (a, b)) in left.1.iter().zip(&right.1).enumerate() {
-        if a != b {
-            if changed.is_some() {
-                return None;
-            }
-            changed = Some(index);
-        }
-    }
-    changed
+    Some(
+        left.1
+            .iter()
+            .zip(&right.1)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(index, (_, value))| (index, value.clone()))
+            .collect(),
+    )
 }
 
 /// Group legal proposals by constructor before sampling tuning variants. The

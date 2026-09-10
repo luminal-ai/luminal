@@ -505,3 +505,33 @@ fn argument_coverage_retains_coupled_tuning_choices() {
         );
     }
 }
+
+#[test]
+fn argument_coverage_proposes_required_companion_changes() {
+    let graph = paired_arguments_fixture(3, true);
+    let root = &graph.roots[0];
+    let mut rng = StdRng::seed_from_u64(977);
+    let mut choices = random_initial_choice(&graph, &mut rng);
+    choices.insert(root, &graph.eclasses[root].1[0]);
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let base = extractor.index_choice_set(&choices);
+    let pools = extractor.argument_pools(&base, extractor.root_index);
+    assert_eq!(
+        pools.len(),
+        2,
+        "both coupled arguments need direct coverage"
+    );
+    for pool in pools.values() {
+        let nodes = extractor.indexed_classes[extractor.root_index as usize].nodes;
+        let selected: FxHashSet<_> = pool
+            .iter()
+            .map(|&slot| nodes[slot as usize].clone())
+            .collect();
+        assert_eq!(
+            selected,
+            [NodeId::from("pair-1-1"), NodeId::from("pair-2-2")]
+                .into_iter()
+                .collect()
+        );
+    }
+}
