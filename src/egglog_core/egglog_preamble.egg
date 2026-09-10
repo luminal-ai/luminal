@@ -2865,6 +2865,7 @@
     (< ?inner_lower ?inner_upper)
   )
   ((union ?expr (IntAdd ?lhs (IntAdd ?rhs ?outer))))
+  :name "int-add-associate"
 )
 
 ; Associativity : IntMul
@@ -2879,6 +2880,7 @@
     (< ?inner_lower ?inner_upper)
   )
   ((union ?expr (IntMul ?lhs (IntMul ?rhs ?outer))))
+  :name "int-mul-associate"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2941,6 +2943,7 @@
     (< ?summands_lower ?summands_upper)
   )
   ((union ?expr (IntAdd (IntMul ?lhs ?factor) (IntMul ?rhs ?factor))))
+  :name "int-distribute-expand"
 )
 
 ; Distributivity : factor
@@ -2952,6 +2955,7 @@
     (provably-cannot-union-with-zero ?expr)
   )
   ((union ?expr (IntMul (IntAdd ?lhs ?rhs) ?factor)))
+  :name "int-distribute-factor"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

@@ -1,32 +1,36 @@
 [package]
 name = "luminal_metal"
 version = "0.2.0"
-edition = "2024"
+edition.workspace = true
 description = "Metal backend for luminal"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 luminal = { path = "../.." }
+anyhow = "1"
+rustc-hash = "2"
+petgraph = "0.6.4"
+rand = "0.9.2"
+colored = "2.0.4"
+half = "2.7.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"
-as-any = "0.3.2"
-itertools = "0.12.1"
-half = { version = "2.7.1", features = ["bytemuck"] }
-tracing = "0.1.43"
-safetensors = "0.7.0"
-memmap2 = "0.9.9"
-bytemuck = "1.24.0"
 
 [dev-dependencies]
-candle-core = "0.9.2-alpha.1"
-hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
+luminal_reference = { path = "../luminal_reference" }
 luminal_nn = { path = "../luminal_nn" }
-luminal_tracing = { path = "../luminal_tracing" }
-proptest = "1.9.0"
-rand = "0.9.2"
-rustc-hash = "2.1"
+mini_llama3 = { path = "../../examples/mini/llama3" }
+mini_conv = { path = "../../examples/mini/conv" }
+safetensors = "0.7"
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
 tokenizers = "0.22.2"
+luminal_tracing = { path = "../luminal_tracing" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+mini_qwen3 = { path = "../../examples/mini/qwen3" }
+mini_qwen3_moe = { path = "../../examples/mini/qwen3_moe" }
+mini_whisper = { path = "../../examples/mini/whisper" }
+mini_gemma3 = { path = "../../examples/mini/gemma3" }
+mini_gemma4_moe = { path = "../../examples/mini/gemma4_moe" }
+mini_flux = { path = "../../examples/mini/flux" }

@@ -1,0 +1,66 @@
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
+    (= ?out_logical (LogicalReduceSum ?in_logical ?reduction_dim))
+    (= ?value_dtype (dtype-of ?out_logical))
+    (!= ?value_dtype (Int))
+    (!= ?value_dtype (Int64))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
+  )
+)
+
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
+    (= ?out_logical (LogicalReduceSum ?in_logical ?reduction_dim))
+    (= (dtype-of ?out_logical) (Int))
+    (= ?value_lower (value-lower-bound-of ?out_logical))
+    (= ?value_upper (value-upper-bound-of ?out_logical))
+    (>= ?value_lower (bigint -2147483648))
+    (<= ?value_upper (bigint 2147483647))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
+  )
+)
+
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
+    (= ?out_logical (LogicalReduceSum ?in_logical ?reduction_dim))
+    (= (dtype-of ?out_logical) (Int64))
+    (= ?value_lower (value-lower-bound-of ?out_logical))
+    (= ?value_upper (value-upper-bound-of ?out_logical))
+    (>= ?value_lower (bigint -9223372036854775808))
+    (<= ?value_upper (bigint 9223372036854775807))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
+  )
+)

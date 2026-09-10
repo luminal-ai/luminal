@@ -1,0 +1,19 @@
+(rule
+  (
+    (= ?in1_layout_tensor (LayoutTensorLit ?in1_logical ?in1_layout))
+    (= ?in2_layout_tensor (LayoutTensorLit ?in2_logical ?in2_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
+    (= ?out_logical (LogicalLessThan ?in1_logical ?in2_logical))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in1_layout_tensor
+          (LayoutTensorCons ?in2_layout_tensor (LayoutTensorNil)))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpLessThanGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
+  )
+)

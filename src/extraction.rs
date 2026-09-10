@@ -325,6 +325,33 @@ impl<'a> ExtractionSession<'a> {
         SamplingSpace::from_candidate_inputs(candidate_inputs)
     }
 
+    /// Per-producer byte-movement estimates, parallel to a producer index.
+    /// These are each operation's own reads and writes, without recursively
+    /// counting its inputs' producers. Runtime search policies can use this
+    /// metadata to seed genomes; it does not select or rewrite operations.
+    pub fn producer_costs(
+        &self,
+        index: &std::collections::BTreeMap<ClassId, Vec<(String, ProducerChoice)>>,
+    ) -> std::collections::BTreeMap<ClassId, Vec<u64>> {
+        index
+            .iter()
+            .map(|(class, entries)| {
+                let costs = entries
+                    .iter()
+                    .map(|(_, choice)| {
+                        self.extractor
+                            .producer_candidates_for_choice(class, choice)
+                            .iter()
+                            .map(|candidate| self.extractor.candidate_heuristic_cost(candidate))
+                            .min()
+                            .unwrap_or(u64::MAX)
+                    })
+                    .collect();
+                (class.clone(), costs)
+            })
+            .collect()
+    }
+
     /// Classify the last failed extraction's blockage (diagnosis ruling
     /// 2026-08-07: understand refusals, never auto-repair). Returns
     /// (has_choice_cycle, has_dead_end, summary): choice-cycles are

@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpSinFunctionalGeneric (LayoutTensor Layout) LayoutTensorOp)

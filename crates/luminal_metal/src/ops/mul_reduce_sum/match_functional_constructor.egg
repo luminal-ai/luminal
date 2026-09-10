@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpMulReduceSumGeneric (LayoutTensor LayoutTensor i64 Layout) LayoutTensorOp)

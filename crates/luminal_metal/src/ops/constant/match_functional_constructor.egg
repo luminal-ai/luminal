@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpConstantGeneric (f64 Layout) LayoutTensorOp)
