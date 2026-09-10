@@ -2263,6 +2263,21 @@ impl<'a> LlirExtractor<'a> {
         self.index_choice_set(&choices)
     }
 
+    /// Complete dormant genes introduced after a saved incumbent was created.
+    /// Existing bindings remain exact; callers verify the extracted incumbent.
+    pub(crate) fn index_seed_choices(&mut self, choices: &[(String, String)]) -> IndexedChoiceSet {
+        let mut genome = self.index_named_choices(choices);
+        for index in 0..self.indexed_classes.len() {
+            if self.indexed_classes[index].searchable && genome.choices[index] == NO_DENSE_INDEX {
+                let slot = self.mutation_pool(index as DenseIndex)[0];
+                let class = &self.indexed_classes[index];
+                genome.choices[index] = slot;
+                genome.hash ^= hash_choice_entry(class.id, &class.nodes[slot as usize]);
+            }
+        }
+        genome
+    }
+
     pub fn random_indexed_generation(
         &self,
         generation_size: usize,

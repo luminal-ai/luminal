@@ -199,7 +199,7 @@ impl SelectedSchedule {
         } else {
             remap_choices(&bucket.egraph, ctx.egraph(), &bucket.choices)?
         };
-        let genome = extractor.index_named_choices(&choices);
+        let genome = extractor.index_seed_choices(&choices);
         let llir = unroll_packed_llir(extractor.extract_indexed_packed(&genome, &[]));
         (fingerprint_llir(&llir) == bucket.unrolled_llir_fingerprint).then_some(genome)
     }

@@ -109,6 +109,41 @@ fn reachable_mutation_balances_families_and_preserves_every_variant() {
     }
 }
 
+#[test]
+fn saved_incumbent_can_mutate_into_new_searchable_classes() {
+    let old = choices_fixture(0);
+    let mut rng = StdRng::seed_from_u64(937);
+    let old_extractor = LlirExtractor::new(&old, &[]);
+    let bindings = old_extractor.named_choices(&old_extractor.random_indexed_choice(&mut rng));
+    let expanded = choices_fixture(16);
+    let mut extractor = LlirExtractor::new(&expanded, &[]);
+    let seed = extractor.index_seed_choices(&bindings);
+    let completed = extractor.named_choices(&seed);
+    assert!(bindings.iter().all(|binding| completed.contains(binding)));
+    assert_eq!(seed.hash, extractor.index_named_choices(&completed).hash);
+    let mut reached = FxHashSet::default();
+    for _ in 0..1024 {
+        for child in extractor.extract_reachable_indexed_generation(
+            &seed,
+            1,
+            2,
+            &mut FxHashSet::default(),
+            &mut rng,
+        ) {
+            let selected = extractor.indexed_selected(&child, extractor.root_index);
+            reached.insert(extractor.indexed_node_id(selected).clone());
+            extractor.reachable_mutation_classes(&child);
+            let named = extractor.named_choices(&child);
+            assert_eq!(child.hash, extractor.index_named_choices(&named).hash);
+        }
+    }
+    assert_eq!(
+        reached.len(),
+        17,
+        "every added implementation stays searchable"
+    );
+}
+
 // A direct implementation hides the input of an equivalent wrapped form.
 // Switching to the wrapper must initialize its newly activated input in the
 // same proposal, without first retaining a worse intermediate parent.
