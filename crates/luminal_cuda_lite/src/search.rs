@@ -164,11 +164,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         }
     }
 
-    /// Direct step launch is cheap enough for broad exploration, but serving
-    /// uses materialized CUDA graphs and can rank close schedules differently.
-    /// Re-extract the search's best parent-width set and measure that exact
-    /// deployment path before bucket-lattice selection. No schedule is named
-    /// or forced: both stages are ordered solely by measured device time.
+    /// Re-extract and remeasure the search's best parent-width set on the same
+    /// deployment graph path before bucket-lattice selection. No schedule is
+    /// named or forced: both stages are ordered solely by measured device time.
     fn rerank_cuda_graph_finalists<'a>(
         &mut self,
         ranked: Ranked<Duration>,

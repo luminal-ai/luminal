@@ -362,19 +362,37 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 );
             }
         }
-        // Allocate before altering caller bindings, so allocation failures leave
-        // the original runtime usable. Device capacity checks see these slots.
+        // The previous program is about to be searched again. Its captured
+        // graphs and high-water intermediate arena are disposable caches, and
+        // keeping them alive while allocating replay storage can exhaust the
+        // device before the first candidate is evaluated. Preserve the compiled
+        // program and caller bindings so even an allocation failure can lazily
+        // rematerialize the original program on its next execution.
+        self.release_all_arenas();
+        self.release_pooled_memory();
+        let workload = self.profile_workload.as_ref().unwrap();
         let slots = capacities
             .into_iter()
-            .map(|n| self.cuda_stream.alloc_zeros(n))
-            .collect::<Result<Vec<_>, _>>()?;
+            .enumerate()
+            .map(|(i, n)| {
+                self.cuda_stream.alloc_zeros(n).map_err(|error| {
+                    anyhow::anyhow!(
+                        "profile replay slot {i} ({n} bytes): {error}; device free/total: {:?}",
+                        self.cuda_stream.context().mem_get_info()
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let mut snapshots = FxHashMap::default();
         if workload.device_snapshots {
             for case in &workload.cases {
                 for group in case.inputs.groups() {
                     let key = group.0.as_ptr() as usize;
                     if let std::collections::hash_map::Entry::Vacant(entry) = snapshots.entry(key) {
-                        entry.insert(self.cuda_stream.clone_htod(group.0.as_ref())?);
+                        let snapshot = self.cuda_stream.clone_htod(group.0.as_ref()).map_err(|error| {
+                            anyhow::anyhow!("profile snapshot for case {:?} ({} bytes): {error}; device free/total: {:?}", case.id, group.0.len(), self.cuda_stream.context().mem_get_info())
+                        })?;
+                        entry.insert(snapshot);
                     }
                 }
             }

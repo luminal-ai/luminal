@@ -821,3 +821,52 @@ fn synthetic_search_profiles_materialized_graphs() {
     rt.execute(&graph.dyn_map);
     assert_eq!(rt.get_i32(output), vec![19; 4]);
 }
+
+#[test]
+fn profile_replay_reclaims_previous_arena_and_rematerializes_original_program() {
+    let mut graph = Graph::new();
+    let input = graph.tensor(256).persist();
+    let output = (input + 2.0).output();
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut rt = runtime();
+    rt.set_data(input, vec![3f32; 256]);
+    rt = graph.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(2).trials(1),
+        &mut SmallRng::seed_from_u64(831),
+    );
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_f32(output), vec![5.; 256]);
+    assert!(rt.shared_arena.is_some(), "test requires a resident arena");
+    assert!(rt.cuda_graphs().any(CudaGraphOp::is_materialized));
+    let original = rt.current_hlir_device_binding(input.id).unwrap();
+    rt.set_profile_workload(
+        &graph,
+        ProfileWorkload::new().device_snapshots(true).case(
+            "replacement",
+            DynMap::default(),
+            ProfileInputs::new().input(input, vec![7f32; 256]),
+            1.,
+        ),
+    )
+    .unwrap();
+    let contexts = graph
+        .search_space()
+        .unwrap()
+        .bucket_contexts(&graph.dyn_map);
+    rt.begin_profile_replay(&contexts).unwrap();
+    assert!(
+        rt.shared_arena.is_none(),
+        "previous arena overlaps replay storage"
+    );
+    assert!(!rt.cuda_graphs().any(CudaGraphOp::is_materialized));
+    assert_eq!(rt.profile_replay.as_ref().unwrap().snapshots.len(), 1);
+    rt.activate_profile_case(0).unwrap();
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_f32(output), vec![9.; 256]);
+    rt.finish_profile_replay();
+    assert_eq!(rt.current_hlir_device_binding(input.id).unwrap(), original);
+    rt.clear_profile_workload();
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_f32(output), vec![5.; 256]);
+}
