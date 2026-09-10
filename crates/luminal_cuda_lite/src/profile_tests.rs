@@ -61,34 +61,27 @@ fn profile_dense_exact_cases_and_unseen_shapes() {
     );
     assert_eq!(rt.current_hlir_device_binding(input.id).unwrap(), original);
     assert!(!rt.profile_evaluations().is_empty());
-    for graph in [false, true] {
-        let evaluations: Vec<_> = rt
-            .profile_evaluations()
-            .iter()
-            .filter(|e| e.cuda_graph == graph)
-            .collect();
-        assert!(!evaluations.is_empty());
-        for evaluation in evaluations {
-            let expected = if evaluation.bucket == 0 {
-                vec![1, 4]
-            } else {
-                vec![7]
-            };
-            assert_eq!(
-                evaluation
-                    .cases
-                    .iter()
-                    .map(|c| c.dims[&'s'.into()])
-                    .collect::<Vec<_>>(),
-                expected
-            );
-            let score: f64 = evaluation
+    assert!(rt.profile_evaluations().iter().all(|e| e.cuda_graph));
+    for evaluation in rt.profile_evaluations() {
+        let expected = if evaluation.bucket == 0 {
+            vec![1, 4]
+        } else {
+            vec![7]
+        };
+        assert_eq!(
+            evaluation
                 .cases
                 .iter()
-                .map(|c| c.duration.as_secs_f64() * c.weight / 10.)
-                .sum();
-            assert!((evaluation.weighted_cost.as_secs_f64() - score).abs() < 1e-9);
-        }
+                .map(|c| c.dims[&'s'.into()])
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let score: f64 = evaluation
+            .cases
+            .iter()
+            .map(|c| c.duration.as_secs_f64() * c.weight / 10.)
+            .sum();
+        assert!((evaluation.weighted_cost.as_secs_f64() - score).abs() < 1e-9);
     }
     rt.begin_cuda_graph_warmup(&[]);
     for s in [2, 8, 3, 6, 1] {
@@ -678,7 +671,9 @@ fn profile_bf16_strided_graph_uses_physical_input_abi() {
 }
 
 #[derive(Debug, Clone, Default)]
-struct MetadataCopy;
+struct MetadataCopy {
+    direct_launches: Arc<std::sync::atomic::AtomicUsize>,
+}
 impl EgglogOp for MetadataCopy {
     fn sort(&self) -> luminal::egglog_utils::api::SortDef {
         luminal::egglog_utils::api::sort(luminal::egglog_utils::base::OP_KIND, "MetadataCopy", &[])
@@ -740,6 +735,12 @@ impl HostOp for MetadataCopy {
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dims: &DynMap,
     ) -> anyhow::Result<()> {
+        if stream.capture_status()?
+            == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+        {
+            self.direct_launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         unsafe {
             result::memcpy_dtod_async(
                 buffers[&node].ptr(),
@@ -757,8 +758,10 @@ fn profile_capture_preparation_uses_exact_metadata() {
     let mut graph = Graph::new();
     let input = graph.tensor('s').as_dtype(DType::Int).persist();
     let metadata = graph.tensor(1).as_dtype(DType::Int).persist();
+    let copy = MetadataCopy::default();
+    let direct_launches = copy.direct_launches.clone();
     let output = graph
-        .custom_op(MetadataCopy, (input.id, metadata.id), 's', DType::Int)
+        .custom_op(copy, (input.id, metadata.id), 's', DType::Int)
         .output();
     graph.set_dim('s', 1);
     graph.build_search_space::<CudaRuntime>(
@@ -789,6 +792,32 @@ fn profile_capture_preparation_uses_exact_metadata() {
             .iter()
             .any(|e| e.cuda_graph && e.cases.len() == 2)
     );
+    assert_eq!(direct_launches.load(std::sync::atomic::Ordering::SeqCst), 0);
     rt.execute(&graph.dyn_map);
     assert_eq!(rt.get_i32(output), vec![19]);
+}
+
+#[test]
+fn synthetic_search_profiles_materialized_graphs() {
+    let mut graph = Graph::new();
+    let input = graph.tensor('s').as_dtype(DType::Int).persist();
+    let metadata = graph.tensor(1).as_dtype(DType::Int).persist();
+    let copy = MetadataCopy::default();
+    let direct_launches = copy.direct_launches.clone();
+    let output = graph
+        .custom_op(copy, (input.id, metadata.id), 's', DType::Int)
+        .output();
+    graph.set_dim('s', 4);
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut rt = runtime();
+    rt.set_data(input, vec![19i32; 4]);
+    rt.set_data_with_host_mirror(metadata, vec![4i32]);
+    rt = graph.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(1).trials(3),
+        &mut SmallRng::seed_from_u64(17),
+    );
+    assert_eq!(direct_launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_i32(output), vec![19; 4]);
 }

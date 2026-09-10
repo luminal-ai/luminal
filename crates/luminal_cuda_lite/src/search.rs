@@ -33,21 +33,21 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             let bucket_started = Instant::now();
             let setup_started = Instant::now();
             let mut search = GeneticSearch::<Duration>::new(space, ctx, options, search_started_at);
-            log_search_phase(ctx.index, "direct", "search_init", setup_started);
+            log_search_phase(ctx.index, "graph-search", "search_init", setup_started);
             loop {
                 let extract_started = Instant::now();
                 let candidate = search.next_candidate(rng);
-                log_search_phase(ctx.index, "direct", "extract", extract_started);
+                log_search_phase(ctx.index, "graph-search", "extract", extract_started);
                 let Some(mut candidate) = candidate else {
                     break;
                 };
                 let evaluate_started = Instant::now();
                 let outcome = self.evaluate_candidate(&mut candidate, ctx, options);
-                log_search_phase(ctx.index, "direct", "evaluate", evaluate_started);
+                log_search_phase(ctx.index, "graph-search", "evaluate", evaluate_started);
                 let cleanup_started = Instant::now();
                 search.report(candidate, outcome);
                 self.release_search_candidate_allocations();
-                log_search_phase(ctx.index, "direct", "report_release", cleanup_started);
+                log_search_phase(ctx.index, "graph-search", "report_release", cleanup_started);
             }
             let ranked = search.into_ranked();
             let bucket_finalists =
@@ -144,7 +144,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         };
         candidate.restart_timer();
         let profiled = catch_unwind(AssertUnwindSafe(|| {
-            self.profile_loaded_llir(
+            self.profile_loaded_cuda_graph(
                 &candidate.llir,
                 &candidate.profile_dyn_map,
                 options.trials,
@@ -180,13 +180,13 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let target = options.keep_best.max(1).min(ranked.len());
         let mut deployment_ranked = Vec::with_capacity(target);
 
-        for (direct_metric, genome) in &ranked {
+        for (search_metric, genome) in &ranked {
             let extract_started = Instant::now();
             // Use Core's ordinary extractor on a one-genome ranked set. This
             // preserves the exact final extraction/unroll path the lattice
             // will use after the deployment metrics have been sorted.
             let mut extracted = Finalists::new(
-                vec![(*direct_metric, genome.clone())],
+                vec![(*search_metric, genome.clone())],
                 space,
                 ctx,
                 options,
@@ -231,7 +231,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 Ok(metric) => {
                     if options.search_log_enabled() {
                         println!(
-                            "   Search  deployment finalist direct={direct_metric:?} graph={metric:?}"
+                            "   Search  deployment finalist search={search_metric:?} graph={metric:?}"
                         );
                     }
                     deployment_ranked.push((metric, genome.clone()));
@@ -287,11 +287,11 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         llir: &LLIRGraph,
         ctx: &BucketContext<'_>,
         options: &CompileOptions,
-        cuda_graph: bool,
+        finalist: bool,
     ) -> anyhow::Result<Duration> {
         let result = catch_unwind(AssertUnwindSafe(|| {
             self.capture_profile_op_states(llir)?;
-            self.evaluate_profile_workload_inner(llir, ctx, options, cuda_graph)
+            self.evaluate_profile_workload_inner(llir, ctx, options, finalist)
         }));
         self.release_profile_op_states()?;
         match result {
@@ -305,9 +305,13 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         llir: &LLIRGraph,
         ctx: &BucketContext<'_>,
         options: &CompileOptions,
-        cuda_graph: bool,
+        finalist: bool,
     ) -> anyhow::Result<Duration> {
-        let mode = if cuda_graph { "graph" } else { "direct" };
+        let mode = if finalist {
+            "graph-finalist"
+        } else {
+            "graph-search"
+        };
         if std::env::var_os("LUMINAL_CUDA_PROFILE_EXEC").is_some() {
             eprintln!("SEARCH_EVALUATION_BEGIN bucket={} mode={mode}", ctx.index);
         }
@@ -320,7 +324,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         self.restore_profile_trial()?;
         log_search_phase(ctx.index, mode, "initial_restore_validate", setup_started);
         let compile_started = Instant::now();
-        if cuda_graph {
+        if finalist {
             let prepared = self
                 .compile_and_validate_finalist_candidate(llir, &dims, ctx)
                 .map_err(anyhow::Error::msg)?;
@@ -346,11 +350,8 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             self.activate_profile_case(index)?;
             log_search_phase(ctx.index, mode, "case_activate", activate_started);
             let dims = self.profile_case_dims(index);
-            let (duration, _) = if cuda_graph {
-                self.profile_loaded_cuda_graph(llir, &dims, options.trials, remaining, None)
-            } else {
-                self.profile_loaded_llir(llir, &dims, options.trials, remaining, None)
-            };
+            let (duration, _) =
+                self.profile_loaded_cuda_graph(llir, &dims, options.trials, remaining, None);
             anyhow::ensure!(
                 options
                     .execution_timeout
@@ -359,7 +360,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             );
             timings.push((index, duration));
         }
-        self.record_profile_evaluation(ctx.index, cuda_graph, &timings)
+        self.record_profile_evaluation(ctx.index, true, &timings)
     }
 
     fn prepare_search_candidate(

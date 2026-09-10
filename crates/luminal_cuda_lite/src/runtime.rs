@@ -474,9 +474,8 @@ pub struct CudaRuntimeImpl<O> {
     profile_replay: Option<profile::ReplaySession>,
     profile_evaluations: Vec<ProfileEvaluation>,
     /// Selects the deployment CUDA-graph launch path while profiling. The
-    /// broad genetic search leaves this false and cheaply times prepared
-    /// steps; CUDA re-ranks its small finalist set with this true so the final
-    /// objective matches the executable installed for serving.
+    /// genetic search and finalist validation both use this path so their
+    /// fitness measures the executable installed for serving.
     profile_cuda_graphs: bool,
     /// Reused timing-enabled events bounding only the stream work launched by
     /// `execute`. Search profiling reads this interval instead of host wall
@@ -4523,27 +4522,11 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         }
     }
 
-    /// Every graph output gets a dedicated, statically-sized buffer before
-    /// profiling: candidate execution then includes its real output writes
-    /// (in-place families write through the alias, materializing families
-    /// write into the buffer via substitution), so the step cost the search
-    /// measures is the step cost deployment pays. User registrations take
-    /// precedence; scratch fills the rest and is reused across candidates.
-    pub(crate) fn profile_loaded_llir(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Duration, f64)>,
-    ) -> (Duration, String) {
-        self.profile_loaded_llir_inner(llir_graph, dyn_map, trials, timeout, early_stop, false)
-    }
-
-    /// Re-profile a loaded finalist through the same materialized CUDA-graph
-    /// launch path used by serving. Search uses this only for its bounded
-    /// finalist set; profiling every explored graph would retain excessive
-    /// driver graph state and spend most of the search budget on setup.
+    /// Score every search candidate through the materialized CUDA graph used
+    /// by deployment. Direct launches have different CPU gaps and GPU overlap,
+    /// so using them for genetic fitness can discard the best deployment graph
+    /// before finalist validation. Warmup excludes capture/setup from timing;
+    /// search releases each candidate's graph and arena before moving on.
     pub(crate) fn profile_loaded_cuda_graph(
         &mut self,
         llir_graph: &LLIRGraph,
