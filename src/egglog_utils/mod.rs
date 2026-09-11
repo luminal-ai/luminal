@@ -2434,6 +2434,37 @@ impl<'a> LlirExtractor<'a> {
             // IDs when the caller stops before a whole pass. The supplied RNG
             // makes the order reproducible.
             self.covered_alternatives.shuffle(rng);
+            if !arguments {
+                // Cover distinct algorithm transitions before revisiting their
+                // sites. Otherwise hundreds of repeated elementwise choices
+                // can exhaust a budget before one expensive fusion is offered.
+                // Round-robin ordering retains every site and every family;
+                // backend names and static cost guesses have no preference.
+                let mut visits = FxHashMap::default();
+                self.covered_alternatives
+                    .sort_by_cached_key(|&(class, ref target)| {
+                        let CoverageTarget::Constructor(family) = *target else {
+                            unreachable!()
+                        };
+                        let nodes = self.indexed_classes[class as usize].nodes;
+                        let destination = self.mutation_nodes[class as usize]
+                            .as_ref()
+                            .unwrap()
+                            .families[family][0];
+                        let key = (
+                            proposal_family_key(
+                                self.egraph,
+                                &nodes[choices.choices[class as usize] as usize],
+                            ),
+                            proposal_family_key(self.egraph, &nodes[destination as usize]),
+                        );
+                        let visit = visits.entry(key).or_insert(0usize);
+                        let round = *visit;
+                        *visit += 1;
+                        round
+                    });
+                self.covered_alternatives.reverse(); // pop the first round first
+            }
         }
         None
     }
@@ -3279,18 +3310,7 @@ fn proposal_families<'a, T: Copy>(
     let mut indices = FxHashMap::default();
     let mut families: Vec<Vec<T>> = Vec::new();
     for &choice in pool {
-        let (head, children) = &egraph.enodes[node(choice)];
-        let mut key = vec![head.as_str()];
-        if head == "Op"
-            && let Some((kind_sort, kinds)) = children.first().and_then(|c| egraph.eclasses.get(c))
-            && kind_sort == "OpKind"
-        {
-            let mut constructors: Vec<_> =
-                kinds.iter().map(|k| egraph.enodes[k].0.as_str()).collect();
-            constructors.sort_unstable();
-            constructors.dedup();
-            key.extend(constructors);
-        }
+        let key = proposal_family_key(egraph, node(choice));
         let index = *indices.entry(key).or_insert_with(|| {
             families.push(Vec::new());
             families.len() - 1
@@ -3298,6 +3318,21 @@ fn proposal_families<'a, T: Copy>(
         families[index].push(choice);
     }
     families
+}
+
+fn proposal_family_key<'a>(egraph: &'a SerializedEGraph, node: &NodeId) -> Vec<&'a str> {
+    let (head, children) = &egraph.enodes[node];
+    let mut key = vec![head.as_str()];
+    if head == "Op"
+        && let Some((kind_sort, kinds)) = children.first().and_then(|c| egraph.eclasses.get(c))
+        && kind_sort == "OpKind"
+    {
+        let mut constructors: Vec<_> = kinds.iter().map(|k| egraph.enodes[k].0.as_str()).collect();
+        constructors.sort_unstable();
+        constructors.dedup();
+        key.extend(constructors);
+    }
+    key
 }
 
 pub fn random_initial_choice<'a>(

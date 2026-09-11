@@ -312,6 +312,50 @@ fn independent_choices_fixture(
 }
 
 #[test]
+fn constructor_coverage_is_not_diluted_by_repeated_operation_sites() {
+    let (mut graph, roots) = independent_choices_fixture(129, 70);
+    let rare = roots.last().unwrap();
+    let alternative = graph.eclasses[rare].1[0].clone();
+    let kind = ClassId::from("rare-kind");
+    let kind_node = NodeId::from("rare-kind-node");
+    graph
+        .enodes
+        .insert(kind_node.clone(), ("RareAlgorithm".into(), vec![]));
+    graph.node_to_class.insert(kind_node.clone(), kind.clone());
+    graph
+        .eclasses
+        .insert(kind.clone(), ("OpKind".into(), vec![kind_node]));
+    graph.enodes.get_mut(&alternative).unwrap().1[0] = kind;
+
+    for seed in 0..16 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut choices = random_initial_choice(&graph, &mut rng);
+        for root in &roots {
+            let (class, (_, nodes)) = graph.eclasses.get_key_value(root).unwrap();
+            choices.insert(class, &nodes[1]);
+        }
+        let mut extractor = LlirExtractor::new(&graph, &[]);
+        let base = extractor.index_choice_set(&choices);
+        let mut seen = FxHashSet::default();
+        let mut covered = false;
+        // Two distinct constructor transitions: cover both before spending
+        // more proposals on the 128 repeated sites. Random proposals alternate.
+        for _ in 0..4 {
+            let child = extractor
+                .extract_reachable_indexed_generation(&base, 1, 1, &mut seen, &mut rng)
+                .pop()
+                .unwrap();
+            let node = extractor.indexed_selected(&child, extractor.class_to_index[rare]);
+            covered |= extractor.indexed_node_id(node) == &alternative;
+        }
+        assert!(
+            covered,
+            "rare constructor transition starved for seed {seed}"
+        );
+    }
+}
+
+#[test]
 fn mutation_covers_each_active_constructor_within_bounded_proposals() {
     const CLASSES: usize = 48;
     let (graph, roots) = independent_choices_fixture(CLASSES, 70);
