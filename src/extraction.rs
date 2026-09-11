@@ -2565,7 +2565,10 @@ impl<'a> ClassRenderer<'a> {
 
     fn choose_logical_node(&self, class: &ClassId) -> Option<&NodeId> {
         let node_ids = self.class_nodes.get(class)?;
-        for op in crate::logical_op::built_in_logical_ops() {
+        for op in crate::logical_op::built_in_logical_ops()
+            .iter()
+            .chain(crate::logical_helper::built_in_logical_helpers())
+        {
             if let Some(node_id) = node_ids.iter().find(|node_id| {
                 self.egraph
                     .nodes

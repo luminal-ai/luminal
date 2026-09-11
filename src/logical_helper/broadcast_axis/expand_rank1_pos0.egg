@@ -1,0 +1,13 @@
+; BroadcastAxis, parent rank 1, new axis at from-end position 0: expand
+; the helper into the apply it names, tagged with the parent's shape.
+(rule
+  (
+    (= ?h (LogicalHelperBroadcastAxis ?p 0 ?e))
+    (= ?ishape (shape-of ?p))
+    (= ?ishape (ShapeLit (IntExprCons ?d0 (IntExprNil))))
+  )
+  (
+    (let oshape (ShapeLit (IntExprCons ?d0 (IntExprCons ?e (IntExprNil)))))
+    (union ?h (LogicalIndexMapApply ?p (IndexMapLit (IntExprCons (CoordVar oshape 1) (IntExprNil)) ?ishape) oshape))
+  )
+)

@@ -1,0 +1,8 @@
+; The transpose of a transpose is the tensor itself.
+(rule
+  (
+    (= ?w (LogicalHelperMatrixTranspose ?v))
+    (= ?v (LogicalHelperMatrixTranspose ?x))
+  )
+  ((union ?w ?x))
+)

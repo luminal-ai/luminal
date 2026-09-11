@@ -1,27 +1,24 @@
-//! ROUND-11 REVERT PROBE (permanent): the double-transpose collapse rule
-//! is the sandwich's termination anchor.
+//! ROUND-11 REVERT PROBE (permanent): the transpose sandwich needs a
+//! termination anchor, and the probe pins that one is in force.
 //!
 //! The canonical-form sandwich mints a sibling whose operands are rank-2
 //! transpose VIEWS, and the sibling is itself canonical, so the sandwich
-//! fires on it too. WITH the collapse rule, generation-3 operands
-//! (views-of-views) union back into generation 1 and every rebuilt chain
-//! hash-conses into the original — saturation closes. WITHOUT it, each
-//! generation's views are NEW values and the main ruleset never
-//! saturates.
+//! fires on it too. Unless views-of-views union back into the original
+//! tensor, each generation's views are NEW values and the main ruleset
+//! never saturates (measured 2026-08-26 with no anchor: 3729 / 4616 /
+//! 5386 / 6156 nodes at K = 40/60/80/100, ~38 nodes per iteration).
 //!
-//! The default schedule ((saturate ...)) would simply HANG without the
-//! collapse rule, so this probe runs a BOUNDED schedule ((run-schedule
-//! (repeat K (run)))) at increasing K and prints node counts:
-//!   * collapse REMOVED:  counts grow strictly with every added
-//!     iteration block — unbounded growth (measured 2026-08-26: 3729 /
-//!     4616 / 5386 / 6156 at K = 40/60/80/100, ~38 nodes per iteration
-//!     with no plateau);
-//!   * collapse PRESENT:  the count reaches the main ruleset's fixed
-//!     point and stays flat (measured: 3022 at K = 60, 80, and 100).
-//!
-//! The rule text is removed by exact string surgery on the assembled
-//! program (a marker-comment slice), so what runs without the rule is
-//! byte-identical everywhere else.
+//! Two anchors exist. The cuBLASLt estate's double-transpose collapse
+//! rule (cublaslt_marker_canonicalize.egg) unions an apply-of-apply
+//! transpose with its base directly. Core's `LogicalHelperMatrixTranspose`
+//! recognizer names every rank-2 transpose view, and its involution rule
+//! unions a transpose of a transpose with the base, so core anchors the
+//! sandwich on its own. The probe runs a BOUNDED schedule ((run-schedule
+//! (repeat K (run)))) at increasing K WITH and WITHOUT the collapse rule
+//! (removed by exact string surgery on the assembled program) and
+//! requires both to reach the same flat node count inside the range: the
+//! collapse rule is redundant, and if this ever grows again the anchor
+//! has been lost.
 
 use luminal::dtype::DType;
 use luminal::graph::Graph;
@@ -96,36 +93,34 @@ fn node_count(program: &str) -> usize {
 }
 
 #[test]
-fn r11_collapse_removed_diverges_and_present_saturates() {
-    // WITHOUT the collapse rule: strictly growing node counts — every
-    // added iteration mints a fresh generation of views-of-views.
-    let mut without = Vec::new();
-    for iters in [40usize, 60, 80, 100] {
-        let n = node_count(&bounded_program(iters, false));
-        println!("collapse REMOVED, run {iters}: {n} nodes");
-        without.push(n);
-    }
-    for pair in without.windows(2) {
-        assert!(
-            pair[1] > pair[0],
-            "without the collapse rule the count must grow every added \
-             iteration block (got {without:?}) — if this ever plateaus, the \
-             divergence closed some other way and the collapse rule may be \
-             re-litigated"
-        );
-    }
-
-    // WITH the collapse rule: the same K range is DEEP saturation — the
-    // count reaches its fixed point and stays flat.
-    let mut with = Vec::new();
-    for iters in [60usize, 80, 100] {
-        let n = node_count(&bounded_program(iters, true));
-        println!("collapse PRESENT, run {iters}: {n} nodes");
-        with.push(n);
-    }
+fn r11_sandwich_terminates_with_and_without_the_collapse_rule() {
+    let counts = |with_collapse: bool| -> Vec<usize> {
+        [60usize, 80, 100]
+            .into_iter()
+            .map(|iters| {
+                let n = node_count(&bounded_program(iters, with_collapse));
+                println!(
+                    "collapse {}, run {iters}: {n} nodes",
+                    if with_collapse { "PRESENT" } else { "REMOVED" }
+                );
+                n
+            })
+            .collect()
+    };
+    let without = counts(false);
+    let with = counts(true);
+    assert!(
+        without.windows(2).all(|p| p[0] == p[1]),
+        "without the collapse rule the main ruleset must still saturate inside \
+         the probe range — core's transpose involution is the anchor (got {without:?})"
+    );
     assert!(
         with.windows(2).all(|p| p[0] == p[1]),
         "with the collapse rule the main ruleset must saturate inside the \
          probe range (got {with:?})"
+    );
+    assert_eq!(
+        without[0], with[0],
+        "the two anchors must close at the same fixed point"
     );
 }
