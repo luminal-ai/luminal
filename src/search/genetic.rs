@@ -410,6 +410,17 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             .options
             .candidate_timeout
             .is_some_and(|timeout| candidate.timer.elapsed() >= timeout);
+        super::diagnostics::log_candidate_choices(|| {
+            serde_json::json!({
+                "search_started": format!("{:?}", self.search_started_at),
+                "bucket": self.ctx.index,
+                "candidate": candidate.id.0,
+                "candidate_seconds": candidate.timer.elapsed().as_secs_f64(),
+                "timed_out": timed_out,
+                "outcome": format!("{outcome:?}"),
+                "choices": self.extractor.named_choices(&genome),
+            })
+        });
         match self.phase {
             Phase::Initial => self.report_initial(genome, candidate, outcome, timed_out),
             Phase::Evolving => self.report_evolving(genome, candidate, outcome, timed_out),
