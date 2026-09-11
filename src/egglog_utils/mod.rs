@@ -3356,7 +3356,14 @@ fn proposal_families<'a, T: Copy>(
     let mut indices = FxHashMap::default();
     let mut families: Vec<Vec<T>> = Vec::new();
     for &choice in pool {
-        let key = proposal_family_key(egraph, node(choice));
+        let selected = node(choice);
+        let (head, children) = &egraph.enodes[selected];
+        // Changing an Op's input dependencies is an implementation change,
+        // even when its backend constructor is unchanged (e.g. cast absorption).
+        // Keep tuning variants with identical inputs together. Across sites,
+        // transition ordering still uses constructor names, not unique class IDs.
+        let inputs = if head == "Op" { &children[1..] } else { &[] };
+        let key = (proposal_family_key(egraph, selected), inputs);
         let index = *indices.entry(key).or_insert_with(|| {
             families.push(Vec::new());
             families.len() - 1

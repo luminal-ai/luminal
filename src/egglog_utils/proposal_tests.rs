@@ -846,3 +846,54 @@ fn saved_schedule_constructor_transition_diagnostic() {
     )
     .unwrap();
 }
+
+#[test]
+fn coverage_separates_changed_inputs_from_tunings_of_the_same_constructor() {
+    let mut graph = choices_fixture(70);
+    // Every alternative uses the same operation constructor. One reads a
+    // different existing input, as with an absorbed cast or a fused operand.
+    for i in 0..=70 {
+        graph
+            .enodes
+            .get_mut(&NodeId::from(format!("kind-node-{i}")))
+            .unwrap()
+            .0 = "SameOp".into();
+    }
+    let source = ClassId::from("source");
+    let source_node = NodeId::from("source-value");
+    graph
+        .enodes
+        .insert(source_node.clone(), ("Leaf".into(), vec![]));
+    graph
+        .node_to_class
+        .insert(source_node.clone(), source.clone());
+    graph
+        .eclasses
+        .insert(source.clone(), ("IR".into(), vec![source_node]));
+    let inputs = ClassId::from("different-inputs");
+    let list = NodeId::from("different-inputs-node");
+    graph.enodes.insert(
+        list.clone(),
+        ("ICons".into(), vec![source, ClassId::from("sources")]),
+    );
+    graph.node_to_class.insert(list.clone(), inputs.clone());
+    graph
+        .eclasses
+        .insert(inputs.clone(), ("IList".into(), vec![list]));
+    graph.enodes.get_mut(&NodeId::from("op-70")).unwrap().1[1] = inputs;
+    for seed in 0..32 {
+        let mut extractor = LlirExtractor::new(&graph, &[]);
+        let base = extractor.index_seed_choices(&[("root".into(), "op-0".into())]);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let child = extractor
+            .extract_reachable_indexed_generation(&base, 1, 1, &mut FxHashSet::default(), &mut rng)
+            .pop()
+            .unwrap();
+        let selected = extractor.indexed_selected(&child, extractor.root_index);
+        assert_eq!(
+            extractor.indexed_node_id(selected),
+            &NodeId::from("op-70"),
+            "seed {seed}: input-changing implementation must receive systematic coverage"
+        );
+    }
+}
