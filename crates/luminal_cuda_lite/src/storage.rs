@@ -16,6 +16,24 @@ pub(crate) fn plan_resident(
     bounds: &Bounds,
     bindings: &crate::resident::ResidentBindings,
 ) -> Result<ArenaPlan> {
+    // Output slots whose buffer IS a resident input are mutation sinks:
+    // `.output_into()` pinned them to the input's buffer, so their writes
+    // already land in the arena home and they reserve no pinned staging.
+    let device_outputs: std::collections::BTreeSet<usize> = plan
+        .dag
+        .node_weights()
+        .filter_map(|node| match node {
+            luminal::bufferize::BufferNode::BufferOutput { slots } => Some(slots),
+            _ => None,
+        })
+        .flatten()
+        .filter(|slot| {
+            plan.buffers[&slot.buffer]
+                .lit
+                .is_some_and(|lit| bindings.inputs.contains(&lit))
+        })
+        .map(|slot| slot.index)
+        .collect();
     crate::arena::plan_resident_over(
         plan,
         |buffer| capacity_bytes(&buffer.layout, bounds),
@@ -32,7 +50,7 @@ pub(crate) fn plan_resident(
             .max(8),
         crate::arena::issue_order(plan)?,
         &bindings.inputs,
-        &bindings.feedback.keys().copied().collect(),
+        &device_outputs,
     )
 }
 

@@ -1,6 +1,7 @@
 //! Metal boundary layouts and saturation schedule. Booleans use byte storage.
 
 use luminal::dtype::DType;
+use luminal::layout_ir::Access;
 use luminal::runtime_binding::RuntimeBindingsGenerator;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -25,12 +26,13 @@ impl RuntimeBindingsGenerator for MetalBindings {
         logical_name: &str,
         shape: &str,
         width: &str,
+        access: Access,
     ) -> String {
         format!(
             "(let {stem}_layout (RightMajorContiguousElementLayoutLit {shape} {width}))\n\
              (let {stem}_layout_tensor (LayoutTensorLit {logical_name} {stem}_layout))\n\
              (let {stem}_buffer_id (BufferLit {idx}))\n\
-             (set (buffer-access-of {stem}_buffer_id) (ReadOnly))\n\
+             (set (buffer-access-of {stem}_buffer_id) ({access:?}))\n\
              (set (buffer-freed-by {stem}_buffer_id) (CallerFrees))\n\
              (let {stem}_buffer_tensor (BufferTensorLit {stem}_layout_tensor {stem}_buffer_id))\n\n"
         )

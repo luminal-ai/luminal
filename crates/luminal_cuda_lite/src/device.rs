@@ -78,7 +78,6 @@ pub struct CudaDevice {
     stats: GraphStats,
     residents: BTreeMap<i64, ResidentHome>,
     resident_initialized: BTreeSet<i64>,
-    feedback: BTreeMap<usize, i64>,
 }
 impl CudaDevice {
     pub fn new(ordinal: usize) -> Result<Self> {
@@ -94,7 +93,6 @@ impl CudaDevice {
             stats: GraphStats::default(),
             residents: BTreeMap::new(),
             resident_initialized: BTreeSet::new(),
-            feedback: BTreeMap::new(),
         })
     }
     pub fn stats(&self) -> GraphStats {
@@ -143,7 +141,6 @@ impl CudaDevice {
         self.installed.clear();
         self.residents = allocation.homes;
         self.resident_initialized.clear();
-        self.feedback = allocation.feedback;
 
         let staging_bytes = installed
             .iter()
@@ -234,7 +231,6 @@ impl CudaDevice {
         self.installed.clear();
         self.residents.clear();
         self.resident_initialized.clear();
-        self.feedback.clear();
         self.slab = None;
         self.staging = None;
         self.stats.staging_bytes = 0;
@@ -275,7 +271,6 @@ impl CudaDevice {
                 &mut self.cache,
                 &mut self.stats,
                 &self.residents,
-                &self.feedback,
             )?);
         }
         // Move the executable out while updating it. An error or unwind drops
@@ -564,7 +559,6 @@ impl CompiledPlan {
         cache: &mut HashMap<String, Module>,
         stats: &mut GraphStats,
         residents: &BTreeMap<i64, ResidentHome>,
-        feedback: &BTreeMap<usize, i64>,
     ) -> Result<Self> {
         let schema: Vec<_> = bounds.keys().copied().collect();
         ensure!(
@@ -628,30 +622,18 @@ impl CompiledPlan {
                     let BufferNode::BufferOutput { slots } = &plan.dag[*node] else {
                         unreachable!()
                     };
+                    // A resident input's home IS this output's buffer: the
+                    // mutation wrote it in place, so there is nothing to
+                    // copy and nothing to stage for readback.
+                    if plan.buffers[id]
+                        .lit
+                        .is_some_and(|lit| residents.contains_key(&lit))
+                    {
+                        continue;
+                    }
                     let buffer = &plan.buffers[id];
                     let range = range(plan, storage, id, base, dims)?;
                     let size = size(&buffer.layout)?;
-                    for &i in indices {
-                        if let Some(lit) = feedback.get(&slots[i].index) {
-                            let next = residents[lit].next.unwrap();
-                            out.actions.push(Action::Copy {
-                                src: range.ptr,
-                                dst: base + next.offset as u64,
-                                kind: CopyKind::DtoD,
-                                size: size.clone(),
-                                other_size: None,
-                                bytes: range.bytes,
-                            });
-                        }
-                    }
-                    let host_indices: Vec<_> = indices
-                        .iter()
-                        .copied()
-                        .filter(|&i| !feedback.contains_key(&slots[i].index))
-                        .collect();
-                    if host_indices.is_empty() {
-                        continue;
-                    }
                     out.actions.push(Action::Copy {
                         src: range.ptr,
                         dst: pinned.ptr(staging),
@@ -660,7 +642,7 @@ impl CompiledPlan {
                         other_size: None,
                         bytes: range.bytes,
                     });
-                    for &i in &host_indices {
+                    for &i in indices {
                         let slot = &slots[i];
                         let mut resolved = slot.clone();
                         resolved.layout = symbolic::resolve_layout(&slot.layout, dims)?;
@@ -799,18 +781,6 @@ impl CompiledPlan {
                     }
                     _ => {}
                 },
-            }
-        }
-        for home in residents.values() {
-            if let Some(next) = home.next {
-                out.actions.push(Action::Copy {
-                    src: base + next.offset as u64,
-                    dst: base + home.data.offset as u64,
-                    kind: CopyKind::DtoD,
-                    size: home.data.bytes.into(),
-                    other_size: None,
-                    bytes: home.data.bytes,
-                });
             }
         }
         for (i, action) in out.actions.iter().enumerate() {

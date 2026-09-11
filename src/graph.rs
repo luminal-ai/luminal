@@ -9,10 +9,11 @@ use petgraph::{
     stable_graph::{NodeIndex, StableDiGraph},
     visit::EdgeRef,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::dtype::DType;
 use crate::frontend::GraphTensor;
+use crate::layout_ir::Access;
 use crate::shape::ToShape;
 
 /// A bucket for a dynamic dimension, defining a range of valid values.
@@ -358,10 +359,14 @@ pub struct LogicalNode {
 }
 
 /// One `.output()` designation: the value and optional authored name.
+/// `storage` is `Some(input)` when the output is a MUTATION of that input
+/// (`.output_into()`): the two share one boundary buffer, so the value
+/// stays SSA and storage identity lives in the binding.
 #[derive(Debug)]
 struct OutputRecord {
     value: ValueId,
     label: Option<String>,
+    storage: Option<ValueId>,
 }
 
 /// One bound input of the recorded model: the pristine label, the
@@ -1273,6 +1278,60 @@ impl LogicalGraph {
         self.outputs.push(OutputRecord {
             value: id,
             label: label.map(str::to_string),
+            storage: None,
+        });
+    }
+
+    /// Record an output that WRITES INTO an input's storage — the
+    /// mutation contract (PyTorch's functionalized `x.copy_(...)`), kept
+    /// SSA: the value is a fresh SSA value; only its boundary storage is
+    /// stated. The binding layer pins both the input and this output to
+    /// one `BufferLit` and marks the input `ReadWrite`, so the
+    /// bufferizer's conflict engine orders the read-modify-write — or
+    /// repairs with a copy — exactly as it does for any tied pair.
+    ///
+    /// The target must be a graph input, and the value must carry the
+    /// target's dtype (a mutation writes the caller's bytes).
+    pub fn output_into(&mut self, operand: &Operand, target: &Operand, label: Option<&str>) {
+        if self.poisoned.is_some() {
+            return;
+        }
+        if let Some(name) = label
+            && self
+                .outputs
+                .iter()
+                .any(|record| record.label.as_deref() == Some(name))
+        {
+            return self.poison(format!("duplicate output name \"{name}\""));
+        }
+        let id = match self.resolve(operand, "output_into") {
+            Ok(id) => id,
+            Err(reason) => return self.poison(reason),
+        };
+        let target_id = match self.resolve(target, "output_into target") {
+            Ok(id) => id,
+            Err(reason) => return self.poison(reason),
+        };
+        if !matches!(self.graph[target_id].op, LogicalOp::Input { .. }) {
+            return self.poison(format!(
+                "output_into target t{}: mutation targets must be graph inputs",
+                target_id.index()
+            ));
+        }
+        let (value, target_value) = (&self.graph[id], &self.graph[target_id]);
+        if value.dtype != target_value.dtype {
+            return self.poison(format!(
+                "output_into at t{}: a {:?} value cannot overwrite the {:?} input t{}",
+                id.index(),
+                value.dtype,
+                target_value.dtype,
+                target_id.index()
+            ));
+        }
+        self.outputs.push(OutputRecord {
+            value: id,
+            label: label.map(str::to_string),
+            storage: Some(target_id),
         });
     }
 
@@ -1442,8 +1501,17 @@ impl LogicalGraph {
         String,
     > {
         let mut text = self.model_text()?;
+        // Inputs that some `.output_into()` writes into: their boundary
+        // becomes ReadWrite, admitting in-place lowerings (the writability
+        // veto only fires on ReadOnly storage).
+        let mutable_inputs: FxHashSet<ValueId> = self
+            .outputs
+            .iter()
+            .filter_map(|record| record.storage)
+            .collect();
         let mut input_slots = Vec::new();
         let mut input_buffer_tensors = Vec::new();
+        let mut input_buffers: FxHashMap<ValueId, i64> = FxHashMap::default();
         let mut next_buffer: i64 = 0;
         for id in self.graph.node_indices() {
             let value = &self.graph[id];
@@ -1460,14 +1528,21 @@ impl LogicalGraph {
             } else {
                 format!("v{}", id.index())
             };
+            let access = if mutable_inputs.contains(&id) {
+                Access::ReadWrite
+            } else {
+                Access::ReadOnly
+            };
             text.push_str(&bindings.input_binding(
                 &stem,
                 buffer as usize,
                 &value_name,
                 &shape,
                 &bindings.width_term(value.dtype),
+                access,
             ));
             input_buffer_tensors.push(format!("{stem}_buffer_tensor"));
+            input_buffers.insert(id, buffer);
             input_slots.push(InputSlot {
                 tensor: id,
                 buffer,
@@ -1483,8 +1558,17 @@ impl LogicalGraph {
             let value = &self.graph[id];
             let shape = Self::shape_term(&value.dims)?;
             let stem = format!("natout{key}");
-            let buffer = next_buffer;
-            next_buffer += 1;
+            // A mutation output shares its target input's BufferLit; any
+            // other output mints a fresh boundary. (Boundary values
+            // pinned to one buffer are pre-unioned by the bufferizer.)
+            let buffer = match record.storage.and_then(|target| input_buffers.get(&target)) {
+                Some(&shared) => shared,
+                None => {
+                    let buffer = next_buffer;
+                    next_buffer += 1;
+                    buffer
+                }
+            };
             text.push_str(&bindings.output_binding(
                 &stem,
                 buffer as usize,
@@ -1532,7 +1616,8 @@ impl LogicalGraph {
 
 /// One bound input: the graph tensor it carries, the buffer the runtime
 /// allocated for it, and its declared size. Buffer ids are an internal,
-/// sequential, binding-time allocation — inputs first, outputs after —
+/// binding-time allocation — inputs first, outputs after, except that a
+/// mutation output (`.output_into()`) shares its target input's id —
 /// never derived from graph node indices (the retired HLIR keyspace).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputSlot {
@@ -1677,5 +1762,95 @@ mod logical_petgraph_tests {
 
         assert_eq!(cx.logical.input_specs()[0].id, lhs.id);
         assert_eq!(cx.logical.output_specs()[0].id, viewed.id);
+    }
+
+    /// A `.output_into()` output shares its target input's `BufferLit`
+    /// and marks that input `ReadWrite`; every other boundary keeps the
+    /// fresh-buffer + `ReadOnly` default. This is the mutation contract
+    /// the runtimes key on (resident sinks, no readback).
+    #[test]
+    fn output_into_shares_the_input_buffer_and_marks_it_writable() {
+        struct TestBindings;
+        impl crate::runtime_binding::RuntimeBindingsGenerator for TestBindings {
+            fn width_term(&self, dtype: DType) -> String {
+                format!("(bits-of ({dtype:?}))")
+            }
+            fn input_binding(
+                &self,
+                stem: &str,
+                idx: usize,
+                _logical_name: &str,
+                _shape: &str,
+                _width: &str,
+                access: Access,
+            ) -> String {
+                format!("(let {stem}_buffer_id (BufferLit {idx}))\n(access {access:?} {stem})\n")
+            }
+            fn output_binding(
+                &self,
+                stem: &str,
+                key: usize,
+                _value_name: &str,
+                _shape: &str,
+                _dtype: DType,
+            ) -> String {
+                format!("(let {stem}_buffer_id (BufferLit {key}))\n(access ReadWrite {stem})\n")
+            }
+            fn schedule(&self) -> &str {
+                ""
+            }
+        }
+
+        let mut cx = Graph::new();
+        let x = cx.named_tensor("x", (2usize,), DType::F32);
+        let y = cx.named_tensor("y", (2usize,), DType::F32);
+        let z = (x + y).output_into(&x);
+        let (text, inputs, outputs, _, _) = cx.logical.bound_parts(&TestBindings).unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(outputs.len(), 1);
+        let x_buffer = inputs[0].buffer;
+        let y_buffer = inputs[1].buffer;
+        assert_ne!(x_buffer, y_buffer);
+        assert_eq!(
+            outputs[0].buffer, x_buffer,
+            "the mutation output shares x's boundary buffer"
+        );
+        assert_eq!(outputs[0].tensor, z.id);
+        assert!(
+            text.contains(&format!("(access ReadWrite nat{})", x.id.index())),
+            "x must be writable:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("(access ReadOnly nat{})", y.id.index())),
+            "y stays read-only:\n{text}"
+        );
+    }
+
+    /// `output_into` refuses non-input targets and dtype mismatches at
+    /// authoring time (fail closed, never mistranslate).
+    #[test]
+    fn output_into_rejects_non_input_targets_and_dtype_mismatch() {
+        let mut cx = Graph::new();
+        let x = cx.named_tensor("x", (2usize,), DType::F32);
+        let y = cx.named_tensor("y", (2usize,), DType::F32);
+        let sum = x + y;
+        sum.output_into(&sum);
+        assert!(
+            cx.logical.poisoned().is_some_and(|r| r.contains("inputs")),
+            "non-input target must poison: {:?}",
+            cx.logical.poisoned()
+        );
+
+        let mut cx = Graph::new();
+        let x = cx.named_tensor("x", (2usize,), DType::F32);
+        let i = cx.named_tensor("i", (2usize,), DType::Int);
+        (x + x).output_into(&i);
+        assert!(
+            cx.logical
+                .poisoned()
+                .is_some_and(|r| r.contains("cannot overwrite")),
+            "dtype mismatch must poison: {:?}",
+            cx.logical.poisoned()
+        );
     }
 }

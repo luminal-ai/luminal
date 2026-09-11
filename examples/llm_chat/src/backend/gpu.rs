@@ -41,7 +41,7 @@ impl GpuBackend {
             runtime.retain_input(id)?;
         }
         for state in &graph.state {
-            runtime.bind_feedback(state.input, state.output)?;
+            runtime.retain_input(state.input)?;
         }
         for (id, data) in data {
             runtime.set_data(id, data);

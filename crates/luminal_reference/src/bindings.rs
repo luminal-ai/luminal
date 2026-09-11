@@ -12,6 +12,7 @@
 //! caller-owned buffers.
 
 use luminal::dtype::DType;
+use luminal::layout_ir::Access;
 use luminal::runtime_binding::RuntimeBindingsGenerator;
 
 /// The reference runtime's binding vocabulary.
@@ -37,8 +38,9 @@ impl RuntimeBindingsGenerator for ReferenceBindings {
     }
 
     /// Input boundary: contiguous row-major storage of the declared
-    /// dtype, read-only, caller-owned, buffer id = the HLIR node index
-    /// (their set_data keying). `stem` namespaces the lets; the
+    /// dtype, caller-owned, buffer id = the HLIR node index (their
+    /// set_data keying). `access` is ReadWrite when a `.output_into()`
+    /// mutates this input in place. `stem` namespaces the lets; the
     /// buffer-tensor let is named `{stem}_buffer_tensor`.
     fn input_binding(
         &self,
@@ -47,12 +49,13 @@ impl RuntimeBindingsGenerator for ReferenceBindings {
         logical_name: &str,
         shape: &str,
         width: &str,
+        access: Access,
     ) -> String {
         format!(
             "(let {stem}_layout (RightMajorContiguousElementLayoutLit {shape} {width}))\n\
              (let {stem}_layout_tensor (LayoutTensorLit {logical_name} {stem}_layout))\n\
              (let {stem}_buffer_id (BufferLit {idx}))\n\
-             (set (buffer-access-of {stem}_buffer_id) (ReadOnly))\n\
+             (set (buffer-access-of {stem}_buffer_id) ({access:?}))\n\
              (set (buffer-freed-by {stem}_buffer_id) (CallerFrees))\n\
              (let {stem}_buffer_tensor (BufferTensorLit {stem}_layout_tensor {stem}_buffer_id))\n\n"
         )

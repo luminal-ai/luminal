@@ -106,6 +106,31 @@ impl GraphTensor {
         source
     }
 
+    /// Mark this tensor as an observable output that MUTATES `target` in
+    /// place: the value stays SSA, and the binding pins this output and
+    /// `target` to one buffer id (target must be a graph input). This is
+    /// PyTorch's functionalized in-place contract — `x.copy_(y)`.
+    pub fn output_into(&self, target: &GraphTensor) -> GraphTensor {
+        let source = *self;
+        let dims = source.dims();
+        let target_dims = target.dims();
+        self.graph()
+            .logical
+            .output_into(&(source.id, dims), &(target.id, target_dims), None);
+        source
+    }
+
+    /// `.output_into()` with an authored interface name.
+    pub fn output_into_named(&self, name: &str, target: &GraphTensor) -> GraphTensor {
+        let source = *self;
+        let dims = source.dims();
+        let target_dims = target.dims();
+        self.graph()
+            .logical
+            .output_into(&(source.id, dims), &(target.id, target_dims), Some(name));
+        source
+    }
+
     pub fn dims(&self) -> Vec<IntExpr> {
         self.dims.to_vec()
     }

@@ -117,7 +117,7 @@ cargo test -p llm_chat --features metal
 The shared device test compares prefill and decode against ReferenceRuntime
 using a small zoo model. Other tests cover namespace mappings, sharded
 checkpoints, dtype/layout conversion, templates, sampling, prefix reuse, and
-cache reset. Both runtime suites check resident feedback across buckets.
+cache reset. Both runtime suites check in-place resident state across buckets.
 
 For real-checkpoint comparisons against Transformers across prompts, follow-ups,
 prefill chunk sizes, and resets, see the [validation tools](validation/README.md).

@@ -53,7 +53,6 @@ pub struct MetalDevice {
     stats: GraphStats,
     residents: BTreeMap<i64, ResidentHome>,
     resident_initialized: BTreeSet<i64>,
-    feedback: BTreeMap<usize, i64>,
 }
 impl MetalDevice {
     pub fn new() -> Result<Self> {
@@ -70,7 +69,6 @@ impl MetalDevice {
             stats: GraphStats::default(),
             residents: BTreeMap::new(),
             resident_initialized: BTreeSet::new(),
-            feedback: BTreeMap::new(),
         })
     }
     pub fn stats(&self) -> GraphStats {
@@ -88,7 +86,6 @@ impl MetalDevice {
         self.staging = None;
         self.residents.clear();
         self.resident_initialized.clear();
-        self.feedback.clear();
         self.stats.arena_bytes = 0;
         self.stats.staging_bytes = 0;
     }
@@ -218,7 +215,6 @@ impl MetalDevice {
         self.installed = installed;
         self.residents = allocation.homes;
         self.resident_initialized.clear();
-        self.feedback = allocation.feedback;
         Ok(())
     }
     pub fn execute(
@@ -406,41 +402,33 @@ impl MetalDevice {
                 ArenaStep::Download {
                     buffer,
                     node,
-                    slots,
+                    slots: _,
                     staging: home,
                 } => {
                     let bytes = sizes[buffer];
                     if bytes == 0 {
                         continue;
                     }
-                    let blit = command.new_blit_command_encoder();
-                    let BufferNode::BufferOutput { slots: bindings } = &p.plan.dag[*node] else {
+                    // A resident input's home IS this output's buffer: the
+                    // mutation wrote it in place, so there is nothing to
+                    // copy and nothing to stage for readback.
+                    if p.plan.buffers[buffer]
+                        .lit
+                        .is_some_and(|lit| self.residents.contains_key(&lit))
+                    {
+                        continue;
+                    }
+                    let BufferNode::BufferOutput { .. } = &p.plan.dag[*node] else {
                         bail!("download without output node")
                     };
-                    let mut host_output = false;
-                    for index in slots {
-                        if let Some(lit) = self.feedback.get(&bindings[*index].index) {
-                            let next = self.residents[lit].next.unwrap();
-                            blit.copy_from_buffer(
-                                slab,
-                                p.storage.slices[buffer].offset as u64,
-                                slab,
-                                next.offset as u64,
-                                bytes as u64,
-                            );
-                        } else {
-                            host_output = true;
-                        }
-                    }
-                    if host_output {
-                        blit.copy_from_buffer(
-                            slab,
-                            p.storage.slices[buffer].offset as u64,
-                            staging,
-                            home.offset as u64,
-                            bytes as u64,
-                        );
-                    }
+                    let blit = command.new_blit_command_encoder();
+                    blit.copy_from_buffer(
+                        slab,
+                        p.storage.slices[buffer].offset as u64,
+                        staging,
+                        home.offset as u64,
+                        bytes as u64,
+                    );
                     blit.end_encoding();
                 }
                 ArenaStep::Node(node) => match &p.plan.dag[*node] {
@@ -557,23 +545,6 @@ impl MetalDevice {
                 },
             }
         }
-        // Feedback snapshots outlive output storage recycling. Commit only
-        // after every kernel has finished reading the previous input state.
-        for home in self.residents.values() {
-            if let Some(next) = home.next
-                && home.data.bytes > 0
-            {
-                let blit = command.new_blit_command_encoder();
-                blit.copy_from_buffer(
-                    slab,
-                    next.offset as u64,
-                    slab,
-                    home.data.offset as u64,
-                    home.data.bytes as u64,
-                );
-                blit.end_encoding();
-            }
-        }
         command.commit();
         command.wait_until_completed();
         if command.status() != MTLCommandBufferStatus::Completed {
@@ -592,10 +563,14 @@ impl MetalDevice {
                 let BufferNode::BufferOutput { slots: bindings } = &p.plan.dag[*node] else {
                     bail!("download without output node")
                 };
-                let slots: Vec<_> = slots
-                    .iter()
-                    .filter(|&&i| !self.feedback.contains_key(&bindings[i].index))
-                    .collect();
+                // A resident sink was never blitted to staging.
+                if p.plan.buffers[buffer]
+                    .lit
+                    .is_some_and(|lit| self.residents.contains_key(&lit))
+                {
+                    continue;
+                }
+                let slots: Vec<_> = slots.iter().collect();
                 if slots.is_empty() {
                     continue;
                 }
