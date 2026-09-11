@@ -1993,9 +1993,11 @@ fn metal_constant_negative_infinity_mask_matches_reference() {
 ///   leaky_relu -> relu;  gelu -> abs + sign.
 #[test]
 fn metal_bool_dependent_unary_ops_match_reference() {
+    type UnaryOp = fn(GraphTensor) -> GraphTensor;
+
     let input = seeded_data(64, 4.0, -2.0);
 
-    let cases: [(&str, fn(GraphTensor) -> GraphTensor); 5] = [
+    let cases: [(&str, UnaryOp); 5] = [
         ("relu", |a| a.relu()),
         ("abs", |a| a.abs()),
         ("sign", |a| a.sign()),
@@ -2166,11 +2168,11 @@ fn metal_f16_gelu_through_bool_intermediate() {
 fn libm_erf(x: f32) -> f32 {
     const P: f32 = 0.3275911;
     const A: [f32; 5] = [
-        0.254829592,
-        -0.284496736,
-        1.421413741,
-        -1.453152027,
-        1.061405429,
+        0.254_829_6,
+        -0.284_496_72,
+        1.421_413_8,
+        -1.453_152_1,
+        1.061_405_4,
     ];
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
