@@ -57,7 +57,7 @@ pub type MetalOps = (
 
 fn compile_shader(device: &Device, source: &str, function_name: &str) -> ComputePipelineState {
     let options = metal::CompileOptions::new();
-    options.set_language_version(MTLLanguageVersion::V2_4);
+    options.set_language_version(MTLLanguageVersion::V3_1);
     let library = device
         .new_library_with_source(source, &options)
         .unwrap_or_else(|err| {
@@ -99,6 +99,7 @@ fn metal_buffer_type(dtype: DType) -> &'static str {
     match dtype {
         DType::F32 => "float",
         DType::F16 => "half",
+        DType::Bf16 => "bfloat",
         DType::Int => "int",
         _ => panic!("Metal dtype {dtype:?} is not supported yet"),
     }
@@ -108,6 +109,7 @@ fn metal_numeric_read(dtype: DType, buffer: &str, index: &str) -> String {
     match dtype {
         DType::F32 => format!("{buffer}[{index}]"),
         DType::F16 => format!("float({buffer}[{index}])"),
+        DType::Bf16 => format!("float({buffer}[{index}])"),
         DType::Int => format!("float({buffer}[{index}])"),
         _ => panic!("Metal dtype {dtype:?} is not supported yet"),
     }
@@ -117,6 +119,7 @@ fn metal_numeric_write(dtype: DType, expr: &str) -> String {
     match dtype {
         DType::F32 => expr.to_string(),
         DType::F16 => format!("half({expr})"),
+        DType::Bf16 => format!("bfloat({expr})"),
         DType::Int => format!("int({expr})"),
         _ => panic!("Metal dtype {dtype:?} is not supported yet"),
     }
@@ -124,7 +127,9 @@ fn metal_numeric_write(dtype: DType, expr: &str) -> String {
 
 fn metal_copy_value(dtype: DType, buffer: &str, index: &str) -> String {
     match dtype {
-        DType::F32 | DType::F16 | DType::Int => format!("{buffer}[{index}]"),
+        DType::F32 | DType::F16 | DType::Bf16 | DType::Int => {
+            format!("{buffer}[{index}]")
+        }
         _ => panic!("Metal dtype {dtype:?} is not supported yet"),
     }
 }
@@ -1717,11 +1722,12 @@ impl EgglogOp for MPSMatmul {
                 .fold(nil(), |tail, head| cons(head, tail))
         };
 
-        let matmul_rule = |name: &'static str,
+        let matmul_rule = |name: &str,
                            lhs_layout: MPSMatrixLayout,
                            rhs_layout: MPSMatrixLayout,
                            transpose_lhs: i64,
-                           transpose_rhs: i64| {
+                           transpose_rhs: i64,
+                           supported_dtype: &SortDef| {
             let m = v("?m");
             let n = v("?n");
             let k = v("?k");
@@ -1786,51 +1792,89 @@ impl EgglogOp for MPSMatmul {
                 ("m", m),
                 ("n", n),
                 ("k", k),
-                ("lhs", lhs),
+                ("lhs", lhs.clone()),
                 ("lhs_row_stride", lhs_row_stride),
-                ("rhs", rhs),
+                ("rhs", rhs.clone()),
                 ("rhs_row_stride", rhs_row_stride),
                 ("out_row_stride", out_row_stride),
                 ("transpose_lhs", lit_i64(transpose_lhs)),
                 ("transpose_rhs", lit_i64(transpose_rhs)),
             ]);
-            let dt = v(format!("?{}_dt", name.replace('-', "_")));
+            let supported_dtype = app(supported_dtype, vec![]);
 
             rule(union(sum_op.clone(), mps_op.clone()))
-                .set(dtype(mps_op), dt.clone())
-                .fact(eq(dt, dtype(sum_op)))
+                .set(dtype(mps_op), supported_dtype.clone())
+                .fact(eq(supported_dtype.clone(), dtype(sum_op)))
+                .fact(eq(supported_dtype.clone(), dtype(lhs)))
+                .fact(eq(supported_dtype, dtype(rhs)))
                 .ruleset("kernel_lower")
                 .name(name)
         };
 
         vec![
             matmul_rule(
-                "mps-matmul-row-row",
+                "mps-matmul-row-row-f32",
                 MPSMatrixLayout::RowMajor,
                 MPSMatrixLayout::RowMajor,
                 0,
                 0,
+                &SORTS.f32_dt,
             ),
             matmul_rule(
-                "mps-matmul-row-transposed-rhs",
+                "mps-matmul-row-row-f16",
+                MPSMatrixLayout::RowMajor,
+                MPSMatrixLayout::RowMajor,
+                0,
+                0,
+                &SORTS.f16_dt,
+            ),
+            matmul_rule(
+                "mps-matmul-row-transposed-rhs-f32",
                 MPSMatrixLayout::RowMajor,
                 MPSMatrixLayout::TransposedRowMajor,
                 0,
                 1,
+                &SORTS.f32_dt,
             ),
             matmul_rule(
-                "mps-matmul-transposed-lhs-row",
+                "mps-matmul-row-transposed-rhs-f16",
+                MPSMatrixLayout::RowMajor,
+                MPSMatrixLayout::TransposedRowMajor,
+                0,
+                1,
+                &SORTS.f16_dt,
+            ),
+            matmul_rule(
+                "mps-matmul-transposed-lhs-row-f32",
                 MPSMatrixLayout::TransposedRowMajor,
                 MPSMatrixLayout::RowMajor,
                 1,
                 0,
+                &SORTS.f32_dt,
             ),
             matmul_rule(
-                "mps-matmul-transposed-lhs-transposed-rhs",
+                "mps-matmul-transposed-lhs-row-f16",
+                MPSMatrixLayout::TransposedRowMajor,
+                MPSMatrixLayout::RowMajor,
+                1,
+                0,
+                &SORTS.f16_dt,
+            ),
+            matmul_rule(
+                "mps-matmul-transposed-lhs-transposed-rhs-f32",
                 MPSMatrixLayout::TransposedRowMajor,
                 MPSMatrixLayout::TransposedRowMajor,
                 1,
                 1,
+                &SORTS.f32_dt,
+            ),
+            matmul_rule(
+                "mps-matmul-transposed-lhs-transposed-rhs-f16",
+                MPSMatrixLayout::TransposedRowMajor,
+                MPSMatrixLayout::TransposedRowMajor,
+                1,
+                1,
+                &SORTS.f16_dt,
             ),
             Rule::raw(
                 "(rule
@@ -2094,10 +2138,11 @@ impl EgglogOp for MPSBatchedMatmul {
                 .fold(nil(), |tail, head| cons(head, tail))
         };
 
-        let batched_rule = |name: &'static str,
+        let batched_rule = |name: &str,
                             rhs_layout: MPSMatrixLayout,
                             lhs_inner_stride: EggTerm,
-                            transpose_rhs: i64| {
+                            transpose_rhs: i64,
+                            supported_dtype: &SortDef| {
             let batch = v("?batch");
             let m = v("?m");
             let n = v("?n");
@@ -2192,10 +2237,10 @@ impl EgglogOp for MPSBatchedMatmul {
                 ("m", m),
                 ("n", n),
                 ("k", k),
-                ("lhs", lhs),
+                ("lhs", lhs.clone()),
                 ("lhs_batch_stride", lhs_batch_stride),
                 ("lhs_row_stride", lhs_row_stride),
-                ("rhs", rhs),
+                ("rhs", rhs.clone()),
                 ("rhs_batch_stride", rhs_batch_stride),
                 ("rhs_row_stride", rhs_row_stride),
                 ("out_batch_stride", out_batch_stride),
@@ -2203,11 +2248,13 @@ impl EgglogOp for MPSBatchedMatmul {
                 ("transpose_lhs", lit_i64(0)),
                 ("transpose_rhs", lit_i64(transpose_rhs)),
             ]);
-            let dt = v(format!("?{}_dt", name.replace('-', "_")));
+            let supported_dtype = app(supported_dtype, vec![]);
 
             rule(union(sum_op.clone(), mps_op.clone()))
-                .set(dtype(mps_op), dt.clone())
-                .fact(eq(dt, dtype(sum_op)))
+                .set(dtype(mps_op), supported_dtype.clone())
+                .fact(eq(supported_dtype.clone(), dtype(sum_op)))
+                .fact(eq(supported_dtype.clone(), dtype(lhs)))
+                .fact(eq(supported_dtype, dtype(rhs)))
                 .when(mps_matrix_row_byte_guards)
                 .ruleset("kernel_lower")
                 .name(name)
@@ -2215,34 +2262,72 @@ impl EgglogOp for MPSBatchedMatmul {
 
         vec![
             batched_rule(
-                "mps-batched-matmul-row-row",
+                "mps-batched-matmul-row-row-f32",
                 MPSMatrixLayout::RowMajor,
                 z.clone(),
                 0,
+                &SORTS.f32_dt,
             ),
             batched_rule(
-                "mps-batched-matmul-row-transposed-rhs",
+                "mps-batched-matmul-row-row-f16",
+                MPSMatrixLayout::RowMajor,
+                z.clone(),
+                0,
+                &SORTS.f16_dt,
+            ),
+            batched_rule(
+                "mps-batched-matmul-row-transposed-rhs-f32",
                 MPSMatrixLayout::TransposedRowMajor,
                 z.clone(),
                 1,
+                &SORTS.f32_dt,
             ),
             batched_rule(
-                "mps-batched-matmul-row-row-wrapped-inner",
+                "mps-batched-matmul-row-transposed-rhs-f16",
+                MPSMatrixLayout::TransposedRowMajor,
+                z.clone(),
+                1,
+                &SORTS.f16_dt,
+            ),
+            batched_rule(
+                "mps-batched-matmul-row-row-wrapped-inner-f32",
                 MPSMatrixLayout::RowMajor,
                 add(
                     mul(mul(div(z.clone(), v("?k")), v("?k")), v("?m")),
                     modd(z.clone(), v("?k")),
                 ),
                 0,
+                &SORTS.f32_dt,
             ),
             batched_rule(
-                "mps-batched-matmul-row-transposed-rhs-wrapped-inner",
+                "mps-batched-matmul-row-row-wrapped-inner-f16",
+                MPSMatrixLayout::RowMajor,
+                add(
+                    mul(mul(div(z.clone(), v("?k")), v("?k")), v("?m")),
+                    modd(z.clone(), v("?k")),
+                ),
+                0,
+                &SORTS.f16_dt,
+            ),
+            batched_rule(
+                "mps-batched-matmul-row-transposed-rhs-wrapped-inner-f32",
                 MPSMatrixLayout::TransposedRowMajor,
                 add(
                     mul(mul(div(z.clone(), v("?k")), v("?k")), v("?m")),
                     modd(z.clone(), v("?k")),
                 ),
                 1,
+                &SORTS.f32_dt,
+            ),
+            batched_rule(
+                "mps-batched-matmul-row-transposed-rhs-wrapped-inner-f16",
+                MPSMatrixLayout::TransposedRowMajor,
+                add(
+                    mul(mul(div(z.clone(), v("?k")), v("?k")), v("?m")),
+                    modd(z.clone(), v("?k")),
+                ),
+                1,
+                &SORTS.f16_dt,
             ),
             Rule::raw(
                 "(rule
@@ -3762,19 +3847,15 @@ impl MetalKernelOp for MetalCast {
         let input_dtype = input_dtypes.first().copied().unwrap_or(DType::F32);
         let input_ty = metal_buffer_type(input_dtype);
         let output_ty = metal_buffer_type(output_dtype);
-        let cast_expr = match (input_dtype, output_dtype) {
-            (DType::F32, DType::F32)
-            | (DType::F16, DType::F16)
-            | (DType::Int, DType::Int)
-            | (DType::F32, DType::F16)
-            | (DType::F16, DType::F32)
-            | (DType::F32, DType::Int)
-            | (DType::Int, DType::F32)
-            | (DType::F16, DType::Int)
-            | (DType::Int, DType::F16) => format!("({output_ty})(inp[idx])"),
-            _ => panic!(
+        let supports_runtime_cast =
+            |dtype| matches!(dtype, DType::F32 | DType::F16 | DType::Bf16 | DType::Int);
+        let cast_expr = if supports_runtime_cast(input_dtype) && supports_runtime_cast(output_dtype)
+        {
+            format!("({output_ty})(inp[idx])")
+        } else {
+            panic!(
                 "MetalCast does not support runtime cast from {input_dtype:?} to {output_dtype:?}"
-            ),
+            )
         };
         let source = format!(
             r#"

@@ -939,6 +939,147 @@ fn metal_f16_intermediate_add_roundtrip() {
 }
 
 #[test]
+fn metal_bf16_constant_arithmetic_rounds_to_bf16() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(8).as_dtype(DType::Bf16);
+    let output = (input * 2.5_f32).output();
+    let input_data = [
+        bf16::from_f32(-0.3125),
+        bf16::from_f32(-0.1015625),
+        bf16::from_f32(0.0078125),
+        bf16::from_f32(0.125),
+        bf16::from_f32(0.203125),
+        bf16::from_f32(0.296875),
+        bf16::from_f32(0.3984375),
+        bf16::from_f32(0.5),
+    ];
+    let expected = input_data.map(|value| bf16::from_f32(value.to_f32() * 2.5).to_f32());
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, &input_data);
+    rt = search_candidates(&mut cx, rt, 5);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_eq!(rt.get_f32(output), expected);
+}
+
+#[test]
+fn metal_bf16_embedding_gather_is_bit_exact() {
+    const VOCAB_SIZE: usize = 7;
+    const EMBED_DIM: usize = 5;
+    const SEQ_LEN: usize = 4;
+
+    let mut cx = Graph::default();
+    let token_ids = cx.tensor(SEQ_LEN).as_dtype(DType::Int);
+    let table = cx.tensor((VOCAB_SIZE, EMBED_DIM)).as_dtype(DType::Bf16);
+    let output = table
+        .gather(
+            (token_ids * EMBED_DIM).expand_dim(1, EMBED_DIM)
+                + cx.arange(EMBED_DIM).expand_dim(0, SEQ_LEN),
+        )
+        .output();
+    let token_data = [6, 1, 4, 0];
+    let table_data = (0..VOCAB_SIZE * EMBED_DIM)
+        .map(|index| bf16::from_f32(index as f32 / 16.0 - 1.0))
+        .collect::<Vec<_>>();
+    let expected = token_data
+        .iter()
+        .flat_map(|&token| {
+            table_data[token as usize * EMBED_DIM..(token as usize + 1) * EMBED_DIM]
+                .iter()
+                .map(|value| value.to_f32())
+        })
+        .collect::<Vec<_>>();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(token_ids, &token_data);
+    rt.set_data(table, &table_data);
+    rt = search_candidates(&mut cx, rt, 5);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_eq!(rt.get_f32(output), expected);
+}
+
+#[test]
+fn metal_bf16_cast_sum_cast_uses_f32_accumulation() {
+    const ROWS: usize = 4;
+    const COLS: usize = 64;
+
+    let mut cx = Graph::default();
+    let input = cx.tensor((ROWS, COLS)).as_dtype(DType::Bf16);
+    let output = input.cast(DType::F32).sum(1).cast(DType::Bf16).output();
+    let input_data = seeded_data(ROWS * COLS, 1.0, -0.5)
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    let expected = input_data
+        .chunks_exact(COLS)
+        .map(|row| bf16::from_f32(row.iter().map(|value| value.to_f32()).sum::<f32>()).to_f32())
+        .collect::<Vec<_>>();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, &input_data);
+    rt = search_candidates(&mut cx, rt, 5);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(output), &expected, 1e-5);
+}
+
+#[test]
+fn metal_bf16_elementwise_roundtrip_matches_per_op_rounding() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(8);
+    let output = ((input.cast(DType::Bf16) * 2.0_f32) + 1.0_f32)
+        .cast(DType::F32)
+        .output();
+    let input_data = [-0.91, -0.63, -0.37, -0.11, 0.13, 0.39, 0.67, 0.93];
+    let expected = input_data.map(|value| {
+        let input_bf16 = bf16::from_f32(value);
+        let product = bf16::from_f32(input_bf16.to_f32() * 2.0);
+        bf16::from_f32(product.to_f32() + 1.0).to_f32()
+    });
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, &input_data);
+    rt = search_candidates(&mut cx, rt, 5);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_eq!(rt.get_f32(output), expected);
+}
+
+#[test]
+fn metal_bf16_reciprocal_roundtrip_matches_per_op_rounding() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(8);
+    let output = ((input.cast(DType::Bf16).reciprocal()) * 1.0_f32)
+        .cast(DType::F32)
+        .output();
+    let input_data = [1.0, 1.25, 1.5, 1.75, 2.25, 2.5, 3.25, 4.0];
+    let expected = input_data.map(|value| {
+        let input_bf16 = bf16::from_f32(value);
+        let reciprocal = bf16::from_f32(1.0 / input_bf16.to_f32());
+        bf16::from_f32(reciprocal.to_f32() * 1.0).to_f32()
+    });
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, &input_data);
+    rt = search_candidates(&mut cx, rt, 5);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_eq!(rt.get_f32(output), expected);
+}
+
+#[test]
 fn metal_specialized_matmul() {
     let mut cx = Graph::default();
     let a = cx.tensor((TRANSFORMER_SEQ, TRANSFORMER_HIDDEN));
@@ -1008,6 +1149,78 @@ fn metal_regular_tiled_matmul_path() {
     let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
 
     assert_close(&result, &expected, 2e-3);
+}
+
+#[test]
+fn metal_bf16_matmul_uses_generic_f32_accumulator() {
+    const M: usize = 2;
+    const K: usize = 4;
+    const N: usize = 3;
+
+    let mut cx = Graph::default();
+    let a = cx.tensor((M, K)).as_dtype(DType::Bf16);
+    let b = cx.tensor((K, N)).as_dtype(DType::Bf16);
+    let output = a.matmul(b).cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_op(&cx, "MPSMatmul"),
+        "MPSMatrix must not be selectable for unsupported BF16 storage"
+    );
+    assert!(
+        egraph_has_op(&cx, "GenericMatmul"),
+        "BF16 matmul must retain the generic Metal fallback"
+    );
+
+    let a_values = [1.0, -2.0, 0.5, 4.0, -1.0, 3.0, 2.0, -0.5];
+    let b_values = [
+        0.5, 2.0, -1.0, 3.0, -0.5, 1.0, 2.0, 1.5, 0.25, -1.0, 4.0, 2.0,
+    ];
+    let a_data = a_values.map(bf16::from_f32);
+    let b_data = b_values.map(bf16::from_f32);
+    let mut expected = vec![0.0; M * N];
+    for row in 0..M {
+        for col in 0..N {
+            let sum = (0..K)
+                .map(|inner| a_data[row * K + inner].to_f32() * b_data[inner * N + col].to_f32())
+                .sum::<f32>();
+            expected[row * N + col] = bf16::from_f32(sum).to_f32();
+        }
+    }
+
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(a, &a_data);
+    rt.set_data(b, &b_data);
+    rt = search_candidates(&mut cx, rt, 8);
+    assert!(
+        rt.debug_kernel_ops()
+            .iter()
+            .any(|op| op.contains("GenericMatmul")),
+        "BF16 matmul must lower to GenericMatmul, selected ops: {:?}",
+        rt.debug_kernel_ops()
+    );
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(output), &expected, 0.001);
+}
+
+#[test]
+fn metal_bf16_batched_matmul_rejects_mps() {
+    let mut cx = Graph::default();
+    let a = cx.tensor((2, 3, 4)).as_dtype(DType::Bf16);
+    let b = cx.tensor((2, 4, 5)).as_dtype(DType::Bf16);
+    a.matmul(b).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_op(&cx, "MPSBatchedMatmul"),
+        "MPSMatrix must not be selectable for unsupported BF16 storage"
+    );
+    assert!(
+        egraph_has_op(&cx, "GenericMatmul"),
+        "BF16 batched matmul must retain the generic Metal fallback"
+    );
 }
 
 #[test]
@@ -1651,18 +1864,27 @@ fn test_load_safetensors_converts_supported_float_dtypes() {
     let f16_to_f16 = cx.named_tensor("f16_to_f16", 2).as_dtype(DType::F16);
     let f32_to_f16 = cx.named_tensor("f32_to_f16", 2).as_dtype(DType::F16);
     let bf16_to_f16 = cx.named_tensor("bf16_to_f16", 2).as_dtype(DType::F16);
+    let bf16_to_bf16 = cx.named_tensor("bf16_to_bf16", 2).as_dtype(DType::Bf16);
+    let f32_to_bf16 = cx.named_tensor("f32_to_bf16", 2).as_dtype(DType::Bf16);
+    let f16_to_bf16 = cx.named_tensor("f16_to_bf16", 2).as_dtype(DType::Bf16);
 
     let f16_to_f32_out = (f16_to_f32 + 0.0).output();
     let bf16_to_f32_out = (bf16_to_f32 + 0.0).output();
     let f16_to_f16_out = f16_to_f16.cast(DType::F32).output();
     let f32_to_f16_out = f32_to_f16.cast(DType::F32).output();
     let bf16_to_f16_out = bf16_to_f16.cast(DType::F32).output();
+    let bf16_to_bf16_out = bf16_to_bf16.cast(DType::F32).output();
+    let f32_to_bf16_out = f32_to_bf16.cast(DType::F32).output();
+    let f16_to_bf16_out = f16_to_bf16.cast(DType::F32).output();
 
     let f16_to_f32_values = [f16::from_f32(1.5), f16::from_f32(-2.25)];
     let bf16_to_f32_values = [bf16::from_f32(3.5), bf16::from_f32(-4.25)];
     let f16_to_f16_values = [f16::from_f32(5.5), f16::from_f32(-6.25)];
     let f32_to_f16_values = [7.5f32, -8.25];
     let bf16_to_f16_values = [bf16::from_f32(9.5), bf16::from_f32(-10.25)];
+    let bf16_to_bf16_values = [bf16::from_f32(11.5), bf16::from_f32(-12.25)];
+    let f32_to_bf16_values = [13.5f32, -14.25];
+    let f16_to_bf16_values = [f16::from_f32(15.5), f16::from_f32(-16.25)];
     let tensors = [
         (
             "f16_to_f32",
@@ -1694,6 +1916,24 @@ fn test_load_safetensors_converts_supported_float_dtypes() {
             vec![2],
             bytes_of(&bf16_to_f16_values),
         ),
+        (
+            "bf16_to_bf16",
+            Dtype::BF16,
+            vec![2],
+            bytes_of(&bf16_to_bf16_values),
+        ),
+        (
+            "f32_to_bf16",
+            Dtype::F32,
+            vec![2],
+            bytes_of(&f32_to_bf16_values),
+        ),
+        (
+            "f16_to_bf16",
+            Dtype::F16,
+            vec![2],
+            bytes_of(&f16_to_bf16_values),
+        ),
     ];
     let path = write_test_safetensors(&tensors);
 
@@ -1709,6 +1949,9 @@ fn test_load_safetensors_converts_supported_float_dtypes() {
     assert_close(&rt.get_f32(f16_to_f16_out), &[5.5, -6.25], 0.001);
     assert_close(&rt.get_f32(f32_to_f16_out), &[7.5, -8.25], 0.001);
     assert_close(&rt.get_f32(bf16_to_f16_out), &[9.5, -10.25], 0.001);
+    assert_close(&rt.get_f32(bf16_to_bf16_out), &[11.5, -12.25], 0.001);
+    assert_close(&rt.get_f32(f32_to_bf16_out), &[13.5, -14.25], 0.001);
+    assert_close(&rt.get_f32(f16_to_bf16_out), &[15.5, -16.25], 0.001);
     std::fs::remove_file(path).ok();
 }
 

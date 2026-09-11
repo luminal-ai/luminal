@@ -133,7 +133,7 @@ impl MetalRuntime {
         dtype: DType,
     ) -> Buffer {
         match (tensor.dtype(), dtype) {
-            (Dtype::F32, DType::F32) | (Dtype::F16, DType::F16) => {
+            (Dtype::F32, DType::F32) | (Dtype::F16, DType::F16) | (Dtype::BF16, DType::Bf16) => {
                 let data = tensor.data();
                 self.device.new_buffer_with_data(
                     data.as_ptr() as *const _,
@@ -166,6 +166,20 @@ impl MetalRuntime {
                 let values: Vec<f16> = bytemuck::cast_slice::<u8, bf16>(tensor.data())
                     .iter()
                     .map(|v| f16::from_f32(v.to_f32()))
+                    .collect();
+                self.buffer_from_slice(&values)
+            }
+            (Dtype::F32, DType::Bf16) => {
+                let values: Vec<bf16> = bytemuck::cast_slice::<u8, f32>(tensor.data())
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect();
+                self.buffer_from_slice(&values)
+            }
+            (Dtype::F16, DType::Bf16) => {
+                let values: Vec<bf16> = bytemuck::cast_slice::<u8, f16>(tensor.data())
+                    .iter()
+                    .map(|v| bf16::from_f32(v.to_f32()))
                     .collect();
                 self.buffer_from_slice(&values)
             }
@@ -298,6 +312,14 @@ impl MetalRuntime {
                 DType::F16 => {
                     let ptr = buffer.contents() as *const f16;
                     let len = logical_bytes as usize / std::mem::size_of::<f16>();
+                    std::slice::from_raw_parts(ptr, len)
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .collect()
+                }
+                DType::Bf16 => {
+                    let ptr = buffer.contents() as *const bf16;
+                    let len = logical_bytes as usize / std::mem::size_of::<bf16>();
                     std::slice::from_raw_parts(ptr, len)
                         .iter()
                         .map(|v| v.to_f32())
@@ -584,6 +606,14 @@ impl MetalRuntime {
             }
             DType::F16 => {
                 let values = data.to_f16_vec();
+                self.device.new_buffer_with_data(
+                    values.as_ptr() as *const _,
+                    std::mem::size_of_val(values.as_slice()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            DType::Bf16 => {
+                let values = data.to_bf16_vec();
                 self.device.new_buffer_with_data(
                     values.as_ptr() as *const _,
                     std::mem::size_of_val(values.as_slice()) as u64,
