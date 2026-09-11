@@ -422,8 +422,9 @@ fn constructor_coverage_is_not_diluted_by_repeated_operation_sites() {
         let mut seen = FxHashSet::default();
         let mut covered = false;
         // Two distinct constructor transitions: cover both before spending
-        // more proposals on the 128 repeated sites. Random proposals alternate.
-        for _ in 0..4 {
+        // more constructor proposals on repeated sites. Argument and random
+        // proposals each retain their independent share of the budget.
+        for _ in 0..8 {
             let child = extractor
                 .extract_reachable_indexed_generation(&base, 1, 1, &mut seen, &mut rng)
                 .pop()
@@ -451,7 +452,9 @@ fn mutation_covers_each_active_constructor_within_bounded_proposals() {
     let mut extractor = LlirExtractor::new(&graph, &[]);
     let base = extractor.index_choice_set(&choices);
     let mut covered = FxHashSet::default();
-    for _ in 0..CLASSES * 2 {
+    // One constructor proposal per four proposals: argument coverage and
+    // unrestricted random exploration also receive a bounded share.
+    for _ in 0..CLASSES * 4 {
         let child = extractor
             .extract_reachable_indexed_generation(&base, 1, 1, &mut FxHashSet::default(), &mut rng)
             .pop()
@@ -947,5 +950,52 @@ fn dtype_transitions_are_not_starved_by_repeated_constructor_transitions() {
             covered |= extractor.indexed_node_id(choice) == &alternative;
         }
         assert!(covered, "dtype-changing transition starved for seed {seed}");
+    }
+}
+
+#[test]
+fn constructor_and_argument_coverage_do_not_starve_each_other() {
+    for rare_argument in [true, false] {
+        let (mut graph, roots) = independent_choices_fixture(129, 1);
+        let kind = ClassId::from("same-constructor-new-argument");
+        let node = NodeId::from("same-constructor-new-argument-node");
+        graph.enodes.insert(
+            node.clone(),
+            ("Tuned".into(), vec![ClassId::from("parameter-0")]),
+        );
+        graph.node_to_class.insert(node.clone(), kind.clone());
+        graph
+            .eclasses
+            .insert(kind.clone(), ("OpKind".into(), vec![node]));
+        for (index, root) in roots.iter().enumerate() {
+            if (index == roots.len() - 1) == rare_argument {
+                let alternative = graph.eclasses[root].1[0].clone();
+                graph.enodes.get_mut(&alternative).unwrap().1[0] = kind.clone();
+            }
+        }
+        let rare = roots.last().unwrap();
+        for seed in 0..32 {
+            let mut extractor = LlirExtractor::new(&graph, &[]);
+            let bindings = roots
+                .iter()
+                .map(|r| (r.to_string(), graph.eclasses[r].1[1].to_string()))
+                .collect::<Vec<_>>();
+            let parent = extractor.index_seed_choices(&bindings);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut seen = FxHashSet::default();
+            let mut covered = false;
+            for _ in 0..4 {
+                let child = extractor
+                    .extract_reachable_indexed_generation(&parent, 1, 1, &mut seen, &mut rng)
+                    .pop()
+                    .unwrap();
+                let choice = extractor.indexed_selected(&child, extractor.class_to_index[rare]);
+                covered |= extractor.indexed_node_id(choice) == &graph.eclasses[rare].1[0];
+            }
+            assert!(
+                covered,
+                "rare_argument={rare_argument}, seed={seed}: one coverage queue starved the other"
+            );
+        }
     }
 }

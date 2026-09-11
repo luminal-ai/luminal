@@ -1968,7 +1968,7 @@ pub struct LlirExtractor<'a> {
     indexed_extractions: Vec<Vec<(DenseIndex, Vec<CachedIndexedExtraction>)>>,
     mutation_nodes: Vec<Option<MutationChoices>>,
     cover_next_proposal: bool,
-    covered_alternatives: Vec<(DenseIndex, CoverageTarget)>,
+    covered_alternatives: [Vec<(DenseIndex, CoverageTarget)>; 2],
     cover_arguments_next: bool,
     visit_epoch: u32,
     visited: Vec<u32>,
@@ -2063,7 +2063,7 @@ impl<'a> LlirExtractor<'a> {
             indexed_extractions,
             mutation_nodes,
             cover_next_proposal: true,
-            covered_alternatives: Vec::new(),
+            covered_alternatives: [Vec::new(), Vec::new()],
             cover_arguments_next: false,
             visit_epoch: 0,
             visited: vec![0; indexed_class_count],
@@ -2371,99 +2371,102 @@ impl<'a> LlirExtractor<'a> {
         active_classes: &[DenseIndex],
         rng: &mut (impl Rng + ?Sized),
     ) -> Option<(DenseIndex, DenseIndex)> {
-        // Alternate full constructor and argument passes. Starting with the
-        // constructor pass preserves coverage before revisiting tuning variants.
-        for refill in 0..=2 {
-            while let Some((class, target)) = self.covered_alternatives.pop() {
-                if !active_classes.contains(&class) {
-                    continue;
-                }
-                let pool = match target {
-                    CoverageTarget::Constructor(family) => {
-                        let nodes = self.indexed_classes[class as usize].nodes;
-                        nearest_constructor_alternatives(
-                            self.egraph,
-                            &nodes[choices.choices[class as usize] as usize],
-                            &self.mutation_nodes[class as usize]
+        // Independent queues: a long constructor/site pass must not delay all
+        // argument exploration (or vice versa). Random proposals remain intact.
+        let requested = usize::from(self.cover_arguments_next);
+        self.cover_arguments_next = !self.cover_arguments_next;
+        for queue in [requested, 1 - requested] {
+            for refill in 0..=1 {
+                while let Some((class, target)) = self.covered_alternatives[queue].pop() {
+                    if !active_classes.contains(&class) {
+                        continue;
+                    }
+                    let pool = match target {
+                        CoverageTarget::Constructor(family) => {
+                            let nodes = self.indexed_classes[class as usize].nodes;
+                            let family = &self.mutation_nodes[class as usize]
                                 .as_ref()
                                 .unwrap()
-                                .families[family],
-                            |slot| &nodes[slot as usize],
-                        )
-                    }
-                    // Parents can change while a pass is pending. Recompute
-                    // neighbors so companion changes remain minimal for this parent.
-                    CoverageTarget::Argument(argument) => {
-                        let Some(pool) = self.argument_pools(choices, class).remove(&argument)
-                        else {
-                            continue;
-                        };
-                        pool
-                    }
-                };
-                return Some((class, pool[rng.random_range(0..pool.len())]));
-            }
-            if refill == 2 {
-                break;
-            }
-            let arguments = self.cover_arguments_next;
-            self.cover_arguments_next = !arguments;
-            let mut classes = active_classes.to_vec();
-            classes.sort_unstable();
-            for class in classes.into_iter().rev() {
-                if arguments {
-                    for argument in self.argument_pools(choices, class).into_keys().rev() {
-                        self.covered_alternatives
-                            .push((class, CoverageTarget::Argument(argument)));
-                    }
-                } else {
-                    self.mutation_pool(class);
-                    let families = &self.mutation_nodes[class as usize]
-                        .as_ref()
-                        .unwrap()
-                        .families;
-                    for (index, family) in families.iter().enumerate().rev() {
-                        if !family.contains(&choices.choices[class as usize]) {
-                            self.covered_alternatives
-                                .push((class, CoverageTarget::Constructor(index)));
+                                .families[family];
+                            if family.contains(&choices.choices[class as usize]) {
+                                continue;
+                            }
+                            nearest_constructor_alternatives(
+                                self.egraph,
+                                &nodes[choices.choices[class as usize] as usize],
+                                family,
+                                |slot| &nodes[slot as usize],
+                            )
+                        }
+                        CoverageTarget::Argument(argument) => {
+                            // A changed parent may need different companion
+                            // changes. Only existing legal alternatives enter.
+                            let Some(pool) = self.argument_pools(choices, class).remove(&argument)
+                            else {
+                                continue;
+                            };
+                            pool
+                        }
+                    };
+                    return Some((class, pool[rng.random_range(0..pool.len())]));
+                }
+                if refill == 1 {
+                    break;
+                }
+                let mut pending = Vec::new();
+                let mut classes = active_classes.to_vec();
+                classes.sort_unstable();
+                for class in classes.into_iter().rev() {
+                    if queue == 1 {
+                        for argument in self.argument_pools(choices, class).into_keys().rev() {
+                            pending.push((class, CoverageTarget::Argument(argument)));
+                        }
+                    } else {
+                        self.mutation_pool(class);
+                        let families = &self.mutation_nodes[class as usize]
+                            .as_ref()
+                            .unwrap()
+                            .families;
+                        for (index, family) in families.iter().enumerate().rev() {
+                            if !family.contains(&choices.choices[class as usize]) {
+                                pending.push((class, CoverageTarget::Constructor(index)));
+                            }
                         }
                     }
                 }
-            }
-            // Keep complete-pass coverage, but avoid favoring serialized class
-            // IDs when the caller stops before a whole pass. The supplied RNG
-            // makes the order reproducible.
-            self.covered_alternatives.shuffle(rng);
-            if !arguments {
-                // Cover distinct algorithm transitions before revisiting their
-                // sites. Otherwise hundreds of repeated elementwise choices
-                // can exhaust a budget before one expensive fusion is offered.
-                // Round-robin ordering retains every site and every family;
-                // backend names and static cost guesses have no preference.
+                pending.shuffle(rng);
+                // Visit distinct implementation transitions / argument positions
+                // before repeated sites. Neither backend names nor class IDs
+                // determine priority, and every queued site remains reachable.
                 let mut visits = FxHashMap::default();
-                self.covered_alternatives
-                    .sort_by_cached_key(|&(class, ref target)| {
-                        let CoverageTarget::Constructor(family) = *target else {
-                            unreachable!()
-                        };
-                        let nodes = self.indexed_classes[class as usize].nodes;
-                        let destination = self.mutation_nodes[class as usize]
-                            .as_ref()
-                            .unwrap()
-                            .families[family][0];
-                        let key = (
-                            proposal_family_key(
-                                self.egraph,
-                                &nodes[choices.choices[class as usize] as usize],
-                            ),
-                            proposal_family_key(self.egraph, &nodes[destination as usize]),
-                        );
-                        let visit = visits.entry(key).or_insert(0usize);
-                        let round = *visit;
-                        *visit += 1;
-                        round
-                    });
-                self.covered_alternatives.reverse(); // pop the first round first
+                pending.sort_by_cached_key(|&(class, ref target)| {
+                    let nodes = self.indexed_classes[class as usize].nodes;
+                    let source = proposal_family_key(
+                        self.egraph,
+                        &nodes[choices.choices[class as usize] as usize],
+                    );
+                    let (destination, argument) = match *target {
+                        CoverageTarget::Constructor(family) => {
+                            let slot = self.mutation_nodes[class as usize]
+                                .as_ref()
+                                .unwrap()
+                                .families[family][0];
+                            (
+                                proposal_family_key(self.egraph, &nodes[slot as usize]),
+                                None,
+                            )
+                        }
+                        CoverageTarget::Argument(argument) => (Vec::new(), Some(argument)),
+                    };
+                    let visit = visits
+                        .entry((source, destination, argument))
+                        .or_insert(0usize);
+                    let round = *visit;
+                    *visit += 1;
+                    round
+                });
+                pending.reverse();
+                self.covered_alternatives[queue] = pending;
             }
         }
         None
