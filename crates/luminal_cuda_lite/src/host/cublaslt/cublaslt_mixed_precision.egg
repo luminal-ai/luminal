@@ -1,0 +1,67 @@
+; Widening F16/BF16 operands to F32 is exact. Preserve the F32
+; product/accumulator/output contract while letting cuBLASLt read 16-bit storage.
+(relation cublaslt_widenable_dtype (DType))
+(cublaslt_widenable_dtype (F16))
+(cublaslt_widenable_dtype (Bf16))
+(rule (
+    (= ?out (Op (cublaslt
+        ?m ?n ?k ?al ?bl ?ao ?bo ?co ?do
+        ?lda ?ldb ?ldc ?ldd ?batch ?sa ?sb ?sc ?sd
+        (F32) (F32) (F32) (F32) "default" "default" ?alpha 0.0 "DEFAULT")
+        (ICons ?ac (ICons ?bc (INil)))))
+    (= ?ac (Op (Cast ?asize (F32)) (ICons ?a (INil))))
+    (= ?bc (Op (Cast ?bsize (F32)) (ICons ?b (INil))))
+    (= (dtype ?a) ?dt) (= (dtype ?b) ?dt)
+    (cublaslt_widenable_dtype ?dt)
+) (
+    (let ?mixed (Op (cublaslt
+        ?m ?n ?k ?al ?bl ?ao ?bo ?co ?do
+        ?lda ?ldb ?ldc ?ldd ?batch ?sa ?sb ?sc ?sd
+        ?dt ?dt (F32) (F32) "32F" "F32" ?alpha 0.0 "DEFAULT")
+        (ICons ?a (ICons ?b (INil)))))
+    (union ?out ?mixed) (set (dtype ?mixed) (F32))
+) :ruleset matmul_backend :name "cublaslt exact widened low-precision operands")
+
+; A final cast may be folded only over the whole canonical output. Never
+; remove a low-precision rounding which occurs BEFORE a pointwise operation.
+(rule (
+    (= ?out (Op (Cast ?size ?dt) (ICons ?mm (INil))))
+    (cublaslt_widenable_dtype ?dt)
+    (= ?mm (Op (cublaslt
+        ?m ?n ?k ?al ?bl ?ao ?bo ?co ?do
+        ?lda ?ldb ?ldc ?ldd ?batch ?sa ?sb ?sc ?sd
+        ?dt ?dt (F32) (F32) "32F" "F32" ?alpha 0.0 "DEFAULT")
+        (ICons ?a (ICons ?b (INil)))))
+    (cublaslt_exact_pointwise_output ?mm ?do ?m ?n ?ldd ?batch ?sd
+        (F32) ?shape ?strides ?zeros ?size)
+) (
+    (let ?narrow (Op (cublaslt
+        ?m ?n ?k ?al ?bl ?ao ?bo ?co ?do
+        ?lda ?ldb ?ldc ?ldd ?batch ?sa ?sb ?sc ?sd
+        ?dt ?dt ?dt ?dt "32F" "F32" ?alpha 0.0 "DEFAULT")
+        (ICons ?a (ICons ?b (INil)))))
+    (union ?out ?narrow) (set (dtype ?narrow) ?dt)
+) :ruleset matmul_backend :name "cublaslt narrow final mixed-precision product")
+
+; The bias is widened from the SAME low-precision dtype as the final output.
+; Recover its storage too, since cuBLASLt's default bias dtype follows D.
+(rule (
+    (= ?out (Op (Cast ?size ?dt) (ICons ?mm (INil))))
+    (cublaslt_widenable_dtype ?dt)
+    (= ?mm (Op (cublaslt
+        ?m ?n ?k ?al ?bl ?ao ?bo ?co ?do
+        ?lda ?ldb ?ldc ?ldd ?batch ?sa ?sb ?sc ?sd
+        ?dt ?dt (F32) (F32) "32F" "F32" ?alpha 0.0 "BIAS")
+        (ICons ?a (ICons ?b (ICons ?bias32 (INil))))))
+    (= ?bias32 (Op (Cast ?bias_size (F32)) (ICons ?bias (INil))))
+    (= (dtype ?bias) ?dt)
+    (cublaslt_exact_pointwise_output ?mm ?do ?m ?n ?ldd ?batch ?sd
+        (F32) ?shape ?strides ?zeros ?size)
+) (
+    (let ?narrow (Op (cublaslt
+        ?m ?n ?k ?al ?bl ?ao ?bo ?co ?do
+        ?lda ?ldb ?ldc ?ldd ?batch ?sa ?sb ?sc ?sd
+        ?dt ?dt ?dt ?dt "32F" "F32" ?alpha 0.0 "BIAS")
+        (ICons ?a (ICons ?b (ICons ?bias (INil))))))
+    (union ?out ?narrow) (set (dtype ?narrow) ?dt)
+) :ruleset matmul_backend :name "cublaslt narrow final mixed-precision affine")

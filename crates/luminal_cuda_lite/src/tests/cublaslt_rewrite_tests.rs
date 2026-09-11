@@ -4356,3 +4356,197 @@ fn cublaslt_c_d_layout_matches(llir: &LLIRGraph) -> Vec<bool> {
         .filter_map(|host_op| cublaslt_c_d_layouts_match(host_op.as_ref().as_ref()))
         .collect()
 }
+
+#[test]
+fn cublaslt_mixed_affine_matches_single_round_reference_across_layouts() {
+    let stream = get_cuda_stream().expect("CUDA required for mixed-precision regression");
+    for (dtype, delta) in [(DType::Bf16, 1.0 / 256.0), (DType::F16, 1.0 / 2048.0)] {
+        for layout in LAYOUT_CASES {
+            for bias_enabled in [false, true] {
+                let (m, n, k) = (4, 64, 64);
+                let mut cx = Graph::new();
+                let a = cx
+                    .tensor(if layout.a_col_major { (k, m) } else { (m, k) })
+                    .as_dtype(dtype)
+                    .persist();
+                let b = cx
+                    .tensor(if layout.b_col_major { (n, k) } else { (k, n) })
+                    .as_dtype(dtype)
+                    .persist();
+                let bias = cx.tensor(n).as_dtype(dtype).persist();
+                let a32 = a.cast(DType::F32);
+                let b32 = b.cast(DType::F32);
+                let product = (if layout.a_col_major { a32.t() } else { a32 })
+                    .matmul(if layout.b_col_major { b32.t() } else { b32 });
+                let result = if bias_enabled {
+                    product + bias.cast(DType::F32).expand_dim(0, m)
+                } else {
+                    product
+                };
+                let out = result.cast(dtype).cast(DType::F32).output();
+                cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+                let llir = try_extract_forced_op_llir_where(
+                    &cx,
+                    &["cublaslt"],
+                    ForcedExtractionConfig::new(0x00C0_B1A5).attempts_per_node(16),
+                    |llir| {
+                        cublaslt_type_tuples(llir).contains(&(
+                            dtype,
+                            dtype,
+                            dtype,
+                            dtype,
+                            "32F",
+                            DType::F32,
+                        )) && cublaslt_epilogues(llir).contains(&if bias_enabled {
+                            "BIAS"
+                        } else {
+                            "DEFAULT"
+                        })
+                    },
+                )
+                .unwrap_or_else(|err| panic!("{dtype:?} {layout:?} bias={bias_enabled}: {err}"));
+                let encode = |values: Vec<f32>| -> Vec<u8> {
+                    values
+                        .into_iter()
+                        .flat_map(|v| match dtype {
+                            DType::Bf16 => half::bf16::from_f32(v).to_bits().to_le_bytes(),
+                            _ => half::f16::from_f32(v).to_bits().to_le_bytes(),
+                        })
+                        .collect()
+                };
+                let av = (0..m * k)
+                    .map(|i| {
+                        let col = if layout.a_col_major { i / m } else { i % k };
+                        match col {
+                            0 => 1.0,
+                            1 => delta,
+                            _ => 0.0,
+                        }
+                    })
+                    .collect();
+                let bv = (0..k * n)
+                    .map(|i| {
+                        let row = if layout.b_col_major { i % k } else { i / n };
+                        if row < 2 { 1.0 } else { 0.0 }
+                    })
+                    .collect();
+                let mut rt = CudaRuntime::initialize(stream.clone());
+                rt.load_llir(&llir);
+                rt.set_data(a, encode(av));
+                rt.set_data(b, encode(bv));
+                rt.set_data(bias, encode(vec![-1.0; n]));
+                for _ in 0..3 {
+                    rt.execute(&cx.dyn_map);
+                    // The exact product is 1+delta. Round after adding -1.
+                    assert_eq!(
+                        rt.get_f32(out),
+                        vec![if bias_enabled { delta } else { 1.0 }; m * n],
+                        "{dtype:?} {layout:?}"
+                    );
+                }
+
+                if !bias_enabled {
+                    // Widening also preserves subnormal operands. Their product
+                    // here is normal, so flushing them would be observable.
+                    let (tiny, large) = match dtype {
+                        DType::Bf16 => (half::bf16::from_bits(1).to_f32(), 2.0f32.powi(120)),
+                        _ => (half::f16::from_bits(1).to_f32(), 2.0f32.powi(15)),
+                    };
+                    for (av, bv) in [(tiny, large), (large, tiny)] {
+                        rt.set_data(a, encode(vec![av; m * k]));
+                        rt.set_data(b, encode(vec![bv; k * n]));
+                        rt.execute(&cx.dyn_map);
+                        assert_eq!(rt.get_f32(out), vec![tiny * large * k as f32; m * n]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cublaslt_mixed_affine_keeps_unconverted_f32_bias_and_partial_output() {
+    for partial in [false, true] {
+        let mut cx = Graph::new();
+        let a = cx.tensor((4, 64)).as_dtype(DType::Bf16);
+        let b = cx.tensor((64, 64)).as_dtype(DType::Bf16);
+        let bias = cx.tensor(64);
+        let product = a.cast(DType::F32).matmul(b.cast(DType::F32));
+        let value = if partial {
+            product.slice((.., ..32))
+        } else {
+            product + bias.expand_dim(0, 4)
+        };
+        value.cast(DType::Bf16).output();
+        assert_no_cublaslt_llir_where(
+            &mut cx,
+            "mixed cast must preserve bias dtype and view extent",
+            |llir| {
+                cublaslt_type_tuples(llir)
+                    .iter()
+                    .any(|t| t.3 == DType::Bf16)
+            },
+        );
+    }
+}
+
+#[test]
+fn cublaslt_mixed_affine_batched_dynamic_f32_output() {
+    let stream = get_cuda_stream().expect("CUDA required for mixed-precision regression");
+    let (batch, n, k) = (3, 64, 64);
+    let mut cx = Graph::new();
+    let a = cx.tensor((batch, 'm', k)).as_dtype(DType::Bf16);
+    let b = cx.tensor((batch, k, n)).as_dtype(DType::Bf16).persist();
+    // F32 bias must retain its original precision and storage type.
+    let bias = cx.tensor(n).persist();
+    let product = a.cast(DType::F32).matmul(b.cast(DType::F32));
+    let out =
+        (product + bias.expand_lhs([Expression::from(batch), Expression::from('m')])).output();
+    cx.set_dim('m', 4);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let llir = try_extract_forced_op_llir_where(
+        &cx,
+        &["cublaslt"],
+        ForcedExtractionConfig::new(0x00C0_B1A5).attempts_per_node(16),
+        |llir| {
+            cublaslt_type_tuples(llir).contains(&(
+                DType::Bf16,
+                DType::Bf16,
+                DType::F32,
+                DType::F32,
+                "32F",
+                DType::F32,
+            )) && cublaslt_epilogues(llir).contains(&"BIAS")
+        },
+    )
+    .expect("batched mixed affine should be extractable");
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(
+        b,
+        (0..batch * k * n)
+            .map(|i| half::bf16::from_f32(if (i / n) % k < 2 { 1.0 } else { 0.0 }))
+            .collect::<Vec<_>>(),
+    );
+    rt.set_data(bias, vec![-1.0 + 1.0 / 65536.0; n]);
+    for m in [4, 1, 8, 4] {
+        cx.set_dim('m', m);
+        rt.set_data(
+            a,
+            (0..batch * m * k)
+                .map(|i| {
+                    half::bf16::from_f32(match i % k {
+                        0 => 1.0,
+                        1 => 1.0 / 256.0,
+                        _ => 0.0,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        rt.execute(&cx.dyn_map);
+        assert_eq!(
+            rt.get_f32(out),
+            vec![1.0 / 256.0 + 1.0 / 65536.0; batch * m * n]
+        );
+    }
+}

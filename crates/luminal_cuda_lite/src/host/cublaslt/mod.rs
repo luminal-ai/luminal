@@ -215,6 +215,7 @@ impl EgglogOp for CuBlasLt {
             Rule::raw(include_str!["cublaslt_CmCm_rewrite.egg"]), // col col
             Rule::raw(include_str!["cublaslt_fp8_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_output_witness.egg"]),
+            Rule::raw(include_str!["cublaslt_mixed_precision.egg"]),
             Rule::raw(include_str!["cublaslt_scale_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_beta_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_epilogue_rewrite.egg"]),
