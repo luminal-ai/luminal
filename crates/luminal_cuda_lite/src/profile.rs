@@ -170,6 +170,20 @@ pub struct ProfileEvaluation {
     pub weighted_cost: Duration,
 }
 
+impl ProfileEvaluation {
+    pub(crate) fn display(&self) -> String {
+        format!(
+            "weighted workload score={:?}; measured case latencies=[{}]",
+            self.weighted_cost,
+            self.cases
+                .iter()
+                .map(|case| format!("{}: {:?}", case.case_id, case.duration))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 pub(super) struct ReplaySession {
     assigned: Vec<Vec<usize>>,
     slots: Vec<CudaSlice<u8>>,

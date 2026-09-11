@@ -1471,6 +1471,39 @@ fn seeded_search_remeasures_and_can_replace_or_reject_the_incumbent() {
 }
 
 #[test]
+fn recombination_proposals_do_not_extend_the_measured_candidate_budget() {
+    let mut graph = Graph::new();
+    // Distinct shapes keep these choices independent of loop-body sharing.
+    for n in 8..14 {
+        graph.tensor(n).sin().output();
+    }
+    let options = CompileOptions::default()
+        .search_graph_limit(5)
+        .generation_size(4)
+        .mutations(3)
+        .search_log(false);
+    graph.build_search_space::<ExplicitLoopRuntime>(options.clone());
+    let space = graph.search_space().unwrap();
+    let contexts = space.bucket_contexts(&graph.dyn_map);
+    for seed in 0..16 {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut search = super::GeneticSearch::<usize>::new(
+            space,
+            &contexts[0],
+            &options,
+            std::time::Instant::now(),
+        );
+        while let Some(candidate) = search.next_candidate(&mut rng) {
+            // Every report triggers incumbent recombination, including reports
+            // made with otherwise-full or almost-exhausted generation queues.
+            let cost = 100usize.saturating_sub(search.measured());
+            search.report(candidate, Outcome::Measured(cost, "improvement".into()));
+        }
+        assert_eq!(search.measured(), 5, "seed {seed}");
+    }
+}
+
+#[test]
 fn bucket_candidate_budgets_override_only_the_requested_bucket() {
     let mut graph = Graph::new();
     let _ = graph.tensor('s').sin().sin().sin().output();

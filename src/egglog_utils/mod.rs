@@ -2485,11 +2485,57 @@ impl<'a> LlirExtractor<'a> {
             let family = &families[rng.random_range(0..families.len())];
             family[rng.random_range(0..family.len())]
         });
+        self.set_indexed_choice(child, class, new_node)
+    }
+
+    fn set_indexed_choice(
+        &self,
+        child: &mut IndexedChoiceSet,
+        class: DenseIndex,
+        new_node: DenseIndex,
+    ) -> bool {
         let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
         let class_info = &self.indexed_classes[class as usize];
         child.hash ^= hash_choice_entry(class_info.id, &class_info.nodes[old_node as usize]);
         child.hash ^= hash_choice_entry(class_info.id, &class_info.nodes[new_node as usize]);
         old_node != new_node
+    }
+
+    /// Offer each differing active choice from a donor independently. Newly
+    /// exposed dependencies inherit its choices too, while already-active
+    /// shared choices stay with the receiver. These are ordinary e-graph
+    /// genomes: extraction, validation and measured fitness still decide.
+    pub fn recombine_reachable_choices(
+        &mut self,
+        receiver: &IndexedChoiceSet,
+        donor: &IndexedChoiceSet,
+        prev_selected: &mut FxHashSet<u64>,
+    ) -> Vec<IndexedChoiceSet> {
+        let active = self.reachable_mutation_classes(receiver);
+        let mut offspring = Vec::new();
+        for &class in &active {
+            let choice = donor.choices[class as usize];
+            if receiver.choices[class as usize] == choice {
+                continue;
+            }
+            let mut child = receiver.clone();
+            // No random initialization: preserve the donor's tested branch.
+            self.set_indexed_choice(&mut child, class, choice);
+            let mut initialized: FxHashSet<_> = active.iter().copied().collect();
+            loop {
+                let reachable = self.reachable_mutation_classes(&child);
+                let Some(new_class) = reachable.into_iter().find(|c| !initialized.contains(c))
+                else {
+                    break;
+                };
+                initialized.insert(new_class);
+                self.set_indexed_choice(&mut child, new_class, donor.choices[new_class as usize]);
+            }
+            if prev_selected.insert(child.hash) {
+                offspring.push(child);
+            }
+        }
+        offspring
     }
 
     pub fn extract_reachable_indexed_generation(

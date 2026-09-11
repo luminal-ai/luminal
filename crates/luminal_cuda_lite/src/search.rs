@@ -121,7 +121,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             }));
             return match result {
                 Ok(Ok(metric)) => {
-                    Outcome::Measured(metric, format!("representative workload {metric:?}"))
+                    Outcome::Measured(metric, self.profile_evaluations().last().unwrap().display())
                 }
                 Ok(Err(reason)) => Outcome::Rejected(reason.to_string()),
                 Err(_) => {
@@ -233,9 +233,16 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             match profiled {
                 Ok(metric) => {
                     if options.search_log_enabled() {
-                        println!(
-                            "   Search  deployment finalist search={search_metric:?} graph={metric:?}"
-                        );
+                        if self.profile_case_indices(ctx.index).is_some() {
+                            println!(
+                                "   Search  deployment finalist search_score={search_metric:?}; {}",
+                                self.profile_evaluations().last().unwrap().display()
+                            );
+                        } else {
+                            println!(
+                                "   Search  deployment finalist search={search_metric:?} graph={metric:?}"
+                            );
+                        }
                     }
                     deployment_ranked.push((metric, genome.clone()));
                     if deployment_ranked.len() == target {

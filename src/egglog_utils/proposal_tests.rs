@@ -312,6 +312,89 @@ fn independent_choices_fixture(
 }
 
 #[test]
+fn recombination_combines_independent_parent_improvements() {
+    let (graph, roots) = independent_choices_fixture(3, 1);
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let parent = |variants: [usize; 3]| {
+        roots
+            .iter()
+            .zip(variants)
+            .map(|(class, variant)| {
+                (
+                    class.to_string(),
+                    graph.eclasses[class].1[variant].to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let receiver = extractor.index_seed_choices(&parent([0, 1, 1]));
+    let donor = extractor.index_seed_choices(&parent([1, 0, 1]));
+    let target = extractor.index_seed_choices(&parent([0, 0, 1]));
+    let mut seen = FxHashSet::from_iter([receiver.hash, donor.hash]);
+    let children = extractor.recombine_reachable_choices(&receiver, &donor, &mut seen);
+    assert!(children.iter().any(|child| child.hash == target.hash));
+    for child in &children {
+        assert_eq!(
+            extractor
+                .index_named_choices(&extractor.named_choices(child))
+                .hash,
+            child.hash
+        );
+        let c = extractor.class_to_index[&roots[2]];
+        assert_eq!(child.choices[c as usize], receiver.choices[c as usize]);
+    }
+    assert!(
+        extractor
+            .recombine_reachable_choices(&receiver, &donor, &mut seen)
+            .is_empty()
+    );
+    assert_eq!(
+        receiver.hash,
+        extractor.index_seed_choices(&parent([0, 1, 1])).hash
+    );
+}
+
+#[test]
+fn recombination_inherits_new_dependencies_but_preserves_shared_active_choices() {
+    for shared in [false, true] {
+        let mut graph = activated_input_fixture();
+        if shared {
+            let class = ClassId::from("join");
+            let node = NodeId::from("join-node");
+            graph.enodes.insert(
+                node.clone(),
+                (
+                    "OutputJoin".into(),
+                    vec![ClassId::from("root"), ClassId::from("hidden")],
+                ),
+            );
+            graph.node_to_class.insert(node.clone(), class.clone());
+            graph
+                .eclasses
+                .insert(class.clone(), ("IR".into(), vec![node]));
+            graph.roots = vec![class];
+        }
+        let mut extractor = LlirExtractor::new(&graph, &[]);
+        let receiver = extractor.index_seed_choices(&[
+            ("root".into(), "direct".into()),
+            ("hidden".into(), "slow".into()),
+        ]);
+        let donor = extractor.index_seed_choices(&[
+            ("root".into(), "wrapped".into()),
+            ("hidden".into(), "fast".into()),
+        ]);
+        let children =
+            extractor.recombine_reachable_choices(&receiver, &donor, &mut FxHashSet::default());
+        let choices = children
+            .iter()
+            .map(|child| extractor.named_choices(child))
+            .find(|choices| choices.contains(&("root".into(), "wrapped".into())))
+            .unwrap();
+        assert!(choices.contains(&("hidden".into(), if shared { "slow" } else { "fast" }.into())));
+    }
+}
+
+#[test]
 fn constructor_coverage_is_not_diluted_by_repeated_operation_sites() {
     let (mut graph, roots) = independent_choices_fixture(129, 70);
     let rare = roots.last().unwrap();

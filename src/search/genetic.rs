@@ -300,13 +300,18 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                     }
                 }
                 Phase::Evolving => {
-                    if self.pending.is_empty() {
+                    // Recombination can add proposals during a generation.
+                    // The measured-candidate budget applies before every handout.
+                    if self.n_graphs >= self.search_limit || self.time_limit_reached() {
                         if self.generation_open {
                             self.close_generation();
                         }
-                        if self.n_graphs >= self.search_limit || self.time_limit_reached() {
-                            self.finish();
-                            return None;
+                        self.finish();
+                        return None;
+                    }
+                    if self.pending.is_empty() {
+                        if self.generation_open {
+                            self.close_generation();
                         }
                         self.breed(rng);
                         if self.pending.is_empty() {
@@ -515,6 +520,24 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             }
         };
 
+        let new_best = self
+            .best_metric
+            .as_ref()
+            .is_some_and(|best| best.gt(&new_metric));
+        if new_best {
+            // A winner may descend from an older parent and lose independent
+            // improvements in the previous incumbent. Test their combinations
+            // immediately instead of waiting for mutation to rediscover them.
+            let combinations = self.extractor.recombine_reachable_choices(
+                &genome,
+                &self.ranked[0].1,
+                &mut self.prev_selected,
+            );
+            for child in combinations.into_iter().rev() {
+                self.pending.push_front(child);
+            }
+        }
+
         let rank = self
             .ranked
             .iter()
@@ -550,10 +573,6 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             &candidate.llir,
             &format!("cand={} {display_metric}", self.n_graphs),
         );
-        let new_best = self
-            .best_metric
-            .as_ref()
-            .is_some_and(|best| best.gt(&new_metric));
         if new_best {
             self.generation_found_new_best = true;
             self.best_metric = Some(new_metric);
