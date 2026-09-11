@@ -2,7 +2,7 @@ use colored::Colorize;
 use egglog::{ast::Span, prelude::RustSpan, var};
 use itertools::Itertools;
 use petgraph::{Direction, graph::NodeIndex};
-use rand::Rng;
+use rand::{Rng, seq::SliceRandom};
 use rustc_hash::FxHashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -2379,11 +2379,18 @@ impl<'a> LlirExtractor<'a> {
                     continue;
                 }
                 let pool = match target {
-                    CoverageTarget::Constructor(family) => self.mutation_nodes[class as usize]
-                        .as_ref()
-                        .unwrap()
-                        .families[family]
-                        .clone(),
+                    CoverageTarget::Constructor(family) => {
+                        let nodes = self.indexed_classes[class as usize].nodes;
+                        nearest_constructor_alternatives(
+                            self.egraph,
+                            &nodes[choices.choices[class as usize] as usize],
+                            &self.mutation_nodes[class as usize]
+                                .as_ref()
+                                .unwrap()
+                                .families[family],
+                            |slot| &nodes[slot as usize],
+                        )
+                    }
                     // Parents can change while a pass is pending. Recompute
                     // neighbors so companion changes remain minimal for this parent.
                     CoverageTarget::Argument(argument) => {
@@ -2423,6 +2430,10 @@ impl<'a> LlirExtractor<'a> {
                     }
                 }
             }
+            // Keep complete-pass coverage, but avoid favoring serialized class
+            // IDs when the caller stops before a whole pass. The supplied RNG
+            // makes the order reproducible.
+            self.covered_alternatives.shuffle(rng);
         }
         None
     }
@@ -3179,12 +3190,14 @@ fn non_marker_enode_indices(egraph: &SerializedEGraph, enodes: &[NodeId]) -> Vec
 
 // Compare existing terms, without inventing parameter combinations. For the
 // generic Op wrapper, require identical inputs and an unambiguous OpKind so a
-// constructor-argument proposal cannot silently change its data dependencies.
-fn changed_constructor_arguments(
-    egraph: &SerializedEGraph,
+// tuning-preserving proposal cannot silently change its data dependencies.
+type ConstructorTerm = (String, Vec<ClassId>);
+
+fn comparable_constructor_terms<'a>(
+    egraph: &'a SerializedEGraph,
     before: &NodeId,
     after: &NodeId,
-) -> Option<Vec<(usize, ClassId)>> {
+) -> Option<(&'a ConstructorTerm, &'a ConstructorTerm)> {
     let (mut left, mut right) = (&egraph.enodes[before], &egraph.enodes[after]);
     if left.0 == "Op" && right.0 == "Op" {
         if left.1.get(1..) != right.1.get(1..) {
@@ -3202,6 +3215,44 @@ fn changed_constructor_arguments(
         left = &egraph.enodes[&left_kinds[0]];
         right = &egraph.enodes[&right_kinds[0]];
     }
+    Some((left, right))
+}
+
+// On the systematic constructor pass, preserve as many existing argument
+// classes as possible. Extra arguments are free to vary. Only existing enodes
+// participate; the random half still samples every configuration in the family.
+fn nearest_constructor_alternatives<'a, T: Copy>(
+    egraph: &'a SerializedEGraph,
+    current: &NodeId,
+    pool: &[T],
+    node: impl Fn(T) -> &'a NodeId,
+) -> Vec<T> {
+    let mut nearest = Vec::new();
+    let mut best = usize::MAX;
+    for &candidate in pool {
+        let distance = comparable_constructor_terms(egraph, current, node(candidate))
+            .map(|(left, right)| {
+                left.1.len().abs_diff(right.1.len())
+                    + left.1.iter().zip(&right.1).filter(|(a, b)| a != b).count()
+            })
+            .unwrap_or(usize::MAX);
+        if distance < best {
+            best = distance;
+            nearest.clear();
+        }
+        if distance == best {
+            nearest.push(candidate);
+        }
+    }
+    nearest
+}
+
+fn changed_constructor_arguments(
+    egraph: &SerializedEGraph,
+    before: &NodeId,
+    after: &NodeId,
+) -> Option<Vec<(usize, ClassId)>> {
+    let (left, right) = comparable_constructor_terms(egraph, before, after)?;
     if left.0 != right.0 || left.1.len() != right.1.len() {
         return None;
     }

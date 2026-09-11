@@ -570,3 +570,152 @@ fn argument_coverage_proposes_required_companion_changes() {
         );
     }
 }
+
+#[test]
+fn constructor_coverage_preserves_existing_arguments_without_pruning_variants() {
+    let mut graph = paired_arguments_fixture(4, false);
+    let root = graph.roots[0].clone();
+    let before = NodeId::from("pair-2-3");
+    let original = graph.eclasses[&root].1.clone();
+    for node in original {
+        let (_, inputs) = &graph.enodes[&node];
+        let kind = &graph.eclasses[&inputs[0]].1[0];
+        let (_, arguments) = &graph.enodes[kind];
+        let arguments = arguments.clone();
+        for extra in 0..4 {
+            let class = ClassId::from(format!("extended-{node}-{extra}"));
+            let kind = NodeId::from(format!("extended-kind-{node}-{extra}"));
+            let mut args = arguments.clone();
+            args.push(ClassId::from(format!("knob-{extra}")));
+            graph.enodes.insert(kind.clone(), ("Extended".into(), args));
+            graph.node_to_class.insert(kind.clone(), class.clone());
+            graph
+                .eclasses
+                .insert(class.clone(), ("OpKind".into(), vec![kind]));
+            let op = NodeId::from(format!("extended-op-{node}-{extra}"));
+            graph.enodes.insert(
+                op.clone(),
+                ("Op".into(), vec![class, ClassId::from("sources")]),
+            );
+            graph.node_to_class.insert(op.clone(), root.clone());
+            graph.eclasses.get_mut(&root).unwrap().1.push(op);
+        }
+    }
+    let mut rng = StdRng::seed_from_u64(971);
+    let mut choices = random_initial_choice(&graph, &mut rng);
+    choices.insert(&root, &before);
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let base = extractor.index_choice_set(&choices);
+    let mut reached = FxHashSet::default();
+    let mut covered_extra = FxHashSet::default();
+    for proposal in 0..4096 {
+        let child = extractor
+            .extract_reachable_indexed_generation(&base, 1, 1, &mut FxHashSet::default(), &mut rng)
+            .pop()
+            .unwrap();
+        let selected = extractor.indexed_selected(&child, extractor.root_index);
+        let node = extractor.indexed_node_id(selected);
+        reached.insert(node.clone());
+        let (_, term) = comparable_constructor_terms(&graph, &before, node).unwrap();
+        if proposal % 2 == 0 && term.0 == "Extended" {
+            assert_eq!(
+                term.1[..2],
+                [ClassId::from("knob-2"), ClassId::from("knob-3")]
+            );
+            covered_extra.insert(term.1[2].clone());
+        }
+    }
+    assert_eq!(
+        covered_extra.len(),
+        4,
+        "new arguments must remain free to vary"
+    );
+    assert_eq!(
+        reached.len(),
+        80,
+        "random exploration must retain every configuration"
+    );
+}
+
+#[test]
+fn short_coverage_passes_do_not_always_start_at_the_same_class() {
+    let (graph, roots) = independent_choices_fixture(48, 1);
+    let mut first_classes = FxHashSet::default();
+    for seed in 0..32 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut choices = random_initial_choice(&graph, &mut rng);
+        for root in &roots {
+            let (class, (_, nodes)) = graph.eclasses.get_key_value(root).unwrap();
+            choices.insert(class, &nodes[1]);
+        }
+        let mut extractor = LlirExtractor::new(&graph, &[]);
+        let base = extractor.index_choice_set(&choices);
+        let child = extractor
+            .extract_reachable_indexed_generation(&base, 1, 1, &mut FxHashSet::default(), &mut rng)
+            .pop()
+            .unwrap();
+        for root in &roots {
+            let class = extractor.class_to_index[root];
+            if extractor.indexed_selected(&child, class) != extractor.indexed_selected(&base, class)
+            {
+                first_classes.insert(root);
+            }
+        }
+    }
+    assert!(
+        first_classes.len() > 8,
+        "short runs must not always cover the same class first"
+    );
+}
+
+/// CPU-only proposal inspection. It holds each saved parent fixed; this is not
+/// a substitute for measured search, parent selection, or backend validation.
+#[test]
+#[ignore = "requires a saved schedule and an output path"]
+fn saved_schedule_constructor_transition_diagnostic() {
+    let schedule: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("LUMINAL_PROPOSAL_SCHEDULE").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let limit = std::env::var("LUMINAL_PROPOSAL_LIMIT")
+        .unwrap_or("80".into())
+        .parse::<usize>()
+        .unwrap();
+    let mut report = Vec::new();
+    for (bucket, data) in schedule["buckets"].as_array().unwrap().iter().enumerate() {
+        let graph: SerializedEGraph = serde_json::from_value(data["egraph"].clone()).unwrap();
+        let bindings: Vec<(String, String)> =
+            serde_json::from_value(data["choices"].clone()).unwrap();
+        let mut extractor = LlirExtractor::new(&graph, &[]);
+        let base = extractor.index_named_choices(&bindings);
+        let active = extractor.reachable_mutation_classes(&base);
+        let mut rng = StdRng::seed_from_u64(0x1A11_CE5E_ED5E_ED01);
+        let mut seen = FxHashSet::default();
+        for proposal in 0..limit {
+            let child = extractor
+                .extract_reachable_indexed_generation(&base, 1, 1, &mut seen, &mut rng)
+                .pop()
+                .unwrap();
+            for &class in &active {
+                let old = extractor.indexed_node_id(extractor.indexed_selected(&base, class));
+                let new = extractor.indexed_node_id(extractor.indexed_selected(&child, class));
+                if old == new {
+                    continue;
+                }
+                let terms = comparable_constructor_terms(&graph, old, new);
+                report.push(serde_json::json!({
+                    "bucket": bucket, "proposal": proposal,
+                    "class": extractor.indexed_classes[class as usize].id,
+                    "old": old, "new": new,
+                    "comparable_terms": terms,
+                    "changed_shared_arguments": terms.map(|(a,b)| a.1.iter().zip(&b.1).filter(|(a,b)|a!=b).count()),
+                }));
+            }
+        }
+    }
+    std::fs::write(
+        std::env::var("LUMINAL_PROPOSAL_REPORT").unwrap(),
+        serde_json::to_vec(&report).unwrap(),
+    )
+    .unwrap();
+}
