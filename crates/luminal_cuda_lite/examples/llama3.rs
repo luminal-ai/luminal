@@ -19,12 +19,10 @@ fn main() {
 
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
-    use llama3::{
-        Llama3, Llama3Dims,
-        model_support::{Namespace, named_kv_cache_pool},
-    };
     use luminal::prelude::*;
     use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};
+    use model_zoo::llama3::{Llama3, Llama3Dims};
+    use model_zoo::model_support::{Namespace, named_kv_cache_pool};
 
     const SLOTS: usize = 4;
     let dims = Llama3Dims::llama3_8b();

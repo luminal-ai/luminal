@@ -1,7 +1,7 @@
 # CUDA Lite model applications
 
-The root `examples/` crates contain only logical model definitions. This
-directory owns the CUDA-specific search, binding, execution, and readback.
+The `model_zoo` crate contains the logical model definitions. This directory
+owns the CUDA-specific search, binding, execution, and readback.
 
 Run any application with a CUDA device and the `device` feature:
 

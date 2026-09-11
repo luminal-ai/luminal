@@ -12,7 +12,7 @@ use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::HostBuffer;
-use mini_conv::MiniConvNet;
+use model_zoo::mini::conv::MiniConvNet;
 
 /// The examples' shared seeding discipline (examples/support/mod.rs,
 /// verbatim from the mini measure harnesses).

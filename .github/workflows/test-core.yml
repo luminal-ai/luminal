@@ -22,4 +22,4 @@ jobs:
         steps:
             - uses: actions/checkout@v6
             - name: Run tests
-              run: cargo test --release -p luminal -p luminal_nn -p luminal_reference -p luminal_tracing -p luminal_python --verbose
+              run: cargo test --release -p luminal -p luminal_nn -p model_zoo -p luminal_reference -p luminal_tracing -p luminal_python --verbose

@@ -1,0 +1,10 @@
+[package]
+name = "model_zoo"
+version = "0.1.0"
+edition.workspace = true
+description = "Backend-neutral logical model definitions for Luminal"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+luminal = { path = "../.." }
+luminal_nn = { path = "../luminal_nn" }

@@ -1,0 +1,34 @@
+name: LLM chat
+on:
+  pull_request:
+    branches: [logical-ssa-project, main]
+    paths:
+      - 'Cargo.toml'
+      - 'src/**'
+      - 'crates/luminal_nn/**'
+      - 'examples/llm_chat/**'
+      - 'crates/luminal_metal/**'
+      - 'crates/luminal_cuda_lite/**'
+      - 'crates/model_zoo/**'
+      - '.github/workflows/llm-chat.yml'
+  workflow_dispatch:
+jobs:
+  chat:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            features: metal
+          - os: macos-14
+            features: metal
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo clippy -p llm_chat --all-targets --features '${{ matrix.features }}' -- -D warnings
+      - run: cargo test -p llm_chat --features '${{ matrix.features }}'
+      - if: runner.os == 'macOS'
+        run: cargo test -p luminal_metal --test resident_feedback --test dynamic_execution

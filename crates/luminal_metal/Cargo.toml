@@ -19,18 +19,11 @@ metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"
 
 [dev-dependencies]
+model_zoo = { path = "../model_zoo" }
 luminal_reference = { path = "../luminal_reference" }
 luminal_nn = { path = "../luminal_nn" }
-mini_llama3 = { path = "../../examples/mini/llama3" }
-mini_conv = { path = "../../examples/mini/conv" }
 safetensors = "0.7"
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
 tokenizers = "0.22.2"
 luminal_tracing = { path = "../luminal_tracing" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-mini_qwen3 = { path = "../../examples/mini/qwen3" }
-mini_qwen3_moe = { path = "../../examples/mini/qwen3_moe" }
-mini_whisper = { path = "../../examples/mini/whisper" }
-mini_gemma3 = { path = "../../examples/mini/gemma3" }
-mini_gemma4_moe = { path = "../../examples/mini/gemma4_moe" }
-mini_flux = { path = "../../examples/mini/flux" }

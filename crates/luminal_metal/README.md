@@ -39,6 +39,17 @@ execution. Buckets share one arena sized for the largest selected plan;
 staging, host payloads, or cached pipelines. Commands follow the buffer plan's
 data and anti-dependencies, and preserve outputs before recycling their storage.
 
+`retain_input(tensor)` keeps a static, read-only input in the arena after its
+initial upload. Call it after search and before execution; a later `set_data`
+explicitly updates that input. `bind_feedback(input, output)` routes a matching
+static, contiguous output into a retained input, snapshotting it at the output
+boundary and committing it after all previous-state reads finish. Feedback
+outputs stay on device and are not available through `fetch`. Dimension values
+may change between executions; re-searching or changing bounds requires a new
+runtime once residency is configured. Resident ranges and feedback snapshots
+count toward the arena budget and are shared across every bucket. Physical
+lifetimes and resident allocation use core's planner, also used by CUDA Lite.
+
 `fetch` returns an owned backing payload and its elected layout. For views, use
 `layouts::dense_f32` to interpret that layout; `get_f32` returns backing elements.
 Inputs must have the declared dtype and exact live byte length. Supported
@@ -61,3 +72,6 @@ core suite's documented adaLN rejoin-divergence search blocker.
 The `llama_1b` example retains its checkpoint, model, and prompt and uses the
 native runtime API. It stages KV cache updates through host readback. Run it
 with `cargo run --release -p luminal_metal --example llama_1b`.
+
+For a shared model-zoo chat runner with resident weights and KV state, see
+[`llm_chat`](../../examples/llm_chat/README.md).

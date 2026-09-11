@@ -28,6 +28,8 @@ pub struct MetalRuntime {
     decoders: luminal::egglog_utils::eclass::ConstructorRegistry,
     plan: Option<BufferIrGraph<DecodedLayout>>,
     staged: FxHashMap<i64, HostBuffer>,
+    residents: luminal::resident::ResidentBindings,
+    device_budget_bytes: Option<usize>,
     outputs_host: FxHashMap<usize, (HostBuffer, luminal::bufferize::OutputBinding<DecodedLayout>)>,
     input_buffers: FxHashMap<NodeIndex, i64>,
     output_index: FxHashMap<NodeIndex, usize>,
@@ -102,6 +104,10 @@ impl MetalRuntime {
         lower: u64,
         upper: u64,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "configure dimension bounds before residency"
+        );
         let name = var.into();
         let (lower, upper) = self
             .range_bound
@@ -139,6 +145,10 @@ impl MetalRuntime {
         dim: impl Into<shape::Symbol>,
         buckets: Vec<graph::DimBucket>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "configure dimension buckets before residency"
+        );
         let dim = dim.into();
         anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
         if let Some((lo, hi)) = self.range_bound.get(&dim) {
@@ -283,6 +293,10 @@ impl MetalRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
+        anyhow::ensure!(
+            self.residents.inputs.is_empty(),
+            "create a new runtime to re-search a resident program"
+        );
         self.invalidate_plans();
         let mut resolved_options = options.clone();
         #[cfg(target_os = "macos")]
@@ -426,6 +440,7 @@ impl MetalRuntime {
                 .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
             (first, None, plans)
         };
+        self.device_budget_bytes = options.device_budget_bytes;
         self.bucket_plans = searched_buckets;
         self.selected_bucket = None;
 
@@ -450,6 +465,59 @@ impl MetalRuntime {
             let _ = self.select_bucket_plan();
         }
         Ok(outcome)
+    }
+
+    /// Resolve public graph handles to this compiled program's boundary IDs.
+    pub fn input_buffer(&self, tensor: NodeIndex) -> Result<i64> {
+        self.input_buffers
+            .get(&tensor)
+            .copied()
+            .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))
+    }
+    pub fn output_slot_index(&self, tensor: NodeIndex) -> Result<usize> {
+        self.output_index
+            .get(&tensor)
+            .copied()
+            .ok_or_else(|| anyhow!("no output binding for {tensor:?}"))
+    }
+
+    /// Keep this input in the shared device arena between executions. Its
+    /// shape must be static and its boundary must be read-only. Call after
+    /// search and before the first execute; set_data uploads it only when changed.
+    pub fn retain_input(&mut self, tensor: NodeIndex) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        anyhow::ensure!(
+            self.device.as_ref().is_none_or(|d| !d.is_installed()),
+            "configure residency before execution"
+        );
+        let lit = *self
+            .input_buffers
+            .get(&tensor)
+            .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))?;
+        self.residents.inputs.insert(lit);
+        Ok(())
+    }
+
+    /// Route an output into a resident input after each execution. Feedback
+    /// outputs stay on device and are unavailable through fetch. Their elected
+    /// layout must equal the static, contiguous input boundary layout.
+    pub fn bind_feedback(&mut self, input: NodeIndex, output: NodeIndex) -> Result<()> {
+        let slot = *self
+            .output_index
+            .get(&output)
+            .ok_or_else(|| anyhow!("no output binding for {output:?}"))?;
+        let lit = *self
+            .input_buffers
+            .get(&input)
+            .ok_or_else(|| anyhow!("no input binding for {input:?}"))?;
+        anyhow::ensure!(
+            !self.residents.feedback.contains_key(&slot)
+                && !self.residents.feedback.values().any(|v| *v == lit),
+            "duplicate feedback endpoint"
+        );
+        self.retain_input(input)?;
+        self.residents.feedback.insert(slot, lit);
+        Ok(())
     }
 
     pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) {
@@ -493,12 +561,18 @@ impl MetalRuntime {
                         })
                         .collect()
                 };
-                device.install(plans)?;
+                device.install_resident_with_budget(
+                    plans,
+                    self.residents.clone(),
+                    self.device_budget_bytes,
+                )?;
             }
             let bucket = self.selected_bucket.unwrap_or(0);
             let staged = self.staged.iter().map(|(lit, data)| (*lit, data)).collect();
             let outputs = device.execute(bucket, &staged, &self.dims)?;
             self.outputs_host = outputs;
+            self.staged
+                .retain(|lit, _| !self.residents.inputs.contains(lit));
             Ok(())
         }
         #[cfg(not(target_os = "macos"))]
@@ -507,7 +581,7 @@ impl MetalRuntime {
                 .plan()
                 .ok_or_else(|| anyhow!("search before execute"))?;
             bail!(
-                "Metal execution is only available on macOS: plans can be \
+                "Metal device execution is only available on macOS: plans can be \
                  searched and inspected but not executed on this host"
             )
         }

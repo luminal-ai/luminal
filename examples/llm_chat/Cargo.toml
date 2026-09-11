@@ -1,0 +1,32 @@
+[package]
+name = "llm_chat"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[features]
+default = []
+cuda_lite = ["luminal_cuda_lite/device"]
+metal = ["dep:luminal_metal"]
+
+[dependencies]
+luminal = { path = "../.." }
+luminal_nn = { path = "../../crates/luminal_nn" }
+model_zoo = { path = "../../crates/model_zoo" }
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite", optional = true }
+luminal_metal = { path = "../../crates/luminal_metal", optional = true }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+half = "2"
+memmap2 = "0.9"
+minijinja = { version = "2", features = ["json", "loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+rand = "0.9"
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+tempfile = "3"
+luminal_reference = { path = "../../crates/luminal_reference" }

@@ -221,7 +221,7 @@ pub fn search_implementations(
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
-    mut evaluator: Evaluator<'_>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))] mut evaluator: Evaluator<'_>,
 ) -> Result<SearchOutcome> {
     ensure!(
         !options.profile_on_device || evaluator.is_device(),

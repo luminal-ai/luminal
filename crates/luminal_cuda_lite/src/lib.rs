@@ -82,6 +82,7 @@ pub mod lattice;
 pub mod layouts;
 pub mod op;
 pub mod ops;
+pub mod resident;
 pub mod runtime;
 pub mod search;
 mod storage;

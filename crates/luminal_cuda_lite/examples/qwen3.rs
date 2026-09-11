@@ -21,10 +21,8 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     use luminal::prelude::*;
     use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};
-    use qwen3::{
-        Qwen, QwenDims,
-        model_support::{Namespace, named_kv_cache_pool},
-    };
+    use model_zoo::model_support::{Namespace, named_kv_cache_pool};
+    use model_zoo::qwen3::{Qwen, QwenDims};
 
     const SLOTS: usize = 4;
     let dims = QwenDims::qwen3_4b();

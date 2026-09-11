@@ -256,14 +256,19 @@ pub(crate) enum CopyKind {
 
 /// A bucket's view into the runtime's shared pinned staging allocation.
 /// The runtime serializes launches and completes readback before reusing it.
-impl crate::arena::ArenaSlice {
-    pub(crate) fn ptr(self, staging: &Pinned) -> u64 {
+pub(crate) trait PinnedRange {
+    fn ptr(self, staging: &Pinned) -> u64;
+    fn bytes(self, staging: &Pinned) -> &[u8];
+    fn bytes_mut(self, staging: &mut Pinned) -> &mut [u8];
+}
+impl PinnedRange for crate::arena::ArenaSlice {
+    fn ptr(self, staging: &Pinned) -> u64 {
         staging.ptr() as u64 + self.offset as u64
     }
-    pub(crate) fn bytes(self, staging: &Pinned) -> &[u8] {
+    fn bytes(self, staging: &Pinned) -> &[u8] {
         &staging.bytes()[self.offset..self.offset + self.bytes]
     }
-    pub(crate) fn bytes_mut(self, staging: &mut Pinned) -> &mut [u8] {
+    fn bytes_mut(self, staging: &mut Pinned) -> &mut [u8] {
         &mut staging.bytes_mut()[self.offset..self.offset + self.bytes]
     }
 }

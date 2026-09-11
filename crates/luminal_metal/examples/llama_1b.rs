@@ -1,8 +1,5 @@
 use hf_hub::api::sync::Api;
 
-#[path = "../../../examples/common/model_support.rs"]
-mod model_support;
-use crate::model_support::{LayerNorm, Namespace, gather_rows, scatter_rows};
 use luminal::{
     dtype::DType,
     graph::{DimBucket, Graph},
@@ -10,6 +7,7 @@ use luminal::{
 };
 use luminal_metal::{CompileOptions, HostBuffer, MetalRuntime};
 use luminal_tracing::luminal_filter;
+use model_zoo::model_support::{LayerNorm, Namespace, gather_rows, scatter_rows};
 use rustc_hash::FxHashSet;
 use std::{
     error::Error,
@@ -502,18 +500,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             let values: Vec<f32> = match tensor.dtype() {
                 safetensors::Dtype::F32 => tensor
                     .data()
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect(),
                 safetensors::Dtype::BF16 => tensor
                     .data()
-                    .chunks_exact(2)
-                    .map(|b| half::bf16::from_le_bytes(b.try_into().unwrap()).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| half::bf16::from_le_bytes(*b).to_f32())
                     .collect(),
                 safetensors::Dtype::F16 => tensor
                     .data()
-                    .chunks_exact(2)
-                    .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| half::f16::from_le_bytes(*b).to_f32())
                     .collect(),
                 dtype => return Err(format!("unsupported checkpoint dtype {dtype:?}").into()),
             };

@@ -33,7 +33,7 @@ cuda_image = (
     timeout=modal_timeout,
 )
 def run_cargo_test():
-    """Run cargo test for luminal_cuda_lite on a Modal GPU."""
+    """Run CUDA runtime and shared chat tests on a Modal GPU."""
     subprocess.run(["nvidia-smi"], check=True)
 
     # Detect GPU compute capability
@@ -52,6 +52,10 @@ def run_cargo_test():
         "--release",
         "-p",
         "luminal_cuda_lite",
+        "-p",
+        "llm_chat",
+        "--features",
+        "luminal_cuda_lite/device,llm_chat/cuda_lite",
         "--verbose",
         "--",
         *test_args,

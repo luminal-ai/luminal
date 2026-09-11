@@ -20,10 +20,10 @@ fn main() {
 
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
-    use flux2::transformer::{
+    use luminal::prelude::*;
+    use model_zoo::flux2::transformer::{
         Flux2Transformer, HEAD_DIM, IN_CHANNELS, JOINT_ATTENTION_DIM, build_rope_tables,
     };
-    use luminal::prelude::*;
 
     const TEXT_TOKENS: usize = 1;
     const IMAGE_HEIGHT: usize = 1;
