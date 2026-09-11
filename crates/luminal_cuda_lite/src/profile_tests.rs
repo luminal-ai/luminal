@@ -15,6 +15,28 @@ fn dims(s: usize) -> DynMap {
 }
 
 #[test]
+fn profile_budget_never_substitutes_warmup_for_a_timed_trial() {
+    let mut cx = Graph::new();
+    let input = cx.tensor(4).persist();
+    let output = (input + 1.).output();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let space = cx.search_space().unwrap();
+    let contexts = space.bucket_contexts(&cx.dyn_map);
+    let llir = luminal::search::extract_one(space, &contexts[0], &mut SmallRng::seed_from_u64(73));
+    let mut rt = runtime();
+    rt.load_llir(&llir);
+    rt.set_data(input, vec![2f32; 4]);
+    let before = rt.next_execution_id;
+    rt.profile_loaded_cuda_graph(&llir, &cx.dyn_map, 3, Some(Duration::ZERO), None);
+    assert_eq!(
+        rt.next_execution_id - before,
+        2,
+        "even an exhausted profiling budget requires a warmup and one timed trial"
+    );
+    assert_eq!(rt.get_f32(output), vec![3f32; 4]);
+}
+
+#[test]
 fn profile_dense_exact_cases_and_unseen_shapes() {
     let mut cx = Graph::new();
     let input = cx.tensor(('s', 4)).persist();
@@ -129,8 +151,9 @@ fn profile_capture_aliases_and_restore_mirrors() {
         .unwrap()
         .bucket_contexts(&DynMap::default());
     rt.begin_profile_replay(&contexts).unwrap();
-    assert_eq!(rt.profile_replay.as_ref().unwrap().snapshots.len(), 2);
+    assert!(rt.profile_replay.as_ref().unwrap().snapshots.is_empty());
     rt.activate_profile_case(0).unwrap();
+    assert_eq!(rt.profile_replay.as_ref().unwrap().snapshots.len(), 2);
     let replay_a = rt.current_hlir_device_binding(a.id).unwrap().0;
     let replay_b = rt.current_hlir_device_binding(b.id).unwrap().0;
     assert_eq!(replay_b, replay_a + 8);
@@ -723,6 +746,7 @@ fn profile_bf16_strided_graph_uses_physical_input_abi() {
 #[derive(Debug, Clone, Default)]
 struct MetadataCopy {
     direct_launches: Arc<std::sync::atomic::AtomicUsize>,
+    preparation_delay: Duration,
 }
 impl EgglogOp for MetadataCopy {
     fn sort(&self) -> luminal::egglog_utils::api::SortDef {
@@ -775,6 +799,7 @@ impl HostOp for MetadataCopy {
             metadata[0] == rows as i32,
             "metadata disagrees with capture dimensions"
         );
+        std::thread::sleep(self.preparation_delay);
         Ok(())
     }
     fn execute(
@@ -800,6 +825,81 @@ impl HostOp for MetadataCopy {
             )?;
         }
         Ok(())
+    }
+}
+
+#[test]
+fn profile_budget_accepts_complete_workload_but_rejects_missing_cases() {
+    let mut graph = Graph::new();
+    let input = graph.tensor('s').as_dtype(DType::Int).persist();
+    let metadata = graph.tensor(1).as_dtype(DType::Int).persist();
+    let output = graph
+        .custom_op(
+            MetadataCopy {
+                preparation_delay: Duration::from_millis(100),
+                ..Default::default()
+            },
+            (input.id, metadata.id),
+            's',
+            DType::Int,
+        )
+        .output();
+    graph.set_dim('s', 4);
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let space = graph.search_space().unwrap();
+    let contexts = space.bucket_contexts(&graph.dyn_map);
+    let llir = luminal::search::extract_one(space, &contexts[0], &mut SmallRng::seed_from_u64(17));
+    for cases in [1, 2] {
+        let mut rt = runtime();
+        rt.set_data(input, vec![19i32; 4]);
+        rt.set_data_with_host_mirror(metadata, vec![4i32]);
+        let mut workload = ProfileWorkload::new();
+        for case in 0..cases {
+            workload = workload.case(
+                format!("case-{case}"),
+                dims(4),
+                ProfileInputs::new()
+                    .input(input, vec![19i32; 4])
+                    .mirrored_input(metadata, vec![4i32]),
+                1.0,
+            );
+        }
+        rt.set_profile_workload(&graph, workload).unwrap();
+        rt.begin_profile_replay(&contexts).unwrap();
+        let before = rt.next_execution_id;
+        let result = rt.evaluate_profile_workload(
+            &llir,
+            &contexts[0],
+            &CompileOptions::default()
+                .trials(1)
+                .execution_timeout(Duration::from_millis(50)),
+            false,
+        );
+        assert_eq!(
+            rt.next_execution_id - before,
+            2,
+            "warmup and one full timed trial"
+        );
+        assert_eq!(rt.get_i32(output), vec![19; 4]);
+        if cases == 1 {
+            assert!(
+                result.is_ok(),
+                "completed workload must be rankable despite slow warmup: {result:?}"
+            );
+            assert_eq!(rt.profile_evaluations().len(), 1);
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("before every case was measured")
+            );
+            assert!(
+                rt.profile_evaluations().is_empty(),
+                "incomplete workloads must not be ranked"
+            );
+        }
+        rt.finish_profile_replay();
     }
 }
 
@@ -975,8 +1075,9 @@ fn profile_replay_reclaims_previous_arena_and_rematerializes_original_program() 
         "previous arena overlaps replay storage"
     );
     assert!(!rt.cuda_graphs().any(CudaGraphOp::is_materialized));
-    assert_eq!(rt.profile_replay.as_ref().unwrap().snapshots.len(), 1);
+    assert!(rt.profile_replay.as_ref().unwrap().snapshots.is_empty());
     rt.activate_profile_case(0).unwrap();
+    assert_eq!(rt.profile_replay.as_ref().unwrap().snapshots.len(), 1);
     rt.execute(&graph.dyn_map);
     assert_eq!(rt.get_f32(output), vec![9.; 256]);
     rt.finish_profile_replay();
@@ -1131,4 +1232,335 @@ fn captured_workspace_owners_follow_resident_graph_lifetimes() {
         owners.lock().unwrap().iter().all(|w| w.upgrade().is_none()),
         "dropping runtime retains workspace owners"
     );
+}
+
+#[test]
+fn prepared_input_survives_replay_and_clears_on_ordinary_write() {
+    let mut graph = Graph::new();
+    let input = graph.tensor(4).persist();
+    let output = (input + 1.).output();
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut rt = runtime();
+    let bytes: Vec<u8> = [2f32, 3., 4., 5., 99., 98., 97., 96.]
+        .into_iter()
+        .flat_map(f32::to_ne_bytes)
+        .collect();
+    let allocation = rt.cuda_stream.clone_htod(&bytes).unwrap();
+    rt.set_prepared_buffer(input, allocation, 16, "test.dual.v1");
+    let binding = rt.current_hlir_device_binding(input.id).unwrap();
+    let before = rt.current_resource_input_signature();
+    assert_eq!(before[&input.id].owned_capacity_bytes, Some(32));
+    assert!(rt.capture_profile_inputs(&[input], &graph.dyn_map).is_err());
+    assert!(
+        rt.set_profile_workload(
+            &graph,
+            ProfileWorkload::new().case(
+                "bad",
+                graph.dyn_map.clone(),
+                ProfileInputs::new().input(input, vec![0f32; 4]),
+                1.
+            )
+        )
+        .is_err()
+    );
+    rt.set_profile_workload(
+        &graph,
+        ProfileWorkload::new().shared_input(input).case(
+            "shared",
+            graph.dyn_map.clone(),
+            ProfileInputs::new(),
+            1.,
+        ),
+    )
+    .unwrap();
+    let contexts = graph
+        .search_space()
+        .unwrap()
+        .bucket_contexts(&graph.dyn_map);
+    rt.begin_profile_replay(&contexts).unwrap();
+    assert_eq!(rt.profile_replay.as_ref().unwrap().owned_device_bytes(), 32);
+    let view = CudaRuntime::input_device_buffer(
+        input.id,
+        &rt.cuda_stream,
+        &rt.hlir_buffers,
+        &rt.external_buffers,
+        &rt.prepared_inputs,
+    )
+    .unwrap();
+    assert_eq!(
+        (view.ptr(), view.len(), view.capacity(), view.input_format()),
+        (binding.0, 16, 32, Some("test.dual.v1"))
+    );
+    rt.finish_profile_replay();
+    assert_eq!(before, rt.current_resource_input_signature());
+    rt = graph.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(2).trials(1),
+        &mut SmallRng::seed_from_u64(671),
+    );
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_f32(output), vec![3., 4., 5., 6.]);
+    rt.set_data(input, vec![7f32; 4]);
+    assert!(!rt.prepared_inputs.contains_key(&input.id));
+    assert_eq!(rt.current_hlir_device_binding(input.id).unwrap(), binding);
+    assert_ne!(before, rt.current_resource_input_signature());
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_f32(output), vec![8.; 4]);
+}
+
+#[test]
+fn prepared_input_rejects_writes_and_overlapping_output() {
+    let mut rt = runtime();
+    let input = NodeIndex::new(721);
+    let allocation = rt.cuda_stream.alloc_zeros::<u8>(64).unwrap();
+    let ptr = allocation.device_ptr(&rt.cuda_stream).0;
+    rt.set_prepared_buffer(input, allocation, 16, "test.dual.v1");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        rt.set_output_device_ptr(NodeIndex::new(722), ptr + 32, 4);
+    }));
+    assert!(result.is_err());
+    let mut llir = LLIRGraph::default();
+    let source = llir.add_node(LLIROp::new(Box::new(Input {
+        node: input.index(),
+        label: String::new(),
+        dtype: DType::Int,
+    })));
+    let op = llir.add_node(Probe::default().to_llir_op());
+    llir.add_edge(source, op, ());
+    llir.add_edge(source, op, ());
+    assert!(rt.validate_prepared_input_effects(&llir).is_err());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.copy_output_to_input(NodeIndex::new(722), input);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn reused_replay_inputs_reset_each_trial_and_restore_after_failure() {
+    for fail in [false, true] {
+        let mut graph = Graph::new();
+        let state = graph.tensor(1).as_dtype(DType::Int).persist();
+        let meta = graph.tensor(1).as_dtype(DType::Int).persist();
+        let probe = Probe {
+            fail,
+            ..Probe::default()
+        };
+        graph
+            .custom_op(probe.clone(), (state.id, meta.id), 1, DType::F32)
+            .output();
+        graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+        let mut rt = runtime();
+        rt.set_data(state, vec![101i32]);
+        rt.set_data_with_host_mirror(meta, vec![202i32]);
+        let original = rt.current_hlir_device_binding(state.id).unwrap();
+        let restore = rt.capture_profile_inputs(&[state], &graph.dyn_map).unwrap();
+        let workload = ProfileWorkload::new()
+            .device_snapshots(true)
+            .reuse_input_buffers(restore)
+            .case(
+                "a",
+                DynMap::default(),
+                ProfileInputs::new()
+                    .input(state, vec![7i32])
+                    .mirrored_input(meta, vec![11i32]),
+                1.,
+            )
+            .case(
+                "b",
+                DynMap::default(),
+                ProfileInputs::new()
+                    .input(state, vec![19i32])
+                    .mirrored_input(meta, vec![23i32]),
+                1.,
+            );
+        rt.set_profile_workload(&graph, workload).unwrap();
+        let space = graph.search_space().unwrap();
+        let contexts = space.bucket_contexts(&graph.dyn_map);
+        let llir =
+            luminal::search::extract_one(space, &contexts[0], &mut SmallRng::seed_from_u64(12));
+        rt.begin_profile_replay(&contexts).unwrap();
+        assert_eq!(
+            rt.profile_replay
+                .as_ref()
+                .unwrap()
+                .slots
+                .iter()
+                .flatten()
+                .count(),
+            1
+        );
+        assert!(rt.profile_replay.as_ref().unwrap().snapshots.is_empty());
+        rt.activate_profile_case(0).unwrap();
+        assert_eq!(rt.profile_replay.as_ref().unwrap().snapshots.len(), 2);
+        let first_keys: FxHashSet<_> = rt
+            .profile_replay
+            .as_ref()
+            .unwrap()
+            .snapshots
+            .keys()
+            .copied()
+            .collect();
+        rt.activate_profile_case(1).unwrap();
+        let second_keys: FxHashSet<_> = rt
+            .profile_replay
+            .as_ref()
+            .unwrap()
+            .snapshots
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(second_keys.len(), 2);
+        assert!(
+            first_keys.is_disjoint(&second_keys),
+            "inactive snapshots must be released"
+        );
+        rt.activate_profile_case(0).unwrap();
+        assert_eq!(rt.current_hlir_device_binding(state.id).unwrap(), original);
+        for _ in 0..2 {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.evaluate_profile_workload(
+                    &llir,
+                    &contexts[0],
+                    &CompileOptions::default().trials(3),
+                    false,
+                )
+            }));
+        }
+        rt.finish_profile_replay();
+        assert_eq!(rt.current_hlir_device_binding(state.id).unwrap(), original);
+        assert_eq!(rt.get_i32(state), vec![101]);
+        assert_eq!(rt.hlir_host_mirrors[&meta.id], 202i32.to_ne_bytes());
+        let seen = probe.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|v| *v == (7, 11, 0) || *v == (19, 23, 0)),
+            "{seen:?}"
+        );
+    }
+}
+
+#[test]
+fn reused_replay_rejects_external_aliases_and_oversized_cases() {
+    let mut graph = Graph::new();
+    let a = graph.tensor('s').persist();
+    let b = graph.tensor(1).persist();
+    (a * 2.).output();
+    b.output();
+    graph.set_dim('s', 1);
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut rt = runtime();
+    rt.set_data(a, vec![3f32]);
+    rt.set_data(b, vec![4f32]);
+    let restore = rt.capture_profile_inputs(&[a], &graph.dyn_map).unwrap();
+    for oversized in [false, true] {
+        let ptr = rt.current_hlir_device_binding(a.id).unwrap().0;
+        if !oversized {
+            unsafe {
+                rt.set_device_ptr(b, ptr, 4);
+            }
+        } else {
+            rt.set_data(b, vec![4f32]);
+        }
+        rt.set_profile_workload(
+            &graph,
+            ProfileWorkload::new()
+                .reuse_input_buffers(restore.clone())
+                .shared_input(b)
+                .case(
+                    "bad",
+                    dims(if oversized { 2 } else { 1 }),
+                    ProfileInputs::new().input(a, vec![1f32; if oversized { 2 } else { 1 }]),
+                    1.,
+                ),
+        )
+        .unwrap();
+        let contexts = graph
+            .search_space()
+            .unwrap()
+            .bucket_contexts(&graph.dyn_map);
+        assert!(rt.begin_profile_replay(&contexts).is_err());
+        assert!(rt.profile_replay.is_none());
+        let mut actual = [0f32];
+        unsafe {
+            result::memcpy_dtoh_sync(&mut actual, ptr).unwrap();
+        }
+        assert_eq!(actual, [3.]);
+    }
+}
+
+#[test]
+fn prepared_unified_owner_survives_replay_and_releases_on_replacement() {
+    let mut graph = Graph::new();
+    let input = graph.tensor(4).persist();
+    let output = (input + 1.).output();
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut rt = runtime();
+    let mut buffer = unsafe {
+        rt.cuda_stream
+            .context()
+            .alloc_unified::<u8>(32, true)
+            .unwrap()
+    };
+    let bytes: Vec<_> = [5f32; 8].iter().flat_map(|x| x.to_ne_bytes()).collect();
+    rt.cuda_stream.memcpy_htod(&bytes, &mut buffer).unwrap();
+    let ptr = buffer.device_ptr(&rt.cuda_stream).0;
+    rt.set_prepared_unified_buffer(input, buffer, 16, "test.dual.f32");
+    assert_eq!(rt.input_buffer(input).unwrap().capacity(), 32);
+    rt.set_profile_workload(
+        &graph,
+        ProfileWorkload::new().shared_input(input).case(
+            "shared",
+            DynMap::default(),
+            ProfileInputs::new(),
+            1.,
+        ),
+    )
+    .unwrap();
+    let contexts = graph
+        .search_space()
+        .unwrap()
+        .bucket_contexts(&graph.dyn_map);
+    let original_limits = rt.device_resource_limits;
+    rt.device_resource_limits
+        .as_mut()
+        .unwrap()
+        .max_candidate_memory_bytes = 16;
+    // The 32-byte managed owner is allowed to exceed the simulated physical
+    // budget. It must not eliminate room for non-evictable graph allocations.
+    assert_eq!(
+        rt.candidate_device_resource_limits()
+            .unwrap()
+            .max_candidate_memory_bytes,
+        16
+    );
+    let before = rt
+        .candidate_device_resource_limits()
+        .unwrap()
+        .max_candidate_memory_bytes;
+    rt.begin_profile_replay(&contexts).unwrap();
+    assert_eq!(
+        rt.candidate_device_resource_limits()
+            .unwrap()
+            .max_candidate_memory_bytes,
+        before
+    );
+    assert!(rt.prepared_unified_owners.is_empty());
+    assert_eq!(rt.profile_replay.as_ref().unwrap().owned_device_bytes(), 32);
+    rt.finish_profile_replay();
+    assert_eq!(rt.prepared_unified_owners.len(), 1);
+    rt.device_resource_limits = original_limits;
+    rt = graph.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(1).trials(2),
+        &mut SmallRng::seed_from_u64(74),
+    );
+    assert_eq!(rt.input_buffer(input).unwrap().ptr(), ptr);
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_f32(output), vec![6.; 4]);
+    rt.clear_profile_workload();
+    rt.set_data(input, vec![9f32; 4]);
+    assert!(rt.prepared_unified_owners.is_empty());
+    assert!(rt.prepared_inputs.is_empty());
+    rt.execute(&graph.dyn_map);
+    assert_eq!(rt.get_f32(output), vec![10.; 4]);
 }

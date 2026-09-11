@@ -292,7 +292,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         Ok(metric)
     }
 
-    fn evaluate_profile_workload(
+    pub(crate) fn evaluate_profile_workload(
         &mut self,
         llir: &LLIRGraph,
         ctx: &BucketContext<'_>,
@@ -362,12 +362,10 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             let dims = self.profile_case_dims(index);
             let (duration, _) =
                 self.profile_loaded_cuda_graph(llir, &dims, options.trials, remaining, None);
-            anyhow::ensure!(
-                options
-                    .execution_timeout
-                    .is_none_or(|timeout| started.elapsed() < timeout),
-                "profile workload execution budget exhausted; partial measurements are not ranked"
-            );
+            // The profiler always finishes at least one timed trial. Exceeding
+            // the budget during warmup or that final trial does not invalidate
+            // a complete measurement. The next iteration rejects an incomplete
+            // multi-case workload if no budget remains for its other cases.
             timings.push((index, duration));
         }
         self.record_profile_evaluation(ctx.index, true, &timings)

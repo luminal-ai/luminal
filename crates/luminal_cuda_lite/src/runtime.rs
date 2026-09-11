@@ -46,9 +46,12 @@ use std::{
 use tracing::{Level, span, trace};
 use uuid::Uuid;
 
+#[path = "prepared_input.rs"]
+mod prepared_input;
 #[path = "profile.rs"]
 mod profile;
 pub use crate::host::ProfileState;
+use prepared_input::{PreparedInput, PreparedUnifiedOwner, input_writes};
 pub use profile::{ProfileEvaluation, ProfileInputs, ProfileStorage, ProfileWorkload};
 
 const ARENA_ALIGNMENT: usize = 256;
@@ -116,6 +119,7 @@ pub enum CudaInput {
 /// the same logical length/capacity only requires refreshing launch bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ResourceInputFootprint {
+    prepared: Option<PreparedInput>,
     logical_bytes: Option<usize>,
     owned_capacity_bytes: Option<usize>,
 }
@@ -135,6 +139,7 @@ impl ResourceInputFootprint {
         Self {
             logical_bytes,
             owned_capacity_bytes: Some(capacity_bytes),
+            prepared: None,
         }
     }
 
@@ -142,6 +147,7 @@ impl ResourceInputFootprint {
         Self {
             logical_bytes: Some(logical_bytes),
             owned_capacity_bytes: None,
+            prepared: None,
         }
     }
 }
@@ -294,6 +300,7 @@ enum ResolvedOutputRegistration {
 /// Weights and the physical intermediate arena are shared by every bucket.
 pub(crate) struct CompiledBucket {
     pub(crate) exec_graph: StableGraph<ExecutableHostOp, (), Directed>,
+    input_writes: FxHashSet<NodeIndex>,
     /// One dynamic-dimension vector shared by CUDA graphs compiled with the
     /// same global ABI. Keeping this after `exec_graph` also guarantees graph
     /// executables are dropped before the pointer they capture.
@@ -358,6 +365,7 @@ impl CompiledBucket {
     fn new() -> Self {
         CompiledBucket {
             exec_graph: StableGraph::default(),
+            input_writes: FxHashSet::default(),
             shared_dyn_dims_buffer: None,
             shared_dyn_dims_order: Vec::new(),
             shared_dyn_dims_values: FxHashMap::default(),
@@ -453,6 +461,8 @@ pub struct CudaRuntimeImpl<O> {
     /// Opt-in host copies for small dynamic inputs consumed by HostOps. Large
     /// tensors are never mirrored implicitly.
     hlir_host_mirrors: FxHashMap<NodeIndex, Vec<u8>>,
+    prepared_inputs: FxHashMap<NodeIndex, PreparedInput>,
+    prepared_unified_owners: FxHashMap<NodeIndex, PreparedUnifiedOwner>,
     owned_stream: Arc<CudaStream>,
     cuda_stream: Arc<CudaStream>,
     changed_hlir: FxHashSet<NodeIndex>,
@@ -1123,10 +1133,11 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         buffer: DeviceBuffer,
     ) {
         let changed = bucket.cached_buffer_ptrs.get(&node) != Some(&buffer.ptr())
-            || bucket
-                .cached_device_buffers
-                .get(&node)
-                .is_none_or(|old| old.len() != buffer.len() || old.capacity() != buffer.capacity());
+            || bucket.cached_device_buffers.get(&node).is_none_or(|old| {
+                old.len() != buffer.len()
+                    || old.capacity() != buffer.capacity()
+                    || old.input_format() != buffer.input_format()
+            });
         if changed {
             bucket.materialization_dirty_nodes.insert(node);
         }
@@ -1187,6 +1198,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 bucket,
                 &self.cuda_stream,
                 &self.hlir_buffers,
+                &self.prepared_inputs,
                 &self.external_buffers,
                 &self.external_output_buffers,
                 spec_node,
@@ -1247,6 +1259,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         bucket: &CompiledBucket,
         stream: &Arc<CudaStream>,
         hlir_buffers: &FxHashMap<NodeIndex, CudaInput>,
+        prepared_inputs: &FxHashMap<NodeIndex, PreparedInput>,
         external_buffers: &FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
         external_output_buffers: &FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
         mut node: NodeIndex,
@@ -1265,18 +1278,16 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 return Some(buf);
             }
 
-            if let Some(hlir_node) = bucket.llir_to_hlir.get(&node) {
-                match hlir_buffers.get(hlir_node) {
-                    Some(CudaInput::Buffer { buf, len }) => {
-                        return Some(DeviceBuffer::new(buf.device_ptr(stream).0, *len));
-                    }
-                    Some(CudaInput::Ptr(_)) => {
-                        if let Some(ext) = external_buffers.get(hlir_node) {
-                            return Some(DeviceBuffer::new(ext.device_ptr(stream).0, ext.len()));
-                        }
-                    }
-                    None => {}
-                }
+            if let Some(hlir_node) = bucket.llir_to_hlir.get(&node)
+                && let Some(buffer) = Self::input_device_buffer(
+                    *hlir_node,
+                    stream,
+                    hlir_buffers,
+                    external_buffers,
+                    prepared_inputs,
+                )
+            {
+                return Some(buffer);
             }
 
             let alias_target = bucket.output_alias_map.get(&node)?;
@@ -1356,6 +1367,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                         "cannot load safetensor {label} dtype {tensor_dtype:?} into CUDA graph dtype {graph_dtype:?}"
                     ),
                 };
+                self.clear_prepared_input(node);
                 self.hlir_buffers.insert(node, dev);
             }
         }
@@ -1379,6 +1391,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     }
 
     fn set_data_bytes(&mut self, id: NodeIndex, bytes: Vec<u8>, keep_host_mirror: bool) {
+        self.clear_prepared_input(id);
         if let Some(CudaInput::Buffer { buf, len }) = self.hlir_buffers.get_mut(&id)
             && bytes.len() <= buf.len()
         {
@@ -1421,6 +1434,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         capacity_bytes: usize,
     ) {
         let id = id.to_id();
+        self.clear_prepared_input(id);
         let bytes = data.into_cuda_bytes();
         assert!(
             capacity_bytes >= bytes.len(),
@@ -1439,8 +1453,18 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// `set_data` with a host-side zero vector since it avoids the host allocation and H2D copy.
     pub fn set_zeros(&mut self, id: impl ToId, num_bytes: usize) {
         let id = id.to_id();
+        self.clear_prepared_input(id);
         self.hlir_host_mirrors.remove(&id);
-        let buf = self.cuda_stream.alloc_zeros(num_bytes).unwrap();
+        let buf = self
+            .cuda_stream
+            .alloc_zeros(num_bytes)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "CUDA zeroed input allocation failed: node={id:?}, bytes={num_bytes}, \
+                 device free/total={:?}: {error}",
+                    self.cuda_stream.context().mem_get_info()
+                )
+            });
         self.hlir_buffers.insert(
             id,
             CudaInput::Buffer {
@@ -1463,6 +1487,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     pub unsafe fn set_device_ptr(&mut self, id: impl ToId, device_ptr: u64, n_bytes: usize) {
         debug_assert!(device_ptr != 0, "set_device_ptr called with null pointer");
         let id = id.to_id();
+        self.clear_prepared_input(id);
         self.hlir_host_mirrors.remove(&id);
         let current_ptr = match self.hlir_buffers.get(&id) {
             Some(CudaInput::Ptr(ptr)) => Some(*ptr),
@@ -1496,6 +1521,15 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         debug_assert!(
             device_ptr != 0,
             "set_output_device_ptr called with null pointer"
+        );
+        assert!(
+            self.prepared_inputs.iter().all(|(&input, layout)| {
+                self.current_hlir_device_binding(input)
+                    .is_none_or(|(ptr, _)| {
+                        !device_ranges_overlap(ptr, layout.capacity, device_ptr, n_bytes)
+                    })
+            }),
+            "external output overlaps a prepared read-only input"
         );
         let id = id.to_id();
         if self.output_ptr_registrations.get(&id) == Some(&(device_ptr, n_bytes)) {
@@ -2005,6 +2039,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 .copied();
             if let Some(hlir_node) = hlir_node {
                 self.hlir_host_mirrors.remove(&hlir_node);
+                self.clear_prepared_input(hlir_node);
                 match self
                     .hlir_buffers
                     .remove(&hlir_node)
@@ -2031,6 +2066,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 .get(&lineage_node)
                 .expect("output_data_input lineage must reach an HLIR input node");
             self.hlir_host_mirrors.remove(&hlir_node);
+            self.clear_prepared_input(hlir_node);
 
             let output =
                 Self::bucket_buffer(&self.compiled_buckets[bi], &self.cuda_stream, &alias_node)
@@ -2055,6 +2091,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// (just a pointer swap, no GPU memcpy).
     pub fn set_buffer(&mut self, id: impl ToId, buf: CudaSlice<u8>) {
         let id = id.to_id();
+        self.clear_prepared_input(id);
         self.hlir_host_mirrors.remove(&id);
         let len = buf.len();
         self.hlir_buffers.insert(id, CudaInput::Buffer { buf, len });
@@ -2067,6 +2104,10 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     pub fn copy_output_to_input(&mut self, output: impl ToId, input: impl ToId) {
         let output = output.to_id();
         let input = input.to_id();
+        assert!(
+            !self.prepared_inputs.contains_key(&input),
+            "cannot commit state into a prepared read-only input"
+        );
         let data_node = self.resolve_data_node(output);
         if self.active().llir_to_hlir.get(&data_node) == Some(&input)
             && !self.external_output_buffers.contains_key(&data_node)
@@ -3354,25 +3395,18 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             let hlir_nodes = hlir_nodes.into_iter().unique().collect_vec();
             let collect_hlir_time = timer.elapsed();
             let timer = std::time::Instant::now();
-            let to_process: Vec<(NodeIndex, u64, usize)> = hlir_nodes
+            let to_process: Vec<(NodeIndex, DeviceBuffer)> = hlir_nodes
                 .iter()
-                .filter_map(|hlir_node| {
-                    bucket.hlir_to_all_llir.get(hlir_node)?;
-                    let input = self.hlir_buffers.get(hlir_node)?;
-                    let (ptr, len) = match input {
-                        CudaInput::Buffer { buf, len } => {
-                            (buf.device_ptr(&self.cuda_stream).0, *len)
-                        }
-                        CudaInput::Ptr(p) => {
-                            let len = self
-                                .external_buffers
-                                .get(hlir_node)
-                                .map(|buf| buf.len())
-                                .unwrap_or(0);
-                            (*p, len)
-                        }
-                    };
-                    Some((*hlir_node, ptr, len))
+                .filter_map(|&id| {
+                    bucket.hlir_to_all_llir.get(&id)?;
+                    Self::input_device_buffer(
+                        id,
+                        &self.cuda_stream,
+                        &self.hlir_buffers,
+                        &self.external_buffers,
+                        &self.prepared_inputs,
+                    )
+                    .map(|buffer| (id, buffer))
                 })
                 .collect();
             (
@@ -3386,14 +3420,14 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let timer = std::time::Instant::now();
         let bucket = &mut self.compiled_buckets[bucket_idx];
         let to_process_count = to_process.len();
-        for (hlir_node, ptr, len) in to_process {
+        for (hlir_node, buffer) in to_process {
             let llir_nodes = bucket
                 .hlir_to_all_llir
                 .get(&hlir_node)
                 .cloned()
                 .unwrap_or_default();
             for llir_node in llir_nodes {
-                Self::cache_bucket_device_buffer(bucket, llir_node, DeviceBuffer::new(ptr, len));
+                Self::cache_bucket_device_buffer(bucket, llir_node, buffer);
             }
         }
         bucket.hlir_synced = true;
@@ -3475,6 +3509,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     bucket,
                     &self.cuda_stream,
                     &self.hlir_buffers,
+                    &self.prepared_inputs,
                     &self.external_buffers,
                     &self.external_output_buffers,
                     exec_op.output,
@@ -3490,6 +3525,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     bucket,
                     &self.cuda_stream,
                     &self.hlir_buffers,
+                    &self.prepared_inputs,
                     &self.external_buffers,
                     &self.external_output_buffers,
                     inp,
@@ -3519,6 +3555,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 bucket,
                 &self.cuda_stream,
                 &self.hlir_buffers,
+                &self.prepared_inputs,
                 &self.external_buffers,
                 &self.external_output_buffers,
                 extra_node,
@@ -3556,6 +3593,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     bucket,
                     &self.cuda_stream,
                     &self.hlir_buffers,
+                    &self.prepared_inputs,
                     &self.external_buffers,
                     &self.external_output_buffers,
                     node,
@@ -3645,6 +3683,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                             bucket,
                             &self.cuda_stream,
                             &self.hlir_buffers,
+                            &self.prepared_inputs,
                             &self.external_buffers,
                             &self.external_output_buffers,
                             node,
@@ -3863,7 +3902,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         input: &CudaInput,
     ) -> Option<ResourceInputFootprint> {
         let length_sensitive = self.resource_length_sensitive_hlir.contains(&node);
-        match input {
+        let mut footprint = match input {
             // Runtime-owned allocation capacity always contributes to the
             // device-memory limit. Its logical length matters only when an
             // attached HostOp explicitly consumes it during planning.
@@ -3875,14 +3914,18 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             // device-memory accounting: aliases/views could otherwise be
             // counted repeatedly. Retain only logical lengths that a HostOp
             // resource plan actually reads.
-            CudaInput::Ptr(_) if length_sensitive => Some(ResourceInputFootprint::external(
-                self.external_buffers
-                    .get(&node)
-                    .map(|buffer| buffer.len())
-                    .unwrap_or(0),
-            )),
+            CudaInput::Ptr(_) if length_sensitive || self.prepared_inputs.contains_key(&node) => {
+                Some(ResourceInputFootprint::external(
+                    self.external_buffers
+                        .get(&node)
+                        .map(|buffer| buffer.len())
+                        .unwrap_or(0),
+                ))
+            }
             CudaInput::Ptr(_) => None,
-        }
+        }?;
+        footprint.prepared = self.prepared_inputs.get(&node).copied();
+        Some(footprint)
     }
 
     fn current_resource_input_signature(&self) -> FxHashMap<NodeIndex, ResourceInputFootprint> {
@@ -4257,6 +4300,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         // Context state, allocator overhead/reservations, and unrelated device
         // allocations are also unknown, so this remains a necessary
         // planned-capacity check rather than an available-memory guarantee.
+        // Managed prepared storage can be evicted, so its entire allocation is
+        // not a lower bound on physical residency. Include migration in measured
+        // fitness; only non-evictable storage belongs in this capacity bound.
         let resident_owned_bytes = self
             .hlir_buffers
             .values()
@@ -4267,7 +4313,12 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             .fold(0usize, usize::saturating_add);
         limits.max_candidate_memory_bytes = limits
             .max_candidate_memory_bytes
-            .saturating_sub(resident_owned_bytes);
+            .saturating_sub(resident_owned_bytes)
+            .saturating_sub(self.profile_replay.as_ref().map_or(0, |session| {
+                session
+                    .owned_device_bytes()
+                    .saturating_sub(session.managed_capacity())
+            }));
         Some(limits)
     }
 
@@ -4286,7 +4337,22 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         {
             caps.max_intermediate_bytes = Some(bounded_search_intermediate_bytes(
                 caps.max_intermediate_bytes,
-                free,
+                // Managed prepared storage can release cold pages for a new
+                // arena. The separate total-capacity check still accounts for
+                // every owned byte; instantaneous free memory is not a hard
+                // ceiling when CUDA can evict these representations.
+                free.saturating_add(
+                    self.prepared_unified_owners
+                        .values()
+                        .map(|o| o.buffer.len())
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(
+                    self.profile_replay
+                        .as_ref()
+                        .map_or(0, profile::ReplaySession::managed_capacity),
+                )
+                .min(total),
                 total,
             ));
         }
@@ -4563,22 +4629,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let warmup_duration = self
             .last_profile_duration
             .expect("profiled CUDA warmup did not record a duration");
-        // A warmup that already blew the whole profiling budget has proven
-        // the candidate slow; return it as the measurement instead of paying
-        // for a timed trial of the same magnitude. Bad candidates are the
-        // most expensive ones to run, so this halves their cost.
-        if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
-            self.profiling = false;
-            self.profile_cuda_graphs = false;
-            if diagnostic {
-                eprintln!(
-                    "SEARCH_PROFILE_END graph={profile_cuda_graphs} warmups=1 trials=0 wall_ms={:.6} warmup_metric_ms={:.6} timed_metric_ms=0",
-                    profile_start.elapsed().as_secs_f64() * 1e3,
-                    warmup_duration.as_secs_f64() * 1e3
-                );
-            }
-            return (warmup_duration, format_duration_precise(&warmup_duration));
-        }
+        // Capture and first-use setup belong to warmup, not candidate fitness.
+        // Start the execution budget afterwards and always measure one trial.
+        let timed_trials_started = std::time::Instant::now();
         let mut durations = Vec::with_capacity(trials.max(1));
         for _ in 0..trials.max(1) {
             // Keep legacy synthetic profiling's forced plan refresh. Explicit
@@ -4592,7 +4645,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 self.last_profile_duration
                     .expect("profiled CUDA trial did not record a duration"),
             );
-            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+            if timeout.is_some_and(|timeout| timed_trials_started.elapsed() >= timeout) {
                 break;
             }
             // Early stop against the search's best-so-far: once this
@@ -4657,6 +4710,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     }
 
     fn try_load_llir(&mut self, llir_graph: &LLIRGraph) -> anyhow::Result<()> {
+        self.validate_prepared_input_effects(llir_graph)?;
         validate_static_llir_semantics(llir_graph)
             .map_err(|violation| anyhow::anyhow!("invalid CUDA LLIR candidate: {violation}"))?;
 
@@ -4885,6 +4939,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         // loaded runtime. A bad later bucket must not discard a previously
         // usable graph after the earlier buckets have already compiled.
         for bucket in bucket_llirs {
+            self.validate_prepared_input_effects(bucket.llir)?;
             validate_static_llir_semantics(bucket.llir)
                 .map_err(|violation| anyhow::anyhow!("invalid CUDA LLIR bucket: {violation}"))?;
         }
@@ -5100,6 +5155,8 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             selected_schedule: None,
             hlir_buffers: FxHashMap::default(),
             hlir_host_mirrors: FxHashMap::default(),
+            prepared_inputs: FxHashMap::default(),
+            prepared_unified_owners: FxHashMap::default(),
             owned_stream: Arc::clone(&stream),
             cuda_stream: stream,
             changed_hlir: FxHashSet::default(),
@@ -5763,6 +5820,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         prepared_kernel: Option<&PreparedKernelToHostPlan>,
     ) -> CompiledBucket {
         let mut bucket = CompiledBucket::new();
+        bucket.input_writes = input_writes(llir_graph).expect("invalid declared input effects");
         let mut exec_graph = StableGraph::default();
         let mut node_to_exec = FxHashMap::default();
 

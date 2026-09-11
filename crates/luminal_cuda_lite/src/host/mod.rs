@@ -110,6 +110,7 @@ pub struct DeviceBuffer {
     capacity: usize,
     host_ptr: u64,
     host_len: usize,
+    input_format: Option<&'static str>,
 }
 
 impl DeviceBuffer {
@@ -120,6 +121,7 @@ impl DeviceBuffer {
             capacity: len,
             host_ptr: 0,
             host_len: 0,
+            input_format: None,
         }
     }
 
@@ -130,6 +132,16 @@ impl DeviceBuffer {
         self.host_ptr = bytes.as_ptr() as u64;
         self.host_len = bytes.len();
         self
+    }
+
+    pub(crate) fn with_input_format(mut self, format: &'static str) -> Self {
+        self.input_format = Some(format);
+        self
+    }
+
+    /// Explicit physical ABI attached to a prepared, read-only input.
+    pub fn input_format(self) -> Option<&'static str> {
+        self.input_format
     }
 
     pub fn ptr(self) -> u64 {

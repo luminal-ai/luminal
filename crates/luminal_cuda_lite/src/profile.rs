@@ -100,6 +100,22 @@ impl ProfileInputs {
         });
         self
     }
+    /// Select existing snapshots without copying their backing bytes.
+    pub fn select(&self, tensors: &[GraphTensor]) -> anyhow::Result<Self> {
+        let bindings = tensors
+            .iter()
+            .map(|tensor| {
+                self.bindings
+                    .iter()
+                    .find(|b| {
+                        b.schema.id == tensor.id && b.schema.graph == tensor.graph_ref as usize
+                    })
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing snapshot input {:?}", tensor.id))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self { bindings })
+    }
     fn groups(&self) -> Vec<ProfileStorage> {
         let mut groups: Vec<ProfileStorage> = vec![];
         for b in self.bindings.iter().sorted_by_key(|b| b.schema.id) {
@@ -120,6 +136,7 @@ pub struct ProfileWorkload {
     shared: Vec<InputSchema>,
     timing_method: luminal::op::TimingMethod,
     device_snapshots: bool,
+    reused_inputs: ProfileInputs,
     space_token: Option<Arc<Box<dyn luminal::op::EgglogOp>>>,
 }
 impl ProfileWorkload {
@@ -136,9 +153,20 @@ impl ProfileWorkload {
     }
     /// Cache immutable sample backing on the device. Repeated resets use device
     /// copies instead of host transfers, at the cost of extra device memory.
-    /// Shared backing objects are uploaded once across all cases.
+    /// Only the active case's backing stays resident; shared backing objects
+    /// survive case switches. Uploads happen before candidate timing.
     pub fn device_snapshots(mut self, enabled: bool) -> Self {
         self.device_snapshots = enabled;
+        self
+    }
+    /// Replay selected inputs in their existing owned device allocations. These
+    /// inputs need no additional replay slots. `device_snapshots` also applies
+    /// to their trial resets. On exit (including candidate failure), restore the supplied
+    /// bytes and the original bindings. Capture `restore` immediately before
+    /// search to preserve current application state. Each selected input must
+    /// own a non-overlapping allocation and use a whole-storage snapshot.
+    pub fn reuse_input_buffers(mut self, restore: ProfileInputs) -> Self {
+        self.reused_inputs = restore;
         self
     }
     pub fn cases(&self) -> &[ProfileCase<ProfileInputs>] {
@@ -186,14 +214,39 @@ impl ProfileEvaluation {
 
 pub(super) struct ReplaySession {
     assigned: Vec<Vec<usize>>,
-    slots: Vec<CudaSlice<u8>>,
+    slots: Vec<Option<CudaSlice<u8>>>,
+    group_ptrs: Vec<Vec<u64>>,
+    reused: Vec<(u64, Binding)>,
     snapshots: FxHashMap<usize, CudaSlice<u8>>,
     active: Option<usize>,
     host_states: Vec<Box<dyn crate::host::ProfileState>>,
     saved_inputs: FxHashMap<NodeIndex, CudaInput>,
+    saved_prepared: FxHashMap<NodeIndex, PreparedInput>,
+    saved_prepared_unified: FxHashMap<NodeIndex, PreparedUnifiedOwner>,
     saved_mirrors: FxHashMap<NodeIndex, Vec<u8>>,
     saved_external: FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
     saved_outputs: FxHashMap<NodeIndex, (u64, usize)>,
+}
+
+impl ReplaySession {
+    pub(super) fn managed_capacity(&self) -> usize {
+        self.saved_prepared_unified
+            .values()
+            .map(|o| o.buffer.len())
+            .fold(0usize, usize::saturating_add)
+    }
+    pub(super) fn owned_device_bytes(&self) -> usize {
+        self.saved_inputs
+            .values()
+            .filter_map(|input| match input {
+                CudaInput::Buffer { buf, .. } => Some(buf.len()),
+                CudaInput::Ptr(_) => None,
+            })
+            .chain(self.saved_prepared_unified.values().map(|o| o.buffer.len()))
+            .chain(self.slots.iter().flatten().map(CudaSlice::len))
+            .chain(self.snapshots.values().map(CudaSlice::len))
+            .fold(0usize, usize::saturating_add)
+    }
 }
 
 impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
@@ -231,6 +284,10 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             s.validate(graph)?;
             anyhow::ensure!(shared.insert(s.id), "duplicate shared profile input");
         }
+        anyhow::ensure!(
+            self.prepared_inputs.keys().all(|id| shared.contains(id)),
+            "prepared inputs must be shared by the representative workload"
+        );
         let mut ids = FxHashSet::default();
         for case in &workload.cases {
             anyhow::ensure!(
@@ -271,6 +328,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 case.id
             );
         }
+        for b in &workload.reused_inputs.bindings {
+            b.schema.validate(graph)?;
+        }
         self.profile_workload = Some(workload);
         self.profile_evaluations.clear();
         Ok(())
@@ -295,6 +355,10 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         self.cuda_stream.synchronize()?;
         let mut ranges = vec![];
         for &tensor in tensors {
+            anyhow::ensure!(
+                !self.prepared_inputs.contains_key(&tensor.id),
+                "prepared inputs must be shared, not snapshotted"
+            );
             let (ptr, len) = self
                 .current_hlir_device_binding(tensor.id)
                 .ok_or_else(|| anyhow::anyhow!("missing capture input {:?}", tensor.id))?;
@@ -357,6 +421,58 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 .is_some_and(|(a, b)| Arc::ptr_eq(a, b))),
             "profile workload belongs to another search space"
         );
+        anyhow::ensure!(
+            self.prepared_inputs
+                .keys()
+                .all(|id| workload.shared.iter().any(|s| s.id == *id)),
+            "prepared inputs must be shared by the representative workload"
+        );
+        let mut reused = vec![];
+        let mut reuse_ids = FxHashSet::default();
+        for b in &workload.reused_inputs.bindings {
+            let id = b.schema.id;
+            anyhow::ensure!(reuse_ids.insert(id), "duplicate reused input");
+            anyhow::ensure!(
+                !workload.shared.iter().any(|s| s.id == id),
+                "reused input cannot also be shared"
+            );
+            let Some(CudaInput::Buffer { buf, len }) = self.hlir_buffers.get(&id) else {
+                anyhow::bail!("reused input must have owned device storage");
+            };
+            anyhow::ensure!(
+                b.range == (0..b.storage.0.len()) && b.range.len() == *len,
+                "reused input restore snapshot must cover its whole logical binding"
+            );
+            let ptr = buf.device_ptr(&self.cuda_stream).0;
+            for &other in self.hlir_buffers.keys().filter(|&&other| other != id) {
+                if let Some((other_ptr, other_len)) = self.current_hlir_device_binding(other) {
+                    anyhow::ensure!(
+                        !device_ranges_overlap(ptr, buf.len(), other_ptr, other_len),
+                        "reused allocation overlaps another input"
+                    );
+                }
+            }
+            for case in &workload.cases {
+                let sample = case
+                    .inputs
+                    .bindings
+                    .iter()
+                    .find(|s| s.schema.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("reused input missing from case"))?;
+                anyhow::ensure!(
+                    sample.range == (0..sample.storage.0.len())
+                        && sample.range.len() <= buf.len()
+                        && case
+                            .inputs
+                            .bindings
+                            .iter()
+                            .all(|other| other.schema.id == id
+                                || !Arc::ptr_eq(&other.storage.0, &sample.storage.0)),
+                    "reused case input must fit its owned allocation and have unaliased backing"
+                );
+            }
+            reused.push((ptr, b.clone()));
+        }
         let assigned = assign_profile_cases(&workload.cases, contexts)?;
         let mut capacities: Vec<usize> = vec![];
         for case in &workload.cases {
@@ -364,7 +480,11 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 if capacities.len() <= i {
                     capacities.push(0);
                 }
-                capacities[i] = capacities[i].max(group.0.len().max(1));
+                if !case.inputs.bindings.iter().any(|b| {
+                    reuse_ids.contains(&b.schema.id) && Arc::ptr_eq(&b.storage.0, &group.0)
+                }) {
+                    capacities[i] = capacities[i].max(group.0.len().max(1));
+                }
             }
             for s in &workload.shared {
                 let (_, len) = self
@@ -389,7 +509,10 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             .into_iter()
             .enumerate()
             .map(|(i, n)| {
-                self.cuda_stream.alloc_zeros(n).map_err(|error| {
+                if n == 0 {
+                    return Ok(None);
+                }
+                self.cuda_stream.alloc_zeros(n).map(Some).map_err(|error| {
                     anyhow::anyhow!(
                         "profile replay slot {i} ({n} bytes): {error}; device free/total: {:?}",
                         self.cuda_stream.context().mem_get_info()
@@ -397,20 +520,35 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut snapshots = FxHashMap::default();
-        if workload.device_snapshots {
-            for case in &workload.cases {
-                for group in case.inputs.groups() {
-                    let key = group.0.as_ptr() as usize;
-                    if let std::collections::hash_map::Entry::Vacant(entry) = snapshots.entry(key) {
-                        let snapshot = self.cuda_stream.clone_htod(group.0.as_ref()).map_err(|error| {
-                            anyhow::anyhow!("profile snapshot for case {:?} ({} bytes): {error}; device free/total: {:?}", case.id, group.0.len(), self.cuda_stream.context().mem_get_info())
-                        })?;
-                        entry.insert(snapshot);
-                    }
-                }
-            }
-        }
+        let group_ptrs = workload
+            .cases
+            .iter()
+            .map(|case| {
+                case.inputs
+                    .groups()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, group)| {
+                        reused
+                            .iter()
+                            .find(|(_, restored)| {
+                                case.inputs.bindings.iter().any(|b| {
+                                    b.schema.id == restored.schema.id
+                                        && Arc::ptr_eq(&b.storage.0, &group.0)
+                                })
+                            })
+                            .map(|(ptr, _)| *ptr)
+                            .unwrap_or_else(|| {
+                                slots[index]
+                                    .as_ref()
+                                    .unwrap()
+                                    .device_ptr(&self.cuda_stream)
+                                    .0
+                            })
+                    })
+                    .collect()
+            })
+            .collect();
         self.cuda_stream.synchronize()?;
         let shared_ids: Vec<_> = workload.shared.iter().map(|s| s.id).collect();
         self.release_all_bucket_cuda_graphs();
@@ -418,25 +556,38 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             .iter()
             .map(|&id| {
                 let (ptr, len) = self.current_hlir_device_binding(id).unwrap();
-                (id, ptr, len, self.hlir_host_mirrors.get(&id).cloned())
+                (
+                    id,
+                    ptr,
+                    len,
+                    self.hlir_host_mirrors.get(&id).cloned(),
+                    self.prepared_inputs.get(&id).copied(),
+                )
             })
             .collect();
         let session = ReplaySession {
             assigned,
+            group_ptrs,
+            reused,
             slots,
-            snapshots,
+            snapshots: FxHashMap::default(),
             active: None,
             host_states: vec![],
             saved_inputs: std::mem::take(&mut self.hlir_buffers),
+            saved_prepared: std::mem::take(&mut self.prepared_inputs),
+            saved_prepared_unified: std::mem::take(&mut self.prepared_unified_owners),
             saved_mirrors: std::mem::take(&mut self.hlir_host_mirrors),
             saved_external: std::mem::take(&mut self.external_buffers),
             saved_outputs: std::mem::take(&mut self.output_ptr_registrations),
         };
         self.invalidate_output_registration_resolution();
         self.profile_replay = Some(session);
-        for (id, ptr, len, mirror) in shared_bindings {
+        for (id, ptr, len, mirror, prepared) in shared_bindings {
             unsafe {
                 self.set_device_ptr(id, ptr, len);
+            }
+            if let Some(prepared) = prepared {
+                self.prepared_inputs.insert(id, prepared);
             }
             if let Some(bytes) = mirror {
                 self.hlir_host_mirrors.insert(id, bytes);
@@ -456,8 +607,17 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             .synchronize()
             .expect("profile replay synchronization failed");
         self.release_all_bucket_cuda_graphs();
+        // Owners are still retained by the session while restoring their bytes.
+        for (ptr, binding) in &self.profile_replay.as_ref().unwrap().reused {
+            if !binding.storage.0.is_empty() {
+                unsafe { result::memcpy_htod_sync(*ptr, binding.storage.0.as_ref()) }
+                    .expect("reused profile input restoration failed");
+            }
+        }
         let session = self.profile_replay.take().unwrap();
         self.hlir_buffers = session.saved_inputs;
+        self.prepared_inputs = session.saved_prepared;
+        self.prepared_unified_owners = session.saved_prepared_unified;
         self.hlir_host_mirrors = session.saved_mirrors;
         self.external_buffers = session.saved_external;
         self.output_ptr_registrations = session.saved_outputs;
@@ -482,7 +642,28 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             .clone()
     }
     pub(crate) fn activate_profile_case(&mut self, case: usize) -> anyhow::Result<()> {
-        self.profile_replay.as_mut().unwrap().active = Some(case);
+        let workload = self.profile_workload.as_ref().unwrap();
+        let session = self.profile_replay.as_mut().unwrap();
+        if workload.device_snapshots && session.active != Some(case) {
+            let sample = &workload.cases[case];
+            let groups = sample.inputs.groups();
+            let keys: FxHashSet<_> = groups.iter().map(|g| g.0.as_ptr() as usize).collect();
+            // Release inactive storage before allocating its replacement, so
+            // memory scales with the largest case rather than the case count.
+            session.snapshots.retain(|key, _| keys.contains(key));
+            for group in groups {
+                let key = group.0.as_ptr() as usize;
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    session.snapshots.entry(key)
+                {
+                    let snapshot = self.cuda_stream.clone_htod(group.0.as_ref()).map_err(|error| {
+                        anyhow::anyhow!("profile snapshot for case {:?} ({} bytes): {error}; device free/total: {:?}", sample.id, group.0.len(), self.cuda_stream.context().mem_get_info())
+                    })?;
+                    entry.insert(snapshot);
+                }
+            }
+        }
+        session.active = Some(case);
         self.restore_profile_inputs()
     }
     fn restore_profile_inputs(&mut self) -> anyhow::Result<()> {
@@ -494,14 +675,17 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         };
         let inputs = &self.profile_workload.as_ref().unwrap().cases[index].inputs;
         let groups = inputs.groups();
-        for (group, slot) in groups.iter().zip(&mut session.slots) {
+        for (group, &ptr) in groups.iter().zip(&session.group_ptrs[index]) {
             if !group.0.is_empty() {
-                let mut destination = slot.slice_mut(..group.0.len());
+                let mut destination = std::mem::ManuallyDrop::new(unsafe {
+                    self.cuda_stream
+                        .upgrade_device_ptr::<u8>(ptr, group.0.len())
+                });
                 if let Some(source) = session.snapshots.get(&(group.0.as_ptr() as usize)) {
-                    self.cuda_stream.memcpy_dtod(source, &mut destination)?;
+                    self.cuda_stream.memcpy_dtod(source, &mut *destination)?;
                 } else {
                     self.cuda_stream
-                        .memcpy_htod(group.0.as_ref(), &mut destination)?;
+                        .memcpy_htod(group.0.as_ref(), &mut *destination)?;
                 }
             }
         }
@@ -513,8 +697,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     .iter()
                     .position(|g| Arc::ptr_eq(&g.0, &b.storage.0))
                     .unwrap();
-                let ptr =
-                    session.slots[group].device_ptr(&self.cuda_stream).0 + b.range.start as u64;
+                let ptr = session.group_ptrs[index][group] + b.range.start as u64;
                 (
                     b.schema.id,
                     ptr,
