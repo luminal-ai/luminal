@@ -742,6 +742,7 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
             .ruleset("expr"),
     );
     p.add_rule(rewrite("div-one", div(v("a"), num(i64(1))), v("a")).ruleset("expr"));
+    p.add_rule(rewrite("mod-one", modd(v("a"), num(i64(1))), num(i64(0))).ruleset("expr"));
     p.add_rule(
         rewrite(
             "mod-mul-self",
@@ -1494,4 +1495,26 @@ pub fn base_cleanup_egglog() -> String {
     }
 
     p.to_egglog_string()
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    #[test]
+    fn singleton_axis_index_matches_its_constant_folded_spelling() {
+        let mut egraph = egglog::EGraph::default();
+        let program = format!(
+            "{}\n{}",
+            super::base_expression_egglog(),
+            r#"
+            (let outer (MDiv (MIter) (MNum 2880)))
+            (let folded (MAdd (MNum 1) (MMul outer (MNum 5760))))
+            (let full (MAdd (MAdd (MNum 1)
+                (MMul (MMod outer (MNum 1)) (MNum 5760)))
+                (MMul outer (MNum 5760))))
+            (run-schedule (saturate expr))
+            (check (= full folded))
+        "#
+        );
+        egraph.parse_and_run_program(None, &program).unwrap();
+    }
 }
