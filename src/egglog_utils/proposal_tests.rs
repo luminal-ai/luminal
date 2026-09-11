@@ -897,3 +897,55 @@ fn coverage_separates_changed_inputs_from_tunings_of_the_same_constructor() {
         );
     }
 }
+
+#[test]
+fn dtype_transitions_are_not_starved_by_repeated_constructor_transitions() {
+    let (mut graph, roots) = independent_choices_fixture(129, 1);
+    for dtype in ["F32", "Bf16"] {
+        let class = ClassId::from(dtype);
+        let node = NodeId::from(format!("dtype-{dtype}"));
+        graph.enodes.insert(node.clone(), (dtype.into(), vec![]));
+        graph.node_to_class.insert(node.clone(), class.clone());
+        graph.eclasses.insert(class, ("DType".into(), vec![node]));
+    }
+    for i in 0..=1 {
+        graph
+            .enodes
+            .get_mut(&NodeId::from(format!("kind-node-{i}")))
+            .unwrap()
+            .1
+            .push(ClassId::from("F32"));
+    }
+    let rare = roots.last().unwrap();
+    let alternative = graph.eclasses[rare].1[0].clone();
+    let kind = ClassId::from("mixed-kind");
+    let kind_node = NodeId::from("mixed-kind-node");
+    let mut term = graph.enodes[&NodeId::from("kind-node-0")].clone();
+    *term.1.last_mut().unwrap() = ClassId::from("Bf16");
+    graph.enodes.insert(kind_node.clone(), term);
+    graph.node_to_class.insert(kind_node.clone(), kind.clone());
+    graph
+        .eclasses
+        .insert(kind.clone(), ("OpKind".into(), vec![kind_node]));
+    graph.enodes.get_mut(&alternative).unwrap().1[0] = kind;
+    for seed in 0..32 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut extractor = LlirExtractor::new(&graph, &[]);
+        let bindings = roots
+            .iter()
+            .map(|r| (r.to_string(), graph.eclasses[r].1[1].to_string()))
+            .collect::<Vec<_>>();
+        let parent = extractor.index_seed_choices(&bindings);
+        let mut seen = FxHashSet::default();
+        let mut covered = false;
+        for _ in 0..4 {
+            let child = extractor
+                .extract_reachable_indexed_generation(&parent, 1, 1, &mut seen, &mut rng)
+                .pop()
+                .unwrap();
+            let choice = extractor.indexed_selected(&child, extractor.class_to_index[rare]);
+            covered |= extractor.indexed_node_id(choice) == &alternative;
+        }
+        assert!(covered, "dtype-changing transition starved for seed {seed}");
+    }
+}

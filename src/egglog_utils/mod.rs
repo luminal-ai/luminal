@@ -3361,7 +3361,7 @@ fn proposal_families<'a, T: Copy>(
         // Changing an Op's input dependencies is an implementation change,
         // even when its backend constructor is unchanged (e.g. cast absorption).
         // Keep tuning variants with identical inputs together. Across sites,
-        // transition ordering still uses constructor names, not unique class IDs.
+        // transition ordering uses constructor/dtype values, not unique class IDs.
         let inputs = if head == "Op" { &children[1..] } else { &[] };
         let key = (proposal_family_key(egraph, selected), inputs);
         let index = *indices.entry(key).or_insert_with(|| {
@@ -3380,10 +3380,32 @@ fn proposal_family_key<'a>(egraph: &'a SerializedEGraph, node: &NodeId) -> Vec<&
         && let Some((kind_sort, kinds)) = children.first().and_then(|c| egraph.eclasses.get(c))
         && kind_sort == "OpKind"
     {
-        let mut constructors: Vec<_> = kinds.iter().map(|k| egraph.enodes[k].0.as_str()).collect();
+        let mut constructors: Vec<_> = kinds
+            .iter()
+            .map(|kind| proposal_family_key(egraph, kind))
+            .collect();
         constructors.sort_unstable();
         constructors.dedup();
-        key.extend(constructors);
+        key.extend(constructors.into_iter().flatten());
+    } else {
+        // Storage and accumulation dtypes distinguish implementations, even
+        // when constructor names coincide. Use dtype values, never site IDs,
+        // so repeated sites share a transition while numeric tuning variants
+        // remain together. Empty separators preserve argument positions.
+        for child in children {
+            key.push("");
+            if let Some((sort, variants)) = egraph.eclasses.get(child)
+                && sort == "DType"
+            {
+                let mut dtypes: Vec<_> = variants
+                    .iter()
+                    .map(|variant| egraph.enodes[variant].0.as_str())
+                    .collect();
+                dtypes.sort_unstable();
+                dtypes.dedup();
+                key.extend(dtypes);
+            }
+        }
     }
     key
 }
