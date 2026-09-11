@@ -13,16 +13,19 @@
 //! runtime without touching core.
 
 use crate::dtype::DType;
+use crate::layout_ir::Access;
 
 /// Per-runtime boundary vocabulary: how a runtime states its
 /// representation contract in egglog at load time.
 pub trait RuntimeBindingsGenerator {
     /// The boundary element width term for a dtype under this binding
-    /// (e.g. whether booleans cross as Bool8).
+    /// (e.g., whether booleans cross as Bool8).
     fn width_term(&self, dtype: DType) -> String;
 
     /// Input boundary text. `stem` namespaces the lets; the produced
-    /// buffer-tensor let must be named `{stem}_buffer_tensor`.
+    /// buffer-tensor let must be named `{stem}_buffer_tensor`. `access`
+    /// is `ReadWrite` when some `.output_into()` targets this input (a
+    /// caller-storage mutation), `ReadOnly` otherwise.
     fn input_binding(
         &self,
         stem: &str,
@@ -30,6 +33,7 @@ pub trait RuntimeBindingsGenerator {
         logical_name: &str,
         shape: &str,
         width: &str,
+        access: Access,
     ) -> String;
 
     /// Output boundary text. Same `{stem}_buffer_tensor` naming

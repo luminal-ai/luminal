@@ -482,8 +482,10 @@ impl MetalRuntime {
     }
 
     /// Keep this input in the shared device arena between executions. Its
-    /// shape must be static and its boundary must be read-only. Call after
-    /// search and before the first execute; set_data uploads it only when changed.
+    /// shape must be static. A `.output_into()` output targeting this input
+    /// shares its buffer, so the mutation lands in the arena home and is
+    /// neither copied nor read back. Call after search and before the first
+    /// execute; set_data uploads it only when changed.
     pub fn retain_input(&mut self, tensor: NodeIndex) -> Result<()> {
         #[cfg(target_os = "macos")]
         anyhow::ensure!(
@@ -495,28 +497,6 @@ impl MetalRuntime {
             .get(&tensor)
             .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))?;
         self.residents.inputs.insert(lit);
-        Ok(())
-    }
-
-    /// Route an output into a resident input after each execution. Feedback
-    /// outputs stay on device and are unavailable through fetch. Their elected
-    /// layout must equal the static, contiguous input boundary layout.
-    pub fn bind_feedback(&mut self, input: NodeIndex, output: NodeIndex) -> Result<()> {
-        let slot = *self
-            .output_index
-            .get(&output)
-            .ok_or_else(|| anyhow!("no output binding for {output:?}"))?;
-        let lit = *self
-            .input_buffers
-            .get(&input)
-            .ok_or_else(|| anyhow!("no input binding for {input:?}"))?;
-        anyhow::ensure!(
-            !self.residents.feedback.contains_key(&slot)
-                && !self.residents.feedback.values().any(|v| *v == lit),
-            "duplicate feedback endpoint"
-        );
-        self.retain_input(input)?;
-        self.residents.feedback.insert(slot, lit);
         Ok(())
     }
 

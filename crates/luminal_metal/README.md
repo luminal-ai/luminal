@@ -39,16 +39,15 @@ execution. Buckets share one arena sized for the largest selected plan;
 staging, host payloads, or cached pipelines. Commands follow the buffer plan's
 data and anti-dependencies, and preserve outputs before recycling their storage.
 
-`retain_input(tensor)` keeps a static, read-only input in the arena after its
-initial upload. Call it after search and before execution; a later `set_data`
-explicitly updates that input. `bind_feedback(input, output)` routes a matching
-static, contiguous output into a retained input, snapshotting it at the output
-boundary and committing it after all previous-state reads finish. Feedback
-outputs stay on device and are not available through `fetch`. Dimension values
-may change between executions; re-searching or changing bounds requires a new
-runtime once residency is configured. Resident ranges and feedback snapshots
-count toward the arena budget and are shared across every bucket. Physical
-lifetimes and resident allocation use core's planner, also used by CUDA Lite.
+`retain_input(tensor)` keeps a static input in the arena after its initial
+upload. Call it after search and before execution; a later `set_data`
+explicitly updates that input. A `.output_into(&input)` output shares the
+input's buffer (one `BufferLit`), so the mutation writes the retained range in
+place; it is not copied to host and is not available through `fetch`. Dimension
+values may change between executions; re-searching or changing bounds requires
+a new runtime once residency is configured. Resident ranges count toward the
+arena budget and are shared across every bucket. Physical lifetimes and
+resident allocation use core's planner, also used by CUDA Lite.
 
 `fetch` returns an owned backing payload and its elected layout. For views, use
 `layouts::dense_f32` to interpret that layout; `get_f32` returns backing elements.

@@ -380,15 +380,19 @@ impl LlmGraph {
             .zip(caches)
             .zip(widths)
             .flat_map(|(((ki, vi), (ko, vo)), w)| {
+                // The cache outputs MUTATE their cache inputs in place:
+                // one boundary buffer, stated in the SSA graph itself.
+                let ko = ko.output_into(ki);
+                let vo = vo.output_into(vi);
                 [
                     StateBinding {
                         input: ki.id,
-                        output: ko.output().id,
+                        output: ko.id,
                         elements: capacity * w,
                     },
                     StateBinding {
                         input: vi.id,
-                        output: vo.output().id,
+                        output: vo.id,
                         elements: capacity * w,
                     },
                 ]
