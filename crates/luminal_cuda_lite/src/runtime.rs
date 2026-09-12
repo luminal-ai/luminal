@@ -4338,8 +4338,8 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             caps.max_intermediate_bytes = Some(bounded_search_intermediate_bytes(
                 caps.max_intermediate_bytes,
                 // Managed prepared storage can release cold pages for a new
-                // arena. The separate total-capacity check still accounts for
-                // every owned byte; instantaneous free memory is not a hard
+                // arena. The separate physical-capacity check accounts for
+                // non-evictable storage; instantaneous free memory is not a hard
                 // ceiling when CUDA can evict these representations.
                 free.saturating_add(
                     self.prepared_unified_owners
