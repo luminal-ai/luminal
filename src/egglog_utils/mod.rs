@@ -2533,6 +2533,62 @@ impl<'a> LlirExtractor<'a> {
         old_node != new_node
     }
 
+    /// Active implementation families that differ from the incumbent. Family
+    /// identities include input dependencies and dtypes, not tuning values.
+    pub(crate) fn alternate_families(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        incumbent: &IndexedChoiceSet,
+    ) -> Vec<(u32, usize)> {
+        let incumbent_active = self.reachable_mutation_classes(incumbent);
+        let active = self.reachable_mutation_classes(choices);
+        let mut result = Vec::new();
+        for class in active {
+            if !incumbent_active.contains(&class) {
+                continue;
+            }
+            self.mutation_pool(class);
+            let families = &self.mutation_nodes[class as usize]
+                .as_ref()
+                .unwrap()
+                .families;
+            for (family, slots) in families.iter().enumerate() {
+                if slots.contains(&choices.choices[class as usize])
+                    && !slots.contains(&incumbent.choices[class as usize])
+                {
+                    result.push((class, family));
+                }
+            }
+        }
+        result
+    }
+
+    /// Existing nearest legal neighbors, preserving the candidate's other
+    /// choices. A family can climb through improving configurations even while
+    /// every intermediate configuration remains slower than another family.
+    pub(crate) fn argument_neighbors(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        class: u32,
+        seen: &mut FxHashSet<u64>,
+    ) -> Vec<IndexedChoiceSet> {
+        let mut slots: Vec<_> = self
+            .argument_pools(choices, class)
+            .into_values()
+            .flatten()
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+            .into_iter()
+            .filter_map(|slot| {
+                let mut child = choices.clone();
+                self.set_indexed_choice(&mut child, class, slot);
+                seen.insert(child.hash).then_some(child)
+            })
+            .collect()
+    }
+
     /// Offer each differing active choice from a donor independently. Newly
     /// exposed dependencies inherit its choices too, while already-active
     /// shared choices stay with the receiver. These are ordinary e-graph
@@ -4106,7 +4162,7 @@ fn egglog_to_llir_from_root_cached<'a>(
 }
 
 #[cfg(test)]
-mod proposal_tests;
+pub(crate) mod proposal_tests;
 
 #[cfg(test)]
 mod tests {

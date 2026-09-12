@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use colored::Colorize;
 use rand::RngCore;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::diagnostics::{
     ProgressBars, log_best_llir, log_candidate_ops, panic_initial_filter_limit,
@@ -126,6 +126,7 @@ pub struct GeneticSearch<'a, M> {
     ranked: Ranked<M>,
     parents: Vec<(M, IndexedChoiceSet)>,
     best_metric: Option<M>,
+    family_best: FxHashMap<(u32, usize), M>,
     n_graphs: usize,
     resample_generation: bool,
     stagnant_generations: usize,
@@ -211,6 +212,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             ranked: Vec::new(),
             parents: Vec::new(),
             best_metric: None,
+            family_best: FxHashMap::default(),
             n_graphs: 0,
             resample_generation: false,
             stagnant_generations: 0,
@@ -550,6 +552,29 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
         self.ranked
             .insert(rank, (new_metric.clone(), genome.clone()));
 
+        if !new_best {
+            for family in self
+                .extractor
+                .alternate_families(&genome, &self.ranked[0].1)
+            {
+                let improved = self
+                    .family_best
+                    .get(&family)
+                    .is_none_or(|best| new_metric.lt(best));
+                if improved {
+                    self.family_best.insert(family, new_metric.clone());
+                    for neighbor in self
+                        .extractor
+                        .argument_neighbors(&genome, family.0, &mut self.prev_selected)
+                        .into_iter()
+                        .rev()
+                    {
+                        self.pending.push_front(neighbor);
+                    }
+                }
+            }
+        }
+
         // Update parents list (keep top-N for next generation)
         let dominated_by_all = self.parents.len() >= self.options.keep_best
             && !self.parents.last().unwrap().0.gt(&new_metric);
@@ -687,5 +712,109 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
         }
         self.finish();
         std::mem::take(&mut self.ranked)
+    }
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+    use crate::egglog_utils::proposal_tests::{choices_fixture, paired_arguments_fixture};
+    use crate::search::BucketSearchSpace;
+    use rand::SeedableRng;
+
+    #[test]
+    fn losing_family_climbs_multiple_arguments_within_candidate_budget() {
+        let mut graph = paired_arguments_fixture(2, false);
+        let old = choices_fixture(0);
+        let root = graph.roots[0].clone();
+        graph
+            .eclasses
+            .get_mut(&root)
+            .unwrap()
+            .1
+            .extend(old.eclasses[&root].1.clone());
+        graph.enodes.extend(old.enodes);
+        graph.node_to_class.extend(old.node_to_class);
+        for (class, value) in old.eclasses {
+            if class != root {
+                graph.eclasses.insert(class, value);
+            }
+        }
+        let space = SearchSpace {
+            buckets: vec![BucketSearchSpace {
+                egraph: graph,
+                bucket_indices: Default::default(),
+                intervals: Default::default(),
+            }],
+            ops: vec![],
+            custom_ops: vec![],
+            dim_buckets: Default::default(),
+        };
+        let ctx = BucketContext {
+            space: &space,
+            index: 0,
+            representative_dyn_map: Default::default(),
+        };
+        let options = CompileOptions::default()
+            .search_log(false)
+            .search_graph_limit(5);
+        let mut search = GeneticSearch::<usize>::new(&space, &ctx, &options, Instant::now());
+        // Extraction is irrelevant to this state-machine test. Each fake
+        // evaluation reports the metric for an ordinary legal genome.
+        let incumbent = search
+            .extractor
+            .index_seed_choices(&[("root".into(), "op-0".into())]);
+        fn mark_seen(search: &mut GeneticSearch<usize>, genome: &IndexedChoiceSet) {
+            let bindings: Vec<_> = search
+                .extractor
+                .named_choices(genome)
+                .into_iter()
+                .map(|(c, n)| {
+                    (
+                        egraph_serialize::ClassId::from(c),
+                        egraph_serialize::NodeId::from(n),
+                    )
+                })
+                .collect();
+            search
+                .prev_selected
+                .insert(crate::egglog_utils::hash_choice_set(
+                    &bindings.iter().map(|(c, n)| (c, n)).collect(),
+                ));
+        }
+        mark_seen(&mut search, &incumbent);
+        let candidate = search.hand_out(incumbent, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(100, "incumbent".into()));
+        let seed = search
+            .extractor
+            .index_seed_choices(&[("root".into(), "pair-1-1".into())]);
+        mark_seen(&mut search, &seed);
+        let candidate = search.hand_out(seed, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(120, "new family".into()));
+        assert_eq!(search.best(), Some(&100));
+        assert_eq!(search.pending.len(), 2);
+        while let Some(genome) = search.pending.pop_front() {
+            let named = search.extractor.named_choices(&genome);
+            let node = &named.iter().find(|(class, _)| class == "root").unwrap().1;
+            let metric = if node == "pair-0-0" { 80 } else { 110 };
+            let candidate = search.hand_out(genome, LLIRGraph::default(), None);
+            search.report(candidate, Outcome::Measured(metric, metric.to_string()));
+        }
+        assert_eq!(
+            search.best(),
+            Some(&80),
+            "two individually losing changes must compose"
+        );
+        assert_eq!(search.measured(), 5);
+        assert!(
+            search
+                .next_candidate(&mut rand::rngs::StdRng::seed_from_u64(993))
+                .is_none()
+        );
+        assert_eq!(
+            search.measured(),
+            5,
+            "family exploration consumes the ordinary budget"
+        );
     }
 }

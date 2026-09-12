@@ -3,7 +3,7 @@ use rand::{SeedableRng, rngs::StdRng};
 
 // Two arbitrary implementations of a value: one untuned and one with many
 // configurations. This fixture has no backend, shape, or model policy.
-fn choices_fixture(variants: usize) -> SerializedEGraph {
+pub(crate) fn choices_fixture(variants: usize) -> SerializedEGraph {
     let root = ClassId::from("root");
     let mut graph = SerializedEGraph {
         enodes: FxHashMap::default(),
@@ -548,7 +548,7 @@ fn constructor_coverage_tests_direct_alternatives_with_large_mutation_limits() {
     }
 }
 
-fn paired_arguments_fixture(width: usize, coupled: bool) -> SerializedEGraph {
+pub(crate) fn paired_arguments_fixture(width: usize, coupled: bool) -> SerializedEGraph {
     let mut graph = choices_fixture(0);
     graph.enodes.remove(&NodeId::from("op-0"));
     graph.node_to_class.remove(&NodeId::from("op-0"));
