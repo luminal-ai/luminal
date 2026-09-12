@@ -61,4 +61,30 @@ fn qwen3_30b_a3b_full_forward_contract_builds() {
     assert_eq!(static_dims(logits), vec![1, d.vocab]);
     assert_eq!(cache_out.len(), d.layers);
     assert_eq!(static_dims(cache_out[0].0), vec![SLOTS, d.kv_dim()]);
+
+    // The expert banks enter stacked (two rank-3 inputs per layer); the
+    // loader relayouts the checkpoint's per-expert tensors into them.
+    let moe = &model.blocks[0].moe;
+    assert_eq!(
+        static_dims(moe.gate_up),
+        vec![d.experts, 2 * d.moe_intermediate, d.hidden]
+    );
+    assert_eq!(
+        static_dims(moe.down),
+        vec![d.experts, d.hidden, d.moe_intermediate]
+    );
+    let labels: Vec<String> = cx
+        .logical
+        .input_specs()
+        .into_iter()
+        .map(|spec| spec.label)
+        .filter(|label| label.starts_with("model.layers.0.mlp.experts"))
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.down_proj",
+        ]
+    );
 }

@@ -5,6 +5,18 @@
 //! experts, top-8, NO shared expert, router in F32 with the Qwen3
 //! scoring order (softmax over all experts FIRST, then top-k, then
 //! renormalize — norm_topk_prob).
+//!
+//! THE EXPERT BANKS ARE TWO RANK-3 INPUTS PER LAYER, not 3×E rank-2
+//! ones: `mlp.experts.gate_up_proj` [E, 2I, H] and
+//! `mlp.experts.down_proj` [E, H, I] — the fused form transformers v5
+//! gives this model, and the form `gemma4_moe`'s checkpoint stores
+//! natively. The Qwen3 checkpoint on disk stores every expert
+//! separately (`mlp.experts.{e}.gate_proj|up_proj|down_proj.weight`),
+//! so the LOADER stacks them, a pure byte relayout with no arithmetic
+//! and no dtype change: `gate_up_proj[e, ..I, :]` = expert e's gate
+//! rows, `gate_up_proj[e, I.., :]` = its up rows, `down_proj[e]` = its
+//! down matrix. (Stacking in-graph instead would put 3×E inputs on the
+//! boundary and build the bank by pad+add.)
 
 use crate::model_support::{
     AttentionGeometry, CacheAccess, Embedding, KvCache, KvCachePool, LayerNorm, Linear, Namespace,
@@ -55,46 +67,42 @@ impl Qwen3MoeDims {
     }
 }
 
-/// Qwen3's model-specific routed SwiGLU feed-forward network.
+/// Qwen3's model-specific routed SwiGLU feed-forward network over the
+/// stacked expert banks (see the module doc for their layout).
 pub struct Qwen3MoeFfn {
     pub router: Linear,
+    /// `[E, 2I, H]`: gate rows then up rows per expert.
     pub gate_up: GraphTensor,
+    /// `[E, H, I]`.
     pub down: GraphTensor,
     pub top_k: usize,
     pub intermediate: usize,
 }
 
 impl Qwen3MoeFfn {
-    fn from_per_expert(
-        router: Linear,
-        parts: &[(GraphTensor, GraphTensor, GraphTensor)],
-        top_k: usize,
-    ) -> Self {
-        let (gate, _, _) = parts.first().expect("Qwen3 MoE requires an expert");
-        let intermediate = gate.dims()[0]
-            .to_usize()
-            .expect("Qwen3 expert intermediate size must be static");
-        let mut gate_up: Option<GraphTensor> = None;
-        let mut down: Option<GraphTensor> = None;
-        for (gate_part, up_part, down_part) in parts {
-            let gate_up_part = gate_part.concat_along(*up_part, 0).expand_dim(0, 1);
-            let down_part = down_part.expand_dim(0, 1);
-            gate_up = Some(match gate_up {
-                Some(stack) => stack.concat_along(gate_up_part, 0),
-                None => gate_up_part,
-            });
-            down = Some(match down {
-                Some(stack) => stack.concat_along(down_part, 0),
-                None => down_part,
-            });
-        }
-
+    fn new(mlp: &Namespace, d: &Qwen3MoeDims, cx: &mut Graph) -> Self {
+        let experts = mlp.child("experts");
         Self {
-            router,
-            gate_up: gate_up.expect("Qwen3 MoE requires an expert"),
-            down: down.expect("Qwen3 MoE requires an expert"),
-            top_k,
-            intermediate,
+            router: Linear::new(
+                d.hidden,
+                d.experts,
+                false,
+                DType::F32,
+                &mlp.child("gate"),
+                cx,
+            ),
+            gate_up: cx.named_tensor(
+                experts.leaf("gate_up_proj"),
+                (d.experts, 2 * d.moe_intermediate, d.hidden),
+                DType::F32,
+            ),
+            down: cx.named_tensor(
+                experts.leaf("down_proj"),
+                (d.experts, d.hidden, d.moe_intermediate),
+                DType::F32,
+            ),
+            top_k: d.top_k,
+            intermediate: d.moe_intermediate,
         }
     }
 
@@ -123,9 +131,6 @@ impl Qwen3MoeFfn {
 }
 
 pub struct Qwen3MoeBlock {
-    /// Per-expert (gate, up, down) handles — the HF checkpoint
-    /// anatomy; the Qwen3 feed-forward network stacks them in-graph.
-    pub expert_parts: Vec<(GraphTensor, GraphTensor, GraphTensor)>,
     pub attn_norm: LayerNorm,
     pub wq: Linear,
     pub wk: Linear,
@@ -145,29 +150,6 @@ impl Qwen3MoeBlock {
         let ns = Namespace::root().child("model").child("layers").index(l);
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
-        let experts = mlp.child("experts");
-        let expert_parts: Vec<(GraphTensor, GraphTensor, GraphTensor)> = (0..d.experts)
-            .map(|e| {
-                let expert = experts.index(e);
-                (
-                    cx.named_tensor(
-                        expert.child("gate_proj").leaf("weight"),
-                        (d.moe_intermediate, d.hidden),
-                        DType::F32,
-                    ),
-                    cx.named_tensor(
-                        expert.child("up_proj").leaf("weight"),
-                        (d.moe_intermediate, d.hidden),
-                        DType::F32,
-                    ),
-                    cx.named_tensor(
-                        expert.child("down_proj").leaf("weight"),
-                        (d.hidden, d.moe_intermediate),
-                        DType::F32,
-                    ),
-                )
-            })
-            .collect();
         Self {
             attn_norm: LayerNorm::new(
                 d.hidden,
@@ -223,19 +205,7 @@ impl Qwen3MoeBlock {
                 &ns.child("post_attention_layernorm"),
                 cx,
             ),
-            moe: Qwen3MoeFfn::from_per_expert(
-                Linear::new(
-                    d.hidden,
-                    d.experts,
-                    false,
-                    DType::F32,
-                    &mlp.child("gate"),
-                    cx,
-                ),
-                &expert_parts,
-                d.top_k,
-            ),
-            expert_parts,
+            moe: Qwen3MoeFfn::new(&mlp, d, cx),
             n_heads: d.n_heads,
             n_kv_heads: d.n_kv_heads,
             head_dim: d.head_dim,
