@@ -166,8 +166,9 @@ impl EgglogOp for FusionEnd {
         // versus absorbed partition.  Subsumption removes that spelling from
         // both future matching and extraction, so each boundary is fused once
         // and the e-graph retains only the canonical absorbed representation.
-        vec![Rule::raw(
-            "(rule (
+        vec![
+            Rule::raw(
+                "(rule (
                 (= ?producer_fe
                    (Op (FusionEnd ?shape ?stride ?dt) (ICons ?producer_inner (INil))))
                 (= ?boundary
@@ -178,7 +179,26 @@ impl EgglogOp for FusionEnd {
                     (Op (FusionStart ?shape ?stride ?dt) (ICons ?producer_fe (INil))))
              ) :ruleset fusion_inline_safe_late
                 :name \"inline-safe-FE-through-FS\")",
-        )]
+            ),
+            // A materialized cast is pointwise in storage order. Reading any
+            // broadcast, sliced or permuted view of it equals casting the source
+            // at that same address. Preserve the conversion as a region-local op;
+            // never cancel rounding or commute another operation through a view.
+            // Retain the original strided read so measured search can compare
+            // materialization with duplicated conversion work under fanout, and
+            // existing selected schedules remain valid seeds.
+            Rule::raw(
+                "(rule (
+                (= ?cast (Op (KernelCast ?size ?in_dt ?out_dt) (ICons ?x (INil))))
+                (= ?boundary (Op (FusionStart ?shape ?stride ?out_dt) (ICons ?cast (INil))))
+             ) (
+                (let ?source (Op (FusionStart ?shape ?stride ?in_dt) (ICons ?x (INil))))
+                (let ?inner (Op (CudaUnaryElementwise \"Cast\" ?shape ?stride ?stride ?out_dt)
+                                (ICons ?source (INil))))
+                (union ?boundary ?inner)
+             ) :ruleset fusion_inline_safe_late :name \"inline-cast-through-strided-read\")",
+            ),
+        ]
     }
 
     fn cleanup(&self) -> bool {

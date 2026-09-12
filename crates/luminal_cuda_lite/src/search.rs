@@ -400,13 +400,13 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
 
 pub(crate) fn safe_fusion_late_pass() -> luminal::egglog_utils::LateEgglogPass {
     // Singleton elementwise regions already exist when this late pass runs.
-    // One Egglog round sees every materialized FE -> FS boundary in the DAG;
-    // the rule dissolves and subsumes those boundaries simultaneously, giving
-    // us maximal destructive fusion without enumerating fusion partitions.
+    // Matching-layout FE/FS boundaries are subsumed. Saturation also exposes
+    // cast conversions at strided reads, including chains of conversions;
+    // their materialized alternatives remain available to measured search.
     luminal::egglog_utils::LateEgglogPass::new(
         "",
         "(seq
-            fusion_inline_safe_late
+            (saturate fusion_inline_safe_late)
             (saturate expr)
             (saturate cleanup)
             (saturate post_cleanup)

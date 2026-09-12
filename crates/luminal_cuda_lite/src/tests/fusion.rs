@@ -1413,3 +1413,90 @@ fn test_cast_fusion_preserves_output() {
         tol,
     );
 }
+
+#[test]
+fn strided_cast_read_fuses_broadcast_and_preserves_fanout() {
+    use luminal::dtype::DType;
+    for fanout in [false, true] {
+        let mut cx = Graph::new();
+        let x = cx.tensor(('s', 7));
+        let bias = cx.tensor(7).cast(DType::Bf16).cast(DType::F32);
+        if fanout {
+            bias.output();
+        }
+        (x + bias.expand_dim(0, 's')).output();
+        cx.set_dim('s', 3);
+        let regions = extract_fused_regions_with_options(
+            &mut cx,
+            CompileOptions::default().dim_buckets('s', &[DimBucket::new(2, 8)]),
+        );
+        let expected = sorted_names(&["FusedAdd", "FusedCast", "FusedCast"]);
+        assert!(
+            regions
+                .iter()
+                .any(|r| r.internal_ops_sorted == expected && r.start_count == 2),
+            "fanout={fanout}: {regions:#?}"
+        );
+        let egraph = cx.egraph().unwrap();
+        assert!(
+            egraph.eclasses.keys().any(|class| {
+                eclass_has_op_kind(egraph, class, "FusionStart")
+                    && eclass_has_op_kind(egraph, class, "CudaUnaryElementwise")
+            }),
+            "materialized and inline cast reads must both remain searchable"
+        );
+    }
+}
+
+#[test]
+fn strided_cast_read_preserves_transposed_values() {
+    test_unary_cuda::<f32>(
+        (3, 7),
+        |a| {
+            a.cast(luminal::dtype::DType::Bf16)
+                .cast(luminal::dtype::DType::F32)
+                .permute((1, 0))
+                .sin()
+        },
+        |a| {
+            a.to_dtype(candle_core::DType::BF16)
+                .unwrap()
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .permute((1, 0))
+                .unwrap()
+                .sin()
+                .unwrap()
+        },
+        |n, seed| random_f32_vec(n, seed, -2., 2.),
+        0xCA57_051D,
+    );
+}
+
+#[test]
+fn strided_cast_read_preserves_broadcast_rounding() {
+    test_binary_cuda::<f32>(
+        (3, 7),
+        7,
+        |a, b| {
+            a + b
+                .cast(luminal::dtype::DType::Bf16)
+                .cast(luminal::dtype::DType::F32)
+                .expand_dim(0, 3)
+        },
+        |a, b| {
+            a.broadcast_add(
+                &b.to_dtype(candle_core::DType::BF16)
+                    .unwrap()
+                    .to_dtype(candle_core::DType::F32)
+                    .unwrap(),
+            )
+            .unwrap()
+        },
+        |n, seed| random_f32_vec(n, seed, -2., 2.),
+        |n, seed| random_f32_vec(n, seed, -2., 2.),
+        0xCA57_051E,
+        1e-6,
+        1e-6,
+    );
+}
