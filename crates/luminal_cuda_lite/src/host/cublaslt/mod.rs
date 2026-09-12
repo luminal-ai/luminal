@@ -7,7 +7,7 @@ use half::{bf16, f16};
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{Field, Rule, SortDef, sort},
         base::{DTYPE, EXPRESSION, F64, OP_KIND, STRING},
         extract_dtype, extract_expr,
     },
@@ -57,7 +57,6 @@ fn parse_cublas_op(s: &str) -> cublasOperation_t {
 
 type CuBlasLtResourcePrepareCache = Mutex<Option<(Vec<(Symbol, usize)>, CuBlasLtPrepareKey)>>;
 
-#[derive(Debug)]
 #[allow(dead_code)]
 pub struct CuBlasLt {
     m: Expression,
@@ -89,8 +88,52 @@ pub struct CuBlasLt {
     epilogue: cublasLtEpilogue_t,
     a_scale_input: bool,
     b_scale_input: bool,
+    algorithm_rank: usize,
     cublaslt: OnceLock<Arc<CudaBlasLT>>,
     resource_prepare_cache: CuBlasLtResourcePrepareCache,
+}
+
+// Preserve the canonical default spelling used by saved schedule fingerprints.
+// Every non-default algorithm rank participates in search deduplication.
+impl std::fmt::Debug for CuBlasLt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("CuBlasLt");
+        debug.field("m", &self.m);
+        debug.field("n", &self.n);
+        debug.field("k", &self.k);
+        debug.field("a_layout", &self.a_layout);
+        debug.field("b_layout", &self.b_layout);
+        debug.field("a_order", &self.a_order);
+        debug.field("b_order", &self.b_order);
+        debug.field("c_order", &self.c_order);
+        debug.field("d_order", &self.d_order);
+        debug.field("lda", &self.lda);
+        debug.field("ldb", &self.ldb);
+        debug.field("ldc", &self.ldc);
+        debug.field("ldd", &self.ldd);
+        debug.field("batch_count", &self.batch_count);
+        debug.field("stride_a", &self.stride_a);
+        debug.field("stride_b", &self.stride_b);
+        debug.field("stride_c", &self.stride_c);
+        debug.field("stride_d", &self.stride_d);
+        debug.field("a_dtype", &self.a_dtype);
+        debug.field("b_dtype", &self.b_dtype);
+        debug.field("c_dtype", &self.c_dtype);
+        debug.field("d_dtype", &self.d_dtype);
+        debug.field("compute_type", &self.compute_type);
+        debug.field("scale_dtype", &self.scale_dtype);
+        debug.field("alpha", &self.alpha);
+        debug.field("beta", &self.beta);
+        debug.field("epilogue", &self.epilogue);
+        debug.field("a_scale_input", &self.a_scale_input);
+        debug.field("b_scale_input", &self.b_scale_input);
+        if self.algorithm_rank != 0 {
+            debug.field("algorithm_rank", &self.algorithm_rank);
+        }
+        debug.field("cublaslt", &self.cublaslt);
+        debug.field("resource_prepare_cache", &self.resource_prepare_cache);
+        debug.finish()
+    }
 }
 
 // Useless default for IntoEgglogOp
@@ -126,6 +169,7 @@ impl Default for CuBlasLt {
             epilogue: cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
             a_scale_input: false,
             b_scale_input: false,
+            algorithm_rank: 0,
             cublaslt: OnceLock::new(),
             resource_prepare_cache: Mutex::new(None),
         }
@@ -215,6 +259,7 @@ impl EgglogOp for CuBlasLt {
             Rule::raw(include_str!["cublaslt_CmCm_rewrite.egg"]), // col col
             Rule::raw(include_str!["cublaslt_fp8_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_output_witness.egg"]),
+            Rule::raw(include_str!["cublaslt_mixed_precision.egg"]),
             Rule::raw(include_str!["cublaslt_scale_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_beta_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_epilogue_rewrite.egg"]),
@@ -228,91 +273,10 @@ impl EgglogOp for CuBlasLt {
         egraph: &'a luminal::egglog_utils::SerializedEGraph,
         kind_children: &[&'a ENodeId],
         input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        // Extract dimensions from egglog
-        let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
-        let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-        let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
-
-        // Extract transpose/layout strings from egglog
-        let a_layout_str = &egraph.enodes[kind_children[3]].0;
-        let b_layout_str = &egraph.enodes[kind_children[4]].0;
-        let a_layout = parse_cublas_op(a_layout_str);
-        let b_layout = parse_cublas_op(b_layout_str);
-        let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
-        let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
-        let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
-        let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
-
-        // Extract leading dimensions from egglog
-        let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
-        let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
-        let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
-        let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
-
-        // Extract batch parameters
-        let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
-        let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
-        let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
-        let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
-        let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
-
-        // Extract cuBLASLt type tuple from egglog. Existing rewrites emit the
-        // same dtype for A/B/C/D, but keeping these fields separate lets later
-        // rewrites model mixed-input and mixed-output matmuls without changing
-        // the host launch helper again.
-        let a_dtype = extract_dtype(egraph, kind_children[18]);
-        let b_dtype = extract_dtype(egraph, kind_children[19]);
-        let c_dtype = extract_dtype(egraph, kind_children[20]);
-        let d_dtype = extract_dtype(egraph, kind_children[21]);
-        let compute_type_str = &egraph.enodes[kind_children[22]].0;
-        let scale_dtype_str = &egraph.enodes[kind_children[23]].0;
-        let compute_type = parse_cublaslt_compute_type(compute_type_str, a_dtype);
-        let scale_dtype = parse_cublaslt_scale_dtype(scale_dtype_str, a_dtype);
-        let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
-        let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
-        let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
-
-        let extracted_state = Self {
-            m,
-            n,
-            k,
-            a_layout,
-            b_layout,
-            a_order,
-            b_order,
-            c_order,
-            d_order,
-            lda,
-            ldb,
-            ldc,
-            ldd,
-            batch_count,
-            stride_a,
-            stride_b,
-            stride_c,
-            stride_d,
-            a_dtype,
-            b_dtype,
-            c_dtype,
-            d_dtype,
-            compute_type,
-            scale_dtype,
-            alpha,
-            beta,
-            epilogue,
-            a_scale_input: false,
-            b_scale_input: false,
-            cublaslt: OnceLock::new(),
-            resource_prepare_cache: Mutex::new(None),
-        };
-        trace!(?extracted_state);
-
-        let extracted = LLIROp::new::<dyn HostOp>(Box::new(extracted_state) as Box<dyn HostOp>);
-
-        (extracted, input_enodes)
+        extract_cublaslt(egraph, kind_children, input_enodes, expr_cache, false)
     }
 
     fn cleanup(&self) -> bool {
@@ -335,85 +299,175 @@ impl EgglogOp for CuBlasLtScaled {
         egraph: &'a luminal::egglog_utils::SerializedEGraph,
         kind_children: &[&'a ENodeId],
         input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
-        let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-        let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
-
-        let a_layout = parse_cublas_op(&egraph.enodes[kind_children[3]].0);
-        let b_layout = parse_cublas_op(&egraph.enodes[kind_children[4]].0);
-        let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
-        let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
-        let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
-        let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
-
-        let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
-        let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
-        let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
-        let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
-
-        let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
-        let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
-        let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
-        let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
-        let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
-
-        let a_dtype = extract_dtype(egraph, kind_children[18]);
-        let b_dtype = extract_dtype(egraph, kind_children[19]);
-        let c_dtype = extract_dtype(egraph, kind_children[20]);
-        let d_dtype = extract_dtype(egraph, kind_children[21]);
-        let compute_type_str = &egraph.enodes[kind_children[22]].0;
-        let scale_dtype_str = &egraph.enodes[kind_children[23]].0;
-        let compute_type = parse_cublaslt_compute_type(compute_type_str, a_dtype);
-        let scale_dtype = parse_cublaslt_scale_dtype(scale_dtype_str, a_dtype);
-        let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
-        let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
-        let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
-
-        let extracted_state = CuBlasLt {
-            m,
-            n,
-            k,
-            a_layout,
-            b_layout,
-            a_order,
-            b_order,
-            c_order,
-            d_order,
-            lda,
-            ldb,
-            ldc,
-            ldd,
-            batch_count,
-            stride_a,
-            stride_b,
-            stride_c,
-            stride_d,
-            a_dtype,
-            b_dtype,
-            c_dtype,
-            d_dtype,
-            compute_type,
-            scale_dtype,
-            alpha,
-            beta,
-            epilogue,
-            a_scale_input: true,
-            b_scale_input: true,
-            cublaslt: OnceLock::new(),
-            resource_prepare_cache: Mutex::new(None),
-        };
-        trace!(?extracted_state);
-
-        let extracted = LLIROp::new::<dyn HostOp>(Box::new(extracted_state) as Box<dyn HostOp>);
-
-        (extracted, input_enodes)
+        extract_cublaslt(egraph, kind_children, input_enodes, expr_cache, true)
     }
 
     fn cleanup(&self) -> bool {
         false
+    }
+}
+
+fn extract_cublaslt<'a>(
+    egraph: &'a SerializedEGraph,
+    kind_children: &[&'a ENodeId],
+    input_enodes: Vec<&'a ENodeId>,
+    expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    scaled: bool,
+) -> (LLIROp, Vec<&'a ENodeId>) {
+    // Extract dimensions from egglog
+    let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
+    let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
+    let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+
+    // Extract transpose/layout strings from egglog
+    let a_layout_str = &egraph.enodes[kind_children[3]].0;
+    let b_layout_str = &egraph.enodes[kind_children[4]].0;
+    let a_layout = parse_cublas_op(a_layout_str);
+    let b_layout = parse_cublas_op(b_layout_str);
+    let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
+    let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
+    let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
+    let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
+
+    // Extract leading dimensions from egglog
+    let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
+    let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
+    let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
+    let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
+
+    // Extract batch parameters
+    let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
+    let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
+    let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
+    let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
+    let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
+
+    // Extract cuBLASLt type tuple from egglog. Existing rewrites emit the
+    // same dtype for A/B/C/D, but keeping these fields separate lets later
+    // rewrites model mixed-input and mixed-output matmuls without changing
+    // the host launch helper again.
+    let a_dtype = extract_dtype(egraph, kind_children[18]);
+    let b_dtype = extract_dtype(egraph, kind_children[19]);
+    let c_dtype = extract_dtype(egraph, kind_children[20]);
+    let d_dtype = extract_dtype(egraph, kind_children[21]);
+    let compute_type_str = &egraph.enodes[kind_children[22]].0;
+    let scale_dtype_str = &egraph.enodes[kind_children[23]].0;
+    let compute_type = parse_cublaslt_compute_type(compute_type_str, a_dtype);
+    let scale_dtype = parse_cublaslt_scale_dtype(scale_dtype_str, a_dtype);
+    let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
+    let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
+    let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
+
+    let extracted_state = CuBlasLt {
+        m,
+        n,
+        k,
+        a_layout,
+        b_layout,
+        a_order,
+        b_order,
+        c_order,
+        d_order,
+        lda,
+        ldb,
+        ldc,
+        ldd,
+        batch_count,
+        stride_a,
+        stride_b,
+        stride_c,
+        stride_d,
+        a_dtype,
+        b_dtype,
+        c_dtype,
+        d_dtype,
+        compute_type,
+        scale_dtype,
+        alpha,
+        beta,
+        epilogue,
+        a_scale_input: scaled,
+        b_scale_input: scaled,
+        algorithm_rank: kind_children.get(27).map_or(0, |rank| {
+            extract_expr(egraph, rank, expr_cache)
+                .unwrap()
+                .to_usize()
+                .expect("constant algorithm rank")
+        }),
+        cublaslt: OnceLock::new(),
+        resource_prepare_cache: Mutex::new(None),
+    };
+    trace!(?extracted_state);
+
+    let extracted = LLIROp::new::<dyn HostOp>(Box::new(extracted_state) as Box<dyn HostOp>);
+
+    (extracted, input_enodes)
+}
+
+const CUBLASLT_ALGORITHM_CHOICES: usize = 16;
+
+/// Ranked legal cuBLASLt algorithms are ordinary compiler-search alternatives.
+/// Each dynamic shape queries its own list; ranks past its end select the last
+/// available algorithm, so a chosen program remains defined across its bucket.
+#[derive(Debug, Default)]
+pub struct CuBlasLtTuned<const SCALED: bool>;
+
+impl<const SCALED: bool> EgglogOp for CuBlasLtTuned<SCALED> {
+    fn sort(&self) -> SortDef {
+        let mut def = cublaslt_sort(if SCALED {
+            "cublaslt_scaled_algorithm"
+        } else {
+            "cublaslt_algorithm"
+        });
+        def.fields.push(Field {
+            name: "algorithm_rank".into(),
+            sort: EXPRESSION.name.into(),
+        });
+        def
+    }
+    fn n_inputs(&self) -> usize {
+        if SCALED { 4 } else { 2 }
+    }
+    fn cleanup(&self) -> bool {
+        false
+    }
+    fn rewrites(&self) -> Vec<Rule> {
+        let base = if SCALED {
+            "cublaslt_scaled"
+        } else {
+            "cublaslt"
+        };
+        let args = cublaslt_sort(base)
+            .fields
+            .iter()
+            .map(|f| format!("?{}", f.name))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tuned = self.sort().name;
+        (0..CUBLASLT_ALGORITHM_CHOICES)
+            .map(|rank| {
+                Rule::raw(format!(
+                    r#"(rule
+            ((= ?out (Op ({base} {args}) ?inputs)))
+            ((let ?tuned (Op ({tuned} {args} (MNum {rank})) ?inputs))
+             (union ?out ?tuned) (set (dtype ?tuned) ?d_dtype))
+            :ruleset matmul_backend :name "{tuned} rank {rank}")"#
+                ))
+            })
+            .collect()
+    }
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        children: &[&'a ENodeId],
+        inputs: Vec<&'a ENodeId>,
+        _lists: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expressions: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        extract_cublaslt(egraph, children, inputs, expressions, SCALED)
     }
 }
 
@@ -637,9 +691,16 @@ pub(crate) struct LtMatmulSpec {
     d: LtMatrixSpec,
     compute: LtComputeSpec,
     workspace_size: usize,
+    algorithm_rank: usize,
+    alignments: [u32; 4],
 }
 
 impl LtMatmulSpec {
+    fn with_pointers(mut self, ptrs: LtMatmulPointers) -> Self {
+        self.alignments =
+            [ptrs.a, ptrs.b, ptrs.c, ptrs.d].map(|ptr| 1 << ptr.trailing_zeros().min(8));
+        self
+    }
     pub(crate) fn persistent_device_bytes(self) -> usize {
         let scale_bytes = [self.a.dtype, self.b.dtype, self.c.dtype, self.d.dtype]
             .into_iter()
@@ -831,6 +892,15 @@ impl PreparedCuBlasLtMatmul {
         stream: &Arc<CudaStream>,
         ptrs: LtMatmulPointers,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.spec
+                .with_pointers(ptrs)
+                .alignments
+                .into_iter()
+                .zip(self.spec.alignments)
+                .all(|(actual, required)| actual >= required),
+            "cuBLASLt pointer alignment changed after preparation"
+        );
         self.update_descriptor_pointers(stream, ptrs)?;
         let alpha_ptr = self.spec.compute.alpha.as_ptr();
         let beta_ptr = self.spec.compute.beta.as_ptr();
@@ -1147,14 +1217,12 @@ pub(crate) fn prepare_cublaslt_matmul_with_workspace(
             .find(|(cached_spec, _)| cached_spec == spec)
             .map(|(_, heuristic)| unsafe { std::ptr::read(heuristic) })
     };
-    const AUTOTUNE_CANDIDATES: usize = 16;
-    let mut candidates: Vec<cublasLtMatmulHeuristicResult_t> = Vec::new();
     let from_cache = cached_heuristic.is_some();
     if let Some(cached) = cached_heuristic {
         heuristic = cached;
     } else {
         let mut algo_count: i32 = 0;
-        let mut results: [cublasLtMatmulHeuristicResult_t; AUTOTUNE_CANDIDATES] =
+        let mut results: [cublasLtMatmulHeuristicResult_t; CUBLASLT_ALGORITHM_CHOICES] =
             unsafe { std::mem::zeroed() };
         unsafe {
             cublasLtMatmulPreferenceCreate(&mut resources.preference).result()?;
@@ -1166,6 +1234,34 @@ pub(crate) fn prepare_cublaslt_matmul_with_workspace(
             )
             .result()?;
 
+            // Match actual buffer alignment and preserve compute-precision
+            // partial sums before the final output conversion.
+            for (attr, alignment) in [
+                cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
+                cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+                cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
+                cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
+            ]
+            .into_iter()
+            .zip(spec.alignments)
+            {
+                cublasLtMatmulPreferenceSetAttribute(
+                    resources.preference,
+                    attr,
+                    &alignment as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<u32>(),
+                )
+                .result()?;
+            }
+            let reduction: u32 = 2; // CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE; NONE is always allowed.
+            cublasLtMatmulPreferenceSetAttribute(
+                resources.preference,
+                cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                &reduction as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<u32>(),
+            )
+            .result()?;
+
             cublasLtMatmulAlgoGetHeuristic(
                 *cublaslt.handle(),
                 resources.matmul_desc,
@@ -1174,7 +1270,7 @@ pub(crate) fn prepare_cublaslt_matmul_with_workspace(
                 resources.c_desc,
                 resources.d_desc,
                 resources.preference,
-                AUTOTUNE_CANDIDATES as i32,
+                CUBLASLT_ALGORITHM_CHOICES as i32,
                 results.as_mut_ptr(),
                 &mut algo_count,
             )
@@ -1184,20 +1280,14 @@ pub(crate) fn prepare_cublaslt_matmul_with_workspace(
                 return Err(anyhow::anyhow!("No suitable cuBLASLT algorithm found"));
             }
         }
-        candidates.extend_from_slice(&results[..algo_count as usize]);
-        heuristic = candidates[0];
+        heuristic = results[spec.algorithm_rank.min(algo_count as usize - 1)];
     }
     // The preference's workspace limit controls which algorithms cuBLASLt may
     // return; it is not the amount selected algorithm actually needs. Allocate
     // only that algorithm's requirement. Most Llama GEMM/GEMV choices need no
     // workspace, so allocating the full 32 MiB limit here was the dominant
     // cold graph-construction cost.
-    let should_autotune = !from_cache && candidates.len() > 1 && autotune_allowed(stream, ptrs);
-    let required_workspace_bytes = if should_autotune {
-        spec.workspace_size
-    } else {
-        heuristic.workspaceSize
-    };
+    let required_workspace_bytes = heuristic.workspaceSize;
     let workspace = match recycled_workspace {
         Some(workspace) if workspace.len() >= required_workspace_bytes => workspace,
         _ if required_workspace_bytes == 0 => Arc::new(stream.null::<u8>()?),
@@ -1205,7 +1295,7 @@ pub(crate) fn prepare_cublaslt_matmul_with_workspace(
     };
     let (workspace_ptr, workspace_guard) = workspace.device_ptr(stream);
     drop(workspace_guard);
-    let mut prepared = PreparedCuBlasLtMatmul {
+    let prepared = PreparedCuBlasLtMatmul {
         cublaslt: cublaslt.clone(),
         spec: *spec,
         resources,
@@ -1221,11 +1311,6 @@ pub(crate) fn prepare_cublaslt_matmul_with_workspace(
     };
 
     if !from_cache {
-        if should_autotune
-            && let Some(best) = autotune_select(stream, &mut prepared, &candidates, ptrs)
-        {
-            prepared.heuristic = best;
-        }
         heuristic_cache
             .lock()
             .unwrap()
@@ -1233,93 +1318,6 @@ pub(crate) fn prepare_cublaslt_matmul_with_workspace(
     }
 
     Ok(prepared)
-}
-
-/// Autotuning launches real matmuls, which is only safe when the stream is
-/// not mid-capture (the benchmark kernels would be recorded into the graph)
-/// and the operand pointers are live.
-fn autotune_allowed(stream: &Arc<CudaStream>, ptrs: LtMatmulPointers) -> bool {
-    // Opt-in: measured on Llama 3 8B decode, the heuristic's first choice was
-    // already within noise of the benchmarked best (the GEMV slack is fixed
-    // per-launch cost, not algorithm choice), while the one-time benchmark
-    // sweep added ~60ms to first-step latency.
-    if std::env::var_os("LUMINAL_CUBLASLT_AUTOTUNE").is_none_or(|v| v != "1") {
-        return false;
-    }
-    if ptrs.a == 0 || ptrs.b == 0 || ptrs.d == 0 {
-        return false;
-    }
-    let mut status = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-    let ok = unsafe {
-        cudarc::driver::sys::cuStreamIsCapturing(stream.cu_stream(), &mut status)
-            == cudarc::driver::sys::CUresult::CUDA_SUCCESS
-    };
-    ok && status == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
-}
-
-/// Benchmark each heuristic candidate with the real operands and return the
-/// fastest. The D buffer is scratch from the runtime's perspective (it is
-/// rewritten every step), so benchmarking writes are harmless. Runs once per
-/// `LtMatmulSpec` (results are cached by the caller).
-fn autotune_select(
-    stream: &Arc<CudaStream>,
-    prepared: &mut PreparedCuBlasLtMatmul,
-    candidates: &[cublasLtMatmulHeuristicResult_t],
-    ptrs: LtMatmulPointers,
-) -> Option<cublasLtMatmulHeuristicResult_t> {
-    const REPS: usize = 16;
-    let log = std::env::var_os("LUMINAL_CUBLASLT_AUTOTUNE_LOG").is_some_and(|v| v == "1");
-    let timing_flags = Some(crate::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
-    let start = stream.context().new_event(timing_flags).ok()?;
-    let end = stream.context().new_event(timing_flags).ok()?;
-    let mut best: Option<(f32, usize)> = None;
-    for (idx, candidate) in candidates.iter().enumerate() {
-        prepared.heuristic = unsafe { std::ptr::read(candidate) };
-        // Warmup + validity check: a candidate may fail at execution.
-        if prepared.enqueue(stream, ptrs).is_err() {
-            continue;
-        }
-        if stream.synchronize().is_err() {
-            return None;
-        }
-        if start.record(stream).is_err() {
-            return None;
-        }
-        let mut failed = false;
-        for _ in 0..REPS {
-            if prepared.enqueue(stream, ptrs).is_err() {
-                failed = true;
-                break;
-            }
-        }
-        if failed || end.record(stream).is_err() || end.synchronize().is_err() {
-            continue;
-        }
-        let Ok(elapsed_ms) = start.elapsed_ms(&end) else {
-            continue;
-        };
-        let elapsed_us = elapsed_ms * 1_000.0 / REPS as f32;
-        if log {
-            eprintln!(
-                "CUBLASLT_AUTOTUNE m={} n={} k={} candidate={} workspace={} elapsed_us={elapsed_us:.6}",
-                prepared.spec.problem.m,
-                prepared.spec.problem.n,
-                prepared.spec.problem.k,
-                idx,
-                candidate.workspaceSize,
-            );
-        }
-        if best.is_none_or(|(b, _)| elapsed_us < b) {
-            best = Some((elapsed_us, idx));
-        }
-    }
-    if log && let Some((elapsed_us, idx)) = best {
-        eprintln!(
-            "CUBLASLT_AUTOTUNE_SELECTED m={} n={} k={} candidate={} elapsed_us={elapsed_us:.6}",
-            prepared.spec.problem.m, prepared.spec.problem.n, prepared.spec.problem.k, idx,
-        );
-    }
-    best.map(|(_, idx)| unsafe { std::ptr::read(&candidates[idx]) })
 }
 
 fn run_cublaslt_matmul(
@@ -1376,6 +1374,8 @@ pub(crate) fn cublaslt_graph_capture_supported(stream: &Arc<CudaStream>) -> bool
                 epilogue: cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
             },
             workspace_size: 1024 * 1024,
+            algorithm_rank: 0,
+            alignments: [256; 4],
         };
         let ptrs = LtMatmulPointers {
             a,
@@ -1617,6 +1617,8 @@ impl CuBlasLt {
                 epilogue: self.epilogue,
             },
             workspace_size: Self::WORKSPACE_SIZE_BYTES,
+            algorithm_rank: self.algorithm_rank,
+            alignments: [256; 4],
         })
     }
 
@@ -1724,7 +1726,10 @@ impl CuBlasLt {
         )
         .entered();
 
-        Ok(CuBlasLtResolvedGraphCall { spec, ptrs })
+        Ok(CuBlasLtResolvedGraphCall {
+            spec: spec.with_pointers(ptrs),
+            ptrs,
+        })
     }
 
     pub(crate) fn prepare_resolved_for_graph_with_workspace(
@@ -1840,7 +1845,7 @@ impl HostOp for CuBlasLt {
 
         let cublaslt = self.get_cublaslt(stream)?;
 
-        run_cublaslt_matmul(stream, &cublaslt, &spec, ptrs)?;
+        run_cublaslt_matmul(stream, &cublaslt, &spec.with_pointers(ptrs), ptrs)?;
 
         // No stream.synchronize() here — CUDA stream ordering guarantees
         // sequential execution. The runtime syncs once at the end of execute().
@@ -2230,3 +2235,6 @@ mod tests {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod algorithm_tests;

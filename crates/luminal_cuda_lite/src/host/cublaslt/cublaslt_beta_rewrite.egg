@@ -1,3 +1,6 @@
+; A pointwise operation after F16/BF16 matmul observes its rounded result.
+; cuBLASLt epilogues/scales run before output conversion, so only F32
+; intermediates may cross this boundary. Keep low-precision rounding explicit.
 ; Fuse a row-major Add on top of an existing cuBLASLt matmul into
 ; D = alpha * A * B + beta * C.
 ;
@@ -9,6 +12,7 @@
 ; beta rules only fuse C layouts that map to the current COL-ordered D layout.
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -67,6 +71,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -125,6 +130,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -183,6 +189,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -245,6 +252,7 @@
 ; ROW-ordered cuBLASLt C[m,n] descriptor with ldc=row_stride.
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -303,6 +311,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -361,6 +370,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -419,6 +429,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout

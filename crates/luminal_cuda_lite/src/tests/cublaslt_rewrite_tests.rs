@@ -2879,6 +2879,86 @@ fn cublaslt_scaled_alpha_beta_candidate_executes_batched_matmul_plus_c() {
 }
 
 #[test]
+fn cublaslt_postops_do_not_remove_low_precision_rounding() {
+    for dtype in [DType::Bf16, DType::F16] {
+        for commuted in [false, true] {
+            for mut graph in [
+                build_2d_scaled_alpha_beta_graph(LAYOUT_CASES[0], dtype, commuted),
+                build_batched_scaled_alpha_beta_graph(LAYOUT_CASES[1], dtype, commuted),
+                build_batched_matmul_plus_column_bias_graph(LAYOUT_CASES[1], dtype, commuted),
+            ] {
+                assert_no_cublaslt_llir_where(
+                    &mut graph,
+                    "postops must retain low-precision rounding",
+                    |llir| {
+                        cublaslt_epilogues(llir).contains(&"BIAS")
+                            || cublaslt_scale_value_tuples(llir)
+                                .iter()
+                                .any(|&(alpha, beta)| alpha != 1.0 || beta != 0.0)
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// The low-precision matmul is an observable rounding boundary. For this
+/// exactly representable dot product, round(dot) + bias is zero while the
+/// library bias epilogue rounds(dot + bias) to a nonzero value.
+#[test]
+fn cublaslt_bias_preserves_low_precision_matmul_rounding() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    for (dtype, delta) in [(DType::Bf16, 1.0 / 512.0), (DType::F16, 1.0 / 4096.0)] {
+        let (m, n, k) = (16, 64, 64);
+        let mut cx = Graph::new();
+        let a = cx.tensor((m, k)).as_dtype(dtype);
+        let b = cx.tensor((n, k)).as_dtype(dtype);
+        let bias = cx.tensor(n).as_dtype(dtype);
+        let out = (a.matmul(b.t()) + bias.expand_dim(0, m))
+            .cast(DType::F32)
+            .output();
+        assert_no_cublaslt_llir_where(&mut cx, "bias must retain low-precision rounding", |llir| {
+            cublaslt_epilogues(llir).contains(&"BIAS")
+        });
+        let llir =
+            extract_forced_cublaslt_llir_where(&mut cx, "rounded matmul then bias", |llir| {
+                cublaslt_epilogues(llir).contains(&"DEFAULT")
+            });
+        let mut rt = CudaRuntime::initialize(stream.clone());
+        rt.load_llir(&llir);
+        let values: Vec<f32> = (0..m * k)
+            .map(|i| match i % k {
+                0 => 1.0,
+                1 => delta,
+                _ => 0.0,
+            })
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| if i % k < 2 { 1.0 } else { 0.0 })
+            .collect();
+        let encode = |data: Vec<f32>| -> Vec<u8> {
+            data.into_iter()
+                .flat_map(|x| match dtype {
+                    DType::Bf16 => half::bf16::from_f32(x).to_bits().to_le_bytes(),
+                    _ => half::f16::from_f32(x).to_bits().to_le_bytes(),
+                })
+                .collect()
+        };
+        rt.set_data(a, encode(values));
+        rt.set_data(b, encode(weights));
+        rt.set_data(bias, encode(vec![-1.0; n]));
+        rt.execute(&cx.dyn_map);
+        assert_eq!(
+            rt.get_f32(out),
+            vec![0.0; m * n],
+            "{dtype:?} rounding before bias"
+        );
+    }
+}
+
+#[test]
 #[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
     let Some(stream) = get_cuda_stream() else {
@@ -4275,4 +4355,198 @@ fn cublaslt_c_d_layout_matches(llir: &LLIRGraph) -> Vec<bool> {
         .filter_map(|op| op.to_dialect::<dyn HostOp>())
         .filter_map(|host_op| cublaslt_c_d_layouts_match(host_op.as_ref().as_ref()))
         .collect()
+}
+
+#[test]
+fn cublaslt_mixed_affine_matches_single_round_reference_across_layouts() {
+    let stream = get_cuda_stream().expect("CUDA required for mixed-precision regression");
+    for (dtype, delta) in [(DType::Bf16, 1.0 / 256.0), (DType::F16, 1.0 / 2048.0)] {
+        for layout in LAYOUT_CASES {
+            for bias_enabled in [false, true] {
+                let (m, n, k) = (4, 64, 64);
+                let mut cx = Graph::new();
+                let a = cx
+                    .tensor(if layout.a_col_major { (k, m) } else { (m, k) })
+                    .as_dtype(dtype)
+                    .persist();
+                let b = cx
+                    .tensor(if layout.b_col_major { (n, k) } else { (k, n) })
+                    .as_dtype(dtype)
+                    .persist();
+                let bias = cx.tensor(n).as_dtype(dtype).persist();
+                let a32 = a.cast(DType::F32);
+                let b32 = b.cast(DType::F32);
+                let product = (if layout.a_col_major { a32.t() } else { a32 })
+                    .matmul(if layout.b_col_major { b32.t() } else { b32 });
+                let result = if bias_enabled {
+                    product + bias.cast(DType::F32).expand_dim(0, m)
+                } else {
+                    product
+                };
+                let out = result.cast(dtype).cast(DType::F32).output();
+                cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+                let llir = try_extract_forced_op_llir_where(
+                    &cx,
+                    &["cublaslt"],
+                    ForcedExtractionConfig::new(0x00C0_B1A5).attempts_per_node(16),
+                    |llir| {
+                        cublaslt_type_tuples(llir).contains(&(
+                            dtype,
+                            dtype,
+                            dtype,
+                            dtype,
+                            "32F",
+                            DType::F32,
+                        )) && cublaslt_epilogues(llir).contains(&if bias_enabled {
+                            "BIAS"
+                        } else {
+                            "DEFAULT"
+                        })
+                    },
+                )
+                .unwrap_or_else(|err| panic!("{dtype:?} {layout:?} bias={bias_enabled}: {err}"));
+                let encode = |values: Vec<f32>| -> Vec<u8> {
+                    values
+                        .into_iter()
+                        .flat_map(|v| match dtype {
+                            DType::Bf16 => half::bf16::from_f32(v).to_bits().to_le_bytes(),
+                            _ => half::f16::from_f32(v).to_bits().to_le_bytes(),
+                        })
+                        .collect()
+                };
+                let av = (0..m * k)
+                    .map(|i| {
+                        let col = if layout.a_col_major { i / m } else { i % k };
+                        match col {
+                            0 => 1.0,
+                            1 => delta,
+                            _ => 0.0,
+                        }
+                    })
+                    .collect();
+                let bv = (0..k * n)
+                    .map(|i| {
+                        let row = if layout.b_col_major { i % k } else { i / n };
+                        if row < 2 { 1.0 } else { 0.0 }
+                    })
+                    .collect();
+                let mut rt = CudaRuntime::initialize(stream.clone());
+                rt.load_llir(&llir);
+                rt.set_data(a, encode(av));
+                rt.set_data(b, encode(bv));
+                rt.set_data(bias, encode(vec![-1.0; n]));
+                for _ in 0..3 {
+                    rt.execute(&cx.dyn_map);
+                    // The exact product is 1+delta. Round after adding -1.
+                    assert_eq!(
+                        rt.get_f32(out),
+                        vec![if bias_enabled { delta } else { 1.0 }; m * n],
+                        "{dtype:?} {layout:?}"
+                    );
+                }
+
+                if !bias_enabled {
+                    // Widening also preserves subnormal operands. Their product
+                    // here is normal, so flushing them would be observable.
+                    let (tiny, large) = match dtype {
+                        DType::Bf16 => (half::bf16::from_bits(1).to_f32(), 2.0f32.powi(120)),
+                        _ => (half::f16::from_bits(1).to_f32(), 2.0f32.powi(15)),
+                    };
+                    for (av, bv) in [(tiny, large), (large, tiny)] {
+                        rt.set_data(a, encode(vec![av; m * k]));
+                        rt.set_data(b, encode(vec![bv; k * n]));
+                        rt.execute(&cx.dyn_map);
+                        assert_eq!(rt.get_f32(out), vec![tiny * large * k as f32; m * n]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cublaslt_mixed_affine_keeps_unconverted_f32_bias_and_partial_output() {
+    for partial in [false, true] {
+        let mut cx = Graph::new();
+        let a = cx.tensor((4, 64)).as_dtype(DType::Bf16);
+        let b = cx.tensor((64, 64)).as_dtype(DType::Bf16);
+        let bias = cx.tensor(64);
+        let product = a.cast(DType::F32).matmul(b.cast(DType::F32));
+        let value = if partial {
+            product.slice((.., ..32))
+        } else {
+            product + bias.expand_dim(0, 4)
+        };
+        value.cast(DType::Bf16).output();
+        assert_no_cublaslt_llir_where(
+            &mut cx,
+            "mixed cast must preserve bias dtype and view extent",
+            |llir| {
+                cublaslt_type_tuples(llir)
+                    .iter()
+                    .any(|t| t.3 == DType::Bf16)
+            },
+        );
+    }
+}
+
+#[test]
+fn cublaslt_mixed_affine_batched_dynamic_f32_output() {
+    let stream = get_cuda_stream().expect("CUDA required for mixed-precision regression");
+    let (batch, n, k) = (3, 64, 64);
+    let mut cx = Graph::new();
+    let a = cx.tensor((batch, 'm', k)).as_dtype(DType::Bf16);
+    let b = cx.tensor((batch, k, n)).as_dtype(DType::Bf16).persist();
+    // F32 bias must retain its original precision and storage type.
+    let bias = cx.tensor(n).persist();
+    let product = a.cast(DType::F32).matmul(b.cast(DType::F32));
+    let out =
+        (product + bias.expand_lhs([Expression::from(batch), Expression::from('m')])).output();
+    cx.set_dim('m', 4);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let llir = try_extract_forced_op_llir_where(
+        &cx,
+        &["cublaslt"],
+        ForcedExtractionConfig::new(0x00C0_B1A5).attempts_per_node(16),
+        |llir| {
+            cublaslt_type_tuples(llir).contains(&(
+                DType::Bf16,
+                DType::Bf16,
+                DType::F32,
+                DType::F32,
+                "32F",
+                DType::F32,
+            )) && cublaslt_epilogues(llir).contains(&"BIAS")
+        },
+    )
+    .expect("batched mixed affine should be extractable");
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(
+        b,
+        (0..batch * k * n)
+            .map(|i| half::bf16::from_f32(if (i / n) % k < 2 { 1.0 } else { 0.0 }))
+            .collect::<Vec<_>>(),
+    );
+    rt.set_data(bias, vec![-1.0 + 1.0 / 65536.0; n]);
+    for m in [4, 1, 8, 4] {
+        cx.set_dim('m', m);
+        rt.set_data(
+            a,
+            (0..batch * m * k)
+                .map(|i| {
+                    half::bf16::from_f32(match i % k {
+                        0 => 1.0,
+                        1 => 1.0 / 256.0,
+                        _ => 0.0,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        rt.execute(&cx.dyn_map);
+        assert_eq!(
+            rt.get_f32(out),
+            vec![1.0 / 256.0 + 1.0 / 65536.0; batch * m * n]
+        );
+    }
 }

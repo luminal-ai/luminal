@@ -2,7 +2,7 @@ use colored::Colorize;
 use egglog::{ast::Span, prelude::RustSpan, var};
 use itertools::Itertools;
 use petgraph::{Direction, graph::NodeIndex};
-use rand::Rng;
+use rand::{Rng, seq::SliceRandom};
 use rustc_hash::FxHashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -41,10 +41,9 @@ const EGGLOG_RULESETS: &[&str] = &[
     "fusion_pair",
     "fusion_grow",
     "fusion_merge",
-    // One-shot structural fusion rules (large joins), run once in the
-    // dedicated "fuse late" phase instead of inside the saturating main
-    // cycles. The _pre ruleset holds producer stages (e.g. the RoPE angle
-    // relation) consumed by rules in the main late ruleset.
+    // Structural fusion markers converge in a dedicated late phase, after
+    // dtype/shape facts are available and before cleanup removes proof nodes.
+    // The _pre rulesets seed facts consumed by the main late ruleset.
     "kernel_fuse_late_pre_rms",
     "kernel_fuse_late_pre_topk",
     "kernel_fuse_late_pre_rope",
@@ -200,7 +199,7 @@ pub struct OpTextParts {
     /// Backend-provided egglog text (see [`crate::op::Runtime::extra_egglog`]),
     /// spliced after `op_defs` and `op_declarations`, before the rewrite rules.
     /// Empty for core / the reference backend.
-    extra_egglog: String,
+    pub(crate) extra_egglog: String,
     cleanups: String,
     /// Names of op kinds that are eligible for cleanup (cleanup() == true).
     /// Used by the Rust post-processing pass to safely strip HLIR ops only
@@ -321,19 +320,12 @@ fn egglog_main_cycle_phases(cycle: usize, use_interval_analysis: bool) -> Vec<Eg
 
 fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> {
     vec![
-        // One-shot structural fusion rules with large joins. Running them
-        // once here (dtype facts present, raw HLIR rows not yet deleted by
-        // the cleanup phases) instead of inside the saturating main cycles
-        // avoids re-evaluating tens-of-seconds joins on every iteration.
-        // `seq` so each ruleset's join runs exactly once: producer stages
-        // first, then the consumer rules.
+        // Establish producer facts, converge the structural markers, then
+        // materialize consumers while the original HLIR proof nodes exist.
         EgglogSchedulePhase {
             name: "fuse late".to_string(),
-            // The second `kernel_fuse_late` run consumes relation facts the
-            // first run produced (e.g. rope_rotated); semi-naive evaluation
-            // makes it a cheap delta join.
-            // Depth = the longest relation cascade: invf(pre) → angles →
-            // rotation → concat each consume the previous run's facts.
+            // Marker rules may have arbitrary dependency depth. Reach their
+            // fixed point before consumers materialize the fused operations.
             schedule: "(seq
                 kernel_fuse_late_pre_rms
                 kernel_fuse_late_pre_topk
@@ -343,9 +335,7 @@ fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> 
                 kernel_fuse_late_pre_sink_attention_past
                 kernel_fuse_late_pre_sink_attention_finish
                 kernel_fuse_late_pre_flashinfer
-                kernel_fuse_late
-                kernel_fuse_late
-                kernel_fuse_late
+                (saturate kernel_fuse_late)
                 kernel_fuse_late2_rope
                 kernel_fuse_late2_sink_attention
                 kernel_fuse_late2_flashinfer_value
@@ -454,7 +444,7 @@ use crate::{
 use egglog::{ArcSort, CommandOutput, EGraph, Value};
 use egglog_reports::ReportLevel;
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 ///  This is snapshot of an EGraph with Rust native hash maps and sets for enabling more native traversal / algorithm writing.
 ///  The name comes from the serialize egraph crates, which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
 pub struct SerializedEGraph {
@@ -1330,7 +1320,7 @@ pub fn run_egglog_with_report_parts(
     )
 }
 
-fn run_egglog_with_report_parts_impl(
+pub(crate) fn run_egglog_with_report_parts_impl(
     program: &str,
     root: &str,
     op_parts: &OpTextParts,
@@ -1424,6 +1414,21 @@ fn run_egglog_with_report_parts_impl(
     }
     let full_report = stage_report(&egraph, full_start.elapsed());
     trace_stage_report("---- Egglog Rule Matches ----", &full_report);
+    if log && egglog_debug() {
+        let report = egraph.get_overall_run_report();
+        eprintln!("---- Egglog Overall Run Report ----\n{report}");
+        // Keep complete rule names and precise timings for cross-bucket analysis.
+        eprintln!(
+            "EGGLOG_RUN_REPORT_JSON {}",
+            serde_json::json!({
+                "search_and_apply_time_per_rule": report.search_and_apply_time_per_rule,
+                "num_matches_per_rule": report.num_matches_per_rule,
+                "search_and_apply_time_per_ruleset": report.search_and_apply_time_per_ruleset,
+                "merge_time_per_ruleset": report.merge_time_per_ruleset,
+                "rebuild_time_per_ruleset": report.rebuild_time_per_ruleset,
+            })
+        );
+    }
 
     let run_report = EgglogRunReport {
         full: full_report,
@@ -1953,6 +1958,7 @@ pub struct LlirExtractor<'a> {
     egraph: &'a SerializedEGraph,
     ops: &'a [Arc<Box<dyn EgglogOp>>],
     op_by_name: FxHashMap<String, usize>,
+    constructor_fields: FxHashMap<String, Vec<(String, String)>>,
     list_cache: FxHashMap<&'a NodeId, Vec<Expression>>,
     expr_cache: FxHashMap<&'a NodeId, Expression>,
     indexed_classes: Vec<IndexedEClass<'a>>,
@@ -1961,12 +1967,26 @@ pub struct LlirExtractor<'a> {
     class_to_index: FxHashMap<&'a ClassId, DenseIndex>,
     root_index: DenseIndex,
     indexed_extractions: Vec<Vec<(DenseIndex, Vec<CachedIndexedExtraction>)>>,
-    mutation_nodes: Vec<Option<Vec<DenseIndex>>>,
+    mutation_nodes: Vec<Option<MutationChoices>>,
+    cover_next_proposal: bool,
+    covered_alternatives: [Vec<(DenseIndex, CoverageTarget)>; 3],
+    cover_queue: usize,
     visit_epoch: u32,
     visited: Vec<u32>,
     reachable: Vec<DenseNode>,
     reachability_stack: Vec<DenseNode>,
     graph_nodes: Vec<(u32, usize)>,
+}
+
+enum CoverageTarget {
+    Constructor(usize),
+    Argument(usize),
+    FamilyArgument(DenseIndex, usize),
+}
+
+struct MutationChoices {
+    nodes: Vec<DenseIndex>,
+    families: Vec<Vec<DenseIndex>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1989,6 +2009,16 @@ impl<'a> LlirExtractor<'a> {
             .iter()
             .enumerate()
             .map(|(index, op)| (op.sort().name, index))
+            .collect();
+        let constructor_fields = ops
+            .iter()
+            .map(|op| {
+                let sort = op.sort();
+                (
+                    sort.name,
+                    sort.fields.into_iter().map(|f| (f.name, f.sort)).collect(),
+                )
+            })
             .collect();
 
         let mut classes = egraph.eclasses.keys().collect::<Vec<_>>();
@@ -2035,6 +2065,7 @@ impl<'a> LlirExtractor<'a> {
             egraph,
             ops,
             op_by_name,
+            constructor_fields,
             list_cache: FxHashMap::default(),
             expr_cache: FxHashMap::default(),
             indexed_classes,
@@ -2044,6 +2075,9 @@ impl<'a> LlirExtractor<'a> {
             root_index,
             indexed_extractions,
             mutation_nodes,
+            cover_next_proposal: true,
+            covered_alternatives: [Vec::new(), Vec::new(), Vec::new()],
+            cover_queue: 0,
             visit_epoch: 0,
             visited: vec![0; indexed_class_count],
             reachable: Vec::new(),
@@ -2174,9 +2208,14 @@ impl<'a> LlirExtractor<'a> {
             } else {
                 all()
             };
-            self.mutation_nodes[class as usize] = Some(pool);
+            let nodes = class_info.nodes;
+            let families = proposal_families(self.egraph, &pool, |slot| &nodes[slot as usize]);
+            self.mutation_nodes[class as usize] = Some(MutationChoices {
+                nodes: pool,
+                families,
+            });
         }
-        self.mutation_nodes[class as usize].as_deref().unwrap()
+        &self.mutation_nodes[class as usize].as_ref().unwrap().nodes
     }
 
     pub fn index_choice_set(&self, choices: &EGraphChoiceSet<'a>) -> IndexedChoiceSet {
@@ -2237,6 +2276,21 @@ impl<'a> LlirExtractor<'a> {
         self.index_choice_set(&choices)
     }
 
+    /// Complete dormant genes introduced after a saved incumbent was created.
+    /// Existing bindings remain exact; callers verify the extracted incumbent.
+    pub(crate) fn index_seed_choices(&mut self, choices: &[(String, String)]) -> IndexedChoiceSet {
+        let mut genome = self.index_named_choices(choices);
+        for index in 0..self.indexed_classes.len() {
+            if self.indexed_classes[index].searchable && genome.choices[index] == NO_DENSE_INDEX {
+                let slot = self.mutation_pool(index as DenseIndex)[0];
+                let class = &self.indexed_classes[index];
+                genome.choices[index] = slot;
+                genome.hash ^= hash_choice_entry(class.id, &class.nodes[slot as usize]);
+            }
+        }
+        genome
+    }
+
     pub fn random_indexed_generation(
         &self,
         generation_size: usize,
@@ -2256,14 +2310,7 @@ impl<'a> LlirExtractor<'a> {
         generation
     }
 
-    pub fn extract_reachable_indexed_generation(
-        &mut self,
-        base: &IndexedChoiceSet,
-        generation_size: usize,
-        mutations_per_generation: usize,
-        prev_selected: &mut FxHashSet<u64>,
-        rng: &mut (impl Rng + ?Sized),
-    ) -> Vec<IndexedChoiceSet> {
+    fn reachable_mutation_classes(&mut self, choices: &IndexedChoiceSet) -> Vec<DenseIndex> {
         let mut seen_nodes = FxHashSet::default();
         let mut seen_classes = FxHashSet::default();
         let mut mutable_classes = Vec::new();
@@ -2273,7 +2320,7 @@ impl<'a> LlirExtractor<'a> {
             seen_classes.insert(root);
             mutable_classes.push(root);
         }
-        let mut stack = vec![self.indexed_selected(base, root)];
+        let mut stack = vec![self.indexed_selected(choices, root)];
         while let Some(node) = stack.pop() {
             if !seen_nodes.insert(node) {
                 continue;
@@ -2287,9 +2334,320 @@ impl<'a> LlirExtractor<'a> {
                 if class.nodes.len() > 1 && seen_classes.insert(child_class) {
                     mutable_classes.push(child_class);
                 }
-                stack.push(self.indexed_selected(base, child_class));
+                stack.push(self.indexed_selected(choices, child_class));
             }
         }
+
+        mutable_classes
+    }
+
+    // For each argument value, keep existing alternatives requiring the fewest
+    // companion changes. Independent knobs still move alone; coupled legal
+    // configurations remain reachable without inventing invalid combinations.
+    fn argument_pools(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        class: DenseIndex,
+    ) -> std::collections::BTreeMap<usize, Vec<DenseIndex>> {
+        let pool = self.mutation_pool(class).to_vec();
+        let nodes = self.indexed_classes[class as usize].nodes;
+        let current = &nodes[choices.choices[class as usize] as usize];
+        let mut nearest = std::collections::BTreeMap::<_, (usize, Vec<_>)>::new();
+        for slot in pool {
+            let Some(changes) =
+                changed_constructor_arguments(self.egraph, current, &nodes[slot as usize])
+            else {
+                continue;
+            };
+            let distance = changes.len();
+            for target in changes {
+                let (best, candidates) = nearest.entry(target).or_insert((distance, Vec::new()));
+                if distance < *best {
+                    *best = distance;
+                    candidates.clear();
+                }
+                if distance == *best {
+                    candidates.push(slot);
+                }
+            }
+        }
+        let mut arguments = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for ((argument, _), (_, candidates)) in nearest {
+            arguments.entry(argument).or_default().extend(candidates);
+        }
+        arguments
+    }
+
+    fn next_covered_choice(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        active_classes: &[DenseIndex],
+        rng: &mut (impl Rng + ?Sized),
+    ) -> Option<(DenseIndex, DenseIndex)> {
+        // Share coverage among implementation transitions, incumbent arguments,
+        // and the tuning neighborhoods of newly proposed implementations. A
+        // losing initial configuration must not suppress its whole family.
+        let requested = self.cover_queue;
+        self.cover_queue = (self.cover_queue + 1) % 3;
+        for queue in (0..3).map(|offset| (requested + offset) % 3) {
+            for refill in 0..=1 {
+                while let Some((class, target)) = self.covered_alternatives[queue].pop() {
+                    if !active_classes.contains(&class) {
+                        continue;
+                    }
+                    let pool = match target {
+                        CoverageTarget::Constructor(family) => {
+                            let nodes = self.indexed_classes[class as usize].nodes;
+                            let family = &self.mutation_nodes[class as usize]
+                                .as_ref()
+                                .unwrap()
+                                .families[family];
+                            if family.contains(&choices.choices[class as usize]) {
+                                continue;
+                            }
+                            nearest_constructor_alternatives(
+                                self.egraph,
+                                &self.constructor_fields,
+                                &nodes[choices.choices[class as usize] as usize],
+                                family,
+                                |slot| &nodes[slot as usize],
+                            )
+                        }
+                        CoverageTarget::FamilyArgument(anchor, argument) => {
+                            let mut anchored = choices.clone();
+                            self.set_indexed_choice(&mut anchored, class, anchor);
+                            let Some(pool) =
+                                self.argument_pools(&anchored, class).remove(&argument)
+                            else {
+                                continue;
+                            };
+                            pool
+                        }
+                        CoverageTarget::Argument(argument) => {
+                            // A changed parent may need different companion
+                            // changes. Only existing legal alternatives enter.
+                            let Some(pool) = self.argument_pools(choices, class).remove(&argument)
+                            else {
+                                continue;
+                            };
+                            pool
+                        }
+                    };
+                    let selected = pool[rng.random_range(0..pool.len())];
+                    if matches!(target, CoverageTarget::Constructor(_)) {
+                        let mut anchored = choices.clone();
+                        self.set_indexed_choice(&mut anchored, class, selected);
+                        let mut arguments: Vec<_> =
+                            self.argument_pools(&anchored, class).into_keys().collect();
+                        arguments.shuffle(rng);
+                        for argument in arguments {
+                            self.covered_alternatives[2].insert(
+                                0,
+                                (class, CoverageTarget::FamilyArgument(selected, argument)),
+                            );
+                        }
+                    }
+                    return Some((class, selected));
+                }
+                if refill == 1 || queue == 2 {
+                    break;
+                }
+                let mut pending = Vec::new();
+                let mut classes = active_classes.to_vec();
+                classes.sort_unstable();
+                for class in classes.into_iter().rev() {
+                    if queue == 1 {
+                        for argument in self.argument_pools(choices, class).into_keys().rev() {
+                            pending.push((class, CoverageTarget::Argument(argument)));
+                        }
+                    } else {
+                        self.mutation_pool(class);
+                        let families = &self.mutation_nodes[class as usize]
+                            .as_ref()
+                            .unwrap()
+                            .families;
+                        for (index, family) in families.iter().enumerate().rev() {
+                            if !family.contains(&choices.choices[class as usize]) {
+                                pending.push((class, CoverageTarget::Constructor(index)));
+                            }
+                        }
+                    }
+                }
+                pending.shuffle(rng);
+                // Visit distinct implementation transitions / argument positions
+                // before repeated sites. Neither backend names nor class IDs
+                // determine priority, and every queued site remains reachable.
+                let mut visits = FxHashMap::default();
+                pending.sort_by_cached_key(|&(class, ref target)| {
+                    let nodes = self.indexed_classes[class as usize].nodes;
+                    let source = proposal_family_key(
+                        self.egraph,
+                        &nodes[choices.choices[class as usize] as usize],
+                    );
+                    let (destination, argument) = match *target {
+                        CoverageTarget::Constructor(family) => {
+                            let slot = self.mutation_nodes[class as usize]
+                                .as_ref()
+                                .unwrap()
+                                .families[family][0];
+                            (
+                                proposal_family_key(self.egraph, &nodes[slot as usize]),
+                                None,
+                            )
+                        }
+                        CoverageTarget::Argument(argument) => (Vec::new(), Some(argument)),
+                        CoverageTarget::FamilyArgument(..) => {
+                            unreachable!("local neighborhoods are queued at proposal time")
+                        }
+                    };
+                    let visit = visits
+                        .entry((source, destination, argument))
+                        .or_insert(0usize);
+                    let round = *visit;
+                    *visit += 1;
+                    round
+                });
+                pending.reverse();
+                self.covered_alternatives[queue] = pending;
+            }
+        }
+        None
+    }
+
+    fn mutate_choice(
+        &mut self,
+        child: &mut IndexedChoiceSet,
+        class: DenseIndex,
+        selected: Option<DenseIndex>,
+        rng: &mut (impl Rng + ?Sized),
+    ) -> bool {
+        let new_node = selected.unwrap_or_else(|| {
+            self.mutation_pool(class);
+            let families = &self.mutation_nodes[class as usize]
+                .as_ref()
+                .unwrap()
+                .families;
+            let family = &families[rng.random_range(0..families.len())];
+            family[rng.random_range(0..family.len())]
+        });
+        self.set_indexed_choice(child, class, new_node)
+    }
+
+    fn set_indexed_choice(
+        &self,
+        child: &mut IndexedChoiceSet,
+        class: DenseIndex,
+        new_node: DenseIndex,
+    ) -> bool {
+        let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
+        let class_info = &self.indexed_classes[class as usize];
+        child.hash ^= hash_choice_entry(class_info.id, &class_info.nodes[old_node as usize]);
+        child.hash ^= hash_choice_entry(class_info.id, &class_info.nodes[new_node as usize]);
+        old_node != new_node
+    }
+
+    /// Active implementation families that differ from the incumbent. Family
+    /// identities include input dependencies and dtypes, not tuning values.
+    pub(crate) fn alternate_families(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        incumbent: &IndexedChoiceSet,
+    ) -> Vec<(u32, usize)> {
+        let incumbent_active = self.reachable_mutation_classes(incumbent);
+        let active = self.reachable_mutation_classes(choices);
+        let mut result = Vec::new();
+        for class in active {
+            if !incumbent_active.contains(&class) {
+                continue;
+            }
+            self.mutation_pool(class);
+            let families = &self.mutation_nodes[class as usize]
+                .as_ref()
+                .unwrap()
+                .families;
+            for (family, slots) in families.iter().enumerate() {
+                if slots.contains(&choices.choices[class as usize])
+                    && !slots.contains(&incumbent.choices[class as usize])
+                {
+                    result.push((class, family));
+                }
+            }
+        }
+        result
+    }
+
+    /// Existing nearest legal neighbors, preserving the candidate's other
+    /// choices. A family can climb through improving configurations even while
+    /// every intermediate configuration remains slower than another family.
+    pub(crate) fn argument_neighbors(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        class: u32,
+        seen: &mut FxHashSet<u64>,
+    ) -> Vec<IndexedChoiceSet> {
+        let mut slots: Vec<_> = self
+            .argument_pools(choices, class)
+            .into_values()
+            .flatten()
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+            .into_iter()
+            .filter_map(|slot| {
+                let mut child = choices.clone();
+                self.set_indexed_choice(&mut child, class, slot);
+                seen.insert(child.hash).then_some(child)
+            })
+            .collect()
+    }
+
+    /// Offer each differing active choice from a donor independently. Newly
+    /// exposed dependencies inherit its choices too, while already-active
+    /// shared choices stay with the receiver. These are ordinary e-graph
+    /// genomes: extraction, validation and measured fitness still decide.
+    pub fn recombine_reachable_choices(
+        &mut self,
+        receiver: &IndexedChoiceSet,
+        donor: &IndexedChoiceSet,
+        prev_selected: &mut FxHashSet<u64>,
+    ) -> Vec<IndexedChoiceSet> {
+        let active = self.reachable_mutation_classes(receiver);
+        let mut offspring = Vec::new();
+        for &class in &active {
+            let choice = donor.choices[class as usize];
+            if receiver.choices[class as usize] == choice {
+                continue;
+            }
+            let mut child = receiver.clone();
+            // No random initialization: preserve the donor's tested branch.
+            self.set_indexed_choice(&mut child, class, choice);
+            let mut initialized: FxHashSet<_> = active.iter().copied().collect();
+            loop {
+                let reachable = self.reachable_mutation_classes(&child);
+                let Some(new_class) = reachable.into_iter().find(|c| !initialized.contains(c))
+                else {
+                    break;
+                };
+                initialized.insert(new_class);
+                self.set_indexed_choice(&mut child, new_class, donor.choices[new_class as usize]);
+            }
+            if prev_selected.insert(child.hash) {
+                offspring.push(child);
+            }
+        }
+        offspring
+    }
+
+    pub fn extract_reachable_indexed_generation(
+        &mut self,
+        base: &IndexedChoiceSet,
+        generation_size: usize,
+        mutations_per_generation: usize,
+        prev_selected: &mut FxHashSet<u64>,
+        rng: &mut (impl Rng + ?Sized),
+    ) -> Vec<IndexedChoiceSet> {
+        let mutable_classes = self.reachable_mutation_classes(base);
 
         if mutable_classes.is_empty() {
             if prev_selected.insert(base.hash) {
@@ -2304,19 +2662,45 @@ impl<'a> LlirExtractor<'a> {
         while offspring.len() < generation_size && attempts < max_attempts {
             attempts += 1;
             let mut child = base.clone();
+            let cover_proposal = self.cover_next_proposal;
+            self.cover_next_proposal = !self.cover_next_proposal;
+            let mut active_classes = mutable_classes.clone();
             let mutation_count = rng.random_range(1..=mutations_per_generation.max(1));
+            // Measure direct alternatives independently; the random half keeps
+            // the caller's full joint-mutation budget for escaping local minima.
+            let mutation_count = if cover_proposal { 1 } else { mutation_count };
             for _ in 0..mutation_count {
-                let class = mutable_classes[rng.random_range(0..mutable_classes.len())];
-                let new_node = {
-                    let pool = self.mutation_pool(class);
-                    pool[rng.random_range(0..pool.len())]
-                };
-                let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
-                let class_info = &self.indexed_classes[class as usize];
-                child.hash ^=
-                    hash_choice_entry(class_info.id, &class_info.nodes[old_node as usize]);
-                child.hash ^=
-                    hash_choice_entry(class_info.id, &class_info.nodes[new_node as usize]);
+                // Cover alternate constructors between unrestricted random
+                // proposals, which continue exploring every tuning/joint choice.
+                let alternative = cover_proposal
+                    .then(|| self.next_covered_choice(&child, &active_classes, rng))
+                    .flatten();
+                let class = alternative
+                    .map(|(class, _)| class)
+                    .unwrap_or_else(|| active_classes[rng.random_range(0..active_classes.len())]);
+                if self.mutate_choice(&mut child, class, alternative.map(|(_, node)| node), rng) {
+                    // A structural choice can expose dormant genes left at an
+                    // unrelated implementation by an earlier genome. Initialize
+                    // the newly active subgraph in this same proposal, so a
+                    // wrapper change need not survive as a slower intermediate
+                    // parent before its underlying implementation can change.
+                    let mut initialized: FxHashSet<_> = active_classes.iter().copied().collect();
+                    loop {
+                        active_classes = self.reachable_mutation_classes(&child);
+                        let Some(new_class) = active_classes
+                            .iter()
+                            .find(|c| !initialized.contains(c))
+                            .copied()
+                        else {
+                            break;
+                        };
+                        initialized.insert(new_class);
+                        self.mutate_choice(&mut child, new_class, None, rng);
+                    }
+                    if active_classes.is_empty() {
+                        break;
+                    }
+                }
             }
             if prev_selected.insert(child.hash) {
                 offspring.push(child);
@@ -2982,6 +3366,176 @@ fn non_marker_enode_indices(egraph: &SerializedEGraph, enodes: &[NodeId]) -> Vec
         .collect()
 }
 
+// Compare existing terms, without inventing parameter combinations. For the
+// generic Op wrapper, require identical inputs and an unambiguous OpKind so a
+// tuning-preserving proposal cannot silently change its data dependencies.
+type ConstructorTerm = (String, Vec<ClassId>);
+
+fn comparable_constructor_terms<'a>(
+    egraph: &'a SerializedEGraph,
+    before: &NodeId,
+    after: &NodeId,
+) -> Option<(&'a ConstructorTerm, &'a ConstructorTerm)> {
+    let (mut left, mut right) = (&egraph.enodes[before], &egraph.enodes[after]);
+    if left.0 == "Op" && right.0 == "Op" {
+        if left.1.get(1..) != right.1.get(1..) {
+            return None;
+        }
+        let (left_sort, left_kinds) = &egraph.eclasses[left.1.first()?];
+        let (right_sort, right_kinds) = &egraph.eclasses[right.1.first()?];
+        if left_sort != "OpKind"
+            || right_sort != "OpKind"
+            || left_kinds.len() != 1
+            || right_kinds.len() != 1
+        {
+            return None;
+        }
+        left = &egraph.enodes[&left_kinds[0]];
+        right = &egraph.enodes[&right_kinds[0]];
+    }
+    Some((left, right))
+}
+
+// Across constructors, align only uniquely named fields with the same declared
+// sort. This is a proposal heuristic over existing equivalent enodes, not a
+// proof that two fields have identical semantics. Positions alone are meaningful
+// only within a constructor. Unmatched fields and random proposals remain free.
+fn nearest_constructor_alternatives<'a, T: Copy>(
+    egraph: &'a SerializedEGraph,
+    fields: &FxHashMap<String, Vec<(String, String)>>,
+    current: &NodeId,
+    pool: &[T],
+    node: impl Fn(T) -> &'a NodeId,
+) -> Vec<T> {
+    let mut nearest = Vec::new();
+    let mut best = usize::MAX;
+    for &candidate in pool {
+        let distance = comparable_constructor_terms(egraph, current, node(candidate))
+            .map(|(left, right)| {
+                if left.0 == right.0 {
+                    return left.1.len().abs_diff(right.1.len())
+                        + left.1.iter().zip(&right.1).filter(|(a, b)| a != b).count();
+                }
+                let Some(lf) = fields.get(&left.0).filter(|f| f.len() == left.1.len()) else {
+                    return usize::MAX;
+                };
+                let Some(rf) = fields.get(&right.0).filter(|f| f.len() == right.1.len()) else {
+                    return usize::MAX;
+                };
+                let mut compared = 0;
+                let mut changed = 0;
+                for (i, field) in lf.iter().enumerate() {
+                    if lf.iter().filter(|f| *f == field).count() != 1 {
+                        continue;
+                    }
+                    let mut matches = rf.iter().enumerate().filter(|(_, f)| *f == field);
+                    if let Some((j, _)) = matches.next()
+                        && matches.next().is_none()
+                    {
+                        compared += 1;
+                        changed += usize::from(left.1[i] != right.1[j]);
+                    }
+                }
+                if compared == 0 { usize::MAX } else { changed }
+            })
+            .unwrap_or(usize::MAX);
+        if distance < best {
+            best = distance;
+            nearest.clear();
+        }
+        if distance == best {
+            nearest.push(candidate);
+        }
+    }
+    nearest
+}
+
+fn changed_constructor_arguments(
+    egraph: &SerializedEGraph,
+    before: &NodeId,
+    after: &NodeId,
+) -> Option<Vec<(usize, ClassId)>> {
+    let (left, right) = comparable_constructor_terms(egraph, before, after)?;
+    if left.0 != right.0 || left.1.len() != right.1.len() {
+        return None;
+    }
+    Some(
+        left.1
+            .iter()
+            .zip(&right.1)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(index, (_, value))| (index, value.clone()))
+            .collect(),
+    )
+}
+
+/// Group legal proposals by constructor before sampling tuning variants. The
+/// generic IR `Op` wrapper carries its constructor in the OpKind child; no
+/// backend names, tensor dimensions, or preferred implementations enter the
+/// proposal policy. Pool filtering and measured fitness remain unchanged.
+fn proposal_families<'a, T: Copy>(
+    egraph: &'a SerializedEGraph,
+    pool: &[T],
+    node: impl Fn(T) -> &'a NodeId,
+) -> Vec<Vec<T>> {
+    let mut indices = FxHashMap::default();
+    let mut families: Vec<Vec<T>> = Vec::new();
+    for &choice in pool {
+        let selected = node(choice);
+        let (head, children) = &egraph.enodes[selected];
+        // Changing an Op's input dependencies is an implementation change,
+        // even when its backend constructor is unchanged (e.g. cast absorption).
+        // Keep tuning variants with identical inputs together. Across sites,
+        // transition ordering uses constructor/dtype values, not unique class IDs.
+        let inputs = if head == "Op" { &children[1..] } else { &[] };
+        let key = (proposal_family_key(egraph, selected), inputs);
+        let index = *indices.entry(key).or_insert_with(|| {
+            families.push(Vec::new());
+            families.len() - 1
+        });
+        families[index].push(choice);
+    }
+    families
+}
+
+fn proposal_family_key<'a>(egraph: &'a SerializedEGraph, node: &NodeId) -> Vec<&'a str> {
+    let (head, children) = &egraph.enodes[node];
+    let mut key = vec![head.as_str()];
+    if head == "Op"
+        && let Some((kind_sort, kinds)) = children.first().and_then(|c| egraph.eclasses.get(c))
+        && kind_sort == "OpKind"
+    {
+        let mut constructors: Vec<_> = kinds
+            .iter()
+            .map(|kind| proposal_family_key(egraph, kind))
+            .collect();
+        constructors.sort_unstable();
+        constructors.dedup();
+        key.extend(constructors.into_iter().flatten());
+    } else {
+        // Storage and accumulation dtypes distinguish implementations, even
+        // when constructor names coincide. Use dtype values, never site IDs,
+        // so repeated sites share a transition while numeric tuning variants
+        // remain together. Empty separators preserve argument positions.
+        for child in children {
+            key.push("");
+            if let Some((sort, variants)) = egraph.eclasses.get(child)
+                && sort == "DType"
+            {
+                let mut dtypes: Vec<_> = variants
+                    .iter()
+                    .map(|variant| egraph.enodes[variant].0.as_str())
+                    .collect();
+                dtypes.sort_unstable();
+                dtypes.dedup();
+                key.extend(dtypes);
+            }
+        }
+    }
+    key
+}
+
 pub fn random_initial_choice<'a>(
     egraph: &'a SerializedEGraph,
     rng: &mut (impl Rng + ?Sized),
@@ -3034,15 +3588,18 @@ pub fn random_initial_choice<'a>(
         };
         let consistent_opkind_indices = restrict(consistent_opkind_indices);
         let synth_indices = restrict(synth_indices);
-        let pick_idx = if !consistent_opkind_indices.is_empty() {
-            consistent_opkind_indices[rng.random_range(0..consistent_opkind_indices.len())]
+        let pool = if !consistent_opkind_indices.is_empty() {
+            consistent_opkind_indices
         } else if !synth_indices.is_empty() {
-            synth_indices[rng.random_range(0..synth_indices.len())]
+            synth_indices
         } else if !marker_free.is_empty() {
-            marker_free[rng.random_range(0..marker_free.len())]
+            marker_free
         } else {
-            rng.random_range(0..enodes.len())
+            (0..enodes.len()).collect()
         };
+        let families = proposal_families(egraph, &pool, |index| &enodes[index]);
+        let family = &families[rng.random_range(0..families.len())];
+        let pick_idx = family[rng.random_range(0..family.len())];
         choices.insert(eclass, &enodes[pick_idx]);
     }
     repair_choice_cycles(egraph, &mut choices, rng);
@@ -3641,6 +4198,9 @@ fn egglog_to_llir_from_root_cached<'a>(
 }
 
 #[cfg(test)]
+pub(crate) mod proposal_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         EGraphChoiceSet, LateEgglogPass, LlirExtractor, OpTextParts, SerializedEGraph,
@@ -3871,6 +4431,38 @@ mod tests {
                 "seed {seed} retained a reachable cycle"
             );
         }
+    }
+
+    #[test]
+    fn late_fusion_markers_reach_a_fixed_point() {
+        let ops = <HLIROps as IntoEgglogOp>::into_vec();
+        let egraph = super::run_egglog_with_late_passes_interval_analysis_and_log(
+            "(let t0 (Input 0 \"\" (F32))) (let t1 (Output t0 0 false))",
+            "t1",
+            &ops,
+            false,
+            &[],
+            r#"
+            (relation test_late_marker (i64 IR))
+            (rule ((= ?x (Input ?id ?name ?dtype)))
+                  ((test_late_marker 0 ?x)) :ruleset kernel_fuse_late)
+            (rule ((test_late_marker ?step ?x) (< ?step 7))
+                  ((test_late_marker (+ ?step 1) ?x)) :ruleset kernel_fuse_late)
+            (rule ((test_late_marker 7 ?x) (= ?out (Output ?x ?id ?persist)))
+                  ((union ?out ?x)) :ruleset kernel_fuse_late)
+            "#,
+            false,
+            false,
+        )
+        .unwrap();
+        let root = &egraph.roots[0];
+        assert!(
+            egraph.eclasses[root]
+                .1
+                .iter()
+                .any(|node| egraph.enodes[node].0 == "Input"),
+            "the consumer must see markers deeper than the old three-run limit"
+        );
     }
 
     #[test]

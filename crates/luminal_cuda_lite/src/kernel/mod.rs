@@ -22,6 +22,7 @@ pub mod quant_f8;
 pub mod rms_norm;
 pub mod rope;
 pub mod swiglu;
+pub mod thin_matmul;
 pub mod topk;
 
 pub use conv2d::KernelConv2D;
@@ -38,7 +39,9 @@ pub type Ops = (
     hlir::Ops,
     argmax::KernelArgmax,
     gemv::KernelGemv,
+    thin_matmul::KernelThinMatmul<false>,
     rms_norm::KernelRMSNorm,
+    rms_norm::RMSNormKernel,
     rope::RoPEHalfKernel,
     rope::RoPEScatterKernel,
     rope::KernelRoPE,

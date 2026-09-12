@@ -9,6 +9,7 @@ use luminal::{op::EgglogOp, prelude::*};
 pub(crate) mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
+pub mod workspace;
 
 /// Generic host operations shared unchanged by Lite and CUDA supersets.
 /// Hardware- or model-specialized attention operations belong to the
@@ -16,6 +17,8 @@ pub mod moe;
 pub type BaseOps = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
+    cublaslt::CuBlasLtTuned<false>,
+    cublaslt::CuBlasLtTuned<true>,
     moe::GLUMoE,
     flashinfer::FlashInferAttention,
 );
@@ -109,6 +112,7 @@ pub struct DeviceBuffer {
     capacity: usize,
     host_ptr: u64,
     host_len: usize,
+    input_format: Option<&'static str>,
 }
 
 impl DeviceBuffer {
@@ -119,6 +123,7 @@ impl DeviceBuffer {
             capacity: len,
             host_ptr: 0,
             host_len: 0,
+            input_format: None,
         }
     }
 
@@ -129,6 +134,16 @@ impl DeviceBuffer {
         self.host_ptr = bytes.as_ptr() as u64;
         self.host_len = bytes.len();
         self
+    }
+
+    pub(crate) fn with_input_format(mut self, format: &'static str) -> Self {
+        self.input_format = Some(format);
+        self
+    }
+
+    /// Explicit physical ABI attached to a prepared, read-only input.
+    pub fn input_format(self) -> Option<&'static str> {
+        self.input_format
     }
 
     pub fn ptr(self) -> u64 {
@@ -181,7 +196,43 @@ impl DeviceBuffer {
 /// Host operations that execute on the CPU but orchestrate GPU work.
 ///
 /// This includes operations like cuBLAS calls and CUDA graph executions.
+/// Backend-owned snapshot for an opaque operation's semantic state. RNG state
+/// can use this hook when it cannot be represented as ordinary graph inputs.
+pub trait ProfileState {
+    fn restore(&self, stream: &Arc<CudaStream>) -> anyhow::Result<()>;
+}
+impl ProfileState for () {
+    fn restore(&self, _: &Arc<CudaStream>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Allocation owners pinned by one captured graph generation. Implementations
+/// allocate on the supplied execution stream (not a temporary capture stream)
+/// and return every owner whose raw address is recorded in the graph.
+pub type CudaGraphCaptureResources = Vec<Arc<dyn std::any::Any + Send + Sync>>;
+
 pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
+    /// Snapshot semantic state hidden outside graph buffers before representative
+    /// profiling. The snapshot restores identical state before each trial and
+    /// after candidate evaluation, including failure. The default declares all
+    /// semantic state explicit in graph tensors; caches/scratch overwritten by
+    /// execution need no snapshot. Stateful custom ops must implement this hook
+    /// or return an error when replay is unsupported.
+    fn capture_profile_state(
+        &self,
+        _stream: &Arc<CudaStream>,
+    ) -> anyhow::Result<Box<dyn ProfileState>> {
+        Ok(Box::new(()))
+    }
+
+    /// Graph inputs this operation may modify, indexed in data-input order.
+    /// The default declares inputs read-only. Custom mutating HostOps must list
+    /// their writes so representative replay can protect shared read-only inputs.
+    fn profile_mutated_inputs(&self) -> Vec<usize> {
+        vec![]
+    }
+
     /// Execute the operation with access to buffers via a map.
     ///
     /// # Arguments
@@ -288,6 +339,22 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         _dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         anyhow::bail!("HostOp did not implement CUDA graph capture preparation")
+    }
+
+    /// Prepare a child capture and transfer ownership of its scratch to that
+    /// graph generation. Resident variants retain independent owners, including
+    /// old allocations after growth. The default preserves existing HostOps.
+    fn prepare_cuda_graph_capture_resources(
+        &self,
+        capture_stream: &Arc<CudaStream>,
+        _execution_stream: &Arc<CudaStream>,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dyn_map: &DynMap,
+    ) -> anyhow::Result<CudaGraphCaptureResources> {
+        self.prepare_cuda_graph_capture(capture_stream, self_node, inputs, buffers, dyn_map)?;
+        Ok(vec![])
     }
 
     /// Refresh execution-specific metadata immediately before launching a

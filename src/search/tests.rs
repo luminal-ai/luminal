@@ -1387,3 +1387,143 @@ fn reported_candidate_must_be_outstanding() {
     assert_eq!(search.measured(), 1);
     assert_eq!(search.best(), Some(&1));
 }
+
+#[test]
+fn seeded_search_remeasures_and_can_replace_or_reject_the_incumbent() {
+    let mut graph = Graph::new();
+    let _ = graph.tensor(8).sin().sin().sin().output();
+    graph.build_search_space::<ExplicitLoopRuntime>(CompileOptions::default());
+    let space = graph.search_space().unwrap();
+    let contexts = space.bucket_contexts(&graph.dyn_map);
+    let ctx = &contexts[0];
+    let options = CompileOptions::default()
+        .search_graph_limit(16)
+        .generation_size(4)
+        .mutations(2)
+        .search_log(false);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_2026);
+    let mut extractor = super::LlirExtractor::new(ctx.egraph(), &space.ops);
+    let genome = extractor.random_indexed_choice(&mut rng);
+    let llir = super::unroll_packed_llir(extractor.extract_indexed_packed(&genome, &[]));
+    let expected = format!("{llir:?}");
+    let schedule = crate::graph::SelectedSchedule::from_search(
+        space,
+        &[super::SelectedProgram {
+            bucket_indices: ctx.bucket_indices().clone(),
+            representative_dyn_map: ctx.representative_dyn_map.clone(),
+            genome,
+            llir,
+        }],
+    )
+    .unwrap();
+    for reject in [false, true] {
+        let options = options
+            .clone()
+            .seed_schedule(std::sync::Arc::new(schedule.clone()));
+        let mut search =
+            super::GeneticSearch::<usize>::new(space, ctx, &options, std::time::Instant::now());
+        assert_eq!(search.best(), None, "prior fitness must not be reused");
+        assert_eq!(search.measured(), 0);
+        let candidate = search.next_candidate(&mut rng).unwrap();
+        assert_eq!(format!("{:?}", candidate.llir), expected);
+        search.report(
+            candidate,
+            if reject {
+                Outcome::Rejected("current resource contract rejects the old program".into())
+            } else {
+                Outcome::Measured(1_000, "new workload makes the incumbent slow".into())
+            },
+        );
+        assert_eq!(search.measured(), usize::from(!reject));
+        let mut alternatives = 0;
+        while let Some(candidate) = search.next_candidate(&mut rng) {
+            assert_ne!(format!("{:?}", candidate.llir), expected, "program dedup");
+            alternatives += 1;
+            search.report(candidate, Outcome::Measured(1, "faster replacement".into()));
+        }
+        assert!(alternatives > 0);
+        assert_eq!(search.measured(), alternatives + usize::from(!reject));
+        assert!(search.measured() <= 16);
+        let ranked = search.into_ranked();
+        assert_eq!(ranked[0].0, 1);
+        assert_eq!(
+            ranked.iter().filter(|(cost, _)| *cost == 1_000).count(),
+            usize::from(!reject)
+        );
+    }
+
+    let mut different_graph = Graph::new();
+    let _ = different_graph.tensor(9).sin().output();
+    different_graph.build_search_space::<ExplicitLoopRuntime>(CompileOptions::default());
+    let different_space = different_graph.search_space().unwrap();
+    let contexts = different_space.bucket_contexts(&different_graph.dyn_map);
+    let mut search = super::GeneticSearch::<usize>::new(
+        different_space,
+        &contexts[0],
+        &options,
+        std::time::Instant::now(),
+    );
+    assert!(
+        !search.seed_schedule(&schedule),
+        "different graph must not inherit indexed choices"
+    );
+    assert!(search.next_candidate(&mut rng).is_some());
+}
+
+#[test]
+fn recombination_proposals_do_not_extend_the_measured_candidate_budget() {
+    let mut graph = Graph::new();
+    // Distinct shapes keep these choices independent of loop-body sharing.
+    for n in 8..14 {
+        graph.tensor(n).sin().output();
+    }
+    let options = CompileOptions::default()
+        .search_graph_limit(5)
+        .generation_size(4)
+        .mutations(3)
+        .search_log(false);
+    graph.build_search_space::<ExplicitLoopRuntime>(options.clone());
+    let space = graph.search_space().unwrap();
+    let contexts = space.bucket_contexts(&graph.dyn_map);
+    for seed in 0..16 {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut search = super::GeneticSearch::<usize>::new(
+            space,
+            &contexts[0],
+            &options,
+            std::time::Instant::now(),
+        );
+        while let Some(candidate) = search.next_candidate(&mut rng) {
+            // Every report triggers incumbent recombination, including reports
+            // made with otherwise-full or almost-exhausted generation queues.
+            let cost = 100usize.saturating_sub(search.measured());
+            search.report(candidate, Outcome::Measured(cost, "improvement".into()));
+        }
+        assert_eq!(search.measured(), 5, "seed {seed}");
+    }
+}
+
+#[test]
+fn bucket_candidate_budgets_override_only_the_requested_bucket() {
+    let mut graph = Graph::new();
+    let _ = graph.tensor('s').sin().sin().sin().output();
+    let options = CompileOptions::default()
+        .dim_buckets('s', &[DimBucket::new(1, 1), DimBucket::new(2, 2)])
+        .search_graph_limit(2)
+        .bucket_search_graph_limit(1, 1)
+        .search_log(false);
+    graph.build_search_space::<ExplicitLoopRuntime>(options.clone());
+    let space = graph.search_space().unwrap();
+    let contexts = space.bucket_contexts(&graph.dyn_map);
+    assert_eq!(contexts.len(), 2);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xB0D6E7);
+    for (ctx, expected) in contexts.iter().zip([2, 1]) {
+        let mut search =
+            super::GeneticSearch::<usize>::new(space, ctx, &options, std::time::Instant::now());
+        while let Some(candidate) = search.next_candidate(&mut rng) {
+            search.report(candidate, Outcome::Measured(1, "measured".into()));
+        }
+        assert_eq!(search.measured(), expected);
+        assert!(!search.into_ranked().is_empty());
+    }
+}
