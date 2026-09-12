@@ -53,7 +53,7 @@
     (BufferTensorCons lookup_output_buffer_tensor
       (BufferTensorNil))))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; Iota authoring contract: every constructed iota demands its expression's
 ; bounds — an absent entry fails the check loudly at the fixpoint.

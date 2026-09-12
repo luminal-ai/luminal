@@ -19,6 +19,7 @@
     (union ?layout_tensor_op
       (LayoutTensorOpMulFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
+  :ruleset backend
 )
 
 (rule
@@ -44,6 +45,7 @@
     (union ?layout_tensor_op
       (LayoutTensorOpMulFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
+  :ruleset backend
 )
 
 (rule
@@ -69,4 +71,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpMulFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
+  :ruleset backend
 )

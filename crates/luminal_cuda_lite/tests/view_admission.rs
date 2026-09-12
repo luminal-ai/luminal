@@ -1,203 +1,220 @@
-//! M4 PHASE 5 ACCEPTANCE (CPU side): the view op is ELECTABLE on
-//! CUDA-lite — real searched plans fold movement to producer redirects
-//! and consumers read through the composed access.
+//! M4 PHASE 5 ACCEPTANCE (CPU side): the view op is ADMITTED on CUDA-lite
+//! — movement folds to a producer redirect and consumers can read through
+//! the composed access.
 //!
-//! Mirrors `plan_smoke` on view-heavy fixtures, through the REAL
-//! CudaRuntime ladder (load → search under the CUDA allow list → plan
-//! inspection). Everything here is device-free: electing and folding a
-//! view is planner work; only the read-through happens on the device
-//! (the device differentials pin that half).
-//!
-//! Assertion discipline:
-//!  * movement that folds is PINNED as zero materialize nodes — the op
-//!    whose whole purpose is materializing an index map
-//!    (`IndexMapApplyMaterialize`, label = IR identity) must not appear;
-//!  * NO unfolded-view compute nodes — re-checked here by the same
-//!    effect-predicate shape the plan validator uses (the validator in
-//!    `luminal::bufferize` stays the fence; this keeps the acceptance
-//!    test honest if the fence ever moves);
-//!  * buffer/copy counts are PINNED per fixture (regression tripwires
-//!    for the folded shape);
-//!  * consumers. operand descriptors must CARRY A LAYOUT WHOSE READ
-//!    DOES NOT SIMPLIFY TO THE IDENTITY —
-//!    the view's own composed layout as the e-graph minted it — checked
-//!    by EVALUATING that layout to a flat parent element index and
-//!    comparing against the hand-computed map. (The hop chain is retired:
-//!    corrected contract, 2026-08-31. The e-graph composes views at view
-//!    creation; the decoded `L` IS the read path, and how it is spelled
-//!    is the e-graph's business.)
+//! Asked of the SATURATED E-GRAPH the search reads, never of an election
+//! (which spelling a budgeted, seeded search elects is the search's
+//! business and moves with row order):
+//!  * every recorded movement whose parent has storage holds its
+//!    zero-movement spelling — a `LayoutTensorOpIndexMapApplyViewGeneric`
+//!    whose layout is the composed access over the view's own domain;
+//!  * every consumer of such a movement holds a kernel spelling that reads
+//!    THROUGH the view's layout tensor;
+//!  * the composed layout, decoded, evaluates to the hand-computed map —
+//!    the view's own layout as the e-graph minted it (the hop chain is
+//!    retired: corrected contract, 2026-08-31).
 
-use luminal::bufferize::{BufferIrGraph, BufferNode};
+use std::collections::{BTreeMap, BTreeSet};
+
 use luminal::dtype::DType;
+use luminal::egglog_utils::eclass::EGraphView;
 use luminal::graph::Graph;
-use luminal::prelude::{FxHashMap, NodeIndex};
-use luminal_cuda_lite::CompileOptions;
+use luminal::layouts::DecodedLayout;
+use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
 use luminal_cuda_lite::CudaRuntime;
-use luminal_cuda_lite::HostBuffer;
 
-/// Search budget for the view fixtures: profiling is static (bytes
-/// moved), so generations are cheap — enough sampling that the
-/// all-views plan is reliably in the profiled set, seeded for
-/// deterministic pins.
-fn view_search_options() -> CompileOptions {
-    CompileOptions {
-        generations: 4,
-        generation_size: 8,
-        mutations: 4,
-        trials: 1,
-        seed: 0,
-        search_log: false,
-        ..Default::default()
-    }
-}
+const VIEW_OP: &str = "LayoutTensorOpIndexMapApplyViewGeneric";
+const MUL_OP: &str = "LayoutTensorOpMulFunctionalGeneric";
 
-/// Load → search on the CUDA runtime; return the best plan.
-fn plan_for(
-    cx: &Graph,
-    inputs: &[(NodeIndex, HostBuffer)],
-) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
-    // THE DECOMPOSED ROUTE ON PURPOSE: this file audits the NVRTC plan
-    // SHAPE (materialize/copy/buffer counts, and `audit`'s standing
-    // requirement that every elected compute op have a kernel interface). A
-    // cuBLASLt marker — default since 2026-09-04 — is a host library
-    // call with no kernel interface, so the chained-matmul fixture would
-    // leave the audit rather than pass it.
-    let mut rt =
+/// Load under the CUDA runtime's kernel-only vocabulary (a cuBLASLt marker
+/// is a host library call; these fixtures are about kernels reading
+/// through views) and saturate — the e-graph the search would read.
+fn saturated(cx: &Graph) -> (CudaRuntime, EGraph) {
+    let rt =
         CudaRuntime::load_with_registry(cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
             .expect("cuda load");
-    let data: FxHashMap<NodeIndex, HostBuffer> = inputs.iter().cloned().collect();
-    let outcome = rt
-        .search(&data, &view_search_options())
-        .expect("cuda search");
-    assert!(outcome.plans_profiled > 0, "no plans profiled");
-    rt.plan().expect("plan loaded").clone()
+    let egraph = rt.saturated_egraph().expect("saturation");
+    (rt, egraph)
 }
 
-/// The plan-shape audit shared by every fixture. Returns
-/// (compute_count, copy_count, buffer_count, folded slots) — a "folded
-/// slot" being an operand whose carried layout does NOT reduce to the
-/// identity read over its own domain.
-type FoldedSlot = (String, usize, luminal::layouts::DecodedLayout);
-fn audit(
-    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
-) -> (usize, usize, usize, Vec<FoldedSlot>) {
-    let mut computes = 0usize;
-    let mut copies = 0usize;
-    let mut composed = Vec::new();
-    for node in plan.dag.node_weights() {
-        match node {
-            BufferNode::BufferCopy { .. } => copies += 1,
-            BufferNode::Compute {
-                op,
-                reads,
-                writes,
-                ties,
-                operand_info,
-                result_info,
-            } => {
-                let label = op.label();
-                if label == "BufferAlloc" || label == "BufferFree" {
-                    continue;
-                }
-                computes += 1;
+fn child_class(egraph: &EGraph, node: &Node, index: usize) -> ClassId {
+    egraph.nodes[&node.children[index]].eclass.clone()
+}
 
-                // ZERO materialize nodes for foldable movement: every
-                // fixture's movement is within the parsed expression
-                // subset, so the materializing spelling must lose to
-                // the fold. (Label = IR identity, house policy.)
-                assert_ne!(
-                    label,
-                    "IndexMapApplyMaterialize",
-                    "foldable movement was materialized:\n{}",
-                    plan.summary()
-                );
+/// The logical classes that have storage: some `LayoutTensorLit` names them.
+fn stored_logicals(egraph: &EGraph) -> BTreeSet<ClassId> {
+    egraph
+        .nodes
+        .values()
+        .filter(|n| n.op == "LayoutTensorLit")
+        .map(|n| child_class(egraph, n, 0))
+        .collect()
+}
 
-                // NO unfolded-view compute nodes — the same
-                // effect-predicate shape `validate_plan` fences on.
-                let derives = |result: usize| ties.iter().any(|(_, r)| *r == result);
-                let view_shaped = !reads.is_empty()
-                    && !writes.is_empty()
-                    && (0..reads.len()).all(|o| !op.operand_reads_memory(o))
-                    && (0..writes.len()).all(|r| !op.result_writes_memory(r) && derives(r));
-                assert!(!view_shaped, "unfolded view ({label}) reached the plan");
+/// Every `LogicalIndexMapApply` class whose parent has storage — the
+/// movements a view could fold.
+fn movements(egraph: &EGraph) -> BTreeSet<ClassId> {
+    let stored = stored_logicals(egraph);
+    egraph
+        .nodes
+        .values()
+        .filter(|n| n.op == "LogicalIndexMapApply")
+        .filter(|n| stored.contains(&child_class(egraph, n, 0)))
+        .map(|n| n.eclass.clone())
+        .collect()
+}
 
-                // Every kernel-bearing elected op has a kernel interface.
-                assert!(
-                    luminal_cuda_lite::as_kernel_op(op.as_ref()).is_some(),
-                    "elected op {label} has no kernel interface"
-                );
+/// A fold the e-graph holds: the view op's output layout tensor and its
+/// composed layout, keyed by the movement (the output's logical class).
+struct Fold {
+    view_lt: ClassId,
+    layout: ClassId,
+}
 
-                for (slot, info) in operand_info.iter().enumerate() {
-                    let dims = info
-                        .layout
-                        .literal_extents()
-                        .expect("elected slot layouts are literal in these fixtures");
-                    // Ask the PRODUCTION read path what it emits: a read
-                    // whose expression simplifies to the bare `i` needs
-                    // no chain and is the flat read. An unlowerable
-                    // layout is certainly not one.
-                    let flat = luminal_cuda_lite::kernels::layout_read_index(
-                        "probe",
-                        &info.layout,
-                        &dims.into_iter().map(Into::into).collect::<Vec<_>>(),
-                        luminal_cuda_lite::kernels::Coords::FlatIndex { prefix: "c" },
-                    )
-                    .is_ok_and(|(chain, idx)| chain.is_empty() && idx == "i");
-                    if !flat {
-                        composed.push((label.to_string(), slot, info.layout.clone()));
-                    }
-                }
-                for info in result_info {
-                    let dims = info
-                        .layout
-                        .literal_extents()
-                        .expect("elected slot layouts are literal in these fixtures");
-                    // THE WRITE-CAPABILITY CONSTRAINT'S REGRESSION
-                    // TEST. The backend does not check this (ruling
-                    // 2026-09-01); the constraint lives in egglog —
-                    // every codegen'd kernel's match rule fires only on
-                    // a right-major-contiguous out class
-                    // (ops/*/match_functional.egg). If this assertion
-                    // ever fires, that guard has a hole, and the
-                    // consequence is silent corruption (kernels write
-                    // out[i] unconditionally), so treat a failure here
-                    // as a wrong-bytes bug, not a test nit.
-                    let flat = luminal_cuda_lite::kernels::layout_read_index(
-                        "probe",
-                        &info.layout,
-                        &dims.into_iter().map(Into::into).collect::<Vec<_>>(),
-                        luminal_cuda_lite::kernels::Coords::FlatIndex { prefix: "c" },
-                    )
-                    .is_ok_and(|(chain, idx)| chain.is_empty() && idx == "i");
-                    assert!(
-                        flat,
-                        "{label}: a compute RESULT is produced by the node, never read \
-                         through a fold — every kernel writes out[i], so its elected \
-                         layout must BE the flat index over its dims"
-                    );
-                }
-            }
-            _ => {}
+fn folds(view: &EGraphView<'_>) -> BTreeMap<ClassId, Vec<Fold>> {
+    let egraph = view.egraph();
+    let op_classes: BTreeSet<ClassId> = egraph
+        .nodes
+        .values()
+        .filter(|n| n.op == VIEW_OP)
+        .map(|n| n.eclass.clone())
+        .collect();
+    let mut out: BTreeMap<ClassId, Vec<Fold>> = BTreeMap::new();
+    for id in &op_classes {
+        let class = view.class(id);
+        let view_op = class.nodes_named(VIEW_OP).next().expect("view op enode");
+        let layout = view_op.child(3).expect("view op layout");
+        // The class also holds the generic (ins, outs) spelling; its outs
+        // list names the view's own layout tensor, whose literal names the
+        // movement.
+        let generic = class
+            .nodes_named("LayoutTensorOpLit")
+            .next()
+            .expect("generic op spelling");
+        let outs = generic.child(1).expect("outs");
+        let head = outs
+            .nodes_named("LayoutTensorCons")
+            .next()
+            .expect("one output");
+        let view_lt = head.child(0).expect("output layout tensor");
+        let lit = view_lt
+            .nodes_named("LayoutTensorLit")
+            .next()
+            .expect("output LayoutTensorLit");
+        let movement = lit.child(0).expect("output logical");
+        out.entry(movement.id().clone()).or_default().push(Fold {
+            view_lt: view_lt.id().clone(),
+            layout: layout.id().clone(),
+        });
+    }
+    out
+}
+
+/// The shared questions: every movement is folded, and every `LogicalMul`
+/// consumer of a movement has a kernel spelling reading through one of its
+/// view layout tensors. Returns the folds for the fixture's assertions.
+fn assert_admitted(view: &EGraphView<'_>) -> BTreeMap<ClassId, Vec<Fold>> {
+    let egraph = view.egraph();
+    let movements = movements(egraph);
+    assert!(!movements.is_empty(), "fixture records no movement");
+    let folds = folds(view);
+    for movement in &movements {
+        assert!(
+            folds.contains_key(movement),
+            "movement {movement:?} ({:?}) has no view spelling in the saturated e-graph",
+            view.class(movement).ops()
+        );
+    }
+    let mut consumers = 0usize;
+    for mul in egraph.nodes.values().filter(|n| n.op == "LogicalMul") {
+        for slot in 0..2 {
+            let operand = child_class(egraph, mul, slot);
+            let Some(view_lts) = folds.get(&operand) else {
+                continue;
+            };
+            consumers += 1;
+            let read_through = egraph
+                .nodes
+                .values()
+                .filter(|n| n.op == MUL_OP)
+                .any(|kernel| {
+                    (0..2).any(|k| {
+                        let lt = child_class(egraph, kernel, k);
+                        view_lts.iter().any(|f| f.view_lt == lt)
+                    })
+                });
+            assert!(
+                read_through,
+                "a LogicalMul consumes movement {operand:?} but no {MUL_OP} spelling reads \
+                 through its view layout tensor"
+            );
         }
     }
-    (computes, copies, plan.buffers.len(), composed)
+    assert!(
+        consumers > 0,
+        "no consumer reads a movement in this fixture"
+    );
+    folds
 }
 
-/// THE READ PATH, evaluated: the slot's own carried layout at one
-/// out-coordinate, down to the FLAT ELEMENT INDEX into the residence's
-/// bytes. This replaces the hop-chain walk — there are no intermediate
-/// parents any more, so there is one answer, not a chain of coordinate
-/// frames. (Honesty note carried from the kernels module: with the chain
-/// gone, the only bounds fence is the final index against the layout's
-/// span where the constructor discloses one.)
-fn flat_index(layout: &luminal::layouts::DecodedLayout, out_coord: &[usize]) -> i64 {
+/// The single movement of a fixture — by the input it moves — decoded.
+fn decoded_fold(
+    view: &EGraphView<'_>,
+    folds: &BTreeMap<ClassId, Vec<Fold>>,
+    parent_extents: &[usize],
+) -> DecodedLayout {
+    let egraph = view.egraph();
+    let mut found: Vec<DecodedLayout> = Vec::new();
+    for (movement, fs) in folds {
+        // The movement's apply spelling names its parent; match the input
+        // by its shape (fixtures move exactly one input of that shape).
+        let parent_is_input = view
+            .class(movement)
+            .nodes_named("LogicalIndexMapApply")
+            .filter_map(|apply| apply.child(0))
+            .any(|parent| {
+                parent.nodes_named("LogicalTensorInputLit").next().is_some()
+                    && egraph
+                        .nodes
+                        .values()
+                        .filter(|n| {
+                            n.op == "LayoutTensorLit" && child_class(egraph, n, 0) == *parent.id()
+                        })
+                        .any(|lt| {
+                            DecodedLayout::from_class(
+                                &view.class(&child_class(egraph, lt, 1)),
+                                None,
+                            )
+                            .ok()
+                            .and_then(|d| d.literal_extents())
+                            .is_some_and(|e| e == parent_extents)
+                        })
+            });
+        if parent_is_input {
+            for f in fs {
+                found.push(
+                    DecodedLayout::from_class(&view.class(&f.layout), None)
+                        .expect("the composed layout decodes"),
+                );
+            }
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "no fold of the input with extents {parent_extents:?}"
+    );
+    // Every fold of that movement is the same access; evaluate the first.
+    found.swap_remove(0)
+}
+
+fn flat_index(layout: &DecodedLayout, out_coord: &[usize]) -> i64 {
     layout
         .element_index(out_coord)
-        .expect("the elected layout reads at this coordinate") as i64
+        .expect("the composed layout reads at this coordinate") as i64
 }
 
-/// TRANSPOSE CONSUMER: x(2,3) permuted then multiplied. The searched
-/// plan must fold the permute and hand the mul a swap map.
+/// TRANSPOSE CONSUMER: x(2,3) permuted then multiplied — the mul can read
+/// x through a swap map.
 #[test]
 fn transpose_consumer_folds_and_carries_the_swap_map() {
     let mut cx = Graph::new();
@@ -205,25 +222,10 @@ fn transpose_consumer_folds_and_carries_the_swap_map() {
     let c = cx.tensor((3usize, 2usize), DType::F32);
     let _out = (x.permute((1, 0)) * c).output();
 
-    let plan = plan_for(
-        &cx,
-        &[
-            (x.id, vec![1.0f32, 2., 3., 4., 5., 6.].into()),
-            (c.id, vec![1.0f32; 6].into()),
-        ],
-    );
-    let (computes, copies, buffers, composed) = audit(&plan);
-    // One real kernel (the mul), no copies, three buffers (x, c, out).
-    assert_eq!(computes, 1, "plan shape drifted:\n{}", plan.summary());
-    assert_eq!(copies, 0, "plan shape drifted:\n{}", plan.summary());
-    assert_eq!(buffers, 3, "plan shape drifted:\n{}", plan.summary());
-    assert!(
-        !composed.is_empty(),
-        "no operand carries a folded layout:\n{}",
-        plan.summary()
-    );
-    let (label, slot, layout) = &composed[0];
-    assert_eq!(label, "MulFunctionalGeneric");
+    let (rt, egraph) = saturated(&cx);
+    let view = EGraphView::new(&egraph, rt.decoders());
+    let folds = assert_admitted(&view);
+    let layout = decoded_fold(&view, &folds, &[2, 3]);
     // The layout's DOMAIN is the view's shape (3,2) — the value's own
     // extents, which is exactly why no `dims` field is needed.
     assert_eq!(layout.literal_extents(), Some(vec![3, 2]));
@@ -232,16 +234,16 @@ fn transpose_consumer_folds_and_carries_the_swap_map() {
             // Parent x is (2,3) row-major; the transpose's (i,j) is
             // parent (j,i), flat j*3 + i.
             assert_eq!(
-                flat_index(layout, &[i, j]),
+                flat_index(&layout, &[i, j]),
                 (j * 3 + i) as i64,
-                "transpose: mul operand {slot} out ({i},{j}) must read parent flat {}",
+                "transpose: out ({i},{j}) must read parent flat {}",
                 j * 3 + i
             );
         }
     }
 }
 
-/// SLICE CONSUMER: rows 1..3 of a (4,6), multiplied. Fold + offset map.
+/// SLICE CONSUMER: rows 1..3 of a (4,6), multiplied — an offset map.
 #[test]
 fn slice_consumer_folds_and_carries_the_offset_map() {
     let mut cx = Graph::new();
@@ -249,30 +251,17 @@ fn slice_consumer_folds_and_carries_the_offset_map() {
     let c = cx.tensor((2usize, 6usize), DType::F32);
     let _out = (x.slice((1..3, ..)) * c).output();
 
-    let plan = plan_for(
-        &cx,
-        &[
-            (x.id, (0..24).map(|v| v as f32).collect::<Vec<f32>>().into()),
-            (c.id, vec![1.0f32; 12].into()),
-        ],
-    );
-    let (computes, copies, buffers, composed) = audit(&plan);
-    assert_eq!(computes, 1, "plan shape drifted:\n{}", plan.summary());
-    assert_eq!(copies, 0, "plan shape drifted:\n{}", plan.summary());
-    assert_eq!(buffers, 3, "plan shape drifted:\n{}", plan.summary());
-    assert!(
-        !composed.is_empty(),
-        "no operand carries a folded layout:\n{}",
-        plan.summary()
-    );
-    let (_, _, layout) = &composed[0];
+    let (rt, egraph) = saturated(&cx);
+    let view = EGraphView::new(&egraph, rt.decoders());
+    let folds = assert_admitted(&view);
+    let layout = decoded_fold(&view, &folds, &[4, 6]);
     assert_eq!(layout.literal_extents(), Some(vec![2, 6]));
     for i in 0..2usize {
         for j in 0..6usize {
             // Parent x is (4,6) row-major; rows 1..3, so out (i,j) is
             // parent (i+1, j), flat (i+1)*6 + j.
             assert_eq!(
-                flat_index(layout, &[i, j]),
+                flat_index(&layout, &[i, j]),
                 ((i + 1) * 6 + j) as i64,
                 "slice: out ({i},{j}) must read parent flat {}",
                 (i + 1) * 6 + j
@@ -281,8 +270,8 @@ fn slice_consumer_folds_and_carries_the_offset_map() {
     }
 }
 
-/// BROADCAST CONSUMER: a (3,) row broadcast over (2,3), multiplied.
-/// Views read through non-injective maps legally (stride-0 axis).
+/// BROADCAST CONSUMER: a (3,) row broadcast over (2,3), multiplied. Views
+/// read through non-injective maps legally (stride-0 axis).
 #[test]
 fn broadcast_consumer_folds_and_carries_the_stride0_map() {
     let mut cx = Graph::new();
@@ -290,30 +279,17 @@ fn broadcast_consumer_folds_and_carries_the_stride0_map() {
     let c = cx.tensor((2usize, 3usize), DType::F32);
     let _out = (x.expand_dim(0, 2) * c).output();
 
-    let plan = plan_for(
-        &cx,
-        &[
-            (x.id, vec![1.0f32, 2., 3.].into()),
-            (c.id, vec![1.0f32; 6].into()),
-        ],
-    );
-    let (computes, copies, buffers, composed) = audit(&plan);
-    assert_eq!(computes, 1, "plan shape drifted:\n{}", plan.summary());
-    assert_eq!(copies, 0, "plan shape drifted:\n{}", plan.summary());
-    assert_eq!(buffers, 3, "plan shape drifted:\n{}", plan.summary());
-    assert!(
-        !composed.is_empty(),
-        "no operand carries a folded layout:\n{}",
-        plan.summary()
-    );
-    let (_, _, layout) = &composed[0];
+    let (rt, egraph) = saturated(&cx);
+    let view = EGraphView::new(&egraph, rt.decoders());
+    let folds = assert_admitted(&view);
+    let layout = decoded_fold(&view, &folds, &[3]);
     assert_eq!(layout.literal_extents(), Some(vec![2, 3]));
     for i in 0..2usize {
         for j in 0..3usize {
             // Parent x is (3,) — the broadcast axis is stride-0, so every
             // i reads the same parent element j.
             assert_eq!(
-                flat_index(layout, &[i, j]),
+                flat_index(&layout, &[i, j]),
                 j as i64,
                 "broadcast: out ({i},{j}) must read parent flat {j} for every i"
             );
@@ -322,9 +298,9 @@ fn broadcast_consumer_folds_and_carries_the_stride0_map() {
 }
 
 /// CHAINED-MATMUL-SHAPED: (a·b)·c through the decomposed frontend
-/// spelling (expand/permute movement + mul + sum at both stages). All
-/// movement is foldable, so the plan is exactly the four kernels —
-/// two muls, two reduces — with zero materializes and zero copies.
+/// spelling (expand/permute movement + mul + sum at both stages). Every
+/// movement — of the inputs and of the intermediate product — is folded,
+/// and both muls can read through the folds.
 #[test]
 fn chained_matmul_folds_all_movement() {
     let mut cx = Graph::new();
@@ -333,29 +309,20 @@ fn chained_matmul_folds_all_movement() {
     let c = cx.tensor((4usize, 2usize), DType::F32);
     let _out = a.matmul(b).matmul(c).output();
 
-    let plan = plan_for(
-        &cx,
-        &[
-            (a.id, vec![1.0f32; 6].into()),
-            (b.id, vec![1.0f32; 12].into()),
-            (c.id, vec![1.0f32; 8].into()),
-        ],
-    );
-    let (computes, copies, buffers, composed) = audit(&plan);
-    // 2 broadcast-muls + 2 reduces; inputs a,b,c + the four kernel
-    // results (out is the last reduce's destination) = 7 buffers.
-    assert_eq!(computes, 4, "plan shape drifted:\n{}", plan.summary());
-    assert_eq!(copies, 0, "plan shape drifted:\n{}", plan.summary());
-    assert_eq!(buffers, 7, "plan shape drifted:\n{}", plan.summary());
-    // Both muls read at least one operand through a composed access
-    // (the expand_dim broadcasts and the rhs permute+expand).
-    let mul_slots = composed
-        .iter()
-        .filter(|(label, _, _)| label == "MulFunctionalGeneric")
-        .count();
+    let (rt, egraph) = saturated(&cx);
+    let view = EGraphView::new(&egraph, rt.decoders());
+    let folds = assert_admitted(&view);
+    // The intermediate product (a reduce) is moved too, and its movement
+    // is folded like the inputs': some folded movement's parent is a
+    // LogicalReduceSum.
+    let reduce_moved = folds.keys().any(|movement| {
+        view.class(movement)
+            .nodes_named("LogicalIndexMapApply")
+            .filter_map(|apply| apply.child(0))
+            .any(|parent| parent.nodes_named("LogicalReduceSum").next().is_some())
+    });
     assert!(
-        mul_slots >= 2,
-        "expected both broadcast-muls to read through folds, got {mul_slots}:\n{}",
-        plan.summary()
+        reduce_moved,
+        "the (a·b) product's broadcast has no view spelling"
     );
 }

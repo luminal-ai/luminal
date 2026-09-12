@@ -29,4 +29,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpScatterFunctionalGeneric ?init_layout_tensor ?src_layout_tensor ?coordinate_layout_tensors ?out_layout))
   )
+  :ruleset backend
 )

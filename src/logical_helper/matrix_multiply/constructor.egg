@@ -1,0 +1,5 @@
+; The matrix product of two rank-2 logical tensors: out[m,n] = sum_k a[m,k]
+; b[k,n]. A helper spelling of the canonical chain (the two broadcasts, the
+; elementwise multiply, the reduction over k), unioned into the chain's
+; class, so backend rules match one term instead of the chain.
+(constructor LogicalHelperMatrixMultiply (LogicalTensor LogicalTensor) LogicalTensor)

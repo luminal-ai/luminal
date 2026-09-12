@@ -1,0 +1,12 @@
+; BroadcastAxis, parent rank 1, new axis at from-end position 1: recognize
+; the apply whose out dims are the parent's dims with one extent inserted
+; and whose entries read every parent axis from its own coordinate.
+(rule
+  (
+    (= ?v (LogicalIndexMapApply ?p ?map ?oshape))
+    (= ?map (IndexMapLit (IntExprCons (CoordVar ?oshape 0) (IntExprNil)) ?tag))
+    (= ?tag    (ShapeLit (IntExprCons ?d0 (IntExprNil))))
+    (= ?oshape (ShapeLit (IntExprCons ?e (IntExprCons ?d0 (IntExprNil)))))
+  )
+  ((union ?v (LogicalHelperBroadcastAxis ?p 1 ?e)))
+)

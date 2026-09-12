@@ -30,7 +30,7 @@
     (LogicalTensorCons ids_a
       (LogicalTensorCons iota_b (LogicalTensorNil)))))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; Iota authoring contract: every constructed iota demands its expression's
 ; bounds — an absent entry fails the check loudly at the fixpoint.

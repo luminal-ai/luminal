@@ -1292,7 +1292,7 @@ mod harness_tests {
     (LogicalTensorCons row_iota (LogicalTensorCons col_iota (LogicalTensorNil)))))
 (let data_layout (RightMajorContiguousElementLayoutLit data_shape (bits-of (F32))))
 (let data_layout_tensor (LayoutTensorLit data_logical data_layout))
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 "#;
         let full = format!("{}\n\n{}", luminal_reference::assembled_program(), body);
         luminal::egglog_snippet::new_egraph()
@@ -1402,7 +1402,7 @@ mod harness_tests {
   (LogicalScatter cache
     (LogicalTensorCons position (LogicalTensorCons column (LogicalTensorNil)))
     src))
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 "#;
         let program = format!(
             "{preamble}
@@ -1558,7 +1558,7 @@ mod harness_tests {
 (set (buffer-freed-by out_buffer) (CallerFrees))
 (let output
   (BufferOutputLit (BufferTensorCons (BufferTensorLit out_lt out_buffer) (BufferTensorNil))))
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 "#;
         let program = format!("{preamble}\n\n{script}");
         let mut egraph = luminal::egglog_snippet::new_egraph();
@@ -1584,7 +1584,7 @@ mod harness_tests {
 (let mystery_var (IntVar "mystery_var"))
 (let unsafe_shape (ShapeLit (IntExprCons (IntLit 4) (IntExprNil))))
 (let unbounded_iota (LogicalIota mystery_var unsafe_shape))
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 (check (= ?demanded_lower (lower-bound-of mystery_var)))
 (check (= ?demanded_upper (upper-bound-of mystery_var)))
 "#;
@@ -2080,7 +2080,7 @@ mod intcoordvar_probe {
   (IndexMapLit (IntExprCons (CoordVar out_shape 0) (IntExprNil)) vec_shape) out_shape))
 (let v_layout (RightMajorContiguousElementLayoutLit vec_shape (bits-of (F32))))
 (let v_lt (LayoutTensorLit v_in v_layout))
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 "#,
         );
         let mut egraph = crate::egglog_snippet::new_egraph();
@@ -2243,7 +2243,7 @@ mod stage4b_probes {
             for round in 1..=150 {
                 let start = std::time::Instant::now();
                 let round_out = egraph
-                    .parse_and_run_program(None, "(run-schedule (run) (run prop))")
+                    .parse_and_run_program(None, "(run-schedule (run) (run backend) (run prop))")
                     .expect("round runs");
                 // Name the firing rules once the mint turns geometric.
                 for chunk in &round_out {
@@ -2603,7 +2603,7 @@ mod stage4b_probes {
 (let plt (LayoutTensorLit plog p))
 (let osh (ShapeLit (IntExprCons (IntLit 5) (IntExprCons (IntLit 4) (IntExprNil)))))
 (let v (LogicalIndexMapApply plog (IndexMapLit (IntExprCons (CoordVar osh 1) (IntExprCons (CoordVar osh 0) (IntExprNil))) psh) osh))
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 "#;
         let full = format!("{}\n\n{body}", luminal_reference::assembled_program());
         let err = luminal::egglog_snippet::new_egraph()
@@ -2695,7 +2695,7 @@ mod subst_guard_study {
 (let sg_map (IndexMapLit (IntExprCons sg_entry (IntExprNil)) sg_src))\n\
 (let sg_coord (CoordVar sg_src 0))\n\
 (int-subst-demand sg_coord sg_map)\n\
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)))\n";
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)))\n";
         let sg4_common = "\
 (let s4n (IntVar \"s4n\"))\n\
 (set (lower-bound-of s4n) (bigint 1))\n\
@@ -2705,7 +2705,7 @@ mod subst_guard_study {
 (let s4_map (IndexMapLit (IntExprCons s4_entry (IntExprNil)) s4_src))\n\
 (let s4_coord (CoordVar s4_src 0))\n\
 (int-subst-demand s4_coord s4_map)\n\
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)))\n";
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)))\n";
         vec![
             (
                 "sg1_admits",
@@ -2714,7 +2714,7 @@ mod subst_guard_study {
             (
                 "sg1_tighten",
                 format!(
-                    "{sg1_common}(set (upper-bound-of sgn) (bigint 1))\n(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)))\n"
+                    "{sg1_common}(set (upper-bound-of sgn) (bigint 1))\n(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)))\n"
                 ),
             ),
             (
@@ -2727,7 +2727,7 @@ mod subst_guard_study {
 (let s2_map (IndexMapLit (IntExprCons s2_entry (IntExprNil)) s2_src))\n\
 (let s2_coord (CoordVar s2_src 0))\n\
 (int-subst-demand s2_coord s2_map)\n\
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)))\n\
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)))\n\
 (check (= (int-subst-of s2_coord s2_map) s2_entry))\n"
                     .to_string(),
             ),
@@ -2743,7 +2743,7 @@ mod subst_guard_study {
 (let s3_map (IndexMapLit (IntExprCons s3_entry (IntExprNil)) s3_src))\n\
 (let s3_coord (CoordVar s3_src 0))\n\
 (int-subst-demand s3_coord s3_map)\n\
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)))\n\
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)))\n\
 (check (= (int-subst-of s3_coord s3_map) s3_entry))\n"
                     .to_string(),
             ),
@@ -2757,7 +2757,7 @@ mod subst_guard_study {
             (
                 "sg4_tighten",
                 format!(
-                    "{s4}(set (upper-bound-of s4n) (bigint 1))\n(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)))\n",
+                    "{s4}(set (upper-bound-of s4n) (bigint 1))\n(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)))\n",
                     s4 = sg4_common
                 ),
             ),

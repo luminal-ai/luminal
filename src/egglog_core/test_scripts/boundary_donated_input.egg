@@ -42,7 +42,7 @@
 (let output
   (BufferOutputLit (BufferTensorCons y_output_buffer_tensor (BufferTensorNil))))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; The sqrt implementation derives (the plan behavior under test — the free
 ; insertion and its ordering — lives in the golden, not the e-graph).

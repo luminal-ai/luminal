@@ -19,4 +19,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpReduceMaxGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
+  :ruleset backend
 )

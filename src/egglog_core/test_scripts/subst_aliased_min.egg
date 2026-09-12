@@ -18,7 +18,7 @@
 (int-subst-demand probe_off probe_row0_map)
 (int-subst-demand probe_off probe_row1_map)
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; expected images: row0 -> probe_v (0*3 + v folds), row1 -> 3 + v
 (check (= (int-subst-of probe_off probe_row0_map) probe_v))

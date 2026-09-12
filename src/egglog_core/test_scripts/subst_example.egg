@@ -191,7 +191,7 @@
   (IntCastFromBool (BoolLessThanInt (CoordVar p9_source_shape 0) (IntLit 2))))
 (int-subst-demand p9_parent p9_map)
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; P1: swap lands both variables at once: 3*v0 + v1.

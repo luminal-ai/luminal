@@ -12,7 +12,7 @@ use luminal::dtype::DType;
 use luminal::layout_ir::ExtractedNode;
 use test_runtime::cublaslt_marker::CublasLt;
 
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 const PIN: &[&str] = &[
     "LayoutTensorOpCublasLtAccumulateBias",

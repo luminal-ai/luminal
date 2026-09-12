@@ -31,4 +31,5 @@
     (union ?op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b ?desc_d
       (CublasLtEpilogueDefault)))
   )
+  :ruleset backend
 )

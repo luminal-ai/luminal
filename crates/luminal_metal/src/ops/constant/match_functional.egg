@@ -13,4 +13,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpConstantGeneric ?constant_value ?out_layout))
   )
+  :ruleset backend
 )

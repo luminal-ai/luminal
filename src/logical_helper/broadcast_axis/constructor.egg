@@ -1,0 +1,5 @@
+; A logical tensor with one NEW axis of the given extent inserted at the
+; given from-end position of the output; identity on every existing axis.
+; Rank grows by one. A helper spelling of one LogicalIndexMapApply pattern,
+; unioned into the same class, so rules can match and mint it by name.
+(constructor LogicalHelperBroadcastAxis (LogicalTensor i64 IntExpr) LogicalTensor)

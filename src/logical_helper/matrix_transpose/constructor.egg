@@ -1,0 +1,4 @@
+; The rank-2 transpose of a logical tensor: the view whose two axes trade
+; places. A helper spelling of one LogicalIndexMapApply pattern, unioned
+; into the same class, so rules can match and mint the pattern by name.
+(constructor LogicalHelperMatrixTranspose (LogicalTensor) LogicalTensor)

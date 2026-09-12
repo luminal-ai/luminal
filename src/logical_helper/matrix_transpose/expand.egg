@@ -1,0 +1,19 @@
+; Expand: a transpose helper over a [d1, d0] parent is the apply reading it
+; through (c0 c1) into [d0, d1]. The map is tagged with the parent's shape,
+; as the recorder tags it, so both spellings land on one apply row.
+(rule
+  (
+    (= ?h (LogicalHelperMatrixTranspose ?p))
+    (= ?ishape (shape-of ?p))
+    (= ?ishape (ShapeLit (IntExprCons ?d1 (IntExprCons ?d0 (IntExprNil)))))
+  )
+  (
+    (let oshape (ShapeLit (IntExprCons ?d0 (IntExprCons ?d1 (IntExprNil)))))
+    (union ?h (LogicalIndexMapApply ?p
+      (IndexMapLit
+        (IntExprCons (CoordVar oshape 0)
+          (IntExprCons (CoordVar oshape 1) (IntExprNil)))
+        ?ishape)
+      oshape))
+  )
+)

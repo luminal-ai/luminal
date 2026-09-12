@@ -28,32 +28,25 @@
 ; refusal is NOT this rule's job: the descriptor stratum's literal-extent
 ; gate keeps symbolic sites from ever assembling an op.
 ; ============================================================================
-; --- THE canonical form: A[m,k] (map c2 c0), B[k,n] (map c0 c1) ------------
+; --- THE canonical form, named by the core helper -------------------------
+; (LogicalHelperMatrixMultiply ?a ?b) is the whole canonical chain — the two
+; broadcasts, the elementwise multiply, the reduction over k — recognized
+; and expanded in core (src/logical_helper/matrix_multiply). Both operand
+; storages reach it: an operand stored transposed arrives as a
+; LogicalHelperMatrixTranspose of the stored tensor, and the site names
+; the [m,k] and [k,n] operands either way.
+;
+; Site admission is UNGUARDED beyond dtype — logical identity only.
+; Symbolic-extent refusal is NOT this rule's job: the descriptor stratum's
+; literal-extent gate keeps symbolic sites from ever assembling an op.
 (rule
   (
-    (= ?out (LogicalReduceSum ?prod 0))
-    (= ?prod (LogicalMul ?a_bcast ?b_bcast))
-    (= ?a_bcast (LogicalIndexMapApply ?a ?a_map ?prod_shape))
-    (= ?b_bcast (LogicalIndexMapApply ?b ?b_map ?prod_shape))
-    (= ?a_map (IndexMapLit
-        (IntExprCons (CoordVar ?prod_shape 2)
-          (IntExprCons (CoordVar ?prod_shape 0) (IntExprNil)))
-        ?a_shape))
-    (= ?b_map (IndexMapLit
-        (IntExprCons (CoordVar ?prod_shape 0)
-          (IntExprCons (CoordVar ?prod_shape 1) (IntExprNil)))
-        ?b_shape))
-    (= ?prod_shape (ShapeLit
-        (IntExprCons ?m (IntExprCons ?n (IntExprCons ?k (IntExprNil))))))
-    (= (shape-of ?a) ?a_shape)
-    (= ?a_shape (ShapeLit (IntExprCons ?m (IntExprCons ?k (IntExprNil)))))
-    (= (shape-of ?b) ?b_shape)
-    (= ?b_shape (ShapeLit (IntExprCons ?k (IntExprCons ?n (IntExprNil)))))
-    (= (shape-of ?out) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil)))))
+    (= ?out (LogicalHelperMatrixMultiply ?a ?b))
     (= (dtype-of ?a) (F32))
     (= (dtype-of ?b) (F32))
     (= (dtype-of ?out) (F32))
   )
   ((let ?site (CublasLtLogicalMatmulSite ?a ?b ?out)))
+  :ruleset backend
 )
 ; ============================================================================

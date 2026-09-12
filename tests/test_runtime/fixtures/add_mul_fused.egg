@@ -59,7 +59,7 @@
       (BufferTensorCons mul_output_buffer_tensor
         (BufferTensorNil)))))
 
-(run-schedule (saturate (run prop)) (saturate (run) (run prop)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (run) (run prop)) (saturate (run) (run backend) (run prop)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; The input-alias-safe mutating add is offered: x, y, and the add output all
 ; share data_layout (the match precondition) and the written tensor is

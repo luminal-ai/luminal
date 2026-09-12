@@ -2565,7 +2565,10 @@ impl<'a> ClassRenderer<'a> {
 
     fn choose_logical_node(&self, class: &ClassId) -> Option<&NodeId> {
         let node_ids = self.class_nodes.get(class)?;
-        for op in crate::logical_op::built_in_logical_ops() {
+        for op in crate::logical_op::built_in_logical_ops()
+            .iter()
+            .chain(crate::logical_helper::built_in_logical_helpers())
+        {
             if let Some(node_id) = node_ids.iter().find(|node_id| {
                 self.egraph
                     .nodes
@@ -4641,7 +4644,7 @@ mod chain_stride_tests {
 (let v (LogicalIndexMapApply plog (IndexMapLit (IntExprCons (CoordVar osh 2) (IntExprCons (CoordVar osh 0) (IntExprNil))) psh) osh))
 (let dsh (ShapeLit (IntExprCons (IntLit 1) (IntExprCons (IntLit 2) (IntExprNil)))))
 (let d (RightMajorContiguousElementLayoutLit dsh (bits-of (F32))))
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 "#;
         let full = format!("{}\n\n{body}", luminal_reference::assembled_program());
         let mut egraph = luminal::egglog_snippet::new_egraph();

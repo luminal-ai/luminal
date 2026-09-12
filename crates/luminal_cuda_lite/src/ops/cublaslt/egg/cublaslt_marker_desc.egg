@@ -1,117 +1,82 @@
 ; ============================================================================
-; Descriptor READINGS — ROUND 10: UNSWAPPED-ONLY, layout-derived, slim
-; spelling-independent terms.
+; Descriptor READINGS — layout-derived, one per (operand layout tensor,
+; orientation), read off the OPERAND'S OWN strided chain.
 ;
 ; LINEAGE. Round 5 established the guard census (structural premises,
 ; lattice bounds, no numeric destructuring of class spellings — the house
 ; doctrine "never depend on the spelling of a node in the eclass"). Round 9
-; established THE SEPARATION: N vs T is read off the operand's COMPOSED
-; LAYOUT (offset_operand ∘ map, a strided chain over the product shape),
-; tied by (= ?composed (int-subst-of ?bit_expr ?map)) with the map bound
-; OPAQUELY — a composition key, never a source of orientation. Both survive
-; here unchanged. What round 10 changes is WHICH operand each descriptor
-; reads.
-;
-; ROUND 10 (Austin, 2026-08-25): the descriptor roles are UNSWAPPED —
-;   descriptor A reads the site's a  (the logical [m,k] operand),
-;   descriptor B reads the site's b  (the logical [k,n] operand),
-;   descriptor D admits an out whose layout presents out ITSELF in column
-;   order (COL m x n = unit stride on the m axis).
-; The swapped call family (round 9: A read our b, B read our a, D admitted
-; a right-major = transposed out) is DELETED. A recorder-minted right-major
-; out therefore no longer matches D here — by design: the standalone
-; transpose-sandwich rewrite (cublaslt_marker_rewrite.egg) mints the
-; sibling matmul (B^T x A^T) whose out' is the transpose VIEW of out, and
-; THAT site's operands and output present exactly what these arms want.
-; The e-graph joins the general rewrite and the literal matcher.
+; read N vs T off the operand's COMPOSED layout (offset_operand ∘ map, a
+; strided chain over the product shape), tied by int-subst-of with the map
+; bound opaquely, because a site's operand could then be stored either
+; way and only the map said which of its axes was m. Round 10 fixed the
+; roles (A reads the site's a, the logical [m,k] operand; B reads the
+; site's b, the logical [k,n] operand; D admits an out presenting itself
+; in column order). Round 11 made the site rule fire on the canonical form
+; only, with a transposed-storage operand presented as a transpose VIEW —
+; so the site's a IS [m,k] and its b IS [k,n], and the operand's own
+; layout says everything: the map carried nothing the site does not.
 ;
 ; THE READINGS, derived once. All descriptors are COL by convention; COL
-; places (r, c) at byte offset c*ld + r. The composed chain over the
-; product shape [m, n, k] has one entry per product axis (positional,
-; spelling-proof); a unit stride is spelled as the BARE coordinate (the x*1
-; elimination subsumes (IntMul coord 1) into the coordinate — preamble
-; "Arm S-unit", egglog_preamble.egg:4158-4180), so "unit stride on axis i"
-; is the MEMBERSHIP TEST (= ?e_i (CoordVar ?prod_shape i)) — binds nothing,
-; enumerates nothing, cannot harvest a weld.
+; places (r, c) at element offset c*ld + r. An operand's strided chain has
+; one entry per axis, outermost first (positional, spelling-proof); a unit
+; stride is spelled as the BARE coordinate (the x*1 elimination subsumes
+; (IntMul coord 1) into the coordinate — preamble "Arm S-unit"), so "unit
+; stride on axis i" is the MEMBERSHIP TEST (= ?s_i (CoordVar ?shape i)) —
+; binds nothing, enumerates nothing, cannot harvest a weld. The other
+; entry is the ld source.
 ;
-;   descriptor A must present call-m x call-k = m x k:
-;     s_m == 1  =>  (R,C,ld) = (m, k, s_k)            => op N
-;     s_k == 1  =>  (R,C,ld) = (k, m, s_m), transpose => op T
-;   descriptor B must present call-k x call-n = k x n:
-;     s_k == 1  =>  (R,C,ld) = (k, n, s_n)            => op N
-;     s_n == 1  =>  (R,C,ld) = (n, k, s_k), transpose => op T
-;   descriptor D must present m x n (no transD exists):
-;     the out layout's own chain has the unit stride on the m axis
-;     (chain entry for axis 1 of the rank-2 out shape) and ld = the n
-;     axis's stride.
+;   descriptor A reads a[m,k]:
+;     unit stride on m  =>  (R,C,ld) = (m, k, s_k)            => op N
+;     unit stride on k  =>  (R,C,ld) = (k, m, s_m), transpose => op T
+;   descriptor B reads b[k,n]:
+;     unit stride on k  =>  (R,C,ld) = (k, n, s_n)            => op N
+;     unit stride on n  =>  (R,C,ld) = (n, k, s_k), transpose => op T
+;   descriptor D reads out[m,n] presenting itself in column order (no
+;     transD exists): unit stride on m, ld = the n axis's stride.
 ;
-; THE TIE (unchanged from round 9, load-bearing): a logical value carries
-; MANY layout tensors (the preamble mints a fresh right-major one for every
-; value — egglog_preamble.egg:4281-4291). The arms therefore never read
-; "some layout of the broadcast": they REQUIRE the composed expression to
-; be the operand layout's own bit-offset expression substituted through
-; THIS apply's map. Pairing an operation read off a foreign layout with a
-; descriptor pointing at the operand's own buffer is the unsoundness this
-; tie kills.
+; SELF-DESCRIBING, all five: a descriptor CARRIES the layout tensor it
+; read, the extractor computes its ld from that layout's own chain, and
+; assembly claims that same tensor — a reading cannot be paired with
+; foreign bytes because it names its bytes. A logical value carries MANY
+; layout tensors (the preamble mints a fresh right-major one for every
+; value); each with a strided spelling yields its own reading, sound
+; multiplicity that election resolves. A transposed-storage operand's
+; VIEW layout tensor has a strided spelling too (the affine-view walk
+; derives it), and injectivity through the transpose transport
+; (cublaslt_marker_rewrite.egg).
 ;
 ; ADMISSION GATE, uniform: injectivity-of. Proven by the preamble for the
-; contiguous constructors (:4217-4238), asserted by the creator for pitched
-; layouts (the round-8c padding obligation: pitch >= extent for every
-; valuation, unit inner axis, nonnegative pitch — whoever MINTS a padded
-; layout owes these), and transported through transpose views by the
-; round-10 transport rule (cublaslt_marker_rewrite.egg).
+; contiguous constructors, asserted by the creator for pitched layouts
+; (the round-8c padding obligation: pitch >= extent for every valuation,
+; unit inner axis, nonnegative pitch — whoever MINTS a padded layout owes
+; these), and transported through transpose views.
 ;
-; LD NONNEGATIVITY, now uniform across all four operand arms (round 9 had
-; it on the B arms only): the non-unit stride is the ld source and cuBLASLt
-; rejects a negative ld; injectivity does not rule out a reversed-row view,
-; so the entry's lattice lower bound must. e3_negative_pitch still refuses.
-;
-; THE MAP-SPELLING FALLBACK ARM IS DELETED (round 10). Round 9 kept one
-; arm that matched an index-map SPELLING because a pitched operand born as
-; a bare affine CHAIN never climbs to a BitOffsetExpressionLayoutLit
-; spelling (no strided-lists provenance row — egglog_preamble.egg:2981),
-; so it could not be a composition parent and the layout-native arms had
-; nothing to read. The strided-lists authoring probe proved the fix: a
-; creator-AUTHORED strided-lists row gives the pitched layout the full
-; ladder (Strided -> ElementOffset -> BitOffset), so it composes like any
-; contiguous layout and the native arms read it. The pitched fixtures now
-; author their rows (the creator has the (dims, strides) lists in hand at
-; mint time — a sanctioned strided-lists write site); IndexMapLit premises
-; in this file: ZERO. The separation is complete.
+; LD NONNEGATIVITY: the non-unit stride is the ld source and cuBLASLt
+; rejects a negative ld; injectivity does not rule out a reversed-row
+; view, so the entry's lattice lower bound must.
 ;
 ; SYMBOLIC LDS (round-6 Ruling 1, unchanged): m/n/k and every ld may be
 ; symbolic; the spec carries class handles; the executor binds at call
 ; time. Nonemptiness stays on the lattice ((>= (lower-bound-of ?ext)
 ; (bigint 1))).
 ; ============================================================================
-; --- A reading (site's a): the m axis carries the unit stride -> N ---------
+; --- A reading (site's a[m,k]): the m axis carries the unit stride -> N ---
 (rule
   (
     (= ?site (CublasLtLogicalMatmulSite ?a ?b ?out))
-    (= ?out (LogicalReduceSum ?prod 0))
-    (= ?prod (LogicalMul ?a_bcast ?b_bcast))
-    (= ?a_bcast (LogicalIndexMapApply ?a ?a_map ?prod_shape))
-    (= ?prod_shape (ShapeLit
-        (IntExprCons ?m (IntExprCons ?n (IntExprCons ?k (IntExprNil))))))
+    (= ?a_shape (shape-of ?a))
+    (= ?a_shape (ShapeLit (IntExprCons ?m (IntExprCons ?k (IntExprNil)))))
     (= ?a_lt (LayoutTensorLit ?a ?a_layout))
-    (= ?a_layout (BitOffsetExpressionLayoutLit ?a_bit_expr ?a_shape ?a_bits))
+    (= ?a_layout (StridedElementLayoutLit ?a_shape
+        (IntAffineExprCons ?s_m (IntAffineExprCons ?s_k (IntAffineExprNil)))
+        ?a_bits))
     (= ?a_bits (bits-of (F32)))
     (= (injectivity-of ?a_lt) (Injective))
-    (= ?composed (int-subst-of ?a_bit_expr ?a_map))
-    (= ?bcast_layout
-       (BitOffsetExpressionLayoutLit ?composed ?prod_shape ?a_bits))
-    (= ?bcast_layout (StridedElementLayoutLit ?prod_shape
-        (IntAffineExprCons ?e_m
-          (IntAffineExprCons ?e_n
-            (IntAffineExprCons ?e_k (IntAffineExprNil))))
-        ?a_bits))
-    ; a does not depend on the n axis (its A matrix is 2-D).
-    (= ?e_n (IntLit 0))
     ; THE READING: unit stride on m.
-    (= ?e_m (CoordVar ?prod_shape 2))
+    (= ?s_m (CoordVar ?a_shape 1))
     ; the other stride is the ld source: it must be non-negative.
-    (= ?e_k_lower (lower-bound-of ?e_k))
-    (>= ?e_k_lower (bigint 0))
+    (= ?s_k_lower (lower-bound-of ?s_k))
+    (>= ?s_k_lower (bigint 0))
     (= ?m_lower (lower-bound-of ?m))
     (>= ?m_lower (bigint 1))
     (= ?k_lower (lower-bound-of ?k))
@@ -119,33 +84,24 @@
   )
   ((let ?reading (CublasLtOperandADescriptor ?site ?a_lt
      (CublasLtOperationN))))
+  :ruleset backend
 )
-; --- A reading (site's a): the k axis carries the unit stride -> T ---------
+; --- A reading (site's a[m,k]): the k axis carries the unit stride -> T ---
 (rule
   (
     (= ?site (CublasLtLogicalMatmulSite ?a ?b ?out))
-    (= ?out (LogicalReduceSum ?prod 0))
-    (= ?prod (LogicalMul ?a_bcast ?b_bcast))
-    (= ?a_bcast (LogicalIndexMapApply ?a ?a_map ?prod_shape))
-    (= ?prod_shape (ShapeLit
-        (IntExprCons ?m (IntExprCons ?n (IntExprCons ?k (IntExprNil))))))
+    (= ?a_shape (shape-of ?a))
+    (= ?a_shape (ShapeLit (IntExprCons ?m (IntExprCons ?k (IntExprNil)))))
     (= ?a_lt (LayoutTensorLit ?a ?a_layout))
-    (= ?a_layout (BitOffsetExpressionLayoutLit ?a_bit_expr ?a_shape ?a_bits))
+    (= ?a_layout (StridedElementLayoutLit ?a_shape
+        (IntAffineExprCons ?s_m (IntAffineExprCons ?s_k (IntAffineExprNil)))
+        ?a_bits))
     (= ?a_bits (bits-of (F32)))
     (= (injectivity-of ?a_lt) (Injective))
-    (= ?composed (int-subst-of ?a_bit_expr ?a_map))
-    (= ?bcast_layout
-       (BitOffsetExpressionLayoutLit ?composed ?prod_shape ?a_bits))
-    (= ?bcast_layout (StridedElementLayoutLit ?prod_shape
-        (IntAffineExprCons ?e_m
-          (IntAffineExprCons ?e_n
-            (IntAffineExprCons ?e_k (IntAffineExprNil))))
-        ?a_bits))
-    (= ?e_n (IntLit 0))
     ; THE READING: unit stride on k.
-    (= ?e_k (CoordVar ?prod_shape 0))
-    (= ?e_m_lower (lower-bound-of ?e_m))
-    (>= ?e_m_lower (bigint 0))
+    (= ?s_k (CoordVar ?a_shape 0))
+    (= ?s_m_lower (lower-bound-of ?s_m))
+    (>= ?s_m_lower (bigint 0))
     (= ?m_lower (lower-bound-of ?m))
     (>= ?m_lower (bigint 1))
     (= ?k_lower (lower-bound-of ?k))
@@ -153,34 +109,24 @@
   )
   ((let ?reading (CublasLtOperandADescriptor ?site ?a_lt
      (CublasLtOperationT))))
+  :ruleset backend
 )
-; --- B reading (site's b): the k axis carries the unit stride -> N ---------
+; --- B reading (site's b[k,n]): the k axis carries the unit stride -> N ---
 (rule
   (
     (= ?site (CublasLtLogicalMatmulSite ?a ?b ?out))
-    (= ?out (LogicalReduceSum ?prod 0))
-    (= ?prod (LogicalMul ?a_bcast ?b_bcast))
-    (= ?b_bcast (LogicalIndexMapApply ?b ?b_map ?prod_shape))
-    (= ?prod_shape (ShapeLit
-        (IntExprCons ?m (IntExprCons ?n (IntExprCons ?k (IntExprNil))))))
+    (= ?b_shape (shape-of ?b))
+    (= ?b_shape (ShapeLit (IntExprCons ?k (IntExprCons ?n (IntExprNil)))))
     (= ?b_lt (LayoutTensorLit ?b ?b_layout))
-    (= ?b_layout (BitOffsetExpressionLayoutLit ?b_bit_expr ?b_shape ?b_bits))
+    (= ?b_layout (StridedElementLayoutLit ?b_shape
+        (IntAffineExprCons ?s_k (IntAffineExprCons ?s_n (IntAffineExprNil)))
+        ?b_bits))
     (= ?b_bits (bits-of (F32)))
     (= (injectivity-of ?b_lt) (Injective))
-    (= ?composed (int-subst-of ?b_bit_expr ?b_map))
-    (= ?bcast_layout
-       (BitOffsetExpressionLayoutLit ?composed ?prod_shape ?b_bits))
-    (= ?bcast_layout (StridedElementLayoutLit ?prod_shape
-        (IntAffineExprCons ?e_m
-          (IntAffineExprCons ?e_n
-            (IntAffineExprCons ?e_k (IntAffineExprNil))))
-        ?b_bits))
-    ; b does not depend on the m axis (its B matrix is 2-D).
-    (= ?e_m (IntLit 0))
     ; THE READING: unit stride on k.
-    (= ?e_k (CoordVar ?prod_shape 0))
-    (= ?e_n_lower (lower-bound-of ?e_n))
-    (>= ?e_n_lower (bigint 0))
+    (= ?s_k (CoordVar ?b_shape 1))
+    (= ?s_n_lower (lower-bound-of ?s_n))
+    (>= ?s_n_lower (bigint 0))
     (= ?n_lower (lower-bound-of ?n))
     (>= ?n_lower (bigint 1))
     (= ?k_lower (lower-bound-of ?k))
@@ -188,33 +134,24 @@
   )
   ((let ?reading (CublasLtOperandBDescriptor ?site ?b_lt
      (CublasLtOperationN))))
+  :ruleset backend
 )
-; --- B reading (site's b): the n axis carries the unit stride -> T ---------
+; --- B reading (site's b[k,n]): the n axis carries the unit stride -> T ---
 (rule
   (
     (= ?site (CublasLtLogicalMatmulSite ?a ?b ?out))
-    (= ?out (LogicalReduceSum ?prod 0))
-    (= ?prod (LogicalMul ?a_bcast ?b_bcast))
-    (= ?b_bcast (LogicalIndexMapApply ?b ?b_map ?prod_shape))
-    (= ?prod_shape (ShapeLit
-        (IntExprCons ?m (IntExprCons ?n (IntExprCons ?k (IntExprNil))))))
+    (= ?b_shape (shape-of ?b))
+    (= ?b_shape (ShapeLit (IntExprCons ?k (IntExprCons ?n (IntExprNil)))))
     (= ?b_lt (LayoutTensorLit ?b ?b_layout))
-    (= ?b_layout (BitOffsetExpressionLayoutLit ?b_bit_expr ?b_shape ?b_bits))
+    (= ?b_layout (StridedElementLayoutLit ?b_shape
+        (IntAffineExprCons ?s_k (IntAffineExprCons ?s_n (IntAffineExprNil)))
+        ?b_bits))
     (= ?b_bits (bits-of (F32)))
     (= (injectivity-of ?b_lt) (Injective))
-    (= ?composed (int-subst-of ?b_bit_expr ?b_map))
-    (= ?bcast_layout
-       (BitOffsetExpressionLayoutLit ?composed ?prod_shape ?b_bits))
-    (= ?bcast_layout (StridedElementLayoutLit ?prod_shape
-        (IntAffineExprCons ?e_m
-          (IntAffineExprCons ?e_n
-            (IntAffineExprCons ?e_k (IntAffineExprNil))))
-        ?b_bits))
-    (= ?e_m (IntLit 0))
     ; THE READING: unit stride on n.
-    (= ?e_n (CoordVar ?prod_shape 1))
-    (= ?e_k_lower (lower-bound-of ?e_k))
-    (>= ?e_k_lower (bigint 0))
+    (= ?s_n (CoordVar ?b_shape 0))
+    (= ?s_k_lower (lower-bound-of ?s_k))
+    (>= ?s_k_lower (bigint 0))
     (= ?n_lower (lower-bound-of ?n))
     (>= ?n_lower (bigint 1))
     (= ?k_lower (lower-bound-of ?k))
@@ -222,6 +159,7 @@
   )
   ((let ?reading (CublasLtOperandBDescriptor ?site ?b_lt
      (CublasLtOperationT))))
+  :ruleset backend
 )
 ; --- D reading (site's out): the layout presents out in COLUMN order -------
 ; COL m x n over the out's own bytes: the rank-2 chain has its unit stride
@@ -266,5 +204,6 @@
     (>= ?n_lower (bigint 1))
   )
   ((let ?reading (CublasLtOutputDDescriptor ?site ?out_lt)))
+  :ruleset backend
 )
 ; ============================================================================

@@ -1,0 +1,13 @@
+; BroadcastAxis over a transposed parent, position 0: the apply reading a
+; [r, q] parent through (c1 c2) into [q, r, p] is the transpose of the
+; parent with p inserted at from-end position 0. One fused map, named as
+; two helpers; the plain expander then rebuilds it as two hops.
+(rule
+  (
+    (= ?v (LogicalIndexMapApply ?x ?map ?os))
+    (= ?map (IndexMapLit (IntExprCons (CoordVar ?os 1) (IntExprCons (CoordVar ?os 2) (IntExprNil))) ?tag))
+    (= ?tag (ShapeLit (IntExprCons ?r (IntExprCons ?q (IntExprNil)))))
+    (= ?os  (ShapeLit (IntExprCons ?q (IntExprCons ?r (IntExprCons ?p (IntExprNil))))))
+  )
+  ((union ?v (LogicalHelperBroadcastAxis (LogicalHelperMatrixTranspose ?x) 0 ?p)))
+)

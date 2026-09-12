@@ -166,7 +166,7 @@
 ; each as a root (root-only substitution mints no per-subterm rows).
 (int-subst-demand seq_len row0_map)
 (int-subst-demand gap_probe_offset gap_transpose_map)
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; The right-major fold over [4, seq_len] produces SYMBOLIC strides
 ; [seq_len, 1]...
@@ -187,7 +187,7 @@
 ; it here and re-saturate.
 (int-subst-demand storage_offset row0_map)
 (int-subst-demand storage_offset transpose_map)
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)))
 (check
   (= storage_layout
      (ElementOffsetExpressionLayoutLit storage_offset storage_shape (bits-of storage_dtype))))

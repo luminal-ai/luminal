@@ -15,4 +15,6 @@
   ((let ?op (LayoutTensorOpLit
      (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorNil)))
      (LayoutTensorCons ?out_lt (LayoutTensorNil))))
-   (union ?op (LayoutTensorOpMulReduceSumGeneric ?a_lt ?b_lt ?axis ?out_layout))))
+   (union ?op (LayoutTensorOpMulReduceSumGeneric ?a_lt ?b_lt ?axis ?out_layout)))
+  :ruleset backend
+)

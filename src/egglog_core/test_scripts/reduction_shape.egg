@@ -36,7 +36,7 @@
 (let sum_axis1 (LogicalReduceSum x_logical 1))
 (let max_axis2 (LogicalReduceMax x_logical 2))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 (check (= (expr-list-remove-axis-from-end
             (IntExprCons (IntLit 30)

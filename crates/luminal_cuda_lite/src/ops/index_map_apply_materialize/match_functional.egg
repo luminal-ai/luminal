@@ -20,4 +20,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpIndexMapApplyMaterialize ?in_layout_tensor ?index_map ?out_shape ?out_layout))
   )
+  :ruleset backend
 )

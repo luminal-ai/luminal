@@ -19,6 +19,7 @@
     (union ?layout_tensor_op
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
+  :ruleset backend
 )
 
 ; Int: PROOF-GATED (non-wrapping ruling 2026-08-11) — mints
@@ -46,6 +47,7 @@
     (union ?layout_tensor_op
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
+  :ruleset backend
 )
 
 ; Int64: PROOF-GATED (non-wrapping ruling 2026-08-11) — mints
@@ -73,4 +75,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
+  :ruleset backend
 )

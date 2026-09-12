@@ -18,4 +18,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpIotaGeneric ?index_expression ?shape ?out_layout))
   )
+  :ruleset backend
 )

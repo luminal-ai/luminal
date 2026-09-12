@@ -90,6 +90,7 @@
       0))
     (union ?out ?canon_out)
   )
+  :ruleset backend
 )
 ; --- "A[k,m], B[k,n] -> A[m,k], B[k,n]" ------------------------------------
 ; a stored [k,m], read through map (c0 c2). RHS: the a position holds the
@@ -140,6 +141,7 @@
       0))
     (union ?out ?canon_out)
   )
+  :ruleset backend
 )
 ; --- "A[k,m], B[n,k] -> A[m,k], B[k,n]" ------------------------------------
 ; Both operands stored transposed to the canonical form; both reach it as
@@ -201,27 +203,31 @@
       0))
     (union ?out ?canon_out)
   )
+  :ruleset backend
 )
 ; ============================================================================
-; THE DOUBLE-TRANSPOSE COLLAPSE — the termination anchor (round 11).
+; THE DOUBLE-TRANSPOSE COLLAPSE.
 ;
 ; A rank-2 transpose view of a rank-2 transpose view is the original
 ; tensor: transpose is an involution on index space, so ?w below reads
 ; exactly ?x's elements at exactly ?x's coordinates. The conclusion is
 ; UNION-ONLY — it mints no terms and can never diverge.
 ;
-; WHY IT IS LOAD-BEARING: the transpose-sandwich rewrite
-; (cublaslt_marker_rewrite.egg) fires on the canonical form and mints a
-; sibling whose operands are transpose VIEWS — and the sibling is itself
-; canonical, so the sandwich fires on it too, minting views-of-views.
-; Without this rule those are NEW values every generation and saturation
-; never closes (demonstrated by the round-11 revert probe,
-; tests/r11_collapse_revert_probe.rs — bounded runs grow without bound).
-; With it, generation-3 operands collapse into generation 1, every
-; generation-3 chain term hash-conses into the original chain, and the
-; sandwich closes in two generations. The same collapse closes the
-; canonicalization/sandwich composition: the sandwich's transpose view of
-; a canonicalization view rejoins the stored operand.
+; WHAT IS LOAD-BEARING is the BEHAVIOUR, not this rule: a transpose of a
+; transpose must eventually hash-cons back into its base tensor. The
+; transpose-sandwich rewrite (cublaslt_marker_rewrite.egg) fires on the
+; canonical form and mints a sibling whose operands are transposes — and
+; the sibling is itself canonical, so the sandwich fires on it too,
+; minting transposes of transposes. If those never rejoin their base they
+; are NEW values every generation and saturation never closes; once they
+; do, every next-generation chain term hash-conses into the original and
+; the sandwich closes in two generations. Core's transpose involution
+; (src/logical_helper/matrix_transpose) provides that for the helper
+; spellings the sandwich mints today; this rule provides it for raw
+; transpose maps (tests/r11_collapse_revert_probe.rs pins that the walk
+; converges with and without it). The same collapse closes the
+; canonicalization/sandwich composition: a transpose view of a
+; canonicalization view rejoins the stored operand.
 ;
 ; WELD-SOUNDNESS (extent-1 corners): on an extent-1 axis the coordinate
 ; class is welded to zero, so a map entry spelled some other way can fall
@@ -247,5 +253,6 @@
   (
     (union ?w ?x)
   )
+  :ruleset backend
 )
 ; ============================================================================

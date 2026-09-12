@@ -1,7 +1,7 @@
 //! E3 pins: what the injectivity premise and the nonnegativity bound each
 //! refuse (the revert-probe anchors for the deleted certificate relation).
 
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 fn skeleton(x_layout_lines: &str) -> String {
     format!(

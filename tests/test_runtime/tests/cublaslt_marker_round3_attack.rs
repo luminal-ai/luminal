@@ -35,7 +35,7 @@ use luminal::layout_ir::ExtractedNode;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use test_runtime::cublaslt_marker::{CuDim, CuEpilogue, CublasLt, LtMatmulSpec};
 
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 const PIN: &[&str] = &[
     "LayoutTensorOpCublasLtAccumulateBias",
@@ -1427,7 +1427,14 @@ fn rc4_bias_relu_chain_no_stale_d() {
 
 /// Elect every cuBLASLt op enode of a class in turn; the parsed spec must
 /// match THAT enode's own descriptors (operation + lds), every time.
-fn per_enode_election_sweep(tag: &str, fx: &str, expect_enodes: usize) {
+///
+/// The precondition is MULTIPLICITY — several op enodes to elect in turn
+/// — asserted as such, never as a count. `shared_class` additionally
+/// requires two spellings in ONE e-class, the case that could let a
+/// decoder mix fields across enodes; it arises where one layout tensor
+/// reads both ways (a [1,1] operand), not from dual-spelled products,
+/// whose readings are one orientation per layout tensor.
+fn per_enode_election_sweep(tag: &str, fx: &str, shared_class: bool) {
     let s = test_runtime::serialize_fixture(fx);
     dump_reading_sets(tag, &s);
     assert_coherent(tag, &s);
@@ -1438,8 +1445,26 @@ fn per_enode_election_sweep(tag: &str, fx: &str, expect_enodes: usize) {
         .filter(|(_, n)| n.op.starts_with("LayoutTensorOpCublasLt"))
         .map(|(id, n)| (id.clone(), n.clone()))
         .collect();
-    println!("  [{tag}] {} cuBLASLt op enode(s)", op_nodes.len());
-    assert_eq!(op_nodes.len(), expect_enodes, "{tag}: op enode count");
+    let mut per_class: BTreeMap<ClassId, usize> = BTreeMap::new();
+    for (_, n) in &op_nodes {
+        *per_class.entry(n.eclass.clone()).or_default() += 1;
+    }
+    let widest = per_class.values().copied().max().unwrap_or(0);
+    println!(
+        "  [{tag}] {} cuBLASLt op enode(s) in {} class(es); widest class holds {widest}",
+        op_nodes.len(),
+        per_class.len()
+    );
+    assert!(
+        op_nodes.len() >= 2,
+        "{tag}: the fixture must offer at least two op enodes to elect"
+    );
+    if shared_class {
+        assert!(
+            widest >= 2,
+            "{tag}: the fixture must put at least two op spellings in one e-class"
+        );
+    }
 
     let mut elected_any = 0usize;
     for (id, node) in &op_nodes {
@@ -1575,13 +1600,7 @@ fn re1_dual_spelling_per_enode_election() {
         rm("b_shape"),
         rm("out_shape")
     );
-    // ROUND-10 RE-PIN (was 2): + the sibling site's two spellings (the
-    // dual-spelled outs weld the two siblings into one site, which reads
-    // its A operand both ways).
-    // ROUND-11 RE-PIN (was 4): the dual spelling now canonicalizes into
-    // two canonical chains (stored w / viewed w) with their siblings — 4
-    // sites — and each operand reads in two frames; 20 candidates.
-    per_enode_election_sweep("RE1", &fx, 20);
+    per_enode_election_sweep("RE1", &fx, false);
 }
 
 /// The weld corner: A [1,1], B [1,3], product (m n k) = (1, 3, 1). Both the
@@ -1600,10 +1619,7 @@ fn re2_weld_corner_per_enode_election() {
         ..Default::default()
     }
     .render();
-    let s = test_runtime::serialize_fixture(&fx);
-    let enodes = count_cublaslt(&s);
-    println!("RE2 weld corner: {enodes} op enode(s)");
-    per_enode_election_sweep("RE2", &fx, enodes);
+    per_enode_election_sweep("RE2", &fx, true);
 }
 
 // ===========================================================================

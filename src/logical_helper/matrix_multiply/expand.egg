@@ -1,0 +1,15 @@
+; Expand: a matrix product of a[m,k] and b[k,n] is the canonical chain over
+; the helpers; their expanders mint the applies.
+(rule
+  (
+    (= ?mm (LogicalHelperMatrixMultiply ?a ?b))
+    (= (shape-of ?a) (ShapeLit (IntExprCons ?m (IntExprCons ?k (IntExprNil)))))
+    (= (shape-of ?b) (ShapeLit (IntExprCons ?k (IntExprCons ?n (IntExprNil)))))
+  )
+  ((union ?mm
+    (LogicalReduceSum
+      (LogicalMul
+        (LogicalHelperBroadcastAxis ?a 1 ?n)
+        (LogicalHelperBroadcastAxis (LogicalHelperMatrixTranspose ?b) 2 ?m))
+      0)))
+)

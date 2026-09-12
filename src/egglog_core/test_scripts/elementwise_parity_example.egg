@@ -23,7 +23,7 @@
 (let less_logical (LogicalLessThan x_logical y_logical))
 (let half_logical (LogicalCast x_logical (F16)))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; --- the unary four: dtype and shape propagate; the functional match is
 ; pinned in full for Exp2 (the other three are byte-identical clones) ---

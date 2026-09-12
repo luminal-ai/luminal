@@ -49,7 +49,7 @@
 ; must stay out of the transient window.
 (let zero_summand_seed (IntMul (IntAdd coord_inner (IntLit 0)) (IntLit 32)))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; The concrete bridge holds...
 (check (= concrete_factored concrete_expanded))

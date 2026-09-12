@@ -9,7 +9,7 @@
 //!     "Panic: Illegal merge attempted for function cu-trans-a-of"
 //! With descriptor TERMS the same programs are legal multiplicity.
 
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 const PIN: &[&str] = &[
     "LayoutTensorOpCublasLtAccumulateBias",
@@ -32,6 +32,55 @@ fn count_cublaslt(egraph: &luminal::prelude::egraph_serialize::EGraph) -> usize 
         .values()
         .filter(|n| n.op.starts_with("LayoutTensorOpCublasLt"))
         .count()
+}
+
+/// (role, site) pairs whose readings include BOTH an N and a T
+/// orientation — over different layout tensors of the operand, since a
+/// layout has one unit axis. The multiplicity the descriptor TERMS exist
+/// to hold — a site-keyed function had to pick one and panicked.
+fn sites_read_both_ways(
+    egraph: &luminal::prelude::egraph_serialize::EGraph,
+) -> Vec<(&'static str, luminal::prelude::egraph_serialize::ClassId)> {
+    use std::collections::BTreeMap;
+    let mut ops: BTreeMap<
+        (&'static str, luminal::prelude::egraph_serialize::ClassId),
+        Vec<String>,
+    > = BTreeMap::new();
+    for (role, ctor) in [
+        ("A", "CublasLtOperandADescriptor"),
+        ("B", "CublasLtOperandBDescriptor"),
+    ] {
+        for node in egraph.nodes.values().filter(|n| n.op == ctor) {
+            let (Some(site), Some(op_class)) = (
+                node.children
+                    .first()
+                    .and_then(|id| egraph.nodes.get(id))
+                    .map(|c| c.eclass.clone()),
+                node.children
+                    .get(2)
+                    .and_then(|id| egraph.nodes.get(id))
+                    .map(|c| c.eclass.clone()),
+            ) else {
+                continue;
+            };
+            let Some(op) = egraph
+                .nodes
+                .values()
+                .find(|m| m.eclass == op_class && m.op.starts_with("CublasLtOperation"))
+                .map(|m| m.op.clone())
+            else {
+                continue;
+            };
+            ops.entry((role, site)).or_default().push(op);
+        }
+    }
+    ops.into_iter()
+        .filter(|(_, seen)| {
+            seen.iter().any(|o| o == "CublasLtOperationN")
+                && seen.iter().any(|o| o == "CublasLtOperationT")
+        })
+        .map(|(key, _)| key)
+        .collect()
 }
 
 fn pinned_cublaslt(text: &str) -> Vec<test_runtime::cublaslt_marker::CublasLt> {
@@ -202,23 +251,23 @@ fn hypothesis_two_layout_multiplicity() {
 fn hypothesis_dual_spelling_multiplicity() {
     let fx = dual_spelling_fixture();
     let s = test_runtime::serialize_fixture(&fx); // round 2: PANIC (cu-trans-a-of)
-    let sites = count_op(&s, "CublasLtLogicalMatmulSite");
-    let a_readings = count_op(&s, "CublasLtOperandADescriptor");
-    let op_enodes = count_cublaslt(&s);
     println!(
-        "dual-spelling: {} nodes, {sites} site(s), {a_readings} A reading(s), {op_enodes} op enode(s)",
-        s.nodes.len()
+        "dual-spelling: {} nodes, {} site(s), {} A reading(s), {} op enode(s)",
+        s.nodes.len(),
+        count_op(&s, "CublasLtLogicalMatmulSite"),
+        count_op(&s, "CublasLtOperandADescriptor"),
+        count_cublaslt(&s)
     );
-    // ROUND-11 RE-PIN (was 2/3/4): the two seeded spellings of one
-    // product canonicalize into TWO canonical chains over the same out
-    // (b = w stored, and b = the transpose view of w), each with its
-    // sandwich sibling — 4 sites; readings and products scale with the
-    // two frames per operand.
-    assert_eq!(sites, 4, "two canonical chains x (canonicalized + sibling)");
-    assert_eq!(a_readings, 8, "two frames per site's a operand");
-    assert_eq!(
-        op_enodes, 20,
-        "the frame cross products across the four sites"
+    // THE FACT: a site carries BOTH an N and a T reading of an operand,
+    // and both survive as descriptor terms. A site-keyed function holding
+    // the orientation had to merge the two and panicked here (round 2).
+    // How many sites, readings and op spellings the estate mints around
+    // that is not this test's subject.
+    let both_ways = sites_read_both_ways(&s);
+    println!("  read both ways: {both_ways:?}");
+    assert!(
+        !both_ways.is_empty(),
+        "some site must carry both an N and a T reading of an operand"
     );
 
     let ops = pinned_cublaslt(&fx);

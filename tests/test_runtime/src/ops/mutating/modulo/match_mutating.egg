@@ -16,4 +16,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpModMutatingGeneric ?in1_layout_tensor ?in2_layout_tensor))
   )
+  :ruleset backend
 )

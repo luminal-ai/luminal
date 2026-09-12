@@ -49,7 +49,7 @@
 ; the fail-closed partiality gate: NOTHING may derive for this one
 (let quotient_maybe_zero (IntTruncDiv bounded_dividend maybe_zero_divisor))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; --- truncation is TOWARD ZERO, all quadrants (fail-pins guard the
 ; floor drift on the negative-dividend case) ---
