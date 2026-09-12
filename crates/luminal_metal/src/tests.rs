@@ -2134,7 +2134,7 @@ fn metal_f16_relu_through_bool_intermediate() {
 
     assert_close(&rt.get_f32(out), &expected, 0.002);
 }
-/// `gelu` in half precision — the heaviest Bool consumer, since it routes
+/// `gelu` in half precision - the heaviest Bool consumer, since it routes
 /// through both `abs` and `sign`.
 #[test]
 fn metal_f16_gelu_through_bool_intermediate() {
@@ -2163,7 +2163,7 @@ fn metal_f16_gelu_through_bool_intermediate() {
     // F16 storage plus the A&S 7.1.26 erf approximation Luminal uses.
     assert_close(&rt.get_f32(out), &expected, 0.02);
 }
-/// Abramowitz & Stegun 7.1.26 — same approximation `GraphTensor::gelu` uses,
+/// Abramowitz & Stegun 7.1.26 - same approximation `GraphTensor::gelu` uses,
 /// so the test measures backend error rather than approximation error.
 fn libm_erf(x: f32) -> f32 {
     const P: f32 = 0.3275911;
@@ -2180,7 +2180,8 @@ fn libm_erf(x: f32) -> f32 {
     let poly = ((((A[4] * t + A[3]) * t + A[2]) * t + A[1]) * t + A[0]) * t;
     sign * (1.0 - poly * (-(x * x)).exp())
 }
-/// argmax 無法走差分 harness（見上），改為直接驗證 Metal 輸出正確。
+/// argmax cannot go through the differential harness (see above), so this
+/// checks the Metal output against a CPU argmax directly.
 #[test]
 fn metal_argmax_matches_cpu() {
     let data = seeded_data(64, 2.0, 0.5);
@@ -2210,4 +2211,343 @@ fn metal_argmax_matches_cpu() {
     rt.allocate_intermediate_buffers(&cx.dyn_map);
     rt.execute(&cx.dyn_map);
     assert_close(&rt.get_f32(out), &expected, 0.001);
+}
+
+// Differential op sweep. Each case builds the same graph twice and runs it on
+// MetalRuntime and ReferenceRuntime, then compares the outputs elementwise.
+//
+//   cargo test --release -p luminal_metal diffsweep -- --test-threads=1 --nocapture
+//
+// A run collects every divergence rather than stopping at the first, so one
+// invocation reports the full set of broken ops.
+#[allow(clippy::type_complexity)]
+mod diffsweep {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    type Build = Box<dyn Fn(&mut Graph) -> (GraphTensor, GraphTensor)>;
+
+    fn worst_rel_err(m: &[f32], r: &[f32]) -> (f32, usize) {
+        let mut worst = 0.0f32;
+        let mut idx = 0usize;
+        for (i, (a, b)) in m.iter().zip(r.iter()).enumerate() {
+            let d = if a.is_nan() && b.is_nan() {
+                0.0
+            } else if a.is_nan() != b.is_nan() {
+                f32::INFINITY
+            } else {
+                (a - b).abs() / b.abs().max(1.0)
+            };
+            if d > worst {
+                worst = d;
+                idx = i;
+            }
+        }
+        (worst, idx)
+    }
+
+    fn sweep(label: &str, cases: Vec<(&'static str, Build)>, input: &[f32]) {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut ok = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for (name, build) in cases {
+            match catch_unwind(AssertUnwindSafe(|| metal_and_reference(&*build, input))) {
+                Err(e) => {
+                    let msg = e
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "<non-string panic>".into());
+                    let msg = msg
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(160)
+                        .collect::<String>();
+                    bad.push(format!("PANIC    {name:<28} {msg}"));
+                }
+                Ok((m, r)) => {
+                    if m.len() != r.len() {
+                        bad.push(format!(
+                            "LEN      {name:<28} metal {} vs reference {}",
+                            m.len(),
+                            r.len()
+                        ));
+                        continue;
+                    }
+                    let (w, i) = worst_rel_err(&m, &r);
+                    if w > 1e-3 {
+                        bad.push(format!("MISMATCH {name:<28} rel_err {w:.3e} at [{i}]: metal {} vs reference {}", m[i], r[i]));
+                    } else {
+                        ok += 1;
+                    }
+                }
+            }
+        }
+        std::panic::set_hook(prev);
+        println!("\n===== {label}: {ok} agree, {} diverge =====", bad.len());
+        for b in &bad {
+            println!("  {b}");
+        }
+        if !bad.is_empty() {
+            panic!("{label}: {} case(s) diverged", bad.len());
+        }
+    }
+
+    macro_rules! c {
+        ($name:expr, $f:expr) => {
+            ($name, Box::new($f) as Build)
+        };
+    }
+
+    #[test]
+    fn diffsweep_unary() {
+        let input = seeded_data(64, 2.0, 0.5);
+        let cases: Vec<(&'static str, Build)> = vec![
+            c!("exp2", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.exp2().output())
+            }),
+            c!("log2", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.log2().output())
+            }),
+            c!("exp", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.exp().output())
+            }),
+            c!("log", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.log().output())
+            }),
+            c!("sin", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.sin().output())
+            }),
+            c!("cos", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.cos().output())
+            }),
+            c!("sqrt", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.sqrt().output())
+            }),
+            c!("reciprocal", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.reciprocal().output())
+            }),
+            c!("square", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.square().output())
+            }),
+            c!("abs", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.abs().output())
+            }),
+            c!("sign", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.sign().output())
+            }),
+            c!("relu", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.relu().output())
+            }),
+            c!("sigmoid", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.sigmoid().output())
+            }),
+            c!("tanh", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.tanh().output())
+            }),
+            c!("swish", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.swish().output())
+            }),
+            c!("silu", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.silu().output())
+            }),
+            c!("gelu", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.gelu().output())
+            }),
+            c!("leaky_relu", |cx: &mut Graph| {
+                let a = cx.tensor(64);
+                (a, a.leaky_relu(0.1).output())
+            }),
+        ];
+        sweep("unary (1-D, len 64)", cases, &input);
+    }
+
+    #[test]
+    fn diffsweep_reduction_and_norm() {
+        let input = seeded_data(64, 2.0, 0.5);
+        let cases: Vec<(&'static str, Build)> = vec![
+            c!("sum_axis1", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.sum(1).output())
+            }),
+            c!("sum_axis0", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.sum(0).output())
+            }),
+            c!("max_axis1", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.max(1).output())
+            }),
+            c!("max_axis0", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.max(0).output())
+            }),
+            c!("min_axis1", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.min(1).output())
+            }),
+            c!("mean_axis1", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.mean(1).output())
+            }),
+            c!("prod_axis1", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.prod(1).output())
+            }),
+            c!("sum_both_axes", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.sum((0, 1)).output())
+            }),
+            c!("softmax", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.softmax(1).output())
+            }),
+            c!("log_softmax", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.log_softmax(1).output())
+            }),
+            c!("mean_norm", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.mean_norm(1).output())
+            }),
+            c!("std_norm", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.std_norm(1, 1e-5).output())
+            }),
+            c!("layer_norm", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.layer_norm(1, 1e-5).output())
+            }),
+            c!("cumsum", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.cumsum(1).output())
+            }),
+            c!("cummax", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.cummax(1).output())
+            }),
+            // argmax is excluded here: it returns Int indices, and
+            // ReferenceRuntime::get_f32 panics on any non-F32 buffer, so it
+            // cannot go through this harness. metal_argmax_matches_cpu covers
+            // it on the Metal side instead.
+            c!("sum_3d_axis1", |cx: &mut Graph| {
+                let a = cx.tensor((2, 4, 8));
+                (a, a.sum(1).output())
+            }),
+            c!("sum_3d_axis2", |cx: &mut Graph| {
+                let a = cx.tensor((2, 4, 8));
+                (a, a.sum(2).output())
+            }),
+        ];
+        sweep("reduction / norm", cases, &input);
+    }
+
+    #[test]
+    fn diffsweep_movement() {
+        let input = seeded_data(64, 2.0, 0.5);
+        let cases: Vec<(&'static str, Build)> = vec![
+            c!("transpose_then_sum", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.permute((1, 0)).sum(1).output())
+            }),
+            c!("transpose_identity", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.permute((1, 0)).permute((1, 0)).output())
+            }),
+            c!("t_then_output", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.t().output())
+            }),
+            c!("permute_3d", |cx: &mut Graph| {
+                let a = cx.tensor((2, 4, 8));
+                (a, a.permute((2, 0, 1)).output())
+            }),
+            c!("permute_3d_then_sum", |cx: &mut Graph| {
+                let a = cx.tensor((2, 4, 8));
+                (a, a.permute((2, 0, 1)).sum(2).output())
+            }),
+            c!("flatten", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.flatten().output())
+            }),
+            c!("merge_dims", |cx: &mut Graph| {
+                let a = cx.tensor((2, 4, 8));
+                (a, a.merge_dims(0, 1).output())
+            }),
+            c!("unsqueeze_squeeze", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.unsqueeze(1).squeeze(1).output())
+            }),
+            c!("slice_rows", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.slice((1..3, ..)).output())
+            }),
+            c!("slice_cols", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.slice((.., 2..10)).output())
+            }),
+            c!("slice_then_sum", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.slice((.., 2..10)).sum(1).output())
+            }),
+            c!("pad_zero", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.pad(((0, 0), (1, 1)), 0.0).output())
+            }),
+            c!("pad_then_sum", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.pad(((0, 0), (1, 1)), 0.0).sum(1).output())
+            }),
+            c!("expand_dim", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.expand_dim(1, 3).output())
+            }),
+            c!("expand_then_sum", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.expand_dim(1, 3).sum(1).output())
+            }),
+            c!("concat_self", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.concat_along(a, 0).output())
+            }),
+            c!("matmul_self_t", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.matmul(a.t()).output())
+            }),
+            c!("matmul_t_self", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.t().matmul(a).output())
+            }),
+            c!("noncontig_softmax", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                (a, a.permute((1, 0)).softmax(1).output())
+            }),
+            c!("slice_then_matmul", |cx: &mut Graph| {
+                let a = cx.tensor((4, 16));
+                let s = a.slice((.., 0..8));
+                (a, s.matmul(s.t()).output())
+            }),
+        ];
+        sweep("movement / views", cases, &input);
+    }
 }
