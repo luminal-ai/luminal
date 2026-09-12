@@ -16,6 +16,31 @@ impl ProfileStorage {
     pub fn new(data: impl ToCudaInput) -> Self {
         Self(data.into_cuda_bytes().into())
     }
+
+    fn captured(bytes: Vec<u8>) -> Self {
+        const CHUNK: usize = 64 * 1024;
+        if bytes.len() < 1024 * 1024 {
+            return Self(bytes.into());
+        }
+        let nonzero: Vec<_> = bytes
+            .chunks(CHUNK)
+            .enumerate()
+            .filter_map(|(i, chunk)| chunk.iter().any(|&v| v != 0).then_some(i))
+            .collect();
+        if nonzero.len() * CHUNK > bytes.len() / 2 {
+            return Self(bytes.into());
+        }
+        // D2H writes commit every page, even for mostly untouched state.
+        // Copy only nonzero chunks into a fresh zeroed allocation: untouched
+        // pages can remain lazy while ordinary slices and overlapping views
+        // retain exactly the same bytes. Dense snapshots retain their allocation.
+        let mut sparse = vec![0; bytes.len()];
+        for i in nonzero {
+            let range = i * CHUNK..((i + 1) * CHUNK).min(bytes.len());
+            sparse[range.clone()].copy_from_slice(&bytes[range]);
+        }
+        Self(sparse.into())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -400,14 +425,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     result::memcpy_dtoh_sync(&mut bytes, start)?;
                 }
             }
-            // A device read commits every destination page, including untouched
-            // zero-filled state. A fresh zeroed allocation can retain lazy zero
-            // pages instead; Arc<Vec<_>> then owns it without an eager copy.
-            // The captured values and all overlapping views remain identical.
-            if bytes.len() >= 1024 * 1024 && bytes.iter().all(|&byte| byte == 0) {
-                bytes = vec![0; bytes.len()];
-            }
-            let storage = ProfileStorage(bytes.into());
+            let storage = ProfileStorage::captured(bytes);
             for &(ptr, end, tensor) in &ranges[i..j] {
                 let range = (ptr - start) as usize..(end - start) as usize;
                 let mirror = self.hlir_host_mirrors.get(&tensor.id);

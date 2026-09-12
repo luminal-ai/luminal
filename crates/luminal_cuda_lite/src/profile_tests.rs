@@ -1584,14 +1584,25 @@ fn profile_storage_retains_owned_allocation_and_shared_alias_identity() {
 
 #[test]
 fn large_zero_capture_preserves_overlapping_views_after_device_mutation() {
+    check_large_capture_aliases(false);
+    check_large_capture_aliases(true);
+}
+
+fn check_large_capture_aliases(sparse: bool) {
     let mut graph = Graph::new();
-    let n = 256 * 1024;
+    let n = 512 * 1024;
     let a = graph.tensor(n).persist();
     let b = graph.tensor(n).persist();
     (a + b).output();
     graph.build_search_space::<CudaRuntime>(CompileOptions::default().search_log(false));
     let mut rt = runtime();
-    let mut backing = rt.cuda_stream.alloc_zeros::<f32>(n + 2).unwrap();
+    let mut expected = vec![0f32; n + 2];
+    if sparse {
+        for i in [0, 1, 16383, 16384, n, n + 1] {
+            expected[i] = i as f32 + 0.25;
+        }
+    }
+    let mut backing = rt.cuda_stream.clone_htod(&expected).unwrap();
     let ptr = backing.device_ptr(&rt.cuda_stream).0;
     unsafe {
         rt.set_device_ptr(a, ptr, n * 4);
@@ -1607,9 +1618,32 @@ fn large_zero_capture_preserves_overlapping_views_after_device_mutation() {
         .memcpy_htod(&vec![7.0f32; n + 2], &mut backing)
         .unwrap();
     rt.cuda_stream.synchronize().unwrap();
-    assert!(groups[0].0.iter().all(|&byte| byte == 0));
+    let expected: Vec<_> = expected.into_iter().flat_map(f32::to_ne_bytes).collect();
+    assert_eq!(groups[0].0.as_slice(), expected);
     assert!(Arc::ptr_eq(
         &captured.bindings[0].storage.0,
         &captured.bindings[1].storage.0
     ));
+}
+
+#[test]
+fn sparse_captured_storage_preserves_chunk_boundaries_and_dense_ownership() {
+    for len in [17, 1024 * 1024 + 7, 4 * 1024 * 1024 + 3] {
+        for dense in [false, true] {
+            let mut bytes = vec![if dense { 19 } else { 0 }; len];
+            for index in [0, 65535, 65536, 65537, len - 1] {
+                if index < len {
+                    bytes[index] = (index % 251 + 1) as u8;
+                }
+            }
+            let expected = bytes.clone();
+            let address = bytes.as_ptr();
+            let storage = ProfileStorage::captured(bytes);
+            assert_eq!(storage.0.as_slice(), expected);
+            if dense || len < 1024 * 1024 {
+                assert_eq!(storage.0.as_ptr(), address);
+            }
+            assert!(Arc::ptr_eq(&storage.0, &storage.clone().0));
+        }
+    }
 }
