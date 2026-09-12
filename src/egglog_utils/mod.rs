@@ -1958,6 +1958,7 @@ pub struct LlirExtractor<'a> {
     egraph: &'a SerializedEGraph,
     ops: &'a [Arc<Box<dyn EgglogOp>>],
     op_by_name: FxHashMap<String, usize>,
+    constructor_fields: FxHashMap<String, Vec<(String, String)>>,
     list_cache: FxHashMap<&'a NodeId, Vec<Expression>>,
     expr_cache: FxHashMap<&'a NodeId, Expression>,
     indexed_classes: Vec<IndexedEClass<'a>>,
@@ -2009,6 +2010,16 @@ impl<'a> LlirExtractor<'a> {
             .enumerate()
             .map(|(index, op)| (op.sort().name, index))
             .collect();
+        let constructor_fields = ops
+            .iter()
+            .map(|op| {
+                let sort = op.sort();
+                (
+                    sort.name,
+                    sort.fields.into_iter().map(|f| (f.name, f.sort)).collect(),
+                )
+            })
+            .collect();
 
         let mut classes = egraph.eclasses.keys().collect::<Vec<_>>();
         classes.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
@@ -2054,6 +2065,7 @@ impl<'a> LlirExtractor<'a> {
             egraph,
             ops,
             op_by_name,
+            constructor_fields,
             list_cache: FxHashMap::default(),
             expr_cache: FxHashMap::default(),
             indexed_classes,
@@ -2395,6 +2407,7 @@ impl<'a> LlirExtractor<'a> {
                             }
                             nearest_constructor_alternatives(
                                 self.egraph,
+                                &self.constructor_fields,
                                 &nodes[choices.choices[class as usize] as usize],
                                 family,
                                 |slot| &nodes[slot as usize],
@@ -3383,12 +3396,13 @@ fn comparable_constructor_terms<'a>(
     Some((left, right))
 }
 
-// Preserve argument positions only within the same constructor. Different
-// constructors can assign unrelated meanings to the same position (e.g. a
-// thread count versus a row tile); their variants must not inherit that bias.
-// Only existing enodes participate; random proposals retain every variant.
+// Across constructors, align only uniquely named fields with the same declared
+// sort. This is a proposal heuristic over existing equivalent enodes, not a
+// proof that two fields have identical semantics. Positions alone are meaningful
+// only within a constructor. Unmatched fields and random proposals remain free.
 fn nearest_constructor_alternatives<'a, T: Copy>(
     egraph: &'a SerializedEGraph,
+    fields: &FxHashMap<String, Vec<(String, String)>>,
     current: &NodeId,
     pool: &[T],
     node: impl Fn(T) -> &'a NodeId,
@@ -3397,10 +3411,32 @@ fn nearest_constructor_alternatives<'a, T: Copy>(
     let mut best = usize::MAX;
     for &candidate in pool {
         let distance = comparable_constructor_terms(egraph, current, node(candidate))
-            .filter(|(left, right)| left.0 == right.0)
             .map(|(left, right)| {
-                left.1.len().abs_diff(right.1.len())
-                    + left.1.iter().zip(&right.1).filter(|(a, b)| a != b).count()
+                if left.0 == right.0 {
+                    return left.1.len().abs_diff(right.1.len())
+                        + left.1.iter().zip(&right.1).filter(|(a, b)| a != b).count();
+                }
+                let Some(lf) = fields.get(&left.0).filter(|f| f.len() == left.1.len()) else {
+                    return usize::MAX;
+                };
+                let Some(rf) = fields.get(&right.0).filter(|f| f.len() == right.1.len()) else {
+                    return usize::MAX;
+                };
+                let mut compared = 0;
+                let mut changed = 0;
+                for (i, field) in lf.iter().enumerate() {
+                    if lf.iter().filter(|f| *f == field).count() != 1 {
+                        continue;
+                    }
+                    let mut matches = rf.iter().enumerate().filter(|(_, f)| *f == field);
+                    if let Some((j, _)) = matches.next()
+                        && matches.next().is_none()
+                    {
+                        compared += 1;
+                        changed += usize::from(left.1[i] != right.1[j]);
+                    }
+                }
+                if compared == 0 { usize::MAX } else { changed }
             })
             .unwrap_or(usize::MAX);
         if distance < best {

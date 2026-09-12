@@ -701,11 +701,9 @@ fn argument_coverage_proposes_required_companion_changes() {
     }
 }
 
-#[test]
-fn constructor_coverage_does_not_align_unrelated_argument_positions() {
+fn extended_arguments_fixture() -> SerializedEGraph {
     let mut graph = paired_arguments_fixture(4, false);
     let root = graph.roots[0].clone();
-    let before = NodeId::from("pair-2-3");
     let original = graph.eclasses[&root].1.clone();
     for node in original {
         let (_, inputs) = &graph.enodes[&node];
@@ -731,6 +729,14 @@ fn constructor_coverage_does_not_align_unrelated_argument_positions() {
             graph.eclasses.get_mut(&root).unwrap().1.push(op);
         }
     }
+    graph
+}
+
+#[test]
+fn constructor_coverage_does_not_align_unrelated_argument_positions() {
+    let graph = extended_arguments_fixture();
+    let root = graph.roots[0].clone();
+    let before = NodeId::from("pair-2-3");
     let mut rng = StdRng::seed_from_u64(971);
     let mut choices = random_initial_choice(&graph, &mut rng);
     choices.insert(&root, &before);
@@ -1029,4 +1035,87 @@ fn losing_constructor_proposals_still_receive_tuning_neighbors() {
         proposal_family_key(&graph, &nodes[first.1 as usize]),
         proposal_family_key(&graph, &nodes[next.1 as usize])
     );
+}
+
+#[test]
+fn constructor_coverage_transfers_named_fields_across_reordered_schemas() {
+    let graph = extended_arguments_fixture();
+    let fields: FxHashMap<_, _> = [
+        (
+            "Tunable".into(),
+            vec![("x".into(), "i64".into()), ("y".into(), "i64".into())],
+        ),
+        (
+            "Extended".into(),
+            vec![
+                ("y".into(), "i64".into()),
+                ("x".into(), "i64".into()),
+                ("new".into(), "i64".into()),
+            ],
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let root = &graph.roots[0];
+    let before = NodeId::from("pair-2-3");
+    let mut extras = FxHashSet::default();
+    for seed in 0..64 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut choices = random_initial_choice(&graph, &mut rng);
+        choices.insert(root, &before);
+        let mut extractor = LlirExtractor::new(&graph, &[]);
+        extractor.constructor_fields = fields.clone();
+        let base = extractor.index_choice_set(&choices);
+        let child = extractor
+            .extract_reachable_indexed_generation(&base, 1, 1, &mut FxHashSet::default(), &mut rng)
+            .pop()
+            .unwrap();
+        let selected = extractor.indexed_selected(&child, extractor.root_index);
+        let node = extractor.indexed_node_id(selected);
+        let (_, term) = comparable_constructor_terms(&graph, &before, node).unwrap();
+        assert_eq!(term.0, "Extended");
+        assert_eq!(
+            term.1[..2],
+            [ClassId::from("knob-3"), ClassId::from("knob-2")]
+        );
+        extras.insert(term.1[2].clone());
+    }
+    assert_eq!(extras.len(), 4, "new fields remain free to vary");
+}
+
+#[test]
+fn named_constructor_alignment_requires_matching_sorts_and_unique_fields() {
+    let graph = extended_arguments_fixture();
+    let before = NodeId::from("pair-2-3");
+    let pool = graph.eclasses[&graph.roots[0]]
+        .1
+        .iter()
+        .filter(|n| n.as_ref().starts_with("extended-op-"))
+        .collect::<Vec<_>>();
+    for extended in [
+        vec![
+            ("x".into(), "Expression".into()),
+            ("unrelated".into(), "i64".into()),
+            ("new".into(), "i64".into()),
+        ],
+        vec![
+            ("x".into(), "i64".into()),
+            ("x".into(), "i64".into()),
+            ("new".into(), "i64".into()),
+        ],
+    ] {
+        let fields = [
+            (
+                "Tunable".into(),
+                vec![("x".into(), "i64".into()), ("y".into(), "i64".into())],
+            ),
+            ("Extended".into(), extended),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            nearest_constructor_alternatives(&graph, &fields, &before, &pool, |n| n).len(),
+            pool.len()
+        );
+    }
 }
