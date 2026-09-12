@@ -17,6 +17,8 @@ pub mod workspace;
 pub type BaseOps = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
+    cublaslt::CuBlasLtTuned<false>,
+    cublaslt::CuBlasLtTuned<true>,
     moe::GLUMoE,
     flashinfer::FlashInferAttention,
 );

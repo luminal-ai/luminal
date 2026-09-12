@@ -397,6 +397,130 @@ fn test_scatter_nocopy_not_selected_for_expanded_dest_layout() {
 
 /// Actually execute the scatter and verify every selected implementation.
 #[test]
+fn scatter_copy_preserves_strided_and_broadcast_destinations_across_sizes() {
+    for broadcast in [false, true] {
+        let mut cx = Graph::new();
+        let dest = if broadcast {
+            cx.tensor(3)
+        } else {
+            cx.tensor(('d', 3))
+        }
+        .persist();
+        let src = if broadcast {
+            cx.tensor(2)
+        } else {
+            cx.tensor(('u', 2))
+        }
+        .persist();
+        let indexes = cx.tensor(('u', 2)).as_dtype(DType::Int).persist();
+        let dest_view = if broadcast {
+            dest.expand_dim(0, 'd')
+        } else {
+            dest
+        }
+        .permute((1, 0));
+        let src_view = if broadcast {
+            src.expand_dim(0, 'u')
+        } else {
+            src
+        }
+        .permute((1, 0));
+        let result = src_view
+            .scatter(indexes.permute((1, 0)), dest_view)
+            .output();
+        dest.output();
+        cx.set_dim('d', 17);
+        cx.set_dim('u', 3);
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+        let llir = extract_forced_kernel_llir(&cx, "KernelScatter", "Scatter");
+        let mut rt = CudaRuntime::initialize(CudaContext::new(0).unwrap().default_stream());
+        rt.load_llir(&llir);
+        for (d, u) in [
+            (17, 3),
+            (1023, 5),
+            (1025, 33),
+            (8193, 257),
+            (65537, 4097),
+            (17, 3),
+        ] {
+            cx.set_dim('d', d);
+            cx.set_dim('u', u);
+            let original: Vec<f32> = (0..if broadcast { 3 } else { d * 3 })
+                .map(|i| (i % 10000) as f32)
+                .collect();
+            let updates: Vec<f32> = (0..if broadcast { 2 } else { u * 2 })
+                .map(|i| -(i as f32) - 1.)
+                .collect();
+            let mut indices = vec![0i32; u * 2];
+            let mut expected: Vec<f32> = (0..d * 3)
+                .map(|z| original[if broadcast { z / d } else { z % d * 3 + z / d }])
+                .collect();
+            for z in 0..u * 2 {
+                let physical = z % u * 2 + z / u;
+                let index = match z {
+                    0 => -1,
+                    1 => (d * 3) as i32,
+                    _ => ((z * 13 + 7) % (d * 3)) as i32,
+                };
+                indices[physical] = index;
+                if index >= 0 && (index as usize) < expected.len() {
+                    expected[index as usize] = updates[if broadcast { z / u } else { physical }];
+                }
+            }
+            rt.set_data(dest, original.clone());
+            rt.set_data(src, updates);
+            rt.set_data(indexes, indices);
+            rt.execute(&cx.dyn_map);
+            assert_eq!(
+                rt.get_f32(result),
+                expected,
+                "broadcast={broadcast}, d={d}, u={u}"
+            );
+            assert_eq!(
+                rt.get_f32(dest),
+                original,
+                "scatter must preserve the observed destination"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "CUDA performance comparison; run explicitly before and after kernel changes"]
+fn scatter_large_destination_profile() {
+    let mut cx = Graph::new();
+    let elements = 32 * 1024 * 1024;
+    let dest = cx.tensor(elements).persist();
+    let src = cx.tensor('u').persist();
+    let indexes = cx.tensor('u').as_dtype(DType::Int).persist();
+    let result = src.scatter(indexes, dest).output();
+    dest.output();
+    cx.set_dim('u', 1024);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let llir = extract_forced_kernel_llir(&cx, "KernelScatter", "Scatter");
+    let mut rt = CudaRuntime::initialize(CudaContext::new(0).unwrap().default_stream());
+    rt.load_llir(&llir);
+    for updates in [1024, 1024 * 1024] {
+        cx.set_dim('u', updates);
+        rt.set_data(dest, vec![0.125f32; elements]);
+        rt.set_data(src, vec![2f32; updates]);
+        let positions: Vec<i32> = (0..updates).map(|i| (i * 17 % elements) as i32).collect();
+        rt.set_data(indexes, positions.clone());
+        let (duration, _) = rt.profile_loaded_cuda_graph(&llir, &cx.dyn_map, 3, None, None);
+        let mut expected = vec![0.125f32; elements];
+        for i in positions {
+            expected[i as usize] = 2.;
+        }
+        assert_eq!(rt.get_f32(result), expected);
+        assert!(rt.get_f32(dest).iter().all(|x| *x == 0.125));
+        println!(
+            "SCATTER_BENCH elements={elements} updates={updates} wall_ms={:.6}",
+            duration.as_secs_f64() * 1000.
+        );
+    }
+}
+
+#[test]
 fn test_scatter_execution_correctness() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
