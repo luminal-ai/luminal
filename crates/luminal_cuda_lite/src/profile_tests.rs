@@ -15,6 +15,55 @@ fn dims(s: usize) -> DynMap {
 }
 
 #[test]
+fn boundary_counterfactual_restores_fixed_case_and_then_changed_inputs() {
+    let mut cx = Graph::new();
+    let input = cx.tensor(('s', 64)).persist();
+    let output = ((input + 1.).sin() * 3.).output();
+    cx.set_dim('s', 2);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut rt = runtime();
+    rt.set_data(input, vec![2f32; 128]);
+    rt.set_profile_workload(
+        &cx,
+        ProfileWorkload::new().device_snapshots(true).case(
+            "actual",
+            dims(2),
+            ProfileInputs::new().input(input, vec![2f32; 128]),
+            1.,
+        ),
+    )
+    .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "luminal-counterfactual-{}.json",
+        std::process::id()
+    ));
+    rt.request_region_counterfactual(0, path.clone());
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(1),
+        &mut SmallRng::seed_from_u64(43),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(report.get("error").is_none(), "{report}");
+    assert_eq!(report["measurements"].as_array().unwrap().len(), 6);
+    assert!(report["checked_output_count"].as_u64().unwrap() >= 1);
+    assert!(
+        report["measurements"][2]["replaced_operations"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{report}"
+    );
+    rt.clear_profile_workload();
+    rt.set_data(input, vec![4f32; 128]);
+    rt.execute(&dims(2));
+    for value in rt.get_f32(output) {
+        assert!((value - 5f32.sin() * 3.).abs() < 1e-5);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn profile_budget_never_substitutes_warmup_for_a_timed_trial() {
     let mut cx = Graph::new();
     let input = cx.tensor(4).persist();

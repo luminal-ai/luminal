@@ -46,6 +46,8 @@ use std::{
 use tracing::{Level, span, trace};
 use uuid::Uuid;
 
+#[path = "counterfactual.rs"]
+mod counterfactual;
 #[path = "prepared_input.rs"]
 mod prepared_input;
 #[path = "profile.rs"]
@@ -476,6 +478,7 @@ pub struct CudaRuntimeImpl<O> {
     /// consumption (used during search/profile).
     profiling: bool,
     profile_workload: Option<ProfileWorkload>,
+    pub(crate) counterfactual_request: Option<(usize, std::path::PathBuf)>,
     profile_replay: Option<profile::ReplaySession>,
     profile_evaluations: Vec<ProfileEvaluation>,
     /// Selects the deployment CUDA-graph launch path while profiling. The
@@ -5134,6 +5137,9 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
         if ops.iter().any(|op| op.sort().name == "KernelScatterNoCopy") {
             passes.push(crate::kernel::other_ops::scatter_reuse_late_pass());
         }
+        if let Some(pass) = crate::temporary_fast_paths::pass(ops) {
+            passes.push(pass);
+        }
         passes
     }
 
@@ -5172,6 +5178,7 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             region_source_cache: RegionSourceCache::default(),
             profiling: false,
             profile_workload: None,
+            counterfactual_request: None,
             profile_replay: None,
             profile_evaluations: vec![],
             profile_cuda_graphs: false,

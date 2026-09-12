@@ -11,6 +11,7 @@ mod resource;
 pub mod runtime;
 mod search;
 mod search_image_cache;
+mod temporary_fast_paths;
 use std::{
     cell::Cell,
     ffi::{CStr, CString},

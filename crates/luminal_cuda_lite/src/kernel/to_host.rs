@@ -968,6 +968,14 @@ pub struct CudaGraphOp {
     resident: RefCell<Option<ResidentGraphVariants>>,
     residency_frozen: std::cell::Cell<bool>,
     graph_builds: std::cell::Cell<usize>,
+    boundary_probe: RefCell<Option<BoundaryProbe>>,
+}
+
+struct BoundaryProbe {
+    replay: bool,
+    names: FxHashSet<String>,
+    copies: FxHashMap<NodeIndex, CudaSlice<u8>>,
+    replaced: FxHashSet<NodeIndex>,
 }
 
 struct ArenaBufferOrderAccumulator {
@@ -1253,6 +1261,7 @@ impl CudaGraphOp {
             resident: RefCell::new(None),
             residency_frozen: std::cell::Cell::new(false),
             graph_builds: std::cell::Cell::new(0),
+            boundary_probe: RefCell::new(None),
         }
     }
 
@@ -2494,6 +2503,124 @@ impl CudaGraphOp {
         Self::reset_materialization_state(&mut state);
     }
 
+    pub(crate) fn record_boundaries(&self, names: &[String]) {
+        self.release_materialization();
+        *self.boundary_probe.borrow_mut() = Some(BoundaryProbe {
+            replay: false,
+            names: names.iter().cloned().collect(),
+            copies: FxHashMap::default(),
+            replaced: FxHashSet::default(),
+        });
+    }
+
+    pub(crate) fn replay_boundaries(&self, names: &[String]) {
+        self.release_materialization();
+        let mut probe = self.boundary_probe.borrow_mut();
+        let probe = probe.as_mut().expect("record boundaries before replay");
+        probe.replay = true;
+        probe.names = names.iter().cloned().collect();
+        probe.replaced.clear();
+    }
+
+    pub(crate) fn boundary_probe_counts(&self) -> (usize, usize) {
+        let probe = self.boundary_probe.borrow();
+        let probe = probe.as_ref().expect("active boundary probe");
+        (
+            probe.replaced.len(),
+            probe.replaced.iter().map(|n| probe.copies[n].len()).sum(),
+        )
+    }
+
+    pub(crate) fn clear_boundaries(&self) {
+        self.release_materialization();
+        self.boundary_probe.borrow_mut().take();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boundary_copy(
+        &self,
+        state: &CudaGraphOpState,
+        step: CompiledStep,
+        graph: &mut CudaGraphHandle,
+        dependencies: &[CUgraphNode],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dims: &DynMap,
+        replay: bool,
+    ) -> anyhow::Result<Option<CUgraphNode>> {
+        let mut probe = self.boundary_probe.borrow_mut();
+        let Some(probe) = probe.as_mut().filter(|p| p.replay == replay) else {
+            return Ok(None);
+        };
+        let (node, name, size) = match step {
+            CompiledStep::Kernel(i) => {
+                let k = &state.kernels[i];
+                // An aliased output may represent a mutation larger than the
+                // returned view. Never model that effect as a pure output copy.
+                if k.kernel_op.output_aliases_input().is_some() {
+                    return Ok(None);
+                }
+                (
+                    k.node,
+                    k.kernel_op.kernel_name(),
+                    k.kernel_op.output_bytes(),
+                )
+            }
+            CompiledStep::CuBlasLt(i) => {
+                let op = &state.cublaslt_ops[i];
+                (op.node, "cublaslt", op.host_op.output_bytes())
+            }
+            CompiledStep::CapturedHost(i) => {
+                let op = &state.captured_host_ops[i];
+                (
+                    op.node,
+                    op.host_op.stats_name().unwrap_or("CapturedHost"),
+                    op.host_op.output_bytes(),
+                )
+            }
+            CompiledStep::FlashInferDecode(_) => return Ok(None),
+        };
+        if !probe.names.contains(name) {
+            return Ok(None);
+        }
+        let bytes = size
+            .exec(dims)
+            .ok_or_else(|| anyhow::anyhow!("unresolved probe size"))?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let output = buffers
+            .get(&node)
+            .ok_or_else(|| anyhow::anyhow!("missing probe output"))?;
+        anyhow::ensure!(bytes <= output.len(), "probe output exceeds allocation");
+        if !replay && !probe.copies.contains_key(&node) {
+            probe
+                .copies
+                .insert(node, self.stream.alloc_zeros::<u8>(bytes)?);
+        }
+        if replay {
+            probe.replaced.insert(node);
+        }
+        let copy = probe
+            .copies
+            .get(&node)
+            .ok_or_else(|| anyhow::anyhow!("unrecorded probe boundary"))?;
+        anyhow::ensure!(bytes == copy.len(), "probe dimensions changed");
+        let saved = copy.device_ptr(&self.stream).0;
+        let (dst, src) = if replay {
+            (output.ptr(), saved)
+        } else {
+            (saved, output.ptr())
+        };
+        unsafe {
+            graph
+                .add_device_copy(dependencies, dst, src, bytes)
+                .map(Some)
+                .map_err(Into::into)
+        }
+    }
+
+    /// E-class costs for proposal guidance only. Timing events serialize
+    /// steps, so these must never replace clean whole-graph candidate fitness.
     /// Emit a diagnostic-only breakdown of one completed graph launch. Step
     /// timing nodes are inserted only when `LUMINAL_CUDA_PROFILE_GRAPH_STEPS`
     /// is present at materialization time, so production graphs carry no event
@@ -2550,6 +2677,11 @@ impl CudaGraphOp {
         changed_buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &DynMap,
     ) -> anyhow::Result<bool> {
+        // Diagnostic copies carry their own pointers. Their graph is rebuilt
+        // on a binding change rather than applying kernel-only node updates.
+        if self.boundary_probe.borrow().is_some() {
+            return Ok(false);
+        }
         let mut state = self.state.borrow_mut();
         if state.cuda_graph.is_none() || state.cuda_graph_exec.is_none() {
             return Ok(false);
@@ -3065,6 +3197,14 @@ impl CudaGraphOp {
 
         // Check if we need to update the graph
         let buffer_ptrs_changed = current_buffer_ptrs != state.last_buffer_ptrs;
+        if self.boundary_probe.borrow().is_some() {
+            // The first build refreshed last_dyn_values. Do not use the stale
+            // pre-build dirty set to update kernels replaced by copy nodes.
+            if buffer_ptrs_changed || *dyn_map != state.last_dyn_values {
+                self.build_graph(&mut state, stream, buffers, dyn_map)?;
+            }
+            return Ok(());
+        }
         let needs_update = dyn_map_changed || buffer_ptrs_changed;
 
         if needs_update {
@@ -4117,10 +4257,13 @@ impl CudaGraphOp {
             op.child_graph = None;
         }
 
-        let tracing_enabled = enabled!(Level::TRACE)
+        let step_profile = std::env::var_os("LUMINAL_CUDA_PROFILE_GRAPH_STEPS").is_some();
+        // Both modes reuse this event pool. Do not record a step boundary a
+        // second time as a kernel tracing event in the same launch.
+        let tracing_enabled = !step_profile
+            && enabled!(Level::TRACE)
             && state.cublaslt_ops.is_empty()
             && state.flashinfer_ops.is_empty();
-        let step_profile = std::env::var_os("LUMINAL_CUDA_PROFILE_GRAPH_STEPS").is_some();
         if tracing_enabled || step_profile {
             let needed_events = if step_profile {
                 state.steps.len() + 1
@@ -4191,6 +4334,13 @@ impl CudaGraphOp {
             debug_assert!(deps.iter().all(|node| !node.is_null()));
 
             let step = state.steps[step_index];
+            if let Some(copy) =
+                self.boundary_copy(state, step, &mut graph, &deps, buffers, dyn_map, true)?
+            {
+                state.step_entry_nodes[step_index] = copy;
+                state.step_output_nodes[step_index] = copy;
+                continue;
+            }
             match step {
                 CompiledStep::Kernel(idx) => {
                     {
@@ -4432,6 +4582,18 @@ impl CudaGraphOp {
                     state.step_entry_nodes[step_index] = child_node;
                     state.step_output_nodes[step_index] = child_node;
                 }
+            }
+            let output = state.step_output_nodes[step_index];
+            if let Some(copy) = self.boundary_copy(
+                state,
+                step,
+                &mut graph,
+                std::slice::from_ref(&output),
+                buffers,
+                dyn_map,
+                false,
+            )? {
+                state.step_output_nodes[step_index] = copy;
             }
             if step_profile {
                 let output = state.step_output_nodes[step_index];

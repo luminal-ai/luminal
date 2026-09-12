@@ -129,6 +129,57 @@ impl CudaGraphHandle {
     }
 
     /// Adds an empty dependency node to the graph.
+    pub(crate) unsafe fn add_device_copy(
+        &mut self,
+        dependencies: &[CUgraphNode],
+        destination: u64,
+        source: u64,
+        bytes: usize,
+    ) -> Result<CUgraphNode, DriverError> {
+        self.ctx.bind_to_thread()?;
+        let params = sys::CUDA_MEMCPY3D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcZ: 0,
+            srcLOD: 0,
+            srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            srcHost: std::ptr::null(),
+            srcArray: std::ptr::null_mut(),
+            reserved0: std::ptr::null_mut(),
+            srcHeight: 0,
+            srcDevice: source,
+            srcPitch: bytes,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstZ: 0,
+            dstLOD: 0,
+            dstMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            dstHost: std::ptr::null_mut(),
+            dstArray: std::ptr::null_mut(),
+            reserved1: std::ptr::null_mut(),
+            dstHeight: 0,
+            dstDevice: destination,
+            dstPitch: bytes,
+            WidthInBytes: bytes,
+            Height: 1,
+            Depth: 1,
+        };
+        let mut node = MaybeUninit::uninit();
+        unsafe {
+            sys::cuGraphAddMemcpyNode(
+                node.as_mut_ptr(),
+                self.cu_graph,
+                dependencies.as_ptr(),
+                dependencies.len(),
+                &params,
+                self.ctx.cu_ctx(),
+            )
+            .result()?;
+            Ok(node.assume_init())
+        }
+    }
+
+    /// Adds an empty dependency node to the graph.
     pub fn add_empty_node(
         &mut self,
         dependencies: &[CUgraphNode],

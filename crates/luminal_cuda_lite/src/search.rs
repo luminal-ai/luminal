@@ -50,6 +50,18 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 let evaluate_started = Instant::now();
                 let outcome = self.evaluate_candidate(&mut candidate, ctx, options);
                 log_search_phase(ctx.index, "graph-search", "evaluate", evaluate_started);
+                if matches!(outcome, Outcome::Measured(..))
+                    && self
+                        .counterfactual_request
+                        .as_ref()
+                        .is_some_and(|(bucket, _)| *bucket == ctx.index)
+                {
+                    let (_, path) = self.counterfactual_request.take().unwrap();
+                    let report = self
+                        .profile_region_counterfactuals(&candidate.llir, ctx.index)
+                        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+                    std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+                }
                 let cleanup_started = Instant::now();
                 search.report(candidate, outcome);
                 self.release_search_candidate_allocations();
