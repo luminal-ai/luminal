@@ -3213,7 +3213,8 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     }
 
     fn prepare_bucket_buffers(&mut self, bucket_idx: usize, dyn_map: &DynMap) {
-        let profile_prepare = std::env::var_os("LUMINAL_CUDA_PROFILE_EXEC").is_some()
+        let profile_prepare = std::env::var_os("LUMINAL_CUDA_PROFILE_EXEC")
+            .is_some_and(|mode| mode != "search" || self.profiling)
             || std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let prepare_start = std::time::Instant::now();
         let changed_hlir_count = self.changed_hlir.len();
@@ -4622,13 +4623,16 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 self.profile_timing_method()
             );
         }
-        // Warmup absorbs one-time costs (CUDA graph materialization, lazy
-        // allocations, cache warming) so the timed trials measure steady-state
-        // execution instead of folding setup noise into the candidate ranking.
-        self.execute(dyn_map);
-        let warmup_duration = self
-            .last_profile_duration
-            .expect("profiled CUDA warmup did not record a duration");
+        // The workload chooses the number of exact untimed replays. One graph
+        // execution need not settle lazy initialization or managed residency.
+        let warmups = self.profile_warmup_trials();
+        let mut warmup_duration = Duration::ZERO;
+        for _ in 0..warmups {
+            self.execute(dyn_map);
+            warmup_duration += self
+                .last_profile_duration
+                .expect("profiled CUDA warmup did not record a duration");
+        }
         // Capture and first-use setup belong to warmup, not candidate fitness.
         // Start the execution budget afterwards and always measure one trial.
         let timed_trials_started = std::time::Instant::now();
@@ -4667,7 +4671,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
 
         if diagnostic {
             eprintln!(
-                "SEARCH_PROFILE_END graph={profile_cuda_graphs} warmups=1 trials={} wall_ms={:.6} warmup_metric_ms={:.6} timed_metric_ms={:.6}",
+                "SEARCH_PROFILE_END graph={profile_cuda_graphs} warmups={warmups} trials={} wall_ms={:.6} warmup_metric_ms={:.6} timed_metric_ms={:.6}",
                 durations.len(),
                 profile_start.elapsed().as_secs_f64() * 1e3,
                 warmup_duration.as_secs_f64() * 1e3,
@@ -5256,7 +5260,8 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
         // `PROFILE_EXEC` measures only these coarse runtime phases. The older
         // `PROFILE_RECAPTURE` additionally instruments every CUDA-graph
         // materialization subphase and is intentionally more perturbative.
-        let profile_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_EXEC").is_some()
+        let profile_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_EXEC")
+            .is_some_and(|mode| mode != "search" || self.profiling)
             || std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let runtime_profile_start = std::time::Instant::now();
         let mut bucket_dispatch_time = Duration::ZERO;

@@ -849,11 +849,11 @@ fn profile_budget_accepts_complete_workload_but_rejects_missing_cases() {
     let space = graph.search_space().unwrap();
     let contexts = space.bucket_contexts(&graph.dyn_map);
     let llir = luminal::search::extract_one(space, &contexts[0], &mut SmallRng::seed_from_u64(17));
-    for cases in [1, 2] {
+    for (cases, warmups) in [(1, 1), (2, 1), (1, 3), (2, 3)] {
         let mut rt = runtime();
         rt.set_data(input, vec![19i32; 4]);
         rt.set_data_with_host_mirror(metadata, vec![4i32]);
-        let mut workload = ProfileWorkload::new();
+        let mut workload = ProfileWorkload::new().warmup_trials(warmups);
         for case in 0..cases {
             workload = workload.case(
                 format!("case-{case}"),
@@ -877,8 +877,8 @@ fn profile_budget_accepts_complete_workload_but_rejects_missing_cases() {
         );
         assert_eq!(
             rt.next_execution_id - before,
-            2,
-            "warmup and one full timed trial"
+            warmups as u64 + 1,
+            "configured warmups and one full timed trial"
         );
         assert_eq!(rt.get_i32(output), vec![19; 4]);
         if cases == 1 {

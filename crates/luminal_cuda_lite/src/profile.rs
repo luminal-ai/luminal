@@ -136,6 +136,7 @@ pub struct ProfileWorkload {
     shared: Vec<InputSchema>,
     timing_method: luminal::op::TimingMethod,
     device_snapshots: bool,
+    warmup_trials: Option<usize>,
     reused_inputs: ProfileInputs,
     space_token: Option<Arc<Box<dyn luminal::op::EgglogOp>>>,
 }
@@ -149,6 +150,15 @@ impl ProfileWorkload {
     /// invocation timing, not an application scheduler or multi-step trace metric.
     pub fn timing_method(mut self, method: luminal::op::TimingMethod) -> Self {
         self.timing_method = method;
+        self
+    }
+    /// Untimed exact replays before measuring each candidate (default: one).
+    /// Use additional replays when lazy initialization or managed-memory
+    /// residency persists beyond the first invocation. These use the same
+    /// case and restore its state before every invocation; no data is generated.
+    pub fn warmup_trials(mut self, trials: usize) -> Self {
+        assert!(trials > 0, "profile warmup count must be positive");
+        self.warmup_trials = Some(trials);
         self
     }
     /// Cache immutable sample backing on the device. Repeated resets use device
@@ -629,6 +639,13 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         }
         self.cancel_search_profile();
         // Slots drop only after graph releases and restoration of all bindings.
+    }
+
+    pub(crate) fn profile_warmup_trials(&self) -> usize {
+        self.profile_workload
+            .as_ref()
+            .and_then(|w| w.warmup_trials)
+            .unwrap_or(1)
     }
 
     pub(crate) fn profile_case_indices(&self, bucket: usize) -> Option<Vec<usize>> {

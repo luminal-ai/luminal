@@ -452,9 +452,9 @@ fn mutation_covers_each_active_constructor_within_bounded_proposals() {
     let mut extractor = LlirExtractor::new(&graph, &[]);
     let base = extractor.index_choice_set(&choices);
     let mut covered = FxHashSet::default();
-    // One constructor proposal per four proposals: argument coverage and
-    // unrestricted random exploration also receive a bounded share.
-    for _ in 0..CLASSES * 4 {
+    // One constructor proposal per six proposals: incumbent/local argument
+    // coverage and random exploration also receive a bounded share.
+    for _ in 0..CLASSES * 6 {
         let child = extractor
             .extract_reachable_indexed_generation(&base, 1, 1, &mut FxHashSet::default(), &mut rng)
             .pop()
@@ -702,7 +702,7 @@ fn argument_coverage_proposes_required_companion_changes() {
 }
 
 #[test]
-fn constructor_coverage_preserves_existing_arguments_without_pruning_variants() {
+fn constructor_coverage_does_not_align_unrelated_argument_positions() {
     let mut graph = paired_arguments_fixture(4, false);
     let root = graph.roots[0].clone();
     let before = NodeId::from("pair-2-3");
@@ -738,6 +738,7 @@ fn constructor_coverage_preserves_existing_arguments_without_pruning_variants() 
     let base = extractor.index_choice_set(&choices);
     let mut reached = FxHashSet::default();
     let mut covered_extra = FxHashSet::default();
+    let mut covered_prefix = FxHashSet::default();
     for proposal in 0..4096 {
         let child = extractor
             .extract_reachable_indexed_generation(&base, 1, 1, &mut FxHashSet::default(), &mut rng)
@@ -748,13 +749,15 @@ fn constructor_coverage_preserves_existing_arguments_without_pruning_variants() 
         reached.insert(node.clone());
         let (_, term) = comparable_constructor_terms(&graph, &before, node).unwrap();
         if proposal % 2 == 0 && term.0 == "Extended" {
-            assert_eq!(
-                term.1[..2],
-                [ClassId::from("knob-2"), ClassId::from("knob-3")]
-            );
+            covered_prefix.insert(term.1[..2].to_vec());
             covered_extra.insert(term.1[2].clone());
         }
     }
+    assert_eq!(
+        covered_prefix.len(),
+        16,
+        "unrelated positional values must not bias the new constructor"
+    );
     assert_eq!(
         covered_extra.len(),
         4,
@@ -998,4 +1001,32 @@ fn constructor_and_argument_coverage_do_not_starve_each_other() {
             );
         }
     }
+}
+
+#[test]
+fn losing_constructor_proposals_still_receive_tuning_neighbors() {
+    let graph = choices_fixture(16);
+    let mut extractor = LlirExtractor::new(&graph, &[]);
+    let base = extractor.index_seed_choices(&[("root".into(), "op-0".into())]);
+    let active = extractor.reachable_mutation_classes(&base);
+    let mut rng = StdRng::seed_from_u64(991);
+    let first = extractor
+        .next_covered_choice(&base, &active, &mut rng)
+        .unwrap();
+    assert_ne!(first.1, base.choices[first.0 as usize]);
+    assert!(!extractor.covered_alternatives[2].is_empty());
+    extractor.cover_queue = 2;
+    let next = extractor
+        .next_covered_choice(&base, &active, &mut rng)
+        .unwrap();
+    assert_eq!(first.0, next.0);
+    assert_ne!(
+        first.1, next.1,
+        "explore another tuning even though the base retained the old family"
+    );
+    let nodes = extractor.indexed_classes[first.0 as usize].nodes;
+    assert_eq!(
+        proposal_family_key(&graph, &nodes[first.1 as usize]),
+        proposal_family_key(&graph, &nodes[next.1 as usize])
+    );
 }

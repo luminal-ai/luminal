@@ -1968,8 +1968,8 @@ pub struct LlirExtractor<'a> {
     indexed_extractions: Vec<Vec<(DenseIndex, Vec<CachedIndexedExtraction>)>>,
     mutation_nodes: Vec<Option<MutationChoices>>,
     cover_next_proposal: bool,
-    covered_alternatives: [Vec<(DenseIndex, CoverageTarget)>; 2],
-    cover_arguments_next: bool,
+    covered_alternatives: [Vec<(DenseIndex, CoverageTarget)>; 3],
+    cover_queue: usize,
     visit_epoch: u32,
     visited: Vec<u32>,
     reachable: Vec<DenseNode>,
@@ -1980,6 +1980,7 @@ pub struct LlirExtractor<'a> {
 enum CoverageTarget {
     Constructor(usize),
     Argument(usize),
+    FamilyArgument(DenseIndex, usize),
 }
 
 struct MutationChoices {
@@ -2063,8 +2064,8 @@ impl<'a> LlirExtractor<'a> {
             indexed_extractions,
             mutation_nodes,
             cover_next_proposal: true,
-            covered_alternatives: [Vec::new(), Vec::new()],
-            cover_arguments_next: false,
+            covered_alternatives: [Vec::new(), Vec::new(), Vec::new()],
+            cover_queue: 0,
             visit_epoch: 0,
             visited: vec![0; indexed_class_count],
             reachable: Vec::new(),
@@ -2371,11 +2372,12 @@ impl<'a> LlirExtractor<'a> {
         active_classes: &[DenseIndex],
         rng: &mut (impl Rng + ?Sized),
     ) -> Option<(DenseIndex, DenseIndex)> {
-        // Independent queues: a long constructor/site pass must not delay all
-        // argument exploration (or vice versa). Random proposals remain intact.
-        let requested = usize::from(self.cover_arguments_next);
-        self.cover_arguments_next = !self.cover_arguments_next;
-        for queue in [requested, 1 - requested] {
+        // Share coverage among implementation transitions, incumbent arguments,
+        // and the tuning neighborhoods of newly proposed implementations. A
+        // losing initial configuration must not suppress its whole family.
+        let requested = self.cover_queue;
+        self.cover_queue = (self.cover_queue + 1) % 3;
+        for queue in (0..3).map(|offset| (requested + offset) % 3) {
             for refill in 0..=1 {
                 while let Some((class, target)) = self.covered_alternatives[queue].pop() {
                     if !active_classes.contains(&class) {
@@ -2398,6 +2400,16 @@ impl<'a> LlirExtractor<'a> {
                                 |slot| &nodes[slot as usize],
                             )
                         }
+                        CoverageTarget::FamilyArgument(anchor, argument) => {
+                            let mut anchored = choices.clone();
+                            self.set_indexed_choice(&mut anchored, class, anchor);
+                            let Some(pool) =
+                                self.argument_pools(&anchored, class).remove(&argument)
+                            else {
+                                continue;
+                            };
+                            pool
+                        }
                         CoverageTarget::Argument(argument) => {
                             // A changed parent may need different companion
                             // changes. Only existing legal alternatives enter.
@@ -2408,9 +2420,23 @@ impl<'a> LlirExtractor<'a> {
                             pool
                         }
                     };
-                    return Some((class, pool[rng.random_range(0..pool.len())]));
+                    let selected = pool[rng.random_range(0..pool.len())];
+                    if matches!(target, CoverageTarget::Constructor(_)) {
+                        let mut anchored = choices.clone();
+                        self.set_indexed_choice(&mut anchored, class, selected);
+                        let mut arguments: Vec<_> =
+                            self.argument_pools(&anchored, class).into_keys().collect();
+                        arguments.shuffle(rng);
+                        for argument in arguments {
+                            self.covered_alternatives[2].insert(
+                                0,
+                                (class, CoverageTarget::FamilyArgument(selected, argument)),
+                            );
+                        }
+                    }
+                    return Some((class, selected));
                 }
-                if refill == 1 {
+                if refill == 1 || queue == 2 {
                     break;
                 }
                 let mut pending = Vec::new();
@@ -2457,6 +2483,9 @@ impl<'a> LlirExtractor<'a> {
                             )
                         }
                         CoverageTarget::Argument(argument) => (Vec::new(), Some(argument)),
+                        CoverageTarget::FamilyArgument(..) => {
+                            unreachable!("local neighborhoods are queued at proposal time")
+                        }
                     };
                     let visit = visits
                         .entry((source, destination, argument))
@@ -3298,9 +3327,10 @@ fn comparable_constructor_terms<'a>(
     Some((left, right))
 }
 
-// On the systematic constructor pass, preserve as many existing argument
-// classes as possible. Extra arguments are free to vary. Only existing enodes
-// participate; the random half still samples every configuration in the family.
+// Preserve argument positions only within the same constructor. Different
+// constructors can assign unrelated meanings to the same position (e.g. a
+// thread count versus a row tile); their variants must not inherit that bias.
+// Only existing enodes participate; random proposals retain every variant.
 fn nearest_constructor_alternatives<'a, T: Copy>(
     egraph: &'a SerializedEGraph,
     current: &NodeId,
@@ -3311,6 +3341,7 @@ fn nearest_constructor_alternatives<'a, T: Copy>(
     let mut best = usize::MAX;
     for &candidate in pool {
         let distance = comparable_constructor_terms(egraph, current, node(candidate))
+            .filter(|(left, right)| left.0 == right.0)
             .map(|(left, right)| {
                 left.1.len().abs_diff(right.1.len())
                     + left.1.iter().zip(&right.1).filter(|(a, b)| a != b).count()
