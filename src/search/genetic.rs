@@ -122,6 +122,8 @@ pub struct GeneticSearch<'a, M> {
 
     // Evolving phase.
     pending: VecDeque<IndexedChoiceSet>,
+    refinements: VecDeque<((u32, usize), VecDeque<IndexedChoiceSet>)>,
+    prefer_refinement: bool,
     generation_open: bool,
     ranked: Ranked<M>,
     parents: Vec<(M, IndexedChoiceSet)>,
@@ -208,6 +210,8 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             n_timed_out: 0,
             n_invalid_profile: 0,
             pending: VecDeque::new(),
+            refinements: VecDeque::new(),
+            prefer_refinement: false,
             generation_open: false,
             ranked: Vec::new(),
             parents: Vec::new(),
@@ -311,12 +315,14 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                         self.finish();
                         return None;
                     }
-                    if self.pending.is_empty() {
+                    if self.pending.is_empty()
+                        && (!self.prefer_refinement || self.refinements.is_empty())
+                    {
                         if self.generation_open {
                             self.close_generation();
                         }
                         self.breed(rng);
-                        if self.pending.is_empty() {
+                        if self.pending.is_empty() && self.refinements.is_empty() {
                             self.finish();
                             return None;
                         }
@@ -327,7 +333,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                         self.finish();
                         return None;
                     }
-                    let genome = self.pending.pop_front().unwrap();
+                    let genome = self.take_pending().unwrap();
                     match self.extract(&genome) {
                         Ok(Some((pre_collapse, llir))) => {
                             return Some(self.hand_out(genome, llir, pre_collapse));
@@ -342,6 +348,25 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                     }
                 }
             }
+        }
+    }
+
+    // Alternate exploration with refinement. A continually improving losing
+    // family must not delay every other constructor until its lattice is spent.
+    // Within refinement, visit families round-robin while prioritizing each
+    // family's newest measured improvement. Every proposal uses the same budget.
+    fn take_pending(&mut self) -> Option<IndexedChoiceSet> {
+        if !self.refinements.is_empty() && (self.prefer_refinement || self.pending.is_empty()) {
+            self.prefer_refinement = false;
+            let (key, mut queue) = self.refinements.pop_front().unwrap();
+            let genome = queue.pop_front();
+            if !queue.is_empty() {
+                self.refinements.push_back((key, queue));
+            }
+            genome
+        } else {
+            self.prefer_refinement = true;
+            self.pending.pop_front()
         }
     }
 
@@ -563,13 +588,21 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                     .is_none_or(|best| new_metric.lt(best));
                 if improved {
                     self.family_best.insert(family, new_metric.clone());
-                    for neighbor in self
-                        .extractor
-                        .argument_neighbors(&genome, family.0, &mut self.prev_selected)
-                        .into_iter()
-                        .rev()
-                    {
-                        self.pending.push_front(neighbor);
+                    let neighbors = self.extractor.argument_neighbors(
+                        &genome,
+                        family.0,
+                        &mut self.prev_selected,
+                    );
+                    if !neighbors.is_empty() {
+                        if let Some((_, queue)) =
+                            self.refinements.iter_mut().find(|(key, _)| *key == family)
+                        {
+                            for neighbor in neighbors.into_iter().rev() {
+                                queue.push_front(neighbor);
+                            }
+                        } else {
+                            self.refinements.push_back((family, neighbors.into()));
+                        }
                     }
                 }
             }
@@ -722,10 +755,9 @@ mod family_tests {
     use crate::search::BucketSearchSpace;
     use rand::SeedableRng;
 
-    #[test]
-    fn losing_family_climbs_multiple_arguments_within_candidate_budget() {
-        let mut graph = paired_arguments_fixture(2, false);
-        let old = choices_fixture(0);
+    fn family_space(width: usize, variants: usize) -> SearchSpace {
+        let mut graph = paired_arguments_fixture(width, false);
+        let old = choices_fixture(variants);
         let root = graph.roots[0].clone();
         graph
             .eclasses
@@ -740,7 +772,7 @@ mod family_tests {
                 graph.eclasses.insert(class, value);
             }
         }
-        let space = SearchSpace {
+        SearchSpace {
             buckets: vec![BucketSearchSpace {
                 egraph: graph,
                 bucket_indices: Default::default(),
@@ -749,7 +781,12 @@ mod family_tests {
             ops: vec![],
             custom_ops: vec![],
             dim_buckets: Default::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn losing_family_climbs_multiple_arguments_within_candidate_budget() {
+        let space = family_space(2, 0);
         let ctx = BucketContext {
             space: &space,
             index: 0,
@@ -792,8 +829,15 @@ mod family_tests {
         let candidate = search.hand_out(seed, LLIRGraph::default(), None);
         search.report(candidate, Outcome::Measured(120, "new family".into()));
         assert_eq!(search.best(), Some(&100));
-        assert_eq!(search.pending.len(), 2);
-        while let Some(genome) = search.pending.pop_front() {
+        assert_eq!(
+            search
+                .refinements
+                .iter()
+                .map(|(_, q)| q.len())
+                .sum::<usize>(),
+            2
+        );
+        while let Some(genome) = search.take_pending() {
             let named = search.extractor.named_choices(&genome);
             let node = &named.iter().find(|(class, _)| class == "root").unwrap().1;
             let metric = if node == "pair-0-0" { 80 } else { 110 };
@@ -816,5 +860,74 @@ mod family_tests {
             5,
             "family exploration consumes the ordinary budget"
         );
+    }
+
+    #[test]
+    fn improving_losing_family_does_not_starve_queued_algorithms() {
+        let space = family_space(16, 3);
+        let ctx = BucketContext {
+            space: &space,
+            index: 0,
+            representative_dyn_map: Default::default(),
+        };
+        let options = CompileOptions::default()
+            .search_log(false)
+            .search_graph_limit(8);
+        let mut search = GeneticSearch::<usize>::new(&space, &ctx, &options, Instant::now());
+        let incumbent = search
+            .extractor
+            .index_seed_choices(&[("root".into(), "op-0".into())]);
+        let candidate = search.hand_out(incumbent, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(100, "incumbent".into()));
+        let family = search
+            .extractor
+            .index_seed_choices(&[("root".into(), "pair-15-15".into())]);
+        let candidate = search.hand_out(family, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(200, "losing family".into()));
+        // These proposals were already generated before refinement began. Only
+        // the last is a winner; improvements within the large losing family
+        // must leave enough of the same eight-evaluation budget to discover it.
+        for i in 1..=3 {
+            let genome = search
+                .extractor
+                .index_seed_choices(&[("root".into(), format!("op-{i}"))]);
+            search.pending.push_back(genome);
+        }
+        let mut tried = Vec::new();
+        while search.measured() < 8 {
+            let genome = search.take_pending().expect("unmeasured proposals remain");
+            let named = search.extractor.named_choices(&genome);
+            let node = named
+                .iter()
+                .find(|(class, _)| class == "root")
+                .unwrap()
+                .1
+                .clone();
+            // Every visited family refinement improves, but still loses to the
+            // incumbent. This reproduced exhaustion of the serving search budget.
+            let metric = if node == "op-3" {
+                80
+            } else {
+                200 - search.measured()
+            };
+            tried.push(node);
+            let candidate = search.hand_out(genome, LLIRGraph::default(), None);
+            search.report(candidate, Outcome::Measured(metric, metric.to_string()));
+        }
+        assert!(
+            tried.iter().any(|node| node.starts_with("pair-")),
+            "refinement remains useful"
+        );
+        assert_eq!(
+            search.best(),
+            Some(&80),
+            "queued algorithms must be tested before the budget is exhausted: {tried:?}"
+        );
+        assert!(
+            search
+                .next_candidate(&mut rand::rngs::StdRng::seed_from_u64(993))
+                .is_none()
+        );
+        assert_eq!(search.measured(), 8);
     }
 }
