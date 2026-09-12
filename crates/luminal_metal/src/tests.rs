@@ -138,6 +138,11 @@ fn extract_llir_with_op(cx: &Graph, op_name: &str) -> luminal::graph::LLIRGraph 
         .enodes
         .iter()
         .filter_map(|(node, (label, children))| {
+            // Bare first-class IR nodes (e.g. MPSMatmul, unioned into the
+            // Mul+Sum eclass rather than wrapped in an `Op`).
+            if label == op_name {
+                return Some(node);
+            }
             if label != "Op" {
                 return None;
             }
@@ -1008,6 +1013,93 @@ fn metal_regular_tiled_matmul_path() {
     let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
 
     assert_close(&result, &expected, 2e-3);
+}
+
+#[test]
+fn metal_mps_matmul_leading_axis_contraction() {
+    // Regression for issue #382: a matmul whose contraction lands on the
+    // LEADING axis of the broadcast-multiply (as produced by luminal_training
+    // autograd weight gradients, `dW = Σ_k g[k,·]·x[k,·]`) must still lower to
+    // MPSMatmul. Reproduces the exact leading-reduction `SumReduce(dim=0, Mul)`
+    // shape without pulling in luminal_training. (Here the product axes are
+    // [k, n, m], i.e. the rule binds its output dims as m'=n, n'=m.) Before
+    // this rule the shape only offered GenericMatmul (~10-20 GFLOP/s vs ~800).
+    let mut cx = Graph::default();
+    let k = 6;
+    let n = 4;
+    let m = 8;
+    let g = cx.tensor((k, n));
+    let x = cx.tensor((k, m));
+    // [k,n,m] product contracting the leading k axis.
+    let prod = g.expand_dim(2, m) * x.expand_dim(1, n);
+    let output = prod.sum(0).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    // The leading-axis contraction must now offer an MPSMatmul candidate, at
+    // parity with the equivalent forward matmul.
+    assert_matmul_options(&cx, "MPSMatmul");
+
+    // And the compiled result must be correct: out[i, j] = Σ_k g[k, i] · x[k, j],
+    // shape [n, m]. Guards against the union asserting a wrong equivalence.
+    let g_data = seeded_data(k * n, 0.31, -0.14);
+    let x_data = seeded_data(k * m, 0.23, -0.11);
+    let mut expected = vec![0.0f32; n * m];
+    for i in 0..n {
+        for j in 0..m {
+            let mut sum = 0.0;
+            for kk in 0..k {
+                sum += g_data[kk * n + i] * x_data[kk * m + j];
+            }
+            expected[i * m + j] = sum;
+        }
+    }
+
+    // Force the MPS candidate (search prefers GenericMatmul at these sizes, for
+    // this and the equivalent forward matmul alike) and execute it, so the
+    // operand-stride -> transpose-flag mapping of the leading rule is validated
+    // numerically, not just by option presence.
+    let llir = extract_llir_with_op(&cx, "MPSMatmul");
+    let mut rt = MetalRuntime::initialize(());
+    rt.load_llir(&llir);
+    rt.set_data(g, &g_data);
+    rt.set_data(x, &x_data);
+    let selected = rt.debug_kernel_ops();
+    assert!(
+        selected.iter().any(|op| op.contains("MPSMatmul")),
+        "forced LLIR must run the leading-axis MPSMatmul, got: {selected:?}"
+    );
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+    assert_close(&rt.get_f32(output), &expected, 1e-3);
+}
+
+#[test]
+fn metal_leading_axis_contraction_rejects_permuted_surviving_axes() {
+    // The leading-axis MPS rule must match ONLY the canonical contiguous read of
+    // the surviving axes. For a SQUARE [k, m, m] product, a movement-only
+    // `permute((0, 2, 1))` before the reduction keeps the [m, m] shape and the
+    // leading m*m*z reduction stride but transposes the result. It must NOT be
+    // unioned with the (untransposed) MPSMatmul — otherwise selecting MPS would
+    // return the transpose. The e-graph must offer GenericMatmul (correct) and
+    // must not offer an MPSMatmul candidate for this view.
+    let mut cx = Graph::default();
+    let k = 6;
+    let mm = 5;
+    let g = cx.tensor((k, mm));
+    let x = cx.tensor((k, mm));
+    let prod = g.expand_dim(2, mm) * x.expand_dim(1, mm); // [k, mm, mm]
+    let output = prod.permute((0, 2, 1)).sum(0).output();
+    let _ = output;
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op(&cx, "GenericMatmul"),
+        "expected GenericMatmul rewrite option in e-graph"
+    );
+    assert!(
+        !egraph_has_op(&cx, "MPSMatmul"),
+        "a permuted-surviving-axes (transposed) reduction must not be unioned with an untransposed MPSMatmul"
+    );
 }
 
 #[test]
