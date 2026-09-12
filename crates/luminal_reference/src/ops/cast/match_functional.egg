@@ -15,4 +15,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpCastGeneric ?in_layout_tensor ?target_dtype ?out_layout))
   )
+  :ruleset backend
 )

@@ -21,6 +21,7 @@
     (union ?layout_tensor_op
       (LayoutTensorOpAddMutatingGeneric ?in1_layout_tensor ?in2_layout_tensor))
   )
+  :ruleset backend
 )
 
 ; Int: PROOF-GATED (non-wrapping ruling 2026-08-11) — mints
@@ -50,6 +51,7 @@
     (union ?layout_tensor_op
       (LayoutTensorOpAddMutatingGeneric ?in1_layout_tensor ?in2_layout_tensor))
   )
+  :ruleset backend
 )
 
 ; Int64: PROOF-GATED (non-wrapping ruling 2026-08-11) — mints
@@ -79,4 +81,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpAddMutatingGeneric ?in1_layout_tensor ?in2_layout_tensor))
   )
+  :ruleset backend
 )

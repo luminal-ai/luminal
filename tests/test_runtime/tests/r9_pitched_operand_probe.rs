@@ -32,7 +32,7 @@ use luminal::layout_ir::ExtractedNode;
 use luminal::prelude::egraph_serialize::EGraph;
 use test_runtime::cublaslt_marker::CublasLt;
 
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 /// x[2,3] @ w[3,4], where w is a column-slice VIEW of a [3,8] parent.
 /// `certificate` supplies the creator's injectivity assertion (or not).

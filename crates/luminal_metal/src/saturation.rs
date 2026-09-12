@@ -69,23 +69,34 @@ pub(crate) fn run_program(egraph: &mut EGraph, text: &str, budget: Option<usize>
         limit,
         used: BTreeMap::new(),
     }));
-    loop {
-        let mut changed = false;
+    // The same two strata as `MetalBindings::SCHEDULE`, stepped by hand so
+    // the algebra budget applies: core rulesets first, then everything
+    // including the backend matchers.
+    for extra in [&[][..], &["backend"][..]] {
         loop {
-            let ring = egraph
-                .step_rules_with_scheduler(scheduler, "")
+            let mut changed = false;
+            loop {
+                let mut updated = egraph
+                    .step_rules_with_scheduler(scheduler, "")
+                    .map_err(|err| anyhow!(err))?
+                    .updated;
+                for ruleset in extra.iter().copied().chain(["prop"]) {
+                    updated |= egraph
+                        .step_rules(ruleset)
+                        .map_err(|err| anyhow!(err))?
+                        .updated;
+                }
+                changed |= updated;
+                if !updated {
+                    break;
+                }
+            }
+            let subst = egraph
+                .step_rules("subst-walk")
                 .map_err(|err| anyhow!(err))?;
-            let prop = egraph.step_rules("prop").map_err(|err| anyhow!(err))?;
-            changed |= ring.updated || prop.updated;
-            if !ring.updated && !prop.updated {
+            if !changed && !subst.updated {
                 break;
             }
-        }
-        let subst = egraph
-            .step_rules("subst-walk")
-            .map_err(|err| anyhow!(err))?;
-        if !changed && !subst.updated {
-            break;
         }
     }
     egraph.remove_scheduler(scheduler);

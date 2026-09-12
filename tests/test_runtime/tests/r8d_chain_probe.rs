@@ -23,7 +23,7 @@ use luminal::layout_ir::{ExtractionSite, SerializedIndex};
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 use test_runtime::cublaslt_marker::{CublasLtForm, parse_spec};
 
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 /// Two matmuls sharing ONE square weight `b` [3,3]:
 ///   out1 = x[2,3] @ b        (A[m,k],B[k,n] spelling, map (c0 c1))

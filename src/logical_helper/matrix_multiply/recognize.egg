@@ -1,0 +1,18 @@
+; Recognize: the reduction over the innermost axis of the product of
+; a[m,k] broadcast with n inserted and a [n,k]-shaped operand broadcast with
+; m inserted outermost is the matrix product of a and that operand's
+; transpose. The product's own shape ties the two legs to one [m, n, k];
+; the operand shapes pin rank 2 and bind k once across both.
+(rule
+  (
+    (= ?out (LogicalReduceSum ?prod 0))
+    (= ?prod (LogicalMul ?a_b ?b_b))
+    (= ?a_b (LogicalHelperBroadcastAxis ?a 1 ?n))
+    (= ?b_b (LogicalHelperBroadcastAxis ?bT 2 ?m))
+    (= (shape-of ?prod) (ShapeLit
+        (IntExprCons ?m (IntExprCons ?n (IntExprCons ?k (IntExprNil))))))
+    (= (shape-of ?a) (ShapeLit (IntExprCons ?m (IntExprCons ?k (IntExprNil)))))
+    (= (shape-of ?bT) (ShapeLit (IntExprCons ?n (IntExprCons ?k (IntExprNil)))))
+  )
+  ((union ?out (LogicalHelperMatrixMultiply ?a (LogicalHelperMatrixTranspose ?bT))))
+)

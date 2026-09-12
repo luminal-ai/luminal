@@ -28,7 +28,7 @@
     (IntCastFromBool (BoolLessThanInt (IntLit 0) position))
     (IntCastFromBool (BoolLessThanInt position (IntLit 3)))))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; Decided comparisons ARE their literals — at the BOOL level first, and
 ; through the cast's literal mapping at the ring level.

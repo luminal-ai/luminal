@@ -13,7 +13,7 @@
 //! (:3865, :3882 and the native chain-walk seed :4076, :4090), so a pitched
 //! operand's broadcast has NO composed layout, and the layout-native arms
 //! have nothing to read. That is why one map-spelling B arm survives.
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 #[test]
 fn raw_strided_never_climbs_to_bit_offset() {

@@ -18,4 +18,5 @@
         (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
     (union ?layout_tensor_op (LayoutTensorOpExp2FunctionalGeneric ?in_layout_tensor ?out_layout))
   )
+  :ruleset backend
 )

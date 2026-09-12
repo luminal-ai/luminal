@@ -4501,6 +4501,18 @@
 )
 
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; BACKEND MATCHERS — every backend match rule spliced below (the op
+; matchers and the cuBLASLt estate) carries `:ruleset backend`. The
+; schedule saturates the core rulesets and the logical helpers first,
+; then saturates everything together:
+;   (saturate (saturate (run) (run prop)) (run subst-walk))
+;   (saturate (saturate (run) (run backend) (run prop)) (run subst-walk))
+; The second stratum runs every ruleset, so the fixpoint is the one the
+; interleaved loop reached; the first keeps the wide matcher rules from
+; being re-evaluated while the layout tables are still churning.
+(ruleset backend)
+
 ;; @SPLICE match
 
 
@@ -4546,7 +4558,7 @@
 ; every invariant lives in egglog; nothing is checked in the extractor).
 ;
 ; This ruleset runs to saturation ONLY AFTER the main run has saturated:
-;   (run-schedule (saturate (run prop)) (saturate (run) (run prop)) ... (saturate (run fixpoint-invariants)))
+;   (run-schedule (saturate (run prop)) (saturate (run) (run prop)) (saturate (run) (run backend) (run prop)) ... (saturate (run fixpoint-invariants)))
 ; That ordering is what makes its optimistic rules LEGAL. The main
 ; stratum is the prover; by its fixpoint every provable equality has
 ; landed and every bound is final. Rules here may therefore do what

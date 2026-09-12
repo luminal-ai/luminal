@@ -17,7 +17,7 @@
 //! that anchor: if the collapse rule is ever weakened or dropped, the
 //! transpose-sandwich rewrite mints views-of-views without bound and
 //! saturation never closes (see tests/r11_collapse_revert_probe.rs).
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 #[test]
 fn double_transpose_rejoins_via_the_collapse_rule() {

@@ -149,6 +149,9 @@ pub fn assembled_program_for(matchers: &[Box<dyn crate::layout_ir::OpMatcher>]) 
     for op in crate::logical_op::built_in_logical_ops() {
         snippets.extend(op.snippets());
     }
+    for helper in crate::logical_helper::built_in_logical_helpers() {
+        snippets.extend(helper.snippets());
+    }
     for matcher in matchers {
         snippets.extend(matcher.snippets());
     }

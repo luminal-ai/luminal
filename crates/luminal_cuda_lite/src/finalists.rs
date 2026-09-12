@@ -77,6 +77,30 @@ pub struct PendingFinalist {
     pub shapes: crate::symbolic::ShapeEnv,
 }
 
+#[cfg(test)]
+impl PendingFinalist {
+    /// TEST-ONLY: a finalist with an empty plan and only the numbers the
+    /// lattice reads.
+    pub(crate) fn synthetic(rank: usize, metric: u128, slab_bytes: usize) -> Self {
+        Self {
+            rank,
+            metric,
+            genome: Genome::default(),
+            plan: CudaPlan {
+                dag: Default::default(),
+                buffers: Default::default(),
+                value_buffer: Default::default(),
+                outputs: Default::default(),
+            },
+            arena: ArenaPlan {
+                slab_bytes,
+                ..Default::default()
+            },
+            shapes: Default::default(),
+        }
+    }
+}
+
 /// The ranked finalists of one bucket, materialized lazily.
 pub struct Finalists<'a> {
     shapes: crate::symbolic::ShapeEnv,
@@ -151,6 +175,23 @@ impl<'a> Finalists<'a> {
             last_rejection: None,
             layout_cache: luminal::layouts::LayoutDecodeCache::new(),
         }
+    }
+
+    /// TEST-ONLY: a bucket whose finalists are given outright as
+    /// `(metric, slab_bytes)` pairs, fastest first, with empty plans —
+    /// what the lattice unit tests walk over, so their preconditions hold
+    /// by construction.
+    #[cfg(test)]
+    pub(crate) fn synthetic(
+        label: impl Into<String>,
+        egraph: &'a egraph_serialize::EGraph,
+        ranked: &[(u128, usize)],
+    ) -> Self {
+        let mut bucket = Self::new(label, egraph, None, &[], Vec::new(), None);
+        for (offset, (metric, slab_bytes)) in ranked.iter().enumerate() {
+            bucket.accept(PendingFinalist::synthetic(offset + 1, *metric, *slab_bytes));
+        }
+        bucket
     }
 
     pub fn with_shapes(mut self, shapes: crate::symbolic::ShapeEnv) -> Self {

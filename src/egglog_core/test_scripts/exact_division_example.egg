@@ -70,7 +70,7 @@
 (let sum_trunc (IntTruncDiv sum_of_multiples (IntLit 64)))
 (let sum_ceil (IntCeilDiv sum_of_multiples (IntLit 64)))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; --- the tiling round trip: quotient recovers the tile index, the
 ; remainder is the zero function and is eliminated as a summand ---

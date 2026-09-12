@@ -13,4 +13,5 @@
         (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
     (union ?layout_tensor_op (LayoutTensorOpLog2MutatingGeneric ?in_layout_tensor))
   )
+  :ruleset backend
 )

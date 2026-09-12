@@ -218,10 +218,11 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
     })
 }
 
-/// Registry lookup by egglog constructor name.
+/// Registry lookup by egglog constructor name — the ops, then the helpers.
 pub fn logical_op_for(constructor: &str) -> Option<&'static (dyn LogicalOp + Send + Sync)> {
     built_in_logical_ops()
         .iter()
         .find(|op| op.egglog_constructor() == constructor)
         .map(|op| op.as_ref())
+        .or_else(|| crate::logical_helper::logical_helper_for(constructor))
 }

@@ -75,6 +75,16 @@ pub fn sum_metrics(metrics: &[u128]) -> u128 {
         .fold(0u128, |total, metric| total.saturating_add(*metric))
 }
 
+/// What a completed walk installs: the selected finalist per bucket, how
+/// many sets were rejected on the way, and the installed ranks (1-based,
+/// for the fallback log line).
+#[derive(Debug)]
+pub struct Installed {
+    pub selected: Vec<(usize, PendingFinalist)>,
+    pub rejections: usize,
+    pub ranks: Vec<usize>,
+}
+
 /// Best-first selection over the buckets' finalist ranks.
 pub struct BucketLattice<'a> {
     buckets: Vec<Finalists<'a>>,
@@ -267,6 +277,38 @@ impl<'a> BucketLattice<'a> {
         selected
     }
 
+    /// DRIVE THE WALK TO AN INSTALLED SET: propose the cheapest untried
+    /// set, check the caller's set-level constraint over its slabs,
+    /// install it or reject it and let the lattice open the
+    /// one-coordinate-slower successors. `Err` carries
+    /// [`BucketLattice::failure_message`].
+    pub fn drive(
+        mut self,
+        validate: &mut dyn FnMut(&PendingFinalist) -> Result<(), String>,
+        validate_set: &mut dyn FnMut(&[usize]) -> Result<(), String>,
+    ) -> Result<Installed, String> {
+        loop {
+            let Some(set) = self.next(validate) else {
+                return Err(self.failure_message());
+            };
+            // Owned numbers, so the immutable borrow of the lattice ends
+            // before a rejection takes it mutably.
+            let slabs = self.slab_bytes(&set);
+            match validate_set(&slabs) {
+                Ok(()) => {
+                    let rejections = self.rejections();
+                    let ranks = self.ranks(&set);
+                    return Ok(Installed {
+                        selected: self.select(&set),
+                        rejections,
+                        ranks,
+                    });
+                }
+                Err(reason) => self.reject(&set, reason, validate),
+            }
+        }
+    }
+
     /// Why nothing viable was found — the text `search` refuses with.
     ///
     /// MAIN'S SPLIT, kept: when NOTHING was ever proposed the failure is
@@ -297,5 +339,140 @@ impl<'a> BucketLattice<'a> {
             message.push_str(&format!("; no slower set is available ({stopped})"));
         }
         message
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The walk over SYNTHETIC finalists: `(metric, slab_bytes)` pairs
+    //! written down, so every precondition holds by construction rather
+    //! than by what a seeded genetic sample happened to contain.
+
+    use super::*;
+    use luminal::prelude::egraph_serialize;
+
+    fn bucket<'a>(
+        label: &str,
+        egraph: &'a egraph_serialize::EGraph,
+        ranked: &[(u128, usize)],
+    ) -> Finalists<'a> {
+        Finalists::synthetic(label, egraph, ranked)
+    }
+
+    fn budget(bytes: usize) -> impl FnMut(&[usize]) -> Result<(), String> {
+        move |slabs: &[usize]| {
+            let peak = slabs.iter().copied().max().unwrap_or(0);
+            if peak > bytes {
+                Err(format!("peak {peak} over the {bytes}-byte budget"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn accept_all(_: &PendingFinalist) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// A budget one byte under the winning set's slab rejects it, and the
+    /// walk installs the cheapest one-coordinate-slower set that fits.
+    #[test]
+    fn a_budget_under_the_winner_installs_the_cheapest_slower_set_that_fits() {
+        let egraph = egraph_serialize::EGraph::default();
+        let buckets = vec![
+            bucket("bucket 0", &egraph, &[(10, 100), (12, 50)]),
+            bucket("bucket 1", &egraph, &[(5, 80)]),
+        ];
+        let lattice = BucketLattice::new(buckets, sum_metrics);
+        let Installed {
+            selected: installed,
+            rejections,
+            ranks,
+        } = lattice
+            .drive(&mut accept_all, &mut budget(99))
+            .expect("the slower set fits");
+        assert_eq!(rejections, 1, "exactly the winning set was rejected");
+        assert_eq!(
+            ranks,
+            vec![2, 1],
+            "bucket 0 fell back one rank, bucket 1 kept its winner"
+        );
+        let slabs: Vec<usize> = installed.iter().map(|(_, f)| f.arena.slab_bytes).collect();
+        assert_eq!(slabs, vec![50, 80]);
+        assert!(slabs.iter().all(|s| *s <= 99));
+    }
+
+    /// No budget: the origin set installs, nothing is rejected.
+    #[test]
+    fn unconstrained_installs_every_bucket_winner() {
+        let egraph = egraph_serialize::EGraph::default();
+        let buckets = vec![
+            bucket("bucket 0", &egraph, &[(10, 100), (12, 50)]),
+            bucket("bucket 1", &egraph, &[(5, 80), (6, 10)]),
+        ];
+        let Installed {
+            selected: installed,
+            rejections,
+            ranks,
+        } = BucketLattice::new(buckets, sum_metrics)
+            .drive(&mut accept_all, &mut |_: &[usize]| Ok(()))
+            .expect("the winners install");
+        assert_eq!(rejections, 0);
+        assert_eq!(ranks, vec![1, 1]);
+        assert_eq!(installed.len(), 2);
+    }
+
+    /// A budget nothing meets: every set is rejected, the walk runs out,
+    /// and the message names the constraint and the exhaustion.
+    #[test]
+    fn a_budget_nothing_meets_runs_out_and_names_it() {
+        let egraph = egraph_serialize::EGraph::default();
+        let buckets = vec![
+            bucket("bucket 0", &egraph, &[(10, 100), (12, 50)]),
+            bucket("bucket 1", &egraph, &[(5, 80)]),
+        ];
+        let err = BucketLattice::new(buckets, sum_metrics)
+            .drive(&mut accept_all, &mut budget(10))
+            .expect_err("nothing fits in 10 bytes");
+        assert!(
+            err.contains("no viable plan set after 2 proposal(s) and 2 rejection(s)"),
+            "{err}"
+        );
+        assert!(err.contains("over the 10-byte budget"), "{err}");
+        assert!(err.contains("ran out of finalists"), "{err}");
+    }
+
+    /// Sets are proposed in nondecreasing aggregate order and never twice.
+    #[test]
+    fn sets_are_proposed_cheapest_first_and_once() {
+        let egraph = egraph_serialize::EGraph::default();
+        let metrics: Vec<Vec<u128>> = vec![vec![10, 11, 20], vec![5, 9]];
+        let buckets = vec![
+            bucket("bucket 0", &egraph, &[(10, 1), (11, 1), (20, 1)]),
+            bucket("bucket 1", &egraph, &[(5, 1), (9, 1)]),
+        ];
+        let mut lattice = BucketLattice::new(buckets, sum_metrics);
+        let mut proposed: Vec<Vec<usize>> = Vec::new();
+        while let Some(set) = lattice.next(&mut accept_all) {
+            proposed.push(set.indices.clone());
+            lattice.reject(&set, "recording", &mut accept_all);
+        }
+        assert_eq!(
+            proposed.len(),
+            6,
+            "every point of the 3x2 lattice was proposed exactly once"
+        );
+        let aggregates: Vec<u128> = proposed
+            .iter()
+            .map(|idx| idx.iter().enumerate().map(|(b, i)| metrics[b][*i]).sum())
+            .collect();
+        assert!(
+            aggregates.windows(2).all(|w| w[0] <= w[1]),
+            "not cheapest-first: {aggregates:?}"
+        );
+        let mut unique = proposed.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), proposed.len());
     }
 }

@@ -99,6 +99,7 @@
       (CublasLtOutputDDescriptor ?site ?out2_lt)
       ?c_view_lt (CublasLtEpilogueDefault)))
   )
+  :ruleset backend
 )
 ; --- C-fold: CublasLtBias -> CublasLtAccumulateBias (c inserted at #2) ----
 (rule
@@ -145,6 +146,7 @@
       (CublasLtOutputDDescriptor ?site ?out2_lt)
       ?c_view_lt ?bias_lt (CublasLtEpilogueDefault)))
   )
+  :ruleset backend
 )
 ; --- bias: CublasLt -> CublasLtBias ---------------------------------------
 ; The bias vector is the per-output-feature n-vector, recognized by the
@@ -211,6 +213,7 @@
       (CublasLtOutputDDescriptor ?site ?out2_lt)
       ?bias_lt (CublasLtEpilogueDefault)))
   )
+  :ruleset backend
 )
 ; --- bias: CublasLtAccumulate -> CublasLtAccumulateBias -------------------
 (rule
@@ -273,6 +276,7 @@
       (CublasLtOutputDDescriptor ?site ?out2_lt)
       ?c_lt ?bias_lt (CublasLtEpilogueDefault)))
   )
+  :ruleset backend
 )
 ; --- relu: epilogue field rewrite in place, one rule per constructor ------
 ; The dance is matched in the RECORDER frame (on ?y_outer); the decorated
@@ -331,6 +335,7 @@
       (CublasLtOutputDDescriptor ?site ?relu_lt)
       (CublasLtEpilogueRelu)))
   )
+  :ruleset backend
 )
 (rule
   (
@@ -385,6 +390,7 @@
       (CublasLtOutputDDescriptor ?site ?relu_lt)
       ?bias_lt (CublasLtEpilogueRelu)))
   )
+  :ruleset backend
 )
 (rule
   (
@@ -439,6 +445,7 @@
       (CublasLtOutputDDescriptor ?site ?relu_lt)
       ?c_lt (CublasLtEpilogueRelu)))
   )
+  :ruleset backend
 )
 (rule
   (
@@ -493,4 +500,5 @@
       (CublasLtOutputDDescriptor ?site ?relu_lt)
       ?c_lt ?bias_lt (CublasLtEpilogueRelu)))
   )
+  :ruleset backend
 )

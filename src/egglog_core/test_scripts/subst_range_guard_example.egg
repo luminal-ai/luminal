@@ -27,7 +27,7 @@
 (let oor_map (IndexMapLit (IntExprCons (IntAdd c0 (IntLit 1)) (IntExprNil)) d_shape))
 (let oor_view (LogicalIndexMapApply d oor_map d_shape))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))
 
 ; (1) The in-range composition completed: the parent bit-offset expression
 ; has an image under rev_map, and the composed layout tensor was minted.

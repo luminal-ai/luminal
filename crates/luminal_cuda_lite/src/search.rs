@@ -802,36 +802,29 @@ pub fn select_finalist_set(
     options: &CompileOptions,
     evaluator: &mut Evaluator<'_>,
 ) -> Result<(Vec<(usize, crate::finalists::PendingFinalist)>, usize)> {
-    let mut lattice = crate::lattice::BucketLattice::new(buckets, crate::lattice::sum_metrics);
+    let lattice = crate::lattice::BucketLattice::new(buckets, crate::lattice::sum_metrics);
     let mut validate = |pending: &crate::finalists::PendingFinalist| -> Result<(), String> {
         finalist_validate(pending, options, evaluator)
     };
-    loop {
-        let Some(set) = lattice.next(&mut validate) else {
-            return Err(anyhow!("{}", lattice.failure_message()));
-        };
-        // Owned numbers, so the immutable borrow of the lattice ends
-        // before a rejection takes it mutably.
-        let slabs = lattice.slab_bytes(&set);
-        match validate_set(&slabs, options) {
-            Ok(()) => {
-                let rejections = lattice.rejections();
-                if rejections > 0 && options.search_log_enabled() {
-                    // MAIN'S FALLBACK LINE ("aggregate fallback: selected
-                    // per-bucket finalist ranks …"): the one moment the
-                    // installed plan is NOT the search's winner is worth
-                    // saying out loud.
-                    eprintln!(
-                        "   {} finalist ranks {:?} after {rejections} rejection(s)",
-                        "Fallback".yellow().bold(),
-                        lattice.ranks(&set)
-                    );
-                }
-                return Ok((lattice.select(&set), rejections));
-            }
-            Err(reason) => lattice.reject(&set, reason, &mut validate),
-        }
+    let mut validate_slabs = |slabs: &[usize]| validate_set(slabs, options);
+    let crate::lattice::Installed {
+        selected,
+        rejections,
+        ranks,
+    } = lattice
+        .drive(&mut validate, &mut validate_slabs)
+        .map_err(|message| anyhow!("{message}"))?;
+    if rejections > 0 && options.search_log_enabled() {
+        // MAIN'S FALLBACK LINE ("aggregate fallback: selected per-bucket
+        // finalist ranks …"): the one moment the installed plan is NOT
+        // the search's winner is worth saying out loud.
+        eprintln!(
+            "   {} finalist ranks {:?} after {rejections} rejection(s)",
+            "Fallback".yellow().bold(),
+            ranks
+        );
     }
+    Ok((selected, rejections))
 }
 
 /// One bucket combination's finished search: the dim ranges it covers, the

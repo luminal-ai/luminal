@@ -45,7 +45,7 @@
     (IntLit 64)) (IntLit 64)) (IntLit 64)) (IntLit 64)) (IntLit 64)) (IntLit 64))
     (IntLit 64)) (IntLit 64)) (IntLit 64)))
 
-(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
+(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (saturate (run fixpoint-invariants)))
 
 ; Literals are exact.
 (check (= (lower-bound-of (IntLit 64)) (bigint 64)))
