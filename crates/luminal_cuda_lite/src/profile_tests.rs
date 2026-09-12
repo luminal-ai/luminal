@@ -1564,3 +1564,52 @@ fn prepared_unified_owner_survives_replay_and_releases_on_replacement() {
     rt.execute(&graph.dyn_map);
     assert_eq!(rt.get_f32(output), vec![10.; 4]);
 }
+
+#[test]
+fn profile_storage_retains_owned_allocation_and_shared_alias_identity() {
+    let bytes = vec![0u8; 1024 * 1024];
+    let address = bytes.as_ptr();
+    let storage = ProfileStorage::new(bytes);
+    assert_eq!(
+        storage.0.as_ptr(),
+        address,
+        "moving a snapshot must not copy its bytes"
+    );
+    let alias = storage.clone();
+    assert!(Arc::ptr_eq(&storage.0, &alias.0));
+    assert_eq!(alias.0.len(), 1024 * 1024);
+    drop(storage);
+    assert!(alias.0.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn large_zero_capture_preserves_overlapping_views_after_device_mutation() {
+    let mut graph = Graph::new();
+    let n = 256 * 1024;
+    let a = graph.tensor(n).persist();
+    let b = graph.tensor(n).persist();
+    (a + b).output();
+    graph.build_search_space::<CudaRuntime>(CompileOptions::default().search_log(false));
+    let mut rt = runtime();
+    let mut backing = rt.cuda_stream.alloc_zeros::<f32>(n + 2).unwrap();
+    let ptr = backing.device_ptr(&rt.cuda_stream).0;
+    unsafe {
+        rt.set_device_ptr(a, ptr, n * 4);
+        rt.set_device_ptr(b, ptr + 8, n * 4);
+    }
+    let captured = rt.capture_profile_inputs(&[a, b], &graph.dyn_map).unwrap();
+    let groups = captured.groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].0.len(), (n + 2) * 4);
+    assert_eq!(captured.bindings[0].range, 0..n * 4);
+    assert_eq!(captured.bindings[1].range, 8..(n + 2) * 4);
+    rt.cuda_stream
+        .memcpy_htod(&vec![7.0f32; n + 2], &mut backing)
+        .unwrap();
+    rt.cuda_stream.synchronize().unwrap();
+    assert!(groups[0].0.iter().all(|&byte| byte == 0));
+    assert!(Arc::ptr_eq(
+        &captured.bindings[0].storage.0,
+        &captured.bindings[1].storage.0
+    ));
+}

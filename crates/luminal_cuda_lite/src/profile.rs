@@ -9,7 +9,9 @@ use std::ops::Range;
 /// Immutable backing bytes. Views of the same storage preserve aliasing and are
 /// restored together, once per reset. Bytes use the graph input's physical ABI.
 #[derive(Clone, Debug)]
-pub struct ProfileStorage(Arc<[u8]>);
+// Retain the caller's allocation. Converting Vec into Arc<[u8]> copies every
+// byte and physically commits lazily allocated zero pages for large states.
+pub struct ProfileStorage(Arc<Vec<u8>>);
 impl ProfileStorage {
     pub fn new(data: impl ToCudaInput) -> Self {
         Self(data.into_cuda_bytes().into())
@@ -398,6 +400,13 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     result::memcpy_dtoh_sync(&mut bytes, start)?;
                 }
             }
+            // A device read commits every destination page, including untouched
+            // zero-filled state. A fresh zeroed allocation can retain lazy zero
+            // pages instead; Arc<Vec<_>> then owns it without an eager copy.
+            // The captured values and all overlapping views remain identical.
+            if bytes.len() >= 1024 * 1024 && bytes.iter().all(|&byte| byte == 0) {
+                bytes = vec![0; bytes.len()];
+            }
             let storage = ProfileStorage(bytes.into());
             for &(ptr, end, tensor) in &ranges[i..j] {
                 let range = (ptr - start) as usize..(end - start) as usize;
@@ -664,12 +673,12 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         if workload.device_snapshots && session.active != Some(case) {
             let sample = &workload.cases[case];
             let groups = sample.inputs.groups();
-            let keys: FxHashSet<_> = groups.iter().map(|g| g.0.as_ptr() as usize).collect();
+            let keys: FxHashSet<_> = groups.iter().map(|g| Arc::as_ptr(&g.0) as usize).collect();
             // Release inactive storage before allocating its replacement, so
             // memory scales with the largest case rather than the case count.
             session.snapshots.retain(|key, _| keys.contains(key));
             for group in groups {
-                let key = group.0.as_ptr() as usize;
+                let key = Arc::as_ptr(&group.0) as usize;
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     session.snapshots.entry(key)
                 {
@@ -698,7 +707,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     self.cuda_stream
                         .upgrade_device_ptr::<u8>(ptr, group.0.len())
                 });
-                if let Some(source) = session.snapshots.get(&(group.0.as_ptr() as usize)) {
+                if let Some(source) = session.snapshots.get(&(Arc::as_ptr(&group.0) as usize)) {
                     self.cuda_stream.memcpy_dtod(source, &mut *destination)?;
                 } else {
                     self.cuda_stream

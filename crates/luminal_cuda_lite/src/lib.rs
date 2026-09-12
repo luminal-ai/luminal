@@ -10,6 +10,7 @@ pub mod kernel;
 mod resource;
 pub mod runtime;
 mod search;
+mod search_image_cache;
 use std::{
     cell::Cell,
     ffi::{CStr, CString},
@@ -563,6 +564,11 @@ pub fn compile_module_image_for_current_device<S: AsRef<str>>(
     {
         panic!("kernel source too large for nvrtc ({src_len} bytes > {limit})");
     }
+    let search_image_key = search_image_cache::key(&module_key, &nvrtc_options);
+    if let Some(image) = search_image_cache::lookup(&search_image_key) {
+        record_module_image(&module_key, &image);
+        return Ok(Ptx::from_binary(image));
+    }
     if src_len > 128 * 1024 {
         eprintln!("nvrtc: compiling a large kernel ({src_len} bytes)");
     }
@@ -644,6 +650,7 @@ pub fn compile_module_image_for_current_device<S: AsRef<str>>(
     }
 
     record_module_image(&module_key, &cubin);
+    search_image_cache::record(search_image_key, &cubin);
     Ok(Ptx::from_binary(cubin))
 }
 

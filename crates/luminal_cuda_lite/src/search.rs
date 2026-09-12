@@ -30,6 +30,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let contexts = space.bucket_contexts(dyn_map);
         let mut finalists = Vec::with_capacity(contexts.len());
         for ctx in &contexts {
+            let _image_cache = crate::search_image_cache::SearchImageCache::enter();
             let bucket_started = Instant::now();
             let setup_started = Instant::now();
             let mut search = GeneticSearch::<Duration>::new(space, ctx, options, search_started_at);
