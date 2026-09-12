@@ -92,6 +92,12 @@ enum Phase {
 
 const MAX_INVALID_INITIAL_ATTEMPTS: usize = 100;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refinement {
+    Family(u32, usize),
+    Recombination,
+}
+
 pub struct GeneticSearch<'a, M> {
     space: &'a SearchSpace,
     ctx: &'a BucketContext<'a>,
@@ -122,7 +128,7 @@ pub struct GeneticSearch<'a, M> {
 
     // Evolving phase.
     pending: VecDeque<IndexedChoiceSet>,
-    refinements: VecDeque<((u32, usize), VecDeque<IndexedChoiceSet>)>,
+    refinements: VecDeque<(Refinement, VecDeque<IndexedChoiceSet>)>,
     prefer_refinement: bool,
     generation_open: bool,
     ranked: Ranked<M>,
@@ -352,7 +358,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
     }
 
     // Alternate exploration with refinement. A continually improving losing
-    // family must not delay every other constructor until its lattice is spent.
+    // family or winner recombination must not delay every other constructor.
     // Within refinement, visit families round-robin while prioritizing each
     // family's newest measured improvement. Every proposal uses the same budget.
     fn take_pending(&mut self) -> Option<IndexedChoiceSet> {
@@ -367,6 +373,19 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
         } else {
             self.prefer_refinement = true;
             self.pending.pop_front()
+        }
+    }
+
+    fn queue_refinement(&mut self, key: Refinement, neighbors: Vec<IndexedChoiceSet>) {
+        if neighbors.is_empty() {
+            return;
+        }
+        if let Some((_, queue)) = self.refinements.iter_mut().find(|(k, _)| *k == key) {
+            for neighbor in neighbors.into_iter().rev() {
+                queue.push_front(neighbor);
+            }
+        } else {
+            self.refinements.push_back((key, neighbors.into()));
         }
     }
 
@@ -560,9 +579,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                 &self.ranked[0].1,
                 &mut self.prev_selected,
             );
-            for child in combinations.into_iter().rev() {
-                self.pending.push_front(child);
-            }
+            self.queue_refinement(Refinement::Recombination, combinations);
         }
 
         let rank = self
@@ -593,17 +610,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                         family.0,
                         &mut self.prev_selected,
                     );
-                    if !neighbors.is_empty() {
-                        if let Some((_, queue)) =
-                            self.refinements.iter_mut().find(|(key, _)| *key == family)
-                        {
-                            for neighbor in neighbors.into_iter().rev() {
-                                queue.push_front(neighbor);
-                            }
-                        } else {
-                            self.refinements.push_back((family, neighbors.into()));
-                        }
-                    }
+                    self.queue_refinement(Refinement::Family(family.0, family.1), neighbors);
                 }
             }
         }
@@ -751,7 +758,9 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
 #[cfg(test)]
 mod family_tests {
     use super::*;
-    use crate::egglog_utils::proposal_tests::{choices_fixture, paired_arguments_fixture};
+    use crate::egglog_utils::proposal_tests::{
+        choices_fixture, independent_choices_fixture, paired_arguments_fixture,
+    };
     use crate::search::BucketSearchSpace;
     use rand::SeedableRng;
 
@@ -929,5 +938,80 @@ mod family_tests {
                 .is_none()
         );
         assert_eq!(search.measured(), 8);
+    }
+
+    #[test]
+    fn winner_recombination_does_not_starve_queued_algorithms() {
+        let (graph, roots) = independent_choices_fixture(8, 1);
+        let space = SearchSpace {
+            buckets: vec![BucketSearchSpace {
+                egraph: graph,
+                bucket_indices: Default::default(),
+                intervals: Default::default(),
+            }],
+            ops: vec![],
+            custom_ops: vec![],
+            dim_buckets: Default::default(),
+        };
+        let ctx = BucketContext {
+            space: &space,
+            index: 0,
+            representative_dyn_map: Default::default(),
+        };
+        let options = CompileOptions::default()
+            .search_log(false)
+            .search_graph_limit(4);
+        let mut search = GeneticSearch::<usize>::new(&space, &ctx, &options, Instant::now());
+        let bindings = |which: fn(usize) -> bool| {
+            roots
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    (
+                        c.to_string(),
+                        format!("value-{i}-variant-{}", usize::from(which(i))),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let incumbent = search.extractor.index_seed_choices(&bindings(|i| i < 4));
+        let candidate = search.hand_out(incumbent, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(100, "incumbent".into()));
+        let probe = search.extractor.index_seed_choices(&bindings(|_| true));
+        search.pending.push_back(probe);
+        let winner = search.extractor.index_seed_choices(&bindings(|i| i >= 4));
+        let candidate = search.hand_out(winner, LLIRGraph::default(), None);
+        search.report(
+            candidate,
+            Outcome::Measured(90, "independent improvements".into()),
+        );
+        // The two parents disagree at eight sites, generating more combinations
+        // than the remaining budget. The queued all-improved program must still
+        // be evaluated, while combination proposals retain a share of the work.
+        let mut combinations = 0;
+        while search.measured() < 4 {
+            let genome = search.take_pending().unwrap();
+            let all_improved = search
+                .extractor
+                .named_choices(&genome)
+                .iter()
+                .filter(|(class, node)| {
+                    class.starts_with("value-class-") && node.ends_with("variant-1")
+                })
+                .count()
+                == 8;
+            combinations += usize::from(!all_improved);
+            let cost = if all_improved { 1 } else { 95 };
+            let candidate = search.hand_out(genome, LLIRGraph::default(), None);
+            search.report(candidate, Outcome::Measured(cost, cost.to_string()));
+        }
+        assert_eq!(search.best(), Some(&1));
+        assert_eq!(combinations, 1);
+        assert!(
+            search
+                .next_candidate(&mut rand::rngs::StdRng::seed_from_u64(997))
+                .is_none()
+        );
+        assert_eq!(search.measured(), 4);
     }
 }

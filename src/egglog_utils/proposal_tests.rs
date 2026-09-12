@@ -276,7 +276,7 @@ fn check_activated_input_mutation(already_active: bool) {
     );
 }
 
-fn independent_choices_fixture(
+pub(crate) fn independent_choices_fixture(
     classes: usize,
     variants: usize,
 ) -> (SerializedEGraph, Vec<ClassId>) {
