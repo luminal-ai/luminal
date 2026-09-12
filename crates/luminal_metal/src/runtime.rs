@@ -598,6 +598,19 @@ impl MetalRuntime {
                     MTLResourceOptions::StorageModeShared,
                 )
             }
+            // `DType::Bool` is documented in src/dtype.rs as "stored as u8,
+            // 0 or 1" and reports bits() == 8. Normalise through u8 rather
+            // than uploading `Vec<bool>` directly so the 0/1 invariant the
+            // generated `uchar` kernels rely on is enforced here, at the one
+            // place host data enters the backend.
+            DType::Bool => {
+                let values: Vec<u8> = data.to_bool_vec().into_iter().map(|b| b as u8).collect();
+                self.device.new_buffer_with_data(
+                    values.as_ptr() as *const _,
+                    std::mem::size_of_val(values.as_slice()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
             unsupported => panic!("Metal input dtype {unsupported:?} is not supported yet"),
         }
     }

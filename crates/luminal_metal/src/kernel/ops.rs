@@ -100,6 +100,10 @@ fn metal_buffer_type(dtype: DType) -> &'static str {
         DType::F32 => "float",
         DType::F16 => "half",
         DType::Int => "int",
+        // `DType::Bool` is documented in src/dtype.rs as "stored as u8, 0 or 1"
+        // and reports bits() == 8, matching the CUDA backend's
+        // `DType::Bool => "unsigned char"`.
+        DType::Bool => "uchar",
         _ => panic!("Metal dtype {dtype:?} is not supported yet"),
     }
 }
@@ -109,6 +113,7 @@ fn metal_numeric_read(dtype: DType, buffer: &str, index: &str) -> String {
         DType::F32 => format!("{buffer}[{index}]"),
         DType::F16 => format!("float({buffer}[{index}])"),
         DType::Int => format!("float({buffer}[{index}])"),
+        DType::Bool => format!("float({buffer}[{index}])"),
         _ => panic!("Metal dtype {dtype:?} is not supported yet"),
     }
 }
@@ -118,13 +123,18 @@ fn metal_numeric_write(dtype: DType, expr: &str) -> String {
         DType::F32 => expr.to_string(),
         DType::F16 => format!("half({expr})"),
         DType::Int => format!("int({expr})"),
+        // Normalise to the documented 0/1 storage invariant rather than
+        // truncating, so a non-{0,1} float can never land in a Bool buffer.
+        DType::Bool => format!("uchar(({expr}) != 0.0f)"),
         _ => panic!("Metal dtype {dtype:?} is not supported yet"),
     }
 }
 
 fn metal_copy_value(dtype: DType, buffer: &str, index: &str) -> String {
     match dtype {
-        DType::F32 | DType::F16 | DType::Int => format!("{buffer}[{index}]"),
+        DType::F32 | DType::F16 | DType::Int | DType::Bool => {
+            format!("{buffer}[{index}]")
+        }
         _ => panic!("Metal dtype {dtype:?} is not supported yet"),
     }
 }
@@ -3763,6 +3773,15 @@ impl MetalKernelOp for MetalCast {
         let input_ty = metal_buffer_type(input_dtype);
         let output_ty = metal_buffer_type(output_dtype);
         let cast_expr = match (input_dtype, output_dtype) {
+            // Casting *to* Bool normalises to the documented 0/1 storage
+            // invariant; a plain truncating cast would let e.g. 2.0 become 2.
+            (DType::F32 | DType::F16 | DType::Int | DType::Bool, DType::Bool) => {
+                format!("({output_ty})(inp[idx] != 0)")
+            }
+            // Casting *from* Bool is an ordinary widening of 0/1.
+            (DType::Bool, DType::F32 | DType::F16 | DType::Int) => {
+                format!("({output_ty})(inp[idx])")
+            }
             (DType::F32, DType::F32)
             | (DType::F16, DType::F16)
             | (DType::Int, DType::Int)
