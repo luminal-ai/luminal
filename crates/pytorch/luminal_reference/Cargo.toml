@@ -1,0 +1,19 @@
+[package]
+name = "luminal_reference_py"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "luminal_reference_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+luminal = { path = "../../.." }
+luminal_reference = { path = "../../luminal_reference" }
+luminal_pytorch_utils = { path = "../utils" }
+anyhow = "1"
+rustc-hash = "2.1.1"
+
+[dependencies.pyo3]
+version = "0.28.0"
+features = ["abi3-py38"]

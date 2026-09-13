@@ -26,10 +26,12 @@
 // `<op_module>::kernel` (op-folder ruling 2026-08-13).
 pub(crate) mod add;
 pub(crate) mod cast;
+pub(crate) mod ceil;
 pub(crate) mod constant;
 pub(crate) mod div;
 pub(crate) mod exp;
 pub(crate) mod exp2;
+pub(crate) mod floor;
 pub(crate) mod gather;
 pub(crate) mod index_map_apply_materialize;
 pub(crate) mod iota;
@@ -43,9 +45,12 @@ pub(crate) mod trunc_rem;
 pub(crate) mod recip;
 pub(crate) mod reduce_max;
 pub(crate) mod reduce_sum;
+pub(crate) mod round;
 pub(crate) mod scatter;
 pub(crate) mod sin;
 pub(crate) mod sqrt;
+pub(crate) mod trunc;
+pub(crate) mod trunc_cast;
 
 // The functional forms, the mutating forms, and Poison are exported: a DPS
 // form is an implementation detail of its op pair, entering the world solely
@@ -58,10 +63,12 @@ pub(crate) mod sqrt;
 // by the DPS pass, for Poison) — a hygiene convention, not a privacy fence.
 pub use add::AddFunctional;
 pub use cast::Cast;
+pub use ceil::CeilFunctional;
 pub use constant::Constant;
 pub use div::DivFunctional;
 pub use exp::ExpFunctional;
 pub use exp2::Exp2Functional;
+pub use floor::FloorFunctional;
 pub use gather::Gather;
 pub use index_map_apply_materialize::IndexMapApplyMaterialize;
 pub use iota::Iota;
@@ -73,19 +80,24 @@ pub use mul::MulFunctional;
 pub use recip::RecipFunctional;
 pub use reduce_max::ReduceMax;
 pub use reduce_sum::ReduceSum;
+pub use round::RoundFunctional;
 pub use scatter::ScatterFunctional;
 pub use sin::SinFunctional;
 pub use sqrt::SqrtFunctional;
+pub use trunc::TruncFunctional;
+pub use trunc_cast::TruncCast;
 
 // DPS forms, re-exported for the reference runtime's kernel registry
 // (reference::kernels downcasts plan ops to these concrete types —
 // ops carry no execution of their own, ruling 2026-08-06).
 pub use add::AddFunctionalDps;
 pub use cast::CastDps;
+pub use ceil::CeilFunctionalDps;
 pub use constant::ConstantDps;
 pub use div::DivFunctionalDps;
 pub use exp::ExpFunctionalDps;
 pub use exp2::Exp2FunctionalDps;
+pub use floor::FloorFunctionalDps;
 pub use gather::GatherDps;
 pub use index_map_apply_materialize::IndexMapApplyMaterializeDps;
 pub use iota::{IotaDps, IotaExpr};
@@ -96,16 +108,21 @@ pub use mul::MulFunctionalDps;
 pub use recip::RecipFunctionalDps;
 pub use reduce_max::ReduceMaxDps;
 pub use reduce_sum::ReduceSumDps;
+pub use round::RoundFunctionalDps;
 pub use scatter::ScatterFunctionalDps;
 pub use sin::SinFunctionalDps;
 pub use sqrt::SqrtFunctionalDps;
+pub use trunc::TruncFunctionalDps;
+pub use trunc_cast::TruncCastDps;
 
 pub use add::AddFunctionalMatcher;
 pub use cast::CastMatcher;
+pub use ceil::CeilFunctionalMatcher;
 pub use constant::ConstantMatcher;
 pub use div::DivFunctionalMatcher;
 pub use exp::ExpFunctionalMatcher;
 pub use exp2::Exp2FunctionalMatcher;
+pub use floor::FloorFunctionalMatcher;
 pub use gather::GatherMatcher;
 pub use index_map_apply_materialize::IndexMapApplyMaterializeMatcher;
 pub use iota::IotaMatcher;
@@ -116,9 +133,12 @@ pub use mul::MulFunctionalMatcher;
 pub use recip::RecipFunctionalMatcher;
 pub use reduce_max::ReduceMaxMatcher;
 pub use reduce_sum::ReduceSumMatcher;
+pub use round::RoundFunctionalMatcher;
 pub use scatter::ScatterFunctionalMatcher;
 pub use sin::SinFunctionalMatcher;
 pub use sqrt::SqrtFunctionalMatcher;
+pub use trunc::TruncFunctionalMatcher;
+pub use trunc_cast::TruncCastMatcher;
 pub use trunc_div::{TruncDivFunctional, TruncDivFunctionalDps, TruncDivFunctionalMatcher};
 pub use trunc_rem::{TruncRemFunctional, TruncRemFunctionalDps, TruncRemFunctionalMatcher};
 
@@ -205,6 +225,26 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(SqrtFunctionalMatcher),
                 kernel: entry::<SqrtFunctionalDps>("SqrtFunctionalGeneric", sqrt::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(FloorFunctionalMatcher),
+                kernel: entry::<FloorFunctionalDps>("FloorFunctionalGeneric", floor::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(CeilFunctionalMatcher),
+                kernel: entry::<CeilFunctionalDps>("CeilFunctionalGeneric", ceil::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(TruncFunctionalMatcher),
+                kernel: entry::<TruncFunctionalDps>("TruncFunctionalGeneric", trunc::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(RoundFunctionalMatcher),
+                kernel: entry::<RoundFunctionalDps>("RoundFunctionalGeneric", round::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(TruncCastMatcher),
+                kernel: entry::<TruncCastDps>("TruncCastGeneric", trunc_cast::kernel),
             },
             ReferenceOp {
                 matcher: || Box::new(ExpFunctionalMatcher),

@@ -456,10 +456,10 @@ impl GraphTensor {
         // adjustment stay in i32 end to end — the old f32 detour ended
         // in a cast back to Int, which the cast policy now refuses.
         assert_eq!(indexes.dtype, DType::Int, "index tensor must be Int");
-        let zero = indexes.graph().constant(0).expand_rhs(indexes.dims());
+        let zero = indexes.graph().constant_i32(0).expand_rhs(indexes.dims());
         let adj = indexes
             .graph()
-            .constant(axis_dim)
+            .constant_i32(axis_dim)
             .expand_rhs(indexes.dims());
         let is_neg = indexes.lt(zero).cast(DType::Int);
         // Plain Int arithmetic is proof-gated (non-wrapping ruling): this
@@ -480,7 +480,7 @@ impl GraphTensor {
         // Axis contribution from the runtime index values
         let stride_tensor = self
             .graph()
-            .constant(strides[axis])
+            .constant_i32(strides[axis])
             .expand_rhs(idx_normalized.dims());
         let flat_idx = non_axis_flat + idx_normalized * stride_tensor;
 
@@ -519,10 +519,10 @@ impl GraphTensor {
         let axis_dim = data_dims[axis];
         // Int-native normalization (2026-08-11) — see gather_elements.
         assert_eq!(indices.dtype, DType::Int, "index tensor must be Int");
-        let zero = indices.graph().constant(0).expand_rhs(indices.dims());
+        let zero = indices.graph().constant_i32(0).expand_rhs(indices.dims());
         let adj = indices
             .graph()
-            .constant(axis_dim)
+            .constant_i32(axis_dim)
             .expand_rhs(indices.dims());
         let is_neg = indices.lt(zero).cast(DType::Int);
         // Proof-gated plain arithmetic — see gather_elements: the caller
@@ -539,7 +539,7 @@ impl GraphTensor {
         // Axis contribution from the runtime index values
         let stride_tensor = self
             .graph()
-            .constant(strides[axis])
+            .constant_i32(strides[axis])
             .expand_rhs(idx_normalized.dims());
         let flat_dest = non_axis_flat + idx_normalized * stride_tensor;
 
@@ -611,7 +611,7 @@ impl GraphTensor {
             let idx_k = indices_flat.slice_along(k_dim..k_dim + 1, indices_flat.dims().len() - 1);
             let idx_k = idx_k.squeeze(idx_k.dims().len() - 1);
 
-            let stride_tensor = self.graph().constant(stride).expand_rhs(idx_k.dims());
+            let stride_tensor = self.graph().constant_i32(stride).expand_rhs(idx_k.dims());
             // Proof-gated plain arithmetic — see gather_elements: the
             // caller declares the index range at binding time.
             let contribution = idx_k * stride_tensor;
@@ -1107,7 +1107,7 @@ impl GraphTensor {
             Some(elem) => {
                 let one = self
                     .graph()
-                    .constant(1)
+                    .constant_i32(1)
                     .cast(self.dtype)
                     .expand_rhs(out_dims.clone());
                 masked + (one - mask) * elem.expand_rhs(out_dims)
@@ -1127,7 +1127,7 @@ impl GraphTensor {
         if elem == 0.0 {
             return self.pad_impl(padding, None);
         }
-        let fill = self.graph().constant_float(elem).cast(self.dtype);
+        let fill = self.graph().constant_f32(elem).cast(self.dtype);
         self.pad_impl(padding, Some(fill))
     }
 
@@ -1523,7 +1523,7 @@ mod tests {
     fn pad_with_uses_a_typed_scalar_fill() {
         let mut cx = Graph::new();
         let a = cx.tensor(3, DType::F32);
-        let fill = cx.constant_float(-7.0);
+        let fill = cx.constant_f32(-7.0);
         let b = a.pad_with((1, 2), fill).output();
 
         let rt = luminal_reference::harness::run_reference(
@@ -1561,7 +1561,7 @@ mod tests {
     //     // #[test]
     //     // fn test_cumsum() {
     //     //     let mut cx = Graph::new();
-    //     //     let a = cx.constant(1.).expand_dim(0, 3);
+    //     //     let a = cx.constant_i32(1.).expand_dim(0, 3);
     //     //     let b = a.cumsum_last_dim().retrieve();
     //     //     let c = a
     //     //         .expand_dim(1, 3)

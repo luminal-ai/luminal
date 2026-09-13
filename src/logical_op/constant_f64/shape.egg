@@ -1,0 +1,10 @@
+; Shape Propagation : LogicalConstantF64 — RANK 0, always: the empty shape.
+(rule
+  (
+    (= ?out_logical (LogicalConstantF64 ?constant_value))
+  )
+  (
+    (set (shape-of ?out_logical) (ShapeLit (IntExprNil)))
+  )
+  :ruleset prop
+)

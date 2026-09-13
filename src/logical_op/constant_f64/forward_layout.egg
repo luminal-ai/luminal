@@ -1,0 +1,11 @@
+; Forward LayoutTensor Propagation : Logical Constant F64 — the same
+; source-op mint as LogicalConstant, over the RANK-0 canonical layout.
+(rule
+  (
+    (= ?out_logical (LogicalConstantF64 ?constant_value))
+    (= ?bits (bits-of (dtype-of ?out_logical)))
+  )
+  (
+    (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit (ShapeLit (IntExprNil)) ?bits)))
+  )
+)

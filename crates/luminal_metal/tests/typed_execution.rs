@@ -6,7 +6,7 @@ use luminal_metal::{HostBuffer, MetalRuntime, harness_search_options};
 fn bool_output_uses_byte_storage_with_odd_lengths() {
     let mut g = Graph::new();
     let x = g.tensor(5, DType::F32);
-    let out = x.lt(g.constant_float(0.).expand_dim(0, 5)).output();
+    let out = x.lt(g.constant_f32(0.).expand_dim(0, 5)).output();
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();

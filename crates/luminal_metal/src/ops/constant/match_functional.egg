@@ -15,3 +15,21 @@
   )
   :ruleset backend
 )
+
+; The exact-F64 scalar source lowers through the same constant op.
+(rule
+  (
+    (= ?out_logical (LogicalConstantF64 ?constant_value))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorNil)
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpConstantGeneric ?constant_value ?out_layout))
+  )
+)

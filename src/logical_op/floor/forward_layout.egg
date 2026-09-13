@@ -1,0 +1,10 @@
+; Forward LayoutTensor Propagation : Logical Floor — elementwise, same layout.
+(rule
+  (
+    (= ?out_logical (LogicalFloor ?in_logical))
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+  )
+  (
+    (let new_out_layout_tensor (LayoutTensorLit ?out_logical ?in_layout)) ; Forward Propagation
+  )
+)

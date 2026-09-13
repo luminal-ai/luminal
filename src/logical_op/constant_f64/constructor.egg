@@ -1,0 +1,5 @@
+; Logical F64 Constant : ONE exact double scalar — a true RANK-0 tensor
+; (empty shape), never a length-1 vector. Separate from LogicalConstant
+; (F32 by its parity rule) so `0.1f64`/`1e300` cross the pipeline at full
+; double precision. Congruence dedupes equal values.
+(constructor LogicalConstantF64 (f64) LogicalTensor)

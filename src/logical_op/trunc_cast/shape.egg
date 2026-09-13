@@ -1,0 +1,12 @@
+; Shape Propagation : LogicalTruncCast — the shape is the input's (only
+; the element type changes).
+(rule
+  (
+    (= ?out_logical (LogicalTruncCast ?in_logical ?target_dtype))
+    (= ?shape (shape-of ?in_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?shape)
+  )
+  :ruleset prop
+)

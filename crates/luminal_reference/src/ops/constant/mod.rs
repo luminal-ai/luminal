@@ -150,10 +150,14 @@ pub(crate) fn kernel(
     let op = expect_op::<ConstantDps>(op)?;
     match &mut ctx.dests[0] {
         TypedBuffer::F32(dest) => dest.fill(op.value as f32),
-        // LogicalConstant is F32 by its dtype rule; integer dests would
-        // mean the plan annotated something the op cannot mean.
+        // `LogicalConstantF64` lowers through this same op; the dest's F64
+        // dtype carries the exact double.
+        TypedBuffer::F64(dest) => dest.fill(op.value),
+        // Every other dest would mean the plan annotated a dtype neither
+        // constant rule can mean.
         other => anyhow::bail!(
-            "constant fill has no {} arm (LogicalConstant is F32)",
+            "constant fill has no {} arm (LogicalConstant is F32, \
+             LogicalConstantF64 is F64)",
             other.type_name()
         ),
     }

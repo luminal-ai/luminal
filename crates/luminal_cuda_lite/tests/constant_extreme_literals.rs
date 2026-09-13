@@ -7,7 +7,7 @@
 //!
 //! THE PATH THE LITERAL TAKES, in order:
 //!
-//!  1. `Graph::constant_float(v)` (src/frontend/other.rs) records
+//!  1. `Graph::constant_f32(v)` (src/frontend/other.rs) records
 //!     `LogicalOp::Constant(v as f64)`; the term's f64 child is written
 //!     into the egglog program by `Graph`'s renderer as Rust's `{:?}`
 //!     form — `-3.4028234663852886e38`, `-inf`, `NaN` — which the
@@ -34,7 +34,7 @@
 //! CUMULATIVE MAX is the frontend-reachable witness: `GraphTensor::cummax`
 //! seeds its window with `f32::MIN` (src/frontend/unary.rs), which `pad`
 //! mints as exactly this constant (src/frontend/movement.rs `pad` ->
-//! `constant_float(elem)`). It runs here as a fourth case with a host
+//! `constant_f32(elem)`). It runs here as a fourth case with a host
 //! reference, so the motivating caller is covered end to end and not
 //! only the synthetic constant.
 #![cfg(feature = "device")]
@@ -132,7 +132,7 @@ fn constant_plus_zero(value: f32) -> Vec<f32> {
     const N: usize = 8;
     let mut cx = Graph::new();
     let a = cx.tensor(N, DType::F32);
-    let c = cx.constant_float(value).expand_rhs(a.dims());
+    let c = cx.constant_f32(value).expand_rhs(a.dims());
     let out = (a + c).output();
     let got = run_on_device(
         &cx,
@@ -188,7 +188,7 @@ fn nan_constant_survives_nvrtc() {
 
 /// THE FRONTEND-REACHABLE CASE. `cummax` pads its window with
 /// `f32::MIN` (src/frontend/unary.rs), `pad` mints that as
-/// `constant_float(f32::MIN)` (src/frontend/movement.rs), and the
+/// `constant_f32(f32::MIN)` (src/frontend/movement.rs), and the
 /// windowed max then selects over it. The seed is the reduction
 /// identity: it must be smaller than every real element, so a literal
 /// that compiled to the wrong magnitude would show up as a wrong

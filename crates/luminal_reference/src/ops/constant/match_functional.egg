@@ -17,3 +17,21 @@
   )
   :ruleset backend
 )
+
+; The exact-F64 scalar source lowers through the same constant op; the
+; F64 dtype fact comes from LogicalConstantF64's own dtype rule.
+(rule
+  (
+    (= ?out_logical (LogicalConstantF64 ?constant_value))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorNil)
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpConstantGeneric ?constant_value ?out_layout))
+  )
+)

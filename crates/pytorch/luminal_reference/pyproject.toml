@@ -1,0 +1,18 @@
+[project]
+name = "luminal_reference"
+version = "0.1.0"
+description = "Luminal reference (CPU) torch.compile backend"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.14"]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+manifest-path = "Cargo.toml"
+module-name = "luminal_reference._luminal"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

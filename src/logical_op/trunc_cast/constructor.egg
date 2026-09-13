@@ -1,0 +1,7 @@
+; Logical Truncating Cast : the EXPLICIT lossy float -> integer
+; conversion (torch.int()/long()). Truncation toward zero is the ruled
+; semantics; PyTorch declares NaN/inf/out-of-range as undefined, so the
+; runtime refuses those loudly. The TARGET dtype rides in the term; the
+; bit width changes, so this is always a materializer, never a view.
+; Plain LogicalCast stays lossless-only.
+(constructor LogicalTruncCast (LogicalTensor Dtype) LogicalTensor)

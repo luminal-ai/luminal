@@ -256,6 +256,55 @@ pub(crate) fn kernel(
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
             dest.copy_from_slice(input);
         }
+        // F64 bridges (exact widths only). F64 -> int stays the explicit-op
+        // refusal; F64 -> F32 narrows precision but is a float->float cast.
+        (TypedBuffer::F64(input), TypedBuffer::F64(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            dest.copy_from_slice(input);
+        }
+        (TypedBuffer::F32(input), TypedBuffer::F64(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (out, value) in dest.iter_mut().zip(input) {
+                *out = f64::from(*value);
+            }
+        }
+        (TypedBuffer::F64(input), TypedBuffer::F32(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (out, value) in dest.iter_mut().zip(input) {
+                *out = *value as f32;
+            }
+        }
+        (TypedBuffer::I32(input), TypedBuffer::F64(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (out, value) in dest.iter_mut().zip(input) {
+                *out = f64::from(*value);
+            }
+        }
+        (TypedBuffer::I64(input), TypedBuffer::F64(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (out, value) in dest.iter_mut().zip(input) {
+                anyhow::ensure!(
+                    value.abs() <= (1i64 << 53),
+                    "cast i64 -> f64 loses exactness at value {value} \
+                     (|v| <= 2^53 by the conservative-exact ruling)"
+                );
+                *out = *value as f64;
+            }
+        }
+        (TypedBuffer::Bool8(input), TypedBuffer::F64(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (out, code) in dest.iter_mut().zip(input) {
+                anyhow::ensure!(*code <= 1, "Bool8 buffer holds ill-formed code {code}");
+                *out = f64::from(*code);
+            }
+        }
+        (TypedBuffer::F64(_), TypedBuffer::I32(_) | TypedBuffer::I64(_)) => {
+            anyhow::bail!(
+                "cast f64 -> int is not a reinterpretation: a rounding \
+                 or truncation is a lossy read and must appear as an \
+                 explicit op in the model, never as a cast"
+            );
+        }
         // Float -> int is a REFUSAL: rounding/truncation is a lossy
         // read and must be an explicit op with ruled semantics, never
         // a cast (the F32 -> Bool8 projection rule generalized).

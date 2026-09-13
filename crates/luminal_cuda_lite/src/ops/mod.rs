@@ -31,11 +31,13 @@
 
 pub mod add;
 pub mod cast;
+pub mod ceil;
 pub mod constant;
 pub mod cublaslt;
 pub mod div;
 pub mod exp;
 pub mod exp2;
+pub mod floor;
 pub mod gather;
 pub mod index_map_apply_materialize;
 pub mod index_map_apply_view;
@@ -48,9 +50,12 @@ pub mod mul;
 pub mod recip;
 pub mod reduce_max;
 pub mod reduce_sum;
+pub mod round;
 pub mod scatter;
 pub mod sin;
 pub mod sqrt;
+pub mod trunc;
+pub mod trunc_cast;
 pub mod trunc_div;
 pub mod trunc_rem;
 
@@ -168,6 +173,11 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
             materialize_layout_copy::MaterializeLayoutCopy,
         ),
         reg(sqrt::SqrtFunctionalMatcher, sqrt::SqrtFunctional),
+        reg(floor::FloorFunctionalMatcher, floor::FloorFunctional),
+        reg(ceil::CeilFunctionalMatcher, ceil::CeilFunctional),
+        reg(trunc::TruncFunctionalMatcher, trunc::TruncFunctional),
+        reg(round::RoundFunctionalMatcher, round::RoundFunctional),
+        reg(trunc_cast::TruncCastMatcher, trunc_cast::TruncCast),
         reg(exp::ExpFunctionalMatcher, exp::ExpFunctional),
         reg(mul::MulFunctionalMatcher, mul::MulFunctional),
         reg(div::DivFunctionalMatcher, div::DivFunctional),

@@ -249,13 +249,19 @@ pub type Operand = (ValueId, Vec<IntExpr>);
 pub enum LogicalOp {
     Input { label: String },
     Constant(f64),
+    ConstantF64(f64),
     Iota { value_expr: String },
     Cast(DType),
+    TruncCast(DType),
     Sqrt,
     Exp,
     Exp2,
     Log2,
     Sin,
+    Floor,
+    Ceil,
+    Trunc,
+    Round,
     Recip,
     Add,
     Mul,
@@ -276,13 +282,19 @@ impl LogicalOp {
         match self {
             Self::Input { .. } => "LogicalTensorInputLit",
             Self::Constant(_) => "LogicalConstant",
+            Self::ConstantF64(_) => "LogicalConstantF64",
             Self::Iota { .. } => "LogicalIota",
             Self::Cast(_) => "LogicalCast",
+            Self::TruncCast(_) => "LogicalTruncCast",
             Self::Sqrt => "LogicalSqrt",
             Self::Exp => "LogicalExp",
             Self::Exp2 => "LogicalExp2",
             Self::Log2 => "LogicalLog2",
             Self::Sin => "LogicalSin",
+            Self::Floor => "LogicalFloor",
+            Self::Ceil => "LogicalCeil",
+            Self::Trunc => "LogicalTrunc",
+            Self::Round => "LogicalRound",
             Self::Recip => "LogicalRecip",
             Self::Add => "LogicalAdd",
             Self::Mul => "LogicalMul",
@@ -309,13 +321,18 @@ impl LogicalOp {
 
     fn fixed_arity(&self) -> Option<usize> {
         Some(match self {
-            Self::Input { .. } | Self::Constant(_) | Self::Iota { .. } => 0,
+            Self::Input { .. } | Self::Constant(_) | Self::ConstantF64(_) | Self::Iota { .. } => 0,
             Self::Cast(_)
+            | Self::TruncCast(_)
             | Self::Sqrt
             | Self::Exp
             | Self::Exp2
             | Self::Log2
             | Self::Sin
+            | Self::Floor
+            | Self::Ceil
+            | Self::Trunc
+            | Self::Round
             | Self::Recip
             | Self::ReduceSum { .. }
             | Self::ReduceMax { .. }
@@ -1384,12 +1401,16 @@ impl LogicalGraph {
             RenderForm::Plain => {
                 let mut parts: Vec<String> = operands.iter().map(name).collect();
                 match &value.op {
-                    LogicalOp::Constant(constant) => parts.push(format!("{constant:?}")),
+                    LogicalOp::Constant(constant) | LogicalOp::ConstantF64(constant) => {
+                        parts.push(format!("{constant:?}"))
+                    }
                     LogicalOp::Iota { value_expr } => {
                         parts.push(value_expr.clone());
                         parts.push(shape);
                     }
-                    LogicalOp::Cast(dtype) => parts.push(Self::dtype_term(*dtype)),
+                    LogicalOp::Cast(dtype) | LogicalOp::TruncCast(dtype) => {
+                        parts.push(Self::dtype_term(*dtype))
+                    }
                     LogicalOp::ReduceSum { axis_from_end }
                     | LogicalOp::ReduceMax { axis_from_end } => {
                         parts.push(axis_from_end.to_string());

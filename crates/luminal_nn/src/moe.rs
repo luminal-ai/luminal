@@ -325,7 +325,7 @@ impl Routes {
         destination_dims.extend_from_slice(payload_dims);
         let destination = routed_output
             .graph()
-            .constant(0)
+            .constant_i32(0)
             .cast(routed_output.dtype)
             .expand_rhs(destination_dims);
 
