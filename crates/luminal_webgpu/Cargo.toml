@@ -1,0 +1,25 @@
+[package]
+name = "luminal_webgpu"
+version = "0.2.0"
+edition = "2024"
+description = "WebGPU backend for luminal"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+luminal = { path = "../.." }
+itertools = "0.12.1"
+half = { version = "2.7.1", features = ["bytemuck"] }
+tracing = "0.1.43"
+safetensors = "0.7.0"
+memmap2 = "0.9.9"
+bytemuck = "1.24.0"
+pollster = "0.3"
+wgpu = "0.19"
+
+[dev-dependencies]
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
+luminal_nn = { path = "../luminal_nn" }
+luminal_tracing = { path = "../luminal_tracing" }
+rustc-hash = "2.1"
+tokenizers = "0.22.2"
+tracing-subscriber = "0.3"
