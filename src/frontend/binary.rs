@@ -182,7 +182,7 @@ impl Add<f32> for GraphTensor {
     fn add(self, rhs: f32) -> Self::Output {
         self + self
             .graph()
-            .constant_float(rhs)
+            .constant_f32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -194,7 +194,7 @@ impl<S: Into<IntExpr>> Add<S> for GraphTensor {
     fn add(self, rhs: S) -> Self::Output {
         self + self
             .graph()
-            .constant(rhs)
+            .constant_i32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -206,7 +206,7 @@ impl Sub<f32> for GraphTensor {
     fn sub(self, rhs: f32) -> Self::Output {
         self - self
             .graph()
-            .constant_float(rhs)
+            .constant_f32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -218,7 +218,7 @@ impl<S: Into<IntExpr>> Sub<S> for GraphTensor {
     fn sub(self, rhs: S) -> Self::Output {
         self - self
             .graph()
-            .constant(rhs)
+            .constant_i32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -230,7 +230,7 @@ impl Mul<f32> for GraphTensor {
     fn mul(self, rhs: f32) -> Self::Output {
         self * self
             .graph()
-            .constant_float(rhs)
+            .constant_f32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -242,7 +242,7 @@ impl<S: Into<IntExpr>> Mul<S> for GraphTensor {
     fn mul(self, rhs: S) -> Self::Output {
         self * self
             .graph()
-            .constant(rhs)
+            .constant_i32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -255,7 +255,7 @@ impl Div<f32> for GraphTensor {
     fn div(self, rhs: f32) -> Self::Output {
         self * self
             .graph()
-            .constant_float(rhs.recip())
+            .constant_f32(rhs.recip())
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -267,7 +267,7 @@ impl<S: Into<IntExpr>> Div<S> for GraphTensor {
     fn div(self, rhs: S) -> Self::Output {
         self / self
             .graph()
-            .constant(rhs)
+            .constant_i32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -279,7 +279,7 @@ impl Rem<f32> for GraphTensor {
     fn rem(self, rhs: f32) -> Self::Output {
         self % self
             .graph()
-            .constant_float(rhs)
+            .constant_f32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -291,7 +291,7 @@ impl<S: Into<IntExpr>> Rem<S> for GraphTensor {
     fn rem(self, rhs: S) -> Self::Output {
         self % self
             .graph()
-            .constant(rhs)
+            .constant_i32(rhs)
             .cast(self.dtype)
             .expand_rhs(self.dims())
     }
@@ -417,14 +417,14 @@ impl GraphTensor {
 
     /// Take the elementwise maximum of a tensor and a float
     pub fn maximum_f32(self, rhs: f32) -> GraphTensor {
-        // `constant_float` always emits F32; cast it to `self.dtype` so the
+        // `constant_f32` always emits F32; cast it to `self.dtype` so the
         // downstream `lt`/`le` comparisons inside `maximum` don't panic when
         // `self` is Int (e.g. `aten.clamp` on Int top-k indices coming out
         // of an MoE router). For Int self the cast floors the bound, which
         // matches PyTorch's `clamp(int_tensor, min=<float>)` semantics.
         self.maximum(
             self.graph()
-                .constant_float(rhs)
+                .constant_f32(rhs)
                 .cast(self.dtype)
                 .expand_rhs(self.dims()),
         )
@@ -491,7 +491,7 @@ fn integral_pow(base: GraphTensor, exponent: i64) -> GraphTensor {
     if exponent == 0 {
         return base
             .graph()
-            .constant_float(1.0)
+            .constant_f32(1.0)
             .cast(base.dtype)
             .expand_rhs(base.dims());
     }
@@ -935,7 +935,7 @@ pub(super) mod tests {
             |a, b| {
                 // gt() returns Bool, cast to F32 for cond which expects F32
                 let cond = a
-                    .gt(b.graph().constant_float(0.0).expand_rhs(a.dims()))
+                    .gt(b.graph().constant_f32(0.0).expand_rhs(a.dims()))
                     .cast(luminal::dtype::DType::F32);
                 a.cond(cond, b)
             },

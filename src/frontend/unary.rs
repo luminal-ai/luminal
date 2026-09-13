@@ -167,6 +167,36 @@ impl GraphTensor {
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
+    /// Round every element toward negative infinity. NaN and ±inf propagate.
+    pub fn floor(self) -> GraphTensor {
+        self.round_logical(LogicalOp::Floor)
+    }
+
+    /// Round every element toward positive infinity. NaN and ±inf propagate.
+    pub fn ceil(self) -> GraphTensor {
+        self.round_logical(LogicalOp::Ceil)
+    }
+
+    /// Round every element toward zero. NaN and ±inf propagate.
+    pub fn trunc(self) -> GraphTensor {
+        self.round_logical(LogicalOp::Trunc)
+    }
+
+    /// Round every element to the nearest integer; ties go to even.
+    pub fn round(self) -> GraphTensor {
+        self.round_logical(LogicalOp::Round)
+    }
+
+    /// Shared recorder path for the dtype-preserving rounding ops.
+    fn round_logical(self, op: LogicalOp) -> GraphTensor {
+        let new_id = self
+            .graph()
+            .logical
+            .op(op, &[(self.id, self.dims())], self.dims(), self.dtype)
+            .unwrap_or_else(crate::graph::unrecorded_value);
+        GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
+    }
+
     /// Scale so std is 1.0
     pub fn std_norm<T>(self, axes: impl ToAxes, epsilon: T) -> GraphTensor
     where
@@ -282,7 +312,7 @@ impl GraphTensor {
     /// DTYPE-AWARE (main #399, re-expressed 2026-09-02). The float path
     /// is unchanged: `relu(x) + relu(-x)`. Integers cannot take it —
     /// `relu` is `maximum_f32`, which builds its bound with
-    /// `constant_float(0.0).cast(self.dtype)`, and an F32 -> Int cast is
+    /// `constant_f32(0.0).cast(self.dtype)`, and an F32 -> Int cast is
     /// REFUSED at authoring by the cast policy of 2026-08-11, so
     /// `abs()` on an Int tensor used to panic before it recorded
     /// anything. So:
@@ -303,10 +333,14 @@ impl GraphTensor {
                 let dims = self.dims();
                 let zero = self
                     .graph()
-                    .constant(0)
+                    .constant_i32(0)
                     .cast(self.dtype)
                     .expand_rhs(dims.clone());
-                let one = self.graph().constant(1).cast(self.dtype).expand_rhs(dims);
+                let one = self
+                    .graph()
+                    .constant_i32(1)
+                    .cast(self.dtype)
+                    .expand_rhs(dims);
                 let negative = self.lt(zero).cast(self.dtype);
                 self * (one - negative * 2)
             }
@@ -445,7 +479,7 @@ impl GraphTensor {
         let idx_count = idx_cmp.cast(DType::Int);
         let lt_count = a_val.lt(b_val).cast(DType::Int);
         let gt_count = a_val.gt(b_val).cast(DType::Int);
-        let one = self.graph().constant(1).expand_rhs(lt_count.dims());
+        let one = self.graph().constant_i32(1).expand_rhs(lt_count.dims());
         let val_eq = (one - lt_count) * (one - gt_count);
         let cmp = primary_count + val_eq * idx_count;
 

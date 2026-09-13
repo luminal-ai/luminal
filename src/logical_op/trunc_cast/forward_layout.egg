@@ -1,0 +1,14 @@
+; Forward LayoutTensor Propagation : Logical TruncCast — the bit width
+; CHANGES, so the input's layout cannot be forwarded: the canonical
+; layout is minted from the output's own shape and dtype.
+(rule
+  (
+    (= ?out_logical (LogicalTruncCast ?in_logical ?target_dtype))
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?bits (bits-of (dtype-of ?out_logical)))
+    (= ?shape (shape-of ?out_logical))
+  )
+  (
+    (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit ?shape ?bits)))
+  )
+)

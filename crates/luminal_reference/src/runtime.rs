@@ -944,6 +944,34 @@ mod tests {
     use luminal::graph::Graph;
     use rustc_hash::FxHashMap;
 
+    /// `constant_f64` crosses the pipeline as an exact double: the value
+    /// read back must be bit-identical to the f64 literal, and distinct
+    /// from the f32-rounded constant the old single-constant path would
+    /// have produced. (CUDA Lite and Metal have no double device type
+    /// yet, so the reference is the semantic authority here.)
+    #[test]
+    fn f64_constant_keeps_double_precision() {
+        let exact = 0.1f64 + 0.2f64;
+        let mut cx = Graph::new();
+        let constant = cx.constant_f64(exact);
+        let out = constant.output();
+
+        let mut runtime = ReferenceRuntime::load(&cx).expect("load");
+        runtime
+            .search(&FxHashMap::default(), &crate::harness_search_options())
+            .expect("search a constant-only graph");
+        runtime.execute().expect("execute");
+
+        let value = runtime.get_f64(out.id).expect("F64 readback");
+        assert_eq!(value.len(), 1);
+        assert_eq!(value[0].to_bits(), exact.to_bits());
+        assert_ne!(
+            value[0],
+            f64::from(0.1f32) + f64::from(0.2f32),
+            "the F64 constant must not round through F32"
+        );
+    }
+
     /// The allow list is DERIVED from the kernel registry — which is
     /// itself derived from the op rows (runtime split, PR #425), so
     /// "registered" and "executable" cannot drift apart by construction.
@@ -960,6 +988,7 @@ mod tests {
         let expected = vec![
             "LayoutTensorOpAddFunctionalGeneric",
             "LayoutTensorOpCastGeneric",
+            "LayoutTensorOpCeilFunctionalGeneric",
             "LayoutTensorOpConstantGeneric",
             // No CopyGeneric: `materialize_layout_copy` left this runtime
             // with the split (PR #425). Its kernel only ever copied under
@@ -970,6 +999,7 @@ mod tests {
             "LayoutTensorOpDivFunctionalGeneric",
             "LayoutTensorOpExp2FunctionalGeneric",
             "LayoutTensorOpExpFunctionalGeneric",
+            "LayoutTensorOpFloorFunctionalGeneric",
             "LayoutTensorOpGatherGeneric",
             "LayoutTensorOpIndexMapApplyMaterialize",
             "LayoutTensorOpIotaGeneric",
@@ -980,10 +1010,13 @@ mod tests {
             "LayoutTensorOpRecipFunctionalGeneric",
             "LayoutTensorOpReduceMaxGeneric",
             "LayoutTensorOpReduceSumGeneric",
+            "LayoutTensorOpRoundFunctionalGeneric",
             "LayoutTensorOpScatterFunctionalGeneric",
             "LayoutTensorOpSinFunctionalGeneric",
             "LayoutTensorOpSqrtFunctionalGeneric",
+            "LayoutTensorOpTruncCastGeneric",
             "LayoutTensorOpTruncDivFunctionalGeneric",
+            "LayoutTensorOpTruncFunctionalGeneric",
             "LayoutTensorOpTruncRemFunctionalGeneric",
         ];
         assert_eq!(allow, expected, "derived allow list drifted");
@@ -2062,7 +2095,7 @@ mod tests {
 
     /// INTEGER `abs()` EXECUTES (main #399's dtype-aware `abs`,
     /// re-expressed). Before this, `abs()` on any integer went through
-    /// `relu` -> `maximum_f32` -> `constant_float(0.0).cast(Int)`, and
+    /// `relu` -> `maximum_f32` -> `constant_f32(0.0).cast(Int)`, and
     /// that F32 -> Int cast is REFUSED at authoring, so integer `abs`
     /// panicked before it recorded anything. Now it is
     /// `x * (1 - 2*(x < 0))` built from INT constants.

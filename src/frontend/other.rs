@@ -1,8 +1,8 @@
 use crate::prelude::*;
 
 impl Graph {
-    /// A scalar expression constant
-    pub fn constant(&mut self, i: impl Into<IntExpr>) -> GraphTensor {
+    /// A scalar `Int` (i32) expression constant.
+    pub fn constant_i32(&mut self, i: impl Into<IntExpr>) -> GraphTensor {
         let expr = i.into();
         let id = self
             .logical
@@ -13,34 +13,50 @@ impl Graph {
 
     /// An EXACT scalar `I64` constant, assembled from 16-bit limbs.
     ///
-    /// `constant` records a `LogicalIota`, and `src/logical_op/iota/dtype.egg`
-    /// pins every iota's dtype to `(Int)` — 32 bits — unconditionally. So a
-    /// literal wider than `i32` cannot be minted directly: the reference
-    /// kernel's `luminal_reference::TypedBuffer::I32` arm does
-    /// `i32::try_from(value)` and REFUSES ("iota value {value} overflows
-    /// i32 (ints are non-wrapping)"),
-    /// and casting after the fact is too late because the narrow buffer is
-    /// already the value. Horner assembly instead keeps every limb inside
-    /// `i32`, casts each to `I64` FIRST, and does all four multiplies and
-    /// adds in 64-bit — covering the complete signed range, `i64::MIN`
-    /// included, with no new op and no wrapping.
+    /// `constant_i32` records a `LogicalIota`, and
+    /// `src/logical_op/iota/dtype.egg` pins every iota's dtype to `(Int)` —
+    /// 32 bits — unconditionally. So a literal wider than `i32` cannot be
+    /// minted directly: the reference kernel's `luminal_reference::TypedBuffer::I32`
+    /// arm does `i32::try_from(value)` and REFUSES ("iota value {value}
+    /// overflows i32 (ints are non-wrapping)"), and casting after the fact
+    /// is too late because the narrow buffer is already the value. Horner
+    /// assembly instead keeps every limb inside `i32`, casts each to `I64`
+    /// FIRST, and does all four multiplies and adds in 64-bit — covering
+    /// the complete signed range, `i64::MIN` included, with no new op and
+    /// no wrapping.
     pub fn constant_i64(&mut self, value: i64) -> GraphTensor {
-        let base = self.constant(1i64 << 16).cast(DType::I64);
-        let mut result = self.constant(value >> 48).cast(DType::I64);
+        let base = self.constant_i32(1i64 << 16).cast(DType::I64);
+        let mut result = self.constant_i32(value >> 48).cast(DType::I64);
         for shift in [32, 16, 0] {
-            let limb = self.constant((value >> shift) & 0xffff).cast(DType::I64);
+            let limb = self
+                .constant_i32((value >> shift) & 0xffff)
+                .cast(DType::I64);
             result = result * base + limb;
         }
         result
     }
 
-    /// A scalar float constant
-    pub fn constant_float(&mut self, i: f32) -> GraphTensor {
+    /// An exact scalar `F32` constant. The term stores the `f64` number but
+    /// the logical dtype is F32 (the parity rule); narrow float constants
+    /// are casts of this.
+    pub fn constant_f32(&mut self, i: f32) -> GraphTensor {
         let id = self
             .logical
             .op(LogicalOp::Constant(i as f64), &[], Vec::new(), DType::F32)
             .unwrap_or_else(crate::graph::unrecorded_value);
         GraphTensor::from_id(id, (), self, DType::F32)
+    }
+
+    /// An exact scalar `F64` constant. `LogicalConstantF64` owns the F64
+    /// dtype rule, so the literal crosses the whole pipeline at full
+    /// double precision (unlike `constant_f32(x).cast(F64)`, which widens
+    /// an already-f32-rounded value).
+    pub fn constant_f64(&mut self, value: f64) -> GraphTensor {
+        let id = self
+            .logical
+            .op(LogicalOp::ConstantF64(value), &[], Vec::new(), DType::F64)
+            .unwrap_or_else(crate::graph::unrecorded_value);
+        GraphTensor::from_id(id, (), self, DType::F64)
     }
 
     /// Iota as a TRUE COORDINATE FUNCTION (P1 ruling 2026-08-07): the
@@ -159,11 +175,11 @@ impl GraphTensor {
             // it in Bool exactly — total, and exact at every float.
             let zero = self
                 .graph()
-                .constant_float(0.0)
+                .constant_f32(0.0)
                 .cast(self.dtype)
                 .expand_rhs(self.dims());
             let sum = zero.lt(self).cast(DType::F32) + self.lt(zero).cast(DType::F32);
-            let zero_f32 = self.graph().constant_float(0.0).expand_rhs(self.dims());
+            let zero_f32 = self.graph().constant_f32(0.0).expand_rhs(self.dims());
             return zero_f32.lt(sum);
         }
         let operand = (self.id, self.dims());
@@ -172,6 +188,36 @@ impl GraphTensor {
             .graph()
             .logical
             .op(LogicalOp::Cast(dtype), &[operand], out_dims, dtype)
+            .unwrap_or_else(crate::graph::unrecorded_value);
+        GraphTensor::from_id(id, self.dims(), self.graph_ref, dtype)
+    }
+
+    /// THE EXPLICIT LOSSY READ: float -> integer conversion with
+    /// truncation toward zero (`torch.int()` / `torch.long()` /
+    /// `_to_copy` float->int). This exists so [`Self::cast`] can stay
+    /// lossless-only; the lossy conversion is a named op the author (or
+    /// translator) opts into, and runtimes handle NaN/±inf/out-of-range
+    /// loudly (PyTorch declares those undefined).
+    pub fn trunc_cast(self, dtype: DType) -> GraphTensor {
+        let float_source = matches!(
+            self.dtype,
+            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
+        );
+        assert!(
+            float_source,
+            "trunc_cast source must be a float, got {:?}",
+            self.dtype
+        );
+        assert!(
+            matches!(dtype, DType::Int | DType::I64),
+            "trunc_cast target must be an integer, got {dtype:?}"
+        );
+        let operand = (self.id, self.dims());
+        let out_dims = self.dims();
+        let id = self
+            .graph()
+            .logical
+            .op(LogicalOp::TruncCast(dtype), &[operand], out_dims, dtype)
             .unwrap_or_else(crate::graph::unrecorded_value);
         GraphTensor::from_id(id, self.dims(), self.graph_ref, dtype)
     }

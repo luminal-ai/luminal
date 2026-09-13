@@ -1,0 +1,2 @@
+; Unary rounding Ops
+(constructor LogicalTrunc (LogicalTensor) LogicalTensor)

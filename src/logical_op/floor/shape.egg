@@ -1,0 +1,11 @@
+; Shape Propagation : LogicalFloor
+(rule
+  (
+    (= ?out_logical (LogicalFloor ?in_logical))
+    (= ?shape (shape-of ?in_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?shape)
+  )
+  :ruleset prop
+)

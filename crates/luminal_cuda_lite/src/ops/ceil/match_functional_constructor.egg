@@ -1,0 +1,3 @@
+; Functional (out-of-place) Unary Ops: work on ANY input/output layouts,
+; never alias their inputs.
+(constructor LayoutTensorOpCeilFunctionalGeneric (LayoutTensor Layout) LayoutTensorOp)

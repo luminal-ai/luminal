@@ -140,10 +140,13 @@ impl LogicalOp for LogicalTensorNamed {
 
 mod add;
 mod cast;
+mod ceil;
 mod constant;
+mod constant_f64;
 mod div;
 mod exp;
 mod exp2;
+mod floor;
 mod gather;
 mod index_map_apply;
 mod iota;
@@ -154,18 +157,24 @@ mod mul;
 mod recip;
 mod reduce_max;
 mod reduce_sum;
+mod round;
 mod scatter;
 mod sin;
 mod sqrt;
+mod trunc;
+mod trunc_cast;
 mod trunc_div;
 mod trunc_rem;
 
 pub use add::LogicalAdd;
 pub use cast::LogicalCast;
+pub use ceil::LogicalCeil;
 pub use constant::LogicalConstant;
+pub use constant_f64::LogicalConstantF64;
 pub use div::LogicalDiv;
 pub use exp::LogicalExp;
 pub use exp2::LogicalExp2;
+pub use floor::LogicalFloor;
 pub use gather::LogicalGather;
 pub use index_map_apply::LogicalIndexMapApply;
 pub use iota::LogicalIota;
@@ -176,9 +185,12 @@ pub use mul::LogicalMul;
 pub use recip::LogicalRecip;
 pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
+pub use round::LogicalRound;
 pub use scatter::LogicalScatter;
 pub use sin::LogicalSin;
 pub use sqrt::LogicalSqrt;
+pub use trunc::LogicalTrunc;
+pub use trunc_cast::LogicalTruncCast;
 pub use trunc_div::LogicalTruncDiv;
 pub use trunc_rem::LogicalTruncRem;
 
@@ -195,6 +207,10 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalTensorNamed),
             Box::new(LogicalSqrt),
             Box::new(LogicalExp),
+            Box::new(LogicalFloor),
+            Box::new(LogicalCeil),
+            Box::new(LogicalTrunc),
+            Box::new(LogicalRound),
             Box::new(LogicalAdd),
             Box::new(LogicalMul),
             Box::new(LogicalDiv),
@@ -207,8 +223,10 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalMod),
             Box::new(LogicalLessThan),
             Box::new(LogicalCast),
+            Box::new(LogicalTruncCast),
             Box::new(LogicalIota),
             Box::new(LogicalConstant),
+            Box::new(LogicalConstantF64),
             Box::new(LogicalGather),
             Box::new(LogicalScatter),
             Box::new(LogicalIndexMapApply),

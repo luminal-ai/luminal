@@ -65,7 +65,7 @@ fn constant_plus_zero(value: f32) -> Vec<f32> {
     const N: usize = 8;
     let mut cx = Graph::new();
     let a = cx.tensor(N, DType::F32);
-    let c = cx.constant_float(value).expand_rhs(a.dims());
+    let c = cx.constant_f32(value).expand_rhs(a.dims());
     let out = (a + c).output();
     let got = run_on_device(
         &cx,

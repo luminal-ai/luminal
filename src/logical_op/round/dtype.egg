@@ -1,0 +1,11 @@
+; DType Propagation : LogicalRound — a rounding op preserves the element type.
+(rule
+  (
+    (= ?out_logical_tensor (LogicalRound ?in_logical))
+    (= ?dtype (dtype-of ?in_logical))
+  )
+  (
+    (set (dtype-of ?out_logical_tensor) ?dtype)
+  )
+  :ruleset prop
+)

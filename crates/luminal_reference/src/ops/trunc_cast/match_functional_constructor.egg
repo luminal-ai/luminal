@@ -1,0 +1,2 @@
+; The explicit lossy float -> integer conversion (truncation toward zero).
+(constructor LayoutTensorOpTruncCastGeneric (LayoutTensor Dtype Layout) LayoutTensorOp)

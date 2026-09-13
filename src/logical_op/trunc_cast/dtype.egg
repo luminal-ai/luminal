@@ -1,0 +1,10 @@
+; Dtype Propagation : LogicalTruncCast — the TARGET dtype, carried in the term.
+(rule
+  (
+    (= ?out_logical_tensor (LogicalTruncCast ?in_logical ?target_dtype))
+  )
+  (
+    (set (dtype-of ?out_logical_tensor) ?target_dtype)
+  )
+  :ruleset prop
+)
