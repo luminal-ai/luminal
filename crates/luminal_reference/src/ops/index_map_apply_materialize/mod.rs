@@ -245,6 +245,9 @@ pub(crate) fn kernel(
     }
     let out_rank = out_dims.len();
     let numel = ctx.dests[0].len();
+    // Index-map entries may retain symbolic dims from the searched plan;
+    // resolve them against THIS call's assignment (see `ReferenceKernelCtx`).
+    let dims = ctx.dims.clone();
     let mut index_of = vec![0usize; numel];
     for (flat, slot) in index_of.iter_mut().enumerate() {
         // Decompose the flat OUT index into row-major coordinates.
@@ -256,7 +259,7 @@ pub(crate) fn kernel(
         }
         let mut parent_flat = 0usize;
         for (k, entry) in entries.iter().enumerate() {
-            let index = entry.eval(&coords);
+            let index = entry.eval_with_dims(&coords, &dims);
             anyhow::ensure!(
                 index >= 0 && (index as usize) < parent_dims[k],
                 "materialize index {index} out of bounds for parent axis {k} (extent {})",

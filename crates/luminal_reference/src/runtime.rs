@@ -374,6 +374,7 @@ impl ReferenceRuntime {
             &serialized,
             &program,
             input_data,
+            &self.dims,
             options,
             spec.ops,
         )?;
@@ -386,13 +387,16 @@ impl ReferenceRuntime {
 
     /// BUCKETED SEARCH (D7, 2026-09-03): one search per Cartesian
     /// combination of the bound [`Self::bind_dim_buckets`] intervals.
-    /// Each combination is rendered TWICE — a bucket-wide RANGE-seeded
-    /// render whose whole fixpoint (authoring checks included) must pass,
-    /// proving the base logical program valid over the WHOLE interval,
-    /// then a representative-pinned render that is searched and profiled.
+    /// Each combination is rendered RANGE-seeded: its whole fixpoint
+    /// (authoring checks included) must pass, proving the base logical
+    /// program valid over the WHOLE interval, and the plan is extracted
+    /// from that range-valid fixpoint so its spans/extents stay symbolic.
+    /// The representative assignment is used only to STAGE and PRICE the
+    /// plan during profiling; the resulting plan executes at every value
+    /// in the bucket.
     ///
     /// `input_data` is a FUNCTION of the pins because it has to be: a
-    /// bucket searched at `a = 3` and one searched at `a = 7` want
+    /// bucket profiled at `a = 3` and one profiled at `a = 7` want
     /// differently sized payloads. It is called once per combination with
     /// that combination's representative map.
     ///
@@ -440,14 +444,14 @@ impl ReferenceRuntime {
 
     /// Pick and load the bucket plan covering the current dims.
     ///
-    /// THE STATIC-PLAN REFUSAL (the Phase 1 limitation, stated rather
-    /// than solved): a bucket's winning plan was searched at ONE pin and
-    /// carries LITERAL spans, so it allocates and indexes for that pin
-    /// and nothing else. Executing it at another value inside the same
-    /// bucket would silently run the representative's geometry over the
-    /// caller's data, so it is refused by name. Lifting this needs
-    /// symbolic plans (spans as expressions) and the capacity contract
-    /// that goes with them.
+    /// SYMBOLIC PLANS (the Phase 1 limitation, lifted): a bucket's winning
+    /// plan is searched over the bucket's RANGE-seeded render, so its
+    /// spans and extents stay expressions (`Var("a")`) rather than the
+    /// representative's literals. `execute` evaluates them under the
+    /// runtime's current [`Self::dims`], so the one plan runs correctly at
+    /// every value in the bucket — no re-search. The representative still
+    /// picks the plan by bucket coverage and prices it during search, but
+    /// it no longer constrains what the loaded plan can execute.
     fn select_bucket_plan(&mut self) -> Result<()> {
         let Some(plan) = crate::search::select_bucket(&self.bucket_plans, &self.dims) else {
             let covered: Vec<_> = self.bucket_plans.iter().map(|p| p.ranges.clone()).collect();
@@ -456,20 +460,6 @@ impl ReferenceRuntime {
                 self.dims
             );
         };
-        for (dim, representative) in &plan.representative {
-            if let Some(value) = self.dims.get(dim) {
-                ensure!(
-                    value == representative,
-                    "bucket {:?} was searched at `{dim} = {representative}` and its plan is \
-                     STATIC at that pin (plan spans are literals), but this runtime is set \
-                     to `{dim} = {value}`. Re-search at this pin, or pick a bucket whose \
-                     representative is it. Running the representative's plan here would \
-                     silently use the wrong geometry — the open item is symbolic plans \
-                     (spans as expressions) and the capacity contract that goes with them.",
-                    plan.ranges
-                );
-            }
-        }
         let chosen = plan.outcome.best_plan.clone();
         let (inputs, outputs) = (
             plan.program.input_slots.clone(),
@@ -554,10 +544,14 @@ impl ReferenceRuntime {
         // variant is a loud refusal, never a conversion.
         let mut storage: FxHashMap<BufferId, TypedBuffer> = FxHashMap::default();
         for (id, buffer) in &plan.buffers {
-            let numel = buffer.layout.literal_span_elements().ok_or_else(|| {
+            // Exact per-call geometry: a symbolic plan's span is evaluated
+            // under the runtime's CURRENT dims, so one searched plan runs
+            // at every value of its declared dynamic domain. Storage is
+            // reallocated fresh each call, which is what makes exactness
+            // (not a capacity bound) the correctness argument here.
+            let numel = buffer.layout.span_with(&self.dims).map_err(|err| {
                 anyhow!(
-                    "buffer {} (backing {}) has no literal span — symbolic \
-                     or undisclosed-reach layouts are not executable",
+                    "buffer {} (backing {}) has no evaluable span: {err:#}",
                     buffer.label,
                     buffer.backs
                 )
@@ -777,8 +771,11 @@ impl ReferenceRuntime {
                                 plan.buffers[id].label,
                             );
                         }
-                        let dims = slot.layout.literal_extents().ok_or_else(|| {
-                            anyhow!("{} operand {k} has symbolic extents", op.label())
+                        let dims = slot.layout.extents_with(&self.dims).map_err(|err| {
+                            anyhow!(
+                                "{} operand {k} extents cannot be evaluated: {err:#}",
+                                op.label()
+                            )
                         })?;
                         operand_dims.push(dims);
                     }
@@ -793,6 +790,7 @@ impl ReferenceRuntime {
                         operands,
                         operand_dims,
                         dests,
+                        dims: self.dims.clone(),
                     };
                     match crate::kernels::kernel_for(op.as_ref()) {
                         Some(kernel) => (kernel.execute)(op.as_ref(), &mut ctx)
@@ -2438,16 +2436,151 @@ mod tests {
             }
         }
 
-        // THE PHASE 1 LIMITATION, pinned: a bucket's plan is static at
-        // its representative. Another value INSIDE the same bucket is
-        // refused by name, never silently run at the wrong geometry.
-        rt.set_dim('a', 4);
-        let err = rt
-            .execute()
-            .expect_err("a non-representative pin must refuse");
-        let text = format!("{err:#}");
-        assert!(text.contains("STATIC at that pin"), "{text}");
-        assert!(text.contains("symbolic plans"), "{text}");
+        // SYMBOLIC PLANS (the Phase 1 limitation, lifted): a bucket's
+        // plan stays an expression in `a`, so a NON-representative value
+        // inside the same bucket now executes correctly instead of being
+        // refused. `a = 4` sits in the first bucket [2, 4] but is not its
+        // representative (3).
+        let non_representative = 4usize;
+        rt.set_dim('a', non_representative);
+        let mut pins = luminal::shape::DynMap::default();
+        pins.insert(Symbol::from('a'), non_representative);
+        for (id, values) in data_for(&pins) {
+            rt.set_data(id, values);
+        }
+        rt.execute()
+            .expect("a symbolic bucket plan executes at a non-representative value");
+        let n = non_representative * 2;
+        let expected: Vec<f32> = (0..n)
+            .map(|v| (v as f32 + 1.0) * (v as f32 * 0.5))
+            .collect();
+        let ours = rt.get_f32(out.id).unwrap();
+        assert_eq!(ours.len(), expected.len());
+        for (index, (lhs, rhs)) in ours.iter().zip(&expected).enumerate() {
+            assert!(
+                (lhs - rhs).abs() <= 1e-5 * rhs.abs().max(1.0),
+                "a = {non_representative} element {index}: ours {lhs} vs theirs {rhs}"
+            );
+        }
+    }
+
+    /// DEFINITION OF DONE for symbolic plans: ONE bucketed search produces
+    /// a plan whose spans/extents stay expressions in the symbolic dim,
+    /// and that single plan then executes at SEVERAL dim values with NO
+    /// re-search. The values cross bucket boundaries, so this also proves
+    /// [`crate::search::select_bucket`] picks the covering symbolic plan
+    /// per execution while the searched plans stay fixed.
+    ///
+    /// Golden values are computed INDEPENDENTLY from the scalar formula
+    /// `out[i] = x[i] * y[i] + x[i]` with `x[i] = i + 1`, `y[i] = i / 2`.
+    #[test]
+    fn one_searched_symbolic_plan_executes_at_many_dim_values() {
+        use luminal::graph::DimBucket;
+        use luminal::shape::Symbol;
+
+        let mut cx = Graph::new();
+        cx.set_dim('a', 3);
+        let x = cx.tensor(('a', 2), DType::F32);
+        let y = cx.tensor(('a', 2), DType::F32);
+        let out = (x * y + x).output();
+
+        let data_for = |n: usize| {
+            let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
+            data.insert(
+                x.id,
+                (0..n).map(|v| v as f32 + 1.0).collect::<Vec<f32>>().into(),
+            );
+            data.insert(
+                y.id,
+                (0..n).map(|v| v as f32 * 0.5).collect::<Vec<f32>>().into(),
+            );
+            data
+        };
+
+        let mut rt = ReferenceRuntime::load(&cx).expect("records + loads");
+        rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
+            .expect("disjoint sorted buckets bind");
+        rt.search_buckets(
+            |rep| data_for(rep[&Symbol::from('a')] * 2),
+            &crate::search::harness_search_options(),
+        )
+        .expect("bucketed search completes ONCE");
+        assert_eq!(rt.bucket_plans().len(), 2, "one searched plan per bucket");
+
+        // SEVERAL values per bucket, representatives and non-representatives
+        // alike. Nothing below searches again: set_dim + set_data + execute
+        // only, so every value after the initial search reuses a searched
+        // symbolic plan.
+        for a in [2usize, 3, 4, 5, 6, 7, 8, 9] {
+            rt.set_dim('a', a);
+            for (id, values) in data_for(a * 2) {
+                rt.set_data(id, values);
+            }
+            rt.execute()
+                .expect("the searched symbolic plan executes at every dim value");
+            assert_eq!(rt.bucket_plans().len(), 2, "execution must never re-search");
+            // INDEPENDENT GOLDEN: scalar formula, not another runtime.
+            let expected: Vec<f32> = (0..a * 2)
+                .map(|v| {
+                    let xv = v as f32 + 1.0;
+                    let yv = v as f32 * 0.5;
+                    xv * yv + xv
+                })
+                .collect();
+            let ours = rt.get_f32(out.id).unwrap();
+            assert_eq!(ours.len(), expected.len(), "a = {a}");
+            for (index, (lhs, rhs)) in ours.iter().zip(&expected).enumerate() {
+                assert!(
+                    (lhs - rhs).abs() <= 1e-5 * rhs.abs().max(1.0),
+                    "a = {a} element {index}: ours {lhs} vs theirs {rhs}"
+                );
+            }
+        }
+    }
+
+    /// OP-RECORD GEOMETRY audit: an `arange` whose extent (and iota
+    /// expression) is the symbolic dim retains `Var("a")` in the searched
+    /// op record. One bucketed search then serves every value because the
+    /// kernel evaluates that expression against the runtime's PER-CALL
+    /// dims instead of a representative's literals.
+    #[test]
+    fn symbolic_iota_reuses_one_plan_across_dims() {
+        use luminal::graph::DimBucket;
+        use luminal::shape::IntExpr;
+
+        let mut cx = Graph::new();
+        cx.set_dim('a', 5);
+        let out = cx.arange(IntExpr::from('a')).output();
+
+        let mut rt = ReferenceRuntime::load(&cx).expect("records + loads");
+        rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
+            .expect("buckets bind");
+        rt.search_buckets(
+            |_| FxHashMap::default(),
+            &crate::search::harness_search_options(),
+        )
+        .expect("bucketed search completes once");
+        assert_eq!(rt.bucket_plans().len(), 2, "one plan per bucket");
+        // The searched plan must actually be symbolic, or this test would
+        // pass by way of a literal plan and prove nothing about the
+        // op-record path.
+        assert!(
+            rt.bucket_plans()[0]
+                .outcome
+                .best_plan
+                .buffers
+                .values()
+                .any(|buffer| buffer.layout.literal_span_elements().is_none()),
+            "the searched arange plan must keep a symbolic span"
+        );
+
+        for a in [2usize, 3, 4, 5, 7, 9] {
+            rt.set_dim('a', a);
+            rt.execute().expect("symbolic iota plan executes");
+            // INDEPENDENT GOLDEN: arange(a) is 0..a.
+            let expected: Vec<i32> = (0..a as i32).collect();
+            assert_eq!(rt.get_i32(out.id).unwrap(), &expected, "a = {a}");
+        }
     }
 
     /// Buckets must partition: overlap is refused, not resolved

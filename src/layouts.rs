@@ -41,9 +41,10 @@
 use crate::egglog_utils::eclass::{
     ConstructorDecoder, DynFacts, EClass, EGraphView, ENode, EgglogConstructor, Sort, Spellings,
 };
+use crate::shape::{DynMap, Symbol};
 use anyhow::{Result, anyhow, bail, ensure};
 use egraph_serialize::ClassId;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 // =============================================================================
@@ -318,6 +319,158 @@ impl IntExprTerm {
             IntExprTerm::Max(a, b) => a.eval_at(coords)?.max(b.eval_at(coords)?),
             IntExprTerm::LessThanCast(a, b) => i64::from(a.eval_at(coords)? < b.eval_at(coords)?),
         })
+    }
+}
+
+/// Per-dimension bounds `symbol → (lower, upper)`, the interval domain the
+/// symbolic readers evaluate under. A concrete assignment uses `(v, v)`.
+pub type DimBounds = BTreeMap<Symbol, (i64, i64)>;
+
+impl IntExprTerm {
+    /// Evaluate this term under a CONCRETE assignment of its symbolic
+    /// dimensions — the runtime-side reader for plans whose spans and
+    /// extents stayed symbolic. Literal-only terms evaluate with `dims`
+    /// empty. Coordinates refuse (`Coord` is a per-element read, not an
+    /// allocation-size term) and an unbound `Var` refuses loudly, naming
+    /// the variable — never a guessed value.
+    pub fn eval_dims(&self, dims: &DynMap) -> Result<i64> {
+        let bounds: DimBounds = dims
+            .iter()
+            .map(|(symbol, value)| {
+                let value = i64::try_from(*value)
+                    .map_err(|_| anyhow!("dimension `{symbol}` exceeds i64"))?;
+                Ok((*symbol, (value, value)))
+            })
+            .collect::<Result<_>>()?;
+        let (lo, hi) = self.interval(&bounds)?;
+        ensure!(
+            lo == hi,
+            "layout expression {self:?} is not exact under dims {dims:?}: [{lo}, {hi}]"
+        );
+        Ok(lo)
+    }
+
+    /// The inclusive interval this term ranges over given per-dimension
+    /// bounds. Exact for a concrete assignment (`(v, v)` bounds), which is
+    /// what makes a SYMBOLIC plan's allocation computable at every point
+    /// of a declared dynamic domain rather than only at a representative.
+    /// Coordinates refuse: an allocation span has none.
+    pub fn interval(&self, bounds: &DimBounds) -> Result<(i64, i64)> {
+        let checked =
+            |v: i128| i64::try_from(v).map_err(|_| anyhow!("shape expression overflow: {self:?}"));
+        let (lo, hi) = match self {
+            IntExprTerm::Lit(v) => (*v, *v),
+            IntExprTerm::Var(name) => {
+                let symbol = Symbol::try_new_dim(name)
+                    .map_err(|e| anyhow!("unusable dimension `{name}`: {e}"))?;
+                let (lo, hi) = bounds
+                    .get(&symbol)
+                    .ok_or_else(|| anyhow!("unbound dimension `{name}`"))?;
+                (*lo, *hi)
+            }
+            IntExprTerm::Coord { .. } => {
+                bail!("coordinate-dependent term has no allocation interval: {self:?}")
+            }
+            IntExprTerm::Add(a, b) => {
+                let (a, z) = a.interval(bounds)?;
+                let (b, y) = b.interval(bounds)?;
+                (
+                    checked(a as i128 + b as i128)?,
+                    checked(z as i128 + y as i128)?,
+                )
+            }
+            IntExprTerm::Mul(a, b) => {
+                let (a, z) = a.interval(bounds)?;
+                let (b, y) = b.interval(bounds)?;
+                let v = [
+                    a as i128 * b as i128,
+                    a as i128 * y as i128,
+                    z as i128 * b as i128,
+                    z as i128 * y as i128,
+                ];
+                (
+                    checked(*v.iter().min().expect("four products"))?,
+                    checked(*v.iter().max().expect("four products"))?,
+                )
+            }
+            IntExprTerm::TruncDiv(a, b) | IntExprTerm::CeilDiv(a, b) => {
+                let (a, z) = a.interval(bounds)?;
+                let (b, y) = b.interval(bounds)?;
+                ensure!(b > 0 || y < 0, "divisor interval contains zero: {self:?}");
+                let mut v = vec![];
+                for n in [a, z] {
+                    for d in [b, y] {
+                        let (n, d) = (n as i128, d as i128);
+                        let q = n / d;
+                        v.push(
+                            q + if matches!(self, IntExprTerm::CeilDiv(..))
+                                && n % d != 0
+                                && ((n > 0) == (d > 0))
+                            {
+                                1
+                            } else {
+                                0
+                            },
+                        );
+                    }
+                }
+                (
+                    checked(*v.iter().min().expect("four quotients"))?,
+                    checked(*v.iter().max().expect("four quotients"))?,
+                )
+            }
+            IntExprTerm::TruncRem(a, b) => {
+                let (a, z) = a.interval(bounds)?;
+                let (b, y) = b.interval(bounds)?;
+                ensure!(b > 0 || y < 0, "divisor interval contains zero: {self:?}");
+                if a == z && b == y {
+                    let r = checked(a as i128 % b as i128)?;
+                    (r, r)
+                } else {
+                    let m = (b as i128).abs().max((y as i128).abs()) - 1;
+                    (
+                        if a < 0 {
+                            checked((-m).max(a as i128))?
+                        } else {
+                            0
+                        },
+                        if z > 0 { checked(m.min(z as i128))? } else { 0 },
+                    )
+                }
+            }
+            IntExprTerm::Min(a, b) => {
+                let (a, z) = a.interval(bounds)?;
+                let (b, y) = b.interval(bounds)?;
+                (a.min(b), z.min(y))
+            }
+            IntExprTerm::Max(a, b) => {
+                let (a, z) = a.interval(bounds)?;
+                let (b, y) = b.interval(bounds)?;
+                (a.max(b), z.max(y))
+            }
+            IntExprTerm::LessThanCast(a, b) => {
+                let (a, z) = a.interval(bounds)?;
+                let (b, y) = b.interval(bounds)?;
+                if z < b {
+                    (1, 1)
+                } else if a >= y {
+                    (0, 0)
+                } else {
+                    (0, 1)
+                }
+            }
+        };
+        ensure!(lo <= hi, "invalid dimension interval {lo}..{hi}");
+        Ok((lo, hi))
+    }
+
+    /// The largest value this term attains over `bounds`, in elements —
+    /// the allocation capacity a symbolic plan may ever need. Refuses a
+    /// negative lower bound (a reach cannot be negative) and overflow.
+    pub fn capacity_elements(&self, bounds: &DimBounds) -> Result<usize> {
+        let (lo, hi) = self.interval(bounds)?;
+        ensure!(lo >= 0, "negative dimension bound {lo} for {self:?}");
+        Ok(usize::try_from(hi)?)
     }
 }
 
@@ -1017,6 +1170,42 @@ impl DecodedLayout {
             .and_then(|v| usize::try_from(v).ok())
     }
 
+    /// The storage reach in ELEMENTS under a CONCRETE dimension
+    /// assignment `dims` — the symbolic-plan twin of
+    /// [`Self::literal_span_elements`]. Literal-only layouts evaluate with
+    /// `dims` empty, so this is the one reader a symbolic plan needs.
+    /// Loud: a layout with no disclosed reach and an expression with an
+    /// unbound variable both refuse, naming what is missing.
+    pub fn span_with(&self, dims: &DynMap) -> Result<usize> {
+        let span = self
+            .spellings
+            .iter()
+            .find_map(|f| f.span_elements())
+            .ok_or_else(|| {
+                anyhow!(
+                    "layout {:?} discloses no storage span; an offset function \
+                     alone does not size storage",
+                    self.present()
+                )
+            })?;
+        let value = span.eval_dims(dims)?;
+        usize::try_from(value).map_err(|_| anyhow!("negative storage span {value}"))
+    }
+
+    /// The domain extents under a CONCRETE dimension assignment `dims` —
+    /// the symbolic-plan twin of [`Self::literal_extents`]. Literal-only
+    /// layouts evaluate with `dims` empty.
+    pub fn extents_with(&self, dims: &DynMap) -> Result<Vec<usize>> {
+        self.shape()
+            .0
+            .iter()
+            .map(|extent| {
+                let value = extent.eval_dims(dims)?;
+                usize::try_from(value).map_err(|_| anyhow!("negative extent {value}"))
+            })
+            .collect()
+    }
+
     /// Element `coords` down to the flat ELEMENT index, read through the
     /// first spelling — every spelling of the class denotes the same
     /// function, so this answer is the class's.
@@ -1456,5 +1645,55 @@ mod tests {
         assert!(symbolic.element_index(&[0, 0]).is_err());
         assert_eq!(symbolic.literal_extents(), None);
         assert_eq!(symbolic.literal_span_elements(), None);
+    }
+
+    /// SYMBOLIC READERS: `eval_dims` / `extents_with` / `span_with` resolve
+    /// a plan's symbolic dimensions PER CALL — the runtime-side
+    /// counterpart to the literal readers, and what lets one searched plan
+    /// execute at every value of a declared dynamic domain.
+    #[test]
+    fn dims_readers_resolve_symbolic_plans_per_call() {
+        let symbolic = DecodedLayout::of(
+            RightMajorContiguousElementLayout {
+                shape: ShapeTerm(vec![IntExprTerm::Var("a".into()), IntExprTerm::Lit(2)]),
+                width: w32(),
+            },
+            None,
+        );
+        // Empty dims: the literal readers answer `None`, and the symbolic
+        // readers refuse loudly, naming the unbound variable.
+        assert_eq!(symbolic.literal_extents(), None);
+        assert_eq!(symbolic.literal_span_elements(), None);
+        assert!(symbolic.extents_with(&DynMap::default()).is_err());
+        assert!(symbolic.span_with(&DynMap::default()).is_err());
+
+        for a in [1usize, 3, 7, 11] {
+            let dims: DynMap = [('a'.into(), a)].into_iter().collect();
+            assert_eq!(symbolic.extents_with(&dims).unwrap(), vec![a, 2]);
+            assert_eq!(symbolic.span_with(&dims).unwrap(), a * 2);
+        }
+
+        // The interval evaluator covers interior extrema: `n*(10-n)` peaks
+        // inside [1,9], so endpoint sizing would underallocate.
+        let term = IntExprTerm::Mul(
+            Box::new(IntExprTerm::Var("n".into())),
+            Box::new(IntExprTerm::Add(
+                Box::new(IntExprTerm::Lit(10)),
+                Box::new(IntExprTerm::Mul(
+                    Box::new(IntExprTerm::Lit(-1)),
+                    Box::new(IntExprTerm::Var("n".into())),
+                )),
+            )),
+        );
+        let bounds: DimBounds = [('n'.into(), (1i64, 9i64))].into_iter().collect();
+        let capacity = term.capacity_elements(&bounds).unwrap();
+        for n in 1usize..=9 {
+            let dims: DynMap = [('n'.into(), n)].into_iter().collect();
+            assert!(term.eval_dims(&dims).unwrap() as usize <= capacity);
+        }
+
+        // A coordinate-bearing term has no allocation interval.
+        let coord_term = IntExprTerm::Coord { axis_from_end: 0 };
+        assert!(coord_term.eval_dims(&DynMap::default()).is_err());
     }
 }

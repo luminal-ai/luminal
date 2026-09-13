@@ -6,12 +6,14 @@ for translation and reference-runtime search, and returns a callable that
 binds caller tensors per invocation.
 """
 
+import concurrent.futures
+import copy
 import os
 import tempfile
 from typing import Any, Callable, Optional, Sequence
 
 import torch
-from torch.export import export
+from torch.export import Dim, export
 
 from . import _luminal
 
@@ -55,36 +57,46 @@ class CompiledModel:
         self._user_input_names = [
             name for name, kind in zip(names, kinds) if kind == "user_input"
         ]
-        self._outputs = list(
-            zip(
-                graph.output_names,
-                graph.output_dtypes,
-                graph.output_shapes,
-                graph.output_mutations,
-                graph.output_returns,
-            )
-        )
+        self._output_names = graph.output_names
+        self._output_dtypes = graph.output_dtypes
+        self._output_mutations = graph.output_mutations
+        self._output_returns = graph.output_returns
 
     def __call__(self, *args: torch.Tensor) -> Any:
-        if len(args) != len(self._user_input_names):
+        # Under dynamic shapes Dynamo's wrapper passes the graph's symbolic
+        # shape values alongside the tensor inputs (as SymInt or int). The
+        # compiled program folds those symbols into `sym_size`, so it has no
+        # scalar inputs: keep tensors, drop the scalars.
+        inputs = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        if len(inputs) != len(self._user_input_names):
             raise RuntimeError(
                 f"luminal_reference expected {len(self._user_input_names)} inputs, "
-                f"got {len(args)}"
+                f"got {len(inputs)}"
             )
-        for name, value in zip(self._user_input_names, args):
-            self._graph.set_input(name, _tensor_bytes(value))
+        for name, value in zip(self._user_input_names, inputs):
+            self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+        # Output shapes depend on the bound dims, so read them after the
+        # inputs are staged rather than caching them at compile time.
+        output_shapes = self._graph.output_shapes
         self._graph.execute()
 
         results = []
-        for index, (_, dtype_code, shape, mutation, returned) in enumerate(self._outputs):
+        outputs = zip(
+            self._output_names,
+            self._output_dtypes,
+            output_shapes,
+            self._output_mutations,
+            self._output_returns,
+        )
+        for index, (_, dtype_code, shape, mutation, returned) in enumerate(outputs):
             tensor = _output_tensor(self._graph.output_bytes(index), dtype_code, shape)
             if mutation is not None:
                 target = self._user_input_names.index(mutation)
-                args[target].copy_(tensor)
+                inputs[target].copy_(tensor)
                 # A returned mutation IS the caller's tensor (same storage),
                 # matching eager's aliasing semantics.
                 if returned:
-                    results.append(args[target])
+                    results.append(inputs[target])
                 continue
             if returned:
                 results.append(tensor)
@@ -92,6 +104,105 @@ class CompiledModel:
         # sequence), even for one result. It unwraps single-tensor returns
         # for the user.
         return tuple(results)
+
+
+def _is_dynamic(size: Any) -> bool:
+    """A dim is dynamic only if it is a SymInt that is not a literal.
+
+    Static dims can also surface as ``SymInt('8')``; those are numbers and
+    must NOT be marked dynamic.
+    """
+    return isinstance(size, torch.SymInt) and not size.node.expr.is_number
+
+
+def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> Any:
+    """Export a Dynamo GraphModule, preserving its symbolic dimensions.
+
+    Dynamo hands each free symbolic dimension to the backend as an explicit
+    ``SymInt`` graph input (``view``/``reshape`` take integer shape arguments,
+    so the symbol has to be a scalar input), and ``torch.export`` rejects a raw
+    ``SymInt``. We therefore:
+
+    1. read the dynamic dims from the *fake* tensor metadata **before**
+       materialising any hint (materialising a hint specializes the ShapeEnv,
+       and every later shape comes back concrete);
+    2. erase unused ``SymInt`` placeholders and rewrite used ones to
+       ``aten.sym_size.int(tensor, dim)``, which carries the same symbol on
+       the tensor's own dimension — no scalar input survives;
+    3. re-export with a ``dynamic_shapes`` tree rebuilt from the fake metadata.
+    """
+    # Work on a copy: Dynamo keeps the original GraphModule and checks its own
+    # guards against it after the backend returns, so mutating it in place
+    # trips "Guard failed on the same frame it was created".
+    gm = copy.deepcopy(gm)
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+
+    records: list[tuple[str, torch.fx.Node, Any]] = []
+    tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
+    for node, value in zip(placeholders, example_inputs):
+        if isinstance(value, torch.SymInt):
+            records.append(("sym", node, value))
+            continue
+        shape = getattr(node.meta.get("example_value"), "shape", None)
+        if shape is None:
+            shape = getattr(value, "shape", ())
+        dims = {dim: Dim.AUTO for dim, size in enumerate(shape) if _is_dynamic(size)}
+        for dim, size in enumerate(shape):
+            if _is_dynamic(size):
+                tensor_dims.setdefault(size.node.expr, (node, dim))
+        records.append(("tensor", node, dims))
+
+    # Pass 2: rewrite used SymInts to `sym_size`, drop unused ones.
+    erased: set[int] = set()
+    for kind, node, value in records:
+        if kind != "sym":
+            continue
+        if not node.users:
+            gm.graph.erase_node(node)
+            erased.add(id(node))
+            continue
+        source = tensor_dims.get(value.node.expr)
+        if source is None:
+            raise RuntimeError(
+                f"cannot locate the tensor dimension for symbolic input {value}"
+            )
+        tensor_node, dim = source
+        with gm.graph.inserting_after(tensor_node):
+            size = gm.graph.call_function(
+                torch.ops.aten.sym_size.int, args=(tensor_node, dim)
+            )
+        node.replace_all_uses_with(size)
+        gm.graph.erase_node(node)
+        erased.add(id(node))
+    if erased:
+        gm.graph.lint()
+        gm.recompile()
+
+    inputs: list[Any] = []
+    specs: list[Any] = []
+    any_dynamic = False
+    for (kind, node, info), value in zip(records, example_inputs):
+        if id(node) in erased:
+            continue
+        inputs.append(value)
+        if kind == "tensor" and info:
+            specs.append(info)
+            any_dynamic = True
+        else:
+            specs.append(None)
+
+    dynamic_shapes = {"args": tuple(specs)} if any_dynamic else None
+
+    # `torch.export` runs its own Dynamo pass. Running that inside the caller's
+    # compile pollutes the caller's guard manager (the inner frame's `args`
+    # guards leak into the outer sanity check), so isolate the nested compile
+    # on its own thread with a fresh Dynamo compile context.
+    def _export():
+        return export(gm, tuple(inputs), dynamic_shapes=dynamic_shapes, strict=False)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        ep = pool.submit(_export).result()
+    return ep, inputs
 
 
 def luminal_reference(
@@ -104,7 +215,7 @@ def luminal_reference(
     if options:
         search_iterations = options.get("search_iterations", search_iterations)
 
-    ep = export(gm, tuple(example_inputs), strict=False)
+    ep, export_inputs = _dynamic_export(gm, example_inputs)
     with tempfile.TemporaryDirectory() as tmp:
         pt2_path = os.path.join(tmp, "model.pt2")
         torch.export.save(ep, pt2_path)
@@ -117,11 +228,11 @@ def luminal_reference(
     user_index = 0
     for name, kind, parameter_name in zip(names, kinds, parameter_names):
         if kind == "user_input":
-            if user_index >= len(example_inputs):
+            if user_index >= len(export_inputs):
                 raise RuntimeError(
                     f"export declared more user inputs than example_inputs: {name!r}"
                 )
-            value = example_inputs[user_index]
+            value = export_inputs[user_index]
             user_index += 1
         else:
             if parameter_name not in ep.state_dict:
@@ -130,11 +241,11 @@ def luminal_reference(
                     "the exported state_dict"
                 )
             value = ep.state_dict[parameter_name]
-        graph.set_input(name, _tensor_bytes(value))
+        graph.set_input(name, _tensor_bytes(value), list(value.shape))
 
-    if user_index != len(example_inputs):
+    if user_index != len(export_inputs):
         raise RuntimeError(
-            f"export consumed {user_index} of {len(example_inputs)} example_inputs"
+            f"export consumed {user_index} of {len(export_inputs)} example_inputs"
         )
 
     graph.search(search_iterations)

@@ -101,8 +101,8 @@ impl Translator<'_> {
 
     pub(super) fn translate_view(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let target = self.get_ints_arg(node, 1)?;
-        let dims = util::resolve_neg1_dim(&target, &x.dims());
+        let target = self.get_int_exprs_arg(node, 1)?;
+        let dims = util::resolve_neg1_dim_exprs(&target, &x.dims());
         Ok(util::reshape_tensor(x, &dims))
     }
 

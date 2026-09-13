@@ -8,7 +8,11 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use luminal::prelude::DType;
+use luminal::prelude::{DType, DimBucket, DynMap, IntExpr, NodeIndex, Symbol};
+
+/// Largest value a dynamic dimension's bucket covers (the searched plan stays
+/// symbolic inside it, so one compile serves every covered context length).
+const MAX_DYNAMIC_DIM: usize = 4096;
 use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
 use luminal_reference::{CompileOptions, ReferenceRuntime, TypedBuffer};
 use pyo3::exceptions::PyRuntimeError;
@@ -71,6 +75,40 @@ pub struct CompiledGraph {
     staged: HashMap<String, TypedBuffer>,
     dirty: HashSet<String>,
     searched: bool,
+    /// Current concrete value of every symbolic dim, seeded from the exported
+    /// hints and updated from real input shapes as they are bound.
+    dims: DynMap,
+}
+
+/// Resolve a symbolic recorder shape to concrete extents. Literals and
+/// hint-seeded symbols resolve immediately; a symbol with no value yet is a
+/// programming error (it should have been seeded at translate time).
+fn resolve_shape(shape: &[IntExpr], dims: &DynMap) -> Vec<usize> {
+    shape
+        .iter()
+        .map(|dim| {
+            dim.exec(dims)
+                .or_else(|| dim.to_usize())
+                .unwrap_or_else(|| panic!("shape dim {dim:?} has no bound value"))
+        })
+        .collect()
+}
+
+/// A zero-filled buffer of `dtype` with `elements` entries. Used only to
+/// profile a symbolic bucket at its representative; the values are irrelevant
+/// to the search.
+fn zero_buffer(dtype: DType, elements: usize) -> TypedBuffer {
+    match dtype {
+        DType::F32 => TypedBuffer::F32(vec![0.0; elements]),
+        DType::F64 => TypedBuffer::F64(vec![0.0; elements]),
+        DType::Int => TypedBuffer::I32(vec![0; elements]),
+        DType::I64 => TypedBuffer::I64(vec![0; elements]),
+        DType::I8 => TypedBuffer::I8(vec![0; elements]),
+        DType::U8 => TypedBuffer::U8(vec![0; elements]),
+        DType::I16 => TypedBuffer::I16(vec![0; elements]),
+        DType::Bool => TypedBuffer::bool8(vec![0; elements]).expect("zero bool8 is well-formed"),
+        other => panic!("reference backend has no zero buffer for {other:?}"),
+    }
 }
 
 #[pymethods]
@@ -116,7 +154,7 @@ impl CompiledGraph {
         self.translation
             .inputs
             .iter()
-            .map(|input| input.shape.clone())
+            .map(|input| resolve_shape(&input.shape, &self.dims))
             .collect()
     }
 
@@ -143,7 +181,7 @@ impl CompiledGraph {
         self.translation
             .outputs
             .iter()
-            .map(|output| output.shape.clone())
+            .map(|output| resolve_shape(&output.shape, &self.dims))
             .collect()
     }
 
@@ -166,14 +204,37 @@ impl CompiledGraph {
     }
 
     /// Stage one input's raw little-endian bytes by graph name.
-    fn set_input(&mut self, name: &str, bytes: &[u8]) -> PyResult<()> {
-        let input = self
-            .translation
-            .inputs
-            .iter()
-            .find(|input| input.graph_name == name)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("unknown input {name:?}")))?;
-        let buffer = typed_buffer(input.dtype, bytes).map_err(to_py)?;
+    ///
+    /// `shape` is the concrete tensor shape at the call site. Its axes bind
+    /// the graph's symbolic dims, so a symbolic input can be driven at a new
+    /// extent without re-exporting.
+    fn set_input(&mut self, name: &str, bytes: &[u8], shape: Vec<usize>) -> PyResult<()> {
+        let (dtype, bindings): (DType, Vec<(usize, Symbol)>) = {
+            let input = self
+                .translation
+                .inputs
+                .iter()
+                .find(|input| input.graph_name == name)
+                .ok_or_else(|| PyRuntimeError::new_err(format!("unknown input {name:?}")))?;
+            let mut bindings = Vec::new();
+            for (axis, dim) in input.shape.iter().enumerate() {
+                if let Some(value) = shape.get(axis) {
+                    for symbol in dim.to_symbols() {
+                        bindings.push((*value, symbol));
+                    }
+                }
+            }
+            (input.dtype, bindings)
+        };
+        for (value, symbol) in bindings {
+            self.dims.insert(symbol, value);
+            // Before search the bucket/range binding owns the dims; setting
+            // them now would make `bind_dim_buckets` refuse as "already set".
+            if self.searched {
+                self.runtime.set_dim(symbol, value);
+            }
+        }
+        let buffer = typed_buffer(dtype, bytes).map_err(to_py)?;
         self.staged.insert(name.to_string(), buffer);
         self.dirty.insert(name.to_string());
         Ok(())
@@ -200,7 +261,47 @@ impl CompiledGraph {
             options.generations = generations;
         }
         options.search_log = false;
-        self.runtime.search(&data, &options).map_err(to_py)?;
+        if self.dims.is_empty() {
+            // Static program: one concrete plan at the exported shapes.
+            self.runtime.search(&data, &options).map_err(to_py)?;
+        } else {
+            // Dynamic program: bind one bucket per symbolic dim and search it
+            // ONCE. The winning plan keeps symbolic spans, so every later call
+            // whose dims fall in the bucket re-renders without re-searching.
+            let hints: Vec<(Symbol, usize)> = self.dims.iter().map(|(s, v)| (*s, *v)).collect();
+            for (symbol, hint) in hints {
+                let representative = hint.clamp(1, MAX_DYNAMIC_DIM);
+                let bucket = DimBucket::new(1, MAX_DYNAMIC_DIM).representative(representative);
+                self.runtime
+                    .bind_dim_buckets(symbol, vec![bucket])
+                    .map_err(to_py)?;
+            }
+            let inputs_meta: Vec<(NodeIndex, DType, Vec<IntExpr>)> = self
+                .translation
+                .inputs
+                .iter()
+                .map(|input| (input.tensor, input.dtype, input.shape.clone()))
+                .collect();
+            let data_for = move |representative: &DynMap| {
+                inputs_meta
+                    .iter()
+                    .map(|(tensor, dtype, shape)| {
+                        let elements = shape
+                            .iter()
+                            .map(|dim| {
+                                dim.exec(representative)
+                                    .or_else(|| dim.to_usize())
+                                    .unwrap_or(0)
+                            })
+                            .product();
+                        (*tensor, zero_buffer(*dtype, elements))
+                    })
+                    .collect()
+            };
+            self.runtime
+                .search_buckets(data_for, &options)
+                .map_err(to_py)?;
+        }
         self.searched = true;
         Ok(())
     }
@@ -274,6 +375,7 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
     let translation = translate(&parsed).map_err(to_py)?;
+    let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let runtime = ReferenceRuntime::load(&translation.graph)
         .context("loading the translated graph on the reference runtime")
         .map_err(to_py)?;
@@ -283,6 +385,7 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         staged: HashMap::new(),
         dirty: HashSet::new(),
         searched: false,
+        dims,
     })
 }
 

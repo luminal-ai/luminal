@@ -99,11 +99,15 @@ pub(super) fn reshape_tensor(t: GraphTensor, target: &[IntExpr]) -> GraphTensor 
         return t.flatten().squeeze(0);
     }
     let mut flat = t.flatten();
-    for (i, dim) in target.iter().enumerate() {
-        if i + 1 == target.len() {
-            break;
-        }
-        flat = flat.split_dims(i, *dim);
+    // `split_dims(axis, inner)` leaves `old / inner` at `axis` and inserts
+    // `inner` directly after it. To rebuild `target` from the flat axis we
+    // therefore split each leading axis by the product of the *remaining*
+    // target extents, not by the target extent itself.
+    for i in 0..target.len().saturating_sub(1) {
+        let rest: IntExpr = target[i + 1..]
+            .iter()
+            .fold(IntExpr::from(1), |acc, d| acc * *d);
+        flat = flat.split_dims(i, rest);
     }
     flat
 }
@@ -312,6 +316,32 @@ impl Translator<'_> {
         }
         arg.as_ints()
             .map(|v| v.to_vec())
+            .with_context(|| format!("input {idx} of {} is not an int list", node.target))
+    }
+
+    /// Like [`Self::get_ints_arg`], but keeps symbolic entries as `IntExpr`
+    /// instead of collapsing them to their hint. A `sym_size` result (or a
+    /// bare sym_int) resolves through `sym_int_values` to the recorder symbol
+    /// that also names the tensor's own dimension.
+    pub(super) fn get_int_exprs_arg(&self, node: &Node, idx: usize) -> Result<Vec<IntExpr>> {
+        let arg = &node
+            .inputs
+            .get(idx)
+            .with_context(|| format!("{} missing input {idx}", node.target))?
+            .arg;
+        if let Some(entries) = arg.as_sym_ints() {
+            return entries
+                .iter()
+                .map(|entry| match entry {
+                    SymIntEntry::Int(i) => Ok(IntExpr::from(i.as_int)),
+                    SymIntEntry::Name(s) => self.resolve_sym_int(&s.as_name).with_context(|| {
+                        format!("input {idx} of {} has an unresolved sym_int", node.target)
+                    }),
+                })
+                .collect();
+        }
+        arg.as_ints()
+            .map(|values| values.iter().map(|v| IntExpr::from(*v)).collect())
             .with_context(|| format!("input {idx} of {} is not an int list", node.target))
     }
 

@@ -173,6 +173,10 @@ pub(crate) fn kernel(
     let out_dims = ctx.operand_dims.last().cloned().unwrap_or_default();
     let rank = out_dims.len();
     let numel = ctx.dests[0].len();
+    // The expression may retain symbolic dims (`Var("a")`) from the
+    // searched plan; resolve them against THIS call's assignment so one
+    // op record serves every value.
+    let dims = ctx.dims.clone();
     let mut coords = vec![0usize; rank];
     let eval_at = |flat: usize, coords: &mut Vec<usize>| {
         let mut remainder = flat;
@@ -180,7 +184,7 @@ pub(crate) fn kernel(
             coords[axis] = remainder % out_dims[axis];
             remainder /= out_dims[axis];
         }
-        expr.eval(coords)
+        expr.eval_with_dims(coords, &dims)
     };
     match &mut ctx.dests[0] {
         // Iota is Int by its dtype rule; the i64 evaluation lands

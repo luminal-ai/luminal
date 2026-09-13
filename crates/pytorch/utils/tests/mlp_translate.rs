@@ -4,10 +4,19 @@
 //! `luminal_reference/tests/test_mlp.py`); the test skips when absent so
 //! `cargo test` stays runnable without a torch environment.
 
-use luminal::prelude::DType;
+use luminal::prelude::{DType, IntExpr};
 use luminal_pytorch_utils::{InputKind, parse_pt2, translate};
 
 const MLP_PT2: &str = "/tmp/luminal_mlp.pt2";
+
+/// A translated boundary shape is symbolic; this fixture is static, so every
+/// dim must resolve to a literal.
+fn concrete(shape: &[IntExpr]) -> Vec<usize> {
+    shape
+        .iter()
+        .map(|dim| dim.to_usize().expect("static fixture dim"))
+        .collect()
+}
 
 #[test]
 fn mlp_translates_to_the_recorder_frontend() {
@@ -38,10 +47,10 @@ fn mlp_translates_to_the_recorder_frontend() {
         .filter(|input| matches!(input.kind, InputKind::UserInput { .. }))
         .collect();
     assert_eq!(user.len(), 1);
-    assert_eq!(user[0].shape, vec![3, 4]);
+    assert_eq!(concrete(&user[0].shape), vec![3, 4]);
 
     assert_eq!(translation.outputs.len(), 1);
-    assert_eq!(translation.outputs[0].shape, vec![3, 2]);
+    assert_eq!(concrete(&translation.outputs[0].shape), vec![3, 2]);
     assert_eq!(translation.outputs[0].dtype, DType::F32);
     assert!(translation.outputs[0].mutation_target.is_none());
 }

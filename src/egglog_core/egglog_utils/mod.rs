@@ -238,6 +238,12 @@ pub fn extract_expr<'a>(
                     .unwrap_or_else(|_| panic!("malformed coord M-var '{op}'"));
                 IntExpr::new(vec![crate::shape::Term::Coord(axis)])
             }
+            // A bare `MVar`'s string child: egglog serializes the symbol as a
+            // quoted literal node (`"s21"`), which the `MVar` arm lands on
+            // directly. Parse it into the same `Symbol` the boxed form yields.
+            op if op.starts_with('"') && op.ends_with('"') => {
+                IntExpr::from(crate::shape::Symbol::new(op.trim_matches('"')))
+            }
             op => op
                 .parse::<i64>()
                 .map(IntExpr::from)

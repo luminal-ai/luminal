@@ -309,6 +309,12 @@ pub struct ReferenceKernelCtx {
     pub operand_dims: Vec<Vec<usize>>,
     /// Result contents to fill, in result order (zero-initialized).
     pub dests: Vec<TypedBuffer>,
+    /// The runtime's current symbolic-dim assignment. Ops whose geometric
+    /// metadata is an EXPRESSION retained from the search (iota totals,
+    /// index-map entries) evaluate it against this PER CALL, so a symbolic
+    /// plan reuses one op record across every dim value. Ops that read
+    /// `operand_dims` ignore it.
+    pub dims: luminal::shape::DynMap,
 }
 
 /// The elementwise-binary and axis-reduce helpers for one narrow integer
