@@ -697,11 +697,12 @@ impl EgglogOp for LoopInput {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        // Declare the `identical_inputs` relation and the three-way unification
-        // chain between `LoopInput`, `LoopInputStatic`, and an inlined source.
-        // Running alongside fusion rules (e.g. GLUMoE) so that fusion patterns
-        // that expect raw op kinds at boundary positions can match via the
-        // unioned eclass.
+        // Prove invariant input streams only for lists attached to LoopInput.
+        // A global IList proof makes the e-graph recursively inspect every
+        // argument list in the model, even though only loop-boundary lists can
+        // become LoopInputStatic.  Scoping the relation from LoopInput roots
+        // keeps the same equivalences available to fusion rules without making
+        // saturation scale with all unrelated IR lists.
         vec![
             // Loop rolling stamps the concrete stream dtype into the marker;
             // the field is the same type contract consumed by rewrites and
@@ -709,29 +710,45 @@ impl EgglogOp for LoopInput {
             dtype_from_kind_field(&self.sort(), "dtype"),
             Rule::raw(
                 r#"
-            (relation identical_inputs (IList))
+            (relation loop_input_list (IList))
+            (relation identical_loop_inputs (IList))
 
-            ; All four rules live in the `expr` ruleset, which the schedule
+            ; All rules live in the `expr` ruleset, which the schedule
             ; saturates each iteration. Default-ruleset scheduling only runs
             ; each rule once per outer step, which is not enough to propagate
-            ; `identical_inputs` through an N-element IList.
+            ; the proof through an N-element IList.
+
+            ; Seed the proof only from lists that are actual LoopInput operands.
+            (rule ((= ?e (Op (LoopInput ?id ?stream ?dt) ?l)))
+                  ((loop_input_list ?l))
+                  :ruleset expr
+                  :name "loop input list seed")
+
+            ; Mark only tails reachable from a LoopInput list.
+            (rule ((loop_input_list ?l)
+                   (= ?l (ICons ?x ?tail)))
+                  ((loop_input_list ?tail))
+                  :ruleset expr
+                  :name "loop input list tail")
 
             ; Base: single-element list is trivially identical.
-            (rule ((= ?l (ICons ?x (INil))))
-                  ((identical_inputs ?l))
+            (rule ((loop_input_list ?l)
+                   (= ?l (ICons ?x (INil))))
+                  ((identical_loop_inputs ?l))
                   :ruleset expr
-                  :name "identical_inputs base")
+                  :name "identical loop inputs base")
 
             ; Inductive: head equals next-head, and the tail starting at next-head is identical.
-            (rule ((= ?l (ICons ?x (ICons ?x ?tail)))
-                   (identical_inputs (ICons ?x ?tail)))
-                  ((identical_inputs ?l))
+            (rule ((loop_input_list ?l)
+                   (= ?l (ICons ?x (ICons ?x ?tail)))
+                   (identical_loop_inputs (ICons ?x ?tail)))
+                  ((identical_loop_inputs ?l))
                   :ruleset expr
-                  :name "identical_inputs ind")
+                  :name "identical loop inputs ind")
 
             ; LoopInput with an identical IList is equivalent to LoopInputStatic over a single copy.
             (rule ((= ?e (Op (LoopInput ?id ?stream ?dt) (ICons ?x ?cont)))
-                   (identical_inputs (ICons ?x ?cont)))
+                   (identical_loop_inputs (ICons ?x ?cont)))
                   ((let ?static (Op (LoopInputStatic ?id ?stream ?dt) (ICons ?x (INil))))
                    (union ?e ?static))
                   :ruleset expr
@@ -802,7 +819,7 @@ impl ReferenceOp for LoopInput {
 
 /// Iteration-independent boundary input: the same value flows into every
 /// iteration of a loop. Structurally a `LoopInput` whose per-iteration
-/// sources have all been proven equal (via the `identical_inputs` egglog
+/// sources have all been proven equal (via the `identical_loop_inputs` egglog
 /// relation) collapses into `LoopInputStatic` with a single-element IList,
 /// and that in turn collapses via a further rewrite into just its inner
 /// value — so egglog search can explore any of the three representations.

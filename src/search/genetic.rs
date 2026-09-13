@@ -132,6 +132,7 @@ pub struct GeneticSearch<'a, M> {
     generation_found_new_best: bool,
     slower_since_faster: usize,
     slower_line_visible: bool,
+    tried_minimum_cost_seed: bool,
 }
 
 impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
@@ -197,6 +198,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             generation_found_new_best: false,
             slower_since_faster: 0,
             slower_line_visible: false,
+            tried_minimum_cost_seed: false,
         }
     }
 
@@ -235,14 +237,24 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             match self.phase {
                 Phase::Done => return None,
                 Phase::Initial => {
-                    let mut generation =
-                        self.extractor
-                            .random_indexed_generation(1, &mut self.prev_selected, rng);
-                    let Some(genome) = generation.pop() else {
-                        panic_initial_filter_limit(
-                            self.filter_fails,
-                            self.last_filter_rejection.as_deref(),
+                    let genome = if !self.tried_minimum_cost_seed {
+                        self.tried_minimum_cost_seed = true;
+                        let genome = self.extractor.minimum_cost_indexed_choice();
+                        self.prev_selected.insert(genome.hash);
+                        genome
+                    } else {
+                        let mut generation = self.extractor.random_indexed_generation(
+                            1,
+                            &mut self.prev_selected,
+                            rng,
                         );
+                        let Some(genome) = generation.pop() else {
+                            panic_initial_filter_limit(
+                                self.filter_fails,
+                                self.last_filter_rejection.as_deref(),
+                            );
+                        };
+                        genome
                     };
                     match self.extract(&genome) {
                         Ok(Some((_, llir))) => return Some(self.hand_out(genome, llir, None)),
@@ -422,7 +434,15 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                 return;
             }
             Outcome::Measured(..) => self.n_timed_out += 1,
-            Outcome::Invalid(_) => self.n_invalid_profile += 1,
+            Outcome::Invalid(reason) => {
+                self.n_invalid_profile += 1;
+                if self.search_log && self.n_invalid_profile <= 5 {
+                    eprintln!(
+                        "   Search  initial-genome execution invalid #{}: {reason}",
+                        self.n_invalid_profile
+                    );
+                }
+            }
         }
         self.invalid_attempts += 1;
         if self.invalid_attempts > MAX_INVALID_INITIAL_ATTEMPTS {

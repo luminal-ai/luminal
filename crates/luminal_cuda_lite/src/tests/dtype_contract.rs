@@ -47,6 +47,42 @@ fn egraph_has_enode(cx: &Graph, label: &str, child_label: Option<&str>) -> bool 
 }
 
 #[test]
+fn f32_to_f8e4m3_cast_rounds_nonrepresentable_values() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !crate::tests::utilities::gpu_supports_dtype(DType::F8E4M3) {
+        return;
+    }
+
+    // These values are deliberately between E4M3 grid points. Tests that use
+    // only exactly representable inputs cannot detect a broken conversion or
+    // rounding path.
+    let input = vec![
+        -46.447_056_f32,
+        21.247_044_f32,
+        -169.976_06_f32,
+        -0.55_f32,
+        0.3_f32,
+        447.0_f32,
+    ];
+    let expected = vec![0xe4, 0x5b, 0xf3, 0xb1, 0x2a, 0x7e];
+
+    let mut cx = Graph::default();
+    let x = cx.tensor(input.len());
+    let out = x.cast(DType::F8E4M3).output();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.set_data(x, input.clone());
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.set_data(x, input);
+    rt.execute(&cx.dyn_map);
+
+    assert_eq!(rt.get_f8e4m3_bytes(out.id), expected);
+}
+
+#[test]
 fn test_bf16_constant_folds_into_kernel_constant() {
     // `bf16_tensor * 2.5` — the frontend emits `constant(2.5).cast(Bf16)`,
     // and the fold rule must offer a Bf16 KernelConstant in the Cast's

@@ -40,7 +40,10 @@ use std::{
     fmt::Debug,
     fs::File,
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tracing::{Level, span, trace};
@@ -79,6 +82,12 @@ fn materialized_bucket_evictions(
     }
     evictions
 }
+
+/// Process-wide execution identities keep static HostOp caches isolated even
+/// when compiler search moves between freshly constructed runtime instances.
+/// Host-side planners can still share immutable preparation within one
+/// execution without carrying dynamic metadata across executions.
+static NEXT_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn search_candidate_node_limit(baseline_nodes: usize) -> usize {
     baseline_nodes.saturating_add(MIN_SEARCH_CANDIDATE_NODE_ALLOWANCE)
@@ -477,10 +486,6 @@ pub struct CudaRuntimeImpl<O> {
     profile_start_event: CudaEvent,
     profile_end_event: CudaEvent,
     last_profile_device_duration: Option<Duration>,
-    /// Monotonic identifier passed to every HostOp in one `execute` call.
-    /// Host-side planners use it to share immutable per-tick preparation
-    /// without carrying dynamic metadata across executions.
-    next_execution_id: u64,
     max_intermediate_memory_bytes: Option<usize>,
     max_kernel_source_bytes: Option<usize>,
     /// Cheap pre-codegen limit derived from the first viable candidate in the
@@ -2124,6 +2129,19 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             buf_dtype,
             Some(DType::U8),
             "get_u8: buffer dtype is {buf_dtype:?}, expected U8"
+        );
+        self.get_output_data(id)
+    }
+
+    /// Read the raw IEEE E4M3 byte encodings of an FP8 output.
+    pub fn get_f8e4m3_bytes(&self, id: impl ToId) -> Vec<u8> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let buf_dtype = self.active().buffer_specs.get(&data_id).map(|s| s.dtype);
+        assert_eq!(
+            buf_dtype,
+            Some(DType::F8E4M3),
+            "get_f8e4m3_bytes: buffer dtype is {buf_dtype:?}, expected F8E4M3"
         );
         self.get_output_data(id)
     }
@@ -5119,7 +5137,6 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             profile_start_event,
             profile_end_event,
             last_profile_device_duration: None,
-            next_execution_id: 0,
             max_intermediate_memory_bytes: None,
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
             search_candidate_node_limit: None,
@@ -5175,8 +5192,7 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
-        let execution_id = self.next_execution_id;
-        self.next_execution_id = self.next_execution_id.wrapping_add(1);
+        let execution_id = NEXT_EXECUTION_ID.fetch_add(1, Ordering::Relaxed);
         // `PROFILE_EXEC` measures only these coarse runtime phases. The older
         // `PROFILE_RECAPTURE` additionally instruments every CUDA-graph
         // materialization subphase and is intentionally more perturbative.

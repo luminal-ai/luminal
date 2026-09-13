@@ -128,9 +128,12 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                 metric,
                 diagnostics::append_filter_display(display, Some(&resource_display)),
             ),
-            Err(_) => {
+            Err(payload) => {
                 self.cancel_search_profile();
-                Outcome::Invalid("candidate profiling panicked".to_string())
+                Outcome::Invalid(format!(
+                    "candidate profiling panicked: {}",
+                    luminal::mask_events::panic_payload(payload.as_ref())
+                ))
             }
         }
     }

@@ -59,7 +59,13 @@ impl EgglogOp for KernelQuantF8 {
                 (
                     (= ?xf (Op (Cast ?xf_size (F32)) (ICons ?x (INil))))
                     (= (Bf16) (dtype ?x))
-                    (= ?recip (Op (Recip ?r_shape ?r_in_strides ?r_out_strides)
+                    ; This kernel reads scale[0], so the scale must be a
+                    ; scalar broadcast across the complete 2-D activation.
+                    ; Per-row/per-group scales have nonzero logical strides
+                    ; and must remain on their exact elementwise path.
+                    (= ?recip (Op (Recip ?r_shape
+                        (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+                        ?r_out_strides)
                         (ICons ?scale (INil))))
                     (= ?mul (Op (Mul ?m_shape ?xf_strides ?recip_strides ?m_out_strides)
                         (ICons ?xf (ICons ?recip (INil)))))
