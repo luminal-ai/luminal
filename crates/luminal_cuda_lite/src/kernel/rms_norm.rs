@@ -11,12 +11,14 @@
 //! Layout: x `(rows, cols)` contiguous in `dtype` with dynamic `rows`;
 //! w `(cols,)` F32. One block per row; F32 warp + block reduction.
 
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
-    dtype::DType, op::CustomOp, op::LLIROp, prelude::FxHashMap, prelude::GraphTensor,
-    prelude::Symbol, shape::Expression,
+    dtype::DType,
+    op::{CustomOp, HLIROp, LLIROp},
+    prelude::{FxHashMap, GraphTensor, NodeIndex, ShapeTracker, Symbol},
+    shape::Expression,
 };
 
 use crate::compile_module_image_for_current_device;
@@ -30,11 +32,17 @@ pub struct RMSNormKernel {
     pub cols: usize,
     pub eps: f32,
     pub dtype: DType,
+    /// Storage dtype; conversion to `dtype` happens before either reduction or scaling.
+    pub input_dtype: DType,
+    pub threads: usize,
 }
 
-impl KernelOp for RMSNormKernel {
-    fn compile(
+impl RMSNormKernel {
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn compile_impl(
         &self,
+        residual: bool,
+        bias: Option<(usize, DType)>,
         stream: &Arc<CudaStream>,
         compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     ) -> (
@@ -48,44 +56,172 @@ impl KernelOp for RMSNormKernel {
     ) {
         let cols = self.cols;
         let eps = self.eps;
+        let tpb = self.threads;
+        assert!(matches!(self.dtype, DType::F32 | DType::F16 | DType::Bf16));
+        assert!(matches!(tpb, 128 | 256 | 512 | 1024));
+        assert!(
+            self.input_dtype == self.dtype
+                || (self.input_dtype == DType::F32
+                    && matches!(self.dtype, DType::F16 | DType::Bf16))
+        );
+        let input_ty = crate::cuda_dtype(self.input_dtype);
+        // Keep the logical reduction groups unchanged when absorbing a cast.
+        // F32 storage needs two 16-byte loads for eight rounded 16-bit values.
+        let elements = 128 / self.dtype.bits();
+        let vectors = self.input_dtype.bits() / self.dtype.bits();
+        let loads = (0..vectors)
+            .map(|i| format!("xv[c * {vectors} + {i}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let ty = crate::cuda_dtype(self.dtype);
-        let includes = crate::kernel::hlir::dtype_includes(&[self.dtype]);
+        let includes = crate::kernel::hlir::dtype_includes(&[
+            self.dtype,
+            self.input_dtype,
+            bias.map_or(self.dtype, |b| b.1),
+        ]);
+        assert!(bias.is_none_or(|(side, dt)| residual
+            && side < 2
+            && self.input_dtype == DType::F32
+            && matches!(dt, DType::F32 | DType::Bf16 | DType::F16)));
+        let bias_parameter = bias.map_or(String::new(), |(_, dt)| {
+            format!(", const {}* __restrict__ bias", crate::cuda_dtype(dt))
+        });
+        let value = |side, raw: &str, index: &str| {
+            if bias.is_some_and(|b| b.0 == side) {
+                format!("__fadd_rn((float){raw}, (float)bias[{index}])")
+            } else {
+                format!("(float){raw}")
+            }
+        };
+        let (xs, rs) = (value(0, "xr[i]", "i"), value(1, "rr[i]", "i"));
+        let index = format!("c * {elements} + e");
+        let next_index = format!("{index} + 1");
+        let (x0, x1) = (value(0, "xe[e]", &index), value(0, "xe[e+1]", &next_index));
+        let (r0, r1) = (value(1, "re[e]", &index), value(1, "re[e+1]", &next_index));
+        let output_ty = if residual { "unsigned char" } else { ty };
+        let residual_parameter = if residual {
+            format!(", const {input_ty}* __restrict__ residual")
+        } else {
+            String::new()
+        };
+        let output_rows = if residual {
+            format!(
+                "float* sr = (float*)out + row * COLS;\n    {ty}* yr = ({ty}*)(out + (long long)gridDim.x * COLS * sizeof(float)) + row * COLS;\n    const {input_ty}* rr = residual + row * COLS;\n    {ty}* sum_low = ({ty}*)(out + (long long)gridDim.x * COLS * (sizeof(float) + sizeof({ty}))) + row * COLS;"
+            )
+        } else {
+            format!("{ty}* yr = out + row * COLS;")
+        };
+        let residual_vectors = if residual {
+            let loads = (0..vectors)
+                .map(|i| format!("rv[c * {vectors} + {i}]"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "const uint4* rv = (const uint4*)rr; const uint4 rchunks[{vectors}] = {{{loads}}}; const {input_ty}* re = (const {input_ty}*)rchunks;"
+            )
+        } else {
+            String::new()
+        };
+        let vector_value = if residual {
+            format!("(float)({ty})((float)({ty})xe[e] + (float)({ty})re[e])")
+        } else {
+            format!("(float)({ty})xe[e]")
+        };
+        let scalar_value = if residual {
+            format!("(float)({ty})((float)({ty})({xs}) + (float)({ty})({rs}))")
+        } else {
+            format!("(float)({ty})xr[i]")
+        };
+        let vector_store = if residual {
+            format!("sr[c * {elements} + e] = v; sum_low[c * {elements} + e] = ({ty})v;")
+        } else {
+            String::new()
+        };
+        let scalar_store = if residual {
+            format!("sr[i] = v; sum_low[i] = ({ty})v;")
+        } else {
+            String::new()
+        };
+        let scale_value = if residual {
+            "sr[i]".to_string()
+        } else {
+            format!("(float)({ty})xr[i]")
+        };
+        let vector_body = if residual && matches!(self.dtype, DType::Bf16 | DType::F16) {
+            let pack = if self.dtype == DType::Bf16 {
+                "__floats2bfloat162_rn"
+            } else {
+                "__floats2half2_rn"
+            };
+            let unpack = if self.dtype == DType::Bf16 {
+                "__bfloat1622float2"
+            } else {
+                "__half22float2"
+            };
+            let pair_type = if self.dtype == DType::Bf16 {
+                "__nv_bfloat162"
+            } else {
+                "__half2"
+            };
+            format!(
+                r#"
+            #pragma unroll
+            for (int e = 0; e < {elements}; e += 2) {{
+                auto a = {pack}({x0}, {x1});
+                auto b = {pack}({r0}, {r1});
+                auto rounded = __hadd2(a, b);
+                (({pair_type}*)sum_low)[(c * {elements} + e)/2] = rounded;
+                float2 v = {unpack}(rounded);
+                ((float2*)sr)[(c * {elements} + e)/2] = v;
+                partial += v.x * v.x;
+                partial += v.y * v.y;
+            }}"#
+            )
+        } else {
+            format!(
+                r#"
+            #pragma unroll
+            for (int e = 0; e < {elements}; e++) {{
+                float v = {vector_value};
+                {vector_store}
+                partial += v * v;
+            }}"#
+            )
+        };
         let kernel = format!(
             r#"{includes}
 #define WARP_SIZE 32
 #define FULL_MASK 0xffffffff
 extern "C" __global__ void rms_norm_k(
-    {ty}* __restrict__ out,
-    const {ty}* __restrict__ x,
-    const float* __restrict__ w
+    {output_ty}* __restrict__ out,
+    const {input_ty}* __restrict__ x,
+    const float* __restrict__ w{residual_parameter}{bias_parameter}
 ) {{
     const int COLS = {cols};
-    __shared__ float warp_sums[{TPB} / WARP_SIZE];
+    __shared__ float warp_sums[{tpb} / WARP_SIZE];
     long long row = blockIdx.x;
     int tid = threadIdx.x;
     int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
 
-    const {ty}* xr = x + row * COLS;
-    {ty}* yr = out + row * COLS;
+    const {input_ty}* xr = x + row * COLS;
+    {output_rows}
 
     float partial = 0.0f;
-#if {cols} % 8 == 0
+#if {cols} % {elements} == 0
     {{
         const uint4* xv = (const uint4*)xr;
-        for (int c = tid; c < COLS / 8; c += {TPB}) {{
-            uint4 chunk = xv[c];
-            const {ty}* xe = (const {ty}*)&chunk;
-            #pragma unroll
-            for (int e = 0; e < 8; e++) {{
-                float v = (float)xe[e];
-                partial += v * v;
-            }}
+        for (int c = tid; c < COLS / {elements}; c += {tpb}) {{
+            const uint4 chunks[{vectors}] = {{{loads}}};
+            const {input_ty}* xe = (const {input_ty}*)chunks;
+            {residual_vectors}
+            {vector_body}
         }}
     }}
 #else
-    for (int i = tid; i < COLS; i += {TPB}) {{
-        float v = (float)xr[i];
+    for (int i = tid; i < COLS; i += {tpb}) {{
+        float v = {scalar_value};
+        {scalar_store}
         partial += v * v;
     }}
 #endif
@@ -100,21 +236,21 @@ extern "C" __global__ void rms_norm_k(
     __syncthreads();
 
     if (warp_id == 0) {{
-        int cnt = {TPB} / WARP_SIZE;
+        int cnt = {tpb} / WARP_SIZE;
         float block_sum = tid < cnt ? warp_sums[tid] : 0.0f;
         #pragma unroll
         for (int s = cnt / 2; s > 0; s /= 2) {{
             block_sum += __shfl_down_sync(FULL_MASK, block_sum, s);
         }}
         if (tid == 0) {{
-            warp_sums[0] = rsqrtf(block_sum / (float)COLS + {eps:.10}f);
+            warp_sums[0] = rsqrtf(block_sum / (float)COLS + {eps:e}f);
         }}
     }}
     __syncthreads();
     float rinv = warp_sums[0];
 
-    for (int i = tid; i < COLS; i += {TPB}) {{
-        yr[i] = ({ty})((float)xr[i] * rinv * w[i]);
+    for (int i = tid; i < COLS; i += {tpb}) {{
+        yr[i] = ({ty})({scale_value} * rinv * w[i]);
     }}
 }}
 "#
@@ -140,13 +276,31 @@ extern "C" __global__ void rms_norm_k(
                 Expression::from(1usize),
             ),
             (
-                Expression::from(TPB),
+                Expression::from(tpb),
                 Expression::from(1usize),
                 Expression::from(1usize),
             ),
             Expression::from(0usize),
             FxHashMap::default(),
         )
+    }
+}
+
+impl KernelOp for RMSNormKernel {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<Symbol, CudaSlice<u8>>,
+    ) {
+        self.compile_impl(false, None, stream, compile_cache)
     }
 
     fn output_size(&self) -> Expression {
@@ -163,7 +317,7 @@ extern "C" __global__ void rms_norm_k(
 
     fn bytes_loaded(&self) -> Expression {
         // Two passes over x plus the weight row.
-        (self.rows * self.cols * self.dtype.bits() * 2).ceil_div(8) + self.cols * 4
+        (self.rows * self.cols * self.input_dtype.bits() * 2).ceil_div(8) + self.cols * 4
     }
 
     fn bytes_stored(&self) -> Expression {
@@ -194,24 +348,49 @@ impl CustomOp for RMSNormCustom {
 /// `w` is `(cols,)` F32. Returns `(rows, cols)` in `x`'s dtype.
 pub fn fused_rms_norm(x: GraphTensor, w: GraphTensor, eps: f32) -> GraphTensor {
     assert_eq!(w.dtype, DType::F32, "RMSNorm weight must be F32");
+    assert_eq!(w.dims().len(), 1, "RMSNorm weight must be a vector");
+    assert!(
+        matches!(x.dtype, DType::F32 | DType::F16 | DType::Bf16),
+        "RMSNorm requires F32, F16 or BF16 input"
+    );
     let x_dims = x.dims();
     assert_eq!(x_dims.len(), 2, "RMSNorm x must be 2-D (rows, cols)");
     let rows = x_dims[0];
     let cols = x_dims[1].to_usize().expect("RMSNorm cols must be static");
+    assert!(cols > 0, "RMSNorm reduction must be nonempty");
     assert_eq!(
         w.dims()[0].to_usize().expect("RMSNorm weight dim"),
         cols,
         "RMSNorm weight length mismatch"
     );
 
+    let contiguous = |t: GraphTensor| {
+        if t.shape.is_contiguous() {
+            return t;
+        }
+        let indices = t.graph().arange(t.shape.n_elements());
+        let mut gathered = t.gather(indices);
+        gathered.shape = ShapeTracker::new_with_element_bits(t.dims(), t.dtype.bits());
+        gathered
+    };
+    let x = contiguous(x);
+    let w = contiguous(w);
     let kern = RMSNormKernel {
         rows,
         cols,
         eps,
         dtype: x.dtype,
+        input_dtype: x.dtype,
+        threads: TPB,
     };
     let cx = unsafe { &mut *x.graph_ref };
-    cx.custom_op(RMSNormCustom(kern), vec![x, w], (rows, cols), x.dtype)
+    let id = cx.add_op(kern, &[x.id, w.id]);
+    GraphTensor::from_id(
+        id,
+        ShapeTracker::new_with_element_bits((rows, cols), x.dtype.bits()),
+        cx,
+        x.dtype,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -387,8 +566,142 @@ impl EgglogOp for KernelRMSNorm {
                 cols,
                 eps: eps as f32,
                 dtype: DType::Bf16,
+                input_dtype: DType::Bf16,
+                threads: TPB,
             }) as Box<dyn KernelOp>),
             input_enodes,
         )
     }
 }
+
+// The explicit primitive is a normal searchable IR node. It keeps rsqrt and
+// conversion boundaries independent of the decomposed sqrt/reciprocal pattern.
+impl Default for RMSNormKernel {
+    fn default() -> Self {
+        Self {
+            rows: 1.into(),
+            cols: 1,
+            eps: 1e-5,
+            dtype: DType::F32,
+            input_dtype: DType::F32,
+            threads: TPB,
+        }
+    }
+}
+
+impl Display for RMSNormKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FusedRMSNorm")
+    }
+}
+
+impl HLIROp for RMSNormKernel {
+    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
+        use luminal::egglog_utils::list_to_egglog;
+        assert_eq!(inputs.len(), 2);
+        format!(
+            "(Op (FusedRMSNorm {} {} {} {:?} ({:?}) ({:?}) {}) {})",
+            self.rows.to_egglog(),
+            Expression::from(self.cols).to_egglog(),
+            ShapeTracker::new((self.rows, self.cols))
+                .n_elements()
+                .to_egglog(),
+            self.eps as f64,
+            self.dtype,
+            self.input_dtype,
+            Expression::from(self.threads).to_egglog(),
+            list_to_egglog(&[&inputs[0].1, &inputs[1].1], "ICons", "INil")
+        )
+    }
+
+    fn output_dtype(&self, _: &[DType]) -> DType {
+        self.dtype
+    }
+}
+
+impl EgglogOp for RMSNormKernel {
+    fn sort(&self) -> SortDef {
+        use luminal::egglog_utils::base::{DTYPE, EXPRESSION};
+        sort(
+            OP_KIND,
+            "FusedRMSNorm",
+            &[
+                ("rows", EXPRESSION),
+                ("cols", EXPRESSION),
+                ("size", EXPRESSION),
+                ("eps", F64),
+                ("dtype", DTYPE),
+                ("input_dtype", DTYPE),
+                ("threads", EXPRESSION),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        2
+    }
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        let mut rules = vec![Rule::raw(
+            r#"
+            (rule ((= ?out (Op (FusedRMSNorm ?rows ?cols ?size ?eps ?dt ?input_dt ?threads) ?inputs)))
+                ((set (dtype ?out) ?dt)) :ruleset dtype_prop :name "explicit rmsnorm dtype")
+            (rule (
+                (= ?out (Op (FusedRMSNorm ?rows ?cols ?size ?eps ?dt ?dt ?threads)
+                    (ICons ?cast (ICons ?w (INil)))))
+                (= ?cast (Op (Cast ?size ?dt) (ICons ?x (INil))))
+                (= (dtype ?x) (F32))
+                (!= ?dt (F32))
+            ) (
+                (let ?fused (Op (FusedRMSNorm ?rows ?cols ?size ?eps ?dt (F32) ?threads)
+                    (ICons ?x (ICons ?w (INil)))))
+                (union ?out ?fused)
+                (set (dtype ?fused) ?dt)
+            ) :ruleset kernel_fuse_late :name "explicit rmsnorm absorb rounded input cast")
+        "#
+            .to_string(),
+        )];
+        rules.extend([128, 256, 512].map(|threads| Rule::raw(format!(r#"
+            (rule ((= ?out (Op (FusedRMSNorm ?rows ?cols ?size ?eps ?dt ?input_dt (MNum 1024)) ?inputs)))
+                ((let ?tuned (Op (FusedRMSNorm ?rows ?cols ?size ?eps ?dt ?input_dt (MNum {threads})) ?inputs))
+                 (union ?out ?tuned) (set (dtype ?tuned) ?dt))
+                :ruleset kernel_fuse_late :name "explicit rmsnorm {threads} threads")
+        "#))));
+        rules
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        use luminal::egglog_utils::{extract_dtype, extract_expr};
+        let mut expr = |i| extract_expr(egraph, kind_children[i], expr_cache).unwrap();
+        let kernel = Self {
+            rows: expr(0),
+            cols: expr(1).to_usize().unwrap(),
+            eps: egraph.enodes[kind_children[3]]
+                .0
+                .replace('"', "")
+                .parse::<f64>()
+                .unwrap() as f32,
+            dtype: extract_dtype(egraph, kind_children[4]),
+            input_dtype: extract_dtype(egraph, kind_children[5]),
+            threads: expr(6).to_usize().unwrap(),
+        };
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(kernel) as Box<dyn KernelOp>),
+            input_enodes,
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "rms_norm_tests.rs"]
+mod tests;

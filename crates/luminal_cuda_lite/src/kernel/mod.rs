@@ -10,6 +10,7 @@ use luminal_tracing::schema::{
 use uuid::Uuid;
 
 pub mod argmax;
+pub mod buffer_view;
 pub mod conv2d;
 pub mod cuda_graph;
 pub mod fusion;
@@ -19,9 +20,11 @@ pub mod hlir;
 pub mod matmul2d;
 pub mod other_ops;
 pub mod quant_f8;
+pub mod residual_rms_norm;
 pub mod rms_norm;
 pub mod rope;
 pub mod swiglu;
+pub mod thin_matmul;
 pub mod topk;
 
 pub use conv2d::KernelConv2D;
@@ -37,8 +40,14 @@ pub use rope::{RoPECustom, RoPEKernel, apply_rope};
 pub type Ops = (
     hlir::Ops,
     argmax::KernelArgmax,
+    buffer_view::BufferView,
+    buffer_view::BufferViewRead,
     gemv::KernelGemv,
+    thin_matmul::KernelThinMatmul<false>,
     rms_norm::KernelRMSNorm,
+    rms_norm::RMSNormKernel,
+    residual_rms_norm::ResidualRMSNorm,
+    residual_rms_norm::BiasResidualRMSNorm,
     rope::RoPEHalfKernel,
     rope::RoPEScatterKernel,
     rope::KernelRoPE,
@@ -325,6 +334,18 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     /// storage. Mutating specializations must inherit an exclusive-use proof.
     fn output_aliases_input(&self) -> Option<usize> {
         None
+    }
+
+    /// Restrict a pure alias to a logical byte range. Offsets and lengths are
+    /// evaluated for each invocation, including a reused CUDA graph. Kernels
+    /// declaring a range must alias an input and must not mutate it.
+    fn output_view_range(&self) -> Option<(Expression, Expression)> {
+        None
+    }
+
+    /// Pure storage views carry dependencies but launch no device work.
+    fn is_storage_view(&self) -> bool {
+        self.output_view_range().is_some()
     }
 
     /// Whether aliasing the output also mutates the aliased input buffer.

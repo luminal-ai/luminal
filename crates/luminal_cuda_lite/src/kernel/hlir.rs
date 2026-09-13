@@ -1009,7 +1009,7 @@ extern \"C\" {{
 }
 
 // KernelScatter: inverse of gather - out = copy(dest); out[indexes[i]] = src[i]
-// Two-phase: memcpy graph node copies dest→output, then scatter kernel runs in same CUDA graph.
+// Blocks copy and update disjoint output tiles, with a local barrier between phases.
 #[derive(Debug, Clone)]
 pub struct KernelScatter {
     dest_shape: Vec<Expression>,
@@ -1167,8 +1167,22 @@ impl KernelOp for KernelScatter {
             ", const int* dyn_dims"
         };
 
-        // Single-kernel scatter: copy dest→output then scatter src→output[indexes]
-        // Launched as 1 block of 1024 threads with __syncthreads() barrier.
+        // Each block owns its round-robin output tiles for both phases. The
+        // lowering above guarantees contiguous row-major output, so a block
+        // barrier orders every copy against the updates to that same tile.
+        // Bound the grid by hardware parallelism: every block scans the index
+        // list, but only its owner loads and writes an update's source value.
+        let multiprocessors = stream
+            .context()
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .expect("query scatter multiprocessor count") as usize;
+        let blocks = self
+            .output_size()
+            .ceil_div(1024)
+            .min(multiprocessors)
+            .max(1);
         let n_src_elements = self
             .index_shape
             .iter()
@@ -1198,14 +1212,15 @@ extern \"C\" {{
         // Phase 1: materialize dest into the contiguous output layout.
         // dest may be a strided or broadcast view, so copying dest[i] would read
         // past the physical source buffer for expanded tensors.
-        for (long long const_z = tid; const_z < n_dest; const_z += blockDim.x) {{
+        for (long long const_z = (long long)blockIdx.x * blockDim.x + tid;
+             const_z < n_dest; const_z += (long long)blockDim.x * gridDim.x) {{
             out[{copy_out_idx}] = dest[{copy_dest_idx}];
         }}
         __syncthreads();
         // Phase 2: scatter src → output[indexes[i]]
         for (long long const_z = tid; const_z < n_src; const_z += blockDim.x) {{
             int idx = indexes[{scatter_idx_idx}];
-            if (idx >= 0 && idx < n_dest) {{
+            if (idx >= 0 && idx < n_dest && (idx / blockDim.x) % gridDim.x == blockIdx.x) {{
                 out[idx] = src[{scatter_src_idx}];
             }}
         }}
@@ -1226,7 +1241,7 @@ extern \"C\" {{
             func,
             module,
             scatter_kernel,
-            (1.into(), 1.into(), 1.into()),    // grid: 1 block
+            (blocks, 1.into(), 1.into()),
             (1024.into(), 1.into(), 1.into()), // block: 1024 threads
             0.into(),
             FxHashMap::default(),

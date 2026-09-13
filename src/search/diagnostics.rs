@@ -310,3 +310,21 @@ pub fn log_best_llir(llir: &LLIRGraph, context: &str) {
     }
     println!("LLIR_BEST_END");
 }
+
+/// Exact generic search choices, including rejected candidates. Construct records
+/// only when requested; writing happens after evaluation and outside its metric.
+pub(super) fn log_candidate_choices(record: impl FnOnce() -> serde_json::Value) {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("LUMINAL_SEARCH_CHOICE_TRACE").ok()) else {
+        return;
+    };
+    let mut line = serde_json::to_vec(&record()).expect("serialize search choice trace");
+    line.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open requested search choice trace");
+    file.write_all(&line)
+        .expect("write requested search choice trace");
+}

@@ -30,17 +30,49 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let contexts = space.bucket_contexts(dyn_map);
         let mut finalists = Vec::with_capacity(contexts.len());
         for ctx in &contexts {
+            let _image_cache = crate::search_image_cache::SearchImageCache::enter();
+            let bucket_started = Instant::now();
+            let setup_started = Instant::now();
             let mut search = GeneticSearch::<Duration>::new(space, ctx, options, search_started_at);
-            while let Some(mut candidate) = search.next_candidate(rng) {
+            if options.seed_schedule.is_none()
+                && let Some(schedule) = &self.selected_schedule
+            {
+                search.seed_schedule(schedule);
+            }
+            log_search_phase(ctx.index, "graph-search", "search_init", setup_started);
+            loop {
+                let extract_started = Instant::now();
+                let candidate = search.next_candidate(rng);
+                log_search_phase(ctx.index, "graph-search", "extract", extract_started);
+                let Some(mut candidate) = candidate else {
+                    break;
+                };
+                let evaluate_started = Instant::now();
                 let outcome = self.evaluate_candidate(&mut candidate, ctx, options);
+                log_search_phase(ctx.index, "graph-search", "evaluate", evaluate_started);
+                if matches!(outcome, Outcome::Measured(..))
+                    && self
+                        .counterfactual_request
+                        .as_ref()
+                        .is_some_and(|(bucket, _)| *bucket == ctx.index)
+                {
+                    let (_, path) = self.counterfactual_request.take().unwrap();
+                    let report = self
+                        .profile_region_counterfactuals(&candidate.llir, ctx.index)
+                        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+                    std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+                }
+                let cleanup_started = Instant::now();
                 search.report(candidate, outcome);
                 self.release_search_candidate_allocations();
+                log_search_phase(ctx.index, "graph-search", "report_release", cleanup_started);
             }
             let ranked = search.into_ranked();
             let bucket_finalists =
                 self.rerank_cuda_graph_finalists(ranked, space, ctx, options, search_started_at);
             self.discard_search_bucket_compilation_state();
             finalists.push(bucket_finalists);
+            log_search_phase(ctx.index, "all", "bucket_total", bucket_started);
         }
 
         let mut lattice = BucketLattice::new(
@@ -96,6 +128,21 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         ctx: &BucketContext<'_>,
         options: &CompileOptions,
     ) -> Outcome<Duration> {
+        if self.profile_case_indices(ctx.index).is_some() {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                self.evaluate_profile_workload(&candidate.llir, ctx, options, false)
+            }));
+            return match result {
+                Ok(Ok(metric)) => {
+                    Outcome::Measured(metric, self.profile_evaluations().last().unwrap().display())
+                }
+                Ok(Err(reason)) => Outcome::Rejected(reason.to_string()),
+                Err(_) => {
+                    self.cancel_search_profile();
+                    Outcome::Invalid("representative profiling panicked".into())
+                }
+            };
+        }
         // Snapshot before static preparation as well as execution: candidate
         // planning/codegen is synchronous and may itself be the phase that
         // needs post-mortem diagnosis.
@@ -115,7 +162,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         };
         candidate.restart_timer();
         let profiled = catch_unwind(AssertUnwindSafe(|| {
-            self.profile_loaded_llir(
+            self.profile_loaded_cuda_graph(
                 &candidate.llir,
                 &candidate.profile_dyn_map,
                 options.trials,
@@ -135,11 +182,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         }
     }
 
-    /// Direct step launch is cheap enough for broad exploration, but serving
-    /// uses materialized CUDA graphs and can rank close schedules differently.
-    /// Re-extract the search's best parent-width set and measure that exact
-    /// deployment path before bucket-lattice selection. No schedule is named
-    /// or forced: both stages are ordered solely by measured device time.
+    /// Re-extract and remeasure the search's best parent-width set on the same
+    /// deployment graph path before bucket-lattice selection. No schedule is
+    /// named or forced: both stages are ordered solely by measured device time.
     fn rerank_cuda_graph_finalists<'a>(
         &mut self,
         ranked: Ranked<Duration>,
@@ -151,12 +196,13 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let target = options.keep_best.max(1).min(ranked.len());
         let mut deployment_ranked = Vec::with_capacity(target);
 
-        for (direct_metric, genome) in &ranked {
+        for (search_metric, genome) in &ranked {
+            let extract_started = Instant::now();
             // Use Core's ordinary extractor on a one-genome ranked set. This
             // preserves the exact final extraction/unroll path the lattice
             // will use after the deployment metrics have been sorted.
             let mut extracted = Finalists::new(
-                vec![(*direct_metric, genome.clone())],
+                vec![(*search_metric, genome.clone())],
                 space,
                 ctx,
                 options,
@@ -165,11 +211,15 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             let Some(pending) = extracted.extract_next() else {
                 continue;
             };
+            log_search_phase(ctx.index, "graph", "extract", extract_started);
             let candidate_started_at = Instant::now();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 self.profile_finalist_cuda_graph(&pending, ctx, options)
             }));
+            log_search_phase(ctx.index, "graph", "evaluate", candidate_started_at);
+            let cleanup_started = Instant::now();
             self.release_search_candidate_allocations();
+            log_search_phase(ctx.index, "graph", "report_release", cleanup_started);
 
             let profiled = match result {
                 Ok(Ok(metric)) => Ok(metric),
@@ -196,9 +246,16 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             match profiled {
                 Ok(metric) => {
                     if options.search_log_enabled() {
-                        println!(
-                            "   Search  deployment finalist direct={direct_metric:?} graph={metric:?}"
-                        );
+                        if self.profile_case_indices(ctx.index).is_some() {
+                            println!(
+                                "   Search  deployment finalist search_score={search_metric:?}; {}",
+                                self.profile_evaluations().last().unwrap().display()
+                            );
+                        } else {
+                            println!(
+                                "   Search  deployment finalist search={search_metric:?} graph={metric:?}"
+                            );
+                        }
                     }
                     deployment_ranked.push((metric, genome.clone()));
                     if deployment_ranked.len() == target {
@@ -229,8 +286,13 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         ctx: &BucketContext<'_>,
         options: &CompileOptions,
     ) -> Result<Duration, String> {
+        if self.profile_case_indices(ctx.index).is_some() {
+            return self
+                .evaluate_profile_workload(&pending.llir, ctx, options, true)
+                .map_err(|e| e.to_string());
+        }
         let candidate =
-            self.compile_and_validate_finalist_candidate(&pending.llir, &pending.dyn_map, ctx)?;
+            self.compile_and_validate_profile_candidate(&pending.llir, &pending.dyn_map, ctx)?;
         self.install_validated_bucket_set(ctx.dim_buckets(), candidate.buckets)
             .map_err(|error| format!("deployment CUDA-graph load reject: {error}"))?;
         let (metric, _) = self.profile_loaded_cuda_graph(
@@ -241,6 +303,85 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             None,
         );
         Ok(metric)
+    }
+
+    pub(crate) fn evaluate_profile_workload(
+        &mut self,
+        llir: &LLIRGraph,
+        ctx: &BucketContext<'_>,
+        options: &CompileOptions,
+        finalist: bool,
+    ) -> anyhow::Result<Duration> {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.capture_profile_op_states(llir)?;
+            self.evaluate_profile_workload_inner(llir, ctx, options, finalist)
+        }));
+        self.release_profile_op_states()?;
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn evaluate_profile_workload_inner(
+        &mut self,
+        llir: &LLIRGraph,
+        ctx: &BucketContext<'_>,
+        options: &CompileOptions,
+        finalist: bool,
+    ) -> anyhow::Result<Duration> {
+        let mode = if finalist {
+            "graph-finalist"
+        } else {
+            "graph-search"
+        };
+        if std::env::var_os("LUMINAL_CUDA_PROFILE_EXEC").is_some() {
+            eprintln!("SEARCH_EVALUATION_BEGIN bucket={} mode={mode}", ctx.index);
+        }
+        let setup_started = Instant::now();
+        let indices = self.profile_case_indices(ctx.index).unwrap();
+        self.validate_profile_effects(llir)?;
+        let first = indices[0];
+        let dims = self.profile_case_dims(first);
+        self.activate_profile_case(first)?;
+        self.restore_profile_trial()?;
+        log_search_phase(ctx.index, mode, "initial_restore_validate", setup_started);
+        let compile_started = Instant::now();
+        if finalist {
+            let prepared = self
+                .compile_and_validate_profile_candidate(llir, &dims, ctx)
+                .map_err(anyhow::Error::msg)?;
+            self.install_validated_bucket_set(ctx.dim_buckets(), prepared.buckets)?;
+        } else {
+            self.prepare_search_candidate(llir, &dims, ctx)
+                .map_err(anyhow::Error::msg)?;
+        }
+        log_search_phase(ctx.index, mode, "compile_install", compile_started);
+        let started = Instant::now();
+        let mut timings = Vec::with_capacity(indices.len());
+        // A single case cannot be early-stopped against an aggregate incumbent.
+        // Complete every case; execution/candidate budgets still bound the work.
+        for index in indices {
+            let remaining = if let Some(timeout) = options.execution_timeout {
+                Some(timeout.checked_sub(started.elapsed()).ok_or_else(|| {
+                    anyhow::anyhow!("workload timeout before every case was measured")
+                })?)
+            } else {
+                None
+            };
+            let activate_started = Instant::now();
+            self.activate_profile_case(index)?;
+            log_search_phase(ctx.index, mode, "case_activate", activate_started);
+            let dims = self.profile_case_dims(index);
+            let (duration, _) =
+                self.profile_loaded_cuda_graph(llir, &dims, options.trials, remaining, None);
+            // The profiler always finishes at least one timed trial. Exceeding
+            // the budget during warmup or that final trial does not invalidate
+            // a complete measurement. The next iteration rejects an incomplete
+            // multi-case workload if no budget remains for its other cases.
+            timings.push((index, duration));
+        }
+        self.record_profile_evaluation(ctx.index, true, &timings)
     }
 
     fn prepare_search_candidate(
@@ -262,27 +403,35 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         pending: &PendingFinalist<Duration>,
         ctx: &BucketContext<'_>,
     ) -> Result<(), String> {
-        // This genome was already compiled and timed during search. Re-run the
-        // exact CUDA/resource checks for deployment, but do not apply the
-        // cheap candidate-planning node guard: that guard bounds exploration
-        // work and is not a property of the measured graph.
-        self.compile_and_validate_finalist_candidate(&pending.llir, &pending.dyn_map, ctx)
+        // Revalidate the measured genome with the same CUDA/resource checks
+        // used during search before installing the deployment bucket set.
+        self.compile_and_validate_profile_candidate(&pending.llir, &pending.dyn_map, ctx)
             .map(|_| ())
     }
 }
 
 pub(crate) fn safe_fusion_late_pass() -> luminal::egglog_utils::LateEgglogPass {
     // Singleton elementwise regions already exist when this late pass runs.
-    // One Egglog round sees every materialized FE -> FS boundary in the DAG;
-    // the rule dissolves and subsumes those boundaries simultaneously, giving
-    // us maximal destructive fusion without enumerating fusion partitions.
+    // Matching-layout FE/FS boundaries are subsumed. Saturation also exposes
+    // cast conversions at strided reads, including chains of conversions;
+    // their materialized alternatives remain available to measured search.
     luminal::egglog_utils::LateEgglogPass::new(
         "",
         "(seq
-            fusion_inline_safe_late
+            (saturate fusion_inline_safe_late)
             (saturate expr)
             (saturate cleanup)
             (saturate post_cleanup)
             (saturate base_cleanup))",
     )
+}
+
+/// Coarse search wall times, enabled with the existing execution diagnostic.
+fn log_search_phase(bucket: usize, mode: &str, phase: &str, started: Instant) {
+    if std::env::var_os("LUMINAL_CUDA_PROFILE_EXEC").is_some() {
+        eprintln!(
+            "SEARCH_PHASE bucket={bucket} mode={mode} phase={phase} ms={:.6}",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
 }

@@ -30,7 +30,7 @@ use tracing::{Level, enabled, span};
 
 use crate::{
     host::{
-        DeviceBuffer, HostOp,
+        CudaGraphCaptureResources, DeviceBuffer, HostOp,
         cublaslt::{
             CuBlasLt, CuBlasLtCaptureSignature, CuBlasLtPrepareKey, LtMatmulPointers,
             PreparedCuBlasLtMatmul,
@@ -219,6 +219,7 @@ struct CompiledCapturedHost {
     host_op: Arc<Box<dyn HostOp>>,
     child_graph: Option<CudaGraphHandle>,
     graph_node: Option<CUgraphNode>,
+    resources: CudaGraphCaptureResources,
 }
 
 impl CompiledCapturedHost {
@@ -233,13 +234,21 @@ impl CompiledCapturedHost {
     }
 
     fn prepare_graph_capture(
-        &self,
-        stream: &Arc<CudaStream>,
+        &mut self,
+        capture_stream: &Arc<CudaStream>,
+        execution_stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
-        let host = self.host_op.as_ref().as_ref();
-        host.prepare_cuda_graph_capture(stream, self.node, &self.inputs, buffers, dyn_map)
+        self.resources = self.host_op.prepare_cuda_graph_capture_resources(
+            capture_stream,
+            execution_stream,
+            self.node,
+            &self.inputs,
+            buffers,
+            dyn_map,
+        )?;
+        Ok(())
     }
 }
 
@@ -592,6 +601,9 @@ impl CompiledKernel {
         input_ptrs: &[u64],
         dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
+        if self.kernel_op.is_storage_view() {
+            return Ok(());
+        }
         if self.requires_output_buffer(dyn_map) && output_ptr == 0 {
             anyhow::bail!(
                 "missing output buffer for CUDA kernel {} at LLIR node {:?}",
@@ -619,6 +631,9 @@ impl CompiledKernel {
         dyn_map: &DynMap,
         dyn_dims_ptr: u64,
     ) -> anyhow::Result<()> {
+        if self.kernel_op.is_storage_view() {
+            return Ok(());
+        }
         self.kernel_op.pre_execute(
             stream,
             &mut self.internal_bufs,
@@ -811,6 +826,7 @@ impl ResidentGraphVariant {
                 host_op: op.host_op.clone(),
                 child_graph: None,
                 graph_node: None,
+                resources: vec![],
             })
             .collect();
         variant.kernel_nodes = vec![None; state.kernels.len()];
@@ -943,7 +959,7 @@ pub struct CudaGraphOp {
     /// Union computed once; dynamic materialization can rule out internal
     /// reallocations without asking every kernel for its dimension set.
     internal_buffer_dyn_dims: FxHashSet<Symbol>,
-    output_aliases: Vec<(NodeIndex, NodeIndex)>,
+    output_aliases: Vec<OutputAlias>,
     library_buffer_nodes: FxHashSet<NodeIndex>,
     /// Buffer size requirements for extra nodes (node -> size in elements)
     buffer_sizes: FxHashMap<NodeIndex, Expression>,
@@ -958,6 +974,14 @@ pub struct CudaGraphOp {
     resident: RefCell<Option<ResidentGraphVariants>>,
     residency_frozen: std::cell::Cell<bool>,
     graph_builds: std::cell::Cell<usize>,
+    boundary_probe: RefCell<Option<BoundaryProbe>>,
+}
+
+struct BoundaryProbe {
+    replay: bool,
+    names: FxHashSet<String>,
+    copies: FxHashMap<NodeIndex, CudaSlice<u8>>,
+    replaced: FxHashSet<NodeIndex>,
 }
 
 struct ArenaBufferOrderAccumulator {
@@ -1171,7 +1195,11 @@ impl CudaGraphOp {
             }
             internal_buffer_dyn_dims.extend(kernel.kernel_op.internal_buffer_dyn_dims());
             if let Some(input_idx) = kernel.kernel_op.output_aliases_input() {
-                output_aliases.push((kernel.inputs[input_idx], kernel.node));
+                output_aliases.push((
+                    kernel.inputs[input_idx],
+                    kernel.node,
+                    kernel.kernel_op.output_view_range(),
+                ));
             }
         }
         for (idx, op) in state.cublaslt_ops.iter().enumerate() {
@@ -1243,6 +1271,7 @@ impl CudaGraphOp {
             resident: RefCell::new(None),
             residency_frozen: std::cell::Cell::new(false),
             graph_builds: std::cell::Cell::new(0),
+            boundary_probe: RefCell::new(None),
         }
     }
 
@@ -2448,6 +2477,7 @@ impl CudaGraphOp {
         for op in &mut state.captured_host_ops {
             op.child_graph = None;
             op.graph_node = None;
+            op.resources.clear();
         }
         state.dyn_dims_buffer = None;
     }
@@ -2483,6 +2513,124 @@ impl CudaGraphOp {
         Self::reset_materialization_state(&mut state);
     }
 
+    pub(crate) fn record_boundaries(&self, names: &[String]) {
+        self.release_materialization();
+        *self.boundary_probe.borrow_mut() = Some(BoundaryProbe {
+            replay: false,
+            names: names.iter().cloned().collect(),
+            copies: FxHashMap::default(),
+            replaced: FxHashSet::default(),
+        });
+    }
+
+    pub(crate) fn replay_boundaries(&self, names: &[String]) {
+        self.release_materialization();
+        let mut probe = self.boundary_probe.borrow_mut();
+        let probe = probe.as_mut().expect("record boundaries before replay");
+        probe.replay = true;
+        probe.names = names.iter().cloned().collect();
+        probe.replaced.clear();
+    }
+
+    pub(crate) fn boundary_probe_counts(&self) -> (usize, usize) {
+        let probe = self.boundary_probe.borrow();
+        let probe = probe.as_ref().expect("active boundary probe");
+        (
+            probe.replaced.len(),
+            probe.replaced.iter().map(|n| probe.copies[n].len()).sum(),
+        )
+    }
+
+    pub(crate) fn clear_boundaries(&self) {
+        self.release_materialization();
+        self.boundary_probe.borrow_mut().take();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boundary_copy(
+        &self,
+        state: &CudaGraphOpState,
+        step: CompiledStep,
+        graph: &mut CudaGraphHandle,
+        dependencies: &[CUgraphNode],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dims: &DynMap,
+        replay: bool,
+    ) -> anyhow::Result<Option<CUgraphNode>> {
+        let mut probe = self.boundary_probe.borrow_mut();
+        let Some(probe) = probe.as_mut().filter(|p| p.replay == replay) else {
+            return Ok(None);
+        };
+        let (node, name, size) = match step {
+            CompiledStep::Kernel(i) => {
+                let k = &state.kernels[i];
+                // An aliased output may represent a mutation larger than the
+                // returned view. Never model that effect as a pure output copy.
+                if k.kernel_op.output_aliases_input().is_some() {
+                    return Ok(None);
+                }
+                (
+                    k.node,
+                    k.kernel_op.kernel_name(),
+                    k.kernel_op.output_bytes(),
+                )
+            }
+            CompiledStep::CuBlasLt(i) => {
+                let op = &state.cublaslt_ops[i];
+                (op.node, "cublaslt", op.host_op.output_bytes())
+            }
+            CompiledStep::CapturedHost(i) => {
+                let op = &state.captured_host_ops[i];
+                (
+                    op.node,
+                    op.host_op.stats_name().unwrap_or("CapturedHost"),
+                    op.host_op.output_bytes(),
+                )
+            }
+            CompiledStep::FlashInferDecode(_) => return Ok(None),
+        };
+        if !probe.names.contains(name) {
+            return Ok(None);
+        }
+        let bytes = size
+            .exec(dims)
+            .ok_or_else(|| anyhow::anyhow!("unresolved probe size"))?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let output = buffers
+            .get(&node)
+            .ok_or_else(|| anyhow::anyhow!("missing probe output"))?;
+        anyhow::ensure!(bytes <= output.len(), "probe output exceeds allocation");
+        if !replay && !probe.copies.contains_key(&node) {
+            probe
+                .copies
+                .insert(node, self.stream.alloc_zeros::<u8>(bytes)?);
+        }
+        if replay {
+            probe.replaced.insert(node);
+        }
+        let copy = probe
+            .copies
+            .get(&node)
+            .ok_or_else(|| anyhow::anyhow!("unrecorded probe boundary"))?;
+        anyhow::ensure!(bytes == copy.len(), "probe dimensions changed");
+        let saved = copy.device_ptr(&self.stream).0;
+        let (dst, src) = if replay {
+            (output.ptr(), saved)
+        } else {
+            (saved, output.ptr())
+        };
+        unsafe {
+            graph
+                .add_device_copy(dependencies, dst, src, bytes)
+                .map(Some)
+                .map_err(Into::into)
+        }
+    }
+
+    /// E-class costs for proposal guidance only. Timing events serialize
+    /// steps, so these must never replace clean whole-graph candidate fitness.
     /// Emit a diagnostic-only breakdown of one completed graph launch. Step
     /// timing nodes are inserted only when `LUMINAL_CUDA_PROFILE_GRAPH_STEPS`
     /// is present at materialization time, so production graphs carry no event
@@ -2539,6 +2687,11 @@ impl CudaGraphOp {
         changed_buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &DynMap,
     ) -> anyhow::Result<bool> {
+        // Diagnostic copies carry their own pointers. Their graph is rebuilt
+        // on a binding change rather than applying kernel-only node updates.
+        if self.boundary_probe.borrow().is_some() {
+            return Ok(false);
+        }
         let mut state = self.state.borrow_mut();
         if state.cuda_graph.is_none() || state.cuda_graph_exec.is_none() {
             return Ok(false);
@@ -2549,6 +2702,17 @@ impl CudaGraphOp {
             .copied()
             .filter(|dim| dyn_map.get(dim) != state.last_dyn_values.get(dim))
             .collect::<FxHashSet<_>>();
+        if self
+            .output_aliases
+            .iter()
+            .filter_map(|(_, _, range)| *range)
+            .any(|(offset, bytes)| {
+                offset.exec(dyn_map) != offset.exec(&state.last_dyn_values)
+                    || bytes.exec(dyn_map) != bytes.exec(&state.last_dyn_values)
+            })
+        {
+            return Ok(false);
+        }
         if !changed_dyn_vars.is_empty() {
             // Kernel bodies read dynamic values through the bucket-shared
             // device ABI. Do not clone every graph's complete binding map just
@@ -2588,16 +2752,26 @@ impl CudaGraphOp {
         let mut changed = changed_buffers.clone();
         // Output aliases always inherit their input pointer, even when the
         // caller attempted to register a distinct output allocation.
-        for &(input, output) in &self.output_aliases {
+        for &(input, output, range) in &self.output_aliases {
             if !changed.contains_key(&input) && !changed.contains_key(&output) {
                 continue;
             }
-            let input_buffer = changed.get(&input).copied().or_else(|| {
-                let ptr = state.last_buffer_ptrs.get(&input).copied()?;
-                let len = changed.get(&output).map(|buffer| buffer.len()).unwrap_or(0);
-                Some(DeviceBuffer::new(ptr, len))
-            });
+            let input_buffer = changed
+                .get(&input)
+                .copied()
+                .or_else(|| state.last_buffers.get(&input).copied())
+                .or_else(|| {
+                    let ptr = state.last_buffer_ptrs.get(&input).copied()?;
+                    let len = changed.get(&output).map(|buffer| buffer.len()).unwrap_or(0);
+                    Some(DeviceBuffer::new(ptr, len))
+                });
             if let Some(input_buffer) = input_buffer {
+                let input_buffer = if let Some((offset, bytes)) = range {
+                    input_buffer
+                        .subview(offset.exec(dyn_map).unwrap(), bytes.exec(dyn_map).unwrap())?
+                } else {
+                    input_buffer
+                };
                 changed.insert(output, input_buffer);
             }
         }
@@ -2667,6 +2841,9 @@ impl CudaGraphOp {
 
         for &idx in &dirty_kernels {
             let kernel = &state.kernels[idx];
+            if kernel.kernel_op.is_storage_view() {
+                continue;
+            }
             let graph_node = kernel
                 .graph_node
                 .expect("materialized kernel must have a CUDA graph node");
@@ -2694,6 +2871,9 @@ impl CudaGraphOp {
             .bind_to_thread()?;
         for &idx in &dirty_kernels {
             let kernel = &state.kernels[idx];
+            if kernel.kernel_op.is_storage_view() {
+                continue;
+            }
             let graph_node = kernel
                 .graph_node
                 .expect("materialized kernel must have a CUDA graph node");
@@ -2872,6 +3052,11 @@ impl CudaGraphOp {
         dyn_map: &DynMap,
         bindings_known_unchanged: bool,
     ) -> anyhow::Result<()> {
+        let bindings_known_unchanged = bindings_known_unchanged
+            && self
+                .output_aliases
+                .iter()
+                .all(|(_, _, range)| range.is_none());
         let materialize_start = Instant::now();
         let mut profile = RecaptureProfile::new();
         let mut state = self.state.borrow_mut();
@@ -2974,8 +3159,9 @@ impl CudaGraphOp {
             }
 
             // Apply output-aliases-input
-            for &(input, output) in &self.output_aliases {
+            for &(input, output, range) in &self.output_aliases {
                 if let Some(&input_ptr) = current_buffer_ptrs.get(&input) {
+                    let input_ptr = view_pointer(input_ptr, range, dyn_map)?;
                     current_buffer_ptrs.insert(output, input_ptr);
                     if state.last_buffer_ptrs.get(&output) != Some(&input_ptr) {
                         changed_buffer_nodes.insert(output);
@@ -3032,8 +3218,9 @@ impl CudaGraphOp {
                 .iter()
                 .filter_map(|node| buffers.get(node).map(|buffer| (*node, buffer.ptr())))
                 .collect();
-            for &(input, output) in &self.output_aliases {
+            for &(input, output, range) in &self.output_aliases {
                 if let Some(&input_ptr) = current_buffer_ptrs.get(&input) {
+                    let input_ptr = view_pointer(input_ptr, range, dyn_map)?;
                     current_buffer_ptrs.insert(output, input_ptr);
                 }
             }
@@ -3054,6 +3241,14 @@ impl CudaGraphOp {
 
         // Check if we need to update the graph
         let buffer_ptrs_changed = current_buffer_ptrs != state.last_buffer_ptrs;
+        if self.boundary_probe.borrow().is_some() {
+            // The first build refreshed last_dyn_values. Do not use the stale
+            // pre-build dirty set to update kernels replaced by copy nodes.
+            if buffer_ptrs_changed || *dyn_map != state.last_dyn_values {
+                self.build_graph(&mut state, stream, buffers, dyn_map)?;
+            }
+            return Ok(());
+        }
         let needs_update = dyn_map_changed || buffer_ptrs_changed;
 
         if needs_update {
@@ -3145,6 +3340,9 @@ impl CudaGraphOp {
             let timer = Instant::now();
             for &idx in &dirty_kernels {
                 let kernel = &state.kernels[idx];
+                if kernel.kernel_op.is_storage_view() {
+                    continue;
+                }
                 let graph_node = kernel
                     .graph_node
                     .expect("materialized kernel must have a CUDA graph node");
@@ -3526,6 +3724,9 @@ impl CudaGraphOp {
                 let timer = Instant::now();
                 for &idx in &dirty_kernels {
                     let kernel = &state.kernels[idx];
+                    if kernel.kernel_op.is_storage_view() {
+                        continue;
+                    }
                     let graph_node = kernel
                         .graph_node
                         .expect("materialized kernel must have a CUDA graph node");
@@ -3637,9 +3838,9 @@ impl CudaGraphOp {
                 buffer_ptrs.insert(node, buffer.ptr());
             }
         }
-        for &(input, output) in &self.output_aliases {
+        for &(input, output, range) in &self.output_aliases {
             if let Some(&ptr) = buffer_ptrs.get(&input) {
-                buffer_ptrs.insert(output, ptr);
+                buffer_ptrs.insert(output, view_pointer(ptr, range, dyn_map)?);
             }
         }
         let dyn_dims_ptr = Self::dyn_dims_ptr(&state, stream);
@@ -4085,6 +4286,11 @@ impl CudaGraphOp {
         let ctx = stream.context().clone();
         let mut graph = CudaGraphHandle::new(ctx.clone())?;
         let old_exec = state.cuda_graph_exec.take();
+        let old_resources: Vec<_> = state
+            .captured_host_ops
+            .iter_mut()
+            .flat_map(|op| std::mem::take(&mut op.resources))
+            .collect();
 
         let num_kernels = state.kernels.len();
         state.kernel_params.clear();
@@ -4101,10 +4307,13 @@ impl CudaGraphOp {
             op.child_graph = None;
         }
 
-        let tracing_enabled = enabled!(Level::TRACE)
+        let step_profile = std::env::var_os("LUMINAL_CUDA_PROFILE_GRAPH_STEPS").is_some();
+        // Both modes reuse this event pool. Do not record a step boundary a
+        // second time as a kernel tracing event in the same launch.
+        let tracing_enabled = !step_profile
+            && enabled!(Level::TRACE)
             && state.cublaslt_ops.is_empty()
             && state.flashinfer_ops.is_empty();
-        let step_profile = std::env::var_os("LUMINAL_CUDA_PROFILE_GRAPH_STEPS").is_some();
         if tracing_enabled || step_profile {
             let needed_events = if step_profile {
                 state.steps.len() + 1
@@ -4136,7 +4345,10 @@ impl CudaGraphOp {
             if let Some(input_idx) = kernel.kernel_op.output_aliases_input()
                 && let Some(&input_ptr) = buffer_ptrs.get(&kernel.inputs[input_idx])
             {
-                buffer_ptrs.insert(kernel.node, input_ptr);
+                buffer_ptrs.insert(
+                    kernel.node,
+                    view_pointer(input_ptr, kernel.kernel_op.output_view_range(), dyn_map)?,
+                );
             }
         }
 
@@ -4175,6 +4387,13 @@ impl CudaGraphOp {
             debug_assert!(deps.iter().all(|node| !node.is_null()));
 
             let step = state.steps[step_index];
+            if let Some(copy) =
+                self.boundary_copy(state, step, &mut graph, &deps, buffers, dyn_map, true)?
+            {
+                state.step_entry_nodes[step_index] = copy;
+                state.step_output_nodes[step_index] = copy;
+                continue;
+            }
             match step {
                 CompiledStep::Kernel(idx) => {
                     {
@@ -4261,15 +4480,19 @@ impl CudaGraphOp {
                         Some(node) => std::slice::from_ref(node),
                         None => &deps,
                     };
-                    let graph_node = unsafe {
-                        graph.add_kernel_node(
-                            kernel_dependencies,
-                            cu_func,
-                            launch.grid,
-                            launch.block,
-                            launch.shared_mem,
-                            params.as_cuda_params(),
-                        )?
+                    let graph_node = if kernel.kernel_op.is_storage_view() {
+                        graph.add_empty_node(kernel_dependencies)?
+                    } else {
+                        unsafe {
+                            graph.add_kernel_node(
+                                kernel_dependencies,
+                                cu_func,
+                                launch.grid,
+                                launch.block,
+                                launch.shared_mem,
+                                params.as_cuda_params(),
+                            )?
+                        }
                     };
 
                     state.kernels[idx].graph_node = Some(graph_node);
@@ -4393,8 +4616,8 @@ impl CudaGraphOp {
                 CompiledStep::CapturedHost(idx) => {
                     let capture_stream = self.capture_stream()?;
                     {
-                        let op = &state.captured_host_ops[idx];
-                        op.prepare_graph_capture(&capture_stream, buffers, dyn_map)?;
+                        let op = &mut state.captured_host_ops[idx];
+                        op.prepare_graph_capture(&capture_stream, stream, buffers, dyn_map)?;
                     }
                     CudaGraphHandle::begin_standalone_capture(&capture_stream)?;
                     {
@@ -4416,6 +4639,18 @@ impl CudaGraphOp {
                     state.step_entry_nodes[step_index] = child_node;
                     state.step_output_nodes[step_index] = child_node;
                 }
+            }
+            let output = state.step_output_nodes[step_index];
+            if let Some(copy) = self.boundary_copy(
+                state,
+                step,
+                &mut graph,
+                std::slice::from_ref(&output),
+                buffers,
+                dyn_map,
+                false,
+            )? {
+                state.step_output_nodes[step_index] = copy;
             }
             if step_profile {
                 let output = state.step_output_nodes[step_index];
@@ -4445,6 +4680,7 @@ impl CudaGraphOp {
 
         state.cuda_graph = Some(graph);
         state.cuda_graph_exec = Some(exec);
+        drop(old_resources);
         state.cublaslt_prepare_cache = prepared_cache_plan;
         state.cublaslt_workspace_pool = workspace_pool_plan;
         state.flashinfer_prepare_cache = flashinfer_prepare_cache_plan;
@@ -5063,6 +5299,7 @@ pub(crate) fn kernel_to_host_with_prepared(
                     host_op: Arc::clone(host_op),
                     child_graph: None,
                     graph_node: None,
+                    resources: vec![],
                 });
                 captured_host_step_by_node.insert(*node, idx);
             }
@@ -5202,6 +5439,24 @@ pub(crate) fn kernel_to_host_with_prepared(
         }
     }
 }
+
+fn view_pointer(
+    ptr: u64,
+    range: Option<(Expression, Expression)>,
+    dims: &DynMap,
+) -> anyhow::Result<u64> {
+    let offset = if let Some((offset, _)) = range {
+        offset
+            .exec(dims)
+            .ok_or_else(|| anyhow::anyhow!("unresolved buffer view offset"))?
+    } else {
+        0
+    };
+    ptr.checked_add(offset as u64)
+        .ok_or_else(|| anyhow::anyhow!("buffer view pointer overflow"))
+}
+
+type OutputAlias = (NodeIndex, NodeIndex, Option<(Expression, Expression)>);
 
 #[cfg(test)]
 mod tests {

@@ -282,6 +282,12 @@ impl ShapeTracker {
     /// Stride expressions are nondecreasing in z, so each axis peaks at
     /// `dim - 1`.
     pub fn physical_span(&self) -> Expression {
+        if self.is_contiguous() {
+            // The row-major offset sum telescopes to product(dims) - 1.
+            // Keep the product form so consumers can prove equal buffer sizes
+            // without saturating distributivity over dynamic expressions.
+            return self.n_elements();
+        }
         self.dims
             .into_iter()
             .zip(&self.strides)
@@ -547,6 +553,10 @@ mod tests {
         assert!(tracker.is_contiguous());
         let span = tracker.physical_span();
         let n_elem = tracker.n_elements();
+        assert_eq!(
+            span, n_elem,
+            "contiguous spans must retain the product form"
+        );
         // A contiguous view addresses exactly n_elements offsets. Evaluate at a
         // few concrete sizes: span and n_elements must agree (regression for the
         // Add fold bug that over-counted the constant as 533 instead of 383).
@@ -559,6 +569,20 @@ mod tests {
             );
             assert_eq!(span.exec(&map), Some(384 * s));
         }
+        let empty = [(sym("s"), 0)].into_iter().collect();
+        assert_eq!(span.exec(&empty), Some(1));
+    }
+
+    #[test]
+    fn physical_span_preserves_strided_and_offset_views() {
+        let mut tracker = ShapeTracker::new([expr(3), expr(4)]);
+        tracker.strides[0] = expr('z') * 16;
+        assert!(!tracker.is_contiguous());
+        assert_eq!(tracker.physical_span().to_usize(), Some(36));
+        tracker.strides[1] = expr('z') + 5;
+        assert_eq!(tracker.physical_span().to_usize(), Some(41));
+        tracker.permute(&[1, 0]);
+        assert_eq!(tracker.physical_span().to_usize(), Some(41));
     }
 
     #[test]

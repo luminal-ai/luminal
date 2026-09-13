@@ -1,3 +1,6 @@
+; A pointwise operation after F16/BF16 matmul observes its rounded result.
+; cuBLASLt epilogues/scales run before output conversion, so only F32
+; intermediates may cross this boundary. Keep low-precision rounding explicit.
 ; cuBLASLt epilogue rewrites.
 ;
 ; ReLU in the frontend lowers through maximum_f32(0.0):
@@ -585,6 +588,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -634,6 +638,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -683,6 +688,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout
@@ -732,6 +738,7 @@
 
 (rule
     (
+        (= ?d_dtype (F32))
         (= ?matmul (Op (cublaslt
             ?m ?n ?k
             ?a_layout ?b_layout

@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use colored::Colorize;
 use rand::RngCore;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::diagnostics::{
     ProgressBars, log_best_llir, log_candidate_ops, panic_initial_filter_limit,
@@ -92,6 +92,12 @@ enum Phase {
 
 const MAX_INVALID_INITIAL_ATTEMPTS: usize = 100;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refinement {
+    Family(u32, usize),
+    Recombination,
+}
+
 pub struct GeneticSearch<'a, M> {
     space: &'a SearchSpace,
     ctx: &'a BucketContext<'a>,
@@ -112,6 +118,7 @@ pub struct GeneticSearch<'a, M> {
     outstanding: Option<(CandidateId, IndexedChoiceSet)>,
 
     // Initial phase.
+    initial_seed: Option<IndexedChoiceSet>,
     invalid_attempts: usize,
     filter_fails: usize,
     max_filter_fails: usize,
@@ -121,10 +128,13 @@ pub struct GeneticSearch<'a, M> {
 
     // Evolving phase.
     pending: VecDeque<IndexedChoiceSet>,
+    refinements: VecDeque<(Refinement, VecDeque<IndexedChoiceSet>)>,
+    prefer_refinement: bool,
     generation_open: bool,
     ranked: Ranked<M>,
     parents: Vec<(M, IndexedChoiceSet)>,
     best_metric: Option<M>,
+    family_best: FxHashMap<(u32, usize), M>,
     n_graphs: usize,
     resample_generation: bool,
     stagnant_generations: usize,
@@ -156,19 +166,38 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                 );
             }
         }
-        let max_filter_fails = options
-            .limit
+        let limit = options
+            .bucket_limits
+            .get(&ctx.index)
+            .copied()
+            .unwrap_or(options.limit);
+        let max_filter_fails = limit
             .max(1)
             .saturating_mul(options.generation_size.max(1))
             .saturating_mul(100)
             .max(10_000);
+        let initial_seed = options
+            .seed_schedule
+            .as_ref()
+            .and_then(|schedule| schedule.seed_for_bucket(ctx));
+        if search_log && options.seed_schedule.is_some() {
+            println!(
+                "Search seed bucket {}: {}",
+                ctx.index,
+                if initial_seed.is_some() {
+                    "accepted; revalidating and remeasuring"
+                } else {
+                    "incompatible; ordinary initialization"
+                }
+            );
+        }
         Self {
             space,
             ctx,
             options,
             extractor: LlirExtractor::new(ctx.egraph(), &space.ops),
             profile_dyn_map: ctx.profile_dyn_map(options),
-            search_limit: count_choice_sets_up_to(ctx.egraph(), options.limit),
+            search_limit: count_choice_sets_up_to(ctx.egraph(), limit),
             started_at: Instant::now(),
             search_started_at,
             search_log,
@@ -179,6 +208,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             phase: Phase::Initial,
             next_id: 0,
             outstanding: None,
+            initial_seed,
             invalid_attempts: 0,
             filter_fails: 0,
             max_filter_fails,
@@ -186,10 +216,13 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             n_timed_out: 0,
             n_invalid_profile: 0,
             pending: VecDeque::new(),
+            refinements: VecDeque::new(),
+            prefer_refinement: false,
             generation_open: false,
             ranked: Vec::new(),
             parents: Vec::new(),
             best_metric: None,
+            family_best: FxHashMap::default(),
             n_graphs: 0,
             resample_generation: false,
             stagnant_generations: 0,
@@ -202,6 +235,24 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
 
     pub fn bucket_context(&self) -> &'a BucketContext<'a> {
         self.ctx
+    }
+
+    /// Start from a previously selected program when its e-graph and bucket
+    /// contracts match. It enters the ordinary validation/profiling path and
+    /// consumes one measured-candidate slot; no old fitness is reused. A
+    /// rejected seed falls back to random initialization, and mutation remains
+    /// free to replace any of its choices.
+    pub fn seed_schedule(&mut self, schedule: &crate::graph::SelectedSchedule) -> bool {
+        assert!(
+            self.phase == Phase::Initial
+                && self.outstanding.is_none()
+                && self.initial_seed.is_none()
+                && self.invalid_attempts == 0
+                && self.filter_fails == 0,
+            "seed a search only before requesting its first candidate"
+        );
+        self.initial_seed = schedule.seed_for_bucket(self.ctx);
+        self.initial_seed.is_some()
     }
 
     /// Dyn values candidates should be evaluated with.
@@ -235,10 +286,12 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             match self.phase {
                 Phase::Done => return None,
                 Phase::Initial => {
-                    let mut generation =
+                    let genome = self.initial_seed.take().or_else(|| {
                         self.extractor
-                            .random_indexed_generation(1, &mut self.prev_selected, rng);
-                    let Some(genome) = generation.pop() else {
+                            .random_indexed_generation(1, &mut self.prev_selected, rng)
+                            .pop()
+                    });
+                    let Some(genome) = genome else {
                         panic_initial_filter_limit(
                             self.filter_fails,
                             self.last_filter_rejection.as_deref(),
@@ -259,16 +312,23 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                     }
                 }
                 Phase::Evolving => {
-                    if self.pending.is_empty() {
+                    // Recombination can add proposals during a generation.
+                    // The measured-candidate budget applies before every handout.
+                    if self.n_graphs >= self.search_limit || self.time_limit_reached() {
                         if self.generation_open {
                             self.close_generation();
                         }
-                        if self.n_graphs >= self.search_limit || self.time_limit_reached() {
-                            self.finish();
-                            return None;
+                        self.finish();
+                        return None;
+                    }
+                    if self.pending.is_empty()
+                        && (!self.prefer_refinement || self.refinements.is_empty())
+                    {
+                        if self.generation_open {
+                            self.close_generation();
                         }
                         self.breed(rng);
-                        if self.pending.is_empty() {
+                        if self.pending.is_empty() && self.refinements.is_empty() {
                             self.finish();
                             return None;
                         }
@@ -279,7 +339,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                         self.finish();
                         return None;
                     }
-                    let genome = self.pending.pop_front().unwrap();
+                    let genome = self.take_pending().unwrap();
                     match self.extract(&genome) {
                         Ok(Some((pre_collapse, llir))) => {
                             return Some(self.hand_out(genome, llir, pre_collapse));
@@ -294,6 +354,38 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                     }
                 }
             }
+        }
+    }
+
+    // Alternate exploration with refinement. A continually improving losing
+    // family or winner recombination must not delay every other constructor.
+    // Within refinement, visit families round-robin while prioritizing each
+    // family's newest measured improvement. Every proposal uses the same budget.
+    fn take_pending(&mut self) -> Option<IndexedChoiceSet> {
+        if !self.refinements.is_empty() && (self.prefer_refinement || self.pending.is_empty()) {
+            self.prefer_refinement = false;
+            let (key, mut queue) = self.refinements.pop_front().unwrap();
+            let genome = queue.pop_front();
+            if !queue.is_empty() {
+                self.refinements.push_back((key, queue));
+            }
+            genome
+        } else {
+            self.prefer_refinement = true;
+            self.pending.pop_front()
+        }
+    }
+
+    fn queue_refinement(&mut self, key: Refinement, neighbors: Vec<IndexedChoiceSet>) {
+        if neighbors.is_empty() {
+            return;
+        }
+        if let Some((_, queue)) = self.refinements.iter_mut().find(|(k, _)| *k == key) {
+            for neighbor in neighbors.into_iter().rev() {
+                queue.push_front(neighbor);
+            }
+        } else {
+            self.refinements.push_back((key, neighbors.into()));
         }
     }
 
@@ -369,6 +461,17 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             .options
             .candidate_timeout
             .is_some_and(|timeout| candidate.timer.elapsed() >= timeout);
+        super::diagnostics::log_candidate_choices(|| {
+            serde_json::json!({
+                "search_started": format!("{:?}", self.search_started_at),
+                "bucket": self.ctx.index,
+                "candidate": candidate.id.0,
+                "candidate_seconds": candidate.timer.elapsed().as_secs_f64(),
+                "timed_out": timed_out,
+                "outcome": format!("{outcome:?}"),
+                "choices": self.extractor.named_choices(&genome),
+            })
+        });
         match self.phase {
             Phase::Initial => self.report_initial(genome, candidate, outcome, timed_out),
             Phase::Evolving => self.report_evolving(genome, candidate, outcome, timed_out),
@@ -463,6 +566,22 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             }
         };
 
+        let new_best = self
+            .best_metric
+            .as_ref()
+            .is_some_and(|best| best.gt(&new_metric));
+        if new_best {
+            // A winner may descend from an older parent and lose independent
+            // improvements in the previous incumbent. Test their combinations
+            // immediately instead of waiting for mutation to rediscover them.
+            let combinations = self.extractor.recombine_reachable_choices(
+                &genome,
+                &self.ranked[0].1,
+                &mut self.prev_selected,
+            );
+            self.queue_refinement(Refinement::Recombination, combinations);
+        }
+
         let rank = self
             .ranked
             .iter()
@@ -474,6 +593,27 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             .unwrap_or(self.ranked.len());
         self.ranked
             .insert(rank, (new_metric.clone(), genome.clone()));
+
+        if !new_best {
+            for family in self
+                .extractor
+                .alternate_families(&genome, &self.ranked[0].1)
+            {
+                let improved = self
+                    .family_best
+                    .get(&family)
+                    .is_none_or(|best| new_metric.lt(best));
+                if improved {
+                    self.family_best.insert(family, new_metric.clone());
+                    let neighbors = self.extractor.argument_neighbors(
+                        &genome,
+                        family.0,
+                        &mut self.prev_selected,
+                    );
+                    self.queue_refinement(Refinement::Family(family.0, family.1), neighbors);
+                }
+            }
+        }
 
         // Update parents list (keep top-N for next generation)
         let dominated_by_all = self.parents.len() >= self.options.keep_best
@@ -498,10 +638,6 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             &candidate.llir,
             &format!("cand={} {display_metric}", self.n_graphs),
         );
-        let new_best = self
-            .best_metric
-            .as_ref()
-            .is_some_and(|best| best.gt(&new_metric));
         if new_best {
             self.generation_found_new_best = true;
             self.best_metric = Some(new_metric);
@@ -616,5 +752,266 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
         }
         self.finish();
         std::mem::take(&mut self.ranked)
+    }
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+    use crate::egglog_utils::proposal_tests::{
+        choices_fixture, independent_choices_fixture, paired_arguments_fixture,
+    };
+    use crate::search::BucketSearchSpace;
+    use rand::SeedableRng;
+
+    fn family_space(width: usize, variants: usize) -> SearchSpace {
+        let mut graph = paired_arguments_fixture(width, false);
+        let old = choices_fixture(variants);
+        let root = graph.roots[0].clone();
+        graph
+            .eclasses
+            .get_mut(&root)
+            .unwrap()
+            .1
+            .extend(old.eclasses[&root].1.clone());
+        graph.enodes.extend(old.enodes);
+        graph.node_to_class.extend(old.node_to_class);
+        for (class, value) in old.eclasses {
+            if class != root {
+                graph.eclasses.insert(class, value);
+            }
+        }
+        SearchSpace {
+            buckets: vec![BucketSearchSpace {
+                egraph: graph,
+                bucket_indices: Default::default(),
+                intervals: Default::default(),
+            }],
+            ops: vec![],
+            custom_ops: vec![],
+            dim_buckets: Default::default(),
+        }
+    }
+
+    #[test]
+    fn losing_family_climbs_multiple_arguments_within_candidate_budget() {
+        let space = family_space(2, 0);
+        let ctx = BucketContext {
+            space: &space,
+            index: 0,
+            representative_dyn_map: Default::default(),
+        };
+        let options = CompileOptions::default()
+            .search_log(false)
+            .search_graph_limit(5);
+        let mut search = GeneticSearch::<usize>::new(&space, &ctx, &options, Instant::now());
+        // Extraction is irrelevant to this state-machine test. Each fake
+        // evaluation reports the metric for an ordinary legal genome.
+        let incumbent = search
+            .extractor
+            .index_seed_choices(&[("root".into(), "op-0".into())]);
+        fn mark_seen(search: &mut GeneticSearch<usize>, genome: &IndexedChoiceSet) {
+            let bindings: Vec<_> = search
+                .extractor
+                .named_choices(genome)
+                .into_iter()
+                .map(|(c, n)| {
+                    (
+                        egraph_serialize::ClassId::from(c),
+                        egraph_serialize::NodeId::from(n),
+                    )
+                })
+                .collect();
+            search
+                .prev_selected
+                .insert(crate::egglog_utils::hash_choice_set(
+                    &bindings.iter().map(|(c, n)| (c, n)).collect(),
+                ));
+        }
+        mark_seen(&mut search, &incumbent);
+        let candidate = search.hand_out(incumbent, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(100, "incumbent".into()));
+        let seed = search
+            .extractor
+            .index_seed_choices(&[("root".into(), "pair-1-1".into())]);
+        mark_seen(&mut search, &seed);
+        let candidate = search.hand_out(seed, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(120, "new family".into()));
+        assert_eq!(search.best(), Some(&100));
+        assert_eq!(
+            search
+                .refinements
+                .iter()
+                .map(|(_, q)| q.len())
+                .sum::<usize>(),
+            2
+        );
+        while let Some(genome) = search.take_pending() {
+            let named = search.extractor.named_choices(&genome);
+            let node = &named.iter().find(|(class, _)| class == "root").unwrap().1;
+            let metric = if node == "pair-0-0" { 80 } else { 110 };
+            let candidate = search.hand_out(genome, LLIRGraph::default(), None);
+            search.report(candidate, Outcome::Measured(metric, metric.to_string()));
+        }
+        assert_eq!(
+            search.best(),
+            Some(&80),
+            "two individually losing changes must compose"
+        );
+        assert_eq!(search.measured(), 5);
+        assert!(
+            search
+                .next_candidate(&mut rand::rngs::StdRng::seed_from_u64(993))
+                .is_none()
+        );
+        assert_eq!(
+            search.measured(),
+            5,
+            "family exploration consumes the ordinary budget"
+        );
+    }
+
+    #[test]
+    fn improving_losing_family_does_not_starve_queued_algorithms() {
+        let space = family_space(16, 3);
+        let ctx = BucketContext {
+            space: &space,
+            index: 0,
+            representative_dyn_map: Default::default(),
+        };
+        let options = CompileOptions::default()
+            .search_log(false)
+            .search_graph_limit(8);
+        let mut search = GeneticSearch::<usize>::new(&space, &ctx, &options, Instant::now());
+        let incumbent = search
+            .extractor
+            .index_seed_choices(&[("root".into(), "op-0".into())]);
+        let candidate = search.hand_out(incumbent, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(100, "incumbent".into()));
+        let family = search
+            .extractor
+            .index_seed_choices(&[("root".into(), "pair-15-15".into())]);
+        let candidate = search.hand_out(family, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(200, "losing family".into()));
+        // These proposals were already generated before refinement began. Only
+        // the last is a winner; improvements within the large losing family
+        // must leave enough of the same eight-evaluation budget to discover it.
+        for i in 1..=3 {
+            let genome = search
+                .extractor
+                .index_seed_choices(&[("root".into(), format!("op-{i}"))]);
+            search.pending.push_back(genome);
+        }
+        let mut tried = Vec::new();
+        while search.measured() < 8 {
+            let genome = search.take_pending().expect("unmeasured proposals remain");
+            let named = search.extractor.named_choices(&genome);
+            let node = named
+                .iter()
+                .find(|(class, _)| class == "root")
+                .unwrap()
+                .1
+                .clone();
+            // Every visited family refinement improves, but still loses to the
+            // incumbent. This reproduced exhaustion of the serving search budget.
+            let metric = if node == "op-3" {
+                80
+            } else {
+                200 - search.measured()
+            };
+            tried.push(node);
+            let candidate = search.hand_out(genome, LLIRGraph::default(), None);
+            search.report(candidate, Outcome::Measured(metric, metric.to_string()));
+        }
+        assert!(
+            tried.iter().any(|node| node.starts_with("pair-")),
+            "refinement remains useful"
+        );
+        assert_eq!(
+            search.best(),
+            Some(&80),
+            "queued algorithms must be tested before the budget is exhausted: {tried:?}"
+        );
+        assert!(
+            search
+                .next_candidate(&mut rand::rngs::StdRng::seed_from_u64(993))
+                .is_none()
+        );
+        assert_eq!(search.measured(), 8);
+    }
+
+    #[test]
+    fn winner_recombination_does_not_starve_queued_algorithms() {
+        let (graph, roots) = independent_choices_fixture(8, 1);
+        let space = SearchSpace {
+            buckets: vec![BucketSearchSpace {
+                egraph: graph,
+                bucket_indices: Default::default(),
+                intervals: Default::default(),
+            }],
+            ops: vec![],
+            custom_ops: vec![],
+            dim_buckets: Default::default(),
+        };
+        let ctx = BucketContext {
+            space: &space,
+            index: 0,
+            representative_dyn_map: Default::default(),
+        };
+        let options = CompileOptions::default()
+            .search_log(false)
+            .search_graph_limit(4);
+        let mut search = GeneticSearch::<usize>::new(&space, &ctx, &options, Instant::now());
+        let bindings = |which: fn(usize) -> bool| {
+            roots
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    (
+                        c.to_string(),
+                        format!("value-{i}-variant-{}", usize::from(which(i))),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let incumbent = search.extractor.index_seed_choices(&bindings(|i| i < 4));
+        let candidate = search.hand_out(incumbent, LLIRGraph::default(), None);
+        search.report(candidate, Outcome::Measured(100, "incumbent".into()));
+        let probe = search.extractor.index_seed_choices(&bindings(|_| true));
+        search.pending.push_back(probe);
+        let winner = search.extractor.index_seed_choices(&bindings(|i| i >= 4));
+        let candidate = search.hand_out(winner, LLIRGraph::default(), None);
+        search.report(
+            candidate,
+            Outcome::Measured(90, "independent improvements".into()),
+        );
+        // The two parents disagree at eight sites, generating more combinations
+        // than the remaining budget. The queued all-improved program must still
+        // be evaluated, while combination proposals retain a share of the work.
+        let mut combinations = 0;
+        while search.measured() < 4 {
+            let genome = search.take_pending().unwrap();
+            let all_improved = search
+                .extractor
+                .named_choices(&genome)
+                .iter()
+                .filter(|(class, node)| {
+                    class.starts_with("value-class-") && node.ends_with("variant-1")
+                })
+                .count()
+                == 8;
+            combinations += usize::from(!all_improved);
+            let cost = if all_improved { 1 } else { 95 };
+            let candidate = search.hand_out(genome, LLIRGraph::default(), None);
+            search.report(candidate, Outcome::Measured(cost, cost.to_string()));
+        }
+        assert_eq!(search.best(), Some(&1));
+        assert_eq!(combinations, 1);
+        assert!(
+            search
+                .next_candidate(&mut rand::rngs::StdRng::seed_from_u64(997))
+                .is_none()
+        );
+        assert_eq!(search.measured(), 4);
     }
 }

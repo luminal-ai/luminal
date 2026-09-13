@@ -149,6 +149,8 @@ off by default; set to `1` to enable unless noted.
 
 ### Search & compile behavior
 
+`Graph::build_search_space` builds independent dynamic-dimension buckets in parallel, preserving bucket order and interval isolation. Worker count is capped by the bucket count and the caller’s Rayon thread budget, which is divided among workers. Each worker owns an e-graph, so parallel builds use more host memory. GPU candidate profiling is unaffected.
+
 | Flag | Effect |
 |---|---|
 | `LUMINAL_SEARCH_SEED` | Overrides the search RNG seed in the examples (integer). |

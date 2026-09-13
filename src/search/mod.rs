@@ -24,6 +24,8 @@ pub mod finalist;
 pub mod genetic;
 pub mod lattice;
 pub mod packed;
+pub mod profile;
+pub use profile::{ProfileCase, ProfileMeasurement, assign_profile_cases, weighted_profile_cost};
 #[cfg(test)]
 mod tests;
 pub mod unroll;

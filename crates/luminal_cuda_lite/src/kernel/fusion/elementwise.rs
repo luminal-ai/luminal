@@ -65,6 +65,10 @@ impl EgglogOp for CudaUnaryElementwise {
         1
     }
 
+    fn egglog_declarations(&self) -> Vec<String> {
+        vec!["(relation cuda_cast_grid (IR EList EList))".into()]
+    }
+
     fn rewrites(&self) -> Vec<Rule> {
         let mut rules = Vec::new();
         for (hlir, opcode) in [
@@ -118,6 +122,47 @@ impl EgglogOp for CudaUnaryElementwise {
                 (union ?cast ?fe)
                 (set (dtype ?fe) ?dt_out)
              ) :ruleset kernel_lower :name \"cuda-elem-singleton-Cast\")",
+        ));
+
+        // A Cast describes a flat buffer, while its neighbours may describe
+        // the same buffer with several axes. Offer the cast in that grid only
+        // when it spans the whole buffer in row-major order. Keep every cast
+        // and its rounding; no numerical conversion is cancelled here.
+        for (name, boundary) in [
+            (
+                "producer",
+                "(= ?x (Op (FusionEnd ?shape ?stride ?dt) ?inputs))",
+            ),
+            (
+                "consumer",
+                "(= ?boundary (Op (FusionStart ?shape ?stride ?out_dt) (ICons ?cast (INil))))",
+            ),
+        ] {
+            rules.push(Rule::raw(format!(
+                "(rule (
+                    (= ?cast (Op (Cast ?size ?out_dt) (ICons ?x (INil))))
+                    {boundary}
+                 ) (
+                    (cuda_cast_grid ?cast ?shape ?stride)
+                    (let ?row_major (RowMajor ?shape))
+                 ) :ruleset kernel_lower :name \"cuda-cast-grid-{name}\")"
+            )));
+        }
+        rules.push(Rule::raw(
+            "(rule (
+                (cuda_cast_grid ?cast ?shape ?stride)
+                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
+                (= ?stride (RowMajor ?shape))
+                (= ?size (n_elements ?shape))
+                (= ?dt_in (dtype ?x))
+             ) (
+                (let ?fs (Op (FusionStart ?shape ?stride ?dt_in) (ICons ?x (INil))))
+                (let ?elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?stride ?stride ?dt_out)
+                               (ICons ?fs (INil))))
+                (let ?fe (Op (FusionEnd ?shape ?stride ?dt_out) (ICons ?elem (INil))))
+                (union ?cast ?fe)
+                (set (dtype ?fe) ?dt_out)
+             ) :ruleset kernel_lower :name \"cuda-cast-row-major-grid\")",
         ));
 
         rules

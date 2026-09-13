@@ -1,5 +1,5 @@
 use crate::egglog_utils::{
-    hlir_to_egglog, log_channel_enabled, run_egglog_with_late_passes_interval_analysis_and_log,
+    OpTextParts, hlir_to_egglog, log_channel_enabled, run_egglog_with_report_parts_impl,
 };
 pub use crate::search::unroll::{collapse_loops_to_first_iter, unroll_loops_in_llir};
 use crate::search::{BucketSearchSpace, SearchSpace, bucket_index_combinations};
@@ -21,6 +21,7 @@ use std::{
 use tracing;
 
 mod artifact;
+mod parallel;
 
 pub use artifact::{ScheduleBucket, SelectedSchedule};
 
@@ -158,13 +159,21 @@ impl DimBucket {
 /// ```
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
+    /// Optional previously selected schedule to revalidate and remeasure as the
+    /// first candidate. Incompatible buckets fall back to ordinary search.
+    pub seed_schedule: Option<std::sync::Arc<SelectedSchedule>>,
     /// Maximum number of graphs to evaluate during search.
     pub limit: usize,
+    /// Candidate-budget overrides by zero-based SearchSpace bucket index.
+    /// Unspecified buckets use `limit`; every bucket still needs a viable,
+    /// freshly measured candidate, including when seeded from a prior schedule.
+    pub bucket_limits: FxHashMap<usize, usize>,
     /// Maximum wall-clock time to spend searching.
     pub search_time_limit: std::time::Duration,
     /// Number of offspring per generation (default: 10)
     pub generation_size: usize,
-    /// Number of mutations applied to each offspring (default: 10)
+    /// Maximum active-choice mutations per offspring (default: 10). Newly
+    /// exposed subgraphs are initialized within the same structural proposal.
     pub mutations: usize,
     /// Number of profiling trials per candidate (default: 3)
     pub trials: usize,
@@ -225,9 +234,22 @@ fn checked_dim(dimension: impl Into<Symbol>) -> Symbol {
 }
 
 impl CompileOptions {
+    /// Start search from a compatible prior program without reusing its timing.
+    pub fn seed_schedule(mut self, schedule: std::sync::Arc<SelectedSchedule>) -> Self {
+        self.seed_schedule = Some(schedule);
+        self
+    }
+
     /// Set the maximum number of graphs to evaluate during search.
     pub fn search_graph_limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Override the candidate budget for one SearchSpace bucket. With a viable
+    /// seed, a limit of one revalidates and remeasures only that incumbent.
+    pub fn bucket_search_graph_limit(mut self, bucket: usize, limit: usize) -> Self {
+        self.bucket_limits.insert(bucket, limit);
         self
     }
 
@@ -354,7 +376,9 @@ impl CompileOptions {
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
+            seed_schedule: None,
             limit: 100,
+            bucket_limits: FxHashMap::default(),
             search_time_limit: std::time::Duration::MAX,
             generation_size: 10,
             mutations: 10,
@@ -1601,30 +1625,43 @@ impl Graph {
         let extra_egglog = Rt::extra_egglog();
 
         let (program, root) = hlir_to_egglog(self);
-        let buckets = bucket_index_combinations(&dim_buckets)
+        // Materialize op-owned text before crossing thread boundaries: backend
+        // op trait objects need not be Send/Sync. Each bucket owns its EGraph.
+        let mut parts = OpTextParts::new_with_late_passes(&ops, Rt::CLEANUP_HLIR, &late_passes);
+        parts.extra_egglog = extra_egglog;
+        let jobs: Vec<_> = bucket_index_combinations(&dim_buckets)
             .into_iter()
             .map(|bucket_indices| {
                 let intervals = self.bucket_intervals(&dim_buckets, &bucket_indices);
                 let (contextual_program, use_interval_analysis) =
                     self.egglog_program_with_interval_facts(&program, &intervals);
-                let egraph = run_egglog_with_late_passes_interval_analysis_and_log(
-                    &contextual_program,
-                    &root,
-                    &ops,
-                    Rt::CLEANUP_HLIR,
-                    &late_passes,
-                    &extra_egglog,
+                (
+                    bucket_indices,
+                    intervals,
+                    contextual_program,
                     use_interval_analysis,
-                    options.egglog_log_enabled(),
+                )
+            })
+            .collect();
+        let log = options.egglog_log_enabled();
+        let buckets = parallel::map_buckets(
+            &jobs,
+            |(bucket_indices, intervals, contextual_program, use_interval_analysis)| {
+                let (egraph, _) = run_egglog_with_report_parts_impl(
+                    contextual_program,
+                    &root,
+                    &parts,
+                    *use_interval_analysis,
+                    log,
                 )
                 .unwrap();
                 BucketSearchSpace {
                     egraph,
-                    bucket_indices,
-                    intervals,
+                    bucket_indices: bucket_indices.clone(),
+                    intervals: intervals.clone(),
                 }
-            })
-            .collect();
+            },
+        );
         let custom_ops = self.custom_ops.iter().map(|op| op.to_llir_op()).collect();
         self.search_space = Some(SearchSpace {
             buckets,
