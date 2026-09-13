@@ -37,9 +37,12 @@ pub struct RMSNormKernel {
     pub threads: usize,
 }
 
-impl KernelOp for RMSNormKernel {
-    fn compile(
+impl RMSNormKernel {
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn compile_impl(
         &self,
+        residual: bool,
+        bias: Option<(usize, DType)>,
         stream: &Arc<CudaStream>,
         compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     ) -> (
@@ -71,15 +74,128 @@ impl KernelOp for RMSNormKernel {
             .collect::<Vec<_>>()
             .join(", ");
         let ty = crate::cuda_dtype(self.dtype);
-        let includes = crate::kernel::hlir::dtype_includes(&[self.dtype, self.input_dtype]);
+        let includes = crate::kernel::hlir::dtype_includes(&[
+            self.dtype,
+            self.input_dtype,
+            bias.map_or(self.dtype, |b| b.1),
+        ]);
+        assert!(bias.is_none_or(|(side, dt)| residual
+            && side < 2
+            && self.input_dtype == DType::F32
+            && matches!(dt, DType::F32 | DType::Bf16 | DType::F16)));
+        let bias_parameter = bias.map_or(String::new(), |(_, dt)| {
+            format!(", const {}* __restrict__ bias", crate::cuda_dtype(dt))
+        });
+        let value = |side, raw: &str, index: &str| {
+            if bias.is_some_and(|b| b.0 == side) {
+                format!("__fadd_rn((float){raw}, (float)bias[{index}])")
+            } else {
+                format!("(float){raw}")
+            }
+        };
+        let (xs, rs) = (value(0, "xr[i]", "i"), value(1, "rr[i]", "i"));
+        let index = format!("c * {elements} + e");
+        let next_index = format!("{index} + 1");
+        let (x0, x1) = (value(0, "xe[e]", &index), value(0, "xe[e+1]", &next_index));
+        let (r0, r1) = (value(1, "re[e]", &index), value(1, "re[e+1]", &next_index));
+        let output_ty = if residual { "unsigned char" } else { ty };
+        let residual_parameter = if residual {
+            format!(", const {input_ty}* __restrict__ residual")
+        } else {
+            String::new()
+        };
+        let output_rows = if residual {
+            format!(
+                "float* sr = (float*)out + row * COLS;\n    {ty}* yr = ({ty}*)(out + (long long)gridDim.x * COLS * sizeof(float)) + row * COLS;\n    const {input_ty}* rr = residual + row * COLS;\n    {ty}* sum_low = ({ty}*)(out + (long long)gridDim.x * COLS * (sizeof(float) + sizeof({ty}))) + row * COLS;"
+            )
+        } else {
+            format!("{ty}* yr = out + row * COLS;")
+        };
+        let residual_vectors = if residual {
+            let loads = (0..vectors)
+                .map(|i| format!("rv[c * {vectors} + {i}]"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "const uint4* rv = (const uint4*)rr; const uint4 rchunks[{vectors}] = {{{loads}}}; const {input_ty}* re = (const {input_ty}*)rchunks;"
+            )
+        } else {
+            String::new()
+        };
+        let vector_value = if residual {
+            format!("(float)({ty})((float)({ty})xe[e] + (float)({ty})re[e])")
+        } else {
+            format!("(float)({ty})xe[e]")
+        };
+        let scalar_value = if residual {
+            format!("(float)({ty})((float)({ty})({xs}) + (float)({ty})({rs}))")
+        } else {
+            format!("(float)({ty})xr[i]")
+        };
+        let vector_store = if residual {
+            format!("sr[c * {elements} + e] = v; sum_low[c * {elements} + e] = ({ty})v;")
+        } else {
+            String::new()
+        };
+        let scalar_store = if residual {
+            format!("sr[i] = v; sum_low[i] = ({ty})v;")
+        } else {
+            String::new()
+        };
+        let scale_value = if residual {
+            "sr[i]".to_string()
+        } else {
+            format!("(float)({ty})xr[i]")
+        };
+        let vector_body = if residual && matches!(self.dtype, DType::Bf16 | DType::F16) {
+            let pack = if self.dtype == DType::Bf16 {
+                "__floats2bfloat162_rn"
+            } else {
+                "__floats2half2_rn"
+            };
+            let unpack = if self.dtype == DType::Bf16 {
+                "__bfloat1622float2"
+            } else {
+                "__half22float2"
+            };
+            let pair_type = if self.dtype == DType::Bf16 {
+                "__nv_bfloat162"
+            } else {
+                "__half2"
+            };
+            format!(
+                r#"
+            #pragma unroll
+            for (int e = 0; e < {elements}; e += 2) {{
+                auto a = {pack}({x0}, {x1});
+                auto b = {pack}({r0}, {r1});
+                auto rounded = __hadd2(a, b);
+                (({pair_type}*)sum_low)[(c * {elements} + e)/2] = rounded;
+                float2 v = {unpack}(rounded);
+                ((float2*)sr)[(c * {elements} + e)/2] = v;
+                partial += v.x * v.x;
+                partial += v.y * v.y;
+            }}"#
+            )
+        } else {
+            format!(
+                r#"
+            #pragma unroll
+            for (int e = 0; e < {elements}; e++) {{
+                float v = {vector_value};
+                {vector_store}
+                partial += v * v;
+            }}"#
+            )
+        };
         let kernel = format!(
             r#"{includes}
 #define WARP_SIZE 32
 #define FULL_MASK 0xffffffff
 extern "C" __global__ void rms_norm_k(
-    {ty}* __restrict__ out,
+    {output_ty}* __restrict__ out,
     const {input_ty}* __restrict__ x,
-    const float* __restrict__ w
+    const float* __restrict__ w{residual_parameter}{bias_parameter}
 ) {{
     const int COLS = {cols};
     __shared__ float warp_sums[{tpb} / WARP_SIZE];
@@ -89,7 +205,7 @@ extern "C" __global__ void rms_norm_k(
     int warp_id = tid / WARP_SIZE;
 
     const {input_ty}* xr = x + row * COLS;
-    {ty}* yr = out + row * COLS;
+    {output_rows}
 
     float partial = 0.0f;
 #if {cols} % {elements} == 0
@@ -98,16 +214,14 @@ extern "C" __global__ void rms_norm_k(
         for (int c = tid; c < COLS / {elements}; c += {tpb}) {{
             const uint4 chunks[{vectors}] = {{{loads}}};
             const {input_ty}* xe = (const {input_ty}*)chunks;
-            #pragma unroll
-            for (int e = 0; e < {elements}; e++) {{
-                float v = (float)({ty})xe[e];
-                partial += v * v;
-            }}
+            {residual_vectors}
+            {vector_body}
         }}
     }}
 #else
     for (int i = tid; i < COLS; i += {tpb}) {{
-        float v = (float)({ty})xr[i];
+        float v = {scalar_value};
+        {scalar_store}
         partial += v * v;
     }}
 #endif
@@ -136,7 +250,7 @@ extern "C" __global__ void rms_norm_k(
     float rinv = warp_sums[0];
 
     for (int i = tid; i < COLS; i += {tpb}) {{
-        yr[i] = ({ty})((float)({ty})xr[i] * rinv * w[i]);
+        yr[i] = ({ty})({scale_value} * rinv * w[i]);
     }}
 }}
 "#
@@ -169,6 +283,24 @@ extern "C" __global__ void rms_norm_k(
             Expression::from(0usize),
             FxHashMap::default(),
         )
+    }
+}
+
+impl KernelOp for RMSNormKernel {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<Symbol, CudaSlice<u8>>,
+    ) {
+        self.compile_impl(false, None, stream, compile_cache)
     }
 
     fn output_size(&self) -> Expression {

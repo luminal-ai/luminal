@@ -333,6 +333,7 @@ pub(crate) struct CompiledBucket {
     pub(crate) hlir_to_all_llir: FxHashMap<NodeIndex, Vec<NodeIndex>>,
     pub(crate) output_producers: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
+    output_view_ranges: FxHashMap<NodeIndex, (Expression, Expression, DType)>,
     pub(crate) output_data_map: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) preserved_hlir_inputs: FxHashSet<NodeIndex>,
     pub(crate) kernel_names: Vec<&'static str>,
@@ -389,6 +390,7 @@ impl CompiledBucket {
             hlir_to_all_llir: FxHashMap::default(),
             output_producers: FxHashMap::default(),
             output_alias_map: FxHashMap::default(),
+            output_view_ranges: FxHashMap::default(),
             output_data_map: FxHashMap::default(),
             preserved_hlir_inputs: FxHashSet::default(),
             kernel_names: Vec::new(),
@@ -1265,37 +1267,77 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         prepared_inputs: &FxHashMap<NodeIndex, PreparedInput>,
         external_buffers: &FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
         external_output_buffers: &FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
-        mut node: NodeIndex,
+        node: NodeIndex,
     ) -> Option<DeviceBuffer> {
-        let mut visited = FxHashSet::default();
-        loop {
-            if !visited.insert(node) {
-                return None;
-            }
-
+        Self::resolve_alias_buffer(bucket, node, |node| {
             if let Some(ext) = external_output_buffers.get(&node) {
                 return Some(DeviceBuffer::new(ext.device_ptr(stream).0, ext.len()));
             }
-
-            if let Some(buf) = Self::bucket_buffer(bucket, stream, &node) {
-                return Some(buf);
-            }
-
-            if let Some(hlir_node) = bucket.llir_to_hlir.get(&node)
-                && let Some(buffer) = Self::input_device_buffer(
-                    *hlir_node,
+            // Inputs can be rebound between execution and readback. Their
+            // cached launch address then belongs to the previous allocation.
+            if let Some(&input) = bucket.llir_to_hlir.get(&node) {
+                return Self::input_device_buffer(
+                    input,
                     stream,
                     hlir_buffers,
                     external_buffers,
                     prepared_inputs,
-                )
-            {
+                );
+            }
+            // Resolve views and in-place results from their live owner too.
+            if bucket.output_alias_map.contains_key(&node) {
+                return None;
+            }
+            Self::bucket_buffer(bucket, stream, &node)
+        })
+    }
+
+    fn resolve_alias_buffer(
+        bucket: &CompiledBucket,
+        mut node: NodeIndex,
+        lookup: impl Fn(NodeIndex) -> Option<DeviceBuffer>,
+    ) -> Option<DeviceBuffer> {
+        let mut ranges = Vec::new();
+        for _ in 0..=bucket.output_alias_map.len() {
+            if let Some(mut buffer) = lookup(node) {
+                for &(offset, bytes, dtype) in ranges.iter().rev() {
+                    let offset: Expression = offset;
+                    let bytes: Expression = bytes;
+                    buffer = buffer
+                        .subview(
+                            offset.exec(&bucket.last_dyn_map)?,
+                            bytes.exec(&bucket.last_dyn_map)?,
+                        )
+                        .expect("invalid logical output view");
+                    let dtype: DType = dtype;
+                    assert_eq!(
+                        buffer.ptr() % (dtype.bits() / 8).max(1) as u64,
+                        0,
+                        "misaligned tensor view"
+                    );
+                }
                 return Some(buffer);
             }
-
-            let alias_target = bucket.output_alias_map.get(&node)?;
-            node = *alias_target;
+            if let Some(range) = bucket.output_view_ranges.get(&node) {
+                ranges.push(*range);
+            }
+            node = *bucket.output_alias_map.get(&node)?;
         }
+        None
+    }
+
+    fn output_contains_view(&self, mut node: NodeIndex) -> bool {
+        let bucket = self.active();
+        for _ in 0..=bucket.output_alias_map.len() {
+            if bucket.output_view_ranges.contains_key(&node) {
+                return true;
+            }
+            let Some(next) = bucket.output_alias_map.get(&node) else {
+                return false;
+            };
+            node = *next;
+        }
+        panic!("cyclic output aliases");
     }
 
     #[tracing::instrument(skip_all)]
@@ -1581,7 +1623,8 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     pub fn output_is_zero_copy(&self, id: impl ToId) -> bool {
         let producer = self.find_producer_node(id);
         let data_node = self.follow_aliases(producer);
-        self.external_output_buffers.contains_key(&data_node)
+        !self.output_contains_view(producer)
+            && self.external_output_buffers.contains_key(&data_node)
     }
 
     /// Find the LLIR producing node for an output tensor.
@@ -1627,85 +1670,53 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         self.follow_aliases(producer)
     }
 
-    fn get_output_data(&self, id: impl ToId) -> Vec<u8> {
-        let data_id = self.resolve_data_node(id);
+    fn output_storage_dtype(&self, id: impl ToId) -> Option<DType> {
         let bucket = self.active();
-
-        let truncate_to_logical_bytes = |mut data: Vec<u8>| {
-            if let Some(spec) = bucket.buffer_specs.get(&data_id)
-                && let Some(logical_bytes) = spec.bytes.exec(&bucket.last_dyn_map)
-            {
-                data.truncate(logical_bytes.min(data.len()));
+        let mut node = self.find_producer_node(id);
+        for _ in 0..=bucket.output_alias_map.len() {
+            if let Some((_, _, dtype)) = bucket.output_view_ranges.get(&node) {
+                return Some(*dtype);
             }
-            data
-        };
-
-        let _span = span!(Level::TRACE, "dtoh").entered();
-        // If predecessor is an Input node, data lives in hlir_buffers
-        if let Some(hlir_node) = bucket.llir_to_hlir.get(&data_id) {
-            match self
-                .hlir_buffers
-                .get(hlir_node)
-                .expect("Cannot find input tensor in runtime!")
-            {
-                CudaInput::Buffer { buf, len } => {
-                    DeviceBuffer::new(buf.device_ptr(&self.cuda_stream).0, *len)
-                        .clone_dtoh(&self.cuda_stream)
-                        .unwrap()
-                }
-                CudaInput::Ptr(_) => {
-                    // External device pointer — use the CudaSlice view from external_buffers
-                    if let Some(ext) = self.external_buffers.get(hlir_node) {
-                        self.cuda_stream.clone_dtoh(&**ext).unwrap()
-                    } else {
-                        panic!(
-                            "Cannot read raw pointer input — no external_buffers entry for node"
-                        );
-                    }
-                }
+            if let Some(spec) = bucket.buffer_specs.get(&node) {
+                return Some(spec.dtype);
             }
-        } else {
-            if let Some(ext) = self.external_output_buffers.get(&data_id) {
-                return truncate_to_logical_bytes(self.cuda_stream.clone_dtoh(&**ext).unwrap());
-            }
-
-            // Predecessor is a computation node — data is in the intermediate arena.
-            truncate_to_logical_bytes(
-                Self::bucket_buffer(bucket, &self.cuda_stream, &data_id)
-                    .expect("Cannot find tensor in runtime!")
-                    .clone_dtoh(&self.cuda_stream)
-                    .unwrap(),
-            )
+            node = *bucket.output_alias_map.get(&node)?;
         }
+        None
     }
 
-    /// Resolve the device-side buffer for an output tensor without copying to host.
-    /// Used by copy_output_to_device_ptr for DtoD transfers.
+    fn get_output_data(&self, id: impl ToId) -> Vec<u8> {
+        let _span = span!(Level::TRACE, "dtoh").entered();
+        self.resolve_output_buffer(id)
+            .clone_dtoh(&self.cuda_stream)
+            .unwrap()
+    }
+
+    /// Resolve an output's exact logical range, including chained storage views.
     fn resolve_output_buffer(&self, id: impl ToId) -> DeviceBuffer {
-        let data_id = self.resolve_data_node(id);
-        let bucket = self.active();
-        if let Some(ext) = self.external_output_buffers.get(&data_id) {
-            return DeviceBuffer::new(ext.device_ptr(&self.cuda_stream).0, ext.len());
-        }
-        if let Some(hlir_node) = bucket.llir_to_hlir.get(&data_id) {
-            match self
-                .hlir_buffers
-                .get(hlir_node)
-                .expect("Cannot find input tensor in runtime!")
+        let producer = self.find_producer_node(id);
+        let buffer = Self::resolve_runtime_buffer(
+            self.active(),
+            &self.cuda_stream,
+            &self.hlir_buffers,
+            &self.prepared_inputs,
+            &self.external_buffers,
+            &self.external_output_buffers,
+            producer,
+        )
+        .expect("Cannot find output tensor in runtime!");
+        if !self.output_contains_view(producer) {
+            let owner = self.follow_aliases(producer);
+            if let Some(bytes) = self
+                .active()
+                .buffer_specs
+                .get(&owner)
+                .and_then(|spec| spec.bytes.exec(&self.active().last_dyn_map))
             {
-                CudaInput::Buffer { buf, len } => {
-                    DeviceBuffer::new(buf.device_ptr(&self.cuda_stream).0, *len)
-                }
-                CudaInput::Ptr(_) => self
-                    .external_buffers
-                    .get(hlir_node)
-                    .map(|ext| DeviceBuffer::new(ext.device_ptr(&self.cuda_stream).0, ext.len()))
-                    .expect("Cannot read raw pointer input — no external_buffers entry for node"),
+                return buffer.subview(0, bytes.min(buffer.len())).unwrap();
             }
-        } else {
-            Self::bucket_buffer(bucket, &self.cuda_stream, &data_id)
-                .expect("Cannot find tensor in runtime!")
         }
+        buffer
     }
 
     /// Copy output tensor data to an external CUDA device pointer (DtoD).
@@ -1915,6 +1926,20 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     .insert(hlir_id, ResolvedOutputRegistration::Missing);
                 continue;
             };
+            if self.output_contains_view(producer) {
+                let source = self.resolve_output_buffer(hlir_id);
+                self.resolved_output_registrations.insert(
+                    hlir_id,
+                    ResolvedOutputRegistration::Copy {
+                        data_node: producer,
+                        source_ptr: source.ptr(),
+                        source_bytes: source.len(),
+                        destination_ptr: device_ptr,
+                        copy_bytes: n_bytes.min(source.len()),
+                    },
+                );
+                continue;
+            }
             let data_node = self.follow_aliases(producer);
 
             if let Some(&hlir_input) = self.active().llir_to_hlir.get(&data_node) {
@@ -2027,7 +2052,14 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// lives in an intermediate buffer while the HLIR buffer has stale data — swap them
     /// so the caller gets the updated data and the intermediate slot stays allocated.
     pub fn remove_buffer(&mut self, id: impl ToId) -> CudaSlice<u8> {
+        let id = id.to_id();
         let producer = self.find_producer_node(id);
+        if self.output_contains_view(producer) {
+            return Self::copy_device_buffer_to_new_slice(
+                &self.cuda_stream,
+                self.resolve_output_buffer(id),
+            );
+        }
         let alias_node = self.follow_aliases(producer);
         let lineage_node = self.follow_data_lineage(producer);
         let bi = self.active_bucket;
@@ -2112,7 +2144,8 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             "cannot commit state into a prepared read-only input"
         );
         let data_node = self.resolve_data_node(output);
-        if self.active().llir_to_hlir.get(&data_node) == Some(&input)
+        if !self.output_contains_view(self.find_producer_node(output))
+            && self.active().llir_to_hlir.get(&data_node) == Some(&input)
             && !self.external_output_buffers.contains_key(&data_node)
             && matches!(
                 self.hlir_buffers.get(&input),
@@ -2159,8 +2192,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// Read an output buffer as i8 without widening at the read boundary.
     pub fn get_i8(&self, id: impl ToId) -> Vec<i8> {
         let id = id.to_id();
-        let data_id = self.resolve_data_node(id);
-        let buf_dtype = self.active().buffer_specs.get(&data_id).map(|s| s.dtype);
+        let buf_dtype = self.output_storage_dtype(id);
         assert_eq!(
             buf_dtype,
             Some(DType::I8),
@@ -2175,8 +2207,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// Read an output buffer as u8 without widening at the read boundary.
     pub fn get_u8(&self, id: impl ToId) -> Vec<u8> {
         let id = id.to_id();
-        let data_id = self.resolve_data_node(id);
-        let buf_dtype = self.active().buffer_specs.get(&data_id).map(|s| s.dtype);
+        let buf_dtype = self.output_storage_dtype(id);
         assert_eq!(
             buf_dtype,
             Some(DType::U8),
@@ -2188,8 +2219,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// Read an output buffer as i16 without widening at the read boundary.
     pub fn get_i16(&self, id: impl ToId) -> Vec<i16> {
         let id = id.to_id();
-        let data_id = self.resolve_data_node(id);
-        let buf_dtype = self.active().buffer_specs.get(&data_id).map(|s| s.dtype);
+        let buf_dtype = self.output_storage_dtype(id);
         assert_eq!(
             buf_dtype,
             Some(DType::I16),
@@ -2216,9 +2246,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// be `DType::I64`; no widening at the read boundary.
     pub fn get_i64(&self, id: impl ToId) -> Vec<i64> {
         let id = id.to_id();
-        let data_id = self.resolve_data_node(id);
-        let bucket = self.active();
-        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        let buf_dtype = self.output_storage_dtype(id);
         if !matches!(buf_dtype, Some(DType::I64)) {
             panic!(
                 "get_i64: buffer dtype is {buf_dtype:?}, expected I64. \
@@ -2237,9 +2265,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// be `DType::F64`; no widening at the read boundary.
     pub fn get_f64(&self, id: impl ToId) -> Vec<f64> {
         let id = id.to_id();
-        let data_id = self.resolve_data_node(id);
-        let bucket = self.active();
-        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        let buf_dtype = self.output_storage_dtype(id);
         if !matches!(buf_dtype, Some(DType::F64)) {
             panic!(
                 "get_f64: buffer dtype is {buf_dtype:?}, expected F64. \
@@ -2258,9 +2284,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// be `DType::F16`; no widening at the read boundary.
     pub fn get_f16(&self, id: impl ToId) -> Vec<f16> {
         let id = id.to_id();
-        let data_id = self.resolve_data_node(id);
-        let bucket = self.active();
-        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        let buf_dtype = self.output_storage_dtype(id);
         if !matches!(buf_dtype, Some(DType::F16)) {
             panic!(
                 "get_f16: buffer dtype is {buf_dtype:?}, expected F16. \
@@ -2279,9 +2303,7 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// be `DType::Bf16`; no widening at the read boundary.
     pub fn get_bf16(&self, id: impl ToId) -> Vec<bf16> {
         let id = id.to_id();
-        let data_id = self.resolve_data_node(id);
-        let bucket = self.active();
-        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        let buf_dtype = self.output_storage_dtype(id);
         if !matches!(buf_dtype, Some(DType::Bf16)) {
             panic!(
                 "get_bf16: buffer dtype is {buf_dtype:?}, expected Bf16. \
@@ -2305,21 +2327,12 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let bi = self.active_bucket;
 
         let bucket = &self.compiled_buckets[bi];
-        let data_llir_node = *bucket
-            .output_producers
-            .get(&output_id)
-            .expect("Cannot find output node for swap!");
         assert!(
             bucket.hlir_to_all_llir.contains_key(&input_id),
             "Cannot find input in LLIR mapping!"
         );
 
-        let src = Self::bucket_buffer(
-            &self.compiled_buckets[bi],
-            &self.cuda_stream,
-            &data_llir_node,
-        )
-        .expect("Output not in intermediate buffers");
+        let src = self.resolve_output_buffer(output_id);
         let input_buf = Self::copy_device_buffer_to_new_slice(&self.cuda_stream, src);
         let len = input_buf.len();
         self.hlir_buffers.insert(
@@ -3619,18 +3632,11 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
 
     fn cached_device_buffer_for_node(
         bucket: &CompiledBucket,
-        mut node: NodeIndex,
+        node: NodeIndex,
     ) -> Option<DeviceBuffer> {
-        let mut visited = FxHashSet::default();
-        loop {
-            if !visited.insert(node) {
-                return None;
-            }
-            if let Some(buf) = bucket.cached_device_buffers.get(&node) {
-                return Some(*buf);
-            }
-            node = *bucket.output_alias_map.get(&node)?;
-        }
+        Self::resolve_alias_buffer(bucket, node, |node| {
+            bucket.cached_device_buffers.get(&node).copied()
+        })
     }
 
     /// Post-mortem aid for sticky CUDA errors during search: keep the most
@@ -4053,6 +4059,22 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     continue;
                 }
                 if let Some(bytes) = buffers.get(target).copied() {
+                    let bytes =
+                        if let Some(&(offset, len, _)) = bucket.output_view_ranges.get(alias) {
+                            let offset = offset
+                                .exec(&bucket.last_dyn_map)
+                                .expect("view offset dimension");
+                            let len = len
+                                .exec(&bucket.last_dyn_map)
+                                .expect("view length dimension");
+                            assert!(
+                                bytes == 0 || (offset <= bytes && len <= bytes - offset),
+                                "planned view exceeds input"
+                            );
+                            len
+                        } else {
+                            bytes
+                        };
                     buffers.insert(*alias, bytes);
                     changed = true;
                 }
@@ -5316,6 +5338,12 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
         // output registrations and materializing graph node parameters.
         let timer = std::time::Instant::now();
         self.prepare_bucket_buffers(self.active_bucket, dyn_map);
+        // View bounds refer to exact logical extents, including when only an
+        // owner's dimension changed and the captured view pointer stayed fixed.
+        for &node in self.active().output_view_ranges.keys() {
+            Self::cached_device_buffer_for_node(self.active(), node)
+                .expect("output view has no live owning buffer");
+        }
         // Every packaged graph in a bucket is normally compiled against the
         // same global dynamic-dimension ordering. Upload that tiny vector once
         // instead of issuing one HtoD copy per graph per token.
@@ -5917,10 +5945,27 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
                     );
                 }
 
+                if kernel_op.output_view_range().is_some() {
+                    assert!(
+                        kernel_op
+                            .output_aliases_input()
+                            .is_some_and(|i| i < inputs().len()),
+                        "storage views must alias a valid input"
+                    );
+                }
                 if let Some(input_idx) = kernel_op.output_aliases_input()
                     && let Some(target) = inputs().get(input_idx).copied()
                 {
                     bucket.output_alias_map.insert(node, target);
+                    if let Some(range) = kernel_op.output_view_range() {
+                        assert!(
+                            !kernel_op.mutates_aliased_input(),
+                            "storage views must be pure"
+                        );
+                        bucket
+                            .output_view_ranges
+                            .insert(node, (range.0, range.1, kernel_op.output_dtype()));
+                    }
                 }
 
                 if let Some(input_idx) = kernel_op.output_data_input()

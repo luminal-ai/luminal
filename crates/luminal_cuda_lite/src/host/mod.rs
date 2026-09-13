@@ -158,6 +158,28 @@ impl DeviceBuffer {
         self.capacity
     }
 
+    /// A bounded logical byte view. A subview never exposes its owner's spare
+    /// capacity or prepared-layout ABI. Its owner must outlive every use.
+    pub fn subview(self, offset: usize, bytes: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            offset <= self.len && bytes <= self.len - offset,
+            "device buffer view exceeds its logical input extent"
+        );
+        let ptr = self
+            .ptr
+            .checked_add(offset as u64)
+            .ok_or_else(|| anyhow::anyhow!("device buffer view pointer overflow"))?;
+        let mut view = Self::new(ptr, bytes);
+        if self.host_ptr != 0 && offset <= self.host_len && bytes <= self.host_len - offset {
+            view.host_ptr = self
+                .host_ptr
+                .checked_add(offset as u64)
+                .ok_or_else(|| anyhow::anyhow!("host buffer view pointer overflow"))?;
+            view.host_len = bytes;
+        }
+        Ok(view)
+    }
+
     pub(crate) fn with_capacity(mut self, capacity: usize) -> Self {
         assert!(capacity >= self.len);
         self.capacity = capacity;
