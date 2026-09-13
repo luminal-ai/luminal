@@ -31,4 +31,4 @@ jobs:
       - run: cargo clippy -p llm_chat --all-targets --features '${{ matrix.features }}' -- -D warnings
       - run: cargo test -p llm_chat --features '${{ matrix.features }}'
       - if: runner.os == 'macOS'
-        run: cargo test -p luminal_metal --test resident_feedback --test dynamic_execution
+        run: cargo test -p luminal_metal --test resident_mutation --test dynamic_execution
