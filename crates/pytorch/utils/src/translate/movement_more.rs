@@ -461,14 +461,21 @@ impl Translator<'_> {
             "narrow_copy dimension {raw_dim} out of range for rank {rank}"
         );
         let dim = normalize_dim(raw_dim, rank);
-        let start = self.get_int_arg(node, 2)?;
-        let length = self.get_int_arg(node, 3)?;
-        anyhow::ensure!(
-            length >= 0,
-            "narrow_copy length must be nonnegative, got {length}"
-        );
-        let start = normalize_slice_bound(IntExpr::from(start), x.dims()[dim]);
-        let end = start + IntExpr::from(length);
+        // Start/length may be sym-int expressions (dynamic dims).
+        let start = self
+            .resolve_arg_as_expression(&node.inputs[2].arg)
+            .ok_or_else(|| anyhow::anyhow!("narrow_copy start is not an expression"))?;
+        let length = self
+            .resolve_arg_as_expression(&node.inputs[3].arg)
+            .ok_or_else(|| anyhow::anyhow!("narrow_copy length is not an expression"))?;
+        if let Some(length) = length.as_num() {
+            anyhow::ensure!(
+                length >= 0,
+                "narrow_copy length must be nonnegative, got {length}"
+            );
+        }
+        let start = normalize_slice_bound(start, x.dims()[dim]);
+        let end = start + length;
         Ok(x.slice_along(start..end, dim))
     }
 

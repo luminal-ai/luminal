@@ -13,21 +13,26 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 use luminal::prelude::*;
 
+mod attention;
 mod conv;
+mod dim_arith;
 mod expr;
+mod grouped_mm;
 mod index;
 mod movement_more;
 mod ops;
 mod pooling;
 mod special;
+mod sympy;
 mod unary;
+mod upsample;
 mod util;
 
 use ops::ReductionOp;
 
 use crate::dtype::TorchDType;
 use crate::pt2_parser::{InputKind, ParsedPT2};
-use crate::pt2_schema::{DimSize, Node, NodeInput, TensorMeta};
+use crate::pt2_schema::{DimSize, Node, NodeInput, RangeConstraint, TensorMeta};
 
 /// One bound graph input, in export order.
 pub struct TranslatedInput {
@@ -65,6 +70,8 @@ pub struct Translation {
     pub outputs: Vec<TranslatedOutput>,
     /// Recorder dim symbol -> the concrete hint torch exported with it.
     pub dims: HashMap<Symbol, usize>,
+    /// PT2 symbol name -> recorder dim symbol, for runtime `set_dim` by name.
+    pub symbols: HashMap<String, Symbol>,
 }
 
 struct Translator<'a> {
@@ -79,19 +86,24 @@ struct Translator<'a> {
     sink_by_value: HashMap<NodeIndex, usize>,
     /// PT2 symbol name -> recorder dim symbol (dynamic dims).
     symbols: HashMap<String, Symbol>,
+    /// PT2 symbol name -> torch's exported range constraint.
+    ranges: HashMap<String, RangeConstraint>,
     parsed: &'a ParsedPT2,
+    /// Recorder dim symbol -> concrete hint, seeded into the runtime.
     dims: HashMap<Symbol, usize>,
 }
 
 /// Translate a parsed PT2 program into the recorder frontend.
 pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
+    let sym_dim_map = parsed.build_sym_dim_map();
     let mut t = Translator {
         cx: Graph::new(),
         values: HashMap::new(),
         input_values: HashMap::new(),
         sinks: Vec::new(),
         sink_by_value: HashMap::new(),
-        symbols: expr::build_sym_map(parsed),
+        symbols: sym_dim_map.sym_to_symbol.clone(),
+        ranges: sym_dim_map.ranges,
         parsed,
         dims: HashMap::new(),
     };
@@ -216,6 +228,7 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         inputs,
         outputs,
         dims: t.dims,
+        symbols: t.symbols,
     })
 }
 
@@ -237,9 +250,10 @@ impl Translator<'_> {
     }
 
     /// Resolve a tensor's dims to recorder expressions: literals stay literal
-    /// and symbols stay symbols. Every symbol's exported hint is recorded in
-    /// `self.dims`, so a caller can pin the graph (static execution) or drive
-    /// it dynamically from the bound values.
+    /// and symbols (including compound sympy extents) stay symbolic. Every
+    /// symbol's exported hint is recorded in `self.dims`, so a caller can pin
+    /// the graph (static execution) or drive it dynamically from the bound
+    /// values.
     fn boundary_shape(&mut self, meta: &TensorMeta, name: &str) -> Result<Vec<IntExpr>> {
         let mut shape = Vec::with_capacity(meta.sizes.len());
         for size in &meta.sizes {
@@ -248,6 +262,9 @@ impl Translator<'_> {
                 .with_context(|| format!("{name}: cannot resolve a dimension expression"))?;
             if let DimSize::Expr(value) = size
                 && let Some(hint) = value.as_expr.hint.as_ref().and_then(|h| h.as_int())
+                // A compound extent's hint is the WHOLE expression's hint, so
+                // only a bare symbol may seed that symbol's value.
+                && value.as_expr.expr_str.trim_start().starts_with("Symbol(")
             {
                 let hint = usize::try_from(hint).context("negative dim hint")?;
                 for symbol in expr.to_symbols() {
@@ -361,6 +378,10 @@ impl Translator<'_> {
                 let a = self.operand(&n[0])?;
                 let b = self.operand(&n[1])?;
                 a.matmul(b)
+            }
+            // ---- grouped GEMM (batch 6) ----
+            "_grouped_mm.default" | "transformers.grouped_mm_fallback.default" => {
+                self.translate_grouped_mm(node)?
             }
             // ---- elementwise unary ----
             "relu.default" => self.operand(&n[0])?.relu(),
@@ -515,6 +536,15 @@ impl Translator<'_> {
             "clamp.Tensor" => self.translate_clamp_tensor(node)?,
             "softmax.int" | "_softmax.default" => self.translate_softmax(node, false)?,
             "log_softmax.int" | "_log_softmax.default" => self.translate_softmax(node, true)?,
+            // ---- attention (batch 6) ----
+            "scaled_dot_product_attention.default"
+            | "_scaled_dot_product_efficient_attention.default"
+            | "_scaled_dot_product_flash_attention.default"
+            | "_scaled_dot_product_flash_attention_for_cpu.default"
+            | "_scaled_dot_product_cudnn_attention.default" => {
+                self.translate_sdpa(node)?;
+                return Ok(());
+            }
             "embedding.default" => self.translate_embedding(node)?,
             "item.default" | "_local_scalar_dense.default" => {
                 self.translate_item(node)?;
@@ -574,6 +604,12 @@ impl Translator<'_> {
             }
             "convolution.default" => self.translate_conv(node)?,
             "conv2d.default" => self.translate_conv(node)?,
+            // ---- upsample / resize (batch 6) ----
+            "upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
+            "upsample_bilinear2d.vec" => self.translate_upsample_bilinear2d(node)?,
+            "_upsample_bilinear2d_aa.default" | "_upsample_bilinear2d_aa.vec" => {
+                self.translate_upsample_bilinear2d_aa(node)?
+            }
             "max_pool2d.default" => {
                 self.translate_max_pool(node, 2)?;
                 return Ok(());
