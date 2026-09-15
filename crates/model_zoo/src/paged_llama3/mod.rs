@@ -64,12 +64,7 @@ impl BatchStep {
             x = next;
             cache_outs.push((k_cache, v_cache));
         }
-        let logits = model.lm_head.forward(model.final_norm.forward(x)).output();
-        let cache_outs = cache_outs
-            .into_iter()
-            .map(|(keys, values)| (keys.output(), values.output()))
-            .collect();
-
+        let logits = model.lm_head.forward(model.final_norm.forward(x));
         Self {
             cx,
             model,

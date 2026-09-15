@@ -965,7 +965,7 @@ mod tests {
         let exact = 0.1f64 + 0.2f64;
         let mut cx = Graph::new();
         let constant = cx.constant_f64(exact);
-        let out = constant.output();
+        let out = constant;
 
         let mut runtime = ReferenceRuntime::load(&cx).expect("load");
         runtime
@@ -1071,8 +1071,8 @@ mod tests {
             let c = cx.tensor(3, DType::F32);
             let g = cx.tensor(3, DType::F32);
             let e = cx.tensor(3, DType::F32);
-            let a = (b * c + g).output();
-            let d = (b * c / e).sin().output();
+            let a = b * c + g;
+            let d = (b * c / e).sin();
             (cx, b, c, g, e, a, d)
         };
         let b_data = vec![1.0, 2.0, 3.0];
@@ -1105,7 +1105,7 @@ mod tests {
             let mut cx = Graph::new();
             let x = cx.tensor((2, 3), DType::F32);
             let y = cx.tensor((3, 2), DType::F32);
-            let out = (x.permute((1, 0)) * y).output();
+            let out = x.permute((1, 0)) * y;
             (cx, x, y, out)
         };
         let x_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -1126,7 +1126,7 @@ mod tests {
             let mut cx = Graph::new();
             let x = cx.tensor(4, DType::F32);
             let y = cx.tensor(4, DType::F32);
-            let out = (x - y).output();
+            let out = x - y;
             (cx, x, y, out)
         };
         let x_data = vec![10.0, 20.0, 30.0, 40.0];
@@ -1148,7 +1148,7 @@ mod tests {
             let mut cx = Graph::new();
             let a = cx.tensor((2, 3), DType::F32);
             let b = cx.tensor((3, 4), DType::F32);
-            let c = a.matmul(b).output();
+            let c = a.matmul(b);
             (cx, a, b, c)
         };
         let a_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -1173,7 +1173,7 @@ mod tests {
                 cx.set_dim('a', dim);
                 let x = cx.tensor(('a', 2), DType::F32);
                 let y = cx.tensor(('a', 2), DType::F32);
-                let out = (x * y).output();
+                let out = x * y;
                 (cx, x, y, out)
             };
             let data_x: Vec<f32> = (0..pin * 2).map(|v| v as f32 + 1.0).collect();
@@ -1186,14 +1186,13 @@ mod tests {
                 _ => unreachable!(),
             };
             let (cx2, x2, y2, out2) = build(pin);
-            let program = cx2
-                .logical
-                .bound_program(&crate::bindings::ReferenceBindings)
+            let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+                .bind(&cx2.logical)
                 .expect("native program");
             assert!(
-                program.text.contains("(IntVar \"a\")"),
+                bound.text().contains("(IntVar \"a\")"),
                 "the model must stay symbolic:\n{}",
-                program.text
+                bound.text()
             );
             // The pin arrives as BINDING seeds, not model content: run_reference
             // injects (bigint {pin}) bounds from the graph's dyn_map — the
@@ -1212,7 +1211,7 @@ mod tests {
         let build = || {
             let mut cx = Graph::new();
             let x = cx.tensor(8, DType::F32);
-            let out = (x.slice(2..6) + x.slice(1..5)).output();
+            let out = x.slice(2..6) + x.slice(1..5);
             (cx, x, out)
         };
         let x_data: Vec<f32> = (0..8).map(|v| (v * v) as f32).collect();
@@ -1220,14 +1219,13 @@ mod tests {
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
         let expected = vec![5.0, 13.0, 25.0, 41.0];
         let (cx2, x2, out2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
         assert!(
-            program.text.contains("LogicalIndexMapApply"),
+            bound.text().contains("LogicalIndexMapApply"),
             "the slice must arrive as a view:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(&cx2, &[(x2.id, x_data.into())]);
         assert_close(ours.get_f32(out2.id).unwrap(), &expected);
@@ -1242,7 +1240,7 @@ mod tests {
         let build = || {
             let mut cx = Graph::new();
             let x = cx.tensor((4, 5), DType::F32);
-            let out = x.slice((1..3, 2..5)).output();
+            let out = x.slice((1..3, 2..5));
             (cx, x, out)
         };
         let x_data: Vec<f32> = (0..20).map(|v| v as f32 * 1.5).collect();
@@ -1250,14 +1248,13 @@ mod tests {
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
         let expected = vec![10.5, 12.0, 13.5, 18.0, 19.5, 21.0];
         let (cx2, x2, out2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
         assert!(
-            program.text.contains("LogicalIndexMapApply"),
+            bound.text().contains("LogicalIndexMapApply"),
             "the slice must arrive as a view:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(&cx2, &[(x2.id, x_data.into())]);
         assert_close(ours.get_f32(out2.id).unwrap(), &expected);
@@ -1272,9 +1269,9 @@ mod tests {
         let build = || {
             let mut cx = Graph::new();
             let x = cx.tensor(8, DType::F32);
-            let plain = x.unfold(3, 2, 1).output(); // windows at 0,2,4
+            let plain = x.unfold(3, 2, 1); // windows at 0,2,4
             let y = cx.tensor(10, DType::F32);
-            let dilated = y.unfold(3, 2, 2).output(); // effective window 5
+            let dilated = y.unfold(3, 2, 2); // effective window 5
             (cx, x, y, plain, dilated)
         };
         let x_data: Vec<f32> = (0..8).map(|v| (v * v) as f32).collect();
@@ -1284,14 +1281,13 @@ mod tests {
         let expected_plain = vec![0.0, 1.0, 4.0, 4.0, 9.0, 16.0, 16.0, 25.0, 36.0];
         let expected_dilated = vec![-5.0, 1.0, 7.0, 1.0, 7.0, 13.0, 7.0, 13.0, 19.0];
         let (cx2, x2, y2, plain2, dilated2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
         assert!(
-            program.text.contains("LogicalIndexMapApply"),
+            bound.text().contains("LogicalIndexMapApply"),
             "unfold must arrive as a view:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(&cx2, &[(x2.id, x_data.into()), (y2.id, y_data.into())]);
         assert_close(ours.get_f32(plain2.id).unwrap(), &expected_plain);
@@ -1310,7 +1306,7 @@ mod tests {
             let build = |fill: f32| {
                 let mut cx = Graph::new();
                 let x = cx.tensor(4, DType::F32);
-                let out = x.pad((1, 2), fill).output();
+                let out = x.pad((1, 2), fill);
                 (cx, x, out)
             };
             let x_data = vec![10.0, 20.0, 30.0, 40.0];
@@ -1322,14 +1318,13 @@ mod tests {
                 vec![2.5, 10.0, 20.0, 30.0, 40.0, 2.5, 2.5]
             };
             let (cx2, x2, out2) = build(fill);
-            let program = cx2
-                .logical
-                .bound_program(&crate::bindings::ReferenceBindings)
+            let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+                .bind(&cx2.logical)
                 .expect("native program");
             assert!(
-                program.text.contains("IntCastFromBool"),
+                bound.text().contains("IntCastFromBool"),
                 "the mask must ride the bool bridge:\n{}",
-                program.text
+                bound.text()
             );
             let ours = run_reference(&cx2, &[(x2.id, x_data.into())]);
             assert_close(ours.get_f32(out2.id).unwrap(), &expected);
@@ -1346,7 +1341,7 @@ mod tests {
             let build = |fill: f32| {
                 let mut cx = Graph::new();
                 let x = cx.tensor((3, 4), DType::F32);
-                let out = x.pad(((1, 0), (2, 1)), fill).output();
+                let out = x.pad(((1, 0), (2, 1)), fill);
                 (cx, x, out)
             };
             let x_data: Vec<f32> = (0..12).map(|v| v as f32 + 1.0).collect();
@@ -1364,14 +1359,13 @@ mod tests {
                 ]
             };
             let (cx2, x2, out2) = build(fill);
-            let program = cx2
-                .logical
-                .bound_program(&crate::bindings::ReferenceBindings)
+            let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+                .bind(&cx2.logical)
                 .expect("native program");
             assert!(
-                program.text.contains("IntMax") && program.text.contains("IntCastFromBool"),
+                bound.text().contains("IntMax") && bound.text().contains("IntCastFromBool"),
                 "clamp view + indicator mask expected:\n{}",
-                program.text
+                bound.text()
             );
             let ours = run_reference(&cx2, &[(x2.id, x_data.into())]);
             assert_close(ours.get_f32(out2.id).unwrap(), &expected);
@@ -1390,7 +1384,7 @@ mod tests {
             let data = cx.tensor((3, 4), DType::F32);
             let row = cx.tensor((2, 3), luminal::dtype::DType::Int);
             let col = cx.tensor((2, 3), luminal::dtype::DType::Int);
-            let out = data.gather(&[row, col]).output();
+            let out = data.gather(&[row, col]);
             (cx, data, row, col, out)
         };
         let data_vals: Vec<f32> = (0..12).map(|v| v as f32 * 1.5 + 1.0).collect();
@@ -1402,14 +1396,13 @@ mod tests {
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
         let expected = vec![5.5, 13.0, 10.0, 17.5, 2.5, 7.0];
         let (cx2, data2, row2, col2, out2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
         assert!(
-            program.text.contains("(LogicalGather v"),
+            bound.text().contains("(LogicalGather v"),
             "coordinate-form gather expected in the model:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(
             &cx2,
@@ -1433,7 +1426,7 @@ mod tests {
             let row = cx.tensor(4, luminal::dtype::DType::Int);
             let col = cx.tensor(4, luminal::dtype::DType::Int);
             let src = cx.tensor(4, DType::F32);
-            let out = dest.scatter(&[row, col], src).output();
+            let out = dest.scatter(&[row, col], src);
             (cx, dest, row, col, src, out)
         };
         let dest_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
@@ -1448,14 +1441,13 @@ mod tests {
             0.0, 100.0, 2.0, 3.0, 400.0, 5.0, 6.0, 200.0, 300.0, 9.0, 10.0, 11.0,
         ];
         let (cx2, dest2, row2, col2, src2, out2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
         assert!(
-            program.text.contains("(LogicalScatter v"),
+            bound.text().contains("(LogicalScatter v"),
             "coordinate-form scatter expected in the model:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(
             &cx2,
@@ -1476,7 +1468,7 @@ mod tests {
         let mut cx = Graph::new();
         let data = cx.tensor((3, 4), DType::F32);
         let idx = cx.tensor((2, 3), luminal::dtype::DType::Int);
-        let out = data.gather1d(idx).output();
+        let out = data.gather1d(idx);
         assert_eq!(out.dims(), idx.dims(), "out shape = index shape");
 
         let data_vals: Vec<f32> = (0..12).map(|v| v as f32 * 1.5 + 1.0).collect();
@@ -1485,14 +1477,13 @@ mod tests {
         // Hand golden: data.flat[i] = i*1.5 + 1.
         let expected = vec![1.0, 8.5, 17.5, 11.5, 5.5, 4.0];
 
-        let program = cx
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx.logical)
+            .bind(&cx.logical)
             .expect("native program");
         assert!(
-            program.text.contains("(LogicalGather v"),
+            bound.text().contains("(LogicalGather v"),
             "flat sugar lowers to coordinate gather:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(
             &cx,
@@ -1509,7 +1500,7 @@ mod tests {
         let dest = cx.tensor((2, 6), DType::F32);
         let idx = cx.tensor(4, luminal::dtype::DType::Int);
         let src = cx.tensor(4, DType::F32);
-        let out = src.scatter1d(idx, dest).output();
+        let out = src.scatter1d(idx, dest);
         assert_eq!(out.dims(), dest.dims(), "out shape = dest shape");
 
         let dest_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
@@ -1519,14 +1510,13 @@ mod tests {
             200.0, 1.0, 2.0, 100.0, 4.0, 5.0, 400.0, 7.0, 8.0, 9.0, 10.0, 300.0,
         ];
 
-        let program = cx
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx.logical)
+            .bind(&cx.logical)
             .expect("native program");
         assert!(
-            program.text.contains("(LogicalScatter v"),
+            bound.text().contains("(LogicalScatter v"),
             "flat sugar lowers to coordinate scatter:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(
             &cx,
@@ -1547,21 +1537,20 @@ mod tests {
         let mut cx = Graph::new();
         // out[r, c] = (r·3 + c)·2 over (2, 3) — read back NATIVE i32
         // (the observe-only cast to F32 died with typed buffers).
-        let out = cx.iota((2, 3), |c| (c[0] * 3 + c[1]) * 2).output();
+        let out = cx.iota((2, 3), |c| (c[0] * 3 + c[1]) * 2);
 
-        let program = cx
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx.logical)
+            .bind(&cx.logical)
             .expect("native program");
         assert!(
-            program.text.contains("(LogicalIota"),
+            bound.text().contains("(LogicalIota"),
             "iota expected in the model:\n{}",
-            program.text
+            bound.text()
         );
         assert!(
-            !program.text.contains("LogicalIndexMapApply"),
+            !bound.text().contains("LogicalIndexMapApply"),
             "no view detour for a bare multi-dim iota:\n{}",
-            program.text
+            bound.text()
         );
         let expected = vec![0i32, 2, 4, 6, 8, 10];
         let ours = run_reference(&cx, &[]);
@@ -1576,7 +1565,7 @@ mod tests {
     fn differential_dynamic_arange() {
         let mut cx = Graph::new();
         cx.set_dim('a', 5);
-        let out = cx.arange(luminal::shape::IntExpr::from('a')).output();
+        let out = cx.arange(luminal::shape::IntExpr::from('a'));
 
         let expected = vec![0i32, 1, 2, 3, 4];
         let ours = run_reference(&cx, &[]);
@@ -1591,7 +1580,7 @@ mod tests {
     fn differential_dynamic_offset_iota() {
         let mut cx = Graph::new();
         cx.set_dim('a', 10);
-        let out = cx.iota(3, |c| c[0] + 'a').output();
+        let out = cx.iota(3, |c| c[0] + 'a');
 
         let expected = vec![10i32, 11, 12];
         let ours = run_reference(&cx, &[]);
@@ -1605,15 +1594,15 @@ mod tests {
         let mut cx = Graph::new();
         let data = cx.tensor((2, 3), DType::F32);
         let idx = cx.tensor((2, 2), luminal::dtype::DType::Int);
-        let out = data.gather_elements(idx, 1).output();
+        let out = data.gather_elements(idx, 1);
 
         let data_vals: Vec<f32> = (0..6).map(|v| v as f32 * 10.0).collect();
         // out[i, j] = data[i, idx[i, j]]; -1 normalizes to axis extent - 1 = 2.
         let idx_vals = vec![2i32, 0, -1, 1];
         let expected = vec![20.0, 0.0, 50.0, 40.0];
 
-        cx.logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        crate::bindings::ReferenceBindings::leaves(&cx.logical)
+            .bind(&cx.logical)
             .expect("native program");
         // Landing D: plain Int assembly is proof-gated — the caller
         // ATTESTS the index range (gather semantics require it in
@@ -1634,7 +1623,7 @@ mod tests {
         let data = cx.tensor((3, 2), DType::F32);
         let idx = cx.tensor((1, 2), luminal::dtype::DType::Int);
         let upd = cx.tensor((1, 2), DType::F32);
-        let out = data.scatter_elements(idx, upd, 0).output();
+        let out = data.scatter_elements(idx, upd, 0);
         assert_eq!(out.dims(), data.dims());
 
         let data_vals: Vec<f32> = (0..6).map(|v| v as f32).collect();
@@ -1643,8 +1632,8 @@ mod tests {
         let upd_vals = vec![100.0f32, 200.0];
         let expected = vec![0.0, 200.0, 2.0, 3.0, 100.0, 5.0];
 
-        cx.logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        crate::bindings::ReferenceBindings::leaves(&cx.logical)
+            .bind(&cx.logical)
             .expect("native program");
         let ours = crate::harness::run_reference_with_ranges(
             &cx,
@@ -1666,7 +1655,7 @@ mod tests {
         let data = cx.tensor((3, 2), DType::F32);
         let idx = cx.tensor((2, 1), luminal::dtype::DType::Int);
         let upd = cx.tensor((2, 2), DType::F32);
-        let out = data.scatter_nd(idx, upd).output();
+        let out = data.scatter_nd(idx, upd);
         assert_eq!(out.dims(), data.dims());
 
         let data_vals: Vec<f32> = (0..6).map(|v| v as f32).collect();
@@ -1674,8 +1663,8 @@ mod tests {
         let upd_vals = vec![100.0f32, 101.0, 200.0, 201.0];
         let expected = vec![200.0, 201.0, 2.0, 3.0, 100.0, 101.0];
 
-        cx.logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        crate::bindings::ReferenceBindings::leaves(&cx.logical)
+            .bind(&cx.logical)
             .expect("native program");
         let ours = crate::harness::run_reference_with_ranges(
             &cx,
@@ -1698,21 +1687,12 @@ mod tests {
         let dest = cx.tensor(6, DType::F32);
         let idx = cx.tensor(3, luminal::dtype::DType::Int);
         let src = cx.tensor(3, DType::F32);
-        let out = src.scatter1d(idx, dest).output();
+        let out = src.scatter1d(idx, dest);
 
-        let (pre, input_slots, output_slots, post, _labeled) = cx
-            .logical
-            .bound_parts(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx.logical)
+            .bind(&cx.logical)
             .expect("recorder clean");
-        let program = luminal::graph::LogicalProgram {
-            text: format!(
-                "{pre}{}{post}",
-                crate::bindings::ReferenceBindings::SCHEDULE
-            ),
-            input_slots,
-            output_slots,
-        };
-        let text = format!("{}\n\n{}", crate::assembled_program(), program.text);
+        let text = format!("{}\n\n{}", crate::assembled_program(), bound.text());
         let mut egraph = luminal::egglog_snippet::new_egraph();
         egraph
             .parse_and_run_program(None, &text)
@@ -1740,7 +1720,7 @@ mod tests {
         .expect("layouts decode");
         let plan = luminal::bufferize::bufferize(&dps, &layouts).expect("bufferizes");
         let mut rt = crate::ReferenceRuntime::default();
-        rt.stage_slots(&program.input_slots, &program.output_slots);
+        rt.stage_bindings(&bound.inputs, &bound.outputs);
         rt.load_plan(plan);
         rt.set_data(dest.id, (0..6).map(|v| v as f32).collect::<Vec<f32>>());
         rt.set_data(idx.id, vec![1i32, 4, 1]); // 1 appears twice — conflict
@@ -1754,29 +1734,22 @@ mod tests {
         let _ = out;
     }
 
-    /// The poison MECHANISM: a poisoned recorder refuses the native path
-    /// loudly with its attributable reason — never mistranslates. (As of
-    /// the persist deletion, 2026-08-06, NO public frontend construct
-    /// poisons — the recorder covers the whole live surface — so this
-    /// pokes the mechanism directly; internal guards like the multi-dim
-    /// iota tripwire still route through it.)
+    /// The REFUSAL MECHANISM: a construct the recorder cannot lower
+    /// refuses at the construction site, loudly, carrying its
+    /// attributable reason — never mistranslates, and never leaves a
+    /// half-recorded graph behind to be discovered later. (NO public
+    /// frontend construct refuses here — the recorder covers the whole
+    /// live surface — so this pokes the mechanism directly; internal
+    /// guards like the multi-dim iota tripwire go through the same
+    /// door.)
     #[test]
-    fn recorder_poisons_refuse_loudly() {
+    #[should_panic(expected = "synthetic guard tripped at t0 (mechanism test)")]
+    fn recorder_refusals_are_loud() {
         let mut cx = Graph::new();
         let x = cx.tensor((2, 3), DType::F32);
-        let _out = x.output();
+        let _out = x;
         cx.logical
-            .poison("synthetic guard tripped at t0 (mechanism test)".to_string());
-        let reason = cx.logical.poisoned().expect("poison recorded");
-        assert!(
-            reason.contains("synthetic guard"),
-            "attributable reason: {reason}"
-        );
-        assert!(
-            cx.logical
-                .bound_program(&crate::bindings::ReferenceBindings)
-                .is_err()
-        );
+            .refuse("synthetic guard tripped at t0 (mechanism test)");
     }
 
     /// M3 STEP 1: THE FIRST NATIVE DIFFERENTIAL — the recorder's model +
@@ -1790,8 +1763,8 @@ mod tests {
             let c = cx.tensor(3, DType::F32);
             let g = cx.tensor(3, DType::F32);
             let e = cx.tensor(3, DType::F32);
-            let a = (b * c + g).output();
-            let d = (b * c / e).sin().output();
+            let a = b * c + g;
+            let d = (b * c / e).sin();
             (cx, b, c, g, e, a, d)
         };
         let b_data = vec![1.0, 2.0, 3.0];
@@ -1804,8 +1777,8 @@ mod tests {
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
         let expected_d = vec![0.9092974, 0.5984721, 0.7780732];
         let (cx2, b2, c2, g2, e2, a2, d2) = build();
-        cx2.logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
         let ours = run_reference(
             &cx2,
@@ -1832,7 +1805,7 @@ mod tests {
             let mut cx = Graph::new();
             let x = cx.tensor((2, 3), DType::F32);
             let y = cx.tensor((2, 3), DType::F32);
-            let out = (x.lt(y).cast(DType::F32) * 3.0 + 1.0).output();
+            let out = x.lt(y).cast(DType::F32) * 3.0 + 1.0;
             (cx, x, y, out)
         };
         let x_data = vec![1.0, 5.0, 2.0, 8.0, -1.0, 0.0];
@@ -1841,14 +1814,13 @@ mod tests {
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
         let expected = vec![4.0, 1.0, 1.0, 4.0, 1.0, 4.0];
         let (cx2, x2, y2, out2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
         assert!(
-            program.text.contains("LogicalLessThan") && program.text.contains("LogicalCast"),
+            bound.text().contains("LogicalLessThan") && bound.text().contains("LogicalCast"),
             "comparison + cast expected in the model:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(&cx2, &[(x2.id, x_data.into()), (y2.id, y_data.into())]);
         assert_close(ours.get_f32(out2.id).unwrap(), &expected);
@@ -1865,7 +1837,7 @@ mod tests {
             let mut cx = Graph::new();
             let x = cx.tensor((2, 3), DType::F32);
             let y = cx.tensor((2, 3), DType::F32);
-            let out = x.lt(y).output();
+            let out = x.lt(y);
             (cx, x, y, out)
         };
         let x_data = vec![1.0, 5.0, 2.0, 8.0, -1.0, 0.0];
@@ -1874,19 +1846,18 @@ mod tests {
         // GOLDEN (pinned; x.lt(y) elementwise on the fixed data).
         let expected: Vec<bool> = vec![true, false, false, true, false, true];
         let (cx2, x2, y2, out2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::bindings::ReferenceBindings)
+        let bound = crate::bindings::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
         assert!(
-            program.text.contains("(LogicalCast v") && program.text.contains("(Bool8)"),
+            bound.text().contains("(LogicalCast v") && bound.text().contains("(Bool8)"),
             "boundary Bool8 cast expected in the binding:\n{}",
-            program.text
+            bound.text()
         );
         assert!(
-            program.text.contains("(bits-of (Bool8))"),
+            bound.text().contains("(bits-of (Bool8))"),
             "Bool8 boundary layout width expected:\n{}",
-            program.text
+            bound.text()
         );
         let ours = run_reference(&cx2, &[(x2.id, x_data.into()), (y2.id, y_data.into())]);
         let codes = ours.get_bool8(out2.id).expect("bool8 boundary");
@@ -1910,13 +1881,13 @@ mod tests {
             let mut cx = Graph::new();
             let a = cx.tensor(12, DType::F32);
             let b = cx.tensor((3, 4), DType::F32);
-            let split_out = (a.split_dims(0, 4) * b).output(); // [12] -> [3,4]
+            let split_out = a.split_dims(0, 4) * b; // [12] -> [3,4]
             let c = cx.tensor((3, 4), DType::F32);
             let d = cx.tensor(12, DType::F32);
-            let merge_out = (c.merge_dims(0, 1) * d).output(); // [3,4] -> [12]
+            let merge_out = c.merge_dims(0, 1) * d; // [3,4] -> [12]
             let e = cx.tensor((2, 3, 2), DType::F32);
             let f = cx.tensor(12, DType::F32);
-            let flatten_out = (e.flatten() * f).output(); // [2,3,2] -> [12]
+            let flatten_out = e.flatten() * f; // [2,3,2] -> [12]
             (cx, a, b, c, d, e, f, split_out, merge_out, flatten_out)
         };
         let v12a: Vec<f32> = (0..12).map(|v| v as f32 + 1.0).collect();
@@ -1963,7 +1934,7 @@ mod tests {
             let mut cx = Graph::new();
             let x = cx.tensor(3, DType::F32);
             let y = cx.tensor(12, DType::F32);
-            let out = (x.repeat(4) * y).output();
+            let out = x.repeat(4) * y;
             (cx, x, y, out)
         };
         let x_data = vec![1.0, 2.0, 3.0];
@@ -1985,7 +1956,7 @@ mod tests {
         let build = || {
             let mut cx = Graph::new();
             let x = cx.tensor((2, 3), DType::F32);
-            let s = x.sum(0).output();
+            let s = x.sum(0);
             (cx, x, s)
         };
         let x_data = vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0];
@@ -2013,7 +1984,7 @@ mod tests {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor(2, DType::I8);
         let b = cx.tensor(2, DType::I8);
-        let out = (a + b).output();
+        let out = a + b;
         let rt = crate::harness::run_reference(
             &cx,
             &[
@@ -2026,7 +1997,7 @@ mod tests {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor(2, DType::U8);
         let b = cx.tensor(2, DType::U8);
-        let out = (a + b).output();
+        let out = a + b;
         let rt = crate::harness::run_reference(
             &cx,
             &[
@@ -2039,7 +2010,7 @@ mod tests {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor(2, DType::I16);
         let b = cx.tensor(2, DType::I16);
-        let out = (a + b).output();
+        let out = a + b;
         let rt = crate::harness::run_reference(
             &cx,
             &[
@@ -2062,7 +2033,7 @@ mod tests {
 
         let mut cx = luminal::graph::Graph::new();
         let x = cx.tensor(9, DType::Int);
-        let out = x.cast(DType::I8).output();
+        let out = x.cast(DType::I8);
         let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
         assert_eq!(
             rt.get_i8(out.id).unwrap(),
@@ -2071,7 +2042,7 @@ mod tests {
 
         let mut cx = luminal::graph::Graph::new();
         let x = cx.tensor(9, DType::Int);
-        let out = x.cast(DType::U8).output();
+        let out = x.cast(DType::U8);
         let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
         assert_eq!(
             rt.get_u8(out.id).unwrap(),
@@ -2080,7 +2051,7 @@ mod tests {
 
         let mut cx = luminal::graph::Graph::new();
         let x = cx.tensor(9, DType::Int);
-        let out = x.cast(DType::I16).output();
+        let out = x.cast(DType::I16);
         let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
         assert_eq!(
             rt.get_i16(out.id).unwrap(),
@@ -2090,7 +2061,7 @@ mod tests {
         // The wide half of the policy, unchanged by the carve-out.
         let mut cx = luminal::graph::Graph::new();
         let x = cx.tensor(1, DType::I64);
-        let _out = x.cast(DType::Int).output();
+        let _out = x.cast(DType::Int);
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
         data.insert(x.id, TypedBuffer::I64(vec![i64::from(i32::MAX) + 1]));
@@ -2118,7 +2089,7 @@ mod tests {
     fn integer_abs_executes_and_wraps_at_the_signed_minimum() {
         let mut cx = luminal::graph::Graph::new();
         let x = cx.tensor(4, DType::I16);
-        let out = x.abs().output();
+        let out = x.abs();
         let rt = crate::harness::run_reference(
             &cx,
             &[(x.id, TypedBuffer::I16(vec![-3, 0, 5, i16::MIN]))],
@@ -2129,7 +2100,7 @@ mod tests {
         // range; inside it the answer is exact.
         let mut cx = luminal::graph::Graph::new();
         let x = cx.tensor(4, DType::Int);
-        let out = x.abs().output();
+        let out = x.abs();
         let rt = crate::harness::run_reference_with_ranges(
             &cx,
             &[(x.id, vec![-3i32, 0, 5, -7].into())],
@@ -2179,7 +2150,7 @@ mod tests {
     fn f64_unary_round_trips_exactly() {
         let mut cx = luminal::graph::Graph::new();
         let x = cx.tensor(4, DType::F64);
-        let out = x.sqrt().output();
+        let out = x.sqrt();
 
         let values = vec![2.0f64, 3.0, 0.1, 1e300];
         let rt = crate::harness::run_reference(&cx, &[(x.id, TypedBuffer::F64(values.clone()))]);
@@ -2216,7 +2187,7 @@ mod tests {
         let mut cx = luminal::graph::Graph::new();
         let mask = cx.tensor(4, DType::Bool);
         let x = cx.tensor(4, DType::F32);
-        let out = (mask.cast(DType::F32) * x).output();
+        let out = mask.cast(DType::F32) * x;
 
         let x_vals = vec![2.0f32, 3.0, 5.0, 7.0];
         let codes = TypedBuffer::bool8(vec![1u8, 0, 1, 0]).expect("legal codes");
@@ -2232,7 +2203,7 @@ mod tests {
         let mut cx2 = luminal::graph::Graph::new();
         let mask2 = cx2.tensor(4, DType::Bool);
         let x2 = cx2.tensor(4, DType::F32);
-        let out2 = (mask2.cast(DType::F32) * x2).output();
+        let out2 = mask2.cast(DType::F32) * x2;
         let _ = out2;
         let mut rt2 = ReferenceRuntime::load(&cx2).expect("native load");
         let mut data = FxHashMap::default();
@@ -2256,7 +2227,7 @@ mod tests {
     fn differential_int_output_reads_native() {
         let mut cx = luminal::graph::Graph::new();
         let idx = cx.tensor(5, DType::Int);
-        let out = (idx * 3usize).output();
+        let out = idx * 3usize;
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.bind_value_range(idx.id, 0, 4).expect("range binds");
         let mut data = FxHashMap::default();
@@ -2281,7 +2252,7 @@ mod tests {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor(1, DType::Int);
         let b = cx.tensor(1, DType::Int);
-        let _out = (a + b).output();
+        let _out = a + b;
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
         data.insert(a.id, vec![1i32].into());
@@ -2304,7 +2275,7 @@ mod tests {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor(1, DType::Int);
         let b = cx.tensor(1, DType::Int);
-        let out = (a + b).output();
+        let out = a + b;
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.bind_value_range(a.id, 0, 1000).expect("range binds");
         rt.bind_value_range(b.id, 0, 1000).expect("range binds");
@@ -2325,7 +2296,7 @@ mod tests {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor(4, DType::Int);
         let b = cx.tensor(4, DType::Int);
-        let out = a.trunc_div(b).output();
+        let out = a.trunc_div(b);
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.bind_value_range(a.id, -100, 100).expect("range binds");
         rt.bind_value_range(b.id, 2, 4).expect("range binds");
@@ -2344,7 +2315,7 @@ mod tests {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor(1, DType::Int);
         let b = cx.tensor(1, DType::Int);
-        let _out = a.trunc_div(b).output();
+        let _out = a.trunc_div(b);
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
         data.insert(a.id, vec![7i32].into());
@@ -2371,7 +2342,7 @@ mod tests {
         cx.set_dim('a', 3);
         let x = cx.tensor(('a', 2), DType::F32);
         let y = cx.tensor(('a', 2), DType::F32);
-        let out = (x * y).output();
+        let out = x * y;
 
         let data_for = |rep: &luminal::shape::DynMap| {
             let n = rep[&Symbol::from('a')] * 2;
@@ -2470,7 +2441,7 @@ mod tests {
         let mut cx = Graph::new();
         cx.set_dim('a', 3);
         let x = cx.tensor(('a', 2), DType::F32);
-        let _out = (x * x).output();
+        let _out = x * x;
 
         let mut rt = ReferenceRuntime::load(&cx).expect("records + loads");
         let err = rt
@@ -2509,7 +2480,7 @@ mod tests {
             let mut cx = Graph::new();
             cx.set_dim('a', 3);
             let x = cx.tensor(('a', 2), DType::F32);
-            let _out = (x * x).output();
+            let _out = x * x;
             cx
         };
 
