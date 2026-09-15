@@ -139,11 +139,20 @@ pub struct SearchOutcome {
 fn profile_on_reference_runtime(
     plan: &BufferIrGraph<DecodedLayout>,
     input_data: &FxHashMap<i64, TypedBuffer>,
+    dims: &luminal::shape::DynMap,
     trials: usize,
     best_so_far: Option<u128>,
 ) -> Result<u128> {
     let mut runtime = ReferenceRuntime::default();
     runtime.load_plan(plan.clone());
+    // The plan's spans/extents may be SYMBOLIC (`Var("a")`), so the
+    // profiling runtime must hold the representative assignment before it
+    // can allocate or index anything. This is the whole point of pricing a
+    // symbolic plan: it is a valid plan for the whole bucket, and the
+    // representative is only where it gets measured.
+    for (symbol, value) in dims {
+        runtime.set_dim(*symbol, *value);
+    }
     for (id, data) in input_data {
         runtime.set_data_buffer(*id, data.clone());
     }
@@ -184,6 +193,7 @@ pub fn search_implementations_with_ops(
     egraph: &egraph_serialize::EGraph,
     program: &LogicalProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
+    dims: &luminal::shape::DynMap,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
 ) -> Result<SearchOutcome> {
@@ -388,6 +398,7 @@ pub fn search_implementations_with_ops(
                     let profiled = profile_on_reference_runtime(
                         &plan,
                         input_data,
+                        dims,
                         options.trials,
                         best_so_far,
                     );
@@ -512,20 +523,15 @@ pub struct BucketAssembly<'a> {
 }
 
 /// Range-seeded bucketed search: one Cartesian combination of
-/// `DimBucket`s per search, each combination run TWICE — a bucket-wide
+/// `DimBucket`s per search, each combination run as a bucket-wide
 /// RANGE-seeded render whose WHOLE FIXPOINT (authoring checks included)
 /// must pass, proving the base logical program valid over the entire
-/// interval, then a representative-pinned render that is searched.
-/// [`select_bucket`] picks the covering plan at execute time.
-///
-/// THE LIMITATION, stated rather than solved (Phase 1 scope): each
-/// winning plan is STATIC at its representative — plans carry LITERAL
-/// spans, so a plan searched at `a = 3` allocates and indexes for `a =
-/// 3` and nothing else. Executing a bucket's plan at any OTHER value
-/// inside that bucket is REFUSED loudly by the runtime, naming the
-/// representative; it is never silently run. Lifting this needs symbolic
-/// plans (spans as expressions) and the capacity contract that goes with
-/// them — the open item this note points at.
+/// interval. The EXTRACTION comes from that range-valid fixpoint (matching
+/// CUDA Lite), so the winning plan's spans and extents stay expressions
+/// (`Var("a")`) and it executes at every value in the bucket without a
+/// re-search — the representative only selects the plan by bucket coverage
+/// and prices it during profiling. [`select_bucket`] picks the covering
+/// plan at execute time.
 pub fn bucketed_search_implementations(
     assembly: &BucketAssembly<'_>,
     dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
@@ -550,6 +556,7 @@ pub fn bucketed_search_implementations(
             &serialized,
             &program,
             &data,
+            &representative,
             options,
             allow_override.clone(),
         )?;
@@ -646,12 +653,12 @@ fn bucket_renders(
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
 
-        // Representative render: pinned via tight bounds.
-        let mut pin_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
-        for (dim, value) in &representative {
-            pin_seeds.insert(*dim, (*value as u64, *value as u64));
-        }
-        renders.push((ranges, representative, assemble(&pin_seeds)));
+        // Extract from the range-valid fixpoint (matching CUDA Lite): the
+        // bucket's dimensional seeds stay INTERVALS, so the winning plan's
+        // spans and extents remain expressions (`Var("a")`) and one plan
+        // serves the whole bucket. Pinning here would collapse them to the
+        // representative's literals and reintroduce the static-plan limit.
+        renders.push((ranges, representative, validation));
     }
     Ok(renders)
 }
@@ -692,14 +699,23 @@ pub fn harness_search_options() -> CompileOptions {
 
 /// Search the saturated e-graph for the fastest executable plan on the
 /// reference runtime, profiling with the given caller data.
-/// Deterministic for a fixed seed.
+/// Deterministic for a fixed seed. No dimension assignment: literal-only
+/// plans evaluate with an empty map (see
+/// [`search_implementations_with_ops`] for the bucketed/symbolic path).
 pub fn search_implementations(
     egraph: &egraph_serialize::EGraph,
     program: &LogicalProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     options: &CompileOptions,
 ) -> Result<SearchOutcome> {
-    search_implementations_with_ops(egraph, program, input_data, options, None)
+    search_implementations_with_ops(
+        egraph,
+        program,
+        input_data,
+        &luminal::shape::DynMap::default(),
+        options,
+        None,
+    )
 }
 
 #[cfg(test)]

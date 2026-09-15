@@ -27,7 +27,7 @@ use ops::ReductionOp;
 
 use crate::dtype::TorchDType;
 use crate::pt2_parser::{InputKind, ParsedPT2};
-use crate::pt2_schema::{DimSize, ExprValue, Node, NodeInput, TensorMeta};
+use crate::pt2_schema::{DimSize, Node, NodeInput, TensorMeta};
 
 /// One bound graph input, in export order.
 pub struct TranslatedInput {
@@ -37,7 +37,9 @@ pub struct TranslatedInput {
     pub kind: InputKind,
     pub tensor: NodeIndex,
     pub dtype: DType,
-    pub shape: Vec<usize>,
+    /// Symbolic dims: literal extents and recorder dim symbols. Resolve with
+    /// [`Translation::dims`] to recover the concrete shape.
+    pub shape: Vec<IntExpr>,
 }
 
 /// One graph output, in export order.
@@ -45,7 +47,8 @@ pub struct TranslatedOutput {
     pub graph_name: String,
     pub tensor: NodeIndex,
     pub dtype: DType,
-    pub shape: Vec<usize>,
+    /// Symbolic dims (see [`TranslatedInput::shape`]).
+    pub shape: Vec<IntExpr>,
     /// For a `user_input_mutation` output: the graph name of the input it
     /// writes into. These are writebacks, not returned tensors.
     pub mutation_target: Option<String>,
@@ -60,8 +63,8 @@ pub struct Translation {
     pub graph: Graph,
     pub inputs: Vec<TranslatedInput>,
     pub outputs: Vec<TranslatedOutput>,
-    /// Symbolic dim -> the concrete hint torch exported with it.
-    pub dims: HashMap<String, usize>,
+    /// Recorder dim symbol -> the concrete hint torch exported with it.
+    pub dims: HashMap<Symbol, usize>,
 }
 
 struct Translator<'a> {
@@ -77,7 +80,7 @@ struct Translator<'a> {
     /// PT2 symbol name -> recorder dim symbol (dynamic dims).
     symbols: HashMap<String, Symbol>,
     parsed: &'a ParsedPT2,
-    dims: HashMap<String, usize>,
+    dims: HashMap<Symbol, usize>,
 }
 
 /// Translate a parsed PT2 program into the recorder frontend.
@@ -118,7 +121,7 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             .with_context(|| format!("input {name} has no tensor metadata"))?
             .clone();
         let dtype = dtype_of(meta.dtype)?;
-        let shape = t.static_shape(&meta, &name)?;
+        let shape = t.boundary_shape(&meta, &name)?;
         let tensor = t.cx.named_tensor(&name, shape.as_slice(), dtype);
         t.values.insert(name.clone(), tensor);
         t.input_values.insert(name.clone(), tensor);
@@ -163,7 +166,7 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             .with_context(|| format!("output {name} has no tensor metadata"))?
             .clone();
         let dtype = dtype_of(meta.dtype)?;
-        let shape = t.static_shape(&meta, &name)?;
+        let shape = t.boundary_shape(&meta, &name)?;
         let value = *t
             .values
             .get(&name)
@@ -233,31 +236,26 @@ impl Translator<'_> {
             .ok_or_else(|| anyhow!("no tensor_values entry for {name}"))
     }
 
-    /// Resolve a tensor's dims to concrete sizes. Symbols use the hint torch
-    /// exported with them; a symbol without a hint refuses (dynamic shapes
-    /// are a later milestone).
-    fn static_shape(&mut self, meta: &TensorMeta, name: &str) -> Result<Vec<usize>> {
+    /// Resolve a tensor's dims to recorder expressions: literals stay literal
+    /// and symbols stay symbols. Every symbol's exported hint is recorded in
+    /// `self.dims`, so a caller can pin the graph (static execution) or drive
+    /// it dynamically from the bound values.
+    fn boundary_shape(&mut self, meta: &TensorMeta, name: &str) -> Result<Vec<IntExpr>> {
         let mut shape = Vec::with_capacity(meta.sizes.len());
         for size in &meta.sizes {
-            match size {
-                DimSize::Int(i) => {
-                    shape.push(usize::try_from(i.as_int).context("negative dim")?);
-                }
-                DimSize::Expr(expr) => {
-                    let symbol = symbol_of(&expr.as_expr)
-                        .ok_or_else(|| anyhow!("{name}: unreadable dim expression"))?;
-                    let hint = expr
-                        .as_expr
-                        .hint
-                        .as_ref()
-                        .and_then(|h| h.as_int())
-                        .ok_or_else(|| {
-                            anyhow!("{name}: dynamic dim {symbol:?} has no concrete hint")
-                        })?;
-                    self.dims.insert(symbol.clone(), usize::try_from(hint)?);
-                    shape.push(usize::try_from(hint)?);
+            let expr = self
+                .dim_size_to_expr(size)
+                .with_context(|| format!("{name}: cannot resolve a dimension expression"))?;
+            if let DimSize::Expr(value) = size
+                && let Some(hint) = value.as_expr.hint.as_ref().and_then(|h| h.as_int())
+            {
+                let hint = usize::try_from(hint).context("negative dim hint")?;
+                for symbol in expr.to_symbols() {
+                    self.dims.insert(symbol, hint);
+                    self.cx.set_dim(symbol, hint);
                 }
             }
+            shape.push(expr);
         }
         Ok(shape)
     }
@@ -329,9 +327,12 @@ impl Translator<'_> {
             .unwrap_or(&node.target);
 
         // Assertion nodes carry no dataflow; they never bind outputs.
+        // `sym_size` produces a scalar SymInt, not a tensor: its value is
+        // carried in `sym_int_values` and resolved where a shape argument
+        // needs it (`get_int_exprs_arg`), so it binds nothing here.
         if matches!(
             target,
-            "_assert_tensor_metadata.default" | "_assert_scalar.default"
+            "_assert_tensor_metadata.default" | "_assert_scalar.default" | "sym_size.int"
         ) {
             return Ok(());
         }
@@ -412,8 +413,9 @@ impl Translator<'_> {
             "t.default" => self.operand(&n[0])?.t(),
             "transpose.int" => {
                 let x = self.operand(&n[0])?;
-                let d0 = self.int_arg(&n[1])? as usize;
-                let d1 = self.int_arg(&n[2])? as usize;
+                let rank = x.rank();
+                let d0 = util::normalize_dim(self.int_arg(&n[1])?, rank);
+                let d1 = util::normalize_dim(self.int_arg(&n[2])?, rank);
                 x.transpose(d0, d1)
             }
             "permute.default" => {
@@ -827,7 +829,7 @@ impl Translator<'_> {
             .ok_or_else(|| anyhow!("in-place `{}` has no output name", node.target))?
             .to_string();
         let meta = self.tensor_meta(&output_name)?.clone();
-        let shape = self.static_shape(&meta, &output_name)?;
+        let shape = self.boundary_shape(&meta, &output_name)?;
         value.output_into(&target);
         self.sink_by_value.insert(value.id, self.sinks.len());
         self.sinks.push(TranslatedOutput {
@@ -940,18 +942,4 @@ fn normalize_axes(axes: &[i64], rank: usize) -> Result<Vec<usize>> {
                 .ok_or_else(|| anyhow!("axis {a} out of range for rank {rank}"))
         })
         .collect()
-}
-
-/// Pull the symbol name out of an `expr_str` like
-/// `Symbol('s77', positive=True, integer=True)`.
-fn symbol_of(expr: &ExprValue) -> Option<String> {
-    let s = &expr.expr_str;
-    let start = s.find("Symbol(")? + 7;
-    let rest = s.get(start..)?;
-    let quote = rest.chars().next()?;
-    if quote != '\'' && quote != '"' {
-        return None;
-    }
-    let rest = &rest[1..];
-    Some(rest[..rest.find(quote)?].to_string())
 }
