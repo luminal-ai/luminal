@@ -57,7 +57,7 @@ mod tests {
         let mut cx = Graph::new();
         let ids = cx.tensor(3, DType::Int);
         let weight = cx.tensor((3, 4), DType::F32);
-        let out = embedding(ids, weight).output();
+        let out = embedding(ids, weight);
         assert_eq!(out.dims(), vec![IntExpr::from(3), IntExpr::from(4)]);
 
         let ids_data = vec![1i32, 0, 2];
@@ -86,7 +86,7 @@ mod tests {
         let mut cx = Graph::new();
         let ids = cx.tensor((2, 3), DType::Int);
         let weight = cx.tensor((3, 4), DType::F32);
-        let out = embedding(ids, weight).output();
+        let out = embedding(ids, weight);
         assert_eq!(
             out.dims(),
             vec![IntExpr::from(2), IntExpr::from(3), IntExpr::from(4)]

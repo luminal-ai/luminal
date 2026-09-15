@@ -427,7 +427,7 @@ mod tests {
         let dispatched = routes.dispatch(input);
         let selected = routes.select(expert_weights);
         let routed = dispatched.unsqueeze(2).matmul(selected).squeeze(2);
-        let output = routes.combine(routed).output();
+        let output = routes.combine(routed);
 
         let score_values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 1.0];
         let id_values = vec![2, 0, 1, 2];
@@ -494,7 +494,7 @@ mod tests {
         let dispatched = routes.dispatch(input);
         let selected = routes.select(expert_weights);
         let routed = dispatched.unsqueeze(1).matmul(selected).squeeze(1);
-        let output = routes.combine(routed).output();
+        let output = routes.combine(routed);
 
         let token_values = vec![2, 0, 1, 2, 0];
         let expert_values = vec![1, 0, 1, 0, 1];
@@ -532,11 +532,8 @@ mod tests {
         let weights = cx.tensor((TOKENS, K), DType::F32);
         let routed = cx.tensor((TOKENS, K, WIDTH), DType::F32);
         let top_k = TopKRoutes::new(expert_ids, weights);
-        let structured = top_k.combine(routed).output();
-        let general = top_k
-            .into_routes()
-            .combine(routed.merge_dims(0, 1))
-            .output();
+        let structured = top_k.combine(routed);
+        let general = top_k.into_routes().combine(routed.merge_dims(0, 1));
 
         let runtime = luminal_reference::harness::run_reference(
             &cx,

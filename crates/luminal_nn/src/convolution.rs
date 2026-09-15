@@ -411,7 +411,7 @@ mod forward_tests {
         let x = cx.tensor((b, ci, h, w), DType::F32);
         let weight = cx.tensor((co, ci * k * k), DType::F32);
         let config = ConvNdConfig::new([k, k], [1, 1], [1, 1], [0, 0]);
-        let out = conv_nd(x, weight, None, &config).output();
+        let out = conv_nd(x, weight, None, &config);
         let rt = luminal_reference::harness::run_reference(
             &cx,
             &[
@@ -454,7 +454,7 @@ mod forward_tests {
         let weight = cx.tensor((2, 1), DType::F32);
         let bias = cx.tensor(2, DType::F32);
         let config = ConvNdConfig::new([1, 1], [1, 1], [1, 1], [0, 0]);
-        let output = conv_nd(input, weight, Some(bias), &config).output();
+        let output = conv_nd(input, weight, Some(bias), &config);
         let runtime = luminal_reference::harness::run_reference(
             &cx,
             &[
