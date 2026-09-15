@@ -1,14 +1,15 @@
 # Real-checkpoint validation
 
 These tools exercise the actual chat tokenizer, model adapter, checkpoint
-loader, GPU backend, sampler, and `Session`. They require local, immutable
-Hugging Face checkpoints and a GPU that fits the selected model in F32.
+loader, CUDA backend and bindings, and sampler, under the validator's own
+chunked prefill/decode loop. They require local, immutable Hugging Face
+checkpoints and a GPU that fits the selected model in F32.
 
 First generate reference data with PyTorch, Transformers, Accelerate, and
 Safetensors installed:
 
 ```sh
-python examples/llm_chat/validation/generate_reference.py \
+python examples/llm_chat_cuda/validation/generate_reference.py \
   --model qwen3 --checkpoint /path/to/Qwen3-0.6B --output /tmp/qwen-reference
 ```
 
@@ -21,11 +22,11 @@ agree with Transformers' cached generation before a fixture is accepted.
 Dependency versions and an optional checkpoint `REVISION` file are recorded in
 `suite.json`.
 
-Then compare the shared chat runner at multiple prefill chunk sizes:
+Then compare the chat runner at multiple prefill chunk sizes:
 
 ```sh
 for chunk in 1 4 8; do
-  cargo run --release -p llm_chat --features cuda_lite --example validate -- \
+  cargo run --release -p llm_chat_cuda --features device --example validate -- \
     --model qwen3 --checkpoint /path/to/Qwen3-0.6B \
     --suite /tmp/qwen-reference/suite.json --prefill-chunk "$chunk" \
     --report "/tmp/qwen-reference/cuda-chunk${chunk}.json"
@@ -33,9 +34,8 @@ done
 ```
 
 Use the same commands with `--model llama3`, `gemma3`, or `qwen3-moe` and the
-corresponding checkpoint. On a Mac, replace the Cargo feature with `metal`.
-The reference process exits before the runner starts, so they need not hold
-their models in GPU memory simultaneously.
+corresponding checkpoint. The reference process exits before the runner
+starts, so they need not hold their models in GPU memory simultaneously.
 
 The validator compares every execution's last-token logits, including prefill
 boundaries, decode, and consumed EOS tokens. It also checks the complete
@@ -53,7 +53,7 @@ For a sharded checkpoint, `--inspect` checks its configuration and tensor names
 without loading its weights:
 
 ```sh
-cargo run -p llm_chat --features cuda_lite --example validate -- \
+cargo run -p llm_chat_cuda --features device --example validate -- \
   --model gemma3 --checkpoint /path/to/gemma-3-4b-it --inspect
 ```
 

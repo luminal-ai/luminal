@@ -1,20 +1,21 @@
 [package]
-name = "llm_chat"
+name = "llm_chat_cuda"
 version = "0.1.0"
 edition.workspace = true
 publish = false
 
 [features]
 default = []
-cuda_lite = ["luminal_cuda_lite/device"]
-metal = ["dep:luminal_metal"]
+# Device execution, exactly as the old `cuda_lite` feature gated it: with
+# it off the crate still builds and plans everywhere, and `execute`
+# refuses.
+device = ["luminal_cuda_lite/device"]
 
 [dependencies]
 luminal = { path = "../.." }
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
 luminal_nn = { path = "../../crates/luminal_nn" }
 model_zoo = { path = "../../crates/model_zoo" }
-luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite", optional = true }
-luminal_metal = { path = "../../crates/luminal_metal", optional = true }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 half = "2"
@@ -28,5 +29,5 @@ serde_json = "1"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
-tempfile = "3"
 luminal_reference = { path = "../../crates/luminal_reference" }
+tempfile = "3"
