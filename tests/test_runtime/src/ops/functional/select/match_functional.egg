@@ -1,0 +1,25 @@
+; SelectFunctionalGeneric — boolean select over two value branches.
+; The condition is Bool; the branches and the output share one dtype and
+; shape (enforced by the LogicalSelect estate), and the output layout must
+; be injective. No width gate: the result is one of the branches verbatim.
+(rule
+  (
+    (= ?cond_layout_tensor (LayoutTensorLit ?cond_logical ?cond_layout))
+    (= ?true_layout_tensor (LayoutTensorLit ?if_true_logical ?if_true_layout))
+    (= ?false_layout_tensor (LayoutTensorLit ?if_false_logical ?if_false_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_logical (LogicalSelect ?cond_logical ?if_true_logical ?if_false_logical))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?cond_layout_tensor
+          (LayoutTensorCons ?true_layout_tensor
+            (LayoutTensorCons ?false_layout_tensor (LayoutTensorNil))))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpSelectFunctionalGeneric ?cond_layout_tensor ?true_layout_tensor ?false_layout_tensor ?out_layout))
+  )
+  :ruleset backend
+)

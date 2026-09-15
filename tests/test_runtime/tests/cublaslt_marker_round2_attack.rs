@@ -278,6 +278,90 @@ fn logical_of_lt(s: &EGraph, lt: &ClassId) -> Option<ClassId> {
     })
 }
 
+/// Logical classes of the D layout tensors of every RELU-decorated cuBLASLt
+/// enode (D descriptor at child 3, epilogue last).
+fn decorated_d_logicals(s: &EGraph) -> BTreeSet<ClassId> {
+    let class_of =
+        |id: &luminal::prelude::egraph_serialize::NodeId| s.nodes.get(id).map(|c| c.eclass.clone());
+    let mut out = BTreeSet::new();
+    for n in s
+        .nodes
+        .values()
+        .filter(|n| n.op.starts_with("LayoutTensorOpCublasLt"))
+    {
+        let Some(ep) = n.children.last().and_then(class_of) else {
+            continue;
+        };
+        if !s
+            .nodes
+            .values()
+            .any(|m| m.eclass == ep && m.op == "CublasLtEpilogueRelu")
+        {
+            continue;
+        }
+        let Some(desc_d) = n.children.get(3).and_then(class_of) else {
+            continue;
+        };
+        let d_lt = s
+            .nodes
+            .values()
+            .find(|m| m.eclass == desc_d && m.op == "CublasLtOutputDDescriptor")
+            .and_then(|m| m.children.get(1))
+            .and_then(class_of);
+        if let Some(l) = d_lt.and_then(|lt| logical_of_lt(s, &lt)) {
+            out.insert(l);
+        }
+    }
+    out
+}
+
+/// Logical classes of the program's boundary values (the BufferOutputLit
+/// list's layout tensors).
+fn boundary_logicals(s: &EGraph) -> BTreeSet<ClassId> {
+    let class_of =
+        |id: &luminal::prelude::egraph_serialize::NodeId| s.nodes.get(id).map(|c| c.eclass.clone());
+    let find =
+        |class: &ClassId, op: &str| s.nodes.values().find(|m| m.eclass == *class && m.op == op);
+    let mut out = BTreeSet::new();
+    for root in s.nodes.values().filter(|n| n.op == "BufferOutputLit") {
+        let mut cur = root.children.first().and_then(class_of);
+        let mut guard = 0;
+        while let Some(list) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cons) = find(&list, "BufferTensorCons") else {
+                break;
+            };
+            let lt = cons
+                .children
+                .first()
+                .and_then(class_of)
+                .and_then(|bt| find(&bt, "BufferTensorLit"))
+                .and_then(|m| m.children.first())
+                .and_then(class_of);
+            if let Some(l) = lt.and_then(|lt| logical_of_lt(s, &lt)) {
+                out.insert(l);
+            }
+            cur = cons.children.get(1).and_then(class_of);
+        }
+    }
+    out
+}
+
+/// Does `class` hold a `LogicalIndexMapApply` whose source is `src`?
+fn class_applies(s: &EGraph, class: &ClassId, src: &ClassId) -> bool {
+    s.nodes.values().any(|n| {
+        n.eclass == *class
+            && n.op == "LogicalIndexMapApply"
+            && n.children
+                .first()
+                .and_then(|id| s.nodes.get(id))
+                .is_some_and(|c| c.eclass == *src)
+    })
+}
+
 /// THE STRUCTURAL INVARIANT the parser's slot discipline rests on: the
 /// dataflow Lit lives in the CLASS, so a class that holds two DIFFERENT
 /// Lit spellings would make `op.inputs` ambiguous — the a/b/c/bias slots
@@ -2083,18 +2167,25 @@ fn attack_d2_double_relu() {
     assert_candidates_sound(&s, "d2");
     assert_one_lit_per_op_class(&s, "d2");
 
-    let (elected, labels) = flavored_cublaslt(&text, false, false, true);
-    let lt: Vec<_> = elected
-        .iter()
-        .filter(|e| e.label.starts_with("CublasLt"))
-        .collect();
+    // Election-free: the boundary value is the OUTER relu. A decoration
+    // unions its D back into the recorder-frame class as a transpose view,
+    // so an undecorated class holds no apply of any decorated D — the
+    // epilogue is a single flag and fires once per op.
+    let outer = boundary_logicals(&s);
+    assert!(!outer.is_empty(), "the boundary value is the outer relu");
+    let decorated = decorated_d_logicals(&s);
+    assert!(!decorated.is_empty(), "the inner relu decorates some D");
+    for d in &decorated {
+        for o in &outer {
+            assert!(
+                !class_applies(&s, o, d),
+                "the outer relu must NOT be decorated (Relu on Relu)"
+            );
+        }
+    }
+
+    let (_elected, labels) = flavored_cublaslt(&text, false, false, true);
     println!("  labels={labels:?}");
-    assert_eq!(
-        lt.len(),
-        1,
-        "ONE fused kernel — the epilogue is a single flag"
-    );
-    assert_eq!(lt[0].spec().epilogue, CuEpilogue::Relu);
     let residual = labels.iter().filter(|l| !l.starts_with("CublasLt")).count();
     assert!(
         residual > 0,
@@ -2166,7 +2257,7 @@ fn attack_d3_mm_plus_mm_two_sites() {
 
 // ===========================================================================
 // GROUP E — CONSTANT / RELU SPELLING DRIFT
-// The relu dance is inlined in FOUR places (round 7 E1/E2 deleted the
+// The relu spelling is inlined in FOUR places (round 7 E1/E2 deleted the
 // recognizer relations). Drift between the copies, or a premise that is not
 // load-bearing, is the hazard.
 // ===========================================================================
@@ -2207,36 +2298,33 @@ fn attack_e1_runtime_zeros_maximum_not_fused() {
     );
 }
 
-/// e2: a hand-seeded relu dance that is structurally IDENTICAL to the
-/// recognized one except that ONE of the five zero fills is a runtime
-/// tensor. Positive control first (the untouched dance fuses), then the
-/// respelled one must NOT — proving each fill premise is load-bearing
-/// rather than incidental.
+/// e2: a hand-seeded relu that is structurally IDENTICAL to the recognized
+/// select spelling except that the maximum's zero fill is a runtime tensor
+/// (what `maximum(zeros)` records). Positive control first (the canonical
+/// spelling fuses), then the respelled one must NOT — proving the fill
+/// premise is load-bearing rather than incidental.
 #[test]
 fn attack_e2_respelled_relu_stays_decomposed() {
-    fn dance(first_compare_rhs: &str, zeros_decl: &str) -> String {
+    fn dance(fill: &str, zeros_decl: &str) -> String {
         let extra = format!(
             r#"{zeros_decl}
 (let zconst (LogicalConstant 0.0))
 (let scalar_shape (ShapeLit (IntExprNil)))
 (let scalar_map (IndexMapLit (IntExprNil) scalar_shape))
 (let zfill (LogicalIndexMapApply zconst scalar_map out_shape))
-(let nconst (LogicalConstant -1.0))
-(let nfill (LogicalIndexMapApply nconst scalar_map out_shape))
-(let oconst (LogicalConstant 1.0))
-(let ofill (LogicalIndexMapApply oconst scalar_map out_shape))
-(let lt0 (LogicalLessThan out_logical {first_compare_rhs}))
-(let tc (LogicalCast lt0 (F32)))
-(let term1 (LogicalMul tc zfill))
-(let nm (LogicalMul tc nfill))
-(let p (LogicalAdd nm ofill))
-(let sel1 (LogicalCast (LogicalLessThan zfill p) (F32)))
-(let sel2 (LogicalCast (LogicalLessThan p zfill) (F32)))
-(let sum2 (LogicalAdd sel1 sel2))
-(let bsel (LogicalLessThan zfill sum2))
-(let u (LogicalCast bsel (F32)))
-(let term2 (LogicalMul u out_logical))
-(let relu_logical (LogicalAdd term1 term2))
+(let nanconst (LogicalConstant NaN))
+(let nanfill (LogicalIndexMapApply nanconst scalar_map out_shape))
+(let picked (LogicalSelect (LogicalLessThan out_logical {fill}) {fill} out_logical))
+(let yy (LogicalCast (LogicalLessThan out_logical out_logical) (F32)))
+(let ysum (LogicalAdd yy yy))
+(let yind (LogicalAdd (LogicalCast (LogicalLessThan zfill ysum) (F32)) (LogicalCast (LogicalLessThan ysum zfill) (F32))))
+(let ynan (LogicalLessThan zfill yind))
+(let inner (LogicalSelect ynan nanfill picked))
+(let zz (LogicalCast (LogicalLessThan {fill} {fill}) (F32)))
+(let zsum (LogicalAdd zz zz))
+(let zind (LogicalAdd (LogicalCast (LogicalLessThan zfill zsum) (F32)) (LogicalCast (LogicalLessThan zsum zfill) (F32))))
+(let znan (LogicalLessThan zfill zind))
+(let relu_logical (LogicalSelect znan nanfill inner))
 (let relu_lt (LayoutTensorLit relu_logical out_layout))
 (let relu_buffer_id (BufferLit 20))
 (set (buffer-access-of relu_buffer_id) (ReadWrite))
@@ -2252,14 +2340,14 @@ fn attack_e2_respelled_relu_stays_decomposed() {
         .text()
     }
 
-    // POSITIVE CONTROL — the canonical dance.
+    // POSITIVE CONTROL — the canonical spelling.
     let good = dance("zfill", "");
     let s_good = test_runtime::serialize_fixture(&good);
     let good_relu = count_op(&s_good, "CublasLtEpilogueRelu");
-    println!("e2 control (canonical dance): EpilogueRelu = {good_relu}");
+    println!("e2 control (canonical spelling): EpilogueRelu = {good_relu}");
     assert!(
         good_relu >= 1,
-        "the hand-seeded canonical dance MUST fuse (otherwise the negative \
+        "the hand-seeded canonical spelling MUST fuse (otherwise the negative \
          result below proves nothing)"
     );
 
@@ -2285,7 +2373,7 @@ fn attack_e2_respelled_relu_stays_decomposed() {
 }
 
 /// e3 (charter §5, the four-copy agreement): a relu decoration must reach
-/// ALL FOUR contracts. Round 7 inlined the dance premises into four
+/// ALL FOUR contracts. Round 7 inlined the relu premises into four
 /// separate rules; drift between the copies would show as one contract
 /// refusing what its siblings accept.
 ///

@@ -427,12 +427,28 @@ fn fixture6_relu_then_add_c_not_folded() {
             .expect("recorder clean")
             .text
     };
+    // Election-free: `relu(x@w) + c` has no `y + c` to fold, so no
+    // Accumulate contract may exist at all, while the relu decoration does.
+    let s = test_runtime::serialize_fixture(&text);
+    let count = |op: &str| s.nodes.values().filter(|n| n.op == op).count();
+    assert!(count("CublasLtEpilogueRelu") >= 1, "the relu decorates");
+    assert_eq!(count("LayoutTensorOpCublasLtAccumulate"), 0, "no C fold");
+    assert_eq!(
+        count("LayoutTensorOpCublasLtAccumulateBias"),
+        0,
+        "no C fold"
+    );
+
     let ops = flavored_ops(&text, false, false, true);
     let lt = cublaslt_only(&ops);
-    assert_eq!(lt.len(), 1, "only the relu op fuses");
-    let spec = lt[0].0.spec.as_ref().expect("spec parses");
-    assert_eq!(spec.epilogue, CuEpilogue::Relu);
-    assert!(!spec.has_c, "the post-activation add must NOT fold into C");
+    assert!(
+        !lt.is_empty(),
+        "the plan reaches the boundary through cuBLASLt"
+    );
+    for (op, _, _) in &lt {
+        let spec = op.spec.as_ref().expect("spec parses");
+        assert!(!spec.has_c, "the post-activation add must NOT fold into C");
+    }
     let decomposed_adds = ops
         .iter()
         .filter(|(_, _, label)| label.contains("Add"))

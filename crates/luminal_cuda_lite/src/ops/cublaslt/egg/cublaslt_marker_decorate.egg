@@ -14,7 +14,7 @@
 ; THE BRIDGE (round 10): assembled ops now live on the SIBLING site minted
 ; by the transpose-sandwich rewrite — the claimed output ?y is the rank-2
 ; transpose VIEW of the recorder-frame value ?y_outer, and the decoration
-; dances (Add-C, bias broadcast, the relu dance) are recorded on ?y_outer.
+; spellings (Add-C, bias broadcast, the relu select) are recorded on ?y_outer.
 ; Each decorator therefore:
 ;   1. opens the view: (= ?y (LogicalIndexMapApply ?y_outer ?tmap ?ishape))
 ;      with ?tmap pinned to the rank-2 transpose SPELLING — a structural
@@ -24,7 +24,8 @@
 ;      (int-subst-of ?d_expr ?tmap) ...)) — the round-9 tie discipline,
 ;      which kills the wrong-parent binding: a foreign apply spelling of ?y
 ;      cannot satisfy the tie);
-;   3. matches the dance on ?y_outer exactly as rounds 4-7 wrote it;
+;   3. matches the recorder spelling on ?y_outer literally (Add-C, bias
+;      broadcast, and relu as its section describes);
 ;   4. mints the decorated claim as the transpose view of the dance output
 ;      (apply ?dance_out ?tmap ?ishape — same map term: the dance output
 ;      shares ?y_outer's shape), rides it on the SAME inner layout class,
@@ -45,9 +46,9 @@
 ; bias vector is rank-1 [n] indexed by the call's m' = n rows of D' — the
 ; same vector in either frame.
 ;
-; ROUND 7 (E1+E2) relu inlining is unchanged: the dance premises are the
-; ONE-LEVEL canonical fill forms, inlined per constructor, no recognizer
-; relations.
+; The relu premises are inlined per constructor (no recognizer relations)
+; and use ONE-LEVEL canonical fill forms; the relu section states the
+; spelling they match.
 ; ============================================================================
 ; --- C-fold: CublasLt -> CublasLtAccumulate -------------------------------
 (rule
@@ -279,9 +280,13 @@
   :ruleset backend
 )
 ; --- relu: epilogue field rewrite in place, one rule per constructor ------
-; The dance is matched in the RECORDER frame (on ?y_outer); the decorated
-; claim is the transpose view of the dance output. Round-7 one-level
-; canonical fill forms unchanged.
+; relu is matched in the RECORDER frame (on ?y_outer) as the frontend spells
+; it: select(0 != 0, NaN, select(y != y, NaN, select(y < 0, 0, y))), where
+; a != b is the Bool projection 0 < (cast(0 < s) + cast(s < 0)) of
+; s = cast(a < b) + cast(b < a). The two outer selects are the frontend's
+; NaN guards; as spelled they are vacuous (x < x is false for every x), so
+; the matched value is select(y < 0, 0, y). The decorated claim is the
+; transpose view of the relu output. One-level canonical fill forms.
 (rule
   (
     (= ?op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b ?desc_d
@@ -298,25 +303,26 @@
     (= ?d_layout (BitOffsetExpressionLayoutLit ?d_expr ?d_shape ?d_bits))
     (= ?composed_d (int-subst-of ?d_expr ?tmap))
     (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
-    (= ?t (LogicalLessThan ?y_outer ?z_lt))
-    (= ?z_lt (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
-    (= ?tc (LogicalCast ?t (F32)))
-    (= ?term1 (LogicalMul ?tc ?z_t1))
-    (= ?z_t1 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm2 ?zt2))
-    (= ?nm (LogicalMul ?tc ?neg_fill))
-    (= ?neg_fill (LogicalIndexMapApply (LogicalConstant -1.0) ?nm1 ?nt1))
-    (= ?p (LogicalAdd ?nm ?one_fill))
-    (= ?one_fill (LogicalIndexMapApply (LogicalConstant 1.0) ?om1 ?ot1))
-    (= ?s1 (LogicalCast (LogicalLessThan ?z_s1 ?p) (F32)))
-    (= ?z_s1 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm3 ?zt3))
-    (= ?s2 (LogicalCast (LogicalLessThan ?p ?z_s2) (F32)))
-    (= ?z_s2 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm4 ?zt4))
-    (= ?sum (LogicalAdd ?s1 ?s2))
-    (= ?bsel (LogicalLessThan ?z_b ?sum))
-    (= ?z_b (LogicalIndexMapApply (LogicalConstant 0.0) ?zm5 ?zt5))
-    (= ?u (LogicalCast ?bsel (F32)))
-    (= ?term2 (LogicalMul ?u ?y_outer))
-    (= ?relu (LogicalAdd ?term1 ?term2))
+    (= ?z (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
+    (= ?picked (LogicalSelect (LogicalLessThan ?y_outer ?z) ?z ?y_outer))
+    (= ?yy (LogicalCast (LogicalLessThan ?y_outer ?y_outer) (F32)))
+    (= ?ysum (LogicalAdd ?yy ?yy))
+    (= ?z2 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm2 ?zt2))
+    (= ?yind (LogicalAdd (LogicalCast (LogicalLessThan ?z2 ?ysum) (F32))
+        (LogicalCast (LogicalLessThan ?ysum ?z2) (F32))))
+    (= ?z3 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm3 ?zt3))
+    (= ?ynan (LogicalLessThan ?z3 ?yind))
+    (= ?nan1 (LogicalIndexMapApply (LogicalConstant NaN) ?nm1 ?nt1))
+    (= ?yguarded (LogicalSelect ?ynan ?nan1 ?picked))
+    (= ?zz (LogicalCast (LogicalLessThan ?z ?z) (F32)))
+    (= ?zsum (LogicalAdd ?zz ?zz))
+    (= ?z4 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm4 ?zt4))
+    (= ?zind (LogicalAdd (LogicalCast (LogicalLessThan ?z4 ?zsum) (F32))
+        (LogicalCast (LogicalLessThan ?zsum ?z4) (F32))))
+    (= ?z5 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm5 ?zt5))
+    (= ?znan (LogicalLessThan ?z5 ?zind))
+    (= ?nan2 (LogicalIndexMapApply (LogicalConstant NaN) ?nm2 ?nt2))
+    (= ?relu (LogicalSelect ?znan ?nan2 ?yguarded))
     (= ?relu_outer_lt (LayoutTensorLit ?relu ?d_layout))
     (= (injectivity-of ?relu_outer_lt) (Injective))
   )
@@ -353,25 +359,26 @@
     (= ?d_layout (BitOffsetExpressionLayoutLit ?d_expr ?d_shape ?d_bits))
     (= ?composed_d (int-subst-of ?d_expr ?tmap))
     (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
-    (= ?t (LogicalLessThan ?y_outer ?z_lt))
-    (= ?z_lt (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
-    (= ?tc (LogicalCast ?t (F32)))
-    (= ?term1 (LogicalMul ?tc ?z_t1))
-    (= ?z_t1 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm2 ?zt2))
-    (= ?nm (LogicalMul ?tc ?neg_fill))
-    (= ?neg_fill (LogicalIndexMapApply (LogicalConstant -1.0) ?nm1 ?nt1))
-    (= ?p (LogicalAdd ?nm ?one_fill))
-    (= ?one_fill (LogicalIndexMapApply (LogicalConstant 1.0) ?om1 ?ot1))
-    (= ?s1 (LogicalCast (LogicalLessThan ?z_s1 ?p) (F32)))
-    (= ?z_s1 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm3 ?zt3))
-    (= ?s2 (LogicalCast (LogicalLessThan ?p ?z_s2) (F32)))
-    (= ?z_s2 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm4 ?zt4))
-    (= ?sum (LogicalAdd ?s1 ?s2))
-    (= ?bsel (LogicalLessThan ?z_b ?sum))
-    (= ?z_b (LogicalIndexMapApply (LogicalConstant 0.0) ?zm5 ?zt5))
-    (= ?u (LogicalCast ?bsel (F32)))
-    (= ?term2 (LogicalMul ?u ?y_outer))
-    (= ?relu (LogicalAdd ?term1 ?term2))
+    (= ?z (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
+    (= ?picked (LogicalSelect (LogicalLessThan ?y_outer ?z) ?z ?y_outer))
+    (= ?yy (LogicalCast (LogicalLessThan ?y_outer ?y_outer) (F32)))
+    (= ?ysum (LogicalAdd ?yy ?yy))
+    (= ?z2 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm2 ?zt2))
+    (= ?yind (LogicalAdd (LogicalCast (LogicalLessThan ?z2 ?ysum) (F32))
+        (LogicalCast (LogicalLessThan ?ysum ?z2) (F32))))
+    (= ?z3 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm3 ?zt3))
+    (= ?ynan (LogicalLessThan ?z3 ?yind))
+    (= ?nan1 (LogicalIndexMapApply (LogicalConstant NaN) ?nm1 ?nt1))
+    (= ?yguarded (LogicalSelect ?ynan ?nan1 ?picked))
+    (= ?zz (LogicalCast (LogicalLessThan ?z ?z) (F32)))
+    (= ?zsum (LogicalAdd ?zz ?zz))
+    (= ?z4 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm4 ?zt4))
+    (= ?zind (LogicalAdd (LogicalCast (LogicalLessThan ?z4 ?zsum) (F32))
+        (LogicalCast (LogicalLessThan ?zsum ?z4) (F32))))
+    (= ?z5 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm5 ?zt5))
+    (= ?znan (LogicalLessThan ?z5 ?zind))
+    (= ?nan2 (LogicalIndexMapApply (LogicalConstant NaN) ?nm2 ?nt2))
+    (= ?relu (LogicalSelect ?znan ?nan2 ?yguarded))
     (= ?relu_outer_lt (LayoutTensorLit ?relu ?d_layout))
     (= (injectivity-of ?relu_outer_lt) (Injective))
   )
@@ -408,25 +415,26 @@
     (= ?d_layout (BitOffsetExpressionLayoutLit ?d_expr ?d_shape ?d_bits))
     (= ?composed_d (int-subst-of ?d_expr ?tmap))
     (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
-    (= ?t (LogicalLessThan ?y_outer ?z_lt))
-    (= ?z_lt (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
-    (= ?tc (LogicalCast ?t (F32)))
-    (= ?term1 (LogicalMul ?tc ?z_t1))
-    (= ?z_t1 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm2 ?zt2))
-    (= ?nm (LogicalMul ?tc ?neg_fill))
-    (= ?neg_fill (LogicalIndexMapApply (LogicalConstant -1.0) ?nm1 ?nt1))
-    (= ?p (LogicalAdd ?nm ?one_fill))
-    (= ?one_fill (LogicalIndexMapApply (LogicalConstant 1.0) ?om1 ?ot1))
-    (= ?s1 (LogicalCast (LogicalLessThan ?z_s1 ?p) (F32)))
-    (= ?z_s1 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm3 ?zt3))
-    (= ?s2 (LogicalCast (LogicalLessThan ?p ?z_s2) (F32)))
-    (= ?z_s2 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm4 ?zt4))
-    (= ?sum (LogicalAdd ?s1 ?s2))
-    (= ?bsel (LogicalLessThan ?z_b ?sum))
-    (= ?z_b (LogicalIndexMapApply (LogicalConstant 0.0) ?zm5 ?zt5))
-    (= ?u (LogicalCast ?bsel (F32)))
-    (= ?term2 (LogicalMul ?u ?y_outer))
-    (= ?relu (LogicalAdd ?term1 ?term2))
+    (= ?z (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
+    (= ?picked (LogicalSelect (LogicalLessThan ?y_outer ?z) ?z ?y_outer))
+    (= ?yy (LogicalCast (LogicalLessThan ?y_outer ?y_outer) (F32)))
+    (= ?ysum (LogicalAdd ?yy ?yy))
+    (= ?z2 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm2 ?zt2))
+    (= ?yind (LogicalAdd (LogicalCast (LogicalLessThan ?z2 ?ysum) (F32))
+        (LogicalCast (LogicalLessThan ?ysum ?z2) (F32))))
+    (= ?z3 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm3 ?zt3))
+    (= ?ynan (LogicalLessThan ?z3 ?yind))
+    (= ?nan1 (LogicalIndexMapApply (LogicalConstant NaN) ?nm1 ?nt1))
+    (= ?yguarded (LogicalSelect ?ynan ?nan1 ?picked))
+    (= ?zz (LogicalCast (LogicalLessThan ?z ?z) (F32)))
+    (= ?zsum (LogicalAdd ?zz ?zz))
+    (= ?z4 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm4 ?zt4))
+    (= ?zind (LogicalAdd (LogicalCast (LogicalLessThan ?z4 ?zsum) (F32))
+        (LogicalCast (LogicalLessThan ?zsum ?z4) (F32))))
+    (= ?z5 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm5 ?zt5))
+    (= ?znan (LogicalLessThan ?z5 ?zind))
+    (= ?nan2 (LogicalIndexMapApply (LogicalConstant NaN) ?nm2 ?nt2))
+    (= ?relu (LogicalSelect ?znan ?nan2 ?yguarded))
     (= ?relu_outer_lt (LayoutTensorLit ?relu ?d_layout))
     (= (injectivity-of ?relu_outer_lt) (Injective))
   )
@@ -463,25 +471,26 @@
     (= ?d_layout (BitOffsetExpressionLayoutLit ?d_expr ?d_shape ?d_bits))
     (= ?composed_d (int-subst-of ?d_expr ?tmap))
     (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
-    (= ?t (LogicalLessThan ?y_outer ?z_lt))
-    (= ?z_lt (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
-    (= ?tc (LogicalCast ?t (F32)))
-    (= ?term1 (LogicalMul ?tc ?z_t1))
-    (= ?z_t1 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm2 ?zt2))
-    (= ?nm (LogicalMul ?tc ?neg_fill))
-    (= ?neg_fill (LogicalIndexMapApply (LogicalConstant -1.0) ?nm1 ?nt1))
-    (= ?p (LogicalAdd ?nm ?one_fill))
-    (= ?one_fill (LogicalIndexMapApply (LogicalConstant 1.0) ?om1 ?ot1))
-    (= ?s1 (LogicalCast (LogicalLessThan ?z_s1 ?p) (F32)))
-    (= ?z_s1 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm3 ?zt3))
-    (= ?s2 (LogicalCast (LogicalLessThan ?p ?z_s2) (F32)))
-    (= ?z_s2 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm4 ?zt4))
-    (= ?sum (LogicalAdd ?s1 ?s2))
-    (= ?bsel (LogicalLessThan ?z_b ?sum))
-    (= ?z_b (LogicalIndexMapApply (LogicalConstant 0.0) ?zm5 ?zt5))
-    (= ?u (LogicalCast ?bsel (F32)))
-    (= ?term2 (LogicalMul ?u ?y_outer))
-    (= ?relu (LogicalAdd ?term1 ?term2))
+    (= ?z (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
+    (= ?picked (LogicalSelect (LogicalLessThan ?y_outer ?z) ?z ?y_outer))
+    (= ?yy (LogicalCast (LogicalLessThan ?y_outer ?y_outer) (F32)))
+    (= ?ysum (LogicalAdd ?yy ?yy))
+    (= ?z2 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm2 ?zt2))
+    (= ?yind (LogicalAdd (LogicalCast (LogicalLessThan ?z2 ?ysum) (F32))
+        (LogicalCast (LogicalLessThan ?ysum ?z2) (F32))))
+    (= ?z3 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm3 ?zt3))
+    (= ?ynan (LogicalLessThan ?z3 ?yind))
+    (= ?nan1 (LogicalIndexMapApply (LogicalConstant NaN) ?nm1 ?nt1))
+    (= ?yguarded (LogicalSelect ?ynan ?nan1 ?picked))
+    (= ?zz (LogicalCast (LogicalLessThan ?z ?z) (F32)))
+    (= ?zsum (LogicalAdd ?zz ?zz))
+    (= ?z4 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm4 ?zt4))
+    (= ?zind (LogicalAdd (LogicalCast (LogicalLessThan ?z4 ?zsum) (F32))
+        (LogicalCast (LogicalLessThan ?zsum ?z4) (F32))))
+    (= ?z5 (LogicalIndexMapApply (LogicalConstant 0.0) ?zm5 ?zt5))
+    (= ?znan (LogicalLessThan ?z5 ?zind))
+    (= ?nan2 (LogicalIndexMapApply (LogicalConstant NaN) ?nm2 ?nt2))
+    (= ?relu (LogicalSelect ?znan ?nan2 ?yguarded))
     (= ?relu_outer_lt (LayoutTensorLit ?relu ?d_layout))
     (= (injectivity-of ?relu_outer_lt) (Injective))
   )

@@ -61,7 +61,7 @@ use std::path::PathBuf;
 use luminal::layout_ir::ExtractedGraph;
 use luminal::layout_ir::OpMatcher;
 
-/// THE TestRuntime vocabulary, every op entry owned by this crate: 22
+/// THE TestRuntime vocabulary, every op entry owned by this crate: 23
 /// forked functional ops, the metadata view op, the fused add+mul pair,
 /// and the 12 mutating forms — plus the cuBLASLt markers, which stay
 /// borrowed from their executing runtime (see [`cublaslt_marker`]).
