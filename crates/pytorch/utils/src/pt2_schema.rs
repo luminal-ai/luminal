@@ -415,14 +415,18 @@ pub struct Signature {
     pub output_specs: Vec<OutputSpec>,
 }
 
-/// An output spec — tagged enum via JSON key. Only mutations are modeled;
-/// user outputs (and anything else) fall through to `Other`.
+/// An output spec — tagged enum via JSON key. Both mutation kinds are
+/// modeled; user outputs (and anything else) fall through to `Other`.
 /// `{"user_input_mutation": {"arg": {...}, "user_input_name": "cache"}}`
+/// `{"buffer_mutation": {"arg": {...}, "buffer_name": "cache"}}`
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum OutputSpec {
     UserInputMutation {
         user_input_mutation: UserInputMutation,
+    },
+    BufferMutation {
+        buffer_mutation: BufferMutation,
     },
     #[allow(dead_code)] // Serde catch-all for untagged enum
     Other(serde_json::Value),
@@ -431,6 +435,13 @@ pub enum OutputSpec {
 #[derive(Debug, Deserialize)]
 pub struct UserInputMutation {
     pub user_input_name: String,
+}
+
+/// A mutated module buffer, named by its FQN — the same name the matching
+/// `InputSpec::Buffer` carries, not the buffer's graph input name.
+#[derive(Debug, Deserialize)]
+pub struct BufferMutation {
+    pub buffer_name: String,
 }
 
 /// An input spec — tagged enum via JSON key.

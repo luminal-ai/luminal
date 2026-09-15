@@ -169,7 +169,7 @@ class CompiledModel:
         input_bindings: Sequence[Binding],
         output_bindings: Sequence[Binding],
         scalar_output_positions: Sequence[int] = (),
-        held_tensors: Sequence[torch.Tensor] = (),
+        held_tensors: Optional[dict[str, torch.Tensor]] = None,
     ):
         self._graph = graph
         self._ep = ep
@@ -177,8 +177,9 @@ class CompiledModel:
         self._input_names = [binding.name for binding in self._input_bindings]
         self._output_bindings = list(output_bindings)
         self._scalar_output_positions = frozenset(scalar_output_positions)
-        # Parameters and buffers whose device pointers the runtime holds.
-        self._held = list(held_tensors)
+        # Parameters and buffers, by graph input name, whose device pointers
+        # the runtime holds for its life; a buffer writeback lands in them.
+        self._held: dict[str, torch.Tensor] = dict(held_tensors or {})
         # Fixed once a plan set is searched; the per-execution arena sizes to it.
         self._arena_bytes = graph.arena_bytes()
         # The runtime always launches captured CUDA graphs, which the legacy
@@ -187,6 +188,21 @@ class CompiledModel:
         self._side_stream: Optional[torch.cuda.Stream] = None
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
+
+    def _mutation_destination(
+        self, mutation: str, inputs: Sequence[torch.Tensor]
+    ) -> torch.Tensor:
+        """The tensor a writeback landed in: the call's user input, or the
+        held parameter/buffer (PT2 ``buffer_mutation``) whose buffer the
+        sink shares."""
+        if mutation in self._input_names:
+            return inputs[self._input_names.index(mutation)]
+        if mutation in self._held:
+            return self._held[mutation]
+        raise RuntimeError(
+            f"luminal_cuda_lite: mutation target {mutation!r} is neither a user "
+            "input nor a held parameter/buffer"
+        )
 
     def __call__(self, *args: torch.Tensor) -> Any:
         # Under dynamic shapes Dynamo's wrapper passes the graph's symbolic
@@ -274,7 +290,7 @@ class CompiledModel:
             if mutation is not None:
                 # The write already landed in the caller's tensor.
                 if returned:
-                    results.append(inputs[self._input_names.index(mutation)])
+                    results.append(self._mutation_destination(mutation, inputs))
                 continue
             if returned:
                 tensor = out_tensors[index]
@@ -459,7 +475,7 @@ def luminal_cuda_lite(
     # Seed the symbolic dims from the declared shapes, address the parameter
     # and buffer pointers once (they outlive every call), and keep one
     # `Binding` per user input for the per-call check.
-    held: list[torch.Tensor] = []
+    held: dict[str, torch.Tensor] = {}
     input_bindings: list[Binding] = []
     for name, kind, buffer in zip(graph.input_names, graph.input_kinds, graph.input_buffers):
         if name not in tensors:
@@ -475,7 +491,7 @@ def luminal_cuda_lite(
             )
             continue
         graph.set_device_ptr(buffer, value.data_ptr(), buffer_nbytes(value))
-        held.append(value)
+        held[name] = value
 
     graph.search(search_iterations)
 

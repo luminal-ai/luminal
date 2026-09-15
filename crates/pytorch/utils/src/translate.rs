@@ -2,9 +2,10 @@
 //!
 //! SSA values stay SSA; the model says nothing about boundary storage.
 //! Which values leave, and through whose storage, is a table here: a
-//! functionalized in-place mutation (PT2 `user_input_mutation`) records
-//! the mutated input's graph name as the output's `mutation_target`, and
-//! the backend binds that output on the input's buffer.
+//! functionalized in-place mutation (PT2 `user_input_mutation` or
+//! `buffer_mutation`) records the mutated graph input's name as the
+//! output's `mutation_target`, and the backend binds that output on that
+//! input's buffer.
 //!
 //! Coverage is honest: an unknown ATen target bails with its name. This is
 //! the M4 translator re-attachment, rebuilt against the native recorder.
@@ -62,8 +63,9 @@ pub struct TranslatedOutput {
     pub dtype: DType,
     /// Symbolic dims (see [`TranslatedInput::shape`]).
     pub shape: Vec<IntExpr>,
-    /// For a `user_input_mutation` output: the graph name of the input it
-    /// writes into. These are writebacks, not returned tensors.
+    /// For a mutation output: the graph name of the graph input (user input
+    /// or module buffer) it writes into. These are writebacks, not returned
+    /// tensors.
     pub mutation_target: Option<String>,
     /// Whether this output is part of the caller's returned pytree. A
     /// mutation-only sink is `false`; a mutated input that the model also
@@ -132,6 +134,18 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             (name, kind)
         })
         .collect();
+    // A `buffer_mutation` output names its target by module FQN; the
+    // boundary binds by graph input name.
+    let buffer_graph_names: HashMap<String, String> = kinds
+        .values()
+        .filter_map(|kind| match kind {
+            InputKind::Buffer {
+                graph_name,
+                original_name,
+            } => Some((original_name.clone(), graph_name.clone())),
+            _ => None,
+        })
+        .collect();
 
     // 1. Inputs, in export order.
     let mut inputs = Vec::new();
@@ -190,12 +204,15 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
     }
 
     // 3. Outputs, in export order. Mutations write back into their target
-    //    input's storage instead of materializing a new boundary. An
-    //    in-place ATen node already registered its sink while dispatching;
-    //    a graph output that returns that value marks the sink as returned
-    //    rather than adding a second boundary.
+    //    input's storage instead of materializing a new boundary, and are
+    //    not returned. An in-place ATen node already registered its sink
+    //    while dispatching; a graph output that returns a mutated value
+    //    marks its writeback returned rather than adding a second boundary.
     let output_specs = &parsed.program.graph_module.signature.output_specs;
     let mut regular: Vec<TranslatedOutput> = Vec::new();
+    // Value id -> index in `regular`, so a user output that returns a
+    // mutated value marks THAT writeback returned instead of adding a second.
+    let mut regular_by_value: HashMap<NodeIndex, usize> = HashMap::new();
     for (position, tref) in parsed.program.graph_module.graph.outputs.iter().enumerate() {
         let name = tref
             .value_name()
@@ -225,7 +242,10 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         if let Some(&sink) = t.sink_by_value.get(&value.id) {
             if !matches!(
                 output_specs.get(position),
-                Some(crate::pt2_schema::OutputSpec::UserInputMutation { .. })
+                Some(
+                    crate::pt2_schema::OutputSpec::UserInputMutation { .. }
+                        | crate::pt2_schema::OutputSpec::BufferMutation { .. }
+                )
             ) {
                 t.sinks[sink].returned = true;
             }
@@ -235,25 +255,41 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         let mutation_target = match output_specs.get(position) {
             Some(crate::pt2_schema::OutputSpec::UserInputMutation {
                 user_input_mutation,
-            }) => {
-                let target_name = user_input_mutation.user_input_name.clone();
-                // A mutation writes an INPUT's storage: the target must be
-                // a graph input for the backend to have a buffer to bind
-                // this output on.
-                if !t.input_values.contains_key(&target_name) {
-                    bail!("mutation output {name} targets unknown input {target_name:?}");
-                }
-                Some(target_name)
+            }) => Some(user_input_mutation.user_input_name.clone()),
+            Some(crate::pt2_schema::OutputSpec::BufferMutation { buffer_mutation }) => {
+                let buffer_name = &buffer_mutation.buffer_name;
+                let Some(target_name) = buffer_graph_names.get(buffer_name) else {
+                    bail!("mutation output {name} targets unknown buffer {buffer_name:?}");
+                };
+                Some(target_name.clone())
             }
             _ => None,
         };
+        // A mutation writes an INPUT's storage: the target must be a graph
+        // input for the backend to have a buffer to bind this output on.
+        if let Some(target_name) = &mutation_target
+            && !t.input_values.contains_key(target_name)
+        {
+            bail!("mutation output {name} targets unknown input {target_name:?}");
+        }
+        // A writeback is not part of the caller's returned pytree.
+        let returned = mutation_target.is_none();
+        // torch emits mutation outputs before user outputs, so a user output
+        // for an already-written-back value IS that writeback.
+        if returned && let Some(&index) = regular_by_value.get(&value.id) {
+            regular[index].returned = true;
+            continue;
+        }
+        if !returned {
+            regular_by_value.insert(value.id, regular.len());
+        }
         regular.push(TranslatedOutput {
             graph_name: name,
             tensor: value.id,
             dtype,
             shape,
             mutation_target,
-            returned: true,
+            returned,
         });
     }
 
