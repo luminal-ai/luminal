@@ -108,7 +108,19 @@ def boundary_layout(name: str, tensor: torch.Tensor) -> BoundaryLayout:
     return Strided(strides)
 
 
-def _nbytes(tensor: torch.Tensor) -> int:
+def layout_spec(layout: BoundaryLayout) -> tuple[str, tuple[int, ...]]:
+    """The wire form the runtime declares a layout in: a tag and, for a
+    strided layout, its element strides."""
+    if isinstance(layout, RowMajor):
+        return "row_major", ()
+    if isinstance(layout, ColumnMajor):
+        return "column_major", ()
+    if isinstance(layout, Strided):
+        return "strided", layout.strides
+    raise UnsupportedBoundary(f"{layout!r} is not a boundary layout")
+
+
+def buffer_nbytes(tensor: torch.Tensor) -> int:
     """Bytes the bound buffer spans: the last reachable element plus one."""
     if tensor.numel() == 0:
         return 0

@@ -39,6 +39,24 @@ Status: **core implemented and GPU-verified**; the remaining items are listed in
   executor must resolve them through its external-pointer map. Metal passes
   `false`.
 
+### Bindings (current; supersedes the pointer sentences below)
+
+The boundary is declared once at load through `CudaBindings`: one buffer id per
+boundary tensor, one `BoundaryLayout`, and `Placement::External` for caller
+device memory. That replaces the global `set_external_outputs` flag and the
+tensor-/slot-keyed pointer setters sketched below — the Python layer addresses
+buffers, never tensors (`set_device_ptr(buffer, ptr, bytes)`), and a writeback
+and the input it mutates are one buffer carrying one pointer. Four statements
+further down are therefore stale. There is **no host-staging fallback**: a
+non-CUDA tensor, a storage offset, or a stride pattern the runtime does not
+model is refused by name, never copied or restaged. The call-time check is
+dtype **and** declared layout, not size alone (`boundary.check_binding`).
+Pointers **are** retained across calls — parameters and buffers are addressed
+once at compile time, user inputs and freshly allocated outputs once per
+execution, and `execute` refuses by name if a buffer has no address. And
+`retain_input` is gone: device residency is `Placement::Resident`, which this
+integration does not use, because the caller's arena base moves per call.
+
 Verified on a GH200 (CUDA 13.2, torch 2.10) with `torch.compile`: a `Linear`
 matches eager exactly across repeated calls with fresh inputs and per-call
 arena alloc/free, and dynamic batch sizes (1/2/3/7) match eager. A unit test

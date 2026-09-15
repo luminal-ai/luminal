@@ -2,20 +2,20 @@
 
 The backend self-exports the incoming GraphModule with ``torch.export``,
 saves the program to a temporary ``.pt2``, hands it to the Rust extension
-for translation and CUDA-lite search, and returns a callable that binds
+for translation, declares the boundary, and returns a callable that binds
 caller tensors per invocation.
 
 This is the GPU twin of the ``luminal_reference`` backend. The export
 preparation (dynamic-shape handling, scalar-output boxing, decomposition
 fallback, dead-op/guard cleanup) is backend-neutral, so it is imported
-from the reference package rather than duplicated; see DESIGN.md for the
-plan to lift it into a shared, backend-neutral module.
+from the reference package rather than duplicated.
 
-DEVICE MODEL (interim): the runtime currently owns its CUDA context,
-stream and arena, and stages every input H2D / output D2H. Caller
-tensors are therefore moved with ``.cpu()`` before staging and outputs
-are rebuilt on the caller's device. The zero-copy + PyTorch-caching-
-allocator design is in DESIGN.md.
+DEVICE MODEL: every boundary tensor is the caller's own device memory.
+Its layout is recognized once at compile time (``boundary.py``) and
+declared to the runtime, which binds it on one buffer id; each call hands
+that buffer the tensor's address. Nothing is copied to the host and no
+layout is reinterpreted — a tensor the runtime cannot bind is refused by
+name.
 """
 
 import concurrent.futures
@@ -26,7 +26,15 @@ from typing import Any, Optional, Sequence
 
 import torch
 
-from .boundary import RowMajor, UnsupportedBoundary, boundary_layout
+from .boundary import (
+    Binding,
+    RowMajor,
+    UnsupportedBoundary,
+    boundary_layout,
+    buffer_nbytes,
+    check_binding,
+    layout_spec,
+)
 from torch.export import Dim, export
 
 from luminal_reference.export_utils import (
@@ -54,14 +62,11 @@ _PT2_TO_TORCH = {
     13: torch.bfloat16,
 }
 
-
-def _tensor_bytes(tensor: torch.Tensor) -> bytes:
-    # Interim host-staged path: the runtime does its own H2D, so the caller's
-    # device tensor is copied to host here. The zero-copy path will hand the
-    # runtime `tensor.data_ptr()` instead (DESIGN.md).
-    tensor = tensor.detach().cpu().contiguous()
-    # Flatten first: a 0-dim tensor cannot be viewed as a wider dtype.
-    return tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+# The output specs this backend declares to the runtime. Anything else
+# (a buffer mutation, a gradient, a token) would reach the translator as an
+# ordinary returned tensor, because the PT2 signature reader models only
+# ``user_input_mutation``.
+_BOUND_OUTPUT_KINDS = frozenset({"USER_OUTPUT", "USER_INPUT_MUTATION"})
 
 
 def _torch_dtype(dtype_code: int) -> torch.dtype:
@@ -71,8 +76,75 @@ def _torch_dtype(dtype_code: int) -> torch.dtype:
     return dtype
 
 
-def _nbytes(tensor: torch.Tensor) -> int:
-    return tensor.numel() * tensor.element_size()
+def _boundary_tensors(ep: Any, export_inputs: Sequence[Any]) -> list[tuple[str, str, torch.Tensor]]:
+    """(graph input name, kind, tensor) for every graph input, in export
+    order. The names are the exported program's placeholder names, which
+    are what the translator reads back out of the saved ``.pt2``."""
+    rows: list[tuple[str, str, torch.Tensor]] = []
+    user_index = 0
+    for spec in ep.graph_signature.input_specs:
+        name = getattr(spec.arg, "name", None)
+        kind = spec.kind.name
+        if name is None:
+            raise UnsupportedBoundary(f"graph input {kind.lower()} {spec.target!r} is not a tensor")
+        if kind == "USER_INPUT":
+            if user_index >= len(export_inputs):
+                raise RuntimeError(
+                    f"export declared more user inputs than example_inputs: {name!r}"
+                )
+            value = export_inputs[user_index]
+            user_index += 1
+        elif kind in ("PARAMETER", "BUFFER"):
+            if spec.target not in ep.state_dict:
+                raise RuntimeError(
+                    f"{name}: {spec.target!r} is not in the exported state_dict"
+                )
+            value = ep.state_dict[spec.target]
+        elif kind == "CONSTANT_TENSOR":
+            if spec.target not in ep.constants:
+                raise RuntimeError(f"{name}: {spec.target!r} is not in the exported constants")
+            value = ep.constants[spec.target]
+        else:
+            raise UnsupportedBoundary(
+                f"{name}: graph inputs of kind {kind.lower()} are not bound by luminal_cuda_lite"
+            )
+        if not isinstance(value, torch.Tensor):
+            raise UnsupportedBoundary(f"{name}: graph input {spec.target!r} is not a tensor")
+        rows.append((name, kind, value))
+    if user_index != len(export_inputs):
+        raise RuntimeError(
+            f"export consumed {user_index} of {len(export_inputs)} example_inputs"
+        )
+    return rows
+
+
+def _refuse_unbound_outputs(ep: Any) -> None:
+    """Refuse an output the boundary has no statement for."""
+    for spec in ep.graph_signature.output_specs:
+        kind = spec.kind.name
+        if kind in _BOUND_OUTPUT_KINDS:
+            continue
+        name = getattr(spec.arg, "name", spec.target)
+        raise UnsupportedBoundary(
+            f"output {name!r}: {kind.lower()} outputs are not declared to the runtime"
+        )
+
+
+def _refuse_aliased_inputs(named: Sequence[tuple[str, torch.Tensor]]) -> None:
+    """Two boundary tensors on one storage are one buffer carrying two
+    declarations. That statement is not made yet, so overlapping user
+    inputs are refused by name rather than bound as separate buffers."""
+    spans = []
+    for name, tensor in named:
+        start = tensor.untyped_storage().data_ptr() + tensor.storage_offset() * tensor.element_size()
+        spans.append((name, start, start + buffer_nbytes(tensor)))
+    for index, (name, start, stop) in enumerate(spans):
+        for other, other_start, other_stop in spans[index + 1 :]:
+            if start < other_stop and other_start < stop:
+                raise UnsupportedBoundary(
+                    f"inputs {name!r} and {other!r} share device storage; declared input "
+                    "aliasing is not bound yet"
+                )
 
 
 class CompiledModel:
@@ -80,11 +152,11 @@ class CompiledModel:
 
     Executions are zero-copy and the intermediate arena is PyTorch-owned:
 
-    * every user input and weight is handed to the runtime as a device pointer
-      (``set_input_ptr``) wherever it is contiguous;
-    * every output (and mutation sink) is a PyTorch tensor bound with
-      ``set_output_ptr``, so the producing op writes it in place and it is
-      returned without a D2H;
+    * every boundary tensor is bound by BUFFER ID to the caller's device
+      pointer; a writeback and the input it mutates are one buffer and one
+      pointer;
+    * parameters and buffers are addressed once at compile time, user inputs
+      and freshly allocated outputs once per call;
     * the intermediate-scratch arena is ``caching_allocator_alloc``'d for the
       duration of the call and ``caching_allocator_delete``'d right after, so
       PyTorch accounts for it and can reuse the block next call.
@@ -94,27 +166,25 @@ class CompiledModel:
         self,
         graph: Any,
         ep: Any,
+        input_bindings: Sequence[Binding],
+        output_bindings: Sequence[Binding],
         scalar_output_positions: Sequence[int] = (),
         held_tensors: Sequence[torch.Tensor] = (),
     ):
         self._graph = graph
         self._ep = ep
+        self._input_bindings = list(input_bindings)
+        self._input_names = [binding.name for binding in self._input_bindings]
+        self._output_bindings = list(output_bindings)
         self._scalar_output_positions = frozenset(scalar_output_positions)
-        # Device copies of parameters/buffers whose pointers the runtime holds.
+        # Parameters and buffers whose device pointers the runtime holds.
         self._held = list(held_tensors)
         # Fixed once a plan set is searched; the per-execution arena sizes to it.
-        self._arena_bytes = graph.arena_bytes() if hasattr(graph, "arena_bytes") else 0
+        self._arena_bytes = graph.arena_bytes()
         # The runtime always launches captured CUDA graphs, which the legacy
         # default stream cannot host, so it runs on a dedicated side stream
         # ordered against the caller's stream with events.
         self._side_stream: Optional[torch.cuda.Stream] = None
-        names = graph.input_names
-        kinds = graph.input_kinds
-        self._user_input_names = [
-            name for name, kind in zip(names, kinds) if kind == "user_input"
-        ]
-        self._output_names = graph.output_names
-        self._output_dtypes = graph.output_dtypes
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
 
@@ -124,9 +194,9 @@ class CompiledModel:
         # compiled program folds those symbols into `sym_size`, so it has no
         # scalar inputs: keep tensors, drop the scalars.
         inputs = [arg for arg in args if isinstance(arg, torch.Tensor)]
-        if len(inputs) != len(self._user_input_names):
+        if len(inputs) != len(self._input_bindings):
             raise RuntimeError(
-                f"luminal_cuda_lite expected {len(self._user_input_names)} inputs, "
+                f"luminal_cuda_lite expected {len(self._input_bindings)} inputs, "
                 f"got {len(inputs)}"
             )
         if not inputs:
@@ -143,40 +213,36 @@ class CompiledModel:
             self._side_stream = torch.cuda.Stream(device=device)
         side = self._side_stream
 
-        # Bind inputs zero-copy, as they are. A layout the runtime does not
-        # model is refused, never copied or staged.
-        for name, value in zip(self._user_input_names, inputs):
-            layout = boundary_layout(name, value)
-            if layout != RowMajor():
-                raise UnsupportedBoundary(
-                    f"{name}: layout {layout} is not yet declared to the runtime; "
-                    "only row-major boundaries bind today"
-                )
-            self._graph.set_input_ptr(
-                name, value.data_ptr(), _nbytes(value), list(value.shape)
-            )
+        # Every input is bound as it is, on the buffer it was declared on. A
+        # tensor whose dtype or layout is not the declared one is refused.
+        per_call: list[int] = []
+        for binding, value in zip(self._input_bindings, inputs):
+            check_binding(binding, value)
+            self._graph.bind_input_shape(binding.name, list(value.shape))
+            self._graph.set_device_ptr(binding.buffer, value.data_ptr(), buffer_nbytes(value))
+            per_call.append(binding.buffer)
 
         # Output shapes depend on the bound dims, so read them after the
         # inputs are bound rather than caching them at compile time.
         output_shapes = self._graph.output_shapes
 
-        # Allocate every final output as a PyTorch tensor and bind it. A
-        # mutation sink IS the caller's input tensor (eager aliasing). Allocate
-        # under the side stream so the caching allocator records the stream that
-        # will write them.
+        # Allocate every output that is not a writeback and bind it. A
+        # writeback's buffer IS its target input's, already addressed above.
+        # Allocate under the side stream so the caching allocator records the
+        # stream that will write them.
         with torch.cuda.stream(side):
-            out_tensors: list[torch.Tensor] = []
-            for index, (dtype_code, shape, mutation) in enumerate(
-                zip(self._output_dtypes, output_shapes, self._output_mutations)
-            ):
-                if mutation is not None:
-                    target = self._user_input_names.index(mutation)
-                    tensor = inputs[target]
-                else:
-                    tensor = torch.empty(
-                        tuple(shape), dtype=_torch_dtype(dtype_code), device=device
-                    )
-                self._graph.set_output_ptr(index, tensor.data_ptr(), _nbytes(tensor))
+            out_tensors: list[Optional[torch.Tensor]] = []
+            for index, binding in enumerate(self._output_bindings):
+                if self._output_mutations[index] is not None:
+                    out_tensors.append(None)
+                    continue
+                tensor = torch.empty(
+                    tuple(output_shapes[index]), dtype=binding.dtype, device=device
+                )
+                self._graph.set_device_ptr(
+                    binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
+                )
+                per_call.append(binding.buffer)
                 out_tensors.append(tensor)
 
         # Order the side stream after everything the caller enqueued: this is
@@ -193,6 +259,11 @@ class CompiledModel:
             self._graph.execute()
         finally:
             torch.cuda.caching_allocator_delete(arena)
+            # These addresses belong to this call only: forget them, so an
+            # execute that skipped a binding refuses by name instead of
+            # reading storage the caller has released.
+            for buffer in per_call:
+                self._graph.clear_device_ptr(buffer)
 
         # Hand ordering back to the caller's stream for the returned tensors.
         stream.wait_stream(side)
@@ -203,7 +274,7 @@ class CompiledModel:
             if mutation is not None:
                 # The write already landed in the caller's tensor.
                 if returned:
-                    results.append(inputs[self._user_input_names.index(mutation)])
+                    results.append(inputs[self._input_names.index(mutation)])
                 continue
             if returned:
                 tensor = out_tensors[index]
@@ -352,13 +423,26 @@ def luminal_cuda_lite(
     _lower_sym_sum(ep)
 
     def _save_and_compile(program: Any) -> Any:
+        # Recognize every boundary tensor's layout and declare it with the
+        # program: the runtime binds what the caller has, or refuses it.
+        _refuse_unbound_outputs(program)
+        rows = _boundary_tensors(program, export_inputs)
+        _refuse_aliased_inputs(
+            [(name, value) for name, kind, value in rows if kind == "USER_INPUT"]
+        )
+        layouts = {name: boundary_layout(name, value) for name, _, value in rows}
+        declared = []
+        for name, _, _ in rows:
+            tag, strides = layout_spec(layouts[name])
+            declared.append((name, tag, list(strides)))
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
-            return _luminal.compile(pt2_path)
+            graph = _luminal.compile(pt2_path, declared)
+        return graph, {name: value for name, _, value in rows}, layouts
 
     try:
-        graph = _save_and_compile(ep)
+        graph, tensors, layouts = _save_and_compile(ep)
     except RuntimeError as exc:
         # The translator lowers a fixed op set. Decomposing the exported graph
         # rewrites higher-level composites into primitives the translator
@@ -370,86 +454,52 @@ def luminal_cuda_lite(
             raise
         ep = ep.run_decompositions(_decomp_table())
         _lower_sym_sum(ep)
-        graph = _save_and_compile(ep)
+        graph, tensors, layouts = _save_and_compile(ep)
 
-    names = graph.input_names
-    kinds = graph.input_kinds
-    parameter_names = graph.parameter_names
-
-    # The backend is CUDA-only: pick the device from the example inputs.
-    device = next(
-        (
-            value.device
-            for value in export_inputs
-            if isinstance(value, torch.Tensor) and value.is_cuda
-        ),
-        None,
-    )
-    if device is None:
-        raise RuntimeError(
-            "luminal_cuda_lite requires CUDA example inputs (the model must be on "
-            "a CUDA device)"
-        )
-    # Parameters/buffers are bound once, zero-copy, to persistent device copies
-    # this wrapper holds; only user inputs are rebound per call. The pointer
-    # binding must happen AFTER search: the runtime resolves a graph tensor to
-    # its plan buffer only once a plan is installed.
-    params: list[tuple[str, torch.Tensor]] = []
-    zero_copy = hasattr(graph, "set_input_ptr")
-
-    user_index = 0
-    for name, kind, parameter_name in zip(names, kinds, parameter_names):
-        if kind == "user_input":
-            if user_index >= len(export_inputs):
-                raise RuntimeError(
-                    f"export declared more user inputs than example_inputs: {name!r}"
-                )
-            value = export_inputs[user_index]
-            user_index += 1
-            # Seed the symbolic dims from the example; the real binding happens
-            # per call. Host-staged so no dangling pointer survives compile.
-            graph.set_input(name, _tensor_bytes(value), list(value.shape))
-            continue
-        if parameter_name not in ep.state_dict:
+    # Seed the symbolic dims from the declared shapes, address the parameter
+    # and buffer pointers once (they outlive every call), and keep one
+    # `Binding` per user input for the per-call check.
+    held: list[torch.Tensor] = []
+    input_bindings: list[Binding] = []
+    for name, kind, buffer in zip(graph.input_names, graph.input_kinds, graph.input_buffers):
+        if name not in tensors:
             raise RuntimeError(
-                f"parameter {parameter_name!r} (graph input {name!r}) is not in "
-                "the exported state_dict"
+                f"the translated program names an input {name!r} the export signature "
+                f"does not declare (declared: {sorted(tensors)})"
             )
-        value = ep.state_dict[parameter_name]
-        if not value.is_cuda:
-            raise UnsupportedBoundary(
-                f"{name}: parameter {parameter_name!r} lives on {value.device}; "
-                "the model must be on the CUDA device"
+        value = tensors[name]
+        graph.bind_input_shape(name, list(value.shape))
+        if kind == "user_input":
+            input_bindings.append(
+                Binding(name, buffer, value.dtype, tuple(value.shape), layouts[name])
             )
-        layout = boundary_layout(name, value)
-        if layout != RowMajor():
-            raise UnsupportedBoundary(
-                f"{name}: parameter layout {layout} is not yet declared to the runtime"
-            )
-        graph.set_input(name, _tensor_bytes(value), list(value.shape))
-        params.append((name, value))
-
-    if user_index != len(export_inputs):
-        raise RuntimeError(
-            f"export consumed {user_index} of {len(export_inputs)} example_inputs"
-        )
-
-    # Every final output is bound to a caller tensor per call, so the arena
-    # planner must exclude output buffers from the slab. This must precede
-    # search so the finalist budget and the installed plan agree.
-    if hasattr(graph, "set_external_outputs"):
-        graph.set_external_outputs(True)
+            continue
+        graph.set_device_ptr(buffer, value.data_ptr(), buffer_nbytes(value))
+        held.append(value)
 
     graph.search(search_iterations)
 
-    held: list[torch.Tensor] = []
-    if zero_copy:
-        for name, value in params:
-            graph.set_input_ptr(
-                name, value.data_ptr(), _nbytes(value), list(value.shape)
-            )
-            held.append(value)
-    return CompiledModel(graph, ep, scalar_output_positions, held)
+    # A writeback is declared at its target's layout; every other output is a
+    # tensor this wrapper allocates, so it is row-major by construction.
+    output_bindings = [
+        Binding(
+            name,
+            buffer,
+            _torch_dtype(dtype_code),
+            tuple(shape),
+            layouts[mutation] if mutation is not None else RowMajor(),
+        )
+        for name, buffer, dtype_code, shape, mutation in zip(
+            graph.output_names,
+            graph.output_buffers,
+            graph.output_dtypes,
+            graph.output_shapes,
+            graph.output_mutations,
+        )
+    ]
+    return CompiledModel(
+        graph, ep, input_bindings, output_bindings, scalar_output_positions, held
+    )
 
 
 def register_backend() -> None:

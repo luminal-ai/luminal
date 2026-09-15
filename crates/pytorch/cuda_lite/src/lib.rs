@@ -1,36 +1,32 @@
 //! Python bindings for the CUDA-lite PyTorch backend.
 //!
 //! This is the GPU twin of the `luminal_reference_py` crate: the same
-//! translation seam (`luminal_pytorch_utils`) and the same six-method
-//! ladder, but the runtime behind the pyo3 class is
-//! [`luminal_cuda_lite::CudaRuntime`] and payloads are
-//! [`luminal_cuda_lite::HostBuffer`] rather than the reference's
-//! `TypedBuffer`.
+//! translation seam (`luminal_pytorch_utils`), but the runtime behind the
+//! pyo3 class is [`luminal_cuda_lite::CudaRuntime`].
 //!
-//! PYTORCH-CUDA INTEGRATION (implemented):
-//! - the runtime runs on a borrowed `CUstream` supplied by the Python layer
-//!   (`use_borrowed_stream`), so its CUDA-graph work is stream-ordered with
-//!   surrounding PyTorch ops;
-//! - the intermediate-scratch arena is a caller allocation
-//!   (`set_arena`/`arena_bytes`): the Python layer obtains it from
-//!   `torch.cuda.caching_allocator_alloc` per execution and frees it right
-//!   after, so PyTorch accounts for the bytes;
-//! - inputs and final outputs are bound to caller device pointers
-//!   (`set_input_ptr`/`set_output_ptr`), zero-copy; a bound output is written
-//!   in place by its producer and handed back as the caller's tensor, and
-//!   (`set_external_outputs`) output buffers are excluded from the arena slab.
+//! THE BOUNDARY IS DECLARED AT LOAD. [`bind`] states every boundary tensor
+//! once, in the vocabulary of [`luminal_cuda_lite::CudaBindings`]: one buffer
+//! id per boundary tensor, the layout the caller recognized for it, and
+//! `Placement::External` — the storage is the caller's own live device
+//! allocation, never host-staged and never given an arena range. Aliasing has
+//! one spelling: a writeback binds on the buffer of the input it mutates.
+//! Python addresses buffers, not tensors: `set_device_ptr(buffer, ptr, bytes)`
+//! before each execution.
 //!
-//! `DESIGN.md` records the remaining work (async execution, dtype coverage).
+//! The runtime also runs on a borrowed `CUstream` and takes its
+//! intermediate-scratch arena from the caller per execution
+//! (`use_borrowed_stream`, `arena_bytes`/`set_arena`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use anyhow::{Context, Result, anyhow, bail};
-use luminal::dtype::PlanDtype;
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::{DType, DimBucket, DynMap, IntExpr, NodeIndex, Symbol};
 
 /// Largest value a dynamic dimension's bucket covers (the searched plan stays
 /// symbolic inside it, so one compile serves every covered context length).
 const MAX_DYNAMIC_DIM: usize = 4096;
+use luminal_cuda_lite::bindings::{BoundaryLayout, CudaBindings};
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, harness_search_options};
 use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
 use pyo3::exceptions::PyRuntimeError;
@@ -55,39 +51,16 @@ fn torch_code(dtype: DType) -> Result<u32> {
         .code())
 }
 
-/// The dtypes CUDA-lite can put on a device. Everything else refuses by
-/// name here rather than being staged as some other width's bytes.
-fn plan_dtype(dtype: DType) -> Result<PlanDtype> {
-    Ok(match dtype {
-        DType::F32 => PlanDtype::F32,
-        DType::F64 => PlanDtype::F64,
-        DType::F16 => PlanDtype::F16,
-        DType::Bf16 => PlanDtype::Bf16,
-        DType::Int => PlanDtype::Int,
-        DType::I64 => PlanDtype::Int64,
-        DType::Bool => PlanDtype::Bool8,
-        other => bail!("cuda-lite backend does not support {other:?} inputs yet"),
-    })
-}
-
-/// Raw little-endian bytes tagged with the runtime's dtype. Bool8 codes
-/// go through the validated `HostBuffer::bool8` door.
-fn host_buffer(dtype: DType, bytes: &[u8]) -> Result<HostBuffer> {
-    let plan = plan_dtype(dtype)?;
-    if plan == PlanDtype::Bool8 {
-        HostBuffer::bool8(bytes.to_vec())
-    } else {
-        HostBuffer::new(plan, bytes.to_vec())
-    }
-}
-
 /// A compiled CUDA-lite graph with its boundary tables.
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
     translation: Translation,
     runtime: CudaRuntime,
-    staged: HashMap<String, HostBuffer>,
-    dirty: HashSet<String>,
+    /// The buffer each translation input was bound on, by input index.
+    input_buffers: Vec<i64>,
+    /// The buffer each translation output was bound on, by output index. A
+    /// writeback repeats the buffer of the input it mutates.
+    output_buffers: Vec<i64>,
     searched: bool,
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
@@ -155,6 +128,12 @@ impl CompiledGraph {
             .collect()
     }
 
+    /// The buffer id each input was bound on, aligned with `input_names`.
+    #[getter]
+    fn input_buffers(&self) -> Vec<i64> {
+        self.input_buffers.clone()
+    }
+
     #[getter]
     fn output_names(&self) -> Vec<String> {
         self.translation
@@ -200,89 +179,37 @@ impl CompiledGraph {
             .collect()
     }
 
-    /// Stage one input's raw little-endian bytes by graph name.
+    /// The buffer id each output was bound on, aligned with `output_names`.
+    /// A writeback repeats the buffer of the input it mutates.
+    #[getter]
+    fn output_buffers(&self) -> Vec<i64> {
+        self.output_buffers.clone()
+    }
+
+    /// Record one input's concrete shape by graph name. Its axes bind the
+    /// graph's symbolic dims, so a symbolic input runs at a new extent
+    /// without re-exporting. Dims only: no payload crosses here.
+    fn bind_input_shape(&mut self, name: &str, shape: Vec<usize>) -> PyResult<()> {
+        self.bind_dims(name, &shape)
+    }
+
+    /// Address one EXTERNAL buffer for the next execution: the caller's
+    /// allocation at `ptr` IS the storage every binding on that buffer names.
+    /// One pointer per buffer — a writeback and the input it mutates share the
+    /// buffer and the pointer.
     ///
-    /// `shape` is the concrete tensor shape at the call site. Its axes bind
-    /// the graph's symbolic dims, so a symbolic input can be driven at a new
-    /// extent without re-exporting.
-    ///
-    /// HOST-STAGED: the bytes are held host-side and H2D'd by `execute`. Use
-    /// [`Self::set_input_ptr`] to read the caller's device tensor directly.
-    fn set_input(&mut self, name: &str, bytes: &[u8], shape: Vec<usize>) -> PyResult<()> {
-        let (dtype, _tensor) = self.bind_input_dims(name, &shape)?;
-        // Host-staged: keep the bytes for H2D. A prior zero-copy binding of the
-        // same input is dropped so the staged path wins (only possible once a
-        // plan exists, i.e. after search).
-        #[cfg(feature = "device")]
-        if self.searched {
-            self.clear_input_ptr(name)?;
-        }
-        let buffer = host_buffer(dtype, bytes).map_err(to_py)?;
-        self.staged.insert(name.to_string(), buffer);
-        self.dirty.insert(name.to_string());
-        Ok(())
+    /// The caller owns `ptr` and must keep the allocation live, at the
+    /// buffer's bound layout, until `execute` returns.
+    fn set_device_ptr(&mut self, buffer: i64, ptr: u64, bytes: usize) -> PyResult<()> {
+        // SAFETY: upheld by the Python layer, which binds the pointer of a
+        // tensor it holds for the duration of the call.
+        unsafe { self.runtime.set_device_ptr(buffer, ptr, bytes) }.map_err(to_py)
     }
 
-    /// Bind one input ZERO-COPY to a caller device pointer. `shape` binds the
-    /// graph's symbolic dims exactly as [`Self::set_input`] does; `bytes` is
-    /// the caller's allocation size, checked against the plan at execute.
-    #[cfg(feature = "device")]
-    fn set_input_ptr(
-        &mut self,
-        name: &str,
-        ptr: u64,
-        bytes: usize,
-        shape: Vec<usize>,
-    ) -> PyResult<()> {
-        let (_dtype, tensor) = self.bind_input_dims(name, &shape)?;
-        // A device-bound input is no longer host-staged.
-        self.staged.remove(name);
-        self.dirty.remove(name);
-        // SAFETY: the caller (the Python layer) owns `ptr` and guarantees it
-        // is a live CUDA allocation of at least `bytes` bytes.
-        unsafe { self.runtime.set_input_device_ptr(tensor, ptr, bytes) }.map_err(to_py)
-    }
-
-    #[cfg(feature = "device")]
-    fn clear_input_ptr(&mut self, name: &str) -> PyResult<()> {
-        let tensor = self
-            .translation
-            .inputs
-            .iter()
-            .find(|input| input.graph_name == name)
-            .map(|input| input.tensor)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("unknown input {name:?}")))?;
-        self.runtime.clear_input_device_ptr(tensor).map_err(to_py)
-    }
-
-    /// Bind an output slot ZERO-COPY to a caller device pointer. The producing
-    /// op writes straight into that allocation; no D2H runs and the caller's
-    /// tensor IS the result.
-    #[cfg(feature = "device")]
-    fn set_output_ptr(&mut self, index: usize, ptr: u64, bytes: usize) -> PyResult<()> {
-        let output = self
-            .translation
-            .outputs
-            .get(index)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("no output at {index}")))?;
-        // SAFETY: the caller owns `ptr` and keeps it live through execute.
-        unsafe {
-            self.runtime
-                .set_output_device_ptr(output.tensor, ptr, bytes)
-        }
-        .map_err(to_py)
-    }
-
-    #[cfg(feature = "device")]
-    fn clear_output_ptr(&mut self, index: usize) -> PyResult<()> {
-        let output = self
-            .translation
-            .outputs
-            .get(index)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("no output at {index}")))?;
-        self.runtime
-            .clear_output_device_ptr(output.tensor)
-            .map_err(to_py)
+    /// Forget a buffer's address. The next `execute` refuses by name until one
+    /// is supplied again.
+    fn clear_device_ptr(&mut self, buffer: i64) {
+        self.runtime.clear_device_ptr(buffer);
     }
 
     /// Bytes of intermediate-scratch arena the selected plan set needs for one
@@ -314,14 +241,6 @@ impl CompiledGraph {
     #[cfg(feature = "device")]
     fn use_owned_stream(&mut self) {
         self.runtime.use_owned_stream();
-    }
-
-    /// Declare that every final output will be bound to a caller device tensor
-    /// (zero-copy). Call BEFORE `search`: the planner then excludes output
-    /// buffers from the arena slab, so the searched budget is intermediate
-    /// scratch alone.
-    fn set_external_outputs(&mut self, external: bool) {
-        self.runtime.set_external_outputs(external);
     }
 
     /// Override a dynamic dimension's value before `search`, by PT2 symbol
@@ -364,24 +283,14 @@ impl CompiledGraph {
             .collect()
     }
 
-    /// Saturate and search. Every input must be staged first.
+    /// Saturate and search.
     #[pyo3(signature = (generations = None))]
     fn search(&mut self, generations: Option<usize>) -> PyResult<()> {
-        // The host ladder's `search` takes the caller's payloads by
-        // reference. They are only consumed when the candidate evaluator
-        // profiles ON DEVICE; the default ranks by the device-free
-        // heuristic. We pass whatever is staged so a future
-        // `profile_on_device` option has the bytes it needs.
-        let data: FxHashMap<NodeIndex, HostBuffer> = self
-            .translation
-            .inputs
-            .iter()
-            .filter_map(|input| {
-                self.staged
-                    .get(&input.graph_name)
-                    .map(|buffer| (input.tensor, buffer.clone()))
-            })
-            .collect();
+        // NO PAYLOAD CROSSES HERE. The default evaluator ranks candidates by
+        // the device-free heuristic, which runs nothing; only a
+        // device-profiling search consumes boundary bytes, and this backend's
+        // boundary is the caller's device memory, never host bytes to copy.
+        let data: FxHashMap<NodeIndex, HostBuffer> = FxHashMap::default();
         let mut options: CompileOptions = harness_search_options();
         if let Some(generations) = generations {
             options.generations = generations;
@@ -411,81 +320,15 @@ impl CompiledGraph {
                 "search() must run before execute()",
             ));
         }
-        let updates: Vec<_> = self
-            .translation
-            .inputs
-            .iter()
-            .filter(|input| self.dirty.contains(&input.graph_name))
-            .map(|input| {
-                (
-                    input.tensor,
-                    self.staged.get(&input.graph_name).unwrap().clone(),
-                )
-            })
-            .collect();
-        for (tensor, buffer) in updates {
-            self.runtime.set_data(tensor, buffer);
-        }
-        self.dirty.clear();
         self.runtime.execute().map_err(to_py)
-    }
-
-    /// Raw bytes of one output, in its native storage width.
-    fn output_bytes(&self, index: usize) -> PyResult<Vec<u8>> {
-        let output = self
-            .translation
-            .outputs
-            .get(index)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("no output at {index}")))?;
-        let bytes = match output.dtype {
-            DType::F32 => {
-                let values = self.runtime.get_f32(output.tensor).map_err(to_py)?;
-                as_bytes(&values)
-            }
-            DType::Int => {
-                let values = self.runtime.get_i32(output.tensor).map_err(to_py)?;
-                as_bytes(&values)
-            }
-            DType::I64 => {
-                let values = self.runtime.get_i64(output.tensor).map_err(to_py)?;
-                as_bytes(&values)
-            }
-            DType::Bool => self
-                .runtime
-                .get_bool8(output.tensor)
-                .map_err(to_py)?
-                .to_vec(),
-            // F64/F16/BF16 have no typed getter (the runtime reads them back as
-            // raw bytes); the plan's storage width IS the graph dtype.
-            DType::F64 | DType::F16 | DType::Bf16 => self
-                .runtime
-                .fetch(output.tensor)
-                .map_err(to_py)?
-                .0
-                .bytes
-                .clone(),
-            other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "cuda-lite backend cannot read {other:?} outputs yet"
-                )));
-            }
-        };
-        Ok(bytes)
-    }
-}
-
-fn as_bytes<T>(values: &[T]) -> Vec<u8> {
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
-            .to_vec()
     }
 }
 
 impl CompiledGraph {
     /// Record an input's concrete shape into the symbolic-dim map (and the
-    /// runtime once searched), and return its dtype and graph node.
-    fn bind_input_dims(&mut self, name: &str, shape: &[usize]) -> PyResult<(DType, NodeIndex)> {
-        let (dtype, tensor, bindings): (DType, NodeIndex, Vec<(usize, Symbol)>) = {
+    /// runtime once searched).
+    fn bind_dims(&mut self, name: &str, shape: &[usize]) -> PyResult<()> {
+        let bindings: Vec<(usize, Symbol)> = {
             let input = self
                 .translation
                 .inputs
@@ -500,7 +343,7 @@ impl CompiledGraph {
                     }
                 }
             }
-            (input.dtype, input.tensor, bindings)
+            bindings
         };
         for (value, symbol) in bindings {
             self.dims.insert(symbol, value);
@@ -510,26 +353,134 @@ impl CompiledGraph {
                 self.runtime.set_dim(symbol, value);
             }
         }
-        Ok((dtype, tensor))
+        Ok(())
     }
 }
 
-/// Parse, translate, and load a `.pt2` on the CUDA-lite runtime.
+/// One boundary tensor's layout as the caller spelled it: a tag, plus the
+/// element strides a strided layout carries.
+fn layout_of(name: &str, tag: &str, strides: &[i64]) -> Result<BoundaryLayout> {
+    Ok(match tag {
+        "row_major" => BoundaryLayout::RowMajor,
+        "column_major" => BoundaryLayout::ColumnMajor,
+        "strided" => BoundaryLayout::Strided {
+            strides: strides.to_vec(),
+        },
+        other => bail!("input {name:?}: unknown boundary layout {other:?}"),
+    })
+}
+
+/// The caller's layout table, keyed by graph input name.
+fn layout_table(rows: &[(String, String, Vec<i64>)]) -> Result<HashMap<String, BoundaryLayout>> {
+    let mut table = HashMap::new();
+    for (name, tag, strides) in rows {
+        let layout = layout_of(name, tag, strides)?;
+        if table.insert(name.clone(), layout).is_some() {
+            bail!("input {name:?} was given two boundary layouts");
+        }
+    }
+    Ok(table)
+}
+
+/// The CUDA-lite boundary for a translated program: every input is the
+/// caller's live device memory, at the layout the caller recognized for it, on
+/// its own buffer; every output is a fresh caller-owned device buffer, except
+/// a writeback, which binds on the buffer of the input it mutates — two
+/// bindings naming one buffer id being the single spelling of aliasing.
+/// Returns the bindings and the buffer each input and each output took.
+fn bind(
+    translation: &Translation,
+    layouts: &HashMap<String, BoundaryLayout>,
+) -> Result<(CudaBindings, Vec<i64>, Vec<i64>)> {
+    for name in layouts.keys() {
+        ensure!(
+            translation
+                .inputs
+                .iter()
+                .any(|input| &input.graph_name == name),
+            "a boundary layout was declared for {name:?}, which is not a graph input"
+        );
+    }
+    let mut bindings = CudaBindings::new();
+    let mut input_buffers = Vec::with_capacity(translation.inputs.len());
+    for input in &translation.inputs {
+        let layout = layouts.get(&input.graph_name).ok_or_else(|| {
+            anyhow!(
+                "input {:?} has no declared boundary layout",
+                input.graph_name
+            )
+        })?;
+        input_buffers.push(bindings.input_external_with(input.tensor, layout.clone()));
+    }
+    let mut output_buffers = Vec::with_capacity(translation.outputs.len());
+    for output in &translation.outputs {
+        let buffer = match &output.mutation_target {
+            Some(target) => {
+                let index = translation
+                    .inputs
+                    .iter()
+                    .position(|input| &input.graph_name == target)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "output {} mutates {target:?}, which is not a graph input",
+                            output.graph_name
+                        )
+                    })?;
+                let layout = layouts[target].clone();
+                // A writeback writes the TARGET's storage, so it is bound at
+                // the target's layout and never reinterprets it. A kernel
+                // destination must be dense, so any other layout is refused
+                // here by name rather than written as though it were dense.
+                ensure!(
+                    layout == BoundaryLayout::RowMajor,
+                    "output {} writes back into input {target:?}, whose boundary layout is \
+                     {layout:?}; a writeback destination must be row-major",
+                    output.graph_name
+                );
+                let buffer = input_buffers[index];
+                // The caller's storage is written through: the shared buffer
+                // must say so.
+                bindings.declare(buffer, Access::ReadWrite, FreedBy::Caller);
+                bindings.output_on_with(output.tensor, buffer, layout);
+                buffer
+            }
+            None => bindings.output_external(output.tensor),
+        };
+        output_buffers.push(buffer);
+    }
+    Ok((bindings, input_buffers, output_buffers))
+}
+
+/// Parse, translate, and load a `.pt2` on the CUDA-lite runtime under the
+/// caller's boundary layouts: one `(graph input name, layout tag, element
+/// strides)` row per graph input, the tag being `row_major`, `column_major`
+/// or `strided`.
 #[pyfunction]
-fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
+fn compile(
+    pt2_path: &str,
+    input_layouts: Vec<(String, String, Vec<i64>)>,
+) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
     let translation = translate(&parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
-    let runtime = CudaRuntime::load(&translation.graph)
-        .context("loading the translated graph on the cuda-lite runtime")
+    let layouts = layout_table(&input_layouts).map_err(to_py)?;
+    let (bindings, input_buffers, output_buffers) = bind(&translation, &layouts)
+        .context("declaring the translated program's boundary")
         .map_err(to_py)?;
+    let runtime = CudaRuntime::load_with(
+        &translation.graph,
+        bindings,
+        luminal_cuda_lite::ops::cuda_registry(),
+    )
+    .context("loading the translated graph on the cuda-lite runtime")
+    .map_err(to_py)?;
     Ok(CompiledGraph {
         translation,
         runtime,
-        staged: HashMap::new(),
-        dirty: HashSet::new(),
+        input_buffers,
+        output_buffers,
         searched: false,
         dims,
     })
