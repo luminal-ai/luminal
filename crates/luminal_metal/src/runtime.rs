@@ -11,12 +11,11 @@ use luminal::layouts::DecodedLayout;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal::shape;
 
+/// What `load` captured: the bound program (model text, this runtime's
+/// boundary, the post-schedule checks) plus whatever the binding calls
+/// accumulate before `search` assembles and saturates.
 struct NativeParts {
-    pre_schedule: String,
-    input_slots: Vec<graph::InputSlot>,
-    output_slots: Vec<graph::OutputSlot>,
-    post_checks: String,
-    labeled_checks: Vec<(String, String)>,
+    bound: crate::bindings::BoundProgram,
     binding_seeds: String,
 }
 
@@ -43,6 +42,8 @@ pub struct MetalRuntime {
 }
 
 impl MetalRuntime {
+    /// LOAD under the default binding: every input read-only on its own
+    /// buffer, every leaf read-write on its own.
     pub fn load(graph: &graph::Graph) -> Result<Self> {
         Self::load_with_registry(graph, crate::ops::metal_registry())
     }
@@ -51,26 +52,50 @@ impl MetalRuntime {
         graph: &graph::Graph,
         registry: Vec<crate::ops::RegisteredOp>,
     ) -> Result<Self> {
-        let (pre_schedule, input_slots, output_slots, post_checks, labeled_checks) = graph
-            .logical
-            .bound_parts(&crate::bindings::MetalBindings)
-            .map_err(|e| anyhow!(e))?;
+        Self::load_with(
+            graph,
+            crate::bindings::MetalBindings::leaves(&graph.logical),
+            registry,
+        )
+    }
+
+    /// LOAD under the caller's binding — which values enter and leave
+    /// through which buffers, and which of those buffers stay resident on
+    /// the device. The tensor→buffer maps and the residency set are live
+    /// from here, so `set_data` needs no search first.
+    pub fn load_with(
+        graph: &graph::Graph,
+        bindings: crate::bindings::MetalBindings,
+        registry: Vec<crate::ops::RegisteredOp>,
+    ) -> Result<Self> {
+        let bound = bindings
+            .bind(&graph.logical)
+            .map_err(|reason| anyhow!("load refused: {reason}"))?;
         let allow = Self::allow_list_over(&registry);
         let matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>> =
             registry.into_iter().map(|entry| entry.matcher).collect();
         let decoders = luminal::egglog_snippet::decoder_registry_for(&matchers)?;
+        let input_buffers = bound.inputs.iter().map(|b| (b.value, b.buffer)).collect();
+        let output_index = bound
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, b)| (b.value, index))
+            .collect();
+        let residents = luminal::resident::ResidentBindings {
+            inputs: bound.residents.clone(),
+        };
         Ok(Self {
             native: Some(NativeParts {
-                pre_schedule,
-                input_slots,
-                output_slots,
-                post_checks,
-                labeled_checks,
+                bound,
                 binding_seeds: String::new(),
             }),
             matchers,
             allow,
             decoders,
+            input_buffers,
+            output_index,
+            residents,
             ..Self::default()
         })
     }
@@ -98,16 +123,26 @@ impl MetalRuntime {
         }
     }
 
+    /// Once the arena is installed it owns this program's resident homes,
+    /// so a re-binding that would invalidate the plans is refused.
+    fn ensure_not_installed(&self, change: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        anyhow::ensure!(
+            self.device.as_ref().is_none_or(|d| !d.is_installed()),
+            "{change} after execution: the installed arena holds this program's data"
+        );
+        #[cfg(not(target_os = "macos"))]
+        let _: &str = change;
+        Ok(())
+    }
+
     pub fn bind_dyn_range(
         &mut self,
         var: impl Into<shape::Symbol>,
         lower: u64,
         upper: u64,
     ) -> Result<()> {
-        anyhow::ensure!(
-            self.residents.inputs.is_empty(),
-            "configure dimension bounds before residency"
-        );
+        self.ensure_not_installed("cannot bind a dimension range")?;
         let name = var.into();
         let (lower, upper) = self
             .range_bound
@@ -145,10 +180,7 @@ impl MetalRuntime {
         dim: impl Into<shape::Symbol>,
         buckets: Vec<graph::DimBucket>,
     ) -> Result<()> {
-        anyhow::ensure!(
-            self.residents.inputs.is_empty(),
-            "configure dimension buckets before residency"
-        );
+        self.ensure_not_installed("cannot bind dimension buckets")?;
         let dim = dim.into();
         anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
         if let Some((lo, hi)) = self.range_bound.get(&dim) {
@@ -237,22 +269,16 @@ impl MetalRuntime {
         algebra_match_budget: Option<usize>,
     ) -> Result<(
         luminal::prelude::egraph_serialize::EGraph,
-        graph::LogicalProgram,
+        crate::search::SearchProgram,
     )> {
         let native = self
             .native
             .as_ref()
             .ok_or_else(|| anyhow!("load before search"))?;
-        let program = graph::LogicalProgram {
-            text: format!(
-                "{}{}{}{}",
-                native.pre_schedule,
-                native.binding_seeds,
-                crate::bindings::MetalBindings::SCHEDULE,
-                native.post_checks
-            ),
-            input_slots: native.input_slots.clone(),
-            output_slots: native.output_slots.clone(),
+        let program = crate::search::SearchProgram {
+            text: native.bound.text_with_seeds(&native.binding_seeds),
+            inputs: native.bound.inputs.clone(),
+            outputs: native.bound.outputs.clone(),
         };
         let full = format!(
             "{}\n\n{}",
@@ -263,16 +289,16 @@ impl MetalRuntime {
         if let Err(err) = crate::saturation::run_program(&mut egraph, &full, algebra_match_budget) {
             let mut doors = Vec::new();
             let unchecked = format!(
-                "{}\n\n{}\n{}\n{}",
+                "{}\n\n{}",
                 luminal::egglog_snippet::assembled_program_for(self.matchers()),
-                native.pre_schedule,
-                native.binding_seeds,
-                crate::bindings::MetalBindings::SCHEDULE
+                native
+                    .bound
+                    .text_unchecked_with_seeds(&native.binding_seeds)
             );
             let mut probe = luminal::egglog_snippet::new_egraph();
             if crate::saturation::run_program(&mut probe, &unchecked, algebra_match_budget).is_ok()
             {
-                for (label, text) in &native.labeled_checks {
+                for (label, text) in &native.bound.labeled_checks {
                     if probe.parse_and_run_program(None, text).is_err() {
                         doors.push(label.clone());
                     }
@@ -293,10 +319,7 @@ impl MetalRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
-        anyhow::ensure!(
-            self.residents.inputs.is_empty(),
-            "create a new runtime to re-search a resident program"
-        );
+        self.ensure_not_installed("cannot re-search")?;
         self.invalidate_plans();
         let mut resolved_options = options.clone();
         #[cfg(target_os = "macos")]
@@ -330,7 +353,7 @@ impl MetalRuntime {
 
         for tensor in input_data.keys() {
             assert!(
-                native.input_slots.iter().any(|slot| slot.tensor == *tensor),
+                native.bound.inputs.iter().any(|b| b.value == *tensor),
                 "tensor {tensor:?} is not a bound input"
             );
         }
@@ -344,9 +367,14 @@ impl MetalRuntime {
         #[cfg(target_os = "macos")]
         let staged_for_search: FxHashMap<i64, &HostBuffer> = if options.profile_on_device {
             native
-                .input_slots
+                .bound
+                .inputs
                 .iter()
-                .filter_map(|slot| input_data.get(&slot.tensor).map(|data| (slot.buffer, data)))
+                .filter_map(|bound| {
+                    input_data
+                        .get(&bound.value)
+                        .map(|data| (bound.buffer, data))
+                })
                 .collect()
         } else {
             FxHashMap::default()
@@ -417,12 +445,12 @@ impl MetalRuntime {
         } else {
             let assembly = crate::search::BucketAssembly {
                 assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
-                pre_schedule: &native.pre_schedule,
+                prefix: &native.bound.prefix,
                 binding_seeds: &native.binding_seeds,
                 schedule: crate::bindings::MetalBindings::SCHEDULE,
-                post_checks: &native.post_checks,
-                input_slots: &native.input_slots,
-                output_slots: &native.output_slots,
+                post_checks: &native.bound.post_checks,
+                inputs: &native.bound.inputs,
+                outputs: &native.bound.outputs,
                 base_dims: &options.shapes.values,
                 decoders: &self.decoders,
             };
@@ -444,21 +472,6 @@ impl MetalRuntime {
         self.bucket_plans = searched_buckets;
         self.selected_bucket = None;
 
-        let native = self
-            .native
-            .as_ref()
-            .ok_or_else(|| anyhow!("load before search"))?;
-        self.input_buffers = native
-            .input_slots
-            .iter()
-            .map(|slot| (slot.tensor, slot.buffer))
-            .collect();
-        self.output_index = native
-            .output_slots
-            .iter()
-            .enumerate()
-            .map(|(index, slot)| (slot.tensor, index))
-            .collect();
         if let Some(plan) = unbucketed_plan {
             self.plan = Some(plan);
         } else {
@@ -481,25 +494,8 @@ impl MetalRuntime {
             .ok_or_else(|| anyhow!("no output binding for {tensor:?}"))
     }
 
-    /// Keep this input in the shared device arena between executions. Its
-    /// shape must be static. A `.output_into()` output targeting this input
-    /// shares its buffer, so the mutation lands in the arena home and is
-    /// neither copied nor read back. Call after search and before the first
-    /// execute; set_data uploads it only when changed.
-    pub fn retain_input(&mut self, tensor: NodeIndex) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        anyhow::ensure!(
-            self.device.as_ref().is_none_or(|d| !d.is_installed()),
-            "configure residency before execution"
-        );
-        let lit = *self
-            .input_buffers
-            .get(&tensor)
-            .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))?;
-        self.residents.inputs.insert(lit);
-        Ok(())
-    }
-
+    /// Stage this input's bytes for the next execution. An input the
+    /// binding declared resident is uploaded only when staged again.
     pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) {
         let Some(&buffer) = self.input_buffers.get(&tensor) else {
             panic!("set_data on a tensor with no input binding");

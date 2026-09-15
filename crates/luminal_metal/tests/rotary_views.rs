@@ -16,8 +16,7 @@ fn rotary_split_rejoin_with_dynamic_sequence_matches_scalar() {
     let output = (lo * 2. - hi * 3.)
         .concat_along(hi * 2. + lo * 3., 2)
         .transpose(0, 1)
-        .merge_dims(1, 2)
-        .output();
+        .merge_dims(1, 2);
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     runtime
         .bind_dim_buckets('s', vec![DimBucket::new(2, 64).representative(30)])
