@@ -2398,9 +2398,7 @@ mod stage4b_probes {
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
                     .expect("recorder clean");
-                let pre = bound.prefix;
-
-                pre
+                bound.prefix
             }),
             ("batch_matmul(2,3,4)x(4,5)", {
                 let mut cx = luminal::graph::Graph::new();
@@ -2410,9 +2408,7 @@ mod stage4b_probes {
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
                     .expect("recorder clean");
-                let pre = bound.prefix;
-
-                pre
+                bound.prefix
             }),
             ("specimen(1,2,3)x(3,5)", {
                 let mut cx = luminal::graph::Graph::new();
@@ -2422,9 +2418,7 @@ mod stage4b_probes {
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
                     .expect("recorder clean");
-                let pre = bound.prefix;
-
-                pre
+                bound.prefix
             }),
             ("rejoin_lead1(1,8)", {
                 let mut cx = luminal::graph::Graph::new();
@@ -2436,9 +2430,7 @@ mod stage4b_probes {
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
                     .expect("recorder clean");
-                let pre = bound.prefix;
-
-                pre
+                bound.prefix
             }),
         ];
         for (name, pre) in &specimens {
@@ -2641,7 +2633,7 @@ mod stage4b_probes {
     fn degenerate_broadcast_runs_clean() {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor(1, DType::F32);
-        let b = (a * 2.0);
+        let b = a * 2.0;
         let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, vec![0.5f32].into())]);
         let got = rt.get_f32(b.id).unwrap();
         assert!((got[0] - 1.0).abs() < 1e-6, "{got:?}");
@@ -2903,12 +2895,12 @@ mod subst_guard_study {
         let ba = IntExpr::from('b') + IntExpr::from('a');
         let x = cx.named_tensor("x", (ab,), DType::F32);
         let y = cx.named_tensor("y", (ba,), DType::F32);
-        let doubled = (x + x);
-        let summed = (y * y);
+        let doubled = x + x;
+        let summed = y * y;
         // MIXED-SPELLING elementwise: a+b meets b+a directly — the
         // frontend accepts via egglog_equal (ruling 2026-08-13) and the
         // egglog side unifies the extents through the pin collapse.
-        let mixed = (x + y);
+        let mixed = x + y;
 
         let x_vals = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         let y_vals = vec![2.0f32, 3.0, 4.0, 5.0, 6.0];
@@ -2939,7 +2931,7 @@ mod subst_guard_study {
         let mut cx = Graph::default();
         cx.set_dim('s', 1);
         let x = cx.named_tensor("x", ('s', 3usize), DType::F32);
-        let out = (x.squeeze(0) * 2.0);
+        let out = x.squeeze(0) * 2.0;
         let rt = luminal_reference::harness::run_reference(
             &cx,
             &[(x.id, vec![1.0f32, 2.0, 3.0].into())],
@@ -2949,7 +2941,7 @@ mod subst_guard_study {
         let mut cx = Graph::default();
         cx.set_dim('s', 2);
         let x = cx.named_tensor("x", ('s', 3usize), DType::F32);
-        let _ = (x.squeeze(0) * 2.0);
+        let _ = x.squeeze(0) * 2.0;
         let mut rt = luminal_reference::ReferenceRuntime::load(&cx).expect("records + loads");
         let data: rustc_hash::FxHashMap<_, _> =
             [(x.id, luminal_reference::TypedBuffer::from(vec![0.0f32; 6]))]

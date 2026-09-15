@@ -40,7 +40,7 @@ fn census(name: &str, build: impl Fn(&mut Graph)) {
 fn main() {
     census("scalar_broadcast_rank4", |cx| {
         let x = cx.tensor((2, 3, 4, 5), DType::F32);
-        let _ = (x * 2.0f32);
+        let _ = x * 2.0f32;
     });
     census("stable_argsort_rank2", |cx| {
         let x = cx.tensor((4, 8), DType::F32);
