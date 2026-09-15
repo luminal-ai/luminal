@@ -70,14 +70,30 @@ impl GraphTensor {
     }
 
     /// Reduce a dimension of the tensor by multiplying all elements along that axis.
+    ///
+    /// The magnitude comes from `exp(sum(log(|x|)))` and the sign from the
+    /// parity of the negative element count. Taking `log` of the signed value
+    /// directly is only defined on non-negative inputs, and returned NaN for
+    /// any axis containing a negative element.
     pub fn prod(self, axes: impl ToAxes) -> GraphTensor {
-        self.log().sum(axes).exp()
+        let axes = axes.to_axes();
+        let zero = self
+            .graph()
+            .constant_float(0.0)
+            .cast(self.dtype)
+            .expand_rhs(self.shape);
+        let negatives = self.lt(zero).cast(self.dtype);
+        // Even count of negatives -> +1, odd -> -1.
+        let sign = 1.0 - (negatives.sum(&axes) % 2.0) * 2.0;
+        self.abs().log().sum(&axes).exp() * sign
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::frontend::unary::tests::test_unary;
+    use crate::prelude::*;
+    use crate::tests::assert_close_finite;
     use candle_core::{Device, Tensor};
     use proptest::prelude::*;
 
@@ -140,6 +156,37 @@ mod tests {
                     Tensor::from_vec(out, v.len(), &Device::Cpu).unwrap()
                 },
             );
+        }
+    }
+
+    /// `prod` is `exp(sum(log(|x|)))` with the sign recovered separately.
+    /// Taking `log` of the signed value returns NaN for any axis holding a
+    /// negative element, which `assert_close` cannot catch because every
+    /// comparison against NaN is false.
+    #[test]
+    fn test_prod_signs_and_zeros() {
+        for (input, expected) in [
+            (vec![-2.0, 3.0], -6.0),
+            (vec![-2.0, -3.0], 6.0),
+            (vec![2.0, 3.0], 6.0),
+            (vec![-1.0, -2.0], 2.0),
+            (vec![0.0, 5.0], 0.0),
+            (vec![-2.0, 0.0], 0.0),
+        ] {
+            let cols = input.len();
+            let mut cx = Graph::new();
+            let a = cx.tensor((1, cols));
+            let b = a.prod(1).output();
+
+            cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+            let mut rt = cx.search(
+                ReferenceRuntime::default(),
+                CompileOptions::default().search_graph_limit(1),
+            );
+            rt.set_data(a.id, input.clone());
+            rt.execute(&cx.dyn_map);
+
+            assert_close_finite(rt.get_f32(b), &[expected]);
         }
     }
 }
