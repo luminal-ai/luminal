@@ -383,13 +383,17 @@ pub struct LogicalGraph {
     names: Vec<(ValueId, String)>,
     /// Anonymous-input counter — mints "arg.{k}" labels (Stage 3).
     anon_inputs: usize,
-    post_checks: String,
-    /// The same checks as LABELED units (label carries the named door —
-    /// what failed and how to unblock it): on a saturation CheckError
-    /// the runtime re-runs these one by one to name the culprit
-    /// (ruling 2026-08-13: contract failures never surface as a bare
-    /// "native saturation failed").
-    labeled_checks: Vec<(String, String)>,
+    /// Conditions on extents the recorder could not decide at build time
+    /// (symbolic dims); rendered as facts the fixpoint invariants judge.
+    contracts: Vec<Contract>,
+}
+
+/// A condition on an extent, decided at saturation under the binding's
+/// bounds: the extent equals `n`, or is at least `n`.
+#[derive(Debug, Clone)]
+pub enum Contract {
+    ExtentEq { extent: IntExpr, n: i64 },
+    ExtentAtLeast { extent: IntExpr, n: i64 },
 }
 
 impl LogicalGraph {
@@ -756,22 +760,14 @@ impl LogicalGraph {
                 self.refuse(format!("iota at t{at}: {err}"));
             }
         };
-        let logical = self.push(
+        self.push(
             LogicalOp::Iota {
                 value_expr: value_expr.clone(),
             },
             &[],
             dims.to_vec(),
             DType::Int,
-        );
-        self.post_check(
-            format!("iota value-bounds contract at t{at}"),
-            &format!(
-                "(check (= ?reclo{at} (lower-bound-of {value_expr})))\n\
-             (check (= ?rechi{at} (upper-bound-of {value_expr})))\n"
-            ),
-        );
-        logical
+        )
     }
 
     pub fn record_mask_iota(
@@ -829,25 +825,14 @@ impl LogicalGraph {
         for factor in factors {
             expr = format!("(IntMul {factor} {expr})");
         }
-        let logical = self.push(
+        self.push(
             LogicalOp::Iota {
                 value_expr: expr.clone(),
             },
             &[],
             out_dims,
             DType::Int,
-        );
-        // The authoring-contract bounds pair — uniform with record_iota
-        // (Design A fold-in, 2026-08-06): every recorded iota's value
-        // expression must have derivable bounds, or the fixpoint refuses.
-        self.post_check(
-            format!("iota value-bounds contract at t{at}"),
-            &format!(
-                "(check (= ?reclo{at} (lower-bound-of {expr})))\n\
-             (check (= ?rechi{at} (upper-bound-of {expr})))\n"
-            ),
-        );
-        logical
+        )
     }
 
     /// Record a coordinate-form gather.
@@ -1133,46 +1118,28 @@ pub(crate) fn movement_entries(
 }
 
 impl LogicalGraph {
-    /// Append post-schedule authoring checks (iota bounds pairs).
-    /// SHAPE-CONTRACT INVARIANTS (ruling 2026-08-13, squeeze "option
-    /// 3"): record always; validity is a POST-SATURATION check against
-    /// the bounds lattice, so the BINDING decides per bucket — a
-    /// runtime that pins/buckets the extent appropriately passes (the
-    /// [n,n] pin-collapse discharges the check), any other bucket
-    /// refuses loudly. Static extents discharge trivially.
-    pub(crate) fn require_extent_eq_one(&mut self, at: usize, dim: &IntExpr, what: &str) {
-        match Self::dim_term(dim) {
-            Ok(term) => self.post_check(
-                format!(
-                    "{what} at t{at}: axis extent must be exactly 1 — \
-                     bind or bucket the dim to [1,1]"
-                ),
-                &format!("(check (= {term} (IntLit 1)))\n"),
-            ),
-            Err(reason) => self.refuse(format!("{what} at t{at}: {reason}")),
-        }
+    /// State that `extent` is exactly `n` — a squeeze of a symbolic axis.
+    /// Static extents are decided by the caller; this is for the ones
+    /// only the binding's bounds can decide.
+    pub(crate) fn contract_extent_eq(&mut self, extent: &IntExpr, n: i64) {
+        self.contracts.push(Contract::ExtentEq {
+            extent: *extent,
+            n,
+        });
     }
 
-    /// The ≥-form of the same contract (empty-axis refusals:
-    /// reduce_max/argmax need at least one element; unfold windows need
-    /// a positive count).
-    pub(crate) fn require_extent_at_least(
-        &mut self,
-        at: usize,
-        dim: &IntExpr,
-        min: i64,
-        what: &str,
-    ) {
-        match Self::dim_term(dim) {
-            Ok(term) => self.post_check(
-                format!(
-                    "{what} at t{at}: extent lower bound must reach {min} — \
-                     bind the dim's range to exclude smaller values"
-                ),
-                &format!("(check (>= (lower-bound-of {term}) (bigint {min})))\n"),
-            ),
-            Err(reason) => self.refuse(format!("{what} at t{at}: {reason}")),
-        }
+    /// State that `extent` is at least `n` (a non-empty reduce_max axis,
+    /// a positive unfold window count).
+    pub(crate) fn contract_extent_at_least(&mut self, extent: &IntExpr, n: i64) {
+        self.contracts.push(Contract::ExtentAtLeast {
+            extent: *extent,
+            n,
+        });
+    }
+
+    /// The recorded extent conditions.
+    pub fn contracts(&self) -> &[Contract] {
+        &self.contracts
     }
 
     /// Annotate a value with a name (`LogicalTensorNamed`) so a runtime
@@ -1323,6 +1290,13 @@ impl LogicalGraph {
                 ));
             }
         }
+        for contract in &self.contracts {
+            let (relation, extent, n) = match contract {
+                Contract::ExtentEq { extent, n } => ("extent-eq", extent, n),
+                Contract::ExtentAtLeast { extent, n } => ("extent-at-least", extent, n),
+            };
+            text.push_str(&format!("({relation} {} {n})\n", Self::dim_term(extent)?));
+        }
         Ok(text)
     }
 
@@ -1377,22 +1351,6 @@ impl LogicalGraph {
     /// The value's dims as a `ShapeLit` term.
     pub fn value_shape_term(&self, id: ValueId) -> Result<String, String> {
         Self::shape_term(&self.graph[id].dims)
-    }
-
-    /// The post-schedule authoring checks.
-    pub fn post_check(&mut self, label: impl Into<String>, text: &str) {
-        self.labeled_checks.push((label.into(), text.to_string()));
-        self.post_checks.push_str(text);
-    }
-
-    pub fn post_checks(&self) -> &str {
-        &self.post_checks
-    }
-
-    /// The same checks as labeled units — what a runtime re-runs one by
-    /// one to name a failing door.
-    pub fn labeled_checks(&self) -> &[(String, String)] {
-        &self.labeled_checks
     }
 }
 

@@ -4610,18 +4610,46 @@
   :ruleset fixpoint-invariants
 )
 
-; Iota bounds: the PRESENCE demand only (user ruling 2026-07-23: range
-; checks removed for now). Absence of a lattice entry is unobservable to
-; rules — premises cannot negate, and egglog statically disallows value
-; lookups of non-constructor functions in actions — so the demand lives
-; at the CONSTRUCTION SITE as post-schedule checks (the LogicalIota
-; authoring contract; frontend builders emit the pair mechanically):
-;
-;   (check (= ?demanded_lower (lower-bound-of <the-iota-expr>)))
-;   (check (= ?demanded_upper (upper-bound-of <the-iota-expr>)))
-;
-; A check whose lookup finds nothing fails the program loudly at the
-; fixpoint.
+; SHAPE CONTRACTS: conditions the recorder states about an extent it
+; could not decide at build time (a symbolic dim): squeeze needs its axis
+; exactly 1, reduce_max needs a non-empty axis, unfold needs a positive
+; window count. The recorder emits one fact per condition; the binding's
+; bounds seeds make it decidable; a violated fact dies here.
+(relation extent-eq (IntExpr i64))
+(relation extent-at-least (IntExpr i64))
+(rule
+  (
+    (extent-eq ?extent ?n)
+    (= ?upper (upper-bound-of ?extent))
+    (> ?upper (bigint ?n))
+  )
+  (
+    (panic "shape contract: an axis contracted to a fixed extent may exceed it under this binding (squeeze) — bucket or pin the dim to that extent")
+  )
+  :ruleset fixpoint-invariants
+)
+(rule
+  (
+    (extent-eq ?extent ?n)
+    (= ?lower (lower-bound-of ?extent))
+    (< ?lower (bigint ?n))
+  )
+  (
+    (panic "shape contract: an axis contracted to a fixed extent may fall below it under this binding (squeeze) — bucket or pin the dim to that extent")
+  )
+  :ruleset fixpoint-invariants
+)
+(rule
+  (
+    (extent-at-least ?extent ?n)
+    (= ?lower (lower-bound-of ?extent))
+    (< ?lower (bigint ?n))
+  )
+  (
+    (panic "shape contract: an axis extent may fall below its minimum under this binding (an empty reduce_max axis, or an unfold kernel that does not fit) — bind the dim's range to exclude smaller values")
+  )
+  :ruleset fixpoint-invariants
+)
 
 ; VIEW ARITY LOCK: an index map's entry count IS the rank of its
 ; source-shape tag. That is a property of the LITERAL, and it is checked

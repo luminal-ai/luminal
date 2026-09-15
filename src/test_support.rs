@@ -2930,10 +2930,9 @@ mod subst_guard_study {
         }
     }
 
-    /// SHAPE-CONTRACT PIN (squeeze option 3, ruling 2026-08-13): a
-    /// symbolic-extent squeeze records unconditionally and the
-    /// post-saturation invariant decides per binding — the [1,1] pin
-    /// discharges it; a [2,2] pin refuses at saturation.
+    /// SHAPE-CONTRACT PIN: a symbolic-extent squeeze records an extent
+    /// condition and the fixpoint invariant decides per binding — the
+    /// [1,1] pin discharges it; a [2,2] pin refuses at saturation.
     #[test]
     fn squeeze_contract_discharges_at_one_and_refuses_otherwise() {
         use luminal::prelude::{DType, Graph};
@@ -2961,8 +2960,8 @@ mod subst_guard_study {
             .search(&data, &luminal_reference::CompileOptions::default())
             .expect_err("extent 2 violates the squeeze contract");
         assert!(
-            format!("{err:#}").contains("axis extent must be exactly 1"),
-            "the labeled door names the squeeze contract: {err:#}"
+            format!("{err:#}").contains("shape contract"),
+            "the squeeze contract refuses at saturation: {err:#}"
         );
     }
 
@@ -2989,9 +2988,9 @@ mod subst_guard_study {
         assert_eq!(rt.get_f32(joined.id).unwrap(), &[1.0, 2.0, 3.0, 10.0, 20.0]);
     }
 
-    /// UNFOLD WINDOW CONTRACT: a symbolic dim records with the
-    /// kernel-fits invariant; the fitting pin runs, the violating pin
-    /// refuses with the NAMED door.
+    /// UNFOLD WINDOW CONTRACT: a symbolic dim records the kernel-fits
+    /// condition; the fitting pin runs, the violating pin refuses at
+    /// saturation.
     #[test]
     fn unfold_window_contract_discharges_and_names_its_door() {
         use luminal::prelude::{DType, Graph};
@@ -3019,8 +3018,8 @@ mod subst_guard_study {
             .search(&data, &luminal_reference::CompileOptions::default())
             .expect_err("kernel 3 cannot fit in extent 2");
         assert!(
-            format!("{err:#}").contains("unfold window on axis 0"),
-            "the labeled door names the unfold contract: {err:#}"
+            format!("{err:#}").contains("shape contract"),
+            "the unfold window contract refuses at saturation: {err:#}"
         );
     }
 }

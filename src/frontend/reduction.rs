@@ -24,10 +24,7 @@ impl GraphTensor {
                 // static extents discharge trivially; symbolic ones
                 // refuse unless the binding's range excludes 0.
                 let extent = operand_dims[axes[dim]];
-                let at = id.index();
-                self.graph()
-                    .logical
-                    .require_extent_at_least(at, &extent, 1, "reduce_max axis");
+                self.graph().logical.contract_extent_at_least(&extent, 1);
             }
             let rank = operand_dims.len();
             let axis_from_end = rank - 1 - axes[dim];
