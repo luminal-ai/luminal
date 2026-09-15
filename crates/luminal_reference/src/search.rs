@@ -718,7 +718,7 @@ mod tests {
     use luminal::dtype::DType;
     use luminal::graph::Graph;
 
-    use super::{CompileOptions, search_implementations};
+    use super::{CompileOptions, SearchProgram, search_implementations};
     use crate::ReferenceRuntime;
 
     /// A REAL selection space (x+y and x*y from shared inputs offers the
@@ -731,8 +731,8 @@ mod tests {
             let mut cx = Graph::new();
             let x = cx.tensor(4, DType::F32);
             let y = cx.tensor(4, DType::F32);
-            let a = (x + y).output();
-            let m = (x * y).output();
+            let a = x + y;
+            let m = x * y;
             (cx, x, y, a, m)
         };
         let x_data = vec![1.0, 2.0, 3.0, 4.0];
@@ -744,10 +744,14 @@ mod tests {
 
         // Our search.
         let (cx2, x2, y2, a2, m2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::ReferenceBindings)
+        let bound = crate::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
+        let program = SearchProgram {
+            text: bound.text(),
+            inputs: bound.inputs.clone(),
+            outputs: bound.outputs.clone(),
+        };
         let text = format!("{}\n\n{}", crate::assembled_program(), program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
         egraph
@@ -771,7 +775,7 @@ mod tests {
         );
 
         let mut runtime = ReferenceRuntime::default();
-        runtime.stage_slots(&program.input_slots, &program.output_slots);
+        runtime.stage_bindings(&bound.inputs, &bound.outputs);
         runtime.load_plan(outcome.best_plan.clone());
         runtime.set_data(x2.id, x_data);
         runtime.set_data(y2.id, y_data);

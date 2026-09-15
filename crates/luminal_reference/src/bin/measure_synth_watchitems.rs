@@ -150,7 +150,7 @@ fn main() {
         let t0 = Instant::now();
         let mut cx = Graph::new();
         let x = cx.tensor((16, 16, 64, 64), DType::F32);
-        let _ = (x * 2.0f32);
+        let _ = x * 2.0f32;
         let pairs = vec![(x.id, TypedBuffer::from(random_vec(16 * 16 * 64 * 64)))];
         measure_plan("scalar_broadcast_big", &cx, &pairs, t0);
     }
