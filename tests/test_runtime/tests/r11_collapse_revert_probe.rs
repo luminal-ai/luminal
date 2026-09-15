@@ -32,11 +32,8 @@ fn bounded_program(iters: usize, with_collapse: bool) -> String {
         let mut cx = Graph::new();
         let x = cx.tensor((2usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 3usize), DType::F32);
-        let _out = x.matmul(w).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w);
+        test_runtime::bind_leaves(&cx)
     };
     let preamble = luminal::egglog_snippet::assembled_program_for(&test_runtime::matchers());
     let mut program = format!("{preamble}\n\n{text}");

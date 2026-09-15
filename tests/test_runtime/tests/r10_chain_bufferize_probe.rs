@@ -45,11 +45,8 @@ fn matmul_then_elementwise_bufferize() {
         // Mul, not Add: Add is the C-fold decorator's own pattern, which
         // would fuse into the call instead of standing downstream.
         let y = x.matmul(w) * c;
-        let _ = y.output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = y;
+        test_runtime::bind_leaves(&cx)
     };
     bufferize_and_report(
         "mm+add",
@@ -72,11 +69,8 @@ fn chained_matmuls_bufferize() {
         // escape-and-disclose, ruling 2026-08-27: a view-produced bound
         // output escapes, so no dodge is needed). The probe's subject is
         // the INTERIOR sibling view feeding the second call.
-        let _ = x.matmul(w1).matmul(w2).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(w1).matmul(w2);
+        test_runtime::bind_leaves(&cx)
     };
     bufferize_and_report(
         "mm.mm",

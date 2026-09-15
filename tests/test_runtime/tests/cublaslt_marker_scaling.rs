@@ -26,12 +26,9 @@ fn record_blocks(geometries: &[(usize, usize, usize)]) -> String {
     for &(m, k, n) in geometries {
         let x = cx.tensor((m, k), DType::F32);
         let w = cx.tensor((k, n), DType::F32);
-        let _out = x.matmul(w).relu().output();
+        let _out = x.matmul(w).relu();
     }
-    cx.logical
-        .bound_program(&test_runtime::TestRuntimeBindings)
-        .expect("recorder clean")
-        .text
+    test_runtime::bind_leaves(&cx)
 }
 
 fn probe(name: &str, geometries: &[(usize, usize, usize)], prev_nodes: Option<usize>) -> usize {
