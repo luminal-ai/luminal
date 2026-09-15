@@ -1,0 +1,15 @@
+; Dtype Propagation : LogicalSelect — the result is one of the two value
+; branches, so it takes their (shared) dtype. The two `set`s must agree:
+; `dtype-of` is `:no-merge`, so a branch dtype mismatch aborts saturation.
+(rule
+  (
+    (= ?out_logical_tensor (LogicalSelect ?cond ?if_true ?if_false))
+    (= ?true_dtype (dtype-of ?if_true))
+    (= ?false_dtype (dtype-of ?if_false))
+  )
+  (
+    (set (dtype-of ?out_logical_tensor) ?true_dtype)
+    (set (dtype-of ?out_logical_tensor) ?false_dtype)
+  )
+  :ruleset prop
+)

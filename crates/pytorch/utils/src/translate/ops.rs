@@ -376,7 +376,7 @@ impl Translator<'_> {
         let (shape, dtype, value) = if like {
             let x = self.operand(&node.inputs[0])?;
             let meta = self.output_meta_dtype(node).unwrap_or(x.dtype);
-            (x.dims(), meta, self.get_float_arg(node, 1)?)
+            (x.dims(), meta, self.get_number_arg(node, 1)?)
         } else {
             let shape: Vec<IntExpr> = self
                 .get_ints_arg(node, 0)?
@@ -386,7 +386,7 @@ impl Translator<'_> {
             (
                 shape,
                 self.output_meta_dtype(node)?,
-                self.get_float_arg(node, 1)?,
+                self.get_number_arg(node, 1)?,
             )
         };
         Ok(self.full_tensor(shape, dtype, value))
@@ -394,19 +394,15 @@ impl Translator<'_> {
 
     pub(super) fn translate_arange(&mut self, node: &Node, kind: u8) -> Result<GraphTensor> {
         let dtype = self.output_meta_dtype(node)?;
-        let (start, end, step) = match kind {
-            0 => (0.0, self.get_float_arg(node, 0)?, 1.0),
-            1 => (
-                self.get_float_arg(node, 0)?,
-                self.get_float_arg(node, 1)?,
-                1.0,
-            ),
-            _ => (
-                self.get_float_arg(node, 0)?,
-                self.get_float_arg(node, 1)?,
-                self.get_float_arg(node, 2)?,
-            ),
-        };
+        // Resolve by schema name first: PT2 drops defaulted args (e.g.
+        // `step`) and shifts later kwargs, so positional indices are not
+        // reliable (`arange.start_step` can arrive as start,end,layout,...).
+        let start = self.named_float_arg(node, "start").unwrap_or(0.0);
+        let end = self
+            .named_float_arg(node, "end")
+            .or_else(|| self.get_float_arg(node, if kind == 0 { 0 } else { 1 }).ok())
+            .ok_or_else(|| anyhow::anyhow!("{}: missing end", node.target))?;
+        let step = self.named_float_arg(node, "step").unwrap_or(1.0);
         let arange = self
             .cx
             .arange_options(start as i64, end as i64, step as i64);
@@ -443,25 +439,20 @@ impl Translator<'_> {
         } else {
             self.operand(&node.inputs[2])?
         };
-        let (a, b) = util::broadcast_binary(a, b);
-        let (a, condition) = util::broadcast_binary(a, condition);
-        let mask = condition.cast(DType::F32);
-        let one = self.cx.constant_f32(1.0).expand_rhs(mask.dims());
-        Ok(a * mask + b * (one - mask))
+        Ok(self.select(condition, a, b))
     }
 
     pub(super) fn translate_masked_fill_scalar(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
         let mask = self.operand(&node.inputs[1])?;
         let value = self.get_float_arg(node, 2)? as f32;
-        let mask = mask.cast(DType::F32);
-        let one = self.cx.constant_f32(1.0).expand_rhs(mask.dims());
         let fill = self
             .cx
             .constant_f32(value)
             .cast(x.dtype)
             .expand_rhs(x.dims());
-        Ok(x * (one - mask) + fill * mask)
+        // `masked_fill(mask, value)` = `where(mask, value, x)`.
+        Ok(self.select(mask, fill, x))
     }
 
     pub(super) fn translate_clamp(&mut self, node: &Node) -> Result<GraphTensor> {

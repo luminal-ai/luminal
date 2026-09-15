@@ -100,14 +100,13 @@ pub(super) fn reshape_tensor(t: GraphTensor, target: &[IntExpr]) -> GraphTensor 
     }
     let mut flat = t.flatten();
     // `split_dims(axis, inner)` leaves `old / inner` at `axis` and inserts
-    // `inner` directly after it. To rebuild `target` from the flat axis we
-    // therefore split each leading axis by the product of the *remaining*
-    // target extents, not by the target extent itself.
+    // `inner` directly after it, so each leading target dim is split off by
+    // the product of the REMAINING dims; splitting by the leading dim itself
+    // would reverse the target. `product_of_dims` canonicalises the operand
+    // order, so a symbolic product compares equal across call sites.
     for i in 0..target.len().saturating_sub(1) {
-        let rest: IntExpr = target[i + 1..]
-            .iter()
-            .fold(IntExpr::from(1), |acc, d| acc * *d);
-        flat = flat.split_dims(i, rest);
+        let inner = super::dim_arith::product_of_dims(target[i + 1..].iter().copied());
+        flat = flat.split_dims(i, inner);
     }
     flat
 }
@@ -174,6 +173,12 @@ impl Translator<'_> {
     }
 
     /// `where(condition, a, b)` over already-broadcast operands.
+    ///
+    /// Uses the native ternary `LogicalSelect`: the old arithmetic mask
+    /// `a*mask + b*(1-mask)` is a sum of products, which feeds the integer
+    /// associativity/commutativity/distributivity e-graph closure and can
+    /// explode saturation when chained; it is also NaN/inf-unsafe
+    /// (`NaN * 0`).
     pub(super) fn select(
         &mut self,
         condition: GraphTensor,
@@ -182,9 +187,12 @@ impl Translator<'_> {
     ) -> GraphTensor {
         let (a, condition) = broadcast_binary(a, condition);
         let (a, b) = broadcast_binary(a, b);
-        let mask = condition.cast(DType::F32);
-        let one = self.cx.constant_f32(1.0).expand_rhs(mask.dims());
-        a * mask + b * (one - mask)
+        let condition = if condition.dtype == DType::Bool {
+            condition
+        } else {
+            condition.cast(DType::Bool)
+        };
+        condition.select(a, b)
     }
 
     pub(super) fn bool_or(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
@@ -287,6 +295,27 @@ impl Translator<'_> {
             return Ok(i as f64);
         }
         bail!("input {idx} of {} is not a float: {arg:?}", node.target)
+    }
+
+    /// A numeric scalar argument that may be serialized as a float, int, or
+    /// bool (bools coerce to 1/0). `fill_value` is the motivating case:
+    /// `torch.full(shape, True)` serializes the fill as `as_bool`.
+    pub(super) fn get_number_arg(&self, node: &Node, idx: usize) -> Result<f64> {
+        let arg = &node
+            .inputs
+            .get(idx)
+            .with_context(|| format!("{} missing input {idx}", node.target))?
+            .arg;
+        if let Some(f) = arg.as_float() {
+            return Ok(f);
+        }
+        if let Some(i) = arg.as_int() {
+            return Ok(i as f64);
+        }
+        if let Some(b) = arg.as_bool() {
+            return Ok(if b { 1.0 } else { 0.0 });
+        }
+        bail!("input {idx} of {} is not a number: {arg:?}", node.target)
     }
 
     pub(super) fn get_ints_arg(&self, node: &Node, idx: usize) -> Result<Vec<i64>> {
@@ -460,5 +489,44 @@ impl Translator<'_> {
             }
         }
         positions
+    }
+}
+
+#[cfg(test)]
+mod reshape_order_tests {
+    use super::*;
+
+    #[test]
+    fn reshape_preserves_target_order() {
+        let mut cx = Graph::new();
+        let x = cx.tensor((1usize, 4usize, 64usize), DType::F32);
+        let out = reshape_tensor(x, &[IntExpr::from(4usize), IntExpr::from(64usize)]);
+        assert_eq!(
+            out.dims(),
+            vec![IntExpr::from(4usize), IntExpr::from(64usize)],
+            "reshape [1,4,64] -> [4,64] must not reverse its target"
+        );
+    }
+
+    #[test]
+    fn reshape_three_dims_stays_left_to_right() {
+        let mut cx = Graph::new();
+        let x = cx.tensor((2usize, 12usize), DType::F32);
+        let out = reshape_tensor(
+            x,
+            &[
+                IntExpr::from(2usize),
+                IntExpr::from(3usize),
+                IntExpr::from(4usize),
+            ],
+        );
+        assert_eq!(
+            out.dims(),
+            vec![
+                IntExpr::from(2usize),
+                IntExpr::from(3usize),
+                IntExpr::from(4usize)
+            ]
+        );
     }
 }

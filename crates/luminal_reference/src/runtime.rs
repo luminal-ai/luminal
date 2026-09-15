@@ -1010,6 +1010,7 @@ mod tests {
             "LayoutTensorOpReduceSumGeneric",
             "LayoutTensorOpRoundFunctionalGeneric",
             "LayoutTensorOpScatterFunctionalGeneric",
+            "LayoutTensorOpSelectFunctionalGeneric",
             "LayoutTensorOpSinFunctionalGeneric",
             "LayoutTensorOpSqrtFunctionalGeneric",
             "LayoutTensorOpTruncCastGeneric",

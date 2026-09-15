@@ -410,18 +410,42 @@ impl GraphTensor {
 
     // Clipping ops (minimum, maximum, clip)
 
-    /// Take the elementwise maximum of two tensors
+    /// Take the elementwise maximum of two tensors.
+    ///
+    /// Lowers to the native ternary `Select`, not the old arithmetic mask
+    /// `(a<b)*b + (b<=a)*a`: a sum of products feeds the integer
+    /// associativity/commutativity/distributivity e-graph closure, which
+    /// explodes when such expressions chain. `Select` is also NaN-safe.
+    ///
+    /// `maximum` PROPAGATES NaN (unlike `fmax`): if either operand is NaN the
+    /// result is NaN, so the two NaN cases are steered through `Select` too.
     pub fn maximum(self, rhs: GraphTensor) -> GraphTensor {
-        (self.lt(rhs).cast(self.dtype) * rhs) + (rhs.le(self).cast(self.dtype) * self)
+        let nan_guard = |tensor: GraphTensor, picked: GraphTensor| -> GraphTensor {
+            if !matches!(
+                tensor.dtype,
+                DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
+            ) {
+                return picked;
+            }
+            let dims = picked.dims();
+            let nan = match tensor.dtype {
+                DType::F64 => tensor.graph().constant_f64(f64::NAN),
+                _ => tensor.graph().constant_f32(f32::NAN).cast(tensor.dtype),
+            }
+            .expand_rhs(dims);
+            tensor.ne(tensor).select(nan, picked)
+        };
+        let picked = self.lt(rhs).select(rhs, self);
+        nan_guard(rhs, nan_guard(self, picked))
     }
 
     /// Take the elementwise maximum of a tensor and a float
     pub fn maximum_f32(self, rhs: f32) -> GraphTensor {
         // `constant_f32` always emits F32; cast it to `self.dtype` so the
-        // downstream `lt`/`le` comparisons inside `maximum` don't panic when
-        // `self` is Int (e.g. `aten.clamp` on Int top-k indices coming out
-        // of an MoE router). For Int self the cast floors the bound, which
-        // matches PyTorch's `clamp(int_tensor, min=<float>)` semantics.
+        // downstream `lt`-based `maximum` doesn't panic when `self` is Int
+        // (e.g. `aten.clamp` on Int top-k indices coming out of an MoE
+        // router). For Int self the cast floors the bound, which matches
+        // PyTorch's `clamp(int_tensor, min=<float>)` semantics.
         self.maximum(
             self.graph()
                 .constant_f32(rhs)
@@ -430,14 +454,36 @@ impl GraphTensor {
         )
     }
 
-    /// Take the elementwise minimum of two tensors
+    /// Take the elementwise minimum of two tensors. See [`Self::maximum`]
+    /// for why this is a native select.
     pub fn minimum(self, rhs: GraphTensor) -> GraphTensor {
-        -(-self).maximum(-rhs)
+        let nan_guard = |tensor: GraphTensor, picked: GraphTensor| -> GraphTensor {
+            if !matches!(
+                tensor.dtype,
+                DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
+            ) {
+                return picked;
+            }
+            let dims = picked.dims();
+            let nan = match tensor.dtype {
+                DType::F64 => tensor.graph().constant_f64(f64::NAN),
+                _ => tensor.graph().constant_f32(f32::NAN).cast(tensor.dtype),
+            }
+            .expand_rhs(dims);
+            tensor.ne(tensor).select(nan, picked)
+        };
+        let picked = self.gt(rhs).select(rhs, self);
+        nan_guard(rhs, nan_guard(self, picked))
     }
 
     /// Take the elementwise minimum of a tensor and a float
     pub fn minimum_f32(self, rhs: f32) -> GraphTensor {
-        -(-self).maximum_f32(-rhs)
+        self.minimum(
+            self.graph()
+                .constant_f32(rhs)
+                .cast(self.dtype)
+                .expand_rhs(self.dims()),
+        )
     }
 
     /// Clip (clamp) a tensor into the range [`min`, `max`]
@@ -451,7 +497,56 @@ impl GraphTensor {
             self.dtype, other.dtype,
             "self and other need to be the same dtype!"
         );
-        (cond.cast(self.dtype) * self) + ((1.0 - cond.cast(DType::F32)).cast(other.dtype) * other)
+        // A Bool condition lowers to the native ternary select; a numeric
+        // condition keeps the arithmetic mask (its callers may pass {0,1}
+        // values). The native path is NaN/inf-safe.
+        if cond.dtype == DType::Bool {
+            cond.select(self, other)
+        } else {
+            (cond.cast(self.dtype) * self)
+                + ((1.0 - cond.cast(DType::F32)).cast(other.dtype) * other)
+        }
+    }
+
+    /// Ternary select: `condition.select(if_true, if_false)`.
+    ///
+    /// The condition must be a `Bool` tensor; the two value branches must
+    /// share a shape and dtype, and the output takes both. Unlike [`cond`],
+    /// which blends with `c*a + (1-c)*b` and leaks NaN/inf through `0*inf`,
+    /// this records one `LogicalSelect` node so each backend can lower it to
+    /// a real boolean select.
+    pub fn select(self, if_true: GraphTensor, if_false: GraphTensor) -> GraphTensor {
+        assert_eq!(
+            self.dtype,
+            DType::Bool,
+            "select condition must be a Bool tensor, got {:?}",
+            self.dtype
+        );
+        assert_eq!(
+            if_true.dtype, if_false.dtype,
+            "select branches must share a dtype, got {:?} and {:?}",
+            if_true.dtype, if_false.dtype
+        );
+        assert_eq!(
+            if_true.dims(),
+            if_false.dims(),
+            "select branches must share a shape"
+        );
+        let new_id = self
+            .graph()
+            .logical
+            .op(
+                LogicalOp::Select,
+                &[
+                    (self.id, self.dims()),
+                    (if_true.id, if_true.dims()),
+                    (if_false.id, if_false.dims()),
+                ],
+                if_true.dims(),
+                if_true.dtype,
+            )
+            .unwrap_or_else(crate::graph::unrecorded_value);
+        GraphTensor::from_id(new_id, if_true.dims(), self.graph_ref, if_true.dtype)
     }
 }
 

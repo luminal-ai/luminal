@@ -173,11 +173,18 @@ impl GraphTensor {
             // (0 < x) + (x < 0) is nonzero, and that sum is {0,1}-valued
             // (x cannot be on both sides of 0), so one more `0 <` lands
             // it in Bool exactly — total, and exact at every float.
-            let zero = self
-                .graph()
-                .constant_f32(0.0)
-                .cast(self.dtype)
-                .expand_rhs(self.dims());
+            //
+            // The comparison zero must be built in the SOURCE dtype: an
+            // integer source cannot be given a `constant_f32(0.0).cast(_)`
+            // zero, because float -> int is a refused lossy cast.
+            let zero_scalar = match self.dtype {
+                DType::F64 => self.graph().constant_f64(0.0),
+                DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
+                    self.graph().constant_i32(0).cast(self.dtype)
+                }
+                _ => self.graph().constant_f32(0.0).cast(self.dtype),
+            };
+            let zero = zero_scalar.expand_rhs(self.dims());
             let sum = zero.lt(self).cast(DType::F32) + self.lt(zero).cast(DType::F32);
             let zero_f32 = self.graph().constant_f32(0.0).expand_rhs(self.dims());
             return zero_f32.lt(sum);

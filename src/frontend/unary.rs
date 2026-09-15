@@ -309,42 +309,41 @@ impl GraphTensor {
 
     /// Take the absolute value.
     ///
-    /// DTYPE-AWARE (main #399, re-expressed 2026-09-02). The float path
-    /// is unchanged: `relu(x) + relu(-x)`. Integers cannot take it —
-    /// `relu` is `maximum_f32`, which builds its bound with
-    /// `constant_f32(0.0).cast(self.dtype)`, and an F32 -> Int cast is
-    /// REFUSED at authoring by the cast policy of 2026-08-11, so
-    /// `abs()` on an Int tensor used to panic before it recorded
-    /// anything. So:
+    /// DTYPE-AWARE (main #399, re-expressed 2026-09-02). Both paths now
+    /// lower to the native ternary `Select`:
     ///
     /// * UNSIGNED integers are already their own absolute value —
     ///   identity, and no ops recorded at all.
-    /// * SIGNED integers use main's identity `x * (1 - 2*(x < 0))`,
-    ///   built from Int constants rather than float ones so no
-    ///   float -> int cast appears. This is also CORRECT at the signed
-    ///   minimum in the only sense available: `i32::MIN` has no
-    ///   representable absolute value, and the multiplication reports
-    ///   that as an overflow (the Int kernels are checked) instead of
-    ///   returning `MIN` as `relu` + `relu` would.
+    /// * SIGNED integers use `(x < 0).select(-x, x)`. This is also CORRECT
+    ///   at the signed minimum in the only sense available: `i32::MIN` has
+    ///   no representable absolute value, and the negation reports that as
+    ///   an overflow (the Int kernels are checked) instead of returning
+    ///   `MIN` as a masked multiply would.
+    /// * FLOATS also use `(x < 0).select(-x, x)`; `NaN < 0` is false, so a
+    ///   NaN input passes through unchanged, matching torch.
+    ///
+    /// The old spellings (`x * (1 - 2*(x<0))` for ints,
+    /// `relu(x) + relu(-x)` where `relu` is a masked `maximum` for floats)
+    /// are sums of products: chained, they feed the integer
+    /// associativity/commutativity/distributivity e-graph closure and
+    /// explode saturation. `Select` is one node and is NaN/inf-safe.
     pub fn abs(self) -> GraphTensor {
         match self.dtype {
             DType::U4 | DType::U8 | DType::U16 => self,
-            DType::I4 | DType::I8 | DType::I16 | DType::Int | DType::I64 => {
-                let dims = self.dims();
-                let zero = self
+            DType::I4 | DType::I8 | DType::I16 | DType::Int | DType::I64 => self
+                .lt(self
                     .graph()
                     .constant_i32(0)
                     .cast(self.dtype)
-                    .expand_rhs(dims.clone());
-                let one = self
+                    .expand_rhs(self.dims()))
+                .select(-self, self),
+            _ => self
+                .lt(self
                     .graph()
-                    .constant_i32(1)
+                    .constant_f32(0.0)
                     .cast(self.dtype)
-                    .expand_rhs(dims);
-                let negative = self.lt(zero).cast(self.dtype);
-                self * (one - negative * 2)
-            }
-            _ => self.relu() + (-self).relu(),
+                    .expand_rhs(self.dims()))
+                .select(-self, self),
         }
     }
 

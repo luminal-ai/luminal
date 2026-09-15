@@ -13,22 +13,29 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 use luminal::prelude::*;
 
+mod array_extra;
 mod attention;
+mod complex;
 mod conv;
 mod dim_arith;
+mod elementwise_more;
 mod expr;
 mod grouped_mm;
 mod index;
 mod movement_more;
 mod ops;
 mod pooling;
+mod reductions_more;
 mod special;
+mod stats_more;
 mod sympy;
 mod unary;
 mod upsample;
 mod util;
 
 use ops::ReductionOp;
+use reductions_more::AddMmVariant;
+use stats_more::DistVariant;
 
 use crate::dtype::TorchDType;
 use crate::pt2_parser::{InputKind, ParsedPT2};
@@ -88,6 +95,9 @@ struct Translator<'a> {
     symbols: HashMap<String, Symbol>,
     /// PT2 symbol name -> torch's exported range constraint.
     ranges: HashMap<String, RangeConstraint>,
+    /// Complex-is-a-virtual-type table: value name -> the two real
+    /// components that carry it. HLIR never sees a complex dtype.
+    complex_tensors: HashMap<String, complex::ComplexTensor>,
     parsed: &'a ParsedPT2,
     /// Recorder dim symbol -> concrete hint, seeded into the runtime.
     dims: HashMap<Symbol, usize>,
@@ -104,6 +114,7 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         sink_by_value: HashMap::new(),
         symbols: sym_dim_map.sym_to_symbol.clone(),
         ranges: sym_dim_map.ranges,
+        complex_tensors: HashMap::new(),
         parsed,
         dims: HashMap::new(),
     };
@@ -132,11 +143,9 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             .tensor_meta(&name)
             .with_context(|| format!("input {name} has no tensor metadata"))?
             .clone();
-        let dtype = dtype_of(meta.dtype)?;
-        let shape = t.boundary_shape(&meta, &name)?;
-        let tensor = t.cx.named_tensor(&name, shape.as_slice(), dtype);
-        t.values.insert(name.clone(), tensor);
-        t.input_values.insert(name.clone(), tensor);
+        let torch_dtype = TorchDType::from_code(meta.dtype)
+            .map_err(|code| anyhow!("unknown PT2 dtype code {code} for input {name}"))?;
+        let mut shape = t.boundary_shape(&meta, &name)?;
         let kind = kinds.get(&name).cloned().unwrap_or(InputKind::UserInput {
             graph_name: name.clone(),
         });
@@ -144,6 +153,24 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             InputKind::Parameter { original_name, .. } => Some(original_name.clone()),
             InputKind::Buffer { original_name, .. } => Some(original_name.clone()),
             InputKind::UserInput { .. } => None,
+        };
+        // Complex storage is interleaved real/imaginary pairs: carry one
+        // real-valued input with a trailing extent-2 axis and split it into
+        // the two frontend-only components.
+        let (dtype, tensor) = if let Some(component_dtype) = torch_dtype.complex_component_dtype() {
+            shape.push(2usize.into());
+            let backing = t.cx.named_tensor(&name, shape.as_slice(), component_dtype);
+            let value = complex::ComplexTensor::from_interleaved(&mut t.cx, backing, torch_dtype)?;
+            t.complex_tensors.insert(name.clone(), value);
+            t.values.insert(name.clone(), backing);
+            t.input_values.insert(name.clone(), backing);
+            (component_dtype, backing)
+        } else {
+            let dtype = dtype_of(meta.dtype)?;
+            let tensor = t.cx.named_tensor(&name, shape.as_slice(), dtype);
+            t.values.insert(name.clone(), tensor);
+            t.input_values.insert(name.clone(), tensor);
+            (dtype, tensor)
         };
         inputs.push(TranslatedInput {
             graph_name: name,
@@ -177,12 +204,22 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             .tensor_meta(&name)
             .with_context(|| format!("output {name} has no tensor metadata"))?
             .clone();
-        let dtype = dtype_of(meta.dtype)?;
+        let torch_dtype = TorchDType::from_code(meta.dtype)
+            .map_err(|code| anyhow!("unknown PT2 dtype code {code} for output {name}"))?;
+        let dtype = match torch_dtype.complex_component_dtype() {
+            Some(component_dtype) => component_dtype,
+            None => dtype_of(meta.dtype)?,
+        };
         let shape = t.boundary_shape(&meta, &name)?;
-        let value = *t
-            .values
-            .get(&name)
-            .ok_or_else(|| anyhow!("output {name} was never produced"))?;
+        // A complex output is repacked into interleaved `[..., 2]` storage
+        // for the boundary; its logical shape stays the unpacked one.
+        let value = if let Some(value) = t.complex_tensors.get(&name).copied() {
+            value.pack(&mut t.cx)
+        } else {
+            *t.values
+                .get(&name)
+                .ok_or_else(|| anyhow!("output {name} was never produced"))?
+        };
 
         if let Some(&sink) = t.sink_by_value.get(&value.id) {
             if !matches!(
@@ -354,6 +391,17 @@ impl Translator<'_> {
             return Ok(());
         }
 
+        // Complex is a frontend virtual type. Route every node that consumes
+        // or produces one through algebraic real-component lowerings before
+        // the ordinary GraphTensor-only dispatch below.
+        let first_output = Self::tensor_output_names(node)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        if self.node_uses_complex(node, &first_output) {
+            return self.translate_complex_node(node, &first_output);
+        }
+
         let n = &node.inputs;
 
         let value = match target {
@@ -409,10 +457,10 @@ impl Translator<'_> {
                 self.operand(&n[0])?.round()
             }
             // ---- elementwise binary ----
-            "add.Tensor" => self.binary(n, |a, b| a + b)?,
-            "sub.Tensor" => self.binary(n, |a, b| a - b)?,
-            "mul.Tensor" => self.binary(n, |a, b| a * b)?,
-            "div.Tensor" => self.binary(n, |a, b| a / b)?,
+            "add.Tensor" | "add.Scalar" => self.binary(n, |a, b| a + b)?,
+            "sub.Tensor" | "sub.Scalar" => self.binary(n, |a, b| a - b)?,
+            "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
+            "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
             "minimum.default" => self.binary(n, |a, b| a.maximum(b * -1.0) * -1.0)?,
             // ---- in-place (functional SSA + caller-storage writeback) ----
@@ -509,6 +557,85 @@ impl Translator<'_> {
             "pow.Scalar" => self.pow_scalar_base(node)?,
             "fmod.Tensor" | "fmod.Scalar" => self.fmod_remainder(node, true)?,
             "remainder.Tensor" | "remainder.Scalar" => self.fmod_remainder(node, false)?,
+            // ---- batch 7: elementwise specials, squeeze, triangle ----
+            "atan2.default" => self.translate_atan2(node)?,
+            "copysign.Tensor" => self.translate_copysign(node, false)?,
+            "copysign.Scalar" => self.translate_copysign(node, true)?,
+            "fmax.default" => self.translate_fmax_fmin(node, true)?,
+            "fmin.default" => self.translate_fmax_fmin(node, false)?,
+            "hypot.default" => self.translate_hypot(node)?,
+            "gcd.default" => self.translate_gcd(node)?,
+            "exp2.default" => self.translate_exp2(node)?,
+            "log2.default" => self.translate_log2(node)?,
+            "isnan.default" => self.translate_isnan(node)?,
+            "leaky_relu.default" => self.translate_leaky_relu(node)?,
+            "bitwise_and.Tensor" | "__and__.Tensor" => self.translate_bitwise(node, false)?,
+            "bitwise_or.Tensor" | "__or__.Tensor" => self.translate_bitwise(node, true)?,
+            "squeeze.default" => self.translate_squeeze(node, true)?,
+            "squeeze.dims" => self.translate_squeeze(node, false)?,
+            "tril.default" => self.translate_triangular(node, false)?,
+            "triu.default" => self.translate_triangular(node, true)?,
+            // ---- batch 8: reductions, linalg, copies, constructors ----
+            "any.default" | "any.dim" | "any.dims" => self.translate_any(node)?,
+            "var_mean.default" | "var_mean.dim" | "var_mean.correction" => {
+                self.translate_var_mean(node)?;
+                return Ok(());
+            }
+            "addmm.default" => self.translate_addmm(node, AddMmVariant::AddMm)?,
+            "addbmm.default" => self.translate_addmm(node, AddMmVariant::AddBmm)?,
+            "addmv.default" => self.translate_addmm(node, AddMmVariant::AddMv)?,
+            "copy.default" => self.translate_copy(node)?,
+            "view_copy.default" => self.translate_view_copy(node)?,
+            "permute_copy.default" => self.translate_permute_copy(node)?,
+            "empty.memory_format"
+            | "empty_permuted.default"
+            | "empty_strided.default"
+            | "new_empty_strided.default" => self.translate_empty(node)?,
+            // ---- batch 9: sampling, search, indices, scatter, renorm ----
+            "grid_sampler_2d.default" => self.translate_grid_sampler(node, 2)?,
+            "grid_sampler_3d.default" => self.translate_grid_sampler(node, 3)?,
+            "searchsorted.Tensor" => self.translate_searchsorted(node, false)?,
+            "searchsorted.Scalar" => self.translate_searchsorted(node, true)?,
+            "bucketize.Tensor" => self.translate_bucketize(node)?,
+            "tril_indices.default" => self.translate_triangular_indices(node, false)?,
+            "triu_indices.default" => self.translate_triangular_indices(node, true)?,
+            "slice_scatter.default" => self.translate_slice_scatter(node)?,
+            "embedding_renorm.default" => self.translate_embedding_renorm(node)?,
+            "higher_order.wrap_with_set_grad_enabled" => {
+                self.translate_wrap_set_grad(node)?;
+                return Ok(());
+            }
+            // ---- batch 10: distances, norms, histograms, segment reduce ----
+            "dist.default" => self.translate_dist(node, DistVariant::Dist)?,
+            "_cdist_forward.default" => self.translate_dist(node, DistVariant::Cdist)?,
+            "_pdist_forward.default" => self.translate_dist(node, DistVariant::Pdist)?,
+            "_trilinear.default" => self.translate_trilinear(node)?,
+            "linalg_vector_norm.default" => self.translate_linalg_vector_norm(node)?,
+            "histc.default" => self.translate_histc(node)?,
+            "histogram.bin_ct" => {
+                self.translate_histogram(node, false)?;
+                return Ok(());
+            }
+            "histogram.bins_tensor" => {
+                self.translate_histogram(node, true)?;
+                return Ok(());
+            }
+            "_histogramdd_bin_edges.default"
+            | "_histogramdd_from_bin_cts.default"
+            | "_histogramdd_from_bin_tensors.default" => {
+                self.translate_histogramdd(node)?;
+                return Ok(());
+            }
+            "segment_reduce.default" => self.translate_segment_reduce(node)?,
+            "fractional_max_pool2d.default" => {
+                self.translate_fractional_max_pool(node, 2)?;
+                return Ok(());
+            }
+            "fractional_max_pool3d.default" => {
+                self.translate_fractional_max_pool(node, 3)?;
+                return Ok(());
+            }
+            "max_pool2d_with_indices_backward.default" => self.translate_max_pool_backward(node)?,
             // ---- movement batch ----
             "view.default" | "reshape.default" | "_unsafe_view.default" => {
                 self.translate_view(node)?
@@ -646,7 +773,7 @@ impl Translator<'_> {
                     .arg
                     .as_tensors()
                     .ok_or_else(|| anyhow!("cat: first operand is not a tensor list"))?;
-                let axis = self.int_arg(&n[1])? as usize;
+                let raw_axis = self.int_arg(&n[1])?;
                 let mut values = Vec::with_capacity(tensors.len());
                 for t in tensors {
                     values.push(
@@ -658,6 +785,16 @@ impl Translator<'_> {
                 }
                 let mut iter = values.into_iter();
                 let mut acc = iter.next().ok_or_else(|| anyhow!("cat: empty list"))?;
+                let rank = acc.rank();
+                let axis = if raw_axis < 0 {
+                    raw_axis + rank as i64
+                } else {
+                    raw_axis
+                };
+                let axis = usize::try_from(axis)
+                    .ok()
+                    .filter(|a| *a < rank)
+                    .ok_or_else(|| anyhow!("cat: axis {raw_axis} out of range for rank {rank}"))?;
                 for next in iter {
                     acc = acc.concat_along(next, axis);
                 }
