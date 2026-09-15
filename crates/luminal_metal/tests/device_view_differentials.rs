@@ -19,8 +19,14 @@ fn walked_dense(rt: &MetalRuntime, out: NodeIndex) -> Vec<f32> {
 }
 
 fn view_search_options() -> CompileOptions {
+    // Same reasoning as the CUDA-lite gate: the folded-view and
+    // materializing plans are both in the e-graph and semantically
+    // identical, and the heuristic ranks the fold cheaper, but the genetic
+    // search needs enough generations to leave a materializing local
+    // optimum. Budgets >= 16 reach the fold; smaller ones can fail the
+    // structural assertion for search reasons, not compiler reasons.
     CompileOptions {
-        generations: 4,
+        generations: 16,
         generation_size: 8,
         mutations: 4,
         trials: 1,
