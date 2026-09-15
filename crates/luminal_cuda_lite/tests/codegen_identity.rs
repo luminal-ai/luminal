@@ -156,7 +156,7 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal::layouts::
             searched_plan(|cx| {
                 let a = cx.tensor((2usize, 3usize), DType::F32);
                 let b = cx.tensor((2usize, 3usize), DType::F32);
-                let _ = ((a + b) * a).output();
+                let _ = (a + b) * a;
                 [
                     (a.id, vec![1.0f32, 2., 3., 4., 5., 6.].into()),
                     (b.id, vec![10.0f32, 20., 30., 40., 50., 60.].into()),
@@ -170,7 +170,7 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal::layouts::
             searched_plan(|cx| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).output();
+                let _ = x.matmul(w);
                 [
                     (x.id, vec![0.5f32; 32].into()),
                     (w.id, vec![0.25f32; 24].into()),
@@ -184,7 +184,7 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal::layouts::
             searched_plan(|cx| {
                 let a = cx.tensor((3usize, 4usize), DType::F32);
                 let b = cx.tensor((3usize, 4usize), DType::F32);
-                let _ = (a * b).sum(1).output();
+                let _ = (a * b).sum(1);
                 [
                     (a.id, vec![1.0f32; 12].into()),
                     (b.id, vec![2.0f32; 12].into()),

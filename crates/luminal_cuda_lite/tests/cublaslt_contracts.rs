@@ -393,7 +393,7 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
         let weight = cx.named_tensor("q_proj.weight", (STATE, STATE), DType::F32);
         let bias = cx.named_tensor("q_proj.bias", STATE, DType::F32);
         let x = cx.tensor((1usize, STATE), DType::F32);
-        let out = luminal_nn::linear(x, weight, Some(bias)).output();
+        let out = luminal_nn::linear(x, weight, Some(bias));
         (cx, x.id, weight.id, bias.id, out.id)
     };
     let data_for = |x: NodeIndex, w: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, HostBuffer> {
@@ -486,7 +486,7 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
         let mut cx = luminal::graph::Graph::new();
         let a = cx.tensor((4usize, 8usize), DType::F32);
         let b = cx.tensor((8usize, 3usize), DType::F32);
-        let out = a.matmul(b).output();
+        let out = a.matmul(b);
         (cx, a, b, out)
     };
     let data_for = |a: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, HostBuffer> {

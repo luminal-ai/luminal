@@ -53,7 +53,6 @@ fn run() -> anyhow::Result<()> {
         gather_idx,
         scatter_idx,
     );
-    let logits = logits.output();
 
     let (cos, sin) = rope_tables_split_half(&[1.0], dims.head_dim, dims.rope_theta, 1.0);
     let mut runtime_inputs = vec![

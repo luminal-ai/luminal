@@ -81,10 +81,9 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
             IntExpr::from(1usize),
         );
         h = next;
-        kc.output();
-        vc.output();
+        let _ = (kc, vc);
     }
-    let _ = h.output();
+    let _ = h;
 
     let mut pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (x.id, weights(d, 90).into()),

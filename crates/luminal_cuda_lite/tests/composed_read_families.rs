@@ -216,7 +216,7 @@ fn gather_lowers_a_folded_coordinate_operand() {
     let rows = cx.tensor(2usize, DType::Int);
     let cols = cx.iota((2usize, 3usize), |c| c[1]);
     let row_coord = rows.expand_dim(1, 3usize);
-    let out = data.gather(&[row_coord, cols]).output();
+    let out = data.gather(&[row_coord, cols]);
 
     let data_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
     let inputs: Vec<(NodeIndex, HostBuffer)> =
@@ -286,7 +286,7 @@ fn gather_lowers_a_folded_data_operand() {
     let cols = cx.iota((2usize, 3usize), |c| c[1]);
     // data = base^T, shape (4,3): data[i][j] = base[j][i].
     let data = base.permute((1, 0));
-    let out = data.gather(&[rows.expand_dim(1, 3usize), cols]).output();
+    let out = data.gather(&[rows.expand_dim(1, 3usize), cols]);
 
     let base_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
     let inputs: Vec<(NodeIndex, HostBuffer)> =
@@ -341,7 +341,7 @@ fn scatter_lowers_a_folded_coordinate_operand() {
     let rows = cx.tensor(2usize, DType::Int);
     let cols = cx.iota((2usize, 3usize), |c| c[1]);
     let row_coord = rows.expand_dim(1, 3usize);
-    let out = init.scatter(&[row_coord, cols], src).output();
+    let out = init.scatter(&[row_coord, cols], src);
 
     let inputs: Vec<(NodeIndex, HostBuffer)> = vec![
         (init.id, vec![0.0f32; 12].into()),
@@ -421,9 +421,7 @@ fn scatter_lowers_all_read_side_folds() {
     let cols = cx.iota((2usize, 3usize), |c| c[1]);
     let init = init_base.permute((1, 0)); // (4,3), init[i][j] = init_base[j][i]
     let src = src_base.slice((1..3, ..)); // (2,3), src[i][j] = src_base[i+1][j]
-    let out = init
-        .scatter(&[rows.expand_dim(1, 3usize), cols], src)
-        .output();
+    let out = init.scatter(&[rows.expand_dim(1, 3usize), cols], src);
 
     let init_vals: Vec<f32> = (0..12).map(|v| 100.0 + v as f32).collect();
     let src_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
@@ -502,7 +500,7 @@ fn materialize_lowers_a_folded_input_operand() {
     // A pure movement chain into a pinned output: the planner must
     // land the result in the caller's dense buffer, so one movement
     // materializes — and the other folds onto its input operand.
-    let out = x.permute((1, 0)).slice((0..2, ..)).output();
+    let out = x.permute((1, 0)).slice((0..2, ..));
 
     let inputs: Vec<(NodeIndex, HostBuffer)> =
         vec![(x.id, (0..6).map(|v| v as f32).collect::<Vec<f32>>().into())];
