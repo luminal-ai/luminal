@@ -1122,19 +1122,15 @@ impl LogicalGraph {
     /// Static extents are decided by the caller; this is for the ones
     /// only the binding's bounds can decide.
     pub(crate) fn contract_extent_eq(&mut self, extent: &IntExpr, n: i64) {
-        self.contracts.push(Contract::ExtentEq {
-            extent: *extent,
-            n,
-        });
+        self.contracts
+            .push(Contract::ExtentEq { extent: *extent, n });
     }
 
     /// State that `extent` is at least `n` (a non-empty reduce_max axis,
     /// a positive unfold window count).
     pub(crate) fn contract_extent_at_least(&mut self, extent: &IntExpr, n: i64) {
-        self.contracts.push(Contract::ExtentAtLeast {
-            extent: *extent,
-            n,
-        });
+        self.contracts
+            .push(Contract::ExtentAtLeast { extent: *extent, n });
     }
 
     /// The recorded extent conditions.
