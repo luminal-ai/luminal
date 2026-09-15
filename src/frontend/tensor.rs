@@ -57,20 +57,16 @@ impl GraphTensor {
     /// value (`GraphTensor.id` is the canonical SSA identity, PR #423)
     /// AND the dims derive from the recorder (R-D ruling 2026-08-26,
     /// reasserted 2026-09-01: the recorder's dims are THE dims; no
-    /// frontend method keeps parallel dims arithmetic). `None`
-    /// (poisoned/unrecorded) keeps the current id and dims so reads
-    /// stay panic-free; the graph fails at load with the poison reason.
-    pub(crate) fn with_logical(mut self, value: Option<crate::graph::ValueId>) -> Self {
-        if let Some(id) = value {
-            self.id = id;
-            self.dims = self
-                .graph()
-                .logical
-                .value_dims(id)
-                .iter()
-                .cloned()
-                .collect();
-        }
+    /// frontend method keeps parallel dims arithmetic).
+    pub(crate) fn with_logical(mut self, value: crate::graph::ValueId) -> Self {
+        self.id = value;
+        self.dims = self
+            .graph()
+            .logical
+            .value_dims(value)
+            .iter()
+            .cloned()
+            .collect();
         self
     }
 
@@ -80,54 +76,14 @@ impl GraphTensor {
         unsafe { self.graph_ref.as_mut().unwrap() }
     }
 
-    /// Mark this tensor as an observable output — this protects the
-    /// tensor's logical value from a later in-place update. Viewed sources
-    /// output as the views they are — the BINDING states the contiguous
-    /// boundary and search prices any materialization (Step 4a).
-    ///
-    /// (The old `persist()` residency marker is DELETED — ruling
-    /// 2026-08-06: storage residency across executions is runtime-BINDING
-    /// information, decided at the 4d/M4 binding surface, never authored
-    /// into the graph.)
-    pub fn output(&self) -> GraphTensor {
+    /// Name this value in the logical graph (a `LogicalTensorNamed`
+    /// annotation) so a runtime can bind it by name. Nothing else: what
+    /// is an output, and where its bytes live, is stated by the runtime's
+    /// binding, never by the model.
+    pub fn named(&self, name: &str) -> GraphTensor {
         let source = *self;
         let dims = source.dims();
-        self.graph().logical.output(&(source.id, dims), None);
-        source
-    }
-
-    /// `.output()` with an authored interface name — the label
-    /// `output_specs()` reports (duplicate names poison the graph;
-    /// unnamed outputs keep the synthesized "out_{key}").
-    pub fn output_named(&self, name: &str) -> GraphTensor {
-        let source = *self;
-        let dims = source.dims();
-        self.graph().logical.output(&(source.id, dims), Some(name));
-        source
-    }
-
-    /// Mark this tensor as an observable output that MUTATES `target` in
-    /// place: the value stays SSA, and the binding pins this output and
-    /// `target` to one buffer id (target must be a graph input). This is
-    /// PyTorch's functionalized in-place contract — `x.copy_(y)`.
-    pub fn output_into(&self, target: &GraphTensor) -> GraphTensor {
-        let source = *self;
-        let dims = source.dims();
-        let target_dims = target.dims();
-        self.graph()
-            .logical
-            .output_into(&(source.id, dims), &(target.id, target_dims), None);
-        source
-    }
-
-    /// `.output_into()` with an authored interface name.
-    pub fn output_into_named(&self, name: &str, target: &GraphTensor) -> GraphTensor {
-        let source = *self;
-        let dims = source.dims();
-        let target_dims = target.dims();
-        self.graph()
-            .logical
-            .output_into(&(source.id, dims), &(target.id, target_dims), Some(name));
+        self.graph().logical.name(&(source.id, dims), name);
         source
     }
 

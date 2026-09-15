@@ -4,10 +4,7 @@ impl Graph {
     /// A scalar `Int` (i32) expression constant.
     pub fn constant_i32(&mut self, i: impl Into<IntExpr>) -> GraphTensor {
         let expr = i.into();
-        let id = self
-            .logical
-            .record_iota(&expr, &[])
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let id = self.logical.record_iota(&expr, &[]);
         GraphTensor::from_id(id, (), self, DType::Int)
     }
 
@@ -42,8 +39,7 @@ impl Graph {
     pub fn constant_f32(&mut self, i: f32) -> GraphTensor {
         let id = self
             .logical
-            .op(LogicalOp::Constant(i as f64), &[], Vec::new(), DType::F32)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+            .op(LogicalOp::Constant(i as f64), &[], Vec::new(), DType::F32);
         GraphTensor::from_id(id, (), self, DType::F32)
     }
 
@@ -54,8 +50,7 @@ impl Graph {
     pub fn constant_f64(&mut self, value: f64) -> GraphTensor {
         let id = self
             .logical
-            .op(LogicalOp::ConstantF64(value), &[], Vec::new(), DType::F64)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+            .op(LogicalOp::ConstantF64(value), &[], Vec::new(), DType::F64);
         GraphTensor::from_id(id, (), self, DType::F64)
     }
 
@@ -82,10 +77,7 @@ impl Graph {
         // 2026-08-27): the recorded value expression is
         // construction-simplified, as pre-R-C.
         let expr = f(&coords).simplify();
-        let id = self
-            .logical
-            .record_iota(&expr, &sh)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let id = self.logical.record_iota(&expr, &sh);
         GraphTensor::from_id(id, sh, self, DType::Int)
     }
 
@@ -187,8 +179,7 @@ impl GraphTensor {
         let id = self
             .graph()
             .logical
-            .op(LogicalOp::Cast(dtype), &[operand], out_dims, dtype)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+            .op(LogicalOp::Cast(dtype), &[operand], out_dims, dtype);
         GraphTensor::from_id(id, self.dims(), self.graph_ref, dtype)
     }
 
@@ -217,8 +208,7 @@ impl GraphTensor {
         let id = self
             .graph()
             .logical
-            .op(LogicalOp::TruncCast(dtype), &[operand], out_dims, dtype)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+            .op(LogicalOp::TruncCast(dtype), &[operand], out_dims, dtype);
         GraphTensor::from_id(id, self.dims(), self.graph_ref, dtype)
     }
 }
@@ -235,7 +225,7 @@ mod tests {
         ref_func: impl Fn(&Device) -> Tensor,
     ) {
         let mut cx = Graph::new();
-        let b = func(&mut cx).output();
+        let b = func(&mut cx);
 
         let rt = luminal_reference::harness::run_reference(&cx, &[]);
 
@@ -256,7 +246,7 @@ mod tests {
     fn constant_i64_preserves_full_width_values() {
         for value in [i64::MIN, -(1i64 << 40) + 7, -1, 0, 1i64 << 40, i64::MAX] {
             let mut cx = Graph::new();
-            let c = cx.constant_i64(value).output();
+            let c = cx.constant_i64(value);
             let rt = luminal_reference::harness::run_reference(&cx, &[]);
             assert_eq!(rt.get_i64(c.id).unwrap(), &vec![value], "value {value}");
         }
@@ -317,7 +307,7 @@ mod tests {
         let a = cx.tensor((2, 3), DType::F32);
         let b = cx.tensor((2, 3), DType::F32);
         let c = cx.tensor((2, 3), DType::F32);
-        let stacked = cx.stack(&[a, b, c], 0).output();
+        let stacked = cx.stack(&[a, b, c], 0);
 
         let a_data = random_vec(6);
         let b_data = random_vec(6);

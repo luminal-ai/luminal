@@ -48,16 +48,11 @@ pub fn reference_allow_list() -> Vec<&'static str> {
         .collect()
 }
 
-/// M3 Step 2: what `load` captured from a natively-recorded Graph — the
-/// pre-schedule program text (model + reference-binding defaults), the
-/// I/O slots, the post-schedule authoring checks, plus whatever the
-/// binding calls accumulate before `search` assembles and saturates.
+/// What `load` captured from a recorded Graph: the bound program (model
+/// text, this runtime's boundary, the post-schedule checks) plus whatever
+/// the binding calls accumulate before `search` assembles and saturates.
 struct NativeSpec {
-    pre_schedule: String,
-    input_slots: Vec<luminal::graph::InputSlot>,
-    output_slots: Vec<luminal::graph::OutputSlot>,
-    post_checks: String,
-    labeled_checks: Vec<(String, String)>,
+    bound: crate::bindings::BoundProgram,
     binding_seeds: String,
     ops: Option<Vec<&'static str>>,
 }
@@ -77,7 +72,9 @@ pub struct ReferenceRuntime {
     /// to output), writes stage the input buffer and reads see the
     /// output buffer — two buffers, no ambiguity, no fallback.
     input_buffers: FxHashMap<petgraph::graph::NodeIndex, i64>,
-    output_buffers: FxHashMap<petgraph::graph::NodeIndex, i64>,
+    /// Every buffer a value is bound to as an output. A value bound on
+    /// two buffers is read back by buffer, not by tensor.
+    output_buffers: FxHashMap<petgraph::graph::NodeIndex, Vec<i64>>,
     /// M3 Step 2 native-ladder state (`load` → bind → `with_ops` → `search`).
     native: Option<NativeSpec>,
     /// BUCKETS (D7, 2026-09-03): per-dim intervals a single search
@@ -101,14 +98,20 @@ pub struct ReferenceRuntime {
 }
 
 impl ReferenceRuntime {
-    /// Register the tensor→buffer role maps from a program's slots.
-    pub fn stage_slots(
+    /// Register the tensor→buffer role maps from the boundary bindings.
+    pub fn stage_bindings(
         &mut self,
-        inputs: &[luminal::graph::InputSlot],
-        outputs: &[luminal::graph::OutputSlot],
+        inputs: &[crate::bindings::Bound],
+        outputs: &[crate::bindings::Bound],
     ) {
-        self.input_buffers = inputs.iter().map(|s| (s.tensor, s.buffer)).collect();
-        self.output_buffers = outputs.iter().map(|s| (s.tensor, s.buffer)).collect();
+        self.input_buffers = inputs.iter().map(|b| (b.value, b.buffer)).collect();
+        self.output_buffers.clear();
+        for bound in outputs {
+            self.output_buffers
+                .entry(bound.value)
+                .or_default()
+                .push(bound.buffer);
+        }
     }
 
     /// Load a plan for execution.
@@ -142,26 +145,33 @@ impl ReferenceRuntime {
         self.storage.clear();
     }
 
-    /// M3 Step 2, the native entry ladder: LOAD a natively-recorded graph
-    /// (the model + reference-binding defaults; loud if the recorder is
-    /// poisoned) — then bind, choose allowable ops, and `search`.
+    /// LOAD a recorded graph under the default binding: every input on
+    /// its own read-only buffer, every leaf on its own read-write buffer.
     pub fn load(graph: &luminal::graph::Graph) -> Result<Self> {
-        let (pre_schedule, input_slots, output_slots, post_checks, labeled_checks) = graph
-            .logical
-            .bound_parts(&crate::bindings::ReferenceBindings)
-            .map_err(|reason| anyhow!("native load refused: {reason}"))?;
-        Ok(Self {
-            native: Some(NativeSpec {
-                pre_schedule,
-                input_slots,
-                output_slots,
-                post_checks,
-                labeled_checks,
-                binding_seeds: String::new(),
-                ops: None,
-            }),
-            ..Self::default()
-        })
+        Self::load_with(
+            graph,
+            crate::bindings::ReferenceBindings::leaves(&graph.logical),
+        )
+    }
+
+    /// LOAD a recorded graph under the caller's binding — which values
+    /// enter and leave through which buffers. The tensor→buffer maps are
+    /// live from here, so `set_data` needs no search first.
+    pub fn load_with(
+        graph: &luminal::graph::Graph,
+        bindings: crate::bindings::ReferenceBindings,
+    ) -> Result<Self> {
+        let bound = bindings
+            .bind(&graph.logical)
+            .map_err(|reason| anyhow!("load refused: {reason}"))?;
+        let mut runtime = Self::default();
+        runtime.stage_bindings(&bound.inputs, &bound.outputs);
+        runtime.native = Some(NativeSpec {
+            bound,
+            binding_seeds: String::new(),
+            ops: None,
+        });
+        Ok(runtime)
     }
 
     /// BINDING: seed a dynamic dim's range (bounds-on-vars — never a pin).
@@ -271,10 +281,11 @@ impl ReferenceRuntime {
             .ok_or_else(|| anyhow!("bind before load"))?;
         anyhow::ensure!(lower <= upper, "empty value range [{lower}, {upper}]");
         let name = spec
-            .input_slots
+            .bound
+            .inputs
             .iter()
-            .find(|slot| slot.tensor == tensor)
-            .map(|slot| slot.value_name.clone())
+            .find(|bound| bound.value == tensor)
+            .and_then(|bound| spec.bound.let_names.get(&bound.value).cloned())
             .ok_or_else(|| anyhow!("tensor {tensor:?} is not a bound input"))?;
         spec.binding_seeds.push_str(&format!(
             "(set (value-lower-bound-of {name}) (bigint {lower}))
@@ -314,17 +325,10 @@ impl ReferenceRuntime {
             .native
             .take()
             .ok_or_else(|| anyhow!("search before load"))?;
-        let text = format!(
-            "{}{}{}{}",
-            spec.pre_schedule,
-            spec.binding_seeds,
-            crate::bindings::ReferenceBindings::SCHEDULE,
-            spec.post_checks
-        );
-        let program = luminal::graph::LogicalProgram {
-            text,
-            input_slots: spec.input_slots,
-            output_slots: spec.output_slots,
+        let program = crate::search::SearchProgram {
+            text: spec.bound.text_with_seeds(&spec.binding_seeds),
+            inputs: spec.bound.inputs.clone(),
+            outputs: spec.bound.outputs.clone(),
         };
         let full = format!("{}\n\n{}", crate::assembled_program(), program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
@@ -337,16 +341,14 @@ impl ReferenceRuntime {
             // what failed and how to unblock it. (Failure path only;
             // the green path pays nothing.)
             let unchecked = format!(
-                "{}\n\n{}{}{}",
+                "{}\n\n{}",
                 crate::assembled_program(),
-                spec.pre_schedule,
-                spec.binding_seeds,
-                crate::bindings::ReferenceBindings::SCHEDULE,
+                spec.bound.text_unchecked_with_seeds(&spec.binding_seeds)
             );
             let mut probe = luminal::egglog_snippet::new_egraph();
             if probe.parse_and_run_program(None, &unchecked).is_ok() {
                 let mut failed: Vec<&str> = Vec::new();
-                for (label, text) in &spec.labeled_checks {
+                for (label, text) in &spec.bound.labeled_checks {
                     if probe.parse_and_run_program(None, text).is_err() {
                         failed.push(label);
                     }
@@ -379,7 +381,7 @@ impl ReferenceRuntime {
         )?;
         outcome.timings.saturation_nanos = saturation_nanos;
         outcome.timings.serialize_nanos = serialize_nanos;
-        self.stage_slots(&program.input_slots, &program.output_slots);
+        self.stage_bindings(&program.inputs, &program.outputs);
         self.load_plan(outcome.best_plan.clone());
         Ok(outcome)
     }
@@ -416,12 +418,12 @@ impl ReferenceRuntime {
             .ok_or_else(|| anyhow!("search_buckets before load"))?;
         let assembly = crate::search::BucketAssembly {
             assembled_program: crate::assembled_program(),
-            pre_schedule: &spec.pre_schedule,
+            prefix: &spec.bound.prefix,
             binding_seeds: &spec.binding_seeds,
             schedule: crate::bindings::ReferenceBindings::SCHEDULE,
-            post_checks: &spec.post_checks,
-            input_slots: &spec.input_slots,
-            output_slots: &spec.output_slots,
+            post_checks: &spec.bound.post_checks,
+            inputs: &spec.bound.inputs,
+            outputs: &spec.bound.outputs,
             base_dims: &self.dims,
         };
         self.bucket_plans = crate::search::bucketed_search_implementations(
@@ -431,7 +433,7 @@ impl ReferenceRuntime {
             options,
             spec.ops.clone(),
         )?;
-        self.stage_slots(&spec.input_slots, &spec.output_slots);
+        self.stage_bindings(&spec.bound.inputs, &spec.bound.outputs);
         // Load eagerly when the runtime already sits inside a bucket at
         // its representative; otherwise `execute` will select.
         let _ = self.select_bucket_plan();
@@ -471,11 +473,8 @@ impl ReferenceRuntime {
             }
         }
         let chosen = plan.outcome.best_plan.clone();
-        let (inputs, outputs) = (
-            plan.program.input_slots.clone(),
-            plan.program.output_slots.clone(),
-        );
-        self.stage_slots(&inputs, &outputs);
+        let (inputs, outputs) = (plan.program.inputs.clone(), plan.program.outputs.clone());
+        self.stage_bindings(&inputs, &outputs);
         self.load_plan(chosen);
         Ok(())
     }
@@ -866,10 +865,22 @@ impl ReferenceRuntime {
     }
 
     fn output_buffer(&self, tensor: petgraph::graph::NodeIndex) -> Result<i64> {
-        self.output_buffers
-            .get(&tensor)
-            .copied()
-            .ok_or_else(|| anyhow!("tensor {tensor:?} is not a bound output of this program"))
+        match self.output_buffers.get(&tensor).map(Vec::as_slice) {
+            Some([buffer]) => Ok(*buffer),
+            Some(buffers) => Err(anyhow!(
+                "tensor {tensor:?} is bound as an output on {} buffers ({buffers:?}); read it by buffer",
+                buffers.len()
+            )),
+            None => Err(anyhow!(
+                "tensor {tensor:?} is not a bound output of this program"
+            )),
+        }
+    }
+
+    /// The typed contents of an output BUFFER — for values bound on more
+    /// than one buffer, or for callers that think in buffers.
+    pub fn get_buffer(&self, buffer: i64) -> Result<&TypedBuffer> {
+        self.get_typed(buffer)
     }
 
     /// The escape-and-disclose fetch (ruling 2026-08-27), universal over

@@ -41,8 +41,7 @@ impl GraphTensor {
             id = self
                 .graph()
                 .logical
-                .op(op, &[(id, operand_dims)], out_dims.clone(), self.dtype)
-                .unwrap_or_else(crate::graph::unrecorded_value);
+                .op(op, &[(id, operand_dims)], out_dims.clone(), self.dtype);
             dims = out_dims;
             let axis = axes[dim];
             for ax in &mut axes {

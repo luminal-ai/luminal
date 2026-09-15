@@ -42,7 +42,7 @@ impl ViewChain {
                 self.dims = new_dims;
             }
             Err(reason) => {
-                self.tensor.graph().logical.poison(reason);
+                self.tensor.graph().logical.refuse(reason);
             }
         }
         self
@@ -681,11 +681,12 @@ impl GraphTensor {
             .iter()
             .map(|coord| (coord.id, coord.dims()))
             .collect();
-        let id = self
-            .graph()
-            .logical
-            .record_gather(&data_operand, &coord_operands, out_dims.clone(), self.dtype)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let id = self.graph().logical.record_gather(
+            &data_operand,
+            &coord_operands,
+            out_dims.clone(),
+            self.dtype,
+        );
         GraphTensor::from_id(id, out_dims, self.graph_ref, self.dtype)
     }
 
@@ -716,17 +717,13 @@ impl GraphTensor {
             .iter()
             .map(|coord| (coord.id, coord.dims()))
             .collect();
-        let id = self
-            .graph()
-            .logical
-            .record_scatter(
-                &init_operand,
-                &coord_operands,
-                &src_operand,
-                dims.clone(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let id = self.graph().logical.record_scatter(
+            &init_operand,
+            &coord_operands,
+            &src_operand,
+            dims.clone(),
+            self.dtype,
+        );
         GraphTensor::from_id(id, dims, self.graph_ref, self.dtype)
     }
 
@@ -970,8 +967,7 @@ impl GraphTensor {
             let id = self
                 .graph()
                 .logical
-                .view_op(&operand, &entries, new_dims.clone(), self.dtype)
-                .unwrap_or_else(crate::graph::unrecorded_value);
+                .view_op(&operand, &entries, new_dims.clone(), self.dtype);
             GraphTensor::from_id(id, new_dims, self.graph_ref, self.dtype)
         } else {
             // No start slices so no iota needed, just reduce the shape down
@@ -1077,11 +1073,10 @@ impl GraphTensor {
                 })
                 .collect();
             let operand = (self.id, dims.clone());
-            clamped_id = self
-                .graph()
-                .logical
-                .view_op(&operand, &entries, out_dims.clone(), self.dtype)
-                .unwrap_or_else(crate::graph::unrecorded_value);
+            clamped_id =
+                self.graph()
+                    .logical
+                    .view_op(&operand, &entries, out_dims.clone(), self.dtype);
         }
         let clamped =
             GraphTensor::from_id(clamped_id, out_dims.clone(), self.graph_ref, self.dtype);
@@ -1089,8 +1084,7 @@ impl GraphTensor {
         let mask_id = self
             .graph()
             .logical
-            .record_mask_iota(&befores, &afters, &dims)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+            .record_mask_iota(&befores, &afters, &dims);
         // ARITHMETIC MASKING, restored 2026-09-03. Main #406's select_by_index
         // (packed 2N iota + two scatter1d + gather1d, PR #471) was NaN-safe
         // but made egglog saturation stop converging for rank >= 2 pads
@@ -1524,7 +1518,7 @@ mod tests {
         let mut cx = Graph::new();
         let a = cx.tensor(3, DType::F32);
         let fill = cx.constant_f32(-7.0);
-        let b = a.pad_with((1, 2), fill).output();
+        let b = a.pad_with((1, 2), fill);
 
         let rt = luminal_reference::harness::run_reference(
             &cx,
@@ -1540,7 +1534,7 @@ mod tests {
     fn test_repeat_runtime_values() {
         let mut cx = Graph::new();
         let a = cx.tensor((2, 3), DType::F32);
-        let repeated = (a.repeat((2, 2)) * 1.0).output();
+        let repeated = a.repeat((2, 2)) * 1.0;
 
         let rt = luminal_reference::harness::run_reference(
             &cx,

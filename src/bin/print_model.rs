@@ -8,8 +8,8 @@ fn main() {
     let mut cx = Graph::new();
     let x = cx.tensor((2, 4, 8), DType::F32);
     let idx = cx.tensor((2, 4, 3), DType::Int);
-    let _ = x.gather_elements(idx, 2).output();
-    match cx.logical.model_text() {
+    let _ = x.gather_elements(idx, 2);
+    match cx.logical.render_all() {
         Ok(model) => println!("{model}"),
         Err(e) => println!("POISONED: {e}"),
     }

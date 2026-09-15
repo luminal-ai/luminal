@@ -28,20 +28,15 @@ impl GraphTensor {
     /// visible LogicalCast nodes in the recorded model. fp8 operands are
     /// no exception: fp8 x fp8 records as an fp8 broadcast+reduce; the
     /// F32-accumulator contract, where wanted, is spelled with casts.
-    /// Mixed dtypes cannot multiply and poison loudly.
-    pub fn matmul(self, mut rhs: GraphTensor) -> Self {
+    /// Mixed dtypes cannot multiply and refuse loudly.
+    pub fn matmul(self, rhs: GraphTensor) -> Self {
         if self.dtype != rhs.dtype {
-            self.graph().logical.poison(format!(
+            self.graph().logical.refuse(format!(
                 "matmul on {:?} x {:?}: matmul is broadcast+reduce in the \
                  operands' shared dtype and never casts — cast explicitly \
                  (lhs.cast(D).matmul(rhs.cast(D)))",
                 self.dtype, rhs.dtype
             ));
-            // The graph is already poisoned (nothing records from here on);
-            // align the HANDLE dtype only — no cast op, so e.g. an Int x
-            // F32 pair can't detonate the float->int cast refusal before
-            // the poison surfaces — and let bookkeeping proceed inertly.
-            rhs.dtype = self.dtype;
         }
         self.matmul_body(rhs)
     }
@@ -188,10 +183,10 @@ mod tests {
         let lhs = cx.tensor((2, 4), DType::F8E4M3);
         let rhs = cx.tensor((4, 3), DType::F8E4M3);
 
-        let out = lhs.cast(DType::F32).matmul(rhs.cast(DType::F32)).output();
+        let out = lhs.cast(DType::F32).matmul(rhs.cast(DType::F32));
 
         assert_eq!(out.dtype, DType::F32);
-        let model = cx.logical.model_text().expect("recorded model");
+        let model = cx.logical.render_all().expect("recorded model");
         let promoted_casts = model.matches("(LogicalCast").count();
         assert_eq!(
             promoted_casts, 2,
@@ -207,10 +202,10 @@ mod tests {
         let lhs = cx.tensor((2, 4), DType::F8E4M3);
         let rhs = cx.tensor((4, 3), DType::F8E4M3);
 
-        let out = lhs.matmul(rhs).output();
+        let out = lhs.matmul(rhs);
 
         assert_eq!(out.dtype, DType::F8E4M3);
-        let model = cx.logical.model_text().expect("recorded model");
+        let model = cx.logical.render_all().expect("recorded model");
         assert_eq!(
             model.matches("(LogicalCast").count(),
             0,
@@ -219,37 +214,23 @@ mod tests {
     }
 
     #[test]
-    fn mixed_dtype_matmul_without_explicit_precision_is_a_loud_recorder_error() {
+    #[should_panic(expected = "cast explicitly")]
+    fn mixed_dtype_matmul_refuses_at_construction() {
         let mut cx = Graph::new();
         let lhs = cx.tensor((2, 4), DType::F32);
         let rhs = cx.tensor((4, 3), DType::F16);
-
         let _ = lhs.matmul(rhs);
-
-        let reason = cx
-            .logical
-            .poisoned()
-            .expect("mixed-dtype matmul must poison the recorder (matmul never casts)");
-        assert!(reason.contains("cast explicitly"), "{reason}");
     }
 
+    /// An Int x F32 pair must refuse with the cast-explicitly message,
+    /// never by tripping the float->int cast refusal first.
     #[test]
-    fn int_float_matmul_poisons_without_detonating_the_cast_refusal() {
-        // The poison path must never record a cast: an Int x F32 pair
-        // would otherwise trip the float->int cast refusal assert and
-        // panic with a misleading message instead of surfacing the
-        // cast-explicitly poison.
+    #[should_panic(expected = "cast explicitly")]
+    fn int_float_matmul_refuses_with_the_cast_message() {
         let mut cx = Graph::new();
         let lhs = cx.tensor((2, 4), DType::Int);
         let rhs = cx.tensor((4, 3), DType::F32);
-
         let _ = lhs.matmul(rhs);
-
-        let reason = cx
-            .logical
-            .poisoned()
-            .expect("Int x F32 matmul must poison, not panic");
-        assert!(reason.contains("cast explicitly"), "{reason}");
     }
 
     #[test]

@@ -16,16 +16,12 @@ impl Add for GraphTensor {
             "Dtypes must match to add tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::Add,
-                &[(self.id, self.dims()), (rhs.id, rhs.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::Add,
+            &[(self.id, self.dims()), (rhs.id, rhs.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 }
@@ -85,16 +81,12 @@ impl Mul for GraphTensor {
             "Dtypes must match to multiply tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::Mul,
-                &[(self.id, self.dims()), (rhs.id, rhs.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::Mul,
+            &[(self.id, self.dims()), (rhs.id, rhs.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 }
@@ -153,16 +145,12 @@ impl Rem<GraphTensor> for GraphTensor {
             "Dtypes must match to mod tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::Mod,
-                &[(self.id, self.dims()), (rhs.id, rhs.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::Mod,
+            &[(self.id, self.dims()), (rhs.id, rhs.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 }
@@ -312,16 +300,12 @@ impl GraphTensor {
             "{constructor} is an INTEGER op (got {:?})",
             self.dtype
         );
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                op,
-                &[(self.id, self.dims()), (rhs.id, rhs.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            op,
+            &[(self.id, self.dims()), (rhs.id, rhs.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
@@ -345,16 +329,12 @@ impl GraphTensor {
             "Dtypes must match to compare tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::LessThan,
-                &[(self.id, self.dims()), (rhs.id, rhs.dims())],
-                self.dims(),
-                DType::Bool,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::LessThan,
+            &[(self.id, self.dims()), (rhs.id, rhs.dims())],
+            self.dims(),
+            DType::Bool,
+        );
         // Comparison operations always output Bool
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, DType::Bool)
     }
@@ -577,7 +557,7 @@ pub(super) mod tests {
         let mut cx = Graph::new();
         let a = cx.tensor(a_shape.clone(), luminal::dtype::DType::F32);
         let b = cx.tensor(b_shape.clone(), luminal::dtype::DType::F32);
-        let c = func(a, b).output();
+        let c = func(a, b);
 
         let lhs_values = lhs_transform(random_vec(a_shape.iter().copied().product()));
         let rhs_values = rhs_transform(random_vec(b_shape.iter().copied().product()));
@@ -855,8 +835,16 @@ pub(super) mod tests {
     fn run_pow(values: Vec<f32>, func: impl Fn(GraphTensor) -> GraphTensor) -> Vec<f32> {
         let mut cx = Graph::new();
         let a = cx.tensor(vec![values.len()], luminal::dtype::DType::F32);
-        let b = func(a).output();
-        let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, values.into())]);
+        let b = func(a);
+        // `pow(x, 1)` folds to the input itself, which is no leaf: bind the
+        // result explicitly whatever it turned out to be.
+        let bindings = luminal_reference::ReferenceBindings::dense(&cx.logical, &[b.id]);
+        let rt = luminal_reference::harness::run_reference_bound(
+            &cx,
+            bindings,
+            &[(a.id, values.into())],
+            &[],
+        );
         rt.get_f32(b.id).unwrap().to_vec()
     }
 

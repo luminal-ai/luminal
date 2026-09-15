@@ -26,7 +26,7 @@ fn measure_plan(
     t0: Instant,
 ) {
     let rec_us = t0.elapsed().as_micros();
-    let model = match cx.logical.model_text() {
+    let model = match cx.logical.render_all() {
         Ok(m) => m,
         Err(e) => {
             println!("{name}: RECORD-POISONED: {e}");
@@ -130,7 +130,7 @@ fn main() {
         let t0 = Instant::now();
         let mut cx = Graph::new();
         let x = cx.tensor((4, 4, 64, 64), DType::F32);
-        let _ = x.cumsum(3).output();
+        let _ = x.cumsum(3);
         let pairs = vec![(x.id, TypedBuffer::from(random_vec(4 * 4 * 64 * 64)))];
         measure_plan("cumsum_big", &cx, &pairs, t0);
     }
@@ -140,7 +140,7 @@ fn main() {
         let t0 = Instant::now();
         let mut cx = Graph::new();
         let x = cx.tensor((8, 256), DType::F32);
-        let _ = x.topk_indexes(4, 1).output();
+        let _ = x.topk_indexes(4, 1);
         let pairs = vec![(x.id, TypedBuffer::from(random_vec(8 * 256)))];
         measure_plan("topk_big", &cx, &pairs, t0);
     }
@@ -150,7 +150,7 @@ fn main() {
         let t0 = Instant::now();
         let mut cx = Graph::new();
         let x = cx.tensor((16, 16, 64, 64), DType::F32);
-        let _ = (x * 2.0f32).output();
+        let _ = (x * 2.0f32);
         let pairs = vec![(x.id, TypedBuffer::from(random_vec(16 * 16 * 64 * 64)))];
         measure_plan("scalar_broadcast_big", &cx, &pairs, t0);
     }

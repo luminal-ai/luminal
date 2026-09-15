@@ -3,7 +3,7 @@ use luminal::prelude::*;
 fn census(name: &str, build: impl Fn(&mut Graph)) {
     let mut cx = Graph::new();
     build(&mut cx);
-    match cx.logical.model_text() {
+    match cx.logical.render_all() {
         Ok(model) => {
             let rows = model.lines().filter(|l| !l.trim().is_empty()).count();
             let applies = model.matches("(LogicalIndexMapApply").count();
@@ -40,32 +40,32 @@ fn census(name: &str, build: impl Fn(&mut Graph)) {
 fn main() {
     census("scalar_broadcast_rank4", |cx| {
         let x = cx.tensor((2, 3, 4, 5), DType::F32);
-        let _ = (x * 2.0f32).output();
+        let _ = (x * 2.0f32);
     });
     census("stable_argsort_rank2", |cx| {
         let x = cx.tensor((4, 8), DType::F32);
-        let _ = x.stable_argsort(1, false).output();
+        let _ = x.stable_argsort(1, false);
     });
     census("topk_rank3", |cx| {
         let x = cx.tensor((2, 4, 8), DType::F32);
-        let _ = x.topk_indexes(2, 2).output();
+        let _ = x.topk_indexes(2, 2);
     });
     census("gather_elements_rank3", |cx| {
         let x = cx.tensor((2, 4, 8), DType::F32);
         let idx = cx.tensor((2, 4, 3), DType::Int);
-        let _ = x.gather_elements(idx, 2).output();
+        let _ = x.gather_elements(idx, 2);
     });
     census("concat_rank3", |cx| {
         let a = cx.tensor((2, 4, 8), DType::F32);
         let b = cx.tensor((2, 4, 8), DType::F32);
-        let _ = a.concat_along(b, 2).output();
+        let _ = a.concat_along(b, 2);
     });
     census("cumsum_rank4", |cx| {
         let x = cx.tensor((2, 3, 4, 5), DType::F32);
-        let _ = x.cumsum(3).output();
+        let _ = x.cumsum(3);
     });
     census("expand_pytorch_rank4", |cx| {
         let x = cx.tensor((2, 1, 4, 1), DType::F32);
-        let _ = x.expand((2, 3, 4, 5)).output();
+        let _ = x.expand((2, 3, 4, 5));
     });
 }
