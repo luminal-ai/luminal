@@ -52,6 +52,7 @@ pub mod reduce_max;
 pub mod reduce_sum;
 pub mod round;
 pub mod scatter;
+pub mod select;
 pub mod sin;
 pub mod sqrt;
 pub mod trunc;
@@ -210,6 +211,7 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(recip::RecipFunctionalMatcher, recip::RecipFunctional),
         reg(modulo::ModFunctionalMatcher, modulo::ModFunctional),
         reg(less_than::LessThanMatcher, less_than::LessThan),
+        reg(select::SelectFunctionalMatcher, select::SelectFunctional),
         reg(cast::CastMatcher, cast::Cast),
         reg(
             index_map_apply_materialize::IndexMapApplyMaterializeMatcher,

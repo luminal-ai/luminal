@@ -49,8 +49,18 @@ fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
 }
 
 fn view_search_options() -> CompileOptions {
+    // THE BUDGET IS PART OF THE GATE. The folded-view plan and the
+    // materializing plan are both in the e-graph and are semantically
+    // identical (the materializing route byte-matches the reference too —
+    // verified at budget 4), and the heuristic ranks the fold strictly
+    // cheaper. This is a genetic search, though: a 4- or 8-generation run
+    // converges to a materializing local optimum (cost 2705/2673) that
+    // beats the *nearest* fold it samples (2801 at budget 2) without
+    // reaching the optimal fold (2417). Budgets >= 16 all reach it and
+    // fold. Gate on a budget that actually arrives; a smaller one fails
+    // the structural assertion for search reasons, not compiler reasons.
     CompileOptions {
-        generations: 4,
+        generations: 16,
         generation_size: 8,
         mutations: 4,
         trials: 1,

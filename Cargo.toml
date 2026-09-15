@@ -79,7 +79,8 @@ members = [
     "tests/scalar_refs",
     "tests/test_runtime",
     "crates/pytorch/utils",
-    "crates/pytorch/luminal_reference",
+    "crates/pytorch/reference",
+    "crates/pytorch/cuda_lite",
 ]
 # Parked crates are not members. luminal_bench is excluded explicitly so it
 # still builds standalone (`cargo build --manifest-path
