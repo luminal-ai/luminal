@@ -69,6 +69,12 @@ pub use luminal::search_support::{
 pub struct CompileOptions {
     pub generations: usize,
     pub generation_size: usize,
+    /// FINAL OUTPUTS ARE CALLER-OWNED (PyTorch zero-copy). The arena planner
+    /// excludes output buffers from the slab, so the budget each finalist is
+    /// measured against is the intermediate scratch alone. The runtime fills
+    /// this from its own `external_outputs` flag; a standalone caller leaves it
+    /// false and outputs stay arena-resident.
+    pub external_outputs: bool,
     /// Point mutations per offspring. Mutations hit ANY producer class —
     /// dead rows included, deliberately: a dead-row mutation is free now and
     /// pre-stages the choice a later route flip lands on.
@@ -137,6 +143,7 @@ impl Default for CompileOptions {
             trials: 3,
             seed: 0,
             search_log: true,
+            external_outputs: false,
             profile_on_device: false,
             candidate_timeout: None,
             keep_finalists: 4,
@@ -958,6 +965,7 @@ pub fn bucketed_search_implementations(
                     Some(outcome.best_plan.clone()),
                 )
                 .with_shapes(shapes)
+                .with_external_outputs(options.external_outputs)
             })
             .collect();
         select_finalist_set(buckets, options, &mut evaluator)?

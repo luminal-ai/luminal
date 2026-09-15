@@ -481,14 +481,36 @@ pub trait KernelOp: BufferTensorIrOp {
 }
 
 /// Return the CUDA scalar type, or an error for unsupported data types.
+/// The half types come from the toolkit's `cuda_fp16.h`/`cuda_bf16.h`; a
+/// kernel that mentions them gets those `#include`s prepended (see
+/// [`dtype_includes`]) and NVRTC is run with the toolkit include tree — the
+/// build embeds that tree so it is available even without a runtime toolkit.
 pub(crate) fn cuda_type(dtype: PlanDtype) -> Result<&'static str> {
     Ok(match dtype {
         PlanDtype::F32 => "float",
+        PlanDtype::F64 => "double",
+        PlanDtype::F16 => "__half",
+        PlanDtype::Bf16 => "__nv_bfloat16",
         PlanDtype::Int => "int",
         PlanDtype::Int64 => "long long",
         PlanDtype::Bool | PlanDtype::Bool8 => "unsigned char",
-        other => bail!("cuda-lite CL-1 has no device type for {other:?}"),
+        other => bail!("cuda-lite has no device type for {other:?}"),
     })
+}
+
+/// The NVRTC `#include` directives a kernel needs for the dtypes it mentions.
+/// `cuda_fp16.h`/`cuda_bf16.h` are not built into NVRTC; the build script
+/// embeds the toolkit's header closure so these always resolve.
+#[cfg(feature = "device")]
+pub(crate) fn dtype_includes(dtypes: &[PlanDtype]) -> String {
+    let mut includes = String::new();
+    if dtypes.contains(&PlanDtype::F16) {
+        includes.push_str("#include <cuda_fp16.h>\n");
+    }
+    if dtypes.contains(&PlanDtype::Bf16) {
+        includes.push_str("#include <cuda_bf16.h>\n");
+    }
+    includes
 }
 
 /// Format a number as a CUDA expression accepted by NVRTC.
@@ -533,6 +555,24 @@ pub(crate) fn unary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
     let to = cuda_type(ctx.dest_dtypes[0])?;
     let sig = format!("const {ta}* a");
     elementwise(ctx, expr, &["a"], &sig, to)
+}
+
+/// Generate a three-input elementwise kernel (`c ? a : b`), reading each input
+/// through its layout. The condition is Bool8; the branches and destination
+/// share one dtype. The expression copies a value verbatim, so no arithmetic
+/// is generated and every storage dtype is supported.
+pub(crate) fn ternary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
+    let [c, a, b, _dest] = ctx.operand_dtypes.as_slice() else {
+        bail!(
+            "ternary op expects three operands + dest, got {}",
+            ctx.operand_dtypes.len()
+        );
+    };
+    let tc = cuda_type(*c)?;
+    let (ta, tb) = (cuda_type(*a)?, cuda_type(*b)?);
+    let to = cuda_type(ctx.dest_dtypes[0])?;
+    let sig = format!("const {tc}* c, const {ta}* a, const {tb}* b");
+    elementwise(ctx, expr, &["c", "a", "b"], &sig, to)
 }
 
 // BufferCopy copies whole buffers. Layout conversions use materialize kernels

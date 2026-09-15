@@ -104,6 +104,9 @@ impl PendingFinalist {
 /// The ranked finalists of one bucket, materialized lazily.
 pub struct Finalists<'a> {
     shapes: crate::symbolic::ShapeEnv,
+    /// Whether final outputs are caller-owned at execution time, so the arena
+    /// plan must exclude their buffers from the slab (see `storage::plan`).
+    external_outputs: bool,
     /// How this bucket names itself in a failure message (`"bucket 0
     /// (a in [2, 4])"`, or `"the search"` when unbucketed).
     label: String,
@@ -162,6 +165,7 @@ impl<'a> Finalists<'a> {
     ) -> Self {
         Self {
             shapes: Default::default(),
+            external_outputs: false,
             label: label.into(),
             egraph,
             session: None,
@@ -196,6 +200,11 @@ impl<'a> Finalists<'a> {
 
     pub fn with_shapes(mut self, shapes: crate::symbolic::ShapeEnv) -> Self {
         self.shapes = shapes;
+        self
+    }
+
+    pub fn with_external_outputs(mut self, external: bool) -> Self {
+        self.external_outputs = external;
         self
     }
 
@@ -265,7 +274,7 @@ impl<'a> Finalists<'a> {
                 self.build_plan(genome)?
             }
         };
-        let arena = crate::storage::plan(&plan, &self.shapes.bounds)
+        let arena = crate::storage::plan(&plan, &self.shapes.bounds, self.external_outputs)
             .map_err(|err| format!("arena: {err:#}"))?;
         Ok(PendingFinalist {
             shapes: self.shapes.clone(),
