@@ -242,6 +242,10 @@ impl ModelConfig {
     }
 }
 
+/// One KV cache slot: the value the model reads at the start of a step and
+/// the value it has produced by the end of one. Whether the two share
+/// storage is a BINDING statement, made by whichever runtime loads this
+/// graph; nothing here says it.
 #[derive(Clone, Debug)]
 pub struct StateBinding {
     pub input: NodeIndex,
@@ -373,17 +377,13 @@ impl LlmGraph {
                 tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
             ),
         };
-        let logits = luminal_nn::gather_rows(logits, last).output().id;
+        let logits = luminal_nn::gather_rows(logits, last).id;
         let state: Vec<_> = pool
             .layers
             .iter()
             .zip(caches)
             .zip(widths)
             .flat_map(|(((ki, vi), (ko, vo)), w)| {
-                // The cache outputs MUTATE their cache inputs in place:
-                // one boundary buffer, stated in the SSA graph itself.
-                let ko = ko.output_into(ki);
-                let vo = vo.output_into(vi);
                 [
                     StateBinding {
                         input: ki.id,
@@ -424,6 +424,31 @@ impl LlmGraph {
             ropes,
         })
     }
+    /// The inputs a backend restages before every execution.
+    pub fn step_input_ids(&self) -> Vec<NodeIndex> {
+        let mut ids = vec![
+            self.tokens.id,
+            self.positions.id,
+            self.gather.id,
+            self.scatter.id,
+            self.last.id,
+        ];
+        ids.extend(self.ropes.iter().flat_map(|r| [r.cos.id, r.sin.id]));
+        ids
+    }
+    /// The RoPE pairing matrices, once each: one matrix serves every
+    /// rotary role of the same head width, so the roles share an input.
+    pub fn rope_matrices(&self) -> Vec<NodeIndex> {
+        let mut ids: Vec<NodeIndex> = vec![];
+        for rope in &self.ropes {
+            if !ids.contains(&rope.rot.id) {
+                ids.push(rope.rot.id);
+            }
+        }
+        ids
+    }
+    /// The values that hold their contents between executions: zeroed KV
+    /// state and the RoPE pairing matrices.
     pub fn initial_inputs(&self) -> Inputs {
         let mut out = Inputs::default();
         for s in &self.state {

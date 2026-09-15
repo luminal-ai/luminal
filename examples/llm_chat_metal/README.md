@@ -1,22 +1,24 @@
-# LLM chat
+# LLM chat (Metal)
 
-One chat loop for model-zoo language models, with a backend selected by Cargo
-features. `LlmGraph`, model adapters, checkpoint mappings, tokenization, and
-sampling all live in this example. The zoo retains its logical model APIs and
-its two dependencies (`luminal` and `luminal_nn`).
+One chat loop for model-zoo language models on the native Metal runtime.
+The model graph, model adapters, checkpoint mappings, tokenization,
+sampling, the session loop and this runtime's boundary bindings all live in
+this example. The zoo retains its logical model APIs and its two
+dependencies (`luminal` and `luminal_nn`).
+
+This example is deliberately self-contained, and so is its CUDA twin,
+`llm_chat_cuda`: each drives its own runtime's binding API directly, so the
+two carry separate copies of the application code rather than a shared
+backend abstraction.
 
 ```sh
-cargo run --release -p llm_chat --features cuda_lite -- \
-  --model qwen3 --checkpoint /path/to/Qwen3-0.6B
-
 # Apple Silicon / macOS, using the native BufferIR Metal backend:
-cargo run --release -p llm_chat --features metal -- \
+cargo run --release -p llm_chat_metal -- \
   --model qwen3 --checkpoint /path/to/Qwen3-0.6B
 ```
 
-Enable exactly one of `cuda_lite` and `metal`. CUDA requires an NVIDIA GPU and
-CUDA toolkit; Metal requires macOS. `--prompt 'Hello'` generates one response and
-exits. Otherwise, enter messages interactively; `/reset` clears the conversation
+Metal requires macOS. `--prompt 'Hello'` generates one response and exits.
+Otherwise, enter messages interactively; `/reset` clears the conversation
 and KV state, and `/quit` exits.
 
 The checkpoint directory must contain:
@@ -45,9 +47,9 @@ The adapter validates configuration before loading weights. Model families with
 different architecture or positional conventions need an explicit adapter.
 Gemma4 MoE, Llama3.1 FP8, and multimodal input processing are not exposed here.
 
-Checkpoint names are mapped **inside `llm_chat`** to zoo model namespaces, then
-to graph inputs. The default mappings use the existing zoo namespaces. A partial
-JSON override can adapt another checkpoint's naming:
+Checkpoint names are mapped **inside this example** to zoo model namespaces,
+then to graph inputs. The default mappings use the existing zoo namespaces. A
+partial JSON override can adapt another checkpoint's naming:
 
 ```json
 {
@@ -61,27 +63,36 @@ The application transposes ordinary linear matrices from `[out, in]` into the
 zoo's `[in, out]` order, preserves embeddings and expert matrices, and checks
 shapes. Tied embeddings are represented by the zoo graph's shared input.
 
+## The boundary
+
+The logical graph states no boundary at all: no value in it is an output,
+and nothing in it aliases anything. `backend::bindings` states all of it,
+in `MetalBindings`, at load:
+
+- Every parameter, RoPE pairing matrix and KV state input is bound
+  **resident**: its storage is the device arena's and survives every
+  execution, uploaded once and then only when the application restages it.
+- Tokens, positions, the gather/scatter index maps, the last-row index and
+  the RoPE tables are **staged** from the host before each execution.
+- Each KV cache output is bound **on its input's buffer**, after that
+  buffer is declared `ReadWrite`: that is the one spelling of "this step's
+  cache writes last step's storage", so the new state is never copied and
+  never read back.
+- The logits are the one bound output, and the only value downloaded.
+
+`/reset` re-stages zeros into the resident state inputs.
+
 ## Execution
 
-Prefill and decode use the same logical graph, backend adapter, and execution
-method. Query length and context length are bounded dynamic dimensions; decode
-uses query length one. `--prefill-chunk` controls the maximum query length.
+Prefill and decode use the same graph, bindings, and execution method.
+Query length and context length are bounded dynamic dimensions; decode uses
+query length one. `--prefill-chunk` controls the maximum query length.
 Compilation happens once per session. Subsequent steps update data/dimensions.
 
-Weights and KV state remain in resident ranges of one arena. Transient storage
-uses bufferization lifetimes. State outputs are snapshotted on device at their
-output boundaries and committed after the previous state has finished being
-read. Only the last query token's logits are downloaded. CUDA submits kernels,
-state copies, and weight uploads through CUDA graphs, and bucket graphs share
-the resident ranges. Explicit weight/state changes trigger new uploads.
-
-The Metal feature uses `luminal_metal`'s native runtime, egglog matchers, search,
-and MSL kernels, including its fused multiply/reduce operation. It has no CUDA
-dependency. Both runtimes use the core physical arena and resident allocation
-planner, and the example uses one adapter for their common runtime API.
-Metal encodes command buffers for each execution and copies resident updates
-through bounded shared staging. Its device maximum buffer size also bounds the
-single arena. Neither backend recompiles kernels just to change query/context
+Transient storage uses bufferization lifetimes. Metal encodes command
+buffers for each execution and copies resident updates through bounded
+shared staging. Its device maximum buffer size also bounds the single
+arena. The runtime does not recompile kernels just to change query/context
 lengths within the compiled bounds.
 
 The runner renders the checkpoint chat template for every turn and compares
@@ -108,21 +119,16 @@ Useful options:
 ## Validation
 
 ```sh
-cargo test -p llm_chat
-cargo test -p llm_chat --features cuda_lite
-# On a Mac:
-cargo test -p llm_chat --features metal
+cargo test -p llm_chat_metal
 ```
 
-The shared device test compares prefill and decode against ReferenceRuntime
-using a small zoo model. Other tests cover namespace mappings, sharded
-checkpoints, dtype/layout conversion, templates, sampling, prefix reuse, and
-cache reset. Both runtime suites check in-place resident state across buckets.
+On macOS the device test compares prefill, decode and reset against
+ReferenceRuntime using a small zoo model, and a second test drives the
+session's chunked prefill, history reuse and reset through the real
+backend. Off macOS the same suite still plans the graph without a device.
+Other tests cover namespace mappings, sharded checkpoints, dtype/layout
+conversion, templates, sampling, and cache-prefix reuse.
 
-For real-checkpoint comparisons against Transformers across prompts, follow-ups,
-prefill chunk sizes, and resets, see the [validation tools](validation/README.md).
-
-Real CUDA checkpoint results for Qwen3-0.6B, Llama3-8B-Instruct, and the
-Gemma3-4B-IT text tower are recorded in the [validation report](validation/RESULTS.md).
-Metal planning and its shared chat adapter can be checked on Linux. Metal
-shader compilation and GPU execution require the macOS CI job or a local Mac.
+For real-checkpoint comparisons against Transformers across prompts,
+follow-ups, prefill chunk sizes, and resets, see the CUDA example's
+[validation tools](../llm_chat_cuda/validation/README.md).
