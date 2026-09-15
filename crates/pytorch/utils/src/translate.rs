@@ -1,9 +1,10 @@
 //! ATen (PT2 `model.json`) -> recorder-frontend translator.
 //!
-//! SSA values stay SSA; boundary storage is stated once, at the graph
-//! inputs/outputs. A functionalized in-place mutation (PT2
-//! `user_input_mutation`) becomes `GraphTensor::output_into` on the mutated
-//! input, which the binding layer pins to one buffer id.
+//! SSA values stay SSA; the model says nothing about boundary storage.
+//! Which values leave, and through whose storage, is a table here: a
+//! functionalized in-place mutation (PT2 `user_input_mutation`) records
+//! the mutated input's graph name as the output's `mutation_target`, and
+//! the backend binds that output on the input's buffer.
 //!
 //! Coverage is honest: an unknown ATen target bails with its name. This is
 //! the M4 translator re-attachment, rebuilt against the native recorder.
@@ -184,16 +185,15 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
                 user_input_mutation,
             }) => {
                 let target_name = user_input_mutation.user_input_name.clone();
-                let target = *t.input_values.get(&target_name).ok_or_else(|| {
-                    anyhow!("mutation output {name} targets unknown input {target_name:?}")
-                })?;
-                value.output_into(&target);
+                // A mutation writes an INPUT's storage: the target must be
+                // a graph input for the backend to have a buffer to bind
+                // this output on.
+                if !t.input_values.contains_key(&target_name) {
+                    bail!("mutation output {name} targets unknown input {target_name:?}");
+                }
                 Some(target_name)
             }
-            _ => {
-                value.output();
-                None
-            }
+            _ => None,
         };
         regular.push(TranslatedOutput {
             graph_name: name,
@@ -804,9 +804,10 @@ impl Translator<'_> {
     }
 
     /// An in-place result targeting a graph input registers a writeback
-    /// sink: the input and the result share one boundary buffer, so the
-    /// caller's tensor is updated. Mutations of intermediates need no
-    /// writeback (SSA already carries the new value).
+    /// sink: the table names the target input, and the backend binds the
+    /// sink on that input's buffer, so the caller's tensor is updated.
+    /// Mutations of intermediates need no writeback (SSA already carries
+    /// the new value).
     fn register_inplace(&mut self, node: &Node, value: GraphTensor) -> Result<()> {
         let Some(target_name) = node.inputs[0].arg.as_tensor_name().map(str::to_string) else {
             return Ok(());
@@ -828,7 +829,6 @@ impl Translator<'_> {
             .to_string();
         let meta = self.tensor_meta(&output_name)?.clone();
         let shape = self.static_shape(&meta, &output_name)?;
-        value.output_into(&target);
         self.sink_by_value.insert(value.id, self.sinks.len());
         self.sinks.push(TranslatedOutput {
             graph_name: output_name,
