@@ -90,7 +90,7 @@ fn t6a_bufferize_all_four_forms() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).output();
+                let _ = x.matmul(w);
             }),
         ),
         (
@@ -100,7 +100,7 @@ fn t6a_bufferize_all_four_forms() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
+                let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
         (
@@ -110,7 +110,7 @@ fn t6a_bufferize_all_four_forms() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
-                let _ = (x.matmul(w) + c).output();
+                let _ = x.matmul(w) + c;
             }),
         ),
         (
@@ -121,7 +121,7 @@ fn t6a_bufferize_all_four_forms() {
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).output();
+                let _ = (x.matmul(w) + c) + b.expand_dim(0, 4usize);
             }),
         ),
     ];
@@ -129,10 +129,7 @@ fn t6a_bufferize_all_four_forms() {
         let text = {
             let mut cx = Graph::new();
             build(&mut cx);
-            cx.logical
-                .bound_program(&test_runtime::TestRuntimeBindings)
-                .expect("recorder clean")
-                .text
+            test_runtime::bind_leaves(&cx)
         };
         let (graph, _) = test_runtime::extract_fixture_with_genome(
             &text,
@@ -271,11 +268,8 @@ fn t6a_accumulate_intermediate_c_donation_observed() {
         // Original boundary-flowing spelling (restored under
         // escape-and-disclose: the view-produced bound output escapes);
         // this probe's subject is donation.
-        let _ = (x.matmul(w) + c).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(w) + c;
+        test_runtime::bind_leaves(&cx)
     };
     let (graph, _) = test_runtime::extract_fixture_with_genome(&text, PIN);
     let elected = cublaslt_in_plan(&graph);

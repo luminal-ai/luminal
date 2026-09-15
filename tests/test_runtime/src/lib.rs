@@ -40,7 +40,17 @@ pub mod bindings;
 pub mod ops;
 pub mod test_equality;
 
-pub use bindings::TestRuntimeBindings;
+pub use bindings::{BoundProgram, TestRuntimeBindings};
+
+/// The bound program text for the default binding: every input read-only
+/// on its own buffer, every leaf an output on its own. What a test that
+/// only wants "the recorded model, bound the obvious way" calls.
+pub fn bind_leaves(cx: &luminal::graph::Graph) -> String {
+    TestRuntimeBindings::leaves(&cx.logical)
+        .bind(&cx.logical)
+        .expect("recorder clean")
+        .text()
+}
 pub use ops::{
     AddMulFused, AddMulFusedDps, AddMulFusedMatcher, IndexMapApplyView, IndexMapApplyViewMatcher,
 };

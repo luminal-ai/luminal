@@ -86,12 +86,8 @@ fn recorded_bias_program() -> (String, String, usize) {
     let x = cx.tensor((4usize, 8usize), DType::F32);
     let w = cx.tensor((8usize, 3usize), DType::F32);
     let b = cx.tensor(3usize, DType::F32);
-    let out = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
-    let text = cx
-        .logical
-        .bound_program(&test_runtime::TestRuntimeBindings)
-        .expect("recorder clean")
-        .text;
+    let out = x.matmul(w) + b.expand_dim(0, 4usize);
+    let text = test_runtime::bind_leaves(&cx);
     (text, format!("v{}", out.id.index()), out.id.index())
 }
 

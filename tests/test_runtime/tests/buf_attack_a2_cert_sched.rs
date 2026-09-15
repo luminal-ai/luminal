@@ -111,11 +111,8 @@ fn a2_single_view_to_bound() {
         let mut cx = Graph::new();
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
-        let _ = x.matmul(w).transpose(0, 1).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(w).transpose(0, 1);
+        test_runtime::bind_leaves(&cx)
     };
     report("mm.t", &text);
 }
@@ -128,11 +125,8 @@ fn a2_double_view_roundtrip() {
         let mut cx = Graph::new();
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
-        let _ = x.matmul(w).transpose(0, 1).transpose(0, 1).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(w).transpose(0, 1).transpose(0, 1);
+        test_runtime::bind_leaves(&cx)
     };
     report("mm.t.t", &text);
 }
@@ -147,12 +141,9 @@ fn a2_view_fanout() {
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
         let y = x.matmul(w);
-        let _ = y.transpose(0, 1).output();
-        let _ = (y * c).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = y.transpose(0, 1);
+        let _ = y * c;
+        test_runtime::bind_leaves(&cx)
     };
     report("mm.fanout", &text);
 }
@@ -175,12 +166,13 @@ fn a2_two_slots_same_value() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let y = x.matmul(w);
-        let _ = y.transpose(0, 1).output();
-        let _ = y.output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
+        let t = y.transpose(0, 1);
+        // Two slots on ONE value: the matmul is bound directly as well as
+        // through the view, so the bound outputs are not the leaves.
+        test_runtime::TestRuntimeBindings::dense(&cx.logical, &[t.id, y.id])
+            .bind(&cx.logical)
             .expect("recorder clean")
-            .text
+            .text()
     };
     report("mm.2slots", &text);
 }
