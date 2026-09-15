@@ -42,6 +42,7 @@ pub(crate) fn plan_resident(
         crate::arena::issue_order(plan)?,
         &bindings.inputs,
         &device_outputs,
+        &Default::default(),
     )
 }
 

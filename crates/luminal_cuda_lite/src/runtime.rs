@@ -73,6 +73,11 @@ pub struct CudaRuntime {
     staged: FxHashMap<i64, HostBuffer>,
     residents: crate::resident::ResidentBindings,
     device_budget_bytes: Option<usize>,
+    /// When true, every FINAL output is treated as caller-owned: the planner
+    /// excludes output buffers from the slab, and execute requires an external
+    /// device pointer for each. Set before `search` so the finalist budget and
+    /// the installed plan agree.
+    external_outputs: bool,
     /// Host copies of each output slot's BACKING buffer plus its elected
     /// layout, filled by execute (D2H) — the escape-and-disclose fetch,
     /// keyed by slot index (an escaped slot's backing buffer is a minted
@@ -108,6 +113,21 @@ pub struct CudaRuntime {
     /// that plans and searches by the heuristic on any host.
     #[cfg(feature = "device")]
     device: Option<crate::device::CudaDevice>,
+    /// A caller-allocated (PyTorch caching-allocator) arena for the NEXT
+    /// execution. `None` means the device allocates and owns its slab, the
+    /// pre-existing standalone behaviour.
+    #[cfg(feature = "device")]
+    external_arena: Option<(u64, usize)>,
+    /// Zero-copy inputs by `BufferLit` id.
+    #[cfg(feature = "device")]
+    input_device_ptrs: FxHashMap<i64, (u64, usize)>,
+    /// Zero-copy outputs by output slot index.
+    #[cfg(feature = "device")]
+    output_device_ptrs: FxHashMap<usize, (u64, usize)>,
+    /// Raw `CUstream` to run on (PyTorch's current stream). `None` runs on a
+    /// stream this runtime owns.
+    #[cfg(feature = "device")]
+    borrowed_stream: Option<u64>,
 }
 
 impl CudaRuntime {
@@ -507,6 +527,7 @@ impl CudaRuntime {
         );
         self.invalidate_plans();
         let mut resolved_options = options.clone();
+        resolved_options.external_outputs = self.external_outputs;
         resolved_options.shapes.bounds = self
             .range_bound
             .iter()
@@ -764,6 +785,15 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Declare that every final output will be bound to a caller device
+    /// pointer (zero-copy). The planner then reserves no slab range for output
+    /// buffers, and `execute` requires an external pointer for each output
+    /// slot. Must be set before `search` so the search's budget and the
+    /// installed plan size the arena identically.
+    pub fn set_external_outputs(&mut self, external: bool) {
+        self.external_outputs = external;
+    }
+
     /// Stage input payload for a bound tensor (host side; H2D happens
     /// inside execute).
     pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) {
@@ -771,6 +801,132 @@ impl CudaRuntime {
             panic!("set_data on a tensor with no input binding");
         };
         self.staged.insert(buffer, data.into());
+    }
+
+    /// Bind a graph input to the caller's device memory (zero-copy): the
+    /// kernels read the caller's tensor directly and no H2D runs. The caller
+    /// must keep the allocation alive through the next `execute`; the size is
+    /// checked against the plan's required bytes.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a live device allocation of at least `bytes` bytes that
+    /// stays valid until the next `execute` completes, and the tensor's logical
+    /// layout must match the plan's (row-major, contiguous).
+    #[cfg(feature = "device")]
+    pub unsafe fn set_input_device_ptr(
+        &mut self,
+        tensor: NodeIndex,
+        ptr: u64,
+        bytes: usize,
+    ) -> Result<()> {
+        let lit = self.input_buffer(tensor)?;
+        self.input_device_ptrs.insert(lit, (ptr, bytes));
+        Ok(())
+    }
+
+    #[cfg(feature = "device")]
+    pub fn clear_input_device_ptr(&mut self, tensor: NodeIndex) -> Result<()> {
+        let lit = self.input_buffer(tensor)?;
+        self.input_device_ptrs.remove(&lit);
+        Ok(())
+    }
+
+    /// Bind a graph output to the caller's device memory (zero-copy): the
+    /// producing op writes straight into the caller's tensor, no arena range
+    /// is used, and no D2H runs. The caller owns the allocation and the
+    /// returned result IS that tensor.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a live device allocation of at least `bytes` bytes that
+    /// stays valid through the next `execute`; the runtime writes to it.
+    #[cfg(feature = "device")]
+    pub unsafe fn set_output_device_ptr(
+        &mut self,
+        tensor: NodeIndex,
+        ptr: u64,
+        bytes: usize,
+    ) -> Result<()> {
+        let slot = self.output_slot_index(tensor)?;
+        self.output_device_ptrs.insert(slot, (ptr, bytes));
+        Ok(())
+    }
+
+    #[cfg(feature = "device")]
+    pub fn clear_output_device_ptr(&mut self, tensor: NodeIndex) -> Result<()> {
+        let slot = self.output_slot_index(tensor)?;
+        self.output_device_ptrs.remove(&slot);
+        Ok(())
+    }
+
+    /// Whether this output was bound to caller device memory for the last
+    /// execution (and therefore has no host bytes to read).
+    #[cfg(feature = "device")]
+    pub fn output_is_device_bound(&self, tensor: NodeIndex) -> Result<bool> {
+        Ok(self
+            .output_device_ptrs
+            .contains_key(&self.output_slot_index(tensor)?))
+    }
+
+    /// Run on a stream owned by another library, e.g.
+    /// `torch.cuda.current_stream().cuda_stream`. Rebind each call if the
+    /// caller's current stream can change.
+    #[cfg(feature = "device")]
+    pub fn use_borrowed_stream(&mut self, raw_stream: u64) {
+        self.borrowed_stream = Some(raw_stream);
+    }
+
+    #[cfg(feature = "device")]
+    pub fn use_owned_stream(&mut self) {
+        self.borrowed_stream = None;
+    }
+
+    /// Bind a caller-allocated arena (e.g. from PyTorch's caching allocator)
+    /// for subsequent executions. Called once per execution when the arena is
+    /// allocated and freed per call; `clear_arena` reverts to the owned slab.
+    #[cfg(feature = "device")]
+    pub fn set_arena(&mut self, ptr: u64, bytes: usize) {
+        self.external_arena = Some((ptr, bytes));
+    }
+
+    #[cfg(feature = "device")]
+    pub fn clear_arena(&mut self) {
+        self.external_arena = None;
+    }
+
+    /// The slab size the currently selected plan set requires. The caller
+    /// allocates at least this many bytes (the PyTorch caching allocator does)
+    /// and passes the pointer to [`Self::set_arena`]. Device-free: it packs
+    /// lifetimes but touches no CUDA API.
+    #[cfg(feature = "device")]
+    pub fn arena_bytes(&self) -> Result<usize> {
+        let plans = self.install_plans()?;
+        Ok(crate::resident::allocate(plans, self.residents.clone(), self.external_outputs)?.bytes)
+    }
+
+    /// The `(plan, bounds)` set `execute` installs — the single unpinned plan,
+    /// or one per bucket. Factored out so `arena_bytes` can size the slab
+    /// without a device.
+    #[cfg(feature = "device")]
+    fn install_plans(&self) -> Result<Vec<(crate::layouts::CudaPlan, crate::symbolic::Bounds)>> {
+        let base_bounds: crate::symbolic::Bounds = self
+            .range_bound
+            .iter()
+            .map(|(s, (lo, hi))| Ok((*s, (usize::try_from(*lo)?, usize::try_from(*hi)?))))
+            .collect::<Result<_>>()?;
+        Ok(if self.bucket_plans.is_empty() {
+            vec![(self.plan.as_ref().unwrap().clone(), base_bounds)]
+        } else {
+            self.bucket_plans
+                .iter()
+                .map(|p| {
+                    let mut bounds = base_bounds.clone();
+                    bounds.extend(p.ranges.iter().map(|(k, v)| (*k, *v)));
+                    (p.plan.clone(), bounds)
+                })
+                .collect()
+        })
     }
 
     /// Run the plan on the CUDA device. Requires the `device` feature
@@ -792,36 +948,64 @@ impl CudaRuntime {
                 self.plan.is_some() || !self.bucket_plans.is_empty(),
                 "search before execute"
             );
-            let device = self.device.as_mut().unwrap();
-            if !device.is_installed() {
-                let base_bounds: crate::symbolic::Bounds = self
-                    .range_bound
-                    .iter()
-                    .map(|(s, (lo, hi))| Ok((*s, (usize::try_from(*lo)?, usize::try_from(*hi)?))))
-                    .collect::<Result<_>>()?;
-
-                let plans = if self.bucket_plans.is_empty() {
-                    vec![(self.plan.as_ref().unwrap().clone(), base_bounds)]
+            {
+                let device = self.device.as_mut().unwrap();
+                // The borrowed stream is rebound every execution because
+                // PyTorch's "current stream" is thread-local and may change.
+                if let Some(raw) = self.borrowed_stream {
+                    device.use_borrowed_stream(raw)?;
+                } else if device.stream_is_borrowed() {
+                    device.use_owned_stream()?;
+                }
+                if let Some((ptr, bytes)) = self.external_arena {
+                    device.set_external_arena(ptr, bytes);
                 } else {
-                    self.bucket_plans
-                        .iter()
-                        .map(|p| {
-                            let mut bounds = base_bounds.clone();
-                            bounds.extend(p.ranges.iter().map(|(k, v)| (*k, *v)));
-                            (p.plan.clone(), bounds)
-                        })
-                        .collect()
-                };
-                device.install_resident_with_budget(
+                    device.clear_external_arena();
+                }
+            }
+            if !self.device.as_ref().unwrap().is_installed() {
+                let plans = self.install_plans()?;
+                self.device.as_mut().unwrap().install_resident_with_budget(
                     plans,
                     self.residents.clone(),
                     self.device_budget_bytes,
+                    self.external_outputs,
                 )?;
             }
+            let device = self.device.as_mut().unwrap();
             let bucket = self.selected_bucket.unwrap_or(0);
             let staged = self.staged.iter().map(|(lit, data)| (*lit, data)).collect();
-            let outputs = device.execute(bucket, &staged, &self.dims)?;
+            let inputs = self
+                .input_device_ptrs
+                .iter()
+                .map(|(lit, (ptr, bytes))| {
+                    (
+                        *lit,
+                        crate::device::ExternalPtr {
+                            ptr: *ptr,
+                            bytes: *bytes,
+                        },
+                    )
+                })
+                .collect();
+            let outputs = self
+                .output_device_ptrs
+                .iter()
+                .map(|(slot, (ptr, bytes))| {
+                    (
+                        *slot,
+                        crate::device::ExternalPtr {
+                            ptr: *ptr,
+                            bytes: *bytes,
+                        },
+                    )
+                })
+                .collect();
+            let outputs =
+                device.execute_external(bucket, &staged, &self.dims, &inputs, &outputs)?;
             self.outputs_host = outputs;
+            // Zero-copy inputs are not staged, so nothing to clear; host-staged
+            // residents are kept for the (owned-slab) reuse path.
             self.staged
                 .retain(|lit, _| !self.residents.inputs.contains(lit));
             Ok(())

@@ -35,6 +35,9 @@ pub struct HostBuffer {
 pub fn dtype_bytes(dtype: PlanDtype) -> Result<usize> {
     Ok(match dtype {
         PlanDtype::F32 => 4,
+        PlanDtype::F64 => 8,
+        PlanDtype::F16 => 2,
+        PlanDtype::Bf16 => 2,
         PlanDtype::Int => 4,
         PlanDtype::Int64 => 8,
         PlanDtype::Bool | PlanDtype::Bool8 => 1,
@@ -107,6 +110,13 @@ impl HostBuffer {
     pub fn as_i64(&self) -> Result<Vec<i64>> {
         self.decode(PlanDtype::Int64, |chunk| {
             i64::from_ne_bytes(chunk.try_into().expect("8-byte chunk"))
+        })
+    }
+
+    /// Decode as `f64` (see [`Self::as_f32`]).
+    pub fn as_f64(&self) -> Result<Vec<f64>> {
+        self.decode(PlanDtype::F64, |chunk| {
+            f64::from_ne_bytes(chunk.try_into().expect("8-byte chunk"))
         })
     }
 

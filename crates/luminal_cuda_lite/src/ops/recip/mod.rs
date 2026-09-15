@@ -91,7 +91,17 @@ impl LayoutIrOp for RecipFunctionalDps {}
 /// The CUDA lowering, colocated with its op.
 impl KernelOp for RecipFunctionalDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-        unary(ctx, "1.0f / a[i]")
+        // `1.0f / a[i]` is ambiguous for `__half` (float / __half matches both
+        // the builtin operator and cuda_fp16.h's `operator/`), so half inputs
+        // divide in float and cast back. Other dtypes keep the literal form.
+        let expr = match ctx.operand_dtypes[0] {
+            luminal::dtype::PlanDtype::F16 | luminal::dtype::PlanDtype::Bf16 => {
+                let to = crate::kernels::cuda_type(ctx.dest_dtypes[0])?;
+                format!("({to})(1.0f / (float)a[i])")
+            }
+            _ => "1.0f / a[i]".to_string(),
+        };
+        unary(ctx, &expr)
     }
 }
 

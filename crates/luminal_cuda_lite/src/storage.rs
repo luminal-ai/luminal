@@ -6,15 +6,43 @@ use crate::{
     symbolic::{Bounds, capacity_bytes},
 };
 use anyhow::{Result, anyhow};
+use luminal::bufferize::{BufferId, BufferNode};
+use luminal::prelude::FxHashSet;
 
-pub(crate) fn plan(plan: &CudaPlan, bounds: &Bounds) -> Result<ArenaPlan> {
-    plan_resident(plan, bounds, &Default::default())
+/// The output-slot buffers that will be bound to caller device memory at
+/// execution time and must therefore reserve NO arena range. Resident
+/// mutation sinks are excluded: their buffer IS an arena home that
+/// `upload_residents` fills, so treating it as caller memory would make the
+/// kernels read an uninitialized external pointer.
+pub(crate) fn external_output_buffers(
+    plan: &CudaPlan,
+    bindings: &crate::resident::ResidentBindings,
+) -> FxHashSet<BufferId> {
+    plan.dag
+        .node_weights()
+        .filter_map(|node| match node {
+            BufferNode::BufferOutput { slots } => Some(slots),
+            _ => None,
+        })
+        .flatten()
+        .filter(|slot| {
+            !plan.buffers[&slot.buffer]
+                .lit
+                .is_some_and(|lit| bindings.inputs.contains(&lit))
+        })
+        .map(|slot| slot.buffer.clone())
+        .collect()
+}
+
+pub(crate) fn plan(plan: &CudaPlan, bounds: &Bounds, external_outputs: bool) -> Result<ArenaPlan> {
+    plan_resident(plan, bounds, &Default::default(), external_outputs)
 }
 
 pub(crate) fn plan_resident(
     plan: &CudaPlan,
     bounds: &Bounds,
     bindings: &crate::resident::ResidentBindings,
+    external_outputs: bool,
 ) -> Result<ArenaPlan> {
     // Output slots whose buffer IS a resident input are mutation sinks:
     // `.output_into()` pinned them to the input's buffer, so their writes
@@ -23,7 +51,7 @@ pub(crate) fn plan_resident(
         .dag
         .node_weights()
         .filter_map(|node| match node {
-            luminal::bufferize::BufferNode::BufferOutput { slots } => Some(slots),
+            BufferNode::BufferOutput { slots } => Some(slots),
             _ => None,
         })
         .flatten()
@@ -34,11 +62,20 @@ pub(crate) fn plan_resident(
         })
         .map(|slot| slot.index)
         .collect();
+    // When the caller will bind every final output to its own device tensor,
+    // the output buffers are caller-owned and must not be packed into the
+    // slab — otherwise the slab reserves output-sized ranges that no kernel
+    // ever writes through.
+    let external_buffers = if external_outputs {
+        external_output_buffers(plan, bindings)
+    } else {
+        FxHashSet::default()
+    };
     crate::arena::plan_resident_over(
         plan,
         |buffer| capacity_bytes(&buffer.layout, bounds),
         |node| match &plan.dag[node] {
-            luminal::bufferize::BufferNode::Compute { op, .. } => {
+            BufferNode::Compute { op, .. } => {
                 crate::as_host_op(op.as_ref()).map_or(Ok(0), |host| host.workspace_bytes(bounds))
             }
             _ => Ok(0),
@@ -51,6 +88,7 @@ pub(crate) fn plan_resident(
         crate::arena::issue_order(plan)?,
         &bindings.inputs,
         &device_outputs,
+        &external_buffers,
     )
 }
 
@@ -260,10 +298,51 @@ mod tests {
         [('n'.into(), (0, hi))].into_iter().collect()
     }
 
+    /// THE CALLER-OWNED OUTPUT CONTRACT: with `external_outputs`, every output
+    /// buffer leaves `slices` (so the slab no longer reserves output-sized
+    /// ranges), is listed in `externals`, and gets no Download step — the
+    /// executor must supply a pointer instead of reading it back.
+    #[test]
+    fn external_outputs_leave_the_slab_and_require_caller_pointers() {
+        let (graph, _ids) = copy_plan();
+        let bindings = crate::resident::ResidentBindings::default();
+        let external = external_output_buffers(&graph, &bindings);
+        assert!(
+            !external.is_empty(),
+            "copy_plan has output slots to externalize"
+        );
+        let base = plan(&graph, &bounds(128), false).unwrap();
+        let ext = plan(&graph, &bounds(128), true).unwrap();
+        for id in &external {
+            assert!(
+                base.slices.contains_key(id),
+                "the arena-only plan keeps {id:?} in the slab"
+            );
+            assert!(
+                !ext.slices.contains_key(id),
+                "external output {id:?} must reserve no slab range"
+            );
+            assert!(ext.externals.contains(id));
+            assert!(
+                !ext.steps.iter().any(|step| matches!(
+                    step,
+                    ArenaStep::Download { buffer, .. } if buffer == id
+                )),
+                "external output {id:?} must not be read back"
+            );
+        }
+        assert!(
+            ext.slab_bytes < base.slab_bytes,
+            "excluding outputs must shrink the slab ({} -> {})",
+            base.slab_bytes,
+            ext.slab_bytes
+        );
+    }
+
     #[test]
     fn all_storage_classes_share_physical_ranges_and_transfer_lifetimes() {
         let (graph, ids) = copy_plan();
-        let p = plan(&graph, &bounds(128)).unwrap();
+        let p = plan(&graph, &bounds(128), false).unwrap();
         let overlaps = |a: crate::arena::ArenaSlice, b: crate::arena::ArenaSlice| {
             a.offset < b.offset + b.reserved() && b.offset < a.offset + a.reserved()
         };
@@ -344,7 +423,7 @@ mod tests {
         let capacities = [32, 128];
         let expected_bytes = capacities
             .iter()
-            .map(|&hi| plan(&graph, &bounds(hi)).unwrap().slab_bytes)
+            .map(|&hi| plan(&graph, &bounds(hi), false).unwrap().slab_bytes)
             .max()
             .unwrap();
         let mut device = CudaDevice::new(0).unwrap();

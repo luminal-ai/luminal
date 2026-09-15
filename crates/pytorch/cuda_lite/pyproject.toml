@@ -1,0 +1,25 @@
+[project]
+name = "luminal_cuda_lite"
+version = "0.1.0"
+description = "Luminal CUDA-lite torch.compile backend"
+requires-python = ">=3.10"
+# The PT2 export-preparation helpers are shared with the reference backend;
+# `luminal_reference` is a build-time/runtime dependency until they are lifted
+# into a backend-neutral package (see DESIGN.md, "Shared export pipeline").
+dependencies = ["torch>=2.14", "luminal_reference"]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+manifest-path = "Cargo.toml"
+module-name = "luminal_cuda_lite._luminal"
+# A CUDA backend is not useful without device execution, so the wheel always
+# builds with it on. `cargo check`/clippy on CUDA-free hosts still work because
+# the *crate* default is off.
+features = ["device"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

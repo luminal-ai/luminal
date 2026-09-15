@@ -6,7 +6,7 @@
 
 use crate::bufferize::{Buffer, BufferId, BufferIrGraph, BufferNode, Owner, PlanLayout};
 use crate::layout_ir::FreedBy;
-use crate::prelude::{FxHashMap, NodeIndex, petgraph};
+use crate::prelude::{FxHashMap, FxHashSet, NodeIndex, petgraph};
 use anyhow::{Result, anyhow, bail, ensure};
 use petgraph::visit::{EdgeRef, NodeIndexable};
 use std::collections::{BTreeMap, BinaryHeap};
@@ -70,6 +70,12 @@ pub struct ArenaPlan {
     pub parameters: ArenaSlice,
     pub staging_parameters: ArenaSlice,
     pub staging_bytes: usize,
+    /// Buffers whose storage is caller-owned device memory (zero-copy
+    /// boundaries). They reserve no slab range and get no upload/download step;
+    /// the executor resolves them through its external-pointer map. A buffer in
+    /// here that the executor has no pointer for is a hard error, never a
+    /// silent arena fallback.
+    pub externals: FxHashSet<BufferId>,
 }
 
 /// Node kinds, for the order policy.
@@ -413,6 +419,7 @@ fn plan_arena_over<L: PlanLayout>(
         order,
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
 }
 
@@ -427,12 +434,14 @@ pub fn plan_resident_over<L: PlanLayout>(
     order: Vec<NodeIndex>,
     resident_inputs: &std::collections::BTreeSet<i64>,
     device_outputs: &std::collections::BTreeSet<usize>,
+    external_buffers: &FxHashSet<BufferId>,
 ) -> Result<ArenaPlan> {
     let is_resident = |id: &BufferId| {
         plan.buffers[id]
             .lit
             .is_some_and(|lit| resident_inputs.contains(&lit))
     };
+    let is_external = |id: &BufferId| external_buffers.contains(id);
     let mut allocs = FxHashMap::default();
     let mut frees = FxHashMap::default();
     for &node in &order {
@@ -486,7 +495,11 @@ pub fn plan_resident_over<L: PlanLayout>(
                 live.contains(id),
                 "node {node:?} touches non-live buffer {id:?}"
             );
-            if plan.buffers[id].lit.is_some() && !is_resident(id) && uploaded.insert(id.clone()) {
+            if plan.buffers[id].lit.is_some()
+                && !is_resident(id)
+                && !is_external(id)
+                && uploaded.insert(id.clone())
+            {
                 steps.push(ArenaStep::Upload {
                     buffer: id.clone(),
                     staging: ArenaSlice::default(),
@@ -509,6 +522,11 @@ pub fn plan_resident_over<L: PlanLayout>(
                 }
             }
             for (buffer, slots) in groups {
+                // A caller-owned output is written in place by its producer;
+                // there is no readback and no pinned staging to reserve.
+                if is_external(&buffer) {
+                    continue;
+                }
                 steps.push(ArenaStep::Download {
                     buffer,
                     node,
@@ -534,7 +552,7 @@ pub fn plan_resident_over<L: PlanLayout>(
         0
     });
     let mut touch = |id: &BufferId, at: usize, intervals: &mut Vec<Lifetime>| -> Result<()> {
-        if is_resident(id) {
+        if is_resident(id) || is_external(id) {
             return Ok(());
         }
         if let Some(&i) = buffers.get(id) {
@@ -650,6 +668,7 @@ pub fn plan_resident_over<L: PlanLayout>(
             .map(|i| staging_slices[i])
             .unwrap_or_default(),
         staging_bytes,
+        externals: external_buffers.clone(),
     })
 }
 
