@@ -118,6 +118,21 @@ class CompiledModel:
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
 
+    def _mutation_destination(
+        self, mutation: str, inputs: Sequence[torch.Tensor]
+    ) -> torch.Tensor:
+        """The caller tensor a mutation output writes into.
+
+        Only user inputs have one here: a parameter/buffer writeback (PT2
+        ``buffer_mutation``) is refused by name rather than mis-bound.
+        """
+        if mutation not in self._user_input_names:
+            raise RuntimeError(
+                f"luminal_cuda_lite: mutation target {mutation!r} is not a user "
+                "input; parameter/buffer writeback is not supported here"
+            )
+        return inputs[self._user_input_names.index(mutation)]
+
     def __call__(self, *args: torch.Tensor) -> Any:
         # Under dynamic shapes Dynamo's wrapper passes the graph's symbolic
         # shape values alongside the tensor inputs (as SymInt or int). The
@@ -170,8 +185,7 @@ class CompiledModel:
                 zip(self._output_dtypes, output_shapes, self._output_mutations)
             ):
                 if mutation is not None:
-                    target = self._user_input_names.index(mutation)
-                    tensor = inputs[target]
+                    tensor = self._mutation_destination(mutation, inputs)
                 else:
                     tensor = torch.empty(
                         tuple(shape), dtype=_torch_dtype(dtype_code), device=device
@@ -203,7 +217,7 @@ class CompiledModel:
             if mutation is not None:
                 # The write already landed in the caller's tensor.
                 if returned:
-                    results.append(inputs[self._user_input_names.index(mutation)])
+                    results.append(self._mutation_destination(mutation, inputs))
                 continue
             if returned:
                 tensor = out_tensors[index]

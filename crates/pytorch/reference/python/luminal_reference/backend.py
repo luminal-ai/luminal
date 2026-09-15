@@ -58,11 +58,18 @@ class CompiledModel:
     """Callable wrapper around a compiled reference-backend graph."""
 
     def __init__(
-        self, graph: Any, ep: Any, scalar_output_positions: Sequence[int] = ()
+        self,
+        graph: Any,
+        ep: Any,
+        scalar_output_positions: Sequence[int] = (),
+        held: Optional[dict] = None,
     ):
         self._graph = graph
         self._ep = ep
         self._scalar_output_positions = frozenset(scalar_output_positions)
+        # Graph input name -> the exported parameter/buffer tensor staged for
+        # it, so a buffer mutation has somewhere to write back.
+        self._held = dict(held or {})
         names = graph.input_names
         kinds = graph.input_kinds
         self._user_input_names = [
@@ -102,12 +109,22 @@ class CompiledModel:
         for index, (_, dtype_code, shape, mutation, returned) in enumerate(outputs):
             tensor = _output_tensor(self._graph.output_bytes(index), dtype_code, shape)
             if mutation is not None:
-                target = self._user_input_names.index(mutation)
-                inputs[target].copy_(tensor)
+                # A mutation target is a graph input: a user input, or a
+                # parameter/buffer held from the export's state_dict.
+                if mutation in self._user_input_names:
+                    destination = inputs[self._user_input_names.index(mutation)]
+                elif mutation in self._held:
+                    destination = self._held[mutation]
+                else:
+                    raise RuntimeError(
+                        f"luminal_reference: mutation target {mutation!r} is neither a "
+                        "user input nor a staged parameter/buffer"
+                    )
+                destination.copy_(tensor)
                 # A returned mutation IS the caller's tensor (same storage),
                 # matching eager's aliasing semantics.
                 if returned:
-                    results.append(inputs[target])
+                    results.append(destination)
                 continue
             if returned:
                 # Scalar graph outputs were boxed into rank-zero tensors before
@@ -280,6 +297,7 @@ def luminal_reference(
     parameter_names = graph.parameter_names
 
     user_index = 0
+    held: dict = {}
     for name, kind, parameter_name in zip(names, kinds, parameter_names):
         if kind == "user_input":
             if user_index >= len(export_inputs):
@@ -295,6 +313,9 @@ def luminal_reference(
                     "the exported state_dict"
                 )
             value = ep.state_dict[parameter_name]
+            # The export's own tensor, not the caller's module buffer: mutated
+            # state persists across calls on the input's runtime buffer.
+            held[name] = value
         graph.set_input(name, _tensor_bytes(value), list(value.shape))
 
     if user_index != len(export_inputs):
@@ -303,7 +324,7 @@ def luminal_reference(
         )
 
     graph.search(search_iterations)
-    return CompiledModel(graph, ep, scalar_output_positions)
+    return CompiledModel(graph, ep, scalar_output_positions, held)
 
 
 def register_backend() -> None:
