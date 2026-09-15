@@ -1,13 +1,15 @@
-use anyhow::{Context, Result, anyhow, ensure};
-use clap::Parser;
-use llm_chat::{
-    backend::{Backend, CompileOptions, GpuBackend},
+//! This example's chat CLI.
+use crate::{
+    backend::MetalBackend,
     checkpoint,
     graph::{LlmGraph, ModelConfig, ModelType},
     sampling::Sampler,
     session::Session,
     tokenizer::{ChatTokenizer, Message},
 };
+use anyhow::{Context, Result, anyhow, ensure};
+use clap::Parser;
+use luminal_metal::CompileOptions;
 use std::{
     collections::BTreeMap,
     io::{self, Write},
@@ -15,7 +17,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(about = "Chat with a model-zoo LLM. Select the backend with Cargo features.")]
+#[command(about = "Chat with a model-zoo LLM on the Metal runtime.")]
 struct Args {
     #[arg(long, value_enum)]
     model: ModelType,
@@ -52,17 +54,13 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     search_population: usize,
 }
+
 pub fn main() -> Result<()> {
-    let args = Args::parse();
     ensure!(
-        cfg!(feature = "cuda_lite") ^ cfg!(feature = "metal"),
-        "enable exactly one backend: --features cuda_lite or --features metal"
-    );
-    ensure!(
-        !cfg!(feature = "metal") || cfg!(target_os = "macos"),
+        cfg!(target_os = "macos"),
         "the Metal backend requires macOS"
     );
-    run(args)
+    run(Args::parse())
 }
 fn run(args: Args) -> Result<()> {
     ensure!(args.max_new_tokens > 0, "max-new-tokens must be positive");
@@ -107,15 +105,7 @@ fn run(args: Args) -> Result<()> {
         args.checkpoint.display()
     );
     let weights = checkpoint::load(&args.checkpoint, &graph.parameters)?;
-    eprintln!(
-        "Compiling {:?} for {}...",
-        args.model,
-        if cfg!(feature = "metal") {
-            "Metal"
-        } else {
-            "CUDA Lite"
-        }
-    );
+    eprintln!("Compiling {:?} for Metal...", args.model);
     let options = CompileOptions {
         profile_on_device: args.profile,
         // The heuristic is a byte estimate, not the duration printed by the
@@ -126,7 +116,7 @@ fn run(args: Args) -> Result<()> {
         seed: args.seed,
         ..Default::default()
     };
-    let backend = GpuBackend::compile(&graph, weights, &options).context("compile chat graph")?;
+    let backend = MetalBackend::compile(&graph, weights, &options).context("compile chat graph")?;
     let mut session = Session::new(graph, backend);
     let mut history = vec![];
     if let Some(system) = &args.system {
@@ -176,12 +166,12 @@ fn run(args: Args) -> Result<()> {
     }
     Ok(())
 }
-fn turn<B: Backend>(
+fn turn(
     args: &Args,
     prompt: &str,
     tokenizer: &ChatTokenizer,
     history: &mut Vec<Message>,
-    session: &mut Session<B>,
+    session: &mut Session,
     sampler: &mut Sampler,
 ) -> Result<()> {
     let mut messages = history.clone();

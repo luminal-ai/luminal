@@ -83,7 +83,7 @@ mod tests {
     fn avg_pool_2d_batched() {
         let mut cx = Graph::new();
         let input = cx.tensor((1, 1, 4, 4), DType::F32);
-        let output = avg_pool_2d(input, (2, 2), (2, 2)).output();
+        let output = avg_pool_2d(input, (2, 2), (2, 2));
 
         assert_eq!(
             output.dims(),
@@ -114,7 +114,7 @@ mod tests {
     fn avg_pool_2d_unbatched() {
         let mut cx = Graph::new();
         let input = cx.tensor((1, 4, 4), DType::F32);
-        let output = avg_pool_2d(input, (2, 2), (2, 2)).output();
+        let output = avg_pool_2d(input, (2, 2), (2, 2));
 
         assert_eq!(
             output.dims(),
@@ -140,7 +140,7 @@ mod tests {
     fn adaptive_avg_pool_2d_uses_overlapping_windows() {
         let mut cx = Graph::new();
         let input = cx.tensor((1, 1, 5, 5), DType::F32);
-        let output = adaptive_avg_pool_2d(input, (2, 2)).output();
+        let output = adaptive_avg_pool_2d(input, (2, 2));
 
         assert_eq!(
             output.dims(),

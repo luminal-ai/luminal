@@ -1,12 +1,13 @@
 #![cfg(target_os = "macos")]
 use luminal::{dtype::DType, graph::Graph};
-use luminal_metal::{HostBuffer, MetalRuntime, harness_search_options};
+use luminal_metal::bindings::MetalBindings;
+use luminal_metal::{HostBuffer, MetalRuntime, harness_search_options, metal_registry};
 
 #[test]
 fn bool_output_uses_byte_storage_with_odd_lengths() {
     let mut g = Graph::new();
     let x = g.tensor(5, DType::F32);
-    let out = x.lt(g.constant_f32(0.).expand_dim(0, 5)).output();
+    let out = x.lt(g.constant_f32(0.).expand_dim(0, 5));
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
@@ -21,7 +22,7 @@ fn bool_output_uses_byte_storage_with_odd_lengths() {
 fn f16_inputs_cast_and_compute_on_device() {
     let mut g = Graph::new();
     let x = g.tensor(5, DType::F16);
-    let out = (x * x).cast(DType::F32).output();
+    let out = (x * x).cast(DType::F32);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
@@ -42,9 +43,15 @@ fn integer_max_and_i64_copy_preserve_extremes() {
     let mut g = Graph::new();
     let x = g.tensor((2, 3), DType::Int);
     let y = g.tensor(3, DType::I64);
-    let out = x.max(1).output();
-    let wide = y.output();
-    let mut rt = MetalRuntime::load(&g).unwrap();
+    let out = x.max(1);
+    // `wide` hands an input straight back out: not a leaf, so bind it by hand.
+    let wide = y;
+    let mut rt = MetalRuntime::load_with(
+        &g,
+        MetalBindings::dense(&g.logical, &[out.id, wide.id]),
+        metal_registry(),
+    )
+    .unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
     rt.set_data(x.id, vec![i32::MIN, -7, -2, -99, -8, -15]);
@@ -57,7 +64,7 @@ fn integer_max_and_i64_copy_preserve_extremes() {
 fn empty_reduction_and_replay_initialize_recycled_storage() {
     let mut g = Graph::new();
     let x = g.tensor((3, 'n'), DType::F32);
-    let out = x.sum(1).output();
+    let out = x.sum(1);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.bind_dyn_range('n', 0, 4).unwrap();
     rt.search(&Default::default(), &harness_search_options())
@@ -73,7 +80,7 @@ fn empty_reduction_and_replay_initialize_recycled_storage() {
 fn missing_or_mistyped_input_refuses_then_recovers() {
     let mut g = Graph::new();
     let x = g.tensor(3, DType::F32);
-    let out = (x + 1.).output();
+    let out = x + 1.;
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();

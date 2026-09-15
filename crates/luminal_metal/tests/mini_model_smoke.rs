@@ -12,6 +12,8 @@ use luminal::prelude::{GraphTensor, NodeIndex};
 use luminal::shape::IntExpr;
 use luminal_metal::HostBuffer;
 use luminal_metal::MetalRuntime;
+use luminal_metal::bindings::MetalBindings;
+use luminal_metal::metal_registry;
 
 fn values(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
@@ -54,7 +56,15 @@ fn run(
         })
         .collect::<Vec<(NodeIndex, HostBuffer)>>();
     let data = pairs.iter().cloned().collect();
-    let mut runtime = MetalRuntime::load(&cx).expect("reference load");
+    // A mini model's reads are the caller's list — a cache output need not be
+    // a leaf — so the boundary is bound by hand rather than defaulted.
+    let read: Vec<NodeIndex> = outputs.iter().map(|tensor| tensor.id).collect();
+    let mut runtime = MetalRuntime::load_with(
+        &cx,
+        MetalBindings::dense(&cx.logical, &read),
+        metal_registry(),
+    )
+    .expect("mini load");
     runtime
         .search(&data, &luminal_metal::harness_search_options())
         .expect("mini graph searches");
@@ -80,7 +90,7 @@ fn mini_conv_runs() {
     let mut cx = Graph::new();
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
     let input = cx.tensor((1, 1, 5, 5), DType::F32);
-    let output = model.forward(input).output();
+    let output = model.forward(input);
     run(cx, &[output], []);
 }
 
@@ -96,11 +106,11 @@ fn mini_llama3_runs() {
     let scatter = cx.tensor(1, DType::Int);
     let (output, cache_outputs) =
         model.forward(ids, &caches, gather, scatter, IntExpr::from(1usize));
-    let mut outputs = vec![output.output()];
+    let mut outputs = vec![output];
     outputs.extend(
         cache_outputs
             .into_iter()
-            .flat_map(|(key, value)| [key.output(), value.output()]),
+            .flat_map(|(key, value)| [key, value]),
     );
     run(
         cx,
@@ -125,11 +135,11 @@ fn mini_qwen3_runs() {
     let scatter = cx.tensor(1, DType::Int);
     let (output, cache_outputs) =
         model.forward(ids, &caches, gather, scatter, IntExpr::from(1usize));
-    let mut outputs = vec![output.output()];
+    let mut outputs = vec![output];
     outputs.extend(
         cache_outputs
             .into_iter()
-            .flat_map(|(key, value)| [key.output(), value.output()]),
+            .flat_map(|(key, value)| [key, value]),
     );
     run(
         cx,
@@ -179,11 +189,11 @@ fn mini_gemma3_runs() {
         &rope,
         rotation,
     );
-    let mut outputs = vec![output.output()];
+    let mut outputs = vec![output];
     outputs.extend(
         cache_outputs
             .into_iter()
-            .flat_map(|(key, value)| [key.output(), value.output()]),
+            .flat_map(|(key, value)| [key, value]),
     );
     run(
         cx,
@@ -203,11 +213,11 @@ fn mini_moe<M>(
     let mut cx = Graph::new();
     let model = build(&mut cx);
     let (output, cache_outputs) = forward(model, &mut cx);
-    let mut outputs = vec![output.output()];
+    let mut outputs = vec![output];
     outputs.extend(
         cache_outputs
             .into_iter()
-            .flat_map(|(key, value)| [key.output(), value.output()]),
+            .flat_map(|(key, value)| [key, value]),
     );
     run(cx, &outputs, []);
 }
@@ -252,7 +262,7 @@ fn mini_whisper_runs() {
     let model = MiniWhisper::new(4, 6, 2, &mut cx);
     let audio = cx.tensor((2, 4), DType::F32);
     let tokens = cx.tensor((1, 4), DType::F32);
-    let output = model.forward(audio, tokens).output();
+    let output = model.forward(audio, tokens);
     run(cx, &[output], []);
 }
 
@@ -275,17 +285,15 @@ fn mini_flux_runs() {
     let rope_sin = cx.tensor((TEXT_TOKENS + IMAGE_TOKENS, HEAD_DIM), DType::F32);
     let rope_rotation = cx.tensor((HEAD_DIM, HEAD_DIM), DType::F32);
     let joint_base = cx.tensor((TEXT_TOKENS + IMAGE_TOKENS, HIDDEN), DType::F32);
-    let output = model
-        .forward(
-            latent,
-            text,
-            timestep,
-            guidance,
-            rope_cos,
-            rope_sin,
-            rope_rotation,
-            joint_base,
-        )
-        .output();
+    let output = model.forward(
+        latent,
+        text,
+        timestep,
+        guidance,
+        rope_cos,
+        rope_sin,
+        rope_rotation,
+        joint_base,
+    );
     run(cx, &[output], []);
 }

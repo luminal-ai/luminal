@@ -77,7 +77,7 @@ fn elementwise_chain() {
     let mut cx = Graph::new();
     let a = cx.tensor((2usize, 3usize), DType::F32);
     let b = cx.tensor((2usize, 3usize), DType::F32);
-    let out = ((a + b) * a).sqrt().exp().output();
+    let out = ((a + b) * a).sqrt().exp();
     let (want, got) = run_both(
         &cx,
         &[
@@ -95,7 +95,7 @@ fn reduce_and_broadcast() {
     let a = cx.tensor((3usize, 4usize), DType::F32);
     // Softmax-ish: exp(x) / sum(exp(x)) over the last axis.
     let e = a.exp();
-    let out = (e / e.sum(1).expand_dim(1, 4)).output();
+    let out = e / e.sum(1).expand_dim(1, 4);
     let (want, got) = run_both(
         &cx,
         &[(a.id, (0..12).map(|i| i as f32 * 0.25).collect())],
@@ -111,8 +111,7 @@ fn movement_materialize() {
     // slice + pad => index-map materialize territory.
     let out = a
         .slice((1..3, 1..4))
-        .pad(((1usize, 0usize), (0usize, 2usize)), 0.)
-        .output();
+        .pad(((1usize, 0usize), (0usize, 2usize)), 0.);
     let (want, got) = run_both(&cx, &[(a.id, (0..20).map(|i| i as f32).collect())], out.id);
     assert_close(&want, &got, "slice+pad materialize");
 }
@@ -122,7 +121,7 @@ fn iota_arange() {
     let mut cx = Graph::new();
     let idx = cx.arange(6usize);
     let a = cx.tensor(6usize, DType::F32);
-    let out = (a * idx.cast(luminal::dtype::DType::F32)).output();
+    let out = a * idx.cast(luminal::dtype::DType::F32);
     let (want, got) = run_both(&cx, &[(a.id, vec![2.0; 6])], out.id);
     assert_close(&want, &got, "arange*x");
 }
@@ -132,7 +131,7 @@ fn gather_rows() {
     let mut cx = Graph::new();
     let table = cx.tensor((5usize, 3usize), DType::F32);
     let rows = cx.arange(2usize); // rows 0 and 1
-    let out = table.gather1d(rows).output();
+    let out = table.gather1d(rows);
     let (want, got) = run_both(
         &cx,
         &[(table.id, (0..15).map(|i| i as f32).collect())],
@@ -147,7 +146,7 @@ fn scatter_write() {
     let init = cx.tensor(6usize, DType::F32);
     let src = cx.tensor(2usize, DType::F32);
     let coords = cx.arange(2usize); // write positions 0 and 1
-    let out = init.scatter(&[coords], src).output();
+    let out = init.scatter(&[coords], src);
     let (want, got) = run_both(
         &cx,
         &[(init.id, vec![10.0; 6]), (src.id, vec![-1.0, -2.0])],

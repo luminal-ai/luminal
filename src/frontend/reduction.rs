@@ -24,10 +24,7 @@ impl GraphTensor {
                 // static extents discharge trivially; symbolic ones
                 // refuse unless the binding's range excludes 0.
                 let extent = operand_dims[axes[dim]];
-                let at = id.index();
-                self.graph()
-                    .logical
-                    .require_extent_at_least(at, &extent, 1, "reduce_max axis");
+                self.graph().logical.contract_extent_at_least(&extent, 1);
             }
             let rank = operand_dims.len();
             let axis_from_end = rank - 1 - axes[dim];
@@ -41,8 +38,7 @@ impl GraphTensor {
             id = self
                 .graph()
                 .logical
-                .op(op, &[(id, operand_dims)], out_dims.clone(), self.dtype)
-                .unwrap_or_else(crate::graph::unrecorded_value);
+                .op(op, &[(id, operand_dims)], out_dims.clone(), self.dtype);
             dims = out_dims;
             let axis = axes[dim];
             for ax in &mut axes {

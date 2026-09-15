@@ -1,6 +1,6 @@
 //! Opt-in device-resident input boundaries. Names are runtime buffer/slot
 //! IDs; this layer knows nothing about models. A resident input may be
-//! MUTATED in place: a `.output_into()` output shares the input's BufferId,
+//! MUTATED in place: an output bound to the input's BufferId
 //! so its writes land in the home and need no host readback — the state is
 //! still SSA, only its boundary storage is shared.
 use crate::arena::{ArenaPlan, ArenaSlice};

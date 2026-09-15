@@ -10,7 +10,7 @@ fn elementwise_graph() -> (Graph, luminal::prelude::GraphTensor) {
     cx.set_dim('a', 3);
     let x = cx.tensor(('a', 2), DType::F32);
     let y = cx.tensor(('a', 2), DType::F32);
-    let out = (x * y).output();
+    let out = x * y;
     (cx, out)
 }
 
@@ -167,7 +167,7 @@ fn a_bucketed_dim_may_carry_a_bounds_dependent_check() {
     let mut cx = Graph::new();
     cx.set_dim('a', 3);
     let x = cx.tensor(('a', 2), DType::F32);
-    let _out = x.max(0).output();
+    let _out = x.max(0);
 
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])

@@ -1,6 +1,8 @@
 #![cfg(target_os = "macos")]
+use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::*;
-use luminal_metal::{HostBuffer, MetalRuntime, harness_search_options};
+use luminal_metal::bindings::MetalBindings;
+use luminal_metal::{HostBuffer, MetalRuntime, harness_search_options, metal_registry};
 fn dense(rt: &MetalRuntime, t: GraphTensor) -> Vec<f32> {
     let (data, binding) = rt.fetch(t.id).unwrap();
     luminal_metal::layouts::dense_f32(&data.as_f32().unwrap(), &binding.layout).unwrap()
@@ -11,9 +13,18 @@ fn resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updat
     let weights = cx.tensor(4, DType::F32);
     let state = cx.tensor(4, DType::F32);
     let input = cx.tensor('n', DType::F32);
-    let previous = state.sum(0).output();
-    let next = (state + weights * input.sum(0).expand_dim(0, 4)).output_into(&state);
-    let mut rt = MetalRuntime::load(&cx).unwrap();
+    let previous = state.sum(0);
+    let next = state + weights * input.sum(0).expand_dim(0, 4);
+    // `next` writes the state input's storage, and the weights and the
+    // state stay in the device arena between executions: both are
+    // statements of the binding, not of the model.
+    let mut bindings = MetalBindings::dense(&cx.logical, &[previous.id]);
+    let home = bindings.buffer_of_input(state.id).unwrap();
+    bindings.declare(home, Access::ReadWrite, FreedBy::Caller);
+    bindings.output_on(next.id, home);
+    bindings.resident(weights.id).unwrap();
+    bindings.resident(state.id).unwrap();
+    let mut rt = MetalRuntime::load_with(&cx, bindings, metal_registry()).unwrap();
     rt.bind_dim_buckets(
         'n',
         vec![
@@ -31,8 +42,6 @@ fn resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updat
     .into_iter()
     .collect();
     rt.search(&data, &harness_search_options()).unwrap();
-    rt.retain_input(weights.id).unwrap();
-    rt.retain_input(state.id).unwrap();
     for (id, v) in data {
         rt.set_data(id, v);
     }

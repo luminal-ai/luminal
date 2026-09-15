@@ -15,11 +15,11 @@ fn main() {
     let r = x.repeat((2, 3));
     // merge the repeated dims: merged extent (s*2)*(t*3)
     let m = r.merge_dims(0, 1);
-    let _ = m.output();
+    let _ = m;
     // pad along axis 0 of a fresh symbolic tensor: out dim 1 + s + 2
     let y = cx.named_tensor("y", ('s',), DType::F32);
-    let _ = y.pad_along(1, 2, 0, 0.0).output();
-    match cx.logical.model_text() {
+    let _ = y.pad_along(1, 2, 0, 0.0);
+    match cx.logical.render_all() {
         Ok(model) => println!("{model}"),
         Err(e) => println!("POISONED: {e}"),
     }

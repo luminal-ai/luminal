@@ -59,7 +59,7 @@ fn marker_matmul() -> (Graph, NodeIndex, NodeIndex) {
     let mut cx = Graph::new();
     let a = cx.tensor((4usize, 8usize), DType::F32);
     let b = cx.tensor((8usize, 3usize), DType::F32);
-    let _out = a.matmul(b).output();
+    let _out = a.matmul(b);
     (cx, a.id, b.id)
 }
 
@@ -403,8 +403,8 @@ fn sampled_genomes_never_hand_bufferize_a_cyclic_graph() {
 /// The authored names on the NAMED marker fixture. Both inputs and the
 /// output carry one, so the pin covers both name-bearing spellings:
 /// `LogicalTensorInputLit`'s own `LogicalId` (an input's name lives IN
-/// its declaration) and the `LogicalTensorNamed` annotation a
-/// `.output_named()` unions in.
+/// its declaration) and the `LogicalTensorNamed` annotation `.named()`
+/// unions in.
 const NAMED_INPUTS: [&str; 2] = ["blocks.0.attn.q_proj.weight", "hidden_states"];
 const NAMED_OUTPUT: &str = "logits";
 
@@ -414,22 +414,22 @@ fn named_marker_matmul() -> Graph {
     let mut cx = Graph::new();
     let a = cx.named_tensor(NAMED_INPUTS[0], (4usize, 8usize), DType::F32);
     let b = cx.named_tensor(NAMED_INPUTS[1], (8usize, 3usize), DType::F32);
-    let _out = a.matmul(b).output_named(NAMED_OUTPUT);
+    let _out = a.matmul(b).named(NAMED_OUTPUT);
     cx
 }
 
 /// Saturate a program with an ARBITRARY schedule — the seam this pin
 /// needs to measure a WITHOUT-CLEANUP baseline. It mirrors
-/// `CudaRuntime::assemble_and_saturate` over the same public parts
-/// (`bound_parts` + the cuBLASLt matcher vocabulary), so the ONLY
+/// `CudaRuntime::assemble_and_saturate` over the same public parts (the
+/// default binding + the cuBLASLt matcher vocabulary), so the ONLY
 /// difference from [`CudaRuntime::saturated_egraph`] is the schedule.
 fn saturate_with_schedule(cx: &Graph, schedule: &str) -> EGraph {
-    let (pre_schedule, _inputs, _outputs, post_checks, _labeled) = cx
-        .logical
-        .bound_parts(&luminal_cuda_lite::CudaBindings)
-        .expect("bound parts");
+    let bound = luminal_cuda_lite::CudaBindings::leaves(&cx.logical)
+        .bind(&cx.logical)
+        .expect("bound program");
+    let (prefix, post_checks) = (&bound.prefix, &bound.post_checks);
     let full = format!(
-        "{}\n\n{pre_schedule}{schedule}{post_checks}",
+        "{}\n\n{prefix}{schedule}{post_checks}",
         luminal::egglog_snippet::assembled_program_for(&luminal_cuda_lite::ops::cuda_matchers())
     );
     let mut egraph = luminal::egglog_snippet::new_egraph();

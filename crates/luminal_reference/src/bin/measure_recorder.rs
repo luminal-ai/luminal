@@ -35,7 +35,7 @@ fn measure(
     let (inputs, out) = build(&mut cx);
     let _ = out;
     let rec_us = t_rec.elapsed().as_micros();
-    match cx.logical.model_text() {
+    match cx.logical.render_all() {
         Ok(model) => {
             let (rows, applies) = count_rows(&model);
             println!("{name}: rows={rows} applies={applies} record_us={rec_us}");
@@ -74,7 +74,7 @@ fn main() {
         measure("matmul2d", |cx| {
             let x = cx.tensor((8, 16), DType::F32);
             let w = cx.tensor((16, 12), DType::F32);
-            let out = x.matmul(w).output();
+            let out = x.matmul(w);
             (
                 vec![(x.id, random_vec(8 * 16)), (w.id, random_vec(16 * 12))],
                 out,
@@ -86,7 +86,7 @@ fn main() {
         measure("permuted_matmul", |cx| {
             let x = cx.tensor((8, 16), DType::F32);
             let w = cx.tensor((12, 16), DType::F32);
-            let out = x.matmul(w.permute((1, 0))).output();
+            let out = x.matmul(w.permute((1, 0)));
             (
                 vec![(x.id, random_vec(8 * 16)), (w.id, random_vec(12 * 16))],
                 out,
@@ -101,7 +101,7 @@ fn main() {
             let v = cx.tensor((1, 2, 6, 8), DType::F32);
             let scores = q.matmul(k.permute((0, 1, 3, 2))) * (1.0 / (8f32).sqrt());
             let probs = scores.softmax(3);
-            let out = probs.matmul(v).output();
+            let out = probs.matmul(v);
             (
                 vec![
                     (q.id, random_vec(96)),
@@ -116,7 +116,7 @@ fn main() {
     if which.is_empty() || which == "cumsum" {
         measure("cumsum_rank4", |cx| {
             let x = cx.tensor((2, 3, 4, 5), DType::F32);
-            let out = x.cumsum(3).output();
+            let out = x.cumsum(3);
             (vec![(x.id, random_vec(120))], out)
         });
     }

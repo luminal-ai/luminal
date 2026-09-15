@@ -61,7 +61,7 @@ fn linear_with_bias() -> (Graph, NodeIndex, NodeIndex, NodeIndex, NodeIndex) {
     let weight = cx.named_tensor("fc.weight", (K, N), DType::F32);
     let bias = cx.named_tensor("fc.bias", N, DType::F32);
     let x = cx.tensor((M, K), DType::F32);
-    let out = luminal_nn::linear(x, weight, Some(bias)).output();
+    let out = luminal_nn::linear(x, weight, Some(bias));
     (cx, x.id, weight.id, bias.id, out.id)
 }
 
@@ -390,7 +390,7 @@ fn degenerate_linear_with_bias() -> (Graph, NodeIndex, NodeIndex, NodeIndex, Nod
     let weight = cx.named_tensor("fc.weight", (K, N), DType::F32);
     let bias = cx.named_tensor("fc.bias", N, DType::F32);
     let x = cx.tensor((1usize, K), DType::F32);
-    let out = luminal_nn::linear(x, weight, Some(bias)).output();
+    let out = luminal_nn::linear(x, weight, Some(bias));
     (cx, x.id, weight.id, bias.id, out.id)
 }
 
@@ -567,7 +567,7 @@ fn per_row_bias_does_not_mint_the_bias_form() {
     // i.e. bias[i] added to every element of row i — cuBLASLt's epilogue
     // cannot express this for the sibling call (its bias runs along the
     // sibling's rows = the recorder's COLUMNS).
-    let _out = (x.matmul(w) + b_rows.expand_dim(1, N)).output();
+    let _out = x.matmul(w) + b_rows.expand_dim(1, N);
     let rt = CudaRuntime::load(&cx).expect("load");
     let egraph = rt.saturated_egraph().expect("saturation");
     let (base, bias, _acc, acc_bias) = report_forms(&egraph, "matmul + per-ROW b[4]");

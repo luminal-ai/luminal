@@ -10,11 +10,8 @@ fn r11_squares_saturate_bounded() {
         let mut cx = Graph::new();
         let x = cx.tensor((4usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = x.matmul(w).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(w);
+        test_runtime::bind_leaves(&cx)
     };
     let s3 = test_runtime::serialize_fixture(&a3);
     println!("a3 (x[4,4] @ w[4,4]) saturates: {} nodes", s3.nodes.len());
@@ -22,11 +19,8 @@ fn r11_squares_saturate_bounded() {
     let a6b = {
         let mut cx = Graph::new();
         let x = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = x.matmul(x.permute((1usize, 0usize))).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(x.permute((1usize, 0usize)));
+        test_runtime::bind_leaves(&cx)
     };
     let s6 = test_runtime::serialize_fixture(&a6b);
     println!(

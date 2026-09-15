@@ -45,11 +45,8 @@ fn r10_debug_fixture1() {
         let mut cx = Graph::new();
         let x = cx.tensor((2usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 3usize), DType::F32);
-        let _out = x.matmul(w).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w);
+        test_runtime::bind_leaves(&cx)
     };
     let s = test_runtime::serialize_fixture(&text);
     println!("nodes: {}", s.nodes.len());
@@ -153,11 +150,8 @@ fn r10_debug_c6() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = ((x.matmul(w) * 2.0) + c).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = (x.matmul(w) * 2.0) + c;
+        test_runtime::bind_leaves(&cx)
     };
     // PIN-preferring genome: does it reach the boundary?
     let r = std::panic::catch_unwind(|| test_runtime::extract_fixture_with_genome(&text, PIN));
@@ -331,11 +325,8 @@ fn r10_debug_a4() {
         let w1 = cx.tensor((4usize, 4usize), DType::F32);
         let w2 = cx.tensor((4usize, 4usize), DType::F32);
         let y = x.matmul(w1);
-        let _ = y.matmul(w2).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = y.matmul(w2);
+        test_runtime::bind_leaves(&cx)
     };
     let (graph, _) = test_runtime::extract_fixture_with_genome(&text, PIN);
     for node in graph.dag.node_weights() {
@@ -377,12 +368,13 @@ fn r10_debug_g2_mincost() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let y = x.matmul(w);
-        let _ = y.output();
-        let _ = (y * 2.0).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
+        let scaled = y * 2.0;
+        // The CSE'd matmul is bound itself and feeds the scale, so the
+        // bound outputs are not the leaves.
+        test_runtime::TestRuntimeBindings::dense(&cx.logical, &[y.id, scaled.id])
+            .bind(&cx.logical)
             .expect("recorder clean")
-            .text
+            .text()
     };
     let graph = test_runtime::extract_fixture(&text);
     let labels: Vec<String> = graph
@@ -585,11 +577,8 @@ fn r10_debug_bufferize() {
         let mut cx = Graph::new();
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
-        let _ = x.matmul(w).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(w);
+        test_runtime::bind_leaves(&cx)
     };
     let (graph, _) = test_runtime::extract_fixture_with_genome(
         &text,

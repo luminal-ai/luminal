@@ -13,7 +13,7 @@ fn select_picks_branches_elementwise() {
     let condition = cx.tensor((4,), DType::Bool);
     let if_true = cx.tensor((4,), DType::F32);
     let if_false = cx.tensor((4,), DType::F32);
-    let out = condition.select(if_true, if_false).output();
+    let out = condition.select(if_true, if_false);
 
     let mut runtime = ReferenceRuntime::load(&cx).expect("load");
     let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
@@ -42,7 +42,7 @@ fn select_does_not_leak_unselected_nan() {
     let condition = cx.tensor((2,), DType::Bool);
     let if_true = cx.tensor((2,), DType::F32);
     let if_false = cx.tensor((2,), DType::F32);
-    let out = condition.select(if_true, if_false).output();
+    let out = condition.select(if_true, if_false);
 
     let mut runtime = ReferenceRuntime::load(&cx).expect("load");
     let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
@@ -72,7 +72,7 @@ fn select_does_not_leak_unselected_nan() {
 fn abs_uses_select_and_runs() {
     let mut cx = Graph::new();
     let x = cx.tensor((4,), DType::F32);
-    let out = x.abs().output();
+    let out = x.abs();
 
     let values = vec![-1.5f32, 2.0, -3.0, 0.0];
     let mut runtime = ReferenceRuntime::load(&cx).expect("load");
@@ -96,7 +96,7 @@ fn select_i64_branches() {
     let condition = cx.tensor((3,), DType::Bool);
     let if_true = cx.tensor((3,), DType::I64);
     let if_false = cx.tensor((3,), DType::I64);
-    let out = condition.select(if_true, if_false).output();
+    let out = condition.select(if_true, if_false);
 
     let mut runtime = ReferenceRuntime::load(&cx).expect("load");
     let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();

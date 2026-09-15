@@ -8,7 +8,7 @@ fn main() -> Result<()> {
     let mut cx = Graph::new();
     let a = cx.tensor((3, 1), DType::F32);
     let b = cx.tensor((1, 4), DType::F32);
-    let c = a.matmul(b).output();
+    let c = a.matmul(b);
 
     let pairs = vec![
         (a.id, vec![1.0f32, 2.0, 3.0].into()),

@@ -410,11 +410,8 @@ fn marker_matmul_program() -> String {
     let mut cx = Graph::new();
     let a = cx.tensor((4usize, 8usize), DType::F32);
     let b = cx.tensor((8usize, 3usize), DType::F32);
-    let _out = a.matmul(b).output();
-    cx.logical
-        .bound_program(&test_runtime::TestRuntimeBindings)
-        .expect("recorder clean")
-        .text
+    let _out = a.matmul(b);
+    test_runtime::bind_leaves(&cx)
 }
 
 // ---------------------------------------------------------------------------
@@ -438,13 +435,12 @@ fn re_description_program() -> String {
     let a = x + y;
     let b = a - x;
     let c = z + b;
-    let _ = a.output();
-    let _ = c.output();
-    let text = cx
-        .logical
-        .bound_program(&test_runtime::TestRuntimeBindings)
+    // `a` is a bound output AND feeds `b`, so the outputs are not the
+    // leaves: state them.
+    let text = test_runtime::TestRuntimeBindings::dense(&cx.logical, &[a.id, c.id])
+        .bind(&cx.logical)
         .expect("recorder clean")
-        .text;
+        .text();
     let b_name = format!("v{}", b.id.index());
     let y_name = format!("v{}", y.id.index());
     assert!(

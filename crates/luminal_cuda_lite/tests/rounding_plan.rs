@@ -12,11 +12,11 @@ use luminal_cuda_lite::{CudaRuntime, as_kernel_op, harness_search_options};
 fn rounding_and_trunc_cast_plan_with_kernel_interfaces() {
     let mut cx = luminal::graph::Graph::new();
     let x = cx.tensor(6usize, DType::F32);
-    let _floor = x.floor().output();
-    let _ceil = x.ceil().output();
-    let _trunc = x.trunc().output();
-    let _round = x.round().output();
-    let _ints = x.trunc_cast(DType::Int).output();
+    let _floor = x.floor();
+    let _ceil = x.ceil();
+    let _trunc = x.trunc();
+    let _round = x.round();
+    let _ints = x.trunc_cast(DType::Int);
 
     let mut rt = CudaRuntime::load(&cx).expect("load");
     let data: FxHashMap<_, _> = [(x.id, vec![1.9f32, 1.5, 0.5, -0.5, -1.5, -1.9].into())]

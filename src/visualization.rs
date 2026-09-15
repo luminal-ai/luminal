@@ -98,28 +98,19 @@ impl ToDot for crate::egglog_utils::SerializedEGraph {
     }
 }
 
-/// The recorded logical model as a dataflow DAG: one node per LIVE value
-/// (dead rows elided, matching `model_text`), operand edges into consumers.
-/// Boundary rows (inputs, output designations) are blue, interior values
-/// violet — the shared visual grammar. A poisoned graph refuses to render,
-/// same contract as `model_text`.
+/// The recorded logical model as a dataflow DAG: one node per recorded
+/// value, operand edges into consumers. Inputs are blue, interior values
+/// violet, names annotate their value — the shared visual grammar.
 impl ToDot for crate::graph::LogicalGraph {
     fn to_dot(&self) -> Result<String> {
-        if let Some(reason) = self.poisoned() {
-            anyhow::bail!("logical graph poisoned: {reason}");
-        }
-        let live = self.live_set();
-        let mut out_keys: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-        for (id, key) in self.viz_outputs() {
-            out_keys.entry(id.index()).or_default().push(key);
+        let mut names: FxHashMap<usize, Vec<&str>> = FxHashMap::default();
+        for (id, name) in self.viz_names() {
+            names.entry(id.index()).or_default().push(name);
         }
         let mut out = String::from(
             "digraph LogicalGraph {\n  node [fontname=\"Helvetica\"];\n  edge [fontname=\"Helvetica\"];\n",
         );
         for (id, node) in self.viz_nodes() {
-            if !live.contains(&id) {
-                continue;
-            }
             let index = id.index();
             let input_label = match &node.op {
                 crate::graph::LogicalOp::Input { label } => Some(label.as_str()),
@@ -138,12 +129,12 @@ impl ToDot for crate::graph::LogicalGraph {
                 },
                 format!("[{dims_text}] {:?}", node.dtype),
             ];
-            if let Some(keys) = out_keys.get(&index) {
-                for key in keys {
-                    lines.push(format!("out {key}"));
+            if let Some(found) = names.get(&index) {
+                for name in found {
+                    lines.push(format!("name {name}"));
                 }
             }
-            let boundary = input_label.is_some() || out_keys.contains_key(&index);
+            let boundary = input_label.is_some();
             let (fill, border) = if boundary {
                 ("#dbeafe", "#2563eb")
             } else {
@@ -222,7 +213,7 @@ mod tests {
         let mut cx = Graph::new();
         let a = cx.tensor(2, DType::F32);
         let b = cx.tensor(2, DType::F32);
-        let _c = (a + b).output();
+        let _c = a + b;
         let dot = cx.logical.to_dot().expect("recorded model renders");
         assert!(dot.contains("digraph"), "header missing:\n{dot}");
         assert!(dot.contains("LogicalAdd"), "op node missing:\n{dot}");

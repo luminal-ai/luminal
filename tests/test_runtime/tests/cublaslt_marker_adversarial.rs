@@ -155,11 +155,8 @@ fn fixture7_m1_degenerate_no_panic() {
         let mut cx = Graph::new();
         let x = cx.tensor((1usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 3usize), DType::F32);
-        let _out = x.matmul(w).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w);
+        test_runtime::bind_leaves(&cx)
     };
     // serialize_fixture panics if saturation panics.
     let serialized = test_runtime::serialize_fixture(&text);

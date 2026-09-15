@@ -152,7 +152,7 @@ fn cublaslt_contracts_are_registered_host_call_claims() {
     let mut cx = Graph::new();
     let a = cx.tensor((2usize, 3usize), DType::F32);
     let b = cx.tensor((2usize, 3usize), DType::F32);
-    let _out = (a + b).output();
+    let _out = a + b;
     let decomposed =
         CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
             .expect("load decomposed");
@@ -192,7 +192,7 @@ fn canonical_2d_matmul_elects_the_marker() {
     let mut cx = Graph::new();
     let a = cx.tensor((4usize, 8usize), DType::F32);
     let b = cx.tensor((8usize, 3usize), DType::F32);
-    let _out = a.matmul(b).output();
+    let _out = a.matmul(b);
 
     let pairs: Vec<(NodeIndex, HostBuffer)> =
         vec![(a.id, weights(32, 1).into()), (b.id, weights(24, 2).into())];
@@ -240,7 +240,7 @@ fn election_row_conv() {
     let mut cx = Graph::new();
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
     let x = cx.tensor((1, 1, 5, 5), DType::F32);
-    let _out = model.forward(x).output();
+    let _out = model.forward(x);
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (x.id, weights(25, 1).into()),
         (model.conv1.weight.id, weights(18, 2).into()),
@@ -268,7 +268,7 @@ fn election_row_llama3() {
     let caches = vec![(k_cache, v_cache)];
     let (logits, _caches_out) =
         model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
-    let _logits = logits.output();
+    let _logits = logits;
 
     let block = &model.blocks[0];
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
@@ -308,7 +308,7 @@ fn election_row_qwen3() {
     let caches = vec![(k_cache, v_cache)];
     let (logits, _caches_out) =
         model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
-    let _logits = logits.output();
+    let _logits = logits;
 
     let block = &model.blocks[0];
     let (q_norm, k_norm) = block.qk_norm.expect("qwen3 block carries QK-norm");
@@ -342,7 +342,7 @@ fn election_row_whisper() {
     let model = MiniWhisper::new(D, FF, 2, &mut cx);
     let audio = cx.tensor((2, D), DType::F32);
     let tokens = cx.tensor((1, D), DType::F32);
-    let _out = model.forward(audio, tokens).output();
+    let _out = model.forward(audio, tokens);
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (audio.id, weights(2 * D, 1).into()),
         (tokens.id, weights(D, 2).into()),
@@ -379,7 +379,7 @@ fn election_row_qwen3_moe() {
     let scatter_idx = cx.tensor(1, DType::Int);
     let caches = vec![(k_cache, v_cache)];
     let (logits, _) = model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
-    let _logits = logits.output();
+    let _logits = logits;
 
     let block = &model.blocks[0];
     let moe = &block.moe;
@@ -417,7 +417,7 @@ fn election_row_gemma4_moe() {
     let scatter_idx = cx.tensor(1, DType::Int);
     let caches = vec![(k_cache, v_cache)];
     let (logits, _) = model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
-    let _logits = logits.output();
+    let _logits = logits;
 
     let block = &model.blocks[0];
     let moe = &block.moe;
@@ -487,7 +487,7 @@ fn election_row_gemma3() {
         &rope_inputs,
         rope_rot,
     );
-    let _logits = logits.output();
+    let _logits = logits;
 
     let mut pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![3i32].into()),
