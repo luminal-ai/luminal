@@ -363,9 +363,7 @@ fn layout_of(name: &str, tag: &str, strides: &[i64]) -> Result<BoundaryLayout> {
     Ok(match tag {
         "row_major" => BoundaryLayout::RowMajor,
         "column_major" => BoundaryLayout::ColumnMajor,
-        "strided" => BoundaryLayout::Strided {
-            strides: strides.to_vec(),
-        },
+        "strided" => BoundaryLayout::strided_literal(strides.iter().copied()),
         other => bail!("input {name:?}: unknown boundary layout {other:?}"),
     })
 }
@@ -429,8 +427,9 @@ fn bind(
                 let layout = layouts[target].clone();
                 // A writeback writes the TARGET's storage, so it is bound at
                 // the target's layout and never reinterprets it. A kernel
-                // destination must be dense, so any other layout is refused
-                // here by name rather than written as though it were dense.
+                // destination must be row-major (the only destination layout
+                // the kernels write), so any other layout is refused here by
+                // name rather than written as though it were row-major.
                 ensure!(
                     layout == BoundaryLayout::RowMajor,
                     "output {} writes back into input {target:?}, whose boundary layout is \

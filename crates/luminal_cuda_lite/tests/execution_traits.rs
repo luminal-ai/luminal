@@ -177,7 +177,7 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     #[cfg(feature = "device")]
     {
         for (id, buffer) in data {
-            runtime.set_data(id, buffer);
+            runtime.set_data(id, buffer).unwrap();
         }
         runtime.execute().unwrap();
         assert_eq!(
@@ -373,8 +373,8 @@ mod host_graphs {
         let initial = RECORDS.load(Ordering::SeqCst);
         for n in [3, 4, 3, 4, 4] {
             rt.set_dim('a', n);
-            rt.set_data(a.id, vec![n as f32; n * 2]);
-            rt.set_data(b.id, vec![1f32; n * 2]);
+            rt.set_data(a.id, vec![n as f32; n * 2]).unwrap();
+            rt.set_data(b.id, vec![1f32; n * 2]).unwrap();
             rt.execute().unwrap();
             assert_eq!(rt.get_f32(out.id).unwrap(), vec![n as f32 + 1.; n * 2]);
         }
@@ -392,14 +392,14 @@ mod host_graphs {
         // (including their CUDA modules) must survive cache eviction.
         for n in 9..=20 {
             rt.set_dim('a', n);
-            rt.set_data(a.id, vec![n as f32; n * 2]);
-            rt.set_data(b.id, vec![1f32; n * 2]);
+            rt.set_data(a.id, vec![n as f32; n * 2]).unwrap();
+            rt.set_data(b.id, vec![1f32; n * 2]).unwrap();
             rt.execute().unwrap();
             assert_eq!(rt.get_f32(out.id).unwrap(), vec![n as f32 + 1.; n * 2]);
         }
         assert_eq!(DROPPED.load(Ordering::SeqCst) & ((1 << 3) | (1 << 4)), 0);
-        rt.set_data(a.id, vec![4f32; 8]);
-        rt.set_data(b.id, vec![1f32; 8]);
+        rt.set_data(a.id, vec![4f32; 8]).unwrap();
+        rt.set_data(b.id, vec![1f32; 8]).unwrap();
         rt.set_dim('a', 6);
         assert!(
             format!("{:#}", rt.execute().unwrap_err()).contains("injected preparation failure")
@@ -452,8 +452,8 @@ fn external_kernel_launch_geometry_updates_without_reinstantiation() {
         .unwrap();
     for n in [0, 1025, 2, 0, 257] {
         rt.set_dim('a', n);
-        rt.set_data(a.id, vec![2f32; n]);
-        rt.set_data(b.id, vec![3f32; n]);
+        rt.set_data(a.id, vec![2f32; n]).unwrap();
+        rt.set_data(b.id, vec![3f32; n]).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; n]);
     }

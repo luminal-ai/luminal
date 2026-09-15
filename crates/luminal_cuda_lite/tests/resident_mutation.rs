@@ -43,7 +43,7 @@ fn resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updat
     .collect();
     rt.search(&data, &harness_search_options()).unwrap();
     for (id, v) in data {
-        rt.set_data(id, v);
+        rt.set_data(id, v).unwrap();
     }
     rt.execute().unwrap();
     assert_eq!(dense(&rt, previous), vec![0.]);
@@ -55,18 +55,18 @@ fn resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updat
         "rebinding must preserve existing resident data"
     );
     rt.set_dim('n', 3);
-    rt.set_data(input.id, vec![1f32; 3]);
+    rt.set_data(input.id, vec![1f32; 3]).unwrap();
     rt.execute().unwrap();
     assert_eq!(dense(&rt, previous), vec![20.]);
     let second = rt.graph_stats().unwrap();
     assert_eq!(second.resident_upload_bytes, 32);
     assert_eq!(second.arena_base, first.arena_base);
     rt.set_dim('n', 1);
-    rt.set_data(input.id, vec![1f32]);
+    rt.set_data(input.id, vec![1f32]).unwrap();
     rt.execute().unwrap();
     assert_eq!(dense(&rt, previous), vec![50.]);
-    rt.set_data(state.id, vec![0f32; 4]);
-    rt.set_data(weights.id, vec![2f32; 4]);
+    rt.set_data(state.id, vec![0f32; 4]).unwrap();
+    rt.set_data(weights.id, vec![2f32; 4]).unwrap();
     rt.execute().unwrap();
     assert_eq!(dense(&rt, previous), vec![0.]);
     rt.execute().unwrap();

@@ -203,10 +203,10 @@ fn device_profiled_search_ranks_by_measurement_and_keeps_the_numbers() {
 
     // The plan the measurement elected still computes the same thing.
     for (id, v) in &floats {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     for (id, v) in &ints {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     rt.execute().expect("device execute of the profiled winner");
     let got = walked_dense(&rt, out);
@@ -314,10 +314,10 @@ fn the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced() {
         "an unreachable budget must reject nothing"
     );
     for (id, v) in &floats {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     for (id, v) in &ints {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     rt.execute()
         .expect("the plan the lattice installed executes on the device");

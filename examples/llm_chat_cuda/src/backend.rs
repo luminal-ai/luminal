@@ -69,7 +69,7 @@ impl CudaBackend {
         // The boundary maps are live from load, so this stages the first
         // contents of every binding: the resident set is uploaded once.
         for (id, buffer) in data {
-            runtime.set_data(id, buffer);
+            runtime.set_data(id, buffer)?;
         }
         Ok(Self {
             runtime,
@@ -82,7 +82,7 @@ impl CudaBackend {
         self.runtime.set_dim('q', query);
         self.runtime.set_dim('c', context);
         for (id, value) in inputs {
-            self.runtime.set_data(id, host(value));
+            self.runtime.set_data(id, host(value))?;
         }
         self.runtime.execute()?;
         let (data, binding) = self.runtime.fetch(self.logits)?;
@@ -93,7 +93,7 @@ impl CudaBackend {
     pub fn reset(&mut self) -> Result<()> {
         for state in &self.state {
             self.runtime
-                .set_data(state.input, vec![0f32; state.elements]);
+                .set_data(state.input, vec![0f32; state.elements])?;
         }
         Ok(())
     }

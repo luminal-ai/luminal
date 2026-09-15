@@ -441,8 +441,8 @@ impl CudaDevice {
         }
         // A changed arena base (per-execution allocator block) or a changed
         // caller pointer invalidates every baked address, so rebuild rather
-        // than patch. Steady state — the caching allocator returns the same
-        // block — takes the `update` fast path.
+        // than patch. Steady state — the caller re-supplies the same block —
+        // takes the `update` fast path.
         let stale = installed
             .compiled
             .as_ref()

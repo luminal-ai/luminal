@@ -42,8 +42,8 @@ fn mul_device(dtype: DType, a: HostBuffer, b: HostBuffer) -> Vec<u8> {
     let mut rt = CudaRuntime::load(&cx).expect("load");
     rt.search(&data, &harness_search_options())
         .expect("search dtype mul");
-    rt.set_data(ta.id, a);
-    rt.set_data(tb.id, b);
+    rt.set_data(ta.id, a).unwrap();
+    rt.set_data(tb.id, b).unwrap();
     rt.execute().expect("execute");
     rt.fetch(out.id).expect("fetch").0.bytes.clone()
 }
@@ -80,7 +80,7 @@ fn f64_reciprocal_round_trips() {
     let mut rt = CudaRuntime::load(&cx).expect("load");
     rt.search(&data, &harness_search_options())
         .expect("search f64 reciprocal");
-    rt.set_data(t.id, a);
+    rt.set_data(t.id, a).unwrap();
     rt.execute().expect("execute");
     let bytes = rt.fetch(out.id).expect("fetch").0.bytes.clone();
     let got: Vec<f64> = bytes
@@ -101,7 +101,7 @@ fn f16_reciprocal_round_trips() {
     let mut rt = CudaRuntime::load(&cx).expect("load");
     rt.search(&data, &harness_search_options())
         .expect("search f16 reciprocal");
-    rt.set_data(t.id, a);
+    rt.set_data(t.id, a).unwrap();
     rt.execute().expect("execute");
     let bytes = rt.fetch(out.id).expect("fetch").0.bytes.clone();
     assert_eq!(bytes, f16_bytes(&[0.25, 0.5, 1.0, 0.125]));

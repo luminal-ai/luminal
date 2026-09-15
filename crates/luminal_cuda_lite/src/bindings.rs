@@ -21,6 +21,7 @@
 use luminal::dtype::DType;
 use luminal::graph::{LogicalGraph, ValueId};
 use luminal::layout_ir::{Access, FreedBy};
+use luminal::shape::{IntExpr, Term};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
@@ -33,32 +34,55 @@ pub enum BoundaryLayout {
     RowMajor,
     /// Contiguous, first axis fastest.
     ColumnMajor,
-    /// Arbitrary positive element strides, one per axis, in shape order.
-    Strided { strides: Vec<i64> },
+    /// One element stride per axis, in shape order. A stride is any
+    /// extent expression, so a caller whose storage is shaped by a
+    /// symbolic dimension states that dimension here rather than a
+    /// number it does not have.
+    Strided { strides: Vec<IntExpr> },
 }
 
 impl BoundaryLayout {
+    /// A strided boundary at literal element strides.
+    pub fn strided_literal(strides: impl IntoIterator<Item = i64>) -> Self {
+        Self::Strided {
+            strides: strides.into_iter().map(IntExpr::from).collect(),
+        }
+    }
+
     /// The preamble's element-layout literal over `shape` at `width`.
     /// A strided layout renders the `IntAffineExpr` cons list the
     /// preamble's own `affine-zip` builds: one
     /// `(IntMul (CoordVar shape axis) stride)` summand per axis, axes
-    /// counted FROM THE END (the last axis is 0).
-    fn term(&self, shape: &str, width: &str) -> String {
-        match self {
+    /// counted FROM THE END (the last axis is 0). Each stride goes
+    /// through the CORE extent renderer, so a symbolic one reaches the
+    /// e-graph as the same `IntVar` the shape uses.
+    fn term(&self, shape: &str, width: &str) -> Result<String, String> {
+        Ok(match self {
             Self::RowMajor => format!("(RightMajorContiguousElementLayoutLit {shape} {width})"),
             Self::ColumnMajor => format!("(LeftMajorContiguousElementLayoutLit {shape} {width})"),
             Self::Strided { strides } => {
                 let mut chain = "(IntAffineExprNil)".to_string();
                 for (position, stride) in strides.iter().enumerate().rev() {
                     let axis = strides.len() - 1 - position;
+                    let stride = LogicalGraph::dim_term(stride)?;
                     chain = format!(
-                        "(IntAffineExprCons (IntMul (CoordVar {shape} {axis}) (IntLit {stride})) \
-                         {chain})"
+                        "(IntAffineExprCons (IntMul (CoordVar {shape} {axis}) {stride}) {chain})"
                     );
                 }
                 format!("(StridedElementLayoutLit {shape} {chain} {width})")
             }
-        }
+        })
+    }
+}
+
+/// A stride's value where the caller stated a literal one; `None` for a
+/// stride that carries a symbol, which only the runtime's dims decide.
+fn literal_stride(stride: &IntExpr) -> Option<i64> {
+    let folded = stride.simplify();
+    let terms = folded.terms.read();
+    match terms[..] {
+        [Term::Num(n)] => Some(n),
+        _ => None,
     }
 }
 
@@ -386,7 +410,8 @@ impl CudaBindings {
     /// non-input value, a binding on an undeclared buffer, a reachable
     /// input left unbound, a value bound twice on one buffer, an empty
     /// output set, a strided binding whose stride count is not the
-    /// value's rank or whose strides are not positive, and two bindings
+    /// value's rank, whose literal strides include a negative one, or
+    /// whose zero stride sits on a ReadWrite buffer, and two bindings
     /// on one buffer that disagree about placement.
     pub fn bind(&self, graph: &LogicalGraph) -> Result<BoundProgram, String> {
         if self.outputs.is_empty() {
@@ -418,12 +443,33 @@ impl CudaBindings {
                         strides.len()
                     ));
                 }
-                if let Some(stride) = strides.iter().find(|stride| **stride <= 0) {
-                    return Err(format!(
-                        "v{}'s strided boundary has stride {stride}: boundary element \
-                         strides must be positive",
-                        bound.value.index()
-                    ));
+                // A stride the caller spelled symbolically is taken as
+                // stated: which number it is, is the runtime's dims to
+                // say. A literal one is judged here.
+                for (axis, stride) in strides.iter().enumerate() {
+                    let Some(stride) = literal_stride(stride) else {
+                        continue;
+                    };
+                    if stride < 0 {
+                        return Err(format!(
+                            "v{}'s strided boundary has stride {stride} on axis {axis}: \
+                             boundary element strides are never negative",
+                            bound.value.index()
+                        ));
+                    }
+                    // A zero stride is a broadcast: every coordinate of
+                    // that axis reads one element. It is a read map, and
+                    // writing through it would have every coordinate
+                    // land on the same element.
+                    if stride == 0 && self.buffers[&bound.buffer].access == Access::ReadWrite {
+                        return Err(format!(
+                            "v{}'s strided boundary has stride 0 on axis {axis} and buffer \
+                             {} is declared ReadWrite: a zero stride is a broadcast read \
+                             map, never a write target",
+                            bound.value.index(),
+                            bound.buffer
+                        ));
+                    }
                 }
             }
         }
@@ -496,7 +542,7 @@ impl CudaBindings {
                 "(let {stem}_layout {})\n\
                  (let {stem}_layout_tensor (LayoutTensorLit {logical} {stem}_layout))\n\
                  (let {stem}_buffer_tensor (BufferTensorLit {stem}_layout_tensor buf{}_id))\n\n",
-                bound.layout.term(&shape, &width),
+                bound.layout.term(&shape, &width)?,
                 bound.buffer
             ));
             input_tensors.push(format!("{stem}_buffer_tensor"));
@@ -534,7 +580,7 @@ impl CudaBindings {
                  (let {stem}_layout {})\n\
                  (let {stem}_layout_tensor (LayoutTensorLit {boundary_name} {stem}_layout))\n\
                  (let {stem}_buffer_tensor (BufferTensorLit {stem}_layout_tensor buf{}_id))\n\n",
-                bound.layout.term(&shape, &width),
+                bound.layout.term(&shape, &width)?,
                 bound.buffer
             ));
             output_tensors.push(format!("{stem}_buffer_tensor"));
@@ -621,6 +667,33 @@ mod tests {
         let residents = bindings.bind(&cx.logical).unwrap().residents();
         assert_eq!(residents.externals, [out].into_iter().collect());
         assert!(!residents.externals.contains(&staged));
+    }
+
+    /// A SYMBOLIC STRIDE REACHES THE PREAMBLE AS THE DIM ITSELF: the
+    /// boundary's element strides go through the core extent renderer,
+    /// so the stride and the shape name one `IntVar`.
+    #[test]
+    fn a_symbolic_stride_renders_as_the_dim() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(('n', 4usize), DType::F32);
+        let out = x + 1.;
+        let mut bindings = CudaBindings::new();
+        bindings.input_with(
+            x.id,
+            BoundaryLayout::Strided {
+                strides: vec![IntExpr::from(1i64), IntExpr::from('n')],
+            },
+        );
+        bindings.output(out.id);
+        let prefix = bindings.bind(&cx.logical).unwrap().prefix;
+        let shape = cx.logical.value_shape_term(x.id).unwrap();
+        let expected = format!(
+            "(StridedElementLayoutLit {shape} \
+             (IntAffineExprCons (IntMul (CoordVar {shape} 1) (IntLit 1)) \
+             (IntAffineExprCons (IntMul (CoordVar {shape} 0) (IntVar \"n\")) \
+             (IntAffineExprNil))) (bits-of (F32)))"
+        );
+        assert!(prefix.contains(&expected), "{prefix}");
     }
 
     /// TWO PLACEMENTS ON ONE BUFFER ARE REFUSED. The constructors cannot

@@ -144,7 +144,7 @@ fn run_differential(
     );
 
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     rt.execute().expect("device execute");
     let got = walked_dense(&rt, out);

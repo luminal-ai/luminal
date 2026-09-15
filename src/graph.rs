@@ -445,7 +445,10 @@ impl LogicalGraph {
         self.names.iter().map(|(id, name)| (*id, name.as_str()))
     }
 
-    fn dim_term(expr: &IntExpr) -> Result<String, String> {
+    /// One extent rendered as the preamble's `IntExpr` term — the same
+    /// renderer shapes go through, so a boundary that states an extent
+    /// elsewhere (a binding's element strides) spells it identically.
+    pub fn dim_term(expr: &IntExpr) -> Result<String, String> {
         let terms = expr.terms.read();
         match &terms[..] {
             [Term::Num(n)] => Ok(format!("(IntLit {n})")),

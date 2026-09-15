@@ -10,10 +10,13 @@
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::egglog_utils::eclass::EGraphView;
-use luminal::graph::Graph;
+use luminal::graph::{DimBucket, Graph};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
+use luminal::shape::{DynMap, IntExpr, Symbol};
 use luminal_cuda_lite::bindings::BoundaryLayout;
+use luminal_cuda_lite::kernels::{self, Coords};
+use luminal_cuda_lite::symbolic::{self, Expr};
 use luminal_cuda_lite::{
     CudaBindings, CudaRuntime, cuda_registry_without_cublaslt, harness_search_options,
 };
@@ -93,12 +96,7 @@ fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
     let out = x * c;
 
     let mut bindings = CudaBindings::new();
-    bindings.input_with(
-        x.id,
-        BoundaryLayout::Strided {
-            strides: strides.clone(),
-        },
-    );
+    bindings.input_with(x.id, BoundaryLayout::strided_literal(strides.clone()));
     bindings.input(c.id);
     bindings.output(out.id);
     let mut rt =
@@ -139,11 +137,11 @@ fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
     }
 }
 
-/// A REFUSED STRIDED BINDING: the stride count is the value's rank, and
-/// the strides are positive — stated by name at load, not discovered at
-/// saturation.
+/// A REFUSED STRIDED BINDING: the stride count is the value's rank and
+/// no literal stride is negative — stated by name at load, not
+/// discovered at saturation.
 #[test]
-fn a_strided_binding_states_one_positive_stride_per_axis() {
+fn a_strided_binding_states_one_non_negative_stride_per_axis() {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 3usize), DType::F32);
     let out = x + 1.;
@@ -158,18 +156,45 @@ fn a_strided_binding_states_one_positive_stride_per_axis() {
         }
     };
     assert!(
-        refusal(BoundaryLayout::Strided {
-            strides: vec![1, 2, 3],
-        })
-        .contains("rank"),
+        refusal(BoundaryLayout::strided_literal([1, 2, 3])).contains("rank"),
         "a rank mismatch must be named"
     );
     assert!(
-        refusal(BoundaryLayout::Strided {
-            strides: vec![0, 1]
-        })
-        .contains("positive"),
-        "a non-positive stride must be named"
+        refusal(BoundaryLayout::strided_literal([-1, 1])).contains("never negative"),
+        "a negative stride must be named"
+    );
+}
+
+/// A ZERO STRIDE IS A BROADCAST READ MAP: legal on a read-only input,
+/// refused by name on a buffer the program writes.
+#[test]
+fn a_zero_stride_is_read_only() {
+    let mut cx = Graph::new();
+    let x = cx.tensor((2usize, 3usize), DType::F32);
+    let delta = cx.tensor((2usize, 3usize), DType::F32);
+    let out = x + delta;
+
+    let mut bindings = CudaBindings::new();
+    bindings.input_with(x.id, BoundaryLayout::strided_literal([0, 1]));
+    bindings.input(delta.id);
+    bindings.output(out.id);
+    CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a broadcast read map binds");
+
+    let mut bindings = CudaBindings::new();
+    let home = bindings.input_with(x.id, BoundaryLayout::strided_literal([0, 1]));
+    bindings.declare(home, Access::ReadWrite, FreedBy::Caller);
+    bindings.input(delta.id);
+    bindings.output_on(out.id, home);
+    let refusal = match CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt()) {
+        Ok(_) => panic!("a zero stride on a written buffer must be refused"),
+        Err(refusal) => refusal.to_string(),
+    };
+    assert!(
+        refusal.contains(&format!("v{}", x.id.index()))
+            && refusal.contains("ReadWrite")
+            && refusal.contains("stride 0"),
+        "{refusal}"
     );
 }
 
@@ -242,4 +267,158 @@ fn a_value_bound_on_two_buffers_has_no_tensor_keyed_slot() {
         refusal.contains("2 buffers"),
         "the refusal must name the ambiguity: {refusal}"
     );
+}
+
+/// Does the term rooted at this class reach an `(IntVar "name")`?
+fn reaches_int_var(egraph: &EGraph, root: &ClassId, name: &str) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root.clone()];
+    while let Some(class) = stack.pop() {
+        if !seen.insert(class.clone()) {
+            continue;
+        }
+        for node in egraph.nodes.values().filter(|n| n.eclass == class) {
+            if node.op == "IntVar"
+                && node
+                    .children
+                    .iter()
+                    .any(|child| egraph.nodes[child].op.trim_matches('"') == name)
+            {
+                return true;
+            }
+            stack.extend(
+                node.children
+                    .iter()
+                    .map(|child| egraph.nodes[child].eclass.clone()),
+            );
+        }
+    }
+    false
+}
+
+/// A SYMBOLIC STRIDE IS A BINDING, not a number the caller must have.
+/// Two shape-`(n, 4)` inputs whose element strides name `n` itself: `x`
+/// is the transposed (column-major) view, `w` is a four-column slice of
+/// an `(n, n)` buffer, which at symbolic `n` is no contiguous form at
+/// all and can only be read through its chain. The e-graph holds both
+/// spellings with the dim in them, the search plans them over whole
+/// buckets, and the reads the elected nodes lower go through the dim
+/// parameter instead of a baked stride.
+#[test]
+fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
+    let mut cx = Graph::new();
+    let x = cx.named_tensor("x", ('n', 4usize), DType::F32);
+    let w = cx.named_tensor("w", ('n', 4usize), DType::F32);
+    let out = x * w;
+
+    let dim = IntExpr::from('n');
+    let one = IntExpr::from(1i64);
+    let mut bindings = CudaBindings::new();
+    bindings.input_with(
+        x.id,
+        BoundaryLayout::Strided {
+            strides: vec![one, dim],
+        },
+    );
+    bindings.input_with(
+        w.id,
+        BoundaryLayout::Strided {
+            strides: vec![dim, one],
+        },
+    );
+    bindings.output(out.id);
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a symbolic strided boundary loads");
+
+    // (a) THE SPELLING: the strided literal is in the e-graph, and its
+    // chain carries the dim itself, not a number.
+    let egraph = rt.saturated_egraph().expect("saturation");
+    let view = EGraphView::new(&egraph, rt.decoders());
+    for name in ["x", "w"] {
+        let class = input_class(&egraph, name);
+        assert!(
+            holds_spelling(&view, &class, "StridedElementLayoutLit"),
+            "{name}'s layout class holds no StridedElementLayoutLit"
+        );
+        let chain = layout_classes(&egraph, &class)
+            .iter()
+            .flat_map(|class| {
+                view.class(class)
+                    .nodes_named("StridedElementLayoutLit")
+                    .filter_map(|node| node.child(1).map(|chain| chain.id().clone()))
+                    .collect::<Vec<_>>()
+            })
+            .next()
+            .unwrap_or_else(|| panic!("{name}'s strided spelling names no chain"));
+        assert!(
+            reaches_int_var(&egraph, &chain, "n"),
+            "{name}'s strided chain holds no (IntVar \"n\") — the stride was frozen"
+        );
+    }
+
+    // (b) A PLAN AT BOTH DIMS: one search per bucket, each valid over its
+    // whole interval, and both dims select one.
+    rt.bind_dim_buckets('n', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
+        .expect("disjoint sorted buckets bind");
+    rt.search(&Default::default(), &harness_search_options())
+        .expect("host search over the symbolic strided boundary");
+    assert_eq!(rt.bucket_plans().len(), 2, "one plan per bucket");
+    for n in [3usize, 7] {
+        let mut dims = DynMap::default();
+        dims.insert(Symbol::from('n'), n);
+        assert!(
+            luminal_cuda_lite::search::select_bucket(rt.bucket_plans(), &dims).is_some(),
+            "no plan covers n = {n}"
+        );
+    }
+
+    // (c) THE LOWERED READ: ask the production read path for each node
+    // that reads a caller buffer. The index must name the dim parameter
+    // — a literal there would be the bucket representative baked in.
+    let lits: Vec<i64> = [x.id, w.id]
+        .iter()
+        .map(|id| rt.input_buffer(*id).expect("the input has a buffer"))
+        .collect();
+    let parameter = symbolic::variable("n");
+    for bucket in rt.bucket_plans() {
+        let plan = &bucket.plan;
+        let mut probed = 0;
+        for node in plan.dag.node_weights() {
+            let BufferNode::Compute {
+                reads,
+                operand_info,
+                ..
+            } = node
+            else {
+                continue;
+            };
+            for (slot, read) in reads.iter().enumerate() {
+                if !plan.buffers[read]
+                    .lit
+                    .is_some_and(|lit| lits.contains(&lit))
+                {
+                    continue;
+                }
+                let layout = &operand_info[slot].layout;
+                let dims: Vec<Expr> = layout.shape().0.iter().cloned().map(Expr).collect();
+                let (code, index) = kernels::layout_read_index(
+                    "boundary",
+                    layout,
+                    &dims,
+                    Coords::FlatIndex { prefix: "c" },
+                )
+                .expect("the symbolic strided boundary lowers");
+                assert!(
+                    code.contains(&parameter) || index.contains(&parameter),
+                    "a read of the caller's storage baked a literal stride: {code}{index}"
+                );
+                probed += 1;
+            }
+        }
+        assert!(
+            probed >= 2,
+            "bucket {:?} elected no node reading the bound inputs' buffers",
+            bucket.ranges
+        );
+    }
 }

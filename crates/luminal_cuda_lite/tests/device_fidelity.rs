@@ -54,7 +54,7 @@ fn run_both(cx: &Graph, inputs: &[(NodeIndex, Vec<f32>)], out: NodeIndex) -> (Ve
     rt.search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("cuda search");
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     rt.execute().expect("device execute");
     let got = walked_dense(&rt, out);

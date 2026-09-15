@@ -446,9 +446,9 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
          binding at all",
     );
     println!("DEGENERATE-D: executing the plan searched at seed {seed}");
-    fused.set_data(x, weights(STATE, 1));
-    fused.set_data(w, weights(STATE * STATE, 2));
-    fused.set_data(b, weights(STATE, 3));
+    fused.set_data(x, weights(STATE, 1)).unwrap();
+    fused.set_data(w, weights(STATE * STATE, 2)).unwrap();
+    fused.set_data(b, weights(STATE, 3)).unwrap();
     fused
         .execute()
         .expect("fused execute (bias epilogue under a degenerate COL D)");
@@ -466,9 +466,9 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
             &luminal_cuda_lite::harness_search_options(),
         )
         .expect("plain search");
-    plain.set_data(x, weights(STATE, 1));
-    plain.set_data(w, weights(STATE * STATE, 2));
-    plain.set_data(b, weights(STATE, 3));
+    plain.set_data(x, weights(STATE, 1)).unwrap();
+    plain.set_data(w, weights(STATE * STATE, 2)).unwrap();
+    plain.set_data(b, weights(STATE, 3)).unwrap();
     plain.execute().expect("plain execute");
     let want = walked_dense(&plain, out);
 
@@ -522,8 +522,8 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
         elected,
         "the fused route must actually elect the marker for this comparison"
     );
-    fused.set_data(a.id, weights(32, 1));
-    fused.set_data(b.id, weights(24, 2));
+    fused.set_data(a.id, weights(32, 1)).unwrap();
+    fused.set_data(b.id, weights(24, 2)).unwrap();
     fused.execute().expect("fused execute");
     // The marker-elected output is the sandwich's sibling VIEW — it
     // escapes with a composed layout, so the honest readback walks the
@@ -542,8 +542,8 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
     plain
         .search(&data, &luminal_cuda_lite::harness_search_options())
         .expect("plain search");
-    plain.set_data(a.id, weights(32, 1));
-    plain.set_data(b.id, weights(24, 2));
+    plain.set_data(a.id, weights(32, 1)).unwrap();
+    plain.set_data(b.id, weights(24, 2)).unwrap();
     plain.execute().expect("plain execute");
     let want = walked_dense(&plain, out.id);
 

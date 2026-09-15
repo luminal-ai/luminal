@@ -117,7 +117,7 @@ fn run_on_device(
         .expect("cuda search");
     assert_constant_reaches_the_device(&rt, expected_constant, what);
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     rt.execute()
         .expect("device execute (NVRTC compiles the constant kernel here)");

@@ -30,8 +30,8 @@ fn bucket_switches_overlay_one_arena_and_replay_cached_graphs() {
         let xdata: Vec<f32> = (0..n * 2).map(|i| (i + iteration) as f32).collect();
         let ydata: Vec<f32> = (0..n * 2).map(|i| i as f32 * 0.25 - 1.).collect();
         let expected: Vec<_> = xdata.iter().zip(&ydata).map(|(x, y)| x * y + x).collect();
-        rt.set_data(x.id, xdata);
-        rt.set_data(y.id, ydata);
+        rt.set_data(x.id, xdata).unwrap();
+        rt.set_data(y.id, ydata).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), expected);
         let stats = rt.graph_stats().unwrap();
@@ -89,7 +89,7 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
             })
             .collect();
         rt.set_dim('a', n);
-        rt.set_data(x.id, data);
+        rt.set_data(x.id, data).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), expected);
     }
@@ -124,8 +124,8 @@ fn cublas_geometry_changes_refresh_child_and_reuse_capture() {
         for (s, v) in [('m', m), ('n', n), ('k', k)] {
             rt.set_dim(s, v);
         }
-        rt.set_data(a.id, av);
-        rt.set_data(b.id, bv);
+        rt.set_data(a.id, av).unwrap();
+        rt.set_data(b.id, bv).unwrap();
         rt.execute().unwrap();
         let actual = rt.get_f32(out.id).unwrap();
         assert_eq!(actual.len(), expected.len());
@@ -156,7 +156,7 @@ fn profiling_and_serving_share_dynamic_graph_execution() {
     let before = rt.graph_stats().unwrap();
     assert!(before.launches > before.instantiations);
     rt.set_dim('a', 9);
-    rt.set_data(x.id, vec![7f32; 9]);
+    rt.set_data(x.id, vec![7f32; 9]).unwrap();
     rt.execute().unwrap();
     assert_eq!(rt.get_f32(out.id).unwrap(), vec![9f32; 9]);
 }
@@ -172,7 +172,7 @@ fn zero_extents_disable_copies_and_restore_them() {
         .unwrap();
     for n in [0, 9, 0, 2] {
         rt.set_dim('a', n);
-        rt.set_data(x.id, vec![2f32; n]);
+        rt.set_data(x.id, vec![2f32; n]).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; n]);
     }
@@ -206,8 +206,8 @@ fn gather_scatter_update_symbolic_coordinates() {
             }
         }
         rt.set_dim('a', n);
-        rt.set_data(data.id, values);
-        rt.set_data(rows.id, indices);
+        rt.set_data(data.id, values).unwrap();
+        rt.set_data(rows.id, indices).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(gathered.id).unwrap(), expected_gather);
         assert_eq!(rt.get_f32(scattered.id).unwrap(), expected_scatter);
@@ -314,7 +314,7 @@ fn bucketed_and_range_bound_dimensions_both_stay_symbolic() {
     for (a, b) in [(2, 3), (4, 8), (5, 2), (9, 7)] {
         rt.set_dim('a', a);
         rt.set_dim('b', b);
-        rt.set_data(x.id, vec![2f32; a * b]);
+        rt.set_data(x.id, vec![2f32; a * b]).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), vec![3f32; a * b]);
     }
@@ -353,9 +353,9 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
             .collect();
         rt.set_dim('m', m);
         rt.set_dim('n', n);
-        rt.set_data(a.id, av);
-        rt.set_data(b.id, bv);
-        rt.set_data(bias.id, biasv);
+        rt.set_data(a.id, av).unwrap();
+        rt.set_data(b.id, bv).unwrap();
+        rt.set_data(bias.id, biasv).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), expected);
     }

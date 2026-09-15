@@ -46,8 +46,9 @@ fn search_produces_a_codegen_complete_plan() {
     }
     assert!(computes > 0, "plan has no compute nodes");
 
-    rt.set_data(a.id, vec![1.0f32, 2., 3., 4., 5., 6.]);
-    rt.set_data(b.id, vec![10.0f32, 20., 30., 40., 50., 60.]);
+    rt.set_data(a.id, vec![1.0f32, 2., 3., 4., 5., 6.]).unwrap();
+    rt.set_data(b.id, vec![10.0f32, 20., 30., 40., 50., 60.])
+        .unwrap();
     #[cfg(not(feature = "device"))]
     {
         // Without the device feature, execute refuses loudly.

@@ -832,12 +832,23 @@ impl CudaRuntime {
     }
 
     /// Stage input payload for a bound tensor (host side; H2D happens
-    /// inside execute).
-    pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) {
-        let Some(&buffer) = self.input_buffers.get(&tensor) else {
-            panic!("set_data on a tensor with no input binding");
-        };
+    /// inside execute). Refused by name for a tensor with no input
+    /// binding, and for one bound on caller device memory: an External
+    /// buffer has no staging step, so bytes handed over here would
+    /// silently never reach the device.
+    pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) -> Result<()> {
+        let buffer = *self
+            .input_buffers
+            .get(&tensor)
+            .ok_or_else(|| anyhow!("set_data on {tensor:?}, which has no input binding"))?;
+        anyhow::ensure!(
+            !self.residents.externals.contains(&buffer),
+            "v{} is bound on External buffer {buffer}: its storage is the caller's, so \
+             it is addressed with set_device_ptr, never staged",
+            tensor.index()
+        );
         self.staged.insert(buffer, data.into());
+        Ok(())
     }
 
     /// Address an EXTERNAL buffer for the next execution: the storage every
@@ -858,6 +869,11 @@ impl CudaRuntime {
             self.residents.externals.contains(&buffer),
             "buffer {buffer} is not bound External; a device pointer may only \
              be supplied for an External buffer"
+        );
+        anyhow::ensure!(
+            ptr != 0 || bytes == 0,
+            "buffer {buffer} was given the null device pointer for {bytes} bytes: \
+             a null address is not storage"
         );
         self.device_ptrs.insert(buffer, (ptr, bytes));
         Ok(())
@@ -939,13 +955,19 @@ impl CudaRuntime {
         Ok(crate::resident::allocate(plans, self.residents.clone())?.bytes)
     }
 
+    /// The searched plan re-asked of the External output bindings, on any
+    /// host: [`Self::ensure_external_output_slots_are_literal`] over the
+    /// plans `execute` would install.
+    pub fn check_external_outputs(&self) -> Result<()> {
+        self.ensure_external_output_slots_are_literal(&self.install_plans()?)
+    }
+
     /// ESCAPE-AND-DISCLOSE ON CALLER STORAGE: an output bound External is
     /// written in place, so the plan must have elected the buffer itself. A
     /// view of it has the caller's byte count and another layout, which would
     /// hand back plausible, wrongly ordered numbers; the value is refused by
     /// name and directed at the readback path instead.
-    #[cfg(feature = "device")]
-    fn ensure_external_outputs_own_their_buffer(
+    fn ensure_external_output_slots_are_literal(
         &self,
         plans: &[(crate::layouts::CudaPlan, crate::symbolic::Bounds)],
     ) -> Result<()> {
@@ -983,7 +1005,6 @@ impl CudaRuntime {
     /// The `(plan, bounds)` set `execute` installs — the single unpinned plan,
     /// or one per bucket. Factored out so `arena_bytes` can size the slab
     /// without a device.
-    #[cfg(feature = "device")]
     fn install_plans(&self) -> Result<Vec<(crate::layouts::CudaPlan, crate::symbolic::Bounds)>> {
         let base_bounds: crate::symbolic::Bounds = self
             .range_bound
@@ -994,7 +1015,7 @@ impl CudaRuntime {
             let plan = self
                 .plan
                 .as_ref()
-                .ok_or_else(|| anyhow!("search before arena_bytes"))?;
+                .ok_or_else(|| anyhow!("search before reading the installed plans"))?;
             vec![(plan.clone(), base_bounds)]
         } else {
             self.bucket_plans
@@ -1047,7 +1068,7 @@ impl CudaRuntime {
             }
             if !self.device.as_ref().unwrap().is_installed() {
                 let plans = self.install_plans()?;
-                self.ensure_external_outputs_own_their_buffer(&plans)?;
+                self.ensure_external_output_slots_are_literal(&plans)?;
                 self.device.as_mut().unwrap().install_resident_with_budget(
                     plans,
                     self.residents.clone(),
@@ -1153,10 +1174,25 @@ impl CudaRuntime {
         &luminal::bufferize::OutputBinding<DecodedLayout>,
     )> {
         let index = self.output_slot_index(tensor)?;
-        match self.outputs_host.get(&index) {
-            Some((data, binding)) => Ok((data, binding)),
-            None => bail!("execute before fetch"),
+        if let Some((data, binding)) = self.outputs_host.get(&index) {
+            return Ok((data, binding));
         }
+        // An output written straight into caller device memory is never
+        // read back, so it is absent here on a perfectly good execution.
+        if let Some(bound) = self
+            .native
+            .as_ref()
+            .and_then(|native| native.bound.outputs.get(index))
+            && self.residents.externals.contains(&bound.buffer)
+        {
+            bail!(
+                "output v{} is bound External on buffer {}: its bytes are in the \
+                 caller's device memory, not readable through fetch",
+                bound.value.index(),
+                bound.buffer
+            );
+        }
+        bail!("execute before fetch")
     }
 
     /// The slot's elected layout alone (see [`Self::fetch`]).
