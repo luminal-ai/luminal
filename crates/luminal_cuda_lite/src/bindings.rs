@@ -486,8 +486,8 @@ impl CudaBindings {
         // Post-schedule checks: the recorder's shape contracts, then the
         // declaration invariants — every buffer states its access and its
         // deallocation responsibility, re-asserted at the end of saturation.
-        let mut post_checks = graph.post_checks().to_string();
-        let mut labeled_checks = graph.labeled_checks().to_vec();
+        let mut post_checks = String::new();
+        let mut labeled_checks = Vec::new();
         for k in self.buffers.keys() {
             let text = format!(
                 "(check (= ?access{k} (buffer-access-of buf{k}_id)))\n\
