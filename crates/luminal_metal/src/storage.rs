@@ -30,6 +30,18 @@ pub(crate) fn plan_resident(
         })
         .map(|slot| slot.index)
         .collect();
+    // A buffer the bindings declared External is the caller's own device
+    // memory and reserves no slab range.
+    let external_buffers: luminal::prelude::FxHashSet<luminal::bufferize::BufferId> = plan
+        .buffers
+        .values()
+        .filter(|buffer| {
+            buffer
+                .lit
+                .is_some_and(|lit| bindings.externals.contains(&lit))
+        })
+        .map(|buffer| buffer.id.clone())
+        .collect();
     crate::arena::plan_resident_over(
         plan,
         |buffer| capacity_bytes(&buffer.layout, bounds),
@@ -42,7 +54,7 @@ pub(crate) fn plan_resident(
         crate::arena::issue_order(plan)?,
         &bindings.inputs,
         &device_outputs,
-        &Default::default(),
+        &external_buffers,
     )
 }
 
@@ -85,6 +97,7 @@ mod tests {
         let state = runtime.input_buffer(state.id).unwrap();
         let bindings = ResidentBindings {
             inputs: [weights, state].into_iter().collect(),
+            ..Default::default()
         };
         let plans = || {
             runtime

@@ -84,6 +84,7 @@ impl MetalRuntime {
             .collect();
         let residents = luminal::resident::ResidentBindings {
             inputs: bound.residents.clone(),
+            ..Default::default()
         };
         Ok(Self {
             native: Some(NativeParts {

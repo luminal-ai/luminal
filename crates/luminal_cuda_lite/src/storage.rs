@@ -9,40 +9,10 @@ use anyhow::{Result, anyhow};
 use luminal::bufferize::{BufferId, BufferNode};
 use luminal::prelude::FxHashSet;
 
-/// The output-slot buffers that will be bound to caller device memory at
-/// execution time and must therefore reserve NO arena range. Resident
-/// mutation sinks are excluded: their buffer IS an arena home that
-/// `upload_residents` fills, so treating it as caller memory would make the
-/// kernels read an uninitialized external pointer.
-pub(crate) fn external_output_buffers(
-    plan: &CudaPlan,
-    bindings: &crate::resident::ResidentBindings,
-) -> FxHashSet<BufferId> {
-    plan.dag
-        .node_weights()
-        .filter_map(|node| match node {
-            BufferNode::BufferOutput { slots } => Some(slots),
-            _ => None,
-        })
-        .flatten()
-        .filter(|slot| {
-            !plan.buffers[&slot.buffer]
-                .lit
-                .is_some_and(|lit| bindings.inputs.contains(&lit))
-        })
-        .map(|slot| slot.buffer.clone())
-        .collect()
-}
-
-pub(crate) fn plan(plan: &CudaPlan, bounds: &Bounds, external_outputs: bool) -> Result<ArenaPlan> {
-    plan_resident(plan, bounds, &Default::default(), external_outputs)
-}
-
 pub(crate) fn plan_resident(
     plan: &CudaPlan,
     bounds: &Bounds,
     bindings: &crate::resident::ResidentBindings,
-    external_outputs: bool,
 ) -> Result<ArenaPlan> {
     // Output slots whose buffer IS a resident input are mutation sinks:
     // the binding put them on the input's buffer, so their writes already
@@ -62,15 +32,19 @@ pub(crate) fn plan_resident(
         })
         .map(|slot| slot.index)
         .collect();
-    // When the caller will bind every final output to its own device tensor,
-    // the output buffers are caller-owned and must not be packed into the
-    // slab — otherwise the slab reserves output-sized ranges that no kernel
-    // ever writes through.
-    let external_buffers = if external_outputs {
-        external_output_buffers(plan, bindings)
-    } else {
-        FxHashSet::default()
-    };
+    // A buffer the bindings declared External is the caller's own device
+    // memory: it must not be packed into the slab, or the arena would
+    // reserve a range no kernel ever writes through.
+    let external_buffers: FxHashSet<BufferId> = plan
+        .buffers
+        .values()
+        .filter(|buffer| {
+            buffer
+                .lit
+                .is_some_and(|lit| bindings.externals.contains(&lit))
+        })
+        .map(|buffer| buffer.id.clone())
+        .collect();
     crate::arena::plan_resident_over(
         plan,
         |buffer| capacity_bytes(&buffer.layout, bounds),
@@ -298,42 +272,60 @@ mod tests {
         [('n'.into(), (0, hi))].into_iter().collect()
     }
 
-    /// THE CALLER-OWNED OUTPUT CONTRACT: with `external_outputs`, every output
-    /// buffer leaves `slices` (so the slab no longer reserves output-sized
-    /// ranges), is listed in `externals`, and gets no Download step — the
-    /// executor must supply a pointer instead of reading it back.
+    /// THE CALLER-OWNED STORAGE CONTRACT: a buffer the bindings declared
+    /// External leaves `slices` (so the slab no longer reserves a range for
+    /// it), is listed in `externals`, and gets no Upload and no Download —
+    /// the executor addresses the caller's storage instead of transferring
+    /// it. The boundary buffers are declared External together, as a
+    /// zero-copy caller does.
     #[test]
-    fn external_outputs_leave_the_slab_and_require_caller_pointers() {
+    fn external_buffers_leave_the_slab_and_require_caller_pointers() {
         let (graph, _ids) = copy_plan();
-        let bindings = crate::resident::ResidentBindings::default();
-        let external = external_output_buffers(&graph, &bindings);
-        assert!(
-            !external.is_empty(),
-            "copy_plan has output slots to externalize"
-        );
-        let base = plan(&graph, &bounds(128), false).unwrap();
-        let ext = plan(&graph, &bounds(128), true).unwrap();
+        // Every buffer a binding can name is one carrying a BufferLit.
+        let lits: std::collections::BTreeSet<i64> = graph
+            .buffers
+            .values()
+            .filter_map(|buffer| buffer.lit)
+            .collect();
+        assert!(!lits.is_empty(), "copy_plan has boundary buffers");
+        let bindings = crate::resident::ResidentBindings {
+            externals: lits.clone(),
+            ..Default::default()
+        };
+        let external: Vec<BufferId> = graph
+            .buffers
+            .values()
+            .filter(|buffer| buffer.lit.is_some_and(|lit| lits.contains(&lit)))
+            .map(|buffer| buffer.id.clone())
+            .collect();
+        let base = plan_resident(&graph, &bounds(128), &Default::default()).unwrap();
+        let ext = plan_resident(&graph, &bounds(128), &bindings).unwrap();
+        let transferred = |plan: &ArenaPlan, id: &BufferId| {
+            plan.steps.iter().any(|step| match step {
+                ArenaStep::Upload { buffer, .. } | ArenaStep::Download { buffer, .. } => {
+                    buffer == id
+                }
+                _ => false,
+            })
+        };
         for id in &external {
             assert!(
-                base.slices.contains_key(id),
-                "the arena-only plan keeps {id:?} in the slab"
+                base.slices.contains_key(id) && transferred(&base, id),
+                "the arena-only plan keeps {id:?} in the slab and transfers it"
             );
             assert!(
                 !ext.slices.contains_key(id),
-                "external output {id:?} must reserve no slab range"
+                "external buffer {id:?} must reserve no slab range"
             );
             assert!(ext.externals.contains(id));
             assert!(
-                !ext.steps.iter().any(|step| matches!(
-                    step,
-                    ArenaStep::Download { buffer, .. } if buffer == id
-                )),
-                "external output {id:?} must not be read back"
+                !transferred(&ext, id),
+                "external buffer {id:?} must not be staged or read back"
             );
         }
         assert!(
             ext.slab_bytes < base.slab_bytes,
-            "excluding outputs must shrink the slab ({} -> {})",
+            "excluding external buffers must shrink the slab ({} -> {})",
             base.slab_bytes,
             ext.slab_bytes
         );
@@ -342,7 +334,7 @@ mod tests {
     #[test]
     fn all_storage_classes_share_physical_ranges_and_transfer_lifetimes() {
         let (graph, ids) = copy_plan();
-        let p = plan(&graph, &bounds(128), false).unwrap();
+        let p = plan_resident(&graph, &bounds(128), &Default::default()).unwrap();
         let overlaps = |a: crate::arena::ArenaSlice, b: crate::arena::ArenaSlice| {
             a.offset < b.offset + b.reserved() && b.offset < a.offset + a.reserved()
         };
@@ -423,7 +415,11 @@ mod tests {
         let capacities = [32, 128];
         let expected_bytes = capacities
             .iter()
-            .map(|&hi| plan(&graph, &bounds(hi), false).unwrap().slab_bytes)
+            .map(|&hi| {
+                plan_resident(&graph, &bounds(hi), &Default::default())
+                    .unwrap()
+                    .slab_bytes
+            })
             .max()
             .unwrap();
         let mut device = CudaDevice::new(0).unwrap();

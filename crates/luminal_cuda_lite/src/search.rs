@@ -68,12 +68,6 @@ pub use luminal::search_support::{
 pub struct CompileOptions {
     pub generations: usize,
     pub generation_size: usize,
-    /// FINAL OUTPUTS ARE CALLER-OWNED (PyTorch zero-copy). The arena planner
-    /// excludes output buffers from the slab, so the budget each finalist is
-    /// measured against is the intermediate scratch alone. The runtime fills
-    /// this from its own `external_outputs` flag; a standalone caller leaves it
-    /// false and outputs stay arena-resident.
-    pub external_outputs: bool,
     /// Point mutations per offspring. Mutations hit ANY producer class —
     /// dead rows included, deliberately: a dead-row mutation is free now and
     /// pre-stages the choice a later route flip lands on.
@@ -142,7 +136,6 @@ impl Default for CompileOptions {
             trials: 3,
             seed: 0,
             search_log: true,
-            external_outputs: false,
             profile_on_device: false,
             candidate_timeout: None,
             keep_finalists: 4,
@@ -892,6 +885,11 @@ pub struct BucketAssembly<'a> {
     pub post_checks: &'a str,
     pub inputs: &'a [crate::bindings::Bound],
     pub outputs: &'a [crate::bindings::Bound],
+    /// The runtime's placement statement — which boundary buffers the arena
+    /// keeps and which are the caller's device memory. Every bucket's
+    /// finalists are sized under it, so a bucket's budget and its installed
+    /// plan agree.
+    pub residents: &'a crate::resident::ResidentBindings,
     /// Values for profiling non-bucket dimensions. These never narrow the
     /// range facts already present in binding_seeds.
     pub base_dims: &'a luminal::shape::DynMap,
@@ -973,7 +971,7 @@ pub fn bucketed_search_implementations(
                     Some(outcome.best_plan.clone()),
                 )
                 .with_shapes(shapes)
-                .with_external_outputs(options.external_outputs)
+                .with_resident_bindings(assembly.residents.clone())
             })
             .collect();
         select_finalist_set(buckets, options, &mut evaluator)?

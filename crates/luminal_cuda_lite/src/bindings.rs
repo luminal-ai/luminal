@@ -13,9 +13,10 @@
 //! two are separate code: a CUDA boundary is not always dense row-major.
 //! Every binding carries a [`BoundaryLayout`], so a caller can hand this
 //! runtime storage it already has — a column-major matrix, a strided
-//! slice of a larger allocation — without a host-side repack. Inputs
-//! also carry a [`Placement`]: a resident input's storage lives in the
-//! device arena across executions and is uploaded only when restaged.
+//! slice of a larger allocation — without a host-side repack. Every
+//! binding also carries a [`Placement`], which is the BUFFER's storage
+//! statement: a resident buffer lives in the device arena across
+//! executions, an external one is the caller's own device allocation.
 
 use luminal::dtype::DType;
 use luminal::graph::{LogicalGraph, ValueId};
@@ -61,22 +62,29 @@ impl BoundaryLayout {
     }
 }
 
-/// Where an INPUT's storage lives between executions.
+/// Where a BUFFER's storage lives between executions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Placement {
-    /// Staged from the host before each execution (the default).
+    /// Staged from the host before each execution, and read back to the
+    /// host after it (the default).
     #[default]
     Staged,
     /// Kept in the device arena for the runtime's life: uploaded on the
     /// first execution and then only when the caller restages it, and
     /// written in place by an output bound on the same buffer.
     Resident,
+    /// Caller device memory for the runtime's life: never host-staged,
+    /// never given an arena range; the caller supplies a device pointer
+    /// for the buffer before each execute.
+    External,
 }
 
 /// One boundary binding: a logical value on a buffer, at a layout.
-/// `placement` is an INPUT binding's statement; an output's is always
-/// [`Placement::Staged`] — an output does not own storage across calls,
-/// the input it aliases does.
+/// `placement` is the BUFFER's statement, carried by every binding that
+/// names it and meaningful for outputs too: a [`Placement::Staged`]
+/// output is written in the arena and read back to the host, an
+/// [`Placement::External`] one is written straight into the caller's
+/// pointer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bound {
     pub value: ValueId,
@@ -138,14 +146,22 @@ impl BoundProgram {
         format!("{}{seeds}{}", self.prefix, CudaBindings::SCHEDULE)
     }
 
-    /// The buffers whose storage the device keeps between executions —
-    /// the arena's resident set, stated by the input bindings.
+    /// The buffers whose storage is not ordinary host staging: the
+    /// arena's resident set, stated by the input bindings, and the
+    /// caller-owned external set, stated by bindings of either side.
     pub fn residents(&self) -> crate::resident::ResidentBindings {
         crate::resident::ResidentBindings {
             inputs: self
                 .inputs
                 .iter()
                 .filter(|bound| bound.placement == Placement::Resident)
+                .map(|bound| bound.buffer)
+                .collect(),
+            externals: self
+                .inputs
+                .iter()
+                .chain(&self.outputs)
+                .filter(|bound| bound.placement == Placement::External)
                 .map(|bound| bound.buffer)
                 .collect(),
         }
@@ -214,6 +230,32 @@ impl CudaBindings {
         });
     }
 
+    fn push_output(
+        &mut self,
+        value: ValueId,
+        buffer: i64,
+        layout: BoundaryLayout,
+        placement: Placement,
+    ) {
+        self.outputs.push(Bound {
+            value,
+            buffer,
+            layout,
+            placement,
+        });
+    }
+
+    /// The placement the bindings already on `buffer` carry — placement
+    /// is the buffer's property, so a binding added to an existing
+    /// buffer inherits it. A buffer with no binding yet is host-staged.
+    fn placement_on(&self, buffer: i64) -> Placement {
+        self.inputs
+            .iter()
+            .chain(&self.outputs)
+            .find(|bound| bound.buffer == buffer)
+            .map_or(Placement::default(), |bound| bound.placement)
+    }
+
     /// Bind an input on a fresh read-only, caller-owned buffer,
     /// row-major and host-staged.
     pub fn input(&mut self, value: ValueId) -> i64 {
@@ -227,14 +269,16 @@ impl CudaBindings {
         buffer
     }
 
-    /// Bind an input on an existing buffer, row-major.
+    /// Bind an input on an existing buffer, row-major. The binding
+    /// INHERITS the buffer's placement.
     pub fn input_on(&mut self, value: ValueId, buffer: i64) {
         self.input_on_with(value, buffer, BoundaryLayout::RowMajor);
     }
 
     /// [`Self::input_on`] at the caller's layout.
     pub fn input_on_with(&mut self, value: ValueId, buffer: i64, layout: BoundaryLayout) {
-        self.push_input(value, buffer, layout, Placement::Staged);
+        let placement = self.placement_on(buffer);
+        self.push_input(value, buffer, layout, placement);
     }
 
     /// Bind an input on a fresh DEVICE-RESIDENT buffer: its storage is
@@ -252,6 +296,21 @@ impl CudaBindings {
         buffer
     }
 
+    /// Bind an input on a fresh CALLER-OWNED DEVICE buffer: the storage
+    /// is the caller's live allocation, so it is never host-staged and
+    /// never given an arena range, and the caller supplies its address
+    /// before each execution.
+    pub fn input_external(&mut self, value: ValueId) -> i64 {
+        self.input_external_with(value, BoundaryLayout::RowMajor)
+    }
+
+    /// [`Self::input_external`] at the caller's layout.
+    pub fn input_external_with(&mut self, value: ValueId, layout: BoundaryLayout) -> i64 {
+        let buffer = self.buffer(Access::ReadOnly, FreedBy::Caller);
+        self.push_input(value, buffer, layout, Placement::External);
+        buffer
+    }
+
     /// Bind an output on a fresh read-write, caller-owned buffer,
     /// row-major.
     pub fn output(&mut self, value: ValueId) -> i64 {
@@ -265,21 +324,32 @@ impl CudaBindings {
         buffer
     }
 
+    /// Bind an output on a fresh read-write CALLER-OWNED DEVICE buffer:
+    /// the producing op writes straight into the caller's allocation,
+    /// with no arena range and no host readback.
+    pub fn output_external(&mut self, value: ValueId) -> i64 {
+        self.output_external_with(value, BoundaryLayout::RowMajor)
+    }
+
+    /// [`Self::output_external`] at the caller's layout.
+    pub fn output_external_with(&mut self, value: ValueId, layout: BoundaryLayout) -> i64 {
+        let buffer = self.buffer(Access::ReadWrite, FreedBy::Caller);
+        self.push_output(value, buffer, layout, Placement::External);
+        buffer
+    }
+
     /// Bind an output on an existing buffer — naming an input's buffer
     /// here is the one way to state that the output writes the input's
-    /// storage; the buffer must have been declared `ReadWrite`.
+    /// storage; the buffer must have been declared `ReadWrite`. The
+    /// binding INHERITS the buffer's placement.
     pub fn output_on(&mut self, value: ValueId, buffer: i64) {
         self.output_on_with(value, buffer, BoundaryLayout::RowMajor);
     }
 
     /// [`Self::output_on`] at the caller's layout.
     pub fn output_on_with(&mut self, value: ValueId, buffer: i64, layout: BoundaryLayout) {
-        self.outputs.push(Bound {
-            value,
-            buffer,
-            layout,
-            placement: Placement::Staged,
-        });
+        let placement = self.placement_on(buffer);
+        self.push_output(value, buffer, layout, placement);
     }
 
     pub fn inputs(&self) -> &[Bound] {
@@ -316,8 +386,8 @@ impl CudaBindings {
     /// non-input value, a binding on an undeclared buffer, a reachable
     /// input left unbound, a value bound twice on one buffer, an empty
     /// output set, a strided binding whose stride count is not the
-    /// value's rank or whose strides are not positive, and two input
-    /// bindings on one buffer that disagree about residency.
+    /// value's rank or whose strides are not positive, and two bindings
+    /// on one buffer that disagree about placement.
     pub fn bind(&self, graph: &LogicalGraph) -> Result<BoundProgram, String> {
         if self.outputs.is_empty() {
             return Err("bindings name no output".to_string());
@@ -367,17 +437,17 @@ impl CudaBindings {
                 ));
             }
         }
-        // Residency is the BUFFER's property — the arena allocates homes
-        // by buffer id — so two inputs sharing a buffer must agree.
+        // Placement is the BUFFER's property — the arena allocates homes
+        // by buffer id and the caller supplies one device pointer per
+        // buffer — so every binding sharing a buffer must agree.
         let mut placement_of: BTreeMap<i64, Placement> = BTreeMap::new();
-        for bound in &self.inputs {
-            if placement_of
-                .insert(bound.buffer, bound.placement)
-                .is_some_and(|other| other != bound.placement)
+        for bound in self.inputs.iter().chain(&self.outputs) {
+            if let Some(other) = placement_of.insert(bound.buffer, bound.placement)
+                && other != bound.placement
             {
                 return Err(format!(
-                    "buffer {} carries both a resident and a staged input binding",
-                    bound.buffer
+                    "buffer {} carries both a {other:?} and a {:?} binding",
+                    bound.buffer, bound.placement
                 ));
             }
         }
@@ -504,5 +574,73 @@ impl CudaBindings {
             outputs: self.outputs.clone(),
             let_names,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A graph with a mutation shape: two inputs and one sum, so a sink
+    /// can be bound on an input's buffer.
+    fn pair() -> (luminal::graph::Graph, ValueId, ValueId, ValueId) {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(4, DType::F32);
+        let b = cx.tensor(4, DType::F32);
+        let sum = a + b;
+        (cx, a.id, b.id, sum.id)
+    }
+
+    /// PLACEMENT IS THE BUFFER'S: an output bound on an External input's
+    /// buffer inherits External, and `residents()` reports that buffer
+    /// once, over both sides of the boundary.
+    #[test]
+    fn a_sink_inherits_its_buffers_external_placement() {
+        let (cx, a, b, sum) = pair();
+        let mut bindings = CudaBindings::new();
+        let home = bindings.input_external(a);
+        bindings.declare(home, Access::ReadWrite, FreedBy::Caller);
+        bindings.input(b);
+        bindings.output_on(sum, home);
+        let bound = bindings.bind(&cx.logical).unwrap();
+        assert_eq!(bound.outputs[0].placement, Placement::External);
+        let residents = bound.residents();
+        assert_eq!(residents.externals, [home].into_iter().collect());
+        assert!(residents.inputs.is_empty());
+    }
+
+    /// A fresh external output owns its own buffer, and a staged input
+    /// beside it stays out of the external set.
+    #[test]
+    fn an_external_output_declares_its_own_placement() {
+        let (cx, a, b, sum) = pair();
+        let mut bindings = CudaBindings::new();
+        bindings.input(a);
+        let staged = bindings.input(b);
+        let out = bindings.output_external(sum);
+        let residents = bindings.bind(&cx.logical).unwrap().residents();
+        assert_eq!(residents.externals, [out].into_iter().collect());
+        assert!(!residents.externals.contains(&staged));
+    }
+
+    /// TWO PLACEMENTS ON ONE BUFFER ARE REFUSED. The constructors cannot
+    /// state it (every binding on a buffer inherits its placement), so
+    /// the disagreement is pushed directly here — this is the door that
+    /// keeps the arena and the pointer table from disagreeing about who
+    /// owns a buffer's bytes.
+    #[test]
+    fn two_placements_on_one_buffer_are_refused() {
+        let (cx, a, b, sum) = pair();
+        let mut bindings = CudaBindings::new();
+        let home = bindings.input_external(a);
+        bindings.push_input(b, home, BoundaryLayout::RowMajor, Placement::Staged);
+        bindings.output(sum);
+        let refusal = bindings.bind(&cx.logical).unwrap_err();
+        assert!(
+            refusal.contains(&format!("buffer {home} carries both"))
+                && refusal.contains("External")
+                && refusal.contains("Staged"),
+            "{refusal}"
+        );
     }
 }

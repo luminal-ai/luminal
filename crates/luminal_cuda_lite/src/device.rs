@@ -29,9 +29,8 @@ use std::{
 
 type Outputs = FxHashMap<usize, (HostBuffer, OutputBinding<DecodedLayout>)>;
 /// A caller-owned device allocation bound to one plan buffer for the
-/// duration of one execution. This is the zero-copy half of the PyTorch
-/// integration: the kernel reads/writes the caller's tensor directly and no
-/// arena range is involved.
+/// duration of one execution: the kernel reads/writes the caller's storage
+/// directly and no arena range is involved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExternalPtr {
     pub ptr: u64,
@@ -156,12 +155,12 @@ pub struct CudaDevice {
     staging: Option<Pinned>,
     slab: Option<CudaSlice<u8>>,
     /// CALLER-OWNED ARENA: when set, `install` reserves no slab and the
-    /// per-execution base is this address. The owner (PyTorch's caching
-    /// allocator) frees it; this device never does.
+    /// per-execution base is this address. The caller frees it; this device
+    /// never does.
     external_arena: Option<(u64, usize)>,
-    /// True when `stream` was borrowed from another library (PyTorch); the
-    /// device must not destroy it, and the outer owner is responsible for
-    /// ordering work submitted through it.
+    /// True when `stream` was borrowed from another library; the device must
+    /// not destroy it, and the outer owner is responsible for ordering work
+    /// submitted through it.
     stream_is_borrowed: bool,
     cache: HashMap<String, Module>,
     stream: Arc<CudaStream>,
@@ -188,13 +187,12 @@ impl CudaDevice {
             resident_initialized: BTreeSet::new(),
         })
     }
-    /// Run on a stream owned by another library (e.g.
-    /// `torch.cuda.current_stream().cuda_stream`). The wrapped stream is
+    /// Run on a stream owned by another library. The wrapped stream is
     /// non-owning, so dropping the device does not destroy it.
     pub fn use_borrowed_stream(&mut self, raw_stream: u64) -> Result<()> {
         let raw = raw_stream as usize as cu::CUstream;
-        // SAFETY: the caller (the Python backend) owns the stream and keeps it
-        // alive for as long as this device may run.
+        // SAFETY: the caller owns the stream and keeps it alive for as long
+        // as this device may run.
         let stream = unsafe { self.ctx.wrap_borrowed_stream(raw) };
         self.stream = stream;
         self.stream_is_borrowed = true;
@@ -208,8 +206,16 @@ impl CudaDevice {
     /// Bind a caller-allocated arena for subsequent installs/executions. The
     /// caller keeps ownership: `release_slab` and `Drop` will not free it.
     /// A new base invalidates the arena-resident bytes, so they are re-uploaded
-    /// on the next execution.
-    pub fn set_external_arena(&mut self, ptr: u64, bytes: usize) {
+    /// on the next execution. A block smaller than the installed plan set
+    /// needs is REFUSED here rather than written past its end.
+    pub fn set_external_arena(&mut self, ptr: u64, bytes: usize) -> Result<()> {
+        if !self.installed.is_empty() {
+            ensure!(
+                bytes >= self.stats.arena_bytes,
+                "external arena is {bytes} bytes, installed plan set needs {}",
+                self.stats.arena_bytes
+            );
+        }
         let changed = self.external_arena.map(|(p, _)| p) != Some(ptr);
         self.external_arena = Some((ptr, bytes));
         if !self.installed.is_empty() {
@@ -218,24 +224,22 @@ impl CudaDevice {
                 self.resident_initialized.clear();
             }
         }
+        Ok(())
     }
+    /// Revert to the device's own slab. The installed plans were based at the
+    /// caller's block, which it is free to release, so they are dropped: the
+    /// next execution installs again on the owned slab.
     pub fn clear_external_arena(&mut self) {
-        self.external_arena = None;
+        if self.external_arena.take().is_some() && !self.installed.is_empty() {
+            // Every public launch is synchronous, including error paths.
+            let _ = self.stream.synchronize();
+            self.installed.clear();
+            self.stats.arena_base = 0;
+            self.stats.arena_bytes = 0;
+        }
     }
     pub fn stream_is_borrowed(&self) -> bool {
         self.stream_is_borrowed
-    }
-    /// Output slot indices written straight into caller device memory.
-    pub fn external_output_slots(&self) -> Vec<usize> {
-        let mut slots: Vec<usize> = self
-            .installed
-            .iter()
-            .filter_map(|i| i.compiled.as_ref())
-            .flat_map(|c| c.external_outputs.iter().copied())
-            .collect();
-        slots.sort_unstable();
-        slots.dedup();
-        slots
     }
     pub fn stats(&self) -> GraphStats {
         self.stats
@@ -253,16 +257,15 @@ impl CudaDevice {
         plans: Vec<(CudaPlan, Bounds)>,
         bindings: crate::resident::ResidentBindings,
     ) -> Result<()> {
-        self.install_resident_with_budget(plans, bindings, None, false)
+        self.install_resident_with_budget(plans, bindings, None)
     }
     pub fn install_resident_with_budget(
         &mut self,
         plans: Vec<(CudaPlan, Bounds)>,
         bindings: crate::resident::ResidentBindings,
         budget: Option<usize>,
-        external_outputs: bool,
     ) -> Result<()> {
-        let allocation = crate::resident::allocate(plans, bindings, external_outputs)?;
+        let allocation = crate::resident::allocate(plans, bindings)?;
         let bytes = allocation.bytes;
         if let Some(budget) = budget {
             ensure!(
@@ -307,9 +310,9 @@ impl CudaDevice {
         }
         self.stats.staging_bytes = self.staging.as_ref().unwrap().bytes().len();
         if let Some((arena_ptr, arena_bytes)) = self.external_arena {
-            // TORCH-OWNED ARENA: reserve nothing. The Python layer sizes and
-            // frees this block (one per execution); we only check it is large
-            // enough for the plan set and record its base.
+            // CALLER-OWNED ARENA: reserve nothing. The caller sizes and frees
+            // this block (one per execution); we only check it is large enough
+            // for the plan set and record its base.
             ensure!(
                 arena_bytes >= bytes,
                 "external arena is {arena_bytes} bytes, plan set needs {bytes}"
@@ -398,26 +401,19 @@ impl CudaDevice {
         staged: &FxHashMap<i64, &HostBuffer>,
         dims: &DynMap,
     ) -> Result<Outputs> {
-        self.execute_external(
-            bucket,
-            staged,
-            dims,
-            &Default::default(),
-            &Default::default(),
-        )
+        self.execute_external(bucket, staged, dims, &Default::default())
     }
-    /// Execute with PyTorch-style zero-copy boundaries. `external_inputs` maps
-    /// a graph input's `BufferLit` id to the caller's device tensor;
-    /// `external_outputs` maps an output slot index to the caller's device
-    /// tensor. Bound buffers are addressed absolutely (no arena range) and
-    /// bound outputs are never copied to host.
+    /// Execute with zero-copy boundaries: `external_ptrs` maps a boundary
+    /// buffer's `BufferLit` id to the caller's device storage. Those buffers
+    /// are addressed absolutely (no arena range), never staged, and never
+    /// copied back to host — one pointer per buffer, so an output bound on an
+    /// input's buffer resolves to the same address the input reads.
     pub fn execute_external(
         &mut self,
         bucket: usize,
         staged: &FxHashMap<i64, &HostBuffer>,
         dims: &DynMap,
-        external_inputs: &FxHashMap<i64, ExternalPtr>,
-        external_outputs: &FxHashMap<usize, ExternalPtr>,
+        external_ptrs: &FxHashMap<i64, ExternalPtr>,
     ) -> Result<Outputs> {
         self.ctx.bind_to_thread()?;
         self.upload_residents(staged)?;
@@ -434,22 +430,13 @@ impl CudaDevice {
                 "dimension `{dim}`={value} is outside [{lo}, {hi}]"
             );
         }
-        // Resolve the caller's lit/slot keys to the plan's buffer ids.
+        // Resolve the caller's buffer ids to the plan's buffer ids.
         let mut external = ExternalBuffers::default();
         for (id, buffer) in &installed.plan.buffers {
             if let Some(lit) = buffer.lit
-                && let Some(ptr) = external_inputs.get(&lit)
+                && let Some(ptr) = external_ptrs.get(&lit)
             {
                 external.insert(id.clone(), *ptr);
-            }
-        }
-        for node in installed.plan.dag.node_weights() {
-            if let BufferNode::BufferOutput { slots } = node {
-                for slot in slots {
-                    if let Some(ptr) = external_outputs.get(&slot.index) {
-                        external.insert(slot.buffer.clone(), *ptr);
-                    }
-                }
             }
         }
         // A changed arena base (per-execution allocator block) or a changed
@@ -635,9 +622,6 @@ struct CompiledPlan {
     /// The arena base this plan was built against (per-execution allocator
     /// block); a change forces recompilation exactly like `external`.
     base: u64,
-    /// Output slots bound directly to caller device memory: no D2H, no host
-    /// bytes — the caller's tensor IS the result.
-    external_outputs: Vec<usize>,
 }
 fn size(layout: &DecodedLayout) -> Result<Expr> {
     Ok(symbolic::span(layout)?
@@ -814,7 +798,6 @@ impl CompiledPlan {
             last_dims: dims.clone(),
             external: external.clone(),
             base,
-            external_outputs: vec![],
         };
         out.actions.push(Action::Copy {
             src: out.params.ptr(staging),
@@ -830,7 +813,7 @@ impl CompiledPlan {
                     buffer: id,
                     staging: pinned,
                 } => {
-                    // ZERO-COPY INPUT: the caller's tensor already holds the
+                    // ZERO-COPY INPUT: the caller's storage already holds the
                     // bytes on the device, so there is no pinned H2D and no
                     // `Input` staging entry. `range` resolves the reads to the
                     // caller pointer.
@@ -873,11 +856,10 @@ impl CompiledPlan {
                         continue;
                     }
                     // ZERO-COPY OUTPUT: the compute node wrote straight into
-                    // the caller's tensor (via `range`). There is no D2H and
-                    // no host `HostBuffer`; the Python layer returns the very
-                    // tensor it bound.
+                    // the caller's storage (via `range`). There is no D2H and
+                    // no host `HostBuffer`; the caller's own allocation IS the
+                    // result.
                     if external.contains_key(id) {
-                        out.external_outputs.extend(indices.iter().copied());
                         continue;
                     }
                     let buffer = &plan.buffers[id];
@@ -1042,20 +1024,6 @@ impl CompiledPlan {
                 },
             }
         }
-        // Record external outputs from the plan as well as from any Download
-        // step, so this works whether or not the planner excluded them from the
-        // arena. Deduped because a Download step also records its slots.
-        for node in plan.dag.node_weights() {
-            if let BufferNode::BufferOutput { slots } = node {
-                for slot in slots {
-                    if external.contains_key(&slot.buffer) {
-                        out.external_outputs.push(slot.index);
-                    }
-                }
-            }
-        }
-        out.external_outputs.sort_unstable();
-        out.external_outputs.dedup();
         for (i, action) in out.actions.iter().enumerate() {
             let mut vars = BTreeSet::new();
             match action {
