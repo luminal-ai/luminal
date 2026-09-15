@@ -16,6 +16,14 @@ import torch
 from torch.export import Dim, export
 
 from . import _luminal
+from .export_utils import (
+    _box_scalar_graph_outputs,
+    _decomp_table,
+    _drop_dead_data_dependent_ops,
+    _drop_input_guards,
+    _lower_sym_sum,
+    _register_cache_serialization,
+)
 
 # torch._export.serde.schema.ScalarType codes we can round-trip today.
 _PT2_TO_TORCH = {
@@ -49,9 +57,12 @@ def _output_tensor(raw: bytes, dtype_code: int, shape: Sequence[int]) -> torch.T
 class CompiledModel:
     """Callable wrapper around a compiled reference-backend graph."""
 
-    def __init__(self, graph: Any, ep: Any):
+    def __init__(
+        self, graph: Any, ep: Any, scalar_output_positions: Sequence[int] = ()
+    ):
         self._graph = graph
         self._ep = ep
+        self._scalar_output_positions = frozenset(scalar_output_positions)
         names = graph.input_names
         kinds = graph.input_kinds
         self._user_input_names = [
@@ -99,7 +110,12 @@ class CompiledModel:
                     results.append(inputs[target])
                 continue
             if returned:
-                results.append(tensor)
+                # Scalar graph outputs were boxed into rank-zero tensors before
+                # export; restore the Python scalar backend contract here.
+                if index in self._scalar_output_positions:
+                    results.append(tensor.item())
+                else:
+                    results.append(tensor)
         # Dynamo's backend contract: return the graph's output tree (a
         # sequence), even for one result. It unwraps single-tensor returns
         # for the user.
@@ -215,11 +231,49 @@ def luminal_reference(
     if options:
         search_iterations = options.get("search_iterations", search_iterations)
 
+    # HF DynamicCache must be pytree-registered before torch.export capture so
+    # use_cache=True models can export. Idempotent.
+    _register_cache_serialization()
+
+    # Canonicalize scalar (SymInt/SymFloat/SymBool) graph outputs into rank-zero
+    # tensors before the export capture. Work on a private copy: Dynamo holds
+    # onto the original graph module for guard installation and retracing, and
+    # mutating it here would corrupt that bookkeeping.
+    gm = copy.deepcopy(gm)
+    scalar_output_positions = _box_scalar_graph_outputs(gm)
+
+    # The graph-module preprocessing above runs first; `_dynamic_export` then
+    # rewrites the SymInt placeholders onto `sym_size` and runs the nested
+    # `torch.export`, so the exported program keeps its symbolic dims.
     ep, export_inputs = _dynamic_export(gm, example_inputs)
-    with tempfile.TemporaryDirectory() as tmp:
-        pt2_path = os.path.join(tmp, "model.pt2")
-        torch.export.save(ep, pt2_path)
-        graph = _luminal.compile(pt2_path)
+    # LUM-499: drop dynamo-emitted input guards before run_decompositions calls
+    # ep.module(), which would otherwise emit a `_guards_fn` containing
+    # data-dependent .item() calls and unresolved `L[...]` references.
+    _drop_input_guards(ep)
+    _drop_dead_data_dependent_ops(ep.graph_module)
+    # Serde gap workaround; must run before save. See _lower_sym_sum.
+    _lower_sym_sum(ep)
+
+    def _save_and_compile(program: Any) -> Any:
+        with tempfile.TemporaryDirectory() as tmp:
+            pt2_path = os.path.join(tmp, "model.pt2")
+            torch.export.save(program, pt2_path)
+            return _luminal.compile(pt2_path)
+
+    try:
+        graph = _save_and_compile(ep)
+    except RuntimeError as exc:
+        # The translator lowers a fixed op set. Decomposing the exported graph
+        # rewrites higher-level composites into primitives the translator
+        # handles, but it also rewrites ops it already lowers directly (e.g.
+        # ``aten.linear`` -> ``aten.addmm``). Gate the aggressive pass on an
+        # actual translator rejection so the common case keeps its original,
+        # un-decomposed graph.
+        if "unsupported ATen op" not in str(exc):
+            raise
+        ep = ep.run_decompositions(_decomp_table())
+        _lower_sym_sum(ep)
+        graph = _save_and_compile(ep)
 
     names = graph.input_names
     kinds = graph.input_kinds
@@ -249,7 +303,7 @@ def luminal_reference(
         )
 
     graph.search(search_iterations)
-    return CompiledModel(graph, ep)
+    return CompiledModel(graph, ep, scalar_output_positions)
 
 
 def register_backend() -> None:

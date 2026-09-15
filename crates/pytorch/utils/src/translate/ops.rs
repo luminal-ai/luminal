@@ -101,7 +101,13 @@ impl Translator<'_> {
 
     pub(super) fn translate_view(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let target = self.get_int_exprs_arg(node, 1)?;
+        // Prefer the symbolic target (sym-int entries and compound sympy
+        // expressions resolve through the parser); fall back to the sym-int
+        // list reader, which keeps symbolic entries symbolic.
+        let target = match self.resolve_shape_arg(node, 1) {
+            Some(target) => target,
+            None => self.get_int_exprs_arg(node, 1)?,
+        };
         let dims = util::resolve_neg1_dim_exprs(&target, &x.dims());
         Ok(util::reshape_tensor(x, &dims))
     }
@@ -130,20 +136,29 @@ impl Translator<'_> {
         let x = self.operand(&node.inputs[0])?;
         let rank = x.rank();
         let dim = normalize_dim(self.get_int_arg(node, 1)?, rank);
-        let start = self
-            .get_int_arg(node, 2)
-            .map(|v| util::normalize_slice_bound(IntExpr::from(v), x.dims()[dim]))
-            .unwrap_or_else(|_| IntExpr::from(0));
-        let end = self
-            .get_int_arg(node, 3)
-            .map(|v| {
-                if v < 0 {
-                    util::normalize_slice_bound(IntExpr::from(-1i32), x.dims()[dim]) + 1
-                } else {
-                    IntExpr::from(v)
+        let start = match node.inputs.get(2) {
+            Some(input) => {
+                let expr = self
+                    .resolve_arg_as_expression(&input.arg)
+                    .ok_or_else(|| anyhow::anyhow!("slice start is not an expression"))?;
+                util::normalize_slice_bound(expr, x.dims()[dim])
+            }
+            None => IntExpr::from(0),
+        };
+        let end = match node.inputs.get(3) {
+            Some(input) => {
+                let expr = self
+                    .resolve_arg_as_expression(&input.arg)
+                    .ok_or_else(|| anyhow::anyhow!("slice end is not an expression"))?;
+                match expr.as_num() {
+                    Some(v) if v < 0 => {
+                        util::normalize_slice_bound(IntExpr::from(-1i32), x.dims()[dim]) + 1
+                    }
+                    _ => util::normalize_slice_bound(expr, x.dims()[dim]),
                 }
-            })
-            .unwrap_or_else(|_| x.dims()[dim]);
+            }
+            None => x.dims()[dim],
+        };
         let step = node.inputs.get(4).and_then(|i| i.arg.as_int()).unwrap_or(1);
         if step != 1 {
             bail!("slice step {step} != 1 is not ported");
@@ -157,10 +172,12 @@ impl Translator<'_> {
         let x = self.operand(&node.inputs[0])?;
         let dim = normalize_dim(self.get_int_arg(node, 1)?, x.rank());
         let index = self.get_int_arg(node, 2)?;
-        let extent = x.dims()[dim]
-            .to_usize()
-            .ok_or_else(|| anyhow::anyhow!("select on a dynamic axis is not ported"))?;
+        // Only a NEGATIVE index needs the axis extent to wrap; a
+        // non-negative select on a dynamic axis is fine.
         let index = if index < 0 {
+            let extent = x.dims()[dim].to_usize().ok_or_else(|| {
+                anyhow::anyhow!("select with a negative index on a dynamic axis is not ported")
+            })?;
             index + extent as i64
         } else {
             index
@@ -172,20 +189,28 @@ impl Translator<'_> {
 
     pub(super) fn translate_expand(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let target = self.get_ints_arg(node, 1)?;
+        let target = match self.resolve_shape_arg(node, 1) {
+            Some(target) => target,
+            None => self
+                .get_ints_arg(node, 1)?
+                .into_iter()
+                .map(IntExpr::from)
+                .collect(),
+        };
         let dims = x.dims();
         let rank = target.len();
+        let neg1 = IntExpr::from(-1i32);
         let mut aligned = vec![IntExpr::from(1); rank];
         for (i, size) in target.iter().enumerate() {
             let from_end = rank - i;
-            aligned[i] = if *size == -1 {
+            aligned[i] = if *size == neg1 {
                 if from_end <= dims.len() {
                     dims[dims.len() - from_end]
                 } else {
                     IntExpr::from(1)
                 }
             } else {
-                IntExpr::from(*size as usize)
+                *size
             };
         }
         let mut out = x;
@@ -351,7 +376,7 @@ impl Translator<'_> {
         let (shape, dtype, value) = if like {
             let x = self.operand(&node.inputs[0])?;
             let meta = self.output_meta_dtype(node).unwrap_or(x.dtype);
-            (x.dims(), meta, self.get_float_arg(node, 1)?)
+            (x.dims(), meta, self.get_number_arg(node, 1)?)
         } else {
             let shape: Vec<IntExpr> = self
                 .get_ints_arg(node, 0)?
@@ -361,7 +386,7 @@ impl Translator<'_> {
             (
                 shape,
                 self.output_meta_dtype(node)?,
-                self.get_float_arg(node, 1)?,
+                self.get_number_arg(node, 1)?,
             )
         };
         Ok(self.full_tensor(shape, dtype, value))
@@ -369,19 +394,15 @@ impl Translator<'_> {
 
     pub(super) fn translate_arange(&mut self, node: &Node, kind: u8) -> Result<GraphTensor> {
         let dtype = self.output_meta_dtype(node)?;
-        let (start, end, step) = match kind {
-            0 => (0.0, self.get_float_arg(node, 0)?, 1.0),
-            1 => (
-                self.get_float_arg(node, 0)?,
-                self.get_float_arg(node, 1)?,
-                1.0,
-            ),
-            _ => (
-                self.get_float_arg(node, 0)?,
-                self.get_float_arg(node, 1)?,
-                self.get_float_arg(node, 2)?,
-            ),
-        };
+        // Resolve by schema name first: PT2 drops defaulted args (e.g.
+        // `step`) and shifts later kwargs, so positional indices are not
+        // reliable (`arange.start_step` can arrive as start,end,layout,...).
+        let start = self.named_float_arg(node, "start").unwrap_or(0.0);
+        let end = self
+            .named_float_arg(node, "end")
+            .or_else(|| self.get_float_arg(node, if kind == 0 { 0 } else { 1 }).ok())
+            .ok_or_else(|| anyhow::anyhow!("{}: missing end", node.target))?;
+        let step = self.named_float_arg(node, "step").unwrap_or(1.0);
         let arange = self
             .cx
             .arange_options(start as i64, end as i64, step as i64);
@@ -418,25 +439,20 @@ impl Translator<'_> {
         } else {
             self.operand(&node.inputs[2])?
         };
-        let (a, b) = util::broadcast_binary(a, b);
-        let (a, condition) = util::broadcast_binary(a, condition);
-        let mask = condition.cast(DType::F32);
-        let one = self.cx.constant_f32(1.0).expand_rhs(mask.dims());
-        Ok(a * mask + b * (one - mask))
+        Ok(self.select(condition, a, b))
     }
 
     pub(super) fn translate_masked_fill_scalar(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
         let mask = self.operand(&node.inputs[1])?;
         let value = self.get_float_arg(node, 2)? as f32;
-        let mask = mask.cast(DType::F32);
-        let one = self.cx.constant_f32(1.0).expand_rhs(mask.dims());
         let fill = self
             .cx
             .constant_f32(value)
             .cast(x.dtype)
             .expand_rhs(x.dims());
-        Ok(x * (one - mask) + fill * mask)
+        // `masked_fill(mask, value)` = `where(mask, value, x)`.
+        Ok(self.select(mask, fill, x))
     }
 
     pub(super) fn translate_clamp(&mut self, node: &Node) -> Result<GraphTensor> {

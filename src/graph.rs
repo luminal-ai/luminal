@@ -247,10 +247,14 @@ pub type Operand = (ValueId, Vec<IntExpr>);
 /// vocabulary rather than free-form constructor strings.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOp {
-    Input { label: String },
+    Input {
+        label: String,
+    },
     Constant(f64),
     ConstantF64(f64),
-    Iota { value_expr: String },
+    Iota {
+        value_expr: String,
+    },
     Cast(DType),
     TruncCast(DType),
     Sqrt,
@@ -270,11 +274,21 @@ pub enum LogicalOp {
     LessThan,
     TruncDiv,
     TruncRem,
-    ReduceSum { axis_from_end: usize },
-    ReduceMax { axis_from_end: usize },
+    ReduceSum {
+        axis_from_end: usize,
+    },
+    ReduceMax {
+        axis_from_end: usize,
+    },
     Gather,
     Scatter,
-    IndexMapApply { entries: Vec<MapEntry> },
+    /// Ternary selection: `Select(cond, if_true, if_false)` picks elementwise
+    /// from the two value branches by the boolean condition. The output takes
+    /// the branches' shape and dtype.
+    Select,
+    IndexMapApply {
+        entries: Vec<MapEntry>,
+    },
 }
 
 impl LogicalOp {
@@ -303,6 +317,7 @@ impl LogicalOp {
             Self::LessThan => "LogicalLessThan",
             Self::TruncDiv => "LogicalTruncDiv",
             Self::TruncRem => "LogicalTruncRem",
+            Self::Select => "LogicalSelect",
             Self::ReduceSum { .. } => "LogicalReduceSum",
             Self::ReduceMax { .. } => "LogicalReduceMax",
             Self::Gather => "LogicalGather",
@@ -344,6 +359,7 @@ impl LogicalOp {
             | Self::LessThan
             | Self::TruncDiv
             | Self::TruncRem => 2,
+            Self::Select => 3,
             Self::Gather | Self::Scatter => return None,
         })
     }

@@ -1127,7 +1127,15 @@ impl GraphTensor {
         if elem == 0.0 {
             return self.pad_impl(padding, None);
         }
-        let fill = self.graph().constant_f32(elem).cast(self.dtype);
+        // The fill must be built in the tensor's own dtype: a float literal
+        // cast to an integer tensor is a refused lossy read.
+        let fill = match self.dtype {
+            DType::F64 => self.graph().constant_f64(elem as f64),
+            DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
+                self.graph().constant_i32(elem as i64).cast(self.dtype)
+            }
+            _ => self.graph().constant_f32(elem).cast(self.dtype),
+        };
         self.pad_impl(padding, Some(fill))
     }
 

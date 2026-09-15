@@ -47,6 +47,7 @@ pub(crate) mod reduce_max;
 pub(crate) mod reduce_sum;
 pub(crate) mod round;
 pub(crate) mod scatter;
+pub(crate) mod select;
 pub(crate) mod sin;
 pub(crate) mod sqrt;
 pub(crate) mod trunc;
@@ -135,6 +136,7 @@ pub use reduce_max::ReduceMaxMatcher;
 pub use reduce_sum::ReduceSumMatcher;
 pub use round::RoundFunctionalMatcher;
 pub use scatter::ScatterFunctionalMatcher;
+pub use select::{SelectFunctional, SelectFunctionalDps, SelectFunctionalMatcher};
 pub use sin::SinFunctionalMatcher;
 pub use sqrt::SqrtFunctionalMatcher;
 pub use trunc::TruncFunctionalMatcher;
@@ -296,6 +298,11 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(ScatterFunctionalMatcher),
                 kernel: entry::<ScatterFunctionalDps>("ScatterFunctionalGeneric", scatter::kernel),
+            },
+            // ── elementwise ternary ──
+            ReferenceOp {
+                matcher: || Box::new(SelectFunctionalMatcher),
+                kernel: entry::<SelectFunctionalDps>("SelectFunctionalGeneric", select::kernel),
             },
             ReferenceOp {
                 matcher: || Box::new(IndexMapApplyMaterializeMatcher),

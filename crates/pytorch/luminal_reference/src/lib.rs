@@ -240,6 +240,46 @@ impl CompiledGraph {
         Ok(())
     }
 
+    /// Override a dynamic dimension's value before `search`, by PT2 symbol
+    /// name (e.g. `"s77"`). The value becomes the dim's bucket
+    /// representative, so it steers the searched plan without narrowing the
+    /// bucket. Hints are seeded at compile time, so static graphs need no
+    /// call.
+    fn set_dim(&mut self, name: &str, value: usize) -> PyResult<()> {
+        if self.searched {
+            return Err(PyRuntimeError::new_err(
+                "set_dim must be called before search()",
+            ));
+        }
+        let symbol = self
+            .translation
+            .symbols
+            .get(name)
+            .copied()
+            .ok_or_else(|| PyRuntimeError::new_err(format!("unknown dim symbol {name:?}")))?;
+        // The bucket binding owns the runtime's dims until `search` runs;
+        // recording the value here is what reaches it.
+        self.dims.insert(symbol, value);
+        Ok(())
+    }
+
+    /// The PT2 symbol name of every dynamic dimension.
+    #[getter]
+    fn dim_symbols(&self) -> Vec<String> {
+        self.translation.symbols.keys().cloned().collect()
+    }
+
+    /// The exported hint for each dynamic dimension, aligned with
+    /// `dim_symbols`.
+    #[getter]
+    fn dim_hints(&self) -> Vec<usize> {
+        self.translation
+            .symbols
+            .values()
+            .map(|symbol| self.translation.dims.get(symbol).copied().unwrap_or(0))
+            .collect()
+    }
+
     /// Saturate and search. Every input must be staged first.
     #[pyo3(signature = (generations = None))]
     fn search(&mut self, generations: Option<usize>) -> PyResult<()> {

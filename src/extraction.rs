@@ -3657,11 +3657,11 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
         }
     }
 
-    fn ensure_value(&mut self, class: &ClassId) -> Result<NodeIndex> {
-        if let Some(index) = self.value_producer.get(class) {
-            return Ok(*index);
-        }
-        let plan = self.extractor.plan(class)?.clone();
+    /// Build the DAG node for one plan, memoized. Returns the node index and
+    /// the child plans whose edges still have to be connected (empty when the
+    /// node was already built, or has no children). Split out of
+    /// `ensure_value` so that traversal can be iterative.
+    fn build_node(&mut self, class: &ClassId, plan: &Plan) -> Result<(NodeIndex, Vec<PlanChild>)> {
         match &plan.kind {
             PlanKind::Input(info) => {
                 let value = self.extractor.layout_tensor_info(class);
@@ -3678,7 +3678,7 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                         buffer,
                     })));
                 self.value_producer.insert(class.clone(), index);
-                Ok(index)
+                Ok((index, Vec::new()))
             }
             PlanKind::LayoutIr(op) => {
                 let op_eclass = plan
@@ -3692,7 +3692,7 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                 let key = (op_eclass.clone(), source_enode.clone());
                 if let Some(index) = self.op_nodes.get(&key) {
                     self.value_producer.insert(class.clone(), *index);
-                    return Ok(*index);
+                    return Ok((*index, Vec::new()));
                 }
 
                 let outputs = plan
@@ -3757,22 +3757,95 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                     }
                 }
                 self.value_producer.insert(class.clone(), index);
-
-                for child in &plan.children {
-                    let producer = self.ensure_value(&child.class)?;
-                    self.dag.add_edge(
-                        producer,
-                        index,
-                        ExtractedEdge {
-                            value: child.class.clone(),
-                            port: child.port.clone(),
-                        },
-                    );
-                }
-                Ok(index)
+                Ok((index, plan.children.clone()))
             }
             other => bail!("expected value-producing plan at {class}, found {other:?}"),
         }
+    }
+
+    /// Materialize `root` and everything it depends on.
+    ///
+    /// ITERATIVE, never recursive: the plan is a DAG whose longest path grows
+    /// with the model (an unrolled loop is thousands of nodes deep), so a
+    /// recursive DFS overflows the stack. This is a post-order walk with an
+    /// explicit frame stack; the memo maps (`value_producer` / `op_nodes`)
+    /// keep it linear and break re-entrancy.
+    fn ensure_value(&mut self, root: &ClassId) -> Result<NodeIndex> {
+        if let Some(index) = self.value_producer.get(root) {
+            return Ok(*index);
+        }
+
+        struct Frame {
+            index: NodeIndex,
+            children: Vec<PlanChild>,
+            cursor: usize,
+        }
+        enum Step {
+            Done,
+            Pop,
+            Edge(NodeIndex, NodeIndex, ExtractedEdge),
+            Build(ClassId),
+        }
+
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut to_build = root.clone();
+
+        'build: loop {
+            let plan = self.extractor.plan(&to_build)?.clone();
+            let (index, children) = self.build_node(&to_build, &plan)?;
+            stack.push(Frame {
+                index,
+                children,
+                cursor: 0,
+            });
+
+            loop {
+                let step = match stack.last_mut() {
+                    None => Step::Done,
+                    Some(frame) => {
+                        if frame.cursor >= frame.children.len() {
+                            Step::Pop
+                        } else {
+                            let child = &frame.children[frame.cursor];
+                            let class = child.class.clone();
+                            let port = child.port.clone();
+                            match self.value_producer.get(&class) {
+                                Some(&child_index) => {
+                                    // Advance ONLY once the edge is emitted;
+                                    // an unbuilt child stays at the cursor so
+                                    // its edge is added after it is built.
+                                    frame.cursor += 1;
+                                    Step::Edge(
+                                        child_index,
+                                        frame.index,
+                                        ExtractedEdge { value: class, port },
+                                    )
+                                }
+                                None => Step::Build(class),
+                            }
+                        }
+                    }
+                };
+                match step {
+                    Step::Done => break 'build,
+                    Step::Pop => {
+                        stack.pop();
+                    }
+                    Step::Edge(from, to, edge) => {
+                        self.dag.add_edge(from, to, edge);
+                    }
+                    Step::Build(class) => {
+                        to_build = class;
+                        continue 'build;
+                    }
+                }
+            }
+        }
+
+        self.value_producer
+            .get(root)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("ensure_value({root}) built no node"))
     }
 
     fn emit_output(&mut self, class: &ClassId) -> Result<NodeIndex> {

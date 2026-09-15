@@ -1,0 +1,15 @@
+; Forward LayoutTensor Propagation : LogicalSelect — the output may be laid
+; out like any of its three inputs.
+(rule
+  (
+    (= ?out_logical (LogicalSelect ?cond ?if_true ?if_false))
+    (= ?cond_layout_tensor (LayoutTensorLit ?cond ?cond_layout))
+    (= ?true_layout_tensor (LayoutTensorLit ?if_true ?true_layout))
+    (= ?false_layout_tensor (LayoutTensorLit ?if_false ?false_layout))
+  )
+  (
+    (let ?out_layout_tensor1 (LayoutTensorLit ?out_logical ?cond_layout))
+    (let ?out_layout_tensor2 (LayoutTensorLit ?out_logical ?true_layout))
+    (let ?out_layout_tensor3 (LayoutTensorLit ?out_logical ?false_layout))
+  )
+)

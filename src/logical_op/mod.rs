@@ -159,6 +159,7 @@ mod reduce_max;
 mod reduce_sum;
 mod round;
 mod scatter;
+mod select;
 mod sin;
 mod sqrt;
 mod trunc;
@@ -187,6 +188,7 @@ pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
 pub use round::LogicalRound;
 pub use scatter::LogicalScatter;
+pub use select::LogicalSelect;
 pub use sin::LogicalSin;
 pub use sqrt::LogicalSqrt;
 pub use trunc::LogicalTrunc;
@@ -229,6 +231,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalConstantF64),
             Box::new(LogicalGather),
             Box::new(LogicalScatter),
+            Box::new(LogicalSelect),
             Box::new(LogicalIndexMapApply),
             Box::new(LogicalTruncDiv),
             Box::new(LogicalTruncRem),

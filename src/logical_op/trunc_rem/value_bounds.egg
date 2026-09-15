@@ -28,3 +28,68 @@
       (- (max ?rhs_upper (- (bigint 0) ?rhs_lower)) (bigint 1)))
   )
 )
+
+; Tighter sign-aware bounds (merge monotonically with the symmetric rules
+; above). A truncated remainder carries the DIVIDEND's sign and is strictly
+; smaller in magnitude than the divisor, so when the dividend's sign is
+; known the result is sign-definite.
+; non-negative dividend, positive divisor: [0, div_max - 1]
+(rule
+  (
+    (= ?out (LogicalTruncRem ?lhs ?rhs))
+    (= ?lhs_lower (value-lower-bound-of ?lhs))
+    (= ?rhs_lower (value-lower-bound-of ?rhs))
+    (= ?rhs_upper (value-upper-bound-of ?rhs))
+    (>= ?lhs_lower (bigint 0))
+    (>= ?rhs_lower (bigint 1))
+  )
+  (
+    (set (value-lower-bound-of ?out) (bigint 0))
+    (set (value-upper-bound-of ?out) (- ?rhs_upper (bigint 1)))
+  )
+)
+; non-positive dividend, positive divisor: [-(div_max - 1), 0]
+(rule
+  (
+    (= ?out (LogicalTruncRem ?lhs ?rhs))
+    (= ?lhs_upper (value-upper-bound-of ?lhs))
+    (= ?rhs_lower (value-lower-bound-of ?rhs))
+    (= ?rhs_upper (value-upper-bound-of ?rhs))
+    (<= ?lhs_upper (bigint 0))
+    (>= ?rhs_lower (bigint 1))
+  )
+  (
+    (set (value-lower-bound-of ?out) (- (bigint 0) (- ?rhs_upper (bigint 1))))
+    (set (value-upper-bound-of ?out) (bigint 0))
+  )
+)
+; non-negative dividend, negative divisor: [0, |div_min| - 1]
+(rule
+  (
+    (= ?out (LogicalTruncRem ?lhs ?rhs))
+    (= ?lhs_lower (value-lower-bound-of ?lhs))
+    (= ?rhs_lower (value-lower-bound-of ?rhs))
+    (= ?rhs_upper (value-upper-bound-of ?rhs))
+    (>= ?lhs_lower (bigint 0))
+    (<= ?rhs_upper (bigint -1))
+  )
+  (
+    (set (value-lower-bound-of ?out) (bigint 0))
+    (set (value-upper-bound-of ?out) (- (- (bigint 0) ?rhs_lower) (bigint 1)))
+  )
+)
+; non-positive dividend, negative divisor: [div_min + 1, 0]
+(rule
+  (
+    (= ?out (LogicalTruncRem ?lhs ?rhs))
+    (= ?lhs_upper (value-upper-bound-of ?lhs))
+    (= ?rhs_lower (value-lower-bound-of ?rhs))
+    (= ?rhs_upper (value-upper-bound-of ?rhs))
+    (<= ?lhs_upper (bigint 0))
+    (<= ?rhs_upper (bigint -1))
+  )
+  (
+    (set (value-lower-bound-of ?out) (+ ?rhs_lower (bigint 1)))
+    (set (value-upper-bound-of ?out) (bigint 0))
+  )
+)

@@ -1,0 +1,3 @@
+; Ternary select: a boolean condition first, then two same-shape/same-dtype
+; value branches. The output takes the branches' shape and dtype.
+(constructor LogicalSelect (LogicalTensor LogicalTensor LogicalTensor) LogicalTensor)

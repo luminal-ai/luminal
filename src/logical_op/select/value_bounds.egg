@@ -1,0 +1,53 @@
+; Value bounds : LogicalSelect — the result is one of the two branches, so
+; the interval is their union.
+(rule
+  (
+    (= ?out (LogicalSelect ?cond ?if_true ?if_false))
+    (= ?true_lower (value-lower-bound-of ?if_true))
+    (= ?false_lower (value-lower-bound-of ?if_false))
+  )
+  ((set (value-lower-bound-of ?out) (min ?true_lower ?false_lower)))
+)
+(rule
+  (
+    (= ?out (LogicalSelect ?cond ?if_true ?if_false))
+    (= ?true_upper (value-upper-bound-of ?if_true))
+    (= ?false_upper (value-upper-bound-of ?if_false))
+  )
+  ((set (value-upper-bound-of ?out) (max ?true_upper ?false_upper)))
+)
+
+; Structural refinement: the masked max/min idioms carry tighter bounds than
+; the generic union above. `select(a < b, b, a)` IS `maximum(a, b)`, which is
+; at least each operand; `select(b < a, b, a)` IS `minimum(a, b)`, at most
+; each operand. The two patterns are distinct (comparisons are not
+; commutative), so only one fires. Bounds merge monotonically, so these
+; tighten rather than replace the union.
+(rule
+  (
+    (= ?cond (LogicalLessThan ?a ?b))
+    (= ?out (LogicalSelect ?cond ?b ?a))
+    (= ?a_lower (value-lower-bound-of ?a))
+    (= ?b_lower (value-lower-bound-of ?b))
+    (= ?a_upper (value-upper-bound-of ?a))
+    (= ?b_upper (value-upper-bound-of ?b))
+  )
+  (
+    (set (value-lower-bound-of ?out) (max ?a_lower ?b_lower))
+    (set (value-upper-bound-of ?out) (max ?a_upper ?b_upper))
+  )
+)
+(rule
+  (
+    (= ?cond (LogicalLessThan ?b ?a))
+    (= ?out (LogicalSelect ?cond ?b ?a))
+    (= ?a_lower (value-lower-bound-of ?a))
+    (= ?b_lower (value-lower-bound-of ?b))
+    (= ?a_upper (value-upper-bound-of ?a))
+    (= ?b_upper (value-upper-bound-of ?b))
+  )
+  (
+    (set (value-lower-bound-of ?out) (min ?a_lower ?b_lower))
+    (set (value-upper-bound-of ?out) (min ?a_upper ?b_upper))
+  )
+)

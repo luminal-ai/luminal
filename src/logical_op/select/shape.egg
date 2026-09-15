@@ -1,0 +1,13 @@
+; Shape Propagation : LogicalSelect — the branches share a shape and the
+; output takes it.
+(rule
+  (
+    (= ?out_logical (LogicalSelect ?cond ?if_true ?if_false))
+    (= ?shape (shape-of ?if_true))
+    (= ?shape (shape-of ?if_false))
+  )
+  (
+    (set (shape-of ?out_logical) ?shape)
+  )
+  :ruleset prop
+)

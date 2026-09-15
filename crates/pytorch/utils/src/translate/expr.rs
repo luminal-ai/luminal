@@ -1,51 +1,16 @@
 //! Symbolic-dimension resolution for PT2 expressions.
 //!
-//! Bare symbols map to recorder `Symbol` dims so dynamic dims survive as
-//! symbols instead of freezing at the export hint. Compound sympy
-//! expressions are a later port (`pt2_expr`); anything unresolved falls
+//! Bare symbols and compound sympy expressions (`Add`, `Mul`, `FloorDiv`,
+//! `Mod`, `Min`, `Max`) map to recorder `IntExpr`s so dynamic dims survive
+//! as expressions instead of freezing at the export hint. Torch's exported
+//! range constraints feed the bounds simplifier; anything unresolved falls
 //! back to the exported hint, which keeps static programs exact.
 #![allow(dead_code)]
-
-use std::collections::HashMap;
 
 use luminal::prelude::*;
 
 use super::Translator;
-use crate::pt2_schema::{Argument, DimSize, ExprValue, Node};
-
-/// Collect the bare symbols PT2 uses in its tensor metadata, mapped to
-/// recorder dim symbols. A name the recorder rejects is remapped (never
-/// dropped): a dropped symbol would freeze the dim at its hint.
-pub(super) fn build_sym_map(parsed: &crate::pt2_parser::ParsedPT2) -> HashMap<String, Symbol> {
-    let mut names: Vec<String> = Vec::new();
-    for meta in parsed.program.graph_module.graph.tensor_values.values() {
-        for size in &meta.sizes {
-            if let DimSize::Expr(expr) = size
-                && let Some(name) =
-                    crate::pt2_parser::extract_symbol_name_pub(&expr.as_expr.expr_str)
-                && !names.contains(&name)
-            {
-                names.push(name);
-            }
-        }
-    }
-    let mut map = HashMap::new();
-    let mut minted = 0usize;
-    for name in names {
-        let symbol = Symbol::try_new_dim(&name).unwrap_or_else(|_| {
-            let replacement = loop {
-                let candidate = format!("pt2_dim_{minted}");
-                minted += 1;
-                if !map.contains_key(&candidate) {
-                    break candidate;
-                }
-            };
-            Symbol::try_new_dim(&replacement).expect("minted names are well-formed")
-        });
-        map.insert(name, symbol);
-    }
-    map
-}
+use crate::pt2_schema::{Argument, ExprValue, Node, SymIntEntry};
 
 impl Translator<'_> {
     /// Resolve a PT2 sym_int value by name to a dimension expression.
@@ -81,11 +46,33 @@ impl Translator<'_> {
         None
     }
 
-    /// A bare `Symbol('s77', ...)` becomes its recorder dim symbol; a
-    /// compound expression is not parsed yet.
+    /// Resolve a shape-like argument into recorder dimension expressions.
+    /// Handles an int list, a sym-int list (each entry a literal or a
+    /// named sym-int that may itself be a compound expression), and a
+    /// single expression. Returns `None` when the argument is absent or
+    /// not shape-like, or when any entry cannot be resolved.
+    pub(super) fn resolve_shape_arg(&self, node: &Node, idx: usize) -> Option<Vec<IntExpr>> {
+        match &node.inputs.get(idx)?.arg {
+            Argument::Ints(list) => Some(list.as_ints.iter().map(|v| IntExpr::from(*v)).collect()),
+            Argument::SymInts(list) => list
+                .as_sym_ints
+                .iter()
+                .map(|entry| match entry {
+                    SymIntEntry::Int(i) => Some(IntExpr::from(i.as_int)),
+                    SymIntEntry::Name(name) => self.resolve_sym_int(&name.as_name),
+                })
+                .collect(),
+            Argument::Expr(expr) => self.resolve_expr_value(&expr.as_expr).map(|e| vec![e]),
+            _ => None,
+        }
+    }
+
+    /// Resolve a PT2 sympy `srepr` expression string into a recorder
+    /// dimension. Bare `Symbol('s77', ...)` and compound expressions
+    /// (`Add`, `Mul`, `FloorDiv`, `Mod`, `Min`, `Max`) are parsed; torch's
+    /// exported range constraints feed the bounds simplifier.
     pub(super) fn resolve_expr_str(&self, expr_str: &str) -> Option<IntExpr> {
-        let sym = crate::pt2_parser::extract_symbol_name_pub(expr_str)?;
-        self.symbols.get(&sym).copied().map(IntExpr::from)
+        super::sympy::parse_sympy_expr_with_ranges(expr_str, &self.symbols, &self.ranges)
     }
 
     pub(super) fn resolve_expr_value(&self, expr: &ExprValue) -> Option<IntExpr> {
