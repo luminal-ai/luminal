@@ -131,7 +131,7 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     let mut graph = luminal::graph::Graph::new();
     let a = graph.tensor((2, 3), DType::F32);
     let b = graph.tensor((2, 3), DType::F32);
-    let out = (a + b).output();
+    let out = a + b;
     let mut registry = metal_registry();
     registry.retain(|entry| entry.constructor() != AddFunctionalMatcher.egglog_constructor());
     registry.push(RegisteredOp::new(
@@ -190,7 +190,11 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
 
 #[test]
 fn a_familiar_label_without_metal_traits_is_not_claimed() {
-    let graph = luminal::graph::Graph::new();
+    let mut graph = luminal::graph::Graph::new();
+    // A binding names at least one output, so the graph carries a leaf;
+    // the allow list is the registry's, whatever the graph holds.
+    let a = graph.tensor(3, DType::F32);
+    let _out = a + 1.;
     let registry = vec![RegisteredOp::new(
         Box::new(luminal_reference::ops::AddFunctionalMatcher),
         Box::new(luminal_reference::ops::AddFunctional),
@@ -205,7 +209,7 @@ fn external_kernel_launch_geometry_updates_reuse_compiled_pipeline() {
     let mut graph = luminal::graph::Graph::new();
     let a = graph.tensor('a', DType::F32);
     let b = graph.tensor('a', DType::F32);
-    let out = (a + b).output();
+    let out = a + b;
     let mut registry = metal_registry();
     registry.retain(|e| e.constructor() != AddFunctionalMatcher.egglog_constructor());
     registry.push(RegisteredOp::new(

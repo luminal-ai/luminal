@@ -11,7 +11,7 @@ fn bucket_switches_overlay_one_arena() {
     let mut g = Graph::new();
     let x = g.tensor(('a', 2), DType::F32);
     let y = g.tensor(('a', 2), DType::F32);
-    let out = (x * y + x).output();
+    let out = x * y + x;
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
         .unwrap();
@@ -46,7 +46,7 @@ fn bucket_switches_overlay_one_arena() {
 fn metadata_only_dimension_changes_reuse_compiled_kernel() {
     let mut g = Graph::new();
     let a = IntExpr::from('a');
-    let out = g.iota(5, |c| c[0] + a).output();
+    let out = g.iota(5, |c| c[0] + a);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.bind_dyn_range('a', 1, 19).unwrap();
     rt.search(&Default::default(), &harness_search_options())
@@ -67,7 +67,7 @@ fn metadata_only_dimension_changes_reuse_compiled_kernel() {
 fn dynamic_transpose_and_reduction_use_live_strides() {
     let mut g = Graph::new();
     let x = g.tensor((3, 'a'), DType::F32);
-    let out = (x.permute((1, 0)) + 1.).sum(0).output();
+    let out = (x.permute((1, 0)) + 1.).sum(0);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.bind_dyn_range('a', 2, 11).unwrap();
     rt.search(&Default::default(), &harness_search_options())
@@ -93,7 +93,7 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
 fn profiling_and_serving_share_dynamic_graph_execution() {
     let mut g = Graph::new();
     let x = g.tensor('a', DType::F32);
-    let out = (x + 2.).output();
+    let out = x + 2.;
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
         .unwrap();

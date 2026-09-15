@@ -7,7 +7,7 @@ use luminal_metal::{
 fn registry_matches_claims_and_decodes_its_live_schema() {
     let mut g = Graph::new();
     let x = g.tensor(3, DType::F32);
-    let _out = (x + 1.).output();
+    let _out = x + 1.;
     let rows = metal_registry();
     for row in &rows {
         assert_eq!(row.label(), row.prototype.label());
@@ -22,7 +22,7 @@ fn filtered_vocabulary_cannot_elect_an_unregistered_operation() {
     let mut g = Graph::new();
     let x = g.tensor(3, DType::F32);
     let y = g.tensor(3, DType::F32);
-    let _out = (x + y).output();
+    let _out = x + y;
     let mut runtime = MetalRuntime::load_with_registry(
         &g,
         metal_registry_filtered(|row| row.label() != "AddFunctionalGeneric"),
@@ -44,7 +44,7 @@ fn filtered_vocabulary_cannot_elect_an_unregistered_operation() {
 fn arena_budget_rejects_a_plan_set_that_cannot_fit() {
     let mut g = Graph::new();
     let x = g.tensor(3, DType::F32);
-    let _out = (x + 1.).output();
+    let _out = x + 1.;
     let mut runtime = MetalRuntime::load(&g).unwrap();
     let mut options = harness_search_options();
     options.device_budget_bytes = Some(0);

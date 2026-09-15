@@ -7,7 +7,7 @@ fn fused_dot_handles_broadcast_views_and_dynamic_contraction() {
     let mut g = Graph::new();
     let a = g.tensor((3, 'k'), DType::F32);
     let b = g.tensor((2, 'k'), DType::F32);
-    let out = a.matmul(b.t()).output();
+    let out = a.matmul(b.t());
     // Require the fused operation to prove that its own generated shader runs.
     let mut rt = MetalRuntime::load_with_registry(
         &g,
@@ -42,7 +42,7 @@ fn fused_dot_does_not_contract_multiply_and_add() {
     let mut g = Graph::new();
     let a = g.tensor(2, DType::F32);
     let b = g.tensor(2, DType::F32);
-    let out = (a * b).sum(0).output();
+    let out = (a * b).sum(0);
     let mut rt = MetalRuntime::load_with_registry(
         &g,
         metal_registry_filtered(|row| row.label() != "ReduceSumGeneric"),
@@ -66,7 +66,7 @@ fn default_search_seeds_a_compact_matmul_chain() {
     for _ in 0..6 {
         value = value.matmul(weight);
     }
-    let output = value.output();
+    let output = value;
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     let outcome = runtime
         .search(
@@ -118,7 +118,7 @@ fn deep_fork_join_seed_does_not_materialize_broadcast_operands() {
         let twice = projected + projected;
         value = twice + twice;
     }
-    let output = value.output();
+    let output = value;
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     runtime
         .search(

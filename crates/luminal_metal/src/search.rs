@@ -11,7 +11,6 @@ use rand::rngs::StdRng;
 
 use crate::extractor::{self, Genome};
 use luminal::bufferize::BufferIrGraph;
-use luminal::graph::LogicalProgram;
 use luminal::prelude::FxHashMap;
 use luminal::prelude::egraph_serialize;
 
@@ -217,7 +216,7 @@ fn heuristic_seed(
 
 pub fn search_implementations(
     egraph: &egraph_serialize::EGraph,
-    program: &LogicalProgram,
+    program: &SearchProgram,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
@@ -598,11 +597,20 @@ pub fn select_finalist_set(
     }
 }
 
+/// The program a search runs: its text, plus the boundary bindings the
+/// tensor-keyed caller data maps through.
+#[derive(Debug, Clone)]
+pub struct SearchProgram {
+    pub text: String,
+    pub inputs: Vec<crate::bindings::Bound>,
+    pub outputs: Vec<crate::bindings::Bound>,
+}
+
 #[derive(Debug)]
 pub struct BucketPlan {
     pub ranges: BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     pub representative: luminal::shape::DynMap,
-    pub program: LogicalProgram,
+    pub program: SearchProgram,
     pub outcome: SearchOutcome,
     pub plan: crate::layouts::MetalPlan,
     pub finalist_rank: usize,
@@ -611,12 +619,12 @@ pub struct BucketPlan {
 
 pub struct BucketAssembly<'a> {
     pub assembled_program: &'a str,
-    pub pre_schedule: &'a str,
+    pub prefix: &'a str,
     pub binding_seeds: &'a str,
     pub schedule: &'a str,
     pub post_checks: &'a str,
-    pub input_slots: &'a [luminal::graph::InputSlot],
-    pub output_slots: &'a [luminal::graph::OutputSlot],
+    pub inputs: &'a [crate::bindings::Bound],
+    pub outputs: &'a [crate::bindings::Bound],
     pub base_dims: &'a luminal::shape::DynMap,
     pub decoders: &'a luminal::egglog_utils::eclass::ConstructorRegistry,
 }
@@ -722,7 +730,7 @@ pub fn bucketed_search_implementations(
 type SearchedBucket = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
-    LogicalProgram,
+    SearchProgram,
     SearchOutcome,
 );
 
@@ -740,7 +748,7 @@ pub(crate) fn bucket_label(
 type BucketRender = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
-    LogicalProgram,
+    SearchProgram,
 );
 
 fn bucket_renders(
@@ -757,17 +765,17 @@ fn bucket_renders(
         }
         text
     };
-    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| LogicalProgram {
+    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| SearchProgram {
         text: format!(
             "{}{}{}{}{}",
-            assembly.pre_schedule,
+            assembly.prefix,
             assembly.binding_seeds,
             seeds_text(seeds),
             assembly.schedule,
             assembly.post_checks
         ),
-        input_slots: assembly.input_slots.to_vec(),
-        output_slots: assembly.output_slots.to_vec(),
+        inputs: assembly.inputs.to_vec(),
+        outputs: assembly.outputs.to_vec(),
     };
 
     let dims: Vec<&luminal::shape::Symbol> = dim_buckets.keys().collect();

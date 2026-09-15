@@ -9,10 +9,10 @@ use luminal_metal::{MetalRuntime, harness_search_options};
 fn rounding_ops_execute_on_device() {
     let mut g = Graph::new();
     let x = g.tensor(9, DType::F32);
-    let floor = x.floor().output();
-    let ceil = x.ceil().output();
-    let trunc = x.trunc().output();
-    let round = x.round().output();
+    let floor = x.floor();
+    let ceil = x.ceil();
+    let trunc = x.trunc();
+    let round = x.round();
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
@@ -48,7 +48,7 @@ fn rounding_ops_execute_on_device() {
 fn trunc_cast_executes_on_device() {
     let mut g = Graph::new();
     let x = g.tensor(6, DType::F32);
-    let out = x.trunc_cast(DType::Int).output();
+    let out = x.trunc_cast(DType::Int);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
