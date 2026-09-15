@@ -220,7 +220,7 @@ fn transpose_consumer_folds_and_carries_the_swap_map() {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 3usize), DType::F32);
     let c = cx.tensor((3usize, 2usize), DType::F32);
-    let _out = (x.permute((1, 0)) * c).output();
+    let _out = x.permute((1, 0)) * c;
 
     let (rt, egraph) = saturated(&cx);
     let view = EGraphView::new(&egraph, rt.decoders());
@@ -249,7 +249,7 @@ fn slice_consumer_folds_and_carries_the_offset_map() {
     let mut cx = Graph::new();
     let x = cx.tensor((4usize, 6usize), DType::F32);
     let c = cx.tensor((2usize, 6usize), DType::F32);
-    let _out = (x.slice((1..3, ..)) * c).output();
+    let _out = x.slice((1..3, ..)) * c;
 
     let (rt, egraph) = saturated(&cx);
     let view = EGraphView::new(&egraph, rt.decoders());
@@ -277,7 +277,7 @@ fn broadcast_consumer_folds_and_carries_the_stride0_map() {
     let mut cx = Graph::new();
     let x = cx.tensor(3usize, DType::F32);
     let c = cx.tensor((2usize, 3usize), DType::F32);
-    let _out = (x.expand_dim(0, 2) * c).output();
+    let _out = x.expand_dim(0, 2) * c;
 
     let (rt, egraph) = saturated(&cx);
     let view = EGraphView::new(&egraph, rt.decoders());
@@ -307,7 +307,7 @@ fn chained_matmul_folds_all_movement() {
     let a = cx.tensor((2usize, 3usize), DType::F32);
     let b = cx.tensor((3usize, 4usize), DType::F32);
     let c = cx.tensor((4usize, 2usize), DType::F32);
-    let _out = a.matmul(b).matmul(c).output();
+    let _out = a.matmul(b).matmul(c);
 
     let (rt, egraph) = saturated(&cx);
     let view = EGraphView::new(&egraph, rt.decoders());

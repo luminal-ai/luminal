@@ -17,8 +17,8 @@ pub(crate) fn plan_resident(
     bindings: &crate::resident::ResidentBindings,
 ) -> Result<ArenaPlan> {
     // Output slots whose buffer IS a resident input are mutation sinks:
-    // `.output_into()` pinned them to the input's buffer, so their writes
-    // already land in the arena home and they reserve no pinned staging.
+    // the binding put them on the input's buffer, so their writes already
+    // land in the arena home and they reserve no pinned staging.
     let device_outputs: std::collections::BTreeSet<usize> = plan
         .dag
         .node_weights()

@@ -61,7 +61,6 @@ fn mini_llama3_fixture() -> MiniLlama3Fixture {
     let caches = vec![(k_cache, v_cache)];
     let (logits, _caches_out) =
         model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
-    let logits = logits.output();
 
     let block = &model.blocks[0];
     let floats: Vec<(NodeIndex, Vec<f32>)> = vec![

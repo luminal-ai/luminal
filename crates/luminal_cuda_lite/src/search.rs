@@ -49,7 +49,6 @@ use rand::rngs::StdRng;
 
 use crate::extractor::{self, Genome};
 use luminal::bufferize::BufferIrGraph;
-use luminal::graph::LogicalProgram;
 use luminal::prelude::FxHashMap;
 use luminal::prelude::egraph_serialize;
 
@@ -330,7 +329,7 @@ enum Priced {
 #[cfg_attr(not(feature = "device"), allow(unused_mut))]
 pub fn search_implementations(
     egraph: &egraph_serialize::EGraph,
-    program: &LogicalProgram,
+    program: &SearchProgram,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
@@ -827,6 +826,15 @@ pub fn select_finalist_set(
     Ok((selected, rejections))
 }
 
+/// The program a search runs: its text, plus the boundary bindings the
+/// tensor-keyed caller data maps through.
+#[derive(Debug, Clone)]
+pub struct SearchProgram {
+    pub text: String,
+    pub inputs: Vec<crate::bindings::Bound>,
+    pub outputs: Vec<crate::bindings::Bound>,
+}
+
 /// One bucket combination's finished search: the dim ranges it covers, the
 /// representative pins it was searched at, and the plan the bucket
 /// lattice INSTALLED for it.
@@ -834,7 +842,7 @@ pub fn select_finalist_set(
 pub struct BucketPlan {
     pub ranges: BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     pub representative: luminal::shape::DynMap,
-    pub program: LogicalProgram,
+    pub program: SearchProgram,
     /// This bucket's own genetic search — its winner, its accounting,
     /// its ranked finalists. It is the SEARCH's report and is left
     /// exactly as the search wrote it.
@@ -860,8 +868,8 @@ pub struct BucketPlan {
 pub struct BucketAssembly<'a> {
     /// The runtime's assembled egglog preamble (matchers + registry).
     pub assembled_program: &'a str,
-    /// The recorded model, before the schedule.
-    pub pre_schedule: &'a str,
+    /// The bound program before the schedule: model text plus boundary.
+    pub prefix: &'a str,
     /// The caller's own `bind_*` seeds — for the dims that are NOT
     /// bucketed. Buckets and range bindings refuse each other in BOTH
     /// orders (a range-bound dim is refused buckets, a bucketed dim is
@@ -875,8 +883,8 @@ pub struct BucketAssembly<'a> {
     /// the WHOLE interval, not merely at the representative (Austin,
     /// 2026-09-03).
     pub post_checks: &'a str,
-    pub input_slots: &'a [luminal::graph::InputSlot],
-    pub output_slots: &'a [luminal::graph::OutputSlot],
+    pub inputs: &'a [crate::bindings::Bound],
+    pub outputs: &'a [crate::bindings::Bound],
     /// Values for profiling non-bucket dimensions. These never narrow the
     /// range facts already present in binding_seeds.
     pub base_dims: &'a luminal::shape::DynMap,
@@ -991,7 +999,7 @@ pub fn bucketed_search_implementations(
 type SearchedBucket = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
-    LogicalProgram,
+    SearchProgram,
     SearchOutcome,
 );
 
@@ -1012,7 +1020,7 @@ pub(crate) fn bucket_label(
 type BucketRender = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
-    LogicalProgram,
+    SearchProgram,
 );
 
 fn bucket_renders(
@@ -1029,17 +1037,17 @@ fn bucket_renders(
         }
         text
     };
-    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| LogicalProgram {
+    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| SearchProgram {
         text: format!(
             "{}{}{}{}{}",
-            assembly.pre_schedule,
+            assembly.prefix,
             assembly.binding_seeds,
             seeds_text(seeds),
             assembly.schedule,
             assembly.post_checks
         ),
-        input_slots: assembly.input_slots.to_vec(),
-        output_slots: assembly.output_slots.to_vec(),
+        inputs: assembly.inputs.to_vec(),
+        outputs: assembly.outputs.to_vec(),
     };
 
     // Cartesian combinations, dims in sorted order.

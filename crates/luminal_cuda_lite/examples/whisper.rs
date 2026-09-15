@@ -41,7 +41,6 @@ fn run() -> anyhow::Result<()> {
     );
     let encoded = model.encode(mel);
     let (logits, _) = model.decode_step(token, q_pos, encoded, &pool, gather_idx, scatter_idx);
-    let logits = logits.output();
 
     let mut runtime_inputs = vec![
         (

@@ -4,7 +4,8 @@
 //! delegated to the `device` module.
 //!
 //! Everything up to `execute` is device-free BY DEFAULT and runs
-//! anywhere: load accumulates the native program parts, bind_* appends
+//! anywhere: load states this runtime's boundary ([`crate::bindings`])
+//! and captures the bound program, bind_* appends
 //! bounds seeds, search assembles + saturates + runs THIS crate's
 //! genetic search ([`crate::search`]) with OUR allow list, ranking
 //! candidates by the device-free heuristic ([`crate::heuristic`] — a
@@ -26,15 +27,11 @@ use luminal::layouts::DecodedLayout;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal::shape;
 
-/// The accumulated pre-search program parts (the reference runtime's
-/// NativeSpec is private; this is the same accumulation rebuilt from
-/// the public `bound_parts` seam).
+/// What `load` captured: the bound program (model text, this runtime's
+/// boundary, the post-schedule checks) plus whatever the `bind_*` calls
+/// accumulate before `search` assembles and saturates.
 struct NativeParts {
-    pre_schedule: String,
-    input_slots: Vec<graph::InputSlot>,
-    output_slots: Vec<graph::OutputSlot>,
-    post_checks: String,
-    labeled_checks: Vec<(String, String)>,
+    bound: crate::bindings::BoundProgram,
     binding_seeds: String,
 }
 
@@ -71,6 +68,8 @@ pub struct CudaRuntime {
     plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Host-staged input payloads by BufferLit id, H2D'd at execute.
     staged: FxHashMap<i64, HostBuffer>,
+    /// The buffers the device arena keeps between executions, stated by
+    /// the input bindings at load ([`crate::bindings::Placement`]).
     residents: crate::resident::ResidentBindings,
     device_budget_bytes: Option<usize>,
     /// Host copies of each output slot's BACKING buffer plus its elected
@@ -79,8 +78,11 @@ pub struct CudaRuntime {
     /// allocation with no BufferLit, so slot order is the stable key).
     outputs_host: FxHashMap<usize, (HostBuffer, luminal::bufferize::OutputBinding<DecodedLayout>)>,
     input_buffers: FxHashMap<NodeIndex, i64>,
-    /// Bound output tensor → its slot index (program slot order).
-    output_index: FxHashMap<NodeIndex, usize>,
+    /// Bound output tensor → its slot indices, in binding order. A value
+    /// bound on two buffers has two slots and is read back by slot, not
+    /// by tensor: [`Self::output_slot_index`] refuses the ambiguity
+    /// rather than picking one.
+    output_slots: FxHashMap<NodeIndex, Vec<usize>>,
     /// BUCKETS (D7, 2026-09-03): per-dim intervals one search covers.
     /// Empty = the ordinary single-pin ladder, unchanged.
     dim_buckets: std::collections::BTreeMap<shape::Symbol, Vec<graph::DimBucket>>,
@@ -120,6 +122,10 @@ impl CudaRuntime {
     /// For the DECOMPOSED route on purpose (every matmul as CL's own
     /// multiply/reduce kernels), load with
     /// [`crate::ops::cuda_registry_without_cublaslt`].
+    ///
+    /// THE DEFAULT BINDING is dense: every input read-only and
+    /// host-staged on its own row-major buffer, every leaf read-write on
+    /// its own. [`CudaRuntime::load_with`] takes the caller's instead.
     pub fn load(graph: &graph::Graph) -> Result<Self> {
         Self::load_with_registry(graph, crate::ops::cuda_registry())
     }
@@ -150,10 +156,26 @@ impl CudaRuntime {
         graph: &graph::Graph,
         registry: Vec<crate::ops::RegisteredOp>,
     ) -> Result<Self> {
-        let (pre_schedule, input_slots, output_slots, post_checks, labeled_checks) = graph
-            .logical
-            .bound_parts(&crate::bindings::CudaBindings)
-            .map_err(|e| anyhow!(e))?;
+        Self::load_with(
+            graph,
+            crate::bindings::CudaBindings::leaves(&graph.logical),
+            registry,
+        )
+    }
+
+    /// LOAD a recorded graph under the CALLER's binding — which values
+    /// enter and leave, through which buffers, at which layout, and
+    /// which of them stay device-resident. The tensor→buffer maps are
+    /// live from here, so [`Self::set_data`] needs no search first, and
+    /// the resident set is known before the first plan is priced.
+    pub fn load_with(
+        graph: &graph::Graph,
+        bindings: crate::bindings::CudaBindings,
+        registry: Vec<crate::ops::RegisteredOp>,
+    ) -> Result<Self> {
+        let bound = bindings
+            .bind(&graph.logical)
+            .map_err(|reason| anyhow!("load refused: {reason}"))?;
         // THE FOUR cuBLASLt MARKER ROWS ARE ONE VOCABULARY. Only the
         // Base row emits snippets, and that one snippet set declares all
         // four constructors and every minting rule. A registry holding a
@@ -193,18 +215,27 @@ impl CudaRuntime {
         // matchers claim one `(sort, constructor)` — a registration bug,
         // named at load rather than at the first decode.
         let decoders = luminal::egglog_snippet::decoder_registry_for(&matchers)?;
+        // THE BOUNDARY MAPS ARE LIVE AT LOAD, not at search: which
+        // tensor stages onto which buffer, which slot reads a value
+        // back, and which buffers the arena keeps are all statements the
+        // bindings already made.
+        let input_buffers = bound.inputs.iter().map(|b| (b.value, b.buffer)).collect();
+        let mut output_slots: FxHashMap<NodeIndex, Vec<usize>> = FxHashMap::default();
+        for (index, bound) in bound.outputs.iter().enumerate() {
+            output_slots.entry(bound.value).or_default().push(index);
+        }
+        let residents = bound.residents();
         Ok(Self {
             native: Some(NativeParts {
-                pre_schedule,
-                input_slots,
-                output_slots,
-                post_checks,
-                labeled_checks,
+                bound,
                 binding_seeds: String::new(),
             }),
             matchers,
             allow,
             decoders,
+            input_buffers,
+            output_slots,
+            residents,
             ..Self::default()
         })
     }
@@ -232,6 +263,23 @@ impl CudaRuntime {
         &self.allow
     }
 
+    /// Refuse a reconfiguration that would throw away installed device
+    /// state. The arena slab holds the installed graphs and every
+    /// resident input's uploaded home, and anything that invalidates
+    /// plans releases it — so once the device is installed, a caller who
+    /// wants a different program wants a different runtime.
+    fn ensure_not_installed(&self, what: &str) -> Result<()> {
+        #[cfg(feature = "device")]
+        anyhow::ensure!(
+            self.device.as_ref().is_none_or(|d| !d.is_installed()),
+            "{what} after execution: create a new runtime — the device arena holds \
+             the installed plans and the resident inputs' data"
+        );
+        #[cfg(not(feature = "device"))]
+        let _ = what;
+        Ok(())
+    }
+
     fn invalidate_plans(&mut self) {
         self.plan = None;
         self.bucket_plans.clear();
@@ -251,10 +299,7 @@ impl CudaRuntime {
         lower: u64,
         upper: u64,
     ) -> Result<()> {
-        anyhow::ensure!(
-            self.residents.inputs.is_empty(),
-            "configure dimension bounds before residency"
-        );
+        self.ensure_not_installed("binding a dimension range")?;
         let name = var.into();
         let (lower, upper) = self
             .range_bound
@@ -306,10 +351,7 @@ impl CudaRuntime {
         dim: impl Into<shape::Symbol>,
         buckets: Vec<graph::DimBucket>,
     ) -> Result<()> {
-        anyhow::ensure!(
-            self.residents.inputs.is_empty(),
-            "configure dimension bounds before residency"
-        );
+        self.ensure_not_installed("binding dimension buckets")?;
         let dim = dim.into();
         anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
         if let Some((lo, hi)) = self.range_bound.get(&dim) {
@@ -434,22 +476,16 @@ impl CudaRuntime {
         &self,
     ) -> Result<(
         luminal::prelude::egraph_serialize::EGraph,
-        graph::LogicalProgram,
+        crate::search::SearchProgram,
     )> {
         let native = self
             .native
             .as_ref()
             .ok_or_else(|| anyhow!("load before search"))?;
-        let program = graph::LogicalProgram {
-            text: format!(
-                "{}{}{}{}",
-                native.pre_schedule,
-                native.binding_seeds,
-                crate::bindings::CudaBindings::SCHEDULE,
-                native.post_checks
-            ),
-            input_slots: native.input_slots.clone(),
-            output_slots: native.output_slots.clone(),
+        let program = crate::search::SearchProgram {
+            text: native.bound.text_with_seeds(&native.binding_seeds),
+            inputs: native.bound.inputs.clone(),
+            outputs: native.bound.outputs.clone(),
         };
         let full = format!(
             "{}\n\n{}",
@@ -462,15 +498,15 @@ impl CudaRuntime {
             // labeled check alone.
             let mut doors = Vec::new();
             let unchecked = format!(
-                "{}\n\n{}\n{}\n{}",
+                "{}\n\n{}",
                 luminal::egglog_snippet::assembled_program_for(self.matchers()),
-                native.pre_schedule,
-                native.binding_seeds,
-                crate::bindings::CudaBindings::SCHEDULE
+                native
+                    .bound
+                    .text_unchecked_with_seeds(&native.binding_seeds)
             );
             let mut probe = luminal::egglog_snippet::new_egraph();
             if probe.parse_and_run_program(None, &unchecked).is_ok() {
-                for (label, text) in &native.labeled_checks {
+                for (label, text) in &native.bound.labeled_checks {
                     if probe.parse_and_run_program(None, text).is_err() {
                         doors.push(label.clone());
                     }
@@ -501,10 +537,7 @@ impl CudaRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
-        anyhow::ensure!(
-            self.residents.inputs.is_empty(),
-            "create a new runtime to re-search a resident program"
-        );
+        self.ensure_not_installed("re-searching")?;
         self.invalidate_plans();
         let mut resolved_options = options.clone();
         resolved_options.shapes.bounds = self
@@ -534,13 +567,11 @@ impl CudaRuntime {
         // nothing staged, while device profiling (Phase 4) executes each
         // candidate and needs exactly these bytes.
         //
-        // The slot list is the LOAD-TIME one, `native.input_slots` — the
-        // same list a rendered program's `input_slots` is cloned from, and
-        // the one the bucketed ladder has, which renders no base program
-        // at all.
+        // The binding list is the LOAD-TIME one, which the bucketed
+        // ladder also has — it renders no base program at all.
         for tensor in input_data.keys() {
             assert!(
-                native.input_slots.iter().any(|slot| slot.tensor == *tensor),
+                native.bound.inputs.iter().any(|b| b.value == *tensor),
                 "tensor {tensor:?} is not a bound input"
             );
         }
@@ -559,9 +590,14 @@ impl CudaRuntime {
         #[cfg(feature = "device")]
         let staged_for_search: FxHashMap<i64, &HostBuffer> = if options.profile_on_device {
             native
-                .input_slots
+                .bound
+                .inputs
                 .iter()
-                .filter_map(|slot| input_data.get(&slot.tensor).map(|data| (slot.buffer, data)))
+                .filter_map(|bound| {
+                    input_data
+                        .get(&bound.value)
+                        .map(|data| (bound.buffer, data))
+                })
                 .collect()
         } else {
             FxHashMap::default()
@@ -675,12 +711,12 @@ impl CudaRuntime {
             // changes the dim seeds, never the payloads.
             let assembly = crate::search::BucketAssembly {
                 assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
-                pre_schedule: &native.pre_schedule,
+                prefix: &native.bound.prefix,
                 binding_seeds: &native.binding_seeds,
                 schedule: crate::bindings::CudaBindings::SCHEDULE,
-                post_checks: &native.post_checks,
-                input_slots: &native.input_slots,
-                output_slots: &native.output_slots,
+                post_checks: &native.bound.post_checks,
+                inputs: &native.bound.inputs,
+                outputs: &native.bound.outputs,
                 base_dims: &options.shapes.values,
                 decoders: &self.decoders,
             };
@@ -701,22 +737,9 @@ impl CudaRuntime {
         self.device_budget_bytes = options.device_budget_bytes;
         self.bucket_plans = searched_buckets;
         self.selected_bucket = None;
-
-        let native = self
-            .native
-            .as_ref()
-            .ok_or_else(|| anyhow!("load before search"))?;
-        self.input_buffers = native
-            .input_slots
-            .iter()
-            .map(|slot| (slot.tensor, slot.buffer))
-            .collect();
-        self.output_index = native
-            .output_slots
-            .iter()
-            .enumerate()
-            .map(|(index, slot)| (slot.tensor, index))
-            .collect();
+        // The tensor→buffer and tensor→slot maps were built at LOAD from
+        // the same bindings every bucket renders; a search changes which
+        // implementation runs, never which value crosses where.
         if let Some(plan) = unbucketed_plan {
             // THE LATTICE'S CHOICE, not `outcome.best_plan` (Phase 5).
             // Unconstrained they are the same plan — the rank-0 finalist
@@ -731,6 +754,12 @@ impl CudaRuntime {
         Ok(outcome)
     }
 
+    /// The buffers the bindings declared device-resident — the arena's
+    /// homes, readable on any host.
+    pub fn residents(&self) -> &std::collections::BTreeSet<i64> {
+        &self.residents.inputs
+    }
+
     /// Resolve public graph handles to this compiled program's boundary IDs.
     pub fn input_buffer(&self, tensor: NodeIndex) -> Result<i64> {
         self.input_buffers
@@ -738,30 +767,19 @@ impl CudaRuntime {
             .copied()
             .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))
     }
+    /// The output slot a value is read back through. A value bound as an
+    /// output on TWO buffers has two slots and no answer here: the
+    /// ambiguity is refused by name rather than resolved first-wins.
     pub fn output_slot_index(&self, tensor: NodeIndex) -> Result<usize> {
-        self.output_index
-            .get(&tensor)
-            .copied()
-            .ok_or_else(|| anyhow!("no output binding for {tensor:?}"))
-    }
-
-    /// Keep this input in the shared device arena between executions. Its
-    /// shape must be static. A `.output_into()` output targeting this input
-    /// shares its buffer, so the mutation lands in the arena home and is
-    /// neither copied nor read back. Call after search and before the first
-    /// execute; set_data uploads it only when changed.
-    pub fn retain_input(&mut self, tensor: NodeIndex) -> Result<()> {
-        #[cfg(feature = "device")]
-        anyhow::ensure!(
-            self.device.as_ref().is_none_or(|d| !d.is_installed()),
-            "configure residency before execution"
-        );
-        let lit = *self
-            .input_buffers
-            .get(&tensor)
-            .ok_or_else(|| anyhow!("no input binding for {tensor:?}"))?;
-        self.residents.inputs.insert(lit);
-        Ok(())
+        match self.output_slots.get(&tensor).map(Vec::as_slice) {
+            Some([index]) => Ok(*index),
+            Some(many) => bail!(
+                "{tensor:?} is bound as an output on {} buffers (slots {many:?}); \
+                 read it back by slot, not by tensor",
+                many.len()
+            ),
+            _ => bail!("no output binding for {tensor:?}"),
+        }
     }
 
     /// Stage input payload for a bound tensor (host side; H2D happens
@@ -900,11 +918,8 @@ impl CudaRuntime {
         &HostBuffer,
         &luminal::bufferize::OutputBinding<DecodedLayout>,
     )> {
-        let index = self
-            .output_index
-            .get(&tensor)
-            .ok_or_else(|| anyhow!("tensor has no output binding"))?;
-        match self.outputs_host.get(index) {
+        let index = self.output_slot_index(tensor)?;
+        match self.outputs_host.get(&index) {
             Some((data, binding)) => Ok((data, binding)),
             None => bail!("execute before fetch"),
         }

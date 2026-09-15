@@ -27,7 +27,7 @@ fn conv_example_graph_searches_with_zero_refusals() {
     let mut cx = Graph::new();
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
     let x = cx.tensor((1, 1, 5, 5), DType::F32);
-    let out = model.forward(x).output();
+    let out = model.forward(x);
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (x.id, weights(25, 1).into()),
         (model.conv1.weight.id, weights(18, 2).into()),

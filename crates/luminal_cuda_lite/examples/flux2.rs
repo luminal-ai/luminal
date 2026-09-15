@@ -39,9 +39,7 @@ fn run() -> anyhow::Result<()> {
     let rope_sin = cx.tensor((TOKENS, HEAD_DIM), DType::F32);
     let timestep = cx.tensor(1, DType::F32);
     let guidance = cx.tensor(1, DType::F32);
-    let velocity = model
-        .forward(latent, text, rope_cos, rope_sin, timestep, guidance)
-        .output();
+    let velocity = model.forward(latent, text, rope_cos, rope_sin, timestep, guidance);
 
     let (cos, sin) = build_rope_tables(TEXT_TOKENS, IMAGE_HEIGHT, IMAGE_WIDTH);
     let pairs = support::device::seeded_graph_inputs(

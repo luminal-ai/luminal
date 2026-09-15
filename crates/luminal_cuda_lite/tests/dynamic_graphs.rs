@@ -12,7 +12,7 @@ fn bucket_switches_overlay_one_arena_and_replay_cached_graphs() {
     let mut g = Graph::new();
     let x = g.tensor(('a', 2), DType::F32);
     let y = g.tensor(('a', 2), DType::F32);
-    let out = (x * y + x).output();
+    let out = x * y + x;
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
         .unwrap();
@@ -50,7 +50,7 @@ fn bucket_switches_overlay_one_arena_and_replay_cached_graphs() {
 fn metadata_only_dimension_change_patches_no_nodes() {
     let mut g = Graph::new();
     let a = IntExpr::from('a');
-    let out = g.iota(5, |c| c[0] + a).output();
+    let out = g.iota(5, |c| c[0] + a);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.bind_dyn_range('a', 1, 19).unwrap();
     rt.search(&Default::default(), &harness_search_options())
@@ -73,7 +73,7 @@ fn metadata_only_dimension_change_patches_no_nodes() {
 fn dynamic_transpose_and_reduction_use_live_strides() {
     let mut g = Graph::new();
     let x = g.tensor((3, 'a'), DType::F32);
-    let out = (x.permute((1, 0)) + 1.).sum(0).output();
+    let out = (x.permute((1, 0)) + 1.).sum(0);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.bind_dyn_range('a', 2, 11).unwrap();
     rt.search(&Default::default(), &harness_search_options())
@@ -101,7 +101,7 @@ fn cublas_geometry_changes_refresh_child_and_reuse_capture() {
     let mut g = Graph::new();
     let a = g.tensor(('m', 'k'), DType::F32);
     let b = g.tensor(('k', 'n'), DType::F32);
-    let out = a.matmul(b).output();
+    let out = a.matmul(b);
     let mut rt = CudaRuntime::load(&g).unwrap();
     for s in ['m', 'k', 'n'] {
         rt.bind_dyn_range(s, 2, 12).unwrap();
@@ -143,7 +143,7 @@ fn cublas_geometry_changes_refresh_child_and_reuse_capture() {
 fn profiling_and_serving_share_dynamic_graph_execution() {
     let mut g = Graph::new();
     let x = g.tensor('a', DType::F32);
-    let out = (x + 2.).output();
+    let out = x + 2.;
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
         .unwrap();
@@ -165,7 +165,7 @@ fn profiling_and_serving_share_dynamic_graph_execution() {
 fn zero_extents_disable_copies_and_restore_them() {
     let mut g = Graph::new();
     let x = g.tensor('a', DType::F32);
-    let out = (x + 3.).output();
+    let out = x + 3.;
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.bind_dyn_range('a', 0, 9).unwrap();
     rt.search(&Default::default(), &harness_search_options())
@@ -186,8 +186,8 @@ fn gather_scatter_update_symbolic_coordinates() {
     let rows = g.tensor('a', DType::Int);
     let cols = g.iota(('a', 3), |c| c[1]);
     let coords = [rows.expand_dim(1, 3), cols];
-    let gathered = data.gather(&coords).output();
-    let scattered = (data * 0.).scatter(&coords, data + 1.).output();
+    let gathered = data.gather(&coords);
+    let scattered = (data * 0.).scatter(&coords, data + 1.);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.bind_dyn_range('a', 2, 9).unwrap();
     let mut opts = harness_search_options();
@@ -220,7 +220,7 @@ fn installing_larger_plan_invalidates_graphs_before_arena_growth() {
     use luminal_cuda_lite::device::CudaDevice;
     fn plan(n: usize) -> luminal_cuda_lite::CudaPlan {
         let mut g = Graph::new();
-        g.iota(n, |c| c[0]).output();
+        let _ = g.iota(n, |c| c[0]);
         let mut rt = CudaRuntime::load(&g).unwrap();
         rt.search(&Default::default(), &harness_search_options())
             .unwrap();
@@ -258,7 +258,7 @@ fn ceil_division_in_dynamic_iota_is_evaluated_on_device() {
     use luminal_cuda_lite::ops::iota::IotaDps;
     let mut g = Graph::new();
     let a = IntExpr::from('a');
-    g.iota(7, |c| c[0] + a).output();
+    let _ = g.iota(7, |c| c[0] + a);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.bind_dyn_range('a', 1, 12).unwrap();
     rt.search(&Default::default(), &harness_search_options())
@@ -303,7 +303,7 @@ fn ceil_division_in_dynamic_iota_is_evaluated_on_device() {
 fn bucketed_and_range_bound_dimensions_both_stay_symbolic() {
     let mut g = Graph::new();
     let x = g.tensor(('a', 'b'), DType::F32);
-    let out = (x + 1.).output();
+    let out = x + 1.;
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.bind_dyn_range('b', 2, 8).unwrap();
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
@@ -327,7 +327,7 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
     let a = g.tensor(('m', 4), DType::F32);
     let b = g.tensor((4, 'n'), DType::F32);
     let bias = g.tensor('n', DType::F32);
-    let out = (a.matmul(b) + bias.expand_dim(0, 'm')).relu().output();
+    let out = (a.matmul(b) + bias.expand_dim(0, 'm')).relu();
     let mut rt = CudaRuntime::load(&g).unwrap();
     for s in ['m', 'n'] {
         rt.bind_dyn_range(s, 2, 9).unwrap();
