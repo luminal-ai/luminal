@@ -470,6 +470,50 @@ fn a_row_major_output_bound_external_plans() {
         .expect("the elected slot sits on the bound buffer");
 }
 
+/// A ZERO EXTENT AT TORCH'S OWN CONTIGUOUS CHAIN: torch's running
+/// product multiplies by `max(size, 1)`, so a contiguous (4, 0) arrives
+/// at [1, 1]; the preamble's right-major fold multiplies by the raw
+/// extent and renders [0, 1]. They differ on the axis OUTSIDE the empty
+/// one, whose coordinate is not zero, so the bound chain is no
+/// contiguous spelling — and only a contiguous spelling certifies a
+/// destination injective. The search answers by naming the output and
+/// the layout it is bound at, exactly as it does for a left-major
+/// destination; at the chain the preamble itself renders, the same
+/// empty output plans.
+#[test]
+fn a_zero_extent_output_at_torchs_contiguous_chain_is_named_by_the_search() {
+    let plan_at = |strides: [i64; 2]| {
+        let mut cx = Graph::new();
+        let a = cx.tensor((4usize, 0usize), DType::F32);
+        let b = cx.tensor((4usize, 0usize), DType::F32);
+        let out = a + b;
+
+        let mut bindings = CudaBindings::new();
+        bindings.input_external(a.id);
+        bindings.input_external(b.id);
+        bindings.output_external_with(out.id, BoundaryLayout::strided_literal(strides));
+        let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+            .expect("an empty bound output loads");
+        let result = rt
+            .search(&Default::default(), &harness_search_options())
+            .map(|_| ());
+        (out.id, result)
+    };
+
+    let (out, refused) = plan_at([1, 1]);
+    let refusal = match refused {
+        Ok(()) => panic!("torch's zero-extent chain is no contiguous spelling here"),
+        Err(refusal) => format!("{refusal:#}"),
+    };
+    assert!(
+        refusal.contains(&format!("v{}", out.index())) && refusal.contains("[1, 1]"),
+        "the refusal must name the output and its bound chain: {refusal}"
+    );
+
+    let (_, rendered) = plan_at([0, 1]);
+    rendered.expect("the preamble's own right-major rendering of (4, 0) plans");
+}
+
 /// A SYMBOLIC STRIDE ON A USER-VISIBLE OUTPUT ROUND-TRIPS THROUGH BIND:
 /// the output's element layout reaches the preamble as the dim itself,
 /// so the caller's declared strides stay a statement over the program's

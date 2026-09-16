@@ -77,11 +77,16 @@ def _reads_as_plain_storage(value: Any) -> bool:
     """A torch tensor whose sizes and strides describe its own storage: a
     tensor, a parameter, or the exported program's fake stand-in for one.
     A subclass carrying semantics of its own — a distributed, masked or
-    nested tensor — describes something else."""
+    nested tensor — describes something else.
+
+    Asked by EXACT type: ``isinstance(t, torch.nn.Parameter)`` is true of
+    any tensor carrying ``_is_param``, which is how a custom subclass
+    becomes a parameter while staying that subclass.
+    """
     # Imported here because the fake tensor lives in a private torch module.
     from torch._subclasses.fake_tensor import FakeTensor
 
-    return type(value) is torch.Tensor or isinstance(value, (torch.nn.Parameter, FakeTensor))
+    return type(value) in (torch.Tensor, torch.nn.Parameter, FakeTensor)
 
 
 def _refuse_unreadable(name: str, value: Any) -> None:

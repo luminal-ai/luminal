@@ -229,6 +229,27 @@ def test_a_tensor_subclass_is_refused_by_name():
         boundary.boundary_layout("w", torch.nn.Parameter(torch.empty(4, 4)))
 
 
+def test_a_parameter_of_a_custom_tensor_type_is_refused_by_name():
+    """``Parameter`` of a custom tensor type IS that custom type, flagged:
+    ``isinstance(t, torch.nn.Parameter)`` answers yes for any tensor
+    carrying ``_is_param`` while its sizes and strides still describe
+    something other than the storage a binding would name. The gate is the
+    exact type, so the subclass is refused naming itself."""
+
+    class _Exotic(torch.Tensor):
+        pass
+
+    exotic = torch.empty(4, 4).as_subclass(_Exotic)
+    exotic._is_param = True
+    assert isinstance(exotic, torch.nn.Parameter)
+
+    with pytest.raises(boundary.UnsupportedBoundary) as refusal:
+        boundary.boundary_layout("w", exotic)
+    message = str(refusal.value)
+    assert "w:" in message, message
+    assert "_Exotic" in message, message
+
+
 @pytest.mark.parametrize(
     ("shape", "strides"),
     [((4, 0), (1, 1)), ((0, 4), (4, 1)), ((2, 0, 3), (3, 3, 1))],
