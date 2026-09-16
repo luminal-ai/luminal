@@ -124,7 +124,9 @@ fn a_filtered_registry_withholds_the_op_and_the_search_refuses() {
     let err = narrowed
         .search(&data, &harness_search_options())
         .expect_err("a graph that needs add must not plan without the add op");
-    let text = err.to_string();
+    // The whole chain: the runtime names the bound outputs, the search names
+    // the blockage.
+    let text = format!("{err:#}");
     assert!(
         text.contains("no candidate genome produced an executable plan"),
         "the refusal must be the search's exhaustion, got: {text}"
