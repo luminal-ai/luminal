@@ -1,6 +1,7 @@
-; TruncRemFunctionalGeneric — Int, PROOF-GATED (non-wrapping ruling 2026-08-11):
-; mints only where the value-bounds lattice proves the result in width
-; AND the divisor's bounds exclude zero (fail-closed: no facts, no fire).
+; TruncRemFunctionalGeneric — Int. The result WRAPS and mints unproven
+; (LUM-833, temporary: torch wraps at every width; the gate returns with
+; provenance, LUM-802). The divisor's bounds must still exclude zero
+; (fail-closed: no facts, no fire).
 (rule
   (
     (= ?in1_layout_tensor (LayoutTensorLit ?in1_logical ?in1_layout))
@@ -14,10 +15,6 @@
     (= ?out_logical (LogicalTruncRem ?in1_logical ?in2_logical))
     (= (injectivity-of ?out_layout_tensor) (Injective))
     (= (dtype-of ?out_logical) (Int))
-    (= ?lo (value-lower-bound-of ?out_logical))
-    (= ?hi (value-upper-bound-of ?out_logical))
-    (>= ?lo (bigint -2147483648))
-    (<= ?hi (bigint 2147483647))
     (= ?div_lower (value-lower-bound-of ?in2_logical))
     (= ?div_upper (value-upper-bound-of ?in2_logical))
     (>= ?div_lower (bigint 1))
@@ -34,9 +31,10 @@
   :ruleset backend
 )
 
-; TruncRemFunctionalGeneric — Int, PROOF-GATED (non-wrapping ruling 2026-08-11):
-; mints only where the value-bounds lattice proves the result in width
-; AND the divisor's bounds exclude zero (fail-closed: no facts, no fire).
+; TruncRemFunctionalGeneric — Int. The result WRAPS and mints unproven
+; (LUM-833, temporary: torch wraps at every width; the gate returns with
+; provenance, LUM-802). The divisor's bounds must still exclude zero
+; (fail-closed: no facts, no fire).
 (rule
   (
     (= ?in1_layout_tensor (LayoutTensorLit ?in1_logical ?in1_layout))
@@ -50,10 +48,6 @@
     (= ?out_logical (LogicalTruncRem ?in1_logical ?in2_logical))
     (= (injectivity-of ?out_layout_tensor) (Injective))
     (= (dtype-of ?out_logical) (Int))
-    (= ?lo (value-lower-bound-of ?out_logical))
-    (= ?hi (value-upper-bound-of ?out_logical))
-    (>= ?lo (bigint -2147483648))
-    (<= ?hi (bigint 2147483647))
     (= ?div_lower (value-lower-bound-of ?in2_logical))
     (= ?div_upper (value-upper-bound-of ?in2_logical))
     (<= ?div_upper (bigint -1))
@@ -70,9 +64,10 @@
   :ruleset backend
 )
 
-; TruncRemFunctionalGeneric — Int64, PROOF-GATED (non-wrapping ruling 2026-08-11):
-; mints only where the value-bounds lattice proves the result in width
-; AND the divisor's bounds exclude zero (fail-closed: no facts, no fire).
+; TruncRemFunctionalGeneric — Int64. The result WRAPS and mints unproven
+; (LUM-833, temporary: torch wraps at every width; the gate returns with
+; provenance, LUM-802). The divisor's bounds must still exclude zero
+; (fail-closed: no facts, no fire).
 (rule
   (
     (= ?in1_layout_tensor (LayoutTensorLit ?in1_logical ?in1_layout))
@@ -86,10 +81,6 @@
     (= ?out_logical (LogicalTruncRem ?in1_logical ?in2_logical))
     (= (injectivity-of ?out_layout_tensor) (Injective))
     (= (dtype-of ?out_logical) (Int64))
-    (= ?lo (value-lower-bound-of ?out_logical))
-    (= ?hi (value-upper-bound-of ?out_logical))
-    (>= ?lo (bigint -9223372036854775808))
-    (<= ?hi (bigint 9223372036854775807))
     (= ?div_lower (value-lower-bound-of ?in2_logical))
     (= ?div_upper (value-upper-bound-of ?in2_logical))
     (>= ?div_lower (bigint 1))
@@ -106,9 +97,10 @@
   :ruleset backend
 )
 
-; TruncRemFunctionalGeneric — Int64, PROOF-GATED (non-wrapping ruling 2026-08-11):
-; mints only where the value-bounds lattice proves the result in width
-; AND the divisor's bounds exclude zero (fail-closed: no facts, no fire).
+; TruncRemFunctionalGeneric — Int64. The result WRAPS and mints unproven
+; (LUM-833, temporary: torch wraps at every width; the gate returns with
+; provenance, LUM-802). The divisor's bounds must still exclude zero
+; (fail-closed: no facts, no fire).
 (rule
   (
     (= ?in1_layout_tensor (LayoutTensorLit ?in1_logical ?in1_layout))
@@ -122,10 +114,6 @@
     (= ?out_logical (LogicalTruncRem ?in1_logical ?in2_logical))
     (= (injectivity-of ?out_layout_tensor) (Injective))
     (= (dtype-of ?out_logical) (Int64))
-    (= ?lo (value-lower-bound-of ?out_logical))
-    (= ?hi (value-upper-bound-of ?out_logical))
-    (>= ?lo (bigint -9223372036854775808))
-    (<= ?hi (bigint 9223372036854775807))
     (= ?div_lower (value-lower-bound-of ?in2_logical))
     (= ?div_upper (value-upper-bound-of ?in2_logical))
     (<= ?div_upper (bigint -1))
