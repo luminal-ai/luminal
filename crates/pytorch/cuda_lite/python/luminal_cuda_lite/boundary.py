@@ -201,6 +201,19 @@ def layout_spec(layout: BoundaryLayout) -> tuple[str, tuple[str, ...]]:
     raise UnsupportedBoundary(f"{layout!r} is not a boundary layout")
 
 
+def layout_from_spec(name: str, tag: str, strides: Sequence[str]) -> BoundaryLayout:
+    """The same wire form read back: the layout the runtime says a
+    boundary is bound at, in the spelling it was declared in. A tag this
+    module does not model is an error naming the boundary."""
+    if tag == "row_major":
+        return RowMajor()
+    if tag == "column_major":
+        return ColumnMajor()
+    if tag == "strided":
+        return Strided(tuple(strides))
+    raise UnsupportedBoundary(f"{name}: unknown boundary layout {tag!r}")
+
+
 def buffer_nbytes(tensor: torch.Tensor) -> int:
     """Bytes the bound buffer spans, reachable from ``data_ptr()``: the
     last element the strides reach, plus one. The storage offset is
@@ -264,13 +277,15 @@ def call_dim_values(pairs: Sequence[tuple[Binding, torch.Tensor]]) -> dict[str, 
     return values
 
 
-def _declared_strides(
+def declared_strides(
     binding: Binding, shape: Sequence[int], dims: dict[str, int]
 ) -> tuple[int, ...]:
-    """The element strides the declared layout has at this call's shape.
-    A declared stride still naming a symbol after the call's dimensions
-    are substituted is refused by name: nothing downstream compares
-    strides, so an unresolved one would go unchecked."""
+    """The element strides the declared layout has at this call's shape:
+    what an output is allocated with, and what a call's tensors are
+    checked against. A declared stride still naming a symbol after the
+    call's dimensions are substituted is refused by name: nothing
+    downstream compares strides, so an unresolved one would go
+    unchecked."""
     if isinstance(binding.layout, RowMajor):
         return _row_major_strides(shape)
     if isinstance(binding.layout, ColumnMajor):
@@ -349,7 +364,7 @@ def check_binding(
                 f"{binding.name}: axis {axis} is declared {declared}, which this call's "
                 f"dimensions make {int(extent)}, but the tensor's extent is {size}"
             )
-    expected = _declared_strides(binding, shape, dims)
+    expected = declared_strides(binding, shape, dims)
     actual = tuple(int(stride) for stride in tensor.stride())
     for axis, (want, got, size) in enumerate(zip(expected, actual, shape)):
         if size <= 1 or want == got:

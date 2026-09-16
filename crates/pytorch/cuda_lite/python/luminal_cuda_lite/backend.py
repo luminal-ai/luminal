@@ -13,10 +13,14 @@ from the reference package rather than duplicated.
 DEVICE MODEL: every boundary tensor is the caller's own device memory.
 Its layout is recognized once at compile time (``boundary.py``) and
 declared to the runtime, which binds it on one buffer id; each call hands
-that buffer the tensor's address. Nothing is copied to the host and no
-layout is reinterpreted — a tensor the runtime cannot bind is refused by
-name. Aliasing has one spelling: two bindings naming one buffer id, which
-is how a writeback and the input it mutates share a pointer.
+that buffer the tensor's address. A user-visible output is bound at
+eager's exact strides — read from the same fake value the input layouts
+are read from — and allocated at them per call, so the tensor the caller
+receives is laid out the way the uncompiled program lays it out. Nothing
+is copied to the host and no layout is reinterpreted — a tensor the
+runtime cannot bind is refused by name. Aliasing has one spelling: two
+bindings naming one buffer id, which is how a writeback and the input it
+mutates share a pointer.
 
 STREAM AND ARENA: the runtime always launches captured CUDA graphs, which
 the legacy default stream cannot host, so it runs on a dedicated
@@ -47,6 +51,8 @@ from .boundary import (
     buffer_nbytes,
     call_dim_values,
     check_binding,
+    declared_strides,
+    layout_from_spec,
     layout_spec,
     storage_span,
 )
@@ -167,6 +173,62 @@ def _refuse_unbound_outputs(ep: Any) -> None:
         raise UnsupportedBoundary(
             f"output {name!r}: {kind.lower()} outputs are not declared to the runtime"
         )
+
+
+def _node_fakes(ep: Any) -> dict[str, Any]:
+    """The fake example value behind every graph node, by node name.
+
+    An output's layout is read from the same symbolic metadata an input's
+    is: sizes and strides in the exported program's own vocabulary, so a
+    stride shaped by a dynamic dimension states THAT dimension rather than
+    the number one example call happened to have.
+    """
+    fakes: dict[str, Any] = {}
+    for node in ep.graph_module.graph.nodes:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            fakes[node.name] = value
+    return fakes
+
+
+def _user_visible_outputs(ep: Any) -> list[tuple[str, Any]]:
+    """(graph output name, fake example value) for every output this
+    wrapper allocates, in export order.
+
+    A writeback is not one of them: it writes the storage of the input it
+    mutates and is bound at that input's layout, and a program that
+    returns the tensor it mutated returns THAT writeback — one output,
+    stated once.
+    """
+    fakes = _node_fakes(ep)
+    writebacks = {
+        spec.arg.name
+        for spec in ep.graph_signature.output_specs
+        if spec.kind.name == "USER_INPUT_MUTATION"
+    }
+    rows: list[tuple[str, Any]] = []
+    stated: set[str] = set()
+    for spec in ep.graph_signature.output_specs:
+        if spec.kind.name != "USER_OUTPUT":
+            continue
+        name = getattr(spec.arg, "name", None)
+        if name is None:
+            raise UnsupportedBoundary(
+                f"output {spec.target!r} is not a tensor, so no boundary layout states it"
+            )
+        # One value returned twice is one bound output: the same name, at
+        # the same layout, stated once.
+        if name in writebacks or name in stated:
+            continue
+        fake = fakes.get(name)
+        if fake is None:
+            raise UnsupportedBoundary(
+                f"output {name!r} carries no exported example value, so the layout eager "
+                "gives it cannot be read"
+            )
+        stated.add(name)
+        rows.append((name, fake))
+    return rows
 
 
 def _refuse_overlapping_writebacks(
@@ -344,19 +406,32 @@ class CompiledModel:
         # inputs are bound rather than caching them at compile time.
         output_shapes = self._graph.output_shapes
 
-        # Allocate every output that is not a writeback and bind it. A
-        # writeback's buffer IS its target input's, already addressed above.
-        # Allocate under the side stream so the caching allocator records the
-        # stream that will write them.
+        # Allocate every output that is not a writeback and bind it, AT THE
+        # STRIDES IT IS BOUND AT: the declared layout at this call's
+        # dimensions, which is what eager gives this output. A writeback's
+        # buffer IS its target input's, already addressed above. Allocate
+        # under the side stream so the caching allocator records the stream
+        # that will write them.
         with torch.cuda.stream(side):
             out_tensors: list[Optional[torch.Tensor]] = []
             for index, binding in enumerate(self._output_bindings):
                 if self._output_mutations[index] is not None:
                     out_tensors.append(None)
                     continue
-                tensor = torch.empty(
-                    tuple(output_shapes[index]), dtype=binding.dtype, device=device
-                )
+                shape = tuple(output_shapes[index])
+                if isinstance(binding.layout, RowMajor):
+                    tensor = torch.empty(shape, dtype=binding.dtype, device=device)
+                else:
+                    tensor = torch.empty_strided(
+                        shape,
+                        declared_strides(binding, shape, dims),
+                        dtype=binding.dtype,
+                        device=device,
+                    )
+                # The allocation is checked against the binding the runtime
+                # writes through — rank, extents, element strides — so a
+                # disagreement is refused by name rather than written past.
+                check_binding(binding, tensor, dims)
                 self._graph.set_device_ptr(
                     binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
                 )
@@ -551,15 +626,25 @@ def luminal_cuda_lite(
         for name, _, _, _ in rows:
             tag, strides = layout_spec(layouts[name])
             declared.append((name, tag, list(strides)))
+        # A user-visible output is declared at the layout EAGER gives it,
+        # recognized from the traced fake value exactly like an input: what
+        # the caller receives has the strides the uncompiled program hands
+        # back, never a row-major substitute.
+        returned = _user_visible_outputs(program)
+        out_shapes = {name: boundary_shape(fake) for name, fake in returned}
+        declared_outputs = []
+        for name, fake in returned:
+            tag, strides = layout_spec(boundary_layout(name, fake))
+            declared_outputs.append((name, tag, list(strides)))
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
-            graph = _luminal.compile(pt2_path, declared)
+            graph = _luminal.compile(pt2_path, declared, declared_outputs)
         tensors = {name: value for name, _, value, _ in rows}
-        return graph, tensors, layouts, shapes
+        return graph, tensors, layouts, shapes, out_shapes
 
     try:
-        graph, tensors, layouts, shapes = _save_and_compile(ep)
+        graph, tensors, layouts, shapes, out_shapes = _save_and_compile(ep)
     except RuntimeError as exc:
         # The translator lowers a fixed op set. Decomposing the exported graph
         # rewrites higher-level composites into primitives the translator
@@ -571,7 +656,7 @@ def luminal_cuda_lite(
             raise
         ep = ep.run_decompositions(_decomp_table())
         _lower_sym_sum(ep)
-        graph, tensors, layouts, shapes = _save_and_compile(ep)
+        graph, tensors, layouts, shapes, out_shapes = _save_and_compile(ep)
 
     # Every boundary row, not just the user inputs: a parameter tied to
     # another parameter is read-only aliasing and stays two buffers on one
@@ -607,22 +692,26 @@ def luminal_cuda_lite(
 
     graph.search(search_iterations)
 
-    # A writeback is declared at its target's layout; every other output is a
-    # tensor this wrapper allocates, so it is row-major by construction.
+    # The runtime states the layout every output was bound at: a
+    # user-visible one at eager's exact strides, a writeback at the layout
+    # of the input it mutates. The declared extents are the exported
+    # program's own — an ``int`` per literal axis, the program's symbol per
+    # dynamic one — so a call at a new extent is checked against what the
+    # program says, not against what the example call happened to have.
     output_bindings = [
         Binding(
             name,
             buffer,
             _torch_dtype(dtype_code),
-            tuple(shape),
-            layouts[mutation] if mutation is not None else RowMajor(),
+            shapes[mutation] if mutation is not None else out_shapes[name],
+            layout_from_spec(name, tag, strides),
         )
-        for name, buffer, dtype_code, shape, mutation in zip(
+        for name, buffer, dtype_code, mutation, (tag, strides) in zip(
             graph.output_names,
             graph.output_buffers,
             graph.output_dtypes,
-            graph.output_shapes,
             graph.output_mutations,
+            graph.output_layouts,
         )
     ]
     return CompiledModel(

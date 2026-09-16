@@ -9,7 +9,9 @@
 //! id per boundary tensor, the layout the caller recognized for it, and
 //! `Placement::External` — the storage is the caller's own live device
 //! allocation, never host-staged and never given an arena range. Aliasing has
-//! one spelling: a writeback binds on the buffer of the input it mutates.
+//! one spelling: a writeback binds on the buffer of the input it mutates. A
+//! user-visible output is bound at eager's exact strides, so the tensor the
+//! caller receives is laid out the way the uncompiled program lays it out.
 //! Python addresses buffers, not tensors: `set_device_ptr(buffer, ptr, bytes)`
 //! before each execution.
 //!
@@ -62,6 +64,10 @@ pub struct CompiledGraph {
     /// The buffer each translation output was bound on, by output index. A
     /// writeback repeats the buffer of the input it mutates.
     output_buffers: Vec<i64>,
+    /// The layout each translation output was bound at, by output index,
+    /// spelled the way the caller spelled it. A writeback repeats the row of
+    /// the input it mutates.
+    output_layouts: Vec<(String, Vec<String>)>,
     searched: bool,
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
@@ -185,6 +191,16 @@ impl CompiledGraph {
     #[getter]
     fn output_buffers(&self) -> Vec<i64> {
         self.output_buffers.clone()
+    }
+
+    /// The layout each output was bound at, aligned with `output_names`: the
+    /// tag and, for a strided layout, its element strides, in the spelling
+    /// the caller declared them in. A writeback repeats the row of the input
+    /// it mutates, so the caller reads one table for every output rather than
+    /// re-deriving which is which.
+    #[getter]
+    fn output_layouts(&self) -> Vec<(String, Vec<String>)> {
+        self.output_layouts.clone()
     }
 
     /// Record the concrete shapes of one call's inputs by graph name.
@@ -434,62 +450,103 @@ fn is_bare(dim: &IntExpr) -> bool {
     symbols.len() == 1 && *dim == IntExpr::from(symbols[0])
 }
 
-/// One boundary tensor's layout as the caller spelled it: a tag, plus the
-/// element strides a strided layout carries. A stride is a sympy `srepr`
-/// expression read against the translated program's own symbols, so a
-/// caller whose storage is shaped by a dynamic dimension states that
-/// dimension (`Symbol('s77')`) where a static one states a number
-/// (`Integer(4)`).
+/// One boundary tensor's layout as the caller spelled it: the parsed form
+/// the bindings carry, beside the spelling it arrived in. The spelling is
+/// kept because it is the caller's own vocabulary — `output_layouts` hands
+/// it back so Python rebuilds its binding in the terms it declared, rather
+/// than re-reading the runtime's rendering of the same expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredLayout {
+    layout: BoundaryLayout,
+    tag: String,
+    strides: Vec<String>,
+}
+
+impl DeclaredLayout {
+    /// The wire form: the tag and, for a strided layout, its element
+    /// strides.
+    fn spelling(&self) -> (String, Vec<String>) {
+        (self.tag.clone(), self.strides.clone())
+    }
+}
+
+/// Read one declared layout: a tag, plus the element strides a strided
+/// layout carries. A stride is a sympy `srepr` expression read against the
+/// translated program's own symbols, so a caller whose storage is shaped
+/// by a dynamic dimension states that dimension (`Symbol('s77')`) where a
+/// static one states a number (`Integer(4)`). `role` is the side of the
+/// boundary the row names, so a refusal says which.
 fn layout_of(
     translation: &Translation,
+    role: &str,
     name: &str,
     tag: &str,
     strides: &[String],
-) -> Result<BoundaryLayout> {
-    Ok(match tag {
+) -> Result<DeclaredLayout> {
+    let layout = match tag {
         "row_major" => BoundaryLayout::RowMajor,
         "column_major" => BoundaryLayout::ColumnMajor,
         "strided" => {
-            let strides = strides
+            let parsed = strides
                 .iter()
                 .enumerate()
                 .map(|(axis, stride)| {
                     parse_dim_expr(translation, stride)
-                        .with_context(|| format!("input {name:?}, stride on axis {axis}"))
+                        .with_context(|| format!("{role} {name:?}, stride on axis {axis}"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            BoundaryLayout::Strided { strides }
+            BoundaryLayout::Strided { strides: parsed }
         }
-        other => bail!("input {name:?}: unknown boundary layout {other:?}"),
+        other => bail!("{role} {name:?}: unknown boundary layout {other:?}"),
+    };
+    Ok(DeclaredLayout {
+        layout,
+        tag: tag.to_string(),
+        strides: strides.to_vec(),
     })
 }
 
-/// The caller's layout table, keyed by graph input name.
+/// The caller's layout table for one side of the boundary, keyed by graph
+/// name.
 fn layout_table(
     translation: &Translation,
+    role: &str,
     rows: &[(String, String, Vec<String>)],
-) -> Result<HashMap<String, BoundaryLayout>> {
+) -> Result<HashMap<String, DeclaredLayout>> {
     let mut table = HashMap::new();
     for (name, tag, strides) in rows {
-        let layout = layout_of(translation, name, tag, strides)?;
+        let layout = layout_of(translation, role, name, tag, strides)?;
         if table.insert(name.clone(), layout).is_some() {
-            bail!("input {name:?} was given two boundary layouts");
+            bail!("{role} {name:?} was given two boundary layouts");
         }
     }
     Ok(table)
 }
 
+/// A bound translated program: the bindings, the buffer each input and
+/// each output took, and the layout each output was bound at, spelled the
+/// way the caller spelled it.
+#[derive(Debug)]
+struct Boundary {
+    bindings: CudaBindings,
+    input_buffers: Vec<i64>,
+    output_buffers: Vec<i64>,
+    output_layouts: Vec<(String, Vec<String>)>,
+}
+
 /// The CUDA-lite boundary for a translated program: every input is the
 /// caller's live device memory, at the layout the caller recognized for it, on
-/// its own buffer; every output is a fresh caller-owned device buffer, except
-/// a writeback, which binds on the buffer of the input it mutates — two
-/// bindings naming one buffer id being the single spelling of aliasing.
-/// Returns the bindings and the buffer each input and each output took.
+/// its own buffer; every user-visible output is a fresh caller-owned device
+/// buffer at the layout the caller declared for it — eager's exact strides —
+/// except a writeback, which binds on the buffer of the input it mutates, at
+/// that input's layout — two bindings naming one buffer id being the single
+/// spelling of aliasing.
 fn bind(
     translation: &Translation,
-    layouts: &HashMap<String, BoundaryLayout>,
-) -> Result<(CudaBindings, Vec<i64>, Vec<i64>)> {
-    for name in layouts.keys() {
+    input_layouts: &HashMap<String, DeclaredLayout>,
+    output_layouts: &HashMap<String, DeclaredLayout>,
+) -> Result<Boundary> {
+    for name in input_layouts.keys() {
         ensure!(
             translation
                 .inputs
@@ -498,20 +555,38 @@ fn bind(
             "a boundary layout was declared for {name:?}, which is not a graph input"
         );
     }
+    for name in output_layouts.keys() {
+        let output = translation
+            .outputs
+            .iter()
+            .find(|output| &output.graph_name == name)
+            .ok_or_else(|| {
+                anyhow!("a boundary layout was declared for {name:?}, which is not a graph output")
+            })?;
+        // A writeback's layout is its target's, stated once on the input
+        // side; a second statement here could disagree with it.
+        if let Some(target) = &output.mutation_target {
+            bail!(
+                "a boundary layout was declared for output {name:?}, which writes back into \
+                 {target:?}: a writeback is bound at the layout of the input it mutates"
+            );
+        }
+    }
     let mut bindings = CudaBindings::new();
     let mut input_buffers = Vec::with_capacity(translation.inputs.len());
     for input in &translation.inputs {
-        let layout = layouts.get(&input.graph_name).ok_or_else(|| {
+        let layout = input_layouts.get(&input.graph_name).ok_or_else(|| {
             anyhow!(
                 "input {:?} has no declared boundary layout",
                 input.graph_name
             )
         })?;
-        input_buffers.push(bindings.input_external_with(input.tensor, layout.clone()));
+        input_buffers.push(bindings.input_external_with(input.tensor, layout.layout.clone()));
     }
     let mut output_buffers = Vec::with_capacity(translation.outputs.len());
+    let mut spellings = Vec::with_capacity(translation.outputs.len());
     for output in &translation.outputs {
-        let buffer = match &output.mutation_target {
+        let (buffer, layout) = match &output.mutation_target {
             Some(target) => {
                 let index = translation
                     .inputs
@@ -526,43 +601,63 @@ fn bind(
                 // A writeback writes the TARGET's storage, so it is bound at
                 // the target's layout and never reinterprets it. Whether any
                 // kernel writes that layout is the search's question.
-                let layout = layouts[target].clone();
+                let layout = input_layouts[target].clone();
                 let buffer = input_buffers[index];
                 // The caller's storage is written through: the shared buffer
                 // must say so.
                 bindings.declare(buffer, Access::ReadWrite, FreedBy::Caller);
-                bindings.output_on_with(output.tensor, buffer, layout);
-                buffer
+                bindings.output_on_with(output.tensor, buffer, layout.layout.clone());
+                (buffer, layout)
             }
-            None => bindings.output_external(output.tensor),
+            None => {
+                // A user-visible output is the caller's own fresh device
+                // allocation, laid out the way eager lays it out.
+                let layout = output_layouts.get(&output.graph_name).ok_or_else(|| {
+                    anyhow!(
+                        "output {:?} has no declared boundary layout",
+                        output.graph_name
+                    )
+                })?;
+                let buffer = bindings.output_external_with(output.tensor, layout.layout.clone());
+                (buffer, layout.clone())
+            }
         };
         output_buffers.push(buffer);
+        spellings.push(layout.spelling());
     }
-    Ok((bindings, input_buffers, output_buffers))
+    Ok(Boundary {
+        bindings,
+        input_buffers,
+        output_buffers,
+        output_layouts: spellings,
+    })
 }
 
 /// Parse, translate, and load a `.pt2` on the CUDA-lite runtime under the
-/// caller's boundary layouts: one `(graph input name, layout tag, element
-/// strides)` row per graph input, the tag being `row_major`, `column_major`
-/// or `strided`, and each stride a sympy `srepr` expression over the
-/// exported program's symbols.
+/// caller's boundary layouts: one `(graph name, layout tag, element strides)`
+/// row per graph input and per user-visible graph output, the tag being
+/// `row_major`, `column_major` or `strided`, and each stride a sympy `srepr`
+/// expression over the exported program's symbols. A writeback takes no row —
+/// it writes the storage of the input it mutates, at that input's layout.
 #[pyfunction]
 fn compile(
     pt2_path: &str,
     input_layouts: Vec<(String, String, Vec<String>)>,
+    output_layouts: Vec<(String, String, Vec<String>)>,
 ) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
     let translation = translate(&parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
-    let layouts = layout_table(&translation, &input_layouts).map_err(to_py)?;
-    let (bindings, input_buffers, output_buffers) = bind(&translation, &layouts)
+    let inputs = layout_table(&translation, "input", &input_layouts).map_err(to_py)?;
+    let outputs = layout_table(&translation, "output", &output_layouts).map_err(to_py)?;
+    let boundary = bind(&translation, &inputs, &outputs)
         .context("declaring the translated program's boundary")
         .map_err(to_py)?;
     let runtime = CudaRuntime::load_with(
         &translation.graph,
-        bindings,
+        boundary.bindings,
         luminal_cuda_lite::ops::cuda_registry(),
     )
     .context("loading the translated graph on the cuda-lite runtime")
@@ -570,8 +665,9 @@ fn compile(
     Ok(CompiledGraph {
         translation,
         runtime,
-        input_buffers,
-        output_buffers,
+        input_buffers: boundary.input_buffers,
+        output_buffers: boundary.output_buffers,
+        output_layouts: boundary.output_layouts,
         searched: false,
         dims,
     })
@@ -631,11 +727,37 @@ mod tests {
         }
     }
 
-    fn row_major(names: &[&str]) -> HashMap<String, BoundaryLayout> {
+    /// One declared row: the parsed layout beside the spelling it came in.
+    fn declared(layout: BoundaryLayout, tag: &str, strides: &[&str]) -> DeclaredLayout {
+        DeclaredLayout {
+            layout,
+            tag: tag.to_string(),
+            strides: strides.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    fn row_major(names: &[&str]) -> HashMap<String, DeclaredLayout> {
         names
             .iter()
-            .map(|name| ((*name).to_string(), BoundaryLayout::RowMajor))
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    declared(BoundaryLayout::RowMajor, "row_major", &[]),
+                )
+            })
             .collect()
+    }
+
+    /// A row-major row for every output the caller allocates — what a
+    /// contiguous eager output declares.
+    fn row_major_outputs(translation: &Translation) -> HashMap<String, DeclaredLayout> {
+        let names: Vec<&str> = translation
+            .outputs
+            .iter()
+            .filter(|output| output.mutation_target.is_none())
+            .map(|output| output.graph_name.as_str())
+            .collect();
+        row_major(&names)
     }
 
     /// A translation declaring one shape per named input — the spelling
@@ -705,25 +827,27 @@ mod tests {
         compiled_with(translation, &layouts)
     }
 
-    /// The same, under a stated layout table.
+    /// The same, under a stated input layout table; every output the
+    /// caller allocates is row-major.
     fn compiled_with(
         translation: Translation,
-        layouts: &HashMap<String, BoundaryLayout>,
+        layouts: &HashMap<String, DeclaredLayout>,
     ) -> CompiledGraph {
-        let (bindings, input_buffers, output_buffers) =
-            bind(&translation, layouts).expect("the synthetic boundary binds");
+        let outputs = row_major_outputs(&translation);
+        let boundary = bind(&translation, layouts, &outputs).expect("the synthetic boundary binds");
         let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
         let runtime = CudaRuntime::load_with(
             &translation.graph,
-            bindings,
+            boundary.bindings,
             luminal_cuda_lite::ops::cuda_registry_without_cublaslt(),
         )
         .expect("the synthetic program loads");
         CompiledGraph {
             translation,
             runtime,
-            input_buffers,
-            output_buffers,
+            input_buffers: boundary.input_buffers,
+            output_buffers: boundary.output_buffers,
+            output_layouts: boundary.output_layouts,
             searched: false,
             dims,
         }
@@ -866,16 +990,20 @@ mod tests {
     #[test]
     fn a_writeback_and_its_target_are_one_buffer() {
         let translation = translation(&["x"], Some("x"));
-        let (bindings, inputs, outputs) =
-            bind(&translation, &row_major(&["x"])).expect("writeback binds");
-        assert_eq!(outputs[0], inputs[0]);
-        assert_eq!(bindings.buffers()[&inputs[0]].access, Access::ReadWrite);
+        let boundary =
+            bind(&translation, &row_major(&["x"]), &HashMap::new()).expect("writeback binds");
+        assert_eq!(boundary.output_buffers[0], boundary.input_buffers[0]);
+        assert_eq!(
+            boundary.bindings.buffers()[&boundary.input_buffers[0]].access,
+            Access::ReadWrite
+        );
     }
 
     #[test]
     fn a_mutation_target_that_is_not_a_graph_input_is_refused() {
         let translation = translation(&["x"], Some("elsewhere"));
-        let err = bind(&translation, &row_major(&["x"])).expect_err("no such input");
+        let err =
+            bind(&translation, &row_major(&["x"]), &HashMap::new()).expect_err("no such input");
         assert!(
             format!("{err:#}").contains("mutates \"elsewhere\""),
             "{err:#}"
@@ -885,7 +1013,8 @@ mod tests {
     #[test]
     fn an_input_with_no_layout_row_is_refused() {
         let translation = translation(&["x", "y"], None);
-        let err = bind(&translation, &row_major(&["x"])).expect_err("y has no layout");
+        let outputs = row_major_outputs(&translation);
+        let err = bind(&translation, &row_major(&["x"]), &outputs).expect_err("y has no layout");
         assert!(
             format!("{err:#}").contains("input \"y\" has no declared boundary layout"),
             "{err:#}"
@@ -897,15 +1026,120 @@ mod tests {
     #[test]
     fn a_layout_row_for_a_non_input_is_refused() {
         let translation = translation(&["x"], None);
-        let err = bind(&translation, &row_major(&["x", "ghost"])).expect_err("no such input");
+        let outputs = row_major_outputs(&translation);
+        let err =
+            bind(&translation, &row_major(&["x", "ghost"]), &outputs).expect_err("no such input");
         assert!(format!("{err:#}").contains("\"ghost\""), "{err:#}");
+    }
+
+    /// AN OUTPUT IS BOUND AT THE LAYOUT THE CALLER DECLARED FOR IT, on its
+    /// own caller-owned buffer: the tensor handed back carries eager's
+    /// strides, never a row-major substitute.
+    #[test]
+    fn an_output_binds_external_at_its_declared_layout() {
+        let translation = translation(&["x"], None);
+        let outputs: HashMap<String, DeclaredLayout> = [(
+            "out".to_string(),
+            declared(BoundaryLayout::ColumnMajor, "column_major", &[]),
+        )]
+        .into();
+        let boundary = bind(&translation, &row_major(&["x"]), &outputs).expect("the output binds");
+        assert_eq!(
+            boundary.bindings.outputs()[0].layout,
+            BoundaryLayout::ColumnMajor
+        );
+        assert_ne!(boundary.output_buffers[0], boundary.input_buffers[0]);
+        assert_eq!(
+            boundary.output_layouts,
+            vec![("column_major".to_string(), Vec::new())]
+        );
+    }
+
+    /// A WRITEBACK TAKES NO OUTPUT ROW: its layout is its target's, stated
+    /// once on the input side, and a second statement here could disagree
+    /// with it. `output_layouts` still answers for it, repeating the
+    /// target's row, so the caller reads one table for every output.
+    #[test]
+    fn an_output_row_for_a_writeback_is_refused() {
+        let translation = translation(&["x"], Some("x"));
+        let outputs = row_major(&["out"]);
+        let err = bind(&translation, &row_major(&["x"]), &outputs).expect_err("out is a writeback");
+        let text = format!("{err:#}");
+        assert!(text.contains("output \"out\"") && text.contains("writes back into \"x\""));
+
+        let inputs: HashMap<String, DeclaredLayout> = [(
+            "x".to_string(),
+            declared(BoundaryLayout::ColumnMajor, "column_major", &[]),
+        )]
+        .into();
+        let boundary = bind(&translation, &inputs, &HashMap::new()).expect("the writeback binds");
+        assert_eq!(
+            boundary.output_layouts,
+            vec![("column_major".to_string(), Vec::new())]
+        );
+    }
+
+    /// A layout row naming a tensor that is not a graph output is a
+    /// statement about nothing: refused rather than dropped.
+    #[test]
+    fn an_output_row_for_a_non_output_is_refused() {
+        let translation = translation(&["x"], None);
+        let outputs = row_major(&["out", "ghost"]);
+        let err = bind(&translation, &row_major(&["x"]), &outputs).expect_err("no such output");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("\"ghost\"") && text.contains("not a graph output"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_output_with_no_layout_row_is_refused() {
+        let translation = translation(&["x"], None);
+        let err =
+            bind(&translation, &row_major(&["x"]), &HashMap::new()).expect_err("out has no layout");
+        assert!(
+            format!("{err:#}").contains("output \"out\" has no declared boundary layout"),
+            "{err:#}"
+        );
+    }
+
+    /// AN OUTPUT'S ROW IS READ BACK IN THE SPELLING IT ARRIVED IN, so the
+    /// caller rebuilds its own binding in its own vocabulary rather than
+    /// re-reading the runtime's rendering of the same expression.
+    #[test]
+    fn output_layouts_echo_the_declared_spelling() {
+        let symbol = Symbol::new("s77");
+        let mut translation = translation(&["x"], None);
+        translation.symbols.insert("s77".to_string(), symbol);
+        let strides = ["Symbol('s77', positive=True, integer=True)", "Integer(1)"];
+        let outputs: HashMap<String, DeclaredLayout> = [(
+            "out".to_string(),
+            declared(
+                BoundaryLayout::Strided {
+                    strides: vec![IntExpr::from(symbol), IntExpr::from(1i64)],
+                },
+                "strided",
+                &strides,
+            ),
+        )]
+        .into();
+        let boundary =
+            bind(&translation, &row_major(&["x"]), &outputs).expect("a strided output binds");
+        assert_eq!(
+            boundary.output_layouts,
+            vec![(
+                "strided".to_string(),
+                strides.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()
+            )]
+        );
     }
 
     #[test]
     fn an_unknown_layout_tag_is_refused() {
         let translation = translation(&["x"], None);
         let rows = vec![("x".to_string(), "diagonal".to_string(), Vec::new())];
-        let err = layout_table(&translation, &rows).expect_err("no such layout");
+        let err = layout_table(&translation, "input", &rows).expect_err("no such layout");
         assert!(
             format!("{err:#}").contains("unknown boundary layout \"diagonal\""),
             "{err:#}"
@@ -918,13 +1152,22 @@ mod tests {
     #[test]
     fn a_writeback_binds_at_its_targets_layout() {
         let translation = translation(&["x"], Some("x"));
-        let layouts: HashMap<String, BoundaryLayout> =
-            [("x".to_string(), BoundaryLayout::ColumnMajor)].into();
-        let (bindings, inputs, outputs) =
-            bind(&translation, &layouts).expect("a writeback binds at its target's layout");
-        assert_eq!(outputs[0], inputs[0]);
-        assert_eq!(bindings.outputs()[0].layout, BoundaryLayout::ColumnMajor);
-        assert_eq!(bindings.buffers()[&inputs[0]].access, Access::ReadWrite);
+        let layouts: HashMap<String, DeclaredLayout> = [(
+            "x".to_string(),
+            declared(BoundaryLayout::ColumnMajor, "column_major", &[]),
+        )]
+        .into();
+        let boundary = bind(&translation, &layouts, &HashMap::new())
+            .expect("a writeback binds at its target's layout");
+        assert_eq!(boundary.output_buffers[0], boundary.input_buffers[0]);
+        assert_eq!(
+            boundary.bindings.outputs()[0].layout,
+            BoundaryLayout::ColumnMajor
+        );
+        assert_eq!(
+            boundary.bindings.buffers()[&boundary.input_buffers[0]].access,
+            Access::ReadWrite
+        );
     }
 
     /// WHETHER A KERNEL WRITES THAT LAYOUT IS THE SEARCH'S QUESTION, and
@@ -961,8 +1204,11 @@ mod tests {
             dims: HashMap::new(),
             symbols: HashMap::new(),
         };
-        let layouts: HashMap<String, BoundaryLayout> =
-            [("x".to_string(), BoundaryLayout::ColumnMajor)].into();
+        let layouts: HashMap<String, DeclaredLayout> = [(
+            "x".to_string(),
+            declared(BoundaryLayout::ColumnMajor, "column_major", &[]),
+        )]
+        .into();
         let err = compiled_with(translation, &layouts)
             .run_search(Some(1))
             .expect_err("no kernel writes a left-major destination");
@@ -988,8 +1234,8 @@ mod tests {
                 "Mul(Integer(2), Symbol('s77', positive=True, integer=True))".to_string(),
             ],
         )];
-        let table = layout_table(&translation, &rows).expect("symbolic strides");
-        let BoundaryLayout::Strided { strides } = &table["x"] else {
+        let table = layout_table(&translation, "input", &rows).expect("symbolic strides");
+        let BoundaryLayout::Strided { strides } = &table["x"].layout else {
             panic!("expected a strided layout, got {:?}", table["x"]);
         };
         assert_eq!(strides[0], IntExpr::from(1i64));
@@ -1006,7 +1252,7 @@ mod tests {
             "strided".to_string(),
             vec!["Integer(1)".to_string(), "Symbol('s77')".to_string()],
         )];
-        let err = layout_table(&translation, &rows).expect_err("s77 is not declared");
+        let err = layout_table(&translation, "input", &rows).expect_err("s77 is not declared");
         let text = format!("{err:#}");
         assert!(text.contains("Symbol('s77')"), "{text}");
         assert!(text.contains("axis 1"), "{text}");

@@ -156,6 +156,61 @@ def test_transposed_input_binds_zero_copy():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_output_is_returned_at_eagers_strides():
+    """A user-visible output is bound at the strides EAGER gives it and
+    allocated at them, so the tensor the caller receives is laid out the way
+    the uncompiled program lays it out."""
+
+    def fn(x, y):
+        return x * y + 1
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 8, device="cuda")
+    y = torch.randn(4, 8, device="cuda")
+    expected = fn(x, y)
+    got = torch.compile(fn, backend=luminal_cuda_lite)(x, y)
+    assert got.stride() == expected.stride()
+    torch.testing.assert_close(got, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_dynamic_batch_output_is_returned_at_eagers_strides():
+    """The output's declared extents are the program's own dimensions, so
+    each call allocates at the strides eager gives THAT batch size — one
+    compile, every extent in the bucket."""
+    torch.manual_seed(0)
+    model = torch.nn.Linear(16, 8).cuda().eval()
+    compiled = torch.compile(model, backend=luminal_cuda_lite, dynamic=True)
+    with torch.no_grad():
+        for n in (3, 7):
+            x = torch.randn(n, 16, device="cuda")
+            expected = model(x)
+            got = compiled(x)
+            assert got.stride() == expected.stride()
+            torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.xfail(strict=True, reason="LUM-830: no strided-destination write yet")
+def test_transposed_output_keeps_eagers_strides():
+    """Eager lays this output out the way its operands are laid out, so it
+    is column-major, and the output is bound at those exact strides. No
+    elected op writes a non-row-major destination today: the search refuses
+    by name until the layout-changing copy into the bound output lands."""
+
+    def fn(a, b):
+        return a.t() + b.t()
+
+    torch.manual_seed(0)
+    a = torch.randn(8, 4, device="cuda")
+    b = torch.randn(8, 4, device="cuda")
+    expected = fn(a, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite)(a, b)
+    assert got.stride() == expected.stride()
+    torch.testing.assert_close(got, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
     """A writeback is bound at its target's layout — here column-major — and
     whether any kernel writes that layout is the SEARCH's question, never a

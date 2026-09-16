@@ -295,6 +295,99 @@ fn a_column_major_sink_binds_and_the_search_names_it() {
     );
 }
 
+/// A USER-VISIBLE OUTPUT IS BOUND AT THE CALLER'S OWN STRIDES, and
+/// whether a kernel writes them is the search's question: today no
+/// elected op writes a left-major destination, so the search plans
+/// nothing and names the output and the layout it is bound at. LUM-830
+/// — a layout-changing copy into the bound output layout — is the flip
+/// that makes this one plan.
+#[test]
+fn a_column_major_output_binds_and_the_search_names_it() {
+    let mut cx = Graph::new();
+    let a = cx.tensor((2usize, 3usize), DType::F32);
+    let b = cx.tensor((2usize, 3usize), DType::F32);
+    let out = a + b;
+
+    let mut bindings = CudaBindings::new();
+    bindings.input_external(a.id);
+    bindings.input_external(b.id);
+    bindings.output_external_with(out.id, BoundaryLayout::ColumnMajor);
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a column-major output binds");
+
+    let refusal = match rt.search(&Default::default(), &harness_search_options()) {
+        Ok(_) => panic!("no kernel writes a left-major destination today"),
+        Err(refusal) => format!("{refusal:#}"),
+    };
+    assert!(
+        refusal.contains(&format!("v{}", out.id.index())) && refusal.contains("ColumnMajor"),
+        "the refusal must name the output and its bound layout: {refusal}"
+    );
+}
+
+/// THE SAME PROGRAM AT THE OTHER BOUND LAYOUT PLANS: a row-major output
+/// is written straight into the caller's allocation, and the guard reads
+/// that the elected slot sits on the bound buffer rather than on a view
+/// of it.
+#[test]
+fn a_row_major_output_bound_external_plans() {
+    let mut cx = Graph::new();
+    let a = cx.tensor((2usize, 3usize), DType::F32);
+    let b = cx.tensor((2usize, 3usize), DType::F32);
+    let out = a + b;
+
+    let mut bindings = CudaBindings::new();
+    bindings.input_external(a.id);
+    bindings.input_external(b.id);
+    let buffer = bindings.output_external_with(out.id, BoundaryLayout::RowMajor);
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a row-major output binds");
+    rt.search(&Default::default(), &harness_search_options())
+        .expect("host search over a row-major bound output");
+
+    assert_eq!(rt.output_buffer(out.id).expect("out has a buffer"), buffer);
+    rt.check_external_outputs()
+        .expect("the elected slot sits on the bound buffer");
+}
+
+/// A SYMBOLIC STRIDE ON A USER-VISIBLE OUTPUT ROUND-TRIPS THROUGH BIND:
+/// the output's element layout reaches the preamble as the dim itself,
+/// so the caller's declared strides stay a statement over the program's
+/// dimensions rather than the numbers one call happened to have.
+#[test]
+fn a_symbolic_strided_output_binds_at_its_own_dim() {
+    let mut cx = Graph::new();
+    let x = cx.tensor(('n', 4usize), DType::F32);
+    let out = x + 1.;
+
+    let mut bindings = CudaBindings::new();
+    bindings.input_external(x.id);
+    bindings.output_external_with(
+        out.id,
+        BoundaryLayout::Strided {
+            strides: vec![IntExpr::from(1i64), IntExpr::from('n')],
+        },
+    );
+    let bound = bindings
+        .bind(&cx.logical)
+        .expect("a symbolic strided output binds");
+    let shape = cx
+        .logical
+        .value_shape_term(out.id)
+        .expect("the output states its shape");
+    let expected = format!(
+        "(StridedElementLayoutLit {shape} \
+         (IntAffineExprCons (IntMul (CoordVar {shape} 1) (IntLit 1)) \
+         (IntAffineExprCons (IntMul (CoordVar {shape} 0) (IntVar \"n\")) \
+         (IntAffineExprNil))) (bits-of (F32)))"
+    );
+    assert!(
+        bound.prefix.contains(&expected),
+        "the output's declared stride was frozen: {}",
+        bound.prefix
+    );
+}
+
 /// AN OUTPUT ON AN INPUT'S BUFFER: aliasing has exactly one spelling —
 /// two bindings naming one buffer id — and the plan puts both boundary
 /// values on that one buffer.
