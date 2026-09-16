@@ -26,6 +26,29 @@ new home of those passes:
 # ---------------------------------------------------------------------------
 
 
+def private_graph_copy(gm):
+    """A private copy of `gm` that SHARES its parameters and buffers.
+
+    Dynamo keeps the original GraphModule and re-checks its guards against it
+    after the backend returns, so the export passes need a module of their own
+    to edit and recompile. They only ever edit the GRAPH, so only the graph has
+    to be private. `copy.deepcopy(gm)` deep-copies the module's own dict, which
+    clones every parameter and buffer on the device; a writeback then lands in
+    the clone and the caller's module never sees it.
+
+    `copy.copy` goes through `GraphModule.__copy__`, which builds a new module,
+    carries `meta` over, and takes graph-referenced attributes BY REFERENCE.
+    Assigning `.graph` recompiles onto that new module. Deep-copying a Graph
+    copies node structure but shares `node.meta`, so the traced fake values
+    stay the same objects.
+    """
+    import copy
+
+    private = copy.copy(gm)
+    private.graph = copy.deepcopy(gm.graph)
+    return private
+
+
 def _get_cache_dict(cache):
     """Flatten a DynamicCache to a dict of parallel key/value lists."""
     return {

@@ -7,7 +7,6 @@ binds caller tensors per invocation.
 """
 
 import concurrent.futures
-import copy
 import os
 import tempfile
 from typing import Any, Callable, Optional, Sequence
@@ -17,6 +16,7 @@ from torch.export import Dim, export
 
 from . import _luminal
 from .export_utils import (
+    private_graph_copy,
     _box_scalar_graph_outputs,
     _decomp_table,
     _drop_dead_data_dependent_ops,
@@ -166,8 +166,9 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     """
     # Work on a copy: Dynamo keeps the original GraphModule and checks its own
     # guards against it after the backend returns, so mutating it in place
-    # trips "Guard failed on the same frame it was created".
-    gm = copy.deepcopy(gm)
+    # trips "Guard failed on the same frame it was created". Only the GRAPH is
+    # private; the module's weights are shared (see private_graph_copy).
+    gm = private_graph_copy(gm)
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
 
     records: list[tuple[str, torch.fx.Node, Any]] = []
@@ -255,8 +256,9 @@ def luminal_reference(
     # Canonicalize scalar (SymInt/SymFloat/SymBool) graph outputs into rank-zero
     # tensors before the export capture. Work on a private copy: Dynamo holds
     # onto the original graph module for guard installation and retracing, and
-    # mutating it here would corrupt that bookkeeping.
-    gm = copy.deepcopy(gm)
+    # mutating it here would corrupt that bookkeeping. The copy shares the
+    # module's weights (see private_graph_copy).
+    gm = private_graph_copy(gm)
     scalar_output_positions = _box_scalar_graph_outputs(gm)
 
     # The graph-module preprocessing above runs first; `_dynamic_export` then
