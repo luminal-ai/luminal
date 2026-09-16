@@ -97,18 +97,17 @@ def _torch_dtype(dtype_code: int) -> torch.dtype:
     return dtype
 
 
-def _placeholder_fakes(ep: Any) -> dict[str, Any]:
-    """The fake example value of every graph input, by placeholder name.
+def _node_fakes(ep: Any) -> dict[str, Any]:
+    """The fake example value behind every graph node, by node name.
 
     It is the exported program's OWN symbolic metadata — the symbols the
-    translator reads back out of the saved ``.pt2`` — so a stride stated
-    from it names a dimension the runtime knows, at whatever extent a
-    later call gives it.
+    translator reads back out of the saved ``.pt2`` — so a size or stride
+    stated from it names a dimension the runtime knows, at whatever extent
+    a later call gives it. One table for both sides of the boundary: an
+    output's layout is read from the same metadata an input's is.
     """
     fakes: dict[str, Any] = {}
     for node in ep.graph_module.graph.nodes:
-        if node.op != "placeholder":
-            continue
         value = node.meta.get("val")
         if isinstance(value, torch.Tensor):
             fakes[node.name] = value
@@ -124,7 +123,7 @@ def _boundary_tensors(
     saved ``.pt2``. The fake carries the program's symbolic sizes and
     strides for a user input; a parameter, buffer or constant is the
     concrete tensor the state dict holds, and states itself."""
-    fakes = _placeholder_fakes(ep)
+    fakes = _node_fakes(ep)
     rows: list[tuple[str, str, torch.Tensor, Any]] = []
     user_index = 0
     for spec in ep.graph_signature.input_specs:
@@ -175,30 +174,27 @@ def _refuse_unbound_outputs(ep: Any) -> None:
         )
 
 
-def _node_fakes(ep: Any) -> dict[str, Any]:
-    """The fake example value behind every graph node, by node name.
-
-    An output's layout is read from the same symbolic metadata an input's
-    is: sizes and strides in the exported program's own vocabulary, so a
-    stride shaped by a dynamic dimension states THAT dimension rather than
-    the number one example call happened to have.
-    """
-    fakes: dict[str, Any] = {}
-    for node in ep.graph_module.graph.nodes:
-        value = node.meta.get("val")
-        if isinstance(value, torch.Tensor):
-            fakes[node.name] = value
-    return fakes
+def _output_fake(name: str, fakes: dict[str, Any]) -> Any:
+    """The traced example value an output's layout and extents are read
+    from, refused by name when the program carries none."""
+    fake = fakes.get(name)
+    if fake is None:
+        raise UnsupportedBoundary(
+            f"output {name!r} carries no exported example value, so the layout eager "
+            "gives it cannot be read"
+        )
+    return fake
 
 
-def _user_visible_outputs(ep: Any) -> list[tuple[str, Any]]:
-    """(graph output name, fake example value) for every output this
-    wrapper allocates, in export order.
+def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
+    """One ``(graph name, layout tag, element strides)`` row per graph
+    output the caller allocates: the layout EAGER gives it, recognized from
+    the traced fake value exactly like an input's.
 
-    A writeback is not one of them: it writes the storage of the input it
-    mutates and is bound at that input's layout, and a program that
-    returns the tensor it mutated returns THAT writeback — one output,
-    stated once.
+    This is a LAYOUT STATEMENT PER NAME, not the output list — which
+    outputs a program has, and in which order, is the translation's to say
+    (`graph.output_names`). A writeback takes no row: it writes the storage
+    of the input it mutates and is bound at that input's layout.
     """
     fakes = _node_fakes(ep)
     writebacks = {
@@ -206,28 +202,25 @@ def _user_visible_outputs(ep: Any) -> list[tuple[str, Any]]:
         for spec in ep.graph_signature.output_specs
         if spec.kind.name == "USER_INPUT_MUTATION"
     }
-    rows: list[tuple[str, Any]] = []
+    rows: list[tuple[str, str, list[str]]] = []
     stated: set[str] = set()
-    for spec in ep.graph_signature.output_specs:
+    for position, spec in enumerate(ep.graph_signature.output_specs):
         if spec.kind.name != "USER_OUTPUT":
             continue
         name = getattr(spec.arg, "name", None)
         if name is None:
             raise UnsupportedBoundary(
-                f"output {spec.target!r} is not a tensor, so no boundary layout states it"
+                f"graph output {position} ({spec.arg!r}) is not a tensor, so no boundary "
+                "layout states it"
             )
-        # One value returned twice is one bound output: the same name, at
-        # the same layout, stated once.
+        # One value returned twice is one statement: the same name, at the
+        # same layout, stated once.
         if name in writebacks or name in stated:
             continue
-        fake = fakes.get(name)
-        if fake is None:
-            raise UnsupportedBoundary(
-                f"output {name!r} carries no exported example value, so the layout eager "
-                "gives it cannot be read"
-            )
+        fake = _output_fake(name, fakes)
         stated.add(name)
-        rows.append((name, fake))
+        tag, strides = layout_spec(boundary_layout(name, fake))
+        rows.append((name, tag, list(strides)))
     return rows
 
 
@@ -357,12 +350,14 @@ class CompiledModel:
             self._side_stream = torch.cuda.Stream(device=device)
         side = self._side_stream
 
-        # CHECK EVERY INPUT BEFORE ADDRESSING ANY: a refusal on input i must
-        # not leave inputs before it holding this call's pointers. A tensor
-        # whose dtype, rank, extents or element strides are not the declared
-        # ones is refused by name. The dimension map is the whole call's, so
-        # a stride declared over a dimension ANOTHER input carries is still
-        # checked here.
+        # CHECK EVERYTHING BEFORE ADDRESSING ANYTHING: every tensor this
+        # call binds — inputs, held tensors, freshly allocated outputs — is
+        # checked here, and the pointers go in afterwards inside the `try`
+        # whose `finally` clears them, so no refusal can leave one standing.
+        # A tensor whose dtype, rank, extents or element strides are not the
+        # declared ones is refused by name. The dimension map is the whole
+        # call's, so a stride declared over a dimension ANOTHER input
+        # carries is still checked here.
         bound = list(zip(self._input_bindings, inputs)) + [
             (binding, self._held[binding.name]) for binding in self._held_bindings
         ]
@@ -386,32 +381,15 @@ class CompiledModel:
             [(binding.name, list(value.shape)) for binding, value in bound]
         )
 
-        # Every input is bound as it is, on the buffer it was declared on.
-        per_call: list[int] = []
-        for binding, value in zip(self._input_bindings, inputs):
-            self._graph.set_device_ptr(binding.buffer, value.data_ptr(), buffer_nbytes(value))
-            per_call.append(binding.buffer)
-
-        # Held tensors are re-addressed rather than cleared: the address a
-        # parameter has now is the one this execution reads, and leaving it
-        # set is what makes a skipped user-input binding — never a held one
-        # — the thing an execute refuses by name.
-        for binding in self._held_bindings:
-            tensor = self._held[binding.name]
-            self._graph.set_device_ptr(
-                binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
-            )
-
-        # Output shapes depend on the bound dims, so read them after the
-        # inputs are bound rather than caching them at compile time.
+        # Output shapes depend on this call's dims, so they are read after
+        # the input shapes are bound rather than cached at compile time.
         output_shapes = self._graph.output_shapes
 
-        # Allocate every output that is not a writeback and bind it, AT THE
-        # STRIDES IT IS BOUND AT: the declared layout at this call's
-        # dimensions, which is what eager gives this output. A writeback's
-        # buffer IS its target input's, already addressed above. Allocate
-        # under the side stream so the caching allocator records the stream
-        # that will write them.
+        # Allocate every output that is not a writeback, AT THE STRIDES IT
+        # IS BOUND AT: the declared layout at this call's dimensions, which
+        # is what eager gives this output. A writeback's buffer IS its
+        # target input's. Allocate under the side stream so the caching
+        # allocator records the stream that will write them.
         with torch.cuda.stream(side):
             out_tensors: list[Optional[torch.Tensor]] = []
             for index, binding in enumerate(self._output_bindings):
@@ -432,10 +410,6 @@ class CompiledModel:
                 # writes through — rank, extents, element strides — so a
                 # disagreement is refused by name rather than written past.
                 check_binding(binding, tensor, dims)
-                self._graph.set_device_ptr(
-                    binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
-                )
-                per_call.append(binding.buffer)
                 out_tensors.append(tensor)
 
         # Order the side stream after everything the caller enqueued: this is
@@ -448,7 +422,35 @@ class CompiledModel:
         arena = torch.cuda.caching_allocator_alloc(arena_bytes, device, side)
         self._graph.use_borrowed_stream(side.cuda_stream)
         self._graph.set_arena(arena, arena_bytes)
+        # EVERY CHECK IS BEHIND US: the addresses go in here and come out in
+        # `finally`, so no refusal of this call can leave one standing.
+        per_call: list[int] = []
         try:
+            # Every input is bound as it is, on the buffer it was declared on.
+            for binding, value in zip(self._input_bindings, inputs):
+                self._graph.set_device_ptr(
+                    binding.buffer, value.data_ptr(), buffer_nbytes(value)
+                )
+                per_call.append(binding.buffer)
+
+            # Held tensors are re-addressed rather than cleared: the address a
+            # parameter has now is the one this execution reads, and leaving it
+            # set is what makes a skipped user-input binding — never a held one
+            # — the thing an execute refuses by name.
+            for binding in self._held_bindings:
+                tensor = self._held[binding.name]
+                self._graph.set_device_ptr(
+                    binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
+                )
+
+            for binding, tensor in zip(self._output_bindings, out_tensors):
+                if tensor is None:
+                    continue
+                self._graph.set_device_ptr(
+                    binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
+                )
+                per_call.append(binding.buffer)
+
             self._graph.execute()
         finally:
             torch.cuda.caching_allocator_delete(arena)
@@ -630,21 +632,16 @@ def luminal_cuda_lite(
         # recognized from the traced fake value exactly like an input: what
         # the caller receives has the strides the uncompiled program hands
         # back, never a row-major substitute.
-        returned = _user_visible_outputs(program)
-        out_shapes = {name: boundary_shape(fake) for name, fake in returned}
-        declared_outputs = []
-        for name, fake in returned:
-            tag, strides = layout_spec(boundary_layout(name, fake))
-            declared_outputs.append((name, tag, list(strides)))
+        declared_outputs = _output_layout_rows(program)
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
             graph = _luminal.compile(pt2_path, declared, declared_outputs)
         tensors = {name: value for name, _, value, _ in rows}
-        return graph, tensors, layouts, shapes, out_shapes
+        return graph, tensors, layouts, shapes
 
     try:
-        graph, tensors, layouts, shapes, out_shapes = _save_and_compile(ep)
+        graph, tensors, layouts, shapes = _save_and_compile(ep)
     except RuntimeError as exc:
         # The translator lowers a fixed op set. Decomposing the exported graph
         # rewrites higher-level composites into primitives the translator
@@ -656,7 +653,7 @@ def luminal_cuda_lite(
             raise
         ep = ep.run_decompositions(_decomp_table())
         _lower_sym_sum(ep)
-        graph, tensors, layouts, shapes, out_shapes = _save_and_compile(ep)
+        graph, tensors, layouts, shapes = _save_and_compile(ep)
 
     # Every boundary row, not just the user inputs: a parameter tied to
     # another parameter is read-only aliasing and stays two buffers on one
@@ -692,18 +689,27 @@ def luminal_cuda_lite(
 
     graph.search(search_iterations)
 
+    # WHICH OUTPUTS THE PROGRAM HAS IS THE TRANSLATION'S TO SAY, not the
+    # export signature's: the translator resolves a returned alias of a
+    # mutated value onto the writeback itself and may give one value two
+    # names, so the outputs and their order are read off the translation
+    # and their example values looked up by graph name.
+    #
     # The runtime states the layout every output was bound at: a
     # user-visible one at eager's exact strides, a writeback at the layout
     # of the input it mutates. The declared extents are the exported
     # program's own — an ``int`` per literal axis, the program's symbol per
     # dynamic one — so a call at a new extent is checked against what the
     # program says, not against what the example call happened to have.
+    fakes = _node_fakes(ep)
     output_bindings = [
         Binding(
             name,
             buffer,
             _torch_dtype(dtype_code),
-            shapes[mutation] if mutation is not None else out_shapes[name],
+            shapes[mutation]
+            if mutation is not None
+            else boundary_shape(_output_fake(name, fakes)),
             layout_from_spec(name, tag, strides),
         )
         for name, buffer, dtype_code, mutation, (tag, strides) in zip(

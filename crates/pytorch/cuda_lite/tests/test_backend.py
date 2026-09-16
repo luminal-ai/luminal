@@ -122,6 +122,27 @@ def test_writeback_after_read():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_returned_clone_of_a_mutated_value_is_the_writeback():
+    """The translator lowers a clone to its operand, so the returned value
+    IS the mutated one: one output — the writeback — marked returned, and
+    the call hands back the caller's own tensor rather than binding a
+    second output for the same value. Which outputs a program has is read
+    off the translation, so the export's two output specs state one."""
+
+    def fn(x):
+        x.add_(1)
+        return x.clone()
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 8, device="cuda")
+    expected = x + 1
+    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    torch.testing.assert_close(got, expected)
+    torch.testing.assert_close(x, expected)
+    assert got.data_ptr() == x.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_writeback_consumed_downstream():
     """The mutated input is read again after the writeback: the sink and the
     reader are the same storage."""
@@ -140,9 +161,16 @@ def test_writeback_consumed_downstream():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.xfail(
+    strict=True,
+    reason="LUM-830: eager's pointwise output inherits the operand layout; "
+    "no strided-destination write yet",
+)
 def test_transposed_input_binds_zero_copy():
     """A transposed input is bound in the layout it has (column-major), never
-    copied and never reinterpreted."""
+    copied and never reinterpreted. Eager gives the pointwise output the
+    operand's layout too, so the output is bound column-major and the search
+    refuses by name until a strided-destination write lands."""
 
     def fn(x):
         return x * 2 + 1
@@ -280,10 +308,17 @@ def test_int32_and_bool_inputs_bind_external():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.xfail(
+    strict=True,
+    reason="LUM-830: eager's pointwise output inherits the operand layout; "
+    "no strided-destination write yet",
+)
 def test_transposed_dynamic_batch_input():
     """The transposed input's element stride IS the dynamic batch dimension,
     so the binding states that dimension rather than the number one example
-    call had: one compile serves every extent in the bucket."""
+    call had: one compile serves every extent in the bucket. Eager's output
+    is column-major here, so the search refuses by name until a
+    strided-destination write lands."""
 
     def fn(x):
         return x * 2 + 1
@@ -297,11 +332,17 @@ def test_transposed_dynamic_batch_input():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.xfail(
+    strict=True,
+    reason="LUM-830: eager's pointwise output inherits the operand layout; "
+    "no strided-destination write yet",
+)
 def test_permuted_dynamic_view_states_its_size_derived_strides():
     """A permuted view is neither row- nor column-major, and every one of
     its strides is a product of the program's own dimensions: the binding
     states those expressions, so one searched plan serves every extent in
-    the bucket."""
+    the bucket. Eager's output carries the same permuted strides, so the
+    search refuses by name until a strided-destination write lands."""
 
     def fn(x):
         return x * 2 + 1

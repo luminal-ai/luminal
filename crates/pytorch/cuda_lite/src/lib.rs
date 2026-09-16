@@ -1112,27 +1112,40 @@ mod tests {
         let symbol = Symbol::new("s77");
         let mut translation = translation(&["x"], None);
         translation.symbols.insert("s77".to_string(), symbol);
-        let strides = ["Symbol('s77', positive=True, integer=True)", "Integer(1)"];
-        let outputs: HashMap<String, DeclaredLayout> = [(
-            "out".to_string(),
-            declared(
-                BoundaryLayout::Strided {
-                    strides: vec![IntExpr::from(symbol), IntExpr::from(1i64)],
-                },
-                "strided",
-                &strides,
-            ),
-        )]
-        .into();
+        let strides = vec![
+            "Symbol('s77', positive=True, integer=True)".to_string(),
+            "Integer(1)".to_string(),
+        ];
+        let rows = vec![("out".to_string(), "strided".to_string(), strides.clone())];
+        let outputs = layout_table(&translation, "output", &rows).expect("the output row is read");
+        let BoundaryLayout::Strided { strides: parsed } = &outputs["out"].layout else {
+            panic!("expected a strided layout, got {:?}", outputs["out"]);
+        };
+        assert!(parsed[0].to_symbols().contains(&symbol));
         let boundary =
             bind(&translation, &row_major(&["x"]), &outputs).expect("a strided output binds");
         assert_eq!(
             boundary.output_layouts,
-            vec![(
-                "strided".to_string(),
-                strides.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()
-            )]
+            vec![("strided".to_string(), strides)]
         );
+    }
+
+    /// AN OUTPUT ROW IS READ IN THE SAME VOCABULARY AS AN INPUT'S: a stride
+    /// naming a dimension the program does not declare is refused naming the
+    /// output and the axis, so the refusal says which side of the boundary
+    /// the unreadable stride came from.
+    #[test]
+    fn an_output_stride_naming_an_undeclared_symbol_is_refused() {
+        let translation = translation(&["x"], None);
+        let rows = vec![(
+            "out".to_string(),
+            "strided".to_string(),
+            vec!["Integer(1)".to_string(), "Symbol('s77')".to_string()],
+        )];
+        let err = layout_table(&translation, "output", &rows).expect_err("s77 is not declared");
+        let text = format!("{err:#}");
+        assert!(text.contains("output \"out\""), "{text}");
+        assert!(text.contains("axis 1"), "{text}");
     }
 
     #[test]

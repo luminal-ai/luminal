@@ -89,13 +89,23 @@ def _srepr(value: Any) -> str:
     return sympy.srepr(sympy.Integer(value) if isinstance(value, int) else value)
 
 
+def _stride_factor(size: Any) -> Any:
+    """What one extent multiplies the running stride by in torch's
+    contiguous layout: ``max(size, 1)``. An empty axis contributes one, so
+    an empty tensor carries the strides a full one would.
+    """
+    if isinstance(size, int):
+        return max(size, 1)
+    return sympy.Max(size, 1)
+
+
 def _row_major_strides(shape: Sequence[Any]) -> tuple[Any, ...]:
     """Contiguous, last axis fastest."""
     strides: list[Any] = []
     acc: Any = 1
     for size in reversed(shape):
         strides.append(acc)
-        acc = acc * size
+        acc = acc * _stride_factor(size)
     return tuple(reversed(strides))
 
 
@@ -105,7 +115,7 @@ def _column_major_strides(shape: Sequence[Any]) -> tuple[Any, ...]:
     acc: Any = 1
     for size in shape:
         strides.append(acc)
-        acc = acc * size
+        acc = acc * _stride_factor(size)
     return tuple(strides)
 
 
@@ -366,6 +376,12 @@ def check_binding(
             )
     expected = declared_strides(binding, shape, dims)
     actual = tuple(int(stride) for stride in tensor.stride())
+    # Which strides carry information is torch's own contract, spelled in
+    # inductor's `significant_strides_equal`: an axis of extent 0 or 1 has
+    # no significant stride, and one empty axis makes every stride
+    # insignificant, because the tensor addresses no element at all.
+    if any(size == 0 for size in shape) or any(declared == 0 for declared in binding.shape):
+        return
     for axis, (want, got, size) in enumerate(zip(expected, actual, shape)):
         if size <= 1 or want == got:
             continue

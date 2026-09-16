@@ -103,3 +103,77 @@ def test_check_binding_refuses_an_extent_no_dimension_of_the_call_pins():
     binding = _binding("x", (2 * sympy.Symbol("s0"), 4), boundary.RowMajor())
     with pytest.raises(boundary.UnsupportedBoundary, match="s0"):
         boundary.check_binding(binding, torch.empty(6, 4), {})
+
+
+class _Boundary:
+    """What the binding check reads off a call's tensor: a dtype, extents,
+    and element strides. Stated as plain ints, so a fact about an EMPTY
+    tensor's layout needs neither a device nor an allocation."""
+
+    def __init__(self, shape, strides, dtype=torch.float32):
+        self.dtype = dtype
+        self.shape = tuple(shape)
+        self._strides = tuple(strides)
+
+    def stride(self):
+        return self._strides
+
+
+def _torch_contiguous_strides(shape):
+    """PyTorch's own contiguous strides (``TensorImpl::empty_tensor_restride``):
+    the running product multiplies by ``max(size, 1)``, so a zero extent
+    leaves the strides outside it as a full tensor's."""
+    strides = [1] * len(shape)
+    for axis in range(len(shape) - 2, -1, -1):
+        strides[axis] = strides[axis + 1] * max(shape[axis + 1], 1)
+    return tuple(strides)
+
+
+@pytest.mark.parametrize(
+    ("shape", "row_major", "column_major"),
+    [((4, 0), (1, 1), (1, 4)), ((0, 4), (4, 1), (1, 1))],
+)
+def test_contiguous_strides_take_a_zero_extent_as_one(shape, row_major, column_major):
+    """A zero extent multiplies the running stride by one, not by zero:
+    ``torch.empty(4, 0)`` is laid out at strides (1, 1), and a declaration
+    that said (0, 1) would refuse the backend's own allocation."""
+    assert row_major == _torch_contiguous_strides(shape)
+    assert boundary._row_major_strides(shape) == row_major
+    assert boundary._column_major_strides(shape) == column_major
+
+
+@pytest.mark.parametrize("shape", [(4, 0), (0, 4)])
+def test_a_zero_extent_allocation_is_not_refused(shape):
+    """What the wrapper allocates for an empty output — ``torch.empty`` at
+    the row-major strides, ``torch.empty_strided`` at the declared ones —
+    is what the binding check must accept."""
+    row = _binding("out", shape, boundary.RowMajor())
+    boundary.check_binding(row, _Boundary(shape, _torch_contiguous_strides(shape)))
+    column = _binding("out", shape, boundary.ColumnMajor())
+    boundary.check_binding(
+        column, _Boundary(shape, boundary.declared_strides(column, shape, {}))
+    )
+
+
+def test_a_zero_extent_makes_every_stride_insignificant():
+    """One empty axis and the tensor addresses no element at all, so no
+    stride carries information — the contract inductor states in
+    ``significant_strides_equal``. The strides here are nothing torch would
+    produce and are accepted all the same."""
+    binding = _binding("out", (4, 0, 3), boundary.RowMajor())
+    boundary.check_binding(binding, _Boundary((4, 0, 3), (99, 7, 5)))
+    # An extent that is not zero is still held to the declared stride.
+    full = _binding("out", (4, 2, 3), boundary.RowMajor())
+    with pytest.raises(boundary.UnsupportedBoundary, match="axis 0"):
+        boundary.check_binding(full, _Boundary((4, 2, 3), (99, 3, 1)))
+
+
+def test_a_symbolic_extent_beside_a_zero_one_still_strides_the_outer_axes():
+    """The same convention for a dimension the program spells symbolically:
+    the axes outside an empty one are strided by the dimensions outside it,
+    with the empty axis contributing one."""
+    size = sympy.Symbol("s0", positive=True, integer=True)
+    strides = boundary._row_major_strides((2, 0, size))
+    assert boundary._same(strides[2], 1)
+    assert boundary._same(strides[1], size)
+    assert boundary._same(strides[0], size)
