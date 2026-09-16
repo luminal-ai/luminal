@@ -45,6 +45,7 @@ from .boundary import (
     boundary_layout,
     boundary_shape,
     buffer_nbytes,
+    call_dim_values,
     check_binding,
     layout_spec,
     storage_span,
@@ -291,9 +292,13 @@ class CompiledModel:
         # CHECK EVERY INPUT BEFORE ADDRESSING ANY: a refusal on input i must
         # not leave inputs before it holding this call's pointers. A tensor
         # whose dtype, rank, extents or element strides are not the declared
-        # ones is refused by name.
-        for binding, value in zip(self._input_bindings, inputs):
-            check_binding(binding, value)
+        # ones is refused by name. The dimension map is the whole call's, so
+        # a stride declared over a dimension ANOTHER input carries is still
+        # checked here.
+        bound = list(zip(self._input_bindings, inputs))
+        dims = call_dim_values(bound)
+        for binding, value in bound:
+            check_binding(binding, value, dims)
         if self._writebacks:
             # Dynamo guards tensor identity, not storage overlap, so a
             # program compiled on distinct tensors can still be called with

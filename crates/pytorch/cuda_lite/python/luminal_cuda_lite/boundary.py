@@ -235,8 +235,9 @@ class Binding:
 
 def _dim_values(binding: Binding, tensor: torch.Tensor) -> dict[str, int]:
     """The concrete value this call gives each dynamic dimension, read off
-    the axes that are a bare symbol. A compound extent (``s0*2``) is not
-    inverted here; the runtime decides it from the dims these bind."""
+    the axes of THIS tensor that are a bare symbol. A compound extent
+    (``s0*2``) is not inverted here; a dimension only this binding spells
+    compound is pinned by whichever boundary spells it bare."""
     values: dict[str, int] = {}
     for declared, size in zip(binding.shape, tensor.shape):
         if isinstance(declared, sympy.Symbol):
@@ -244,31 +245,66 @@ def _dim_values(binding: Binding, tensor: torch.Tensor) -> dict[str, int]:
     return values
 
 
+def call_dim_values(pairs: Sequence[tuple[Binding, torch.Tensor]]) -> dict[str, int]:
+    """The value one call gives each dynamic dimension, read off the
+    bare-symbol axes of every boundary tensor in it. A dimension two
+    boundaries give two different extents is refused by name: the declared
+    strides are read against this one map, so it must be single-valued."""
+    values: dict[str, int] = {}
+    source: dict[str, str] = {}
+    for binding, tensor in pairs:
+        for symbol, value in _dim_values(binding, tensor).items():
+            if symbol in values and values[symbol] != value:
+                raise UnsupportedBoundary(
+                    f"dimension {symbol} is {values[symbol]} in {source[symbol]!r} and "
+                    f"{value} in {binding.name!r}: one dimension, two extents"
+                )
+            values.setdefault(symbol, value)
+            source.setdefault(symbol, binding.name)
+    return values
+
+
 def _declared_strides(
     binding: Binding, shape: Sequence[int], dims: dict[str, int]
-) -> tuple[Optional[int], ...]:
-    """The element strides the declared layout has at this call's shape: a
-    number per axis the declaration decides, ``None`` where a symbol the
-    call does not bind leaves it open."""
+) -> tuple[int, ...]:
+    """The element strides the declared layout has at this call's shape.
+    A declared stride still naming a symbol after the call's dimensions
+    are substituted is refused by name: nothing downstream compares
+    strides, so an unresolved one would go unchecked."""
     if isinstance(binding.layout, RowMajor):
         return _row_major_strides(shape)
     if isinstance(binding.layout, ColumnMajor):
         return _column_major_strides(shape)
-    resolved: list[Optional[int]] = []
-    for spelling in binding.layout.strides:
+    resolved: list[int] = []
+    for axis, spelling in enumerate(binding.layout.strides):
         expr = sympy.sympify(spelling)
         expr = expr.subs(
             {symbol: dims[symbol.name] for symbol in expr.free_symbols if symbol.name in dims}
         )
-        resolved.append(int(expr) if expr.is_number else None)
+        if not expr.is_number:
+            free = ", ".join(sorted(symbol.name for symbol in expr.free_symbols))
+            raise UnsupportedBoundary(
+                f"{binding.name}: element stride {spelling} on axis {axis} still names "
+                f"{free} once this call's dimensions are substituted; no boundary of this "
+                "call gives that dimension an extent"
+            )
+        resolved.append(int(expr))
     return tuple(resolved)
 
 
-def check_binding(binding: Binding, tensor: torch.Tensor) -> None:
+def check_binding(
+    binding: Binding, tensor: torch.Tensor, dims: Optional[dict[str, int]] = None
+) -> None:
     """Refuse a call-time tensor that does not match its declared binding:
     the dtype, the rank, every literal extent, and the element strides the
-    declared layout has at this call's dims. A stride left symbolic by a
-    dimension this call does not pin is the runtime's to check."""
+    declared layout has at this call's dimensions.
+
+    `dims` is the whole call's dimension map (`call_dim_values`); without
+    one only this tensor's own bare-symbol axes pin the declared strides.
+    This is the last place a stride is looked at: the runtime is handed an
+    address and a byte count, so past this check only Dynamo's shape
+    guards stand between a caller and a misread layout.
+    """
     if tensor.dtype != binding.dtype:
         raise UnsupportedBoundary(
             f"{binding.name}: bound as {binding.dtype}, called with {tensor.dtype}"
@@ -285,10 +321,12 @@ def check_binding(binding: Binding, tensor: torch.Tensor) -> None:
                 f"{binding.name}: bound with extent {declared} on axis {axis}, "
                 f"called with {size}"
             )
-    expected = _declared_strides(binding, shape, _dim_values(binding, tensor))
+    expected = _declared_strides(
+        binding, shape, _dim_values(binding, tensor) if dims is None else dims
+    )
     actual = tuple(int(stride) for stride in tensor.stride())
     for axis, (want, got, size) in enumerate(zip(expected, actual, shape)):
-        if want is None or size <= 1 or want == got:
+        if size <= 1 or want == got:
             continue
         raise UnsupportedBoundary(
             f"{binding.name}: bound with layout {binding.layout}, which at shape {shape} "

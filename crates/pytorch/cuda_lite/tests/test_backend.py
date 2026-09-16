@@ -239,20 +239,39 @@ def test_transposed_dynamic_batch_input():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_strided_dynamic_view_states_its_symbolic_strides():
-    """Neither row- nor column-major, and strided by a symbol: the binding
-    spells the stride as the program's own expression (``2*n``), which is
-    what makes one searched plan serve every extent."""
+def test_permuted_dynamic_view_states_its_size_derived_strides():
+    """A permuted view is neither row- nor column-major, and every one of
+    its strides is a product of the program's own dimensions: the binding
+    states those expressions, so one searched plan serves every extent in
+    the bucket."""
 
     def fn(x):
         return x * 2 + 1
 
     torch.manual_seed(0)
     compiled = torch.compile(fn, backend=luminal_cuda_lite, dynamic=True)
-    for n in (6, 10, 4):
-        x = torch.randn(16, n, device="cuda").t()[:, ::2]
-        assert x.stride() == (1, 2 * n)
+    for a, b, c in ((3, 5, 7), (4, 5, 7), (3, 6, 7)):
+        x = torch.randn(a, b, c, device="cuda").permute(2, 0, 1)
+        assert x.stride() == (1, b * c, c)
         torch.testing.assert_close(compiled(x), fn(x), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_stride_only_symbol_is_refused_by_name():
+    """A stride torch cannot derive from the tensor's own sizes becomes a
+    fresh export symbol that appears in no size and carries no range
+    constraint. The program states no dimension for it, so the binding
+    cannot state it either: refused by name rather than frozen at the
+    number this call happened to have."""
+
+    def fn(x):
+        return x * 2 + 1
+
+    torch.manual_seed(0)
+    compiled = torch.compile(fn, backend=luminal_cuda_lite, dynamic=True)
+    x = torch.randn(16, 6, device="cuda").t()[:, ::2]
+    with pytest.raises(Exception, match="does not declare"):
+        compiled(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")

@@ -7,11 +7,12 @@
 //! installs, never of an election: which spelling a class holds and what
 //! a decoded layout computes are facts; which genome won is not.
 
-use luminal::bufferize::BufferNode;
+use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::egglog_utils::eclass::EGraphView;
 use luminal::graph::{DimBucket, Graph};
 use luminal::layout_ir::{Access, FreedBy};
+use luminal::layouts::DecodedLayout;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 use luminal::shape::{DynMap, IntExpr, Symbol};
 use luminal_cuda_lite::bindings::BoundaryLayout;
@@ -56,6 +57,33 @@ fn holds_spelling(view: &EGraphView<'_>, logical: &ClassId, constructor: &str) -
     layout_classes(view.egraph(), logical)
         .iter()
         .any(|class| view.class(class).nodes_named(constructor).next().is_some())
+}
+
+/// Every operand layout an elected `Compute` node reads one of these
+/// bound buffers through, paired with the buffer it reads: the
+/// production read path's own view of the caller's storage, which is
+/// where a boundary layout ends up if it survives the search intact.
+fn read_layouts<'a>(
+    plan: &'a BufferIrGraph<DecodedLayout>,
+    lits: &[i64],
+) -> Vec<(i64, &'a DecodedLayout)> {
+    let mut layouts = Vec::new();
+    for node in plan.dag.node_weights() {
+        let BufferNode::Compute {
+            reads,
+            operand_info,
+            ..
+        } = node
+        else {
+            continue;
+        };
+        for (slot, read) in reads.iter().enumerate() {
+            if let Some(lit) = plan.buffers[read].lit.filter(|lit| lits.contains(lit)) {
+                layouts.push((lit, &operand_info[slot].layout));
+            }
+        }
+    }
+    layouts
 }
 
 /// A COLUMN-MAJOR INPUT: the boundary the binding stated is the boundary
@@ -178,8 +206,35 @@ fn a_zero_stride_is_read_only() {
     bindings.input_with(x.id, BoundaryLayout::strided_literal([0, 1]));
     bindings.input(delta.id);
     bindings.output(out.id);
-    CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a broadcast read map binds");
+    rt.search(&Default::default(), &harness_search_options())
+        .expect("host search over a broadcast read map");
+
+    // THE BROADCAST SURVIVES TO THE READ: the map an elected node reads
+    // `x` through spans one row — 1 + (2-1)*0 + (3-1)*1 = 3 — rather than
+    // the six elements a materialized copy would need, and the production
+    // read path lowers it.
+    let lit = rt.input_buffer(x.id).expect("x has an input buffer");
+    let plan = rt.plan().expect("the search installed a plan");
+    let layouts = read_layouts(plan, &[lit]);
+    assert!(
+        !layouts.is_empty(),
+        "no elected node reads the broadcast input's buffer"
+    );
+    for (_, layout) in layouts {
+        assert_eq!(
+            symbolic::span(layout)
+                .expect("the broadcast read map has a span")
+                .eval(&DynMap::default())
+                .expect("a literal span evaluates"),
+            3,
+            "the zero stride was widened into a materialized row"
+        );
+        let dims: Vec<Expr> = layout.shape().0.iter().cloned().map(Expr).collect();
+        kernels::layout_read_index("boundary", layout, &dims, Coords::FlatIndex { prefix: "c" })
+            .expect("the broadcast read map lowers");
+    }
 
     let mut bindings = CudaBindings::new();
     let home = bindings.input_with(x.id, BoundaryLayout::strided_literal([0, 1]));
@@ -297,10 +352,12 @@ fn reaches_int_var(egraph: &EGraph, root: &ClassId, name: &str) -> bool {
 }
 
 /// A SYMBOLIC STRIDE IS A BINDING, not a number the caller must have.
-/// Two shape-`(n, 4)` inputs whose element strides name `n` itself: `x`
-/// is the transposed (column-major) view, `w` is a four-column slice of
-/// an `(n, n)` buffer, which at symbolic `n` is no contiguous form at
-/// all and can only be read through its chain. The e-graph holds both
+/// Three shape-`(n, 4)` inputs whose element strides name `n` itself:
+/// `x` is the transposed (column-major) view, `w` is a four-column slice
+/// of an `(n, n)` buffer, which at symbolic `n` is no contiguous form at
+/// all and can only be read through its chain, and `v` is every other
+/// column of a column-major `(n, 8)` buffer, whose fast-axis stride is a
+/// COMPOUND expression over the dim. The e-graph holds all three
 /// spellings with the dim in them, the search plans them over whole
 /// buckets, and the reads the elected nodes lower go through the dim
 /// parameter instead of a baked stride.
@@ -309,7 +366,8 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
     let mut cx = Graph::new();
     let x = cx.named_tensor("x", ('n', 4usize), DType::F32);
     let w = cx.named_tensor("w", ('n', 4usize), DType::F32);
-    let out = x * w;
+    let v = cx.named_tensor("v", ('n', 4usize), DType::F32);
+    let out = x * w * v;
 
     let dim = IntExpr::from('n');
     let one = IntExpr::from(1i64);
@@ -326,6 +384,12 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
             strides: vec![dim, one],
         },
     );
+    bindings.input_with(
+        v.id,
+        BoundaryLayout::Strided {
+            strides: vec![one, dim * IntExpr::from(2i64)],
+        },
+    );
     bindings.output(out.id);
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a symbolic strided boundary loads");
@@ -334,7 +398,7 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
     // chain carries the dim itself, not a number.
     let egraph = rt.saturated_egraph().expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
-    for name in ["x", "w"] {
+    for name in ["x", "w", "v"] {
         let class = input_class(&egraph, name);
         assert!(
             holds_spelling(&view, &class, "StridedElementLayoutLit"),
@@ -375,50 +439,33 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
     // (c) THE LOWERED READ: ask the production read path for each node
     // that reads a caller buffer. The index must name the dim parameter
     // — a literal there would be the bucket representative baked in.
-    let lits: Vec<i64> = [x.id, w.id]
+    let lits: Vec<i64> = [x.id, w.id, v.id]
         .iter()
         .map(|id| rt.input_buffer(*id).expect("the input has a buffer"))
         .collect();
     let parameter = symbolic::variable("n");
     for bucket in rt.bucket_plans() {
-        let plan = &bucket.plan;
-        let mut probed = 0;
-        for node in plan.dag.node_weights() {
-            let BufferNode::Compute {
-                reads,
-                operand_info,
-                ..
-            } = node
-            else {
-                continue;
-            };
-            for (slot, read) in reads.iter().enumerate() {
-                if !plan.buffers[read]
-                    .lit
-                    .is_some_and(|lit| lits.contains(&lit))
-                {
-                    continue;
-                }
-                let layout = &operand_info[slot].layout;
-                let dims: Vec<Expr> = layout.shape().0.iter().cloned().map(Expr).collect();
-                let (code, index) = kernels::layout_read_index(
-                    "boundary",
-                    layout,
-                    &dims,
-                    Coords::FlatIndex { prefix: "c" },
-                )
-                .expect("the symbolic strided boundary lowers");
-                assert!(
-                    code.contains(&parameter) || index.contains(&parameter),
-                    "a read of the caller's storage baked a literal stride: {code}{index}"
-                );
-                probed += 1;
-            }
+        let layouts = read_layouts(&bucket.plan, &lits);
+        for (_, layout) in &layouts {
+            let dims: Vec<Expr> = layout.shape().0.iter().cloned().map(Expr).collect();
+            let (code, index) = kernels::layout_read_index(
+                "boundary",
+                layout,
+                &dims,
+                Coords::FlatIndex { prefix: "c" },
+            )
+            .expect("the symbolic strided boundary lowers");
+            assert!(
+                code.contains(&parameter) || index.contains(&parameter),
+                "a read of the caller's storage baked a literal stride: {code}{index}"
+            );
         }
-        assert!(
-            probed >= 2,
-            "bucket {:?} elected no node reading the bound inputs' buffers",
-            bucket.ranges
-        );
+        for (name, lit) in ["x", "w", "v"].iter().zip(&lits) {
+            assert!(
+                layouts.iter().any(|(read, _)| read == lit),
+                "bucket {:?}: no elected node reads {name}'s own storage",
+                bucket.ranges
+            );
+        }
     }
 }
