@@ -187,11 +187,23 @@ impl CompiledGraph {
         self.output_buffers.clone()
     }
 
-    /// Record one input's concrete shape by graph name. Its axes bind the
-    /// graph's symbolic dims, so a symbolic input runs at a new extent
-    /// without re-exporting. Dims only: no payload crosses here.
+    /// Record the concrete shapes of one call's inputs by graph name.
+    /// Their axes bind the graph's symbolic dims, so a symbolic input runs
+    /// at a new extent without re-exporting. Dims only: no payload crosses
+    /// here.
+    ///
+    /// ONE CALL IS READ AT ONCE, because a compound extent is checked
+    /// against the dimensions THIS call states: read input by input, an
+    /// input declared `2*s0` would be checked against whatever s0 was left
+    /// at by the call before it.
+    fn bind_input_shapes(&mut self, shapes: Vec<(String, Vec<usize>)>) -> PyResult<()> {
+        self.bind_dims(&shapes).map_err(to_py)
+    }
+
+    /// The same for a single input — the whole call, when it has one
+    /// tensor in it.
     fn bind_input_shape(&mut self, name: &str, shape: Vec<usize>) -> PyResult<()> {
-        self.bind_dims(name, &shape).map_err(to_py)
+        self.bind_dims(&[(name.to_string(), shape)]).map_err(to_py)
     }
 
     /// Address one EXTERNAL buffer for the next execution: the caller's
@@ -287,6 +299,23 @@ impl CompiledGraph {
     /// Saturate and search.
     #[pyo3(signature = (generations = None))]
     fn search(&mut self, generations: Option<usize>) -> PyResult<()> {
+        self.run_search(generations).map_err(to_py)
+    }
+
+    fn execute(&mut self) -> PyResult<()> {
+        if !self.searched {
+            return Err(PyRuntimeError::new_err(
+                "search() must run before execute()",
+            ));
+        }
+        self.runtime.execute().map_err(to_py)
+    }
+}
+
+impl CompiledGraph {
+    /// Saturate and search. What this states is what Python reads: the
+    /// `search` method maps it through [`to_py`] unchanged.
+    fn run_search(&mut self, generations: Option<usize>) -> Result<()> {
         // NO PAYLOAD CROSSES HERE. The default evaluator ranks candidates by
         // the device-free heuristic, which runs nothing; only a
         // device-profiling search consumes boundary bytes, and this backend's
@@ -305,94 +334,89 @@ impl CompiledGraph {
             for (symbol, hint) in hints {
                 let representative = hint.clamp(1, MAX_DYNAMIC_DIM);
                 let bucket = DimBucket::new(1, MAX_DYNAMIC_DIM).representative(representative);
-                self.runtime
-                    .bind_dim_buckets(symbol, vec![bucket])
-                    .map_err(to_py)?;
+                self.runtime.bind_dim_buckets(symbol, vec![bucket])?;
             }
         }
-        self.runtime.search(&data, &options).map_err(to_py)?;
+        self.runtime.search(&data, &options)?;
         self.searched = true;
         Ok(())
     }
 
-    fn execute(&mut self) -> PyResult<()> {
-        if !self.searched {
-            return Err(PyRuntimeError::new_err(
-                "search() must run before execute()",
-            ));
-        }
-        self.runtime.execute().map_err(to_py)
-    }
-}
-
-impl CompiledGraph {
-    /// Record an input's concrete shape into the symbolic-dim map (and the
-    /// runtime once searched).
+    /// Record this call's concrete input shapes into the symbolic-dim map
+    /// (and the runtime once searched).
     ///
     /// A DIMENSION IS BOUND ONLY FROM AN AXIS THAT IS THAT DIMENSION. A
     /// compound extent (`2*s0`) says what its dimensions multiply to, not
     /// what any one of them is, so it is checked against them rather than
-    /// read backwards; and one dimension on two axes of one input must be
-    /// given one extent.
-    fn bind_dims(&mut self, name: &str, shape: &[usize]) -> Result<()> {
-        let declared = self
-            .translation
-            .inputs
+    /// read backwards; one dimension on two axes must be given one extent,
+    /// wherever in the call those axes are; and nothing is recorded until
+    /// every input has passed, so a refusal leaves the map as it was.
+    fn bind_dims(&mut self, shapes: &[(String, Vec<usize>)]) -> Result<()> {
+        let declared = |name: &str| -> Result<Vec<IntExpr>> {
+            Ok(self
+                .translation
+                .inputs
+                .iter()
+                .find(|input| input.graph_name == name)
+                .ok_or_else(|| anyhow!("unknown input {name:?}"))?
+                .shape
+                .clone())
+        };
+        // Which axis IS a dimension: the bare ones, over the whole call.
+        let mut bound: HashMap<Symbol, (String, usize, usize)> = HashMap::new();
+        for (name, shape) in shapes {
+            for (axis, dim) in declared(name)?.iter().enumerate() {
+                let Some(value) = shape.get(axis).copied() else {
+                    continue;
+                };
+                if !is_bare(dim) {
+                    continue;
+                }
+                let symbol = dim.to_symbols()[0];
+                if let Some((first_input, first_axis, first)) =
+                    bound.insert(symbol, (name.clone(), axis, value))
+                    && first != value
+                {
+                    bail!(
+                        "dimension {symbol} is axis {first_axis} of input {first_input:?} and \
+                         axis {axis} of input {name:?}, called with {first} and {value}"
+                    );
+                }
+            }
+        }
+        let call: DynMap = bound
             .iter()
-            .find(|input| input.graph_name == name)
-            .ok_or_else(|| anyhow!("unknown input {name:?}"))?
-            .shape
-            .clone();
-
-        let mut bare = vec![false; declared.len()];
-        let mut bound: HashMap<Symbol, (usize, usize)> = HashMap::new();
-        for (axis, dim) in declared.iter().enumerate() {
-            let Some(value) = shape.get(axis).copied() else {
-                continue;
-            };
-            let symbols = dim.to_symbols();
-            let [symbol] = symbols[..] else { continue };
-            if *dim != IntExpr::from(symbol) {
-                continue;
-            }
-            bare[axis] = true;
-            if let Some((first_axis, first)) = bound.insert(symbol, (axis, value))
-                && first != value
-            {
-                bail!(
-                    "input {name:?}: dimension {symbol} is axis {first_axis} and axis {axis}, \
-                     called with {first} and {value}"
-                );
-            }
-        }
-        for (symbol, (_, value)) in &bound {
-            self.dims.insert(*symbol, *value);
-        }
+            .map(|(symbol, (_, _, value))| (*symbol, *value))
+            .collect();
 
         // A compound extent is a statement ABOUT the dimensions, checked
-        // once they are bound and never inverted into one of them.
-        for (axis, dim) in declared.iter().enumerate() {
-            let Some(value) = shape.get(axis).copied() else {
-                continue;
-            };
-            if bare[axis] || dim.to_symbols().is_empty() {
-                continue;
-            }
-            match dim.exec(&self.dims) {
-                Some(computed) if computed == value => {}
-                Some(computed) => bail!(
-                    "input {name:?}: axis {axis} is declared {dim}, which this call's \
-                     dimensions make {computed}, but the caller's extent is {value}"
-                ),
-                None => bail!(
-                    "input {name:?}: axis {axis} is declared {dim}, whose dimensions this \
-                     call does not state, so the caller's extent {value} cannot be read \
-                     as one of them"
-                ),
+        // against the ones THIS call states and never inverted into one of
+        // them.
+        for (name, shape) in shapes {
+            for (axis, dim) in declared(name)?.iter().enumerate() {
+                let Some(value) = shape.get(axis).copied() else {
+                    continue;
+                };
+                if is_bare(dim) || dim.to_symbols().is_empty() {
+                    continue;
+                }
+                match dim.exec(&call) {
+                    Some(computed) if computed == value => {}
+                    Some(computed) => bail!(
+                        "input {name:?}: axis {axis} is declared {dim}, which this call's \
+                         dimensions make {computed}, but the caller's extent is {value}"
+                    ),
+                    None => bail!(
+                        "input {name:?}: axis {axis} is declared {dim}, whose dimensions this \
+                         call does not state, so the caller's extent {value} cannot be read \
+                         as one of them"
+                    ),
+                }
             }
         }
 
-        for (symbol, (_, value)) in bound {
+        for (symbol, value) in call {
+            self.dims.insert(symbol, value);
             // Before search the bucket binding owns the dims; setting them now
             // would make `bind_dim_buckets` refuse as "already set".
             if self.searched {
@@ -401,6 +425,13 @@ impl CompiledGraph {
         }
         Ok(())
     }
+}
+
+/// Is this declared extent a dimension itself, rather than an expression
+/// over dimensions?
+fn is_bare(dim: &IntExpr) -> bool {
+    let symbols = dim.to_symbols();
+    symbols.len() == 1 && *dim == IntExpr::from(symbols[0])
 }
 
 /// One boundary tensor's layout as the caller spelled it: a tag, plus the
@@ -492,18 +523,10 @@ fn bind(
                             output.graph_name
                         )
                     })?;
-                let layout = layouts[target].clone();
                 // A writeback writes the TARGET's storage, so it is bound at
-                // the target's layout and never reinterprets it. A kernel
-                // destination must be row-major (the only destination layout
-                // the kernels write), so any other layout is refused here by
-                // name rather than written as though it were row-major.
-                ensure!(
-                    layout == BoundaryLayout::RowMajor,
-                    "output {} writes back into input {target:?}, whose boundary layout is \
-                     {layout:?}; a writeback destination must be row-major",
-                    output.graph_name
-                );
+                // the target's layout and never reinterprets it. Whether any
+                // kernel writes that layout is the search's question.
+                let layout = layouts[target].clone();
                 let buffer = input_buffers[index];
                 // The caller's storage is written through: the shared buffer
                 // must say so.
@@ -615,26 +638,35 @@ mod tests {
             .collect()
     }
 
-    /// A one-input translation declaring `shape` — the spelling
-    /// `bind_dims` reads — over a program that uses its input, so it
-    /// loads. The graph's own extents are immaterial: `bind_dims` reads
-    /// the DECLARED shape and nothing else.
-    fn declaring(shape: Vec<IntExpr>) -> Translation {
+    /// A translation declaring one shape per named input — the spelling
+    /// `bind_dims` reads — over a program that uses them all, so it loads.
+    /// The graph's own extents are immaterial: `bind_dims` reads the
+    /// DECLARED shapes and nothing else.
+    fn declaring_inputs(rows: &[(&str, Vec<IntExpr>)]) -> Translation {
         let mut cx = Graph::new();
-        let x = cx.named_tensor("x", (2usize, 3usize), DType::F32);
-        let out = x + 1.;
+        let tensors: Vec<_> = rows
+            .iter()
+            .map(|(name, _)| cx.named_tensor(*name, (2usize, 3usize), DType::F32))
+            .collect();
+        let out = tensors[1..]
+            .iter()
+            .fold(tensors[0] + 1., |acc, tensor| acc * *tensor);
         Translation {
             graph: cx,
-            inputs: vec![TranslatedInput {
-                graph_name: "x".to_string(),
-                parameter_name: None,
-                kind: InputKind::UserInput {
-                    graph_name: "x".to_string(),
-                },
-                tensor: x.id,
-                dtype: DType::F32,
-                shape,
-            }],
+            inputs: rows
+                .iter()
+                .zip(&tensors)
+                .map(|((name, shape), tensor)| TranslatedInput {
+                    graph_name: (*name).to_string(),
+                    parameter_name: None,
+                    kind: InputKind::UserInput {
+                        graph_name: (*name).to_string(),
+                    },
+                    tensor: tensor.id,
+                    dtype: DType::F32,
+                    shape: shape.clone(),
+                })
+                .collect(),
             outputs: vec![TranslatedOutput {
                 graph_name: "out".to_string(),
                 tensor: out.id,
@@ -648,6 +680,18 @@ mod tests {
         }
     }
 
+    /// The one-input case.
+    fn declaring(shape: Vec<IntExpr>) -> Translation {
+        declaring_inputs(&[("x", shape)])
+    }
+
+    /// One call's input shapes, the way `bind_input_shapes` takes them.
+    fn call(rows: &[(&str, &[usize])]) -> Vec<(String, Vec<usize>)> {
+        rows.iter()
+            .map(|(name, shape)| ((*name).to_string(), shape.to_vec()))
+            .collect()
+    }
+
     /// The object `compile` hands back, built from a synthetic
     /// translation. `bind_dims` reads the declared input shapes and
     /// nothing else, so the loaded program's own structure is immaterial.
@@ -658,8 +702,16 @@ mod tests {
             .map(|input| input.graph_name.as_str())
             .collect();
         let layouts = row_major(&names);
+        compiled_with(translation, &layouts)
+    }
+
+    /// The same, under a stated layout table.
+    fn compiled_with(
+        translation: Translation,
+        layouts: &HashMap<String, BoundaryLayout>,
+    ) -> CompiledGraph {
         let (bindings, input_buffers, output_buffers) =
-            bind(&translation, &layouts).expect("the synthetic boundary binds");
+            bind(&translation, layouts).expect("the synthetic boundary binds");
         let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
         let runtime = CudaRuntime::load_with(
             &translation.graph,
@@ -688,7 +740,7 @@ mod tests {
             IntExpr::from(symbol),
         ]));
         let err = graph
-            .bind_dims("x", &[3, 5])
+            .bind_dims(&call(&[("x", &[3, 5])]))
             .expect_err("s0 cannot be both 3 and 5");
         let text = format!("{err:#}");
         assert!(text.contains("s0"), "{text}");
@@ -700,8 +752,10 @@ mod tests {
         );
     }
 
-    /// A COMPOUND EXTENT IS NOT INVERTED: `2*s0` at extent 6 says s0 is 3
-    /// or says nothing — it never says s0 is 6.
+    /// A COMPOUND EXTENT IS NOT INVERTED: `2*s0` at extent 6 never says
+    /// s0 is 6, and with nothing else on this input stating s0 it says
+    /// nothing at all — so the call is refused by name rather than
+    /// solved backwards.
     #[test]
     fn a_compound_extent_is_checked_never_read_backwards() {
         let symbol = Symbol::new("s0");
@@ -709,22 +763,102 @@ mod tests {
             IntExpr::from(symbol) * IntExpr::from(2i64),
             IntExpr::from(4i64),
         ]));
-        match graph.bind_dims("x", &[6, 4]) {
-            Ok(()) => assert_eq!(
-                graph.dims.get(&symbol),
-                Some(&3),
-                "a compound extent that binds must bind what it solves to"
-            ),
-            Err(err) => {
-                let text = format!("{err:#}");
-                assert!(text.contains("s0"), "{text}");
-            }
-        }
-        assert_ne!(
+        let err = graph
+            .bind_dims(&call(&[("x", &[6, 4])]))
+            .expect_err("nothing on this call states s0");
+        let text = format!("{err:#}");
+        assert!(text.contains("s0"), "{text}");
+        assert!(text.contains("axis 0"), "{text}");
+        assert!(text.contains('6'), "{text}");
+        assert_eq!(
             graph.dims.get(&symbol),
-            Some(&6),
+            None,
             "the axis extent was read backwards into the dimension"
         );
+    }
+
+    /// A COMPOUND EXTENT IS CHECKED AGAINST THE DIMENSIONS the call does
+    /// state: `2*s0` over an input whose other axis IS s0 agrees or is
+    /// refused naming the axis, what the dimensions make it, and what the
+    /// caller brought.
+    #[test]
+    fn a_compound_extent_is_checked_against_the_calls_dimensions() {
+        let symbol = Symbol::new("s0");
+        let shape = vec![
+            IntExpr::from(symbol),
+            IntExpr::from(symbol) * IntExpr::from(2i64),
+        ];
+        let mut graph = compiled(declaring(shape.clone()));
+        let err = graph
+            .bind_dims(&call(&[("x", &[3, 7])]))
+            .expect_err("s0 is 3, so axis 1 is 6, not 7");
+        let text = format!("{err:#}");
+        assert!(text.contains("axis 1"), "{text}");
+        assert!(text.contains('6') && text.contains('7'), "{text}");
+
+        let mut graph = compiled(declaring(shape));
+        graph
+            .bind_dims(&call(&[("x", &[3, 6])]))
+            .expect("3 and 2*3 agree");
+        assert_eq!(graph.dims.get(&symbol), Some(&3));
+    }
+
+    /// ONE CALL, ONE DIMENSION MAP: a compound extent is checked against
+    /// the dimensions the SAME call states, wherever in the call they are
+    /// spelled — never against what the call before it left behind.
+    #[test]
+    fn a_compound_extent_is_checked_against_the_whole_calls_dimensions() {
+        let symbol = Symbol::new("s0");
+        let rows = [
+            (
+                "a",
+                vec![
+                    IntExpr::from(symbol) * IntExpr::from(2i64),
+                    IntExpr::from(4i64),
+                ],
+            ),
+            ("b", vec![IntExpr::from(symbol), IntExpr::from(4i64)]),
+        ];
+        for order in [[0usize, 1], [1, 0]] {
+            let mut graph = compiled(declaring_inputs(&rows));
+            let shapes = call(&[("a", &[6, 4]), ("b", &[3, 4])]);
+            let shapes: Vec<_> = order.iter().map(|i| shapes[*i].clone()).collect();
+            graph.bind_dims(&shapes).expect("6 is 2*3");
+            assert_eq!(graph.dims.get(&symbol), Some(&3));
+
+            let mut graph = compiled(declaring_inputs(&rows));
+            let shapes = call(&[("a", &[6, 4]), ("b", &[2, 4])]);
+            let shapes: Vec<_> = order.iter().map(|i| shapes[*i].clone()).collect();
+            let err = graph.bind_dims(&shapes).expect_err("2*2 is not 6");
+            let text = format!("{err:#}");
+            assert!(text.contains("\"a\"") && text.contains("axis 0"), "{text}");
+            assert!(text.contains('4') && text.contains('6'), "{text}");
+            assert_eq!(
+                graph.dims.get(&symbol),
+                None,
+                "a refused call recorded a dimension"
+            );
+        }
+    }
+
+    /// ONE DIMENSION, ONE EXTENT ACROSS THE CALL: two inputs that give one
+    /// dimension two extents are refused naming both, rather than the
+    /// second silently overwriting the first.
+    #[test]
+    fn a_dimension_on_two_inputs_must_get_one_extent() {
+        let symbol = Symbol::new("s0");
+        let rows = [
+            ("a", vec![IntExpr::from(symbol), IntExpr::from(4i64)]),
+            ("b", vec![IntExpr::from(symbol), IntExpr::from(4i64)]),
+        ];
+        let mut graph = compiled(declaring_inputs(&rows));
+        let err = graph
+            .bind_dims(&call(&[("a", &[3, 4]), ("b", &[5, 4])]))
+            .expect_err("s0 cannot be both 3 and 5");
+        let text = format!("{err:#}");
+        assert!(text.contains("\"a\"") && text.contains("\"b\""), "{text}");
+        assert!(text.contains('3') && text.contains('5'), "{text}");
+        assert_eq!(graph.dims.get(&symbol), None, "a refused call bound a dim");
     }
 
     /// ALIASING HAS ONE SPELLING: the writeback and the input it mutates
@@ -778,18 +912,63 @@ mod tests {
         );
     }
 
-    /// A kernel writes row-major destinations only, so a writeback into a
-    /// target the caller handed over at another layout is refused BY NAME
-    /// rather than written as though it were row-major.
+    /// A WRITEBACK IS BOUND AT ITS TARGET'S LAYOUT: the sink writes the
+    /// caller's own storage, so it states that storage's layout and never
+    /// reinterprets it as row-major.
     #[test]
-    fn a_writeback_into_a_non_row_major_target_is_refused_by_name() {
+    fn a_writeback_binds_at_its_targets_layout() {
         let translation = translation(&["x"], Some("x"));
         let layouts: HashMap<String, BoundaryLayout> =
             [("x".to_string(), BoundaryLayout::ColumnMajor)].into();
-        let err = bind(&translation, &layouts).expect_err("column-major writeback target");
+        let (bindings, inputs, outputs) =
+            bind(&translation, &layouts).expect("a writeback binds at its target's layout");
+        assert_eq!(outputs[0], inputs[0]);
+        assert_eq!(bindings.outputs()[0].layout, BoundaryLayout::ColumnMajor);
+        assert_eq!(bindings.buffers()[&inputs[0]].access, Access::ReadWrite);
+    }
+
+    /// WHETHER A KERNEL WRITES THAT LAYOUT IS THE SEARCH'S QUESTION, and
+    /// today none writes a left-major destination: the answer is a search
+    /// that plans nothing and names the output and the layout it is bound
+    /// at, which is the text `search()` hands Python unchanged.
+    #[test]
+    fn a_writeback_the_kernels_cannot_write_is_named_by_the_search() {
+        let mut cx = Graph::new();
+        let x = cx.named_tensor("x", (2usize, 3usize), DType::F32);
+        let out = x + 1.;
+        let out_value = out.id.index();
+        let shape = vec![IntExpr::from(2i64), IntExpr::from(3i64)];
+        let translation = Translation {
+            graph: cx,
+            inputs: vec![TranslatedInput {
+                graph_name: "x".to_string(),
+                parameter_name: None,
+                kind: InputKind::UserInput {
+                    graph_name: "x".to_string(),
+                },
+                tensor: x.id,
+                dtype: DType::F32,
+                shape: shape.clone(),
+            }],
+            outputs: vec![TranslatedOutput {
+                graph_name: "out".to_string(),
+                tensor: out.id,
+                dtype: DType::F32,
+                shape,
+                mutation_target: Some("x".to_string()),
+                returned: true,
+            }],
+            dims: HashMap::new(),
+            symbols: HashMap::new(),
+        };
+        let layouts: HashMap<String, BoundaryLayout> =
+            [("x".to_string(), BoundaryLayout::ColumnMajor)].into();
+        let err = compiled_with(translation, &layouts)
+            .run_search(Some(1))
+            .expect_err("no kernel writes a left-major destination");
         let text = format!("{err:#}");
-        assert!(text.contains("\"x\""), "{text}");
-        assert!(text.contains("must be row-major"), "{text}");
+        assert!(text.contains(&format!("v{out_value}")), "{text}");
+        assert!(text.contains("ColumnMajor"), "{text}");
     }
 
     /// A SYMBOLIC STRIDE reaches the binding as the program's own dim: a

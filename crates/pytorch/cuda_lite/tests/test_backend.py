@@ -156,10 +156,11 @@ def test_transposed_input_binds_zero_copy():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_writeback_into_transposed_input_is_refused():
-    """A writeback writes its target's storage, and a kernel destination must
-    be row-major (the only destination layout the kernels write): any other
-    target is refused by name rather than written as though it were."""
+def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
+    """A writeback is bound at its target's layout — here column-major — and
+    whether any kernel writes that layout is the SEARCH's question, never a
+    prior taken at bind. Today none does, so the search plans nothing and
+    says which output, at which layout, it found no plan for."""
 
     def fn(x):
         x.add_(1)
@@ -167,7 +168,9 @@ def test_writeback_into_transposed_input_is_refused():
 
     torch.manual_seed(0)
     x = torch.randn(8, 4, device="cuda").t()
-    with pytest.raises(Exception, match="must be row-major"):
+    with pytest.raises(
+        Exception, match=r"no plan writes the bound outputs: v\d+ at ColumnMajor"
+    ):
         torch.compile(fn, backend=luminal_cuda_lite)(x)
 
 
@@ -270,7 +273,7 @@ def test_stride_only_symbol_is_refused_by_name():
     torch.manual_seed(0)
     compiled = torch.compile(fn, backend=luminal_cuda_lite, dynamic=True)
     x = torch.randn(16, 6, device="cuda").t()[:, ::2]
-    with pytest.raises(Exception, match="does not declare"):
+    with pytest.raises(Exception, match=r"stride on axis 1.*does not declare"):
         compiled(x)
 
 
@@ -308,10 +311,11 @@ def test_expanded_input_is_a_broadcast_read_map():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_stride_zero_mutation_target_is_refused_by_name():
-    """The same broadcast view as a WRITE target: every coordinate of the
-    zero-stride axis would land on one element. Recognized as the strided
-    read map it is, and refused by name as a writeback destination."""
+def test_stride_zero_mutation_target_finds_no_plan_naming_the_output():
+    """The same broadcast view as a WRITE target: it is recognized as the
+    strided map it is and bound as such, and the e-graph's write gate — a
+    destination layout must be injective — leaves the search with nothing
+    to install, which it reports by naming the output and its layout."""
     from luminal_cuda_lite.boundary import Strided, boundary_layout
 
     def fn(t):
@@ -321,5 +325,65 @@ def test_stride_zero_mutation_target_is_refused_by_name():
     torch.manual_seed(0)
     x = torch.randn(1, 8, device="cuda").expand(4, 8)
     assert boundary_layout("x", x) == Strided(("Integer(0)", "Integer(1)"))
-    with pytest.raises(Exception, match="must be row-major"):
+    with pytest.raises(
+        Exception, match=r"no plan writes the bound outputs: v\d+ at Strided"
+    ):
         torch.compile(fn, backend=luminal_cuda_lite)(x)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_a_held_buffer_is_bound_on_the_modules_own_storage():
+    """A parameter or buffer is the CALLER's memory too: it is bound at the
+    address the module's own tensor has, never at a copy the backend made
+    while preparing the graph. Asked of the module Dynamo does not inline,
+    which is the configuration that hands the backend a graph holding the
+    tensors as attributes."""
+
+    class Counter(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("state", torch.zeros(4, device="cuda"))
+
+        def forward(self, x):
+            self.state.add_(1)
+            return x + self.state
+
+    held = []
+
+    def capture(gm, example_inputs, **kwargs):
+        model = luminal_cuda_lite(gm, example_inputs, **kwargs)
+        held.append(model)
+        return model
+
+    module = Counter()
+    before = module.state.clone()
+    with torch._dynamo.config.patch(inline_inbuilt_nn_modules=False):
+        compiled = torch.compile(module, backend=capture)
+        out = compiled(torch.zeros(4, device="cuda"))
+
+    torch.testing.assert_close(module.state, before + 1)
+    torch.testing.assert_close(out, module.state)
+    bound = [model for model in held if model._held]
+    assert bound, "the backend bound no held tensor"
+    for model in bound:
+        for name, tensor in model._held.items():
+            assert tensor.data_ptr() == module.state.data_ptr(), (
+                f"{name} is bound on a copy of the module's storage"
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_a_parameter_whose_storage_moved_is_read_at_its_new_address():
+    """``p.data = p.data.clone()`` changes no metadata Dynamo guards on, so
+    the compiled frame is re-entered with the parameter living somewhere
+    else. Held tensors are re-addressed every call, so the numbers stay the
+    module's."""
+    torch.manual_seed(0)
+    model = torch.nn.Linear(16, 8).cuda().eval()
+    compiled = torch.compile(model, backend=luminal_cuda_lite)
+    x = torch.randn(4, 16, device="cuda")
+    with torch.no_grad():
+        torch.testing.assert_close(compiled(x), model(x))
+        model.weight.data = model.weight.data.clone() + 1
+        torch.cuda.empty_cache()
+        torch.testing.assert_close(compiled(x), model(x))

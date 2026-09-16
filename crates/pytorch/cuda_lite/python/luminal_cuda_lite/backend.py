@@ -224,6 +224,7 @@ class CompiledModel:
         output_bindings: Sequence[Binding],
         scalar_output_positions: Sequence[int] = (),
         held_tensors: Optional[dict[str, torch.Tensor]] = None,
+        held_bindings: Sequence[Binding] = (),
     ):
         self._graph = graph
         self._ep = ep
@@ -231,9 +232,14 @@ class CompiledModel:
         self._input_names = [binding.name for binding in self._input_bindings]
         self._output_bindings = list(output_bindings)
         self._scalar_output_positions = frozenset(scalar_output_positions)
-        # Parameters and buffers, by graph input name, whose device pointers
-        # the runtime holds for its life; a buffer writeback lands in them.
+        # Parameters and buffers, by graph input name; a buffer writeback
+        # lands in them. Their declared bindings are kept because a held
+        # tensor is checked and re-addressed every call: `p.data = q` moves
+        # a parameter's storage without changing any metadata Dynamo guards
+        # on, so an address taken once at compile can go stale under a
+        # program that still passes every guard.
         self._held: dict[str, torch.Tensor] = dict(held_tensors or {})
+        self._held_bindings = list(held_bindings)
         # Fixed once a plan set is searched; the per-execution arena sizes to it.
         self._arena_bytes = graph.arena_bytes()
         # The runtime always launches captured CUDA graphs, which the legacy
@@ -295,7 +301,9 @@ class CompiledModel:
         # ones is refused by name. The dimension map is the whole call's, so
         # a stride declared over a dimension ANOTHER input carries is still
         # checked here.
-        bound = list(zip(self._input_bindings, inputs))
+        bound = list(zip(self._input_bindings, inputs)) + [
+            (binding, self._held[binding.name]) for binding in self._held_bindings
+        ]
         dims = call_dim_values(bound)
         for binding, value in bound:
             check_binding(binding, value, dims)
@@ -308,12 +316,29 @@ class CompiledModel:
                 self._writebacks,
             )
 
+        # The dimensions THIS call states, read off its every input at once:
+        # a compound extent is checked against them, so reading input by
+        # input would check it against what the call before left behind.
+        # Refused here, before any pointer is set.
+        self._graph.bind_input_shapes(
+            [(binding.name, list(value.shape)) for binding, value in bound]
+        )
+
         # Every input is bound as it is, on the buffer it was declared on.
         per_call: list[int] = []
         for binding, value in zip(self._input_bindings, inputs):
-            self._graph.bind_input_shape(binding.name, list(value.shape))
             self._graph.set_device_ptr(binding.buffer, value.data_ptr(), buffer_nbytes(value))
             per_call.append(binding.buffer)
+
+        # Held tensors are re-addressed rather than cleared: the address a
+        # parameter has now is the one this execution reads, and leaving it
+        # set is what makes a skipped user-input binding — never a held one
+        # — the thing an execute refuses by name.
+        for binding in self._held_bindings:
+            tensor = self._held[binding.name]
+            self._graph.set_device_ptr(
+                binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
+            )
 
         # Output shapes depend on the bound dims, so read them after the
         # inputs are bound rather than caching them at compile time.
@@ -561,21 +586,23 @@ def luminal_cuda_lite(
     # and buffer pointers once (they outlive every call), and keep one
     # `Binding` per user input for the per-call check.
     held: dict[str, torch.Tensor] = {}
+    held_bindings: list[Binding] = []
     input_bindings: list[Binding] = []
-    for name, kind, buffer in zip(graph.input_names, graph.input_kinds, graph.input_buffers):
+    for name in graph.input_names:
         if name not in tensors:
             raise RuntimeError(
                 f"the translated program names an input {name!r} the export signature "
                 f"does not declare (declared: {sorted(tensors)})"
             )
+    graph.bind_input_shapes([(name, list(tensors[name].shape)) for name in graph.input_names])
+    for name, kind, buffer in zip(graph.input_names, graph.input_kinds, graph.input_buffers):
         value = tensors[name]
-        graph.bind_input_shape(name, list(value.shape))
+        binding = Binding(name, buffer, value.dtype, shapes[name], layouts[name])
         if kind == "user_input":
-            input_bindings.append(
-                Binding(name, buffer, value.dtype, shapes[name], layouts[name])
-            )
+            input_bindings.append(binding)
             continue
         graph.set_device_ptr(buffer, value.data_ptr(), buffer_nbytes(value))
+        held_bindings.append(binding)
         held[name] = value
 
     graph.search(search_iterations)
@@ -599,7 +626,13 @@ def luminal_cuda_lite(
         )
     ]
     return CompiledModel(
-        graph, ep, input_bindings, output_bindings, scalar_output_positions, held
+        graph,
+        ep,
+        input_bindings,
+        output_bindings,
+        scalar_output_positions,
+        held,
+        held_bindings,
     )
 
 

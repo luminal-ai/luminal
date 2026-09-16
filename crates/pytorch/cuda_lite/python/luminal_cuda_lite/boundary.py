@@ -296,8 +296,9 @@ def check_binding(
     binding: Binding, tensor: torch.Tensor, dims: Optional[dict[str, int]] = None
 ) -> None:
     """Refuse a call-time tensor that does not match its declared binding:
-    the dtype, the rank, every literal extent, and the element strides the
-    declared layout has at this call's dimensions.
+    the dtype, the rank, every extent — literal, or compound over this
+    call's dimensions — and the element strides the declared layout has at
+    those dimensions.
 
     `dims` is the whole call's dimension map (`call_dim_values`); without
     one only this tensor's own bare-symbol axes pin the declared strides.
@@ -315,15 +316,40 @@ def check_binding(
             f"{binding.name}: bound at rank {len(binding.shape)} (shape {binding.shape}), "
             f"called with rank {len(shape)} (shape {shape})"
         )
+    dims = _dim_values(binding, tensor) if dims is None else dims
     for axis, (declared, size) in enumerate(zip(binding.shape, shape)):
-        if isinstance(declared, int) and declared != size:
+        if isinstance(declared, int):
+            if declared != size:
+                raise UnsupportedBoundary(
+                    f"{binding.name}: bound with extent {declared} on axis {axis}, "
+                    f"called with {size}"
+                )
+            continue
+        # A declared extent over the program's dimensions states what those
+        # dimensions make it, which is checked here: past this the runtime
+        # is handed an address and a byte count, and a call whose extent is
+        # SHORTER than the declared one reaches inside the bytes it brought,
+        # so no length check downstream catches it.
+        extent = sympy.sympify(declared).subs(
+            {
+                symbol: dims[symbol.name]
+                for symbol in declared.free_symbols
+                if symbol.name in dims
+            }
+        )
+        if not extent.is_number:
+            free = ", ".join(sorted(symbol.name for symbol in extent.free_symbols))
             raise UnsupportedBoundary(
-                f"{binding.name}: bound with extent {declared} on axis {axis}, "
-                f"called with {size}"
+                f"{binding.name}: axis {axis} is declared {declared}, which still names "
+                f"{free} once this call's dimensions are substituted; no boundary of this "
+                "call gives that dimension an extent"
             )
-    expected = _declared_strides(
-        binding, shape, _dim_values(binding, tensor) if dims is None else dims
-    )
+        if int(extent) != size:
+            raise UnsupportedBoundary(
+                f"{binding.name}: axis {axis} is declared {declared}, which this call's "
+                f"dimensions make {int(extent)}, but the tensor's extent is {size}"
+            )
+    expected = _declared_strides(binding, shape, dims)
     actual = tuple(int(stride) for stride in tensor.stride())
     for axis, (want, got, size) in enumerate(zip(expected, actual, shape)):
         if size <= 1 or want == got:

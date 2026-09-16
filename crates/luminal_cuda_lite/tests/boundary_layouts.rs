@@ -193,10 +193,11 @@ fn a_strided_binding_states_one_non_negative_stride_per_axis() {
     );
 }
 
-/// A ZERO STRIDE IS A BROADCAST READ MAP: legal on a read-only input,
-/// refused by name on a buffer the program writes.
+/// A ZERO STRIDE IS A BROADCAST READ MAP: a legitimate read of the
+/// caller's storage, planned and lowered as one row rather than widened
+/// into a materialized copy.
 #[test]
-fn a_zero_stride_is_read_only() {
+fn a_zero_stride_input_plans_as_a_broadcast_read() {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 3usize), DType::F32);
     let delta = cx.tensor((2usize, 3usize), DType::F32);
@@ -235,21 +236,62 @@ fn a_zero_stride_is_read_only() {
         kernels::layout_read_index("boundary", layout, &dims, Coords::FlatIndex { prefix: "c" })
             .expect("the broadcast read map lowers");
     }
+}
+
+/// WRITABILITY IS THE SEARCH'S QUESTION, never bind's: a mutation sink
+/// binds at the layout its target has, and a layout no kernel writes —
+/// here a broadcast, where every coordinate would land on one element —
+/// is answered by a search that finds no plan and names the output.
+#[test]
+fn a_zero_stride_sink_binds_and_the_search_names_it() {
+    let mut cx = Graph::new();
+    let x = cx.tensor((2usize, 3usize), DType::F32);
+    let delta = cx.tensor((2usize, 3usize), DType::F32);
+    let out = x + delta;
 
     let mut bindings = CudaBindings::new();
     let home = bindings.input_with(x.id, BoundaryLayout::strided_literal([0, 1]));
     bindings.declare(home, Access::ReadWrite, FreedBy::Caller);
     bindings.input(delta.id);
-    bindings.output_on(out.id, home);
-    let refusal = match CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt()) {
-        Ok(_) => panic!("a zero stride on a written buffer must be refused"),
-        Err(refusal) => refusal.to_string(),
+    bindings.output_on_with(out.id, home, BoundaryLayout::strided_literal([0, 1]));
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a stride-0 sink binds");
+
+    let refusal = match rt.search(&Default::default(), &harness_search_options()) {
+        Ok(_) => panic!("a broadcast write map must plan nothing"),
+        Err(refusal) => format!("{refusal:#}"),
     };
     assert!(
-        refusal.contains(&format!("v{}", x.id.index()))
-            && refusal.contains("ReadWrite")
-            && refusal.contains("stride 0"),
-        "{refusal}"
+        refusal.contains(&format!("v{}", out.id.index())) && refusal.contains("Strided"),
+        "the refusal must name the output and its bound layout: {refusal}"
+    );
+}
+
+/// A COLUMN-MAJOR WRITEBACK TARGET binds — the sink takes the layout its
+/// target has — and the search answers: today no kernel writes a
+/// left-major destination, so the refusal names the output and the
+/// layout instead of a bind-time prior about writability.
+#[test]
+fn a_column_major_sink_binds_and_the_search_names_it() {
+    let mut cx = Graph::new();
+    let x = cx.tensor((2usize, 3usize), DType::F32);
+    let delta = cx.tensor((2usize, 3usize), DType::F32);
+    let out = x + delta;
+
+    let mut bindings = CudaBindings::new();
+    let home = bindings.input_with(x.id, BoundaryLayout::ColumnMajor);
+    bindings.declare(home, Access::ReadWrite, FreedBy::Caller);
+    bindings.input(delta.id);
+    bindings.output_on_with(out.id, home, BoundaryLayout::ColumnMajor);
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a column-major sink binds");
+    let refusal = match rt.search(&Default::default(), &harness_search_options()) {
+        Ok(_) => panic!("no kernel writes a left-major destination today"),
+        Err(refusal) => format!("{refusal:#}"),
+    };
+    assert!(
+        refusal.contains(&format!("v{}", out.id.index())) && refusal.contains("ColumnMajor"),
+        "the refusal must name the output and its bound layout: {refusal}"
     );
 }
 

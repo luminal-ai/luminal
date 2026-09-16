@@ -410,9 +410,8 @@ impl CudaBindings {
     /// non-input value, a binding on an undeclared buffer, a reachable
     /// input left unbound, a value bound twice on one buffer, an empty
     /// output set, a strided binding whose stride count is not the
-    /// value's rank, whose literal strides include a negative one, or
-    /// whose zero stride sits on a ReadWrite buffer, and two bindings
-    /// on one buffer that disagree about placement.
+    /// value's rank or whose literal strides include a negative one,
+    /// and two bindings on one buffer that disagree about placement.
     pub fn bind(&self, graph: &LogicalGraph) -> Result<BoundProgram, String> {
         if self.outputs.is_empty() {
             return Err("bindings name no output".to_string());
@@ -455,19 +454,6 @@ impl CudaBindings {
                             "v{}'s strided boundary has stride {stride} on axis {axis}: \
                              boundary element strides are never negative",
                             bound.value.index()
-                        ));
-                    }
-                    // A zero stride is a broadcast: every coordinate of
-                    // that axis reads one element. It is a read map, and
-                    // writing through it would have every coordinate
-                    // land on the same element.
-                    if stride == 0 && self.buffers[&bound.buffer].access == Access::ReadWrite {
-                        return Err(format!(
-                            "v{}'s strided boundary has stride 0 on axis {axis} and buffer \
-                             {} is declared ReadWrite: a zero stride is a broadcast read \
-                             map, never a write target",
-                            bound.value.index(),
-                            bound.buffer
                         ));
                     }
                 }

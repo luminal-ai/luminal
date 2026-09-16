@@ -655,6 +655,25 @@ impl CudaRuntime {
             None
         };
 
+        // A search that finds nothing has found nothing that WRITES these,
+        // so a refusal states them: whether a kernel can write a bound
+        // layout is the search's question, never bind's.
+        let bound_outputs = native
+            .bound
+            .outputs
+            .iter()
+            .map(|bound| {
+                format!(
+                    "v{} at {:?} on buffer {}",
+                    bound.value.index(),
+                    bound.layout,
+                    bound.buffer
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let no_plan = || format!("no plan writes the bound outputs: {bound_outputs}");
+
         // THIS INSTANCE's claim set, derived at load from THIS
         // instance's registry — no crate-level default is consulted.
         let allow = self.allow.clone();
@@ -702,7 +721,8 @@ impl CudaRuntime {
                 Some(allow.clone()),
                 matchers,
                 evaluator.reborrow(),
-            )?;
+            )
+            .with_context(no_plan)?;
             // THE UNBUCKETED LATTICE (Phase 5) — a lattice over ONE
             // bucket, so unbucketed and bucketed installs run the same
             // code. Main's "one designed difference" from its pre-#420
@@ -754,11 +774,12 @@ impl CudaRuntime {
                 Some(allow),
                 matchers,
                 evaluator,
-            )?;
+            )
+            .with_context(no_plan)?;
             let first = plans
                 .first()
                 .map(|plan| plan.outcome.clone())
-                .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
+                .ok_or_else(|| anyhow!(no_plan()))?;
             (first, None, plans)
         };
         self.device_budget_bytes = options.device_budget_bytes;

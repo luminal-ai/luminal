@@ -80,3 +80,26 @@ def test_check_binding_dimensions_refuse_one_symbol_with_two_extents():
     assert "s0" in message, message
     assert "3" in message and "5" in message, message
     assert "'a'" in message and "'b'" in message, message
+
+
+def test_check_binding_checks_a_compound_extent_against_the_calls_dimensions():
+    """A declared extent over the program's dimensions is checked here, not
+    only its strides: a call that brings FEWER rows than the declaration
+    makes still fits inside the bytes it hands over, so nothing downstream
+    would catch it."""
+    binding = _binding("x", (2 * sympy.Symbol("s0"), 4), boundary.RowMajor())
+    boundary.check_binding(binding, torch.empty(6, 4), {"s0": 3})
+    with pytest.raises(boundary.UnsupportedBoundary) as refusal:
+        boundary.check_binding(binding, torch.empty(4, 4), {"s0": 3})
+    message = str(refusal.value)
+    assert "axis 0" in message, message
+    assert "s0" in message, message
+    assert "6" in message and "4" in message, message
+
+
+def test_check_binding_refuses_an_extent_no_dimension_of_the_call_pins():
+    """The same declaration with nothing stating its dimension: refused by
+    name rather than left unchecked."""
+    binding = _binding("x", (2 * sympy.Symbol("s0"), 4), boundary.RowMajor())
+    with pytest.raises(boundary.UnsupportedBoundary, match="s0"):
+        boundary.check_binding(binding, torch.empty(6, 4), {})
