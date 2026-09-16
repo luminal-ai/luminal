@@ -3,7 +3,8 @@ name = "luminal_reference"
 version = "0.1.0"
 description = "Luminal reference (CPU) torch.compile backend"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.10.0"]
+# numpy: `_tensor_bytes` stages a tensor through `.numpy().tobytes()`.
+dependencies = ["torch>=2.10.0", "numpy>=2.0.2"]
 
 # torch comes from the CUDA 12.8 index, matching crates/luminal_python: the
 # default index's newest builds target CUDA 13 and cannot run on a 12.8 driver.
