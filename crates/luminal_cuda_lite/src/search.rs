@@ -530,6 +530,20 @@ pub fn search_implementations(
                             continue;
                         }
                     };
+                    // A CALLER-OWNED OUTPUT MUST BE WRITTEN, NOT DISCLOSED.
+                    // An output bound External is the caller's memory, so
+                    // the plan has to produce it IN the buffer the binding
+                    // named. A plan that elects a VIEW of it (escape-and-
+                    // disclose) leaves the caller's tensor unwritten, so it
+                    // is not a candidate: refuse it here and the search
+                    // keeps looking for one that materializes.
+                    if let Some(reason) = external_output_is_disclosed(&plan, &program.outputs) {
+                        breakdown.plan_build_refusals += 1;
+                        if refusals.len() < 8 {
+                            refusals.push(reason);
+                        }
+                        continue;
+                    }
                     // The heuristic cost of this graph is ALWAYS computed
                     // — it is what the outcome reports beside a measured
                     // winner — but under device profiling it is never
@@ -824,6 +838,39 @@ pub fn select_finalist_set(
         );
     }
     Ok((selected, rejections))
+}
+
+/// `Some(reason)` when `plan` produces a caller-owned (External) output as a
+/// VIEW of another buffer instead of writing the buffer its binding named.
+/// Disclosure is fine for a runtime-owned output — `fetch` reads it back
+/// through the disclosed layout — but a caller's tensor is only correct if
+/// the plan wrote it.
+fn external_output_is_disclosed(
+    plan: &crate::layouts::CudaPlan,
+    outputs: &[crate::bindings::Bound],
+) -> Option<String> {
+    for node in plan.dag.node_weights() {
+        let luminal::bufferize::BufferNode::BufferOutput { slots } = node else {
+            continue;
+        };
+        for slot in slots {
+            let Some(bound) = outputs.get(slot.index) else {
+                continue;
+            };
+            if bound.placement != crate::bindings::Placement::External {
+                continue;
+            }
+            if plan.buffers[&slot.buffer].lit != Some(bound.buffer) {
+                return Some(format!(
+                    "external output: v{} is bound on caller buffer {}, but this plan \
+                     discloses it as a view of another buffer instead of writing it",
+                    bound.value.index(),
+                    bound.buffer
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// The program a search runs: its text, plus the boundary bindings the

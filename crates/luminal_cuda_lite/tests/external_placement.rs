@@ -7,7 +7,7 @@
 use luminal::bufferize::BufferNode;
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::*;
-use luminal_cuda_lite::{CudaBindings, CudaRuntime, harness_search_options};
+use luminal_cuda_lite::{CudaBindings, CudaRuntime, cuda_registry, harness_search_options};
 
 /// `a + b` with `a` on caller device memory and `b` host-staged.
 fn runtime() -> (CudaRuntime, i64, i64) {
@@ -166,4 +166,36 @@ fn an_external_output_slot_sits_on_the_bound_buffer() {
     runtime
         .check_external_outputs()
         .expect("the guard reads the same fact");
+}
+
+/// A CALLER-OWNED OUTPUT IS WRITTEN, NEVER DISCLOSED — with the cuBLASLt
+/// estate available, which is what makes this a real question. The
+/// decorated matmul claims its result in the sibling (transpose-sandwich)
+/// frame, so the recorder-frame value is a VIEW of the op's D buffer;
+/// elected for a value bound External that leaves the caller's tensor
+/// unwritten. The search refuses such a candidate and keeps looking, so a
+/// plan still exists — it materializes the value into the bound buffer.
+#[test]
+fn an_external_output_is_written_not_disclosed_even_with_cublaslt() {
+    let mut cx = Graph::new();
+    let x = cx.tensor((4usize, 16usize), DType::F32);
+    let w = cx.tensor((16usize, 32usize), DType::F32);
+    let out = x.matmul(w);
+
+    let mut bindings = CudaBindings::new();
+    bindings.input(x.id);
+    bindings.input(w.id);
+    bindings.output_external(out.id);
+
+    let mut runtime = CudaRuntime::load_with(&cx, bindings, cuda_registry())
+        .expect("a matmul with a caller-owned output loads");
+    runtime
+        .search(&FxHashMap::default(), &harness_search_options())
+        .expect("a plan that writes the caller's buffer exists");
+
+    // The fact: the elected plan's output slot sits ON the bound buffer,
+    // so executing it fills the caller's tensor.
+    runtime
+        .check_external_outputs()
+        .expect("the elected plan writes the bound output");
 }
