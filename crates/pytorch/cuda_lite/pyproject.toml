@@ -5,7 +5,7 @@ description = "Luminal CUDA-lite torch.compile backend"
 requires-python = ">=3.10"
 # The PT2 export-preparation helpers are shared with the reference backend;
 # `luminal_reference` is a build-time/runtime dependency until they are lifted
-# into a backend-neutral package (see DESIGN.md, "Shared export pipeline").
+# into a backend-neutral package.
 dependencies = ["torch>=2.14", "luminal_reference"]
 
 [build-system]

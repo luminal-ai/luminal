@@ -106,6 +106,24 @@ struct Translator<'a> {
     dims: HashMap<Symbol, usize>,
 }
 
+/// Read one dimension expression a caller stated in sympy's `srepr`
+/// form — `Integer(4)`, `Symbol('s77')`, `Mul(Integer(4), Symbol('s77'))`
+/// — against this translation's PT2 symbols.
+///
+/// A boundary states its element strides in the same vocabulary the
+/// exported program states its shapes in, so a caller whose storage is
+/// shaped by a dynamic dimension names that dimension rather than the
+/// number one example call happened to have.
+pub fn parse_dim_expr(translation: &Translation, expr: &str) -> Result<IntExpr> {
+    sympy::parse_sympy_expr(expr, &translation.symbols).ok_or_else(|| {
+        anyhow!(
+            "{expr:?} is not a dimension expression this program states: it names a \
+             symbol the exported program does not declare, or a sympy form the \
+             parser does not read"
+        )
+    })
+}
+
 /// Translate a parsed PT2 program into the recorder frontend.
 pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
     let sym_dim_map = parsed.build_sym_dim_map();
@@ -1151,4 +1169,66 @@ fn normalize_axes(axes: &[i64], rank: usize) -> Result<Vec<usize>> {
                 .ok_or_else(|| anyhow!("axis {a} out of range for rank {rank}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod dim_expr_tests {
+    use super::*;
+
+    /// A translation that declares only dimension symbols: a dim
+    /// expression is read against those and nothing else.
+    fn translation(symbols: &[&str]) -> Translation {
+        Translation {
+            graph: Graph::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            dims: HashMap::new(),
+            symbols: symbols
+                .iter()
+                .map(|name| ((*name).to_string(), Symbol::new(*name)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_literal_extent_reads_as_its_number() {
+        let t = translation(&[]);
+        assert_eq!(
+            parse_dim_expr(&t, "Integer(4)").unwrap(),
+            IntExpr::from(4i64)
+        );
+    }
+
+    /// A boundary stride stated as the program's own dimension: asked of
+    /// what it COMPUTES at a dim value, never of how it is spelled.
+    #[test]
+    fn a_symbolic_extent_reads_as_the_programs_dim() {
+        let t = translation(&["s77"]);
+        let symbol = Symbol::new("s77");
+        let stride = parse_dim_expr(
+            &t,
+            "Mul(Integer(2), Symbol('s77', positive=True, integer=True))",
+        )
+        .unwrap();
+        assert!(stride.to_symbols().contains(&symbol));
+        let dims: DynMap = [(symbol, 5usize)].into_iter().collect();
+        assert_eq!(stride.exec(&dims), Some(10));
+    }
+
+    #[test]
+    fn an_undeclared_symbol_is_refused_by_name() {
+        let t = translation(&[]);
+        let err = parse_dim_expr(&t, "Symbol('s77')").expect_err("s77 is not declared");
+        assert!(format!("{err:#}").contains("Symbol('s77')"), "{err:#}");
+    }
+
+    #[test]
+    fn an_unreadable_form_is_refused_by_name() {
+        let t = translation(&[]);
+        let err = parse_dim_expr(&t, "Piecewise(Integer(1))").expect_err("not a dim form");
+        assert!(
+            format!("{err:#}").contains("Piecewise(Integer(1))"),
+            "{err:#}"
+        );
+    }
 }

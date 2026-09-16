@@ -30,8 +30,9 @@ def compile(*args, **kwargs):
     """Compile a saved ``.pt2`` on the CUDA-lite backend.
 
     Takes the path and the caller's boundary layouts: one
-    ``(graph input name, layout tag, element strides)`` row per graph input
-    (see ``boundary.layout_spec``).
+    ``(graph input name, layout tag, element strides)`` row per graph input,
+    each stride a sympy ``srepr`` expression over the exported program's own
+    symbols (see ``boundary.layout_spec``).
     """
     return _compile(*args, **kwargs)
 
