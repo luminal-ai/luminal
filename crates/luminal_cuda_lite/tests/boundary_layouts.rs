@@ -165,6 +165,126 @@ fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
     }
 }
 
+/// A RENDERED CHAIN IS DISCOVERED CONTIGUOUS: the caller states element
+/// strides and nothing else — (2,4) at [4, 1] — and the e-graph mints
+/// the right-major spelling from the chain itself, so recognition is
+/// the preamble's and never the caller's.
+#[test]
+fn a_right_major_strides_chain_is_discovered_contiguous() {
+    let mut cx = Graph::new();
+    let x = cx.named_tensor("x", (2usize, 4usize), DType::F32);
+    let c = cx.tensor((2usize, 4usize), DType::F32);
+    let out = x * c;
+
+    let mut bindings = CudaBindings::new();
+    bindings.input_with(x.id, BoundaryLayout::strided_literal([4, 1]));
+    bindings.input(c.id);
+    bindings.output(out.id);
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a rendered strides chain loads");
+
+    let egraph = rt.saturated_egraph().expect("saturation");
+    let view = EGraphView::new(&egraph, rt.decoders());
+    let x_class = input_class(&egraph, "x");
+    assert!(
+        holds_spelling(&view, &x_class, "RightMajorContiguousElementLayoutLit"),
+        "the row-major chain's layout class holds no RightMajorContiguousElementLayoutLit"
+    );
+    rt.search(&Default::default(), &harness_search_options())
+        .expect("host search over a discovered-contiguous boundary");
+}
+
+/// THE SAME DISCOVERY AT A SYMBOLIC DIM: shape (n, 4) at strides
+/// [4, 1] is the right-major chain for every n, so the spelling is
+/// minted without the dim having a value, and the search plans each
+/// bucket.
+#[test]
+fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
+    let mut cx = Graph::new();
+    let x = cx.named_tensor("x", ('n', 4usize), DType::F32);
+    let c = cx.named_tensor("c", ('n', 4usize), DType::F32);
+    let out = x * c;
+
+    let mut bindings = CudaBindings::new();
+    bindings.input_with(x.id, BoundaryLayout::strided_literal([4, 1]));
+    bindings.input(c.id);
+    bindings.output(out.id);
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a symbolic-shape strides chain loads");
+
+    let egraph = rt.saturated_egraph().expect("saturation");
+    let view = EGraphView::new(&egraph, rt.decoders());
+    let x_class = input_class(&egraph, "x");
+    assert!(
+        holds_spelling(&view, &x_class, "RightMajorContiguousElementLayoutLit"),
+        "the symbolic shape's row-major chain holds no RightMajorContiguousElementLayoutLit"
+    );
+
+    rt.bind_dim_buckets('n', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
+        .expect("disjoint sorted buckets bind");
+    rt.search(&Default::default(), &harness_search_options())
+        .expect("host search over a discovered-contiguous symbolic boundary");
+    assert_eq!(rt.bucket_plans().len(), 2, "one plan per bucket");
+    for n in [3usize, 7] {
+        let mut dims = DynMap::default();
+        dims.insert(Symbol::from('n'), n);
+        assert!(
+            luminal_cuda_lite::search::select_bucket(rt.bucket_plans(), &dims).is_some(),
+            "no plan covers n = {n}"
+        );
+    }
+}
+
+/// A DEGENERATE AXIS CARRIES NO STRIDE: torch's stride on a size-1 axis
+/// is arbitrary, so shape (1,4) arrives at [7, 1]. That axis's
+/// coordinate is zero, so the summand the 7 multiplies is zero and the
+/// chain the caller rendered IS the contiguous chain — the class holds
+/// BOTH contiguous spellings, which at this shape are one map, and the
+/// read the plan installs never reaches the 7.
+#[test]
+fn an_arbitrary_stride_on_a_degenerate_axis_is_discovered_contiguous() {
+    let mut cx = Graph::new();
+    let x = cx.named_tensor("x", (1usize, 4usize), DType::F32);
+    let c = cx.tensor((1usize, 4usize), DType::F32);
+    let out = x * c;
+
+    let mut bindings = CudaBindings::new();
+    bindings.input_with(x.id, BoundaryLayout::strided_literal([7, 1]));
+    bindings.input(c.id);
+    bindings.output(out.id);
+    let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
+        .expect("a degenerate-axis strides chain loads");
+
+    let egraph = rt.saturated_egraph().expect("saturation");
+    let view = EGraphView::new(&egraph, rt.decoders());
+    let x_class = input_class(&egraph, "x");
+    assert!(
+        holds_spelling(&view, &x_class, "RightMajorContiguousElementLayoutLit"),
+        "the degenerate-axis chain holds no RightMajorContiguousElementLayoutLit"
+    );
+    assert!(
+        holds_spelling(&view, &x_class, "LeftMajorContiguousElementLayoutLit"),
+        "the degenerate-axis chain holds no LeftMajorContiguousElementLayoutLit"
+    );
+
+    rt.search(&Default::default(), &harness_search_options())
+        .expect("host search over a degenerate-axis boundary");
+    let lit = rt.input_buffer(x.id).expect("x has an input buffer");
+    let plan = rt.plan().expect("the search installed a plan");
+    let buffer = plan
+        .buffers
+        .values()
+        .find(|buffer| buffer.lit == Some(lit))
+        .expect("the plan holds the bound input's buffer");
+    for j in 0..4usize {
+        assert_eq!(
+            buffer.layout.element_index(&[0, j]).expect("decoded read"),
+            j,
+            "the stride stated on the size-1 axis reached an address"
+        );
+    }
+}
+
 /// A REFUSED STRIDED BINDING: the stride count is the value's rank and
 /// no literal stride is negative — stated by name at load, not
 /// discovered at saturation.
