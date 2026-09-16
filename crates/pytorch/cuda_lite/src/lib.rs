@@ -6,7 +6,7 @@
 //!
 //! THE BOUNDARY IS DECLARED AT LOAD. [`bind`] states every boundary tensor
 //! once, in the vocabulary of [`luminal_cuda_lite::CudaBindings`]: one buffer
-//! id per boundary tensor, the layout the caller recognized for it, and
+//! id per boundary tensor, the layout the caller declared for it, and
 //! `Placement::External` — the storage is the caller's own live device
 //! allocation, never host-staged and never given an arena range. Aliasing has
 //! one spelling: a writeback binds on the buffer of the input it mutates. A
@@ -476,6 +476,10 @@ impl DeclaredLayout {
 /// by a dynamic dimension states that dimension (`Symbol('s77')`) where a
 /// static one states a number (`Integer(4)`). `role` is the side of the
 /// boundary the row names, so a refusal says which.
+///
+/// The torch backend declares `strided` for every boundary and lets the
+/// e-graph discover what map the chain is; the contiguous tags are for a
+/// caller that states a contiguous layout itself.
 fn layout_of(
     translation: &Translation,
     role: &str,
@@ -535,7 +539,7 @@ struct Boundary {
 }
 
 /// The CUDA-lite boundary for a translated program: every input is the
-/// caller's live device memory, at the layout the caller recognized for it, on
+/// caller's live device memory, at the layout the caller declared for it, on
 /// its own buffer; every user-visible output is a fresh caller-owned device
 /// buffer at the layout the caller declared for it — eager's exact strides —
 /// except a writeback, which binds on the buffer of the input it mutates, at

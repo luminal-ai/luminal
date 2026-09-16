@@ -1,10 +1,15 @@
 """Boundary layouts of torch tensors for `luminal_cuda_lite` bindings.
 
-A boundary tensor is bound zero-copy with the layout it has: the binding
-starts at ``tensor.data_ptr()`` — which already carries the storage offset
-— and states one element stride per axis relative to that address.
-Recognition never reinterprets and never repacks: a stride pattern the
-runtime does not model is refused by name.
+A boundary tensor is bound zero-copy in ONE form: the element strides it
+has, one per axis, relative to ``tensor.data_ptr()``. Nothing here
+classifies — whether a chain is contiguous, column-major or neither is
+discovered from the chain itself in the e-graph, so this module states
+what the tensor has and never interprets it. A tensor the runtime cannot
+address as it lies is refused by name, never repacked.
+
+A binding names a buffer's BASE, so a boundary tensor whose storage
+offset is non-zero is refused: two bindings on one buffer share that
+base, and there is no way to say "same buffer, different offset".
 
 A stride is stated in the exported program's own vocabulary. Given a fake
 example value, an axis strided by a dynamic dimension states THAT
@@ -16,7 +21,7 @@ cross to the runtime as sympy ``srepr`` strings.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Sequence
 
 import sympy
 import torch
@@ -46,25 +51,12 @@ SUPPORTED_DTYPES: dict[torch.dtype, str] = {
 
 
 @dataclass(frozen=True)
-class RowMajor:
-    pass
-
-
-@dataclass(frozen=True)
-class ColumnMajor:
-    pass
-
-
-@dataclass(frozen=True)
 class Strided:
     """Element strides relative to ``data_ptr()``, one per axis, each a
     sympy ``srepr`` expression: ``Integer(4)`` for a number, a named
     symbol for an axis strided by a dynamic dimension."""
 
     strides: tuple[str, ...]
-
-
-BoundaryLayout = Union[RowMajor, ColumnMajor, Strided]
 
 
 def _extent(size: Any) -> Any:
@@ -76,84 +68,42 @@ def _extent(size: Any) -> Any:
     return int(size)
 
 
-def _same(lhs: Any, rhs: Any) -> bool:
-    """Two extents are the same number. Concrete ones compare directly; a
-    pair with a symbol in it is decided by sympy."""
-    if isinstance(lhs, int) and isinstance(rhs, int):
-        return lhs == rhs
-    return sympy.simplify(sympy.sympify(lhs) - sympy.sympify(rhs)) == 0
-
-
 def _srepr(value: Any) -> str:
     """The wire spelling of one stride."""
     return sympy.srepr(sympy.Integer(value) if isinstance(value, int) else value)
 
 
-def _stride_factor(size: Any) -> Any:
-    """What one extent multiplies the running stride by in torch's
-    contiguous layout: ``max(size, 1)``. An empty axis contributes one, so
-    an empty tensor carries the strides a full one would.
-    """
-    if isinstance(size, int):
-        return max(size, 1)
-    return sympy.Max(size, 1)
+def _reads_as_plain_storage(value: Any) -> bool:
+    """A torch tensor whose sizes and strides describe its own storage: a
+    tensor, a parameter, or the exported program's fake stand-in for one.
+    A subclass carrying semantics of its own — a distributed, masked or
+    nested tensor — describes something else."""
+    # Imported here because the fake tensor lives in a private torch module.
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    return type(value) is torch.Tensor or isinstance(value, (torch.nn.Parameter, FakeTensor))
 
 
-def _row_major_strides(shape: Sequence[Any]) -> tuple[Any, ...]:
-    """Contiguous, last axis fastest."""
-    strides: list[Any] = []
-    acc: Any = 1
-    for size in reversed(shape):
-        strides.append(acc)
-        acc = acc * _stride_factor(size)
-    return tuple(reversed(strides))
-
-
-def _column_major_strides(shape: Sequence[Any]) -> tuple[Any, ...]:
-    """Contiguous, first axis fastest."""
-    strides: list[Any] = []
-    acc: Any = 1
-    for size in shape:
-        strides.append(acc)
-        acc = acc * _stride_factor(size)
-    return tuple(strides)
-
-
-def _degenerate(size: Any) -> bool:
-    """An axis with one coordinate or none: its stride never multiplies
-    anything but zero, so it does not decide the layout."""
-    return isinstance(size, int) and size <= 1
-
-
-def _matches(shape: Sequence[Any], strides: Sequence[Any], expected: Sequence[Any]) -> bool:
-    return all(
-        _degenerate(size) or _same(stride, want)
-        for size, stride, want in zip(shape, strides, expected)
-    )
-
-
-def _strides_are_injective(shape: Sequence[Any], strides: Sequence[Any]) -> bool:
-    """Distinct coordinates reach distinct elements: axes sorted by stride
-    each start past the extent of the previous one.
-
-    Judged over the CONCRETE, non-zero-stride axes. A zero stride is a
-    broadcast — every coordinate of that axis reads one element, which is
-    a legitimate read map — and a stride the caller spelled symbolically
-    is taken as stated, exactly as the runtime takes it: which number it
-    is, is the runtime's dims to say.
-    """
-    axes = [
-        (stride, size)
-        for stride, size in zip(strides, shape)
-        if isinstance(stride, int) and isinstance(size, int) and stride > 0 and size > 1
-    ]
-    axes.sort()
-    reach = 1
-    for stride, size in axes:
-        if stride < reach:
-            return False
-        reach = stride * size
-    return True
+def _refuse_unreadable(name: str, value: Any) -> None:
+    """Refuse a boundary value whose storage a binding cannot state: a
+    tensor subclass, a layout that is not dense strides, or storage whose
+    base the binding cannot name."""
+    if isinstance(value, torch.Tensor) and not _reads_as_plain_storage(value):
+        raise UnsupportedBoundary(
+            f"{name}: {type(value).__name__} is a tensor subclass with semantics of its "
+            "own, not storage to bind"
+        )
+    if value.layout is not torch.strided:
+        raise UnsupportedBoundary(
+            f"{name}: layout {value.layout} is not torch.strided; a binding states "
+            "element strides over dense storage"
+        )
+    offset = _extent(value.storage_offset())
+    if offset != 0:
+        raise UnsupportedBoundary(
+            f"{name}: storage offset {offset} is not bound today; a binding names a "
+            "buffer's base, and two bindings on one buffer share that base"
+        )
 
 
 def boundary_shape(tensor: torch.Tensor, fake: Optional[Any] = None) -> tuple[Any, ...]:
@@ -165,69 +115,59 @@ def boundary_shape(tensor: torch.Tensor, fake: Optional[Any] = None) -> tuple[An
 
 def boundary_layout(
     name: str, tensor: torch.Tensor, fake: Optional[Any] = None
-) -> BoundaryLayout:
-    """Recognize the layout of a boundary tensor, or refuse it.
+) -> Strided:
+    """The element strides a boundary tensor is bound at, or a refusal.
 
     `fake` is the exported program's example value for this tensor, whose
     sizes and strides carry the program's symbols; without one the real
-    tensor's numbers are read directly. Never reinterprets: a stride
-    pattern the runtime does not model is an error naming the tensor and
-    the offending fact.
+    tensor's numbers are read directly. ONE FORM COMES OUT: the chain the
+    tensor has. Which map that chain is — contiguous, column-major,
+    neither — is the e-graph's to discover from the chain, so nothing is
+    classified here and nothing is reinterpreted: a tensor this boundary
+    cannot state is an error naming it and the offending fact.
     """
+    _refuse_unreadable(name, tensor)
+    if fake is not None:
+        _refuse_unreadable(name, fake)
     if not tensor.is_cuda:
         raise UnsupportedBoundary(f"{name}: expected a CUDA tensor, got device {tensor.device}")
     if tensor.dtype not in SUPPORTED_DTYPES:
         raise UnsupportedBoundary(f"{name}: dtype {tensor.dtype} has no CUDA-lite storage dtype")
     source = fake if fake is not None else tensor
-    shape = tuple(_extent(size) for size in source.shape)
     strides = tuple(_extent(stride) for stride in source.stride())
-    if _matches(shape, strides, _row_major_strides(shape)):
-        return RowMajor()
-    if len(shape) >= 2 and _matches(shape, strides, _column_major_strides(shape)):
-        return ColumnMajor()
-    for axis, (stride, size) in enumerate(zip(strides, shape)):
-        if isinstance(stride, int) and stride < 0 and not _degenerate(size):
+    for axis, stride in enumerate(strides):
+        if isinstance(stride, int) and stride < 0:
             raise UnsupportedBoundary(
-                f"{name}: stride {stride} on axis {axis} runs backwards; a boundary is "
-                "addressed forwards from data_ptr()"
+                f"{name}: element stride {stride} on axis {axis} runs backwards; a "
+                "boundary is addressed forwards from data_ptr()"
             )
-    if not _strides_are_injective(shape, strides):
-        raise UnsupportedBoundary(
-            f"{name}: strides {strides} over shape {shape} overlap; "
-            "two coordinates share one element"
-        )
     return Strided(tuple(_srepr(stride) for stride in strides))
 
 
-def layout_spec(layout: BoundaryLayout) -> tuple[str, tuple[str, ...]]:
-    """The wire form the runtime declares a layout in: a tag and, for a
-    strided layout, its element strides as sympy ``srepr`` expressions."""
-    if isinstance(layout, RowMajor):
-        return "row_major", ()
-    if isinstance(layout, ColumnMajor):
-        return "column_major", ()
+def layout_spec(layout: Strided) -> tuple[str, tuple[str, ...]]:
+    """The wire form the runtime declares a layout in: the ``strided`` tag
+    and the element strides as sympy ``srepr`` expressions."""
     if isinstance(layout, Strided):
         return "strided", layout.strides
     raise UnsupportedBoundary(f"{layout!r} is not a boundary layout")
 
 
-def layout_from_spec(name: str, tag: str, strides: Sequence[str]) -> BoundaryLayout:
+def layout_from_spec(name: str, tag: str, strides: Sequence[str]) -> Strided:
     """The same wire form read back: the layout the runtime says a
-    boundary is bound at, in the spelling it was declared in. A tag this
-    module does not model is an error naming the boundary."""
-    if tag == "row_major":
-        return RowMajor()
-    if tag == "column_major":
-        return ColumnMajor()
+    boundary is bound at, in the spelling it was declared in. This
+    boundary declares element strides and nothing else, so any other tag
+    is an error naming the boundary."""
     if tag == "strided":
         return Strided(tuple(strides))
-    raise UnsupportedBoundary(f"{name}: unknown boundary layout {tag!r}")
+    raise UnsupportedBoundary(
+        f"{name}: boundary layout {tag!r} is not an element-strides chain"
+    )
 
 
 def buffer_nbytes(tensor: torch.Tensor) -> int:
     """Bytes the bound buffer spans, reachable from ``data_ptr()``: the
-    last element the strides reach, plus one. The storage offset is
-    already inside ``data_ptr()``, so it is not counted again."""
+    last element the strides reach, plus one. A bound tensor has storage
+    offset zero, so ``data_ptr()`` is the base of that span."""
     if tensor.numel() == 0:
         return 0
     span = 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
@@ -253,7 +193,7 @@ class Binding:
     buffer: int
     dtype: torch.dtype
     shape: tuple[Any, ...]
-    layout: BoundaryLayout
+    layout: Strided
 
 
 def _dim_values(binding: Binding, tensor: torch.Tensor) -> dict[str, int]:
@@ -296,10 +236,6 @@ def declared_strides(
     call's dimensions are substituted is refused by name: nothing
     downstream compares strides, so an unresolved one would go
     unchecked."""
-    if isinstance(binding.layout, RowMajor):
-        return _row_major_strides(shape)
-    if isinstance(binding.layout, ColumnMajor):
-        return _column_major_strides(shape)
     resolved: list[int] = []
     for axis, spelling in enumerate(binding.layout.strides):
         expr = sympy.sympify(spelling)
@@ -321,9 +257,9 @@ def check_binding(
     binding: Binding, tensor: torch.Tensor, dims: Optional[dict[str, int]] = None
 ) -> None:
     """Refuse a call-time tensor that does not match its declared binding:
-    the dtype, the rank, every extent — literal, or compound over this
-    call's dimensions — and the element strides the declared layout has at
-    those dimensions.
+    the storage it describes, the dtype, the rank, every extent — literal,
+    or compound over this call's dimensions — and the element strides the
+    declared layout has at those dimensions.
 
     `dims` is the whole call's dimension map (`call_dim_values`); without
     one only this tensor's own bare-symbol axes pin the declared strides.
@@ -331,6 +267,7 @@ def check_binding(
     address and a byte count, so past this check only Dynamo's shape
     guards stand between a caller and a misread layout.
     """
+    _refuse_unreadable(binding.name, tensor)
     if tensor.dtype != binding.dtype:
         raise UnsupportedBoundary(
             f"{binding.name}: bound as {binding.dtype}, called with {tensor.dtype}"

@@ -167,10 +167,11 @@ def test_writeback_consumed_downstream():
     "no strided-destination write yet",
 )
 def test_transposed_input_binds_zero_copy():
-    """A transposed input is bound in the layout it has (column-major), never
-    copied and never reinterpreted. Eager gives the pointwise output the
-    operand's layout too, so the output is bound column-major and the search
-    refuses by name until a strided-destination write lands."""
+    """A transposed input is bound at the strides it has — (1, 8) — never
+    copied and never reinterpreted; that the chain is column-major is the
+    e-graph's discovery. Eager gives the pointwise output the operand's
+    layout too, so the output is bound at that chain and the search refuses
+    by name until a strided-destination write lands."""
 
     def fn(x):
         return x * 2 + 1
@@ -240,10 +241,11 @@ def test_transposed_output_keeps_eagers_strides():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
-    """A writeback is bound at its target's layout — here column-major — and
-    whether any kernel writes that layout is the SEARCH's question, never a
-    prior taken at bind. Today none does, so the search plans nothing and
-    says which output, at which layout, it found no plan for."""
+    """A writeback is bound at its target's chain — here the transposed
+    strides — and whether any kernel writes that layout is the SEARCH's
+    question, never a prior taken at bind. Today none does, so the search
+    plans nothing and says which output, at which layout, it found no plan
+    for."""
 
     def fn(x):
         x.add_(1)
@@ -252,7 +254,7 @@ def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
     torch.manual_seed(0)
     x = torch.randn(8, 4, device="cuda").t()
     with pytest.raises(
-        Exception, match=r"no plan writes the bound outputs: v\d+ at ColumnMajor"
+        Exception, match=r"no plan writes the bound outputs: v\d+ at Strided"
     ):
         torch.compile(fn, backend=luminal_cuda_lite)(x)
 
@@ -374,10 +376,11 @@ def test_stride_only_symbol_is_refused_by_name():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_offset_input_binds_at_its_own_data_ptr():
-    """A slice's storage offset is already inside ``data_ptr()``. The binding
-    starts there and states the layout relative to it, so the base tensor is
-    never needed and nothing is repacked."""
+def test_offset_input_is_refused_by_name():
+    """A binding names a buffer's BASE, and two bindings on one buffer share
+    that base: there is no way to say "same buffer, different offset". A
+    boundary tensor that starts inside its storage is refused by name rather
+    than bound alone with its aliasing left unsayable."""
 
     def fn(x):
         return x * 2
@@ -386,7 +389,8 @@ def test_offset_input_binds_at_its_own_data_ptr():
     base = torch.randn(5, 8, device="cuda")
     x = base[1:]
     assert x.storage_offset() == 8
-    torch.testing.assert_close(torch.compile(fn, backend=luminal_cuda_lite)(x), fn(x))
+    with pytest.raises(Exception, match="storage offset 8"):
+        torch.compile(fn, backend=luminal_cuda_lite)(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -408,7 +412,7 @@ def test_expanded_input_is_a_broadcast_read_map():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_stride_zero_mutation_target_finds_no_plan_naming_the_output():
-    """The same broadcast view as a WRITE target: it is recognized as the
+    """The same broadcast view as a WRITE target: it is stated as the
     strided map it is and bound as such, and the e-graph's write gate — a
     destination layout must be injective — leaves the search with nothing
     to install, which it reports by naming the output and its layout."""

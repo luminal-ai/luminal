@@ -11,16 +11,18 @@ fallback, dead-op/guard cleanup) is backend-neutral, so it is imported
 from the reference package rather than duplicated.
 
 DEVICE MODEL: every boundary tensor is the caller's own device memory.
-Its layout is recognized once at compile time (``boundary.py``) and
+Its element strides are read once at compile time (``boundary.py``) and
 declared to the runtime, which binds it on one buffer id; each call hands
-that buffer the tensor's address. A user-visible output is bound at
-eager's exact strides — read from the same fake value the input layouts
-are read from — and allocated at them per call, so the tensor the caller
-receives is laid out the way the uncompiled program lays it out. Nothing
-is copied to the host and no layout is reinterpreted — a tensor the
-runtime cannot bind is refused by name. Aliasing has one spelling: two
-bindings naming one buffer id, which is how a writeback and the input it
-mutates share a pointer.
+that buffer the tensor's address. Which map a chain is — contiguous,
+column-major, neither — is discovered in the e-graph, never decided here.
+A user-visible output is bound at eager's exact strides — read from the
+same fake value the input layouts are read from — and allocated at them
+per call, so the tensor the caller receives is laid out the way the
+uncompiled program lays it out. Nothing is copied to the host and no
+layout is reinterpreted — a tensor the runtime cannot bind, one whose
+storage offset is non-zero among them, is refused by name. Aliasing has
+one spelling: two bindings naming one buffer id, which is how a writeback
+and the input it mutates share a pointer.
 
 STREAM AND ARENA: the runtime always launches captured CUDA graphs, which
 the legacy default stream cannot host, so it runs on a dedicated
@@ -44,7 +46,6 @@ import torch
 
 from .boundary import (
     Binding,
-    RowMajor,
     UnsupportedBoundary,
     boundary_layout,
     boundary_shape,
@@ -188,8 +189,8 @@ def _output_fake(name: str, fakes: dict[str, Any]) -> Any:
 
 def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
     """One ``(graph name, layout tag, element strides)`` row per graph
-    output the caller allocates: the layout EAGER gives it, recognized from
-    the traced fake value exactly like an input's.
+    output the caller allocates: the element strides EAGER gives it, read
+    from the traced fake value exactly like an input's.
 
     This is a LAYOUT STATEMENT PER NAME, not the output list — which
     outputs a program has, and in which order, is the translation's to say
@@ -397,15 +398,12 @@ class CompiledModel:
                     out_tensors.append(None)
                     continue
                 shape = tuple(output_shapes[index])
-                if isinstance(binding.layout, RowMajor):
-                    tensor = torch.empty(shape, dtype=binding.dtype, device=device)
-                else:
-                    tensor = torch.empty_strided(
-                        shape,
-                        declared_strides(binding, shape, dims),
-                        dtype=binding.dtype,
-                        device=device,
-                    )
+                tensor = torch.empty_strided(
+                    shape,
+                    declared_strides(binding, shape, dims),
+                    dtype=binding.dtype,
+                    device=device,
+                )
                 # The allocation is checked against the binding the runtime
                 # writes through — rank, extents, element strides — so a
                 # disagreement is refused by name rather than written past.
@@ -618,8 +616,8 @@ def luminal_cuda_lite(
     _lower_sym_sum(ep)
 
     def _save_and_compile(program: Any) -> Any:
-        # Recognize every boundary tensor's layout and declare it with the
-        # program: the runtime binds what the caller has, or refuses it.
+        # Read every boundary tensor's element strides and declare them with
+        # the program: the runtime binds what the caller has, or refuses it.
         _refuse_unbound_outputs(program)
         rows = _boundary_tensors(program, export_inputs)
         layouts = {name: boundary_layout(name, value, fake) for name, _, value, fake in rows}
@@ -628,10 +626,10 @@ def luminal_cuda_lite(
         for name, _, _, _ in rows:
             tag, strides = layout_spec(layouts[name])
             declared.append((name, tag, list(strides)))
-        # A user-visible output is declared at the layout EAGER gives it,
-        # recognized from the traced fake value exactly like an input: what
-        # the caller receives has the strides the uncompiled program hands
-        # back, never a row-major substitute.
+        # A user-visible output is declared at the strides EAGER gives it,
+        # read from the traced fake value exactly like an input: what the
+        # caller receives has the strides the uncompiled program hands back,
+        # never a contiguous substitute.
         declared_outputs = _output_layout_rows(program)
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
