@@ -14,6 +14,16 @@ pytest.importorskip("luminal_cuda_lite")
 import luminal_cuda_lite  # noqa: E402
 
 # Full float32 on both sides (see conftest), over a three-matmul stack.
+
+@pytest.fixture(autouse=True)
+def _fresh_dynamo():
+    """Every test compiles the same module classes; without a reset the
+    recompile limit on their shared forward is reached and Dynamo falls back
+    to eager without calling the backend."""
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
 ATOL = 1e-3
 RTOL = 1e-3
 

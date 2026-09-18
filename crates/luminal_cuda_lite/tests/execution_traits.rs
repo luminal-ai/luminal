@@ -228,7 +228,11 @@ mod host_graphs {
         atomic::{AtomicUsize, Ordering},
     };
     static RECORDS: AtomicUsize = AtomicUsize::new(0);
-    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    // Preparations made and dropped, per dimension: a dimension is prepared
+    // again on every execution that re-records it, so survival is counted.
+    const ZERO: AtomicUsize = AtomicUsize::new(0);
+    static PREPARED: [AtomicUsize; 32] = [ZERO; 32];
+    static DROPPED: [AtomicUsize; 32] = [ZERO; 32];
     #[derive(Debug, Clone)]
     struct ExternalHostAdd {
         dps: bool,
@@ -272,7 +276,7 @@ mod host_graphs {
     }
     impl Drop for Prepared {
         fn drop(&mut self) {
-            DROPPED.fetch_or(1 << self.dim, Ordering::SeqCst);
+            DROPPED[self.dim].fetch_add(1, Ordering::SeqCst);
         }
     }
     impl PreparedHostOp for Prepared {
@@ -298,6 +302,7 @@ mod host_graphs {
         ) -> anyhow::Result<Box<dyn PreparedHostOp>> {
             let a = ctx.dims[&'a'.into()];
             anyhow::ensure!(a != 6, "injected preparation failure");
+            PREPARED[a].fetch_add(1, Ordering::SeqCst);
             let ptx = cudarc::nvrtc::compile_ptx(
                 r#"extern "C" __global__ void add(const float* a,const float* b,float* out,unsigned long long n){unsigned long long i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]+b[i];}"#,
             )?;
@@ -399,7 +404,14 @@ mod host_graphs {
             rt.execute().unwrap();
             assert_eq!(rt.get_f32(out.id).unwrap(), vec![n as f32 + 1.; n * 2]);
         }
-        assert_eq!(DROPPED.load(Ordering::SeqCst) & ((1 << 3) | (1 << 4)), 0);
+        // The source graphs still refer to their compile-time preparations
+        // for 3 and 4, so at least one preparation of each survives eviction.
+        for dim in [3, 4] {
+            assert!(
+                DROPPED[dim].load(Ordering::SeqCst) < PREPARED[dim].load(Ordering::SeqCst),
+                "every preparation for a={dim} was dropped while a source graph refers to one"
+            );
+        }
         rt.set_data(a.id, vec![4f32; 8]).unwrap();
         rt.set_data(b.id, vec![1f32; 8]).unwrap();
         rt.set_dim('a', 6);
@@ -425,10 +437,13 @@ mod host_graphs {
             "default capture_dims covers newly supplied dimensions too"
         );
         drop(rt);
-        assert_eq!(
-            DROPPED.load(Ordering::SeqCst) & ((1 << 3) | (1 << 4)),
-            (1 << 3) | (1 << 4)
-        );
+        for dim in [3, 4] {
+            assert_eq!(
+                DROPPED[dim].load(Ordering::SeqCst),
+                PREPARED[dim].load(Ordering::SeqCst),
+                "every preparation for a={dim} is released with the runtime"
+            );
+        }
     }
 }
 
