@@ -469,12 +469,11 @@ impl CudaDevice {
         // Move the executable out while updating it. An error or unwind drops
         // any partially patched state before a later invocation can reuse it.
         let mut compiled = installed.compiled.take().unwrap();
-        let dims_changed = compiled.last_dims != *dims;
         compiled.update(dims, &mut self.stats)?;
-        // A plan compiled this execution already addresses these pointers,
-        // and one with no caller pointers and unchanged dims has nothing to
-        // rebind: caller pointers are re-addressed on every execution.
-        if !stale && (dims_changed || !external.is_empty()) {
+        // A plan compiled this execution already addresses these pointers.
+        // Every later execution re-addresses every node and re-records every
+        // library call: that cost is the library call's, and it is timed.
+        if !stale {
             compiled.rebind_addresses(
                 &installed.plan,
                 &installed.storage,
@@ -1254,7 +1253,7 @@ impl CompiledPlan {
     }
     /// Dimension changes only: copy lengths, kernel geometry, node enables
     /// and the outputs' resolved layouts. Node parameters are written by
-    /// `rebind_addresses`, which runs after this whenever anything changed.
+    /// `rebind_addresses`, which runs after this on every execution.
     fn update(&mut self, dims: &DynMap, stats: &mut GraphStats) -> Result<()> {
         if self.last_dims == *dims {
             return Ok(());
@@ -1313,7 +1312,8 @@ impl CompiledPlan {
     }
     /// Re-resolve every address against the current arena base and caller
     /// pointers, rewrite the kernel and copy nodes in place, and re-record
-    /// every library call. A refused in-place edit rebuilds instead.
+    /// every library call. Runs on every execution after the first; a
+    /// refused in-place edit rebuilds instead.
     #[allow(clippy::too_many_arguments)]
     fn rebind_addresses(
         &mut self,

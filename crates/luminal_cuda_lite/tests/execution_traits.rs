@@ -384,9 +384,8 @@ mod host_graphs {
             assert_eq!(rt.get_f32(out.id).unwrap(), vec![n as f32 + 1.; n * 2]);
         }
         let stats = rt.graph_stats().unwrap();
-        // One recording at compile, then one per execution whose dims
-        // changed: 3 -> 4 -> 3 -> 4, and the final 4 repeats.
-        assert_eq!(stats.host_captures, 4);
+        // One recording at compile, then one on every later execution.
+        assert_eq!(stats.host_captures, stats.launches);
         assert_eq!(stats.instantiations, 2);
         assert_eq!(stats.graph_cache_hits, 2);
         assert_eq!(
