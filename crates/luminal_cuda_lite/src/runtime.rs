@@ -782,6 +782,16 @@ impl CudaRuntime {
                 .ok_or_else(|| anyhow!(no_plan()))?;
             (first, None, plans)
         };
+        // CALLER STORAGE BECOMES THE ESCAPE CELL, before anything reads the
+        // plan: every later guard (`check_external_outputs`, the arena's
+        // external set, execute's pointer map) reads the retargeted plan.
+        let (mut unbucketed_plan, mut searched_buckets) = (unbucketed_plan, searched_buckets);
+        if let Some(plan) = unbucketed_plan.as_mut() {
+            Self::retarget_external_outputs(plan, &native.bound.outputs)?;
+        }
+        for bucket in &mut searched_buckets {
+            Self::retarget_external_outputs(&mut bucket.plan, &native.bound.outputs)?;
+        }
         self.device_budget_bytes = options.device_budget_bytes;
         self.bucket_plans = searched_buckets;
         self.selected_bucket = None;
@@ -983,11 +993,72 @@ impl CudaRuntime {
         self.ensure_external_output_slots_are_literal(&self.install_plans()?)
     }
 
-    /// ESCAPE-AND-DISCLOSE ON CALLER STORAGE: an output bound External is
-    /// written in place, so the plan must have elected the buffer itself. A
-    /// view of it has the caller's byte count and another layout, which would
-    /// hand back plausible, wrongly ordered numbers; the value is refused by
-    /// name and directed at the readback path instead.
+    /// THE CALLER'S STORAGE IS THE ESCAPE CELL: an External output elected on
+    /// a planner-minted cell takes the caller's buffer id, so the arena leaves
+    /// it out of the slab and execute addresses it through the caller's
+    /// pointer. Two External outputs on one cell, or an output elected on a
+    /// different caller buffer, are refused by name.
+    fn retarget_external_outputs(
+        plan: &mut crate::layouts::CudaPlan,
+        outputs: &[crate::bindings::Bound],
+    ) -> Result<()> {
+        // Cell → the bound buffer it was given, and the value that gave it.
+        let mut retargeted: FxHashMap<luminal::bufferize::BufferId, (i64, usize)> =
+            FxHashMap::default();
+        for node in plan.dag.node_weights() {
+            let luminal::bufferize::BufferNode::BufferOutput { slots } = node else {
+                continue;
+            };
+            for slot in slots {
+                let bound = outputs
+                    .get(slot.index)
+                    .ok_or_else(|| anyhow!("plan output slot {} has no binding", slot.index))?;
+                if bound.placement != crate::bindings::Placement::External {
+                    continue;
+                }
+                let cell = plan.buffers.get_mut(&slot.buffer).ok_or_else(|| {
+                    anyhow!(
+                        "plan output slot {} names buffer {:?}, which the plan has no entry for",
+                        slot.index,
+                        slot.buffer
+                    )
+                })?;
+                match cell.lit {
+                    Some(lit) if lit == bound.buffer => {}
+                    Some(other) => {
+                        if let Some((_, first)) = retargeted.get(&slot.buffer) {
+                            bail!(
+                                "outputs v{first} and v{} are both bound External and share \
+                                 escape cell {:?}, which can carry only one caller buffer id \
+                                 ({other} and {})",
+                                bound.value.index(),
+                                slot.buffer,
+                                bound.buffer
+                            );
+                        }
+                        bail!(
+                            "output v{} is bound External on buffer {} but the searched plan \
+                             elected a view of caller buffer {other}; aliasing between caller \
+                             buffers is out of scope (LUM-825)",
+                            bound.value.index(),
+                            bound.buffer
+                        );
+                    }
+                    None => {
+                        cell.lit = Some(bound.buffer);
+                        retargeted.insert(slot.buffer.clone(), (bound.buffer, bound.value.index()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// ESCAPE-AND-DISCLOSE ON CALLER STORAGE: an output bound External sits
+    /// on the caller's buffer id, which an escape cell also carries because
+    /// [`Self::retarget_external_outputs`] gave it that id after the search.
+    /// What is left to refuse is a view of a DIFFERENT bound buffer: it has
+    /// another buffer's bytes under the caller's tensor.
     fn ensure_external_output_slots_are_literal(
         &self,
         plans: &[(crate::layouts::CudaPlan, crate::symbolic::Bounds)],
@@ -1224,6 +1295,66 @@ impl CudaRuntime {
         Ok(self.fetch(tensor)?.1)
     }
 
+    /// The buffer id the installed plan writes this output's bytes into —
+    /// the caller's own id for an output bound External. Valid after search.
+    pub fn output_backing_buffer(&self, tensor: NodeIndex) -> Result<i64> {
+        let (plan, slot) = self.installed_output_slot(tensor)?;
+        plan.buffers[&slot.buffer].lit.ok_or_else(|| {
+            anyhow!(
+                "output v{}'s backing buffer is a program allocation with no buffer id",
+                tensor.index()
+            )
+        })
+    }
+
+    /// The bytes that backing buffer spans at the runtime's current dims.
+    pub fn output_span_bytes(&self, tensor: NodeIndex) -> Result<usize> {
+        let (plan, slot) = self.installed_output_slot(tensor)?;
+        crate::symbolic::bytes(&plan.buffers[&slot.buffer].layout, &self.dims)
+    }
+
+    /// The output's ELECTED element strides, one per axis, at the current dims.
+    pub fn output_elected_strides(&self, tensor: NodeIndex) -> Result<Vec<i64>> {
+        let (_, slot) = self.installed_output_slot(tensor)?;
+        let layout = crate::symbolic::resolve_layout(&slot.layout, &self.dims)?;
+        elected_strides(&layout).ok_or_else(|| {
+            anyhow!(
+                "output v{}'s elected layout {:?} has no strides",
+                tensor.index(),
+                layout.present()
+            )
+        })
+    }
+
+    /// A bound output's slot in the plan `execute` would run.
+    fn installed_output_slot(
+        &self,
+        tensor: NodeIndex,
+    ) -> Result<(
+        &crate::layouts::CudaPlan,
+        &luminal::bufferize::OutputBinding<DecodedLayout>,
+    )> {
+        let index = self.output_slot_index(tensor)?;
+        let plan = self
+            .selected_bucket
+            .and_then(|i| self.bucket_plans.get(i))
+            .or_else(|| self.bucket_plans.first())
+            .map(|bucket| &bucket.plan)
+            .or(self.plan.as_ref())
+            .ok_or_else(|| anyhow!("search before reading an output's backing storage"))?;
+        let slot = plan
+            .dag
+            .node_weights()
+            .filter_map(|node| match node {
+                luminal::bufferize::BufferNode::BufferOutput { slots } => Some(slots),
+                _ => None,
+            })
+            .flatten()
+            .find(|slot| slot.index == index)
+            .ok_or_else(|| anyhow!("the installed plan has no output slot {index}"))?;
+        Ok((plan, slot))
+    }
+
     /// The searched plan, for inspection and tests.
     pub fn plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
         self.selected_bucket
@@ -1231,4 +1362,65 @@ impl CudaRuntime {
             .map(|p| &p.plan)
             .or(self.plan.as_ref())
     }
+}
+
+/// One element stride per axis of a RESOLVED layout, taken from the
+/// constructor's own meaning: the contiguous forms state theirs by shape
+/// order, a strided chain by its three canonical residues (`coord * stride`,
+/// the bare coordinate, the dead axis's zero). `None` for a layout that
+/// states an offset function instead of strides, and for a chain summand
+/// outside those residues — a stride is never recovered by evaluation.
+fn elected_strides(layout: &DecodedLayout) -> Option<Vec<i64>> {
+    use luminal::layouts::{
+        IntExprTerm as T, LeftMajorContiguousElementLayout as LM,
+        RightMajorContiguousElementLayout as RM, StridedElementLayout as ST,
+    };
+    let extents: Vec<i64> = layout
+        .literal_extents()?
+        .into_iter()
+        .map(|e| i64::try_from(e).ok())
+        .collect::<Option<_>>()?;
+    let rank = extents.len();
+    if layout.has::<RM>() {
+        let mut strides = vec![1i64; rank];
+        for axis in (0..rank.saturating_sub(1)).rev() {
+            strides[axis] = strides[axis + 1].checked_mul(extents[axis + 1])?;
+        }
+        return Some(strides);
+    }
+    if layout.has::<LM>() {
+        let mut strides = vec![1i64; rank];
+        for axis in 1..rank {
+            strides[axis] = strides[axis - 1].checked_mul(extents[axis - 1])?;
+        }
+        return Some(strides);
+    }
+    let chain = &layout.first::<ST>()?.chain;
+    if chain.len() != rank {
+        return None;
+    }
+    // A summand names its own axis FROM THE END; only the dead axis's bare
+    // zero has none, and it sits at that axis's position in the chain.
+    let axis_of = |axis_from_end: &i64| -> Option<usize> {
+        let axis = usize::try_from(*axis_from_end).ok()?;
+        (axis < rank).then_some(rank - 1 - axis)
+    };
+    let mut strides: Vec<Option<i64>> = vec![None; rank];
+    for (position, summand) in chain.iter().enumerate() {
+        let (axis, stride) = match summand {
+            T::Lit(0) => (position, 0),
+            T::Coord { axis_from_end } => (axis_of(axis_from_end)?, 1),
+            T::Mul(a, b) => match (a.as_ref(), b.as_ref()) {
+                (T::Coord { axis_from_end }, k) | (k, T::Coord { axis_from_end }) => {
+                    (axis_of(axis_from_end)?, k.eval_literal()?)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if strides[axis].replace(stride).is_some() {
+            return None;
+        }
+    }
+    strides.into_iter().collect()
 }

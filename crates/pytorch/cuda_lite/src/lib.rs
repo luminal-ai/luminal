@@ -203,6 +203,24 @@ impl CompiledGraph {
         self.output_layouts.clone()
     }
 
+    /// The buffer id the installed plan writes this output's bytes into.
+    fn output_backing_buffer(&self, name: &str) -> PyResult<i64> {
+        let tensor = self.output_tensor(name)?;
+        self.runtime.output_backing_buffer(tensor).map_err(to_py)
+    }
+
+    /// The bytes that backing buffer spans at the dims bound now.
+    fn output_span_bytes(&self, name: &str) -> PyResult<usize> {
+        let tensor = self.output_tensor(name)?;
+        self.runtime.output_span_bytes(tensor).map_err(to_py)
+    }
+
+    /// The element strides the installed plan elected for this output.
+    fn output_elected_strides(&self, name: &str) -> PyResult<Vec<i64>> {
+        let tensor = self.output_tensor(name)?;
+        self.runtime.output_elected_strides(tensor).map_err(to_py)
+    }
+
     /// Record the concrete shapes of one call's inputs by graph name.
     /// Their axes bind the graph's symbolic dims, so a symbolic input runs
     /// at a new extent without re-exporting. Dims only: no payload crosses
@@ -326,9 +344,50 @@ impl CompiledGraph {
         }
         self.runtime.execute().map_err(to_py)
     }
+
+    /// The runtime's cumulative counters, or None before it touched a device.
+    fn graph_stats(&self) -> Option<HashMap<String, u64>> {
+        #[cfg(feature = "device")]
+        {
+            self.runtime.graph_stats().map(|stats| {
+                HashMap::from([
+                    ("launches".to_string(), stats.launches),
+                    ("instantiations".to_string(), stats.instantiations),
+                    ("graph_cache_hits".to_string(), stats.graph_cache_hits),
+                    ("host_captures".to_string(), stats.host_captures),
+                    ("host_cache_hits".to_string(), stats.host_cache_hits),
+                    ("node_updates".to_string(), stats.node_updates),
+                    ("address_rebinds".to_string(), stats.address_rebinds),
+                    ("kernel_compilations".to_string(), stats.kernel_compilations),
+                    ("arena_generation".to_string(), stats.arena_generation),
+                    ("arena_base".to_string(), stats.arena_base),
+                    ("arena_bytes".to_string(), stats.arena_bytes as u64),
+                    ("staging_bytes".to_string(), stats.staging_bytes as u64),
+                    (
+                        "resident_upload_bytes".to_string(),
+                        stats.resident_upload_bytes,
+                    ),
+                ])
+            })
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            None
+        }
+    }
 }
 
 impl CompiledGraph {
+    /// The graph value one output name names.
+    fn output_tensor(&self, name: &str) -> PyResult<NodeIndex> {
+        self.translation
+            .outputs
+            .iter()
+            .find(|output| output.graph_name == name)
+            .map(|output| output.tensor)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("unknown output {name:?}")))
+    }
+
     /// Saturate and search. What this states is what Python reads: the
     /// `search` method maps it through [`to_py`] unchanged.
     fn run_search(&mut self, generations: Option<usize>) -> Result<()> {

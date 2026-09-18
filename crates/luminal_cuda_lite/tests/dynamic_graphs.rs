@@ -97,7 +97,7 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
 }
 
 #[test]
-fn cublas_geometry_changes_refresh_child_and_reuse_capture() {
+fn cublas_geometry_changes_rerecord_the_child_every_execution() {
     let mut g = Graph::new();
     let a = g.tensor(('m', 'k'), DType::F32);
     let b = g.tensor(('k', 'n'), DType::F32);
@@ -134,8 +134,9 @@ fn cublas_geometry_changes_refresh_child_and_reuse_capture() {
         }
     }
     let stats = rt.graph_stats().unwrap();
-    assert_eq!(stats.host_captures, 3);
-    assert_eq!(stats.host_cache_hits, 1);
+    // Every execution here changes the dims, and every such execution
+    // re-records the library call: one recording per launch.
+    assert_eq!(stats.host_captures, stats.launches);
     assert_eq!(stats.arena_generation, 1);
 }
 
@@ -359,5 +360,6 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), expected);
     }
-    assert_eq!(rt.graph_stats().unwrap().host_captures, 3);
+    let stats = rt.graph_stats().unwrap();
+    assert_eq!(stats.host_captures, stats.launches);
 }

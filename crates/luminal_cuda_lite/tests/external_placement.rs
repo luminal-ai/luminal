@@ -168,15 +168,15 @@ fn an_external_output_slot_sits_on_the_bound_buffer() {
         .expect("the guard reads the same fact");
 }
 
-/// A CALLER-OWNED OUTPUT IS WRITTEN, NEVER DISCLOSED — with the cuBLASLt
-/// estate available, which is what makes this a real question. The
-/// decorated matmul claims its result in the sibling (transpose-sandwich)
-/// frame, so the recorder-frame value is a VIEW of the op's D buffer;
-/// elected for a value bound External that leaves the caller's tensor
-/// unwritten. The search refuses such a candidate and keeps looking, so a
-/// plan still exists — it materializes the value into the bound buffer.
+/// A CALLER-OWNED OUTPUT MAY BE A VIEW OF AN ESCAPE CELL — with the cuBLASLt
+/// estate available, which is what makes this a real question. The decorated
+/// matmul claims its result in the sibling (transpose-sandwich) frame, so the
+/// recorder-frame value is a VIEW of the op's D buffer. That view is a legal
+/// fulfilment: the escaping cell under it IS the caller's storage, retargeted
+/// onto the bound buffer id after the search, and the runtime discloses which
+/// buffer it wrote, how far it reaches, and how the value is strided in it.
 #[test]
-fn an_external_output_is_written_not_disclosed_even_with_cublaslt() {
+fn an_external_output_may_be_a_view_of_an_escape_cell() {
     let mut cx = Graph::new();
     let x = cx.tensor((4usize, 16usize), DType::F32);
     let w = cx.tensor((16usize, 32usize), DType::F32);
@@ -185,17 +185,38 @@ fn an_external_output_is_written_not_disclosed_even_with_cublaslt() {
     let mut bindings = CudaBindings::new();
     bindings.input(x.id);
     bindings.input(w.id);
-    bindings.output_external(out.id);
+    let bound = bindings.output_external(out.id);
 
     let mut runtime = CudaRuntime::load_with(&cx, bindings, cuda_registry())
         .expect("a matmul with a caller-owned output loads");
     runtime
         .search(&FxHashMap::default(), &harness_search_options())
-        .expect("a plan that writes the caller's buffer exists");
+        .expect("a plan that fulfils the caller-owned output exists");
 
-    // The fact: the elected plan's output slot sits ON the bound buffer,
-    // so executing it fills the caller's tensor.
     runtime
         .check_external_outputs()
-        .expect("the elected plan writes the bound output");
+        .expect("the guard reads the retargeted plan");
+    assert_eq!(
+        runtime.output_backing_buffer(out.id).unwrap(),
+        bound,
+        "the output's backing storage is the caller's buffer"
+    );
+    assert_eq!(
+        runtime.output_elected_strides(out.id).unwrap(),
+        vec![32, 1],
+        "the elected layout is the row-major (4, 32) result"
+    );
+    assert!(
+        runtime.output_span_bytes(out.id).unwrap() >= 4 * 32 * 4,
+        "the backing buffer holds at least the whole result"
+    );
+    assert!(
+        runtime
+            .plan()
+            .expect("the search installed a plan")
+            .dag
+            .node_weights()
+            .any(|node| matches!(node, BufferNode::Compute { op, .. } if op.label() == "CublasLt")),
+        "the cuBLASLt estate is what makes this output a view"
+    );
 }

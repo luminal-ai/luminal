@@ -16,9 +16,14 @@ declared to the runtime, which binds it on one buffer id; each call hands
 that buffer the tensor's address. Which map a chain is — contiguous,
 column-major, neither — is discovered in the e-graph, never decided here.
 A user-visible output is bound at eager's exact strides — read from the
-same fake value the input layouts are read from — and allocated at them
-per call, so the tensor the caller receives is laid out the way the
-uncompiled program lays it out. Nothing is copied to the host and no
+same fake value the input layouts are read from — and allocated per call
+at the byte span the installed plan discloses for it, which exceeds the
+tensor's own bytes when the plan elected a view of the escape cell it
+writes through. The plan writes that storage in place either way, so the
+tensor the caller receives is the one the runtime wrote rather than a copy
+of it. Its layout must be the one eager gives it: an output whose elected
+strides are not the declared ones is refused by name, because this backend
+returns outputs in eager's layout. Nothing is copied to the host and no
 layout is reinterpreted — a tensor the runtime cannot bind, one whose
 storage offset is non-zero among them, is refused by name. Aliasing has
 one spelling: two bindings naming one buffer id, which is how a writeback
@@ -257,6 +262,34 @@ def _refuse_overlapping_writebacks(
             )
 
 
+def _allocate_output(
+    binding: Binding,
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    span: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, int, int]:
+    """One output's storage, plus the address and byte count its buffer is
+    bound at.
+
+    The plan discloses the span its backing buffer covers, which exceeds
+    the output's own bytes when the plan elected a view of the escape cell
+    it writes through. Allocating the span is what keeps that write inside
+    storage PyTorch owns; the tensor handed back is a view of it at the
+    declared strides, and reaches no further than the span the runtime
+    computed from the same layout.
+    """
+    dense = torch.empty_strided(shape, strides, dtype=binding.dtype, device=device)
+    if span <= dense.untyped_storage().nbytes():
+        return dense, dense.data_ptr(), buffer_nbytes(dense)
+    base = torch.empty(span, dtype=torch.uint8, device=device)
+    # A span that is not a whole number of elements is viewed as the whole
+    # elements it holds; the trailing bytes stay the runtime's to write.
+    element = dense.element_size()
+    whole = base[: span - span % element].view(binding.dtype)
+    return whole.as_strided(shape, strides), base.data_ptr(), span
+
+
 class CompiledModel:
     """Callable wrapper around a compiled CUDA-lite graph.
 
@@ -393,22 +426,49 @@ class CompiledModel:
         # allocator records the stream that will write them.
         with torch.cuda.stream(side):
             out_tensors: list[Optional[torch.Tensor]] = []
+            # What each output's buffer is addressed with: the base of its
+            # storage and the byte span the plan writes through it, which is
+            # the tensor's own span only when the plan writes it densely.
+            out_spans: list[Optional[tuple[int, int]]] = []
             for index, binding in enumerate(self._output_bindings):
                 if self._output_mutations[index] is not None:
                     out_tensors.append(None)
+                    out_spans.append(None)
                     continue
+                name = binding.name
                 shape = tuple(output_shapes[index])
-                tensor = torch.empty_strided(
-                    shape,
-                    declared_strides(binding, shape, dims),
-                    dtype=binding.dtype,
-                    device=device,
+                # The plan was retargeted onto the caller's buffer at search;
+                # a plan that writes this output somewhere else is a runtime
+                # invariant broken, not a call this caller can fix.
+                backing = self._graph.output_backing_buffer(name)
+                if backing != binding.buffer:
+                    raise RuntimeError(
+                        f"luminal_cuda_lite: output {name!r} is bound on buffer "
+                        f"{binding.buffer}, but the installed plan writes it into "
+                        f"buffer {backing}"
+                    )
+                declared = tuple(declared_strides(binding, shape, dims))
+                elected = tuple(self._graph.output_elected_strides(name))
+                if elected != declared:
+                    raise RuntimeError(
+                        f"luminal_cuda_lite: output {name!r} is elected at element "
+                        f"strides {elected}, and eager's are {declared}. This backend "
+                        "returns outputs in eager's layout and the plan elected a "
+                        "different one (LUM-829 covers making this a toggle)."
+                    )
+                # The span the plan writes through this buffer, at this call's
+                # dimensions: the allocation is sized to it, never to the
+                # tensor alone.
+                span = self._graph.output_span_bytes(name)
+                tensor, base_ptr, base_bytes = _allocate_output(
+                    binding, shape, declared, span, device
                 )
                 # The allocation is checked against the binding the runtime
                 # writes through — rank, extents, element strides — so a
                 # disagreement is refused by name rather than written past.
                 check_binding(binding, tensor, dims)
                 out_tensors.append(tensor)
+                out_spans.append((base_ptr, base_bytes))
 
         # Order the side stream after everything the caller enqueued: this is
         # what makes reading the caller's inputs safe without a host sync.
@@ -441,12 +501,13 @@ class CompiledModel:
                     binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
                 )
 
-            for binding, tensor in zip(self._output_bindings, out_tensors):
+            for binding, tensor, spanned in zip(
+                self._output_bindings, out_tensors, out_spans
+            ):
                 if tensor is None:
                     continue
-                self._graph.set_device_ptr(
-                    binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
-                )
+                base_ptr, base_bytes = spanned
+                self._graph.set_device_ptr(binding.buffer, base_ptr, base_bytes)
                 per_call.append(binding.buffer)
 
             self._graph.execute()
