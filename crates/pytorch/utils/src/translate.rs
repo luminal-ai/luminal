@@ -1,9 +1,16 @@
 //! ATen (PT2 `model.json`) -> recorder-frontend translator.
 //!
-//! SSA values stay SSA; boundary storage is stated once, at the graph
-//! inputs/outputs. A functionalized in-place mutation (PT2
-//! `user_input_mutation`) becomes `GraphTensor::output_into` on the mutated
-//! input, which the binding layer pins to one buffer id.
+//! SSA values stay SSA; the model says nothing about boundary storage.
+//! Which values leave, and through whose storage, is a table here, read
+//! from the export's output specs: a functionalized mutation (PT2
+//! `user_input_mutation` or `buffer_mutation`) records the mutated graph
+//! input's name as the output's `mutation_target`, and the backend binds
+//! that output on that input's buffer. One row per output spec, keyed by
+//! the export's node: two nodes with equal values (a clone and what it
+//! copies) are two rows, and the same node as writeback and user output
+//! is one row, returned. The program must be functionalised before it
+//! reaches here — an in-place op is refused, since which storage it
+//! writes is not something a name can tell.
 //!
 //! Coverage is honest: an unknown ATen target bails with its name. This is
 //! the M4 translator re-attachment, rebuilt against the native recorder.
@@ -61,8 +68,9 @@ pub struct TranslatedOutput {
     pub dtype: DType,
     /// Symbolic dims (see [`TranslatedInput::shape`]).
     pub shape: Vec<IntExpr>,
-    /// For a `user_input_mutation` output: the graph name of the input it
-    /// writes into. These are writebacks, not returned tensors.
+    /// For a mutation output: the graph name of the graph input (user input
+    /// or module buffer) it writes into. These are writebacks, not returned
+    /// tensors.
     pub mutation_target: Option<String>,
     /// Whether this output is part of the caller's returned pytree. A
     /// mutation-only sink is `false`; a mutated input that the model also
@@ -84,13 +92,8 @@ pub struct Translation {
 struct Translator<'a> {
     cx: Graph,
     values: HashMap<String, GraphTensor>,
-    /// Input values, never shadowed by a later in-place rebinding.
+    /// Input values by graph name.
     input_values: HashMap<String, GraphTensor>,
-    /// Writeback sinks registered by in-place ATen nodes, in dispatch order.
-    sinks: Vec<TranslatedOutput>,
-    /// Value id -> index in `sinks`, so a graph output that returns the
-    /// mutated value marks ITS sink as returned instead of adding a second.
-    sink_by_value: HashMap<NodeIndex, usize>,
     /// PT2 symbol name -> recorder dim symbol (dynamic dims).
     symbols: HashMap<String, Symbol>,
     /// PT2 symbol name -> torch's exported range constraint.
@@ -103,6 +106,24 @@ struct Translator<'a> {
     dims: HashMap<Symbol, usize>,
 }
 
+/// Read one dimension expression a caller stated in sympy's `srepr`
+/// form — `Integer(4)`, `Symbol('s77')`, `Mul(Integer(4), Symbol('s77'))`
+/// — against this translation's PT2 symbols.
+///
+/// A boundary states its element strides in the same vocabulary the
+/// exported program states its shapes in, so a caller whose storage is
+/// shaped by a dynamic dimension names that dimension rather than the
+/// number one example call happened to have.
+pub fn parse_dim_expr(translation: &Translation, expr: &str) -> Result<IntExpr> {
+    sympy::parse_sympy_expr(expr, &translation.symbols).ok_or_else(|| {
+        anyhow!(
+            "{expr:?} is not a dimension expression this program states: it names a \
+             symbol the exported program does not declare, or a sympy form the \
+             parser does not read"
+        )
+    })
+}
+
 /// Translate a parsed PT2 program into the recorder frontend.
 pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
     let sym_dim_map = parsed.build_sym_dim_map();
@@ -110,8 +131,6 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         cx: Graph::new(),
         values: HashMap::new(),
         input_values: HashMap::new(),
-        sinks: Vec::new(),
-        sink_by_value: HashMap::new(),
         symbols: sym_dim_map.sym_to_symbol.clone(),
         ranges: sym_dim_map.ranges,
         complex_tensors: HashMap::new(),
@@ -129,6 +148,18 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
                 | InputKind::UserInput { graph_name } => graph_name.clone(),
             };
             (name, kind)
+        })
+        .collect();
+    // A `buffer_mutation` output names its target by module FQN; the
+    // boundary binds by graph input name.
+    let buffer_graph_names: HashMap<String, String> = kinds
+        .values()
+        .filter_map(|kind| match kind {
+            InputKind::Buffer {
+                graph_name,
+                original_name,
+            } => Some((original_name.clone(), graph_name.clone())),
+            _ => None,
         })
         .collect();
 
@@ -188,13 +219,18 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
             .with_context(|| format!("translating `{}`", node.target))?;
     }
 
-    // 3. Outputs, in export order. Mutations write back into their target
-    //    input's storage instead of materializing a new boundary. An
-    //    in-place ATen node already registered its sink while dispatching;
-    //    a graph output that returns that value marks the sink as returned
-    //    rather than adding a second boundary.
+    // 3. Outputs, in export order: one row per output spec, keyed by the
+    //    export's own node name. A mutation spec writes back into its target
+    //    input's storage and is not returned; torch emits it before the user
+    //    output that returns the same NODE, and that user output IS the
+    //    writeback (the caller's tensor), not a second boundary. Two specs
+    //    naming different nodes are two rows even when they translate to one
+    //    value (a returned clone of a written-back value): the boundary gives
+    //    each its own buffer, and the plan writes one and copies.
     let output_specs = &parsed.program.graph_module.signature.output_specs;
     let mut regular: Vec<TranslatedOutput> = Vec::new();
+    // Export node name of each mutation row -> index in `regular`.
+    let mut writeback_by_name: HashMap<String, usize> = HashMap::new();
     for (position, tref) in parsed.program.graph_module.graph.outputs.iter().enumerate() {
         let name = tref
             .value_name()
@@ -221,44 +257,56 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
                 .ok_or_else(|| anyhow!("output {name} was never produced"))?
         };
 
-        if let Some(&sink) = t.sink_by_value.get(&value.id) {
-            if !matches!(
-                output_specs.get(position),
-                Some(crate::pt2_schema::OutputSpec::UserInputMutation { .. })
-            ) {
-                t.sinks[sink].returned = true;
-            }
-            continue;
-        }
-
         let mutation_target = match output_specs.get(position) {
             Some(crate::pt2_schema::OutputSpec::UserInputMutation {
                 user_input_mutation,
-            }) => {
-                let target_name = user_input_mutation.user_input_name.clone();
-                let target = *t.input_values.get(&target_name).ok_or_else(|| {
-                    anyhow!("mutation output {name} targets unknown input {target_name:?}")
-                })?;
-                value.output_into(&target);
-                Some(target_name)
+            }) => Some(user_input_mutation.user_input_name.clone()),
+            Some(crate::pt2_schema::OutputSpec::BufferMutation { buffer_mutation }) => {
+                let buffer_name = &buffer_mutation.buffer_name;
+                let Some(target_name) = buffer_graph_names.get(buffer_name) else {
+                    bail!("mutation output {name} targets unknown buffer {buffer_name:?}");
+                };
+                Some(target_name.clone())
             }
-            _ => {
-                value.output();
-                None
-            }
+            _ => None,
         };
+        // A mutation writes an INPUT's storage: the target must be a graph
+        // input for the backend to have a buffer to bind this output on.
+        if let Some(target_name) = &mutation_target
+            && !t.input_values.contains_key(target_name)
+        {
+            bail!("mutation output {name} targets unknown input {target_name:?}");
+        }
+        if let Some(target_name) = &mutation_target {
+            let target = t.input_values[target_name];
+            if target.dtype != value.dtype {
+                bail!(
+                    "mutation output {name} changes {target_name:?} from {:?} to {:?}",
+                    target.dtype,
+                    value.dtype
+                );
+            }
+        }
+        // A writeback is not part of the caller's returned pytree.
+        let returned = mutation_target.is_none();
+        if returned && let Some(&index) = writeback_by_name.get(&name) {
+            regular[index].returned = true;
+            continue;
+        }
+        if !returned {
+            writeback_by_name.insert(name.clone(), regular.len());
+        }
         regular.push(TranslatedOutput {
             graph_name: name,
             tensor: value.id,
             dtype,
             shape,
             mutation_target,
-            returned: true,
+            returned,
         });
     }
 
-    let mut outputs = std::mem::take(&mut t.sinks);
-    outputs.extend(regular);
+    let outputs = regular;
 
     Ok(Translation {
         graph: t.cx,
@@ -380,6 +428,20 @@ impl Translator<'_> {
             .or_else(|| node.target.strip_prefix("torch.ops."))
             .unwrap_or(&node.target);
 
+        // A functionalised program has no in-place ops. One here means the
+        // export was not functionalised, and which storage it writes is not
+        // something a name can tell (a view of an input is not an input):
+        // refused, never guessed. Dunder ops (`__and__`) end in `__`, not
+        // in the mutation marker.
+        let base = target.split('.').next().unwrap_or(target);
+        if base.ends_with('_') && !base.ends_with("__") {
+            bail!(
+                "in-place ATen op `{}` in a non-functionalised program: export it with \
+                 run_decompositions so the mutation is an output spec",
+                node.target
+            );
+        }
+
         // Assertion nodes carry no dataflow; they never bind outputs.
         // `sym_size` produces a scalar SymInt, not a tensor: its value is
         // carried in `sym_int_values` and resolved where a shape argument
@@ -463,21 +525,6 @@ impl Translator<'_> {
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
             "minimum.default" => self.binary(n, |a, b| a.maximum(b * -1.0) * -1.0)?,
-            // ---- in-place (functional SSA + caller-storage writeback) ----
-            "add_.Tensor" => self.inplace_binary(node, |a, b| a + b)?,
-            "sub_.Tensor" => self.inplace_binary(node, |a, b| a - b)?,
-            "mul_.Tensor" => self.inplace_binary(node, |a, b| a * b)?,
-            "div_.Tensor" => self.inplace_binary(node, |a, b| a / b)?,
-            "relu_.default" => self.inplace_unary(node, |x| x.relu())?,
-            "sigmoid_.default" => self.inplace_unary(node, |x| x.sigmoid())?,
-            "tanh_.default" => self.inplace_unary(node, |x| x.tanh())?,
-            "copy_.default" => {
-                let x = self.operand(&n[0])?;
-                let y = self.operand(&n[1])?;
-                let value = y.cast(x.dtype);
-                self.register_inplace(node, value)?;
-                value
-            }
             // ---- movement ----
             "t.default" => self.operand(&n[0])?.t(),
             "transpose.int" => {
@@ -600,6 +647,7 @@ impl Translator<'_> {
             "tril_indices.default" => self.translate_triangular_indices(node, false)?,
             "triu_indices.default" => self.translate_triangular_indices(node, true)?,
             "slice_scatter.default" => self.translate_slice_scatter(node)?,
+            "select_scatter.default" => self.translate_select_scatter(node)?,
             "embedding_renorm.default" => self.translate_embedding_renorm(node)?,
             "higher_order.wrap_with_set_grad_enabled" => {
                 self.translate_wrap_set_grad(node)?;
@@ -645,7 +693,14 @@ impl Translator<'_> {
             "select.int" => self.translate_select(node)?,
             "expand.default" => self.translate_expand(node)?,
             "repeat.default" => self.translate_repeat(node)?,
-            "clone.default" | "alias.default" => self.operand(&n[0])?,
+            // Value identity: a clone, alias or detach has its operand's
+            // contents. Which storage each returned one gets is the
+            // boundary's statement, read from the export (a clone's own
+            // buffer; an alias's or detach's the storage it shares).
+            "clone.default" | "alias.default" | "detach.default" => {
+                let x = self.operand(&n[0])?;
+                util::materialize_tensor(x)
+            }
             "stack.default" => self.translate_stack(node)?,
             // ---- creation / selection ----
             "full.default" => self.translate_full(node, false)?,
@@ -810,7 +865,7 @@ impl Translator<'_> {
             "scatter.value_reduce" => self.translate_scatter(node, 3)?,
             "scatter_add.default" => self.translate_scatter(node, 4)?,
             "scatter_reduce.two" => self.translate_scatter(node, 5)?,
-            "index_put_.default" | "index_put.default" => self.translate_index_put(node)?,
+            "index_put.default" => self.translate_index_put(node)?,
             "index_reduce.default" => self.translate_index_reduce(node)?,
             "masked_scatter.default" => self.translate_masked_scatter(node)?,
             "put.default" => self.translate_put(node)?,
@@ -958,64 +1013,6 @@ impl Translator<'_> {
         Ok(op(a, b))
     }
 
-    fn inplace_binary(
-        &mut self,
-        node: &Node,
-        op: impl FnOnce(GraphTensor, GraphTensor) -> GraphTensor,
-    ) -> Result<GraphTensor> {
-        let value = self.binary(&node.inputs, op)?;
-        self.register_inplace(node, value)?;
-        Ok(value)
-    }
-
-    fn inplace_unary(
-        &mut self,
-        node: &Node,
-        op: impl FnOnce(GraphTensor) -> GraphTensor,
-    ) -> Result<GraphTensor> {
-        let value = op(self.operand(&node.inputs[0])?);
-        self.register_inplace(node, value)?;
-        Ok(value)
-    }
-
-    /// An in-place result targeting a graph input registers a writeback
-    /// sink: the input and the result share one boundary buffer, so the
-    /// caller's tensor is updated. Mutations of intermediates need no
-    /// writeback (SSA already carries the new value).
-    fn register_inplace(&mut self, node: &Node, value: GraphTensor) -> Result<()> {
-        let Some(target_name) = node.inputs[0].arg.as_tensor_name().map(str::to_string) else {
-            return Ok(());
-        };
-        let Some(&target) = self.input_values.get(&target_name) else {
-            return Ok(());
-        };
-        if target.dtype != value.dtype {
-            bail!(
-                "in-place `{}` changes dtype from {:?} to {:?}",
-                node.target,
-                target.dtype,
-                value.dtype
-            );
-        }
-        let output_name = node.outputs[0]
-            .value_name()
-            .ok_or_else(|| anyhow!("in-place `{}` has no output name", node.target))?
-            .to_string();
-        let meta = self.tensor_meta(&output_name)?.clone();
-        let shape = self.boundary_shape(&meta, &output_name)?;
-        value.output_into(&target);
-        self.sink_by_value.insert(value.id, self.sinks.len());
-        self.sinks.push(TranslatedOutput {
-            graph_name: output_name,
-            tensor: value.id,
-            dtype: value.dtype,
-            shape,
-            mutation_target: Some(target_name),
-            returned: false,
-        });
-        Ok(())
-    }
-
     fn int_arg(&mut self, input: &NodeInput) -> Result<i64> {
         input.arg.as_int().ok_or_else(|| {
             anyhow!(
@@ -1115,4 +1112,66 @@ fn normalize_axes(axes: &[i64], rank: usize) -> Result<Vec<usize>> {
                 .ok_or_else(|| anyhow!("axis {a} out of range for rank {rank}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod dim_expr_tests {
+    use super::*;
+
+    /// A translation that declares only dimension symbols: a dim
+    /// expression is read against those and nothing else.
+    fn translation(symbols: &[&str]) -> Translation {
+        Translation {
+            graph: Graph::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            dims: HashMap::new(),
+            symbols: symbols
+                .iter()
+                .map(|name| ((*name).to_string(), Symbol::new(*name)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_literal_extent_reads_as_its_number() {
+        let t = translation(&[]);
+        assert_eq!(
+            parse_dim_expr(&t, "Integer(4)").unwrap(),
+            IntExpr::from(4i64)
+        );
+    }
+
+    /// A boundary stride stated as the program's own dimension: asked of
+    /// what it COMPUTES at a dim value, never of how it is spelled.
+    #[test]
+    fn a_symbolic_extent_reads_as_the_programs_dim() {
+        let t = translation(&["s77"]);
+        let symbol = Symbol::new("s77");
+        let stride = parse_dim_expr(
+            &t,
+            "Mul(Integer(2), Symbol('s77', positive=True, integer=True))",
+        )
+        .unwrap();
+        assert!(stride.to_symbols().contains(&symbol));
+        let dims: DynMap = [(symbol, 5usize)].into_iter().collect();
+        assert_eq!(stride.exec(&dims), Some(10));
+    }
+
+    #[test]
+    fn an_undeclared_symbol_is_refused_by_name() {
+        let t = translation(&[]);
+        let err = parse_dim_expr(&t, "Symbol('s77')").expect_err("s77 is not declared");
+        assert!(format!("{err:#}").contains("Symbol('s77')"), "{err:#}");
+    }
+
+    #[test]
+    fn an_unreadable_form_is_refused_by_name() {
+        let t = translation(&[]);
+        let err = parse_dim_expr(&t, "Piecewise(Integer(1))").expect_err("not a dim form");
+        assert!(
+            format!("{err:#}").contains("Piecewise(Integer(1))"),
+            "{err:#}"
+        );
+    }
 }

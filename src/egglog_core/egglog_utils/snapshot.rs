@@ -592,15 +592,14 @@ mod differential {
         let mut graph = luminal::prelude::Graph::new();
         let x = graph.tensor((2, 3), luminal::prelude::DType::F32);
         let y = graph.tensor((2, 3), luminal::prelude::DType::F32);
-        let _ = (x * y + x).sum(1).output();
-        let (pre_schedule, _inputs, _outputs, post_checks, _labeled) = graph
-            .logical
-            .bound_parts(&luminal_reference::bindings::ReferenceBindings)
+        let _ = (x * y + x).sum(1);
+        let bound = luminal_reference::ReferenceBindings::leaves(&graph.logical)
+            .bind(&graph.logical)
             .expect("the recorded graph binds");
         let program = format!(
-            "{}\n\n{pre_schedule}{}{post_checks}",
+            "{}\n\n{}",
             luminal_reference::assembled_program(),
-            luminal_reference::bindings::ReferenceBindings::SCHEDULE
+            bound.text()
         );
         let mut egraph = luminal::egglog_snippet::new_egraph();
         egraph

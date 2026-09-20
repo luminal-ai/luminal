@@ -13,7 +13,7 @@ fn run(condition: HostBuffer, if_true: HostBuffer, if_false: HostBuffer) -> Vec<
     let condition_t = cx.tensor((4,), DType::Bool);
     let if_true_t = cx.tensor((4,), DType::F32);
     let if_false_t = cx.tensor((4,), DType::F32);
-    let out = condition_t.select(if_true_t, if_false_t).output();
+    let out = condition_t.select(if_true_t, if_false_t);
 
     let data: FxHashMap<_, _> = [
         (condition_t.id, condition.clone()),
@@ -27,9 +27,9 @@ fn run(condition: HostBuffer, if_true: HostBuffer, if_false: HostBuffer) -> Vec<
     runtime
         .search(&data, &harness_search_options())
         .expect("search finds a Select plan");
-    runtime.set_data(condition_t.id, condition);
-    runtime.set_data(if_true_t.id, if_true);
-    runtime.set_data(if_false_t.id, if_false);
+    runtime.set_data(condition_t.id, condition).unwrap();
+    runtime.set_data(if_true_t.id, if_true).unwrap();
+    runtime.set_data(if_false_t.id, if_false).unwrap();
     runtime.execute().expect("execute");
     runtime.get_f32(out.id).expect("f32 output")
 }

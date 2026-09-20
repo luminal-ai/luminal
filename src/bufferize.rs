@@ -1610,13 +1610,50 @@ fn validate_input_program(graph: &ExtractedGraph) -> Result<()> {
         }
     }
 
+    // Each value's VIEW ROOT: the non-view value whose bytes a chain of
+    // non-writing Must ties (views) addresses. Two demands on one buffer
+    // that share a root are one final byte content read two ways — a value
+    // and a view of it, both delivered on the buffer that holds the root.
+    let mut view_parent: HashMap<ClassId, ClassId> = HashMap::new();
+    for node in graph.dag.node_weights() {
+        let ExtractedNode::LayoutOp(op) = node else {
+            continue;
+        };
+        for (operand, result) in must_ties(op.op.as_ref()) {
+            if !op.op.result_writes_memory(result)
+                && let (Some(input), Some(output)) =
+                    (op.inputs.get(operand), op.outputs.get(result))
+            {
+                view_parent.insert(output.eclass.clone(), input.value.clone());
+            }
+        }
+    }
+    let view_root = |value: &ClassId| -> ClassId {
+        let mut current = value.clone();
+        let mut hops = 0;
+        while let Some(parent) = view_parent.get(&current) {
+            current = parent.clone();
+            hops += 1;
+            if hops > view_parent.len() {
+                break; // a cycle is ill-formed; the analyzer refuses it later
+            }
+        }
+        current
+    };
+
     // The buffer-granular support rule: two or more distinct final values on
-    // one buffer are deliverable only as pass-throughs of that buffer's own
-    // inputs (nothing may be WRITTEN into a buffer that must also preserve a
-    // second value to the end of the program).
+    // one buffer are deliverable only when they are one content — every
+    // demand a view of one root value — or as pass-throughs of that buffer's
+    // own inputs (nothing may be WRITTEN into a buffer that must also
+    // preserve a second value to the end of the program).
     for buffer in &output_buffers {
         let demanded = &output_values[buffer];
         if demanded.len() < 2 {
+            continue;
+        }
+        let mut roots = demanded.iter().map(&view_root);
+        let first_root = roots.next().expect("two or more demands");
+        if roots.all(|root| root == first_root) {
             continue;
         }
         for value in demanded {

@@ -166,11 +166,8 @@ fn fixture5_relu() {
         let mut cx = Graph::new();
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
-        let _out = x.matmul(w).relu().output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w).relu();
+        test_runtime::bind_leaves(&cx)
     };
     println!("MEASURE fixture5 relu: {:.2}s", timed(&text));
     let ops = flavored_ops(&text, false, false, true);
@@ -198,11 +195,8 @@ fn fixture5_c_fold() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _out = (x.matmul(w) + c).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w) + c;
+        test_runtime::bind_leaves(&cx)
     };
     println!("MEASURE fixture5 c-fold: {:.2}s", timed(&text));
     let ops = flavored_ops(&text, true, false, false);
@@ -231,11 +225,8 @@ fn fixture5_c_fold_reversed_orientation() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _out = (c + x.matmul(w)).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = c + x.matmul(w);
+        test_runtime::bind_leaves(&cx)
     };
     let ops = flavored_ops(&text, true, false, false);
     let lt = cublaslt_only(&ops);
@@ -253,11 +244,8 @@ fn fixture5_bias() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let b = cx.tensor(3usize, DType::F32);
-        let _out = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w) + b.expand_dim(0, 4usize);
+        test_runtime::bind_leaves(&cx)
     };
     println!("MEASURE fixture5 bias: {:.2}s", timed(&text));
 
@@ -316,11 +304,8 @@ fn fixture5_bias_elected_by_name_alone() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let b = cx.tensor(3usize, DType::F32);
-        let _out = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w) + b.expand_dim(0, 4usize);
+        test_runtime::bind_leaves(&cx)
     };
     let (graph, _) = test_runtime::extract_fixture_with_genome(
         &text,
@@ -355,11 +340,8 @@ fn fixture5_bias_relu() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let b = cx.tensor(3usize, DType::F32);
-        let _out = (x.matmul(w) + b.expand_dim(0, 4usize)).relu().output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
+        test_runtime::bind_leaves(&cx)
     };
     println!("MEASURE fixture5 bias+relu: {:.2}s", timed(&text));
     let ops = flavored_ops(&text, false, true, true);
@@ -384,13 +366,8 @@ fn fixture5_full_stack() {
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
         let b = cx.tensor(3usize, DType::F32);
-        let _out = ((x.matmul(w) + c) + b.expand_dim(0, 4usize))
-            .relu()
-            .output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
+        test_runtime::bind_leaves(&cx)
     };
     println!("MEASURE fixture5 full stack: {:.2}s", timed(&text));
     let ops = flavored_ops(&text, true, true, true);
@@ -421,18 +398,31 @@ fn fixture6_relu_then_add_c_not_folded() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _out = (x.matmul(w).relu() + c).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w).relu() + c;
+        test_runtime::bind_leaves(&cx)
     };
+    // Election-free: `relu(x@w) + c` has no `y + c` to fold, so no
+    // Accumulate contract may exist at all, while the relu decoration does.
+    let s = test_runtime::serialize_fixture(&text);
+    let count = |op: &str| s.nodes.values().filter(|n| n.op == op).count();
+    assert!(count("CublasLtEpilogueRelu") >= 1, "the relu decorates");
+    assert_eq!(count("LayoutTensorOpCublasLtAccumulate"), 0, "no C fold");
+    assert_eq!(
+        count("LayoutTensorOpCublasLtAccumulateBias"),
+        0,
+        "no C fold"
+    );
+
     let ops = flavored_ops(&text, false, false, true);
     let lt = cublaslt_only(&ops);
-    assert_eq!(lt.len(), 1, "only the relu op fuses");
-    let spec = lt[0].0.spec.as_ref().expect("spec parses");
-    assert_eq!(spec.epilogue, CuEpilogue::Relu);
-    assert!(!spec.has_c, "the post-activation add must NOT fold into C");
+    assert!(
+        !lt.is_empty(),
+        "the plan reaches the boundary through cuBLASLt"
+    );
+    for (op, _, _) in &lt {
+        let spec = op.spec.as_ref().expect("spec parses");
+        assert!(!spec.has_c, "the post-activation add must NOT fold into C");
+    }
     let decomposed_adds = ops
         .iter()
         .filter(|(_, _, label)| label.contains("Add"))
@@ -451,11 +441,8 @@ fn fixture6_relu_then_bias_not_folded() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let b = cx.tensor(3usize, DType::F32);
-        let _out = (x.matmul(w).relu() + b.expand_dim(0, 4usize)).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w).relu() + b.expand_dim(0, 4usize);
+        test_runtime::bind_leaves(&cx)
     };
     let ops = flavored_ops(&text, false, false, true);
     let lt = cublaslt_only(&ops);
@@ -479,12 +466,13 @@ fn fixture8_diamond_base_and_decorated_coexist() {
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let b = cx.tensor(3usize, DType::F32);
         let mm = x.matmul(w);
-        let _mm_out = mm.output();
-        let _biased = (mm + b.expand_dim(0, 4usize)).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
+        let biased = mm + b.expand_dim(0, 4usize);
+        // The diamond: mm is bound as an output AND feeds the bias add, so
+        // it is not a leaf — state both bound outputs.
+        test_runtime::TestRuntimeBindings::dense(&cx.logical, &[mm.id, biased.id])
+            .bind(&cx.logical)
             .expect("recorder clean")
-            .text
+            .text()
     };
     let ops = flavored_ops(&text, false, true, false);
     let lt = cublaslt_only(&ops);

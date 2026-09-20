@@ -117,7 +117,7 @@ fn run_on_device(
         .expect("cuda search");
     assert_constant_reaches_the_device(&rt, expected_constant, what);
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     rt.execute()
         .expect("device execute (NVRTC compiles the constant kernel here)");
@@ -133,7 +133,7 @@ fn constant_plus_zero(value: f32) -> Vec<f32> {
     let mut cx = Graph::new();
     let a = cx.tensor(N, DType::F32);
     let c = cx.constant_f32(value).expand_rhs(a.dims());
-    let out = (a + c).output();
+    let out = a + c;
     let got = run_on_device(
         &cx,
         &[(a.id, vec![0.0f32; N])],
@@ -202,7 +202,7 @@ fn cummax_seed_constant_survives_nvrtc() {
     let input = vec![-5.0f32, -3., -9., -1., -7., -2., -8., -4.];
     let mut cx = Graph::new();
     let a = cx.tensor(input.len(), DType::F32);
-    let out = a.cummax(0).output();
+    let out = a.cummax(0);
     let got = run_on_device(
         &cx,
         &[(a.id, input.clone())],

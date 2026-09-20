@@ -8,7 +8,7 @@
 //! rather than the arithmetic `util::select` (which leaks NaN through the
 //! unselected branch's `NaN * 0`).
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use luminal::prelude::*;
 
 use super::Translator;
@@ -605,6 +605,44 @@ impl Translator<'_> {
                 }));
             } else {
                 coords.push(self.cx.iota(src_shape.clone(), move |c| c[axis]));
+            }
+        }
+        Ok(destination.scatter(&coords, source))
+    }
+
+    /// `select_scatter(dst, src, dim, index)`: `dst` with the `index`-th
+    /// slice along `dim` replaced by `src` (one rank lower). The source's
+    /// coordinates map to `dim = index` and the identity elsewhere.
+    pub(super) fn translate_select_scatter(&mut self, node: &Node) -> Result<GraphTensor> {
+        let destination = self.operand(&node.inputs[0])?;
+        let source = self.operand(&node.inputs[1])?.cast(destination.dtype);
+        let rank = destination.rank();
+        anyhow::ensure!(rank > 0, "select_scatter on a rank-0 tensor is not ported");
+        anyhow::ensure!(
+            source.rank() + 1 == rank,
+            "select_scatter source rank {} is not one below destination rank {rank}",
+            source.rank()
+        );
+        let raw_dim = self.get_int_arg(node, 2)?;
+        anyhow::ensure!(
+            raw_dim >= -(rank as i64) && raw_dim < rank as i64,
+            "select_scatter dimension {raw_dim} out of range for rank {rank}"
+        );
+        let dim = normalize_dim(raw_dim, rank);
+        let index = node
+            .inputs
+            .get(3)
+            .and_then(|input| self.resolve_arg_as_expression(&input.arg))
+            .ok_or_else(|| anyhow!("select_scatter has no index"))?;
+        let index = normalize_slice_bound(index, destination.dims()[dim]);
+        let src_shape = source.dims();
+        let mut coords = Vec::with_capacity(rank);
+        for axis in 0..rank {
+            if axis == dim {
+                coords.push(self.cx.iota(src_shape.clone(), move |_| index));
+            } else {
+                let src_axis = if axis < dim { axis } else { axis - 1 };
+                coords.push(self.cx.iota(src_shape.clone(), move |c| c[src_axis]));
             }
         }
         Ok(destination.scatter(&coords, source))

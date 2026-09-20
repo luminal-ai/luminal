@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 
 use luminal::dtype::DType;
-use luminal::graph::Graph;
+use luminal::graph::{Graph, ValueId};
 use luminal::layout_ir::{ExtractedGraph, ExtractedNode, ExtractionSite, SerializedIndex};
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 use test_runtime::cublaslt_marker::{
@@ -275,6 +275,90 @@ fn logical_of_lt(s: &EGraph, lt: &ClassId) -> Option<ClassId> {
                     .map(|c| c.eclass.clone())
             })
             .flatten()
+    })
+}
+
+/// Logical classes of the D layout tensors of every RELU-decorated cuBLASLt
+/// enode (D descriptor at child 3, epilogue last).
+fn decorated_d_logicals(s: &EGraph) -> BTreeSet<ClassId> {
+    let class_of =
+        |id: &luminal::prelude::egraph_serialize::NodeId| s.nodes.get(id).map(|c| c.eclass.clone());
+    let mut out = BTreeSet::new();
+    for n in s
+        .nodes
+        .values()
+        .filter(|n| n.op.starts_with("LayoutTensorOpCublasLt"))
+    {
+        let Some(ep) = n.children.last().and_then(class_of) else {
+            continue;
+        };
+        if !s
+            .nodes
+            .values()
+            .any(|m| m.eclass == ep && m.op == "CublasLtEpilogueRelu")
+        {
+            continue;
+        }
+        let Some(desc_d) = n.children.get(3).and_then(class_of) else {
+            continue;
+        };
+        let d_lt = s
+            .nodes
+            .values()
+            .find(|m| m.eclass == desc_d && m.op == "CublasLtOutputDDescriptor")
+            .and_then(|m| m.children.get(1))
+            .and_then(class_of);
+        if let Some(l) = d_lt.and_then(|lt| logical_of_lt(s, &lt)) {
+            out.insert(l);
+        }
+    }
+    out
+}
+
+/// Logical classes of the program's boundary values (the BufferOutputLit
+/// list's layout tensors).
+fn boundary_logicals(s: &EGraph) -> BTreeSet<ClassId> {
+    let class_of =
+        |id: &luminal::prelude::egraph_serialize::NodeId| s.nodes.get(id).map(|c| c.eclass.clone());
+    let find =
+        |class: &ClassId, op: &str| s.nodes.values().find(|m| m.eclass == *class && m.op == op);
+    let mut out = BTreeSet::new();
+    for root in s.nodes.values().filter(|n| n.op == "BufferOutputLit") {
+        let mut cur = root.children.first().and_then(class_of);
+        let mut guard = 0;
+        while let Some(list) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cons) = find(&list, "BufferTensorCons") else {
+                break;
+            };
+            let lt = cons
+                .children
+                .first()
+                .and_then(class_of)
+                .and_then(|bt| find(&bt, "BufferTensorLit"))
+                .and_then(|m| m.children.first())
+                .and_then(class_of);
+            if let Some(l) = lt.and_then(|lt| logical_of_lt(s, &lt)) {
+                out.insert(l);
+            }
+            cur = cons.children.get(1).and_then(class_of);
+        }
+    }
+    out
+}
+
+/// Does `class` hold a `LogicalIndexMapApply` whose source is `src`?
+fn class_applies(s: &EGraph, class: &ClassId, src: &ClassId) -> bool {
+    s.nodes.values().any(|n| {
+        n.eclass == *class
+            && n.op == "LogicalIndexMapApply"
+            && n.children
+                .first()
+                .and_then(|id| s.nodes.get(id))
+                .is_some_and(|c| c.eclass == *src)
     })
 }
 
@@ -650,10 +734,19 @@ fn lit(v: i64) -> String {
 fn record(build: impl FnOnce(&mut Graph)) -> String {
     let mut cx = Graph::new();
     build(&mut cx);
-    cx.logical
-        .bound_program(&test_runtime::TestRuntimeBindings)
+    test_runtime::bind_leaves(&cx)
+}
+
+/// [`record`] for programs whose bound outputs are NOT the leaves — a
+/// diamond binds the shared value as well as its consumer, so the builder
+/// hands back the values to bind.
+fn record_outputs(build: impl FnOnce(&mut Graph) -> Vec<ValueId>) -> String {
+    let mut cx = Graph::new();
+    let outputs = build(&mut cx);
+    test_runtime::TestRuntimeBindings::dense(&cx.logical, &outputs)
+        .bind(&cx.logical)
         .expect("recorder clean")
-        .text
+        .text()
 }
 
 /// A/B/D reading census plus op-candidate count — the structural refusal
@@ -737,7 +830,7 @@ fn attack_a1_square_weight_amk_bkn() {
     let text = record(|cx| {
         let x = cx.tensor((2usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = x.matmul(w).output();
+        let _ = x.matmul(w);
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, b, d, ops) = census(&s);
@@ -789,7 +882,7 @@ fn attack_a2_square_weight_amk_bnk() {
     let text = record(|cx| {
         let x = cx.tensor((2usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = x.matmul(w.permute((1usize, 0usize))).output();
+        let _ = x.matmul(w.permute((1usize, 0usize)));
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, ..) = census(&s);
@@ -836,9 +929,7 @@ fn attack_a2b_amk_bnk_with_relu_and_bias() {
         let x = cx.tensor((2usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
         let bias = cx.tensor(4usize, DType::F32);
-        let _ = (x.matmul(w.permute((1usize, 0usize))) + bias.expand_dim(0, 2usize))
-            .relu()
-            .output();
+        let _ = (x.matmul(w.permute((1usize, 0usize))) + bias.expand_dim(0, 2usize)).relu();
     });
     let (ops, labels) = flavored_cublaslt(&text, false, true, true);
     let lt: Vec<_> = ops
@@ -867,7 +958,7 @@ fn attack_a3_all_square_amk_bkn() {
     let text = record(|cx| {
         let x = cx.tensor((4usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = x.matmul(w).output();
+        let _ = x.matmul(w);
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, b, d, ops) = census(&s);
@@ -932,7 +1023,7 @@ fn attack_a4_chained_square_matmuls() {
         let w1 = cx.tensor((4usize, 4usize), DType::F32);
         let w2 = cx.tensor((4usize, 4usize), DType::F32);
         let y = x.matmul(w1);
-        let _ = y.matmul(w2).output();
+        let _ = y.matmul(w2);
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, b, d, ops) = census(&s);
@@ -1028,7 +1119,7 @@ fn attack_a5_chained_mixed_amk_bkn_amk_bnk() {
         let w1 = cx.tensor((4usize, 4usize), DType::F32);
         let w2 = cx.tensor((4usize, 4usize), DType::F32);
         let y = x.matmul(w1);
-        let _ = y.matmul(w2.permute((1usize, 0usize))).output();
+        let _ = y.matmul(w2.permute((1usize, 0usize)));
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, ..) = census(&s);
@@ -1085,7 +1176,7 @@ fn attack_a5_chained_mixed_amk_bkn_amk_bnk() {
 fn attack_a6_x_matmul_x() {
     let text = record(|cx| {
         let x = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = x.matmul(x).output();
+        let _ = x.matmul(x);
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, b, d, ops) = census(&s);
@@ -1130,7 +1221,7 @@ fn attack_a6_x_matmul_x() {
 fn attack_a6b_x_matmul_x_transposed() {
     let text = record(|cx| {
         let x = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = x.matmul(x.permute((1usize, 0usize))).output();
+        let _ = x.matmul(x.permute((1usize, 0usize)));
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, b, d, ops) = census(&s);
@@ -1485,9 +1576,7 @@ fn attack_a11_all_ones_decorated_stress() {
         let w = cx.tensor((1usize, 1usize), DType::F32);
         let c = cx.tensor((1usize, 1usize), DType::F32);
         let bias = cx.tensor(1usize, DType::F32);
-        let _ = ((x.matmul(w) + c) + bias.expand_dim(0, 1usize))
-            .relu()
-            .output();
+        let _ = ((x.matmul(w) + c) + bias.expand_dim(0, 1usize)).relu();
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, b, d, ops) = census(&s);
@@ -1566,7 +1655,7 @@ fn attack_b1_wrong_axis_bias_square_out() {
         let w = cx.tensor((4usize, 4usize), DType::F32);
         let bias = cx.tensor(4usize, DType::F32);
         // expand_dim(1, 4): [4] -> [4,4] varying along axis 0 (rows).
-        let _ = (x.matmul(w) + bias.expand_dim(1, 4usize)).output();
+        let _ = x.matmul(w) + bias.expand_dim(1, 4usize);
     });
     let s = test_runtime::serialize_fixture(&text);
     let bias_ops = count_op(&s, "LayoutTensorOpCublasLtBias");
@@ -1623,7 +1712,7 @@ fn attack_b2_right_axis_bias_square_out() {
         let x = cx.tensor((4usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
         let bias = cx.tensor(4usize, DType::F32);
-        let _ = (x.matmul(w) + bias.expand_dim(0, 4usize)).output();
+        let _ = x.matmul(w) + bias.expand_dim(0, 4usize);
     });
     let s = test_runtime::serialize_fixture(&text);
     let bias_ops = count_op(&s, "LayoutTensorOpCublasLtBias");
@@ -1668,7 +1757,7 @@ fn attack_c1_c_equals_a() {
     let text = record(|cx| {
         let x = cx.tensor((4usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = (x.matmul(w) + x).output();
+        let _ = x.matmul(w) + x;
     });
     let s = test_runtime::serialize_fixture(&text);
     let acc = count_op(&s, "LayoutTensorOpCublasLtAccumulate");
@@ -1753,7 +1842,7 @@ fn attack_c2_self_add_mm_plus_mm() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let y = x.matmul(w);
-        let _ = (y + y).output();
+        let _ = y + y;
     });
     let s = test_runtime::serialize_fixture(&text);
     let acc = count_op(&s, "LayoutTensorOpCublasLtAccumulate");
@@ -1818,7 +1907,7 @@ fn attack_c3_same_c_added_twice() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = ((x.matmul(w) + c) + c).output();
+        let _ = (x.matmul(w) + c) + c;
     });
     let s = test_runtime::serialize_fixture(&text);
     let acc = count_op(&s, "LayoutTensorOpCublasLtAccumulate");
@@ -1850,9 +1939,7 @@ fn attack_c4_bias_then_c_then_relu_order() {
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let bias = cx.tensor(3usize, DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = ((x.matmul(w) + bias.expand_dim(0, 4usize)) + c)
-            .relu()
-            .output();
+        let _ = ((x.matmul(w) + bias.expand_dim(0, 4usize)) + c).relu();
     });
     let s = test_runtime::serialize_fixture(&text);
     println!(
@@ -1898,14 +1985,14 @@ fn attack_c5_bias_then_c_plain() {
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let bias = cx.tensor(3usize, DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = ((x.matmul(w) + bias.expand_dim(0, 4usize)) + c).output();
+        let _ = (x.matmul(w) + bias.expand_dim(0, 4usize)) + c;
     });
     let c_then_bias = record(|cx| {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
         let bias = cx.tensor(3usize, DType::F32);
-        let _ = ((x.matmul(w) + c) + bias.expand_dim(0, 4usize)).output();
+        let _ = (x.matmul(w) + c) + bias.expand_dim(0, 4usize);
     });
 
     for (name, text) in [("bias-then-c", &bias_then_c), ("c-then-bias", &c_then_bias)] {
@@ -1954,7 +2041,7 @@ fn attack_c6_no_alpha_beta_channel() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = ((x.matmul(w) * 2.0) + c).output();
+        let _ = (x.matmul(w) * 2.0) + c;
     });
     let s = test_runtime::serialize_fixture(&scaled_product);
     assert_candidates_sound(&s, "c6-alpha");
@@ -1986,7 +2073,7 @@ fn attack_c6_no_alpha_beta_channel() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = (x.matmul(w) + (c * 2.0)).output();
+        let _ = x.matmul(w) + (c * 2.0);
     });
     let s2 = test_runtime::serialize_fixture(&scaled_c);
     assert_candidates_sound(&s2, "c6-beta");
@@ -2020,8 +2107,8 @@ fn attack_d1_two_relu_consumers() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w1 = cx.tensor((8usize, 3usize), DType::F32);
         let w2 = cx.tensor((8usize, 3usize), DType::F32);
-        let _ = x.matmul(w1).relu().output();
-        let _ = x.matmul(w2).relu().output();
+        let _ = x.matmul(w1).relu();
+        let _ = x.matmul(w2).relu();
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, ..) = census(&s);
@@ -2073,7 +2160,7 @@ fn attack_d2_double_relu() {
     let text = record(|cx| {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
-        let _ = x.matmul(w).relu().relu().output();
+        let _ = x.matmul(w).relu().relu();
     });
     let s = test_runtime::serialize_fixture(&text);
     let relu_values = count_op(&s, "CublasLtEpilogueRelu");
@@ -2083,18 +2170,25 @@ fn attack_d2_double_relu() {
     assert_candidates_sound(&s, "d2");
     assert_one_lit_per_op_class(&s, "d2");
 
-    let (elected, labels) = flavored_cublaslt(&text, false, false, true);
-    let lt: Vec<_> = elected
-        .iter()
-        .filter(|e| e.label.starts_with("CublasLt"))
-        .collect();
+    // Election-free: the boundary value is the OUTER relu. A decoration
+    // unions its D back into the recorder-frame class as a transpose view,
+    // so an undecorated class holds no apply of any decorated D — the
+    // epilogue is a single flag and fires once per op.
+    let outer = boundary_logicals(&s);
+    assert!(!outer.is_empty(), "the boundary value is the outer relu");
+    let decorated = decorated_d_logicals(&s);
+    assert!(!decorated.is_empty(), "the inner relu decorates some D");
+    for d in &decorated {
+        for o in &outer {
+            assert!(
+                !class_applies(&s, o, d),
+                "the outer relu must NOT be decorated (Relu on Relu)"
+            );
+        }
+    }
+
+    let (_elected, labels) = flavored_cublaslt(&text, false, false, true);
     println!("  labels={labels:?}");
-    assert_eq!(
-        lt.len(),
-        1,
-        "ONE fused kernel — the epilogue is a single flag"
-    );
-    assert_eq!(lt[0].spec().epilogue, CuEpilogue::Relu);
     let residual = labels.iter().filter(|l| !l.starts_with("CublasLt")).count();
     assert!(
         residual > 0,
@@ -2111,7 +2205,7 @@ fn attack_d3_mm_plus_mm_two_sites() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w1 = cx.tensor((8usize, 3usize), DType::F32);
         let w2 = cx.tensor((8usize, 3usize), DType::F32);
-        let _ = (x.matmul(w1) + x.matmul(w2)).output();
+        let _ = x.matmul(w1) + x.matmul(w2);
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, ..) = census(&s);
@@ -2166,7 +2260,7 @@ fn attack_d3_mm_plus_mm_two_sites() {
 
 // ===========================================================================
 // GROUP E — CONSTANT / RELU SPELLING DRIFT
-// The relu dance is inlined in FOUR places (round 7 E1/E2 deleted the
+// The relu spelling is inlined in FOUR places (round 7 E1/E2 deleted the
 // recognizer relations). Drift between the copies, or a premise that is not
 // load-bearing, is the hazard.
 // ===========================================================================
@@ -2180,7 +2274,7 @@ fn attack_e1_runtime_zeros_maximum_not_fused() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let zeros = cx.tensor((4usize, 3usize), DType::F32); // runtime data, not a constant
-        let _ = x.matmul(w).maximum(zeros).output();
+        let _ = x.matmul(w).maximum(zeros);
     });
     let s = test_runtime::serialize_fixture(&text);
     let relu_values = count_op(&s, "CublasLtEpilogueRelu");
@@ -2207,36 +2301,33 @@ fn attack_e1_runtime_zeros_maximum_not_fused() {
     );
 }
 
-/// e2: a hand-seeded relu dance that is structurally IDENTICAL to the
-/// recognized one except that ONE of the five zero fills is a runtime
-/// tensor. Positive control first (the untouched dance fuses), then the
-/// respelled one must NOT — proving each fill premise is load-bearing
-/// rather than incidental.
+/// e2: a hand-seeded relu that is structurally IDENTICAL to the recognized
+/// select spelling except that the maximum's zero fill is a runtime tensor
+/// (what `maximum(zeros)` records). Positive control first (the canonical
+/// spelling fuses), then the respelled one must NOT — proving the fill
+/// premise is load-bearing rather than incidental.
 #[test]
 fn attack_e2_respelled_relu_stays_decomposed() {
-    fn dance(first_compare_rhs: &str, zeros_decl: &str) -> String {
+    fn dance(fill: &str, zeros_decl: &str) -> String {
         let extra = format!(
             r#"{zeros_decl}
 (let zconst (LogicalConstant 0.0))
 (let scalar_shape (ShapeLit (IntExprNil)))
 (let scalar_map (IndexMapLit (IntExprNil) scalar_shape))
 (let zfill (LogicalIndexMapApply zconst scalar_map out_shape))
-(let nconst (LogicalConstant -1.0))
-(let nfill (LogicalIndexMapApply nconst scalar_map out_shape))
-(let oconst (LogicalConstant 1.0))
-(let ofill (LogicalIndexMapApply oconst scalar_map out_shape))
-(let lt0 (LogicalLessThan out_logical {first_compare_rhs}))
-(let tc (LogicalCast lt0 (F32)))
-(let term1 (LogicalMul tc zfill))
-(let nm (LogicalMul tc nfill))
-(let p (LogicalAdd nm ofill))
-(let sel1 (LogicalCast (LogicalLessThan zfill p) (F32)))
-(let sel2 (LogicalCast (LogicalLessThan p zfill) (F32)))
-(let sum2 (LogicalAdd sel1 sel2))
-(let bsel (LogicalLessThan zfill sum2))
-(let u (LogicalCast bsel (F32)))
-(let term2 (LogicalMul u out_logical))
-(let relu_logical (LogicalAdd term1 term2))
+(let nanconst (LogicalConstant NaN))
+(let nanfill (LogicalIndexMapApply nanconst scalar_map out_shape))
+(let picked (LogicalSelect (LogicalLessThan out_logical {fill}) {fill} out_logical))
+(let yy (LogicalCast (LogicalLessThan out_logical out_logical) (F32)))
+(let ysum (LogicalAdd yy yy))
+(let yind (LogicalAdd (LogicalCast (LogicalLessThan zfill ysum) (F32)) (LogicalCast (LogicalLessThan ysum zfill) (F32))))
+(let ynan (LogicalLessThan zfill yind))
+(let inner (LogicalSelect ynan nanfill picked))
+(let zz (LogicalCast (LogicalLessThan {fill} {fill}) (F32)))
+(let zsum (LogicalAdd zz zz))
+(let zind (LogicalAdd (LogicalCast (LogicalLessThan zfill zsum) (F32)) (LogicalCast (LogicalLessThan zsum zfill) (F32))))
+(let znan (LogicalLessThan zfill zind))
+(let relu_logical (LogicalSelect znan nanfill inner))
 (let relu_lt (LayoutTensorLit relu_logical out_layout))
 (let relu_buffer_id (BufferLit 20))
 (set (buffer-access-of relu_buffer_id) (ReadWrite))
@@ -2252,14 +2343,14 @@ fn attack_e2_respelled_relu_stays_decomposed() {
         .text()
     }
 
-    // POSITIVE CONTROL — the canonical dance.
+    // POSITIVE CONTROL — the canonical spelling.
     let good = dance("zfill", "");
     let s_good = test_runtime::serialize_fixture(&good);
     let good_relu = count_op(&s_good, "CublasLtEpilogueRelu");
-    println!("e2 control (canonical dance): EpilogueRelu = {good_relu}");
+    println!("e2 control (canonical spelling): EpilogueRelu = {good_relu}");
     assert!(
         good_relu >= 1,
-        "the hand-seeded canonical dance MUST fuse (otherwise the negative \
+        "the hand-seeded canonical spelling MUST fuse (otherwise the negative \
          result below proves nothing)"
     );
 
@@ -2285,7 +2376,7 @@ fn attack_e2_respelled_relu_stays_decomposed() {
 }
 
 /// e3 (charter §5, the four-copy agreement): a relu decoration must reach
-/// ALL FOUR contracts. Round 7 inlined the dance premises into four
+/// ALL FOUR contracts. Round 7 inlined the relu premises into four
 /// separate rules; drift between the copies would show as one contract
 /// refusing what its siblings accept.
 ///
@@ -2301,7 +2392,7 @@ fn attack_e3_four_inlined_relu_copies_agree() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).relu().output();
+                let _ = x.matmul(w).relu();
             }),
         ),
         (
@@ -2312,7 +2403,7 @@ fn attack_e3_four_inlined_relu_copies_agree() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu().output();
+                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
             }),
         ),
         (
@@ -2323,7 +2414,7 @@ fn attack_e3_four_inlined_relu_copies_agree() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
-                let _ = (x.matmul(w) + c).relu().output();
+                let _ = (x.matmul(w) + c).relu();
             }),
         ),
         (
@@ -2335,9 +2426,7 @@ fn attack_e3_four_inlined_relu_copies_agree() {
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize))
-                    .relu()
-                    .output();
+                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
             }),
         ),
     ];
@@ -2704,7 +2793,7 @@ fn attack_s7_symbolic_op_default_cost_election() {
     let literal = record(|cx| {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
-        let _ = x.matmul(w).output();
+        let _ = x.matmul(w);
     });
 
     for (name, text) in [("symbolic", &symbolic), ("literal", &literal)] {
@@ -3186,39 +3275,39 @@ fn attack_p3_no_legal_program_reaches_a_panic() {
         ("plain", record(|cx| {
             let x = cx.tensor((4usize, 8usize), DType::F32);
             let w = cx.tensor((8usize, 3usize), DType::F32);
-            let _ = x.matmul(w).output();
+            let _ = x.matmul(w);
         })),
         ("amk_bnk", record(|cx| {
             let x = cx.tensor((2usize, 4usize), DType::F32);
             let w = cx.tensor((3usize, 4usize), DType::F32);
-            let _ = x.matmul(w.permute((1usize, 0usize))).output();
+            let _ = x.matmul(w.permute((1usize, 0usize)));
         })),
         ("square-chain", record(|cx| {
             let x = cx.tensor((4usize, 4usize), DType::F32);
             let w1 = cx.tensor((4usize, 4usize), DType::F32);
             let w2 = cx.tensor((4usize, 4usize), DType::F32);
-            let _ = x.matmul(w1).matmul(w2).output();
+            let _ = x.matmul(w1).matmul(w2);
         })),
         ("full-stack", record(|cx| {
             let x = cx.tensor((4usize, 8usize), DType::F32);
             let w = cx.tensor((8usize, 3usize), DType::F32);
             let c = cx.tensor((4usize, 3usize), DType::F32);
             let b = cx.tensor(3usize, DType::F32);
-            let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu().output();
+            let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
         })),
         ("m1", record(|cx| {
             let x = cx.tensor((1usize, 4usize), DType::F32);
             let w = cx.tensor((4usize, 3usize), DType::F32);
-            let _ = x.matmul(w).relu().output();
+            let _ = x.matmul(w).relu();
         })),
         ("all-ones", record(|cx| {
             let x = cx.tensor((1usize, 1usize), DType::F32);
             let w = cx.tensor((1usize, 1usize), DType::F32);
-            let _ = x.matmul(w).output();
+            let _ = x.matmul(w);
         })),
         ("x-at-x", record(|cx| {
             let x = cx.tensor((4usize, 4usize), DType::F32);
-            let _ = x.matmul(x).output();
+            let _ = x.matmul(x);
         })),
         ("weld-corner", Fx {
             m: lit(1), n: lit(3), k: lit(1),
@@ -3277,7 +3366,7 @@ fn attack_o1_the_oracles_discriminate() {
     let text = record(|cx| {
         let x = cx.tensor((2usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = x.matmul(w).output();
+        let _ = x.matmul(w);
     });
     let s = test_runtime::serialize_fixture(&text);
     let specs = all_candidate_specs(&s);
@@ -3320,7 +3409,7 @@ fn attack_o1_the_oracles_discriminate() {
         record(|cx| {
             let x = cx.tensor((2usize, 4usize), DType::F32);
             let w = cx.tensor((3usize, 4usize), DType::F32);
-            let _ = x.matmul(w.permute((1usize, 0usize))).output();
+            let _ = x.matmul(w.permute((1usize, 0usize)));
         }),
         Fx {
             m: lit(1),
@@ -3339,9 +3428,7 @@ fn attack_o1_the_oracles_discriminate() {
             let w = cx.tensor((8usize, 3usize), DType::F32);
             let c = cx.tensor((4usize, 3usize), DType::F32);
             let b = cx.tensor(3usize, DType::F32);
-            let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize))
-                .relu()
-                .output();
+            let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
         }),
     ];
     let mut compared = 0usize;
@@ -3515,7 +3602,7 @@ fn attack_g1_x16_same_geometry() {
             for _ in 0..n {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).output();
+                let _ = x.matmul(w);
             }
         })
     };
@@ -3572,12 +3659,12 @@ fn attack_g1_x16_same_geometry() {
 /// consumer.
 #[test]
 fn attack_g2_cse_same_matmul_twice() {
-    let text = record(|cx| {
+    let text = record_outputs(|cx| {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let y = x.matmul(w);
-        let _ = y.output();
-        let _ = (y * 2.0).output();
+        let scaled = y * 2.0;
+        vec![y.id, scaled.id]
     });
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, b, d, ops) = census(&s);
@@ -3629,7 +3716,7 @@ fn attack_h1_one_lit_per_op_class() {
             record(|cx| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).output();
+                let _ = x.matmul(w);
             }),
         ),
         (
@@ -3638,7 +3725,7 @@ fn attack_h1_one_lit_per_op_class() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
+                let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
         (
@@ -3647,7 +3734,7 @@ fn attack_h1_one_lit_per_op_class() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
-                let _ = (x.matmul(w) + c).output();
+                let _ = x.matmul(w) + c;
             }),
         ),
         (
@@ -3657,9 +3744,7 @@ fn attack_h1_one_lit_per_op_class() {
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize))
-                    .relu()
-                    .output();
+                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
             }),
         ),
         (
@@ -3668,18 +3753,18 @@ fn attack_h1_one_lit_per_op_class() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w1 = cx.tensor((8usize, 3usize), DType::F32);
                 let w2 = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = (x.matmul(w1) + x.matmul(w2)).output();
+                let _ = x.matmul(w1) + x.matmul(w2);
             }),
         ),
         (
             "diamond",
-            record(|cx| {
+            record_outputs(|cx| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
                 let mm = x.matmul(w);
-                let _ = mm.output();
-                let _ = (mm + b.expand_dim(0, 4usize)).output();
+                let biased = mm + b.expand_dim(0, 4usize);
+                vec![mm.id, biased.id]
             }),
         ),
         (
@@ -3687,7 +3772,7 @@ fn attack_h1_one_lit_per_op_class() {
             record(|cx| {
                 let x = cx.tensor((4usize, 4usize), DType::F32);
                 let w = cx.tensor((4usize, 4usize), DType::F32);
-                let _ = (x.matmul(w) + x).output();
+                let _ = x.matmul(w) + x;
             }),
         ),
     ];
@@ -3717,7 +3802,7 @@ fn attack_u1_lit_slot_contents_pinned() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).output();
+                let _ = x.matmul(w);
             }),
         ),
         (
@@ -3727,7 +3812,7 @@ fn attack_u1_lit_slot_contents_pinned() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
+                let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
         (
@@ -3737,7 +3822,7 @@ fn attack_u1_lit_slot_contents_pinned() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
-                let _ = (x.matmul(w) + c).output();
+                let _ = x.matmul(w) + c;
             }),
         ),
         (
@@ -3748,7 +3833,7 @@ fn attack_u1_lit_slot_contents_pinned() {
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).output();
+                let _ = (x.matmul(w) + c) + b.expand_dim(0, 4usize);
             }),
         ),
     ];
@@ -3805,7 +3890,7 @@ fn attack_u2_layout_tensor_field_naming_is_inverted() {
     let text = record(|cx| {
         let x = cx.tensor((2usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = x.matmul(w).output();
+        let _ = x.matmul(w);
     });
     let s = test_runtime::serialize_fixture(&text);
     let elected = pinned_cublaslt(&text);
@@ -3853,7 +3938,7 @@ fn attack_u3_bufferize_duplicate_operand_accumulate() {
     let text = record(|cx| {
         let x = cx.tensor((4usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = (x.matmul(w) + x).output();
+        let _ = x.matmul(w) + x;
     });
     let serialized = test_runtime::serialize_fixture(&text);
     let genome = genome_flavored(&serialized, true, false, false);
@@ -3991,13 +4076,13 @@ fn attack_u6_c_layout_mismatch_panics_loudly() {
 /// must be the OTHER value, never the site out.
 #[test]
 fn attack_u4_accumulate_diamond_claimed_outputs() {
-    let text = record(|cx| {
+    let text = record_outputs(|cx| {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let c = cx.tensor((4usize, 3usize), DType::F32);
         let mm = x.matmul(w);
-        let _ = mm.output();
-        let _ = (mm + c).output();
+        let accumulated = mm + c;
+        vec![mm.id, accumulated.id]
     });
     let s = test_runtime::serialize_fixture(&text);
     assert_candidates_sound(&s, "u4");
@@ -4051,7 +4136,7 @@ fn attack_u5_no_spec_less_op_can_be_elected() {
             record(|cx| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).output();
+                let _ = x.matmul(w);
             }),
             false,
             false,
@@ -4062,7 +4147,7 @@ fn attack_u5_no_spec_less_op_can_be_elected() {
             record(|cx| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).relu().output();
+                let _ = x.matmul(w).relu();
             }),
             false,
             false,
@@ -4074,7 +4159,7 @@ fn attack_u5_no_spec_less_op_can_be_elected() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
-                let _ = (x.matmul(w) + c).relu().output();
+                let _ = (x.matmul(w) + c).relu();
             }),
             true,
             false,
@@ -4087,9 +4172,7 @@ fn attack_u5_no_spec_less_op_can_be_elected() {
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize))
-                    .relu()
-                    .output();
+                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
             }),
             true,
             true,

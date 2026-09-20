@@ -27,7 +27,7 @@ pub mod runtime;
 pub mod search;
 pub mod typed_buffer;
 
-pub use bindings::ReferenceBindings;
+pub use bindings::{Bound, BoundProgram, ReferenceBindings};
 pub use harness::{extract_layout_ir, extract_layout_ir_with_genome, producer_index_with_ops};
 pub use layouts::ReferencePlan;
 pub use runtime::{ReferenceRuntime, reference_allow_list};

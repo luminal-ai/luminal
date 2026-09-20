@@ -648,7 +648,7 @@ mod tests {
         let mut cx = Graph::new();
         let data = cx.tensor((4, 3), DType::F32);
         let idx = cx.tensor(2, DType::Int);
-        let out = gather_rows(data, idx).output();
+        let out = gather_rows(data, idx);
 
         let data_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
         let idx_vals = vec![2i32, 0];
@@ -671,7 +671,7 @@ mod tests {
         let mut cx = Graph::new();
         let data = cx.tensor((3, 2, 2), DType::F32);
         let indices = cx.tensor(2, DType::Int);
-        let output = gather_rows(data, indices).output();
+        let output = gather_rows(data, indices);
         assert_eq!(
             output.dims(),
             vec![IntExpr::from(2), IntExpr::from(2), IntExpr::from(2)]
@@ -701,7 +701,7 @@ mod tests {
         let src = cx.tensor((2, 3), DType::F32);
         let idx = cx.tensor(2, DType::Int);
         let dest = cx.tensor((4, 3), DType::F32);
-        let out = scatter_rows(src, idx, dest).output();
+        let out = scatter_rows(src, idx, dest);
         assert_eq!(out.dims(), dest.dims());
 
         let src_vals = vec![100.0f32, 101.0, 102.0, 200.0, 201.0, 202.0];
@@ -759,9 +759,9 @@ mod tests {
             causal_bias(query_positions, key_positions),
             AttentionGeometry::new(N_HEADS, N_KV_HEADS, HEAD_DIM),
         );
-        let attn = result.output.output();
-        let k_cache_new = result.cache.keys.output();
-        let v_cache_new = result.cache.values.output();
+        let attn = result.output;
+        let k_cache_new = result.cache.keys;
+        let v_cache_new = result.cache.values;
 
         let q_vals = vec![0.5f32, -0.3, 0.8, 0.1];
         let k_new_vals = vec![0.2f32, 0.4, -0.1, 0.3];
@@ -801,8 +801,14 @@ mod tests {
             }
         }
 
-        let rt = luminal_reference::harness::run_reference(
+        // The written caches are read back, but the attention gathers from
+        // them, so they are not leaves: name them as outputs by hand.
+        let rt = luminal_reference::harness::run_reference_bound(
             &cx,
+            luminal_reference::ReferenceBindings::dense(
+                &cx.logical,
+                &[attn.id, k_cache_new.id, v_cache_new.id],
+            ),
             &[
                 (q.id, q_vals.into()),
                 (k_new.id, k_new_vals.into()),
@@ -812,6 +818,7 @@ mod tests {
                 (gather_idx.id, gather_vals.into()),
                 (scatter_idx.id, scatter_vals.into()),
             ],
+            &[],
         );
         assert_close(rt.get_f32(attn.id).expect("attn out"), &attn_ref);
         assert_close(rt.get_f32(k_cache_new.id).expect("k cache"), &k_cache_ref);
@@ -836,8 +843,7 @@ mod tests {
             values,
             bias,
             AttentionGeometry::new(QUERY_HEADS, KV_HEADS, HEAD_DIM),
-        )
-        .output();
+        );
 
         let query_values = vec![0.5, -0.3, 0.8, 0.1, -0.2, 0.7, 0.4, -0.6];
         let key_values = vec![0.2, 0.4, -0.1, 0.3, 0.6, -0.5, 0.9, 0.2];
@@ -924,10 +930,10 @@ mod tests {
             causal_bias(expr_positions, key_positions),
             AttentionGeometry::new(N_HEADS, N_KV_HEADS, HEAD_DIM),
         );
-        let attn_pos = result_pos.output.output();
-        let attn_expr = result_expr.output.output();
-        let k_pos_out = result_pos.cache.keys.output();
-        let v_pos_out = result_pos.cache.values.output();
+        let attn_pos = result_pos.output;
+        let attn_expr = result_expr.output;
+        let k_pos_out = result_pos.cache.keys;
+        let v_pos_out = result_pos.cache.values;
 
         let q_vals = vec![0.5f32, -0.3, 0.8, 0.1];
         let k_new_vals = vec![0.2f32, 0.4, -0.1, 0.3];
@@ -966,8 +972,14 @@ mod tests {
             }
         }
 
-        let rt = luminal_reference::harness::run_reference(
+        // Same as above: the written caches feed the attention's gather, so
+        // they are not leaves and must be bound as outputs explicitly.
+        let rt = luminal_reference::harness::run_reference_bound(
             &cx,
+            luminal_reference::ReferenceBindings::dense(
+                &cx.logical,
+                &[attn_pos.id, attn_expr.id, k_pos_out.id, v_pos_out.id],
+            ),
             &[
                 (q.id, q_vals.into()),
                 (k_new.id, k_new_vals.into()),
@@ -978,6 +990,7 @@ mod tests {
                 (scatter_idx.id, scatter_vals.into()),
                 (q_pos.id, q_pos_vals.into()),
             ],
+            &[],
         );
         assert_close(rt.get_f32(attn_pos.id).expect("positional attn"), &attn_ref);
         assert_close(
@@ -999,8 +1012,7 @@ mod tests {
             query_indptr,
             context_indptr,
             IntExpr::from(5),
-        )
-        .output();
+        );
 
         let rt = luminal_reference::harness::run_reference_with_ranges(
             &cx,
@@ -1029,7 +1041,7 @@ mod tests {
         let mut cx = Graph::new();
         let query_positions = cx.tensor(1, DType::Int);
         let key_positions = cx.tensor(5, DType::Int);
-        let bias = sliding_window_bias(query_positions, key_positions, 2).output();
+        let bias = sliding_window_bias(query_positions, key_positions, 2);
 
         let rt = luminal_reference::harness::run_reference(
             &cx,
@@ -1049,7 +1061,7 @@ mod tests {
         let mut cx = Graph::new();
         let query_sequences = cx.tensor(2, DType::Int);
         let key_sequences = cx.tensor(4, DType::Int);
-        let bias = sequence_isolation_bias(query_sequences, key_sequences).output();
+        let bias = sequence_isolation_bias(query_sequences, key_sequences);
 
         let rt = luminal_reference::harness::run_reference(
             &cx,
@@ -1099,7 +1111,7 @@ mod score_bias_tests {
             mask,
             AttentionGeometry::new(N_HEADS, N_KV_HEADS, HEAD_DIM),
         );
-        let attn = result.output.output();
+        let attn = result.output;
 
         let q_vals = vec![0.5f32, -0.3, 0.8, 0.1];
         let k_new_vals = vec![0.2f32, 0.4, -0.1, 0.3];

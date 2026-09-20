@@ -1,15 +1,19 @@
 //! Opt-in device-resident input boundaries. Names are runtime buffer/slot
 //! IDs; this layer knows nothing about models. A resident input may be
-//! MUTATED in place: a `.output_into()` output shares the input's BufferId,
+//! MUTATED in place: an output bound to the input's BufferId
 //! so its writes land in the home and need no host readback — the state is
 //! still SSA, only its boundary storage is shared.
 use crate::arena::{ArenaPlan, ArenaSlice};
 use crate::{bufferize::BufferIrGraph, layouts::DecodedLayout};
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, Default)]
 pub struct ResidentBindings {
+    /// Input buffers with an arena home that survives every execution.
     pub inputs: BTreeSet<i64>,
+    /// Buffers whose storage is the caller's own device memory: no arena
+    /// home, no transfer, an address supplied before each execution.
+    pub externals: BTreeSet<i64>,
 }
 /// Session-lived storage for one resident input boundary.
 #[derive(Clone, Debug)]
@@ -36,6 +40,11 @@ pub fn allocate<B>(
     plan_storage: impl Fn(&BufferIrGraph<DecodedLayout>, &B, &ResidentBindings) -> Result<ArenaPlan>,
     capacity_bytes: impl Fn(&DecodedLayout, &B) -> Result<usize>,
 ) -> Result<ResidentAllocation<B>> {
+    // A buffer's storage is one thing: an arena home this layer allocates,
+    // or the caller's device memory it never sees.
+    if let Some(lit) = bindings.inputs.intersection(&bindings.externals).next() {
+        bail!("buffer {lit} is both resident and external");
+    }
     let mut installed = plans
         .into_iter()
         .map(|(plan, bounds)| {

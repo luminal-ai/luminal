@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use zip::ZipArchive;
 
 use luminal::prelude::Symbol;
@@ -105,19 +105,36 @@ impl ParsedPT2 {
             .collect()
     }
 
-    /// (output position, mutated user-input name) for every output the export
-    /// signature declares as an in-place input mutation — the extra outputs
+    /// (output position, mutated graph-input name) for every output the
+    /// export signature declares as an in-place mutation — the extra outputs
     /// functionalization appends for `index_put_`/`copy_`/`add_` on graph
-    /// inputs (e.g. HF StaticCache updates). Keyed by position, not name: a
-    /// model that mutates an input *and* returns it yields two outputs with
-    /// the same tensor name.
+    /// inputs and module buffers (e.g. HF StaticCache updates). Keyed by
+    /// position, not name: a model that mutates an input *and* returns it
+    /// yields two outputs with the same tensor name.
+    ///
+    /// A `buffer_mutation` names the buffer by its module FQN; the writeback
+    /// binds by graph input name, so the FQN is resolved through the input
+    /// specs here. A buffer with no graph input is an error, not a skip:
+    /// dropping it would silently lose the mutation.
     ///
     /// Positions index the same tensor-only output list `output_names()`
     /// returns: output_specs is parallel to graph.outputs, but non-tensor
     /// user outputs (e.g. a returned `None` serializes as `as_none`) are
     /// filtered out of `output_names()`, so counting raw spec positions
     /// would skew everything after one.
-    pub fn writeback_outputs(&self) -> Vec<(usize, String)> {
+    pub fn writeback_outputs(&self) -> Result<Vec<(usize, String)>> {
+        let kinds = self.classify_inputs();
+        let buffer_graph_names: HashMap<&str, &str> = kinds
+            .iter()
+            .filter_map(|kind| match kind {
+                InputKind::Buffer {
+                    graph_name,
+                    original_name,
+                } => Some((original_name.as_str(), graph_name.as_str())),
+                _ => None,
+            })
+            .collect();
+
         let outputs = &self.program.graph_module.graph.outputs;
         self.program
             .graph_module
@@ -130,8 +147,18 @@ impl ParsedPT2 {
             .filter_map(|(position, (spec, _))| match spec {
                 OutputSpec::UserInputMutation {
                     user_input_mutation,
-                } => Some((position, user_input_mutation.user_input_name.clone())),
-                _ => None,
+                } => Some(Ok((position, user_input_mutation.user_input_name.clone()))),
+                OutputSpec::BufferMutation { buffer_mutation } => {
+                    let name = buffer_mutation.buffer_name.as_str();
+                    Some(match buffer_graph_names.get(name) {
+                        Some(graph_name) => Ok((position, (*graph_name).to_string())),
+                        None => Err(anyhow!(
+                            "buffer mutation output targets buffer {name:?}, \
+                             which has no graph input"
+                        )),
+                    })
+                }
+                OutputSpec::Other(_) => None,
             })
             .collect()
     }
@@ -349,6 +376,82 @@ mod tests {
             archive_prefix: String::new(),
             pt2_path: String::new(),
         }
+    }
+
+    /// Builds a program whose signature carries the given specs and whose
+    /// graph returns one tensor per name in `outputs`.
+    fn program_with_signature(
+        input_specs: &str,
+        outputs: &[&str],
+        output_specs: &str,
+    ) -> ParsedPT2 {
+        let graph_outputs = outputs
+            .iter()
+            .map(|name| format!(r#"{{"as_tensor":{{"name":"{name}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"graph_module":{{"graph":{{"inputs":[],"outputs":[{graph_outputs}],
+               "nodes":[],"tensor_values":{{}}}},
+               "signature":{{"input_specs":[{input_specs}],
+               "output_specs":[{output_specs}]}}}}}}"#
+        );
+        ParsedPT2 {
+            program: serde_json::from_str(&json).expect("fixture must parse"),
+            constants_config: None,
+            weights_config: None,
+            archive_prefix: String::new(),
+            pt2_path: String::new(),
+        }
+    }
+
+    /// A `buffer_mutation` names its target by module FQN ("cache"), but the
+    /// writeback binds by graph input name ("b_cache"). Position is counted
+    /// over tensor outputs, so the user output ahead of it shifts it to 1.
+    #[test]
+    fn buffer_mutation_writes_back_to_the_buffers_graph_input() {
+        let parsed = program_with_signature(
+            r#"{"buffer":{"arg":{"name":"b_cache"},"buffer_name":"cache",
+               "persistent":true}}"#,
+            &["mul", "add_1"],
+            r#"{"user_output":{"arg":{"as_tensor":{"name":"mul"}}}},
+               {"buffer_mutation":{"arg":{"name":"add_1"},"buffer_name":"cache"}}"#,
+        );
+        assert_eq!(
+            parsed.writeback_outputs().expect("buffer resolves"),
+            vec![(1, "b_cache".to_string())]
+        );
+    }
+
+    /// A buffer the signature never declares as an input has no storage to
+    /// write back into; dropping it would silently lose the mutation.
+    #[test]
+    fn buffer_mutation_naming_an_unknown_buffer_is_an_error() {
+        let parsed = program_with_signature(
+            r#"{"buffer":{"arg":{"name":"b_cache"},"buffer_name":"cache"}}"#,
+            &["add_1"],
+            r#"{"buffer_mutation":{"arg":{"name":"add_1"},"buffer_name":"other_cache"}}"#,
+        );
+        let error = parsed
+            .writeback_outputs()
+            .expect_err("unknown buffer must refuse")
+            .to_string();
+        assert!(error.contains("other_cache"), "{error}");
+    }
+
+    /// The user-input mutation path is unchanged: its target is already a
+    /// graph input name and is passed through as written.
+    #[test]
+    fn user_input_mutation_still_yields_its_user_input_name() {
+        let parsed = program_with_signature(
+            r#"{"user_input":{"arg":{"as_tensor":{"name":"x"}}}}"#,
+            &["add_1"],
+            r#"{"user_input_mutation":{"arg":{"name":"add_1"},"user_input_name":"x"}}"#,
+        );
+        assert_eq!(
+            parsed.writeback_outputs().expect("user input resolves"),
+            vec![(0, "x".to_string())]
+        );
     }
 
     /// torch lets a user write `Dim("_batch")` or `Dim("a__b")` — ordinary

@@ -68,11 +68,8 @@ fn record_plain_2d() -> String {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 4usize), DType::F32);
     let w = cx.tensor((4usize, 3usize), DType::F32);
-    let _out = x.matmul(w).output();
-    cx.logical
-        .bound_program(&test_runtime::TestRuntimeBindings)
-        .expect("recorder clean")
-        .text
+    let _out = x.matmul(w);
+    test_runtime::bind_leaves(&cx)
 }
 
 #[test]
@@ -121,11 +118,8 @@ fn record_amk_bnk() -> String {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 4usize), DType::F32);
     let w = cx.tensor((3usize, 4usize), DType::F32); // stored [n, k]
-    let _out = x.matmul(w.permute((1usize, 0usize))).output();
-    cx.logical
-        .bound_program(&test_runtime::TestRuntimeBindings)
-        .expect("recorder clean")
-        .text
+    let _out = x.matmul(w.permute((1usize, 0usize)));
+    test_runtime::bind_leaves(&cx)
 }
 
 #[test]
@@ -180,11 +174,8 @@ fn fixture2b_square_amk_bnk_single_reading() {
         let mut cx = Graph::new();
         let x = cx.tensor((2usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 4usize), DType::F32);
-        let _out = x.matmul(w.permute((1usize, 0usize))).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _out = x.matmul(w.permute((1usize, 0usize)));
+        test_runtime::bind_leaves(&cx)
     };
     let serialized = test_runtime::serialize_fixture(&text);
     let a_readings = serialized
@@ -234,12 +225,9 @@ fn record_two_same_shape_matmuls() -> String {
     let x = cx.tensor((2usize, 4usize), DType::F32);
     let wq = cx.tensor((4usize, 3usize), DType::F32);
     let wk = cx.tensor((4usize, 3usize), DType::F32);
-    let _q = x.matmul(wq).output();
-    let _k = x.matmul(wk).output();
-    cx.logical
-        .bound_program(&test_runtime::TestRuntimeBindings)
-        .expect("recorder clean")
-        .text
+    let _q = x.matmul(wq);
+    let _k = x.matmul(wk);
+    test_runtime::bind_leaves(&cx)
 }
 
 #[test]

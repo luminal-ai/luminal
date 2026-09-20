@@ -2,32 +2,69 @@
 
 The backend self-exports the incoming GraphModule with ``torch.export``,
 saves the program to a temporary ``.pt2``, hands it to the Rust extension
-for translation and CUDA-lite search, and returns a callable that binds
+for translation, declares the boundary, and returns a callable that binds
 caller tensors per invocation.
 
 This is the GPU twin of the ``luminal_reference`` backend. The export
 preparation (dynamic-shape handling, scalar-output boxing, decomposition
 fallback, dead-op/guard cleanup) is backend-neutral, so it is imported
-from the reference package rather than duplicated; see DESIGN.md for the
-plan to lift it into a shared, backend-neutral module.
+from the reference package rather than duplicated.
 
-DEVICE MODEL (interim): the runtime currently owns its CUDA context,
-stream and arena, and stages every input H2D / output D2H. Caller
-tensors are therefore moved with ``.cpu()`` before staging and outputs
-are rebuilt on the caller's device. The zero-copy + PyTorch-caching-
-allocator design is in DESIGN.md.
+DEVICE MODEL: every boundary tensor is the caller's own device memory.
+Its element strides are read once at compile time (``boundary.py``) and
+declared to the runtime, which binds it on one buffer id; each call hands
+that buffer the tensor's address. Which map a chain is — contiguous,
+column-major, neither — is discovered in the e-graph, never decided here.
+A user-visible output is bound at eager's exact strides — read from the
+same fake value the input layouts are read from — and allocated per call
+at the byte span the installed plan discloses for it, which exceeds the
+tensor's own bytes when the plan elected a view of the escape cell it
+writes through. The plan writes that storage in place either way, so the
+tensor the caller receives is the one the runtime wrote rather than a copy
+of it. Its layout must be the one eager gives it: an output whose elected
+strides are not the declared ones is refused by name, because this backend
+returns outputs in eager's layout. Nothing is copied to the host and no
+layout is reinterpreted — a tensor the runtime cannot bind, one whose
+storage offset is non-zero among them, is refused by name. Aliasing has
+one spelling: two bindings naming one buffer id, which is how a writeback
+and the input it mutates share a pointer.
+
+STREAM AND ARENA: the runtime always launches captured CUDA graphs, which
+the legacy default stream cannot host, so it runs on a dedicated
+``torch.cuda.Stream`` borrowed through ``use_borrowed_stream`` and ordered
+against the caller's stream with ``side.wait_stream(caller)`` before the
+launch and ``caller.wait_stream(side)`` after. The intermediate-scratch
+arena is PyTorch's, not the runtime's: ``arena_bytes()`` is the searched
+plan set's requirement, the wrapper ``caching_allocator_alloc``s exactly
+that against the side stream, binds it with ``set_arena``, and
+``caching_allocator_delete``s it right after ``execute`` — so PyTorch
+accounts for the bytes and can reuse the block on the next call.
 """
 
 import concurrent.futures
-import copy
 import os
 import tempfile
 from typing import Any, Optional, Sequence
 
 import torch
+
+from .boundary import (
+    Binding,
+    UnsupportedBoundary,
+    boundary_layout,
+    boundary_shape,
+    buffer_nbytes,
+    call_dim_values,
+    check_binding,
+    declared_strides,
+    layout_from_spec,
+    layout_spec,
+    storage_span,
+)
 from torch.export import Dim, export
 
 from luminal_reference.export_utils import (
+    private_graph_copy,
     _box_scalar_graph_outputs,
     _decomp_table,
     _drop_dead_data_dependent_ops,
@@ -52,14 +89,11 @@ _PT2_TO_TORCH = {
     13: torch.bfloat16,
 }
 
-
-def _tensor_bytes(tensor: torch.Tensor) -> bytes:
-    # Interim host-staged path: the runtime does its own H2D, so the caller's
-    # device tensor is copied to host here. The zero-copy path will hand the
-    # runtime `tensor.data_ptr()` instead (DESIGN.md).
-    tensor = tensor.detach().cpu().contiguous()
-    # Flatten first: a 0-dim tensor cannot be viewed as a wider dtype.
-    return tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+# The output specs this backend declares to the runtime. Anything else
+# (a buffer mutation, a gradient, a token) would reach the translator as an
+# ordinary returned tensor, because the PT2 signature reader models only
+# ``user_input_mutation``.
+_BOUND_OUTPUT_KINDS = frozenset({"USER_OUTPUT", "USER_INPUT_MUTATION", "BUFFER_MUTATION"})
 
 
 def _torch_dtype(dtype_code: int) -> torch.dtype:
@@ -69,8 +103,226 @@ def _torch_dtype(dtype_code: int) -> torch.dtype:
     return dtype
 
 
-def _nbytes(tensor: torch.Tensor) -> int:
-    return tensor.numel() * tensor.element_size()
+def _node_fakes(ep: Any) -> dict[str, Any]:
+    """The fake example value behind every graph node, by node name.
+
+    It is the exported program's OWN symbolic metadata — the symbols the
+    translator reads back out of the saved ``.pt2`` — so a size or stride
+    stated from it names a dimension the runtime knows, at whatever extent
+    a later call gives it. One table for both sides of the boundary: an
+    output's layout is read from the same metadata an input's is.
+    """
+    fakes: dict[str, Any] = {}
+    for node in ep.graph_module.graph.nodes:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            fakes[node.name] = value
+    return fakes
+
+
+def _boundary_tensors(
+    ep: Any, export_inputs: Sequence[Any]
+) -> list[tuple[str, str, torch.Tensor, Any]]:
+    """(graph input name, kind, tensor, fake example value) for every graph
+    input, in export order. The names are the exported program's
+    placeholder names, which are what the translator reads back out of the
+    saved ``.pt2``. The fake carries the program's symbolic sizes and
+    strides for a user input; a parameter, buffer or constant is the
+    concrete tensor the state dict holds, and states itself."""
+    fakes = _node_fakes(ep)
+    rows: list[tuple[str, str, torch.Tensor, Any]] = []
+    user_index = 0
+    for spec in ep.graph_signature.input_specs:
+        name = getattr(spec.arg, "name", None)
+        kind = spec.kind.name
+        if name is None:
+            raise UnsupportedBoundary(f"graph input {kind.lower()} {spec.target!r} is not a tensor")
+        if kind == "USER_INPUT":
+            if user_index >= len(export_inputs):
+                raise RuntimeError(
+                    f"export declared more user inputs than example_inputs: {name!r}"
+                )
+            value = export_inputs[user_index]
+            user_index += 1
+        elif kind in ("PARAMETER", "BUFFER"):
+            if spec.target not in ep.state_dict:
+                raise RuntimeError(
+                    f"{name}: {spec.target!r} is not in the exported state_dict"
+                )
+            value = ep.state_dict[spec.target]
+        elif kind == "CONSTANT_TENSOR":
+            if spec.target not in ep.constants:
+                raise RuntimeError(f"{name}: {spec.target!r} is not in the exported constants")
+            value = ep.constants[spec.target]
+        else:
+            raise UnsupportedBoundary(
+                f"{name}: graph inputs of kind {kind.lower()} are not bound by luminal_cuda_lite"
+            )
+        if not isinstance(value, torch.Tensor):
+            raise UnsupportedBoundary(f"{name}: graph input {spec.target!r} is not a tensor")
+        rows.append((name, kind, value, fakes.get(name) if kind == "USER_INPUT" else None))
+    if user_index != len(export_inputs):
+        raise RuntimeError(
+            f"export consumed {user_index} of {len(export_inputs)} example_inputs"
+        )
+    return rows
+
+
+def _refuse_unbound_outputs(ep: Any) -> None:
+    """Refuse an output the boundary has no statement for."""
+    for spec in ep.graph_signature.output_specs:
+        kind = spec.kind.name
+        if kind in _BOUND_OUTPUT_KINDS:
+            continue
+        name = getattr(spec.arg, "name", spec.target)
+        raise UnsupportedBoundary(
+            f"output {name!r}: {kind.lower()} outputs are not declared to the runtime"
+        )
+
+
+def _output_fake(name: str, fakes: dict[str, Any]) -> Any:
+    """The traced example value an output's layout and extents are read
+    from, refused by name when the program carries none."""
+    fake = fakes.get(name)
+    if fake is None:
+        raise UnsupportedBoundary(
+            f"output {name!r} carries no exported example value, so the layout eager "
+            "gives it cannot be read"
+        )
+    return fake
+
+
+def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
+    """One ``(graph name, layout tag, element strides)`` row per graph
+    output the caller allocates: the element strides EAGER gives it, read
+    from the traced fake value exactly like an input's.
+
+    This is a LAYOUT STATEMENT PER NAME, not the output list — which
+    outputs a program has, and in which order, is the translation's to say
+    (`graph.output_names`). A writeback takes no row: it writes the storage
+    of the input it mutates and is bound at that input's layout.
+    """
+    fakes = _node_fakes(ep)
+    writebacks = {
+        spec.arg.name
+        for spec in ep.graph_signature.output_specs
+        if spec.kind.name in ("USER_INPUT_MUTATION", "BUFFER_MUTATION")
+    }
+    rows: list[tuple[str, str, list[str]]] = []
+    stated: set[str] = set()
+    for position, spec in enumerate(ep.graph_signature.output_specs):
+        if spec.kind.name != "USER_OUTPUT":
+            continue
+        name = getattr(spec.arg, "name", None)
+        if name is None:
+            raise UnsupportedBoundary(
+                f"graph output {position} ({spec.arg!r}) is not a tensor, so no boundary "
+                "layout states it"
+            )
+        # One value returned twice is one statement: the same name, at the
+        # same layout, stated once.
+        if name in writebacks or name in stated:
+            continue
+        fake = _output_fake(name, fakes)
+        stated.add(name)
+        tag, strides = layout_spec(boundary_layout(name, fake))
+        rows.append((name, tag, list(strides)))
+    return rows
+
+
+def _output_alias_rows(ep: Any) -> list[tuple[str, str, int]]:
+    """One ``(output, owner)`` row per user output whose traced example value
+    shares its STORAGE with an earlier boundary tensor: a graph input, a
+    writeback, or an earlier output. Eager hands the caller a view of that
+    tensor, so the runtime binds the output on the owner's buffer and the
+    call returns a view. This is read off the fake tensors torch traced —
+    which storage each value lives in — and states it; nothing is derived
+    from op names."""
+    fakes = _node_fakes(ep)
+    names: list[str] = []
+    for spec in list(ep.graph_signature.input_specs) + list(ep.graph_signature.output_specs):
+        name = getattr(spec.arg, "name", None)
+        if name is not None and name not in names:
+            names.append(name)
+    owner_by_storage: dict[int, str] = {}
+    outputs = {
+        getattr(spec.arg, "name", None)
+        for spec in ep.graph_signature.output_specs
+        if spec.kind.name == "USER_OUTPUT"
+    }
+    # Rows carry the view's element offset RELATIVE to its owner, so the
+    # returned view addresses the owner's storage where eager's does.
+    rows: list[tuple[str, str, int]] = []
+    for name in names:
+        fake = fakes.get(name)
+        if not isinstance(fake, torch.Tensor):
+            continue
+        storage = fake.untyped_storage()._cdata
+        owner = owner_by_storage.setdefault(storage, name)
+        if owner != name and name in outputs:
+            offset = int(fake.storage_offset()) - int(fakes[owner].storage_offset())
+            rows.append((name, owner, offset))
+    return rows
+
+
+def _refuse_overlapping_writebacks(
+    named: Sequence[tuple[str, torch.Tensor]], writebacks: frozenset
+) -> None:
+    """Two boundary tensors whose device storage overlaps are refused when
+    either one is written through.
+
+    Read-only aliasing — tied weights, a tensor passed twice — is two
+    External buffers carrying one address, which is a fact about the
+    caller's memory and harmless. A writeback is not: the runtime knows
+    one buffer per binding, so a write through one of an overlapping pair
+    would land in the other's reads with no edge ordering them. Refused by
+    name rather than bound.
+
+    This is checked per call as well as at compile: Dynamo guards tensor
+    identity, not storage overlap, so a program compiled on distinct
+    tensors can be called as ``fn(x, x[:])``.
+    """
+    spans = [(name, *storage_span(tensor)) for name, tensor in named]
+    for index, (name, start, stop) in enumerate(spans):
+        for other, other_start, other_stop in spans[index + 1 :]:
+            if start >= other_stop or other_start >= stop:
+                continue
+            target = next((row for row in (name, other) if row in writebacks), None)
+            if target is None:
+                continue
+            raise UnsupportedBoundary(
+                f"{name!r} and {other!r} share device storage and {target!r} is "
+                "written back into; one buffer per binding cannot order a write "
+                "against the other's reads"
+            )
+
+
+def _allocate_output(
+    binding: Binding,
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    span: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, int, int]:
+    """One output's storage, plus the address and byte count its buffer is
+    bound at.
+
+    The plan discloses the span its backing buffer covers, which exceeds
+    the output's own bytes when the plan elected a view of the escape cell
+    it writes through. Allocating the span is what keeps that write inside
+    storage PyTorch owns; the tensor handed back is a view of it at the
+    declared strides, and reaches no further than the span the runtime
+    computed from the same layout.
+    """
+    dense = torch.empty_strided(shape, strides, dtype=binding.dtype, device=device)
+    if span <= dense.untyped_storage().nbytes():
+        return dense, dense.data_ptr(), buffer_nbytes(dense)
+    base = torch.empty(span, dtype=torch.uint8, device=device)
+    # A span that is not a whole number of elements is viewed as the whole
+    # elements it holds; the trailing bytes stay the runtime's to write.
+    element = dense.element_size()
+    whole = base[: span - span % element].view(binding.dtype)
+    return whole.as_strided(shape, strides), base.data_ptr(), span
 
 
 class CompiledModel:
@@ -78,11 +330,11 @@ class CompiledModel:
 
     Executions are zero-copy and the intermediate arena is PyTorch-owned:
 
-    * every user input and weight is handed to the runtime as a device pointer
-      (``set_input_ptr``) wherever it is contiguous;
-    * every output (and mutation sink) is a PyTorch tensor bound with
-      ``set_output_ptr``, so the producing op writes it in place and it is
-      returned without a D2H;
+    * every boundary tensor is bound by BUFFER ID to the caller's device
+      pointer; a writeback and the input it mutates are one buffer and one
+      pointer;
+    * parameters and buffers are addressed once at compile time, user inputs
+      and freshly allocated outputs once per call;
     * the intermediate-scratch arena is ``caching_allocator_alloc``'d for the
       duration of the call and ``caching_allocator_delete``'d right after, so
       PyTorch accounts for it and can reuse the block next call.
@@ -92,29 +344,85 @@ class CompiledModel:
         self,
         graph: Any,
         ep: Any,
+        input_bindings: Sequence[Binding],
+        output_bindings: Sequence[Binding],
         scalar_output_positions: Sequence[int] = (),
-        held_tensors: Sequence[torch.Tensor] = (),
+        held_tensors: Optional[dict[str, torch.Tensor]] = None,
+        held_bindings: Sequence[Binding] = (),
+        output_aliases: Optional[dict[str, tuple[str, int]]] = None,
     ):
         self._graph = graph
+        # Output name -> (the boundary tensor whose storage it is a view of,
+        # the view's element offset relative to that tensor).
+        self._output_aliases: dict[str, tuple[str, int]] = dict(output_aliases or {})
+        self._output_names = list(graph.output_names)
         self._ep = ep
+        self._input_bindings = list(input_bindings)
+        self._input_names = [binding.name for binding in self._input_bindings]
+        self._output_bindings = list(output_bindings)
         self._scalar_output_positions = frozenset(scalar_output_positions)
-        # Device copies of parameters/buffers whose pointers the runtime holds.
-        self._held = list(held_tensors)
+        # Parameters and buffers, by graph input name; a buffer writeback
+        # lands in them. Their declared bindings are kept because a held
+        # tensor is checked and re-addressed every call: `p.data = q` moves
+        # a parameter's storage without changing any metadata Dynamo guards
+        # on, so an address taken once at compile can go stale under a
+        # program that still passes every guard.
+        self._held: dict[str, torch.Tensor] = dict(held_tensors or {})
+        self._held_bindings = list(held_bindings)
         # Fixed once a plan set is searched; the per-execution arena sizes to it.
-        self._arena_bytes = graph.arena_bytes() if hasattr(graph, "arena_bytes") else 0
+        self._arena_bytes = graph.arena_bytes()
         # The runtime always launches captured CUDA graphs, which the legacy
         # default stream cannot host, so it runs on a dedicated side stream
         # ordered against the caller's stream with events.
         self._side_stream: Optional[torch.cuda.Stream] = None
-        names = graph.input_names
-        kinds = graph.input_kinds
-        self._user_input_names = [
-            name for name, kind in zip(names, kinds) if kind == "user_input"
-        ]
-        self._output_names = graph.output_names
-        self._output_dtypes = graph.output_dtypes
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
+        # The graph inputs this program writes back into. While it is
+        # empty, overlapping boundary tensors are read-only aliasing and
+        # need no per-call check.
+        self._writebacks = frozenset(
+            mutation for mutation in self._output_mutations if mutation is not None
+        )
+
+    def _boundary_tensor(
+        self,
+        name: str,
+        inputs: Sequence[torch.Tensor],
+        out_tensors: Sequence[Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        """The live tensor a boundary name stands for on this call: a user
+        input, a held parameter/buffer, a writeback's destination, or an
+        output allocated this call."""
+        if name in self._input_names:
+            return inputs[self._input_names.index(name)]
+        if name in self._held:
+            return self._held[name]
+        if name in self._output_names:
+            index = self._output_names.index(name)
+            mutation = self._output_mutations[index]
+            if mutation is not None:
+                return self._mutation_destination(mutation, inputs)
+            tensor = out_tensors[index]
+            if tensor is not None:
+                return tensor
+        raise RuntimeError(
+            f"luminal_cuda_lite: {name!r} is not a boundary tensor this call holds"
+        )
+
+    def _mutation_destination(
+        self, mutation: str, inputs: Sequence[torch.Tensor]
+    ) -> torch.Tensor:
+        """The tensor a writeback landed in: the call's user input, or the
+        held parameter/buffer (PT2 ``buffer_mutation``) whose buffer the
+        sink shares."""
+        if mutation in self._input_names:
+            return inputs[self._input_names.index(mutation)]
+        if mutation in self._held:
+            return self._held[mutation]
+        raise RuntimeError(
+            f"luminal_cuda_lite: mutation target {mutation!r} is neither a user "
+            "input nor a held parameter/buffer"
+        )
 
     def __call__(self, *args: torch.Tensor) -> Any:
         # Under dynamic shapes Dynamo's wrapper passes the graph's symbolic
@@ -122,9 +430,9 @@ class CompiledModel:
         # compiled program folds those symbols into `sym_size`, so it has no
         # scalar inputs: keep tensors, drop the scalars.
         inputs = [arg for arg in args if isinstance(arg, torch.Tensor)]
-        if len(inputs) != len(self._user_input_names):
+        if len(inputs) != len(self._input_bindings):
             raise RuntimeError(
-                f"luminal_cuda_lite expected {len(self._user_input_names)} inputs, "
+                f"luminal_cuda_lite expected {len(self._input_bindings)} inputs, "
                 f"got {len(inputs)}"
             )
         if not inputs:
@@ -141,40 +449,97 @@ class CompiledModel:
             self._side_stream = torch.cuda.Stream(device=device)
         side = self._side_stream
 
-        # Bind inputs. Contiguous tensors go zero-copy; anything else falls
-        # back to host staging (a copy) so a stride/offset the plan does not
-        # model can never be read as dense.
-        zero_copy_inputs = all(value.is_contiguous() for value in inputs)
-        for name, value in zip(self._user_input_names, inputs):
-            if zero_copy_inputs:
-                self._graph.set_input_ptr(
-                    name, value.data_ptr(), _nbytes(value), list(value.shape)
-                )
-            else:
-                self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+        # CHECK EVERYTHING BEFORE ADDRESSING ANYTHING: every tensor this
+        # call binds — inputs, held tensors, freshly allocated outputs — is
+        # checked here, and the pointers go in afterwards inside the `try`
+        # whose `finally` clears them, so no refusal can leave one standing.
+        # A tensor whose dtype, rank, extents or element strides are not the
+        # declared ones is refused by name. The dimension map is the whole
+        # call's, so a stride declared over a dimension ANOTHER input
+        # carries is still checked here.
+        bound = list(zip(self._input_bindings, inputs)) + [
+            (binding, self._held[binding.name]) for binding in self._held_bindings
+        ]
+        dims = call_dim_values(bound)
+        for binding, value in bound:
+            check_binding(binding, value, dims)
+        if self._writebacks:
+            # Dynamo guards tensor identity, not storage overlap, so a
+            # program compiled on distinct tensors can still be called with
+            # two views of one allocation.
+            _refuse_overlapping_writebacks(
+                list(zip(self._input_names, inputs)) + list(self._held.items()),
+                self._writebacks,
+            )
 
-        # Output shapes depend on the bound dims, so read them after the
-        # inputs are bound rather than caching them at compile time.
+        # The dimensions THIS call states, read off its every input at once:
+        # a compound extent is checked against them, so reading input by
+        # input would check it against what the call before left behind.
+        # Refused here, before any pointer is set.
+        self._graph.bind_input_shapes(
+            [(binding.name, list(value.shape)) for binding, value in bound]
+        )
+
+        # Output shapes depend on this call's dims, so they are read after
+        # the input shapes are bound rather than cached at compile time.
         output_shapes = self._graph.output_shapes
 
-        # Allocate every final output as a PyTorch tensor and bind it. A
-        # mutation sink IS the caller's input tensor (eager aliasing). Allocate
-        # under the side stream so the caching allocator records the stream that
-        # will write them.
+        # Allocate every output that is not a writeback, AT THE STRIDES IT
+        # IS BOUND AT: the declared layout at this call's dimensions, which
+        # is what eager gives this output. A writeback's buffer IS its
+        # target input's. Allocate under the side stream so the caching
+        # allocator records the stream that will write them.
         with torch.cuda.stream(side):
-            out_tensors: list[torch.Tensor] = []
-            for index, (dtype_code, shape, mutation) in enumerate(
-                zip(self._output_dtypes, output_shapes, self._output_mutations)
-            ):
-                if mutation is not None:
-                    target = self._user_input_names.index(mutation)
-                    tensor = inputs[target]
-                else:
-                    tensor = torch.empty(
-                        tuple(shape), dtype=_torch_dtype(dtype_code), device=device
+            out_tensors: list[Optional[torch.Tensor]] = []
+            # What each output's buffer is addressed with: the base of its
+            # storage and the byte span the plan writes through it, which is
+            # the tensor's own span only when the plan writes it densely.
+            out_spans: list[Optional[tuple[int, int]]] = []
+            for index, binding in enumerate(self._output_bindings):
+                if self._output_mutations[index] is not None:
+                    out_tensors.append(None)
+                    out_spans.append(None)
+                    continue
+                name = binding.name
+                shape = tuple(output_shapes[index])
+                # The plan was retargeted onto the caller's buffer at search;
+                # a plan that writes this output somewhere else is a runtime
+                # invariant broken, not a call this caller can fix.
+                backing = self._graph.output_backing_buffer(name)
+                if backing != binding.buffer:
+                    raise RuntimeError(
+                        f"luminal_cuda_lite: output {name!r} is bound on buffer "
+                        f"{binding.buffer}, but the installed plan writes it into "
+                        f"buffer {backing}"
                     )
-                self._graph.set_output_ptr(index, tensor.data_ptr(), _nbytes(tensor))
+                declared = tuple(declared_strides(binding, shape, dims))
+                elected = tuple(self._graph.output_elected_strides(name))
+                if elected != declared:
+                    raise RuntimeError(
+                        f"luminal_cuda_lite: output {name!r} is elected at element "
+                        f"strides {elected}, and eager's are {declared}. This backend "
+                        "returns outputs in eager's layout and the plan elected a "
+                        "different one (LUM-829 covers making this a toggle)."
+                    )
+                # A view of another boundary tensor has that tensor's storage:
+                # nothing to allocate or address, the owner's binding does it.
+                if name in self._output_aliases:
+                    out_tensors.append(None)
+                    out_spans.append(None)
+                    continue
+                # The span the plan writes through this buffer, at this call's
+                # dimensions: the allocation is sized to it, never to the
+                # tensor alone.
+                span = self._graph.output_span_bytes(name)
+                tensor, base_ptr, base_bytes = _allocate_output(
+                    binding, shape, declared, span, device
+                )
+                # The allocation is checked against the binding the runtime
+                # writes through — rank, extents, element strides — so a
+                # disagreement is refused by name rather than written past.
+                check_binding(binding, tensor, dims)
                 out_tensors.append(tensor)
+                out_spans.append((base_ptr, base_bytes))
 
         # Order the side stream after everything the caller enqueued: this is
         # what makes reading the caller's inputs safe without a host sync.
@@ -186,10 +551,44 @@ class CompiledModel:
         arena = torch.cuda.caching_allocator_alloc(arena_bytes, device, side)
         self._graph.use_borrowed_stream(side.cuda_stream)
         self._graph.set_arena(arena, arena_bytes)
+        # EVERY CHECK IS BEHIND US: the addresses go in here and come out in
+        # `finally`, so no refusal of this call can leave one standing.
+        per_call: list[int] = []
         try:
+            # Every input is bound as it is, on the buffer it was declared on.
+            for binding, value in zip(self._input_bindings, inputs):
+                self._graph.set_device_ptr(
+                    binding.buffer, value.data_ptr(), buffer_nbytes(value)
+                )
+                per_call.append(binding.buffer)
+
+            # Held tensors are re-addressed rather than cleared: the address a
+            # parameter has now is the one this execution reads, and leaving it
+            # set is what makes a skipped user-input binding — never a held one
+            # — the thing an execute refuses by name.
+            for binding in self._held_bindings:
+                tensor = self._held[binding.name]
+                self._graph.set_device_ptr(
+                    binding.buffer, tensor.data_ptr(), buffer_nbytes(tensor)
+                )
+
+            for binding, tensor, spanned in zip(
+                self._output_bindings, out_tensors, out_spans
+            ):
+                if tensor is None:
+                    continue
+                base_ptr, base_bytes = spanned
+                self._graph.set_device_ptr(binding.buffer, base_ptr, base_bytes)
+                per_call.append(binding.buffer)
+
             self._graph.execute()
         finally:
             torch.cuda.caching_allocator_delete(arena)
+            # These addresses belong to this call only: forget them, so an
+            # execute that skipped a binding refuses by name instead of
+            # reading storage the caller has released.
+            for buffer in per_call:
+                self._graph.clear_device_ptr(buffer)
 
         # Hand ordering back to the caller's stream for the returned tensors.
         stream.wait_stream(side)
@@ -200,13 +599,26 @@ class CompiledModel:
             if mutation is not None:
                 # The write already landed in the caller's tensor.
                 if returned:
-                    results.append(inputs[self._user_input_names.index(mutation)])
+                    results.append(self._mutation_destination(mutation, inputs))
                 continue
             if returned:
+                # Scalar positions index the RETURNED tree, which is what
+                # Dynamo hands back; rows that are not returned (writebacks)
+                # sit before it and do not count.
+                position = len(results)
                 tensor = out_tensors[index]
+                binding = self._output_bindings[index]
+                if binding.name in self._output_aliases:
+                    # Eager returns a view of a tensor the caller already
+                    # holds; so does this call, at the strides eager gives it.
+                    owner_name, offset = self._output_aliases[binding.name]
+                    owner = self._boundary_tensor(owner_name, inputs, out_tensors)
+                    shape = tuple(output_shapes[index])
+                    strides = tuple(declared_strides(binding, shape, dims))
+                    tensor = owner.as_strided(shape, strides, owner.storage_offset() + offset)
                 # Scalar graph outputs were boxed into rank-zero tensors before
                 # export; restore the Python scalar backend contract here.
-                if index in self._scalar_output_positions:
+                if position in self._scalar_output_positions:
                     results.append(tensor.item())
                 else:
                     results.append(tensor)
@@ -243,8 +655,9 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     """
     # Work on a copy: Dynamo keeps the original GraphModule and checks its own
     # guards against it after the backend returns, so mutating it in place
-    # trips "Guard failed on the same frame it was created".
-    gm = copy.deepcopy(gm)
+    # trips "Guard failed on the same frame it was created". Only the GRAPH is
+    # private; the module's weights are shared (see private_graph_copy).
+    gm = private_graph_copy(gm)
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
 
     records: list[tuple[str, torch.fx.Node, Any]] = []
@@ -332,8 +745,9 @@ def luminal_cuda_lite(
     # Canonicalize scalar (SymInt/SymFloat/SymBool) graph outputs into rank-zero
     # tensors before the export capture. Work on a private copy: Dynamo holds
     # onto the original graph module for guard installation and retracing, and
-    # mutating it here would corrupt that bookkeeping.
-    gm = copy.deepcopy(gm)
+    # mutating it here would corrupt that bookkeeping. The copy shares the
+    # module's weights (see private_graph_copy).
+    gm = private_graph_copy(gm)
     scalar_output_positions = _box_scalar_graph_outputs(gm)
 
     # The graph-module preprocessing above runs first; `_dynamic_export` then
@@ -345,17 +759,59 @@ def luminal_cuda_lite(
     # data-dependent .item() calls and unresolved `L[...]` references.
     _drop_input_guards(ep)
     _drop_dead_data_dependent_ops(ep.graph_module)
+    # Functionalise WITHOUT decomposing: every in-place op becomes its
+    # functional form plus a USER_INPUT_MUTATION spec naming the input storage
+    # it writes, and a mutation through a view becomes an explicit scatter
+    # (select_scatter / slice_scatter). The empty table decomposes nothing, so
+    # composites the translator lowers directly (aten.linear) survive. The
+    # translator reads mutations from the specs and refuses in-place ops.
+    try:
+        ep = ep.run_decompositions({})
+    except AssertionError as exc:
+        # torch's export functionalisation cannot express a write to an
+        # input that shares storage with another input (its alias wrapper
+        # returns a callable where export needs a graph); the program is
+        # refused by name, not translated.
+        if "expected compiled_fn to be GraphModule" not in str(exc):
+            raise
+        raise UnsupportedBoundary(
+            "graph inputs share device storage and the program writes one of them: "
+            "the export cannot functionalise a write through aliased inputs"
+        ) from exc
+    _drop_dead_data_dependent_ops(ep.graph_module)
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
 
     def _save_and_compile(program: Any) -> Any:
+        # Read every boundary tensor's element strides and declare them with
+        # the program: the runtime binds what the caller has, or refuses it.
+        _refuse_unbound_outputs(program)
+        rows = _boundary_tensors(program, export_inputs)
+        layouts = {name: boundary_layout(name, value, fake) for name, _, value, fake in rows}
+        shapes = {name: boundary_shape(value, fake) for name, _, value, fake in rows}
+        declared = []
+        for name, _, _, _ in rows:
+            tag, strides = layout_spec(layouts[name])
+            declared.append((name, tag, list(strides)))
+        # A user-visible output is declared at the strides EAGER gives it,
+        # read from the traced fake value exactly like an input: what the
+        # caller receives has the strides the uncompiled program hands back,
+        # never a contiguous substitute.
+        declared_outputs = _output_layout_rows(program)
+        # An output that is a view of another boundary tensor is bound on
+        # that tensor's buffer; the caller receives a view of what it holds.
+        aliases = _output_alias_rows(program)
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
-            return _luminal.compile(pt2_path)
+            graph = _luminal.compile(
+                pt2_path, declared, declared_outputs, [(name, owner) for name, owner, _ in aliases]
+            )
+        tensors = {name: value for name, _, value, _ in rows}
+        return graph, tensors, layouts, shapes, {name: (owner, offset) for name, owner, offset in aliases}
 
     try:
-        graph = _save_and_compile(ep)
+        graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
     except RuntimeError as exc:
         # The translator lowers a fixed op set. Decomposing the exported graph
         # rewrites higher-level composites into primitives the translator
@@ -366,80 +822,85 @@ def luminal_cuda_lite(
         if "unsupported ATen op" not in str(exc):
             raise
         ep = ep.run_decompositions(_decomp_table())
+        _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
-        graph = _save_and_compile(ep)
+        graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
 
-    names = graph.input_names
-    kinds = graph.input_kinds
-    parameter_names = graph.parameter_names
-
-    # The backend is CUDA-only: pick the device from the example inputs.
-    device = next(
-        (
-            value.device
-            for value in export_inputs
-            if isinstance(value, torch.Tensor) and value.is_cuda
-        ),
-        None,
+    # Every boundary row, not just the user inputs: a parameter tied to
+    # another parameter is read-only aliasing and stays two buffers on one
+    # address, but a writeback whose storage overlaps another binding is
+    # refused by name.
+    writebacks = frozenset(
+        mutation for mutation in graph.output_mutations if mutation is not None
     )
-    if device is None:
-        raise RuntimeError(
-            "luminal_cuda_lite requires CUDA example inputs (the model must be on "
-            "a CUDA device)"
-        )
-    # Parameters/buffers are bound once, zero-copy, to persistent device copies
-    # this wrapper holds; only user inputs are rebound per call. The pointer
-    # binding must happen AFTER search: the runtime resolves a graph tensor to
-    # its plan buffer only once a plan is installed.
-    params: list[tuple[str, torch.Tensor]] = []
-    zero_copy = hasattr(graph, "set_input_ptr")
+    _refuse_overlapping_writebacks(list(tensors.items()), writebacks)
 
-    user_index = 0
-    for name, kind, parameter_name in zip(names, kinds, parameter_names):
-        if kind == "user_input":
-            if user_index >= len(export_inputs):
-                raise RuntimeError(
-                    f"export declared more user inputs than example_inputs: {name!r}"
-                )
-            value = export_inputs[user_index]
-            user_index += 1
-            # Seed the symbolic dims from the example; the real binding happens
-            # per call. Host-staged so no dangling pointer survives compile.
-            graph.set_input(name, _tensor_bytes(value), list(value.shape))
-            continue
-        if parameter_name not in ep.state_dict:
+    # Seed the symbolic dims from the declared shapes, address the parameter
+    # and buffer pointers once (they outlive every call), and keep one
+    # `Binding` per user input for the per-call check.
+    held: dict[str, torch.Tensor] = {}
+    held_bindings: list[Binding] = []
+    input_bindings: list[Binding] = []
+    for name in graph.input_names:
+        if name not in tensors:
             raise RuntimeError(
-                f"parameter {parameter_name!r} (graph input {name!r}) is not in "
-                "the exported state_dict"
+                f"the translated program names an input {name!r} the export signature "
+                f"does not declare (declared: {sorted(tensors)})"
             )
-        value = ep.state_dict[parameter_name]
-        if not value.is_cuda:
-            value = value.to(device)
-        value = value.contiguous()
-        graph.set_input(name, _tensor_bytes(value), list(value.shape))
-        params.append((name, value))
-
-    if user_index != len(export_inputs):
-        raise RuntimeError(
-            f"export consumed {user_index} of {len(export_inputs)} example_inputs"
-        )
-
-    # Every final output is bound to a caller tensor per call, so the arena
-    # planner must exclude output buffers from the slab. This must precede
-    # search so the finalist budget and the installed plan agree.
-    if hasattr(graph, "set_external_outputs"):
-        graph.set_external_outputs(True)
+    graph.bind_input_shapes([(name, list(tensors[name].shape)) for name in graph.input_names])
+    for name, kind, buffer in zip(graph.input_names, graph.input_kinds, graph.input_buffers):
+        value = tensors[name]
+        binding = Binding(name, buffer, value.dtype, shapes[name], layouts[name])
+        if kind == "user_input":
+            input_bindings.append(binding)
+            continue
+        graph.set_device_ptr(buffer, value.data_ptr(), buffer_nbytes(value))
+        held_bindings.append(binding)
+        held[name] = value
 
     graph.search(search_iterations)
 
-    held: list[torch.Tensor] = []
-    if zero_copy:
-        for name, value in params:
-            graph.set_input_ptr(
-                name, value.data_ptr(), _nbytes(value), list(value.shape)
-            )
-            held.append(value)
-    return CompiledModel(graph, ep, scalar_output_positions, held)
+    # WHICH OUTPUTS THE PROGRAM HAS IS THE TRANSLATION'S TO SAY, not the
+    # export signature's: the translator resolves a returned alias of a
+    # mutated value onto the writeback itself and may give one value two
+    # names, so the outputs and their order are read off the translation
+    # and their example values looked up by graph name.
+    #
+    # The runtime states the layout every output was bound at: a
+    # user-visible one at eager's exact strides, a writeback at the layout
+    # of the input it mutates. The declared extents are the exported
+    # program's own — an ``int`` per literal axis, the program's symbol per
+    # dynamic one — so a call at a new extent is checked against what the
+    # program says, not against what the example call happened to have.
+    fakes = _node_fakes(ep)
+    output_bindings = [
+        Binding(
+            name,
+            buffer,
+            _torch_dtype(dtype_code),
+            shapes[mutation]
+            if mutation is not None
+            else boundary_shape(_output_fake(name, fakes)),
+            layout_from_spec(name, tag, strides),
+        )
+        for name, buffer, dtype_code, mutation, (tag, strides) in zip(
+            graph.output_names,
+            graph.output_buffers,
+            graph.output_dtypes,
+            graph.output_mutations,
+            graph.output_layouts,
+        )
+    ]
+    return CompiledModel(
+        graph,
+        ep,
+        input_bindings,
+        output_bindings,
+        scalar_output_positions,
+        held,
+        held_bindings,
+        aliases,
+    )
 
 
 def register_backend() -> None:

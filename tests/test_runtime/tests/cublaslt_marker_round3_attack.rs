@@ -1364,11 +1364,8 @@ fn rc4_bias_relu_chain_no_stale_d() {
         let x = cx.tensor((4usize, 8usize), DType::F32);
         let w = cx.tensor((8usize, 3usize), DType::F32);
         let b = cx.tensor(3usize, DType::F32);
-        let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu().output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
+        test_runtime::bind_leaves(&cx)
     };
     let s = test_runtime::serialize_fixture(&text);
     let mut per_ctor = Vec::new();
@@ -1733,7 +1730,7 @@ fn rp2_decoration_depth_enode_count() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).output();
+                let _ = x.matmul(w);
             }),
         ),
         (
@@ -1741,7 +1738,7 @@ fn rp2_decoration_depth_enode_count() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).relu().output();
+                let _ = x.matmul(w).relu();
             }),
         ),
         (
@@ -1750,7 +1747,7 @@ fn rp2_decoration_depth_enode_count() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
+                let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
         (
@@ -1759,7 +1756,7 @@ fn rp2_decoration_depth_enode_count() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu().output();
+                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
             }),
         ),
     ];
@@ -1768,10 +1765,7 @@ fn rp2_decoration_depth_enode_count() {
         let text = {
             let mut cx = Graph::new();
             build(&mut cx);
-            cx.logical
-                .bound_program(&test_runtime::TestRuntimeBindings)
-                .expect("recorder clean")
-                .text
+            test_runtime::bind_leaves(&cx)
         };
         let started = Instant::now();
         let s = test_runtime::serialize_fixture(&text);
@@ -1822,12 +1816,9 @@ fn rp3_product_at_scale() {
                     let (m, k, nn) = if same { (4, 8, 3) } else { (4 + i, 8, 2 + i) };
                     let x = cx.tensor((m, k), DType::F32);
                     let w = cx.tensor((k, nn), DType::F32);
-                    let _ = x.matmul(w).output();
+                    let _ = x.matmul(w);
                 }
-                cx.logical
-                    .bound_program(&test_runtime::TestRuntimeBindings)
-                    .expect("recorder clean")
-                    .text
+                test_runtime::bind_leaves(&cx)
             };
             let started = Instant::now();
             let s = test_runtime::serialize_fixture(&text);
@@ -2863,11 +2854,8 @@ fn ru3_m1_corner_multiplicity() {
         let mut cx = Graph::new();
         let x = cx.tensor((1usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = x.matmul(w).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(w);
+        test_runtime::bind_leaves(&cx)
     };
     let s = test_runtime::serialize_fixture(&text);
     let a = count_op(&s, "CublasLtOperandADescriptor");
@@ -3045,18 +3033,15 @@ fn ru4_weld_harvesting_is_cross_tensor() {
         let mut cx = Graph::new();
         let x = cx.tensor((1usize, 4usize), DType::F32);
         let w = cx.tensor((4usize, 3usize), DType::F32);
-        let _ = x.matmul(w).output();
+        let _ = x.matmul(w);
         if with_stranger {
             // The bait: an unrelated [1,37] tensor whose row coordinate is
             // ALSO the zero class (extent-1 row) and whose cols literal is
             // 37 — exactly what round 4 harvested.
             let stranger = cx.tensor((1usize, 37usize), DType::F32);
-            let _ = (stranger + stranger).output();
+            let _ = stranger + stranger;
         }
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        test_runtime::bind_leaves(&cx)
     }
 
     /// The GEMV site's candidate set, as a comparable fingerprint:

@@ -104,9 +104,12 @@ impl PendingFinalist {
 /// The ranked finalists of one bucket, materialized lazily.
 pub struct Finalists<'a> {
     shapes: crate::symbolic::ShapeEnv,
-    /// Whether final outputs are caller-owned at execution time, so the arena
-    /// plan must exclude their buffers from the slab (see `storage::plan`).
-    external_outputs: bool,
+    /// THE RUNTIME'S PLACEMENT STATEMENT: which boundary buffers the arena
+    /// keeps between executions and which are the caller's own device memory.
+    /// A finalist's `slab_bytes` is what the aggregate device budget is
+    /// checked against, so it must be planned under the same statement the
+    /// installed plan is (see `storage::plan_resident`).
+    bindings: crate::resident::ResidentBindings,
     /// How this bucket names itself in a failure message (`"bucket 0
     /// (a in [2, 4])"`, or `"the search"` when unbucketed).
     label: String,
@@ -165,7 +168,7 @@ impl<'a> Finalists<'a> {
     ) -> Self {
         Self {
             shapes: Default::default(),
-            external_outputs: false,
+            bindings: Default::default(),
             label: label.into(),
             egraph,
             session: None,
@@ -203,8 +206,8 @@ impl<'a> Finalists<'a> {
         self
     }
 
-    pub fn with_external_outputs(mut self, external: bool) -> Self {
-        self.external_outputs = external;
+    pub fn with_resident_bindings(mut self, bindings: crate::resident::ResidentBindings) -> Self {
+        self.bindings = bindings;
         self
     }
 
@@ -274,7 +277,7 @@ impl<'a> Finalists<'a> {
                 self.build_plan(genome)?
             }
         };
-        let arena = crate::storage::plan(&plan, &self.shapes.bounds, self.external_outputs)
+        let arena = crate::storage::plan_resident(&plan, &self.shapes.bounds, &self.bindings)
             .map_err(|err| format!("arena: {err:#}"))?;
         Ok(PendingFinalist {
             shapes: self.shapes.clone(),

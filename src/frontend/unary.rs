@@ -74,31 +74,23 @@ impl Neg for GraphTensor {
 impl GraphTensor {
     /// Base 2 log
     pub fn log2(self) -> GraphTensor {
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::Log2,
-                &[(self.id, self.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::Log2,
+            &[(self.id, self.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
     /// Base 2 exp
     pub fn exp2(self) -> GraphTensor {
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::Exp2,
-                &[(self.id, self.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::Exp2,
+            &[(self.id, self.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
@@ -114,31 +106,23 @@ impl GraphTensor {
 
     /// Take the reciprocal of each element
     pub fn reciprocal(self) -> GraphTensor {
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::Recip,
-                &[(self.id, self.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::Recip,
+            &[(self.id, self.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
     /// The sin(x) function
     pub fn sin(self) -> GraphTensor {
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::Sin,
-                &[(self.id, self.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::Sin,
+            &[(self.id, self.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
@@ -154,16 +138,12 @@ impl GraphTensor {
 
     /// The square root function
     pub fn sqrt(self) -> GraphTensor {
-        let new_id = self
-            .graph()
-            .logical
-            .op(
-                LogicalOp::Sqrt,
-                &[(self.id, self.dims())],
-                self.dims(),
-                self.dtype,
-            )
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id = self.graph().logical.op(
+            LogicalOp::Sqrt,
+            &[(self.id, self.dims())],
+            self.dims(),
+            self.dtype,
+        );
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
@@ -189,11 +169,10 @@ impl GraphTensor {
 
     /// Shared recorder path for the dtype-preserving rounding ops.
     fn round_logical(self, op: LogicalOp) -> GraphTensor {
-        let new_id = self
-            .graph()
-            .logical
-            .op(op, &[(self.id, self.dims())], self.dims(), self.dtype)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let new_id =
+            self.graph()
+                .logical
+                .op(op, &[(self.id, self.dims())], self.dims(), self.dtype);
         GraphTensor::from_id(new_id, self.dims(), self.graph_ref, self.dtype)
     }
 
@@ -623,7 +602,7 @@ pub(super) mod tests {
             .collect_vec();
         let mut cx = Graph::new();
         let a = cx.tensor(shape.clone(), DType::F32);
-        let b = func(a).output();
+        let b = func(a);
 
         let v = random_vec(shape.iter().copied().product());
         let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, v.clone().into())]);
@@ -789,7 +768,7 @@ pub(super) mod tests {
     fn test_topk_indexes() {
         let mut cx = Graph::new();
         let x = cx.tensor((2, 4), DType::F32);
-        let out = x.topk_indexes(2, 1).cast(DType::F32).output();
+        let out = x.topk_indexes(2, 1).cast(DType::F32);
 
         // row 0: [0.1, 3.0, 2.0, -1.0] → top-2 desc = idx 1, 2
         // row 1: [5.0, 5.0, 0.0, 7.0] → 7.0 at idx 3, then the 5.0 tie —

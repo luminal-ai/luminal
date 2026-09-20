@@ -12,9 +12,9 @@ pub(crate) fn plan_resident(
     bounds: &Bounds,
     bindings: &luminal::resident::ResidentBindings,
 ) -> Result<ArenaPlan> {
-    // Output slots whose buffer IS a resident input are mutation sinks:
-    // `.output_into()` pinned them to the input's buffer, so their writes
-    // already land in the arena home and they reserve no pinned staging.
+    // Output slots whose buffer IS a resident input are mutation sinks: the
+    // binding put them on the input's buffer, so their writes already land in
+    // the arena home and they reserve no pinned staging.
     let device_outputs: std::collections::BTreeSet<usize> = plan
         .dag
         .node_weights()
@@ -30,6 +30,18 @@ pub(crate) fn plan_resident(
         })
         .map(|slot| slot.index)
         .collect();
+    // A buffer the bindings declared External is the caller's own device
+    // memory and reserves no slab range.
+    let external_buffers: luminal::prelude::FxHashSet<luminal::bufferize::BufferId> = plan
+        .buffers
+        .values()
+        .filter(|buffer| {
+            buffer
+                .lit
+                .is_some_and(|lit| bindings.externals.contains(&lit))
+        })
+        .map(|buffer| buffer.id.clone())
+        .collect();
     crate::arena::plan_resident_over(
         plan,
         |buffer| capacity_bytes(&buffer.layout, bounds),
@@ -42,14 +54,16 @@ pub(crate) fn plan_resident(
         crate::arena::issue_order(plan)?,
         &bindings.inputs,
         &device_outputs,
-        &Default::default(),
+        &external_buffers,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::MetalBindings;
     use crate::{MetalRuntime, harness_search_options};
+    use luminal::layout_ir::{Access, FreedBy};
     use luminal::{arena::ArenaStep, prelude::*, resident::ResidentBindings};
 
     #[test]
@@ -58,9 +72,15 @@ mod tests {
         let weights = graph.tensor(4, DType::F32);
         let state = graph.tensor(4, DType::F32);
         let input = graph.tensor('n', DType::F32);
-        (state + weights * input.sum(0).expand_dim(0, 4)).output_into(&state);
-        state.sum(0).output();
-        let mut runtime = MetalRuntime::load(&graph).unwrap();
+        let next = state + weights * input.sum(0).expand_dim(0, 4);
+        let previous = state.sum(0);
+        // `next` writes the state input's storage: the alias is a binding.
+        let mut bindings = MetalBindings::dense(&graph.logical, &[previous.id]);
+        let home = bindings.buffer_of_input(state.id).unwrap();
+        bindings.declare(home, Access::ReadWrite, FreedBy::Caller);
+        bindings.output_on(next.id, home);
+        let mut runtime =
+            MetalRuntime::load_with(&graph, bindings, crate::ops::metal_registry()).unwrap();
         runtime
             .bind_dim_buckets(
                 'n',
@@ -77,6 +97,7 @@ mod tests {
         let state = runtime.input_buffer(state.id).unwrap();
         let bindings = ResidentBindings {
             inputs: [weights, state].into_iter().collect(),
+            ..Default::default()
         };
         let plans = || {
             runtime

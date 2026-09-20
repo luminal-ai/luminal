@@ -49,7 +49,6 @@ use rand::rngs::StdRng;
 
 use crate::extractor::{self, Genome};
 use luminal::bufferize::BufferIrGraph;
-use luminal::graph::LogicalProgram;
 use luminal::prelude::FxHashMap;
 use luminal::prelude::egraph_serialize;
 
@@ -69,12 +68,6 @@ pub use luminal::search_support::{
 pub struct CompileOptions {
     pub generations: usize,
     pub generation_size: usize,
-    /// FINAL OUTPUTS ARE CALLER-OWNED (PyTorch zero-copy). The arena planner
-    /// excludes output buffers from the slab, so the budget each finalist is
-    /// measured against is the intermediate scratch alone. The runtime fills
-    /// this from its own `external_outputs` flag; a standalone caller leaves it
-    /// false and outputs stay arena-resident.
-    pub external_outputs: bool,
     /// Point mutations per offspring. Mutations hit ANY producer class —
     /// dead rows included, deliberately: a dead-row mutation is free now and
     /// pre-stages the choice a later route flip lands on.
@@ -143,7 +136,6 @@ impl Default for CompileOptions {
             trials: 3,
             seed: 0,
             search_log: true,
-            external_outputs: false,
             profile_on_device: false,
             candidate_timeout: None,
             keep_finalists: 4,
@@ -316,6 +308,60 @@ enum Priced {
     ExecuteFailed(String),
 }
 
+/// PLACEMENT FEASIBILITY of one genome's plan. An output bound External
+/// sits on the caller's own buffer: a plan that elects that slot as a view
+/// of ANOTHER caller buffer, or lets two External slots bound on different
+/// buffers share one escape cell, cannot be installed on this boundary —
+/// the caller allocated distinct storage. That is a refusal of THIS genome,
+/// and the search tries others (a materializing candidate, where the
+/// e-graph offers one). The runtime's retarget keeps the same rule as its
+/// final tripwire.
+fn external_placement_feasible(
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+    outputs: &[crate::bindings::Bound],
+) -> Result<(), String> {
+    let mut cell_owner: FxHashMap<luminal::bufferize::BufferId, i64> = FxHashMap::default();
+    for node in plan.dag.node_weights() {
+        let luminal::bufferize::BufferNode::BufferOutput { slots } = node else {
+            continue;
+        };
+        for slot in slots {
+            let Some(bound) = outputs.get(slot.index) else {
+                continue;
+            };
+            if bound.placement != crate::bindings::Placement::External {
+                continue;
+            }
+            let Some(cell) = plan.buffers.get(&slot.buffer) else {
+                continue;
+            };
+            match cell.lit {
+                Some(lit) if lit == bound.buffer => {}
+                Some(other) => {
+                    return Err(format!(
+                        "output v{} is bound External on buffer {} but this plan elects it \
+                         as a view of caller buffer {other}",
+                        bound.value.index(),
+                        bound.buffer
+                    ));
+                }
+                None => {
+                    if let Some(first) = cell_owner.insert(slot.buffer.clone(), bound.buffer)
+                        && first != bound.buffer
+                    {
+                        return Err(format!(
+                            "outputs bound External on buffers {first} and {} share one \
+                             escape cell {:?}",
+                            bound.buffer, slot.buffer
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// THE SELECTION LOOP for this backend: the caller supplies its OWN
 /// matcher vocabulary and its OWN allow list — both are properties of
 /// the runtime INSTANCE, chosen when it was loaded (see
@@ -337,7 +383,7 @@ enum Priced {
 #[cfg_attr(not(feature = "device"), allow(unused_mut))]
 pub fn search_implementations(
     egraph: &egraph_serialize::EGraph,
-    program: &LogicalProgram,
+    program: &SearchProgram,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
@@ -538,6 +584,13 @@ pub fn search_implementations(
                             continue;
                         }
                     };
+                    if let Err(why) = external_placement_feasible(&plan, &program.outputs) {
+                        breakdown.plan_build_refusals += 1;
+                        if refusals.len() < 8 {
+                            refusals.push(format!("placement: {why}"));
+                        }
+                        continue;
+                    }
                     // The heuristic cost of this graph is ALWAYS computed
                     // — it is what the outcome reports beside a measured
                     // winner — but under device profiling it is never
@@ -686,6 +739,9 @@ pub fn search_implementations(
                         continue;
                     }
                 };
+                if external_placement_feasible(&plan, &program.outputs).is_err() {
+                    continue;
+                }
                 rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
                 best = Some(Best {
                     nanos,
@@ -834,6 +890,15 @@ pub fn select_finalist_set(
     Ok((selected, rejections))
 }
 
+/// The program a search runs: its text, plus the boundary bindings the
+/// tensor-keyed caller data maps through.
+#[derive(Debug, Clone)]
+pub struct SearchProgram {
+    pub text: String,
+    pub inputs: Vec<crate::bindings::Bound>,
+    pub outputs: Vec<crate::bindings::Bound>,
+}
+
 /// One bucket combination's finished search: the dim ranges it covers, the
 /// representative pins it was searched at, and the plan the bucket
 /// lattice INSTALLED for it.
@@ -841,7 +906,7 @@ pub fn select_finalist_set(
 pub struct BucketPlan {
     pub ranges: BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     pub representative: luminal::shape::DynMap,
-    pub program: LogicalProgram,
+    pub program: SearchProgram,
     /// This bucket's own genetic search — its winner, its accounting,
     /// its ranked finalists. It is the SEARCH's report and is left
     /// exactly as the search wrote it.
@@ -867,8 +932,8 @@ pub struct BucketPlan {
 pub struct BucketAssembly<'a> {
     /// The runtime's assembled egglog preamble (matchers + registry).
     pub assembled_program: &'a str,
-    /// The recorded model, before the schedule.
-    pub pre_schedule: &'a str,
+    /// The bound program before the schedule: model text plus boundary.
+    pub prefix: &'a str,
     /// The caller's own `bind_*` seeds — for the dims that are NOT
     /// bucketed. Buckets and range bindings refuse each other in BOTH
     /// orders (a range-bound dim is refused buckets, a bucketed dim is
@@ -882,8 +947,13 @@ pub struct BucketAssembly<'a> {
     /// the WHOLE interval, not merely at the representative (Austin,
     /// 2026-09-03).
     pub post_checks: &'a str,
-    pub input_slots: &'a [luminal::graph::InputSlot],
-    pub output_slots: &'a [luminal::graph::OutputSlot],
+    pub inputs: &'a [crate::bindings::Bound],
+    pub outputs: &'a [crate::bindings::Bound],
+    /// The runtime's placement statement — which boundary buffers the arena
+    /// keeps and which are the caller's device memory. Every bucket's
+    /// finalists are sized under it, so a bucket's budget and its installed
+    /// plan agree.
+    pub residents: &'a crate::resident::ResidentBindings,
     /// Values for profiling non-bucket dimensions. These never narrow the
     /// range facts already present in binding_seeds.
     pub base_dims: &'a luminal::shape::DynMap,
@@ -965,7 +1035,7 @@ pub fn bucketed_search_implementations(
                     Some(outcome.best_plan.clone()),
                 )
                 .with_shapes(shapes)
-                .with_external_outputs(options.external_outputs)
+                .with_resident_bindings(assembly.residents.clone())
             })
             .collect();
         select_finalist_set(buckets, options, &mut evaluator)?
@@ -999,7 +1069,7 @@ pub fn bucketed_search_implementations(
 type SearchedBucket = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
-    LogicalProgram,
+    SearchProgram,
     SearchOutcome,
 );
 
@@ -1020,7 +1090,7 @@ pub(crate) fn bucket_label(
 type BucketRender = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
-    LogicalProgram,
+    SearchProgram,
 );
 
 fn bucket_renders(
@@ -1037,17 +1107,17 @@ fn bucket_renders(
         }
         text
     };
-    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| LogicalProgram {
+    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| SearchProgram {
         text: format!(
             "{}{}{}{}{}",
-            assembly.pre_schedule,
+            assembly.prefix,
             assembly.binding_seeds,
             seeds_text(seeds),
             assembly.schedule,
             assembly.post_checks
         ),
-        input_slots: assembly.input_slots.to_vec(),
-        output_slots: assembly.output_slots.to_vec(),
+        inputs: assembly.inputs.to_vec(),
+        outputs: assembly.outputs.to_vec(),
     };
 
     // Cartesian combinations, dims in sorted order.

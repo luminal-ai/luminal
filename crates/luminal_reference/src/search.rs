@@ -41,7 +41,6 @@ use rustc_hash::FxHashMap;
 
 use crate::typed_buffer::TypedBuffer;
 use luminal::bufferize::BufferIrGraph;
-use luminal::graph::LogicalProgram;
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::egraph_serialize;
 
@@ -191,7 +190,7 @@ fn profile_on_reference_runtime(
 /// `None` keeps the reference runtime's own allow list.
 pub fn search_implementations_with_ops(
     egraph: &egraph_serialize::EGraph,
-    program: &LogicalProgram,
+    program: &SearchProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     dims: &luminal::shape::DynMap,
     options: &CompileOptions,
@@ -204,12 +203,12 @@ pub fn search_implementations_with_ops(
     let buffer_data: FxHashMap<i64, crate::typed_buffer::TypedBuffer> = input_data
         .iter()
         .map(|(tensor, data)| {
-            let slot = program
-                .input_slots
+            let bound = program
+                .inputs
                 .iter()
-                .find(|slot| slot.tensor == *tensor)
+                .find(|bound| bound.value == *tensor)
                 .unwrap_or_else(|| panic!("tensor {tensor:?} is not a bound input"));
-            (slot.buffer, data.clone())
+            (bound.buffer, data.clone())
         })
         .collect();
     let input_data = &buffer_data;
@@ -482,13 +481,22 @@ pub fn search_implementations_with_ops(
     })
 }
 
+/// The program a search runs: its text, plus the boundary bindings the
+/// tensor-keyed caller data maps through.
+#[derive(Debug, Clone)]
+pub struct SearchProgram {
+    pub text: String,
+    pub inputs: Vec<crate::bindings::Bound>,
+    pub outputs: Vec<crate::bindings::Bound>,
+}
+
 /// One bucket combination's finished search: the dim ranges it covers, the
 /// representative pins it was searched at, and the winning plan.
 #[derive(Debug)]
 pub struct BucketPlan {
     pub ranges: BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     pub representative: luminal::shape::DynMap,
-    pub program: LogicalProgram,
+    pub program: SearchProgram,
     pub outcome: SearchOutcome,
 }
 
@@ -499,8 +507,8 @@ pub struct BucketPlan {
 pub struct BucketAssembly<'a> {
     /// The runtime's assembled egglog preamble (matchers + registry).
     pub assembled_program: &'a str,
-    /// The recorded model, before the schedule.
-    pub pre_schedule: &'a str,
+    /// The bound program before the schedule: model text plus boundary.
+    pub prefix: &'a str,
     /// The caller's own `bind_*` seeds — for the dims that are NOT
     /// bucketed. Buckets and range bindings refuse each other in BOTH
     /// orders (a range-bound dim is refused buckets, a bucketed dim is
@@ -514,8 +522,8 @@ pub struct BucketAssembly<'a> {
     /// the WHOLE interval, not merely at the representative (Austin,
     /// 2026-09-03).
     pub post_checks: &'a str,
-    pub input_slots: &'a [luminal::graph::InputSlot],
-    pub output_slots: &'a [luminal::graph::OutputSlot],
+    pub inputs: &'a [crate::bindings::Bound],
+    pub outputs: &'a [crate::bindings::Bound],
     /// Dim values the runtime already holds, carried into every bucket's
     /// representative map so a plan records the full pin it was searched
     /// at.
@@ -581,7 +589,7 @@ pub fn bucketed_search_implementations(
 type BucketRender = (
     BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     luminal::shape::DynMap,
-    LogicalProgram,
+    SearchProgram,
 );
 
 fn bucket_renders(
@@ -598,17 +606,17 @@ fn bucket_renders(
         }
         text
     };
-    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| LogicalProgram {
+    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| SearchProgram {
         text: format!(
             "{}{}{}{}{}",
-            assembly.pre_schedule,
+            assembly.prefix,
             assembly.binding_seeds,
             seeds_text(seeds),
             assembly.schedule,
             assembly.post_checks
         ),
-        input_slots: assembly.input_slots.to_vec(),
-        output_slots: assembly.output_slots.to_vec(),
+        inputs: assembly.inputs.to_vec(),
+        outputs: assembly.outputs.to_vec(),
     };
 
     // Cartesian combinations, dims in sorted order.
@@ -704,7 +712,7 @@ pub fn harness_search_options() -> CompileOptions {
 /// [`search_implementations_with_ops`] for the bucketed/symbolic path).
 pub fn search_implementations(
     egraph: &egraph_serialize::EGraph,
-    program: &LogicalProgram,
+    program: &SearchProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     options: &CompileOptions,
 ) -> Result<SearchOutcome> {
@@ -726,7 +734,7 @@ mod tests {
     use luminal::dtype::DType;
     use luminal::graph::Graph;
 
-    use super::{CompileOptions, search_implementations};
+    use super::{CompileOptions, SearchProgram, search_implementations};
     use crate::ReferenceRuntime;
 
     /// A REAL selection space (x+y and x*y from shared inputs offers the
@@ -739,8 +747,8 @@ mod tests {
             let mut cx = Graph::new();
             let x = cx.tensor(4, DType::F32);
             let y = cx.tensor(4, DType::F32);
-            let a = (x + y).output();
-            let m = (x * y).output();
+            let a = x + y;
+            let m = x * y;
             (cx, x, y, a, m)
         };
         let x_data = vec![1.0, 2.0, 3.0, 4.0];
@@ -752,10 +760,14 @@ mod tests {
 
         // Our search.
         let (cx2, x2, y2, a2, m2) = build();
-        let program = cx2
-            .logical
-            .bound_program(&crate::ReferenceBindings)
+        let bound = crate::ReferenceBindings::leaves(&cx2.logical)
+            .bind(&cx2.logical)
             .expect("native program");
+        let program = SearchProgram {
+            text: bound.text(),
+            inputs: bound.inputs.clone(),
+            outputs: bound.outputs.clone(),
+        };
         let text = format!("{}\n\n{}", crate::assembled_program(), program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
         egraph
@@ -779,7 +791,7 @@ mod tests {
         );
 
         let mut runtime = ReferenceRuntime::default();
-        runtime.stage_slots(&program.input_slots, &program.output_slots);
+        runtime.stage_bindings(&bound.inputs, &bound.outputs);
         runtime.load_plan(outcome.best_plan.clone());
         runtime.set_data(x2.id, x_data);
         runtime.set_data(y2.id, y_data);

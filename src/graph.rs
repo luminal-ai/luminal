@@ -9,11 +9,10 @@ use petgraph::{
     stable_graph::{NodeIndex, StableDiGraph},
     visit::EdgeRef,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use crate::dtype::DType;
 use crate::frontend::GraphTensor;
-use crate::layout_ir::Access;
 use crate::shape::ToShape;
 
 /// A bucket for a dynamic dimension, defining a range of valid values.
@@ -100,10 +99,7 @@ impl Graph {
     ) -> GraphTensor {
         let name = name.to_string();
         let dims = shape.to_shape();
-        let id = self
-            .logical
-            .input(&name, &dims, dtype)
-            .unwrap_or_else(crate::graph::unrecorded_value);
+        let id = self.logical.input(&name, &dims, dtype);
         GraphTensor::from_id(id, dims, self, dtype)
     }
 }
@@ -224,15 +220,6 @@ pub enum Movement {
 /// The logical SSA identity. A tensor names the node that produces its
 /// value; there is no parallel frontend-id keyspace.
 pub type ValueId = NodeIndex;
-
-/// The sentinel id of an UNRECORDED handle (a source op recorded onto an
-/// already-poisoned graph): never present in the graph, so any use of the
-/// handle resolves to a loud poison instead of a panic. Handles are TOTAL
-/// (the poison-door discipline: the frontend never panics; the graph
-/// refuses at load with the reason).
-pub(crate) fn unrecorded_value() -> ValueId {
-    ValueId::end()
-}
 
 /// An operand as a record call sees it: the handle's value plus its
 /// dims. The dims payload is VESTIGIAL (R-D ruling 2026-08-26,
@@ -391,17 +378,6 @@ pub struct LogicalNode {
     pub dtype: DType,
 }
 
-/// One `.output()` designation: the value and optional authored name.
-/// `storage` is `Some(input)` when the output is a MUTATION of that input
-/// (`.output_into()`): the two share one boundary buffer, so the value
-/// stays SSA and storage identity lives in the binding.
-#[derive(Debug)]
-struct OutputRecord {
-    value: ValueId,
-    label: Option<String>,
-    storage: Option<ValueId>,
-}
-
 /// One bound input of the recorded model: the pristine label, the
 /// staging id (what set_data/search key on), and the declared
 /// geometry. `dtype` is the AUTHORED dtype — Bool inputs stage as
@@ -413,41 +389,34 @@ pub struct InputSpec {
     pub dtype: DType,
 }
 
-/// One output designation: the label (authored via `output_named`,
-/// else the synthesized "out_{key}") and the readback id (the
-/// get_f32-family key).
-pub struct OutputSpec {
-    pub label: String,
-    pub id: petgraph::graph::NodeIndex,
-}
-
 #[derive(Debug, Default)]
 pub struct LogicalGraph {
     graph: StableDiGraph<LogicalNode, InputPort>,
-    /// Output designations in .output() order.
-    outputs: Vec<OutputRecord>,
+    /// Name annotations, `(value, name)`: a name is a pure logical
+    /// annotation (`LogicalTensorNamed`, unionable with any value) so a
+    /// runtime can bind a value by name. It designates nothing — what is
+    /// bound is the runtime's statement.
+    names: Vec<(ValueId, String)>,
     /// Anonymous-input counter — mints "arg.{k}" labels (Stage 3).
     anon_inputs: usize,
-    post_checks: String,
-    /// The same checks as LABELED units (label carries the named door —
-    /// what failed and how to unblock it): on a saturation CheckError
-    /// the runtime re-runs these one by one to name the culprit
-    /// (ruling 2026-08-13: contract failures never surface as a bare
-    /// "native saturation failed").
-    labeled_checks: Vec<(String, String)>,
-    poisoned: Option<String>,
+    /// Conditions on extents the recorder could not decide at build time
+    /// (symbolic dims); rendered as facts the fixpoint invariants judge.
+    contracts: Vec<Contract>,
+}
+
+/// A condition on an extent, decided at saturation under the binding's
+/// bounds: the extent equals `n`, or is at least `n`.
+#[derive(Debug, Clone)]
+pub enum Contract {
+    ExtentEq { extent: IntExpr, n: i64 },
+    ExtentAtLeast { extent: IntExpr, n: i64 },
 }
 
 impl LogicalGraph {
-    /// First poison reason wins; everything after is a no-op.
-    pub fn poison(&mut self, reason: impl Into<String>) {
-        if self.poisoned.is_none() {
-            self.poisoned = Some(reason.into());
-        }
-    }
-
-    pub fn poisoned(&self) -> Option<&str> {
-        self.poisoned.as_deref()
+    /// Refuse a construct the recorder cannot lower: a construction-time
+    /// error, raised where it happens, like every other builder in Rust.
+    pub fn refuse(&self, reason: impl Into<String>) -> ! {
+        panic!("{}", reason.into())
     }
 
     /// The backing petgraph. Nodes are logical SSA values and incoming
@@ -471,14 +440,15 @@ impl LogicalGraph {
         self.operand_edges(id)
     }
 
-    /// The recorded output designations, in .output() order.
-    pub(crate) fn viz_outputs(&self) -> impl Iterator<Item = (ValueId, usize)> + '_ {
-        self.outputs
-            .iter()
-            .map(|record| (record.value, record.value.index()))
+    /// The recorded name annotations.
+    pub(crate) fn viz_names(&self) -> impl Iterator<Item = (ValueId, &str)> + '_ {
+        self.names.iter().map(|(id, name)| (*id, name.as_str()))
     }
 
-    fn dim_term(expr: &IntExpr) -> Result<String, String> {
+    /// One extent rendered as the preamble's `IntExpr` term — the same
+    /// renderer shapes go through, so a boundary that states an extent
+    /// elsewhere (a binding's element strides) spells it identically.
+    pub fn dim_term(expr: &IntExpr) -> Result<String, String> {
         let terms = expr.terms.read();
         match &terms[..] {
             [Term::Num(n)] => Ok(format!("(IntLit {n})")),
@@ -614,15 +584,12 @@ impl LogicalGraph {
     }
 
     /// Record an input declaration. The returned graph node is both its
-    /// SSA identity and its staging key.
-    /// TOTAL: an input is recorded even on a poisoned graph (it has no
-    /// operands, so nothing about it can be wrong that the poison does
-    /// not already cover), and a bad shape poisons AND still records —
-    /// the handle stays usable and load() refuses with the reason.
-    pub fn input(&mut self, label: &str, dims: &[IntExpr], dtype: DType) -> Option<ValueId> {
+    /// SSA identity and its staging key. A bad shape or a duplicate label
+    /// refuses at the construction site.
+    pub fn input(&mut self, label: &str, dims: &[IntExpr], dtype: DType) -> ValueId {
         let at = self.graph.node_count();
         if let Err(reason) = Self::shape_term(dims) {
-            self.poison(format!("input t{at}: {reason}"));
+            self.refuse(format!("input t{at}: {reason}"));
         }
         // STAGE 3 (rulings 2026-08-13): every input has a unique
         // pristine label. Anonymous inputs auto-name "arg.{k}" in
@@ -643,13 +610,9 @@ impl LogicalGraph {
         if self.graph.node_weights().any(
             |node| matches!(&node.op, LogicalOp::Input { label: existing } if existing == &label),
         ) {
-            self.poison(format!("duplicate input label \"{label}\""));
-            // Keep the authored graph structurally complete even after a
-            // fail-closed interface error. `model_text` will refuse this
-            // graph, but the returned tensor still has a real SSA node.
-            return Some(self.push(LogicalOp::Input { label }, &[], dims.to_vec(), dtype));
+            self.refuse(format!("duplicate input label \"{label}\""));
         }
-        Some(self.push(LogicalOp::Input { label }, &[], dims.to_vec(), dtype))
+        self.push(LogicalOp::Input { label }, &[], dims.to_vec(), dtype)
     }
 
     /// Every bound input, in declaration order — the model's input
@@ -675,20 +638,6 @@ impl LogicalGraph {
             .collect()
     }
 
-    /// Every output designation, in .output() order.
-    pub fn output_specs(&self) -> Vec<OutputSpec> {
-        self.outputs
-            .iter()
-            .map(|record| OutputSpec {
-                label: record
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| format!("out_{}", record.value.index())),
-                id: record.value,
-            })
-            .collect()
-    }
-
     /// Record an op over operand values.
     pub fn op(
         &mut self,
@@ -696,32 +645,27 @@ impl LogicalGraph {
         operands: &[Operand],
         out_dims: Vec<IntExpr>,
         out_dtype: DType,
-    ) -> Option<ValueId> {
-        if self.poisoned.is_some() {
-            return None;
-        }
+    ) -> ValueId {
         let constructor = op.constructor();
         let at = self.graph.node_count();
         if let Some(expected) = op.fixed_arity()
             && operands.len() != expected
         {
-            self.poison(format!(
+            self.refuse(format!(
                 "{constructor} at t{at}: expected {expected} operands, got {}",
                 operands.len()
             ));
-            return None;
         }
         let mut ids = Vec::with_capacity(operands.len());
         for operand in operands {
             match self.resolve(operand, &format!("{constructor} at t{at}")) {
                 Ok(id) => ids.push(id),
                 Err(reason) => {
-                    self.poison(reason);
-                    return None;
+                    self.refuse(reason);
                 }
             }
         }
-        Some(self.push(op, &ids, out_dims, out_dtype))
+        self.push(op, &ids, out_dims, out_dtype)
     }
 
     /// Record a seam-node view: an IndexMapApply of the operand through
@@ -732,16 +676,12 @@ impl LogicalGraph {
         entries: &[MapEntry],
         out_dims: Vec<IntExpr>,
         out_dtype: DType,
-    ) -> Option<ValueId> {
-        if self.poisoned.is_some() {
-            return None;
-        }
+    ) -> ValueId {
         let at = self.graph.node_count();
         let base = match self.resolve(operand, &format!("view op at t{at}")) {
             Ok(id) => id,
             Err(reason) => {
-                self.poison(reason);
-                return None;
+                self.refuse(reason);
             }
         };
         self.push_view(base, entries.to_vec(), out_dims, out_dtype)
@@ -753,13 +693,12 @@ impl LogicalGraph {
         entries: Vec<MapEntry>,
         out_dims: Vec<IntExpr>,
         out_dtype: DType,
-    ) -> Option<ValueId> {
+    ) -> ValueId {
         let at = self.graph.node_count();
         let shape = match Self::shape_term(&out_dims) {
             Ok(shape) => shape,
             Err(reason) => {
-                self.poison(format!("view at t{at}: {reason}"));
-                return None;
+                self.refuse(format!("view at t{at}: {reason}"));
             }
         };
         // The map's DOMAIN TAG (ruling 2026-08-11): an IndexMapLit
@@ -770,8 +709,7 @@ impl LogicalGraph {
         let source_shape = match Self::shape_term(&source_dims) {
             Ok(term) => term,
             Err(reason) => {
-                self.poison(format!("view at t{at}: {reason}"));
-                return None;
+                self.refuse(format!("view at t{at}: {reason}"));
             }
         };
         let mut entries_term = "(IntExprNil)".to_string();
@@ -779,19 +717,18 @@ impl LogicalGraph {
             match Self::entry_term(entry, &shape) {
                 Ok(term) => entries_term = format!("(IntExprCons {term} {entries_term})"),
                 Err(reason) => {
-                    self.poison(format!("view at t{at}: {reason}"));
-                    return None;
+                    self.refuse(format!("view at t{at}: {reason}"));
                 }
             }
         }
         // Validate all structured render inputs at the insertion boundary.
         let _ = (shape, source_shape, entries_term);
-        Some(self.push(
+        self.push(
             LogicalOp::IndexMapApply { entries },
             &[base],
             out_dims,
             out_dtype,
-        ))
+        )
     }
 
     /// Record a pad-mask indicator iota (see the pad seam): per padded
@@ -818,16 +755,12 @@ impl LogicalGraph {
     /// coordinate is identically zero); a `Coord(k)` with `k >= rank` is
     /// a leaked atom and poisons loudly. The authoring-contract bounds
     /// pair rides every iota.
-    pub fn record_iota(&mut self, expr: &IntExpr, dims: &[IntExpr]) -> Option<ValueId> {
-        if self.poisoned.is_some() {
-            return None;
-        }
+    pub fn record_iota(&mut self, expr: &IntExpr, dims: &[IntExpr]) -> ValueId {
         let at = self.graph.node_count();
         let shape = match Self::shape_term(dims) {
             Ok(term) => term,
             Err(reason) => {
-                self.poison(format!("iota at t{at}: {reason}"));
-                return None;
+                self.refuse(format!("iota at t{at}: {reason}"));
             }
         };
         let rank = dims.len();
@@ -843,26 +776,17 @@ impl LogicalGraph {
         let value_expr = match int_expr_term(expr, &coord_terms, &format!("recorder iota t{at}")) {
             Ok(text) => text,
             Err(err) => {
-                self.poison(format!("iota at t{at}: {err}"));
-                return None;
+                self.refuse(format!("iota at t{at}: {err}"));
             }
         };
-        let logical = Some(self.push(
+        self.push(
             LogicalOp::Iota {
                 value_expr: value_expr.clone(),
             },
             &[],
             dims.to_vec(),
             DType::Int,
-        ));
-        self.post_check(
-            format!("iota value-bounds contract at t{at}"),
-            &format!(
-                "(check (= ?reclo{at} (lower-bound-of {value_expr})))\n\
-             (check (= ?rechi{at} (upper-bound-of {value_expr})))\n"
-            ),
-        );
-        logical
+        )
     }
 
     pub fn record_mask_iota(
@@ -870,10 +794,7 @@ impl LogicalGraph {
         befores: &[IntExpr],
         afters: &[IntExpr],
         in_dims: &[IntExpr],
-    ) -> Option<ValueId> {
-        if self.poisoned.is_some() {
-            return None;
-        }
+    ) -> ValueId {
         let at = self.graph.node_count();
         let rank = in_dims.len();
         let mut out_dims = Vec::with_capacity(rank);
@@ -886,8 +807,7 @@ impl LogicalGraph {
             match Self::dim_term(&out_dim) {
                 Ok(term) => out_terms.push(term),
                 Err(reason) => {
-                    self.poison(format!("mask iota at t{at}: {reason}"));
-                    return None;
+                    self.refuse(format!("mask iota at t{at}: {reason}"));
                 }
             }
             out_dims.push(out_dim);
@@ -895,8 +815,7 @@ impl LogicalGraph {
         let out_shape_term = match Self::shape_term(&out_dims) {
             Ok(term) => term,
             Err(reason) => {
-                self.poison(format!("mask iota at t{at}: {reason}"));
-                return None;
+                self.refuse(format!("mask iota at t{at}: {reason}"));
             }
         };
         let mut factors: Vec<String> = Vec::new();
@@ -908,8 +827,7 @@ impl LogicalGraph {
                 Self::dim_term(&before),
                 Self::dim_term(&(before + in_dims[k]).simplify()),
             ) else {
-                self.poison(format!("mask iota at t{at}: symbolic pad bound"));
-                return None;
+                self.refuse(format!("mask iota at t{at}: symbolic pad bound"));
             };
             if before != IntExpr::from(0) {
                 factors.push(format!(
@@ -926,25 +844,14 @@ impl LogicalGraph {
         for factor in factors {
             expr = format!("(IntMul {factor} {expr})");
         }
-        let logical = Some(self.push(
+        self.push(
             LogicalOp::Iota {
                 value_expr: expr.clone(),
             },
             &[],
             out_dims,
             DType::Int,
-        ));
-        // The authoring-contract bounds pair — uniform with record_iota
-        // (Design A fold-in, 2026-08-06): every recorded iota's value
-        // expression must have derivable bounds, or the fixpoint refuses.
-        self.post_check(
-            format!("iota value-bounds contract at t{at}"),
-            &format!(
-                "(check (= ?reclo{at} (lower-bound-of {expr})))\n\
-             (check (= ?rechi{at} (upper-bound-of {expr})))\n"
-            ),
-        );
-        logical
+        )
     }
 
     /// Record a coordinate-form gather.
@@ -954,29 +861,24 @@ impl LogicalGraph {
         coords: &[Operand],
         out_dims: Vec<IntExpr>,
         out_dtype: DType,
-    ) -> Option<ValueId> {
-        if self.poisoned.is_some() {
-            return None;
-        }
+    ) -> ValueId {
         let at = self.graph.node_count();
         let mut ids = Vec::with_capacity(coords.len() + 1);
         match self.resolve(data, &format!("gather at t{at}")) {
             Ok(id) => ids.push(id),
             Err(reason) => {
-                self.poison(reason);
-                return None;
+                self.refuse(reason);
             }
         }
         for coord in coords {
             match self.resolve(coord, &format!("gather at t{at}")) {
                 Ok(id) => ids.push(id),
                 Err(reason) => {
-                    self.poison(reason);
-                    return None;
+                    self.refuse(reason);
                 }
             }
         }
-        Some(self.push(LogicalOp::Gather, &ids, out_dims, out_dtype))
+        self.push(LogicalOp::Gather, &ids, out_dims, out_dtype)
     }
 
     /// Record a coordinate-form scatter (operands: init, coords..., src).
@@ -987,36 +889,30 @@ impl LogicalGraph {
         src: &Operand,
         out_dims: Vec<IntExpr>,
         out_dtype: DType,
-    ) -> Option<ValueId> {
-        if self.poisoned.is_some() {
-            return None;
-        }
+    ) -> ValueId {
         let at = self.graph.node_count();
         let mut ids = Vec::with_capacity(coords.len() + 2);
         match self.resolve(init, &format!("scatter at t{at}")) {
             Ok(id) => ids.push(id),
             Err(reason) => {
-                self.poison(reason);
-                return None;
+                self.refuse(reason);
             }
         }
         for coord in coords {
             match self.resolve(coord, &format!("scatter at t{at}")) {
                 Ok(id) => ids.push(id),
                 Err(reason) => {
-                    self.poison(reason);
-                    return None;
+                    self.refuse(reason);
                 }
             }
         }
         match self.resolve(src, &format!("scatter at t{at}")) {
             Ok(id) => ids.push(id),
             Err(reason) => {
-                self.poison(reason);
-                return None;
+                self.refuse(reason);
             }
         }
-        Some(self.push(LogicalOp::Scatter, &ids, out_dims, out_dtype))
+        self.push(LogicalOp::Scatter, &ids, out_dims, out_dtype)
     }
 
     /// Apply a movement: mints ONE view value per movement on the
@@ -1025,16 +921,12 @@ impl LogicalGraph {
     /// the petgraph backing: no base short-circuit, no entry
     /// composition — movement chains are recorded as chains and egglog
     /// composes the index-map applies).
-    pub fn apply_movement(&mut self, current: &Operand, movement: Movement) -> Option<ValueId> {
-        if self.poisoned.is_some() {
-            return None;
-        }
+    pub fn apply_movement(&mut self, current: &Operand, movement: Movement) -> ValueId {
         let at = self.graph.node_count();
         let current_id = match self.resolve(current, &format!("movement at t{at}")) {
             Ok(id) => id,
             Err(reason) => {
-                self.poison(reason);
-                return None;
+                self.refuse(reason);
             }
         };
         let value = &self.graph[current_id];
@@ -1044,8 +936,7 @@ impl LogicalGraph {
         let (replacement, new_dims) = match movement_entries(movement, &prev_dims) {
             Ok(pair) => pair,
             Err(reason) => {
-                self.poison(reason);
-                return None;
+                self.refuse(reason);
             }
         };
 
@@ -1246,138 +1137,52 @@ pub(crate) fn movement_entries(
 }
 
 impl LogicalGraph {
-    /// Append post-schedule authoring checks (iota bounds pairs).
-    /// SHAPE-CONTRACT INVARIANTS (ruling 2026-08-13, squeeze "option
-    /// 3"): record always; validity is a POST-SATURATION check against
-    /// the bounds lattice, so the BINDING decides per bucket — a
-    /// runtime that pins/buckets the extent appropriately passes (the
-    /// [n,n] pin-collapse discharges the check), any other bucket
-    /// refuses loudly. Static extents discharge trivially.
-    pub(crate) fn require_extent_eq_one(&mut self, at: usize, dim: &IntExpr, what: &str) {
-        match Self::dim_term(dim) {
-            Ok(term) => self.post_check(
-                format!(
-                    "{what} at t{at}: axis extent must be exactly 1 — \
-                     bind or bucket the dim to [1,1]"
-                ),
-                &format!("(check (= {term} (IntLit 1)))\n"),
-            ),
-            Err(reason) => self.poison(format!("{what} at t{at}: {reason}")),
-        }
+    /// State that `extent` is exactly `n` — a squeeze of a symbolic axis.
+    /// Static extents are decided by the caller; this is for the ones
+    /// only the binding's bounds can decide.
+    pub(crate) fn contract_extent_eq(&mut self, extent: &IntExpr, n: i64) {
+        self.contracts
+            .push(Contract::ExtentEq { extent: *extent, n });
     }
 
-    /// The ≥-form of the same contract (empty-axis refusals:
-    /// reduce_max/argmax need at least one element; unfold windows need
-    /// a positive count).
-    pub(crate) fn require_extent_at_least(
-        &mut self,
-        at: usize,
-        dim: &IntExpr,
-        min: i64,
-        what: &str,
-    ) {
-        match Self::dim_term(dim) {
-            Ok(term) => self.post_check(
-                format!(
-                    "{what} at t{at}: extent lower bound must reach {min} — \
-                     bind the dim's range to exclude smaller values"
-                ),
-                &format!("(check (>= (lower-bound-of {term}) (bigint {min})))\n"),
-            ),
-            Err(reason) => self.poison(format!("{what} at t{at}: {reason}")),
-        }
+    /// State that `extent` is at least `n` (a non-empty reduce_max axis,
+    /// a positive unfold window count).
+    pub(crate) fn contract_extent_at_least(&mut self, extent: &IntExpr, n: i64) {
+        self.contracts
+            .push(Contract::ExtentAtLeast { extent: *extent, n });
     }
 
-    pub fn output(&mut self, operand: &Operand, label: Option<&str>) {
-        if self.poisoned.is_some() {
-            return;
+    /// The recorded extent conditions.
+    pub fn contracts(&self) -> &[Contract] {
+        &self.contracts
+    }
+
+    /// Annotate a value with a name (`LogicalTensorNamed`) so a runtime
+    /// can bind it by name. A duplicated name would silently union two
+    /// distinct values, so duplicates refuse the graph.
+    pub fn name(&mut self, operand: &Operand, name: &str) {
+        if self.names.iter().any(|(_, existing)| existing == name) {
+            self.refuse(format!("duplicate name \"{name}\""));
         }
-        if let Some(name) = label
-            && self
-                .outputs
-                .iter()
-                .any(|record| record.label.as_deref() == Some(name))
-        {
-            return self.poison(format!("duplicate output name \"{name}\""));
-        }
-        let id = match self.resolve(operand, "output") {
+        let id = match self.resolve(operand, "name") {
             Ok(id) => id,
-            Err(reason) => return self.poison(reason),
+            Err(reason) => self.refuse(reason),
         };
-        // Outputs of view VALUES are fine — the binding puts a contiguous
-        // boundary on the value and search prices the materialization.
-        // (The genuinely divergent case — their pipeline's non-contiguous
-        // materialize path — already poisons via its gather1d.)
-        self.outputs.push(OutputRecord {
-            value: id,
-            label: label.map(str::to_string),
-            storage: None,
-        });
+        self.names.push((id, name.to_string()));
     }
 
-    /// Record an output that WRITES INTO an input's storage — the
-    /// mutation contract (PyTorch's functionalized `x.copy_(...)`), kept
-    /// SSA: the value is a fresh SSA value; only its boundary storage is
-    /// stated. The binding layer pins both the input and this output to
-    /// one `BufferLit` and marks the input `ReadWrite`, so the
-    /// bufferizer's conflict engine orders the read-modify-write — or
-    /// repairs with a copy — exactly as it does for any tied pair.
-    ///
-    /// The target must be a graph input, and the value must carry the
-    /// target's dtype (a mutation writes the caller's bytes).
-    pub fn output_into(&mut self, operand: &Operand, target: &Operand, label: Option<&str>) {
-        if self.poisoned.is_some() {
-            return;
-        }
-        if let Some(name) = label
-            && self
-                .outputs
-                .iter()
-                .any(|record| record.label.as_deref() == Some(name))
-        {
-            return self.poison(format!("duplicate output name \"{name}\""));
-        }
-        let id = match self.resolve(operand, "output_into") {
-            Ok(id) => id,
-            Err(reason) => return self.poison(reason),
-        };
-        let target_id = match self.resolve(target, "output_into target") {
-            Ok(id) => id,
-            Err(reason) => return self.poison(reason),
-        };
-        if !matches!(self.graph[target_id].op, LogicalOp::Input { .. }) {
-            return self.poison(format!(
-                "output_into target t{}: mutation targets must be graph inputs",
-                target_id.index()
-            ));
-        }
-        let (value, target_value) = (&self.graph[id], &self.graph[target_id]);
-        if value.dtype != target_value.dtype {
-            return self.poison(format!(
-                "output_into at t{}: a {:?} value cannot overwrite the {:?} input t{}",
-                id.index(),
-                value.dtype,
-                target_value.dtype,
-                target_id.index()
-            ));
-        }
-        self.outputs.push(OutputRecord {
-            value: id,
-            label: label.map(str::to_string),
-            storage: Some(target_id),
-        });
+    /// The value carrying `name`, if any.
+    pub fn named(&self, name: &str) -> Option<ValueId> {
+        self.names
+            .iter()
+            .find(|(_, existing)| existing == name)
+            .map(|(id, _)| *id)
     }
 
-    /// The live set: every value transitively reachable from the outputs,
-    /// plus every input declaration (bindings enumerate all inputs).
-    pub(crate) fn live_set(&self) -> FxHashSet<ValueId> {
+    /// Every value transitively feeding one of `roots` (roots included).
+    pub fn cone(&self, roots: &[ValueId]) -> FxHashSet<ValueId> {
         let mut live = FxHashSet::default();
-        let mut stack: Vec<ValueId> = self.outputs.iter().map(|record| record.value).collect();
-        for id in self.graph.node_indices() {
-            if matches!(self.graph[id].op, LogicalOp::Input { .. }) {
-                stack.push(id);
-            }
-        }
+        let mut stack: Vec<ValueId> = roots.to_vec();
         while let Some(id) = stack.pop() {
             if !live.insert(id) {
                 continue;
@@ -1480,214 +1285,88 @@ impl LogicalGraph {
         }
     }
 
-    /// The rendered MODEL: live values in SSA order (creation order is
-    /// topological — operands precede consumers), dead values elided,
-    /// plus the output NAME annotations.
-    pub fn model_text(&self) -> Result<String, String> {
-        if let Some(reason) = &self.poisoned {
-            return Err(format!("logical graph poisoned: {reason}"));
-        }
-        let live = self.live_set();
+    /// The model as egglog text: one `let` per value in the cone of
+    /// `roots`, in SSA (node-index) order, then a `LogicalTensorNamed`
+    /// union for every named value in the cone. No buffers, layouts or
+    /// schedule — those are the runtime's binding statements.
+    pub fn render(&self, roots: &[ValueId]) -> Result<String, String> {
+        let live = self.cone(roots);
         let mut text = String::new();
         for id in self.graph.node_indices() {
             if live.contains(&id) {
                 text.push_str(&self.render_value(id)?);
             }
         }
-        for record in &self.outputs {
-            let name = match &record.label {
-                Some(label) => label.clone(),
-                None => format!("out_{}", record.value.index()),
+        for (id, name) in &self.names {
+            if live.contains(id) {
+                text.push_str(&format!(
+                    "(union v{} (LogicalTensorNamed (LogicalIdLit \"{name}\")))\n",
+                    id.index()
+                ));
+            }
+        }
+        for contract in &self.contracts {
+            let (relation, extent, n) = match contract {
+                Contract::ExtentEq { extent, n } => ("extent-eq", extent, n),
+                Contract::ExtentAtLeast { extent, n } => ("extent-at-least", extent, n),
             };
-            text.push_str(&format!(
-                "(union v{} (LogicalTensorNamed (LogicalIdLit \"{name}\")))\n",
-                record.value.index()
-            ));
+            text.push_str(&format!("({relation} {} {n})\n", Self::dim_term(extent)?));
         }
         Ok(text)
     }
 
-    /// The post-schedule authoring checks.
-    pub fn post_check(&mut self, label: impl Into<String>, text: &str) {
-        self.labeled_checks.push((label.into(), text.to_string()));
-        self.post_checks.push_str(text);
+    /// [`Self::render`] over every recorded value.
+    pub fn render_all(&self) -> Result<String, String> {
+        let all: Vec<ValueId> = self.graph.node_indices().collect();
+        self.render(&all)
     }
 
-    pub fn post_checks(&self) -> &str {
-        &self.post_checks
+    /// Values with no consumers that are not inputs — what a runtime
+    /// binds as outputs when the caller does not say otherwise.
+    pub fn leaves(&self) -> Vec<ValueId> {
+        self.graph
+            .node_indices()
+            .filter(|&id| {
+                !self.is_input(id)
+                    && self
+                        .graph
+                        .edges_directed(id, Direction::Outgoing)
+                        .next()
+                        .is_none()
+            })
+            .collect()
     }
 
-    /// The bound assembly SPLIT at the schedule (binding seeds inject
-    /// before saturation): (pre-schedule text, input slots, output slots,
-    /// post-schedule checks). The model text is runtime-neutral; every
-    /// boundary statement comes from the caller's
-    /// [`RuntimeBindingsGenerator`](crate::runtime_binding::RuntimeBindingsGenerator)
-    /// — each runtime hands in its own (Step C, 2026-08-17).
-    #[allow(clippy::type_complexity)]
-    pub fn bound_parts(
-        &self,
-        bindings: &dyn crate::runtime_binding::RuntimeBindingsGenerator,
-    ) -> Result<
-        (
-            String,
-            Vec<InputSlot>,
-            Vec<OutputSlot>,
-            String,
-            Vec<(String, String)>,
-        ),
-        String,
-    > {
-        let mut text = self.model_text()?;
-        // Inputs that some `.output_into()` writes into: their boundary
-        // becomes ReadWrite, admitting in-place lowerings (the writability
-        // veto only fires on ReadOnly storage).
-        let mutable_inputs: FxHashSet<ValueId> = self
-            .outputs
-            .iter()
-            .filter_map(|record| record.storage)
-            .collect();
-        let mut input_slots = Vec::new();
-        let mut input_buffer_tensors = Vec::new();
-        let mut input_buffers: FxHashMap<ValueId, i64> = FxHashMap::default();
-        let mut next_buffer: i64 = 0;
-        for id in self.graph.node_indices() {
-            let value = &self.graph[id];
-            let LogicalOp::Input { .. } = &value.op else {
-                continue;
-            };
-            let slot = id.index();
-            let shape = Self::shape_term(&value.dims)?;
-            let stem = format!("nat{slot}");
-            let buffer = next_buffer;
-            next_buffer += 1;
-            let value_name = if value.dtype == DType::Bool {
-                format!("input_wire_v{}", id.index())
-            } else {
-                format!("v{}", id.index())
-            };
-            let access = if mutable_inputs.contains(&id) {
-                Access::ReadWrite
-            } else {
-                Access::ReadOnly
-            };
-            text.push_str(&bindings.input_binding(
-                &stem,
-                buffer as usize,
-                &value_name,
-                &shape,
-                &bindings.width_term(value.dtype),
-                access,
-            ));
-            input_buffer_tensors.push(format!("{stem}_buffer_tensor"));
-            input_buffers.insert(id, buffer);
-            input_slots.push(InputSlot {
-                tensor: id,
-                buffer,
-                size: slot as u64,
-                value_name,
-            });
+    /// Every input value, in declaration order.
+    pub fn inputs(&self) -> Vec<ValueId> {
+        self.graph
+            .node_indices()
+            .filter(|&id| self.is_input(id))
+            .collect()
+    }
+
+    pub fn is_input(&self, id: ValueId) -> bool {
+        matches!(self.graph[id].op, LogicalOp::Input { .. })
+    }
+
+    pub fn value_dtype(&self, id: ValueId) -> DType {
+        self.graph[id].dtype
+    }
+
+    /// The egglog `let` a boundary attaches to. A Bool input enters as a
+    /// Bool8 wire (`input_wire_v{n}`) that the model casts to Bool — the
+    /// one storage representation the renderer states.
+    pub fn let_name(&self, id: ValueId) -> String {
+        match (&self.graph[id].op, self.graph[id].dtype) {
+            (LogicalOp::Input { .. }, DType::Bool) => format!("input_wire_v{}", id.index()),
+            _ => format!("v{}", id.index()),
         }
-        let mut output_slots = Vec::new();
-        let mut output_buffer_tensors = Vec::new();
-        for record in &self.outputs {
-            let id = record.value;
-            let key = id.index();
-            let value = &self.graph[id];
-            let shape = Self::shape_term(&value.dims)?;
-            let stem = format!("natout{key}");
-            // A mutation output shares its target input's BufferLit; any
-            // other output mints a fresh boundary. (Boundary values
-            // pinned to one buffer are pre-unioned by the bufferizer.)
-            let buffer = match record.storage.and_then(|target| input_buffers.get(&target)) {
-                Some(&shared) => shared,
-                None => {
-                    let buffer = next_buffer;
-                    next_buffer += 1;
-                    buffer
-                }
-            };
-            text.push_str(&bindings.output_binding(
-                &stem,
-                buffer as usize,
-                &format!("v{}", id.index()),
-                &shape,
-                value.dtype,
-            ));
-            output_buffer_tensors.push(format!("{stem}_buffer_tensor"));
-            output_slots.push(OutputSlot {
-                tensor: id,
-                buffer,
-                size: key as u64,
-            });
-        }
-        text.push_str(&bindings.boundary_lists(
-            &input_buffer_tensors,
-            &output_buffer_tensors,
-            "nat_input_boundary",
-            "nat_output_boundary",
-        ));
-        Ok((
-            text,
-            input_slots,
-            output_slots,
-            self.post_checks.clone(),
-            self.labeled_checks.clone(),
-        ))
     }
 
-    /// The assembled program under the given runtime's bindings.
-    pub fn bound_program(
-        &self,
-        bindings: &dyn crate::runtime_binding::RuntimeBindingsGenerator,
-    ) -> Result<LogicalProgram, String> {
-        let (pre, input_slots, output_slots, post_checks, _labeled) = self.bound_parts(bindings)?;
-        Ok(LogicalProgram {
-            text: format!("{pre}{}{post_checks}", bindings.schedule()),
-            input_slots,
-            output_slots,
-        })
+    /// The value's dims as a `ShapeLit` term.
+    pub fn value_shape_term(&self, id: ValueId) -> Result<String, String> {
+        Self::shape_term(&self.graph[id].dims)
     }
-}
-
-// ─── Survivors of the interim translator (M3 Topic D) ───
-
-/// One bound input: the graph tensor it carries, the buffer the runtime
-/// allocated for it, and its declared size. Buffer ids are an internal,
-/// binding-time allocation — inputs first, outputs after, except that a
-/// mutation output (`.output_into()`) shares its target input's id —
-/// never derived from graph node indices (the retired HLIR keyspace).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InputSlot {
-    pub tensor: petgraph::graph::NodeIndex,
-    pub buffer: i64,
-    pub size: u64,
-    /// The input's SSA value name in the model text (`v{index}`) — the
-    /// handle binding-time seeds (value ranges) attach to.
-    pub value_name: String,
-}
-
-/// One bound output. See [`InputSlot`] for the allocation discipline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputSlot {
-    pub tensor: petgraph::graph::NodeIndex,
-    pub buffer: i64,
-    pub size: u64,
-}
-
-/// The assembled program plus the I/O binding tables the runtime needs
-/// (moved here when the interim translator was deleted, M3 Topic D).
-/// Buffer ids are runtime-internal sequential allocations; the runtime's
-/// role-split maps translate tensor identities to buffers.
-#[derive(Debug, Clone)]
-pub struct LogicalProgram {
-    /// Model + binding + schedule + authoring-contract checks. Run as
-    /// `format!("{}\n\n{}", <the runtime's assembled program>, text)` —
-    /// e.g. `luminal_reference::assembled_program()`.
-    pub text: String,
-    /// Bound inputs in signature order.
-    pub input_slots: Vec<InputSlot>,
-    /// Bound outputs in output-slot order.
-    pub output_slots: Vec<OutputSlot>,
 }
 
 /// Their RPN index expression rendered as OUR IntExpr term, with `z`
@@ -1772,7 +1451,7 @@ mod logical_petgraph_tests {
         let lhs = cx.named_tensor("lhs", (2usize, 3usize), DType::F32);
         let rhs = cx.named_tensor("rhs", (2usize, 3usize), DType::F32);
         let sum = lhs + rhs;
-        let viewed = sum.expand_dim(0, 4usize).output();
+        let viewed = sum.expand_dim(0, 4usize);
 
         let graph = cx.logical.petgraph();
         assert_eq!(graph.node_count(), 4);
@@ -1798,96 +1477,49 @@ mod logical_petgraph_tests {
         assert_eq!(view_input, vec![(0, sum.id)]);
 
         assert_eq!(cx.logical.input_specs()[0].id, lhs.id);
-        assert_eq!(cx.logical.output_specs()[0].id, viewed.id);
+        assert_eq!(cx.logical.leaves(), vec![viewed.id]);
     }
 
-    /// A `.output_into()` output shares its target input's `BufferLit`
-    /// and marks that input `ReadWrite`; every other boundary keeps the
-    /// fresh-buffer + `ReadOnly` default. This is the mutation contract
-    /// the runtimes key on (resident sinks, no readback).
+    /// `render(roots)` emits exactly the cone of its roots plus the
+    /// named unions inside it; `leaves()` is every consumer-less
+    /// non-input value.
     #[test]
-    fn output_into_shares_the_input_buffer_and_marks_it_writable() {
-        struct TestBindings;
-        impl crate::runtime_binding::RuntimeBindingsGenerator for TestBindings {
-            fn width_term(&self, dtype: DType) -> String {
-                format!("(bits-of ({dtype:?}))")
-            }
-            fn input_binding(
-                &self,
-                stem: &str,
-                idx: usize,
-                _logical_name: &str,
-                _shape: &str,
-                _width: &str,
-                access: Access,
-            ) -> String {
-                format!("(let {stem}_buffer_id (BufferLit {idx}))\n(access {access:?} {stem})\n")
-            }
-            fn output_binding(
-                &self,
-                stem: &str,
-                key: usize,
-                _value_name: &str,
-                _shape: &str,
-                _dtype: DType,
-            ) -> String {
-                format!("(let {stem}_buffer_id (BufferLit {key}))\n(access ReadWrite {stem})\n")
-            }
-            fn schedule(&self) -> &str {
-                ""
-            }
-        }
-
+    fn render_emits_the_cone_and_its_names() {
         let mut cx = Graph::new();
         let x = cx.named_tensor("x", (2usize,), DType::F32);
         let y = cx.named_tensor("y", (2usize,), DType::F32);
-        let z = (x + y).output_into(&x);
-        let (text, inputs, outputs, _, _) = cx.logical.bound_parts(&TestBindings).unwrap();
-        assert_eq!(inputs.len(), 2);
-        assert_eq!(outputs.len(), 1);
-        let x_buffer = inputs[0].buffer;
-        let y_buffer = inputs[1].buffer;
-        assert_ne!(x_buffer, y_buffer);
-        assert_eq!(
-            outputs[0].buffer, x_buffer,
-            "the mutation output shares x's boundary buffer"
-        );
-        assert_eq!(outputs[0].tensor, z.id);
+        let sum = (x + y).named("sum");
+        let other = x * 2.0f32;
+        assert_eq!(cx.logical.leaves(), vec![sum.id, other.id]);
+        assert_eq!(cx.logical.inputs(), vec![x.id, y.id]);
+        assert_eq!(cx.logical.named("sum"), Some(sum.id));
+
+        let text = cx.logical.render(&[sum.id]).expect("renders");
         assert!(
-            text.contains(&format!("(access ReadWrite nat{})", x.id.index())),
-            "x must be writable:\n{text}"
+            text.contains("LogicalAdd"),
+            "the root's cone renders:\n{text}"
         );
         assert!(
-            text.contains(&format!("(access ReadOnly nat{})", y.id.index())),
-            "y stays read-only:\n{text}"
+            !text.contains("LogicalMul"),
+            "an unbound leaf is not rendered:\n{text}"
         );
+        assert!(
+            text.contains("(union v2 (LogicalTensorNamed (LogicalIdLit \"sum\")))"),
+            "a name in the cone renders as a union:\n{text}"
+        );
+        let all = cx.logical.render_all().expect("renders");
+        assert!(all.contains("LogicalMul"));
+        assert_eq!(cx.logical.let_name(x.id), "v0");
     }
 
-    /// `output_into` refuses non-input targets and dtype mismatches at
-    /// authoring time (fail closed, never mistranslate).
+    /// A duplicated name would silently union two distinct values, so it
+    /// refuses at the construction site.
     #[test]
-    fn output_into_rejects_non_input_targets_and_dtype_mismatch() {
+    #[should_panic(expected = "duplicate name")]
+    fn duplicate_names_refuse_at_construction() {
         let mut cx = Graph::new();
         let x = cx.named_tensor("x", (2usize,), DType::F32);
-        let y = cx.named_tensor("y", (2usize,), DType::F32);
-        let sum = x + y;
-        sum.output_into(&sum);
-        assert!(
-            cx.logical.poisoned().is_some_and(|r| r.contains("inputs")),
-            "non-input target must poison: {:?}",
-            cx.logical.poisoned()
-        );
-
-        let mut cx = Graph::new();
-        let x = cx.named_tensor("x", (2usize,), DType::F32);
-        let i = cx.named_tensor("i", (2usize,), DType::Int);
-        (x + x).output_into(&i);
-        assert!(
-            cx.logical
-                .poisoned()
-                .is_some_and(|r| r.contains("cannot overwrite")),
-            "dtype mismatch must poison: {:?}",
-            cx.logical.poisoned()
-        );
+        let _ = (x + x).named("y");
+        let _ = (x * x).named("y");
     }
 }

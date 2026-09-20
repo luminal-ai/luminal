@@ -36,7 +36,7 @@ fn canonical_2d_matmul_searches_green_at_the_harness_budget() {
     let mut cx = Graph::new();
     let a = cx.tensor((4usize, 8usize), DType::F32);
     let b = cx.tensor((8usize, 3usize), DType::F32);
-    let _out = a.matmul(b).output();
+    let _out = a.matmul(b);
 
     let mut rt = CudaRuntime::load(&cx).expect("load");
     let data: FxHashMap<NodeIndex, HostBuffer> =

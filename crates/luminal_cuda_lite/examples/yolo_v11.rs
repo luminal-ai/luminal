@@ -32,7 +32,7 @@ fn run() -> anyhow::Result<()> {
         DType::F32,
     );
     let model = YoloV11::init(&mut cx);
-    let detections = model.forward(image).output();
+    let detections = model.forward(image);
     let pairs = support::device::seeded_graph_inputs(
         &cx,
         vec![(

@@ -144,7 +144,7 @@ fn run_differential(
     );
 
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone());
+        rt.set_data(*id, v.clone()).unwrap();
     }
     rt.execute().expect("device execute");
     let got = walked_dense(&rt, out);
@@ -170,7 +170,7 @@ fn transpose_consumer_byte_matches_materialize_route() {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 3usize), DType::F32);
     let c = cx.tensor((3usize, 2usize), DType::F32);
-    let out = (x.permute((1, 0)) * c).output();
+    let out = x.permute((1, 0)) * c;
     let (want, got) = run_differential(
         &cx,
         &[
@@ -190,7 +190,7 @@ fn slice_consumer_byte_matches_materialize_route() {
     let mut cx = Graph::new();
     let x = cx.tensor((4usize, 6usize), DType::F32);
     let c = cx.tensor((2usize, 6usize), DType::F32);
-    let out = (x.slice((1..3, ..)) * c).output();
+    let out = x.slice((1..3, ..)) * c;
     let (want, got) = run_differential(
         &cx,
         &[
@@ -210,7 +210,7 @@ fn broadcast_consumer_byte_matches_materialize_route() {
     let mut cx = Graph::new();
     let x = cx.tensor(3usize, DType::F32);
     let c = cx.tensor((2usize, 3usize), DType::F32);
-    let out = (x.expand_dim(0, 2) * c).output();
+    let out = x.expand_dim(0, 2) * c;
     let (want, got) = run_differential(
         &cx,
         &[
@@ -232,7 +232,7 @@ fn chained_matmul_byte_matches_materialize_route() {
     let a = cx.tensor((2usize, 3usize), DType::F32);
     let b = cx.tensor((3usize, 4usize), DType::F32);
     let c = cx.tensor((4usize, 2usize), DType::F32);
-    let out = a.matmul(b).matmul(c).output();
+    let out = a.matmul(b).matmul(c);
     let (want, got) = run_differential(
         &cx,
         &[

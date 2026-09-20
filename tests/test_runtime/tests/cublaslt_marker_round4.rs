@@ -90,7 +90,7 @@ fn t6a_bufferize_all_four_forms() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
-                let _ = x.matmul(w).output();
+                let _ = x.matmul(w);
             }),
         ),
         (
@@ -100,7 +100,7 @@ fn t6a_bufferize_all_four_forms() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
+                let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
         (
@@ -110,7 +110,7 @@ fn t6a_bufferize_all_four_forms() {
                 let x = cx.tensor((4usize, 8usize), DType::F32);
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
-                let _ = (x.matmul(w) + c).output();
+                let _ = x.matmul(w) + c;
             }),
         ),
         (
@@ -121,7 +121,7 @@ fn t6a_bufferize_all_four_forms() {
                 let w = cx.tensor((8usize, 3usize), DType::F32);
                 let c = cx.tensor((4usize, 3usize), DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
-                let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).output();
+                let _ = (x.matmul(w) + c) + b.expand_dim(0, 4usize);
             }),
         ),
     ];
@@ -129,10 +129,7 @@ fn t6a_bufferize_all_four_forms() {
         let text = {
             let mut cx = Graph::new();
             build(&mut cx);
-            cx.logical
-                .bound_program(&test_runtime::TestRuntimeBindings)
-                .expect("recorder clean")
-                .text
+            test_runtime::bind_leaves(&cx)
         };
         let (graph, _) = test_runtime::extract_fixture_with_genome(
             &text,
@@ -271,11 +268,8 @@ fn t6a_accumulate_intermediate_c_donation_observed() {
         // Original boundary-flowing spelling (restored under
         // escape-and-disclose: the view-produced bound output escapes);
         // this probe's subject is donation.
-        let _ = (x.matmul(w) + c).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = x.matmul(w) + c;
+        test_runtime::bind_leaves(&cx)
     };
     let (graph, _) = test_runtime::extract_fixture_with_genome(&text, PIN);
     let elected = cublaslt_in_plan(&graph);
@@ -434,22 +428,19 @@ fn t6b_relu_decorates_symbolic_k() {
 (let scalar_shape (ShapeLit (IntExprNil)))
 (let scalar_map (IndexMapLit (IntExprNil) scalar_shape))
 (let zfill (LogicalIndexMapApply zconst scalar_map out_shape))
-(let nconst (LogicalConstant -1.0))
-(let nfill (LogicalIndexMapApply nconst scalar_map out_shape))
-(let oconst (LogicalConstant 1.0))
-(let ofill (LogicalIndexMapApply oconst scalar_map out_shape))
-(let lt0 (LogicalLessThan out_logical zfill))
-(let tc (LogicalCast lt0 (F32)))
-(let term1 (LogicalMul tc zfill))
-(let nm (LogicalMul tc nfill))
-(let p (LogicalAdd nm ofill))
-(let sel1 (LogicalCast (LogicalLessThan zfill p) (F32)))
-(let sel2 (LogicalCast (LogicalLessThan p zfill) (F32)))
-(let sum2 (LogicalAdd sel1 sel2))
-(let bsel (LogicalLessThan zfill sum2))
-(let u (LogicalCast bsel (F32)))
-(let term2 (LogicalMul u out_logical))
-(let relu_logical (LogicalAdd term1 term2))
+(let nanconst (LogicalConstant NaN))
+(let nanfill (LogicalIndexMapApply nanconst scalar_map out_shape))
+(let picked (LogicalSelect (LogicalLessThan out_logical zfill) zfill out_logical))
+(let yy (LogicalCast (LogicalLessThan out_logical out_logical) (F32)))
+(let ysum (LogicalAdd yy yy))
+(let yind (LogicalAdd (LogicalCast (LogicalLessThan zfill ysum) (F32)) (LogicalCast (LogicalLessThan ysum zfill) (F32))))
+(let ynan (LogicalLessThan zfill yind))
+(let inner (LogicalSelect ynan nanfill picked))
+(let zz (LogicalCast (LogicalLessThan zfill zfill) (F32)))
+(let zsum (LogicalAdd zz zz))
+(let zind (LogicalAdd (LogicalCast (LogicalLessThan zfill zsum) (F32)) (LogicalCast (LogicalLessThan zsum zfill) (F32))))
+(let znan (LogicalLessThan zfill zind))
+(let relu_logical (LogicalSelect znan nanfill inner))
 (let relu_lt (LayoutTensorLit relu_logical out_layout))
 (let xc_buffer_id (BufferLit 10))
 (set (buffer-access-of xc_buffer_id) (ReadOnly))

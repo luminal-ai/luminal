@@ -7,7 +7,6 @@ binds caller tensors per invocation.
 """
 
 import concurrent.futures
-import copy
 import os
 import tempfile
 from typing import Any, Callable, Optional, Sequence
@@ -17,6 +16,7 @@ from torch.export import Dim, export
 
 from . import _luminal
 from .export_utils import (
+    private_graph_copy,
     _box_scalar_graph_outputs,
     _decomp_table,
     _drop_dead_data_dependent_ops,
@@ -58,11 +58,18 @@ class CompiledModel:
     """Callable wrapper around a compiled reference-backend graph."""
 
     def __init__(
-        self, graph: Any, ep: Any, scalar_output_positions: Sequence[int] = ()
+        self,
+        graph: Any,
+        ep: Any,
+        scalar_output_positions: Sequence[int] = (),
+        held: Optional[dict] = None,
     ):
         self._graph = graph
         self._ep = ep
         self._scalar_output_positions = frozenset(scalar_output_positions)
+        # Graph input name -> the exported parameter/buffer tensor staged for
+        # it, so a buffer mutation has somewhere to write back.
+        self._held = dict(held or {})
         names = graph.input_names
         kinds = graph.input_kinds
         self._user_input_names = [
@@ -102,12 +109,22 @@ class CompiledModel:
         for index, (_, dtype_code, shape, mutation, returned) in enumerate(outputs):
             tensor = _output_tensor(self._graph.output_bytes(index), dtype_code, shape)
             if mutation is not None:
-                target = self._user_input_names.index(mutation)
-                inputs[target].copy_(tensor)
+                # A mutation target is a graph input: a user input, or a
+                # parameter/buffer held from the export's state_dict.
+                if mutation in self._user_input_names:
+                    destination = inputs[self._user_input_names.index(mutation)]
+                elif mutation in self._held:
+                    destination = self._held[mutation]
+                else:
+                    raise RuntimeError(
+                        f"luminal_reference: mutation target {mutation!r} is neither a "
+                        "user input nor a staged parameter/buffer"
+                    )
+                destination.copy_(tensor)
                 # A returned mutation IS the caller's tensor (same storage),
                 # matching eager's aliasing semantics.
                 if returned:
-                    results.append(inputs[target])
+                    results.append(destination)
                 continue
             if returned:
                 # Scalar graph outputs were boxed into rank-zero tensors before
@@ -149,8 +166,9 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     """
     # Work on a copy: Dynamo keeps the original GraphModule and checks its own
     # guards against it after the backend returns, so mutating it in place
-    # trips "Guard failed on the same frame it was created".
-    gm = copy.deepcopy(gm)
+    # trips "Guard failed on the same frame it was created". Only the GRAPH is
+    # private; the module's weights are shared (see private_graph_copy).
+    gm = private_graph_copy(gm)
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
 
     records: list[tuple[str, torch.fx.Node, Any]] = []
@@ -238,8 +256,9 @@ def luminal_reference(
     # Canonicalize scalar (SymInt/SymFloat/SymBool) graph outputs into rank-zero
     # tensors before the export capture. Work on a private copy: Dynamo holds
     # onto the original graph module for guard installation and retracing, and
-    # mutating it here would corrupt that bookkeeping.
-    gm = copy.deepcopy(gm)
+    # mutating it here would corrupt that bookkeeping. The copy shares the
+    # module's weights (see private_graph_copy).
+    gm = private_graph_copy(gm)
     scalar_output_positions = _box_scalar_graph_outputs(gm)
 
     # The graph-module preprocessing above runs first; `_dynamic_export` then
@@ -250,6 +269,26 @@ def luminal_reference(
     # ep.module(), which would otherwise emit a `_guards_fn` containing
     # data-dependent .item() calls and unresolved `L[...]` references.
     _drop_input_guards(ep)
+    _drop_dead_data_dependent_ops(ep.graph_module)
+    # Functionalise WITHOUT decomposing: every in-place op becomes its
+    # functional form plus a USER_INPUT_MUTATION spec naming the input storage
+    # it writes, and a mutation through a view becomes an explicit scatter
+    # (select_scatter / slice_scatter). The empty table decomposes nothing, so
+    # composites the translator lowers directly (aten.linear) survive. The
+    # translator reads mutations from the specs and refuses in-place ops.
+    try:
+        ep = ep.run_decompositions({})
+    except AssertionError as exc:
+        # torch's export functionalisation cannot express a write to an
+        # input that shares storage with another input (its alias wrapper
+        # returns a callable where export needs a graph); the program is
+        # refused by name, not translated.
+        if "expected compiled_fn to be GraphModule" not in str(exc):
+            raise
+        raise RuntimeError(
+            "graph inputs share device storage and the program writes one of them: "
+            "the export cannot functionalise a write through aliased inputs"
+        ) from exc
     _drop_dead_data_dependent_ops(ep.graph_module)
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
@@ -272,6 +311,7 @@ def luminal_reference(
         if "unsupported ATen op" not in str(exc):
             raise
         ep = ep.run_decompositions(_decomp_table())
+        _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
         graph = _save_and_compile(ep)
 
@@ -280,6 +320,7 @@ def luminal_reference(
     parameter_names = graph.parameter_names
 
     user_index = 0
+    held: dict = {}
     for name, kind, parameter_name in zip(names, kinds, parameter_names):
         if kind == "user_input":
             if user_index >= len(export_inputs):
@@ -295,6 +336,9 @@ def luminal_reference(
                     "the exported state_dict"
                 )
             value = ep.state_dict[parameter_name]
+            # The export's own tensor, not the caller's module buffer: mutated
+            # state persists across calls on the input's runtime buffer.
+            held[name] = value
         graph.set_input(name, _tensor_bytes(value), list(value.shape))
 
     if user_index != len(export_inputs):
@@ -303,7 +347,7 @@ def luminal_reference(
         )
 
     graph.search(search_iterations)
-    return CompiledModel(graph, ep, scalar_output_positions)
+    return CompiledModel(graph, ep, scalar_output_positions, held)
 
 
 def register_backend() -> None:

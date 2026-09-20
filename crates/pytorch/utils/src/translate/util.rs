@@ -111,9 +111,12 @@ pub(super) fn reshape_tensor(t: GraphTensor, target: &[IntExpr]) -> GraphTensor 
     flat
 }
 
-/// Value-identity: the recorder has no strides, so a copy of a view is
-/// only semantically distinct at the boundary, which the binding and
-/// search handle. Kept as a named seam for the parked `*_copy` ops.
+/// Value identity: `clone`, `alias` and the `*_copy` ops name a tensor
+/// whose contents are the operand's. The recorder has no storage, so the
+/// value IS the operand's; which storage a clone gets is the boundary's
+/// statement (its own buffer id for a returned clone), and a view node
+/// here would say the opposite — that the clone may share its operand's
+/// storage — which the planner would then elect.
 pub(super) fn materialize_tensor(t: GraphTensor) -> GraphTensor {
     t
 }

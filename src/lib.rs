@@ -8,7 +8,6 @@ pub mod dtype;
 pub mod egglog_utils;
 pub mod frontend;
 pub mod graph;
-pub mod runtime_binding;
 pub mod shape;
 
 // The logical-SSA layout compiler. Egglog program assembly and registries live

@@ -193,7 +193,7 @@ pub mod device {
 
         // 3. Execute on device; fetch through the disclosed layout.
         for (id, value) in data.drain() {
-            rt.set_data(id, value);
+            rt.set_data(id, value)?;
         }
         let t = std::time::Instant::now();
         rt.execute().context("device execute")?;

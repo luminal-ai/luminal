@@ -5,8 +5,21 @@ description = "Luminal CUDA-lite torch.compile backend"
 requires-python = ">=3.10"
 # The PT2 export-preparation helpers are shared with the reference backend;
 # `luminal_reference` is a build-time/runtime dependency until they are lifted
-# into a backend-neutral package (see DESIGN.md, "Shared export pipeline").
-dependencies = ["torch>=2.14", "luminal_reference"]
+# into a backend-neutral package.
+dependencies = ["torch>=2.10.0", "luminal_reference"]
+
+# torch comes from the CUDA 12.8 index, matching crates/luminal_python: the
+# default index's newest builds target CUDA 13 and cannot run on a 12.8 driver.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+luminal_reference = { path = "../reference" }
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
@@ -23,3 +36,6 @@ features = ["device"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = ["pytest>=8", "maturin>=1.0,<2.0"]

@@ -64,7 +64,7 @@ fn elementwise_fixture() -> (Graph, FxHashMap<luminal::prelude::NodeIndex, HostB
     let mut cx = Graph::new();
     let a = cx.tensor((2usize, 3usize), DType::F32);
     let b = cx.tensor((2usize, 3usize), DType::F32);
-    let _out = ((a + b) * a).output();
+    let _out = (a + b) * a;
     let data: FxHashMap<_, _> = [
         (a.id, vec![1.0f32, 2., 3., 4., 5., 6.].into()),
         (b.id, vec![10.0f32, 20., 30., 40., 50., 60.].into()),
@@ -140,7 +140,7 @@ fn bucketed_fixture() -> Graph {
     let p = e * scores;
     let o = p.matmul(k);
     let o2 = (o * x) + q;
-    let _out = (o2 * o).output();
+    let _out = o2 * o;
     cx
 }
 

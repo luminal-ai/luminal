@@ -54,7 +54,6 @@ fn run() -> anyhow::Result<()> {
         gather_idx,
         scatter_idx,
     );
-    let logits = logits.output();
 
     let (sliding_c, sliding_s) =
         rope_tables_split_half(&[1.0], dims.sliding_head_dim, 10_000.0, 1.0);

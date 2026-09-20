@@ -18,7 +18,7 @@ fn diag_a5() {
         let w1 = cx.tensor((4usize, 4usize), DType::F32);
         let w2 = cx.tensor((4usize, 4usize), DType::F32);
         let y = x.matmul(w1);
-        let _ = y.matmul(w2.permute((1usize, 0usize))).output();
+        let _ = y.matmul(w2.permute((1usize, 0usize)));
     };
     let program = {
         let mut cx = Graph::new();
@@ -26,11 +26,8 @@ fn diag_a5() {
         let w1 = cx.tensor((4usize, 4usize), DType::F32);
         let w2 = cx.tensor((4usize, 4usize), DType::F32);
         let y = x.matmul(w1);
-        let _ = y.matmul(w2.permute((1usize, 0usize))).output();
-        cx.logical
-            .bound_program(&test_runtime::TestRuntimeBindings)
-            .expect("recorder clean")
-            .text
+        let _ = y.matmul(w2.permute((1usize, 0usize)));
+        test_runtime::bind_leaves(&cx)
     };
     let (graph, _) = test_runtime::extract_fixture_with_genome(&program, PIN);
     for node in graph.dag.node_weights() {

@@ -454,11 +454,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         attn_mask_t,
         &kv_cache,
     );
-    let logits = logits.output();
-    for (k_out, v_out) in &cache_outputs {
-        k_out.output();
-        v_out.output();
-    }
 
     let max_prefill = (prompt_tokens.len() + 16)
         .next_power_of_two()

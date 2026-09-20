@@ -55,7 +55,6 @@ fn run() -> anyhow::Result<()> {
         gather_idx,
         scatter_idx,
     );
-    let logits = logits.output();
 
     let (local_c, local_s) = rope_tables_split_half(&[1.0], dims.head_dim, 10_000.0, 1.0);
     let (global_c, global_s) =

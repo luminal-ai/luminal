@@ -1,5 +1,5 @@
 ; NON-INT dtypes: ungated (float arithmetic carries its own
-; semantics; the non-wrapping ruling gates Int only).
+; semantics).
 ; Layout Tensor Op Add Generic
 (rule
   (
@@ -29,10 +29,10 @@
   :ruleset backend
 )
 
-; Int: PROOF-GATED (non-wrapping ruling 2026-08-11) — mints
-; only where the value-bounds lattice proves every element in
-; width; unproven spellings refuse and the Strict* family is
-; the dynamic-checked escape hatch.
+; Int: WRAPS, and mints unproven (LUM-833, temporary). torch
+; wraps integer arithmetic at every width, so the in-width proof
+; refused programs eager runs. The gate returns for index-born
+; integers once overflow follows provenance (LUM-802).
 ; Layout Tensor Op Add Generic
 (rule
   (
@@ -46,10 +46,6 @@
     (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
     (= ?out_logical (LogicalAdd ?in1_logical ?in2_logical))
     (= (dtype-of ?out_logical) (Int))
-    (= ?value_lower (value-lower-bound-of ?out_logical))
-    (= ?value_upper (value-upper-bound-of ?out_logical))
-    (>= ?value_lower (bigint -2147483648))
-    (<= ?value_upper (bigint 2147483647))
     (= (injectivity-of ?out_layout_tensor) (Injective))
   )
   (
@@ -64,10 +60,10 @@
   :ruleset backend
 )
 
-; Int64: PROOF-GATED (non-wrapping ruling 2026-08-11) — mints
-; only where the value-bounds lattice proves every element in
-; width; unproven spellings refuse and the Strict* family is
-; the dynamic-checked escape hatch.
+; Int64: WRAPS, and mints unproven (LUM-833, temporary). torch
+; wraps integer arithmetic at every width, so the in-width proof
+; refused programs eager runs. The gate returns for index-born
+; integers once overflow follows provenance (LUM-802).
 ; Layout Tensor Op Add Generic
 (rule
   (
@@ -81,10 +77,6 @@
     (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
     (= ?out_logical (LogicalAdd ?in1_logical ?in2_logical))
     (= (dtype-of ?out_logical) (Int64))
-    (= ?value_lower (value-lower-bound-of ?out_logical))
-    (= ?value_upper (value-upper-bound-of ?out_logical))
-    (>= ?value_lower (bigint -9223372036854775808))
-    (<= ?value_upper (bigint 9223372036854775807))
     (= (injectivity-of ?out_layout_tensor) (Injective))
   )
   (

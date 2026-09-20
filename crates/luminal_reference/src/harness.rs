@@ -176,11 +176,10 @@ pub fn try_extract_fixture_with_ops(
 /// (genome-space density). Never used by the main path — everything real
 /// runs the genetic search.
 pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
-    let program = cx
-        .logical
-        .bound_program(&crate::bindings::ReferenceBindings)
+    let bound = crate::bindings::ReferenceBindings::leaves(&cx.logical)
+        .bind(&cx.logical)
         .map_err(|reason| anyhow::anyhow!("recorder: {reason}"))?;
-    let text = format!("{}\n\n{}", crate::assembled_program(), program.text);
+    let text = format!("{}\n\n{}", crate::assembled_program(), bound.text());
     let mut egraph = luminal::egglog_snippet::new_egraph();
     let start = std::time::Instant::now();
     egraph
@@ -248,8 +247,26 @@ pub fn run_reference_with_ranges(
     inputs: &[(petgraph::graph::NodeIndex, crate::typed_buffer::TypedBuffer)],
     ranges: &[(petgraph::graph::NodeIndex, i64, i64)],
 ) -> crate::runtime::ReferenceRuntime {
-    let mut rt =
-        crate::runtime::ReferenceRuntime::load(cx).expect("recorder clean for a covered graph");
+    run_reference_bound(
+        cx,
+        crate::bindings::ReferenceBindings::leaves(&cx.logical),
+        inputs,
+        ranges,
+    )
+}
+
+/// [`run_reference_with_ranges`] under the caller's own bindings — for
+/// graphs whose outputs are not the leaves (a pass-through of an input,
+/// an intermediate observed alongside a consumer, an output aliased onto
+/// an input's buffer).
+pub fn run_reference_bound(
+    cx: &luminal::graph::Graph,
+    bindings: crate::bindings::ReferenceBindings,
+    inputs: &[(petgraph::graph::NodeIndex, crate::typed_buffer::TypedBuffer)],
+    ranges: &[(petgraph::graph::NodeIndex, i64, i64)],
+) -> crate::runtime::ReferenceRuntime {
+    let mut rt = crate::runtime::ReferenceRuntime::load_with(cx, bindings)
+        .expect("recorder clean for a covered graph");
     let mut vars: Vec<_> = cx.dyn_map.iter().collect();
     vars.sort();
     for (var, value) in vars {

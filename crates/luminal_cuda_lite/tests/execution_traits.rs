@@ -131,7 +131,7 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     let mut graph = luminal::graph::Graph::new();
     let a = graph.tensor((2, 3), DType::F32);
     let b = graph.tensor((2, 3), DType::F32);
-    let out = (a + b).output();
+    let out = a + b;
     let mut registry = cuda_registry_without_cublaslt();
     registry.retain(|entry| entry.constructor() != AddFunctionalMatcher.egglog_constructor());
     registry.push(RegisteredOp::new(
@@ -177,7 +177,7 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     #[cfg(feature = "device")]
     {
         for (id, buffer) in data {
-            runtime.set_data(id, buffer);
+            runtime.set_data(id, buffer).unwrap();
         }
         runtime.execute().unwrap();
         assert_eq!(
@@ -191,7 +191,12 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
 
 #[test]
 fn a_familiar_label_without_cuda_traits_is_not_claimed() {
-    let graph = luminal::graph::Graph::new();
+    // A load binds a boundary, so the fixture records one trivial value
+    // to have a leaf to bind. The subject is the REGISTRY's claim
+    // derivation, which reads the rows and never the graph.
+    let mut graph = luminal::graph::Graph::new();
+    let x = graph.tensor(2usize, DType::F32);
+    let _leaf = x + x;
     let registry = vec![RegisteredOp::new(
         Box::new(luminal_reference::ops::AddFunctionalMatcher),
         Box::new(luminal_reference::ops::AddFunctional),
@@ -223,7 +228,11 @@ mod host_graphs {
         atomic::{AtomicUsize, Ordering},
     };
     static RECORDS: AtomicUsize = AtomicUsize::new(0);
-    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    // Preparations made and dropped, per dimension: a dimension is prepared
+    // again on every execution that re-records it, so survival is counted.
+    const ZERO: AtomicUsize = AtomicUsize::new(0);
+    static PREPARED: [AtomicUsize; 32] = [ZERO; 32];
+    static DROPPED: [AtomicUsize; 32] = [ZERO; 32];
     #[derive(Debug, Clone)]
     struct ExternalHostAdd {
         dps: bool,
@@ -267,7 +276,7 @@ mod host_graphs {
     }
     impl Drop for Prepared {
         fn drop(&mut self) {
-            DROPPED.fetch_or(1 << self.dim, Ordering::SeqCst);
+            DROPPED[self.dim].fetch_add(1, Ordering::SeqCst);
         }
     }
     impl PreparedHostOp for Prepared {
@@ -293,6 +302,7 @@ mod host_graphs {
         ) -> anyhow::Result<Box<dyn PreparedHostOp>> {
             let a = ctx.dims[&'a'.into()];
             anyhow::ensure!(a != 6, "injected preparation failure");
+            PREPARED[a].fetch_add(1, Ordering::SeqCst);
             let ptx = cudarc::nvrtc::compile_ptx(
                 r#"extern "C" __global__ void add(const float* a,const float* b,float* out,unsigned long long n){unsigned long long i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]+b[i];}"#,
             )?;
@@ -354,7 +364,7 @@ mod host_graphs {
         let mut g = luminal::graph::Graph::new();
         let a = g.tensor(('a', 2), DType::F32);
         let b = g.tensor(('a', 2), DType::F32);
-        let out = (a + b).output();
+        let out = a + b;
         let mut registry = cuda_registry_without_cublaslt();
         registry.retain(|e| e.constructor() != AddFunctionalMatcher.egglog_constructor());
         registry.push(RegisteredOp::new(
@@ -368,18 +378,19 @@ mod host_graphs {
         let initial = RECORDS.load(Ordering::SeqCst);
         for n in [3, 4, 3, 4, 4] {
             rt.set_dim('a', n);
-            rt.set_data(a.id, vec![n as f32; n * 2]);
-            rt.set_data(b.id, vec![1f32; n * 2]);
+            rt.set_data(a.id, vec![n as f32; n * 2]).unwrap();
+            rt.set_data(b.id, vec![1f32; n * 2]).unwrap();
             rt.execute().unwrap();
             assert_eq!(rt.get_f32(out.id).unwrap(), vec![n as f32 + 1.; n * 2]);
         }
         let stats = rt.graph_stats().unwrap();
-        assert_eq!(stats.host_captures, 2);
+        // One recording at compile, then one on every later execution.
+        assert_eq!(stats.host_captures, stats.launches);
         assert_eq!(stats.instantiations, 2);
         assert_eq!(stats.graph_cache_hits, 2);
         assert_eq!(
             RECORDS.load(Ordering::SeqCst) - initial,
-            2,
+            stats.host_captures as usize,
             "record runs only during capture"
         );
         // More signatures than the capture cache holds. The parent source
@@ -387,14 +398,21 @@ mod host_graphs {
         // (including their CUDA modules) must survive cache eviction.
         for n in 9..=20 {
             rt.set_dim('a', n);
-            rt.set_data(a.id, vec![n as f32; n * 2]);
-            rt.set_data(b.id, vec![1f32; n * 2]);
+            rt.set_data(a.id, vec![n as f32; n * 2]).unwrap();
+            rt.set_data(b.id, vec![1f32; n * 2]).unwrap();
             rt.execute().unwrap();
             assert_eq!(rt.get_f32(out.id).unwrap(), vec![n as f32 + 1.; n * 2]);
         }
-        assert_eq!(DROPPED.load(Ordering::SeqCst) & ((1 << 3) | (1 << 4)), 0);
-        rt.set_data(a.id, vec![4f32; 8]);
-        rt.set_data(b.id, vec![1f32; 8]);
+        // The source graphs still refer to their compile-time preparations
+        // for 3 and 4, so at least one preparation of each survives eviction.
+        for dim in [3, 4] {
+            assert!(
+                DROPPED[dim].load(Ordering::SeqCst) < PREPARED[dim].load(Ordering::SeqCst),
+                "every preparation for a={dim} was dropped while a source graph refers to one"
+            );
+        }
+        rt.set_data(a.id, vec![4f32; 8]).unwrap();
+        rt.set_data(b.id, vec![1f32; 8]).unwrap();
         rt.set_dim('a', 6);
         assert!(
             format!("{:#}", rt.execute().unwrap_err()).contains("injected preparation failure")
@@ -418,10 +436,13 @@ mod host_graphs {
             "default capture_dims covers newly supplied dimensions too"
         );
         drop(rt);
-        assert_eq!(
-            DROPPED.load(Ordering::SeqCst) & ((1 << 3) | (1 << 4)),
-            (1 << 3) | (1 << 4)
-        );
+        for dim in [3, 4] {
+            assert_eq!(
+                DROPPED[dim].load(Ordering::SeqCst),
+                PREPARED[dim].load(Ordering::SeqCst),
+                "every preparation for a={dim} is released with the runtime"
+            );
+        }
     }
 }
 
@@ -431,7 +452,7 @@ fn external_kernel_launch_geometry_updates_without_reinstantiation() {
     let mut graph = luminal::graph::Graph::new();
     let a = graph.tensor('a', DType::F32);
     let b = graph.tensor('a', DType::F32);
-    let out = (a + b).output();
+    let out = a + b;
     let mut registry = cuda_registry_without_cublaslt();
     registry.retain(|e| e.constructor() != AddFunctionalMatcher.egglog_constructor());
     registry.push(RegisteredOp::new(
@@ -447,8 +468,8 @@ fn external_kernel_launch_geometry_updates_without_reinstantiation() {
         .unwrap();
     for n in [0, 1025, 2, 0, 257] {
         rt.set_dim('a', n);
-        rt.set_data(a.id, vec![2f32; n]);
-        rt.set_data(b.id, vec![3f32; n]);
+        rt.set_data(a.id, vec![2f32; n]).unwrap();
+        rt.set_data(b.id, vec![3f32; n]).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; n]);
     }

@@ -29,9 +29,8 @@ use std::{
 
 type Outputs = FxHashMap<usize, (HostBuffer, OutputBinding<DecodedLayout>)>;
 /// A caller-owned device allocation bound to one plan buffer for the
-/// duration of one execution. This is the zero-copy half of the PyTorch
-/// integration: the kernel reads/writes the caller's tensor directly and no
-/// arena range is involved.
+/// duration of one execution: the kernel reads/writes the caller's storage
+/// directly and no arena range is involved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExternalPtr {
     pub ptr: u64,
@@ -123,6 +122,9 @@ pub struct GraphStats {
     pub host_captures: u64,
     pub host_cache_hits: u64,
     pub node_updates: u64,
+    /// Nodes rewritten or library calls re-recorded because an address moved
+    /// or because every execution re-records them.
+    pub address_rebinds: u64,
     pub kernel_compilations: u64,
     pub arena_generation: u64,
     pub arena_base: u64,
@@ -156,12 +158,12 @@ pub struct CudaDevice {
     staging: Option<Pinned>,
     slab: Option<CudaSlice<u8>>,
     /// CALLER-OWNED ARENA: when set, `install` reserves no slab and the
-    /// per-execution base is this address. The owner (PyTorch's caching
-    /// allocator) frees it; this device never does.
+    /// per-execution base is this address. The caller frees it; this device
+    /// never does.
     external_arena: Option<(u64, usize)>,
-    /// True when `stream` was borrowed from another library (PyTorch); the
-    /// device must not destroy it, and the outer owner is responsible for
-    /// ordering work submitted through it.
+    /// True when `stream` was borrowed from another library; the device must
+    /// not destroy it, and the outer owner is responsible for ordering work
+    /// submitted through it.
     stream_is_borrowed: bool,
     cache: HashMap<String, Module>,
     stream: Arc<CudaStream>,
@@ -188,13 +190,12 @@ impl CudaDevice {
             resident_initialized: BTreeSet::new(),
         })
     }
-    /// Run on a stream owned by another library (e.g.
-    /// `torch.cuda.current_stream().cuda_stream`). The wrapped stream is
+    /// Run on a stream owned by another library. The wrapped stream is
     /// non-owning, so dropping the device does not destroy it.
     pub fn use_borrowed_stream(&mut self, raw_stream: u64) -> Result<()> {
         let raw = raw_stream as usize as cu::CUstream;
-        // SAFETY: the caller (the Python backend) owns the stream and keeps it
-        // alive for as long as this device may run.
+        // SAFETY: the caller owns the stream and keeps it alive for as long
+        // as this device may run.
         let stream = unsafe { self.ctx.wrap_borrowed_stream(raw) };
         self.stream = stream;
         self.stream_is_borrowed = true;
@@ -208,8 +209,16 @@ impl CudaDevice {
     /// Bind a caller-allocated arena for subsequent installs/executions. The
     /// caller keeps ownership: `release_slab` and `Drop` will not free it.
     /// A new base invalidates the arena-resident bytes, so they are re-uploaded
-    /// on the next execution.
-    pub fn set_external_arena(&mut self, ptr: u64, bytes: usize) {
+    /// on the next execution. A block smaller than the installed plan set
+    /// needs is REFUSED here rather than written past its end.
+    pub fn set_external_arena(&mut self, ptr: u64, bytes: usize) -> Result<()> {
+        if !self.installed.is_empty() {
+            ensure!(
+                bytes >= self.stats.arena_bytes,
+                "external arena is {bytes} bytes, installed plan set needs {}",
+                self.stats.arena_bytes
+            );
+        }
         let changed = self.external_arena.map(|(p, _)| p) != Some(ptr);
         self.external_arena = Some((ptr, bytes));
         if !self.installed.is_empty() {
@@ -218,24 +227,22 @@ impl CudaDevice {
                 self.resident_initialized.clear();
             }
         }
+        Ok(())
     }
+    /// Revert to the device's own slab. The installed plans were based at the
+    /// caller's block, which it is free to release, so they are dropped: the
+    /// next execution installs again on the owned slab.
     pub fn clear_external_arena(&mut self) {
-        self.external_arena = None;
+        if self.external_arena.take().is_some() && !self.installed.is_empty() {
+            // Every public launch is synchronous, including error paths.
+            let _ = self.stream.synchronize();
+            self.installed.clear();
+            self.stats.arena_base = 0;
+            self.stats.arena_bytes = 0;
+        }
     }
     pub fn stream_is_borrowed(&self) -> bool {
         self.stream_is_borrowed
-    }
-    /// Output slot indices written straight into caller device memory.
-    pub fn external_output_slots(&self) -> Vec<usize> {
-        let mut slots: Vec<usize> = self
-            .installed
-            .iter()
-            .filter_map(|i| i.compiled.as_ref())
-            .flat_map(|c| c.external_outputs.iter().copied())
-            .collect();
-        slots.sort_unstable();
-        slots.dedup();
-        slots
     }
     pub fn stats(&self) -> GraphStats {
         self.stats
@@ -253,16 +260,15 @@ impl CudaDevice {
         plans: Vec<(CudaPlan, Bounds)>,
         bindings: crate::resident::ResidentBindings,
     ) -> Result<()> {
-        self.install_resident_with_budget(plans, bindings, None, false)
+        self.install_resident_with_budget(plans, bindings, None)
     }
     pub fn install_resident_with_budget(
         &mut self,
         plans: Vec<(CudaPlan, Bounds)>,
         bindings: crate::resident::ResidentBindings,
         budget: Option<usize>,
-        external_outputs: bool,
     ) -> Result<()> {
-        let allocation = crate::resident::allocate(plans, bindings, external_outputs)?;
+        let allocation = crate::resident::allocate(plans, bindings)?;
         let bytes = allocation.bytes;
         if let Some(budget) = budget {
             ensure!(
@@ -307,9 +313,9 @@ impl CudaDevice {
         }
         self.stats.staging_bytes = self.staging.as_ref().unwrap().bytes().len();
         if let Some((arena_ptr, arena_bytes)) = self.external_arena {
-            // TORCH-OWNED ARENA: reserve nothing. The Python layer sizes and
-            // frees this block (one per execution); we only check it is large
-            // enough for the plan set and record its base.
+            // CALLER-OWNED ARENA: reserve nothing. The caller sizes and frees
+            // this block (one per execution); we only check it is large enough
+            // for the plan set and record its base.
             ensure!(
                 arena_bytes >= bytes,
                 "external arena is {arena_bytes} bytes, plan set needs {bytes}"
@@ -398,26 +404,19 @@ impl CudaDevice {
         staged: &FxHashMap<i64, &HostBuffer>,
         dims: &DynMap,
     ) -> Result<Outputs> {
-        self.execute_external(
-            bucket,
-            staged,
-            dims,
-            &Default::default(),
-            &Default::default(),
-        )
+        self.execute_external(bucket, staged, dims, &Default::default())
     }
-    /// Execute with PyTorch-style zero-copy boundaries. `external_inputs` maps
-    /// a graph input's `BufferLit` id to the caller's device tensor;
-    /// `external_outputs` maps an output slot index to the caller's device
-    /// tensor. Bound buffers are addressed absolutely (no arena range) and
-    /// bound outputs are never copied to host.
+    /// Execute with zero-copy boundaries: `external_ptrs` maps a boundary
+    /// buffer's `BufferLit` id to the caller's device storage. Those buffers
+    /// are addressed absolutely (no arena range), never staged, and never
+    /// copied back to host — one pointer per buffer, so an output bound on an
+    /// input's buffer resolves to the same address the input reads.
     pub fn execute_external(
         &mut self,
         bucket: usize,
         staged: &FxHashMap<i64, &HostBuffer>,
         dims: &DynMap,
-        external_inputs: &FxHashMap<i64, ExternalPtr>,
-        external_outputs: &FxHashMap<usize, ExternalPtr>,
+        external_ptrs: &FxHashMap<i64, ExternalPtr>,
     ) -> Result<Outputs> {
         self.ctx.bind_to_thread()?;
         self.upload_residents(staged)?;
@@ -434,32 +433,23 @@ impl CudaDevice {
                 "dimension `{dim}`={value} is outside [{lo}, {hi}]"
             );
         }
-        // Resolve the caller's lit/slot keys to the plan's buffer ids.
+        // Resolve the caller's buffer ids to the plan's buffer ids.
         let mut external = ExternalBuffers::default();
         for (id, buffer) in &installed.plan.buffers {
             if let Some(lit) = buffer.lit
-                && let Some(ptr) = external_inputs.get(&lit)
+                && let Some(ptr) = external_ptrs.get(&lit)
             {
                 external.insert(id.clone(), *ptr);
             }
         }
-        for node in installed.plan.dag.node_weights() {
-            if let BufferNode::BufferOutput { slots } = node {
-                for slot in slots {
-                    if let Some(ptr) = external_outputs.get(&slot.index) {
-                        external.insert(slot.buffer.clone(), *ptr);
-                    }
-                }
-            }
-        }
-        // A changed arena base (per-execution allocator block) or a changed
-        // caller pointer invalidates every baked address, so rebuild rather
-        // than patch. Steady state — the caching allocator returns the same
-        // block — takes the `update` fast path.
-        let stale = installed
-            .compiled
-            .as_ref()
-            .is_none_or(|c| c.base != self.stats.arena_base || c.external != external);
+        // A changed arena base or a changed SET of caller buffers invalidates
+        // the compiled plan. Changed caller addresses are patched in place by
+        // `rebind_addresses`, which runs on every execution.
+        let stale = installed.compiled.as_ref().is_none_or(|c| {
+            c.base != self.stats.arena_base
+                || c.external.len() != external.len()
+                || !external.keys().all(|id| c.external.contains_key(id))
+        });
         if stale {
             installed.compiled = Some(CompiledPlan::compile(
                 &installed.plan,
@@ -479,14 +469,21 @@ impl CudaDevice {
         // Move the executable out while updating it. An error or unwind drops
         // any partially patched state before a later invocation can reuse it.
         let mut compiled = installed.compiled.take().unwrap();
-        compiled.update(
-            &installed.plan,
-            &installed.storage,
-            dims,
-            self.stats.arena_base,
-            &self.stream,
-            &mut self.stats,
-        )?;
+        compiled.update(dims, &mut self.stats)?;
+        // A plan compiled this execution already addresses these pointers.
+        // Every later execution re-addresses every node and re-records every
+        // library call: that cost is the library call's, and it is timed.
+        if !stale {
+            compiled.rebind_addresses(
+                &installed.plan,
+                &installed.storage,
+                dims,
+                self.stats.arena_base,
+                &external,
+                &self.stream,
+                &mut self.stats,
+            )?;
+        }
         let result = compiled.launch(
             staged,
             dims,
@@ -527,10 +524,37 @@ struct HostNode {
     variants: VecDeque<Rc<HostVariant>>,
     resource_slot: usize,
 }
+/// Where an action's address comes from, so it can be re-resolved when the
+/// arena base or a caller pointer moves.
+#[derive(Clone)]
+enum Addr {
+    /// A fixed address: pinned host staging.
+    Fixed(u64),
+    /// A plan buffer: an arena slice, or a caller pointer for an external.
+    Buffer(BufferId),
+    /// The parameter block in the arena.
+    Params,
+}
+fn resolve(
+    addr: &Addr,
+    plan: &CudaPlan,
+    storage: &ArenaPlan,
+    base: u64,
+    external: &FxHashMap<BufferId, ExternalPtr>,
+    dims: &DynMap,
+) -> Result<u64> {
+    Ok(match addr {
+        Addr::Fixed(ptr) => *ptr,
+        Addr::Buffer(id) => range(plan, storage, id, base, external, dims)?.ptr,
+        Addr::Params => base + storage.parameters.offset as u64,
+    })
+}
 enum Action {
     Copy {
         src: u64,
         dst: u64,
+        src_ref: Addr,
+        dst_ref: Addr,
         kind: CopyKind,
         size: Expr,
         other_size: Option<Expr>,
@@ -539,6 +563,7 @@ enum Action {
     Kernel {
         func: cu::CUfunction,
         args: Vec<u64>,
+        refs: Vec<Addr>,
         geometry: Option<KernelLaunch>,
         launch: Launch,
     },
@@ -627,17 +652,12 @@ struct CompiledPlan {
     params: ArenaSlice,
     schema: Vec<Symbol>,
     deps: BTreeMap<Symbol, Vec<usize>>,
-    all_dim_hosts: Vec<usize>,
     last_dims: DynMap,
-    /// Caller device pointers this plan was built against. A change means the
-    /// baked addresses are stale and the plan must be recompiled.
+    /// Caller device pointers the nodes currently address; rewritten in place
+    /// by `rebind_addresses`. A changed SET of buffers recompiles.
     external: ExternalBuffers,
-    /// The arena base this plan was built against (per-execution allocator
-    /// block); a change forces recompilation exactly like `external`.
+    /// The arena base the nodes currently address; a change recompiles.
     base: u64,
-    /// Output slots bound directly to caller device memory: no D2H, no host
-    /// bytes — the caller's tensor IS the result.
-    external_outputs: Vec<usize>,
 }
 fn size(layout: &DecodedLayout) -> Result<Expr> {
     Ok(symbolic::span(layout)?
@@ -693,6 +713,23 @@ fn resolve_slots(
         .collect()
 }
 impl HostNode {
+    fn key(&self, dims: &DynMap) -> Result<Vec<(Symbol, usize)>> {
+        if self.all_dims {
+            let mut values: Vec<_> = dims.iter().map(|(s, v)| (*s, *v)).collect();
+            values.sort_unstable();
+            Ok(values)
+        } else {
+            self.dims
+                .iter()
+                .map(|s| {
+                    dims.get(s)
+                        .copied()
+                        .map(|v| (*s, v))
+                        .ok_or_else(|| anyhow!("missing host dimension {s}"))
+                })
+                .collect()
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     fn select(
         &mut self,
@@ -704,21 +741,7 @@ impl HostNode {
         stream: &Arc<CudaStream>,
         stats: &mut GraphStats,
     ) -> Result<()> {
-        let key = if self.all_dims {
-            let mut values: Vec<_> = dims.iter().map(|(s, v)| (*s, *v)).collect();
-            values.sort_unstable();
-            values
-        } else {
-            self.dims
-                .iter()
-                .map(|s| {
-                    dims.get(s)
-                        .copied()
-                        .map(|v| (*s, v))
-                        .ok_or_else(|| anyhow!("missing host dimension {s}"))
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
+        let key = self.key(dims)?;
         if self.variants.front().is_some_and(|v| v.key == key) {
             return Ok(());
         }
@@ -728,6 +751,35 @@ impl HostNode {
             stats.host_cache_hits += 1;
             return Ok(());
         }
+        self.capture(key, plan, storage, dims, base, external, stream, stats)
+    }
+    /// Re-record the library call against the current addresses, cache aside.
+    #[allow(clippy::too_many_arguments)]
+    fn recapture(
+        &mut self,
+        plan: &CudaPlan,
+        storage: &ArenaPlan,
+        dims: &DynMap,
+        base: u64,
+        external: &ExternalBuffers,
+        stream: &Arc<CudaStream>,
+        stats: &mut GraphStats,
+    ) -> Result<()> {
+        let key = self.key(dims)?;
+        self.capture(key, plan, storage, dims, base, external, stream, stats)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn capture(
+        &mut self,
+        key: Vec<(Symbol, usize)>,
+        plan: &CudaPlan,
+        storage: &ArenaPlan,
+        dims: &DynMap,
+        base: u64,
+        external: &ExternalBuffers,
+        stream: &Arc<CudaStream>,
+        stats: &mut GraphStats,
+    ) -> Result<()> {
         let BufferNode::Compute {
             op,
             reads,
@@ -810,15 +862,15 @@ impl CompiledPlan {
             params,
             schema,
             deps: BTreeMap::new(),
-            all_dim_hosts: vec![],
             last_dims: dims.clone(),
             external: external.clone(),
             base,
-            external_outputs: vec![],
         };
         out.actions.push(Action::Copy {
             src: out.params.ptr(staging),
             dst: base + storage.parameters.offset as u64,
+            src_ref: Addr::Fixed(out.params.ptr(staging)),
+            dst_ref: Addr::Params,
             kind: CopyKind::HtoD,
             size: Expr::from(out.params.bytes),
             other_size: None,
@@ -830,7 +882,7 @@ impl CompiledPlan {
                     buffer: id,
                     staging: pinned,
                 } => {
-                    // ZERO-COPY INPUT: the caller's tensor already holds the
+                    // ZERO-COPY INPUT: the caller's storage already holds the
                     // bytes on the device, so there is no pinned H2D and no
                     // `Input` staging entry. `range` resolves the reads to the
                     // caller pointer.
@@ -842,6 +894,8 @@ impl CompiledPlan {
                     out.actions.push(Action::Copy {
                         src: pinned.ptr(staging),
                         dst: range(plan, storage, id, base, external, dims)?.ptr,
+                        src_ref: Addr::Fixed(pinned.ptr(staging)),
+                        dst_ref: Addr::Buffer(id.clone()),
                         kind: CopyKind::HtoD,
                         bytes: size.eval(dims)?,
                         size: size.clone(),
@@ -873,11 +927,10 @@ impl CompiledPlan {
                         continue;
                     }
                     // ZERO-COPY OUTPUT: the compute node wrote straight into
-                    // the caller's tensor (via `range`). There is no D2H and
-                    // no host `HostBuffer`; the Python layer returns the very
-                    // tensor it bound.
+                    // the caller's storage (via `range`). There is no D2H and
+                    // no host `HostBuffer`; the caller's own allocation IS the
+                    // result.
                     if external.contains_key(id) {
-                        out.external_outputs.extend(indices.iter().copied());
                         continue;
                     }
                     let buffer = &plan.buffers[id];
@@ -886,6 +939,8 @@ impl CompiledPlan {
                     out.actions.push(Action::Copy {
                         src: range.ptr,
                         dst: pinned.ptr(staging),
+                        src_ref: Addr::Buffer(id.clone()),
+                        dst_ref: Addr::Fixed(pinned.ptr(staging)),
                         kind: CopyKind::DtoH,
                         size: size.clone(),
                         other_size: None,
@@ -950,6 +1005,11 @@ impl CompiledPlan {
                                 .collect::<Result<Vec<_>>>()?;
                             args.push(range(plan, storage, &writes[0], base, external, dims)?.ptr);
                             args.push(base + storage.parameters.offset as u64);
+                            let refs: Vec<Addr> = reads[..reads.len() - writes.len()]
+                                .iter()
+                                .map(|id| Addr::Buffer(id.clone()))
+                                .chain([Addr::Buffer(writes[0].clone()), Addr::Params])
+                                .collect();
                             for generated in kernel.codegen(&codegen)? {
                                 let mut source = crate::kernels::dtype_includes(&{
                                     let mut dtypes = codegen.operand_dtypes.clone();
@@ -1017,6 +1077,7 @@ impl CompiledPlan {
                                 out.actions.push(Action::Kernel {
                                     func,
                                     args: args.clone(),
+                                    refs: refs.clone(),
                                     geometry: generated.launch,
                                     launch,
                                 });
@@ -1032,6 +1093,8 @@ impl CompiledPlan {
                         out.actions.push(Action::Copy {
                             src: from.ptr,
                             dst: to.ptr,
+                            src_ref: Addr::Buffer(src.clone()),
+                            dst_ref: Addr::Buffer(dst.clone()),
                             kind: CopyKind::DtoD,
                             size: size(&plan.buffers[src].layout)?,
                             other_size: Some(size(&plan.buffers[dst].layout)?),
@@ -1042,20 +1105,6 @@ impl CompiledPlan {
                 },
             }
         }
-        // Record external outputs from the plan as well as from any Download
-        // step, so this works whether or not the planner excluded them from the
-        // arena. Deduped because a Download step also records its slots.
-        for node in plan.dag.node_weights() {
-            if let BufferNode::BufferOutput { slots } = node {
-                for slot in slots {
-                    if external.contains_key(&slot.buffer) {
-                        out.external_outputs.push(slot.index);
-                    }
-                }
-            }
-        }
-        out.external_outputs.sort_unstable();
-        out.external_outputs.dedup();
         for (i, action) in out.actions.iter().enumerate() {
             let mut vars = BTreeSet::new();
             match action {
@@ -1067,13 +1116,7 @@ impl CompiledPlan {
                         symbolic::vars(&s.0, &mut vars);
                     }
                 }
-                Action::Host(h) => {
-                    if h.all_dims {
-                        out.all_dim_hosts.push(i);
-                    } else {
-                        vars.extend(h.dims.iter().copied());
-                    }
-                }
+                Action::Host(_) => {}
                 Action::Kernel {
                     geometry: Some(spec),
                     ..
@@ -1208,92 +1251,56 @@ impl CompiledPlan {
         }
         Ok(())
     }
-    fn update(
-        &mut self,
-        plan: &CudaPlan,
-        storage: &ArenaPlan,
-        dims: &DynMap,
-        base: u64,
-        stream: &Arc<CudaStream>,
-        stats: &mut GraphStats,
-    ) -> Result<()> {
+    /// Dimension changes only: copy lengths, kernel geometry, node enables
+    /// and the outputs' resolved layouts. Node parameters are written by
+    /// `rebind_addresses`, which runs after this on every execution.
+    fn update(&mut self, dims: &DynMap, stats: &mut GraphStats) -> Result<()> {
         if self.last_dims == *dims {
             return Ok(());
         }
-        let mut affected: BTreeSet<_> = self.all_dim_hosts.iter().copied().collect();
+        let mut affected: BTreeSet<usize> = BTreeSet::new();
         for (s, nodes) in &self.deps {
             if self.last_dims.get(s) != dims.get(s) {
                 affected.extend(nodes.iter().copied());
             }
         }
-        let mut rebuild = false;
         for &i in &affected {
             match &mut self.actions[i] {
                 Action::Copy {
-                    src,
-                    dst,
-                    kind,
                     size,
                     other_size,
                     bytes,
+                    ..
                 } => {
                     let next = size.eval(dims)?;
                     if let Some(other) = other_size {
                         ensure!(next == other.eval(dims)?, "dynamic copy length mismatch");
                     }
                     if *bytes != next {
-                        let exec = self.executable.as_ref().unwrap();
-                        if next != 0 {
-                            exec.copy(self.nodes[i], &copy_params(*src, *dst, next, *kind))?;
-                        }
-                        exec.enable(self.nodes[i], next != 0)?;
+                        self.executable
+                            .as_ref()
+                            .unwrap()
+                            .enable(self.nodes[i], next != 0)?;
                         *bytes = next;
                         stats.node_updates += 1;
                     }
                 }
-                Action::Host(host) => {
-                    host.select(plan, storage, dims, base, &self.external, stream, stats)?;
-                    if self
-                        .executable
-                        .as_ref()
-                        .unwrap()
-                        .child(self.nodes[i], &host.variants.front().unwrap().graph)
-                        .is_err()
-                    {
-                        rebuild = true;
-                    } else {
-                        self.live_resources[host.resource_slot] =
-                            host.variants.front().unwrap().clone();
-                    }
-                    stats.node_updates += 1;
-                }
                 Action::Kernel {
-                    func,
-                    args,
                     geometry: Some(spec),
                     launch,
+                    ..
                 } => {
                     let next = Launch::eval(spec, dims)?;
                     if *launch != next {
-                        let mut args = args.clone();
-                        let mut pointers: Vec<_> =
-                            args.iter_mut().map(|p| (p as *mut u64).cast()).collect();
-                        let exec = self.executable.as_ref().unwrap();
-                        exec.kernel(self.nodes[i], &next.params(*func, &mut pointers))?;
-                        exec.enable(self.nodes[i], next.enabled())?;
+                        self.executable
+                            .as_ref()
+                            .unwrap()
+                            .enable(self.nodes[i], next.enabled())?;
                         *launch = next;
                         stats.node_updates += 1;
                     }
                 }
-                Action::Kernel { .. } => {}
-            }
-        }
-        if rebuild {
-            self.rebuild(stream.context(), stats)?;
-        }
-        for &i in &affected {
-            if let Action::Host(host) = &mut self.actions[i] {
-                host.variants.truncate(HOST_VARIANTS);
+                Action::Kernel { .. } | Action::Host(_) => {}
             }
         }
         for out in &mut self.outputs {
@@ -1301,6 +1308,100 @@ impl CompiledPlan {
             out.resolved.layout = symbolic::resolve_layout(&out.slot.layout, dims)?;
         }
         self.last_dims = dims.clone();
+        Ok(())
+    }
+    /// Re-resolve every address against the current arena base and caller
+    /// pointers, rewrite the kernel and copy nodes in place, and re-record
+    /// every library call. Runs on every execution after the first; a
+    /// refused in-place edit rebuilds instead.
+    #[allow(clippy::too_many_arguments)]
+    fn rebind_addresses(
+        &mut self,
+        plan: &CudaPlan,
+        storage: &ArenaPlan,
+        dims: &DynMap,
+        base: u64,
+        external: &ExternalBuffers,
+        stream: &Arc<CudaStream>,
+        stats: &mut GraphStats,
+    ) -> Result<()> {
+        let mut rebuild = false;
+        for i in 0..self.actions.len() {
+            let node = self.nodes[i];
+            match &mut self.actions[i] {
+                Action::Copy {
+                    src,
+                    dst,
+                    src_ref,
+                    dst_ref,
+                    kind,
+                    bytes,
+                    ..
+                } => {
+                    *src = resolve(src_ref, plan, storage, base, external, dims)?;
+                    *dst = resolve(dst_ref, plan, storage, base, external, dims)?;
+                    if *bytes != 0
+                        && self
+                            .executable
+                            .as_ref()
+                            .unwrap()
+                            .copy(node, &copy_params(*src, *dst, *bytes, *kind))
+                            .is_err()
+                    {
+                        rebuild = true;
+                    }
+                }
+                Action::Kernel {
+                    func,
+                    args,
+                    refs,
+                    launch,
+                    ..
+                } => {
+                    for (arg, addr) in args.iter_mut().zip(refs.iter()) {
+                        *arg = resolve(addr, plan, storage, base, external, dims)?;
+                    }
+                    let mut args = args.clone();
+                    let mut pointers: Vec<_> =
+                        args.iter_mut().map(|p| (p as *mut u64).cast()).collect();
+                    if self
+                        .executable
+                        .as_ref()
+                        .unwrap()
+                        .kernel(node, &launch.params(*func, &mut pointers))
+                        .is_err()
+                    {
+                        rebuild = true;
+                    }
+                }
+                Action::Host(host) => {
+                    host.recapture(plan, storage, dims, base, external, stream, stats)?;
+                    let variant = host.variants.front().unwrap().clone();
+                    if self
+                        .executable
+                        .as_ref()
+                        .unwrap()
+                        .child(node, &variant.graph)
+                        .is_err()
+                    {
+                        rebuild = true;
+                    } else {
+                        self.live_resources[host.resource_slot] = variant;
+                    }
+                }
+            }
+            stats.address_rebinds += 1;
+        }
+        if rebuild {
+            self.rebuild(stream.context(), stats)?;
+        }
+        for action in &mut self.actions {
+            if let Action::Host(host) = action {
+                host.variants.truncate(HOST_VARIANTS);
+            }
+        }
+        self.base = base;
+        self.external = external.clone();
         Ok(())
     }
     fn launch(
