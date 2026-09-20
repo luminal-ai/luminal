@@ -9,9 +9,13 @@
 //! id per boundary tensor, the layout the caller declared for it, and
 //! `Placement::External` — the storage is the caller's own live device
 //! allocation, never host-staged and never given an arena range. Aliasing has
-//! one spelling: a writeback binds on the buffer of the input it mutates. A
-//! user-visible output is bound at eager's exact strides, so the tensor the
-//! caller receives is laid out the way the uncompiled program lays it out.
+//! one spelling, the same buffer id: a writeback binds on the buffer of the
+//! input it mutates, and an output that shares storage with an earlier
+//! boundary tensor (a view of an input, of a writeback, or of another
+//! output — read off the export's traced storage) binds on that tensor's
+//! buffer at its own layout. A user-visible output is bound at eager's exact
+//! strides, so the tensor the caller receives is laid out the way the
+//! uncompiled program lays it out.
 //! Python addresses buffers, not tensors: `set_device_ptr(buffer, ptr, bytes)`
 //! before each execution.
 //!
@@ -205,20 +209,22 @@ impl CompiledGraph {
 
     /// The buffer id the installed plan writes this output's bytes into.
     fn output_backing_buffer(&self, name: &str) -> PyResult<i64> {
-        let tensor = self.output_tensor(name)?;
-        self.runtime.output_backing_buffer(tensor).map_err(to_py)
+        let slot = self.output_position(name)?;
+        self.runtime.output_slot_backing_buffer(slot).map_err(to_py)
     }
 
     /// The bytes that backing buffer spans at the dims bound now.
     fn output_span_bytes(&self, name: &str) -> PyResult<usize> {
-        let tensor = self.output_tensor(name)?;
-        self.runtime.output_span_bytes(tensor).map_err(to_py)
+        let slot = self.output_position(name)?;
+        self.runtime.output_slot_span_bytes(slot).map_err(to_py)
     }
 
     /// The element strides the installed plan elected for this output.
     fn output_elected_strides(&self, name: &str) -> PyResult<Vec<i64>> {
-        let tensor = self.output_tensor(name)?;
-        self.runtime.output_elected_strides(tensor).map_err(to_py)
+        let slot = self.output_position(name)?;
+        self.runtime
+            .output_slot_elected_strides(slot)
+            .map_err(to_py)
     }
 
     /// Record the concrete shapes of one call's inputs by graph name.
@@ -379,13 +385,15 @@ impl CompiledGraph {
 
 impl CompiledGraph {
     /// The graph value one output name names.
-    fn output_tensor(&self, name: &str) -> PyResult<NodeIndex> {
+    /// A translation output's position, which is its slot in the bound
+    /// program: outputs are bound in translation order, one slot each, so a
+    /// value returned under two names has two slots and each name finds its own.
+    fn output_position(&self, name: &str) -> PyResult<usize> {
         self.translation
             .outputs
             .iter()
-            .find(|output| output.graph_name == name)
-            .map(|output| output.tensor)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("unknown output {name:?}")))
+            .position(|output| output.graph_name == name)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("{name:?} is not a graph output")))
     }
 
     /// Saturate and search. What this states is what Python reads: the
@@ -608,6 +616,7 @@ fn bind(
     translation: &Translation,
     input_layouts: &HashMap<String, DeclaredLayout>,
     output_layouts: &HashMap<String, DeclaredLayout>,
+    aliases: &HashMap<String, String>,
 ) -> Result<Boundary> {
     for name in input_layouts.keys() {
         ensure!(
@@ -673,16 +682,51 @@ fn bind(
                 (buffer, layout)
             }
             None => {
-                // A user-visible output is the caller's own fresh device
-                // allocation, laid out the way eager lays it out.
                 let layout = output_layouts.get(&output.graph_name).ok_or_else(|| {
                     anyhow!(
                         "output {:?} has no declared boundary layout",
                         output.graph_name
                     )
                 })?;
-                let buffer = bindings.output_external_with(output.tensor, layout.layout.clone());
-                (buffer, layout.clone())
+                match aliases.get(&output.graph_name) {
+                    // A user-visible output that shares its storage with an
+                    // earlier boundary tensor — a view of an input, of a
+                    // writeback, or of another output — is bound on THAT
+                    // tensor's buffer at its own layout. Aliasing has one
+                    // spelling, the same buffer id; the caller receives a
+                    // view of the tensor it already holds.
+                    Some(owner) => {
+                        let buffer = if let Some(index) = translation
+                            .inputs
+                            .iter()
+                            .position(|input| &input.graph_name == owner)
+                        {
+                            input_buffers[index]
+                        } else if let Some(index) = translation
+                            .outputs
+                            .iter()
+                            .position(|earlier| &earlier.graph_name == owner)
+                            && index < output_buffers.len()
+                        {
+                            output_buffers[index]
+                        } else {
+                            bail!(
+                                "output {:?} is declared a view of {owner:?}, which is neither \
+                                 a graph input nor an earlier graph output",
+                                output.graph_name
+                            )
+                        };
+                        bindings.output_on_with(output.tensor, buffer, layout.layout.clone());
+                        (buffer, layout.clone())
+                    }
+                    // Otherwise the caller's own fresh device allocation,
+                    // laid out the way eager lays it out.
+                    None => {
+                        let buffer =
+                            bindings.output_external_with(output.tensor, layout.layout.clone());
+                        (buffer, layout.clone())
+                    }
+                }
             }
         };
         output_buffers.push(buffer);
@@ -702,11 +746,14 @@ fn bind(
 /// `row_major`, `column_major` or `strided`, and each stride a sympy `srepr`
 /// expression over the exported program's symbols. A writeback takes no row —
 /// it writes the storage of the input it mutates, at that input's layout.
+/// `output_aliases` names each output that shares its storage with an earlier
+/// boundary tensor (`(output, owner)`); it is bound on the owner's buffer.
 #[pyfunction]
 fn compile(
     pt2_path: &str,
     input_layouts: Vec<(String, String, Vec<String>)>,
     output_layouts: Vec<(String, String, Vec<String>)>,
+    output_aliases: Vec<(String, String)>,
 ) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
@@ -715,7 +762,8 @@ fn compile(
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let inputs = layout_table(&translation, "input", &input_layouts).map_err(to_py)?;
     let outputs = layout_table(&translation, "output", &output_layouts).map_err(to_py)?;
-    let boundary = bind(&translation, &inputs, &outputs)
+    let aliases: HashMap<String, String> = output_aliases.into_iter().collect();
+    let boundary = bind(&translation, &inputs, &outputs, &aliases)
         .context("declaring the translated program's boundary")
         .map_err(to_py)?;
     let runtime = CudaRuntime::load_with(
@@ -897,7 +945,8 @@ mod tests {
         layouts: &HashMap<String, DeclaredLayout>,
     ) -> CompiledGraph {
         let outputs = row_major_outputs(&translation);
-        let boundary = bind(&translation, layouts, &outputs).expect("the synthetic boundary binds");
+        let boundary = bind(&translation, layouts, &outputs, &HashMap::new())
+            .expect("the synthetic boundary binds");
         let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
         let runtime = CudaRuntime::load_with(
             &translation.graph,

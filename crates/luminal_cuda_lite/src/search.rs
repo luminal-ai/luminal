@@ -308,6 +308,60 @@ enum Priced {
     ExecuteFailed(String),
 }
 
+/// PLACEMENT FEASIBILITY of one genome's plan. An output bound External
+/// sits on the caller's own buffer: a plan that elects that slot as a view
+/// of ANOTHER caller buffer, or lets two External slots bound on different
+/// buffers share one escape cell, cannot be installed on this boundary —
+/// the caller allocated distinct storage. That is a refusal of THIS genome,
+/// and the search tries others (a materializing candidate, where the
+/// e-graph offers one). The runtime's retarget keeps the same rule as its
+/// final tripwire.
+fn external_placement_feasible(
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+    outputs: &[crate::bindings::Bound],
+) -> Result<(), String> {
+    let mut cell_owner: FxHashMap<luminal::bufferize::BufferId, i64> = FxHashMap::default();
+    for node in plan.dag.node_weights() {
+        let luminal::bufferize::BufferNode::BufferOutput { slots } = node else {
+            continue;
+        };
+        for slot in slots {
+            let Some(bound) = outputs.get(slot.index) else {
+                continue;
+            };
+            if bound.placement != crate::bindings::Placement::External {
+                continue;
+            }
+            let Some(cell) = plan.buffers.get(&slot.buffer) else {
+                continue;
+            };
+            match cell.lit {
+                Some(lit) if lit == bound.buffer => {}
+                Some(other) => {
+                    return Err(format!(
+                        "output v{} is bound External on buffer {} but this plan elects it \
+                         as a view of caller buffer {other}",
+                        bound.value.index(),
+                        bound.buffer
+                    ));
+                }
+                None => {
+                    if let Some(first) = cell_owner.insert(slot.buffer.clone(), bound.buffer)
+                        && first != bound.buffer
+                    {
+                        return Err(format!(
+                            "outputs bound External on buffers {first} and {} share one \
+                             escape cell {:?}",
+                            bound.buffer, slot.buffer
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// THE SELECTION LOOP for this backend: the caller supplies its OWN
 /// matcher vocabulary and its OWN allow list — both are properties of
 /// the runtime INSTANCE, chosen when it was loaded (see
@@ -530,6 +584,13 @@ pub fn search_implementations(
                             continue;
                         }
                     };
+                    if let Err(why) = external_placement_feasible(&plan, &program.outputs) {
+                        breakdown.plan_build_refusals += 1;
+                        if refusals.len() < 8 {
+                            refusals.push(format!("placement: {why}"));
+                        }
+                        continue;
+                    }
                     // The heuristic cost of this graph is ALWAYS computed
                     // — it is what the outcome reports beside a measured
                     // winner — but under device profiling it is never
@@ -678,6 +739,9 @@ pub fn search_implementations(
                         continue;
                     }
                 };
+                if external_placement_feasible(&plan, &program.outputs).is_err() {
+                    continue;
+                }
                 rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
                 best = Some(Best {
                     nanos,

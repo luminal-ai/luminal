@@ -1326,6 +1326,33 @@ impl CudaRuntime {
         })
     }
 
+    /// [`Self::output_backing_buffer`] by slot index: the answer for a value
+    /// bound as an output on two buffers, which has two slots.
+    pub fn output_slot_backing_buffer(&self, slot: usize) -> Result<i64> {
+        let (plan, binding) = self.installed_output_slot_at(slot)?;
+        plan.buffers[&binding.buffer].lit.ok_or_else(|| {
+            anyhow!("output slot {slot}'s backing buffer is a program allocation with no buffer id")
+        })
+    }
+
+    /// [`Self::output_span_bytes`] by slot index.
+    pub fn output_slot_span_bytes(&self, slot: usize) -> Result<usize> {
+        let (plan, binding) = self.installed_output_slot_at(slot)?;
+        crate::symbolic::bytes(&plan.buffers[&binding.buffer].layout, &self.dims)
+    }
+
+    /// [`Self::output_elected_strides`] by slot index.
+    pub fn output_slot_elected_strides(&self, slot: usize) -> Result<Vec<i64>> {
+        let (_, binding) = self.installed_output_slot_at(slot)?;
+        let layout = crate::symbolic::resolve_layout(&binding.layout, &self.dims)?;
+        elected_strides(&layout).ok_or_else(|| {
+            anyhow!(
+                "output slot {slot}'s elected layout {:?} has no strides",
+                layout.present()
+            )
+        })
+    }
+
     /// A bound output's slot in the plan `execute` would run.
     fn installed_output_slot(
         &self,
@@ -1334,7 +1361,17 @@ impl CudaRuntime {
         &crate::layouts::CudaPlan,
         &luminal::bufferize::OutputBinding<DecodedLayout>,
     )> {
-        let index = self.output_slot_index(tensor)?;
+        self.installed_output_slot_at(self.output_slot_index(tensor)?)
+    }
+
+    /// Output slot `index` (binding order) in the plan `execute` would run.
+    fn installed_output_slot_at(
+        &self,
+        index: usize,
+    ) -> Result<(
+        &crate::layouts::CudaPlan,
+        &luminal::bufferize::OutputBinding<DecodedLayout>,
+    )> {
         let plan = self
             .selected_bucket
             .and_then(|i| self.bucket_plans.get(i))

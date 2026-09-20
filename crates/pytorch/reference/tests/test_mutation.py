@@ -40,14 +40,23 @@ class CopyFrom(nn.Module):
         return x
 
 
+class ViewMutation(nn.Module):
+    """A write through a view of the input: functionalisation spells it as a
+    scatter into the input, and the caller's tensor must show it."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x[0].add_(1.0)
+        x[:, 1].mul_(2.0)
+        return x
+
+
 class BufferAdd(nn.Module):
     """A module buffer mutated in place.
 
     Under ``torch.compile``, Dynamo lifts ``self.cache`` into a placeholder and
-    the training IR keeps ``aten.add_``, so this reaches the translator's
-    in-place sink path. Exporting directly and decomposing gives the
-    functionalized form whose spec is ``buffer_mutation``; both are covered
-    below.
+    the functionalised export tags the write ``user_input_mutation`` on it.
+    Exporting the module directly gives the form whose spec is
+    ``buffer_mutation``; both are covered below.
     """
 
     def __init__(self) -> None:
@@ -101,6 +110,12 @@ def test_in_place_then_mul_returns_fresh_value() -> None:
 
 def test_in_place_relu() -> None:
     _run(InPlaceRelu, (torch.randn(3, 4),))
+
+
+def test_mutation_through_a_view_reaches_the_caller() -> None:
+    x = torch.randn(3, 4)
+    out, compiled_inputs, _ = _run(ViewMutation, (x,))
+    assert out.data_ptr() == compiled_inputs[0].data_ptr()
 
 
 def test_copy_from() -> None:

@@ -93,7 +93,7 @@ _PT2_TO_TORCH = {
 # (a buffer mutation, a gradient, a token) would reach the translator as an
 # ordinary returned tensor, because the PT2 signature reader models only
 # ``user_input_mutation``.
-_BOUND_OUTPUT_KINDS = frozenset({"USER_OUTPUT", "USER_INPUT_MUTATION"})
+_BOUND_OUTPUT_KINDS = frozenset({"USER_OUTPUT", "USER_INPUT_MUTATION", "BUFFER_MUTATION"})
 
 
 def _torch_dtype(dtype_code: int) -> torch.dtype:
@@ -206,7 +206,7 @@ def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
     writebacks = {
         spec.arg.name
         for spec in ep.graph_signature.output_specs
-        if spec.kind.name == "USER_INPUT_MUTATION"
+        if spec.kind.name in ("USER_INPUT_MUTATION", "BUFFER_MUTATION")
     }
     rows: list[tuple[str, str, list[str]]] = []
     stated: set[str] = set()
@@ -227,6 +227,41 @@ def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
         stated.add(name)
         tag, strides = layout_spec(boundary_layout(name, fake))
         rows.append((name, tag, list(strides)))
+    return rows
+
+
+def _output_alias_rows(ep: Any) -> list[tuple[str, str, int]]:
+    """One ``(output, owner)`` row per user output whose traced example value
+    shares its STORAGE with an earlier boundary tensor: a graph input, a
+    writeback, or an earlier output. Eager hands the caller a view of that
+    tensor, so the runtime binds the output on the owner's buffer and the
+    call returns a view. This is read off the fake tensors torch traced —
+    which storage each value lives in — and states it; nothing is derived
+    from op names."""
+    fakes = _node_fakes(ep)
+    names: list[str] = []
+    for spec in list(ep.graph_signature.input_specs) + list(ep.graph_signature.output_specs):
+        name = getattr(spec.arg, "name", None)
+        if name is not None and name not in names:
+            names.append(name)
+    owner_by_storage: dict[int, str] = {}
+    outputs = {
+        getattr(spec.arg, "name", None)
+        for spec in ep.graph_signature.output_specs
+        if spec.kind.name == "USER_OUTPUT"
+    }
+    # Rows carry the view's element offset RELATIVE to its owner, so the
+    # returned view addresses the owner's storage where eager's does.
+    rows: list[tuple[str, str, int]] = []
+    for name in names:
+        fake = fakes.get(name)
+        if not isinstance(fake, torch.Tensor):
+            continue
+        storage = fake.untyped_storage()._cdata
+        owner = owner_by_storage.setdefault(storage, name)
+        if owner != name and name in outputs:
+            offset = int(fake.storage_offset()) - int(fakes[owner].storage_offset())
+            rows.append((name, owner, offset))
     return rows
 
 
@@ -314,8 +349,13 @@ class CompiledModel:
         scalar_output_positions: Sequence[int] = (),
         held_tensors: Optional[dict[str, torch.Tensor]] = None,
         held_bindings: Sequence[Binding] = (),
+        output_aliases: Optional[dict[str, tuple[str, int]]] = None,
     ):
         self._graph = graph
+        # Output name -> (the boundary tensor whose storage it is a view of,
+        # the view's element offset relative to that tensor).
+        self._output_aliases: dict[str, tuple[str, int]] = dict(output_aliases or {})
+        self._output_names = list(graph.output_names)
         self._ep = ep
         self._input_bindings = list(input_bindings)
         self._input_names = [binding.name for binding in self._input_bindings]
@@ -342,6 +382,31 @@ class CompiledModel:
         # need no per-call check.
         self._writebacks = frozenset(
             mutation for mutation in self._output_mutations if mutation is not None
+        )
+
+    def _boundary_tensor(
+        self,
+        name: str,
+        inputs: Sequence[torch.Tensor],
+        out_tensors: Sequence[Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        """The live tensor a boundary name stands for on this call: a user
+        input, a held parameter/buffer, a writeback's destination, or an
+        output allocated this call."""
+        if name in self._input_names:
+            return inputs[self._input_names.index(name)]
+        if name in self._held:
+            return self._held[name]
+        if name in self._output_names:
+            index = self._output_names.index(name)
+            mutation = self._output_mutations[index]
+            if mutation is not None:
+                return self._mutation_destination(mutation, inputs)
+            tensor = out_tensors[index]
+            if tensor is not None:
+                return tensor
+        raise RuntimeError(
+            f"luminal_cuda_lite: {name!r} is not a boundary tensor this call holds"
         )
 
     def _mutation_destination(
@@ -456,6 +521,12 @@ class CompiledModel:
                         "returns outputs in eager's layout and the plan elected a "
                         "different one (LUM-829 covers making this a toggle)."
                     )
+                # A view of another boundary tensor has that tensor's storage:
+                # nothing to allocate or address, the owner's binding does it.
+                if name in self._output_aliases:
+                    out_tensors.append(None)
+                    out_spans.append(None)
+                    continue
                 # The span the plan writes through this buffer, at this call's
                 # dimensions: the allocation is sized to it, never to the
                 # tensor alone.
@@ -531,10 +602,23 @@ class CompiledModel:
                     results.append(self._mutation_destination(mutation, inputs))
                 continue
             if returned:
+                # Scalar positions index the RETURNED tree, which is what
+                # Dynamo hands back; rows that are not returned (writebacks)
+                # sit before it and do not count.
+                position = len(results)
                 tensor = out_tensors[index]
+                binding = self._output_bindings[index]
+                if binding.name in self._output_aliases:
+                    # Eager returns a view of a tensor the caller already
+                    # holds; so does this call, at the strides eager gives it.
+                    owner_name, offset = self._output_aliases[binding.name]
+                    owner = self._boundary_tensor(owner_name, inputs, out_tensors)
+                    shape = tuple(output_shapes[index])
+                    strides = tuple(declared_strides(binding, shape, dims))
+                    tensor = owner.as_strided(shape, strides, owner.storage_offset() + offset)
                 # Scalar graph outputs were boxed into rank-zero tensors before
                 # export; restore the Python scalar backend contract here.
-                if index in self._scalar_output_positions:
+                if position in self._scalar_output_positions:
                     results.append(tensor.item())
                 else:
                     results.append(tensor)
@@ -675,6 +759,26 @@ def luminal_cuda_lite(
     # data-dependent .item() calls and unresolved `L[...]` references.
     _drop_input_guards(ep)
     _drop_dead_data_dependent_ops(ep.graph_module)
+    # Functionalise WITHOUT decomposing: every in-place op becomes its
+    # functional form plus a USER_INPUT_MUTATION spec naming the input storage
+    # it writes, and a mutation through a view becomes an explicit scatter
+    # (select_scatter / slice_scatter). The empty table decomposes nothing, so
+    # composites the translator lowers directly (aten.linear) survive. The
+    # translator reads mutations from the specs and refuses in-place ops.
+    try:
+        ep = ep.run_decompositions({})
+    except AssertionError as exc:
+        # torch's export functionalisation cannot express a write to an
+        # input that shares storage with another input (its alias wrapper
+        # returns a callable where export needs a graph); the program is
+        # refused by name, not translated.
+        if "expected compiled_fn to be GraphModule" not in str(exc):
+            raise
+        raise UnsupportedBoundary(
+            "graph inputs share device storage and the program writes one of them: "
+            "the export cannot functionalise a write through aliased inputs"
+        ) from exc
+    _drop_dead_data_dependent_ops(ep.graph_module)
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
 
@@ -694,15 +798,20 @@ def luminal_cuda_lite(
         # caller receives has the strides the uncompiled program hands back,
         # never a contiguous substitute.
         declared_outputs = _output_layout_rows(program)
+        # An output that is a view of another boundary tensor is bound on
+        # that tensor's buffer; the caller receives a view of what it holds.
+        aliases = _output_alias_rows(program)
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
-            graph = _luminal.compile(pt2_path, declared, declared_outputs)
+            graph = _luminal.compile(
+                pt2_path, declared, declared_outputs, [(name, owner) for name, owner, _ in aliases]
+            )
         tensors = {name: value for name, _, value, _ in rows}
-        return graph, tensors, layouts, shapes
+        return graph, tensors, layouts, shapes, {name: (owner, offset) for name, owner, offset in aliases}
 
     try:
-        graph, tensors, layouts, shapes = _save_and_compile(ep)
+        graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
     except RuntimeError as exc:
         # The translator lowers a fixed op set. Decomposing the exported graph
         # rewrites higher-level composites into primitives the translator
@@ -713,8 +822,9 @@ def luminal_cuda_lite(
         if "unsupported ATen op" not in str(exc):
             raise
         ep = ep.run_decompositions(_decomp_table())
+        _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
-        graph, tensors, layouts, shapes = _save_and_compile(ep)
+        graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
 
     # Every boundary row, not just the user inputs: a parameter tied to
     # another parameter is read-only aliasing and stays two buffers on one
@@ -789,6 +899,7 @@ def luminal_cuda_lite(
         scalar_output_positions,
         held,
         held_bindings,
+        aliases,
     )
 
 

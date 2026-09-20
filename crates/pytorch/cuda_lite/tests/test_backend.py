@@ -122,12 +122,13 @@ def test_writeback_after_read():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_returned_clone_of_a_mutated_value_is_the_writeback():
-    """The translator lowers a clone to its operand, so the returned value
-    IS the mutated one: one output — the writeback — marked returned, and
-    the call hands back the caller's own tensor rather than binding a
-    second output for the same value. Which outputs a program has is read
-    off the translation, so the export's two output specs state one."""
+def test_returned_clone_of_a_mutated_value_is_fresh_storage():
+    """Eager's contract: `clone` is fresh storage holding the mutated
+    value, and the input is mutated in place. The export names two output
+    nodes — the writeback and the clone — and each is its own boundary
+    row: the writeback on the input's buffer, the clone on a buffer of its
+    own. A clone's only content is that storage identity, so it is never
+    merged into the row of the value it copies."""
 
     def fn(x):
         x.add_(1)
@@ -139,7 +140,9 @@ def test_returned_clone_of_a_mutated_value_is_the_writeback():
     got = torch.compile(fn, backend=luminal_cuda_lite)(x)
     torch.testing.assert_close(got, expected)
     torch.testing.assert_close(x, expected)
-    assert got.data_ptr() == x.data_ptr()
+    assert got.data_ptr() != x.data_ptr()
+    got.add_(1)
+    torch.testing.assert_close(x, expected, msg="the clone is not the input's storage")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")

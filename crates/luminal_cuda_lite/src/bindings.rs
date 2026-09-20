@@ -408,8 +408,8 @@ impl CudaBindings {
     /// Render the bound program: the model's cone over the bound values,
     /// then the boundary. Refuses, by name, an input binding on a
     /// non-input value, a binding on an undeclared buffer, a reachable
-    /// input left unbound, a value bound twice on one buffer, an empty
-    /// output set, a strided binding whose stride count is not the
+    /// input left unbound, an input value bound twice on one buffer, an
+    /// empty output set, a strided binding whose stride count is not the
     /// value's rank or whose literal strides include a negative one,
     /// and two bindings on one buffer that disagree about placement.
     pub fn bind(&self, graph: &LogicalGraph) -> Result<BoundProgram, String> {
@@ -459,11 +459,15 @@ impl CudaBindings {
                 }
             }
         }
+        // An input value is bound once per buffer. An output may repeat an
+        // input's binding — the value passes through, the caller receives
+        // the storage it handed in — or another output's: two returned
+        // names for one value on one buffer are two slots on one content.
         let mut seen = std::collections::HashSet::new();
-        for bound in self.inputs.iter().chain(&self.outputs) {
+        for bound in &self.inputs {
             if !seen.insert((bound.value, bound.buffer)) {
                 return Err(format!(
-                    "v{} is bound twice on buffer {}",
+                    "v{} is bound twice as an input on buffer {}",
                     bound.value.index(),
                     bound.buffer
                 ));

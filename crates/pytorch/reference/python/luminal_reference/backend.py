@@ -270,6 +270,26 @@ def luminal_reference(
     # data-dependent .item() calls and unresolved `L[...]` references.
     _drop_input_guards(ep)
     _drop_dead_data_dependent_ops(ep.graph_module)
+    # Functionalise WITHOUT decomposing: every in-place op becomes its
+    # functional form plus a USER_INPUT_MUTATION spec naming the input storage
+    # it writes, and a mutation through a view becomes an explicit scatter
+    # (select_scatter / slice_scatter). The empty table decomposes nothing, so
+    # composites the translator lowers directly (aten.linear) survive. The
+    # translator reads mutations from the specs and refuses in-place ops.
+    try:
+        ep = ep.run_decompositions({})
+    except AssertionError as exc:
+        # torch's export functionalisation cannot express a write to an
+        # input that shares storage with another input (its alias wrapper
+        # returns a callable where export needs a graph); the program is
+        # refused by name, not translated.
+        if "expected compiled_fn to be GraphModule" not in str(exc):
+            raise
+        raise RuntimeError(
+            "graph inputs share device storage and the program writes one of them: "
+            "the export cannot functionalise a write through aliased inputs"
+        ) from exc
+    _drop_dead_data_dependent_ops(ep.graph_module)
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
 
@@ -291,6 +311,7 @@ def luminal_reference(
         if "unsupported ATen op" not in str(exc):
             raise
         ep = ep.run_decompositions(_decomp_table())
+        _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
         graph = _save_and_compile(ep)
 

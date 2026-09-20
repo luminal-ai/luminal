@@ -895,110 +895,124 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                     // runtimes never allocate it. Dense-resident outputs
                     // keep today's transport byte-for-byte below.
                     if let Some(root) = view_root.get(&slot.value).cloned() {
-                        let backing = match &src_buffer {
-                            // Program-minted residence ESCAPES IN PLACE:
-                            // flip to FreedBy::Caller (the escape cell) —
-                            // optimize mints its alloc and NO free, and the
-                            // caller takes the storage over. Zero-copy;
-                            // views sharing one base share the flip.
-                            BufferId::Allocated(_) => {
-                                let record = buffers.get_mut(&src_buffer).unwrap_or_else(|| {
-                                    unreachable!("assignment interned every minted buffer")
-                                });
-                                record.freed_by = crate::layout_ir::FreedBy::Caller;
-                                src_buffer.clone()
-                            }
-                            BufferId::Boundary(_) => {
-                                // A missing record would make the donation
-                                // status of the residence unknowable — that
-                                // must never fail open into a zero-copy
-                                // escape of storage that may die with the
-                                // call.
-                                let freed_by = buffers
-                                    .get(&src_buffer)
-                                    .unwrap_or_else(|| {
-                                        unreachable!("assignment interned every boundary buffer")
-                                    })
-                                    .freed_by;
-                                match freed_by {
-                                    // Caller-owned residence (an input
-                                    // buffer, or the slot's own seeded
-                                    // destination): the storage is already
-                                    // the caller's — return it zero-copy
-                                    // (liveness keeps output values live to
-                                    // END_OF_PROGRAM).
-                                    crate::layout_ir::FreedBy::Caller => src_buffer.clone(),
-                                    // DONATED residence is the one forced
-                                    // repair: the storage dies with the
-                                    // call, so the fold's BASE is copied
-                                    // whole — the ROOT value; copying the
-                                    // base buffer counts as delivery — into
-                                    // a fresh ESCAPING buffer the fold
-                                    // re-roots onto at lowering. ONE copy
-                                    // and one escaping buffer serve every
-                                    // view of this base. The donated buffer
-                                    // backs no slot, satisfying the
-                                    // donated-never-backs-an-output
-                                    // certificate arm by construction.
-                                    crate::layout_ir::FreedBy::Program => {
-                                        if let Some(existing) = escape_repairs.get(&src_buffer) {
-                                            existing.clone()
-                                        } else {
-                                            let id = BufferId::Allocated(next_alloc);
-                                            next_alloc += 1;
-                                            buffers.insert(
-                                                id.clone(),
-                                                Buffer {
-                                                    id: id.clone(),
-                                                    access: Access::ReadWrite,
-                                                    freed_by: crate::layout_ir::FreedBy::Caller,
-                                                    owner: crate::bufferize::Owner::System,
-                                                    label: "escape-repair".to_string(),
-                                                    lit: None,
-                                                    // The fold ROOT is the
-                                                    // value the base-storage
-                                                    // copy lands here: the
-                                                    // buffer backs it.
-                                                    backs: root.clone(),
-                                                    layout: layout_of(&root)?,
-                                                },
-                                            );
-                                            let src = BufferTensor {
-                                                value: root.clone(),
-                                                buffer: src_buffer.clone(),
-                                            };
-                                            let dst = BufferTensor {
-                                                value: root.clone(),
-                                                buffer: id.clone(),
-                                            };
-                                            // MINT SITE — CAUSE 3: LIFETIME
-                                            // REPAIR. The value must outlive
-                                            // the storage it occupies (it
-                                            // escapes to the caller, but its
-                                            // current residence is
-                                            // FreedBy::Program or otherwise
-                                            // wrongly-lived), so it is
-                                            // relocated into storage with
-                                            // the right lifetime. Same
-                                            // contract as every copy: dumb,
-                                            // EXACT-SIZE (both buffers back
-                                            // the fold ROOT, parent-shaped),
-                                            // whole-buffer; ORDERING IS THE
-                                            // RUNTIME'S OBLIGATION — we emit
-                                            // dependency structure only.
-                                            let copy = dag.add_node(BtNode::Op {
-                                                op: Box::new(BufferCopy),
-                                                operands: vec![src.clone()],
-                                                results: vec![dst.clone()],
-                                                ties: Vec::new(),
-                                            });
-                                            link(&mut dag, &producer, &src, copy);
-                                            producer.insert(
-                                                (dst.value.clone(), dst.buffer.clone()),
-                                                copy,
-                                            );
-                                            escape_repairs.insert(src_buffer.clone(), id.clone());
-                                            id
+                        // The fold ROOT already delivered into this very
+                        // buffer — a writeback, or an earlier slot of the
+                        // same content — is what the view reads: the slot
+                        // sits on `dest`, never on the pre-delivery
+                        // residence the copy read from.
+                        let backing = if producer.contains_key(&(root.clone(), dest.clone())) {
+                            dest.clone()
+                        } else {
+                            match &src_buffer {
+                                // Program-minted residence ESCAPES IN PLACE:
+                                // flip to FreedBy::Caller (the escape cell) —
+                                // optimize mints its alloc and NO free, and the
+                                // caller takes the storage over. Zero-copy;
+                                // views sharing one base share the flip.
+                                BufferId::Allocated(_) => {
+                                    let record =
+                                        buffers.get_mut(&src_buffer).unwrap_or_else(|| {
+                                            unreachable!("assignment interned every minted buffer")
+                                        });
+                                    record.freed_by = crate::layout_ir::FreedBy::Caller;
+                                    src_buffer.clone()
+                                }
+                                BufferId::Boundary(_) => {
+                                    // A missing record would make the donation
+                                    // status of the residence unknowable — that
+                                    // must never fail open into a zero-copy
+                                    // escape of storage that may die with the
+                                    // call.
+                                    let freed_by = buffers
+                                        .get(&src_buffer)
+                                        .unwrap_or_else(|| {
+                                            unreachable!(
+                                                "assignment interned every boundary buffer"
+                                            )
+                                        })
+                                        .freed_by;
+                                    match freed_by {
+                                        // Caller-owned residence (an input
+                                        // buffer, or the slot's own seeded
+                                        // destination): the storage is already
+                                        // the caller's — return it zero-copy
+                                        // (liveness keeps output values live to
+                                        // END_OF_PROGRAM).
+                                        crate::layout_ir::FreedBy::Caller => src_buffer.clone(),
+                                        // DONATED residence is the one forced
+                                        // repair: the storage dies with the
+                                        // call, so the fold's BASE is copied
+                                        // whole — the ROOT value; copying the
+                                        // base buffer counts as delivery — into
+                                        // a fresh ESCAPING buffer the fold
+                                        // re-roots onto at lowering. ONE copy
+                                        // and one escaping buffer serve every
+                                        // view of this base. The donated buffer
+                                        // backs no slot, satisfying the
+                                        // donated-never-backs-an-output
+                                        // certificate arm by construction.
+                                        crate::layout_ir::FreedBy::Program => {
+                                            if let Some(existing) = escape_repairs.get(&src_buffer)
+                                            {
+                                                existing.clone()
+                                            } else {
+                                                let id = BufferId::Allocated(next_alloc);
+                                                next_alloc += 1;
+                                                buffers.insert(
+                                                    id.clone(),
+                                                    Buffer {
+                                                        id: id.clone(),
+                                                        access: Access::ReadWrite,
+                                                        freed_by: crate::layout_ir::FreedBy::Caller,
+                                                        owner: crate::bufferize::Owner::System,
+                                                        label: "escape-repair".to_string(),
+                                                        lit: None,
+                                                        // The fold ROOT is the
+                                                        // value the base-storage
+                                                        // copy lands here: the
+                                                        // buffer backs it.
+                                                        backs: root.clone(),
+                                                        layout: layout_of(&root)?,
+                                                    },
+                                                );
+                                                let src = BufferTensor {
+                                                    value: root.clone(),
+                                                    buffer: src_buffer.clone(),
+                                                };
+                                                let dst = BufferTensor {
+                                                    value: root.clone(),
+                                                    buffer: id.clone(),
+                                                };
+                                                // MINT SITE — CAUSE 3: LIFETIME
+                                                // REPAIR. The value must outlive
+                                                // the storage it occupies (it
+                                                // escapes to the caller, but its
+                                                // current residence is
+                                                // FreedBy::Program or otherwise
+                                                // wrongly-lived), so it is
+                                                // relocated into storage with
+                                                // the right lifetime. Same
+                                                // contract as every copy: dumb,
+                                                // EXACT-SIZE (both buffers back
+                                                // the fold ROOT, parent-shaped),
+                                                // whole-buffer; ORDERING IS THE
+                                                // RUNTIME'S OBLIGATION — we emit
+                                                // dependency structure only.
+                                                let copy = dag.add_node(BtNode::Op {
+                                                    op: Box::new(BufferCopy),
+                                                    operands: vec![src.clone()],
+                                                    results: vec![dst.clone()],
+                                                    ties: Vec::new(),
+                                                });
+                                                link(&mut dag, &producer, &src, copy);
+                                                producer.insert(
+                                                    (dst.value.clone(), dst.buffer.clone()),
+                                                    copy,
+                                                );
+                                                escape_repairs
+                                                    .insert(src_buffer.clone(), id.clone());
+                                                id
+                                            }
                                         }
                                     }
                                 }
@@ -1010,7 +1024,13 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                         });
                         continue;
                     }
-                    if src_buffer != dest {
+                    // A residence an earlier slot already delivered into
+                    // `dest` (one value returned under two names on one
+                    // buffer) is not transported twice: a second copy would
+                    // be a second writer of the same bytes, unordered
+                    // against the first slot's read.
+                    let delivered = producer.contains_key(&(slot.value.clone(), dest.clone()));
+                    if src_buffer != dest && !delivered {
                         // MINT SITE — CAUSE 2: BOUNDARY PLACEMENT. This
                         // tensor is bound to a SPECIFIC caller buffer
                         // (`dest`) whose producing residence is elsewhere
