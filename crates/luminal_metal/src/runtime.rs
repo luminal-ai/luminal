@@ -27,6 +27,8 @@ pub struct MetalRuntime {
     decoders: luminal::egglog_utils::eclass::ConstructorRegistry,
     plan: Option<BufferIrGraph<DecodedLayout>>,
     staged: FxHashMap<i64, HostBuffer>,
+    /// Read by the device execute path, which exists only on macOS.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     residents: luminal::resident::ResidentBindings,
     device_budget_bytes: Option<usize>,
     outputs_host: FxHashMap<usize, (HostBuffer, luminal::bufferize::OutputBinding<DecodedLayout>)>,
