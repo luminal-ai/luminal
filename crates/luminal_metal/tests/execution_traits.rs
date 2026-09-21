@@ -127,6 +127,10 @@ impl OpMatcher for ExternalAddMatcher {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "candidate search requires a Metal device"
+)]
 fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     let mut graph = luminal::graph::Graph::new();
     let a = graph.tensor((2, 3), DType::F32);
@@ -221,8 +225,16 @@ fn external_kernel_launch_geometry_updates_reuse_compiled_pipeline() {
     ));
     let mut rt = MetalRuntime::load_with_registry(&graph, registry).unwrap();
     rt.bind_dyn_range('a', 0, 1025).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &[
+            (a.id, vec![2f32; 512].into()),
+            (b.id, vec![3f32; 512].into()),
+        ]
+        .into_iter()
+        .collect(),
+        &harness_search_options(),
+    )
+    .unwrap();
     for n in [0, 1025, 2, 0, 257] {
         rt.set_dim('a', n);
         rt.set_data(a.id, vec![2f32; n]);

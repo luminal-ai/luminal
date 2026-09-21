@@ -42,6 +42,7 @@ fn resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updat
     .into_iter()
     .collect();
     rt.search(&data, &harness_search_options()).unwrap();
+    let search_stats = rt.graph_stats().unwrap();
     for (id, v) in data {
         rt.set_data(id, v);
     }
@@ -49,7 +50,10 @@ fn resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updat
     assert_eq!(dense(&rt, previous), vec![0.]);
     assert!(rt.fetch(next.id).is_err());
     let first = rt.graph_stats().unwrap();
-    assert_eq!(first.resident_upload_bytes, 32);
+    assert_eq!(
+        first.resident_upload_bytes - search_stats.resident_upload_bytes,
+        32
+    );
     assert!(
         rt.bind_dyn_range("other", 1, 1).is_err(),
         "rebinding must preserve existing resident data"
@@ -59,7 +63,10 @@ fn resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updat
     rt.execute().unwrap();
     assert_eq!(dense(&rt, previous), vec![20.]);
     let second = rt.graph_stats().unwrap();
-    assert_eq!(second.resident_upload_bytes, 32);
+    assert_eq!(
+        second.resident_upload_bytes - search_stats.resident_upload_bytes,
+        32
+    );
     assert_eq!(second.arena_generation, first.arena_generation);
     rt.set_dim('n', 1);
     rt.set_data(input.id, vec![1f32]);
@@ -71,5 +78,8 @@ fn resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updat
     assert_eq!(dense(&rt, previous), vec![0.]);
     rt.execute().unwrap();
     assert_eq!(dense(&rt, previous), vec![8.]);
-    assert_eq!(rt.graph_stats().unwrap().resident_upload_bytes, 64);
+    assert_eq!(
+        rt.graph_stats().unwrap().resident_upload_bytes - search_stats.resident_upload_bytes,
+        64
+    );
 }

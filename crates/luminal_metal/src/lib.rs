@@ -2,8 +2,8 @@
 //! Load a graph, bind shapes, search, stage inputs, execute, and read outputs.
 pub mod arena;
 pub mod bindings;
+pub mod egraph_postpass;
 pub mod finalists;
-pub mod heuristic;
 pub mod host_buffer;
 pub mod kernels;
 pub mod lattice;

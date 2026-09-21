@@ -17,6 +17,10 @@ fn elementwise_graph() -> (Graph, luminal::prelude::GraphTensor) {
 /// Two buckets over 'a': one plan each, both validated bucket-wide,
 /// selection covers runtime dims, and out-of-range dims select nothing.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn bucketed_search_validates_searches_and_selects() {
     let (cx, _out) = elementwise_graph();
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
@@ -71,6 +75,10 @@ fn bucketed_search_validates_searches_and_selects() {
 /// The selected physical plan retains the range variable instead of freezing
 /// geometry to the representative. GPU replay is covered in dynamic_graphs.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn bucket_plan_keeps_symbolic_capacity() {
     let (cx, _) = elementwise_graph();
     let mut rt = CudaRuntime::load(&cx).unwrap();
@@ -163,6 +171,10 @@ fn a_dim_cannot_be_both_pinned_and_bucketed() {
 /// never render one: every per-bucket render seeds the interval and
 /// passes.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_bucketed_dim_may_carry_a_bounds_dependent_check() {
     let mut cx = Graph::new();
     cx.set_dim('a', 3);

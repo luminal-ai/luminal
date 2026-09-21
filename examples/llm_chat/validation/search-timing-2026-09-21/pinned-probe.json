@@ -1,0 +1,7 @@
+{
+  "bytes": 32658510964,
+  "note": "Independent one-allocation microbenchmark; not included in Llama search totals",
+  "cuMemHostAlloc_seconds": 16.452855785028078,
+  "memset_seconds": 0.4202518860111013,
+  "cuMemFreeHost_seconds": 6.422437426983379
+}

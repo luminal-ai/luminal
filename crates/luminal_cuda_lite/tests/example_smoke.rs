@@ -23,6 +23,10 @@ fn weights(n: usize, seed: usize) -> Vec<f32> {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn conv_example_graph_searches_with_zero_refusals() {
     let mut cx = Graph::new();
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);

@@ -1,0 +1,10 @@
+driver_api_version=13000 device_memory_pools_supported=1
+default_device_pool_release_threshold=0
+pool=HOST_NUMA create=success
+  fill_ms=2056.346
+  host_write_and_transfer=pass
+  trial=0 bytes=32658510964 memory_type=1 alloc_sync_ms=3548.704 free_sync_ms=0.014 retained=32682016768
+  fill_ms=1157.852
+  host_write_and_transfer=pass
+  trial=1 bytes=32658510964 memory_type=1 alloc_sync_ms=0.015 free_sync_ms=0.012 retained=32682016768
+pool_destroy_ms=1643.642

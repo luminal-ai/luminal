@@ -9,6 +9,10 @@ use luminal::prelude::FxHashMap;
 use luminal_cuda_lite::{CudaRuntime, as_kernel_op, harness_search_options};
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn rounding_and_trunc_cast_plan_with_kernel_interfaces() {
     let mut cx = luminal::graph::Graph::new();
     let x = cx.tensor(6usize, DType::F32);

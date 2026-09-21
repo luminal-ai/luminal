@@ -1,0 +1,21 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling luminal_metal v0.2.0 (/root/luminal/crates/luminal_metal)
+   Compiling llm_chat v0.1.0 (/root/luminal/examples/llm_chat)
+    Finished `release` profile [optimized] target(s) in 5.79s
+     Running unittests src/lib.rs (target/release/deps/llm_chat-c4d7f9ff73ec0257)
+
+running 9 tests
+test checkpoint::tests::checkpoint_mapping_and_non_square_bf16_transpose ... ok
+test app::tests::profiling_toggle_is_not_an_option ... ok
+test graph::tests::gemma_checkpoint_uses_its_default_tied_embeddings_and_rejects_untied ... ok
+test graph::tests::incompatible_checkpoint_architecture_is_rejected_before_loading ... ok
+test sampling::tests::greedy_ties_invalid_logits_and_seeded_sampling ... ok
+test session::tests::a_cache_is_reusable_exactly_when_it_is_a_token_prefix ... ok
+test tokenizer::tests::checkpoint_template_controls_roles_and_special_tokens ... ok
+test checkpoint::shard_tests::indexed_shards_load_through_application_name_mapping ... ok
+test graph::tests::adapters_keep_parameter_mapping_and_runtime_inputs_separate ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

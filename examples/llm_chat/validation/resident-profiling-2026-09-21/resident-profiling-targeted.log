@@ -1,0 +1,47 @@
+   Compiling luminal_cuda_lite v0.1.0 (/root/luminal/crates/luminal_cuda_lite)
+    Finished `release` profile [optimized] target(s) in 4.92s
+     Running tests/device_profile.rs (target/release/deps/device_profile-2d1d9e908135a025)
+
+running 3 tests
+test a_zero_budget_times_every_candidate_out_and_says_so ... ok
+test device_profiled_search_ranks_by_measurement_and_keeps_the_numbers ... ok
+test the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.26s
+
+     Running tests/dim_buckets.rs (target/release/deps/dim_buckets-5aa6567ab28de210)
+
+running 5 tests
+test overlapping_or_unsorted_buckets_are_refused ... ok
+test a_dim_cannot_be_both_pinned_and_bucketed ... ok
+test bucket_plan_keeps_symbolic_capacity ... ok
+test a_bucketed_dim_may_carry_a_bounds_dependent_check ... ok
+test bucketed_search_validates_searches_and_selects ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
+
+     Running tests/external_placement.rs (target/release/deps/external_placement-304cc682ad274045)
+
+running 6 tests
+test a_device_pointer_is_refused_for_a_buffer_that_is_not_external ... ok
+test execute_refuses_an_external_buffer_with_no_pointer ... ok
+test a_sink_and_its_target_share_one_external_buffer ... ok
+test set_data_on_an_external_binding_is_refused ... ok
+test an_external_output_slot_sits_on_the_bound_buffer ... ok
+test an_external_output_may_be_a_view_of_an_escape_cell ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
+     Running tests/resident_mutation.rs (target/release/deps/resident_mutation-d1c2cfef7ac6f81a)
+
+running 1 test
+test resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updates ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+
+     Running tests/resident_profiling.rs (target/release/deps/resident_profiling-f9b3cae33d4cd498)
+
+running 1 test
+test profiling_retains_weights_resets_mutable_state_and_suppresses_resident_readback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s

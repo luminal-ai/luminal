@@ -49,16 +49,9 @@ fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
 }
 
 fn view_search_options() -> CompileOptions {
-    // THE BUDGET IS PART OF THE GATE. The folded-view plan and the
-    // materializing plan are both in the e-graph and are semantically
-    // identical (the materializing route byte-matches the reference too —
-    // verified at budget 4), and the heuristic ranks the fold strictly
-    // cheaper. This is a genetic search, though: a 4- or 8-generation run
-    // converges to a materializing local optimum (cost 2705/2673) that
-    // beats the *nearest* fold it samples (2801 at budget 2) without
-    // reaching the optimal fold (2417). Budgets >= 16 all reach it and
-    // fold. Gate on a budget that actually arrives; a smaller one fails
-    // the structural assertion for search reasons, not compiler reasons.
+    // This differential must exercise folded reads independently of timing
+    // noise. The fixture registry excludes materialization and cuBLASLt;
+    // production search remains free to choose any measured implementation.
     CompileOptions {
         generations: 16,
         generation_size: 8,
@@ -96,9 +89,11 @@ fn run_differential(
     // contracts FMAs, so the matmul fixtures would be compared
     // bit-for-bit against a route that is only tolerance-equal — see the
     // reduction-order contract in `tests/cublaslt_contracts.rs`.
-    let mut rt =
-        CudaRuntime::load_with_registry(cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
-            .expect("cuda load");
+    let registry = luminal_cuda_lite::cuda_registry_without_cublaslt()
+        .into_iter()
+        .filter(|op| op.label() != "IndexMapApplyMaterialize")
+        .collect();
+    let mut rt = CudaRuntime::load_with_registry(cx, registry).expect("cuda load");
     // THE TWO RUNTIMES TAKE DIFFERENT HOST PAYLOADS (ruling D4,
     // 2026-09-03): the reference side stages `TypedBuffer` (its kernels
     // read typed slices), the CL side `HostBuffer` (bytes plus a dtype

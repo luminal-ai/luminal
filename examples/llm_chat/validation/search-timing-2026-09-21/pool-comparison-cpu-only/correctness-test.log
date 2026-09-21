@@ -1,0 +1,55 @@
+   Compiling luminal_cuda_lite v0.1.0 (/tmp/luminal-search-timing/crates/luminal_cuda_lite)
+    Finished `release` profile [optimized] target(s) in 5.03s
+     Running tests/device_profile.rs (/root/luminal/target/release/deps/device_profile-d6e03b5ec31dc4f5)
+
+running 1 test
+PINNED_POOL numa=0 retain_bytes=68719476736
+SEARCH_TRACE runtime.program_assembly 0.002s
+SEARCH_TRACE runtime.saturation 0.776s
+SEARCH_TRACE runtime.decoder_check 0.000s
+SEARCH_TRACE runtime.serialize 0.043s
+SEARCH_TRACE runtime.assemble_total 0.830s
+SEARCH_TRACE selection.analysis 0.025s
+SEARCH_TRACE selection.sampling_space 0.001s
+SEARCH_TRACE selection.decoder_setup 0.000s
+SEARCH_TRACE candidate.0.0 1.137s
+SEARCH_TRACE candidate.0.1 0.250s
+SEARCH_TRACE candidate.0.2 0.215s
+SEARCH_TRACE candidate.0.3 0.183s
+SEARCH_TRACE candidate.1.0 0.005s
+SEARCH_TRACE candidate.1.1 0.057s
+SEARCH_TRACE candidate.1.2 0.005s
+SEARCH_TRACE candidate.1.3 0.004s
+SEARCH_TRACE selection.total 1.893s
+SEARCH_TRACE runtime.finalists_setup 0.001s
+SEARCH_TRACE runtime.finalist_selection 0.002s
+SEARCH_TRACE runtime.search 2.943s
+SEARCH_TRACE saved 902 events to /tmp/luminal-search-trace/pool-smoke.json
+device-profiled mini-llama3: search 2944 ms | plans profiled 5 | fingerprint hits 3 | [saturation 0ms, serialize 0ms, analysis 25ms, extract 40ms, plan-build 41ms, profile-exec 1771ms]
+device-profiled mini-llama3: winner 0.307011 ms measured on device, heuristic cost 8860403 bytes moved | refusals extract refusals 0 (choice-cycles 0, dead-ends 0), bufferize 0, execute 0, timed out 0
+SEARCH_TRACE runtime.program_assembly 0.001s
+SEARCH_TRACE runtime.saturation 0.767s
+SEARCH_TRACE runtime.decoder_check 0.000s
+SEARCH_TRACE runtime.serialize 0.042s
+SEARCH_TRACE runtime.assemble_total 0.821s
+SEARCH_TRACE selection.analysis 0.027s
+SEARCH_TRACE selection.sampling_space 0.001s
+SEARCH_TRACE selection.decoder_setup 0.000s
+SEARCH_TRACE candidate.0.0 0.029s
+SEARCH_TRACE candidate.0.1 0.008s
+SEARCH_TRACE candidate.0.2 0.010s
+SEARCH_TRACE candidate.0.3 0.008s
+SEARCH_TRACE candidate.1.0 0.004s
+SEARCH_TRACE candidate.1.1 0.006s
+SEARCH_TRACE candidate.1.2 0.006s
+SEARCH_TRACE candidate.1.3 0.004s
+SEARCH_TRACE selection.total 0.114s
+SEARCH_TRACE runtime.finalists_setup 0.001s
+SEARCH_TRACE runtime.finalist_selection 0.000s
+SEARCH_TRACE runtime.search 0.942s
+SEARCH_TRACE saved 78 events to /tmp/luminal-search-trace/pool-smoke.json
+device-profiled mini-llama3: the PRIOR would elect a plan of 7919719 bytes moved; the MEASUREMENT elected one of 8860403 (DIFFERENT — the measurement did not pick the prior's winner)
+PINNED_POOL destroy_seconds=0.001498 status=Ok(())
+test device_profiled_search_ranks_by_measurement_and_keeps_the_numbers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 4.55s

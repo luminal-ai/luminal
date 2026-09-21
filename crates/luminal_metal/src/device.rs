@@ -77,6 +77,9 @@ impl MetalDevice {
     pub fn slab_bytes(&self) -> usize {
         self.stats.arena_bytes
     }
+    pub fn available_arena_bytes(&self) -> Result<usize> {
+        Ok(usize::try_from(self.device.max_buffer_length())?)
+    }
     pub fn is_installed(&self) -> bool {
         !self.installed.is_empty()
     }
@@ -217,43 +220,12 @@ impl MetalDevice {
         self.resident_initialized.clear();
         Ok(())
     }
-    pub fn execute(
-        &mut self,
-        bucket: usize,
-        staged: &FxHashMap<i64, &HostBuffer>,
-        dims: &DynMap,
-    ) -> Result<Outputs> {
-        objc::rc::autoreleasepool(|| self.execute_inner(bucket, staged, dims))
-    }
-    fn execute_inner(
-        &mut self,
-        bucket: usize,
-        staged: &FxHashMap<i64, &HostBuffer>,
-        dims: &DynMap,
-    ) -> Result<Outputs> {
-        let p = self
-            .installed
-            .get(bucket)
-            .ok_or_else(|| anyhow!("Metal bucket {bucket} is not installed"))?;
-        for (s, (lo, hi)) in &p.bounds {
-            let value = dims
-                .get(s)
-                .ok_or_else(|| anyhow!("dimension `{s}` is unset"))?;
-            ensure!(
-                value >= lo && value <= hi,
-                "dimension `{s}` = {value} outside [{lo}, {hi}]"
-            );
+    pub(crate) fn upload_residents(&mut self, staged: &FxHashMap<i64, &HostBuffer>) -> Result<()> {
+        if self.residents.is_empty() {
+            return Ok(());
         }
         let slab = self.slab.as_ref().unwrap();
         let staging = self.staging.as_ref().unwrap();
-        let mut sizes = FxHashMap::default();
-        for (id, buffer) in &p.plan.buffers {
-            let bytes = symbolic::bytes(&buffer.layout, dims)?;
-            if let Some(home) = p.storage.slices.get(id) {
-                ensure!(bytes <= home.bytes, "live buffer exceeds planned capacity");
-            }
-            sizes.insert(id.clone(), bytes);
-        }
         // Resident updates use the same staging allocation before transient
         // inputs populate it. Validate every resident before updating any one.
         for (&lit, home) in &self.residents {
@@ -306,6 +278,47 @@ impl MetalDevice {
             }
             self.resident_initialized.insert(lit);
         }
+        Ok(())
+    }
+    pub fn execute(
+        &mut self,
+        bucket: usize,
+        staged: &FxHashMap<i64, &HostBuffer>,
+        dims: &DynMap,
+    ) -> Result<Outputs> {
+        objc::rc::autoreleasepool(|| self.execute_inner(bucket, staged, dims))
+    }
+    fn execute_inner(
+        &mut self,
+        bucket: usize,
+        staged: &FxHashMap<i64, &HostBuffer>,
+        dims: &DynMap,
+    ) -> Result<Outputs> {
+        let p = self
+            .installed
+            .get(bucket)
+            .ok_or_else(|| anyhow!("Metal bucket {bucket} is not installed"))?;
+        for (s, (lo, hi)) in &p.bounds {
+            let value = dims
+                .get(s)
+                .ok_or_else(|| anyhow!("dimension `{s}` is unset"))?;
+            ensure!(
+                value >= lo && value <= hi,
+                "dimension `{s}` = {value} outside [{lo}, {hi}]"
+            );
+        }
+        let mut sizes = FxHashMap::default();
+        for (id, buffer) in &p.plan.buffers {
+            let bytes = symbolic::bytes(&buffer.layout, dims)?;
+            if let Some(home) = p.storage.slices.get(id) {
+                ensure!(bytes <= home.bytes, "live buffer exceeds planned capacity");
+            }
+            sizes.insert(id.clone(), bytes);
+        }
+        self.upload_residents(staged)?;
+        let p = &self.installed[bucket];
+        let slab = self.slab.as_ref().unwrap();
+        let staging = self.staging.as_ref().unwrap();
         // Validate transient uploads before submitting the execution commands.
         for step in &p.storage.steps {
             if let ArenaStep::Upload {

@@ -108,6 +108,14 @@ pub fn extract_fixture_by_name(name: &str) -> ExtractedGraph {
     extract_fixture(&source)
 }
 
+/// Extract a fixture with explicit producer preferences instead of depending
+/// on the unconstrained fixture extractor's tie-breaking.
+pub fn extract_fixture_preferring(name: &str, preferences: &[&str]) -> ExtractedGraph {
+    let source = std::fs::read_to_string(fixture_path(name))
+        .unwrap_or_else(|_| panic!("fixture script {name} readable"));
+    extract_fixture_with_genome(&source, preferences).0
+}
+
 /// [`extract_fixture_by_name`] restricted to an allow-list of
 /// `LayoutTensorOp` constructor names — forces extraction through
 /// specific implementations so a test can pin one spelling end to end.
@@ -156,7 +164,7 @@ pub fn serialize_fixture(script_text: &str) -> luminal::prelude::egraph_serializ
     egraph.serialize(SerializeConfig::default()).egraph
 }
 
-/// Deterministic (min-cost) extraction of a fixture script on this
+/// Deterministic (minimum-height) extraction of a fixture script on this
 /// runtime's vocabulary.
 pub fn extract_fixture(script_text: &str) -> ExtractedGraph {
     let serialized = serialize_fixture(script_text);

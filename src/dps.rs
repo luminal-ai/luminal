@@ -111,7 +111,6 @@ pub fn dps_rewrite(graph: &ExtractedGraph) -> ExtractedGraph {
                 tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(|| {
                     "synthesized by dps_rewrite".to_string()
                 }))),
-                heuristic_cost: 0,
             }));
 
             let ExtractedNode::LayoutOp(op) = &mut out.dag[idx] else {

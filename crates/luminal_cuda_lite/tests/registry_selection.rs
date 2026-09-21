@@ -103,6 +103,10 @@ fn the_presets_are_just_registries() {
 /// type with the same options, refuses — loudly, naming the blockage —
 /// while the default registry plans it.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_filtered_registry_withholds_the_op_and_the_search_refuses() {
     let (cx, a, b) = add_graph();
     let data = payloads(a, b);

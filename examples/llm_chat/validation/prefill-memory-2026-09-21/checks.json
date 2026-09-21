@@ -1,0 +1,65 @@
+{
+  "runs": [
+    {
+      "log": "memory-pruning-core.log",
+      "passed": 277,
+      "failed": 0,
+      "ignored": 6
+    },
+    {
+      "log": "memory-pass-custom-hook.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "memory-pass-core-integration.log",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "memory-pass-core-doc.log",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "memory-pass-host-landing.log",
+      "passed": 313,
+      "failed": 0,
+      "ignored": 8
+    },
+    {
+      "log": "memory-pass-cuda-landing.log",
+      "passed": 192,
+      "failed": 1,
+      "ignored": 3
+    },
+    {
+      "log": "memory-pass-device-profile-final.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    }
+  ],
+  "passing_tests": 790,
+  "remaining_failures": 0,
+  "excluded": [
+    "frontend::movement::tests::test_pad_2d (pre-existing)"
+  ],
+  "notes": "The CUDA landing run had one stale zero-budget assertion, corrected and rerun successfully.",
+  "commands": [
+    "cargo test --release -p luminal --lib -- --skip frontend::movement::tests::test_pad_2d",
+    "cargo test --release -p luminal --lib egraph_postpass::tests::custom_pass_can_edit_nodes_after_the_class_index_has_been_read",
+    "cargo test --release -p luminal --test '*' -- --test-threads=1",
+    "cargo test --release -p luminal --doc",
+    "cargo test --release --no-fail-fast -p luminal_reference -p luminal_nn -p test_runtime -p luminal_metal -- --test-threads=1",
+    "cargo test --release --no-fail-fast -p luminal_cuda_lite -p llm_chat --features luminal_cuda_lite/device,llm_chat/cuda,llm_chat/metal -- --test-threads=1",
+    "cargo test --release -p luminal_cuda_lite --features device --test device_profile the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced -- --test-threads=1",
+    "cargo clippy -p luminal -p luminal_cuda_lite -p luminal_metal -p llm_chat --features luminal_cuda_lite/device,llm_chat/cuda,llm_chat/metal --all-targets -- -D warnings",
+    "cargo clippy -p luminal_cuda_lite -p luminal_metal -p llm_chat --all-targets -- -D warnings",
+    "cargo fmt --all",
+    "git diff --check"
+  ]
+}

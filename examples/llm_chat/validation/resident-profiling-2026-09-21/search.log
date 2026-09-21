@@ -1,0 +1,7 @@
+Loading checkpoint
+Starting resident-aware search
+    Start 238.031 ms
+[2K   Faster 225.840 ms
+[2K   Faster 219.267 ms
+[2K   Slower x1[2K   Slower x2[2K   Faster 219.262 ms
+[2K   Slower x1[2KSearch finished: 72.226s, winner 219.262ms

@@ -18,6 +18,10 @@ fn registry_matches_claims_and_decodes_its_live_schema() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "candidate search requires a Metal device"
+)]
 fn filtered_vocabulary_cannot_elect_an_unregistered_operation() {
     let mut g = Graph::new();
     let x = g.tensor(3, DType::F32);
@@ -35,12 +39,21 @@ fn filtered_vocabulary_cannot_elect_an_unregistered_operation() {
     );
     assert!(
         runtime
-            .search(&Default::default(), &harness_search_options())
+            .search(
+                &[(x.id, vec![1f32; 3].into()), (y.id, vec![2f32; 3].into())]
+                    .into_iter()
+                    .collect(),
+                &harness_search_options()
+            )
             .is_err()
     );
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "candidate search requires a Metal device"
+)]
 fn arena_budget_rejects_a_plan_set_that_cannot_fit() {
     let mut g = Graph::new();
     let x = g.tensor(3, DType::F32);
@@ -48,7 +61,12 @@ fn arena_budget_rejects_a_plan_set_that_cannot_fit() {
     let mut runtime = MetalRuntime::load(&g).unwrap();
     let mut options = harness_search_options();
     options.device_budget_bytes = Some(0);
-    let error = runtime.search(&Default::default(), &options).unwrap_err();
+    let error = runtime
+        .search(
+            &[(x.id, vec![1f32; 3].into())].into_iter().collect(),
+            &options,
+        )
+        .unwrap_err();
     assert!(error.to_string().contains("device budget"), "{error:#}");
     assert!(runtime.plan().is_none());
 }

@@ -19,14 +19,24 @@ the self-contained repo-side summary.
 - `CudaRuntime::allow_list()` derives from registered operations' DPS
   execution interfaces and plan-transparent effects. Kernel and host
   implementations can be provided externally without a dispatch-table edit.
-- Candidate ranking defaults to measured device execution time via
-  `CompileOptions::profile_on_device` (`src/profile.rs`). This requires
-  the `device` feature, a CUDA device, and input payloads. Device-free
-  callers explicitly set `profile_on_device: false` to rank by
-  `src/heuristic.rs::heuristic_cost_of`. The shared planning-test harness
-  makes that opt-out explicit.
-- `execute` is behind the `device` feature and refuses loudly
-  without it. Plan-layer tests are green on macOS.
+- Candidate ranking always measures device execution time (`src/profile.rs`).
+  Search requires the `device` feature and a CUDA GPU. There is no static
+  byte-cost ranking or profiling option. Loading, saturation, and kernel
+  code generation can still be inspected on a host without CUDA.
+  Profiling and finalist validation honor resident input bindings. Warmup uploads
+  them once; timed trials stage only transient inputs. Writable residents reset
+  from the supplied payloads outside the execution timer and timeout budget.
+  Candidate teardown releases their homes, retaining compiled modules.
+- Before extraction, `CompileOptions::serialized_graph_passes` can edit the
+  received serialized e-graph. CUDA owns these passes, their context/report
+  types, and the memory policy in `egraph_postpass`; core does not prune it.
+  The mandatory memory pass then removes tensors whose
+  physical capacity over the full bucket exceeds the arena budget, and all
+  their producer implementations. Required boundaries cannot disappear.
+  The default limit includes available CUDA memory and reusable allocation-pool
+  reservations; `device_budget_bytes` can lower it. Complete resident candidate
+  arenas are checked against the same limit before allocation.
+- Both search and execution refuse without the `device` feature.
 - The predecessor crate targeting the deleted HLIR pipeline is parked
   at `../luminal_cuda_lite_hlir` — a PARTS LIBRARY (NVRTC plumbing in
   its `lib.rs`, kernel codegen patterns, cuBLASLt/FlashInfer/MoE

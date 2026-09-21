@@ -520,7 +520,7 @@ fn union_of_b_and_y_is_a_leaf_weld_not_a_cycle() {
 /// ROUTES, honestly: only ONE of the two routes for `c` is electable,
 /// and the reason is not the sampler. `b = y`'s class is a bound INPUT,
 /// so it is a LEAF — no genome row, no candidate, planned from the
-/// boundary at `heuristic_cost` 0 whatever the genome says. The
+/// boundary at the former byte estimate of 0 whatever the genome says. The
 /// recomputed `a - x` is not something `is_better` could prefer; it is
 /// not offered at all. Every plan here is therefore two adds — `a` from
 /// x and y, and `c` from z and the same class — with `b`'s -1
@@ -704,7 +704,7 @@ fn producer_op_names(egraph: &EGraph, class: &ClassId) -> BTreeSet<String> {
 /// THE GAP-A BOARD (2026-09-02). The double-transpose collapse gives
 /// the marker matmul's bound INPUTS producers of their own — `x` is in
 /// the class of `Tᵀ(T(x))`, whose producer is a view. A view moves no
-/// bytes, so its plan ties the input plan at `heuristic_cost` 0 and the
+/// bytes, so its plan ties the input plan at the former byte estimate of 0 and the
 /// `plan_label` tie-break ("IndexMapApplyViewGeneric" sorts before
 /// "Input:…") HANDED THE INPUT CLASS TO THE VIEW: the extractor emitted
 /// a plan in which a program input is computed from a value that reads

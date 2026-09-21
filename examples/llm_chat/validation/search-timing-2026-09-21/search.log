@@ -1,0 +1,34 @@
+Loading 291 tensors from /dev/shm/llm-chat-bench-checkpoints/llama3-8b
+Compiling Llama3 for CUDA Lite...
+SEARCH_TRACE runtime.program_assembly 0.001s
+SEARCH_TRACE runtime.saturation 15.278s
+SEARCH_TRACE runtime.decoder_check 0.000s
+SEARCH_TRACE runtime.serialize 1.288s
+SEARCH_TRACE runtime.assemble_total 16.639s
+SEARCH_TRACE selection.analysis 11.621s
+SEARCH_TRACE selection.sampling_space 0.062s
+SEARCH_TRACE selection.decoder_setup 0.000s
+    Start 2893.911 ms
+SEARCH_TRACE candidate.0.0 41.901s
+
+   Faster 2887.032 ms
+SEARCH_TRACE candidate.0.1 36.572s
+
+   Slower x1SEARCH_TRACE candidate.0.2 35.928s
+
+   Slower x2SEARCH_TRACE candidate.0.3 35.785s
+
+   Faster 2868.794 ms
+SEARCH_TRACE candidate.1.0 35.242s
+
+   Slower x1SEARCH_TRACE candidate.1.1 35.494s
+
+   Slower x2SEARCH_TRACE candidate.1.2 35.381s
+
+   Slower x3SEARCH_TRACE candidate.1.3 35.378s
+
+SEARCH_TRACE selection.total 303.615s
+SEARCH_TRACE runtime.finalists_setup 0.033s
+SEARCH_TRACE runtime.finalist_selection 26.487s
+SEARCH_TRACE runtime.search 347.198s
+SEARCH_TRACE saved 44124 events to /tmp/luminal-search-trace/llama-context2048.json

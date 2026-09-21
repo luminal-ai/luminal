@@ -1,0 +1,18 @@
+{
+  "unique_tests_passed": 794,
+  "remaining_failures": 0,
+  "ignored": 17,
+  "excluded": [
+    "frontend::movement::tests::test_pad_2d (pre-existing)"
+  ],
+  "validation": "The full sweep passed 793 tests and had one timing-dependent dynamic-bias selection assertion. It passed unchanged on rerun; the fixture was then restricted to require a bias form, and all 11 dynamic_graphs tests passed. Counts replace the first dynamic_graphs result rather than adding repeated tests.",
+  "commands": [
+    "cargo test --release -p luminal_cuda_lite -p luminal_metal --lib egraph_postpass::tests",
+    "cargo test --release --no-fail-fast -p luminal -p luminal_reference -p luminal_cuda_lite -p luminal_metal -p test_runtime -p luminal_nn -p llm_chat --features luminal_cuda_lite/device,llm_chat/cuda,llm_chat/metal -- --skip frontend::movement::tests::test_pad_2d --test-threads=1",
+    "cargo test --release -p luminal_cuda_lite --features device --test dynamic_graphs -- --test-threads=1",
+    "cargo clippy -p luminal -p luminal_cuda_lite -p luminal_metal -p llm_chat --features luminal_cuda_lite/device,llm_chat/cuda,llm_chat/metal --all-targets -- -D warnings",
+    "cargo clippy -p luminal_cuda_lite -p luminal_metal -p llm_chat --all-targets -- -D warnings",
+    "cargo fmt --all --check",
+    "git diff --check"
+  ]
+}

@@ -497,8 +497,7 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
         .into_iter()
         .collect()
     };
-    // The seeded budget the CPU election pin measured green (see
-    // tests/cublaslt_election.rs).
+    // The registry requires the library route; timing ranks its variants.
     let options = luminal_cuda_lite::CompileOptions {
         generations: 12,
         generation_size: 16,
@@ -511,7 +510,11 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
 
     // Marker-elected route.
     let (cx, a, b, out) = build();
-    let mut fused = CudaRuntime::load(&cx).expect("load fused");
+    let mut fused = CudaRuntime::load_with_registry(
+        &cx,
+        luminal_cuda_lite::cuda_registry_filtered(|row| row.label() != "ReduceSumGeneric"),
+    )
+    .expect("load fused");
     let data = data_for(a.id, b.id);
     fused.search(&data, &options).expect("fused search");
     let elected =

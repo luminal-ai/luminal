@@ -1,0 +1,36 @@
+{
+  "model": "Llama3-8B",
+  "max_context": 2048,
+  "prefill_chunk": 128,
+  "search_seconds": 452.487296716,
+  "buckets": [
+    {
+      "q": 1,
+      "c": 128,
+      "attempts": 100,
+      "profiles": 42,
+      "cache_hits": 58,
+      "arena_bytes": 13779872768,
+      "best_ms": 49.931812,
+      "oversized_tensors_pruned": 0,
+      "producer_classes_pruned": 0,
+      "nodes_removed": 0
+    },
+    {
+      "q": 128,
+      "c": 128,
+      "attempts": 100,
+      "profiles": 35,
+      "cache_hits": 57,
+      "arena_bytes": 28931509248,
+      "best_ms": 444.685619,
+      "oversized_tensors_pruned": 6,
+      "producer_classes_pruned": 121,
+      "nodes_removed": 654
+    }
+  ],
+  "prefill_ms": 5369.203551,
+  "decode_ms": 72.41908099999999,
+  "finite_logits": true,
+  "reset_matches": true
+}

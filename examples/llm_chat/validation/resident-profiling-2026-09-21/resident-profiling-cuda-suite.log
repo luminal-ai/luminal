@@ -1,0 +1,406 @@
+   Compiling luminal_cuda_lite v0.1.0 (/root/luminal/crates/luminal_cuda_lite)
+   Compiling luminal_reference v0.1.0 (/root/luminal/crates/luminal_reference)
+   Compiling llm_chat v0.1.0 (/root/luminal/examples/llm_chat)
+    Finished `release` profile [optimized] target(s) in 10.62s
+     Running unittests src/lib.rs (target/release/deps/llm_chat-09e5efbf8b8687f1)
+
+running 9 tests
+test app::tests::profiling_toggle_is_not_an_option ... ok
+test checkpoint::shard_tests::indexed_shards_load_through_application_name_mapping ... ok
+test checkpoint::tests::checkpoint_mapping_and_non_square_bf16_transpose ... ok
+test graph::tests::adapters_keep_parameter_mapping_and_runtime_inputs_separate ... ok
+test graph::tests::gemma_checkpoint_uses_its_default_tied_embeddings_and_rejects_untied ... ok
+test graph::tests::incompatible_checkpoint_architecture_is_rejected_before_loading ... ok
+test sampling::tests::greedy_ties_invalid_logits_and_seeded_sampling ... ok
+test session::tests::a_cache_is_reusable_exactly_when_it_is_a_token_prefix ... ok
+test tokenizer::tests::checkpoint_template_controls_roles_and_special_tokens ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/release/deps/llm_chat-4d0fb4c6a7ac754e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/backend_cuda.rs (target/release/deps/backend_cuda-cee49888127ebc97)
+
+running 2 tests
+test chunked_prefill_history_reuse_and_reset_drive_one_session ... ok
+test prefill_and_decode_use_resident_state_and_match_reference ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.94s
+
+     Running tests/backend_metal.rs (target/release/deps/backend_metal-7680184391c6510c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/luminal_cuda_lite-571b4386dc06f1ad)
+
+running 22 tests
+test binding_check::tests::disjoint_ranges_pass ... ok
+test binding_check::tests::identical_bases_refuse ... ok
+test binding_check::tests::overlapping_ranges_refuse_loudly_naming_both ... ok
+test binding_check::tests::touching_ranges_are_disjoint ... ok
+test binding_check::tests::zero_length_ranges_cannot_overlap ... ok
+test bindings::tests::a_sink_inherits_its_buffers_external_placement ... ok
+test bindings::tests::a_symbolic_stride_renders_as_the_dim ... ok
+test bindings::tests::an_external_output_declares_its_own_placement ... ok
+test bindings::tests::two_placements_on_one_buffer_are_refused ... ok
+test lattice::tests::a_budget_nothing_meets_runs_out_and_names_it ... ok
+test lattice::tests::a_budget_under_the_winner_installs_the_cheapest_slower_set_that_fits ... ok
+test lattice::tests::sets_are_proposed_cheapest_first_and_once ... ok
+test lattice::tests::unconstrained_installs_every_bucket_winner ... ok
+test ops::constant::tests::constant_kernel_text_is_otherwise_unchanged ... ok
+test ops::constant::tests::constant_literal_is_a_valid_c_token_for_extreme_and_non_finite_values ... ok
+test ops::constant::tests::cuda_f64_literal_is_a_valid_c_token_for_extreme_and_non_finite_values ... ok
+test storage::tests::all_storage_classes_share_physical_ranges_and_transfer_lifetimes ... ok
+test storage::tests::external_buffers_leave_the_slab_and_require_caller_pointers ... ok
+test storage::tests::replay_preserves_early_outputs_and_late_inputs_across_shapes_and_buckets ... ok
+test symbolic::tests::capacities_cover_interior_extrema_and_arithmetic ... ok
+test symbolic::tests::invalid_or_unbounded_allocations_refuse ... ok
+test symbolic::tests::runtime_division_agrees_with_integer_semantics ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/boundary_layouts.rs (target/release/deps/boundary_layouts-8042b5b025c36f90)
+
+running 16 tests
+test a_column_major_input_carries_the_left_major_spelling ... ok
+test a_column_major_output_binds_and_the_search_names_it ... ok
+test a_column_major_sink_binds_and_the_search_names_it ... ok
+test a_right_major_strides_chain_is_discovered_contiguous ... ok
+test a_row_major_output_bound_external_plans ... ok
+test a_strided_binding_states_one_non_negative_stride_per_axis ... ok
+test a_strided_input_is_spelled_and_planned_at_its_own_strides ... ok
+test a_symbolic_shape_at_right_major_strides_is_discovered_contiguous ... ok
+test a_symbolic_strided_output_binds_at_its_own_dim ... ok
+test a_value_bound_on_two_buffers_has_no_tensor_keyed_slot ... ok
+test a_zero_extent_output_at_torchs_contiguous_chain_is_named_by_the_search ... ok
+test a_zero_stride_input_plans_as_a_broadcast_read ... ok
+test a_zero_stride_sink_binds_and_the_search_names_it ... ok
+test an_arbitrary_stride_on_a_degenerate_axis_is_discovered_contiguous ... ok
+test an_output_bound_on_a_read_write_input_shares_its_buffer ... ok
+test symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.26s
+
+     Running tests/codegen_identity.rs (target/release/deps/codegen_identity-e09a75a8caa4fa36)
+
+running 13 tests
+test codegen_strings_via_descriptors_match_the_buffer_table ... ok
+test descriptor_ctx_bails_loudly_on_unusable_layouts ... ok
+test strided::a_dense_strided_destination_is_written_at_the_flat_index ... ok
+test strided::broadcast_read_pins_the_broadcast_axis_to_zero ... ok
+test strided::cast_wraps_the_strided_read ... ok
+test strided::composed_offset_form_reads_one_expression ... ok
+test strided::dense_spellings_all_collapse_to_the_flat_read ... ok
+test strided::flat_path_is_byte_identical ... ok
+test strided::only_the_identity_collapses ... ok
+test strided::pitched_slice_read_on_one_binary_operand_keeps_the_other_flat ... ok
+test strided::reduce_reads_through_the_slot_layout ... ok
+test strided::transpose_read_indexes_the_parent_at_swapped_coords ... ok
+test strided::unlowerable_layouts_refuse_loudly ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+     Running tests/composed_read_families.rs (target/release/deps/composed_read_families-058a8c7f8debe038)
+
+running 5 tests
+test gather_lowers_a_folded_coordinate_operand ... ok
+test gather_lowers_a_folded_data_operand ... ok
+test materialize_lowers_a_folded_input_operand ... ok
+test scatter_lowers_a_folded_coordinate_operand ... ok
+test scatter_lowers_all_read_side_folds ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.09s
+
+     Running tests/constant_extreme_literals.rs (target/release/deps/constant_extreme_literals-e40e2db8b584bf32)
+
+running 4 tests
+test cummax_seed_constant_survives_nvrtc ... ok
+test extreme_finite_constant_survives_nvrtc_bit_for_bit ... ok
+test nan_constant_survives_nvrtc ... ok
+test negative_infinity_constant_survives_nvrtc ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.92s
+
+     Running tests/cublaslt_bias_premise.rs (target/release/deps/cublaslt_bias_premise-8e92f22f9564d269)
+
+running 5 tests
+test a_degenerate_extent_bias_election_binds_col_and_is_not_refused ... ok
+test a_degenerate_extent_d_holds_both_contiguous_spellings_in_one_class ... ok
+test linear_with_bias_mints_the_bias_form_on_a_left_major_d ... ok
+test per_row_bias_does_not_mint_the_bias_form ... ok
+test search_elects_the_bias_form_and_binds_a_col_d ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.73s
+
+     Running tests/cublaslt_contracts.rs (target/release/deps/cublaslt_contracts-6f02f3dbbc4f05c6)
+
+running 6 tests
+test all_four_contract_forms_execute_green ... ok
+test bias_form_with_a_row_d_is_refused_before_dispatch ... ok
+test degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based ... ok
+test ld_bounds_violation_refuses_before_dispatch ... ok
+test marker_elected_plan_matches_decomposed_route_tolerance_based ... ok
+test tf32_strictness_detector_is_green ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+
+     Running tests/cublaslt_contracts_cpu.rs (target/release/deps/cublaslt_contracts_cpu-413b85dfddb82e71)
+
+running 21 tests
+test a_right_major_only_d_trips_the_bias_fence_at_any_extent ... ok
+test an_elected_op_without_a_parsed_spec_refuses ... ok
+test beta_is_structural_per_form_and_nothing_else ... ok
+test bias_epilogue_forms_plan_and_bind_under_a_col_d ... ok
+test bias_epilogue_forms_with_a_row_d_trip_the_unreachable_fence ... ok
+test c_fold_forms_read_c_from_operand_two_with_structural_beta_one ... ok
+test degenerate_extent_binds_a_bias_form_col_in_both_orientations ... ok
+test dest_frame_binds_a_left_major_election_as_col_order ... ok
+test dest_frame_binds_a_right_major_election_as_row_order ... ok
+test dest_frame_refuses_a_permuted_frame ... ok
+test dest_frame_refuses_a_rank_mismatch ... ok
+test dest_frame_refuses_layouts_this_backend_cannot_write ... ok
+test dest_frame_refuses_symbolic_extents ... ok
+test ld_bounds_accepts_contiguous_row_layouts ... ok
+test ld_bounds_gate_runs_for_every_descriptor_at_plan_validation ... ok
+test ld_bounds_reach_is_order_aware ... ok
+test ld_bounds_rejects_short_buffers_and_degenerate_geometry ... ok
+test ld_bounds_rejects_the_rows_one_vacuous_case ... ok
+test no_c_forms_always_carry_a_valid_cdesc_aliasing_d ... ok
+test row_bridge_flips_the_spec_col_readings ... ok
+test symbolic_geometry_is_a_loud_pre_dispatch_refusal ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cublaslt_election.rs (target/release/deps/cublaslt_election-1db5d4a3a12a86a8)
+
+running 9 tests
+test canonical_2d_matmul_elects_the_marker ... ok
+test cublaslt_contracts_are_registered_host_call_claims ... ok
+test election_row_conv ... ok
+test election_row_gemma3 ... ok
+test election_row_gemma4_moe ... ok
+test election_row_llama3 ... ok
+test election_row_qwen3 ... ok
+test election_row_qwen3_moe ... ok
+test election_row_whisper ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.57s
+
+     Running tests/device_fidelity.rs (target/release/deps/device_fidelity-a689a4ea4f69f505)
+
+running 6 tests
+test elementwise_chain ... ok
+test gather_rows ... ok
+test iota_arange ... ok
+test movement_materialize ... ok
+test reduce_and_broadcast ... ok
+test scatter_write ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+
+     Running tests/device_profile.rs (target/release/deps/device_profile-89140d2d432ca8c7)
+
+running 3 tests
+test a_zero_budget_times_every_candidate_out_and_says_so ... ok
+test device_profiled_search_ranks_by_measurement_and_keeps_the_numbers ... ok
+test the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.45s
+
+     Running tests/device_view_differentials.rs (target/release/deps/device_view_differentials-fedfd61ae4422731)
+
+running 4 tests
+test broadcast_consumer_byte_matches_materialize_route ... ok
+test chained_matmul_byte_matches_materialize_route ... ok
+test slice_consumer_byte_matches_materialize_route ... ok
+test transpose_consumer_byte_matches_materialize_route ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.39s
+
+     Running tests/dim_buckets.rs (target/release/deps/dim_buckets-fd10ad9772e2eccf)
+
+running 5 tests
+test a_bucketed_dim_may_carry_a_bounds_dependent_check ... ok
+test a_dim_cannot_be_both_pinned_and_bucketed ... ok
+test bucket_plan_keeps_symbolic_capacity ... ok
+test bucketed_search_validates_searches_and_selects ... ok
+test overlapping_or_unsorted_buckets_are_refused ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+
+     Running tests/dtype_support.rs (target/release/deps/dtype_support-fc0749f59a15cb87)
+
+running 5 tests
+test bfloat16_multiply_round_trips ... ok
+test embedded_headers_compile_without_a_toolkit ... ok
+test f16_multiply_round_trips ... ok
+test f16_reciprocal_round_trips ... ok
+test f64_reciprocal_round_trips ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+
+     Running tests/dynamic_graphs.rs (target/release/deps/dynamic_graphs-f41dff6da765f0cd)
+
+running 11 tests
+test bucket_switches_overlay_one_arena_and_replay_cached_graphs ... ok
+test bucketed_and_range_bound_dimensions_both_stay_symbolic ... ok
+test ceil_division_in_dynamic_iota_is_evaluated_on_device ... ok
+test cublas_geometry_changes_rerecord_the_child_every_execution ... ok
+test dynamic_cublas_bias_epilogue_rebinds_geometry ... ok
+test dynamic_transpose_and_reduction_use_live_strides ... ok
+test gather_scatter_update_symbolic_coordinates ... ok
+test installing_larger_plan_invalidates_graphs_before_arena_growth ... ok
+test metadata_only_dimension_change_patches_no_nodes ... ok
+test profiling_and_serving_share_dynamic_graph_execution ... ok
+test zero_extents_disable_copies_and_restore_them ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.67s
+
+     Running tests/example_smoke.rs (target/release/deps/example_smoke-1bddbd83e7756c09)
+
+running 1 test
+test conv_example_graph_searches_with_zero_refusals ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.70s
+
+     Running tests/execution_traits.rs (target/release/deps/execution_traits-eeaf5af3d60bba4c)
+
+running 5 tests
+test a_familiar_label_without_cuda_traits_is_not_claimed ... ok
+test all_cublaslt_dps_forms_keep_the_host_interface_when_cloned ... ok
+test external_kernel_is_claimed_bufferized_cloned_and_executed ... ok
+test external_kernel_launch_geometry_updates_without_reinstantiation ... ok
+test host_graphs::external_host_topology_changes_cache_graphs_and_recover_from_errors ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+     Running tests/external_placement.rs (target/release/deps/external_placement-f96104b07c197e1d)
+
+running 6 tests
+test a_device_pointer_is_refused_for_a_buffer_that_is_not_external ... ok
+test a_sink_and_its_target_share_one_external_buffer ... ok
+test an_external_output_may_be_a_view_of_an_escape_cell ... ok
+test an_external_output_slot_sits_on_the_bound_buffer ... ok
+test execute_refuses_an_external_buffer_with_no_pointer ... ok
+test set_data_on_an_external_binding_is_refused ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+     Running tests/finalists_lattice.rs (target/release/deps/finalists_lattice-df4597e4effa4f98)
+
+running 3 tests
+test a_budget_nothing_meets_refuses_and_names_it ... ok
+test an_unconstrained_search_installs_the_searched_winner ... ok
+test keep_finalists_bounds_the_ranked_list ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.60s
+
+     Running tests/input_producer_cleanup.rs (target/release/deps/input_producer_cleanup-6a8c11d9f4c81f3b)
+
+running 5 tests
+test cleanup_marks_exactly_the_ops_that_produce_an_input_layout_tensor ... ok
+test marked_ops_produce_only_input_terminals ... ok
+test named_input_keeps_its_name_bearing_spellings ... ok
+test sampled_genomes_never_hand_bufferize_a_cyclic_graph ... ok
+test the_producer_index_offers_no_producer_for_an_input_terminal ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.79s
+
+     Running tests/ladder_refusals.rs (target/release/deps/ladder_refusals-cfbf902656e510a2)
+
+running 6 tests
+test ladder_l1_d16 ... ok
+test ladder_l1_d32 ... ok
+test ladder_l1_d8 ... ok
+test ladder_l2_d8 ... ignored, deep rung (default budget, ~10-60s release) — run explicitly by name, mirroring the original ladder harness discipline
+test ladder_l4_d8 ... ignored, deep rung (default budget, ~10-60s release) — run explicitly by name, mirroring the original ladder harness discipline
+test ladder_l8_d8 ... ignored, deep rung (default budget, ~10-60s release) — run explicitly by name, mirroring the original ladder harness discipline
+
+test result: ok. 3 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 7.81s
+
+     Running tests/plan_smoke.rs (target/release/deps/plan_smoke-b25039f9949079b0)
+
+running 2 tests
+test codegen_emits_wellformed_sources ... ok
+test search_produces_a_codegen_complete_plan ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests/registry_selection.rs (target/release/deps/registry_selection-ab09916f5a1a4c55)
+
+running 6 tests
+test a_filtered_registry_withholds_the_op_and_the_search_refuses ... ok
+test a_non_base_cublaslt_row_without_base_is_refused_at_load ... ok
+test a_row_registered_from_outside_joins_the_claim_set ... ok
+test registry_labels_agree_with_the_prototypes ... ok
+test the_cuda_registry_declares_no_constructor_it_cannot_decode ... ok
+test the_presets_are_just_registries ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+     Running tests/resident_mutation.rs (target/release/deps/resident_mutation-e211154476daf65a)
+
+running 1 test
+test resident_weights_and_in_place_state_survive_bucket_changes_and_explicit_updates ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+
+     Running tests/resident_profiling.rs (target/release/deps/resident_profiling-9e10e38cfc5e6fb9)
+
+running 1 test
+test profiling_retains_weights_resets_mutable_state_and_suppresses_resident_readback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests/rounding_plan.rs (target/release/deps/rounding_plan-19c587a6fd53051e)
+
+running 1 test
+test rounding_and_trunc_cast_plan_with_kernel_interfaces ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests/scc_sampler_marker.rs (target/release/deps/scc_sampler_marker-fe6403d216156bcc)
+
+running 1 test
+test canonical_2d_matmul_searches_green_at_the_harness_budget ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests/select_op.rs (target/release/deps/select_op-93d232fdca6b1a52)
+
+running 2 tests
+test select_does_not_leak_unselected_nan ... ok
+test select_picks_branches_elementwise ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+
+     Running tests/view_admission.rs (target/release/deps/view_admission-5c82a7db2ed7422e)
+
+running 4 tests
+test broadcast_consumer_folds_and_carries_the_stride0_map ... ok
+test chained_matmul_folds_all_movement ... ok
+test slice_consumer_folds_and_carries_the_offset_map ... ok
+test transpose_consumer_folds_and_carries_the_swap_map ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+   Doc-tests llm_chat
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests luminal_cuda_lite
+
+running 1 test
+test crates/luminal_cuda_lite/src/ops/mod.rs - ops::cuda_registry_filtered (line 234) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.52s; merged doctests compilation took 0.51s

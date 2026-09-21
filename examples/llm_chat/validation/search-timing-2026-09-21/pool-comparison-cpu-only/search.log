@@ -1,0 +1,35 @@
+Loading 291 tensors from /dev/shm/llm-chat-bench-checkpoints/llama3-8b
+Compiling Llama3 for CUDA Lite...
+PINNED_POOL numa=0 retain_bytes=68719476736
+SEARCH_TRACE runtime.program_assembly 0.001s
+SEARCH_TRACE runtime.saturation 15.151s
+SEARCH_TRACE runtime.decoder_check 0.000s
+SEARCH_TRACE runtime.serialize 1.321s
+SEARCH_TRACE runtime.assemble_total 16.544s
+SEARCH_TRACE selection.analysis 11.469s
+SEARCH_TRACE selection.sampling_space 0.064s
+SEARCH_TRACE selection.decoder_setup 0.000s
+    Start 3821.956 ms
+SEARCH_TRACE candidate.0.0 27.630s
+
+   Faster 3817.230 ms
+SEARCH_TRACE candidate.0.1 17.356s
+
+   Slower x1SEARCH_TRACE candidate.0.2 16.729s
+
+   Slower x2SEARCH_TRACE candidate.0.3 16.635s
+
+   Slower x3SEARCH_TRACE candidate.1.0 16.324s
+
+   Slower x4SEARCH_TRACE candidate.1.1 16.448s
+
+   Slower x5SEARCH_TRACE candidate.1.2 16.436s
+
+   Slower x6SEARCH_TRACE candidate.1.3 16.454s
+
+SEARCH_TRACE selection.total 155.795s
+SEARCH_TRACE runtime.finalists_setup 0.032s
+SEARCH_TRACE runtime.finalist_selection 4.491s
+SEARCH_TRACE runtime.search 177.290s
+SEARCH_TRACE saved 44169 events to /tmp/luminal-search-trace/llama-pooled-context2048.json
+PINNED_POOL destroy_seconds=1.643318 status=Ok(())

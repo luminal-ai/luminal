@@ -7,7 +7,7 @@
 //! double-transpose collapse unions `apply(apply(x, t), t)` INTO x's
 //! logical class, and forward-layout rules then land a matched view op's
 //! output in a LAYOUT-TENSOR class over that logical value. The
-//! extractor seeds an input terminal at `heuristic_cost` 0 and a view
+//! extractor seeds an input terminal at the former byte estimate of 0 and a view
 //! producer also costs 0, so `is_better` tied on cost and broke on
 //! `plan_label` ("IndexMapApplyViewGeneric" < "Input:..."): the
 //! BufferInput vanished and bufferize received a CYCLIC graph.
@@ -338,6 +338,10 @@ fn the_producer_index_offers_no_producer_for_an_input_terminal() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn sampled_genomes_never_hand_bufferize_a_cyclic_graph() {
     const SEEDS: u64 = 20;
     let mut bufferize_refusals = 0usize;

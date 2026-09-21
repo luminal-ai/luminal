@@ -1,0 +1,15 @@
+driver_api_version=13000 device_memory_pools_supported=1
+default_device_pool_release_threshold=0
+pool=DEVICE create=success
+  trial=0 bytes=1048576 memory_type=2 alloc_sync_ms=8.546 free_sync_ms=0.006 retained=33554432
+  trial=1 bytes=1048576 memory_type=2 alloc_sync_ms=0.004 free_sync_ms=0.002 retained=33554432
+pool=HOST_NUMA create=success
+  host_write_and_transfer=pass
+  trial=0 bytes=1048576 memory_type=1 alloc_sync_ms=4.051 free_sync_ms=0.005 retained=33554432
+  host_write_and_transfer=pass
+  trial=1 bytes=1048576 memory_type=1 alloc_sync_ms=0.006 free_sync_ms=0.004 retained=33554432
+pool=HOST create=success
+  host_write_and_transfer=pass
+  trial=0 bytes=1048576 memory_type=1 alloc_sync_ms=4.914 free_sync_ms=0.006 retained=33554432
+  host_write_and_transfer=pass
+  trial=1 bytes=1048576 memory_type=1 alloc_sync_ms=0.006 free_sync_ms=0.004 retained=33554432

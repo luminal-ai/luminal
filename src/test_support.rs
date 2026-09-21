@@ -527,7 +527,6 @@ impl TestGraph {
             inputs: op_inputs,
             outputs: output_infos,
             tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
-            heuristic_cost: 1,
         }));
         for (index, value) in inputs.iter().enumerate() {
             let producer = *self

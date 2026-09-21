@@ -1,0 +1,244 @@
+   Compiling smallvec v1.16.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling tracing-core v0.1.36
+   Compiling regex-automata v0.4.18
+   Compiling writeable v0.6.4
+   Compiling litemap v0.8.3
+   Compiling icu_properties_data v2.3.0
+   Compiling icu_normalizer_data v2.3.0
+   Compiling syn v3.0.5
+   Compiling getrandom v0.2.17
+   Compiling crossbeam-channel v0.5.16
+   Compiling either v1.18.0
+   Compiling utf8_iter v1.0.4
+   Compiling ring v0.17.14
+   Compiling anyhow v1.0.104
+   Compiling zeroize v1.9.0
+   Compiling portable-atomic v1.15.0
+   Compiling unicode-width v0.2.2
+   Compiling bytes v1.12.1
+   Compiling untrusted v0.9.0
+   Compiling crc32fast v1.5.1
+   Compiling sharded-slab v0.1.7
+   Compiling thread_local v1.1.10
+   Compiling powerfmt v0.2.0
+   Compiling adler2 v2.0.1
+   Compiling simd-adler32 v0.3.10
+   Compiling zerofrom v0.1.8
+   Compiling nu-ansi-term v0.50.3
+   Compiling rustls v0.23.44
+   Compiling percent-encoding v2.3.2
+   Compiling esaxx-rs v0.1.10
+   Compiling subtle v2.6.1
+   Compiling time-core v0.1.7
+   Compiling option-ext v0.2.0
+   Compiling iana-time-zone v0.1.65
+   Compiling num-conv v0.1.0
+   Compiling rand_core v0.6.4
+   Compiling parking_lot_core v0.9.12
+   Compiling socks v0.3.4
+   Compiling rustls-pki-types v1.15.1
+   Compiling itertools v0.12.1
+   Compiling deranged v0.5.8
+   Compiling itertools v0.14.0
+   Compiling dirs-sys v0.5.0
+   Compiling thread-id v4.2.2
+   Compiling yoke v0.8.3
+   Compiling unit-prefix v0.5.2
+   Compiling symlink v0.1.0
+   Compiling base64 v0.22.1
+   Compiling number_prefix v0.4.0
+   Compiling miniz_oxide v0.9.1
+   Compiling form_urlencoded v1.2.2
+   Compiling console v0.15.11
+   Compiling chrono v0.4.45
+   Compiling console v0.16.6
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling tracing v0.1.44
+   Compiling tracing-log v0.2.0
+   Compiling rand_xoshiro v0.6.0
+   Compiling rand_chacha v0.3.1
+   Compiling dirs v6.0.0
+   Compiling dashmap v6.2.1
+   Compiling parking_lot v0.12.5
+   Compiling crossbeam v0.8.4
+   Compiling egglog-concurrency v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling webpki-roots v1.0.9
+   Compiling rand v0.8.8
+   Compiling http v1.5.0
+   Compiling webpki-roots v0.26.11
+   Compiling im-rc v15.1.0
+   Compiling generational-box v0.5.6
+   Compiling flate2 v1.1.10
+   Compiling egglog-union-find v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling indicatif v0.17.11
+   Compiling indicatif v0.18.6
+   Compiling time v0.3.45
+   Compiling prost-derive v0.12.6
+   Compiling prost-derive v0.13.5
+   Compiling prost v0.12.6
+   Compiling prost v0.13.5
+   Compiling serde_derive v1.0.229
+   Compiling zerovec-derive v0.11.6
+   Compiling thiserror-impl v2.0.20
+   Compiling displaydoc v0.2.7
+   Compiling clap_derive v4.6.4
+   Compiling bytemuck_derive v1.12.0
+   Compiling regex v1.13.1
+   Compiling matchers v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling zerotrie v0.2.5
+   Compiling env_filter v2.0.0
+   Compiling zerovec v0.11.8
+   Compiling thiserror v2.0.20
+   Compiling env_logger v0.11.11
+   Compiling bytemuck v1.25.2
+   Compiling half v2.7.1
+   Compiling clap v4.6.6
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.3.0
+   Compiling float8 v0.7.0
+   Compiling icu_locale_core v2.3.0
+   Compiling tracing-perfetto v0.1.5
+   Compiling tracing-appender v0.2.5
+   Compiling serde v1.0.229
+   Compiling icu_provider v2.3.1
+   Compiling ordered-float v5.4.0
+   Compiling egglog-reports v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling ahash v0.8.12
+   Compiling compact_str v0.9.1
+   Compiling spm_precompiled v0.1.4
+   Compiling dary_heap v0.3.9
+   Compiling safetensors v0.7.0
+   Compiling icu_properties v2.3.0
+   Compiling icu_normalizer v2.3.0
+   Compiling egglog-core-relations v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling egraph-serialize v0.3.0
+   Compiling egglog-ast v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling tokenizers v0.22.2
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling rustls-webpki v0.103.15
+   Compiling egglog-bridge v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling egglog v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling ureq v2.12.1
+   Compiling hf-hub v0.4.3
+   Compiling luminal v0.2.0 (/root/luminal)
+   Compiling luminal_nn v0.1.0 (/root/luminal/crates/luminal_nn)
+   Compiling luminal_reference v0.1.0 (/root/luminal/crates/luminal_reference)
+   Compiling luminal_metal v0.2.0 (/root/luminal/crates/luminal_metal)
+   Compiling model_zoo v0.1.0 (/root/luminal/crates/model_zoo)
+   Compiling luminal_tracing v0.1.0 (/root/luminal/crates/luminal_tracing)
+    Finished `release` profile [optimized] target(s) in 44.30s
+     Running unittests src/lib.rs (target/release/deps/luminal_metal-672cbc5c922a010a)
+
+running 7 tests
+test storage::tests::resident_ranges_and_mutation_sinks_share_the_arena_across_buckets ... ignored, candidate search requires a Metal device
+test ops::constant::tests::constant_literal_is_a_valid_c_token_for_extreme_and_non_finite_values ... ok
+test ops::constant::tests::metal_f64_literal_is_a_valid_c_token_for_extreme_and_non_finite_values ... ok
+test symbolic::tests::capacities_cover_interior_extrema_and_arithmetic ... ok
+test symbolic::tests::invalid_or_unbounded_allocations_refuse ... ok
+test symbolic::tests::runtime_division_agrees_with_integer_semantics ... ok
+test saturation::tests::algebra_budget_is_cumulative_and_does_not_limit_other_rules ... ok
+
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/constant_extreme_literals.rs (target/release/deps/constant_extreme_literals-b4f8c4c2e6240a0e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/device_fidelity.rs (target/release/deps/device_fidelity-8112cc444e9160f2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/device_view_differentials.rs (target/release/deps/device_view_differentials-eecb50338ce4b1a4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dynamic_execution.rs (target/release/deps/dynamic_execution-5d2c5dbea453eb36)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/execution_traits.rs (target/release/deps/execution_traits-75b273c21dfdb226)
+
+running 2 tests
+test external_kernel_is_claimed_bufferized_cloned_and_executed ... ignored, candidate search requires a Metal device
+test a_familiar_label_without_metal_traits_is_not_claimed ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mini_model_smoke.rs (target/release/deps/mini_model_smoke-65de9af21288ea75)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mul_reduce_sum.rs (target/release/deps/mul_reduce_sum-c996b30ebf090b9f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/plan_smoke.rs (target/release/deps/plan_smoke-a4856c6adf39d1ec)
+
+running 3 tests
+test search_produces_a_codegen_complete_plan ... ignored, candidate search requires a Metal device
+test codegen_emits_wellformed_sources ... ok
+test search_refuses_without_a_device ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/registry.rs (target/release/deps/registry-3650694c840ec62f)
+
+running 3 tests
+test arena_budget_rejects_a_plan_set_that_cannot_fit ... ignored, candidate search requires a Metal device
+test filtered_vocabulary_cannot_elect_an_unregistered_operation ... ignored, candidate search requires a Metal device
+test registry_matches_claims_and_decodes_its_live_schema ... ok
+
+test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/resident_mutation.rs (target/release/deps/resident_mutation-63421bbd82f4e429)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/resident_profiling.rs (target/release/deps/resident_profiling-eb1cd327b936a90d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/rotary_views.rs (target/release/deps/rotary_views-95185c7d7965af66)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/rounding.rs (target/release/deps/rounding-14b0085ad834dfb5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/typed_execution.rs (target/release/deps/typed_execution-01dc6ebb9cf63464)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests luminal_metal
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

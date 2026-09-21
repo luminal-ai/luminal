@@ -1,0 +1,31 @@
+{
+  "checkpoint": "/dev/shm/llm-chat-bench-checkpoints/llama3-8b",
+  "model": "Llama3-8B FP32",
+  "max_context": 2048,
+  "prefill_chunk": 8,
+  "profile_q": 1,
+  "profile_c": 1,
+  "generations": 2,
+  "population": 4,
+  "trials": 3,
+  "seed": 0,
+  "search_seconds": 72.226097587,
+  "best_trial_mean_seconds": 0.219261653,
+  "plans_profiled": 7,
+  "fingerprint_hits": 1,
+  "search_launches": 29,
+  "search_resident_upload_bytes": 272538140672,
+  "selected_plan_fresh_profile": {
+    "mean_trial_seconds": 0.219820075,
+    "completed_trials": 3,
+    "launches": 4,
+    "resident_upload_bytes": 34268594176,
+    "staging_bytes": 16777216,
+    "arena_bytes": 74556314880,
+    "resident_input_bytes": 32657981440,
+    "transient_input_bytes": 1044,
+    "kernel_compilations": 321
+  },
+  "finite_serving_logits": true,
+  "logits_len": 128256
+}

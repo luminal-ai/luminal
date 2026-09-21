@@ -1,43 +1,4 @@
-//! THE IMPLEMENTATION SEARCH — the CUDA-lite runtime's selection.
-//!
-//! There is NO search at the logical level: saturation discovers the
-//! implementations, and this module only SELECTS among them.
-//!
-//! WHAT STAYS HERE, AND WHY. The loop must price a plan in the middle of
-//! every iteration, and this crate's prices are its own — a heuristic
-//! over the extracted graph, or a real timed run on a real device. That
-//! is why the loop is here and not in core ("just put this search in the
-//! cuda lite runtime\'s crate. it\'s fine."), and the `PlanProfiler`
-//! trait core used to define is GONE: candidates are ranked INLINE by
-//! whichever [`Evaluator`] the caller hands in — there is no trait, no
-//! object, and no third implementation waiting to be written. The option
-//! knobs, the outcome shape, the finalist/lattice policy and the
-//! bucketed driver are here for the same reason: they are choices.
-//!
-//! WHAT DOES NOT: drawing genomes, counting refusals, attributing
-//! wall-clock and printing progress decide nothing, were byte-identical
-//! in every copy, and are [`luminal::search_support`] (#420/#422 rejoin
-//! Phase 8). The names this module used to define are re-exported below
-//! so callers read the same.
-//!
-//! TWO EVALUATORS (Phase 4, 2026-09-03):
-//!
-//! * [`Evaluator::Heuristic`] — the explicit DEVICE-FREE alternative
-//!   ([`crate::heuristic`]): a weak static prior, never a measurement.
-//!   It is what runs on the hosts most of this crate's suite runs on.
-//! * [`Evaluator::Device`] — the default, ON-DEVICE PROFILING ([`crate::profile`]),
-//!   selected by `CompileOptions::profile_on_device`: each candidate
-//!   plan is compiled, warmed and TIMED on a real CUDA device, mirroring
-//!   the reference runtime's evaluator (ruling 4 on #386: *"we need to
-//!   mirror that design"*).
-//!
-//! The two are never blended: with device profiling on, the heuristic is
-//! not consulted at all (D6's "doesn't bias search too much", taken at
-//! full strength — a device build ranks on measured time only).
-//!
-//! The tests for what moved live with it, in core; the dedup search
-//! test that drives a whole runtime stays with the reference copy
-//! (`luminal_reference::search`).
+//! Device-measured implementation search. Candidate selection requires a GPU.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -60,8 +21,8 @@ use luminal::prelude::egraph_serialize;
 pub use luminal::search_support::{
     CaptureAwareStderr, ProducerIndex, RefusalBreakdown, SearchProgress, SearchTimings,
     bufferize_cycle_tripwire, early_stop_exceeded, log_channel_enabled, mutate_genome,
-    mutate_genome_reporting, mutate_genome_with_seed, sample_genome, sample_genome_reporting,
-    sample_genome_with_seed,
+    mutate_genome_reporting, mutate_genome_with_seed, sample_genome, sample_genome_correlated,
+    sample_genome_reporting, sample_genome_with_seed,
 };
 
 #[derive(Debug, Clone)]
@@ -79,16 +40,6 @@ pub struct CompileOptions {
     /// `CompileOptions::search_log`; overridden by `SEARCH_LOG=0`/`1`
     /// or `LUMINAL_LOG=1`.
     pub search_log: bool,
-    /// RANK CANDIDATES BY MEASURED DEVICE TIME (Phase 4, 2026-09-03)
-    /// instead of by the device-free heuristic. ON by default. Set false
-    /// explicitly for device-free planning or heuristic diagnostics.
-    ///
-    /// ON requires the `device` feature, a CUDA device, and the caller's
-    /// input payloads (the ladder's `search` stages them); without the
-    /// feature the search REFUSES by name rather than silently falling
-    /// back to the heuristic — a caller that asked for measurement must
-    /// never be handed a prior.
-    pub profile_on_device: bool,
     /// PER-CANDIDATE BUDGET FOR THE TIMED RUN — and for nothing else
     /// (ruling, 2026-09-03: *"timeout should just cover run"*). The
     /// clock starts at the first TIMED trial, after the candidate has
@@ -112,16 +63,13 @@ pub struct CompileOptions {
     /// It costs NOTHING when nothing refuses: finalists past rank 0 are
     /// extracted only if the walk reaches them.
     pub keep_finalists: usize,
-    /// THE AGGREGATE DEVICE BUDGET (Phase 5): an upper bound, in bytes,
-    /// on the arena slab the installed plan set will need. `None` (the
-    /// default) is unconstrained and is what every existing caller gets.
-    ///
-    /// It is a SET constraint, which is why it is checked by the bucket
-    /// lattice and not by the per-candidate evaluator: the serving slab
-    /// is grown once and sized to the LARGEST installed plan, so what
-    /// has to fit is `max` over the buckets, and no single bucket's
-    /// search can see that number.
+    /// Maximum bytes for the entire arena. Search caps this by available CUDA
+    /// memory (or uses that capacity when None), prunes individually impossible
+    /// materializations, and rejects candidate arenas over the limit before
+    /// allocation. The finalist lattice also enforces the requested set budget.
     pub device_budget_bytes: Option<usize>,
+    /// Custom edits after serialization and before mandatory memory pruning.
+    pub serialized_graph_passes: Vec<crate::egraph_postpass::SerializedGraphPostPass>,
     /// Shape environment for lower-level search callers. The runtime fills this from bindings.
     pub shapes: crate::symbolic::ShapeEnv,
 }
@@ -135,10 +83,10 @@ impl Default for CompileOptions {
             trials: 3,
             seed: 0,
             search_log: true,
-            profile_on_device: true,
             candidate_timeout: None,
             keep_finalists: 4,
             device_budget_bytes: None,
+            serialized_graph_passes: Vec::new(),
             shapes: Default::default(),
         }
     }
@@ -161,15 +109,8 @@ impl CompileOptions {
 pub struct SearchOutcome {
     pub best_plan: BufferIrGraph<luminal::layouts::DecodedLayout>,
     pub best_genome: Genome,
+    pub memory_pruning: crate::egraph_postpass::MemoryPruning,
     pub best_nanos: u128,
-    /// THE WINNER'S HEURISTIC COST, always computed, never consulted by
-    /// a device-profiled ranking. With [`Evaluator::Heuristic`] it IS
-    /// `best_nanos`; with [`Evaluator::Device`] the two sit side by side
-    /// so a caller can see how far the byte-move prior was from the
-    /// measurement (which is the only honest way to talk about D6's
-    /// "doesn't bias search too much" — by reporting the gap, not by
-    /// mixing the numbers).
-    pub best_heuristic_cost: u128,
     /// Plans actually profiled (distinct fingerprints).
     pub plans_profiled: usize,
     /// Candidates answered from the fingerprint cache without re-profiling.
@@ -198,16 +139,35 @@ pub struct SearchOutcome {
     pub lattice_rejections: usize,
 }
 
-/// HOW ONE CANDIDATE IS PRICED — the whole of what used to be a
-/// `PlanProfiler` trait, as a two-variant enum the caller constructs.
-///
-/// NO TRAIT (ruling, 2026-09-03: keep it simple, no new traits). There
-/// are exactly two ways this crate prices a plan and both live in this
-/// crate, so an enum names them and the match is exhaustive.
+/// Representative-specific host payloads, borrowed without copying model weights.
+pub type ProfileInputs<'a> = (
+    luminal::shape::DynMap,
+    FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
+);
+
+#[cfg(feature = "device")]
+fn staged_at<'a>(
+    staged: &FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
+    profiles: &[ProfileInputs<'a>],
+    dims: &luminal::shape::DynMap,
+) -> Result<FxHashMap<i64, &'a crate::host_buffer::HostBuffer>> {
+    let mut data = staged.clone();
+    if !profiles.is_empty() {
+        let mut matches = profiles.iter().filter(|(shape, _)| shape == dims);
+        let (_, inputs) = matches
+            .next()
+            .ok_or_else(|| anyhow!("no profiling inputs for {dims:?}"))?;
+        ensure!(
+            matches.next().is_none(),
+            "ambiguous profiling inputs for {dims:?}"
+        );
+        data.extend(inputs.iter().map(|(id, data)| (*id, *data)));
+    }
+    Ok(data)
+}
+
+/// A persistent device and borrowed inputs for candidate measurements.
 pub enum Evaluator<'a> {
-    /// The DEVICE-FREE prior ([`crate::heuristic`]): bytes moved over
-    /// the extracted graph. Nothing executes.
-    Heuristic,
     /// ON-DEVICE MEASUREMENT ([`crate::profile::profile_candidate`]) on
     /// a persistent device — the module cache and the slab are the
     /// runtime's, so kernel compilation is paid once per distinct source
@@ -222,25 +182,108 @@ pub enum Evaluator<'a> {
     Device {
         device: &'a mut crate::device::CudaDevice,
         staged: &'a FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
+        residents: &'a luminal::resident::ResidentBindings,
+        profile_inputs: &'a [ProfileInputs<'a>],
     },
     /// The lifetime placeholder for builds WITHOUT the `device` feature,
     /// so [`search_implementations`]'s signature is the same in both.
-    /// Unconstructible in practice — [`Evaluator::Heuristic`] is the
-    /// only variant a device-free build has.
+    /// Searching with this placeholder always returns an error.
     #[cfg(not(feature = "device"))]
     #[doc(hidden)]
     NoDevice(std::marker::PhantomData<&'a ()>),
 }
 
 impl Evaluator<'_> {
+    fn arena_budget(&self, requested: Option<usize>) -> Result<usize> {
+        #[cfg(feature = "device")]
+        {
+            let Self::Device { device, .. } = self;
+            let available = device.available_arena_bytes()?;
+            Ok(requested.map_or(available, |limit| limit.min(available)))
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            let _ = requested;
+            Err(anyhow!("device search requires a GPU"))
+        }
+    }
+
+    fn measure(
+        &mut self,
+        plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
+        options: &CompileOptions,
+        best_nanos: Option<u128>,
+    ) -> Priced {
+        #[cfg(feature = "device")]
+        {
+            let Self::Device {
+                device,
+                staged,
+                residents,
+                profile_inputs,
+            } = self;
+            let staged = match staged_at(staged, profile_inputs, &options.shapes.values) {
+                Ok(staged) => staged,
+                Err(error) => return Priced::PrepareFailed(format!("{error:#}")),
+            };
+            let measured = crate::profile::profile_candidate_at(
+                device,
+                plan,
+                &staged,
+                residents,
+                options.trials,
+                best_nanos,
+                options.candidate_timeout,
+                &options.shapes,
+                options.device_budget_bytes,
+            );
+            device.release_slab();
+            match measured {
+                Ok(crate::profile::Measurement::Timed { mean_nanos, .. }) => {
+                    Priced::Cost(mean_nanos)
+                }
+                Ok(crate::profile::Measurement::TimedOut {
+                    elapsed_nanos,
+                    completed_trials,
+                }) => Priced::TimedOut(format!(
+                    "candidate exceeded the timed-run budget after \
+                     {completed_trials} trial(s), {:.3} ms elapsed",
+                    elapsed_nanos as f64 / 1e6
+                )),
+                Err(crate::profile::ProfileFailure::Prepare(err)) => {
+                    Priced::PrepareFailed(format!("{err:#}"))
+                }
+                Err(crate::profile::ProfileFailure::Execute(err)) => {
+                    Priced::ExecuteFailed(format!("{err:#}"))
+                }
+            }
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            let _ = (plan, options, best_nanos);
+            Priced::PrepareFailed(
+                "candidate search requires the `device` feature and a CUDA GPU".into(),
+            )
+        }
+    }
+
     /// Lend this evaluator to a nested search (the bucketed entry runs
     /// one search per Cartesian combination and must hand the SAME
     /// device to each).
     pub fn reborrow(&mut self) -> Evaluator<'_> {
         match self {
-            Evaluator::Heuristic => Evaluator::Heuristic,
             #[cfg(feature = "device")]
-            Evaluator::Device { device, staged } => Evaluator::Device { device, staged },
+            Evaluator::Device {
+                device,
+                staged,
+                residents,
+                profile_inputs,
+            } => Evaluator::Device {
+                device,
+                staged,
+                residents,
+                profile_inputs,
+            },
             #[cfg(not(feature = "device"))]
             Evaluator::NoDevice(marker) => Evaluator::NoDevice(*marker),
         }
@@ -280,12 +323,9 @@ fn rank_insert(ranked: &mut Vec<(u128, Genome)>, nanos: u128, genome: &Genome, k
     ranked.truncate(keep);
 }
 
-/// The incumbent: the best-ranked candidate so far, its plan, and the
-/// heuristic cost of the same graph (carried alongside, never mixed into
-/// the ranking — see [`SearchOutcome::best_heuristic_cost`]).
+/// The fastest measured candidate and its extracted plan.
 struct Best {
     nanos: u128,
-    heuristic: u128,
     genome: Genome,
     plan: BufferIrGraph<luminal::layouts::DecodedLayout>,
 }
@@ -370,18 +410,12 @@ fn external_placement_feasible(
 /// not clonable, so the list lives in the runtime and is lent here.
 /// Deterministic for a fixed seed.
 ///
-/// HOW CANDIDATES ARE PRICED is the caller's too, as the one extra
-/// argument: [`Evaluator::Heuristic`] ranks device-free and needs no
-/// caller data (D6, 2026-09-03), [`Evaluator::Device`] carries the
-/// device and the staged payloads and ranks by measured time (Phase 4).
-/// `options.profile_on_device` and the evaluator must AGREE — a
-/// mismatch is refused up front rather than silently ranking by the
-/// prior when measurement was asked for.
+/// Candidates are always compiled, warmed and measured on the device.
 // The evaluator is mutated (reborrowed per candidate) only by the
 // device arm, which a device-free build compiles out.
 #[cfg_attr(not(feature = "device"), allow(unused_mut))]
 pub fn search_implementations(
-    egraph: &egraph_serialize::EGraph,
+    egraph: &mut egraph_serialize::EGraph,
     program: &SearchProgram,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
@@ -389,19 +423,35 @@ pub fn search_implementations(
     mut evaluator: Evaluator<'_>,
 ) -> Result<SearchOutcome> {
     ensure!(
-        !options.profile_on_device || evaluator.is_device(),
-        "device profiling requested but {}",
-        if cfg!(feature = "device") {
-            "this search was handed the heuristic evaluator (the ladder's \
-             `CudaRuntime::search` builds the device one)"
-        } else {
-            "the `device` feature is off: this build has no device evaluator, and \
-             ranking by the heuristic instead would answer a request for a \
-             measurement with a prior"
-        }
+        evaluator.is_device(),
+        "candidate search requires the `device` feature and a CUDA GPU"
     );
     let mut timings = SearchTimings::default();
     let analysis_start = Instant::now();
+    let decoders = luminal::egglog_snippet::decoder_registry_for(matchers)?;
+    let arena_budget_bytes = evaluator.arena_budget(options.device_budget_bytes)?;
+    let mut resolved_options = options.clone();
+    resolved_options.device_budget_bytes = Some(arena_budget_bytes);
+    let options = &resolved_options;
+    let memory_pruning = crate::egraph_postpass::run(
+        egraph,
+        &crate::egraph_postpass::PostPassContext {
+            decoders: &decoders,
+            bounds: &options.shapes.bounds,
+            arena_budget_bytes,
+        },
+        &options.serialized_graph_passes,
+    )?;
+    if options.search_log_enabled() && memory_pruning.oversized_tensors > 0 {
+        eprintln!(
+            "Arena memory pass: removed {} oversized tensors and {} producer classes ({} nodes), budget {:.2} GiB",
+            memory_pruning.oversized_tensors,
+            memory_pruning.producer_classes,
+            memory_pruning.removed_nodes,
+            arena_budget_bytes as f64 / 1073741824.0
+        );
+    }
+
     // The allow list narrows the caller's matcher set; None = the whole set.
     let allow = allow_override;
     let mut session =
@@ -440,7 +490,6 @@ pub fn search_implementations(
     // matcher set's `(sort, constructor)` decoders. Built once — the
     // view indexes classes through the serialized graph's own
     // `classes()` cache, so every later class lookup is a map hit.
-    let decoders = luminal::egglog_snippet::decoder_registry_for(matchers)?;
     let view = luminal::egglog_utils::eclass::EGraphView::new(egraph, &decoders);
     // THE DECODED-LAYOUT CACHE, one per search and CALLER-OWNED
     // (`decode_layout_table` takes it by `&mut`). Decoding is a pure
@@ -475,8 +524,12 @@ pub fn search_implementations(
         let mut candidates: Vec<Genome> = Vec::with_capacity(options.generation_size);
         match &best {
             None => {
-                for _ in 0..options.generation_size {
-                    candidates.push(random_genome(&mut rng));
+                for attempt in 0..options.generation_size {
+                    candidates.push(if attempt % 2 == 0 {
+                        sample_genome_correlated(&index, &space, &mut rng)
+                    } else {
+                        random_genome(&mut rng)
+                    });
                 }
             }
             Some(incumbent) => {
@@ -590,73 +643,12 @@ pub fn search_implementations(
                         }
                         continue;
                     }
-                    // The heuristic cost of this graph is ALWAYS computed
-                    // — it is what the outcome reports beside a measured
-                    // winner — but under device profiling it is never
-                    // ranked on.
-                    let heuristic = crate::heuristic::heuristic_cost_of(&graph);
                     let profile_start = Instant::now();
-                    let priced = if options.profile_on_device {
-                        // ON-DEVICE MEASUREMENT (Phase 4). Compile +
-                        // warm + time on the persistent device, then
-                        // RELEASE THE SLAB: at search time a candidate's
-                        // arena is not kept between candidates (#422
-                        // reversing #401's retention), so a plan with an
-                        // outsized high-water mark cannot starve the
-                        // next candidate of device memory. Serving keeps
-                        // it — `CudaRuntime::execute` never releases.
-                        #[cfg(feature = "device")]
-                        {
-                            let Evaluator::Device { device, staged } = &mut evaluator else {
-                                unreachable!(
-                                    "profile_on_device without a device evaluator is refused \
-                                     before the loop"
-                                )
-                            };
-                            let measured = crate::profile::profile_candidate_at(
-                                device,
-                                &plan,
-                                staged,
-                                options.trials,
-                                best.as_ref().map(|incumbent| incumbent.nanos),
-                                options.candidate_timeout,
-                                &options.shapes,
-                            );
-                            device.release_slab();
-                            match measured {
-                                Ok(crate::profile::Measurement::Timed { mean_nanos, .. }) => {
-                                    Priced::Cost(mean_nanos)
-                                }
-                                Ok(crate::profile::Measurement::TimedOut {
-                                    elapsed_nanos,
-                                    completed_trials,
-                                }) => Priced::TimedOut(format!(
-                                    "candidate exceeded the timed-run budget after \
-                                     {completed_trials} trial(s), {:.3} ms elapsed",
-                                    elapsed_nanos as f64 / 1e6
-                                )),
-                                Err(crate::profile::ProfileFailure::Prepare(err)) => {
-                                    Priced::PrepareFailed(format!("{err:#}"))
-                                }
-                                Err(crate::profile::ProfileFailure::Execute(err)) => {
-                                    Priced::ExecuteFailed(format!("{err:#}"))
-                                }
-                            }
-                        }
-                        #[cfg(not(feature = "device"))]
-                        {
-                            unreachable!(
-                                "profile_on_device without the `device` feature is refused \
-                                 before the loop"
-                            )
-                        }
-                    } else {
-                        // DEVICE-FREE RANKING (D6): a static prior over
-                        // the extracted graph, never a measurement. See
-                        // [`crate::heuristic`] for what it does and does
-                        // not claim.
-                        Priced::Cost(heuristic)
-                    };
+                    let priced = evaluator.measure(
+                        &plan,
+                        options,
+                        best.as_ref().map(|incumbent| incumbent.nanos),
+                    );
                     timings.profile_nanos += profile_start.elapsed().as_nanos();
                     let nanos = match priced {
                         Priced::Cost(nanos) => nanos,
@@ -709,7 +701,6 @@ pub fn search_implementations(
                     if improved {
                         best = Some(Best {
                             nanos,
-                            heuristic,
                             genome: genome.clone(),
                             plan,
                         });
@@ -744,7 +735,6 @@ pub fn search_implementations(
                 rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
                 best = Some(Best {
                     nanos,
-                    heuristic: crate::heuristic::heuristic_cost_of(&graph),
                     genome: genome.clone(),
                     plan,
                 });
@@ -766,8 +756,8 @@ pub fn search_implementations(
     Ok(SearchOutcome {
         best_plan: best.plan,
         best_genome: best.genome,
+        memory_pruning,
         best_nanos: best.nanos,
-        best_heuristic_cost: best.heuristic,
         plans_profiled,
         fingerprint_hits,
         timings,
@@ -784,51 +774,44 @@ pub fn search_implementations(
 // an INSTALLED plan.
 // ===========================================================================
 
-/// THE FINALIST HARD FILTER — the per-plan half of the Phase 5 gate.
-///
-/// MAIN'S SHAPE (`validate_finalist` = `clear_intermediate_buffers` +
-/// `compile_and_validate_profile_candidate`): a finalist is viable only
-/// if the runtime can actually stand it up. Here that means:
-///
-/// * DEVICE-FREE (the heuristic evaluator, which is what most of this
-///   crate's suite runs under): a candidate that reached this function
-///   already extracted, bufferized and arena-planned, and there is
-///   nothing further a host with no GPU can check. The filter passes.
-/// * ON DEVICE (`profile_on_device` with a live evaluator): ONE warmup
-///   graph preparation and execution — compile, stage, launch, synchronize — which
-///   is exactly the viability check the profiler's prepare phase is. The
-///   slab is released afterwards, matching the search's own per-candidate
-///   hygiene (#422): finalist validation must not leave an outsized
-///   allocation behind for the next bucket.
-///
-/// The candidate timeout is NOT applied here. It is documented to cover
-/// a TIMED RUN (Phase 4's ruling) and a warmup is not one.
+/// Compile, stage and execute the finalist once on the device. The candidate
+/// timeout covers timed trials only, so it does not apply to this warmup.
 pub fn finalist_validate(
     pending: &crate::finalists::PendingFinalist,
-    options: &CompileOptions,
+    _options: &CompileOptions,
     evaluator: &mut Evaluator<'_>,
 ) -> Result<(), String> {
-    let _ = (pending, options);
     #[cfg(feature = "device")]
     {
-        if options.profile_on_device
-            && let Evaluator::Device { device, staged } = evaluator
-        {
-            let ran =
-                crate::profile::prepare_candidate(device, &pending.plan, staged, &pending.shapes)
-                    .and_then(|staged| {
-                        let borrowed = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
-                        device.execute(0, &borrowed, &pending.shapes.values)
-                    });
-            device.release_slab();
-            ran.map_err(|err| format!("device warmup of ranked #{}: {err:#}", pending.rank))?;
-        }
+        let Evaluator::Device {
+            device,
+            staged,
+            residents,
+            profile_inputs,
+        } = evaluator;
+        let ran = staged_at(staged, profile_inputs, &pending.shapes.values).and_then(|staged| {
+            crate::profile::prepare_candidate(
+                device,
+                &pending.plan,
+                &staged,
+                residents,
+                &pending.shapes,
+                _options.device_budget_bytes,
+            )
+            .and_then(|staged| {
+                let borrowed = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+                device.execute(0, &borrowed, &pending.shapes.values)
+            })
+        });
+        device.release_slab();
+        ran.map_err(|err| format!("device warmup of ranked #{}: {err:#}", pending.rank))?;
+        Ok(())
     }
     #[cfg(not(feature = "device"))]
     {
-        let _ = evaluator;
+        let _ = (pending, evaluator);
+        Err("finalist validation requires the `device` feature and a CUDA GPU".into())
     }
-    Ok(())
 }
 
 /// Bound the maximum resident arena across the installed bucket set. Each
@@ -984,6 +967,12 @@ pub fn bucketed_search_implementations(
     let mut egraphs: Vec<egraph_serialize::EGraph> = Vec::new();
     let mut searched: Vec<SearchedBucket> = Vec::new();
     for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
+        if options.search_log_enabled() {
+            eprintln!(
+                "Searching bucket {ranges:?}, representative {representative:?}: {} x {} candidate attempts",
+                options.generations, options.generation_size
+            );
+        }
         let mut bucket_options = options.clone();
         bucket_options.shapes.values = representative.clone();
         bucket_options
@@ -996,11 +985,11 @@ pub fn bucketed_search_implementations(
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} range render fails: {err}"))?;
         assembly.decoders.check(&egraph)?;
-        let serialized = egraph
+        let mut serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
             .egraph;
         let outcome = search_implementations(
-            &serialized,
+            &mut serialized,
             &program,
             &bucket_options,
             allow_override.clone(),
@@ -1196,9 +1185,6 @@ pub fn harness_search_options() -> CompileOptions {
         trials: 1,
         seed: 0,
         search_log: false,
-        // This harness deliberately supports planning without a GPU or
-        // input payloads. Device examples opt in to measured selection.
-        profile_on_device: false,
         ..CompileOptions::default()
     }
 }

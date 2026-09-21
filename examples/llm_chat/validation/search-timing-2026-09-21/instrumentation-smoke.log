@@ -1,0 +1,65 @@
+   Compiling serde_json v1.0.151
+   Compiling env_logger v0.11.11
+   Compiling rayon v1.12.0
+   Compiling egglog-reports v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling egraph-serialize v0.3.0
+   Compiling egglog-core-relations v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling egglog-bridge v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling egglog v2.0.0 (https://github.com/luminal-ai/egglog?rev=1bb30831e11121bd639caf93d84465d8d110e3f7#1bb30831)
+   Compiling luminal v0.2.0 (/tmp/luminal-search-timing)
+   Compiling luminal_nn v0.1.0 (/tmp/luminal-search-timing/crates/luminal_nn)
+   Compiling luminal_reference v0.1.0 (/tmp/luminal-search-timing/crates/luminal_reference)
+   Compiling luminal_cuda_lite v0.1.0 (/tmp/luminal-search-timing/crates/luminal_cuda_lite)
+   Compiling model_zoo v0.1.0 (/tmp/luminal-search-timing/crates/model_zoo)
+    Finished `release` profile [optimized] target(s) in 17.77s
+     Running tests/device_profile.rs (/root/luminal/target/release/deps/device_profile-d6e03b5ec31dc4f5)
+
+running 1 test
+SEARCH_TRACE runtime.program_assembly 0.001s
+SEARCH_TRACE runtime.saturation 0.769s
+SEARCH_TRACE runtime.decoder_check 0.000s
+SEARCH_TRACE runtime.serialize 0.041s
+SEARCH_TRACE runtime.assemble_total 0.822s
+SEARCH_TRACE selection.analysis 0.027s
+SEARCH_TRACE selection.sampling_space 0.001s
+SEARCH_TRACE selection.decoder_setup 0.000s
+SEARCH_TRACE candidate.0.0 1.132s
+SEARCH_TRACE candidate.0.1 0.252s
+SEARCH_TRACE candidate.0.2 0.217s
+SEARCH_TRACE candidate.0.3 0.185s
+SEARCH_TRACE candidate.1.0 0.005s
+SEARCH_TRACE candidate.1.1 0.059s
+SEARCH_TRACE candidate.1.2 0.005s
+SEARCH_TRACE candidate.1.3 0.004s
+SEARCH_TRACE selection.total 1.899s
+SEARCH_TRACE runtime.finalists_setup 0.001s
+SEARCH_TRACE runtime.finalist_selection 0.004s
+SEARCH_TRACE runtime.search 2.947s
+SEARCH_TRACE saved 877 events to /tmp/luminal-search-trace/smoke.json
+device-profiled mini-llama3: search 2947 ms | plans profiled 5 | fingerprint hits 3 | [saturation 0ms, serialize 0ms, analysis 27ms, extract 41ms, plan-build 42ms, profile-exec 1773ms]
+device-profiled mini-llama3: winner 0.324611 ms measured on device, heuristic cost 8860403 bytes moved | refusals extract refusals 0 (choice-cycles 0, dead-ends 0), bufferize 0, execute 0, timed out 0
+SEARCH_TRACE runtime.program_assembly 0.001s
+SEARCH_TRACE runtime.saturation 0.770s
+SEARCH_TRACE runtime.decoder_check 0.000s
+SEARCH_TRACE runtime.serialize 0.043s
+SEARCH_TRACE runtime.assemble_total 0.824s
+SEARCH_TRACE selection.analysis 0.026s
+SEARCH_TRACE selection.sampling_space 0.001s
+SEARCH_TRACE selection.decoder_setup 0.000s
+SEARCH_TRACE candidate.0.0 0.030s
+SEARCH_TRACE candidate.0.1 0.008s
+SEARCH_TRACE candidate.0.2 0.011s
+SEARCH_TRACE candidate.0.3 0.009s
+SEARCH_TRACE candidate.1.0 0.004s
+SEARCH_TRACE candidate.1.1 0.006s
+SEARCH_TRACE candidate.1.2 0.006s
+SEARCH_TRACE candidate.1.3 0.004s
+SEARCH_TRACE selection.total 0.115s
+SEARCH_TRACE runtime.finalists_setup 0.001s
+SEARCH_TRACE runtime.finalist_selection 0.000s
+SEARCH_TRACE runtime.search 0.946s
+SEARCH_TRACE saved 78 events to /tmp/luminal-search-trace/smoke.json
+device-profiled mini-llama3: the PRIOR would elect a plan of 7919719 bytes moved; the MEASUREMENT elected one of 8860403 (DIFFERENT — the measurement did not pick the prior's winner)
+test device_profiled_search_ranks_by_measurement_and_keeps_the_numbers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 4.55s

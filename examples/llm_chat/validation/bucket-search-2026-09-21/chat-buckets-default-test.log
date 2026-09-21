@@ -1,0 +1,10 @@
+   Compiling luminal_cuda_lite v0.1.0 (/root/luminal/crates/luminal_cuda_lite)
+   Compiling llm_chat v0.1.0 (/root/luminal/examples/llm_chat)
+    Finished `release` profile [optimized] target(s) in 6.25s
+     Running tests/backend_cuda.rs (target/release/deps/backend_cuda-cee49888127ebc97)
+
+running 2 tests
+test chunked_prefill_history_reuse_and_reset_drive_one_session ... ok
+test prefill_and_decode_use_resident_state_and_match_reference ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.75s

@@ -32,6 +32,10 @@ fn weights(n: usize, seed: usize) -> Vec<f32> {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn canonical_2d_matmul_searches_green_at_the_harness_budget() {
     let mut cx = Graph::new();
     let a = cx.tensor((4usize, 8usize), DType::F32);

@@ -1007,6 +1007,10 @@ fn descriptor_ctx_bails_loudly_on_unusable_layouts() {
 ///    fixture flips from all-equal to folded (its broadcast/permute
 ///    movement now folds); elementwise and mul_sum stay all-equal.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn codegen_strings_via_descriptors_match_the_buffer_table() {
     let mut folded_seen = 0usize;
     for (name, plan) in representative_plans() {

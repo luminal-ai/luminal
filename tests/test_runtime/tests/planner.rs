@@ -42,7 +42,10 @@ fn must_alloc_outputs_are_coerced_to_caller_provided_storage() {
 
     use luminal::bufferize::{BufferId, BufferNode, Owner};
 
-    let graph = test_runtime::extract_fixture_by_name("basic_program.egg");
+    let graph = test_runtime::extract_fixture_preferring(
+        "basic_program.egg",
+        &["LayoutTensorOpIndexMapApplyViewGeneric"],
+    );
     let plan = bufferize_mock(&luminal::dps::dps_rewrite(&graph)).expect("bufferizes");
 
     // Storage that exists at launch = the buffers backing BufferInput

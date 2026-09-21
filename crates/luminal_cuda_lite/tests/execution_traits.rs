@@ -127,6 +127,10 @@ impl OpMatcher for ExternalAddMatcher {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     let mut graph = luminal::graph::Graph::new();
     let a = graph.tensor((2, 3), DType::F32);
@@ -374,6 +378,7 @@ mod host_graphs {
         rt.bind_dyn_range('a', 2, 30).unwrap();
         rt.search(&Default::default(), &harness_search_options())
             .unwrap();
+        let search_stats = rt.graph_stats().unwrap();
         let initial = RECORDS.load(Ordering::SeqCst);
         for n in [3, 4, 3, 4, 4] {
             rt.set_dim('a', n);
@@ -385,11 +390,11 @@ mod host_graphs {
         let stats = rt.graph_stats().unwrap();
         // One recording at compile, then one on every later execution.
         assert_eq!(stats.host_captures, stats.launches);
-        assert_eq!(stats.instantiations, 2);
+        assert_eq!(stats.instantiations - search_stats.instantiations, 2);
         assert_eq!(stats.graph_cache_hits, 2);
         assert_eq!(
             RECORDS.load(Ordering::SeqCst) - initial,
-            stats.host_captures as usize,
+            (stats.host_captures - search_stats.host_captures) as usize,
             "record runs only during capture"
         );
         // More signatures than the capture cache holds. The parent source
@@ -465,6 +470,7 @@ fn external_kernel_launch_geometry_updates_without_reinstantiation() {
     rt.bind_dyn_range('a', 0, 1025).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
+    let search_stats = rt.graph_stats().unwrap();
     for n in [0, 1025, 2, 0, 257] {
         rt.set_dim('a', n);
         rt.set_data(a.id, vec![2f32; n]).unwrap();
@@ -473,7 +479,7 @@ fn external_kernel_launch_geometry_updates_without_reinstantiation() {
         assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; n]);
     }
     let stats = rt.graph_stats().unwrap();
-    assert_eq!(stats.instantiations, 1);
+    assert_eq!(stats.instantiations - search_stats.instantiations, 1);
     assert_eq!(stats.kernel_compilations, 1);
     assert!(stats.node_updates >= 4);
 }
