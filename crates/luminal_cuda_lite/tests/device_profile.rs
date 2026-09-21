@@ -122,8 +122,8 @@ fn device_profiled_search_ranks_by_measurement_and_keeps_the_numbers() {
     let reference = luminal_reference::harness::run_reference(&cx, &staged);
     let want = reference.get_f32(out).expect("reference logits").clone();
 
-    // The device-profiled search: the shared 2x4 harness budget, ranked
-    // by measured device time.
+    // The default evaluator must rank by measured device time. Keep the
+    // small harness budget, but inherit profiling from production defaults.
     let data: FxHashMap<NodeIndex, HostBuffer> = floats
         .iter()
         .map(|(id, v)| (*id, HostBuffer::from(v.clone())))
@@ -133,8 +133,11 @@ fn device_profiled_search_ranks_by_measurement_and_keeps_the_numbers() {
         )
         .collect();
     let options = CompileOptions {
-        profile_on_device: true,
-        ..luminal_cuda_lite::harness_search_options()
+        generations: 2,
+        generation_size: 4,
+        trials: 1,
+        search_log: false,
+        ..CompileOptions::default()
     };
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let start = std::time::Instant::now();
@@ -161,6 +164,13 @@ fn device_profiled_search_ranks_by_measurement_and_keeps_the_numbers() {
     assert!(
         outcome.plans_profiled > 0,
         "no plan was profiled on the device"
+    );
+    assert!(
+        rt.graph_stats()
+            .expect("default search must create a CUDA device")
+            .launches
+            > 0,
+        "default search must execute candidates before serving"
     );
     let b = &outcome.refusal_breakdown;
     assert_eq!(

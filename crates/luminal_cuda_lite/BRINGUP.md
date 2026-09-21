@@ -19,13 +19,12 @@ the self-contained repo-side summary.
 - `CudaRuntime::allow_list()` derives from registered operations' DPS
   execution interfaces and plan-transparent effects. Kernel and host
   implementations can be provided externally without a dispatch-table edit.
-- Candidate ranking during search is DEVICE-FREE BY DEFAULT: the loop
-  is this crate's own copy (`crates/luminal_cuda_lite/src/search.rs`)
-  and ranks by `src/heuristic.rs::heuristic_cost_of` — a bytes-moved
-  prior, never a measurement. There is no profiler trait in core or
-  here any more. On-device candidate profiling arrived in Phase 4 of
-  the #420/#422 rejoin, behind `CompileOptions::profile_on_device`
-  (`src/profile.rs`), and needs the `device` feature and a device.
+- Candidate ranking defaults to measured device execution time via
+  `CompileOptions::profile_on_device` (`src/profile.rs`). This requires
+  the `device` feature, a CUDA device, and input payloads. Device-free
+  callers explicitly set `profile_on_device: false` to rank by
+  `src/heuristic.rs::heuristic_cost_of`. The shared planning-test harness
+  makes that opt-out explicit.
 - `execute` is behind the `device` feature and refuses loudly
   without it. Plan-layer tests are green on macOS.
 - The predecessor crate targeting the deleted HLIR pipeline is parked

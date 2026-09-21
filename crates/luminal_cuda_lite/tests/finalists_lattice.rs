@@ -156,7 +156,7 @@ fn bucketed_options(budget: Option<usize>) -> CompileOptions {
         search_log: false,
         keep_finalists: 8,
         device_budget_bytes: budget,
-        ..Default::default()
+        ..luminal_cuda_lite::harness_search_options()
     }
 }
 

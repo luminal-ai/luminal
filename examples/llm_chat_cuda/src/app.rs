@@ -47,7 +47,9 @@ struct Args {
     #[arg(long)]
     enable_thinking: bool,
     /// Rank compiler candidates on the selected device using device measurements.
-    #[arg(long)]
+    #[arg(long, default_value_t = CompileOptions::default().profile_on_device,
+        action = clap::ArgAction::Set, num_args = 0..=1,
+        default_missing_value = "true", require_equals = true)]
     profile: bool,
     #[arg(long, default_value_t = 2)]
     search_generations: usize,
@@ -206,4 +208,29 @@ fn turn(
     messages.push(Message::new("assistant", decoded));
     *history = messages;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiling_cli_defaults_on_and_accepts_explicit_opt_out() {
+        let base = [
+            "llm_chat_cuda",
+            "--model",
+            "qwen3",
+            "--checkpoint",
+            "/tmp/checkpoint",
+        ];
+        assert!(Args::try_parse_from(base).unwrap().profile);
+        for (flag, expected) in [
+            ("--profile", true),
+            ("--profile=true", true),
+            ("--profile=false", false),
+        ] {
+            let args = Args::try_parse_from(base.into_iter().chain([flag])).unwrap();
+            assert_eq!(args.profile, expected);
+        }
+    }
 }

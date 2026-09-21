@@ -230,9 +230,8 @@ mod host_graphs {
     static RECORDS: AtomicUsize = AtomicUsize::new(0);
     // Preparations made and dropped, per dimension: a dimension is prepared
     // again on every execution that re-records it, so survival is counted.
-    const ZERO: AtomicUsize = AtomicUsize::new(0);
-    static PREPARED: [AtomicUsize; 32] = [ZERO; 32];
-    static DROPPED: [AtomicUsize; 32] = [ZERO; 32];
+    static PREPARED: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+    static DROPPED: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
     #[derive(Debug, Clone)]
     struct ExternalHostAdd {
         dps: bool,

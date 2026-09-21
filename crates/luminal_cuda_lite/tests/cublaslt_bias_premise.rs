@@ -240,7 +240,7 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
             trials: 1,
             seed,
             search_log: false,
-            ..Default::default()
+            ..luminal_cuda_lite::harness_search_options()
         };
         let mut rt = CudaRuntime::load(&cx).expect("load");
         let outcome = match rt.search(&data, &options) {
@@ -460,7 +460,7 @@ fn a_degenerate_extent_bias_election_binds_col_and_is_not_refused() {
             trials: 1,
             seed,
             search_log: false,
-            ..Default::default()
+            ..luminal_cuda_lite::harness_search_options()
         };
         let mut rt = CudaRuntime::load(&cx).expect("load");
         let outcome = match rt.search(&data, &options) {

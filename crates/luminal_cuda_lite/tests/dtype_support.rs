@@ -35,7 +35,7 @@ fn mul_device(dtype: DType, a: HostBuffer, b: HostBuffer) -> Vec<u8> {
     let mut cx = Graph::new();
     let ta = cx.tensor((4,), dtype);
     let tb = cx.tensor((4,), dtype);
-    let out = (ta * tb);
+    let out = ta * tb;
     let data: FxHashMap<_, _> = [(ta.id, a.clone()), (tb.id, b.clone())]
         .into_iter()
         .collect();
@@ -84,8 +84,10 @@ fn f64_reciprocal_round_trips() {
     rt.execute().expect("execute");
     let bytes = rt.fetch(out.id).expect("fetch").0.bytes.clone();
     let got: Vec<f64> = bytes
-        .chunks_exact(8)
-        .map(|c| f64::from_ne_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| f64::from_ne_bytes(*c))
         .collect();
     assert_eq!(got, vec![0.25, 0.5, 1.0, 0.125]);
 }

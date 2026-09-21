@@ -19,9 +19,9 @@
 //! Phase 1): [`extractor`] and [`search`] are this runtime's own copies
 //! — core keeps the shared machinery (program, assembly, `dps_rewrite`,
 //! `decode_layout_table`, `bufferize`) and nothing that decides which
-//! implementation wins. Candidates rank, by default, through
-//! [`heuristic`], a device-free byte-move prior (CL-5 below is the
-//! opt-in device measurement); there is no profiler trait anywhere any
+//! implementation wins. Candidates rank, by default, by measured device
+//! time (CL-5 below). [`heuristic`] is an explicit device-free alternative;
+//! there is no profiler trait anywhere any
 //! more, in core or here. Host payloads are [`host_buffer::HostBuffer`],
 //! not the reference runtime's `TypedBuffer`.
 //!
@@ -38,8 +38,8 @@
 //!   mirroring the reference evaluator's design —
 //!   `CompileOptions::profile_on_device` ranks candidates by measured
 //!   device time ([`profile`]) instead of by [`heuristic`]'s weak prior.
-//!   The heuristic remains the default and the device-free hosts' only
-//!   option; the two are never blended.
+//!   Device profiling is the default; device-free callers explicitly set
+//!   `profile_on_device: false`. The two are never blended.
 //! - CL-6 (#420/#422 rejoin Phase 5, 2026-09-03): FINALISTS AND THE
 //!   BUCKET LATTICE ([`finalists`], [`lattice`]). The search keeps a
 //!   ranked list of genomes and the plan that gets INSTALLED is chosen by

@@ -1,0 +1,114 @@
+[
+  {
+    "model": "qwen3-0.6b",
+    "old_ttft_ms": 811.2384139999999,
+    "new_ttft_ms": 842.969604,
+    "ttft_speedup": 0.9623578479586553,
+    "old_tpot_ms": 40.45997379527559,
+    "new_tpot_ms": 41.84139088188976,
+    "tpot_speedup": 0.9669844367623044,
+    "output_identical": true,
+    "matching_output_prefix": 128,
+    "old_cublas_ops": 203,
+    "new_cublas_ops": 194,
+    "old_generic_counts": {
+      "rope_rotation": 56,
+      "attention_scores": 28,
+      "attention_values": 28,
+      "dense_projection": 59
+    },
+    "new_generic_counts": {
+      "dense_projection": 61,
+      "rope_rotation": 56,
+      "attention_scores": 28,
+      "attention_values": 28
+    },
+    "compile_seconds": 163.161312579,
+    "old_vocabulary_projection": "cuBLASLt",
+    "new_vocabulary_projection": "cuBLASLt"
+  },
+  {
+    "model": "qwen3-4b",
+    "old_ttft_ms": 3513.270191,
+    "new_ttft_ms": 3524.1126339999996,
+    "ttft_speedup": 0.9969233551460888,
+    "old_tpot_ms": 144.10368422047245,
+    "new_tpot_ms": 144.4146277480315,
+    "tpot_speedup": 0.9978468695837268,
+    "output_identical": true,
+    "matching_output_prefix": 128,
+    "old_cublas_ops": 254,
+    "new_cublas_ops": 254,
+    "old_generic_counts": {
+      "rope_rotation": 72,
+      "dense_projection": 82,
+      "attention_scores": 36,
+      "attention_values": 36
+    },
+    "new_generic_counts": {
+      "rope_rotation": 72,
+      "dense_projection": 82,
+      "attention_scores": 36,
+      "attention_values": 36
+    },
+    "compile_seconds": 189.685745713,
+    "old_vocabulary_projection": "cuBLASLt",
+    "new_vocabulary_projection": "cuBLASLt"
+  },
+  {
+    "model": "llama3-8b",
+    "old_ttft_ms": 6417.703621000001,
+    "new_ttft_ms": 5847.9559500000005,
+    "ttft_speedup": 1.0974268061988395,
+    "old_tpot_ms": 229.01342483464566,
+    "new_tpot_ms": 221.25924065354332,
+    "tpot_speedup": 1.035045696433733,
+    "output_identical": true,
+    "matching_output_prefix": 128,
+    "old_cublas_ops": 218,
+    "new_cublas_ops": 229,
+    "old_generic_counts": {
+      "dense_projection": 75,
+      "rope_rotation": 64,
+      "attention_scores": 32,
+      "attention_values": 32
+    },
+    "new_generic_counts": {
+      "rope_rotation": 64,
+      "attention_scores": 32,
+      "attention_values": 32,
+      "dense_projection": 73
+    },
+    "compile_seconds": 252.834476384,
+    "old_vocabulary_projection": "generic",
+    "new_vocabulary_projection": "cuBLASLt"
+  },
+  {
+    "model": "gemma3-4b",
+    "old_ttft_ms": 4084.8946149999997,
+    "new_ttft_ms": 4095.086918,
+    "ttft_speedup": 0.9975110899465406,
+    "old_tpot_ms": 166.92398651181102,
+    "new_tpot_ms": 167.18457203937004,
+    "tpot_speedup": 0.9984413302951324,
+    "output_identical": true,
+    "matching_output_prefix": 128,
+    "old_cublas_ops": 212,
+    "new_cublas_ops": 212,
+    "old_generic_counts": {
+      "rope_rotation": 68,
+      "dense_projection": 102,
+      "attention_scores": 34,
+      "attention_values": 34
+    },
+    "new_generic_counts": {
+      "rope_rotation": 68,
+      "dense_projection": 102,
+      "attention_scores": 34,
+      "attention_values": 34
+    },
+    "compile_seconds": 377.126351271,
+    "old_vocabulary_projection": "cuBLASLt",
+    "new_vocabulary_projection": "cuBLASLt"
+  }
+]

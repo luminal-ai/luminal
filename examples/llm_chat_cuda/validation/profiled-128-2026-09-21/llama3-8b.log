@@ -1,0 +1,6 @@
+Loading 291 tensors (32121044992 FP32 bytes)
+Compiling Llama3, chunk=8, context=256
+run=0 warm=false input=128 output=128 TTFT=10504.627ms TPOT=221.311ms total=38611.081ms first_eos=None
+run=1 warm=true input=128 output=128 TTFT=5847.440ms TPOT=221.464ms total=33973.413ms first_eos=None
+run=2 warm=true input=128 output=128 TTFT=5848.718ms TPOT=221.203ms total=33941.468ms first_eos=None
+run=3 warm=true input=128 output=128 TTFT=5847.956ms TPOT=221.259ms total=33947.880ms first_eos=None

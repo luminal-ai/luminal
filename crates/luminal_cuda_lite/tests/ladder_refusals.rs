@@ -126,7 +126,11 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
 
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let budget = if default_budget {
-        CompileOptions::default()
+        CompileOptions {
+            // This ladder measures device-free search/refusal behavior.
+            profile_on_device: false,
+            ..CompileOptions::default()
+        }
     } else {
         // The fixed 8-genome budget of the original ladder's depth-1
         // rungs: comparable refusal RATES across d.
@@ -137,7 +141,7 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
             trials: 1,
             seed: 0,
             search_log: false,
-            ..Default::default()
+            ..luminal_cuda_lite::harness_search_options()
         }
     };
     let start = std::time::Instant::now();

@@ -77,6 +77,10 @@ impl CudaBackend {
             logits: graph.logits,
         })
     }
+    /// The selected plan, for inspecting the operations used by this session.
+    pub fn plan(&self) -> Option<&luminal_cuda_lite::CudaPlan> {
+        self.runtime.plan()
+    }
     /// One execution at this step's query and context lengths.
     pub fn step(&mut self, inputs: Inputs, query: usize, context: usize) -> Result<Vec<f32>> {
         self.runtime.set_dim('q', query);
