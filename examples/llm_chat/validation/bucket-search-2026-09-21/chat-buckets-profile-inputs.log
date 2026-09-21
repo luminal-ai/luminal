@@ -1,0 +1,11 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling luminal_cuda_lite v0.1.0 (/root/luminal/crates/luminal_cuda_lite)
+    Finished `release` profile [optimized] target(s) in 1.10s
+     Running tests/profile_inputs.rs (target/release/deps/profile_inputs-bd2a1d2094110cc6)
+
+running 1 test
+test representative_payloads_override_shared_inputs_in_search_and_finalist_validation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s

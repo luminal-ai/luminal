@@ -1,0 +1,4 @@
+    Checking luminal_cuda_lite v0.1.0 (/root/luminal/crates/luminal_cuda_lite)
+    Checking luminal_metal v0.2.0 (/root/luminal/crates/luminal_metal)
+    Checking llm_chat v0.1.0 (/root/luminal/examples/llm_chat)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.64s

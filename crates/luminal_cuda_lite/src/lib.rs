@@ -19,10 +19,8 @@
 //! Phase 1): [`extractor`] and [`search`] are this runtime's own copies
 //! — core keeps the shared machinery (program, assembly, `dps_rewrite`,
 //! `decode_layout_table`, `bufferize`) and nothing that decides which
-//! implementation wins. Candidates rank, by default, by measured device
-//! time (CL-5 below). [`heuristic`] is an explicit device-free alternative;
-//! there is no profiler trait anywhere any
-//! more, in core or here. Host payloads are [`host_buffer::HostBuffer`],
+//! implementation wins. Candidates rank only by measured device time.
+//! Host payloads are [`host_buffer::HostBuffer`],
 //! not the reference runtime's `TypedBuffer`.
 //!
 //! Stage discipline (M4 kickoff ruling, 2026-08-17: "just focus on
@@ -36,10 +34,8 @@
 //!   geometry.
 //! - CL-5 (#420/#422 rejoin Phase 4, 2026-09-03): PROFILING ON DEVICE,
 //!   mirroring the reference evaluator's design —
-//!   `CompileOptions::profile_on_device` ranks candidates by measured
-//!   device time ([`profile`]) instead of by [`heuristic`]'s weak prior.
-//!   Device profiling is the default; device-free callers explicitly set
-//!   `profile_on_device: false`. The two are never blended.
+//!   candidates are compiled, warmed and timed on the device ([`profile`]).
+//!   Search requires the `device` feature and a CUDA GPU.
 //! - CL-6 (#420/#422 rejoin Phase 5, 2026-09-03): FINALISTS AND THE
 //!   BUCKET LATTICE ([`finalists`], [`lattice`]). The search keeps a
 //!   ranked list of genomes and the plan that gets INSTALLED is chosen by
@@ -63,6 +59,7 @@
 pub mod arena;
 pub mod binding_check;
 pub mod bindings;
+pub mod egraph_postpass;
 /// The e-graph walk, in core (#420/#422 rejoin Phase 8): every runtime
 /// calls it with its own matcher list and it names no runtime type.
 /// Kept under this crate's old module name so call sites read the same.
@@ -72,7 +69,6 @@ mod cuda_graph;
 /// FINALISTS (Phase 5 of the #420/#422 rejoin): a bucket's ranked
 /// genomes, re-materialized one at a time under a hard filter.
 pub mod finalists;
-pub mod heuristic;
 pub mod host;
 pub mod host_buffer;
 pub mod kernels;

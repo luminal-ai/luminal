@@ -1,0 +1,951 @@
+   Compiling luminal v0.2.0 (/root/luminal)
+   Compiling luminal_cuda_lite v0.1.0 (/root/luminal/crates/luminal_cuda_lite)
+   Compiling luminal_reference v0.1.0 (/root/luminal/crates/luminal_reference)
+   Compiling luminal_nn v0.1.0 (/root/luminal/crates/luminal_nn)
+   Compiling model_zoo v0.1.0 (/root/luminal/crates/model_zoo)
+   Compiling test_runtime v0.1.0 (/root/luminal/tests/test_runtime)
+    Finished `release` profile [optimized] target(s) in 23.88s
+     Running unittests src/lib.rs (target/release/deps/luminal-a506ffcd16efe19b)
+
+running 278 tests
+test arena::tests::packing_rejects_overflow_and_invalid_lifetimes ... ok
+test arena::tests::donated_device_copy_is_packed_and_frees_after_all_uses ... ok
+test arena::tests::escaping_minted_storage_is_packed_without_a_logical_free ... ok
+test arena::tests::a_recycled_range_is_only_re_let_after_its_occupant_is_finished ... ok
+test arena::tests::chain_of_interior_buffers_costs_the_peak_not_the_sum ... ok
+test buffer_tensor_ir::f8e4m3_semantics::all_256_codes_decode_like_the_checkpoint_codec ... ok
+test buffer_tensor_ir::tests::certificate_accepts_writer_ordered_before_definition ... ok
+test arena::tests::the_issue_order_respects_every_data_and_anti_edge ... ok
+test buffer_tensor_ir::f8e4m3_semantics::quantize_matches_the_checkpoint_codec ... ok
+test arena::tests::scratch_reuses_tensor_storage_and_staging_reuses_uploaded_inputs ... ok
+test buffer_tensor_ir::tests::certificate_rejects_unordered_second_writer ... ok
+test buffer_tensor_ir::tests::certificate_rejects_consumer_with_no_producer ... ok
+test buffer_tensor_ir::tests::certificate_rejects_write_between_definition_and_read ... ok
+test buffer_tensor_ir::tests::lifetime_admits_escaping_minted_buffer_backing_an_output ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_alloc_on_caller_storage ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_donated_buffer_backing_an_output ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_donated_buffer_without_free ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_double_alloc ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_escaping_minted_buffer_backing_no_output ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_free_of_caller_owned_storage ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_free_of_escaping_minted_buffer ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_free_with_an_outgoing_edge ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_minted_buffer_without_alloc ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_minted_buffer_without_free ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_non_escaping_minted_buffer_backing_an_output ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_toucher_unordered_against_alloc ... ok
+test buffer_tensor_ir::tests::lifetime_rejects_use_after_free ... ok
+test bufferize::tests::a_cyclic_extracted_graph_names_the_cycle_members ... ok
+test bufferize::tests::contention_resolved_bottom_up ... ok
+test bufferize::tests::cross_operand_permit_is_unconditional_and_trusted ... ok
+test bufferize::tests::cross_operand_read_of_same_value_still_rejected ... ok
+test bufferize::tests::folded_output_on_donated_residence_repairs_into_fresh_escaping_buffer ... ok
+test bufferize::tests::folded_repair_targets_a_fresh_parent_backed_buffer ... ok
+test bufferize::tests::folded_output_on_input_residence_returns_zero_copy ... ok
+test bufferize::tests::folded_output_on_minted_residence_escapes_in_place ... ok
+test bufferize::tests::input_validation_rejects_poison_valued_output ... ok
+test bufferize::tests::folded_view_slot_carries_the_views_own_layout ... ok
+test bufferize::tests::input_validation_rejects_read_of_undefined_value ... ok
+test bufferize::tests::input_validation_rejects_undeclared_access ... ok
+test bufferize::tests::input_validation_rejects_undeclared_freed_by ... ok
+test bufferize::tests::interior_copy_of_folded_resident_copies_the_parent_and_reroots ... ok
+test bufferize::tests::non_writing_ties_decide_before_writers ... ok
+test bufferize::tests::mapless_view_fold_still_redirects_with_the_views_layout ... ok
+test bufferize::tests::operand_live_at_output_boundary_rejects_in_place ... ok
+test bufferize::tests::permit_never_excuses_cross_op_reads ... ok
+test bufferize::tests::pre_union_rejects_in_place_into_cohabited_buffer ... ok
+test bufferize::tests::read_only_buffer_forces_out_of_place ... ok
+test bufferize::tests::read_only_veto_fires_through_cohabitation ... ok
+test bufferize::tests::read_through_view_of_dest_is_rejected_without_permit ... ok
+test bufferize::tests::reader_before_writer_allows_in_place ... ok
+test bufferize::tests::rejected_view_repairs_by_copying_the_parent ... ok
+test bufferize::tests::same_operand_rmw_is_admitted ... ok
+test bufferize::tests::two_operands_tied_to_one_result_is_rejected ... ok
+test bufferize::tests::two_hop_view_chain_redirects_to_the_root_parent ... ok
+test bufferize::tests::two_view_outputs_of_one_donated_base_share_one_repair ... ok
+test bufferize::tests::unordered_reader_of_operand_forces_out_of_place ... ok
+test bufferize::tests::two_view_outputs_of_one_minted_base_share_one_escaping_buffer ... ok
+test bufferize::tests::validator_rejects_alloc_on_caller_storage ... ok
+test bufferize::tests::validator_rejects_self_copy ... ok
+test bufferize::tests::validator_rejects_unfolded_view ... ok
+test bufferize::tests::view_of_undefined_bound_to_output_slot_is_rejected_at_validation ... ok
+test bufferize::tests::view_of_undefined_read_is_rejected_at_validation ... ok
+test bufferize::tests::write_only_destination_last_use_goes_in_place ... ok
+test egglog_snippet::tests::splices_in_order_at_the_anchor ... ok
+test egglog_utils::eclass::tests::a_class_answers_for_each_constructor_it_is_asked_about ... ok
+test egglog_utils::eclass::tests::a_duplicate_registration_is_refused ... ok
+test egglog_utils::eclass::tests::absent_classes_and_absent_constructors ... ok
+test egglog_utils::eclass::tests::an_undecodable_spelling_is_recorded_not_fatal ... ok
+test egglog_utils::eclass::tests::nodes_are_unsubsumed_first_then_by_id ... ok
+test egglog_utils::eclass::tests::spelling_sets_compare_structurally_and_literals_read ... ok
+test extraction::render_memo_tests::deep_render_does_not_double_borrow_the_memo ... ok
+test extraction::render_memo_tests::memo_is_output_identical_and_does_no_second_walk ... ok
+test extraction::render_memo_tests::memo_keys_on_depth_and_preference ... ok
+test extraction::render_memo_tests::views_over_one_ctx_share_the_memo ... ok
+test arena::tests::interval_packing_checks_all_live_ranges_with_fixed_seed ... ok
+test frontend::matmul::tests::fp8_matmul_with_explicit_casts_records_two_visible_casts ... ok
+test frontend::matmul::tests::mixed_dtype_matmul_refuses_at_construction - should panic ... ok
+test frontend::movement::tests::test_repeat_is_view_only ... ok
+test frontend::matmul::tests::int_float_matmul_refuses_with_the_cast_message - should panic ... ok
+test frontend::matmul::tests::fp8_matmul_records_plainly_in_fp8 ... ok
+test frontend::movement::tests::test_unfold_floor_div_shape_for_odd_window_numerator ... ok
+test frontend::movement::tests::zero_extent_slice_records_without_special_casing ... ok
+test frontend::binary::tests::test_mul_rejects_implicit_broadcast - should panic ... ok
+test frontend::binary::tests::test_add_rejects_implicit_broadcast - should panic ... ok
+test frontend::binary::tests::test_lt_rejects_implicit_broadcast - should panic ... ok
+test frontend::binary::tests::test_mod_rejects_implicit_broadcast - should panic ... ok
+test egglog_snippet::tests::prop_ruleset_is_exactly_the_propagation_rules ... ok
+test egglog_snippet::tests::assembled_program_is_loadable ... ok
+test frontend::binary::tests::test_maximum_f32 ... ok
+test frontend::binary::tests::test_cond ... ok
+test frontend::binary::tests::test_pow_non_integral_scalar_exponent_keeps_the_approximation ... ok
+test frontend::binary::tests::test_pow ... ok
+test frontend::binary::tests::test_ne ... ok
+test frontend::binary::tests::test_eq ... ok
+test frontend::movement::tests::pad_with_uses_a_typed_scalar_fill ... ok
+test frontend::binary::tests::test_clip ... ok
+test extraction::chain_stride_tests::chain_strides_destructure_contract ... ok
+test frontend::unary::tests::test_gelu_exact ... ignored, SCALE-GATED (Step 4b): the exact-gelu model (~100 values: A&S degree-5 Horner + sign/abs + the to-Bool desugar) sends the unbounded (saturate (run)) schedule into a >1h AC/distributivity closure — needs bounded saturation scheduling before it can run as a test
+test frontend::binary::tests::test_minimum_f32 ... ok
+test frontend::other::tests::test_stack ... ok
+test frontend::movement::tests::test_repeat_runtime_values ... ok
+test frontend::movement::tests::test_unfold ... ok
+test frontend::binary::tests::test_pow_integral_scalar_exponent_keeps_sign ... ok
+test frontend::movement::tests::test_unsqueeze ... ok
+test frontend::movement::tests::test_concat ... ok
+test frontend::other::tests::constant_i64_preserves_full_width_values ... ok
+test frontend::matmul::tests::test_batch3_matmul_5d ... ok
+test frontend::binary::tests::test_div ... ok
+test frontend::binary::tests::test_mod_scalar_broadcast ... ok
+test frontend::binary::tests::test_gt ... ok
+test frontend::binary::tests::test_lt_scalar_broadcast ... ok
+test frontend::other::tests::test_arange ... ok
+test frontend::unary::tests::unsigned_abs_is_the_identity ... ok
+test graph::logical_petgraph_tests::duplicate_names_refuse_at_construction - should panic ... ok
+test graph::logical_petgraph_tests::render_emits_the_cone_and_its_names ... ok
+test graph::logical_petgraph_tests::tensor_ids_are_petgraph_values_with_ported_operand_edges ... ok
+test frontend::reduction::tests::test_max ... ok
+test frontend::binary::tests::test_lt ... ok
+test frontend::binary::tests::test_minimum ... ok
+test layouts::tests::a_custom_row_over_a_decoded_sort_is_not_a_spelling ... ok
+test layouts::tests::decoded_layout_equality_is_structural ... ok
+test layouts::tests::dims_readers_resolve_symbolic_plans_per_call ... ok
+test layouts::tests::element_index_reads_each_spelling ... ok
+test layouts::tests::left_major_span_is_numel_and_rank0_is_one ... ok
+test layouts::tests::right_major_span_is_numel ... ok
+test layouts::tests::spans_with_symbolic_dims ... ok
+test layouts::tests::strided_span_bare_coord_residue ... ok
+test layouts::tests::strided_span_product_residue ... ok
+test layouts::tests::strided_span_zero_residue ... ok
+test layouts::tests::a_missing_decoder_is_named ... ok
+test frontend::other::tests::test_arange_options ... ok
+test frontend::binary::tests::test_le ... ok
+test frontend::binary::tests::test_ge ... ok
+test search_support::early_stop_tests::early_stop_exceeded_keeps_mains_margin_semantics ... ok
+test search_support::progress_tests::progress_prints_start_once_faster_per_improvement_and_a_resetting_slower_counter ... ok
+test search_support::sampler_tests::a_component_with_no_progressing_member_falls_back ... ok
+test search_support::sampler_tests::a_self_sourcing_candidate_is_never_elected ... ok
+test search_support::sampler_tests::an_acyclic_candidate_graph_has_no_components ... ok
+test egglog_utils::snapshot::differential::snapshot_matches_the_serializer_up_to_renaming ... ok
+test search_support::sampler_tests::chains_inside_a_component_are_reachable ... ok
+test search_support::sampler_tests::mutual_re_description_is_one_component_and_only_the_cycle_is_excluded ... ok
+test search_support::sampler_tests::the_bufferize_tripwire_fires_only_on_the_cycle_refusal ... ok
+test shape::expression::tests::test_add_num_does_not_fold_into_nested_num ... ok
+test search_support::sampler_tests::mutation_never_closes_a_cycle ... ok
+test frontend::unary::tests::test_exp ... ok
+test frontend::movement::tests::test_pad_1d ... ok
+test shape::expression::tests::test_empty_product_is_one ... ok
+test shape::expression::tests::test_empty_sum_is_zero ... ok
+test shape::expression::tests::test_basic_simplifications ... ok
+test shape::expression::tests::test_hash_consing ... ok
+test shape::expression::tests::test_group_terms ... ok
+test logical_helper::tests::broadcast_axis_over_a_transposed_parent_is_named_as_two_helpers ... ok
+test shape::expression::tests::test_lt_mod_shortcut_requires_literal_bound ... ok
+test frontend::binary::tests::test_maximum ... ok
+test layouts::tests::core_preamble_layout_constructors_all_have_decoders ... ok
+test layouts::tests::a_stale_decoder_is_named ... ok
+test shape::expression::tests::test_merge_dim_simplifications ... ok
+test shape::expression::tests::test_const_remainder_div_mod_simplifications ... ok
+test shape::expression::tests::test_interval_simplification_requires_proof ... ok
+test shape::symbol::tests::fresh_symbols_never_collide ... ok
+test shape::symbol::tests::interning_equality_and_name_order ... ok
+test shape::symbol::tests::malformed_names_are_rejected - should panic ... ok
+test shape::expression::tests::test_egglog_equality ... ok
+test shape::symbol::tests::serde_round_trips_by_name ... ok
+test shape::symbol::tests::try_new_dim_reports_instead_of_unwinding ... ok
+test shape::expression::tests::test_no_explode ... ok
+test test_support::escape_execution_tests::escaped_output_executes_and_reads_through_the_held_layout ... ok
+test test_support::escape_execution_tests::executor_refuses_donated_boundary_output_backing ... ok
+test shape::expression::tests::test_substitution ... ok
+test logical_helper::tests::matrix_transpose_recognizes_expands_and_involutes ... ok
+test test_support::escape_execution_tests::executor_refuses_minted_non_escaping_output_backing ... ok
+test test_support::harness_tests::buffer_swap_fails_loudly_not_silently ... ok
+test shape::expression::tests::test_simplify_preserves_eval ... ok
+test test_support::harness_tests::chained_destinations_collapse_onto_the_output_buffer ... ok
+test test_support::harness_tests::chained_views_bind_through_to_the_root_buffer ... ok
+test test_support::harness_tests::copy_into_read_granted_buffer_rejected ... ok
+test test_support::harness_tests::copy_reading_buffer_ordered_before_copy_writing_it ... ok
+test test_support::harness_tests::builder_graph_bufferizes ... ok
+test logical_helper::tests::broadcast_axis_recognizes_and_expands_every_instance ... ok
+test shape::expression::tests::test_simplify ... ok
+test logical_helper::tests::matrix_multiply_names_the_canonical_chain_both_ways ... ok
+test shape::expression::tests::test_singleton_interval_substitutes_dynamic_var ... ok
+test shape::expression::tests::test_interval_simplifications ... ok
+test frontend::reduction::tests::test_min ... ok
+test frontend::unary::tests::test_cos ... ok
+test test_support::deferred_display_text::extraction_defers_display_text_until_it_is_read ... ok
+test test_support::harness_tests::multi_destination_pairs_get_distinct_allocations ... ok
+test test_support::harness_tests::passthrough_of_read_granted_buffer_is_legal ... ok
+test test_support::harness_tests::passthrough_plus_copy_into_same_buffer_is_rejected ... ok
+test test_support::harness_tests::regenerate_golden_plans ... ignored, golden regenerator — run explicitly by name
+test test_support::harness_tests::rejected_accumulator_copies_contents_and_retargets ... ok
+test test_support::harness_tests::rejected_seed_degrades_to_copy_with_war_edge ... ok
+test test_support::harness_tests::rejected_write_only_dest_retargets_without_copy ... ok
+test test_support::harness_tests::same_layout_pass_through_contradiction_rejected ... ok
+test test_support::harness_tests::aliased_views_in_place_fixture_rejected_as_unsupported ... ok
+test test_support::harness_tests::seed_ties_break_to_lowest_slot ... ok
+test test_support::harness_tests::slot_tables_render_ties_as_spanning_rows ... ok
+test test_support::harness_tests::two_materialized_values_into_one_buffer_rejected ... ok
+test test_support::harness_tests::unordered_second_writer_of_shared_destination_is_rejected ... ok
+test test_support::harness_tests::view_of_read_only_input_is_admitted ... ok
+test test_support::harness_tests::view_passthrough_to_output_slot ... ok
+test test_support::harness_tests::view_reads_parent_buffer_with_zero_plan_nodes ... ok
+test frontend::unary::tests::test_gelu_tanh_approximation ... ok
+test test_support::harness_tests::writer_into_viewed_buffer_yields_out_of_place ... ok
+test test_support::intcoordvar_probe::x_probe_cyclic_selftag ... ok
+test test_support::harness_tests::fixture_extracts_and_bufferizes ... ok
+test test_support::ring_ignition_battery::g2_fence_text_is_intact ... ok
+test test_support::harness_tests::extraction_carries_numeric_dims_and_bits ... ok
+test test_support::harness_tests::div_mod_iota_gather_with_layout_saturates_cleanly ... ok
+test test_support::harness_tests::gather_with_disagreeing_coordinate_shapes_dies_in_the_terminal_stratum ... ok
+test test_support::harness_tests::iota_extracts_as_zero_input_source ... ok
+test test_support::harness_tests::gather_extracts_with_rank_counted_operands ... ok
+test frontend::unary::tests::test_topk_indexes ... ok
+test test_support::harness_tests::bool_bridge_fixture_holds ... ok
+test test_support::harness_tests::scatter_with_disagreeing_src_and_coordinate_shapes_dies_in_the_terminal_stratum ... ok
+test test_support::harness_tests::iota_with_no_derivable_bounds_dies_in_the_terminal_stratum ... ok
+test test_support::harness_tests::donated_input_fixture_frees_the_donated_buffer ... ok
+test frontend::unary::tests::test_sin ... ok
+test test_support::ring_ignition_battery::group_b5_clone_residual_grower_quiesces_on_main ... ok
+test frontend::unary::tests::test_recip ... ok
+test test_support::ring_ignition_battery::subst_composition_coordfree_mints_flagship_quiesces ... ok
+test test_support::harness_tests::dtype_rows_reach_the_runtimes_own_layout_type ... ok
+test test_support::stage4b_probes::rejoin_divergence_probe ... ignored, diagnostic — run explicitly by name (release, bounded)
+test test_support::stage4b_probes::rrx_profile ... ignored, diagnostic — run explicitly by name
+test test_support::stage4b_probes::saturation_ab_report ... ignored, measurement — run explicitly by name (release)
+test test_support::stage4b_probes::specimen_1235_full_schedule ... ignored, diagnostic — run explicitly by name
+test frontend::binary::tests::test_mod ... ok
+test test_support::ring_ignition_battery::subst_composition_minted_nesting_quiesces ... ok
+test test_support::subst_guard_study::duplicate_input_labels_refuse_at_construction - should panic ... ok
+test test_support::subst_guard_study::interface_specs_report_pristine_labels_and_names ... ok
+test test_support::ring_ignition_battery::user_dim_raw_spelling_in_layout_context_quiesces ... ok
+test test_support::deferred_display_text::to_dot_forces_every_deferred_field ... ok
+test test_support::harness_tests::war_hazard_gets_anti_edge ... ok
+test visualization::tests::logical_graph_dot_smoke ... ok
+test frontend::movement::tests::test_transpose ... ok
+test visualization::tests::serialized_egraph_dot_smoke ... ok
+test frontend::unary::tests::test_relu ... ok
+test test_support::intcoordvar_probe::x_probe_slice_views_today ... ok
+test test_support::stage4b_probes::degenerate_broadcast_runs_clean ... ok
+test test_support::ring_ignition_battery::unfold_graph_with_raw_window_count_quiesces ... ok
+test frontend::reduction::tests::test_prod ... ok
+test frontend::unary::tests::test_sqrt ... ok
+test test_support::stage4b_probes::pinned_pure_identity_output ... ok
+test test_support::stage4b_probes::map_range_lock_fires_on_degenerate_bypass ... ok
+test test_support::subst_guard_study::compound_dim_extents_record_saturate_and_run ... ok
+test frontend::unary::tests::test_layer_norm ... ok
+test test_support::ring_ignition_battery::group_g_mixed_bounds_quiesce ... ok
+test frontend::movement::tests::test_slice_pad ... ok
+test test_support::subst_guard_study::symbolic_pad_and_concat_record_and_run ... ok
+test frontend::unary::tests::test_log ... ok
+test test_support::ring_ignition_battery::group_f_predicate_boundaries_quiesce ... ok
+test test_support::ring_ignition_battery::group_c_bounds_variants_quiesce ... ok
+test frontend::matmul::tests::test_batch_matmul ... ok
+test test_support::subst_guard_study::squeeze_contract_discharges_at_one_and_refuses_otherwise ... ok
+test test_support::subst_guard_study::unfold_window_contract_discharges_and_names_its_door ... ok
+test frontend::matmul::tests::test_matmul ... ok
+test frontend::matmul::tests::test_matrix_vector ... ok
+test frontend::unary::tests::test_swish ... ok
+test frontend::binary::tests::test_mul ... ok
+test frontend::binary::tests::test_add ... ok
+test frontend::binary::tests::test_sub ... ok
+test test_support::ring_ignition_battery::group_b_predicate_discriminators_quiesce ... ok
+test frontend::unary::tests::test_square ... ok
+test test_support::ring_ignition_battery::group_m_nested_products_quiesce ... ok
+test test_support::ring_ignition_battery::group_a_controls_and_flagship_igniter_quiesce ... ok
+test frontend::unary::tests::test_std ... ok
+test test_support::ring_ignition_battery::group_d_e_value_coincidence_and_symbolic_window_quiesce ... ok
+test frontend::unary::tests::test_tanh ... ok
+test frontend::reduction::tests::test_mean ... ok
+test frontend::reduction::tests::test_sum ... ok
+test test_support::subst_guard_study::subst_guard_landed_vs_legacy ... ok
+test frontend::other::tests::test_triangle_mask ... ok
+test frontend::unary::tests::test_softmax ... ok
+test frontend::unary::tests::test_argmin ... ok
+test frontend::unary::tests::test_argmax ... ok
+test frontend::unary::tests::test_var ... ok
+test frontend::matmul::tests::test_batch_batch_matmul ... ok
+test frontend::unary::tests::test_cumulative ... ok
+
+test result: ok. 272 passed; 0 failed; 6 ignored; 0 measured; 1 filtered out; finished in 9.65s
+
+     Running unittests src/bin/chain_census.rs (target/release/deps/chain_census-7c7526fc0fa72c23)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/permuted_check.rs (target/release/deps/permuted_check-01e5ba2d129a59ae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/print_model.rs (target/release/deps/print_model-f8844ff7dd697402)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/render_matmul.rs (target/release/deps/render_matmul-ad61430f6ae14c65)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/spell_fixture.rs (target/release/deps/spell_fixture-96d957882f262200)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/model_zoo_boundary.rs (target/release/deps/model_zoo_boundary-e7e1f3cbae4afa43)
+
+running 3 tests
+test neural_network_building_blocks_have_no_runtime_dependency ... ok
+test model_zoo_does_not_depend_on_runtimes ... ok
+test model_zoo_is_library_only ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/luminal_nn-3e6da2d235036139)
+
+running 31 tests
+test api_boundary_tests::production_modules_do_not_name_external_tensors ... ok
+test cache::tests::cache_pool_wraps_caller_supplied_tensors ... ok
+test convolution::tests::conv1d_shapes_follow_stride_and_padding ... ok
+test convolution::tests::conv2d_shapes_follow_stride_and_padding ... ok
+test convolution::tests::conv1d_values_match_expected_window_sums ... ok
+test moe::tests::top_k_routes_preserve_all_token_axes ... ok
+test norm::tests::normalization_uses_caller_supplied_parameters ... ok
+test convolution::tests::conv2d_values_accumulate_across_channels ... ok
+test attention::tests::sliding_window_bias_masks_future_and_old_context ... ok
+test attention::tests::gather_rows_selects_rows ... ok
+test attention::tests::sequence_isolation_bias_supports_interleaved_context ... ok
+test embedding::tests::embedding_looks_up_rows ... ok
+test attention::tests::scatter_rows_replaces_rows ... ok
+test moe::tests::top_k_routes_convert_to_general_routes ... ok
+test linear::tests::linear_forward_matches_hand_reference ... ok
+test attention::tests::packed_causal_bias_isolates_variable_length_sequences ... ok
+test linear::fp8_tests::fp8_linear_matches_scalar_reference ... ok
+test attention::tests::gather_rows_preserves_trailing_axes ... ok
+test convolution::forward_tests::convnd_applies_caller_supplied_bias ... ok
+test embedding::tests::embedding_batches_rebuild_shape ... ok
+test moe::tests::general_routes_scatter_into_slots_then_sum ... ok
+test linear::tests::linear_bias_broadcasts_over_the_batch ... ok
+test attention::tests::paged_attention_decode_step_matches_scalar_reference ... ok
+test pooling::tests::adaptive_avg_pool_2d_uses_overlapping_windows ... ok
+test moe::tests::top_k_routes_select_dispatch_normalize_and_combine ... ok
+test convolution::forward_tests::convnd_2d_matches_naive ... ok
+test pooling::tests::avg_pool_2d_unbatched ... ok
+test attention::tests::grouped_query_attention_shares_each_kv_head_across_its_query_group ... ok
+test pooling::tests::avg_pool_2d_batched ... ok
+test attention::score_bias_tests::paged_attention_accepts_arbitrary_score_bias ... ok
+test attention::tests::paged_attention_runtime_positions_mask_future_context ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running unittests src/lib.rs (target/release/deps/luminal_reference-8143404fa5efd6dd)
+
+running 47 tests
+test ops::registry_contract::builtin_ops_declare_out_of_place_defaults ... ok
+test ops::registry_contract::builtin_ops_declare_no_unconditional_permits ... ok
+test runtime::tests::allow_list_matches_the_kernel_registry ... ok
+test runtime::tests::a_dim_cannot_be_both_range_bound_and_bucketed ... ok
+test runtime::tests::float_to_narrow_int_cast_is_refused_at_authoring ... ok
+test runtime::tests::overlapping_or_unsorted_buckets_are_refused ... ok
+test runtime::tests::recorder_refusals_are_loud - should panic ... ok
+test runtime::tests::differential_dynamic_offset_iota ... ok
+test runtime::tests::differential_dynamic_arange ... ok
+test runtime::tests::f64_unary_round_trips_exactly ... ok
+test runtime::tests::differential_native_coordinate_scatter ... ok
+test runtime::tests::differential_flat_gather1d_sugar ... ok
+test runtime::tests::differential_native_coordinate_gather ... ok
+test runtime::tests::differential_repeat_against_reference_runtime ... ok
+test runtime::tests::f64_constant_keeps_double_precision ... ok
+test runtime::tests::differential_simple_elementwise_against_reference_runtime ... ok
+test runtime::tests::differential_native_recorder_simple_elementwise ... ok
+test runtime::tests::differential_bool8_boundary_against_reference_runtime ... ok
+test runtime::tests::differential_subtraction_against_reference_runtime ... ok
+test runtime::tests::differential_rank2_iota_records_natively ... ok
+test runtime::tests::differential_sum_reduce_against_reference_runtime ... ok
+test search::tests::search_returns_a_correct_plan_and_dedups_duplicate_plans ... ok
+test runtime::tests::differential_two_dim_slice_against_reference_runtime ... ok
+test runtime::tests::differential_slice_against_reference_runtime ... ok
+test runtime::tests::scatter_conflicting_writes_panic ... ok
+test runtime::tests::differential_permuted_mul_against_reference_runtime ... ok
+test runtime::tests::differential_int_output_reads_native ... ok
+test runtime::tests::differential_less_than_cast_against_reference_runtime ... ok
+test runtime::tests::differential_gather_elements_axis1 ... ok
+test runtime::tests::differential_unfold_against_reference_runtime ... ok
+test runtime::tests::differential_flat_scatter1d_sugar ... ok
+test runtime::tests::integer_abs_executes_and_wraps_at_the_signed_minimum ... ok
+test runtime::tests::differential_reshapes_against_reference_runtime ... ok
+test runtime::tests::differential_scatter_elements_axis0 ... ok
+test runtime::tests::differential_bool8_input_staging ... ok
+test runtime::tests::int_add_proof_gating ... ok
+test runtime::tests::trunc_div_gating ... ok
+test runtime::tests::differential_scatter_nd_row_case ... ok
+test runtime::tests::differential_matmul_against_reference_runtime ... ok
+test runtime::tests::differential_dynamic_dim_against_reference_runtime ... ok
+test runtime::tests::differential_rank2_pad_against_reference_runtime ... ok
+test runtime::tests::differential_pad_against_reference_runtime ... ok
+test runtime::tests::narrow_int_add_wraps_at_its_own_width ... ok
+test runtime::tests::narrow_int_casts_truncate_and_wide_casts_stay_checked ... ok
+test runtime::tests::symbolic_iota_reuses_one_plan_across_dims ... ok
+test runtime::tests::bucketed_search_validates_searches_and_selects ... ok
+test runtime::tests::one_searched_symbolic_plan_executes_at_many_dim_values ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+     Running unittests src/bin/measure_recorder.rs (target/release/deps/measure_recorder-4c1944fd3eb5c5ec)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/measure_synth_watchitems.rs (target/release/deps/measure_synth_watchitems-a288d1e218a7e367)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/corpus.rs (target/release/deps/corpus-a3fbace90ff814d9)
+
+running 2 tests
+test dump_assembled_program ... ignored, utility — run explicitly by name
+test corpus_scripts_all_green ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.33s
+
+     Running tests/mini_model_smoke.rs (target/release/deps/mini_model_smoke-c6d105c1bc7f9b39)
+
+running 8 tests
+test mini_flux_runs ... ignored, blocked by the known adaLN rejoin-divergence search issue
+test mini_conv_runs ... ok
+test mini_whisper_runs ... ok
+test mini_qwen3_runs ... ok
+test mini_gemma4_moe_runs ... ok
+test mini_qwen3_moe_runs ... ok
+test mini_llama3_runs ... ok
+test mini_gemma3_runs ... ok
+
+test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running tests/select_op.rs (target/release/deps/select_op-2a56ae5a2e6bb42e)
+
+running 4 tests
+test select_picks_branches_elementwise ... ok
+test abs_uses_select_and_runs ... ok
+test select_i64_branches ... ok
+test select_does_not_leak_unselected_nan ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running unittests src/lib.rs (target/release/deps/test_runtime-fb19b1c4cefe6414)
+
+running 3 tests
+test test_equality::tests::offset_forms_read_and_bit_alignment_refuses ... ok
+test test_equality::tests::domain_violations_refuse ... ok
+test test_equality::tests::transpose_view_pair_equals_the_dense_demand ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/buf_attack_a1_alias_contract.rs (target/release/deps/buf_attack_a1_alias_contract-890f43a6ab81b5bb)
+
+running 7 tests
+test a1_cohabiting_input_admitted_with_trusted_permit_writes_bound_in_kernel ... ok
+test a1_readonly_cohabitant_rejects_program_even_with_permit ... ok
+test a1_unordered_reader_of_cohabited_buffer_hazard_gone_under_escape ... ok
+test a1_cohabiting_input_refuses_seed_without_permit ... ok
+test a1_mutating_consumer_through_view_of_bound_value_vetoed_and_repaired ... ok
+test a1_value_plus_view_to_two_outputs_view_slot_first ... ok
+test a1_value_plus_view_to_two_outputs_direct_slot_first ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/buf_attack_a2_cert_sched.rs (target/release/deps/buf_attack_a2_cert_sched-ee08bc1671f277af)
+
+running 4 tests
+test a2_view_fanout ... ok
+test a2_two_slots_same_value ... ok
+test a2_single_view_to_bound ... ok
+test a2_double_view_roundtrip ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/buf_attack_b1_lifetime.rs (target/release/deps/buf_attack_b1_lifetime-a2142cf9213c6aa4)
+
+running 8 tests
+test attack1b_view_of_poison_bound_to_output_slot ... ok
+test attack1_unordered_direct_and_view_readers_both_precede_free ... ok
+test attack2_program_freed_input_read_only_through_view ... ok
+test attack3a_view_of_view_of_readonly_vetoes_writer ... ok
+test attack3c_readwrite_input_is_admitted_as_inplace_dest_through_view ... ok
+test attack3b_passthrough_obligation_blocks_inplace_writer_via_view ... ok
+test attack5_view_reader_after_mutator_still_blocks_inplace ... ok
+test attack4_view_reader_anti_ordered_before_delivery_copy_overwrite ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/buf_attack_compose.rs (target/release/deps/buf_attack_compose-a9936de3ce9e722f)
+
+running 7 tests
+test chain_with_interior_view_and_terminal_bound_write_certifies ... ok
+test diamond_bound_buffer_is_alias_parent_and_survives_writer_attack ... ok
+test disagreeing_residents_no_longer_hit_a_geometry_door ... ok
+test output_slot_bound_to_view_of_poison_current_behavior ... ok
+test every_compute_node_carries_filled_slot_descriptors ... ok
+test seed_into_cohabited_input_buffer_needs_may_permit ... ok
+test caller_buffer_assignment_is_deterministic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/buf_attack_p2_alias.rs (target/release/deps/buf_attack_p2_alias-a147e24c323e5532)
+
+running 6 tests
+test c_view_bound_to_output_escapes_the_chain_residence ... ok
+test e_view_of_view_chain_folds_to_grandparent ... ok
+test a_view_reader_extends_parent_lifetime_single_free ... ok
+test c_view_of_readonly_input_vetoes_inplace_writer ... ok
+test g_view_of_poison_read_panics_not_bails ... ok
+test d_unordered_view_reader_blocks_inplace_writer ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cublaslt_bias_leftmajor_premise.rs (target/release/deps/cublaslt_bias_leftmajor_premise-741926de0275563a)
+
+running 3 tests
+test padded_output_binding_does_not_remove_the_row_major_route ... ok
+test contiguous_recorder_output_mints_the_bias_form ... ok
+test without_left_major_discovery_the_bias_form_is_not_minted ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/cublaslt_marker.rs (target/release/deps/cublaslt_marker-1e5072ee45d356d3)
+
+running 4 tests
+test fixture2_amk_bnk_live_recorder_mints ... ok
+test fixture3_two_same_shape_matmuls_two_distinct_ops ... ok
+test fixture1_plain_2d_amk_bkn_spec_field_by_field ... ok
+test fixture2b_square_amk_bnk_single_reading ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+
+     Running tests/cublaslt_marker_adversarial.rs (target/release/deps/cublaslt_marker_adversarial-0237e5c97804290b)
+
+running 4 tests
+test fixture7_all_ones_corner_observed ... ok
+test fixture4_sliced_source_refused ... ok
+test fixture7_extent1_weld_single_canonical_reading ... ok
+test fixture7_m1_degenerate_no_panic ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+     Running tests/cublaslt_marker_decorate.rs (target/release/deps/cublaslt_marker_decorate-8fd1dde3df102c31)
+
+running 10 tests
+test fixture5_bias_elected_by_name_alone ... ok
+test fixture8_diamond_base_and_decorated_coexist ... ok
+test fixture6_relu_then_bias_not_folded ... ok
+test fixture5_c_fold_reversed_orientation ... ok
+test fixture5_c_fold ... ok
+test fixture5_relu ... ok
+test fixture6_relu_then_add_c_not_folded ... ok
+test fixture5_full_stack ... ok
+test fixture5_bias_relu ... ok
+test fixture5_bias ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+
+     Running tests/cublaslt_marker_hypothesis.rs (target/release/deps/cublaslt_marker_hypothesis-f7ba2e33e1c3b8d0)
+
+running 4 tests
+test hypothesis_two_layout_multiplicity ... ok
+test hypothesis_dual_spelling_multiplicity ... ok
+test ruling1_symbolic_k_contiguous_mints ... ok
+test hypothesis_static_bucket_layout_multiplicity ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+     Running tests/cublaslt_marker_nulltensor_probe.rs (target/release/deps/cublaslt_marker_nulltensor_probe-ad46d999310e65fd)
+
+running 2 tests
+test nulltensor_probe_egglog_side ... ok
+test nulltensor_probe_extraction_side ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests/cublaslt_marker_round2_attack.rs (target/release/deps/cublaslt_marker_round2_attack-b2f0c405e17e51b8)
+
+running 50 tests
+test attack_a7_amk_bnk_n1_k1_canonicalizes ... ok
+test attack_s4_amk_bnk_no_bounds_refused ... ok
+test attack_f1_dual_readings_are_legal_multiplicity ... ok
+test attack_a6b_x_matmul_x_transposed ... ok
+test attack_p1_form_layout_mismatch_panics_loudly ... ok
+test attack_a11_all_ones_decorated_stress ... ok
+test attack_a3_all_square_amk_bkn ... ok
+test attack_a6_x_matmul_x ... ok
+test attack_a5_chained_mixed_amk_bkn_amk_bnk ... ok
+test attack_c1_c_equals_a ... ok
+test attack_b2_right_axis_bias_square_out ... ok
+test attack_a4_chained_square_matmuls ... ok
+test attack_a10_role_swap_m1_n1 ... ok
+test attack_u3_bufferize_duplicate_operand_accumulate ... ok
+test attack_a9_amk_bnk_k1_n3_outer_product ... ok
+test attack_s5_amk_bkn_no_bounds_site_but_no_op ... ok
+test attack_c3_same_c_added_twice ... ok
+test attack_s7_symbolic_op_default_cost_election ... ok
+test attack_s1_amk_bnk_symbolic_1_64_refused ... ok
+test attack_a8_amk_bnk_n1_k4 ... ok
+test attack_b1_wrong_axis_bias_square_out ... ok
+test attack_a1_square_weight_amk_bkn ... ok
+test attack_u6_c_layout_mismatch_panics_loudly ... ok
+test attack_s2_amk_bnk_symbolic_2_64_admitted ... ok
+test attack_s9_handasserted_symbolic_pitch_admitted ... ok
+test attack_p2_two_bucket_pitches_stay_distinct ... ok
+test attack_d2_double_relu ... ok
+test attack_a2_square_weight_amk_bnk ... ok
+test attack_d3_mm_plus_mm_two_sites ... ok
+test attack_e2_respelled_relu_stays_decomposed ... ok
+test attack_g2_cse_same_matmul_twice ... ok
+test attack_a2b_amk_bnk_with_relu_and_bias ... ok
+test attack_c2_self_add_mm_plus_mm ... ok
+test attack_d1_two_relu_consumers ... ok
+test attack_s6_amk_bkn_symbolic_2_64_op_spec_none ... ok
+test attack_s3_amk_bnk_symbolic_k_1_64_literal_n ... ok
+test attack_u2_layout_tensor_field_naming_is_inverted ... ok
+test attack_e1_runtime_zeros_maximum_not_fused ... ok
+test attack_c4_bias_then_c_then_relu_order ... ok
+test attack_u4_accumulate_diamond_claimed_outputs ... ok
+test attack_s8_symbolic_bucket_request_refused ... ok
+test attack_g1_x16_same_geometry ... ok
+test attack_o1_the_oracles_discriminate ... ok
+test attack_c6_no_alpha_beta_channel ... ok
+test attack_u1_lit_slot_contents_pinned ... ok
+test attack_c5_bias_then_c_plain ... ok
+test attack_u5_no_spec_less_op_can_be_elected ... ok
+test attack_h1_one_lit_per_op_class ... ok
+test attack_p3_no_legal_program_reaches_a_panic ... ok
+test attack_e3_four_inlined_relu_copies_agree ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.07s
+
+     Running tests/cublaslt_marker_round3_attack.rs (target/release/deps/cublaslt_marker_round3_attack-cb6508e4922eb54e)
+
+running 20 tests
+test re2_weld_corner_per_enode_election ... ok
+test rt2_left_coefficient_row_term ... ok
+test rt3_folded_coefficient_row_term ... ok
+test rt1_wrapped_unit_factor_row_term ... ok
+test ru2_left_major_only_election_field_check ... ok
+test rc3_second_output_layout_stays_coherent ... ok
+test rc2_four_way_product_under_c_fold ... ok
+test re1_dual_spelling_per_enode_election ... ok
+test rs2_symbolic_m_probe ... ok
+test rt4_two_static_pitches_coherent ... ok
+test rs1_bias_decorates_symbolic_k ... ok
+test ru3_m1_corner_multiplicity ... ok
+test rc4_bias_relu_chain_no_stale_d ... ok
+test rs3_symbolic_ld_refuses_even_with_parseable_classmate ... ok
+test rc1_four_way_reading_product_coherent ... ok
+test ru1_dot_product_multiplicity ... ok
+test rp2_decoration_depth_enode_count ... ok
+test ru4_weld_harvesting_is_cross_tensor ... ok
+test rp1_candidate_product_growth ... ok
+test rp3_product_at_scale ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.35s
+
+     Running tests/cublaslt_marker_round4.rs (target/release/deps/cublaslt_marker_round4-07ee835bc2ea5a94)
+
+running 6 tests
+test t4_dps_alias_tables ... ok
+test t6a_accumulate_intermediate_c_donation_observed ... ok
+test t5_left_major_b_arm_field_verified ... ok
+test t6c_strided_output_injectivity_probe ... ok
+test t6b_relu_decorates_symbolic_k ... ok
+test t6a_bufferize_all_four_forms ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s
+
+     Running tests/cublaslt_marker_scaling.rs (target/release/deps/cublaslt_marker_scaling-75115b8f77ae69eb)
+
+running 2 tests
+test fixture9_same_geometry_identity_stress ... ok
+test fixture9_distinct_geometry_scaling ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.68s
+
+     Running tests/double_transpose_probe.rs (target/release/deps/double_transpose_probe-c219db69f7a5caa9)
+
+running 1 test
+test double_transpose_rejoins_via_the_collapse_rule ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/folded_operand_layout_probe.rs (target/release/deps/folded_operand_layout_probe-4848681784cf0c06)
+
+running 3 tests
+test transpose_view_consumer_carries_the_views_own_layout ... ok
+test sliced_transpose_chain_arrives_as_one_layout ... ok
+test r10_chained_matmuls_read_through_folded_layouts ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/gap_probe.rs (target/release/deps/gap_probe-be904c895595fe75)
+
+running 1 test
+test raw_strided_never_climbs_to_bit_offset ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/mutation.rs (target/release/deps/mutation-2a13d0ac961a1ce7)
+
+running 8 tests
+test permit_is_declared_and_directional ... ok
+test dps_rewrite_appends_tied_poison_destinations ... ok
+test boundary_mutation_via_functional_degrades_to_copy ... ok
+test mutating_sqrt_bufferizes_zero_copy_in_place ... ok
+test plain_mutating_add_on_x_plus_x_degrades_to_copies ... ok
+test op_filter_excluding_every_implementation_fails_loudly ... ok
+test scatter_mutating_updates_the_cache_in_place ... ok
+test alias_safe_add_accumulates_x_plus_x_in_place ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/planner.rs (target/release/deps/planner-d3080b9b04b2c36d)
+
+running 3 tests
+test dps_destinations_admitted_and_poisons_folded ... ok
+test must_alloc_outputs_are_coerced_to_caller_provided_storage ... ok
+test dps_rewrite_is_idempotent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/r10_chain_bufferize_probe.rs (target/release/deps/r10_chain_bufferize_probe-84b6dfeb0f718e21)
+
+running 2 tests
+test matmul_then_elementwise_bufferize ... ok
+test chained_matmuls_bufferize ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/r10_debug.rs (target/release/deps/r10_debug-44669be864a5ce2e)
+
+running 7 tests
+test r10_debug_a4 ... ok
+test r10_debug_p1 ... ok
+test r10_debug_g2_mincost ... ok
+test r10_debug_bufferize ... ok
+test r10_debug_rc3 ... ok
+test r10_debug_fixture1 ... ok
+test r10_debug_c6 ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/r11_collapse_revert_probe.rs (target/release/deps/r11_collapse_revert_probe-afa825b2d222c7ef)
+
+running 1 test
+test r11_sandwich_terminates_with_and_without_the_collapse_rule ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+
+     Running tests/r11_diag4.rs (target/release/deps/r11_diag4-180cf2c80be9aea6)
+
+running 1 test
+test diag_a5 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/r11_square_saturation.rs (target/release/deps/r11_square_saturation-e40ea4de58f6a616)
+
+running 1 test
+test r11_squares_saturate_bounded ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests/r7_e2_probe.rs (target/release/deps/r7_e2_probe-f194f86848ff5dc6)
+
+running 2 tests
+test e2_composition_canonicalization_probe ... ok
+test e2_fill_depth_from_live_recorder ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+     Running tests/r7_probes.rs (target/release/deps/r7_probes-717081af20d1ab4e)
+
+running 2 tests
+test e3_raw_uncertified_strided_refuses ... ok
+test e3_negative_pitch_refuses_despite_true_injectivity ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running tests/r8_form_hypothesis.rs (target/release/deps/r8_form_hypothesis-dfba982e6a19c96c)
+
+running 5 tests
+test e1a_estate_padded_strided ... ok
+test e1a_left_major_contiguous_seeded ... ok
+test e1_orientation_lives_in_the_operation_not_the_layout ... ok
+test e1a_right_major_contiguous_live_recorder ... ok
+test e1c_pitch_is_canonical_per_layout_class ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+     Running tests/r8d_chain_probe.rs (target/release/deps/r8d_chain_probe-8bfad2f3c93026f4)
+
+running 2 tests
+test r8d_shared_square_weight_each_site_reads_only_its_own_map ... ok
+test r8d_candidate_count_on_the_shared_weight ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/r9_pitched_operand_probe.rs (target/release/deps/r9_pitched_operand_probe-da982ee54cce698e)
+
+running 2 tests
+test pitched_view_refuses_without_an_injectivity_fact ... ok
+test pitched_view_reads_n_with_the_creator_certificate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests/rehomed.rs (target/release/deps/rehomed-3fa10cd9e606d41f)
+
+running 6 tests
+test regenerate_golden_plans ... ignored, golden regenerator — run explicitly by name
+test fixture_extraction_does_not_overwrite_another_selected_producer ... ok
+test golden_plans_are_pinned ... ok
+test genome_fused_choice_dedups_one_instance_claiming_both_slots ... ok
+test genome_mixed_choice_mints_a_waste_destination ... ok
+test genome_plan_fingerprints_identify_plans ... ok
+
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/scc_sampler.rs (target/release/deps/scc_sampler-617ad8f4f8678cdf)
+
+running 6 tests
+test union_of_b_and_y_is_a_leaf_weld_not_a_cycle ... ok
+test union_extraction_never_cycles ... ok
+test coverage_on_the_re_description_program ... ok
+test coverage_on_the_basic_program_fixture ... ok
+test an_input_terminal_keeps_its_buffer_input_and_never_a_producer ... ok
+test marker_matmul_components_span_different_logical_values ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running tests/sep_probe.rs (target/release/deps/sep_probe-ed442a78af4ac35e)
+
+running 1 test
+test r9_layout_census_for_the_shared_weight_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/slice_inj_inheritance_probe.rs (target/release/deps/slice_inj_inheritance_probe-0d7b055a48f658ba)
+
+running 6 tests
+test repeated_entry_map_does_not_inherit ... ok
+test nonzero_start_slice_is_outside_v1_scope_and_fails_closed ... ok
+test broadcast_constant_entry_does_not_inherit ... ok
+test rank3_unread_axis_attack ... ok
+test inheritance_rule_stamps_the_slice_and_the_reading_admits_it ... ok
+test baseline_zero_base_slice_has_no_derived_injectivity ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/spelling_probe_amk_bnk.rs (target/release/deps/spelling_probe_amk_bnk-e48ba7d9eb72e721)
+
+running 1 test
+test print_amk_bnk_spelling ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/strided_lists_authoring_probe.rs (target/release/deps/strided_lists_authoring_probe-6b428591b4a1bfb9)
+
+running 1 test
+test strided_lists_authored_pitch_climbs_the_ladder ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/transpose_identity_cost_probe.rs (target/release/deps/transpose_identity_cost_probe-ef37694b4598bc25)
+
+running 1 test
+test transpose_view_marginal_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+
+     Running tests/transpose_layout_probe.rs (target/release/deps/transpose_layout_probe-ea0ea2001d445620)
+
+running 2 tests
+test probe_a_bare_transpose_view ... ok
+test probe_b_matmul_amk_bnk ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running tests/view_arity_lock.rs (target/release/deps/view_arity_lock-818107ec7b0adc3c)
+
+running 4 tests
+test sound_union_of_different_parent_rank_spellings_saturates ... ok
+test two_spellings_of_one_value_share_one_shape_and_one_rank ... ok
+test genuine_arity_error_is_still_caught_loudly ... ok
+test marker_double_transpose_collapse_over_a_rank_changing_view_saturates ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/views.rs (target/release/deps/views-a4c94e2dc0b63598)
+
+running 5 tests
+test real_view_op_feeds_compute_with_zero_plan_nodes ... ok
+test real_view_op_to_output_slot_escapes_zero_copy ... ok
+test view_feeds_compute_fixture_runs_one_kernel_on_the_input_buffer ... ok
+test write_into_viewed_buffer_fixture_degrades_to_copy ... ok
+test a_view_only_registry_folds_composed_layouts_without_materializing ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+   Doc-tests luminal
+
+running 3 tests
+test src/frontend/tensor.rs - frontend::tensor::GraphTensor (line 11) ... ok
+test src/frontend/movement.rs - frontend::movement::GraphTensor::slice (line 900) ... ok
+test src/frontend/movement.rs - frontend::movement::GraphTensor::slice_along (line 969) ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.56s; merged doctests compilation took 0.55s
+   Doc-tests luminal_nn
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests luminal_reference
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests test_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

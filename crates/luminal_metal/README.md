@@ -13,18 +13,23 @@ let mut graph = Graph::new();
 let x = graph.tensor(3, DType::F32);
 let out = x + 2.;
 let mut runtime = MetalRuntime::load(&graph)?;
-runtime.search(&Default::default(), &harness_search_options())?;
+let data = [(x.id, vec![1f32, 2., 3.].into())].into_iter().collect();
+runtime.search(&data, &harness_search_options())?;
 runtime.set_data(x.id, vec![1f32, 2., 3.]);
 runtime.execute()?;
 assert_eq!(runtime.get_f32(out.id)?, vec![3., 4., 5.]);
 # Ok::<(), anyhow::Error>(())
 ```
 
-Planning works without a GPU. Execution and measured search require macOS with
-Metal. `CompileOptions::profile_on_device` measures synchronized execution,
-including staging and readback; the default ranks by estimated byte movement.
-Search starts with a byte-cost baseline and explores mutations and random plans;
-traffic is counted once per operation in the executable DAG.
+Loading, shape binding, saturation and code generation work without a GPU.
+Search and execution require macOS with Metal. Search always measures
+synchronized execution, including staging and readback, and ranks random
+candidates and mutations by their measured times. There is no byte-cost
+ranking, byte-cost seed, or profiling toggle.
+Profiling and finalist validation honor resident input bindings. Warmup uploads
+residents once per candidate. Timed trials stage only transient inputs; writable
+resident state resets from the supplied payloads before each trial, outside its
+timer and timeout budget. Resident mutation outputs stay on the device.
 `algebra_match_budget` bounds cumulative matches per associativity/distributivity
 rule (4096 by default); `None` requests exhaustive algebra saturation. Layout
 propagation, substitution, and contract checks still run to completion. This
@@ -38,6 +43,15 @@ execution. Buckets share one arena sized for the largest selected plan;
 `device_budget_bytes` bounds this arena. The limit does not include shared host
 staging, host payloads, or cached pipelines. Commands follow the buffer plan's
 data and anti-dependencies, and preserve outputs before recycling their storage.
+
+Before extraction, `CompileOptions::serialized_graph_passes` can edit the
+received serialized e-graph. Metal owns these passes, their context/report
+types, and the memory policy in `egraph_postpass`; core does not prune it.
+A mandatory memory pass removes materializations larger
+than the entire arena limit and all their producer implementations, while
+preserving views with smaller backing storage. It sizes tensors over the full
+bucket bounds and refuses to delete required boundaries. The arena limit is
+capped by Metal's maximum buffer length; full candidate allocations must fit too.
 
 The boundary is a binding, not a model annotation. `load` binds every input
 read-only on its own buffer and every leaf read-write on its own;

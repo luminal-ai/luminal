@@ -1,0 +1,10 @@
+   Compiling luminal_cuda_lite v0.1.0 (/tmp/luminal-search-timing/crates/luminal_cuda_lite)
+    Finished `release` profile [optimized] target(s) in 3.45s
+     Running unittests src/lib.rs (/root/luminal/target/release/deps/luminal_cuda_lite-e8791f7ff3f96ed5)
+
+running 1 test
+PINNED_POOL numa=0 retain_bytes=67108864
+PINNED_POOL destroy_seconds=0.001471 status=Ok(())
+test cuda_graph::pool_tests::pooled_staging_reinitializes_reused_memory ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.31s

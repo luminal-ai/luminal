@@ -1,10 +1,9 @@
 //! Train 3, Item 3: ELECTION ON CL — with the cuBLASLt marker estate
 //! registered as real CL ops, this runtime's search must be ABLE to
-//! elect the marker at matmul sites (bytes-moved cost prefers the fused
-//! call: no intermediate product tensor).
+//! elect the marker at matmul sites. The operation-specific pin requires
+//! the library route; the model probes report measured selection.
 //!
-//! Two halves, both CPU-side (plan shape only; execution is the A100
-//! pass's business):
+//! Both search-based halves require a CUDA device:
 //!
 //!  * THE PIN: a 2D matmul program — the canonical form
 //!    `A[m,k] · B[k,n] -> out[m,n]` the round-11 marker matches — must
@@ -67,6 +66,7 @@ fn search_and_count(name: &str, cx: &Graph, pairs: &[(NodeIndex, HostBuffer)]) -
         cx,
         pairs,
         &luminal_cuda_lite::harness_search_options(),
+        false,
     )
 }
 
@@ -75,8 +75,15 @@ fn search_and_count_opts(
     cx: &Graph,
     pairs: &[(NodeIndex, HostBuffer)],
     options: &luminal_cuda_lite::CompileOptions,
+    require_marker: bool,
 ) -> Row {
-    let mut rt = CudaRuntime::load(cx).expect("load");
+    let mut rt = CudaRuntime::load_with_registry(
+        cx,
+        luminal_cuda_lite::cuda_registry_filtered(|row| {
+            !require_marker || row.label() != "ReduceSumGeneric"
+        }),
+    )
+    .expect("load");
     let mut vars: Vec<_> = cx.dyn_map.iter().collect();
     vars.sort();
     for (var, value) in vars {
@@ -188,6 +195,10 @@ fn cublaslt_contracts_are_registered_host_call_claims() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn canonical_2d_matmul_elects_the_marker() {
     let mut cx = Graph::new();
     let a = cx.tensor((4usize, 8usize), DType::F32);
@@ -196,12 +207,8 @@ fn canonical_2d_matmul_elects_the_marker() {
 
     let pairs: Vec<(NodeIndex, HostBuffer)> =
         vec![(a.id, weights(32, 1).into()), (b.id, weights(24, 2).into())];
-    // MEASURED (Train 3): the marker's sibling-site minting fills the
-    // genome pool with choice-cycle (unfit) samples, so election needs
-    // a real genetic budget — at 12x16/mutations-4 a seed sweep 0..6
-    // elected CublasLt on 5 of 6 seeds (seed 0's best plan is the ideal
-    // fused [BufferAlloc, CublasLt]); the 2x4 harness budget found none.
-    // Seeded, so this pin is deterministic.
+    // This is an election/ABI fixture, so exclude generic reductions. A
+    // fastest-plan assertion would depend on the hardware and timing noise.
     let options = luminal_cuda_lite::CompileOptions {
         generations: 12,
         generation_size: 16,
@@ -211,7 +218,7 @@ fn canonical_2d_matmul_elects_the_marker() {
         search_log: false,
         ..luminal_cuda_lite::harness_search_options()
     };
-    let row = search_and_count_opts("matmul_2d(4x8 . 8x3)", &cx, &pairs, &options);
+    let row = search_and_count_opts("matmul_2d(4x8 . 8x3)", &cx, &pairs, &options, true);
     let Row::Searched { elected, computes } = row else {
         let Row::SearchDied(msg) = row else {
             unreachable!()
@@ -224,7 +231,7 @@ fn canonical_2d_matmul_elects_the_marker() {
     assert!(
         elected > 0,
         "the 2D canonical matmul must elect a CublasLt node \
-         (bytes-moved cost prefers the fused call); plan had {computes} computes, none CublasLt"
+         (the fixture registry requires the fused call); plan had {computes} computes, none CublasLt"
     );
 }
 
@@ -235,6 +242,10 @@ fn canonical_2d_matmul_elects_the_marker() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn election_row_conv() {
     use model_zoo::mini::conv::MiniConvNet;
     let mut cx = Graph::new();
@@ -251,6 +262,10 @@ fn election_row_conv() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn election_row_llama3() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
@@ -290,6 +305,10 @@ fn election_row_llama3() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn election_row_qwen3() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
@@ -333,6 +352,10 @@ fn election_row_qwen3() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn election_row_whisper() {
     use model_zoo::mini::whisper::MiniWhisper;
 
@@ -363,6 +386,10 @@ fn election_row_whisper() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn election_row_qwen3_moe() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
@@ -401,6 +428,10 @@ fn election_row_qwen3_moe() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn election_row_gemma4_moe() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
@@ -439,6 +470,10 @@ fn election_row_gemma4_moe() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn election_row_gemma3() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;

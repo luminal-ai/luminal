@@ -1,0 +1,11 @@
+   Compiling luminal_cuda_lite v0.1.0 (/root/luminal/crates/luminal_cuda_lite)
+    Finished `release` profile [optimized] target(s) in 1.06s
+     Running tests/device_view_differentials.rs (target/release/deps/device_view_differentials-a5be032ca82027f4)
+
+running 4 tests
+test slice_consumer_byte_matches_materialize_route ... ok
+test broadcast_consumer_byte_matches_materialize_route ... ok
+test transpose_consumer_byte_matches_materialize_route ... ok
+test chained_matmul_byte_matches_materialize_route ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s

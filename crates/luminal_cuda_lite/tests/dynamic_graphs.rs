@@ -18,6 +18,7 @@ fn bucket_switches_overlay_one_arena_and_replay_cached_graphs() {
         .unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
+    let before = rt.graph_stats().unwrap();
     let max = rt
         .bucket_plans()
         .iter()
@@ -37,11 +38,11 @@ fn bucket_switches_overlay_one_arena_and_replay_cached_graphs() {
         let stats = rt.graph_stats().unwrap();
         assert_eq!(stats.arena_bytes, max);
         assert_eq!(*base.get_or_insert(stats.arena_base), stats.arena_base);
-        assert_eq!(stats.arena_generation, 1);
+        assert_eq!(stats.arena_generation - before.arena_generation, 1);
     }
     let stats = rt.graph_stats().unwrap();
-    assert_eq!(stats.instantiations, 2);
-    assert_eq!(stats.launches, 8);
+    assert_eq!(stats.instantiations - before.instantiations, 2);
+    assert_eq!(stats.launches - before.launches, 8);
     rt.set_dim('a', 10);
     assert!(rt.execute().is_err());
 }
@@ -55,6 +56,7 @@ fn metadata_only_dimension_change_patches_no_nodes() {
     rt.bind_dyn_range('a', 1, 19).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
+    let before = rt.graph_stats().unwrap();
     for n in [1, 19, 7, 1] {
         rt.set_dim('a', n);
         rt.execute().unwrap();
@@ -64,7 +66,7 @@ fn metadata_only_dimension_change_patches_no_nodes() {
         );
     }
     let stats = rt.graph_stats().unwrap();
-    assert_eq!(stats.instantiations, 1);
+    assert_eq!(stats.instantiations - before.instantiations, 1);
     assert_eq!(stats.node_updates, 0);
     assert_eq!(stats.kernel_compilations, 1);
 }
@@ -78,6 +80,7 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
     rt.bind_dyn_range('a', 2, 11).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
+    let before = rt.graph_stats().unwrap();
     for n in [2, 11, 5, 2] {
         let data: Vec<_> = (0..3 * n).map(|i| i as f32 / 2.).collect();
         let expected: Vec<_> = (0..3)
@@ -93,7 +96,10 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), expected);
     }
-    assert_eq!(rt.graph_stats().unwrap().instantiations, 1);
+    assert_eq!(
+        rt.graph_stats().unwrap().instantiations - before.instantiations,
+        1
+    );
 }
 
 #[test]
@@ -102,7 +108,11 @@ fn cublas_geometry_changes_rerecord_the_child_every_execution() {
     let a = g.tensor(('m', 'k'), DType::F32);
     let b = g.tensor(('k', 'n'), DType::F32);
     let out = a.matmul(b);
-    let mut rt = CudaRuntime::load(&g).unwrap();
+    let mut rt = CudaRuntime::load_with_registry(
+        &g,
+        luminal_cuda_lite::cuda_registry_filtered(|row| !matches!(row.label(), "ReduceSumGeneric")),
+    )
+    .unwrap();
     for s in ['m', 'k', 'n'] {
         rt.bind_dyn_range(s, 2, 12).unwrap();
     }
@@ -110,6 +120,7 @@ fn cublas_geometry_changes_rerecord_the_child_every_execution() {
     options.generations = 4;
     options.generation_size = 12;
     rt.search(&Default::default(), &options).unwrap();
+    let before = rt.graph_stats().unwrap();
     assert!(rt.plan().unwrap().dag.node_weights().any(|node|matches!(node,luminal::bufferize::BufferNode::Compute{op,..} if luminal_cuda_lite::as_host_op(op.as_ref()).is_some())));
     for (m, n, k) in [(2, 3, 4), (12, 9, 7), (5, 2, 11), (2, 3, 4)] {
         let av: Vec<_> = (0..m * k).map(|i| (i % 9) as f32 / 4. - 1.).collect();
@@ -136,8 +147,11 @@ fn cublas_geometry_changes_rerecord_the_child_every_execution() {
     let stats = rt.graph_stats().unwrap();
     // Every execution here changes the dims, and every such execution
     // re-records the library call: one recording per launch.
-    assert_eq!(stats.host_captures, stats.launches);
-    assert_eq!(stats.arena_generation, 1);
+    assert_eq!(
+        stats.host_captures - before.host_captures,
+        stats.launches - before.launches
+    );
+    assert_eq!(stats.arena_generation - before.arena_generation, 1);
 }
 
 #[test]
@@ -150,7 +164,7 @@ fn profiling_and_serving_share_dynamic_graph_execution() {
         .unwrap();
     let data = [(x.id, vec![1f32, 2., 3.].into())].into_iter().collect();
     let mut options = harness_search_options();
-    options.profile_on_device = true;
+
     options.trials = 2;
     let outcome = rt.search(&data, &options).unwrap();
     assert!(outcome.plans_profiled > 0);
@@ -171,13 +185,17 @@ fn zero_extents_disable_copies_and_restore_them() {
     rt.bind_dyn_range('a', 0, 9).unwrap();
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
+    let before = rt.graph_stats().unwrap();
     for n in [0, 9, 0, 2] {
         rt.set_dim('a', n);
         rt.set_data(x.id, vec![2f32; n]).unwrap();
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; n]);
     }
-    assert_eq!(rt.graph_stats().unwrap().instantiations, 1);
+    assert_eq!(
+        rt.graph_stats().unwrap().instantiations - before.instantiations,
+        1
+    );
 }
 
 #[test]
@@ -195,6 +213,7 @@ fn gather_scatter_update_symbolic_coordinates() {
     opts.generations = 4;
     opts.generation_size = 8;
     rt.search(&Default::default(), &opts).unwrap();
+    let before = rt.graph_stats().unwrap();
     for n in [2, 9, 5, 2] {
         let values: Vec<_> = (0..n * 3).map(|i| i as f32 / 4.).collect();
         let indices: Vec<_> = (0..n).map(|i| ((i + 1) % n) as i32).collect();
@@ -213,7 +232,10 @@ fn gather_scatter_update_symbolic_coordinates() {
         assert_eq!(rt.get_f32(gathered.id).unwrap(), expected_gather);
         assert_eq!(rt.get_f32(scattered.id).unwrap(), expected_scatter);
     }
-    assert_eq!(rt.graph_stats().unwrap().instantiations, 1);
+    assert_eq!(
+        rt.graph_stats().unwrap().instantiations - before.instantiations,
+        1
+    );
 }
 
 #[test]
@@ -312,6 +334,7 @@ fn bucketed_and_range_bound_dimensions_both_stay_symbolic() {
     rt.set_dim('b', 3); // This current value must not narrow the searched interval.
     rt.search(&Default::default(), &harness_search_options())
         .unwrap();
+    let before = rt.graph_stats().unwrap();
     for (a, b) in [(2, 3), (4, 8), (5, 2), (9, 7)] {
         rt.set_dim('a', a);
         rt.set_dim('b', b);
@@ -319,7 +342,10 @@ fn bucketed_and_range_bound_dimensions_both_stay_symbolic() {
         rt.execute().unwrap();
         assert_eq!(rt.get_f32(out.id).unwrap(), vec![3f32; a * b]);
     }
-    assert_eq!(rt.graph_stats().unwrap().instantiations, 2);
+    assert_eq!(
+        rt.graph_stats().unwrap().instantiations - before.instantiations,
+        2
+    );
 }
 
 #[test]
@@ -329,7 +355,19 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
     let b = g.tensor((4, 'n'), DType::F32);
     let bias = g.tensor('n', DType::F32);
     let out = (a.matmul(b) + bias.expand_dim(0, 'm')).relu();
-    let mut rt = CudaRuntime::load(&g).unwrap();
+    let mut rt = CudaRuntime::load_with_registry(
+        &g,
+        luminal_cuda_lite::cuda_registry_filtered(|row| {
+            // Exercise the bias epilogue regardless of profiling noise. The
+            // Accumulate form can also add a materialized broadcast bias, but
+            // that valid alternative does not exercise the bias binding.
+            !matches!(
+                row.label(),
+                "ReduceSumGeneric" | "AddFunctionalGeneric" | "CublasLtAccumulate"
+            )
+        }),
+    )
+    .unwrap();
     for s in ['m', 'n'] {
         rt.bind_dyn_range(s, 2, 9).unwrap();
     }
@@ -338,6 +376,7 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
     options.generation_size = 16;
     options.mutations = 4;
     rt.search(&Default::default(), &options).unwrap();
+    let before = rt.graph_stats().unwrap();
     assert!(rt.plan().unwrap().dag.node_weights().any(|node|matches!(node,luminal::bufferize::BufferNode::Compute{op,..} if luminal_cuda_lite::as_host_op(op.as_ref()).is_some()&&op.label().contains("Bias"))));
     for (m, n) in [(2, 3), (9, 7), (4, 9), (2, 3)] {
         let av: Vec<_> = (0..m * 4).map(|i| (i % 5) as f32 - 2.).collect();
@@ -361,5 +400,8 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
         assert_eq!(rt.get_f32(out.id).unwrap(), expected);
     }
     let stats = rt.graph_stats().unwrap();
-    assert_eq!(stats.host_captures, stats.launches);
+    assert_eq!(
+        stats.host_captures - before.host_captures,
+        stats.launches - before.launches
+    );
 }

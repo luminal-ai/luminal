@@ -15,8 +15,13 @@ fn fused_dot_handles_broadcast_views_and_dynamic_contraction() {
     )
     .unwrap();
     rt.bind_dyn_range('k', 0, 7).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &[(a.id, vec![1f32; 9].into()), (b.id, vec![1f32; 6].into())]
+            .into_iter()
+            .collect(),
+        &harness_search_options(),
+    )
+    .unwrap();
     assert!(rt.plan().unwrap().dag.node_weights().any(
         |node| matches!(node, BufferNode::Compute{op,..} if op.label() == "MulReduceSumGeneric")
     ));
@@ -48,8 +53,13 @@ fn fused_dot_does_not_contract_multiply_and_add() {
         metal_registry_filtered(|row| row.label() != "ReduceSumGeneric"),
     )
     .unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &[(a.id, vec![1f32; 2].into()), (b.id, vec![1f32; 2].into())]
+            .into_iter()
+            .collect(),
+        &harness_search_options(),
+    )
+    .unwrap();
     rt.set_data(a.id, vec![-1f32, 1. + f32::EPSILON]);
     rt.set_data(b.id, vec![1f32, 1. - f32::EPSILON]);
     rt.execute().unwrap();
@@ -57,7 +67,7 @@ fn fused_dot_does_not_contract_multiply_and_add() {
 }
 
 #[test]
-fn default_search_seeds_a_compact_matmul_chain() {
+fn default_search_measures_a_matmul_chain() {
     use luminal_metal::CompileOptions;
     let mut graph = Graph::new();
     let input = graph.tensor((4, 32), DType::F32);
@@ -70,7 +80,12 @@ fn default_search_seeds_a_compact_matmul_chain() {
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     let outcome = runtime
         .search(
-            &Default::default(),
+            &[
+                (input.id, vec![1f32; 128].into()),
+                (weight.id, vec![1f32; 1024].into()),
+            ]
+            .into_iter()
+            .collect(),
             &CompileOptions {
                 generations: 1,
                 generation_size: 1,
@@ -79,21 +94,8 @@ fn default_search_seeds_a_compact_matmul_chain() {
             },
         )
         .unwrap();
-    assert_eq!(
-        outcome.best_heuristic_cost,
-        1 + 6 * (2 * 4 * 32 * 32 * 4 + 4 * 32 * 4)
-    );
-    let reductions: Vec<_> = runtime
-        .plan()
-        .unwrap()
-        .dag
-        .node_weights()
-        .filter_map(|node| match node {
-            BufferNode::Compute { op, .. } if op.label().contains("ReduceSum") => Some(op.label()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(reductions, vec!["MulReduceSumGeneric"; 6]);
+    assert!(outcome.plans_profiled > 0);
+    assert!(outcome.best_nanos > 0);
     let values: Vec<_> = (0..128).map(|i| i as f32 / 16.).collect();
     let identity: Vec<_> = (0..1024)
         .map(|i| if i / 32 == i % 32 { 1. } else { 0. })
@@ -105,14 +107,14 @@ fn default_search_seeds_a_compact_matmul_chain() {
 }
 
 #[test]
-fn deep_fork_join_seed_does_not_materialize_broadcast_operands() {
-    use luminal_metal::{CompileOptions, symbolic};
+fn deep_fork_join_search_executes_without_cost_overflow() {
+    use luminal_metal::CompileOptions;
     let mut graph = Graph::new();
     let input = graph.tensor((4, 32), DType::F32);
     let weight = graph.tensor((32, 32), DType::F32);
     let mut value = input;
-    // Recursive subtree sums overflow a u64 on this compact DAG, making
-    // otherwise distinct producer costs tie and electing broadcast copies.
+    // Repeated joins have exponentially many paths but linear graph depth.
+    // Extraction must remain finite without a recursive byte estimate.
     for _ in 0..32 {
         let projected = value.matmul(weight);
         let twice = projected + projected;
@@ -122,7 +124,12 @@ fn deep_fork_join_seed_does_not_materialize_broadcast_operands() {
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     runtime
         .search(
-            &Default::default(),
+            &[
+                (input.id, vec![1f32; 128].into()),
+                (weight.id, vec![1f32; 1024].into()),
+            ]
+            .into_iter()
+            .collect(),
             &CompileOptions {
                 generations: 1,
                 generation_size: 1,
@@ -131,13 +138,6 @@ fn deep_fork_join_seed_does_not_materialize_broadcast_operands() {
             },
         )
         .unwrap();
-    for buffer in runtime.plan().unwrap().buffers.values() {
-        assert!(
-            symbolic::capacity_bytes(&buffer.layout, &Default::default()).unwrap() <= 4096,
-            "expanded broadcast allocated: {:?}",
-            buffer.layout.shape()
-        );
-    }
     let values: Vec<_> = (0..128).map(|i| i as f32 / 16.).collect();
     let identity: Vec<_> = (0..1024)
         .map(|i| if i / 32 == i % 32 { 1. } else { 0. })

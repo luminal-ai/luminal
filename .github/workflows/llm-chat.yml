@@ -6,8 +6,7 @@ on:
       - 'Cargo.toml'
       - 'src/**'
       - 'crates/luminal_nn/**'
-      - 'examples/llm_chat_cuda/**'
-      - 'examples/llm_chat_metal/**'
+      - 'examples/llm_chat/**'
       - 'crates/luminal_metal/**'
       - 'crates/luminal_cuda_lite/**'
       - 'crates/model_zoo/**'
@@ -25,9 +24,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      # The CUDA example's `device` feature needs a CUDA toolkit, so CI
-      # exercises its planning and host-side code only.
-      - run: cargo clippy -p llm_chat_metal -p llm_chat_cuda --all-targets -- -D warnings
-      - run: cargo test -p llm_chat_metal -p llm_chat_cuda
+      - run: cargo clippy -p llm_chat --all-targets -- -D warnings
+      - run: cargo test -p llm_chat
+      - run: cargo clippy -p llm_chat --features metal --all-targets -- -D warnings
+      - run: cargo test -p llm_chat --features metal
       - if: runner.os == 'macOS'
         run: cargo test -p luminal_metal --test resident_mutation --test dynamic_execution

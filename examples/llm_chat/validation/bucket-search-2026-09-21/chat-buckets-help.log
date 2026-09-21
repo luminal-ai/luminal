@@ -1,0 +1,37 @@
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running `target/release/llm_chat --help`
+Chat with a model-zoo LLM. Select CUDA or Metal with Cargo features.
+
+Usage: llm_chat [OPTIONS] --model <MODEL> --checkpoint <CHECKPOINT>
+
+Options:
+      --model <MODEL>
+          [possible values: llama3, qwen3, gemma3, qwen3-moe]
+      --checkpoint <CHECKPOINT>
+          Local Hugging Face checkpoint directory (config, tokenizer, safetensors)
+      --tensor-map <TENSOR_MAP>
+          JSON safetensors-name -> model-namespace overrides
+      --max-context <MAX_CONTEXT>
+          [default: 2048]
+      --prefill-chunk <PREFILL_CHUNK>
+          [default: 128]
+      --max-new-tokens <MAX_NEW_TOKENS>
+          [default: 256]
+      --temperature <TEMPERATURE>
+          [default: 0]
+      --top-p <TOP_P>
+          [default: 1]
+      --seed <SEED>
+          [default: 0]
+      --system <SYSTEM>
+
+      --prompt <PROMPT>
+          Run one turn and exit; omit to start the interactive chat
+      --enable-thinking
+
+      --search-generations <SEARCH_GENERATIONS>
+          Search generations per bucket [default: 10]
+      --search-population <SEARCH_POPULATION>
+          Candidate attempts per generation, per bucket [default: 10]
+  -h, --help
+          Print help

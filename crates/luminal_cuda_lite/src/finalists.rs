@@ -29,14 +29,8 @@
 //! # The hard filter
 //!
 //! `ensure(target, validate)` is the door. `validate` is the RUNTIME's
-//! (see [`crate::search::finalist_validate`]): under
-//! `CompileOptions::profile_on_device` with a live device it runs ONE
-//! warmup execution of the candidate plan, which is main's hard filter
-//! (its `validate_finalist` = `compile_and_validate_profile_candidate`);
-//! on the device-free heuristic path a plan that bufferized and
-//! arena-planned IS the whole of what this host can check, so validation
-//! is trivially satisfied and the first finalist IS the GA's winner —
-//! handed over as an object, not re-derived (see `Finalists::new`).
+//! (see [`crate::search::finalist_validate`]): it runs one warmup execution
+//! of the candidate plan on the device before installation.
 //!
 //! # What is NOT here (main's version, minus LLIR)
 //!
@@ -66,8 +60,7 @@ pub struct PendingFinalist {
     /// winner. (Main's `PendingFinalist.rank` is 1-based too, and its
     /// fallback log line reads "loading ranked #{rank}".)
     pub rank: usize,
-    /// The metric the GA ranked this genome by: measured nanoseconds
-    /// under the device evaluator, bytes-moved under the heuristic.
+    /// The metric the GA ranked this genome by: measured nanoseconds.
     pub metric: u128,
     pub genome: Genome,
     pub plan: CudaPlan,

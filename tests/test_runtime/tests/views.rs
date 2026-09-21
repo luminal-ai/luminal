@@ -145,7 +145,10 @@ fn real_view_op_to_output_slot_escapes_zero_copy() {
 fn view_feeds_compute_fixture_runs_one_kernel_on_the_input_buffer() {
     use luminal::bufferize::{BufferId, BufferNode};
 
-    let graph = test_runtime::extract_fixture_by_name("boundary_view_feeds_compute.egg");
+    let graph = test_runtime::extract_fixture_preferring(
+        "boundary_view_feeds_compute.egg",
+        &["LayoutTensorOpIndexMapApplyViewGeneric"],
+    );
     let plan = bufferize_mock(&luminal::dps::dps_rewrite(&graph)).expect("bufferizes");
 
     assert!(
@@ -208,7 +211,10 @@ fn view_feeds_compute_fixture_runs_one_kernel_on_the_input_buffer() {
 fn write_into_viewed_buffer_fixture_degrades_to_copy() {
     use luminal::bufferize::{BufferId, BufferNode};
 
-    let graph = test_runtime::extract_fixture_by_name("boundary_write_into_viewed_buffer.egg");
+    let graph = test_runtime::extract_fixture_preferring(
+        "boundary_write_into_viewed_buffer.egg",
+        &["LayoutTensorOpIndexMapApplyViewGeneric"],
+    );
     let plan = bufferize_mock(&luminal::dps::dps_rewrite(&graph)).expect("bufferizes");
 
     let launch: Vec<BufferId> = plan
@@ -262,18 +268,29 @@ fn write_into_viewed_buffer_fixture_degrades_to_copy() {
     );
 }
 
-/// EXTRACTION PREFERS THE VIEW: where an IndexMapApply's consumer accepts
-/// the COMPOSED layout, the free view op wins over the materializing
-/// gather (declared-effect cost: 0 vs 2). In basic_program both apply
-/// sites now extract as views — the transpose-onto-z site keeps a
-/// layout-conversion CopyGeneric AFTER its view (z's output slot demands
-/// a non-composed contiguous layout), and no Materialize survives
-/// anywhere.
+/// Require the view route explicitly: operation coverage must not depend on a
+/// byte-cost preference. A non-composed output still needs one conversion copy.
 #[test]
-fn extraction_prefers_the_view_op_where_the_layout_is_composed() {
+fn a_view_only_registry_folds_composed_layouts_without_materializing() {
     use luminal::layout_ir::ExtractedNode;
 
-    let graph = test_runtime::extract_fixture_by_name("basic_program.egg");
+    let allowed: Vec<_> = test_runtime::matchers()
+        .iter()
+        .map(|op| op.egglog_constructor())
+        .filter(|name| *name != "LayoutTensorOpIndexMapApplyMaterialize")
+        .collect();
+    let graph = test_runtime::extract_fixture_with_ops("basic_program.egg", &allowed);
+    let view_values: std::collections::HashSet<_> = graph
+        .dag
+        .node_weights()
+        .filter_map(|node| match node {
+            ExtractedNode::LayoutOp(op) if op.op.label() == "IndexMapApplyViewGeneric" => {
+                Some(op.outputs.iter().map(|v| v.eclass.clone()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
     let mut views = 0;
     let mut materializes = 0;
     let mut conversion_copies = 0;
@@ -282,7 +299,14 @@ fn extraction_prefers_the_view_op_where_the_layout_is_composed() {
             match op.op.label() {
                 "IndexMapApplyViewGeneric" => views += 1,
                 "IndexMapApplyMaterialize" => materializes += 1,
-                "CopyGeneric" => conversion_copies += 1,
+                "CopyGeneric"
+                    if op
+                        .inputs
+                        .iter()
+                        .any(|input| view_values.contains(&input.value)) =>
+                {
+                    conversion_copies += 1
+                }
                 _ => {}
             }
         }

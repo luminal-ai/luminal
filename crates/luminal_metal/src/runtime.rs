@@ -2,7 +2,7 @@
 //! Registry and search state belong to the runtime; core supplies the IR.
 
 use crate::host_buffer::HostBuffer;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::bufferize::BufferIrGraph;
 
 use crate::search::{CompileOptions, SearchOutcome};
@@ -322,6 +322,23 @@ impl MetalRuntime {
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
+        self.search_with_profile_inputs(input_data, &[], options)
+    }
+
+    /// Search with host input overrides for each complete profiling dimension
+    /// assignment. Entries borrow the shared inputs (including weights) and
+    /// override only the supplied tensors. Every representative, including
+    /// finalist validation, must have exactly one entry when overrides are used.
+    pub fn search_with_profile_inputs(
+        &mut self,
+        input_data: &FxHashMap<NodeIndex, HostBuffer>,
+        profile_inputs: &[(shape::DynMap, FxHashMap<NodeIndex, HostBuffer>)],
+        options: &CompileOptions,
+    ) -> Result<SearchOutcome> {
+        ensure!(
+            cfg!(target_os = "macos"),
+            "candidate search requires macOS and a Metal GPU"
+        );
         self.ensure_not_installed("cannot re-search")?;
         self.invalidate_plans();
         let mut resolved_options = options.clone();
@@ -360,15 +377,9 @@ impl MetalRuntime {
                 "tensor {tensor:?} is not a bound input"
             );
         }
-        #[cfg(not(target_os = "macos"))]
-        anyhow::ensure!(
-            !options.profile_on_device,
-            "device profiling requires macOS: this host can search by the heuristic, but a request to MEASURE \
-             must not be answered with a prior"
-        );
 
         #[cfg(target_os = "macos")]
-        let staged_for_search: FxHashMap<i64, &HostBuffer> = if options.profile_on_device {
+        let staged_for_search: FxHashMap<i64, &HostBuffer> = {
             native
                 .bound
                 .inputs
@@ -379,11 +390,32 @@ impl MetalRuntime {
                         .map(|data| (bound.buffer, data))
                 })
                 .collect()
-        } else {
-            FxHashMap::default()
         };
         #[cfg(target_os = "macos")]
-        if options.profile_on_device && self.device.is_none() {
+        let profile_inputs: Vec<crate::search::ProfileInputs<'_>> = profile_inputs
+            .iter()
+            .map(|(dims, inputs)| {
+                let inputs = inputs
+                    .iter()
+                    .map(|(tensor, data)| {
+                        let bound = native
+                            .bound
+                            .inputs
+                            .iter()
+                            .find(|bound| bound.value == *tensor)
+                            .ok_or_else(|| {
+                                anyhow!("profiling tensor {tensor:?} is not a bound input")
+                            })?;
+                        Ok((bound.buffer, data))
+                    })
+                    .collect::<Result<_>>()?;
+                Ok((dims.clone(), inputs))
+            })
+            .collect::<Result<_>>()?;
+        #[cfg(not(target_os = "macos"))]
+        let _ = profile_inputs;
+        #[cfg(target_os = "macos")]
+        if self.device.is_none() {
             self.device = Some(crate::device::MetalDevice::new()?);
         }
 
@@ -398,79 +430,74 @@ impl MetalRuntime {
         let mut evaluator = {
             #[cfg(target_os = "macos")]
             {
-                if options.profile_on_device {
-                    crate::search::Evaluator::Device {
-                        device: self
-                            .device
-                            .as_mut()
-                            .expect("the device was just created if it was missing"),
-                        staged: &staged_for_search,
-                    }
-                } else {
-                    crate::search::Evaluator::Heuristic
+                crate::search::Evaluator::Device {
+                    device: self.device.as_mut().expect("device initialized"),
+                    staged: &staged_for_search,
+                    residents: &self.residents,
+                    profile_inputs: &profile_inputs,
                 }
             }
             #[cfg(not(target_os = "macos"))]
             {
-                crate::search::Evaluator::Heuristic
+                crate::search::Evaluator::NoDevice(std::marker::PhantomData)
             }
         };
 
-        let (outcome, unbucketed_plan, searched_buckets) = if let Some((serialized, program)) = base
-        {
-            let mut outcome = crate::search::search_implementations(
-                &serialized,
-                &program,
-                options,
-                Some(allow.clone()),
-                matchers,
-                evaluator.reborrow(),
-            )?;
-            let finalists = vec![
-                crate::finalists::Finalists::new(
-                    "the search",
-                    &serialized,
+        let (outcome, unbucketed_plan, searched_buckets) =
+            if let Some((mut serialized, program)) = base {
+                let mut outcome = crate::search::search_implementations(
+                    &mut serialized,
+                    &program,
+                    options,
                     Some(allow.clone()),
                     matchers,
-                    outcome.ranked.clone(),
-                    Some(outcome.best_plan.clone()),
-                )
-                .with_shapes(options.shapes.clone()),
-            ];
-            let (selected, rejections) =
-                crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
-            outcome.lattice_rejections = rejections;
-            let (_, finalist) = selected
-                .into_iter()
-                .next()
-                .expect("a one-bucket lattice selects exactly one finalist");
-            (outcome, Some(finalist.plan), Vec::new())
-        } else {
-            let assembly = crate::search::BucketAssembly {
-                assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
-                prefix: &native.bound.prefix,
-                binding_seeds: &native.binding_seeds,
-                schedule: crate::bindings::MetalBindings::SCHEDULE,
-                post_checks: &native.bound.post_checks,
-                inputs: &native.bound.inputs,
-                outputs: &native.bound.outputs,
-                base_dims: &options.shapes.values,
-                decoders: &self.decoders,
+                    evaluator.reborrow(),
+                )?;
+                let finalists = vec![
+                    crate::finalists::Finalists::new(
+                        "the search",
+                        &serialized,
+                        Some(allow.clone()),
+                        matchers,
+                        outcome.ranked.clone(),
+                        Some(outcome.best_plan.clone()),
+                    )
+                    .with_shapes(options.shapes.clone()),
+                ];
+                let (selected, rejections) =
+                    crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
+                outcome.lattice_rejections = rejections;
+                let (_, finalist) = selected
+                    .into_iter()
+                    .next()
+                    .expect("a one-bucket lattice selects exactly one finalist");
+                (outcome, Some(finalist.plan), Vec::new())
+            } else {
+                let assembly = crate::search::BucketAssembly {
+                    assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
+                    prefix: &native.bound.prefix,
+                    binding_seeds: &native.binding_seeds,
+                    schedule: crate::bindings::MetalBindings::SCHEDULE,
+                    post_checks: &native.bound.post_checks,
+                    inputs: &native.bound.inputs,
+                    outputs: &native.bound.outputs,
+                    base_dims: &options.shapes.values,
+                    decoders: &self.decoders,
+                };
+                let plans = crate::search::bucketed_search_implementations(
+                    &assembly,
+                    &self.dim_buckets,
+                    options,
+                    Some(allow),
+                    matchers,
+                    evaluator,
+                )?;
+                let first = plans
+                    .first()
+                    .map(|plan| plan.outcome.clone())
+                    .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
+                (first, None, plans)
             };
-            let plans = crate::search::bucketed_search_implementations(
-                &assembly,
-                &self.dim_buckets,
-                options,
-                Some(allow),
-                matchers,
-                evaluator,
-            )?;
-            let first = plans
-                .first()
-                .map(|plan| plan.outcome.clone())
-                .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
-            (first, None, plans)
-        };
         self.device_budget_bytes = options.device_budget_bytes;
         self.bucket_plans = searched_buckets;
         self.selected_bucket = None;

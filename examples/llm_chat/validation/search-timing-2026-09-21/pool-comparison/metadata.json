@@ -1,0 +1,51 @@
+{
+  "date": "2026-09-21",
+  "base_commit": "f34abe5e3be9c07a1fb3b9feae532bc003393217",
+  "model": "NousResearch/Meta-Llama-3-8B-Instruct",
+  "checkpoint_revision": "53346005fb0ef11d3b6a83b12c895cca40156b6c",
+  "dtype": "FP32",
+  "gpu": "NVIDIA H200",
+  "gpu_memory_mib": 143771,
+  "driver": "580.126.09",
+  "cuda": "12.8",
+  "cpu": "AMD EPYC 9654, 44 visible vCPUs",
+  "build": "cargo build --release -p llm_chat_cuda --features device --bin llm_chat_cuda",
+  "profile_on_device": true,
+  "max_context": 2048,
+  "prefill_chunk": 8,
+  "profile_dimensions": {
+    "q": 1,
+    "c": 1
+  },
+  "shape_bounds": {
+    "q": [
+      1,
+      8
+    ],
+    "c": [
+      1,
+      2048
+    ]
+  },
+  "search_generations": 2,
+  "search_population": 4,
+  "trials_per_candidate": 3,
+  "warmups_per_candidate": 1,
+  "seed": 0,
+  "independent_search_runs": 1,
+  "timing_boundary": "CudaRuntime::search; excludes checkpoint loading, frontend/backend loading before search, and chat generation after search",
+  "command": "LUMINAL_PINNED_POOL_NUMA=0 LUMINAL_PINNED_POOL_DEVICE_ACCESS=1 LUMINAL_PINNED_POOL_RETAIN_BYTES=68719476736 LUMINAL_SEARCH_TRACE_FILE=/tmp/llama-pooled-access-context2048.json cargo run --release -p llm_chat_cuda --features device -- --model llama3 --checkpoint /dev/shm/llm-chat-bench-checkpoints/llama3-8b --max-context 2048 --prefill-chunk 8 --search-generations 2 --search-population 4 --seed 0 --prompt 'Hello!' --max-new-tokens 1",
+  "instrumentation": "Temporary nested wall-clock spans, recorded in memory and written after search; no sampling profiler attached; instrumentation.patch.gz required for LUMINAL_SEARCH_TRACE_FILE",
+  "validation": "Release build; cargo fmt; clippy --all-targets -D warnings; profiled mini-Llama vs semantic reference; pooled staging reinitialization and retained backing-memory test passed",
+  "variant": "persistent CUDA HOST_NUMA pinned-memory pool with device access",
+  "pinned_pool_numa_node": 0,
+  "pinned_pool_release_threshold_bytes": 68719476736,
+  "pool_lifetime": "CudaDevice, spanning all search candidates and final validation; destroyed at process end",
+  "initialization": "Full pinned allocation zeroed after every allocation, including reuse",
+  "device_allocator": "Unchanged cudarc async device allocation and default release policy",
+  "weight_residency": "Unchanged: profiling still stages weights on every execution",
+  "candidate_graph_lifetime": "Unchanged: destroyed after every candidate",
+  "baseline": "Existing llama-context2048 trace from the same base commit and settings",
+  "concurrency": "Mini-model device correctness test and CPU-only clippy overlapped checkpoint loading, finishing before search. No competing CPU/GPU checks overlapped search.",
+  "pinned_pool_device_access": "READWRITE for CUDA device 0, set before first allocation"
+}

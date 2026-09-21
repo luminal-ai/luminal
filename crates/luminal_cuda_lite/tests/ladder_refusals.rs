@@ -6,7 +6,7 @@
 //! configs as `luminal_nn::models::tests::measure_scaling_curves` —
 //! depth 1 at d ∈ {8,16,32}, then depth 2/4/8 at d=8 — searched through
 //! `CudaRuntime::search` (CL matcher set + CL allow list, two-phase
-//! sampler, static byte-move profiler). The original harness runs the
+//! sampler, device profiler). The original harness runs the
 //! ReferenceRuntime; the graphs, budgets, and refusal accounting are
 //! identical, so this is the nearest CL-direct equivalent.
 //!
@@ -126,11 +126,7 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
 
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let budget = if default_budget {
-        CompileOptions {
-            // This ladder measures device-free search/refusal behavior.
-            profile_on_device: false,
-            ..CompileOptions::default()
-        }
+        CompileOptions::default()
     } else {
         // The fixed 8-genome budget of the original ladder's depth-1
         // rungs: comparable refusal RATES across d.
@@ -178,16 +174,28 @@ fn assert_zero(rung: &str, counts: (usize, usize, usize, usize)) {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn ladder_l1_d8() {
     assert_zero("L1 d8", run_rung(1, 8, false));
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn ladder_l1_d16() {
     assert_zero("L1 d16", run_rung(1, 16, false));
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn ladder_l1_d32() {
     assert_zero("L1 d32", run_rung(1, 32, false));
 }

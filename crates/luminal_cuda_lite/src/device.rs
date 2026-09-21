@@ -250,6 +250,44 @@ impl CudaDevice {
     pub fn slab_bytes(&self) -> usize {
         self.stats.arena_bytes
     }
+    /// Current capacity available to this runtime's entire arena.
+    pub fn available_arena_bytes(&self) -> Result<usize> {
+        if let Some((_, bytes)) = self.external_arena {
+            return Ok(bytes);
+        }
+        // A dropped CudaSlice queues cuMemFreeAsync. Complete those frees
+        // before reading capacity, and include unused pool reservations: the
+        // next cuMemAllocAsync can reuse them even though cuMemGetInfo counts
+        // them as occupied. The currently owned slab is also replaceable.
+        self.stream.synchronize()?;
+        let (free, total) = self.ctx.mem_get_info()?;
+        let reusable = if self.ctx.has_async_alloc() {
+            let mut reserved = 0u64;
+            let mut used = 0u64;
+            // SAFETY: the context owns this live device; both attributes are
+            // documented uint64 values, written into correctly sized storage.
+            unsafe {
+                let pool = result::device::get_mem_pool(self.ctx.cu_device())?;
+                result::mem_pool::get_attribute(
+                    pool,
+                    cu::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                    (&mut reserved as *mut u64).cast(),
+                )?;
+                result::mem_pool::get_attribute(
+                    pool,
+                    cu::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                    (&mut used as *mut u64).cast(),
+                )?;
+            }
+            usize::try_from(reserved.saturating_sub(used))?
+        } else {
+            0
+        };
+        Ok(free
+            .saturating_add(reusable)
+            .saturating_add(self.slab_bytes())
+            .min(total))
+    }
     /// Validate all capacities first, then reserve their maximum once. Replacing
     /// the plan set invalidates every executable before any pointer can change.
     pub fn install(&mut self, plans: Vec<(CudaPlan, Bounds)>) -> Result<()> {
@@ -270,12 +308,14 @@ impl CudaDevice {
     ) -> Result<()> {
         let allocation = crate::resident::allocate(plans, bindings)?;
         let bytes = allocation.bytes;
-        if let Some(budget) = budget {
-            ensure!(
-                bytes <= budget,
-                "resident CUDA arena requires {bytes} bytes, exceeding budget {budget}"
-            );
-        }
+        let available = self.available_arena_bytes()?;
+        let budget = budget.map_or(available, |limit| limit.min(available));
+        ensure!(
+            bytes <= budget,
+            "resident CUDA arena requires {bytes} bytes ({:.2} GiB), exceeding budget {budget} bytes ({:.2} GiB)",
+            bytes as f64 / 1073741824.0,
+            budget as f64 / 1073741824.0,
+        );
         let installed: Vec<_> = allocation
             .plans
             .into_iter()
@@ -328,10 +368,12 @@ impl CudaDevice {
             self.slab = None;
             self.stats.arena_bytes = 0;
             self.stats.arena_base = 0;
-            let slab = self
-                .stream
-                .alloc_zeros::<u8>(bytes)
-                .context("shared CUDA arena")?;
+            let slab = self.stream.alloc_zeros::<u8>(bytes).with_context(|| {
+                format!(
+                    "shared CUDA arena: requested {bytes} bytes ({:.2} GiB)",
+                    bytes as f64 / 1073741824.0
+                )
+            })?;
             self.stats.arena_base = slab.device_ptr(&self.stream).0;
             self.stats.arena_bytes = bytes;
             self.stats.arena_generation += 1;
@@ -340,7 +382,7 @@ impl CudaDevice {
         self.installed = installed;
         Ok(())
     }
-    fn upload_residents(&mut self, staged: &FxHashMap<i64, &HostBuffer>) -> Result<()> {
+    pub(crate) fn upload_residents(&mut self, staged: &FxHashMap<i64, &HostBuffer>) -> Result<()> {
         for (&lit, home) in &self.residents {
             let Some(data) = staged.get(&lit) else {
                 ensure!(

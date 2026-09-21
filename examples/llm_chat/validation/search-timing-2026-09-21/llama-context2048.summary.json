@@ -1,0 +1,2428 @@
+{
+  "trace": "llama-context2048.json",
+  "root_seconds": 347.198345523,
+  "all": {
+    "runtime.search": {
+      "count": 1,
+      "inclusive_seconds": 347.198345523,
+      "exclusive_seconds": 0.22171300799999472,
+      "value": 0
+    },
+    "device.init": {
+      "count": 1,
+      "inclusive_seconds": 0.203091283,
+      "exclusive_seconds": 0.203091283,
+      "value": 0
+    },
+    "runtime.assemble_total": {
+      "count": 1,
+      "inclusive_seconds": 16.638851658,
+      "exclusive_seconds": 0.0711460790000018,
+      "value": 0
+    },
+    "runtime.program_assembly": {
+      "count": 1,
+      "inclusive_seconds": 0.000905442,
+      "exclusive_seconds": 0.000905442,
+      "value": 0
+    },
+    "runtime.saturation": {
+      "count": 1,
+      "inclusive_seconds": 15.278250147,
+      "exclusive_seconds": 15.278250147,
+      "value": 0
+    },
+    "runtime.decoder_check": {
+      "count": 1,
+      "inclusive_seconds": 9.269e-05,
+      "exclusive_seconds": 9.269e-05,
+      "value": 0
+    },
+    "runtime.serialize": {
+      "count": 1,
+      "inclusive_seconds": 1.2884573,
+      "exclusive_seconds": 1.2884573,
+      "value": 0
+    },
+    "selection.total": {
+      "count": 1,
+      "inclusive_seconds": 303.615174566,
+      "exclusive_seconds": 0.23559851400000298,
+      "value": 0
+    },
+    "selection.analysis": {
+      "count": 1,
+      "inclusive_seconds": 11.620836625,
+      "exclusive_seconds": 11.620836625,
+      "value": 0
+    },
+    "selection.sampling_space": {
+      "count": 1,
+      "inclusive_seconds": 0.062128358,
+      "exclusive_seconds": 0.062128358,
+      "value": 0
+    },
+    "selection.decoder_setup": {
+      "count": 1,
+      "inclusive_seconds": 5.98e-06,
+      "exclusive_seconds": 5.98e-06,
+      "value": 0
+    },
+    "generation.0": {
+      "count": 1,
+      "inclusive_seconds": 150.198621737,
+      "exclusive_seconds": 0.0006753600000024562,
+      "value": 0
+    },
+    "generation.sample_or_mutate": {
+      "count": 2,
+      "inclusive_seconds": 0.013504207,
+      "exclusive_seconds": 0.013504207,
+      "value": 0
+    },
+    "candidate.0.0": {
+      "count": 1,
+      "inclusive_seconds": 41.901302893,
+      "exclusive_seconds": 0.02150930700000231,
+      "value": 0
+    },
+    "extract": {
+      "count": 8,
+      "inclusive_seconds": 1.9247540669999998,
+      "exclusive_seconds": 1.9247540669999998,
+      "value": 0
+    },
+    "fingerprint": {
+      "count": 8,
+      "inclusive_seconds": 0.016646741000000003,
+      "exclusive_seconds": 0.016646741000000003,
+      "value": 0
+    },
+    "plan_build": {
+      "count": 8,
+      "inclusive_seconds": 1.898339802,
+      "exclusive_seconds": 0.007201928000000114,
+      "value": 0
+    },
+    "dps_rewrite": {
+      "count": 8,
+      "inclusive_seconds": 0.10193281700000001,
+      "exclusive_seconds": 0.10193281700000001,
+      "value": 0
+    },
+    "decode_layouts": {
+      "count": 8,
+      "inclusive_seconds": 1.42428328,
+      "exclusive_seconds": 1.42428328,
+      "value": 0
+    },
+    "bufferize": {
+      "count": 8,
+      "inclusive_seconds": 0.364921777,
+      "exclusive_seconds": 0.364921777,
+      "value": 0
+    },
+    "heuristic_cost": {
+      "count": 8,
+      "inclusive_seconds": 0.00017088999999999999,
+      "exclusive_seconds": 0.00017088999999999999,
+      "value": 0
+    },
+    "profile_and_release": {
+      "count": 8,
+      "inclusive_seconds": 287.616153049,
+      "exclusive_seconds": 2.2320000006459395e-05,
+      "value": 0
+    },
+    "profile.candidate": {
+      "count": 8,
+      "inclusive_seconds": 236.27893801099998,
+      "exclusive_seconds": 0.00010835000000142259,
+      "value": 0
+    },
+    "profile.prepare_and_borrow": {
+      "count": 8,
+      "inclusive_seconds": 136.41849536299998,
+      "exclusive_seconds": 0.000327670000004332,
+      "value": 0
+    },
+    "profile.prepare": {
+      "count": 9,
+      "inclusive_seconds": 153.55430402200003,
+      "exclusive_seconds": 0.0011446019999965529,
+      "value": 0
+    },
+    "profile.plan_clone": {
+      "count": 9,
+      "inclusive_seconds": 0.034987453,
+      "exclusive_seconds": 0.034987453,
+      "value": 0
+    },
+    "device.install": {
+      "count": 9,
+      "inclusive_seconds": 153.518171967,
+      "exclusive_seconds": 0.6657327310000056,
+      "value": 0
+    },
+    "device.arena_plan": {
+      "count": 9,
+      "inclusive_seconds": 0.045982508000000005,
+      "exclusive_seconds": 0.045982508000000005,
+      "value": 0
+    },
+    "device.pinned_alloc": {
+      "count": 9,
+      "inclusive_seconds": 152.17223833399999,
+      "exclusive_seconds": 152.17223833399999,
+      "value": 0
+    },
+    "pinned_bytes": {
+      "count": 9,
+      "inclusive_seconds": 0.0,
+      "exclusive_seconds": 0.0,
+      "value": 293926598676
+    },
+    "device.gpu_alloc_zero": {
+      "count": 9,
+      "inclusive_seconds": 0.6342183939999999,
+      "exclusive_seconds": 0.6342183939999999,
+      "value": 0
+    },
+    "arena_bytes": {
+      "count": 9,
+      "inclusive_seconds": 0.0,
+      "exclusive_seconds": 0.0,
+      "value": 456748899584
+    },
+    "profile.warmup": {
+      "count": 8,
+      "inclusive_seconds": 30.303644966999997,
+      "exclusive_seconds": 0.22226264699999865,
+      "value": 0
+    },
+    "device.execute": {
+      "count": 33,
+      "inclusive_seconds": 101.86783549000002,
+      "exclusive_seconds": 0.0001970299999998204,
+      "value": 0
+    },
+    "device.upload_residents": {
+      "count": 33,
+      "inclusive_seconds": 1.322e-05,
+      "exclusive_seconds": 1.322e-05,
+      "value": 0
+    },
+    "device.compile": {
+      "count": 9,
+      "inclusive_seconds": 7.208393408999998,
+      "exclusive_seconds": 0.18975317399999989,
+      "value": 0
+    },
+    "device.nvrtc_compile": {
+      "count": 449,
+      "inclusive_seconds": 6.722845090999995,
+      "exclusive_seconds": 6.722845090999995,
+      "value": 0
+    },
+    "device.module_load": {
+      "count": 449,
+      "inclusive_seconds": 0.052134255,
+      "exclusive_seconds": 0.052134255,
+      "value": 0
+    },
+    "device.host_capture": {
+      "count": 7117,
+      "inclusive_seconds": 0.26245439900000045,
+      "exclusive_seconds": 0.0985313300000003,
+      "value": 0
+    },
+    "device.host_prepare": {
+      "count": 7117,
+      "inclusive_seconds": 0.13448816300000016,
+      "exclusive_seconds": 0.008080680000000007,
+      "value": 0
+    },
+    "cublas.prepare": {
+      "count": 7117,
+      "inclusive_seconds": 0.12640748300000135,
+      "exclusive_seconds": 0.06436549800000266,
+      "value": 0
+    },
+    "cublas.algorithm_selection": {
+      "count": 7117,
+      "inclusive_seconds": 0.06204198500000052,
+      "exclusive_seconds": 0.06204198500000052,
+      "value": 0
+    },
+    "device.host_record": {
+      "count": 7117,
+      "inclusive_seconds": 0.02943490600000014,
+      "exclusive_seconds": 0.004130378000000016,
+      "value": 0
+    },
+    "cublas.record": {
+      "count": 7117,
+      "inclusive_seconds": 0.025304527999999948,
+      "exclusive_seconds": 0.025304527999999948,
+      "value": 0
+    },
+    "device.graph_rebuild": {
+      "count": 9,
+      "inclusive_seconds": 0.074097771,
+      "exclusive_seconds": 0.074097771,
+      "value": 0
+    },
+    "device.update_dimensions": {
+      "count": 33,
+      "inclusive_seconds": 6.968e-05,
+      "exclusive_seconds": 6.968e-05,
+      "value": 0
+    },
+    "device.launch": {
+      "count": 33,
+      "inclusive_seconds": 94.448763524,
+      "exclusive_seconds": 0.00010418000000145256,
+      "value": 0
+    },
+    "device.host_staging": {
+      "count": 33,
+      "inclusive_seconds": 58.610399227,
+      "exclusive_seconds": 58.610399227,
+      "value": 0
+    },
+    "input_bytes": {
+      "count": 33,
+      "inclusive_seconds": 0.0,
+      "exclusive_seconds": 0.0,
+      "value": 1077730351764
+    },
+    "device.replay_sync": {
+      "count": 33,
+      "inclusive_seconds": 26.458676972,
+      "exclusive_seconds": 26.458676972,
+      "value": 0
+    },
+    "device.output_unpack": {
+      "count": 33,
+      "inclusive_seconds": 9.379583145,
+      "exclusive_seconds": 9.379583145,
+      "value": 0
+    },
+    "profile.trial.0": {
+      "count": 8,
+      "inclusive_seconds": 23.208104169000002,
+      "exclusive_seconds": 0.21974806400000002,
+      "value": 0
+    },
+    "device.rebind_addresses": {
+      "count": 24,
+      "inclusive_seconds": 0.21039862699999998,
+      "exclusive_seconds": 0.11750734599999998,
+      "value": 0
+    },
+    "profile.trial.1": {
+      "count": 8,
+      "inclusive_seconds": 23.185224819,
+      "exclusive_seconds": 0.21714379999999966,
+      "value": 0
+    },
+    "profile.trial.2": {
+      "count": 8,
+      "inclusive_seconds": 23.163360343,
+      "exclusive_seconds": 0.21764341200000015,
+      "value": 0
+    },
+    "device.release_slab": {
+      "count": 9,
+      "inclusive_seconds": 57.767925496,
+      "exclusive_seconds": 57.767925496,
+      "value": 0
+    },
+    "candidate.0.1": {
+      "count": 1,
+      "inclusive_seconds": 36.571588322,
+      "exclusive_seconds": 0.0280469749999952,
+      "value": 0
+    },
+    "candidate.0.2": {
+      "count": 1,
+      "inclusive_seconds": 35.928393408,
+      "exclusive_seconds": 0.02824678500000033,
+      "value": 0
+    },
+    "candidate.0.3": {
+      "count": 1,
+      "inclusive_seconds": 35.784686749,
+      "exclusive_seconds": 0.029557558000000483,
+      "value": 0
+    },
+    "generation.1": {
+      "count": 1,
+      "inclusive_seconds": 141.497983352,
+      "exclusive_seconds": 0.0006761100000005626,
+      "value": 0
+    },
+    "candidate.1.0": {
+      "count": 1,
+      "inclusive_seconds": 35.24189972,
+      "exclusive_seconds": 0.034485882999995,
+      "value": 0
+    },
+    "candidate.1.1": {
+      "count": 1,
+      "inclusive_seconds": 35.494368875,
+      "exclusive_seconds": 0.026769232999996007,
+      "value": 0
+    },
+    "candidate.1.2": {
+      "count": 1,
+      "inclusive_seconds": 35.381212374,
+      "exclusive_seconds": 0.027903795000000287,
+      "value": 0
+    },
+    "candidate.1.3": {
+      "count": 1,
+      "inclusive_seconds": 35.378297071,
+      "exclusive_seconds": 0.029165327000001184,
+      "value": 0
+    },
+    "runtime.finalists_setup": {
+      "count": 1,
+      "inclusive_seconds": 0.032708341,
+      "exclusive_seconds": 0.032708341,
+      "value": 0
+    },
+    "runtime.finalist_selection": {
+      "count": 1,
+      "inclusive_seconds": 26.486806667,
+      "exclusive_seconds": 0.03563844500000002,
+      "value": 0
+    }
+  },
+  "candidates": [
+    {
+      "name": "candidate.0.0",
+      "seconds": 41.901302893,
+      "exclusive_seconds": 0.02150930700000231,
+      "phases": {
+        "extract": {
+          "count": 1,
+          "inclusive_seconds": 0.322509683,
+          "exclusive_seconds": 0.322509683,
+          "value": 0
+        },
+        "fingerprint": {
+          "count": 1,
+          "inclusive_seconds": 0.001997942,
+          "exclusive_seconds": 0.001997942,
+          "value": 0
+        },
+        "plan_build": {
+          "count": 1,
+          "inclusive_seconds": 1.428815006,
+          "exclusive_seconds": 0.0008040710000001283,
+          "value": 0
+        },
+        "dps_rewrite": {
+          "count": 1,
+          "inclusive_seconds": 0.011080754,
+          "exclusive_seconds": 0.011080754,
+          "value": 0
+        },
+        "decode_layouts": {
+          "count": 1,
+          "inclusive_seconds": 1.362926194,
+          "exclusive_seconds": 1.362926194,
+          "value": 0
+        },
+        "bufferize": {
+          "count": 1,
+          "inclusive_seconds": 0.054003987,
+          "exclusive_seconds": 0.054003987,
+          "value": 0
+        },
+        "heuristic_cost": {
+          "count": 1,
+          "inclusive_seconds": 2.116e-05,
+          "exclusive_seconds": 2.116e-05,
+          "value": 0
+        },
+        "profile_and_release": {
+          "count": 1,
+          "inclusive_seconds": 40.126449795,
+          "exclusive_seconds": 2.8099999980213397e-06,
+          "value": 0
+        },
+        "profile.candidate": {
+          "count": 1,
+          "inclusive_seconds": 33.726622016,
+          "exclusive_seconds": 1.9000000001767603e-05,
+          "value": 0
+        },
+        "profile.prepare_and_borrow": {
+          "count": 1,
+          "inclusive_seconds": 17.017747561,
+          "exclusive_seconds": 9.21000000175809e-06,
+          "value": 0
+        },
+        "profile.prepare": {
+          "count": 1,
+          "inclusive_seconds": 17.017738351,
+          "exclusive_seconds": 0.00010211000000026615,
+          "value": 0
+        },
+        "profile.plan_clone": {
+          "count": 1,
+          "inclusive_seconds": 0.002731454,
+          "exclusive_seconds": 0.002731454,
+          "value": 0
+        },
+        "device.install": {
+          "count": 1,
+          "inclusive_seconds": 17.014904787,
+          "exclusive_seconds": 4.287999999874614e-05,
+          "value": 0
+        },
+        "device.arena_plan": {
+          "count": 1,
+          "inclusive_seconds": 0.004801196,
+          "exclusive_seconds": 0.004801196,
+          "value": 0
+        },
+        "device.pinned_alloc": {
+          "count": 1,
+          "inclusive_seconds": 16.890881712,
+          "exclusive_seconds": 16.890881712,
+          "value": 0
+        },
+        "pinned_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 32658510964
+        },
+        "device.gpu_alloc_zero": {
+          "count": 1,
+          "inclusive_seconds": 0.119178999,
+          "exclusive_seconds": 0.119178999,
+          "value": 0
+        },
+        "arena_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 77159966976
+        },
+        "profile.warmup": {
+          "count": 1,
+          "inclusive_seconds": 8.027121173,
+          "exclusive_seconds": 0.0279055339999994,
+          "value": 0
+        },
+        "device.execute": {
+          "count": 4,
+          "inclusive_seconds": 16.601962903,
+          "exclusive_seconds": 2.4149999999778515e-05,
+          "value": 0
+        },
+        "device.upload_residents": {
+          "count": 4,
+          "inclusive_seconds": 1.5500000000000002e-06,
+          "exclusive_seconds": 1.5500000000000002e-06,
+          "value": 0
+        },
+        "device.compile": {
+          "count": 1,
+          "inclusive_seconds": 5.12035796,
+          "exclusive_seconds": 0.029672968999999938,
+          "value": 0
+        },
+        "device.nvrtc_compile": {
+          "count": 325,
+          "inclusive_seconds": 4.907332668999996,
+          "exclusive_seconds": 4.907332668999996,
+          "value": 0
+        },
+        "device.module_load": {
+          "count": 325,
+          "inclusive_seconds": 0.03882130099999997,
+          "exclusive_seconds": 0.03882130099999997,
+          "value": 0
+        },
+        "device.host_capture": {
+          "count": 868,
+          "inclusive_seconds": 0.14029499600000042,
+          "exclusive_seconds": 0.013788514000000009,
+          "value": 0
+        },
+        "device.host_prepare": {
+          "count": 868,
+          "inclusive_seconds": 0.11505039499999996,
+          "exclusive_seconds": 0.0011508819999999885,
+          "value": 0
+        },
+        "cublas.prepare": {
+          "count": 868,
+          "inclusive_seconds": 0.11389951300000012,
+          "exclusive_seconds": 0.061071796000000185,
+          "value": 0
+        },
+        "cublas.algorithm_selection": {
+          "count": 868,
+          "inclusive_seconds": 0.052827717000000114,
+          "exclusive_seconds": 0.052827717000000114,
+          "value": 0
+        },
+        "device.host_record": {
+          "count": 868,
+          "inclusive_seconds": 0.011456087000000016,
+          "exclusive_seconds": 0.0007251130000000005,
+          "value": 0
+        },
+        "cublas.record": {
+          "count": 868,
+          "inclusive_seconds": 0.010730974000000032,
+          "exclusive_seconds": 0.010730974000000032,
+          "value": 0
+        },
+        "device.graph_rebuild": {
+          "count": 1,
+          "inclusive_seconds": 0.01603142,
+          "exclusive_seconds": 0.01603142,
+          "value": 0
+        },
+        "device.update_dimensions": {
+          "count": 4,
+          "inclusive_seconds": 5.2600000000000005e-06,
+          "exclusive_seconds": 5.2600000000000005e-06,
+          "value": 0
+        },
+        "device.launch": {
+          "count": 4,
+          "inclusive_seconds": 11.455391239,
+          "exclusive_seconds": 1.2780000000045533e-05,
+          "value": 0
+        },
+        "device.host_staging": {
+          "count": 4,
+          "inclusive_seconds": 7.055589109,
+          "exclusive_seconds": 7.055589109,
+          "value": 0
+        },
+        "input_bytes": {
+          "count": 4,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 130633982032
+        },
+        "device.replay_sync": {
+          "count": 4,
+          "inclusive_seconds": 3.2498567919999997,
+          "exclusive_seconds": 3.2498567919999997,
+          "value": 0
+        },
+        "device.output_unpack": {
+          "count": 4,
+          "inclusive_seconds": 1.149932558,
+          "exclusive_seconds": 1.149932558,
+          "value": 0
+        },
+        "profile.trial.0": {
+          "count": 1,
+          "inclusive_seconds": 2.916679796,
+          "exclusive_seconds": 0.026030302000000116,
+          "value": 0
+        },
+        "device.rebind_addresses": {
+          "count": 3,
+          "inclusive_seconds": 0.026182743999999997,
+          "exclusive_seconds": 0.014387348999999999,
+          "value": 0
+        },
+        "profile.trial.1": {
+          "count": 1,
+          "inclusive_seconds": 2.881973902,
+          "exclusive_seconds": 0.026601902999999982,
+          "value": 0
+        },
+        "profile.trial.2": {
+          "count": 1,
+          "inclusive_seconds": 2.883080584,
+          "exclusive_seconds": 0.0263548130000002,
+          "value": 0
+        },
+        "device.release_slab": {
+          "count": 1,
+          "inclusive_seconds": 6.399824969,
+          "exclusive_seconds": 6.399824969,
+          "value": 0
+        }
+      }
+    },
+    {
+      "name": "candidate.0.1",
+      "seconds": 36.571588322,
+      "exclusive_seconds": 0.0280469749999952,
+      "phases": {
+        "extract": {
+          "count": 1,
+          "inclusive_seconds": 0.257332902,
+          "exclusive_seconds": 0.257332902,
+          "value": 0
+        },
+        "fingerprint": {
+          "count": 1,
+          "inclusive_seconds": 0.002098343,
+          "exclusive_seconds": 0.002098343,
+          "value": 0
+        },
+        "plan_build": {
+          "count": 1,
+          "inclusive_seconds": 0.086366278,
+          "exclusive_seconds": 0.0008804510000000043,
+          "value": 0
+        },
+        "dps_rewrite": {
+          "count": 1,
+          "inclusive_seconds": 0.012061915,
+          "exclusive_seconds": 0.012061915,
+          "value": 0
+        },
+        "decode_layouts": {
+          "count": 1,
+          "inclusive_seconds": 0.029602437,
+          "exclusive_seconds": 0.029602437,
+          "value": 0
+        },
+        "bufferize": {
+          "count": 1,
+          "inclusive_seconds": 0.043821475,
+          "exclusive_seconds": 0.043821475,
+          "value": 0
+        },
+        "heuristic_cost": {
+          "count": 1,
+          "inclusive_seconds": 2.198e-05,
+          "exclusive_seconds": 2.198e-05,
+          "value": 0
+        },
+        "profile_and_release": {
+          "count": 1,
+          "inclusive_seconds": 36.197721844,
+          "exclusive_seconds": 2.8600000021583583e-06,
+          "value": 0
+        },
+        "profile.candidate": {
+          "count": 1,
+          "inclusive_seconds": 29.770888571,
+          "exclusive_seconds": 1.2489999999587553e-05,
+          "value": 0
+        },
+        "profile.prepare_and_borrow": {
+          "count": 1,
+          "inclusive_seconds": 17.078412056,
+          "exclusive_seconds": 0.00022009000000267065,
+          "value": 0
+        },
+        "profile.prepare": {
+          "count": 1,
+          "inclusive_seconds": 17.078191966,
+          "exclusive_seconds": 0.00011251999999828399,
+          "value": 0
+        },
+        "profile.plan_clone": {
+          "count": 1,
+          "inclusive_seconds": 0.002863773,
+          "exclusive_seconds": 0.002863773,
+          "value": 0
+        },
+        "device.install": {
+          "count": 1,
+          "inclusive_seconds": 17.075215673,
+          "exclusive_seconds": 0.12391540500000175,
+          "value": 0
+        },
+        "device.arena_plan": {
+          "count": 1,
+          "inclusive_seconds": 0.004841406,
+          "exclusive_seconds": 0.004841406,
+          "value": 0
+        },
+        "device.pinned_alloc": {
+          "count": 1,
+          "inclusive_seconds": 16.883045333,
+          "exclusive_seconds": 16.883045333,
+          "value": 0
+        },
+        "pinned_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 32658510964
+        },
+        "device.gpu_alloc_zero": {
+          "count": 1,
+          "inclusive_seconds": 0.063413529,
+          "exclusive_seconds": 0.063413529,
+          "value": 0
+        },
+        "arena_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 46851401984
+        },
+        "profile.warmup": {
+          "count": 1,
+          "inclusive_seconds": 4.031366059,
+          "exclusive_seconds": 0.028456324999999616,
+          "value": 0
+        },
+        "device.execute": {
+          "count": 4,
+          "inclusive_seconds": 12.579786254999998,
+          "exclusive_seconds": 2.228999999998038e-05,
+          "value": 0
+        },
+        "device.upload_residents": {
+          "count": 4,
+          "inclusive_seconds": 2.44e-06,
+          "exclusive_seconds": 2.44e-06,
+          "value": 0
+        },
+        "device.compile": {
+          "count": 1,
+          "inclusive_seconds": 1.154070513,
+          "exclusive_seconds": 0.023436798999999953,
+          "value": 0
+        },
+        "device.nvrtc_compile": {
+          "count": 75,
+          "inclusive_seconds": 1.1090170610000003,
+          "exclusive_seconds": 1.1090170610000003,
+          "value": 0
+        },
+        "device.module_load": {
+          "count": 75,
+          "inclusive_seconds": 0.007925172,
+          "exclusive_seconds": 0.007925172,
+          "value": 0
+        },
+        "device.host_capture": {
+          "count": 852,
+          "inclusive_seconds": 0.017679476,
+          "exclusive_seconds": 0.012193618,
+          "value": 0
+        },
+        "device.host_prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.0026929620000000036,
+          "exclusive_seconds": 0.000987881000000001,
+          "value": 0
+        },
+        "cublas.prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.0017050810000000002,
+          "exclusive_seconds": 0.000492859999999998,
+          "value": 0
+        },
+        "cublas.algorithm_selection": {
+          "count": 852,
+          "inclusive_seconds": 0.0012122209999999994,
+          "exclusive_seconds": 0.0012122209999999994,
+          "value": 0
+        },
+        "device.host_record": {
+          "count": 852,
+          "inclusive_seconds": 0.0027928959999999987,
+          "exclusive_seconds": 0.00048731299999999893,
+          "value": 0
+        },
+        "cublas.record": {
+          "count": 852,
+          "inclusive_seconds": 0.002305582999999999,
+          "exclusive_seconds": 0.002305582999999999,
+          "value": 0
+        },
+        "device.graph_rebuild": {
+          "count": 1,
+          "inclusive_seconds": 0.007193189,
+          "exclusive_seconds": 0.007193189,
+          "value": 0
+        },
+        "device.update_dimensions": {
+          "count": 4,
+          "inclusive_seconds": 5.31e-06,
+          "exclusive_seconds": 5.31e-06,
+          "value": 0
+        },
+        "device.launch": {
+          "count": 4,
+          "inclusive_seconds": 11.399598909,
+          "exclusive_seconds": 1.2939999999961316e-05,
+          "value": 0
+        },
+        "device.host_staging": {
+          "count": 4,
+          "inclusive_seconds": 7.066558932,
+          "exclusive_seconds": 7.066558932,
+          "value": 0
+        },
+        "input_bytes": {
+          "count": 4,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 130633982032
+        },
+        "device.replay_sync": {
+          "count": 4,
+          "inclusive_seconds": 3.201795593,
+          "exclusive_seconds": 3.201795593,
+          "value": 0
+        },
+        "device.output_unpack": {
+          "count": 4,
+          "inclusive_seconds": 1.131231444,
+          "exclusive_seconds": 1.131231444,
+          "value": 0
+        },
+        "profile.trial.0": {
+          "count": 1,
+          "inclusive_seconds": 2.884730446,
+          "exclusive_seconds": 0.02801777499999991,
+          "value": 0
+        },
+        "device.rebind_addresses": {
+          "count": 3,
+          "inclusive_seconds": 0.026086793,
+          "exclusive_seconds": 0.014905609,
+          "value": 0
+        },
+        "profile.trial.1": {
+          "count": 1,
+          "inclusive_seconds": 2.885704067,
+          "exclusive_seconds": 0.02812753499999987,
+          "value": 0
+        },
+        "profile.trial.2": {
+          "count": 1,
+          "inclusive_seconds": 2.890663453,
+          "exclusive_seconds": 0.028076135000000058,
+          "value": 0
+        },
+        "device.release_slab": {
+          "count": 1,
+          "inclusive_seconds": 6.426830413,
+          "exclusive_seconds": 6.426830413,
+          "value": 0
+        }
+      }
+    },
+    {
+      "name": "candidate.0.2",
+      "seconds": 35.928393408,
+      "exclusive_seconds": 0.02824678500000033,
+      "phases": {
+        "extract": {
+          "count": 1,
+          "inclusive_seconds": 0.243098524,
+          "exclusive_seconds": 0.243098524,
+          "value": 0
+        },
+        "fingerprint": {
+          "count": 1,
+          "inclusive_seconds": 0.002044253,
+          "exclusive_seconds": 0.002044253,
+          "value": 0
+        },
+        "plan_build": {
+          "count": 1,
+          "inclusive_seconds": 0.066844773,
+          "exclusive_seconds": 0.0008723509999999934,
+          "value": 0
+        },
+        "dps_rewrite": {
+          "count": 1,
+          "inclusive_seconds": 0.012304785,
+          "exclusive_seconds": 0.012304785,
+          "value": 0
+        },
+        "decode_layouts": {
+          "count": 1,
+          "inclusive_seconds": 0.011243304,
+          "exclusive_seconds": 0.011243304,
+          "value": 0
+        },
+        "bufferize": {
+          "count": 1,
+          "inclusive_seconds": 0.042424333,
+          "exclusive_seconds": 0.042424333,
+          "value": 0
+        },
+        "heuristic_cost": {
+          "count": 1,
+          "inclusive_seconds": 2.104e-05,
+          "exclusive_seconds": 2.104e-05,
+          "value": 0
+        },
+        "profile_and_release": {
+          "count": 1,
+          "inclusive_seconds": 35.588138033,
+          "exclusive_seconds": 2.6999999960253263e-06,
+          "value": 0
+        },
+        "profile.candidate": {
+          "count": 1,
+          "inclusive_seconds": 29.197748475,
+          "exclusive_seconds": 1.2560000001826666e-05,
+          "value": 0
+        },
+        "profile.prepare_and_borrow": {
+          "count": 1,
+          "inclusive_seconds": 17.053735646,
+          "exclusive_seconds": 5.389999998328676e-06,
+          "value": 0
+        },
+        "profile.prepare": {
+          "count": 1,
+          "inclusive_seconds": 17.053730256,
+          "exclusive_seconds": 0.0001383410000030949,
+          "value": 0
+        },
+        "profile.plan_clone": {
+          "count": 1,
+          "inclusive_seconds": 0.002926133,
+          "exclusive_seconds": 0.002926133,
+          "value": 0
+        },
+        "device.install": {
+          "count": 1,
+          "inclusive_seconds": 17.050665782,
+          "exclusive_seconds": 0.07642103599999928,
+          "value": 0
+        },
+        "device.arena_plan": {
+          "count": 1,
+          "inclusive_seconds": 0.004811796,
+          "exclusive_seconds": 0.004811796,
+          "value": 0
+        },
+        "device.pinned_alloc": {
+          "count": 1,
+          "inclusive_seconds": 16.90538014,
+          "exclusive_seconds": 16.90538014,
+          "value": 0
+        },
+        "pinned_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 32658510964
+        },
+        "device.gpu_alloc_zero": {
+          "count": 1,
+          "inclusive_seconds": 0.06405281,
+          "exclusive_seconds": 0.06405281,
+          "value": 0
+        },
+        "arena_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 46927303936
+        },
+        "profile.warmup": {
+          "count": 1,
+          "inclusive_seconds": 3.402989724,
+          "exclusive_seconds": 0.02782913500000017,
+          "value": 0
+        },
+        "device.execute": {
+          "count": 4,
+          "inclusive_seconds": 12.03280703,
+          "exclusive_seconds": 2.3489999999792843e-05,
+          "value": 0
+        },
+        "device.upload_residents": {
+          "count": 4,
+          "inclusive_seconds": 1.38e-06,
+          "exclusive_seconds": 1.38e-06,
+          "value": 0
+        },
+        "device.compile": {
+          "count": 1,
+          "inclusive_seconds": 0.496299161,
+          "exclusive_seconds": 0.020388972999999977,
+          "value": 0
+        },
+        "device.nvrtc_compile": {
+          "count": 32,
+          "inclusive_seconds": 0.460377503,
+          "exclusive_seconds": 0.460377503,
+          "value": 0
+        },
+        "device.module_load": {
+          "count": 32,
+          "inclusive_seconds": 0.0033146590000000006,
+          "exclusive_seconds": 0.0033146590000000006,
+          "value": 0
+        },
+        "device.host_capture": {
+          "count": 856,
+          "inclusive_seconds": 0.016106249000000003,
+          "exclusive_seconds": 0.011132940999999995,
+          "value": 0
+        },
+        "device.host_prepare": {
+          "count": 856,
+          "inclusive_seconds": 0.0024820940000000033,
+          "exclusive_seconds": 0.0009464130000000003,
+          "value": 0
+        },
+        "cublas.prepare": {
+          "count": 856,
+          "inclusive_seconds": 0.0015356810000000003,
+          "exclusive_seconds": 0.0004268209999999978,
+          "value": 0
+        },
+        "cublas.algorithm_selection": {
+          "count": 856,
+          "inclusive_seconds": 0.0011088599999999993,
+          "exclusive_seconds": 0.0011088599999999993,
+          "value": 0
+        },
+        "device.host_record": {
+          "count": 856,
+          "inclusive_seconds": 0.002491214,
+          "exclusive_seconds": 0.0005104199999999991,
+          "value": 0
+        },
+        "cublas.record": {
+          "count": 856,
+          "inclusive_seconds": 0.0019807939999999993,
+          "exclusive_seconds": 0.0019807939999999993,
+          "value": 0
+        },
+        "device.graph_rebuild": {
+          "count": 1,
+          "inclusive_seconds": 0.007025609,
+          "exclusive_seconds": 0.007025609,
+          "value": 0
+        },
+        "device.update_dimensions": {
+          "count": 4,
+          "inclusive_seconds": 2.138e-05,
+          "exclusive_seconds": 2.138e-05,
+          "value": 0
+        },
+        "device.launch": {
+          "count": 4,
+          "inclusive_seconds": 11.510971877,
+          "exclusive_seconds": 1.1470000000901592e-05,
+          "value": 0
+        },
+        "device.host_staging": {
+          "count": 4,
+          "inclusive_seconds": 7.198550027,
+          "exclusive_seconds": 7.198550027,
+          "value": 0
+        },
+        "input_bytes": {
+          "count": 4,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 130633982032
+        },
+        "device.replay_sync": {
+          "count": 4,
+          "inclusive_seconds": 3.1769874199999997,
+          "exclusive_seconds": 3.1769874199999997,
+          "value": 0
+        },
+        "device.output_unpack": {
+          "count": 4,
+          "inclusive_seconds": 1.13542296,
+          "exclusive_seconds": 1.13542296,
+          "value": 0
+        },
+        "profile.trial.0": {
+          "count": 1,
+          "inclusive_seconds": 2.913692782,
+          "exclusive_seconds": 0.02773010499999984,
+          "value": 0
+        },
+        "device.rebind_addresses": {
+          "count": 3,
+          "inclusive_seconds": 0.025489742,
+          "exclusive_seconds": 0.01457591,
+          "value": 0
+        },
+        "profile.trial.1": {
+          "count": 1,
+          "inclusive_seconds": 2.914074602,
+          "exclusive_seconds": 0.027786964999999775,
+          "value": 0
+        },
+        "profile.trial.2": {
+          "count": 1,
+          "inclusive_seconds": 2.913243161,
+          "exclusive_seconds": 0.027847034000000104,
+          "value": 0
+        },
+        "device.release_slab": {
+          "count": 1,
+          "inclusive_seconds": 6.390386858,
+          "exclusive_seconds": 6.390386858,
+          "value": 0
+        }
+      }
+    },
+    {
+      "name": "candidate.0.3",
+      "seconds": 35.784686749,
+      "exclusive_seconds": 0.029557558000000483,
+      "phases": {
+        "extract": {
+          "count": 1,
+          "inclusive_seconds": 0.236907827,
+          "exclusive_seconds": 0.236907827,
+          "value": 0
+        },
+        "fingerprint": {
+          "count": 1,
+          "inclusive_seconds": 0.002096142,
+          "exclusive_seconds": 0.002096142,
+          "value": 0
+        },
+        "plan_build": {
+          "count": 1,
+          "inclusive_seconds": 0.068237115,
+          "exclusive_seconds": 0.0008853209999999945,
+          "value": 0
+        },
+        "dps_rewrite": {
+          "count": 1,
+          "inclusive_seconds": 0.012830636,
+          "exclusive_seconds": 0.012830636,
+          "value": 0
+        },
+        "decode_layouts": {
+          "count": 1,
+          "inclusive_seconds": 0.011359904,
+          "exclusive_seconds": 0.011359904,
+          "value": 0
+        },
+        "bufferize": {
+          "count": 1,
+          "inclusive_seconds": 0.043161254,
+          "exclusive_seconds": 0.043161254,
+          "value": 0
+        },
+        "heuristic_cost": {
+          "count": 1,
+          "inclusive_seconds": 2.186e-05,
+          "exclusive_seconds": 2.186e-05,
+          "value": 0
+        },
+        "profile_and_release": {
+          "count": 1,
+          "inclusive_seconds": 35.447866247,
+          "exclusive_seconds": 2.6700000006485425e-06,
+          "value": 0
+        },
+        "profile.candidate": {
+          "count": 1,
+          "inclusive_seconds": 29.019935562,
+          "exclusive_seconds": 1.3000000002705292e-05,
+          "value": 0
+        },
+        "profile.prepare_and_borrow": {
+          "count": 1,
+          "inclusive_seconds": 17.139133462,
+          "exclusive_seconds": 4.749999998665544e-06,
+          "value": 0
+        },
+        "profile.prepare": {
+          "count": 1,
+          "inclusive_seconds": 17.139128712,
+          "exclusive_seconds": 0.0001279300000014416,
+          "value": 0
+        },
+        "profile.plan_clone": {
+          "count": 1,
+          "inclusive_seconds": 0.002993693,
+          "exclusive_seconds": 0.002993693,
+          "value": 0
+        },
+        "device.install": {
+          "count": 1,
+          "inclusive_seconds": 17.136007089,
+          "exclusive_seconds": 0.0764761149999984,
+          "value": 0
+        },
+        "device.arena_plan": {
+          "count": 1,
+          "inclusive_seconds": 0.004885157,
+          "exclusive_seconds": 0.004885157,
+          "value": 0
+        },
+        "device.pinned_alloc": {
+          "count": 1,
+          "inclusive_seconds": 16.984214319,
+          "exclusive_seconds": 16.984214319,
+          "value": 0
+        },
+        "pinned_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 32658510964
+        },
+        "device.gpu_alloc_zero": {
+          "count": 1,
+          "inclusive_seconds": 0.070431498,
+          "exclusive_seconds": 0.070431498,
+          "value": 0
+        },
+        "arena_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 51788097792
+        },
+        "profile.warmup": {
+          "count": 1,
+          "inclusive_seconds": 3.186150653,
+          "exclusive_seconds": 0.02778868499999998,
+          "value": 0
+        },
+        "device.execute": {
+          "count": 4,
+          "inclusive_seconds": 11.77614803,
+          "exclusive_seconds": 2.4300000000199162e-05,
+          "value": 0
+        },
+        "device.upload_residents": {
+          "count": 4,
+          "inclusive_seconds": 1.32e-06,
+          "exclusive_seconds": 1.32e-06,
+          "value": 0
+        },
+        "device.compile": {
+          "count": 1,
+          "inclusive_seconds": 0.280689731,
+          "exclusive_seconds": 0.019717519000000017,
+          "value": 0
+        },
+        "device.nvrtc_compile": {
+          "count": 17,
+          "inclusive_seconds": 0.24611785799999997,
+          "exclusive_seconds": 0.24611785799999997,
+          "value": 0
+        },
+        "device.module_load": {
+          "count": 17,
+          "inclusive_seconds": 0.002073123,
+          "exclusive_seconds": 0.002073123,
+          "value": 0
+        },
+        "device.host_capture": {
+          "count": 920,
+          "inclusive_seconds": 0.01735700700000001,
+          "exclusive_seconds": 0.012242441000000008,
+          "value": 0
+        },
+        "device.host_prepare": {
+          "count": 920,
+          "inclusive_seconds": 0.0025483139999999986,
+          "exclusive_seconds": 0.0009742109999999997,
+          "value": 0
+        },
+        "cublas.prepare": {
+          "count": 920,
+          "inclusive_seconds": 0.0015741030000000014,
+          "exclusive_seconds": 0.00046443999999999766,
+          "value": 0
+        },
+        "cublas.algorithm_selection": {
+          "count": 920,
+          "inclusive_seconds": 0.0011096629999999997,
+          "exclusive_seconds": 0.0011096629999999997,
+          "value": 0
+        },
+        "device.host_record": {
+          "count": 920,
+          "inclusive_seconds": 0.0025662519999999976,
+          "exclusive_seconds": 0.0004601199999999985,
+          "value": 0
+        },
+        "cublas.record": {
+          "count": 920,
+          "inclusive_seconds": 0.0021061319999999975,
+          "exclusive_seconds": 0.0021061319999999975,
+          "value": 0
+        },
+        "device.graph_rebuild": {
+          "count": 1,
+          "inclusive_seconds": 0.007481689,
+          "exclusive_seconds": 0.007481689,
+          "value": 0
+        },
+        "device.update_dimensions": {
+          "count": 4,
+          "inclusive_seconds": 1.24e-05,
+          "exclusive_seconds": 1.24e-05,
+          "value": 0
+        },
+        "device.launch": {
+          "count": 4,
+          "inclusive_seconds": 11.468471844,
+          "exclusive_seconds": 1.261999999968566e-05,
+          "value": 0
+        },
+        "device.host_staging": {
+          "count": 4,
+          "inclusive_seconds": 7.135338827,
+          "exclusive_seconds": 7.135338827,
+          "value": 0
+        },
+        "input_bytes": {
+          "count": 4,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 130633982032
+        },
+        "device.replay_sync": {
+          "count": 4,
+          "inclusive_seconds": 3.229684898,
+          "exclusive_seconds": 3.229684898,
+          "value": 0
+        },
+        "device.output_unpack": {
+          "count": 4,
+          "inclusive_seconds": 1.103435499,
+          "exclusive_seconds": 1.103435499,
+          "value": 0
+        },
+        "profile.trial.0": {
+          "count": 1,
+          "inclusive_seconds": 2.911945269,
+          "exclusive_seconds": 0.027772853999999736,
+          "value": 0
+        },
+        "device.rebind_addresses": {
+          "count": 3,
+          "inclusive_seconds": 0.026948435,
+          "exclusive_seconds": 0.01489097,
+          "value": 0
+        },
+        "profile.trial.1": {
+          "count": 1,
+          "inclusive_seconds": 2.908259195,
+          "exclusive_seconds": 0.024115929999999786,
+          "value": 0
+        },
+        "profile.trial.2": {
+          "count": 1,
+          "inclusive_seconds": 2.874433983,
+          "exclusive_seconds": 0.024963601000000057,
+          "value": 0
+        },
+        "device.release_slab": {
+          "count": 1,
+          "inclusive_seconds": 6.427928015,
+          "exclusive_seconds": 6.427928015,
+          "value": 0
+        }
+      }
+    },
+    {
+      "name": "candidate.1.0",
+      "seconds": 35.24189972,
+      "exclusive_seconds": 0.034485882999995,
+      "phases": {
+        "extract": {
+          "count": 1,
+          "inclusive_seconds": 0.214707808,
+          "exclusive_seconds": 0.214707808,
+          "value": 0
+        },
+        "fingerprint": {
+          "count": 1,
+          "inclusive_seconds": 0.002169353,
+          "exclusive_seconds": 0.002169353,
+          "value": 0
+        },
+        "plan_build": {
+          "count": 1,
+          "inclusive_seconds": 0.061551617,
+          "exclusive_seconds": 0.0008935210000000013,
+          "value": 0
+        },
+        "dps_rewrite": {
+          "count": 1,
+          "inclusive_seconds": 0.013181516,
+          "exclusive_seconds": 0.013181516,
+          "value": 0
+        },
+        "decode_layouts": {
+          "count": 1,
+          "inclusive_seconds": 0.002318153,
+          "exclusive_seconds": 0.002318153,
+          "value": 0
+        },
+        "bufferize": {
+          "count": 1,
+          "inclusive_seconds": 0.045158427,
+          "exclusive_seconds": 0.045158427,
+          "value": 0
+        },
+        "heuristic_cost": {
+          "count": 1,
+          "inclusive_seconds": 2.133e-05,
+          "exclusive_seconds": 2.133e-05,
+          "value": 0
+        },
+        "profile_and_release": {
+          "count": 1,
+          "inclusive_seconds": 34.928963729,
+          "exclusive_seconds": 2.780000002644556e-06,
+          "value": 0
+        },
+        "profile.candidate": {
+          "count": 1,
+          "inclusive_seconds": 28.543092077,
+          "exclusive_seconds": 1.2460000000658056e-05,
+          "value": 0
+        },
+        "profile.prepare_and_borrow": {
+          "count": 1,
+          "inclusive_seconds": 17.04879342,
+          "exclusive_seconds": 6.948000000051024e-05,
+          "value": 0
+        },
+        "profile.prepare": {
+          "count": 1,
+          "inclusive_seconds": 17.04872394,
+          "exclusive_seconds": 0.00012934999999814067,
+          "value": 0
+        },
+        "profile.plan_clone": {
+          "count": 1,
+          "inclusive_seconds": 0.003060104,
+          "exclusive_seconds": 0.003060104,
+          "value": 0
+        },
+        "device.install": {
+          "count": 1,
+          "inclusive_seconds": 17.045534486,
+          "exclusive_seconds": 0.08430955500000081,
+          "value": 0
+        },
+        "device.arena_plan": {
+          "count": 1,
+          "inclusive_seconds": 0.004943466,
+          "exclusive_seconds": 0.004943466,
+          "value": 0
+        },
+        "device.pinned_alloc": {
+          "count": 1,
+          "inclusive_seconds": 16.892956895,
+          "exclusive_seconds": 16.892956895,
+          "value": 0
+        },
+        "pinned_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 32658510964
+        },
+        "device.gpu_alloc_zero": {
+          "count": 1,
+          "inclusive_seconds": 0.06332457,
+          "exclusive_seconds": 0.06332457,
+          "value": 0
+        },
+        "arena_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 46851401984
+        },
+        "profile.warmup": {
+          "count": 1,
+          "inclusive_seconds": 2.887901979,
+          "exclusive_seconds": 0.025246441000000175,
+          "value": 0
+        },
+        "device.execute": {
+          "count": 4,
+          "inclusive_seconds": 11.392954581,
+          "exclusive_seconds": 2.2899999999381748e-05,
+          "value": 0
+        },
+        "device.upload_residents": {
+          "count": 4,
+          "inclusive_seconds": 1.42e-06,
+          "exclusive_seconds": 1.42e-06,
+          "value": 0
+        },
+        "device.compile": {
+          "count": 1,
+          "inclusive_seconds": 0.029247086,
+          "exclusive_seconds": 0.018288820999999997,
+          "value": 0
+        },
+        "device.host_capture": {
+          "count": 852,
+          "inclusive_seconds": 0.015654552000000006,
+          "exclusive_seconds": 0.01098558800000001,
+          "value": 0
+        },
+        "device.host_prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.002353652000000001,
+          "exclusive_seconds": 0.0009418109999999999,
+          "value": 0
+        },
+        "cublas.prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.0014118410000000014,
+          "exclusive_seconds": 0.000404179999999998,
+          "value": 0
+        },
+        "cublas.algorithm_selection": {
+          "count": 852,
+          "inclusive_seconds": 0.0010076609999999993,
+          "exclusive_seconds": 0.0010076609999999993,
+          "value": 0
+        },
+        "device.host_record": {
+          "count": 852,
+          "inclusive_seconds": 0.0023153119999999995,
+          "exclusive_seconds": 0.00041621999999999926,
+          "value": 0
+        },
+        "cublas.record": {
+          "count": 852,
+          "inclusive_seconds": 0.001899092,
+          "exclusive_seconds": 0.001899092,
+          "value": 0
+        },
+        "device.graph_rebuild": {
+          "count": 1,
+          "inclusive_seconds": 0.006735218,
+          "exclusive_seconds": 0.006735218,
+          "value": 0
+        },
+        "device.update_dimensions": {
+          "count": 4,
+          "inclusive_seconds": 7.74e-06,
+          "exclusive_seconds": 7.74e-06,
+          "value": 0
+        },
+        "device.launch": {
+          "count": 4,
+          "inclusive_seconds": 11.337527212000001,
+          "exclusive_seconds": 1.3010000000424071e-05,
+          "value": 0
+        },
+        "device.host_staging": {
+          "count": 4,
+          "inclusive_seconds": 7.122927743,
+          "exclusive_seconds": 7.122927743,
+          "value": 0
+        },
+        "input_bytes": {
+          "count": 4,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 130633982032
+        },
+        "device.replay_sync": {
+          "count": 4,
+          "inclusive_seconds": 3.2020265739999996,
+          "exclusive_seconds": 3.2020265739999996,
+          "value": 0
+        },
+        "device.output_unpack": {
+          "count": 4,
+          "inclusive_seconds": 1.012559885,
+          "exclusive_seconds": 1.012559885,
+          "value": 0
+        },
+        "profile.trial.0": {
+          "count": 1,
+          "inclusive_seconds": 2.868673716,
+          "exclusive_seconds": 0.025327722000000108,
+          "value": 0
+        },
+        "device.rebind_addresses": {
+          "count": 3,
+          "inclusive_seconds": 0.026148222999999998,
+          "exclusive_seconds": 0.014716718,
+          "value": 0
+        },
+        "profile.trial.1": {
+          "count": 1,
+          "inclusive_seconds": 2.867648524,
+          "exclusive_seconds": 0.025399670999999735,
+          "value": 0
+        },
+        "profile.trial.2": {
+          "count": 1,
+          "inclusive_seconds": 2.870061978,
+          "exclusive_seconds": 0.02535778199999994,
+          "value": 0
+        },
+        "device.release_slab": {
+          "count": 1,
+          "inclusive_seconds": 6.385868872,
+          "exclusive_seconds": 6.385868872,
+          "value": 0
+        }
+      }
+    },
+    {
+      "name": "candidate.1.1",
+      "seconds": 35.494368875,
+      "exclusive_seconds": 0.026769232999996007,
+      "phases": {
+        "extract": {
+          "count": 1,
+          "inclusive_seconds": 0.217221311,
+          "exclusive_seconds": 0.217221311,
+          "value": 0
+        },
+        "fingerprint": {
+          "count": 1,
+          "inclusive_seconds": 0.002088653,
+          "exclusive_seconds": 0.002088653,
+          "value": 0
+        },
+        "plan_build": {
+          "count": 1,
+          "inclusive_seconds": 0.061078526,
+          "exclusive_seconds": 0.0010305810000000026,
+          "value": 0
+        },
+        "dps_rewrite": {
+          "count": 1,
+          "inclusive_seconds": 0.013336207,
+          "exclusive_seconds": 0.013336207,
+          "value": 0
+        },
+        "decode_layouts": {
+          "count": 1,
+          "inclusive_seconds": 0.002265802,
+          "exclusive_seconds": 0.002265802,
+          "value": 0
+        },
+        "bufferize": {
+          "count": 1,
+          "inclusive_seconds": 0.044445936,
+          "exclusive_seconds": 0.044445936,
+          "value": 0
+        },
+        "heuristic_cost": {
+          "count": 1,
+          "inclusive_seconds": 2.164e-05,
+          "exclusive_seconds": 2.164e-05,
+          "value": 0
+        },
+        "profile_and_release": {
+          "count": 1,
+          "inclusive_seconds": 35.187189512,
+          "exclusive_seconds": 2.7000000031307536e-06,
+          "value": 0
+        },
+        "profile.candidate": {
+          "count": 1,
+          "inclusive_seconds": 28.732016493,
+          "exclusive_seconds": 1.2659999999442562e-05,
+          "value": 0
+        },
+        "profile.prepare_and_borrow": {
+          "count": 1,
+          "inclusive_seconds": 17.058968893,
+          "exclusive_seconds": 5.339999997744371e-06,
+          "value": 0
+        },
+        "profile.prepare": {
+          "count": 1,
+          "inclusive_seconds": 17.058963553,
+          "exclusive_seconds": 0.0001447900000002278,
+          "value": 0
+        },
+        "profile.plan_clone": {
+          "count": 1,
+          "inclusive_seconds": 0.003097954,
+          "exclusive_seconds": 0.003097954,
+          "value": 0
+        },
+        "device.install": {
+          "count": 1,
+          "inclusive_seconds": 17.055720809,
+          "exclusive_seconds": 0.07634324500000034,
+          "value": 0
+        },
+        "device.arena_plan": {
+          "count": 1,
+          "inclusive_seconds": 0.004979347,
+          "exclusive_seconds": 0.004979347,
+          "value": 0
+        },
+        "device.pinned_alloc": {
+          "count": 1,
+          "inclusive_seconds": 16.911024328,
+          "exclusive_seconds": 16.911024328,
+          "value": 0
+        },
+        "pinned_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 32658510964
+        },
+        "device.gpu_alloc_zero": {
+          "count": 1,
+          "inclusive_seconds": 0.063373889,
+          "exclusive_seconds": 0.063373889,
+          "value": 0
+        },
+        "arena_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 46851401984
+        },
+        "profile.warmup": {
+          "count": 1,
+          "inclusive_seconds": 2.926657498,
+          "exclusive_seconds": 0.028626345999999803,
+          "value": 0
+        },
+        "device.execute": {
+          "count": 4,
+          "inclusive_seconds": 11.558389896000001,
+          "exclusive_seconds": 2.4280000000320712e-05,
+          "value": 0
+        },
+        "device.upload_residents": {
+          "count": 4,
+          "inclusive_seconds": 1.77e-06,
+          "exclusive_seconds": 1.77e-06,
+          "value": 0
+        },
+        "device.compile": {
+          "count": 1,
+          "inclusive_seconds": 0.030766858,
+          "exclusive_seconds": 0.018066475,
+          "value": 0
+        },
+        "device.host_capture": {
+          "count": 852,
+          "inclusive_seconds": 0.01705197400000003,
+          "exclusive_seconds": 0.010813200000000004,
+          "value": 0
+        },
+        "device.host_prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.003921722000000003,
+          "exclusive_seconds": 0.00093565,
+          "value": 0
+        },
+        "cublas.prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.0029860719999999967,
+          "exclusive_seconds": 0.00044400099999999763,
+          "value": 0
+        },
+        "cublas.algorithm_selection": {
+          "count": 852,
+          "inclusive_seconds": 0.002542071000000004,
+          "exclusive_seconds": 0.002542071000000004,
+          "value": 0
+        },
+        "device.host_record": {
+          "count": 852,
+          "inclusive_seconds": 0.002317052000000001,
+          "exclusive_seconds": 0.0004412899999999997,
+          "value": 0
+        },
+        "cublas.record": {
+          "count": 852,
+          "inclusive_seconds": 0.001875761999999999,
+          "exclusive_seconds": 0.001875761999999999,
+          "value": 0
+        },
+        "device.graph_rebuild": {
+          "count": 1,
+          "inclusive_seconds": 0.00852841,
+          "exclusive_seconds": 0.00852841,
+          "value": 0
+        },
+        "device.update_dimensions": {
+          "count": 4,
+          "inclusive_seconds": 5.82e-06,
+          "exclusive_seconds": 5.82e-06,
+          "value": 0
+        },
+        "device.launch": {
+          "count": 4,
+          "inclusive_seconds": 11.499904403,
+          "exclusive_seconds": 1.2959999999839766e-05,
+          "value": 0
+        },
+        "device.host_staging": {
+          "count": 4,
+          "inclusive_seconds": 7.137168331,
+          "exclusive_seconds": 7.137168331,
+          "value": 0
+        },
+        "input_bytes": {
+          "count": 4,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 130633982032
+        },
+        "device.replay_sync": {
+          "count": 4,
+          "inclusive_seconds": 3.2022534209999995,
+          "exclusive_seconds": 3.2022534209999995,
+          "value": 0
+        },
+        "device.output_unpack": {
+          "count": 4,
+          "inclusive_seconds": 1.1604696909999999,
+          "exclusive_seconds": 1.1604696909999999,
+          "value": 0
+        },
+        "profile.trial.0": {
+          "count": 1,
+          "inclusive_seconds": 2.901706747,
+          "exclusive_seconds": 0.028278976000000178,
+          "value": 0
+        },
+        "device.rebind_addresses": {
+          "count": 3,
+          "inclusive_seconds": 0.027686765,
+          "exclusive_seconds": 0.014806763999999998,
+          "value": 0
+        },
+        "profile.trial.1": {
+          "count": 1,
+          "inclusive_seconds": 2.921280491,
+          "exclusive_seconds": 0.028905336000000226,
+          "value": 0
+        },
+        "profile.trial.2": {
+          "count": 1,
+          "inclusive_seconds": 2.923390204,
+          "exclusive_seconds": 0.028834385999999768,
+          "value": 0
+        },
+        "device.release_slab": {
+          "count": 1,
+          "inclusive_seconds": 6.455170319,
+          "exclusive_seconds": 6.455170319,
+          "value": 0
+        }
+      }
+    },
+    {
+      "name": "candidate.1.2",
+      "seconds": 35.381212374,
+      "exclusive_seconds": 0.027903795000000287,
+      "phases": {
+        "extract": {
+          "count": 1,
+          "inclusive_seconds": 0.216197831,
+          "exclusive_seconds": 0.216197831,
+          "value": 0
+        },
+        "fingerprint": {
+          "count": 1,
+          "inclusive_seconds": 0.002067242,
+          "exclusive_seconds": 0.002067242,
+          "value": 0
+        },
+        "plan_build": {
+          "count": 1,
+          "inclusive_seconds": 0.061993408,
+          "exclusive_seconds": 0.0009261809999999981,
+          "value": 0
+        },
+        "dps_rewrite": {
+          "count": 1,
+          "inclusive_seconds": 0.013428547,
+          "exclusive_seconds": 0.013428547,
+          "value": 0
+        },
+        "decode_layouts": {
+          "count": 1,
+          "inclusive_seconds": 0.002257893,
+          "exclusive_seconds": 0.002257893,
+          "value": 0
+        },
+        "bufferize": {
+          "count": 1,
+          "inclusive_seconds": 0.045380787,
+          "exclusive_seconds": 0.045380787,
+          "value": 0
+        },
+        "heuristic_cost": {
+          "count": 1,
+          "inclusive_seconds": 2.099e-05,
+          "exclusive_seconds": 2.099e-05,
+          "value": 0
+        },
+        "profile_and_release": {
+          "count": 1,
+          "inclusive_seconds": 35.073029108,
+          "exclusive_seconds": 2.780000002644556e-06,
+          "value": 0
+        },
+        "profile.candidate": {
+          "count": 1,
+          "inclusive_seconds": 28.652083413,
+          "exclusive_seconds": 1.2709999996474153e-05,
+          "value": 0
+        },
+        "profile.prepare_and_borrow": {
+          "count": 1,
+          "inclusive_seconds": 17.015664608,
+          "exclusive_seconds": 7.98000000301613e-06,
+          "value": 0
+        },
+        "profile.prepare": {
+          "count": 1,
+          "inclusive_seconds": 17.015656628,
+          "exclusive_seconds": 0.00013895999999746778,
+          "value": 0
+        },
+        "profile.plan_clone": {
+          "count": 1,
+          "inclusive_seconds": 0.003115024,
+          "exclusive_seconds": 0.003115024,
+          "value": 0
+        },
+        "device.install": {
+          "count": 1,
+          "inclusive_seconds": 17.012402644,
+          "exclusive_seconds": 0.07601544500000301,
+          "value": 0
+        },
+        "device.arena_plan": {
+          "count": 1,
+          "inclusive_seconds": 0.004953806,
+          "exclusive_seconds": 0.004953806,
+          "value": 0
+        },
+        "device.pinned_alloc": {
+          "count": 1,
+          "inclusive_seconds": 16.868456174,
+          "exclusive_seconds": 16.868456174,
+          "value": 0
+        },
+        "pinned_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 32658510964
+        },
+        "device.gpu_alloc_zero": {
+          "count": 1,
+          "inclusive_seconds": 0.062977219,
+          "exclusive_seconds": 0.062977219,
+          "value": 0
+        },
+        "arena_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 46616520960
+        },
+        "profile.warmup": {
+          "count": 1,
+          "inclusive_seconds": 2.925707857,
+          "exclusive_seconds": 0.028503645999999883,
+          "value": 0
+        },
+        "device.execute": {
+          "count": 4,
+          "inclusive_seconds": 11.522975842999998,
+          "exclusive_seconds": 2.658999999960443e-05,
+          "value": 0
+        },
+        "device.upload_residents": {
+          "count": 4,
+          "inclusive_seconds": 1.45e-06,
+          "exclusive_seconds": 1.45e-06,
+          "value": 0
+        },
+        "device.compile": {
+          "count": 1,
+          "inclusive_seconds": 0.029066756,
+          "exclusive_seconds": 0.018247481,
+          "value": 0
+        },
+        "device.host_capture": {
+          "count": 852,
+          "inclusive_seconds": 0.015458532,
+          "exclusive_seconds": 0.010712863000000006,
+          "value": 0
+        },
+        "device.host_prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.0023265829999999984,
+          "exclusive_seconds": 0.0009035620000000001,
+          "value": 0
+        },
+        "cublas.prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.0014230209999999998,
+          "exclusive_seconds": 0.0004481599999999982,
+          "value": 0
+        },
+        "cublas.algorithm_selection": {
+          "count": 852,
+          "inclusive_seconds": 0.0009748609999999995,
+          "exclusive_seconds": 0.0009748609999999995,
+          "value": 0
+        },
+        "device.host_record": {
+          "count": 852,
+          "inclusive_seconds": 0.0024190860000000004,
+          "exclusive_seconds": 0.00048290999999999883,
+          "value": 0
+        },
+        "cublas.record": {
+          "count": 852,
+          "inclusive_seconds": 0.0019361759999999995,
+          "exclusive_seconds": 0.0019361759999999995,
+          "value": 0
+        },
+        "device.graph_rebuild": {
+          "count": 1,
+          "inclusive_seconds": 0.006591848,
+          "exclusive_seconds": 0.006591848,
+          "value": 0
+        },
+        "device.update_dimensions": {
+          "count": 4,
+          "inclusive_seconds": 6.279999999999999e-06,
+          "exclusive_seconds": 6.279999999999999e-06,
+          "value": 0
+        },
+        "device.launch": {
+          "count": 4,
+          "inclusive_seconds": 11.468205374,
+          "exclusive_seconds": 1.2250000000157968e-05,
+          "value": 0
+        },
+        "device.host_staging": {
+          "count": 4,
+          "inclusive_seconds": 7.06413037,
+          "exclusive_seconds": 7.06413037,
+          "value": 0
+        },
+        "input_bytes": {
+          "count": 4,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 130633982032
+        },
+        "device.replay_sync": {
+          "count": 4,
+          "inclusive_seconds": 3.1932816109999997,
+          "exclusive_seconds": 3.1932816109999997,
+          "value": 0
+        },
+        "device.output_unpack": {
+          "count": 4,
+          "inclusive_seconds": 1.210781143,
+          "exclusive_seconds": 1.210781143,
+          "value": 0
+        },
+        "profile.trial.0": {
+          "count": 1,
+          "inclusive_seconds": 2.901940497,
+          "exclusive_seconds": 0.028290135000000216,
+          "value": 0
+        },
+        "device.rebind_addresses": {
+          "count": 3,
+          "inclusive_seconds": 0.025669393,
+          "exclusive_seconds": 0.014438288,
+          "value": 0
+        },
+        "profile.trial.1": {
+          "count": 1,
+          "inclusive_seconds": 2.905626332,
+          "exclusive_seconds": 0.028355885000000303,
+          "value": 0
+        },
+        "profile.trial.2": {
+          "count": 1,
+          "inclusive_seconds": 2.903131409,
+          "exclusive_seconds": 0.028280586000000163,
+          "value": 0
+        },
+        "device.release_slab": {
+          "count": 1,
+          "inclusive_seconds": 6.420942915,
+          "exclusive_seconds": 6.420942915,
+          "value": 0
+        }
+      }
+    },
+    {
+      "name": "candidate.1.3",
+      "seconds": 35.378297071,
+      "exclusive_seconds": 0.029165327000001184,
+      "phases": {
+        "extract": {
+          "count": 1,
+          "inclusive_seconds": 0.216778181,
+          "exclusive_seconds": 0.216778181,
+          "value": 0
+        },
+        "fingerprint": {
+          "count": 1,
+          "inclusive_seconds": 0.002084813,
+          "exclusive_seconds": 0.002084813,
+          "value": 0
+        },
+        "plan_build": {
+          "count": 1,
+          "inclusive_seconds": 0.063453079,
+          "exclusive_seconds": 0.0009094509999999917,
+          "value": 0
+        },
+        "dps_rewrite": {
+          "count": 1,
+          "inclusive_seconds": 0.013708457,
+          "exclusive_seconds": 0.013708457,
+          "value": 0
+        },
+        "decode_layouts": {
+          "count": 1,
+          "inclusive_seconds": 0.002309593,
+          "exclusive_seconds": 0.002309593,
+          "value": 0
+        },
+        "bufferize": {
+          "count": 1,
+          "inclusive_seconds": 0.046525578,
+          "exclusive_seconds": 0.046525578,
+          "value": 0
+        },
+        "heuristic_cost": {
+          "count": 1,
+          "inclusive_seconds": 2.089e-05,
+          "exclusive_seconds": 2.089e-05,
+          "value": 0
+        },
+        "profile_and_release": {
+          "count": 1,
+          "inclusive_seconds": 35.066794781,
+          "exclusive_seconds": 3.020000001185963e-06,
+          "value": 0
+        },
+        "profile.candidate": {
+          "count": 1,
+          "inclusive_seconds": 28.636551404,
+          "exclusive_seconds": 1.3469999998960702e-05,
+          "value": 0
+        },
+        "profile.prepare_and_borrow": {
+          "count": 1,
+          "inclusive_seconds": 17.006039717,
+          "exclusive_seconds": 5.430000001638291e-06,
+          "value": 0
+        },
+        "profile.prepare": {
+          "count": 1,
+          "inclusive_seconds": 17.006034287,
+          "exclusive_seconds": 0.00014839099999974792,
+          "value": 0
+        },
+        "profile.plan_clone": {
+          "count": 1,
+          "inclusive_seconds": 0.003181104,
+          "exclusive_seconds": 0.003181104,
+          "value": 0
+        },
+        "device.install": {
+          "count": 1,
+          "inclusive_seconds": 17.002704792,
+          "exclusive_seconds": 0.07567152400000055,
+          "value": 0
+        },
+        "device.arena_plan": {
+          "count": 1,
+          "inclusive_seconds": 0.004944166,
+          "exclusive_seconds": 0.004944166,
+          "value": 0
+        },
+        "device.pinned_alloc": {
+          "count": 1,
+          "inclusive_seconds": 16.859227063,
+          "exclusive_seconds": 16.859227063,
+          "value": 0
+        },
+        "pinned_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 32658510964
+        },
+        "device.gpu_alloc_zero": {
+          "count": 1,
+          "inclusive_seconds": 0.062862039,
+          "exclusive_seconds": 0.062862039,
+          "value": 0
+        },
+        "arena_bytes": {
+          "count": 1,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 46851401984
+        },
+        "profile.warmup": {
+          "count": 1,
+          "inclusive_seconds": 2.915750024,
+          "exclusive_seconds": 0.02790653499999962,
+          "value": 0
+        },
+        "device.execute": {
+          "count": 4,
+          "inclusive_seconds": 11.518511837,
+          "exclusive_seconds": 2.4480000000437485e-05,
+          "value": 0
+        },
+        "device.upload_residents": {
+          "count": 4,
+          "inclusive_seconds": 1.7e-06,
+          "exclusive_seconds": 1.7e-06,
+          "value": 0
+        },
+        "device.compile": {
+          "count": 1,
+          "inclusive_seconds": 0.029180596,
+          "exclusive_seconds": 0.018274915,
+          "value": 0
+        },
+        "device.host_capture": {
+          "count": 852,
+          "inclusive_seconds": 0.015611026999999987,
+          "exclusive_seconds": 0.010908710000000012,
+          "value": 0
+        },
+        "device.host_prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.0023712509999999983,
+          "exclusive_seconds": 0.0009710799999999998,
+          "value": 0
+        },
+        "cublas.prepare": {
+          "count": 852,
+          "inclusive_seconds": 0.001400171,
+          "exclusive_seconds": 0.00042511999999999764,
+          "value": 0
+        },
+        "cublas.algorithm_selection": {
+          "count": 852,
+          "inclusive_seconds": 0.0009750510000000001,
+          "exclusive_seconds": 0.0009750510000000001,
+          "value": 0
+        },
+        "device.host_record": {
+          "count": 852,
+          "inclusive_seconds": 0.002331065999999997,
+          "exclusive_seconds": 0.00043373199999999966,
+          "value": 0
+        },
+        "cublas.record": {
+          "count": 852,
+          "inclusive_seconds": 0.0018973339999999992,
+          "exclusive_seconds": 0.0018973339999999992,
+          "value": 0
+        },
+        "device.graph_rebuild": {
+          "count": 1,
+          "inclusive_seconds": 0.006695448,
+          "exclusive_seconds": 0.006695448,
+          "value": 0
+        },
+        "device.update_dimensions": {
+          "count": 4,
+          "inclusive_seconds": 4.82e-06,
+          "exclusive_seconds": 4.82e-06,
+          "value": 0
+        },
+        "device.launch": {
+          "count": 4,
+          "inclusive_seconds": 11.463113709,
+          "exclusive_seconds": 1.1990000000405843e-05,
+          "value": 0
+        },
+        "device.host_staging": {
+          "count": 4,
+          "inclusive_seconds": 7.057267092,
+          "exclusive_seconds": 7.057267092,
+          "value": 0
+        },
+        "input_bytes": {
+          "count": 4,
+          "inclusive_seconds": 0.0,
+          "exclusive_seconds": 0.0,
+          "value": 130633982032
+        },
+        "device.replay_sync": {
+          "count": 4,
+          "inclusive_seconds": 3.202163082,
+          "exclusive_seconds": 3.202163082,
+          "value": 0
+        },
+        "device.output_unpack": {
+          "count": 4,
+          "inclusive_seconds": 1.2036715450000002,
+          "exclusive_seconds": 1.2036715450000002,
+          "value": 0
+        },
+        "profile.trial.0": {
+          "count": 1,
+          "inclusive_seconds": 2.908734916,
+          "exclusive_seconds": 0.028300194999999917,
+          "value": 0
+        },
+        "device.rebind_addresses": {
+          "count": 3,
+          "inclusive_seconds": 0.026186532,
+          "exclusive_seconds": 0.014785738,
+          "value": 0
+        },
+        "profile.trial.1": {
+          "count": 1,
+          "inclusive_seconds": 2.900657706,
+          "exclusive_seconds": 0.02785057499999999,
+          "value": 0
+        },
+        "profile.trial.2": {
+          "count": 1,
+          "inclusive_seconds": 2.905355571,
+          "exclusive_seconds": 0.02792907499999986,
+          "value": 0
+        },
+        "device.release_slab": {
+          "count": 1,
+          "inclusive_seconds": 6.430240357,
+          "exclusive_seconds": 6.430240357,
+          "value": 0
+        }
+      }
+    }
+  ]
+}

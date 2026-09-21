@@ -781,7 +781,6 @@ pub struct OpNode {
     /// Deferred: visualizer text only. The heaviest of
     /// them — it renders the op's whole operand/result table.
     pub tooltip: Rc<Lazy<String, Box<dyn FnOnce() -> String>>>,
-    pub heuristic_cost: u64,
 }
 
 /// One slot of the program output: a final value written into a destination buffer.

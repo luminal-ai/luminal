@@ -67,6 +67,10 @@ mod tests {
     use luminal::{arena::ArenaStep, prelude::*, resident::ResidentBindings};
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "candidate search requires a Metal device"
+    )]
     fn resident_ranges_and_mutation_sinks_share_the_arena_across_buckets() {
         let mut graph = Graph::new();
         let weights = graph.tensor(4, DType::F32);
@@ -91,7 +95,16 @@ mod tests {
             )
             .unwrap();
         runtime
-            .search(&Default::default(), &harness_search_options())
+            .search(
+                &[
+                    (weights.id, vec![1f32; 4].into()),
+                    (state.id, vec![0f32; 4].into()),
+                    (input.id, vec![1f32; 3].into()),
+                ]
+                .into_iter()
+                .collect(),
+                &harness_search_options(),
+            )
             .unwrap();
         let weights = runtime.input_buffer(weights.id).unwrap();
         let state = runtime.input_buffer(state.id).unwrap();

@@ -1,5 +1,6 @@
 //! Search profiling uses the serving graph path. Preparation/instantiation is
-//! outside the timed trials; staging, graph replay, and readback are timed.
+//! outside the timed trials; transient staging, graph replay, and readback are timed.
+//! Resident inputs upload once; writable resident state is restored outside timing.
 use std::time::{Duration, Instant};
 
 use luminal::bufferize::BufferIrGraph;
@@ -67,27 +68,49 @@ pub fn profile_candidate_at(
     device: &mut CudaDevice,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &HostBuffer>,
+    residents: &luminal::resident::ResidentBindings,
     trials: usize,
     best_so_far: Option<u128>,
     candidate_timeout: Option<Duration>,
     shapes: &crate::symbolic::ShapeEnv,
+    arena_budget: Option<usize>,
 ) -> Result<Measurement, ProfileFailure> {
     // 1. PREPARE: compile + stage + one untimed run (warmup + validity).
-    let staged =
-        prepare_candidate(device, plan, staged, shapes).map_err(ProfileFailure::Prepare)?;
-    let staged = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+    let staged = prepare_candidate(device, plan, staged, residents, shapes, arena_budget)
+        .map_err(ProfileFailure::Prepare)?;
+    let staged: FxHashMap<_, _> = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
     device
         .execute(0, &staged, &shapes.values)
         .map_err(ProfileFailure::Prepare)?;
 
-    // 2. THE TIMED RUN. The budget's clock starts HERE.
+    // Match serving: uploaded residents are absent from subsequent staging.
+    // ReadWrite permission includes transient scratch reuse, even without a
+    // bound mutation output. Restore every writable resident before each trial
+    // so warmup and earlier trials cannot change the measured input state.
+    let reset: FxHashMap<_, _> = plan
+        .buffers
+        .values()
+        .filter(|buffer| buffer.access == luminal::layout_ir::Access::ReadWrite)
+        .filter_map(|buffer| buffer.lit)
+        .filter(|lit| residents.inputs.contains(lit))
+        .filter_map(|lit| staged.get(&lit).map(|data| (lit, *data)))
+        .collect();
+    let transient = staged
+        .into_iter()
+        .filter(|(lit, _)| !residents.inputs.contains(lit))
+        .collect();
+
+    // 2. Accumulate execution time only; preparation does not spend the budget.
     let total = trials.max(1);
-    let run_start = Instant::now();
     let mut sum = 0u128;
     for trial in 0..total {
+        // State restoration is preparation, outside both ranking and timeout.
+        device
+            .upload_residents(&reset)
+            .map_err(ProfileFailure::Execute)?;
         let start = Instant::now();
         device
-            .execute(0, &staged, &shapes.values)
+            .execute(0, &transient, &shapes.values)
             .map_err(ProfileFailure::Execute)?;
         sum += start.elapsed().as_nanos();
         let completed = trial + 1;
@@ -95,9 +118,9 @@ pub fn profile_candidate_at(
             break;
         }
         // TIMEOUT, checked between trials.
-        if candidate_timeout.is_some_and(|budget| run_start.elapsed() > budget) {
+        if candidate_timeout.is_some_and(|budget| sum > budget.as_nanos()) {
             return Ok(Measurement::TimedOut {
-                elapsed_nanos: run_start.elapsed().as_nanos(),
+                elapsed_nanos: sum,
                 completed_trials: completed,
             });
         }
@@ -112,9 +135,9 @@ pub fn profile_candidate_at(
     // A single trial that ran longer than the whole budget is a timeout
     // too — the between-trials check cannot see it, and reporting it as
     // a measurement would rank a plan the caller asked not to wait for.
-    if candidate_timeout.is_some_and(|budget| run_start.elapsed() > budget) {
+    if candidate_timeout.is_some_and(|budget| sum > budget.as_nanos()) {
         return Ok(Measurement::TimedOut {
-            elapsed_nanos: run_start.elapsed().as_nanos(),
+            elapsed_nanos: sum,
             completed_trials: total,
         });
     }
@@ -129,6 +152,7 @@ pub fn profile_candidate(
     device: &mut CudaDevice,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &HostBuffer>,
+    residents: &luminal::resident::ResidentBindings,
     trials: usize,
     best: Option<u128>,
     timeout: Option<Duration>,
@@ -137,10 +161,12 @@ pub fn profile_candidate(
         device,
         plan,
         staged,
+        residents,
         trials,
         best,
         timeout,
         &Default::default(),
+        None,
     )
 }
 
@@ -151,7 +177,9 @@ pub(crate) fn prepare_candidate<'a>(
     device: &mut CudaDevice,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &'a HostBuffer>,
+    residents: &luminal::resident::ResidentBindings,
     shapes: &crate::symbolic::ShapeEnv,
+    arena_budget: Option<usize>,
 ) -> anyhow::Result<FxHashMap<i64, std::borrow::Cow<'a, HostBuffer>>> {
     let mut owned = FxHashMap::default();
     for buffer in plan.buffers.values() {
@@ -173,6 +201,17 @@ pub(crate) fn prepare_candidate<'a>(
             owned.insert(lit, data);
         }
     }
-    device.install(vec![(plan.clone(), shapes.bounds.clone())])?;
+    // Search receives host payloads rather than caller-owned device pointers.
+    // External boundaries keep their existing private staged stand-ins; only
+    // resident inputs use the serving placement during candidate profiling.
+    let bindings = luminal::resident::ResidentBindings {
+        inputs: residents.inputs.clone(),
+        externals: Default::default(),
+    };
+    device.install_resident_with_budget(
+        vec![(plan.clone(), shapes.bounds.clone())],
+        bindings,
+        arena_budget,
+    )?;
     Ok(owned)
 }

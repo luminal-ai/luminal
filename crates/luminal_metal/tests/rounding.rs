@@ -14,8 +14,11 @@ fn rounding_ops_execute_on_device() {
     let trunc = x.trunc();
     let round = x.round();
     let mut rt = MetalRuntime::load(&g).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &[(x.id, vec![1f32; 9].into())].into_iter().collect(),
+        &harness_search_options(),
+    )
+    .unwrap();
 
     let values: Vec<f32> = vec![1.9, 1.5, 0.5, -0.5, -1.5, -1.9, 2.5, 3.5, -2.5];
     rt.set_data(x.id, values.clone());
@@ -50,8 +53,11 @@ fn trunc_cast_executes_on_device() {
     let x = g.tensor(6, DType::F32);
     let out = x.trunc_cast(DType::Int);
     let mut rt = MetalRuntime::load(&g).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &[(x.id, vec![1f32; 6].into())].into_iter().collect(),
+        &harness_search_options(),
+    )
+    .unwrap();
 
     rt.set_data(x.id, vec![1.9, 1.5, 0.5, -0.5, -1.5, -1.9]);
     rt.execute().unwrap();

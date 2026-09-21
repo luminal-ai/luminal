@@ -129,9 +129,7 @@ pub mod device {
     /// 1. CUDA-lite `load → bind dyn pins → search` on the shared harness
     ///    budget, PROFILED ON DEVICE (Phase 4, 2026-09-03): these
     ///    applications run on a real GPU by construction, so their search
-    ///    ranks candidates by measured time rather than by the byte-move
-    ///    prior. The winner's measurement and its heuristic cost are
-    ///    printed side by side.
+    ///    ranks candidates by measured time and prints the winner's timing.
     /// 2. plan stats + refusal counters (all zero expected — the ladder
     ///    acceptance from `tests/ladder_refusals.rs`; nonzero FAILS).
     ///    TIMED-OUT candidates print separately and do NOT gate: nothing
@@ -157,10 +155,7 @@ pub mod device {
         // a full-size model's weights); staging then moves the same
         // buffers into the runtime.
         let mut data: FxHashMap<NodeIndex, HostBuffer> = pairs.into_iter().collect();
-        let options = luminal_cuda_lite::CompileOptions {
-            profile_on_device: true,
-            ..luminal_cuda_lite::harness_search_options()
-        };
+        let options = luminal_cuda_lite::harness_search_options();
         let t = std::time::Instant::now();
         let outcome = rt.search(&data, &options).context("cuda search")?;
         let search_ms = t.elapsed().as_millis();
@@ -170,9 +165,8 @@ pub mod device {
             outcome.timings.summary()
         );
         println!(
-            "{name}: winner {:.3} ms measured on device (heuristic cost {} bytes moved)",
-            outcome.best_nanos as f64 / 1e6,
-            outcome.best_heuristic_cost.saturating_sub(1)
+            "{name}: winner {:.3} ms measured on device",
+            outcome.best_nanos as f64 / 1e6
         );
 
         // 2. Refusal counters — all zero expected (ladder acceptance).

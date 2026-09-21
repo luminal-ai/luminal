@@ -217,6 +217,10 @@ fn linear_with_bias_mints_the_bias_form_on_a_left_major_d() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn search_elects_the_bias_form_and_binds_a_col_d() {
     let (cx, x, w, b, _out) = linear_with_bias();
     let data: FxHashMap<NodeIndex, HostBuffer> = [
@@ -227,10 +231,8 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
     .into_iter()
     .collect();
 
-    // The 2D pin's budget (tests/cublaslt_election.rs): 12x16 / mutations
-    // 4, seeded. A seed sweep is reported so the pin stays honest about
-    // how election-dependent the plan is; the FIRST electing seed is the
-    // one the plan assertions run on.
+    // Constrain the fixture to the bias route whose layout contract is under
+    // test. Device timing must not decide which operation this test covers.
     let mut elected_seed = None;
     for seed in 0..6u64 {
         let options = luminal_cuda_lite::CompileOptions {
@@ -242,7 +244,13 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
             search_log: false,
             ..luminal_cuda_lite::harness_search_options()
         };
-        let mut rt = CudaRuntime::load(&cx).expect("load");
+        let mut rt = CudaRuntime::load_with_registry(
+            &cx,
+            luminal_cuda_lite::cuda_registry_filtered(|row| {
+                !matches!(row.label(), "ReduceSumGeneric" | "AddFunctionalGeneric")
+            }),
+        )
+        .expect("load bias-only route");
         let outcome = match rt.search(&data, &options) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -268,11 +276,12 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
         );
         if labels.iter().any(|l| l == "CublasLtBias") {
             elected_seed.get_or_insert((seed, rt));
+            break;
         }
     }
     let (seed, rt) = elected_seed.expect(
         "some seed in 0..6 at the 12x16/mut-4 pin budget must elect CublasLtBias \
-         (bytes-moved cost prefers the fused bias epilogue over matmul + Add)",
+         (the registry requires the fused bias epilogue)",
     );
     println!("BIAS-PREMISE: asserting on the plan elected at seed {seed}");
 
@@ -441,6 +450,10 @@ fn a_degenerate_extent_d_holds_both_contiguous_spellings_in_one_class() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_degenerate_extent_bias_election_binds_col_and_is_not_refused() {
     let (cx, x, w, b, _out) = degenerate_linear_with_bias();
     let data: FxHashMap<NodeIndex, HostBuffer> = [
@@ -462,7 +475,13 @@ fn a_degenerate_extent_bias_election_binds_col_and_is_not_refused() {
             search_log: false,
             ..luminal_cuda_lite::harness_search_options()
         };
-        let mut rt = CudaRuntime::load(&cx).expect("load");
+        let mut rt = CudaRuntime::load_with_registry(
+            &cx,
+            luminal_cuda_lite::cuda_registry_filtered(|row| {
+                !matches!(row.label(), "ReduceSumGeneric" | "AddFunctionalGeneric")
+            }),
+        )
+        .expect("load bias-only route");
         let outcome = match rt.search(&data, &options) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -494,6 +513,7 @@ fn a_degenerate_extent_bias_election_binds_col_and_is_not_refused() {
             .any(|l| l.starts_with("CublasLt") && l.contains("Bias"))
         {
             elected.get_or_insert((seed, rt));
+            break;
         }
     }
     let (seed, rt) = elected.expect(

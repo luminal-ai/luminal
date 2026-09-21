@@ -1,0 +1,41 @@
+{
+  "model": "Llama3-8B",
+  "max_context": 2048,
+  "prefill_chunk": 128,
+  "search_seconds": 446.925128934,
+  "buckets": [
+    {
+      "q": 1,
+      "c": 128,
+      "attempts": 100,
+      "profiles": 42,
+      "cache_hits": 58,
+      "transient_bytes": 13779872768,
+      "arena_bytes": 46437854208,
+      "best_ms": 49.871779,
+      "refusals": "extract refusals 0 (choice-cycles 0, dead-ends 0), bufferize 0, execute 0, timed out 0",
+      "oversized_tensors_pruned": 0,
+      "producer_classes_pruned": 0,
+      "nodes_removed": 0
+    },
+    {
+      "q": 128,
+      "c": 128,
+      "attempts": 100,
+      "profiles": 35,
+      "cache_hits": 57,
+      "transient_bytes": 28998618112,
+      "arena_bytes": 61656599552,
+      "best_ms": 444.430318,
+      "refusals": "extract refusals 0 (choice-cycles 0, dead-ends 0), bufferize 8, execute 0, timed out 0",
+      "oversized_tensors_pruned": 6,
+      "producer_classes_pruned": 121,
+      "nodes_removed": 654
+    }
+  ],
+  "cold_prefill_ms": 5285.384466,
+  "installed_arena_bytes": 61656599552,
+  "decode_ms": 73.030362,
+  "finite_logits": true,
+  "reset_matches": true
+}

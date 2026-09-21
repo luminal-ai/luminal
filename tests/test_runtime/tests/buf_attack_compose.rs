@@ -441,7 +441,6 @@ impl DimsGraph {
             inputs: op_inputs,
             outputs: vec![out.clone()],
             tooltip: std::rc::Rc::new(once_cell::unsync::Lazy::new(Box::new(String::new))),
-            heuristic_cost: 1,
         }));
         for (i, value) in inputs.iter().enumerate() {
             let producer = *self.producers.get(&value.eclass).expect("operand producer");

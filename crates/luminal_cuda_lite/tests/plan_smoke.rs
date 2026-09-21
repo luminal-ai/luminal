@@ -1,7 +1,5 @@
-//! CL-1 plan-layer smoke: everything up to the device boundary runs on
-//! any host — load, bind, search under the CUDA allow list, plan
-//! inspection, codegen for every elected compute node — and `execute`
-//! without the `device` feature refuses loudly.
+//! Loading, saturation and code generation work on any host. Candidate
+//! search requires a CUDA device and profiles each distinct plan.
 
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
@@ -9,6 +7,10 @@ use luminal::prelude::FxHashMap;
 use luminal_cuda_lite::{CudaRuntime, kernels};
 
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn search_produces_a_codegen_complete_plan() {
     let mut cx = luminal::graph::Graph::new();
     let a = cx.tensor((2usize, 3usize), DType::F32);
@@ -108,4 +110,24 @@ fn codegen_emits_wellformed_sources() {
     assert_eq!(launches[0].n.literal(), Some(6));
     assert!(launches[0].source.contains("__global__ void k("));
     assert!(launches[0].source.contains("a[i] + b[i]"));
+}
+
+#[cfg(not(feature = "device"))]
+#[test]
+fn search_refuses_without_a_device() {
+    let mut graph = luminal::graph::Graph::new();
+    let input = graph.tensor(3, DType::F32);
+    let _out = input + 1.;
+    let mut runtime = CudaRuntime::load(&graph).unwrap();
+    runtime
+        .saturated_egraph()
+        .expect("graph inspection needs no GPU");
+    let error = runtime
+        .search(&Default::default(), &Default::default())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("candidate search requires"),
+        "{error:#}"
+    );
+    assert!(runtime.plan().is_none());
 }

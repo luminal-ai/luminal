@@ -15,8 +15,14 @@ fn bucket_switches_overlay_one_arena() {
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
         .unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &[(x.id, vec![1f32; 6].into()), (y.id, vec![2f32; 6].into())]
+            .into_iter()
+            .collect(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let before = rt.graph_stats().unwrap();
     let max = rt
         .bucket_plans()
         .iter()
@@ -34,10 +40,10 @@ fn bucket_switches_overlay_one_arena() {
         assert_eq!(rt.get_f32(out.id).unwrap(), expected);
         let stats = rt.graph_stats().unwrap();
         assert_eq!(stats.arena_bytes, max);
-        assert_eq!(stats.arena_generation, 1);
+        assert_eq!(stats.arena_generation, before.arena_generation + 1);
     }
     let stats = rt.graph_stats().unwrap();
-    assert_eq!(stats.launches, 8);
+    assert_eq!(stats.launches - before.launches, 8);
     rt.set_dim('a', 10);
     assert!(rt.execute().is_err());
 }
@@ -70,8 +76,11 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
     let out = (x.permute((1, 0)) + 1.).sum(0);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.bind_dyn_range('a', 2, 11).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &[(x.id, vec![1f32; 18].into())].into_iter().collect(),
+        &harness_search_options(),
+    )
+    .unwrap();
     for n in [2, 11, 5, 2] {
         let data: Vec<_> = (0..3 * n).map(|i| i as f32 / 2.).collect();
         let expected: Vec<_> = (0..3)
@@ -99,7 +108,7 @@ fn profiling_and_serving_share_dynamic_graph_execution() {
         .unwrap();
     let data = [(x.id, vec![1f32, 2., 3.].into())].into_iter().collect();
     let mut options = harness_search_options();
-    options.profile_on_device = true;
+
     options.trials = 2;
     let outcome = rt.search(&data, &options).unwrap();
     assert!(outcome.plans_profiled > 0);

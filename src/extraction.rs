@@ -45,8 +45,6 @@ use crate::layout_ir::{
 };
 use crate::logical_op::{LogicalRender, logical_op_for};
 
-type Bounds = (Option<i128>, Option<i128>);
-type BoundsIndex = HashMap<ClassId, Bounds>;
 /// The genome-independent candidate memo: (produced class, chosen enode,
 /// chosen output slot) → that choice's candidates. See the field on
 /// [`Extractor`].
@@ -82,7 +80,7 @@ struct Extractor<'a> {
     producer_index: HashMap<ClassId, Vec<ProducerRef>>,
     input_terminals: HashMap<ClassId, InputInfo>,
     /// The search genome, when this walk is genome-driven (see [`Genome`]).
-    /// `None` = the deterministic fixture extractor (min-cost tooling).
+    /// `None` = the deterministic fixture extractor (minimum-height derivation).
     genome: Option<Genome>,
     memo: HashMap<ClassId, Option<Plan>>,
     /// Post-relaxation blockage record (diagnosis, ruling 2026-08-07:
@@ -98,13 +96,6 @@ struct Extractor<'a> {
     /// cleared by `extract_with_genome` — measured 2026-08-06: re-parsing
     /// per genome was 98% of a 378s MLP search (5.8s × 64 genomes).
     op_cache: std::cell::RefCell<HashMap<NodeId, Box<dyn LayoutIrOp>>>,
-    /// GENOME-INDEPENDENT pricing caches for the bytes-moved heuristic
-    /// (ruling 2026-08-10). `bounds_index` is built once by scanning the
-    /// serialized `lower-bound-of` / `upper-bound-of` rows: IntExpr class →
-    /// (lower, upper). `tensor_bytes_cache` memoizes the per-LayoutTensor
-    /// byte size derived from its layout's shape and bit width.
-    bounds_index: std::cell::RefCell<Option<BoundsIndex>>,
-    tensor_bytes_cache: std::cell::RefCell<HashMap<ClassId, u64>>,
     /// GENOME-INDEPENDENT dtype index (typed-buffers landing A,
     /// 2026-08-11): serialized `dtype-of` rows, scanned once —
     /// LogicalTensor class → the plan dtype. Same row encoding as the
@@ -169,14 +160,10 @@ struct InputInfo {
 
 #[derive(Debug, Clone)]
 struct Plan {
-    /// Bytes-moved estimate for the subplan (ruling 2026-08-10): the sum
-    /// over each op of the byte sizes of the tensors it reads and the
-    /// results it writes, with symbolic dimensions priced at the midpoint
-    /// of their seeded interval bounds. HEURISTIC by name and by nature:
-    /// it assembles one plan per genome and orders the plain path; it
-    /// never ranks genomes (profiling does) and never overrides the
-    /// genome's op choice.
-    heuristic_cost: u64,
+    /// Structural derivation height, used only to find a finite extraction
+    /// and break ties inside a fixed genome. It does not estimate execution
+    /// cost; runtime search ranks genomes using measured execution time.
+    height: usize,
     source_eclass: Option<ClassId>,
     source_enode: Option<NodeId>,
     selected_output_index: Option<usize>,
@@ -208,13 +195,12 @@ struct OpTooltipSeed {
     source_eclass: Option<ClassId>,
     source_enode: Option<NodeId>,
     selected_output_index: Option<usize>,
-    heuristic_cost: u64,
     input_list: Vec<ClassId>,
     output_list: Vec<ClassId>,
     metadata: Vec<PlanMeta>,
 }
 
-/// Extractor-internal ONLY. `PlanKind` is the selection/cost IR at *e-graph*
+/// Extractor-internal ONLY. `PlanKind` is the derivation IR at *e-graph*
 /// granularity — it includes plumbing (buffer-list cons/nil, boundary literals)
 /// that has no place in the clean dataflow output. It is deliberately private and
 /// must never leak out of this module: the public artifact is [`ExtractedGraph`]
@@ -323,33 +309,6 @@ impl<'a> ExtractionSession<'a> {
             })
             .collect();
         SamplingSpace::from_candidate_inputs(candidate_inputs)
-    }
-
-    /// Per-producer byte-movement estimates, parallel to a producer index.
-    /// These are each operation's own reads and writes, without recursively
-    /// counting its inputs' producers. Runtime search policies can use this
-    /// metadata to seed genomes; it does not select or rewrite operations.
-    pub fn producer_costs(
-        &self,
-        index: &std::collections::BTreeMap<ClassId, Vec<(String, ProducerChoice)>>,
-    ) -> std::collections::BTreeMap<ClassId, Vec<u64>> {
-        index
-            .iter()
-            .map(|(class, entries)| {
-                let costs = entries
-                    .iter()
-                    .map(|(_, choice)| {
-                        self.extractor
-                            .producer_candidates_for_choice(class, choice)
-                            .iter()
-                            .map(|candidate| self.extractor.candidate_heuristic_cost(candidate))
-                            .min()
-                            .unwrap_or(u64::MAX)
-                    })
-                    .collect();
-                (class.clone(), costs)
-            })
-            .collect()
     }
 
     /// Classify the last failed extraction's blockage (diagnosis ruling
@@ -589,7 +548,7 @@ impl<'a> ExtractionSession<'a> {
 /// a specific implementation. `None` allows every op; a program not
 /// implementable within the list fails extraction loudly.
 ///
-/// This is the DETERMINISTIC FIXTURE extractor (min-cost, tie-broken) —
+/// This is the DETERMINISTIC FIXTURE extractor (minimum-height, tie-broken) —
 /// tooling for fixtures and goldens, not the selection mechanism. The
 /// search path is [`extract_layout_ir_with_genome_and_matchers`].
 pub fn extract_layout_ir_with_ops_and_matchers(
@@ -612,7 +571,7 @@ pub struct ProducerChoice {
 
 /// The search genome: a per-LayoutTensor-class producer selection. The
 /// genome is the ONLY authority under [`extract_layout_ir_with_genome`] —
-/// it replaces both the cost choice and first-emission slot claiming. The
+/// it replaces both the default choice and first-emission slot claiming. The
 /// contract is TOTALITY over produced classes: a demanded class that has
 /// producers but no entry fails extraction loudly (no silent substitution).
 /// Entries for classes the walk never demands are dead rows — legal and
@@ -1066,8 +1025,6 @@ impl<'a> Extractor<'a> {
             blocked: HashMap::new(),
             no_candidates: Vec::new(),
             op_cache: Default::default(),
-            bounds_index: Default::default(),
-            tensor_bytes_cache: Default::default(),
             dtype_index: Default::default(),
             buffer_access_index: Default::default(),
             buffer_freed_by_index: Default::default(),
@@ -1082,7 +1039,7 @@ impl<'a> Extractor<'a> {
     /// are all transitively realizable from the program inputs. Any
     /// genome over the filtered index assembles an executable graph;
     /// residual discards are choice-cycles. LAZY: only genome-driven
-    /// extraction needs this (the plain cost walk backtracks past dead
+    /// extraction needs this (the plain derivation walk backtracks past dead
     /// candidates on its own), and the fixpoint is too expensive to pay
     /// on every plain extraction.
     fn apply_viability_filter(&mut self) {
@@ -1230,16 +1187,9 @@ impl<'a> Extractor<'a> {
     fn candidates_for_class(&self, class: &ClassId) -> Vec<Candidate> {
         // AN INPUT TERMINAL IS A LEAF BY DEFINITION (2026-09-02): its
         // value exists at launch, so it is PRODUCED BY NOTHING.
-        // `relax_to_fixpoint` seeds its plan from the boundary on pass
-        // one at cost 0 with no children; offering candidates here let a
-        // zero-cost producer (a VIEW moves no bytes, so it ties the
-        // input plan at 0 and wins the `plan_label` tie-break —
-        // "IndexMapApplyViewGeneric" sorts before "Input:…") take the
-        // class over and EMIT a plan in which a program input is
-        // computed from something that reads it back: a cyclic extracted
-        // graph only bufferize rejects. Producers of OTHER classes that
-        // read this one stay available — copies and views out of a
-        // boundary input are exactly how such plans are written.
+        // `relax_to_fixpoint` seeds its plan at height zero with no
+        // children. Producers of other classes that read this leaf stay
+        // available: copies and views out of a boundary input are valid.
         if self.is_input_terminal(class) {
             return Vec::new();
         }
@@ -1276,7 +1226,7 @@ impl<'a> Extractor<'a> {
     /// cycle-rich e-graphs (the 2-layer decoder hang — 15k nodes,
     /// more than 150s), and caching it produced wrong refusals. Relaxation has
     /// neither problem: a class's plan materializes once all of some
-    /// candidate's children have plans, costs only improve
+    /// candidate's children have plans, heights only decrease
     /// monotonically, and cycles simply never enable — no guard, no
     /// taint. The memo fills exactly as the walk would have filled it;
     /// `build_extracted_graph` reads it unchanged.
@@ -1330,8 +1280,8 @@ impl<'a> Extractor<'a> {
     /// THE RELAXATION, as a leaf-driven worklist.
     ///
     /// The fixpoint is the one the note above describes: a class's plan is
-    /// the cheapest over its ELIGIBLE candidates — those all of whose
-    /// children already have plans — costs only improve, and a cycle never
+    /// the shallowest over its ELIGIBLE candidates — those all of whose
+    /// children already have plans — heights only decrease, and a cycle never
     /// enables itself because every enablement chain bottoms out at a leaf.
     /// This decides only WHEN a class is looked at.
     ///
@@ -1348,14 +1298,14 @@ impl<'a> Extractor<'a> {
     /// child classes it still waits on — and each class a list of the
     /// (class, candidate) pairs waiting on IT. A class is evaluated when
     /// one of its candidates becomes eligible, or when a child it already
-    /// consumes gets cheaper, and never otherwise: Kahn's in-degree
+    /// consumes gets shallower, and never otherwise: Kahn's in-degree
     /// scheduling with eligibility as the in-degree, which is the
     /// topological order without computing one. Classes inside a choice
     /// cycle are never evaluated at all — their counters never reach zero,
     /// which IS the refusal the blockage record then names.
     ///
-    /// A re-plan at EQUAL cost enqueues nothing: the fixpoint reads a
-    /// child's COST only (a candidate's label and stable key are its own
+    /// A re-plan at EQUAL height enqueues nothing: the fixpoint reads a
+    /// child's HEIGHT only (a candidate's label and stable key are its own
     /// properties), so a label/key improvement cannot change any parent's
     /// tuple.
     fn worklist_fixpoint(&mut self, u: &Universe) {
@@ -1408,8 +1358,8 @@ impl<'a> Extractor<'a> {
         }
 
         // TERMINATION. Every memo write
-        // strictly improves that class's tuple, whose cost component is a
-        // `u64` that only falls and whose label and key components range
+        // strictly improves that class's tuple, whose height component is a
+        // `usize` that only falls and whose label and key components range
         // over finite sets, so each class is written finitely often and
         // the queue drains.
         while let Some(index) = queue.pop_front() {
@@ -1437,8 +1387,8 @@ impl<'a> Extractor<'a> {
                 continue;
             }
             let first_plan = current.is_none();
-            let cheaper = match (&best, &current) {
-                (Some(new), Some(old)) => new.heuristic_cost < old.heuristic_cost,
+            let shallower = match (&best, &current) {
+                (Some(new), Some(old)) => new.height < old.height,
                 _ => false,
             };
             self.memo.insert(class.clone(), best);
@@ -1450,9 +1400,9 @@ impl<'a> Extractor<'a> {
                     &mut in_queue,
                     &mut queue,
                 );
-            } else if cheaper {
-                // Already-eligible consumers see a cheaper child; the
-                // ineligible ones will read the new cost when their own
+            } else if shallower {
+                // Already-eligible consumers see a shallower child; the
+                // ineligible ones will read the new height when their own
                 // counters reach zero.
                 for &(consumer, candidate) in &dependents[index as usize] {
                     if pending[consumer as usize][candidate as usize] == 0 {
@@ -1464,11 +1414,11 @@ impl<'a> Extractor<'a> {
     }
 
     /// The plan a class gets straight from the boundary, when it is an
-    /// input terminal: cost 0, no children (see the leaf note on
+    /// input terminal: height 0, no children (see the leaf note on
     /// [`Extractor::candidates_for_class`]).
     fn input_terminal_plan(&self, class: &ClassId) -> Option<Plan> {
         self.input_terminals.get(class).map(|input| Plan {
-            heuristic_cost: 0,
+            height: 0,
             source_eclass: None,
             source_enode: None,
             selected_output_index: None,
@@ -1484,23 +1434,19 @@ impl<'a> Extractor<'a> {
     /// memo, or `None` when the candidate is not ELIGIBLE — some child
     /// class has no plan yet.
     fn candidate_plan(&self, class: &ClassId, candidate: &Candidate) -> Option<Plan> {
-        let mut heuristic_cost = self.candidate_heuristic_cost(candidate);
+        let mut height = 1;
         let mut child_plans = Vec::with_capacity(candidate.children.len());
         for child in &candidate.children {
             let Some(Some(child_plan)) = self.memo.get(&child.class) else {
                 return None;
             };
-            // Saturating: child costs are memoized per CLASS but
-            // accumulated per plan EDGE, so a deep graph with shared
-            // subgraphs (whisper's decode loop) counts paths, not
-            // nodes, and overflows u64 (wrapped silently in release,
-            // panicked in debug). Saturation stops the panic; the
-            // path-vs-node cost model itself is a recorded follow-up.
-            heuristic_cost = heuristic_cost.saturating_add(child_plan.heuristic_cost);
+            // Every dependency increases height, so relaxation cannot
+            // prefer a cycle, even for views or shared fork/join graphs.
+            height = height.max(child_plan.height + 1);
             child_plans.push(child.clone());
         }
         Some(Plan {
-            heuristic_cost,
+            height,
             source_eclass: candidate
                 .source_eclass
                 .clone()
@@ -1869,24 +1815,15 @@ impl<'a> Extractor<'a> {
         self.renderer().logical_children(class)
     }
 
-    /// Plan preference: (cost, copies, label) as before, then a CONTENT-based
-    /// stable key. The e-graph unions commutative variants (`IntAdd(x,y)` =
-    /// `IntAdd(y,x)`) into one class; without a content key, which variant wins
-    /// depends on hash-iteration order and flips run to run. Rendering the
-    /// source e-node resolves children to let-names/literals, which are stable
-    /// across runs — making the (user-blessed) arbitrary tie-break deterministic.
-    /// LAZY evaluation of the same total order (2026-08-10, semantics
-    /// identical): cost decides almost every comparison, so labels are
-    /// only built on cost ties and the rendered stable key only on label
-    /// ties — and each enode's key renders once per session (memo).
-    /// Eagerly building the full tuple rendered BOTH plans to depth 3 on
-    /// EVERY comparison: 99% of deep-extraction wall time.
+    /// Prefer a finite derivation of minimum height, then a stable content
+    /// key. This resolves equivalent spellings within the genome; it is not
+    /// a performance model and never overrides the genome's producer choice.
     fn is_better(&self, plan: &Plan, best: Option<&Plan>) -> bool {
         let Some(best) = best else {
             return true;
         };
-        if plan.heuristic_cost != best.heuristic_cost {
-            return plan.heuristic_cost < best.heuristic_cost;
+        if plan.height != best.height {
+            return plan.height < best.height;
         }
         let (plan_label_key, best_label_key) = (plan_label(plan), plan_label(best));
         if plan_label_key != best_label_key {
@@ -1927,179 +1864,6 @@ impl<'a> Extractor<'a> {
     ) -> Rc<Lazy<String, Box<dyn FnOnce() -> String>>> {
         let ctx = Rc::clone(&self.render);
         Rc::new(Lazy::new(Box::new(move || build(&ctx.renderer()))))
-    }
-
-    // ---- bytes-moved heuristic pricing (ruling 2026-08-10): the
-    // heuristic_cost of a candidate is the bytes its op moves — operand
-    // bytes for every declared READ plus result bytes for every declared
-    // WRITE. Symbolic dims price at the midpoint of their seeded interval
-    // bounds. Loud on broken invariants: a value tensor with no readable
-    // shape/width, or a dim with neither literal nor bounds, names itself
-    // and panics rather than silently distorting the search.
-
-    /// The candidate's own contribution to `heuristic_cost` (children add
-    /// theirs during relaxation). Structural plumbing and inputs are 0;
-    /// a view (reads nothing, writes nothing) is honestly free.
-    fn candidate_heuristic_cost(&self, candidate: &Candidate) -> u64 {
-        match &candidate.kind {
-            PlanKind::Input(_)
-            | PlanKind::BufferOutputLit
-            | PlanKind::BufferTensorCons
-            | PlanKind::BufferTensorNil
-            | PlanKind::BufferTensorLit { .. } => 0,
-            PlanKind::LayoutIr(op) => {
-                let reads = candidate
-                    .input_list
-                    .iter()
-                    .enumerate()
-                    .filter(|(operand, _)| op.operand_reads_memory(*operand))
-                    .map(|(_, class)| self.tensor_bytes(class))
-                    .fold(0u64, u64::saturating_add);
-                let writes = candidate
-                    .output_list
-                    .iter()
-                    .enumerate()
-                    .filter(|(result, _)| op.result_writes_memory(*result))
-                    .map(|(_, class)| self.tensor_bytes(class))
-                    .fold(0u64, u64::saturating_add);
-                reads.saturating_add(writes)
-            }
-        }
-    }
-
-    /// Byte size of a LayoutTensor class, memoized: product of its
-    /// layout's extents times the element bit width, rounded up to bytes.
-    fn tensor_bytes(&self, layout_tensor: &ClassId) -> u64 {
-        if let Some(&bytes) = self.tensor_bytes_cache.borrow().get(layout_tensor) {
-            return bytes;
-        }
-        let bytes = self.compute_tensor_bytes(layout_tensor);
-        self.tensor_bytes_cache
-            .borrow_mut()
-            .insert(layout_tensor.clone(), bytes);
-        bytes
-    }
-
-    fn compute_tensor_bytes(&self, layout_tensor: &ClassId) -> u64 {
-        let renderer = self.renderer();
-        let lit = renderer
-            .node_with_op(layout_tensor, "LayoutTensorLit")
-            .unwrap_or_else(|| {
-                panic!("heuristic cost: class {layout_tensor} has no LayoutTensorLit spelling")
-            });
-        let node = self.egraph.nodes.get(lit).expect("lit node resolvable");
-        let layout = child_class(self.egraph, node, 1).unwrap_or_else(|| {
-            panic!("heuristic cost: LayoutTensorLit in {layout_tensor} has no layout child")
-        });
-        let dims = self.estimated_layout_dims(&layout).unwrap_or_else(|| {
-            panic!(
-                "heuristic cost: layout {layout} (of tensor {layout_tensor}) has no \
-                 readable ShapeLit shape"
-            )
-        });
-        let bits = renderer.numeric_layout_bits(&layout).unwrap_or_else(|| {
-            panic!(
-                "heuristic cost: layout {layout} (of tensor {layout_tensor}) has no \
-                 literal bit width"
-            )
-        });
-        let elements = dims
-            .iter()
-            .fold(1u128, |product, &dim| product.saturating_mul(dim as u128));
-        let total_bits = elements.saturating_mul(bits.max(0) as u128);
-        total_bits.div_ceil(8).min(u64::MAX as u128) as u64
-    }
-
-    /// The layout's extents with symbolic dims estimated (mirrors the
-    /// renderer's `numeric_layout_dims`, but symbolic-tolerant).
-    fn estimated_layout_dims(&self, class: &ClassId) -> Option<Vec<u64>> {
-        let renderer = self.renderer();
-        for node_id in renderer.class_nodes.get(class)? {
-            let node = self.egraph.nodes.get(node_id)?;
-            let shape_child = match node.op.as_str() {
-                "RightMajorContiguousElementLayoutLit"
-                | "LeftMajorContiguousElementLayoutLit"
-                | "StridedElementLayoutLit" => 0,
-                "ElementOffsetExpressionLayoutLit" | "BitOffsetExpressionLayoutLit" => 1,
-                _ => continue,
-            };
-            let shape_class = child_class(self.egraph, node, shape_child)?;
-            let shape_node_id = renderer.node_with_op(&shape_class, "ShapeLit")?;
-            let shape_node = self.egraph.nodes.get(shape_node_id)?;
-            let mut current = child_class(self.egraph, shape_node, 0)?;
-            let mut dims = Vec::new();
-            loop {
-                if let Some(cons_id) = renderer.node_with_op(&current, "IntExprCons").cloned() {
-                    let cons = self.egraph.nodes.get(&cons_id)?;
-                    dims.push(self.dim_estimate(&child_class(self.egraph, cons, 0)?));
-                    current = child_class(self.egraph, cons, 1)?;
-                } else if renderer.node_with_op(&current, "IntExprNil").is_some() {
-                    return Some(dims);
-                } else {
-                    return None;
-                }
-            }
-        }
-        None
-    }
-
-    /// One extent: a literal dim exactly; a symbolic dim at the MIDPOINT
-    /// of its seeded interval (ruling 2026-08-10: halfway between the
-    /// bounds). A dim with neither is a broken seeding contract — loud.
-    fn dim_estimate(&self, dim: &ClassId) -> u64 {
-        if let Some(value) = self.renderer().numeric_int_expr(dim) {
-            return value.max(0) as u64;
-        }
-        self.with_bounds_index(|index| {
-            let (lower, upper) = index.get(dim).copied().unwrap_or((None, None));
-            match (lower, upper) {
-                (Some(lower), Some(upper)) => ((lower + upper) / 2).max(0) as u64,
-                _ => panic!(
-                    "heuristic cost: dim class {dim} has neither a literal value nor \
-                     complete seeded bounds (lower {lower:?}, upper {upper:?}) — the \
-                     bounds-seeding contract is broken"
-                ),
-            }
-        })
-    }
-
-    /// The serialized interval rows, indexed once: IntExpr class →
-    /// (lower, upper). Rows encode as op `lower-bound-of`/`upper-bound-of`
-    /// with the argument node as child 0 and the BigInt value as the row
-    /// node's own eclass (observed encoding, probe 2026-08-10). Multiple
-    /// rows per class merge tightest, mirroring the lattice's `:merge`.
-    fn with_bounds_index<R>(
-        &self,
-        read: impl FnOnce(&HashMap<ClassId, (Option<i128>, Option<i128>)>) -> R,
-    ) -> R {
-        let mut slot = self.bounds_index.borrow_mut();
-        if slot.is_none() {
-            let mut index: HashMap<ClassId, (Option<i128>, Option<i128>)> = HashMap::new();
-            for node in self.egraph.nodes.values() {
-                let is_lower = node.op == "lower-bound-of";
-                if !is_lower && node.op != "upper-bound-of" {
-                    continue;
-                }
-                let Some(arg) = node
-                    .children
-                    .first()
-                    .and_then(|id| self.egraph.nodes.get(id))
-                else {
-                    continue;
-                };
-                let Some(value) = self.bigint_value(&node.eclass) else {
-                    continue;
-                };
-                let entry = index.entry(arg.eclass.clone()).or_insert((None, None));
-                if is_lower {
-                    entry.0 = Some(entry.0.map_or(value, |held: i128| held.max(value)));
-                } else {
-                    entry.1 = Some(entry.1.map_or(value, |held: i128| held.min(value)));
-                }
-            }
-            *slot = Some(index);
-        }
-        read(slot.as_ref().expect("bounds index just built"))
     }
 
     /// The serialized `dtype-of` rows, indexed once: LogicalTensor
@@ -2160,20 +1924,6 @@ impl<'a> Extractor<'a> {
                 && let Some(dtype) = crate::dtype::PlanDtype::from_egglog_name(&node.op)
             {
                 return Some(dtype);
-            }
-        }
-        None
-    }
-
-    /// A BigInt primitive class: the childless member whose op is the
-    /// decimal literal.
-    fn bigint_value(&self, class: &ClassId) -> Option<i128> {
-        for node_id in self.class_nodes.get(class)? {
-            let node = self.egraph.nodes.get(node_id)?;
-            if node.children.is_empty()
-                && let Ok(value) = node.op.parse::<i128>()
-            {
-                return Some(value);
             }
         }
         None
@@ -3277,7 +3027,6 @@ impl<'a> ClassRenderer<'a> {
         if let Some(index) = seed.selected_output_index {
             push_detail(&mut lines, "selected_output_index", index);
         }
-        push_detail(&mut lines, "heuristic_cost", seed.heuristic_cost);
         push_details(&mut lines, &self.layout_tensor_details(&seed.class));
         if !seed.input_list.is_empty() {
             push_detail(
@@ -3643,13 +3392,20 @@ struct IrBuilder<'e, 'a> {
 
 impl<'e, 'a> IrBuilder<'e, 'a> {
     /// Whether an instantiated op's output slot BELONGS to its output class.
-    /// Without a genome every slot is claimed (the deterministic extractor's
-    /// first-emission behavior). Under a genome, a slot is claimed only if
-    /// the genome maps that class to exactly this enode and slot — the
-    /// genome, not emission order, decides ownership.
+    /// A slot is claimed only by the producer selected for that value, either
+    /// in the genome or in the fixture extractor's memo. Emission order must
+    /// never let an unselected result overwrite another producer's value.
     fn slot_claimed(&self, output: &ClassId, enode: &NodeId, slot: usize) -> bool {
         match self.extractor.genome.as_ref() {
-            None => true,
+            None => self
+                .extractor
+                .memo
+                .get(output)
+                .and_then(Option::as_ref)
+                .is_some_and(|plan| {
+                    plan.source_enode.as_ref() == Some(enode)
+                        && plan.selected_output_index == Some(slot)
+                }),
             Some(genome) => genome
                 .choices
                 .get(output)
@@ -3702,8 +3458,8 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                     .map(|(slot, output)| {
                         let mut info = self.extractor.layout_tensor_info(output);
                         if !self.slot_claimed(output, &source_enode, slot) {
-                            // WASTE DESTINATION (genome walks only): this
-                            // instance computes the slot, but the genome
+                            // WASTE DESTINATION: this instance computes
+                            // the slot, but the selected derivation
                             // assigned the class to a different producer. A
                             // fresh synthetic value identity (the poison-id
                             // idiom) makes bufferize allocate scratch instead
@@ -3729,7 +3485,6 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                         source_eclass: plan.source_eclass.clone(),
                         source_enode: plan.source_enode.clone(),
                         selected_output_index: plan.selected_output_index,
-                        heuristic_cost: plan.heuristic_cost,
                         input_list: plan.input_list.clone(),
                         output_list: plan.output_list.clone(),
                         metadata: plan.metadata.clone(),
@@ -3747,7 +3502,6 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                     inputs,
                     outputs,
                     tooltip,
-                    heuristic_cost: plan.heuristic_cost,
                 };
                 let index = self.dag.add_node(ExtractedNode::LayoutOp(node));
                 self.op_nodes.insert(key, index);
@@ -4085,13 +3839,9 @@ fn render_class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
 /// invariant is "a class the plan reads as a launch-time leaf offers no
 /// producer".
 ///
-/// A boundary input is a LEAF: it exists at launch. No producer of that
-/// class is ever needed, and none can ever be cheaper than reading the
-/// leaf — but sound unions do mint such producers (the cuBLASLt
-/// double-transpose collapse puts a view op's output into the input's
-/// own layout-tensor class), and a zero-cost view then wins the
-/// `is_better` tie against the zero-cost terminal on `plan_label`,
-/// erasing the BufferInput and handing bufferize a cyclic graph.
+/// A boundary input is a leaf: it exists at launch. Sound unions can mint
+/// producers in its class (for example double-transpose views), but no such
+/// producer may replace the boundary leaf or introduce a dependency cycle.
 ///
 /// The extractor does not filter on this fact: `Extractor::new_with_matchers`
 /// already drops every producer row of a class it seeds as an input

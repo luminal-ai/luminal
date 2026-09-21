@@ -22,7 +22,12 @@ fn rotary_split_rejoin_with_dynamic_sequence_matches_scalar() {
         .bind_dim_buckets('s', vec![DimBucket::new(2, 64).representative(30)])
         .unwrap();
     runtime
-        .search(&Default::default(), &harness_search_options())
+        .search(
+            &[(input.id, vec![1f32; 30 * 2048].into())]
+                .into_iter()
+                .collect(),
+            &harness_search_options(),
+        )
         .unwrap();
     for sequence in [2, 30, 64] {
         let values: Vec<f32> = (0..sequence * 2048)

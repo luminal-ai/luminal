@@ -3,22 +3,12 @@
 //! search claiming only this backend's codegen inventory and execution
 //! delegated to the `device` module.
 //!
-//! Everything up to `execute` is device-free BY DEFAULT and runs
-//! anywhere: load states this runtime's boundary ([`crate::bindings`])
-//! and captures the bound program, bind_* appends
-//! bounds seeds, search assembles + saturates + runs THIS crate's
-//! genetic search ([`crate::search`]) with OUR allow list, ranking
-//! candidates by the device-free heuristic ([`crate::heuristic`] — a
-//! weak static prior, not a measurement). Two things need the `device`
-//! feature and a CUDA device: `execute`, and a `search` with
-//! [`crate::search::CompileOptions::profile_on_device`] set (Phase 4),
-//! which creates the device lazily, stages the caller's payloads, and
-//! ranks by measured time (the `profile` module, `device` only) — on a
-//! device-free build it refuses by name rather than falling back to the
-//! prior.
+//! Loading, shape binding and saturation can run on any host. Search and
+//! execution require the `device` feature and a CUDA GPU. Search compiles,
+//! warms and measures every distinct candidate using the caller's inputs.
 
 use crate::host_buffer::HostBuffer;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::bufferize::BufferIrGraph;
 
 use crate::search::{CompileOptions, SearchOutcome};
@@ -117,7 +107,7 @@ pub struct CudaRuntime {
     /// [`Self::execute`], whichever comes first — and kept for the
     /// runtime's life, "each runtime remembers its own buffer hygiene".
     /// `None` until then, so `Default` still gives a device-free runtime
-    /// that plans and searches by the heuristic on any host.
+    /// that can load, bind and inspect saturated graphs on any host.
     #[cfg(feature = "device")]
     device: Option<crate::device::CudaDevice>,
     /// A caller-allocated arena for the NEXT execution. `None` means the
@@ -554,14 +544,30 @@ impl CudaRuntime {
     /// On saturation failure the labeled post-checks are re-run in
     /// isolation to name the door, mirroring the reference runtime.
     ///
-    /// With `options.profile_on_device` this needs the `device` feature
-    /// and a CUDA device: it creates the device lazily and ranks by
-    /// measured time (see the `profile` module, `device` only).
+    /// Requires the `device` feature and a CUDA GPU; all candidates rank
+    /// by measured execution time.
     pub fn search(
         &mut self,
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
+        self.search_with_profile_inputs(input_data, &[], options)
+    }
+
+    /// Search with host input overrides for each complete profiling dimension
+    /// assignment. Entries borrow the shared inputs (including weights) and
+    /// override only the supplied tensors. Every representative, including
+    /// finalist validation, must have exactly one entry when overrides are used.
+    pub fn search_with_profile_inputs(
+        &mut self,
+        input_data: &FxHashMap<NodeIndex, HostBuffer>,
+        profile_inputs: &[(shape::DynMap, FxHashMap<NodeIndex, HostBuffer>)],
+        options: &CompileOptions,
+    ) -> Result<SearchOutcome> {
+        ensure!(
+            cfg!(feature = "device"),
+            "candidate search requires the `device` feature and a CUDA GPU"
+        );
         self.ensure_not_installed("re-searching")?;
         self.invalidate_plans();
         let mut resolved_options = options.clone();
@@ -584,36 +590,20 @@ impl CudaRuntime {
             .as_ref()
             .ok_or_else(|| anyhow!("load before search"))?;
 
-        // The caller's payloads are CHECKED here always, because binding
-        // a tensor that is not an input of the loaded program is a
-        // caller bug under either evaluator. Whether they go FURTHER
-        // depends on how the search prices candidates: the device-free
-        // heuristic (D6, 2026-09-03) never runs anything and so needs
-        // nothing staged, while device profiling (Phase 4) executes each
-        // candidate and needs exactly these bytes.
-        //
-        // The binding list is the LOAD-TIME one, which the bucketed
-        // ladder also has — it renders no base program at all.
+        // Check the caller's payloads against the load-time input bindings.
         for tensor in input_data.keys() {
             assert!(
                 native.bound.inputs.iter().any(|b| b.value == *tensor),
                 "tensor {tensor:?} is not a bound input"
             );
         }
-        #[cfg(not(feature = "device"))]
-        anyhow::ensure!(
-            !options.profile_on_device,
-            "device profiling requested but cuda-lite was built without the `device` \
-             feature: this host can search by the heuristic, but a request to MEASURE \
-             must not be answered with a prior"
-        );
 
         // THE SEARCH-TIME STAGING (Phase 4), by BufferLit id and BY
         // REFERENCE — the ladder's `set_data` staging is a separate,
         // later step and is untouched. A full-size model's weights are
         // gigabytes; the search must borrow them, never copy them.
         #[cfg(feature = "device")]
-        let staged_for_search: FxHashMap<i64, &HostBuffer> = if options.profile_on_device {
+        let staged_for_search: FxHashMap<i64, &HostBuffer> = {
             native
                 .bound
                 .inputs
@@ -624,14 +614,33 @@ impl CudaRuntime {
                         .map(|data| (bound.buffer, data))
                 })
                 .collect()
-        } else {
-            FxHashMap::default()
         };
-        // THE DEVICE IS CREATED LAZILY, here or at the first `execute`
-        // (Phase 3's persistent device, unchanged): a search that ranks
-        // by the heuristic still touches no CUDA API at all.
         #[cfg(feature = "device")]
-        if options.profile_on_device && self.device.is_none() {
+        let profile_inputs: Vec<crate::search::ProfileInputs<'_>> = profile_inputs
+            .iter()
+            .map(|(dims, inputs)| {
+                let inputs = inputs
+                    .iter()
+                    .map(|(tensor, data)| {
+                        let bound = native
+                            .bound
+                            .inputs
+                            .iter()
+                            .find(|bound| bound.value == *tensor)
+                            .ok_or_else(|| {
+                                anyhow!("profiling tensor {tensor:?} is not a bound input")
+                            })?;
+                        Ok((bound.buffer, data))
+                    })
+                    .collect::<Result<_>>()?;
+                Ok((dims.clone(), inputs))
+            })
+            .collect::<Result<_>>()?;
+        #[cfg(not(feature = "device"))]
+        let _ = profile_inputs;
+        // Keep the device and compiled modules across candidate measurements.
+        #[cfg(feature = "device")]
+        if self.device.is_none() {
             self.device = Some(crate::device::CudaDevice::new(0)?);
         }
 
@@ -685,21 +694,16 @@ impl CudaRuntime {
         let mut evaluator = {
             #[cfg(feature = "device")]
             {
-                if options.profile_on_device {
-                    crate::search::Evaluator::Device {
-                        device: self
-                            .device
-                            .as_mut()
-                            .expect("the device was just created if it was missing"),
-                        staged: &staged_for_search,
-                    }
-                } else {
-                    crate::search::Evaluator::Heuristic
+                crate::search::Evaluator::Device {
+                    device: self.device.as_mut().expect("device initialized"),
+                    staged: &staged_for_search,
+                    residents: &self.residents,
+                    profile_inputs: &profile_inputs,
                 }
             }
             #[cfg(not(feature = "device"))]
             {
-                crate::search::Evaluator::Heuristic
+                crate::search::Evaluator::NoDevice(std::marker::PhantomData)
             }
         };
 
@@ -712,76 +716,76 @@ impl CudaRuntime {
         // plan is whichever FINALIST the bucket lattice selected under the
         // aggregate device budget. With no budget set they coincide,
         // which is why every existing caller sees the trajectory it had.
-        let (outcome, unbucketed_plan, searched_buckets) = if let Some((serialized, program)) = base
-        {
-            let mut outcome = crate::search::search_implementations(
-                &serialized,
-                &program,
-                options,
-                Some(allow.clone()),
-                matchers,
-                evaluator.reborrow(),
-            )
-            .with_context(no_plan)?;
-            // THE UNBUCKETED LATTICE (Phase 5) — a lattice over ONE
-            // bucket, so unbucketed and bucketed installs run the same
-            // code. Main's "one designed difference" from its pre-#420
-            // behaviour, adopted for the same reason: whether the
-            // installed plan fits the caller's device budget is a
-            // property of what is installed, and an unbucketed install is
-            // a set of one.
-            let finalists = vec![
-                crate::finalists::Finalists::new(
-                    "the search",
-                    &serialized,
+        let (outcome, unbucketed_plan, searched_buckets) =
+            if let Some((mut serialized, program)) = base {
+                let mut outcome = crate::search::search_implementations(
+                    &mut serialized,
+                    &program,
+                    options,
                     Some(allow.clone()),
                     matchers,
-                    outcome.ranked.clone(),
-                    Some(outcome.best_plan.clone()),
+                    evaluator.reborrow(),
                 )
-                .with_shapes(options.shapes.clone())
-                .with_resident_bindings(self.residents.clone()),
-            ];
-            let (selected, rejections) =
-                crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
-            outcome.lattice_rejections = rejections;
-            let (_, finalist) = selected
-                .into_iter()
-                .next()
-                .expect("a one-bucket lattice selects exactly one finalist");
-            (outcome, Some(finalist.plan), Vec::new())
-        } else {
-            // BUCKETED (D7): one search per Cartesian combination, each
-            // searched and validated over the complete interval. The caller's data is staged ONCE and every
-            // bucket's search borrows the same map — a bucket only
-            // changes the dim seeds, never the payloads.
-            let assembly = crate::search::BucketAssembly {
-                assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
-                prefix: &native.bound.prefix,
-                binding_seeds: &native.binding_seeds,
-                schedule: crate::bindings::CudaBindings::SCHEDULE,
-                post_checks: &native.bound.post_checks,
-                inputs: &native.bound.inputs,
-                outputs: &native.bound.outputs,
-                residents: &self.residents,
-                base_dims: &options.shapes.values,
-                decoders: &self.decoders,
+                .with_context(no_plan)?;
+                // THE UNBUCKETED LATTICE (Phase 5) — a lattice over ONE
+                // bucket, so unbucketed and bucketed installs run the same
+                // code. Main's "one designed difference" from its pre-#420
+                // behaviour, adopted for the same reason: whether the
+                // installed plan fits the caller's device budget is a
+                // property of what is installed, and an unbucketed install is
+                // a set of one.
+                let finalists = vec![
+                    crate::finalists::Finalists::new(
+                        "the search",
+                        &serialized,
+                        Some(allow.clone()),
+                        matchers,
+                        outcome.ranked.clone(),
+                        Some(outcome.best_plan.clone()),
+                    )
+                    .with_shapes(options.shapes.clone())
+                    .with_resident_bindings(self.residents.clone()),
+                ];
+                let (selected, rejections) =
+                    crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
+                outcome.lattice_rejections = rejections;
+                let (_, finalist) = selected
+                    .into_iter()
+                    .next()
+                    .expect("a one-bucket lattice selects exactly one finalist");
+                (outcome, Some(finalist.plan), Vec::new())
+            } else {
+                // BUCKETED (D7): one search per Cartesian combination, each
+                // searched and validated over the complete interval. The caller's data is staged ONCE and every
+                // bucket's search borrows the same map — a bucket only
+                // changes the dim seeds, never the payloads.
+                let assembly = crate::search::BucketAssembly {
+                    assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
+                    prefix: &native.bound.prefix,
+                    binding_seeds: &native.binding_seeds,
+                    schedule: crate::bindings::CudaBindings::SCHEDULE,
+                    post_checks: &native.bound.post_checks,
+                    inputs: &native.bound.inputs,
+                    outputs: &native.bound.outputs,
+                    residents: &self.residents,
+                    base_dims: &options.shapes.values,
+                    decoders: &self.decoders,
+                };
+                let plans = crate::search::bucketed_search_implementations(
+                    &assembly,
+                    &self.dim_buckets,
+                    options,
+                    Some(allow),
+                    matchers,
+                    evaluator,
+                )
+                .with_context(no_plan)?;
+                let first = plans
+                    .first()
+                    .map(|plan| plan.outcome.clone())
+                    .ok_or_else(|| anyhow!(no_plan()))?;
+                (first, None, plans)
             };
-            let plans = crate::search::bucketed_search_implementations(
-                &assembly,
-                &self.dim_buckets,
-                options,
-                Some(allow),
-                matchers,
-                evaluator,
-            )
-            .with_context(no_plan)?;
-            let first = plans
-                .first()
-                .map(|plan| plan.outcome.clone())
-                .ok_or_else(|| anyhow!(no_plan()))?;
-            (first, None, plans)
-        };
         // CALLER STORAGE BECOMES THE ESCAPE CELL, before anything reads the
         // plan: every later guard (`check_external_outputs`, the arena's
         // external set, execute's pointer map) reads the retargeted plan.

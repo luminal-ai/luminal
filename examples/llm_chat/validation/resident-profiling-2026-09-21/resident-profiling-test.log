@@ -1,0 +1,11 @@
+   Compiling luminal_nn v0.1.0 (/root/luminal/crates/luminal_nn)
+   Compiling luminal_cuda_lite v0.1.0 (/root/luminal/crates/luminal_cuda_lite)
+   Compiling luminal_reference v0.1.0 (/root/luminal/crates/luminal_reference)
+   Compiling model_zoo v0.1.0 (/root/luminal/crates/model_zoo)
+    Finished `release` profile [optimized] target(s) in 5.46s
+     Running tests/resident_profiling.rs (target/release/deps/resident_profiling-f9b3cae33d4cd498)
+
+running 1 test
+test profiling_retains_weights_resets_mutable_state_and_suppresses_resident_readback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s

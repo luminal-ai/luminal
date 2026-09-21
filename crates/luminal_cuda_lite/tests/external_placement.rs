@@ -7,7 +7,7 @@
 use luminal::bufferize::BufferNode;
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::*;
-use luminal_cuda_lite::{CudaBindings, CudaRuntime, cuda_registry, harness_search_options};
+use luminal_cuda_lite::{CudaBindings, CudaRuntime, harness_search_options};
 
 /// `a + b` with `a` on caller device memory and `b` host-staged.
 fn runtime() -> (CudaRuntime, i64, i64) {
@@ -132,6 +132,10 @@ fn set_data_on_an_external_binding_is_refused() {
 /// the output slot carries the bound BufferLit — is what the guard
 /// reads, and it is a fact of the searched plan, not of the device.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn an_external_output_slot_sits_on_the_bound_buffer() {
     let mut cx = Graph::new();
     let a = cx.tensor(4, DType::F32);
@@ -176,6 +180,10 @@ fn an_external_output_slot_sits_on_the_bound_buffer() {
 /// onto the bound buffer id after the search, and the runtime discloses which
 /// buffer it wrote, how far it reaches, and how the value is strided in it.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn an_external_output_may_be_a_view_of_an_escape_cell() {
     let mut cx = Graph::new();
     let x = cx.tensor((4usize, 16usize), DType::F32);
@@ -187,8 +195,12 @@ fn an_external_output_may_be_a_view_of_an_escape_cell() {
     bindings.input(w.id);
     let bound = bindings.output_external(out.id);
 
-    let mut runtime = CudaRuntime::load_with(&cx, bindings, cuda_registry())
-        .expect("a matmul with a caller-owned output loads");
+    let mut runtime = CudaRuntime::load_with(
+        &cx,
+        bindings,
+        luminal_cuda_lite::cuda_registry_filtered(|row| row.label() != "ReduceSumGeneric"),
+    )
+    .expect("a matmul with a caller-owned output loads");
     runtime
         .search(&FxHashMap::default(), &harness_search_options())
         .expect("a plan that fulfils the caller-owned output exists");

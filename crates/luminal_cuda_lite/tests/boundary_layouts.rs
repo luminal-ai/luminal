@@ -114,6 +114,10 @@ fn a_column_major_input_carries_the_left_major_spelling() {
 /// A STRIDED INPUT: the spelling is minted, and the plan the search
 /// installs reads the caller's storage through exactly that map.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
     // (2,3) at element strides [1, 2] — the first axis is the fast one,
     // so out (i, j) lives at flat i + 2j.
@@ -170,6 +174,10 @@ fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
 /// the right-major spelling from the chain itself, so recognition is
 /// the preamble's and never the caller's.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_right_major_strides_chain_is_discovered_contiguous() {
     let mut cx = Graph::new();
     let x = cx.named_tensor("x", (2usize, 4usize), DType::F32);
@@ -199,6 +207,10 @@ fn a_right_major_strides_chain_is_discovered_contiguous() {
 /// minted without the dim having a value, and the search plans each
 /// bucket.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
     let mut cx = Graph::new();
     let x = cx.named_tensor("x", ('n', 4usize), DType::F32);
@@ -242,6 +254,10 @@ fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
 /// BOTH contiguous spellings, which at this shape are one map, and the
 /// read the plan installs never reaches the 7.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn an_arbitrary_stride_on_a_degenerate_axis_is_discovered_contiguous() {
     let mut cx = Graph::new();
     let x = cx.named_tensor("x", (1usize, 4usize), DType::F32);
@@ -317,6 +333,10 @@ fn a_strided_binding_states_one_non_negative_stride_per_axis() {
 /// caller's storage, planned and lowered as one row rather than widened
 /// into a materialized copy.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_zero_stride_input_plans_as_a_broadcast_read() {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 3usize), DType::F32);
@@ -363,6 +383,10 @@ fn a_zero_stride_input_plans_as_a_broadcast_read() {
 /// here a broadcast, where every coordinate would land on one element —
 /// is answered by a search that finds no plan and names the output.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_zero_stride_sink_binds_and_the_search_names_it() {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 3usize), DType::F32);
@@ -392,6 +416,10 @@ fn a_zero_stride_sink_binds_and_the_search_names_it() {
 /// left-major destination, so the refusal names the output and the
 /// layout instead of a bind-time prior about writability.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_column_major_sink_binds_and_the_search_names_it() {
     let mut cx = Graph::new();
     let x = cx.tensor((2usize, 3usize), DType::F32);
@@ -422,6 +450,10 @@ fn a_column_major_sink_binds_and_the_search_names_it() {
 /// — a layout-changing copy into the bound output layout — is the flip
 /// that makes this one plan.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_column_major_output_binds_and_the_search_names_it() {
     let mut cx = Graph::new();
     let a = cx.tensor((2usize, 3usize), DType::F32);
@@ -450,6 +482,10 @@ fn a_column_major_output_binds_and_the_search_names_it() {
 /// that the elected slot sits on the bound buffer rather than on a view
 /// of it.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_row_major_output_bound_external_plans() {
     let mut cx = Graph::new();
     let a = cx.tensor((2usize, 3usize), DType::F32);
@@ -481,6 +517,10 @@ fn a_row_major_output_bound_external_plans() {
 /// destination; at the chain the preamble itself renders, the same
 /// empty output plans.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_zero_extent_output_at_torchs_contiguous_chain_is_named_by_the_search() {
     let plan_at = |strides: [i64; 2]| {
         let mut cx = Graph::new();
@@ -556,6 +596,10 @@ fn a_symbolic_strided_output_binds_at_its_own_dim() {
 /// two bindings naming one buffer id — and the plan puts both boundary
 /// values on that one buffer.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn an_output_bound_on_a_read_write_input_shares_its_buffer() {
     let mut cx = Graph::new();
     let state = cx.tensor(4usize, DType::F32);
@@ -661,6 +705,10 @@ fn reaches_int_var(egraph: &EGraph, root: &ClassId, name: &str) -> bool {
 /// buckets, and the reads the elected nodes lower go through the dim
 /// parameter instead of a baked stride.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
     let mut cx = Graph::new();
     let x = cx.named_tensor("x", ('n', 4usize), DType::F32);

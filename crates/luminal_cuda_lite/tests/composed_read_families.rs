@@ -3,7 +3,7 @@
 //! ScatterFunctional, IndexMapApplyMaterialize. Searches were green and
 //! plans built — only the CL device codegen refused folded read
 //! operands ("operand N carries a composed access this kernel does not
-//! lower"). Everything here is host-side: real searched plans through
+//! lower"). These tests profile plans on the CUDA device through
 //! the CUDA ladder, rendered to CUDA source strings (the
 //! codegen_identity discipline), pinned for composed index arithmetic.
 //! UNDER THE CORRECTED CONTRACT (2026-08-31) the hop chain is gone: each
@@ -27,12 +27,8 @@ use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::HostBuffer;
 use luminal_cuda_lite::{CudaRuntime, kernels};
 
-/// The view fixtures' search budget (mirrors `view_admission`):
-/// profiling is static bytes-moved, so folds win deterministically
-/// under a fixed seed. The seed is per-fixture: fold-vs-materialize
-/// spellings of a movement class are cost-TIED (same bytes), so which
-/// one the genome elects is sampling — a fixture that needs a specific
-/// tied spelling pins the seed that elects it.
+/// Measure candidates with a fixed seed. The fixture registry excludes
+/// materialized index maps and copies so the tests exercise composed view reads.
 fn view_search_options(seed: u64) -> CompileOptions {
     CompileOptions {
         generations: 4,
@@ -51,7 +47,13 @@ fn plan_for(
     inputs: &[(NodeIndex, HostBuffer)],
     seed: u64,
 ) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
-    let mut rt = CudaRuntime::load(cx).expect("cuda load");
+    let mut rt = CudaRuntime::load_with_registry(
+        cx,
+        luminal_cuda_lite::cuda_registry_filtered(|row| {
+            !matches!(row.label(), "IndexMapApplyMaterialize" | "CopyGeneric")
+        }),
+    )
+    .expect("cuda load");
     let data: FxHashMap<NodeIndex, HostBuffer> = inputs.iter().cloned().collect();
     let outcome = rt
         .search(&data, &view_search_options(seed))
@@ -210,6 +212,10 @@ fn reference_values(cx: &Graph, inputs: &[(NodeIndex, HostBuffer)], out: NodeInd
 /// Train-2B this plan's codegen refused with "Gather: operand 1 carries
 /// a composed access this kernel does not lower".
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn gather_lowers_a_folded_coordinate_operand() {
     let mut cx = Graph::new();
     let data = cx.tensor((4usize, 3usize), DType::F32);
@@ -279,6 +285,10 @@ fn gather_lowers_a_folded_coordinate_operand() {
 /// gather's own indirection composes ON TOP of the folded chain
 /// (`data_c* = coord`, then the hops).
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn gather_lowers_a_folded_data_operand() {
     let mut cx = Graph::new();
     let base = cx.tensor((3usize, 4usize), DType::F32);
@@ -334,6 +344,10 @@ fn gather_lowers_a_folded_data_operand() {
 /// it (and its `flags` scratch buffer) is gone — see the NO RUNTIME
 /// BOUNDS TRAPS note in `luminal_cuda_lite::kernels`.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn scatter_lowers_a_folded_coordinate_operand() {
     let mut cx = Graph::new();
     let init = cx.tensor((4usize, 3usize), DType::F32);
@@ -413,6 +427,10 @@ fn scatter_lowers_a_folded_coordinate_operand() {
 /// src a slice view, coord0 a broadcast view. All three fold; the
 /// write side stays direct.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn scatter_lowers_all_read_side_folds() {
     let mut cx = Graph::new();
     let init_base = cx.tensor((3usize, 4usize), DType::F32);

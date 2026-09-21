@@ -11,7 +11,7 @@
 //! WHAT IS NOT HERE, and why. The GA loop stays in each runtime,
 //! because it must PRICE a plan in the middle of every iteration — the
 //! reference runtime executes the candidate and times it, CUDA-lite
-//! reads a heuristic or profiles on the device — and pricing is the
+//! profiles on the device — and pricing is the
 //! decision. Core would have to call back out to get it, which is the
 //! seam the 2026-09-03 no-trait ruling closed. So the loop, the option
 //! knobs, the outcome shape, the evaluators, the bucketed drivers and
@@ -309,7 +309,8 @@ pub struct SearchTimings {
     pub saturation_nanos: u128,
     /// e-graph serialization (one per search).
     pub serialize_nanos: u128,
-    /// ExtractionSession::new + producer index + viability fixpoint.
+    /// Serialized-graph post-passes + ExtractionSession::new + producer index
+    /// + viability fixpoint.
     pub analysis_nanos: u128,
     /// All genome extractions (extract_with_genome, cumulative).
     pub extract_nanos: u128,
@@ -439,6 +440,60 @@ pub fn sample_genome_reporting(
     space: &SamplingSpace,
     rng: &mut StdRng,
 ) -> (Genome, Vec<ClassId>) {
+    sample_genome_with_family_order(index, space, rng, None)
+}
+
+/// Draw one random ordering of implementation families and use it across the
+/// whole genome. Independent per-site choices almost never sample a coherent
+/// implementation on a large repeated graph: every candidate can contain a
+/// few enormous materializing routes, preventing device profiling from finding
+/// its first executable incumbent. Correlated draws explore those otherwise
+/// rare combinations without assigning costs or privileging a backend/op name.
+/// Keep independent draws too, so mixed implementations remain reachable.
+pub fn sample_genome_correlated(
+    index: &ProducerIndex,
+    space: &SamplingSpace,
+    rng: &mut StdRng,
+) -> Genome {
+    let families: std::collections::BTreeSet<_> = index
+        .values()
+        .flatten()
+        .map(|(family, _)| family.clone())
+        .collect();
+    let order = families
+        .into_iter()
+        .map(|family| (family, rng.random::<u64>()))
+        .collect();
+    sample_genome_with_family_order(index, space, rng, Some(&order)).0
+}
+
+fn sample_genome_with_family_order(
+    index: &ProducerIndex,
+    space: &SamplingSpace,
+    rng: &mut StdRng,
+    family_order: Option<&BTreeMap<String, u64>>,
+) -> (Genome, Vec<ClassId>) {
+    let choose = |rng: &mut StdRng, allowed: &[usize], candidates: &[(String, ProducerChoice)]| {
+        if let Some(order) = family_order {
+            let positions: Vec<_> = if allowed.is_empty() {
+                (0..candidates.len()).collect()
+            } else {
+                allowed.to_vec()
+            };
+            let best = positions
+                .iter()
+                .map(|&i| order[&candidates[i].0])
+                .min()
+                .unwrap();
+            let positions: Vec<_> = positions
+                .into_iter()
+                .filter(|&i| order[&candidates[i].0] == best)
+                .collect();
+            positions[rng.random_range(0..positions.len())]
+        } else {
+            choose_position(rng, allowed, candidates.len())
+        }
+    };
     let mut genome = Genome::default();
     let mut fallbacks: Vec<ClassId> = Vec::new();
     for members in &space.components {
@@ -487,6 +542,22 @@ pub fn sample_genome_reporting(
                     .filter(|member| !assigned[*member])
                     .collect();
             }
+            if let Some(order) = family_order {
+                // Compare only choices that preserve the existing SCC forest
+                // invariant. A class whose preferred route is not yet available
+                // can wait while another class supplies its dependencies.
+                let rank = |member: usize| {
+                    index[&members[member]]
+                        .iter()
+                        .enumerate()
+                        .filter(|(position, _)| forced || pending[member][*position] == 0)
+                        .map(|(_, (family, _))| order[family])
+                        .min()
+                        .unwrap()
+                };
+                let best = pool.iter().map(|&member| rank(member)).min().unwrap();
+                pool.retain(|&member| rank(member) == best);
+            }
             let member = pool[rng.random_range(0..pool.len())];
             let class = &members[member];
             let candidates = &index[class];
@@ -497,7 +568,7 @@ pub fn sample_genome_reporting(
             if forced {
                 fallbacks.push(class.clone());
             }
-            let position = choose_position(rng, &allowed, candidates.len());
+            let position = choose(rng, &allowed, candidates);
             genome
                 .choices
                 .insert(class.clone(), candidates[position].1.clone());
@@ -514,7 +585,7 @@ pub fn sample_genome_reporting(
         if genome.choices.contains_key(class) {
             continue;
         }
-        let position = rng.random_range(0..candidates.len());
+        let position = choose(rng, &[], candidates);
         genome
             .choices
             .insert(class.clone(), candidates[position].1.clone());
@@ -774,6 +845,68 @@ mod sampler_tests {
 
     fn cyclic(index: &ProducerIndex, space: &SamplingSpace, genome: &Genome) -> bool {
         edges_have_cycle(&space.chosen_edges(index, genome))
+    }
+
+    #[test]
+    fn correlated_draws_cover_coherent_implementations_across_repeated_sites() {
+        let names: Vec<_> = (0..64).map(|i| format!("site{i}")).collect();
+        let candidates: &[CandidateRow<'_>] = &[("family_a", &[]), ("family_b", &[])];
+        let table: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), candidates))
+            .collect();
+        let (index, space) = build(&table);
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..32 {
+            let genome =
+                super::sample_genome_correlated(&index, &space, &mut StdRng::seed_from_u64(seed));
+            let families: std::collections::BTreeSet<_> = spelling(&index, &genome)
+                .into_iter()
+                .map(|s| s.split_once('=').unwrap().1.to_owned())
+                .collect();
+            assert_eq!(
+                families.len(),
+                1,
+                "a draw should explore a coherent implementation"
+            );
+            seen.extend(families);
+        }
+        assert_eq!(
+            seen,
+            ["family_a".to_string(), "family_b".to_string()].into()
+        );
+        let independent = sample_genome(&index, &space, &mut StdRng::seed_from_u64(0));
+        let families: std::collections::BTreeSet<_> = spelling(&index, &independent)
+            .into_iter()
+            .map(|s| s.split_once('=').unwrap().1.to_owned())
+            .collect();
+        assert_eq!(
+            families.len(),
+            2,
+            "independent draws still explore mixed implementations"
+        );
+    }
+
+    #[test]
+    fn correlated_draws_preserve_cycle_constraints() {
+        let (index, space) = build(&[
+            ("a", &[("leaf", &[]), ("copy", &["b"])]),
+            ("b", &[("leaf", &[]), ("copy", &["a"])]),
+            ("self", &[("leaf", &[]), ("copy", &["self"])]),
+        ]);
+        for seed in 0..200 {
+            let genome =
+                super::sample_genome_correlated(&index, &space, &mut StdRng::seed_from_u64(seed));
+            assert_eq!(genome.choices.len(), index.len());
+            assert!(!cyclic(&index, &space, &genome));
+        }
+        let (index, space) = build(&[("a", &[("copy", &["b"])]), ("b", &[("copy", &["a"])])]);
+        let genome = super::sample_genome_correlated(&index, &space, &mut StdRng::seed_from_u64(0));
+        assert_eq!(
+            genome.choices.len(),
+            2,
+            "an impossible component retains the normal refusal path"
+        );
     }
 
     /// (i) TWO CLASSES RE-DESCRIBING EACH OTHER — the cuBLASLt

@@ -12,7 +12,7 @@
 //! The three things worth pinning:
 //!
 //!  * UNCONSTRAINED, NOTHING MOVES. With no budget the rank-1 finalist of
-//!    every bucket validates trivially, the lattice reports zero
+//!    every bucket passes its device warmup, the lattice reports zero
 //!    rejections, and the installed plan is the search's own winner —
 //!    which is why every pre-Phase-5 suite sees the trajectory it had.
 //!  * A BUDGET NOTHING MEETS REFUSES BY NAME. The error carries the
@@ -26,8 +26,8 @@
 //! on the seeded genetic sample happening to contain such a runner-up
 //! and re-rolled with every change to the e-graph's enumeration order.
 //!
-//! Everything here is device-free: the plans are bufferized and
-//! arena-planned on the host, which is where `slab_bytes` comes from.
+//! Candidate search and finalist validation run on the CUDA device.
+//! Arena planning remains on the host, where `slab_bytes` is computed.
 
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
@@ -82,6 +82,10 @@ fn elementwise_fixture() -> (Graph, FxHashMap<luminal::prelude::NodeIndex, HostB
 /// plan is the searched `best_plan` rather than something re-derived
 /// into a different election.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn an_unconstrained_search_installs_the_searched_winner() {
     let (cx, data) = elementwise_fixture();
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
@@ -167,6 +171,10 @@ fn bucketed_options(budget: Option<usize>) -> CompileOptions {
 /// budget and the bytes that failed it — the runtime's choice (D10) is
 /// to refuse rather than install something over budget.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn a_budget_nothing_meets_refuses_and_names_it() {
     let cx = bucketed_fixture();
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
@@ -177,17 +185,15 @@ fn a_budget_nothing_meets_refuses_and_names_it() {
         .expect_err("a zero budget leaves no viable set");
     let text = format!("{err:#}");
     assert!(
-        text.contains("0-byte device budget"),
+        text.contains("0-byte arena budget"),
         "the refusal must name the budget: {text}"
     );
     assert!(
-        text.contains("no viable plan set"),
-        "the refusal must say the LATTICE failed, not the search: {text}"
+        text.contains("memory pruning removed required"),
+        "an impossible boundary must fail before sampling: {text}"
     );
-    assert!(
-        text.contains("ran out of finalists"),
-        "the refusal must say why no slower set was tried: {text}"
-    );
+    #[cfg(feature = "device")]
+    assert_eq!(rt.graph_stats().unwrap().launches, 0);
 }
 
 /// `keep_finalists: 1` reproduces the pre-Phase-5 world exactly: one
@@ -195,6 +201,10 @@ fn a_budget_nothing_meets_refuses_and_names_it() {
 /// it fails is fatal. The pin is that the OPTION is honoured — a search
 /// that keeps one finalist must not silently keep four.
 #[test]
+#[cfg_attr(
+    not(feature = "device"),
+    ignore = "candidate search requires a CUDA device"
+)]
 fn keep_finalists_bounds_the_ranked_list() {
     let (cx, data) = elementwise_fixture();
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");

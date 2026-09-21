@@ -4,6 +4,10 @@ use luminal::prelude::FxHashMap;
 use luminal_metal::{MetalRuntime, kernels};
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "candidate search requires a Metal device"
+)]
 fn search_produces_a_codegen_complete_plan() {
     let mut cx = luminal::graph::Graph::new();
     let a = cx.tensor((2usize, 3usize), DType::F32);
@@ -92,4 +96,24 @@ fn codegen_emits_wellformed_sources() {
     assert_eq!(launches[0].n.literal(), Some(6));
     assert!(launches[0].source.contains("kernel void k("));
     assert!(launches[0].source.contains("a[i] + b[i]"));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn search_refuses_without_a_device() {
+    let mut graph = luminal::graph::Graph::new();
+    let input = graph.tensor(3, DType::F32);
+    let _out = input + 1.;
+    let mut runtime = MetalRuntime::load(&graph).unwrap();
+    runtime
+        .saturated_egraph()
+        .expect("graph inspection needs no GPU");
+    let error = runtime
+        .search(&Default::default(), &Default::default())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("candidate search requires"),
+        "{error:#}"
+    );
+    assert!(runtime.plan().is_none());
 }

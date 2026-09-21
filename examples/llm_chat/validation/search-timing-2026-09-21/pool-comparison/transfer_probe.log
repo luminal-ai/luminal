@@ -1,0 +1,24 @@
+mode=legacy_host_alloc bytes=32658510964
+alloc_seconds=16.462893
+fill_seconds=1.155501
+trial=0 api_seconds=0.000020 wall_seconds=0.569135 event_ms=569.133 success=1
+trial=1 api_seconds=0.000009 wall_seconds=0.569125 event_ms=569.122 success=1
+trial=2 api_seconds=0.000009 wall_seconds=0.569109 event_ms=569.108 success=1
+first=90 last=90
+release_seconds=6.385264
+mode=host_pool_cpu_access bytes=32658510964
+alloc_seconds=3.564146
+fill_seconds=2.056157
+trial=0 api_seconds=1.500674 wall_seconds=1.500690 event_ms=1500.699 success=1
+trial=1 api_seconds=1.501306 wall_seconds=1.501322 event_ms=1501.332 success=1
+trial=2 api_seconds=1.500098 wall_seconds=1.500114 event_ms=1500.124 success=1
+first=90 last=90
+release_seconds=1.647372
+mode=host_pool_gpu_access bytes=32658510964
+alloc_seconds=3.915217
+fill_seconds=2.054369
+trial=0 api_seconds=0.000014 wall_seconds=0.569143 event_ms=569.128 success=1
+trial=1 api_seconds=0.000013 wall_seconds=0.569117 event_ms=569.114 success=1
+trial=2 api_seconds=0.000011 wall_seconds=0.569127 event_ms=569.126 success=1
+first=90 last=90
+release_seconds=1.739701
