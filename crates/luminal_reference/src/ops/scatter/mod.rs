@@ -301,7 +301,7 @@ pub(crate) fn kernel(
                 dest[*target] = src[i];
             }
         }
-        (TypedBuffer::F8E4M3(init), TypedBuffer::F8E4M3(src), TypedBuffer::F8E4M3(dest)) => {
+        (TypedBuffer::F8E4M3FN(init), TypedBuffer::F8E4M3FN(src), TypedBuffer::F8E4M3FN(dest)) => {
             dest.copy_from_slice(init);
             for (i, target) in target_of.iter().enumerate() {
                 dest[*target] = src[i];

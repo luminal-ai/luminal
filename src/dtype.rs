@@ -46,9 +46,14 @@ pub enum DType {
 
     /// 8-bit unsigned float (e8m0)
     F8UE8M0,
-    /// 8-bit float (e4m3)
-    F8E4M3,
-    /// 8-bit float (e5m2)
+    /// 8-bit float, OCP e4m3 "fn" encoding: bias 7, max 448, no inf, NaN at
+    /// 0x7F/0xFF (torch `float8_e4m3fn`, CUDA `__nv_fp8_e4m3`).
+    F8E4M3FN,
+    /// 8-bit float, e4m3 "fnuz" encoding: bias 8, max 240, no inf, no -0, the
+    /// single NaN at 0x80 (torch `float8_e4m3fnuz`). The same byte decodes
+    /// differently from F8E4M3FN, so it is its own dtype; no device type.
+    F8E4M3FNUZ,
+    /// 8-bit float, e5m2 (IEEE-like: has inf and NaN; torch `float8_e5m2`)
     F8E5M2,
 
     /// 6-bit float (e2m3)
@@ -81,7 +86,8 @@ impl Debug for DType {
             DType::U16 => "U16",
             DType::Bool => "Bool",
             DType::F8UE8M0 => "F8UE8M0",
-            DType::F8E4M3 => "F8E4M3",
+            DType::F8E4M3FN => "F8E4M3FN",
+            DType::F8E4M3FNUZ => "F8E4M3FNUZ",
             DType::F8E5M2 => "F8E5M2",
             DType::F6E2M3 => "F6E2M3",
             DType::F6E3M2 => "F6E3M2",
@@ -113,7 +119,8 @@ impl DType {
             | DType::I8
             | DType::U8
             | DType::F8UE8M0
-            | DType::F8E4M3
+            | DType::F8E4M3FN
+            | DType::F8E4M3FNUZ
             | DType::F8E5M2 => 8,
             DType::F6E2M3 | DType::F6E3M2 => 6,
             DType::F4E2M1 | DType::I4 | DType::U4 => 4,
@@ -147,7 +154,8 @@ pub enum PlanDtype {
     Bool,
     Bool8,
     F8UE8M0,
-    F8E4M3,
+    F8E4M3FN,
+    F8E4M3FNUZ,
     F8E5M2,
     F6E2M3,
     F6E3M2,
@@ -175,7 +183,8 @@ impl PlanDtype {
             "Bool" => Self::Bool,
             "Bool8" => Self::Bool8,
             "F8UE8M0" => Self::F8UE8M0,
-            "F8E4M3" => Self::F8E4M3,
+            "F8E4M3FN" => Self::F8E4M3FN,
+            "F8E4M3FNUZ" => Self::F8E4M3FNUZ,
             "F8E5M2" => Self::F8E5M2,
             "F6E2M3" => Self::F6E2M3,
             "F6E3M2" => Self::F6E3M2,
@@ -193,10 +202,54 @@ impl PlanDtype {
             Self::F32 | Self::Int => 32,
             Self::TF32 => 19,
             Self::F16 | Self::Bf16 | Self::I16 | Self::U16 => 16,
-            Self::Bool8 | Self::I8 | Self::U8 | Self::F8UE8M0 | Self::F8E4M3 | Self::F8E5M2 => 8,
+            Self::Bool8
+            | Self::I8
+            | Self::U8
+            | Self::F8UE8M0
+            | Self::F8E4M3FN
+            | Self::F8E4M3FNUZ
+            | Self::F8E5M2 => 8,
             Self::F6E2M3 | Self::F6E3M2 => 6,
             Self::F4E2M1 | Self::I4 | Self::U4 => 4,
             Self::Bool => 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every plan dtype spells itself the way the egglog `Dtype` sort does,
+    /// and reads back; the fp8 encodings are separate names with one width.
+    #[test]
+    fn plan_dtypes_round_trip_their_egglog_names() {
+        for dtype in [
+            PlanDtype::F8E4M3FN,
+            PlanDtype::F8E4M3FNUZ,
+            PlanDtype::F8E5M2,
+            PlanDtype::F8UE8M0,
+            PlanDtype::Bool8,
+            PlanDtype::Int64,
+        ] {
+            let name = format!("{dtype:?}");
+            assert_eq!(PlanDtype::from_egglog_name(&name), Some(dtype), "{name}");
+        }
+        assert_eq!(PlanDtype::F8E4M3FN.egglog_bits(), 8);
+        assert_eq!(PlanDtype::F8E4M3FNUZ.egglog_bits(), 8);
+        assert_ne!(PlanDtype::F8E4M3FN, PlanDtype::F8E4M3FNUZ);
+        assert_eq!(
+            PlanDtype::from_egglog_name("F8E4M3"),
+            None,
+            "the unqualified name is retired"
+        );
+    }
+
+    #[test]
+    fn authoring_dtypes_name_their_encoding() {
+        assert_eq!(format!("{:?}", DType::F8E4M3FN), "F8E4M3FN");
+        assert_eq!(format!("{:?}", DType::F8E4M3FNUZ), "F8E4M3FNUZ");
+        assert_eq!(DType::F8E4M3FN.bits(), 8);
+        assert_eq!(DType::F8E4M3FNUZ.bits(), 8);
     }
 }

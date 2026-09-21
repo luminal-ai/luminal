@@ -129,7 +129,7 @@ pub fn fp8_linear(
     weight_scale: GraphTensor,
 ) -> GraphTensor {
     assert_eq!(weight.rank(), 2, "FP8 linear weight must be rank two");
-    assert_eq!(weight.dtype, DType::F8E4M3, "FP8 linear weight dtype");
+    assert_eq!(weight.dtype, DType::F8E4M3FN, "FP8 linear weight dtype");
     assert!(input_scale.dims().is_empty(), "input scale must be scalar");
     assert!(
         weight_scale.dims().is_empty(),
@@ -144,7 +144,7 @@ pub fn fp8_linear(
         "FP8 linear input width does not match weight"
     );
     let in_scale = input_scale.expand_lhs(&dims[..]).reciprocal();
-    let quantized = (input * in_scale).cast(DType::F8E4M3);
+    let quantized = (input * in_scale).cast(DType::F8E4M3FN);
     let wide = quantized.cast(DType::F32);
     let weight_wide = weight.cast(DType::F32).permute((1, 0));
     let raw = wide.matmul(weight_wide);
@@ -170,7 +170,7 @@ mod fp8_tests {
         const OUT: usize = 2;
         let mut cx = Graph::new();
         let x = cx.tensor((1, IN), DType::F32);
-        let weight = cx.tensor((OUT, IN), DType::F8E4M3);
+        let weight = cx.tensor((OUT, IN), DType::F8E4M3FN);
         let input_scale_tensor = cx.tensor((), DType::F32);
         let weight_scale_tensor = cx.tensor((), DType::F32);
         let out = fp8_linear(x, weight, input_scale_tensor, weight_scale_tensor);

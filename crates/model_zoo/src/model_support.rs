@@ -206,7 +206,7 @@ pub struct Fp8Linear {
 impl Fp8Linear {
     pub fn new(inp: usize, out: usize, ns: &Namespace, cx: &mut Graph) -> Self {
         Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (out, inp), DType::F8E4M3),
+            weight: cx.named_tensor(ns.leaf("weight"), (out, inp), DType::F8E4M3FN),
             input_scale: cx.named_tensor(ns.leaf("input_scale"), (), DType::F32),
             weight_scale: cx.named_tensor(ns.leaf("weight_scale"), (), DType::F32),
             out,

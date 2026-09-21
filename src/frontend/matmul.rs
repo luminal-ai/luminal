@@ -180,8 +180,8 @@ mod tests {
         // 2026-08-27 ruling: the F32-accumulator contract is the user's
         // explicit cast spelling — matmul itself never casts.
         let mut cx = Graph::new();
-        let lhs = cx.tensor((2, 4), DType::F8E4M3);
-        let rhs = cx.tensor((4, 3), DType::F8E4M3);
+        let lhs = cx.tensor((2, 4), DType::F8E4M3FN);
+        let rhs = cx.tensor((4, 3), DType::F8E4M3FN);
 
         let out = lhs.cast(DType::F32).matmul(rhs.cast(DType::F32));
 
@@ -199,12 +199,12 @@ mod tests {
         // 2026-08-27 ruling: fp8 x fp8 is NOT special — matmul is
         // broadcast+reduce in the shared dtype, no casts, no poison.
         let mut cx = Graph::new();
-        let lhs = cx.tensor((2, 4), DType::F8E4M3);
-        let rhs = cx.tensor((4, 3), DType::F8E4M3);
+        let lhs = cx.tensor((2, 4), DType::F8E4M3FN);
+        let rhs = cx.tensor((4, 3), DType::F8E4M3FN);
 
         let out = lhs.matmul(rhs);
 
-        assert_eq!(out.dtype, DType::F8E4M3);
+        assert_eq!(out.dtype, DType::F8E4M3FN);
         let model = cx.logical.render_all().expect("recorded model");
         assert_eq!(
             model.matches("(LogicalCast").count(),

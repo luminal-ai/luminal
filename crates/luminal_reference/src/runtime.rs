@@ -603,11 +603,11 @@ impl ReferenceRuntime {
                     TypedBuffer::I16(values.clone())
                 }
                 (PlanDtype::I16, None) => TypedBuffer::I16(vec![0; numel]),
-                (PlanDtype::F8E4M3, Some(TypedBuffer::F8E4M3(codes))) => {
-                    TypedBuffer::F8E4M3(codes.clone())
+                (PlanDtype::F8E4M3FN, Some(TypedBuffer::F8E4M3FN(codes))) => {
+                    TypedBuffer::F8E4M3FN(codes.clone())
                 }
-                (PlanDtype::F8E4M3, None) => {
-                    TypedBuffer::F8E4M3(vec![float8::F8E4M3::from_bits(0); numel])
+                (PlanDtype::F8E4M3FN, None) => {
+                    TypedBuffer::F8E4M3FN(vec![float8::F8E4M3::from_bits(0); numel])
                 }
                 // 1-bit logical Bool and byte-code Bool8 both live as
                 // Bool8 codes in reference storage; staged codes were

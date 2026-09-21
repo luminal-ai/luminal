@@ -59,7 +59,8 @@ pub enum TypedBuffer {
     /// 0x7F/0xFF NaN) — quantization is MODEL DEFINITION (ruling
     /// 2026-08-12), so checkpoint fp8 weights stage and store in their
     /// own dtype; arithmetic happens after an explicit widening cast.
-    F8E4M3(Vec<float8::F8E4M3>),
+    /// OCP e4m3fn codes (the `float8` crate's `F8E4M3` is that encoding).
+    F8E4M3FN(Vec<float8::F8E4M3>),
 }
 
 /// The narrow-integer family (I8/U8/I16) is ONE implementation at three
@@ -119,7 +120,7 @@ impl TypedBuffer {
             TypedBuffer::U8(values) => values.len(),
             TypedBuffer::I16(values) => values.len(),
             TypedBuffer::Bool8(bits) => bits.len(),
-            TypedBuffer::F8E4M3(codes) => codes.len(),
+            TypedBuffer::F8E4M3FN(codes) => codes.len(),
         }
     }
 
@@ -137,7 +138,7 @@ impl TypedBuffer {
             TypedBuffer::U8(_) => "u8",
             TypedBuffer::I16(_) => "i16",
             TypedBuffer::Bool8(_) => "bool8",
-            TypedBuffer::F8E4M3(_) => "f8e4m3",
+            TypedBuffer::F8E4M3FN(_) => "f8e4m3fn",
         }
     }
 
@@ -203,14 +204,14 @@ impl TypedBuffer {
 
     pub fn as_f8e4m3(&self) -> Result<&Vec<float8::F8E4M3>> {
         match self {
-            TypedBuffer::F8E4M3(codes) => Ok(codes),
+            TypedBuffer::F8E4M3FN(codes) => Ok(codes),
             other => anyhow::bail!("expected an f8e4m3 buffer, found {}", other.type_name()),
         }
     }
 
     pub fn as_f8e4m3_mut(&mut self) -> Result<&mut Vec<float8::F8E4M3>> {
         match self {
-            TypedBuffer::F8E4M3(codes) => Ok(codes),
+            TypedBuffer::F8E4M3FN(codes) => Ok(codes),
             other => anyhow::bail!("expected an f8e4m3 buffer, found {}", other.type_name()),
         }
     }
@@ -241,8 +242,8 @@ impl TypedBuffer {
             TypedBuffer::U8(values) => TypedBuffer::U8(vec![0; values.len()]),
             TypedBuffer::I16(values) => TypedBuffer::I16(vec![0; values.len()]),
             TypedBuffer::Bool8(bits) => TypedBuffer::Bool8(vec![0u8; bits.len()]),
-            TypedBuffer::F8E4M3(codes) => {
-                TypedBuffer::F8E4M3(vec![float8::F8E4M3::from_bits(0); codes.len()])
+            TypedBuffer::F8E4M3FN(codes) => {
+                TypedBuffer::F8E4M3FN(vec![float8::F8E4M3::from_bits(0); codes.len()])
             }
         }
     }
@@ -292,7 +293,7 @@ impl From<Vec<i16>> for TypedBuffer {
 // `TypedBuffer::U8(values)`.
 impl From<Vec<float8::F8E4M3>> for TypedBuffer {
     fn from(codes: Vec<float8::F8E4M3>) -> Self {
-        TypedBuffer::F8E4M3(codes)
+        TypedBuffer::F8E4M3FN(codes)
     }
 }
 
