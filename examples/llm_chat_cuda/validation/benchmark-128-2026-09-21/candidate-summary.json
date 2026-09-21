@@ -1,0 +1,162 @@
+{
+  "models": [
+    {
+      "key": "qwen3-0.6b",
+      "model": "Qwen3-0.6B",
+      "groups": {
+        "rope_rotation": {
+          "total": 56,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "attention_scores": {
+          "total": 28,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "attention_values": {
+          "total": 28,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "dense_projection": {
+          "total": 59,
+          "with_cublas_route": 59,
+          "route_lengths": {
+            "2": 59
+          }
+        }
+      },
+      "operator_count_differences_from_original": {}
+    },
+    {
+      "key": "qwen3-4b",
+      "model": "Qwen3-4B",
+      "groups": {
+        "rope_rotation": {
+          "total": 72,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "dense_projection": {
+          "total": 82,
+          "with_cublas_route": 82,
+          "route_lengths": {
+            "2": 82
+          }
+        },
+        "attention_scores": {
+          "total": 36,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "attention_values": {
+          "total": 36,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        }
+      },
+      "operator_count_differences_from_original": {}
+    },
+    {
+      "key": "llama3-8b",
+      "model": "Llama3-8B-Instruct",
+      "groups": {
+        "dense_projection": {
+          "total": 75,
+          "with_cublas_route": 75,
+          "route_lengths": {
+            "2": 75
+          }
+        },
+        "rope_rotation": {
+          "total": 64,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "attention_scores": {
+          "total": 32,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "attention_values": {
+          "total": 32,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        }
+      },
+      "operator_count_differences_from_original": {}
+    },
+    {
+      "key": "gemma3-4b",
+      "model": "Gemma3-4B-IT",
+      "groups": {
+        "rope_rotation": {
+          "total": 68,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "dense_projection": {
+          "total": 102,
+          "with_cublas_route": 102,
+          "route_lengths": {
+            "2": 102
+          }
+        },
+        "attention_scores": {
+          "total": 34,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        },
+        "attention_values": {
+          "total": 34,
+          "with_cublas_route": 0,
+          "route_lengths": {}
+        }
+      },
+      "operator_count_differences_from_original": {
+        "CopyGeneric": {
+          "original": 378,
+          "audit": 381
+        },
+        "IndexMapApplyMaterialize": {
+          "original": 543,
+          "audit": 540
+        }
+      }
+    }
+  ],
+  "larger_search_experiment": {
+    "model": "Llama3-8B-Instruct",
+    "baseline_search": [
+      2,
+      4
+    ],
+    "larger_search": [
+      12,
+      16
+    ],
+    "baseline": {
+      "cublas_ops": 218,
+      "generic_matmul_counts": {
+        "dense_projection": 75,
+        "rope_rotation": 64,
+        "attention_scores": 32,
+        "attention_values": 32
+      },
+      "vocabulary_projection": "generic"
+    },
+    "larger": {
+      "cublas_ops": 229,
+      "generic_matmul_counts": {
+        "dense_projection": 59,
+        "rope_rotation": 64,
+        "attention_scores": 32,
+        "attention_values": 32
+      },
+      "vocabulary_projection": "cuBLASLt"
+    },
+    "gpu_timed": false,
+    "note": "Both searches use the existing static heuristic and seed zero. This proves a selection change; latency was not measured for the new plan."
+  }
+}

@@ -91,6 +91,9 @@ Query length and context length are bounded dynamic dimensions; decode uses
 query length one. `--prefill-chunk` controls the maximum query length.
 Compilation happens once per session. Subsequent steps update data/dimensions.
 
+Compiler search ranks candidates by measured CUDA execution time by default.
+Use `--profile=false` to opt into the static heuristic instead.
+
 Transient storage uses bufferization lifetimes. CUDA submits kernels,
 state copies, and weight uploads through CUDA graphs, and bucket graphs
 share the resident ranges. Explicit weight/state changes trigger new
@@ -115,7 +118,7 @@ Useful options:
 --enable-thinking       pass enable_thinking=true to the chat template
 --search-generations 2  compiler search budget
 --search-population 4   candidates per generation
---profile               rank candidates on the selected device
+--profile[=true|false]   rank candidates on the selected device (default: true)
 ```
 
 ## Validation

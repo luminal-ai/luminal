@@ -1,0 +1,6 @@
+Loading 444 tensors (15521052672 FP32 bytes)
+Compiling Gemma3, chunk=8, context=256
+run=0 warm=false input=128 output=128 TTFT=6328.158ms TPOT=167.120ms total=27552.462ms first_eos=None
+run=1 warm=true input=128 output=128 TTFT=4095.120ms TPOT=167.170ms total=25325.720ms first_eos=None
+run=2 warm=true input=128 output=128 TTFT=4095.087ms TPOT=167.191ms total=25328.386ms first_eos=None
+run=3 warm=true input=128 output=128 TTFT=4093.776ms TPOT=167.185ms total=25326.217ms first_eos=None

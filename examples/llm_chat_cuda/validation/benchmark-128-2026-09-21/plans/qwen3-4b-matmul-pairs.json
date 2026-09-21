@@ -1,0 +1,3468 @@
+{
+  "counts": {
+    "rope_rotation": 72,
+    "dense_projection": 82,
+    "attention_scores": 36,
+    "attention_values": 36
+  },
+  "generic_matmul_pairs": {
+    "rope_rotation": [
+      {
+        "reduce_id": 4228,
+        "multiply_id": 4227,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 4267,
+        "multiply_id": 4266,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 4434,
+        "multiply_id": 4432,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 4471,
+        "multiply_id": 4469,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 4626,
+        "multiply_id": 4624,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 4668,
+        "multiply_id": 4666,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 4815,
+        "multiply_id": 4813,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 4861,
+        "multiply_id": 4860,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5017,
+        "multiply_id": 5015,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5059,
+        "multiply_id": 5057,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5203,
+        "multiply_id": 5202,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5249,
+        "multiply_id": 5248,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5409,
+        "multiply_id": 5408,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5446,
+        "multiply_id": 5444,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5596,
+        "multiply_id": 5594,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5651,
+        "multiply_id": 5650,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5816,
+        "multiply_id": 5814,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 5865,
+        "multiply_id": 5863,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6034,
+        "multiply_id": 6033,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6077,
+        "multiply_id": 6075,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6224,
+        "multiply_id": 6223,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6275,
+        "multiply_id": 6273,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6422,
+        "multiply_id": 6421,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6472,
+        "multiply_id": 6470,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6629,
+        "multiply_id": 6627,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6679,
+        "multiply_id": 6678,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6833,
+        "multiply_id": 6831,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 6884,
+        "multiply_id": 6882,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7066,
+        "multiply_id": 7064,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7102,
+        "multiply_id": 7100,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7276,
+        "multiply_id": 7274,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7315,
+        "multiply_id": 7313,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7461,
+        "multiply_id": 7460,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7511,
+        "multiply_id": 7509,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7668,
+        "multiply_id": 7666,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7721,
+        "multiply_id": 7719,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7876,
+        "multiply_id": 7874,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 7920,
+        "multiply_id": 7918,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8072,
+        "multiply_id": 8070,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8115,
+        "multiply_id": 8114,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8276,
+        "multiply_id": 8274,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8334,
+        "multiply_id": 8332,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8493,
+        "multiply_id": 8491,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8536,
+        "multiply_id": 8535,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8694,
+        "multiply_id": 8692,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8733,
+        "multiply_id": 8732,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8886,
+        "multiply_id": 8884,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 8925,
+        "multiply_id": 8923,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9081,
+        "multiply_id": 9079,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9127,
+        "multiply_id": 9125,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9286,
+        "multiply_id": 9284,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9333,
+        "multiply_id": 9332,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9490,
+        "multiply_id": 9488,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9534,
+        "multiply_id": 9532,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9687,
+        "multiply_id": 9685,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9737,
+        "multiply_id": 9735,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9887,
+        "multiply_id": 9885,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 9937,
+        "multiply_id": 9935,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10094,
+        "multiply_id": 10092,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10143,
+        "multiply_id": 10141,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10303,
+        "multiply_id": 10302,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10353,
+        "multiply_id": 10351,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10507,
+        "multiply_id": 10506,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10558,
+        "multiply_id": 10556,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10720,
+        "multiply_id": 10718,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10766,
+        "multiply_id": 10764,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10944,
+        "multiply_id": 10941,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 10980,
+        "multiply_id": 10978,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 11131,
+        "multiply_id": 11129,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 11184,
+        "multiply_id": 11182,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      },
+      {
+        "reduce_id": 11338,
+        "multiply_id": 11336,
+        "product_shape": [
+          "q",
+          32,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          32,
+          128
+        ]
+      },
+      {
+        "reduce_id": 11389,
+        "multiply_id": 11386,
+        "product_shape": [
+          "q",
+          8,
+          128,
+          128
+        ],
+        "output_shape": [
+          "q",
+          8,
+          128
+        ]
+      }
+    ],
+    "dense_projection": [
+      {
+        "reduce_id": 4242,
+        "multiply_id": 4240,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 4388,
+        "multiply_id": 4385,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 4555,
+        "multiply_id": 4552,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 4645,
+        "multiply_id": 4642,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 4828,
+        "multiply_id": 4826,
+        "product_shape": [
+          1024,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          1024,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 4934,
+        "multiply_id": 4932,
+        "product_shape": [
+          9728,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          9728,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 4965,
+        "multiply_id": 4962,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 5034,
+        "multiply_id": 5031,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 5155,
+        "multiply_id": 5152,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 5216,
+        "multiply_id": 5214,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 5326,
+        "multiply_id": 5323,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 5346,
+        "multiply_id": 5344,
+        "product_shape": [
+          9728,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          9728,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 5540,
+        "multiply_id": 5537,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 5548,
+        "multiply_id": 5545,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 5620,
+        "multiply_id": 5617,
+        "product_shape": [
+          1024,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          1024,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 5704,
+        "multiply_id": 5701,
+        "product_shape": [
+          "q",
+          2560,
+          4096
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 5731,
+        "multiply_id": 5728,
+        "product_shape": [
+          9728,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          9728,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 5751,
+        "multiply_id": 5749,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 5757,
+        "multiply_id": 5756,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 5975,
+        "multiply_id": 5972,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 6001,
+        "multiply_id": 5999,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 6012,
+        "multiply_id": 6011,
+        "product_shape": [
+          "q",
+          4096,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          4096
+        ]
+      },
+      {
+        "reduce_id": 6197,
+        "multiply_id": 6196,
+        "product_shape": [
+          "q",
+          4096,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          4096
+        ]
+      },
+      {
+        "reduce_id": 6439,
+        "multiply_id": 6437,
+        "product_shape": [
+          1024,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          1024,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 6547,
+        "multiply_id": 6546,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 6569,
+        "multiply_id": 6566,
+        "product_shape": [
+          9728,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          9728,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 6640,
+        "multiply_id": 6638,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 6650,
+        "multiply_id": 6649,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 6765,
+        "multiply_id": 6762,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 6804,
+        "multiply_id": 6801,
+        "product_shape": [
+          "q",
+          4096,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          4096
+        ]
+      },
+      {
+        "reduce_id": 6850,
+        "multiply_id": 6848,
+        "product_shape": [
+          1024,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          1024,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 6939,
+        "multiply_id": 6937,
+        "product_shape": [
+          "q",
+          2560,
+          4096
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 6972,
+        "multiply_id": 6969,
+        "product_shape": [
+          9728,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          9728,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 7031,
+        "multiply_id": 7029,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 7039,
+        "multiply_id": 7036,
+        "product_shape": [
+          "q",
+          4096,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          4096
+        ]
+      },
+      {
+        "reduce_id": 7161,
+        "multiply_id": 7158,
+        "product_shape": [
+          "q",
+          2560,
+          4096
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 7192,
+        "multiply_id": 7189,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 7364,
+        "multiply_id": 7361,
+        "product_shape": [
+          "q",
+          2560,
+          4096
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 7487,
+        "multiply_id": 7484,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 7564,
+        "multiply_id": 7561,
+        "product_shape": [
+          "q",
+          2560,
+          4096
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 7588,
+        "multiply_id": 7586,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 7824,
+        "multiply_id": 7821,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 7888,
+        "multiply_id": 7886,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 8003,
+        "multiply_id": 8000,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 8026,
+        "multiply_id": 8024,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 8218,
+        "multiply_id": 8216,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 8247,
+        "multiply_id": 8245,
+        "product_shape": [
+          "q",
+          4096,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          4096
+        ]
+      },
+      {
+        "reduce_id": 8295,
+        "multiply_id": 8292,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 8414,
+        "multiply_id": 8412,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 8417,
+        "multiply_id": 8416,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 8632,
+        "multiply_id": 8630,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 8707,
+        "multiply_id": 8706,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 8829,
+        "multiply_id": 8827,
+        "product_shape": [
+          2560,
+          "q",
+          9728
+        ],
+        "output_shape": [
+          2560,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 8861,
+        "multiply_id": 8859,
+        "product_shape": [
+          "q",
+          4096,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          4096
+        ]
+      },
+      {
+        "reduce_id": 9092,
+        "multiply_id": 9089,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 9203,
+        "multiply_id": 9202,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 9207,
+        "multiply_id": 9205,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 9227,
+        "multiply_id": 9225,
+        "product_shape": [
+          2560,
+          "q",
+          9728
+        ],
+        "output_shape": [
+          2560,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 9262,
+        "multiply_id": 9259,
+        "product_shape": [
+          "q",
+          4096,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          4096
+        ]
+      },
+      {
+        "reduce_id": 9306,
+        "multiply_id": 9304,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 9587,
+        "multiply_id": 9584,
+        "product_shape": [
+          "q",
+          2560,
+          4096
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 9829,
+        "multiply_id": 9827,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 9899,
+        "multiply_id": 9898,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 9907,
+        "multiply_id": 9904,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 9987,
+        "multiply_id": 9984,
+        "product_shape": [
+          "q",
+          2560,
+          4096
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 10012,
+        "multiply_id": 10010,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 10028,
+        "multiply_id": 10026,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 10251,
+        "multiply_id": 10248,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 10278,
+        "multiply_id": 10276,
+        "product_shape": [
+          4096,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          4096,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 10432,
+        "multiply_id": 10430,
+        "product_shape": [
+          9728,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          9728,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 10534,
+        "multiply_id": 10531,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 10626,
+        "multiply_id": 10623,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 10632,
+        "multiply_id": 10629,
+        "product_shape": [
+          9728,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          9728,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 10663,
+        "multiply_id": 10661,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 10734,
+        "multiply_id": 10732,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 10821,
+        "multiply_id": 10818,
+        "product_shape": [
+          2560,
+          "q",
+          4096
+        ],
+        "output_shape": [
+          2560,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 10851,
+        "multiply_id": 10849,
+        "product_shape": [
+          "q",
+          9728,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          9728
+        ]
+      },
+      {
+        "reduce_id": 10878,
+        "multiply_id": 10875,
+        "product_shape": [
+          "q",
+          2560,
+          9728
+        ],
+        "output_shape": [
+          "q",
+          2560
+        ]
+      },
+      {
+        "reduce_id": 10955,
+        "multiply_id": 10953,
+        "product_shape": [
+          1024,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          1024,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 11078,
+        "multiply_id": 11076,
+        "product_shape": [
+          2560,
+          "q",
+          9728
+        ],
+        "output_shape": [
+          2560,
+          "q"
+        ]
+      },
+      {
+        "reduce_id": 11359,
+        "multiply_id": 11356,
+        "product_shape": [
+          "q",
+          1024,
+          2560
+        ],
+        "output_shape": [
+          "q",
+          1024
+        ]
+      },
+      {
+        "reduce_id": 11475,
+        "multiply_id": 11474,
+        "product_shape": [
+          9728,
+          "q",
+          2560
+        ],
+        "output_shape": [
+          9728,
+          "q"
+        ]
+      }
+    ],
+    "attention_scores": [
+      {
+        "reduce_id": 4293,
+        "multiply_id": 4290,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 4488,
+        "multiply_id": 4485,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 4683,
+        "multiply_id": 4680,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 4878,
+        "multiply_id": 4875,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 5074,
+        "multiply_id": 5071,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 5266,
+        "multiply_id": 5263,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 5467,
+        "multiply_id": 5464,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 5668,
+        "multiply_id": 5665,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 5882,
+        "multiply_id": 5879,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 6092,
+        "multiply_id": 6089,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 6288,
+        "multiply_id": 6285,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 6487,
+        "multiply_id": 6484,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 6696,
+        "multiply_id": 6693,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 6899,
+        "multiply_id": 6896,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 7121,
+        "multiply_id": 7118,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 7330,
+        "multiply_id": 7327,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 7528,
+        "multiply_id": 7525,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 7736,
+        "multiply_id": 7733,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 7937,
+        "multiply_id": 7934,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 8132,
+        "multiply_id": 8129,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 8353,
+        "multiply_id": 8350,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 8555,
+        "multiply_id": 8552,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 8748,
+        "multiply_id": 8745,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 8944,
+        "multiply_id": 8941,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 9144,
+        "multiply_id": 9141,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 9352,
+        "multiply_id": 9349,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 9549,
+        "multiply_id": 9546,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 9752,
+        "multiply_id": 9749,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 9950,
+        "multiply_id": 9947,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 10162,
+        "multiply_id": 10159,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 10370,
+        "multiply_id": 10367,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 10573,
+        "multiply_id": 10570,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 10781,
+        "multiply_id": 10778,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 10993,
+        "multiply_id": 10990,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 11199,
+        "multiply_id": 11196,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      },
+      {
+        "reduce_id": 11409,
+        "multiply_id": 11406,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          "c",
+          128
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          "c"
+        ]
+      }
+    ],
+    "attention_values": [
+      {
+        "reduce_id": 4318,
+        "multiply_id": 4315,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 4515,
+        "multiply_id": 4512,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 4712,
+        "multiply_id": 4709,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 4905,
+        "multiply_id": 4902,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 5105,
+        "multiply_id": 5102,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 5293,
+        "multiply_id": 5290,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 5492,
+        "multiply_id": 5489,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 5697,
+        "multiply_id": 5694,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 5913,
+        "multiply_id": 5910,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 6117,
+        "multiply_id": 6114,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 6315,
+        "multiply_id": 6312,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 6514,
+        "multiply_id": 6511,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 6721,
+        "multiply_id": 6718,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 6930,
+        "multiply_id": 6927,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 7150,
+        "multiply_id": 7147,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 7357,
+        "multiply_id": 7354,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 7555,
+        "multiply_id": 7552,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 7763,
+        "multiply_id": 7760,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 7964,
+        "multiply_id": 7961,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 8163,
+        "multiply_id": 8160,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 8384,
+        "multiply_id": 8381,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 8584,
+        "multiply_id": 8581,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 8775,
+        "multiply_id": 8772,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 8971,
+        "multiply_id": 8968,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 9169,
+        "multiply_id": 9166,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 9383,
+        "multiply_id": 9380,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 9576,
+        "multiply_id": 9573,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 9777,
+        "multiply_id": 9774,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 9975,
+        "multiply_id": 9972,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 10191,
+        "multiply_id": 10188,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 10397,
+        "multiply_id": 10394,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 10598,
+        "multiply_id": 10595,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 10810,
+        "multiply_id": 10807,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 11020,
+        "multiply_id": 11017,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 11227,
+        "multiply_id": 11224,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      },
+      {
+        "reduce_id": 11442,
+        "multiply_id": 11439,
+        "product_shape": [
+          8,
+          4,
+          "q",
+          128,
+          "c"
+        ],
+        "output_shape": [
+          8,
+          4,
+          "q",
+          128
+        ]
+      }
+    ]
+  },
+  "cublas_calls": 254,
+  "cublas_geometry_groups": [
+    {
+      "operands": [
+        "ShapeTerm([Var(\"q\"), Lit(2560)])",
+        "ShapeTerm([Lit(2560), Lit(4096)])"
+      ],
+      "count": 34
+    },
+    {
+      "operands": [
+        "ShapeTerm([Lit(1024), Lit(2560)])",
+        "ShapeTerm([Lit(2560), Var(\"q\")])"
+      ],
+      "count": 9
+    },
+    {
+      "operands": [
+        "ShapeTerm([Var(\"q\"), Lit(2560)])",
+        "ShapeTerm([Lit(2560), Lit(1024)])"
+      ],
+      "count": 50
+    },
+    {
+      "operands": [
+        "ShapeTerm([Lit(2560), Lit(4096)])",
+        "ShapeTerm([Lit(4096), Var(\"q\")])"
+      ],
+      "count": 33
+    },
+    {
+      "operands": [
+        "ShapeTerm([Var(\"q\"), Lit(4096)])",
+        "ShapeTerm([Lit(4096), Lit(2560)])"
+      ],
+      "count": 20
+    },
+    {
+      "operands": [
+        "ShapeTerm([Lit(9728), Lit(2560)])",
+        "ShapeTerm([Lit(2560), Var(\"q\")])"
+      ],
+      "count": 18
+    },
+    {
+      "operands": [
+        "ShapeTerm([Var(\"q\"), Lit(2560)])",
+        "ShapeTerm([Lit(2560), Lit(9728)])"
+      ],
+      "count": 38
+    },
+    {
+      "operands": [
+        "ShapeTerm([Lit(2560), Lit(9728)])",
+        "ShapeTerm([Lit(9728), Var(\"q\")])"
+      ],
+      "count": 33
+    },
+    {
+      "operands": [
+        "ShapeTerm([Var(\"q\"), Lit(9728)])",
+        "ShapeTerm([Lit(9728), Lit(2560)])"
+      ],
+      "count": 14
+    },
+    {
+      "operands": [
+        "ShapeTerm([Lit(4096), Lit(2560)])",
+        "ShapeTerm([Lit(2560), Var(\"q\")])"
+      ],
+      "count": 4
+    },
+    {
+      "operands": [
+        "ShapeTerm([Var(\"q\"), Lit(2560)])",
+        "ShapeTerm([Lit(2560), Lit(151936)])"
+      ],
+      "count": 1
+    }
+  ]
+}

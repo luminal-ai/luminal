@@ -419,7 +419,7 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
             trials: 1,
             seed,
             search_log: false,
-            ..Default::default()
+            ..luminal_cuda_lite::harness_search_options()
         };
         let (cx, x, w, b, out) = build();
         let mut rt = CudaRuntime::load(&cx).expect("load fused");
@@ -506,7 +506,7 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
         trials: 1,
         seed: 0,
         search_log: false,
-        ..Default::default()
+        ..luminal_cuda_lite::harness_search_options()
     };
 
     // Marker-elected route.

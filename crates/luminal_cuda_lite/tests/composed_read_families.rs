@@ -41,7 +41,7 @@ fn view_search_options(seed: u64) -> CompileOptions {
         trials: 1,
         seed,
         search_log: false,
-        ..Default::default()
+        ..luminal_cuda_lite::harness_search_options()
     }
 }
 

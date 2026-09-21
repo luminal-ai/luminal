@@ -1,0 +1,6 @@
+Loading 310 tensors (2384199680 FP32 bytes)
+Compiling Qwen3, chunk=8, context=256
+run=0 warm=false input=128 output=128 TTFT=1154.288ms TPOT=41.726ms total=6453.502ms first_eos=None
+run=1 warm=true input=128 output=128 TTFT=842.303ms TPOT=41.844ms total=6156.545ms first_eos=None
+run=2 warm=true input=128 output=128 TTFT=844.373ms TPOT=41.841ms total=6158.230ms first_eos=None
+run=3 warm=true input=128 output=128 TTFT=842.970ms TPOT=41.841ms total=6156.725ms first_eos=None

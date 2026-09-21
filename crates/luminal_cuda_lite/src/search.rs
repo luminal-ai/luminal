@@ -22,10 +22,10 @@
 //!
 //! TWO EVALUATORS (Phase 4, 2026-09-03):
 //!
-//! * [`Evaluator::Heuristic`] — the DEVICE-FREE default
+//! * [`Evaluator::Heuristic`] — the explicit DEVICE-FREE alternative
 //!   ([`crate::heuristic`]): a weak static prior, never a measurement.
 //!   It is what runs on the hosts most of this crate's suite runs on.
-//! * [`Evaluator::Device`] — ON-DEVICE PROFILING ([`crate::profile`]),
+//! * [`Evaluator::Device`] — the default, ON-DEVICE PROFILING ([`crate::profile`]),
 //!   selected by `CompileOptions::profile_on_device`: each candidate
 //!   plan is compiled, warmed and TIMED on a real CUDA device, mirroring
 //!   the reference runtime's evaluator (ruling 4 on #386: *"we need to
@@ -80,9 +80,8 @@ pub struct CompileOptions {
     /// or `LUMINAL_LOG=1`.
     pub search_log: bool,
     /// RANK CANDIDATES BY MEASURED DEVICE TIME (Phase 4, 2026-09-03)
-    /// instead of by the device-free heuristic. OFF by default, so every
-    /// trajectory that existed before this option is byte-for-byte the
-    /// one it was.
+    /// instead of by the device-free heuristic. ON by default. Set false
+    /// explicitly for device-free planning or heuristic diagnostics.
     ///
     /// ON requires the `device` feature, a CUDA device, and the caller's
     /// input payloads (the ladder's `search` stages them); without the
@@ -136,7 +135,7 @@ impl Default for CompileOptions {
             trials: 3,
             seed: 0,
             search_log: true,
-            profile_on_device: false,
+            profile_on_device: true,
             candidate_timeout: None,
             keep_finalists: 4,
             device_budget_bytes: None,
@@ -1197,10 +1196,9 @@ pub fn harness_search_options() -> CompileOptions {
         trials: 1,
         seed: 0,
         search_log: false,
-        // UNCHANGED BY PHASE 4: the harness budget is device-free, so
-        // every suite that uses it keeps the trajectory it had. Callers
-        // that want measurement flip the flag on a copy (the examples'
-        // `run_cuda` does, and `tests/device_profile.rs`).
+        // This harness deliberately supports planning without a GPU or
+        // input payloads. Device examples opt in to measured selection.
+        profile_on_device: false,
         ..CompileOptions::default()
     }
 }

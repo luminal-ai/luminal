@@ -1,0 +1,54 @@
+[
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "-p",
+      "luminal",
+      "-p",
+      "luminal_reference",
+      "-p",
+      "luminal_cuda_lite",
+      "-p",
+      "test_runtime",
+      "-p",
+      "luminal_nn",
+      "-p",
+      "llm_chat_cuda"
+    ],
+    "exit_code": 101,
+    "wall_seconds": 55.22746406000806,
+    "log": "verification-0.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "-p",
+      "luminal_cuda_lite",
+      "-p",
+      "llm_chat_cuda",
+      "--features",
+      "llm_chat_cuda/device",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "wall_seconds": 76.99635205999948,
+    "log": "verification-1.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "wall_seconds": 1.3929165009758435,
+    "log": "verification-2.log"
+  }
+]
