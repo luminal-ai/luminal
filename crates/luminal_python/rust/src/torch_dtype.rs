@@ -137,8 +137,8 @@ impl TorchDType {
 }
 
 /// PyTorch dtype → luminal `DType`. `Err(self)` for variants luminal's IR
-/// doesn't model as first-class types — uint16, the complex family, and the
-/// float8 NUZ variants. PyTorch's three common narrow integer storage dtypes
+/// doesn't model as first-class types — uint16 and the complex family. The
+/// four fp8 encodings (fn, fnuz, e5m2, e5m2fnuz) each map to their own dtype. PyTorch's three common narrow integer storage dtypes
 /// map one-to-one to native luminal IR dtypes.
 /// Boundary code panics with the variant name on `Err`; cf.
 /// `typed_data::from_pytorch_bytes`, `pt2_util::torch_dtype_int_to_luminal`.
@@ -159,12 +159,12 @@ impl TryFrom<TorchDType> for DType {
             TorchDType::Float8E4m3Fn => DType::F8E4M3FN,
             TorchDType::Float8E4m3Fnuz => DType::F8E4M3FNUZ,
             TorchDType::Float8E5m2 => DType::F8E5M2,
+            TorchDType::Float8E5m2Fnuz => DType::F8E5M2FNUZ,
             TorchDType::Uint16
             | TorchDType::Unknown
             | TorchDType::ComplexHalf
             | TorchDType::ComplexFloat
-            | TorchDType::ComplexDouble
-            | TorchDType::Float8E5m2Fnuz => return Err(t),
+            | TorchDType::ComplexDouble => return Err(t),
         })
     }
 }
@@ -196,6 +196,7 @@ impl TryFrom<DType> for TorchDType {
             DType::F8E4M3FN => TorchDType::Float8E4m3Fn,
             DType::F8E4M3FNUZ => TorchDType::Float8E4m3Fnuz,
             DType::F8E5M2 => TorchDType::Float8E5m2,
+            DType::F8E5M2FNUZ => TorchDType::Float8E5m2Fnuz,
             _ => return Err(d),
         })
     }
@@ -231,6 +232,7 @@ mod tests {
             DType::F8E4M3FN,
             DType::F8E4M3FNUZ,
             DType::F8E5M2,
+            DType::F8E5M2FNUZ,
         ] {
             let t = TorchDType::try_from(d).expect("known DType");
             let back = DType::try_from(t).expect("known TorchDType");
@@ -259,8 +261,8 @@ mod tests {
         assert_eq!(DType::try_from(TorchDType::Float8E4m3Fnuz).unwrap(), DType::F8E4M3FNUZ);
         assert_eq!(DType::try_from(TorchDType::Float8E5m2).unwrap(), DType::F8E5M2);
         assert_ne!(DType::F8E4M3FN, DType::F8E4M3FNUZ);
-        // e5m2fnuz has no luminal dtype yet: refused, never read as e5m2.
-        assert!(DType::try_from(TorchDType::Float8E5m2Fnuz).is_err());
+        assert_eq!(DType::try_from(TorchDType::Float8E5m2Fnuz).unwrap(), DType::F8E5M2FNUZ);
+        assert_ne!(DType::F8E5M2, DType::F8E5M2FNUZ);
     }
 
     #[test]

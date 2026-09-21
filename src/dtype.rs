@@ -55,6 +55,10 @@ pub enum DType {
     F8E4M3FNUZ,
     /// 8-bit float, e5m2 (IEEE-like: has inf and NaN; torch `float8_e5m2`)
     F8E5M2,
+    /// 8-bit float, e5m2 "fnuz" encoding: bias 16, no inf, no -0, the single NaN
+    /// at 0x80 (torch `float8_e5m2fnuz`). Its own dtype for the same reason as
+    /// F8E4M3FNUZ; no device type.
+    F8E5M2FNUZ,
 
     /// 6-bit float (e2m3)
     F6E2M3,
@@ -89,6 +93,7 @@ impl Debug for DType {
             DType::F8E4M3FN => "F8E4M3FN",
             DType::F8E4M3FNUZ => "F8E4M3FNUZ",
             DType::F8E5M2 => "F8E5M2",
+            DType::F8E5M2FNUZ => "F8E5M2FNUZ",
             DType::F6E2M3 => "F6E2M3",
             DType::F6E3M2 => "F6E3M2",
             DType::F4E2M1 => "F4E2M1",
@@ -121,7 +126,8 @@ impl DType {
             | DType::F8UE8M0
             | DType::F8E4M3FN
             | DType::F8E4M3FNUZ
-            | DType::F8E5M2 => 8,
+            | DType::F8E5M2
+            | DType::F8E5M2FNUZ => 8,
             DType::F6E2M3 | DType::F6E3M2 => 6,
             DType::F4E2M1 | DType::I4 | DType::U4 => 4,
         }
@@ -157,6 +163,7 @@ pub enum PlanDtype {
     F8E4M3FN,
     F8E4M3FNUZ,
     F8E5M2,
+    F8E5M2FNUZ,
     F6E2M3,
     F6E3M2,
     F4E2M1,
@@ -186,6 +193,7 @@ impl PlanDtype {
             "F8E4M3FN" => Self::F8E4M3FN,
             "F8E4M3FNUZ" => Self::F8E4M3FNUZ,
             "F8E5M2" => Self::F8E5M2,
+            "F8E5M2FNUZ" => Self::F8E5M2FNUZ,
             "F6E2M3" => Self::F6E2M3,
             "F6E3M2" => Self::F6E3M2,
             "F4E2M1" => Self::F4E2M1,
@@ -208,7 +216,8 @@ impl PlanDtype {
             | Self::F8UE8M0
             | Self::F8E4M3FN
             | Self::F8E4M3FNUZ
-            | Self::F8E5M2 => 8,
+            | Self::F8E5M2
+            | Self::F8E5M2FNUZ => 8,
             Self::F6E2M3 | Self::F6E3M2 => 6,
             Self::F4E2M1 | Self::I4 | Self::U4 => 4,
             Self::Bool => 1,
@@ -228,6 +237,7 @@ mod tests {
             PlanDtype::F8E4M3FN,
             PlanDtype::F8E4M3FNUZ,
             PlanDtype::F8E5M2,
+            PlanDtype::F8E5M2FNUZ,
             PlanDtype::F8UE8M0,
             PlanDtype::Bool8,
             PlanDtype::Int64,
@@ -237,6 +247,8 @@ mod tests {
         }
         assert_eq!(PlanDtype::F8E4M3FN.egglog_bits(), 8);
         assert_eq!(PlanDtype::F8E4M3FNUZ.egglog_bits(), 8);
+        assert_eq!(PlanDtype::F8E5M2FNUZ.egglog_bits(), 8);
+        assert_ne!(PlanDtype::F8E5M2, PlanDtype::F8E5M2FNUZ);
         assert_ne!(PlanDtype::F8E4M3FN, PlanDtype::F8E4M3FNUZ);
         assert_eq!(
             PlanDtype::from_egglog_name("F8E4M3"),
