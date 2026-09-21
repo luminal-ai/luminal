@@ -1102,8 +1102,13 @@ mod tests {
     #[test]
     fn a_writeback_and_its_target_are_one_buffer() {
         let translation = translation(&["x"], Some("x"));
-        let boundary =
-            bind(&translation, &row_major(&["x"]), &HashMap::new()).expect("writeback binds");
+        let boundary = bind(
+            &translation,
+            &row_major(&["x"]),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("writeback binds");
         assert_eq!(boundary.output_buffers[0], boundary.input_buffers[0]);
         assert_eq!(
             boundary.bindings.buffers()[&boundary.input_buffers[0]].access,
@@ -1114,8 +1119,13 @@ mod tests {
     #[test]
     fn a_mutation_target_that_is_not_a_graph_input_is_refused() {
         let translation = translation(&["x"], Some("elsewhere"));
-        let err =
-            bind(&translation, &row_major(&["x"]), &HashMap::new()).expect_err("no such input");
+        let err = bind(
+            &translation,
+            &row_major(&["x"]),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect_err("no such input");
         assert!(
             format!("{err:#}").contains("mutates \"elsewhere\""),
             "{err:#}"
@@ -1126,7 +1136,8 @@ mod tests {
     fn an_input_with_no_layout_row_is_refused() {
         let translation = translation(&["x", "y"], None);
         let outputs = row_major_outputs(&translation);
-        let err = bind(&translation, &row_major(&["x"]), &outputs).expect_err("y has no layout");
+        let err = bind(&translation, &row_major(&["x"]), &outputs, &HashMap::new())
+            .expect_err("y has no layout");
         assert!(
             format!("{err:#}").contains("input \"y\" has no declared boundary layout"),
             "{err:#}"
@@ -1139,8 +1150,13 @@ mod tests {
     fn a_layout_row_for_a_non_input_is_refused() {
         let translation = translation(&["x"], None);
         let outputs = row_major_outputs(&translation);
-        let err =
-            bind(&translation, &row_major(&["x", "ghost"]), &outputs).expect_err("no such input");
+        let err = bind(
+            &translation,
+            &row_major(&["x", "ghost"]),
+            &outputs,
+            &HashMap::new(),
+        )
+        .expect_err("no such input");
         assert!(format!("{err:#}").contains("\"ghost\""), "{err:#}");
     }
 
@@ -1155,7 +1171,8 @@ mod tests {
             declared(BoundaryLayout::ColumnMajor, "column_major", &[]),
         )]
         .into();
-        let boundary = bind(&translation, &row_major(&["x"]), &outputs).expect("the output binds");
+        let boundary = bind(&translation, &row_major(&["x"]), &outputs, &HashMap::new())
+            .expect("the output binds");
         assert_eq!(
             boundary.bindings.outputs()[0].layout,
             BoundaryLayout::ColumnMajor
@@ -1175,7 +1192,8 @@ mod tests {
     fn an_output_row_for_a_writeback_is_refused() {
         let translation = translation(&["x"], Some("x"));
         let outputs = row_major(&["out"]);
-        let err = bind(&translation, &row_major(&["x"]), &outputs).expect_err("out is a writeback");
+        let err = bind(&translation, &row_major(&["x"]), &outputs, &HashMap::new())
+            .expect_err("out is a writeback");
         let text = format!("{err:#}");
         assert!(text.contains("output \"out\"") && text.contains("writes back into \"x\""));
 
@@ -1184,7 +1202,8 @@ mod tests {
             declared(BoundaryLayout::ColumnMajor, "column_major", &[]),
         )]
         .into();
-        let boundary = bind(&translation, &inputs, &HashMap::new()).expect("the writeback binds");
+        let boundary = bind(&translation, &inputs, &HashMap::new(), &HashMap::new())
+            .expect("the writeback binds");
         assert_eq!(
             boundary.output_layouts,
             vec![("column_major".to_string(), Vec::new())]
@@ -1197,7 +1216,8 @@ mod tests {
     fn an_output_row_for_a_non_output_is_refused() {
         let translation = translation(&["x"], None);
         let outputs = row_major(&["out", "ghost"]);
-        let err = bind(&translation, &row_major(&["x"]), &outputs).expect_err("no such output");
+        let err = bind(&translation, &row_major(&["x"]), &outputs, &HashMap::new())
+            .expect_err("no such output");
         let text = format!("{err:#}");
         assert!(
             text.contains("\"ghost\"") && text.contains("not a graph output"),
@@ -1208,8 +1228,13 @@ mod tests {
     #[test]
     fn an_output_with_no_layout_row_is_refused() {
         let translation = translation(&["x"], None);
-        let err =
-            bind(&translation, &row_major(&["x"]), &HashMap::new()).expect_err("out has no layout");
+        let err = bind(
+            &translation,
+            &row_major(&["x"]),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect_err("out has no layout");
         assert!(
             format!("{err:#}").contains("output \"out\" has no declared boundary layout"),
             "{err:#}"
@@ -1234,8 +1259,8 @@ mod tests {
             panic!("expected a strided layout, got {:?}", outputs["out"]);
         };
         assert!(parsed[0].to_symbols().contains(&symbol));
-        let boundary =
-            bind(&translation, &row_major(&["x"]), &outputs).expect("a strided output binds");
+        let boundary = bind(&translation, &row_major(&["x"]), &outputs, &HashMap::new())
+            .expect("a strided output binds");
         assert_eq!(
             boundary.output_layouts,
             vec![("strided".to_string(), strides)]
@@ -1282,7 +1307,7 @@ mod tests {
             declared(BoundaryLayout::ColumnMajor, "column_major", &[]),
         )]
         .into();
-        let boundary = bind(&translation, &layouts, &HashMap::new())
+        let boundary = bind(&translation, &layouts, &HashMap::new(), &HashMap::new())
             .expect("a writeback binds at its target's layout");
         assert_eq!(boundary.output_buffers[0], boundary.input_buffers[0]);
         assert_eq!(
