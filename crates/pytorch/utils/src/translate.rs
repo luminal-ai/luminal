@@ -726,7 +726,7 @@ impl Translator<'_> {
             "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
-            "minimum.default" => self.binary(n, |a, b| a.maximum(b * -1.0) * -1.0)?,
+            "minimum.default" => self.binary(n, |a, b| a.minimum(b))?,
             // ---- movement ----
             "t.default" => self.operand(&n[0])?.t(),
             "transpose.int" => {

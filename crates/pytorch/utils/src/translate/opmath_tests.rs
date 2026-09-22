@@ -410,46 +410,60 @@ fn native_layer_norm_outputs_take_their_own_declared_dtypes() {
         &[
             ("x", BFLOAT16, &[4, 8]),
             ("out", BFLOAT16, &[4, 8]),
-            ("mean", FLOAT, &[4]),
-            ("rstd", FLOAT, &[4]),
+            ("mean", FLOAT, &[4, 1]),
+            ("rstd", FLOAT, &[4, 1]),
         ],
         &["x"],
         &["out", "mean", "rstd"],
     );
     let dtypes: Vec<DType> = t.outputs.iter().map(|output| output.dtype).collect();
     assert_eq!(dtypes, vec![DType::Bf16, DType::F32, DType::F32]);
+    let statistic_ranks: Vec<usize> = t.outputs[1..]
+        .iter()
+        .map(|output| output.shape.len())
+        .collect();
+    assert_eq!(statistic_ranks, vec![2, 2], "the normalized axes are kept");
 }
 
 #[test]
-fn layer_norm_affine_weight_is_read_wide_without_rounding() {
+fn batch_norm_parameters_are_read_wide_without_rounding() {
     let t = translate_one(
         node(
-            "torch.ops.aten.native_layer_norm.default",
+            "torch.ops.aten._native_batch_norm_legit_no_training.default",
             vec![
                 tensor_input("input", "x"),
-                ints("normalized_shape", &[8]),
                 tensor_input("weight", "w"),
-                none("bias"),
+                tensor_input("bias", "b"),
+                tensor_input("running_mean", "rm"),
+                tensor_input("running_var", "rv"),
+                scalar_float("momentum", 0.1),
                 scalar_float("eps", 1e-5),
             ],
-            &["out", "mean", "rstd"],
+            &["out"],
         ),
         &[
-            ("x", HALF, &[4, 8]),
-            ("w", FLOAT, &[8]),
-            ("out", HALF, &[4, 8]),
-            ("mean", FLOAT, &[4]),
-            ("rstd", FLOAT, &[4]),
+            ("x", HALF, &[2, 3, 4, 4]),
+            ("w", FLOAT, &[3]),
+            ("b", FLOAT, &[3]),
+            ("rm", FLOAT, &[3]),
+            ("rv", FLOAT, &[3]),
+            ("out", HALF, &[2, 3, 4, 4]),
         ],
-        &["x", "w"],
-        &["out", "mean", "rstd"],
+        &["x", "w", "b", "rm", "rv"],
+        &["out"],
     );
+    assert_eq!(t.outputs[0].dtype, DType::F16);
     assert!(input_is_cast_to(&t, "x", DType::F32));
-    assert!(!input_is_cast_to(&t, "w", DType::F16));
+    for parameter in ["w", "b", "rm", "rv"] {
+        assert!(
+            !input_is_cast_to(&t, parameter, DType::F16),
+            "{parameter} is read at F32 unrounded"
+        );
+    }
 }
 
 #[test]
-fn scalar_comparison_compares_at_f32() {
+fn scalar_comparison_rounds_the_literal_to_the_operand_dtype() {
     let t = translate_one(
         node(
             "torch.ops.aten.gt.Scalar",
@@ -467,10 +481,20 @@ fn scalar_comparison_compares_at_f32() {
         .map(|operand| through_views(&t, operand))
         .collect();
     assert!(sources.iter().all(|id| dtype_of(&t, *id) == DType::F32));
+    let constant = only_node(&t, &LogicalOp::Constant(0.0));
+    let rounded: Vec<NodeIndex> = nodes(&t)
+        .into_iter()
+        .filter(|id| {
+            operands(&t, *id)
+                .into_iter()
+                .any(|operand| through_views(&t, operand) == constant)
+        })
+        .collect();
     assert!(
-        sources
+        rounded
             .iter()
-            .any(|id| matches!(op_of(&t, *id), LogicalOp::Constant(_)))
+            .all(|id| is_cast_to(op_of(&t, *id), DType::F16)),
+        "the literal is rounded to the operand dtype first"
     );
     assert!(
         sources

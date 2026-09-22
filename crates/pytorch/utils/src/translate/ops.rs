@@ -35,7 +35,15 @@ impl Translator<'_> {
         let b = if let Some(t) = self.optional_tensor_operand(&node.inputs[1])? {
             t
         } else {
-            self.scalar(&node.inputs[1], a.dtype)?
+            // Unlike arithmetic, torch rounds a comparison's scalar to the
+            // operands' common dtype before comparing.
+            match self.opmath {
+                Some(opmath) => {
+                    let literal = self.scalar(&node.inputs[1], opmath.common)?;
+                    super::convert(literal, opmath.compute)
+                }
+                None => self.scalar(&node.inputs[1], a.dtype)?,
+            }
         };
         let (a, b) = util::broadcast_binary(a, b);
         Ok(cmp(a, b))
@@ -563,9 +571,11 @@ impl Translator<'_> {
         let var = x.var_options(axes.clone(), 0);
         let eps_const = self.cx.constant_f32(eps).expand_rhs(var.dims());
         let rstd = (var + eps_const).sqrt().reciprocal();
-        // `native_layer_norm` returns (out, mean, rstd); `layer_norm`
-        // returns just `out`.
+        // `native_layer_norm` returns (out, mean, rstd) with the normalized
+        // axes kept as size-1 extents; `layer_norm` returns just `out`.
         if node.outputs.len() > 1 {
+            let mean = keep_axes(mean, &axes);
+            let rstd = keep_axes(rstd, &axes);
             self.bind_outputs(node, vec![out, mean, rstd])
         } else {
             self.bind_outputs(node, vec![out])

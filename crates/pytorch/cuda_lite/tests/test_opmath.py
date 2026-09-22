@@ -155,9 +155,9 @@ def test_sum_of_ones_accumulates_in_f32(dtype):
 
 @cuda
 @halves
-def test_scalar_comparisons_are_taken_at_f32(dtype):
-    """Torch compares f32(x) against the f32 scalar; comparing in the half
-    dtype against half(0.1) would call the element holding half(0.1) equal."""
+def test_scalar_comparisons_round_the_literal_to_the_half_dtype(dtype):
+    """Unlike arithmetic, a comparison rounds its scalar to the tensor's dtype
+    first, so the element holding half(0.1) is neither above nor below 0.1."""
 
     def fn(x):
         return x > 0.1, x < 0.1, x > 0.3, x <= 0.7
@@ -278,13 +278,13 @@ def test_attention_bool_mask_excludes_keys():
         return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=m)
 
     torch.manual_seed(0)
-    q = torch.randn(1, 1, 4, 8, device="cuda", dtype=torch.float16)
+    q = torch.randn(2, 2, 4, 8, device="cuda", dtype=torch.float16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     m = torch.tensor([[True, False, False, False]] * 4, device="cuda")
     got = torch.compile(fn, backend=luminal_cuda_lite)(q, k, v, m)
     assert got.dtype == torch.float16
-    assert bits_equal(got[0, 0], v[0, 0, :1].expand(4, 8))
+    assert bits_equal(got, v[:, :, :1].expand(2, 2, 4, 8))
 
 
 # ---------------------------------------------------------------------
@@ -391,18 +391,21 @@ def test_layer_norm_computes_wide(dtype):
 
 @cuda
 @halves
-def test_layer_norm_with_f32_affine_parameters(dtype):
-    """Mixed-type layer norm: half input, f32 weight and bias read unrounded."""
+def test_batch_norm_reads_f32_parameters_unrounded(dtype):
+    """Inference batch norm on a half input with f32 statistics and affine
+    parameters (the autocast layout): the parameters enter the math at f32."""
 
-    def fn(x, w, b):
-        return torch.nn.functional.layer_norm(x, (64,), w, b, 1e-5)
+    def fn(x, rm, rv, w, b):
+        return torch.nn.functional.batch_norm(x, rm, rv, w, b, training=False)
 
     torch.manual_seed(0)
-    x = torch.randn(4, 64, device="cuda", dtype=dtype)
-    w = torch.randn(64, device="cuda") * 1.001
-    b = torch.randn(64, device="cuda") * 1.001
-    ref = fn(x, w, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x, w, b)
+    x = torch.randn(2, 3, 4, 4, device="cuda", dtype=dtype)
+    rm = torch.randn(3, device="cuda")
+    rv = torch.rand(3, device="cuda") + 0.5
+    w = torch.randn(3, device="cuda") * 1.001
+    b = torch.randn(3, device="cuda") * 1.001
+    ref = fn(x, rm, rv, w, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite)(x, rm, rv, w, b)
     close_half(got, ref)
 
 
