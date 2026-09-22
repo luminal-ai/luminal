@@ -21,10 +21,10 @@ impl Translator<'_> {
     // Shared real-domain helpers (private copies of the parked unary ones)
     // -----------------------------------------------------------------
 
-    /// Input cast to the node's output dtype (the parked `unary_input`).
+    /// Input at the dtype the node computes in (the parked `unary_input`).
     fn special_input(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let dtype = self.output_meta_dtype(node).unwrap_or(x.dtype);
+        let dtype = self.compute_dtype(node).unwrap_or(x.dtype);
         Ok(if x.dtype == dtype { x } else { x.cast(dtype) })
     }
 
@@ -835,7 +835,7 @@ impl Translator<'_> {
         if kind > 3 {
             bail!("chebyshev kind {kind} is not ported");
         }
-        let dtype = self.output_meta_dtype(node)?;
+        let dtype = self.compute_dtype(node)?;
         let value = self.special_numeric_tensor_arg(node, 0, dtype)?;
         let degree = self.special_numeric_tensor_arg(node, 1, dtype)?;
         let (mut value, degree) = util::broadcast_binary(value, degree);
@@ -1172,7 +1172,7 @@ impl Translator<'_> {
         let order = self.get_int_arg(node, 0)?;
         anyhow::ensure!(order >= 0, "polygamma order must be nonnegative");
         let value = self.operand(&node.inputs[1])?;
-        let dtype = self.output_meta_dtype(node).unwrap_or(value.dtype);
+        let dtype = self.compute_dtype(node).unwrap_or(value.dtype);
         let value = if value.dtype == dtype {
             value
         } else {

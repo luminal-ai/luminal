@@ -11,7 +11,7 @@ use crate::pt2_schema::{Argument, Node};
 impl Translator<'_> {
     fn unary_input(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let dtype = self.output_meta_dtype(node).unwrap_or(x.dtype);
+        let dtype = self.compute_dtype(node).unwrap_or(x.dtype);
         Ok(if x.dtype == dtype { x } else { x.cast(dtype) })
     }
 

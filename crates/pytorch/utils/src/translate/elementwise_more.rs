@@ -53,10 +53,10 @@ impl Translator<'_> {
         self.bool_not(nonzero_or_nan)
     }
 
-    /// Both operands promoted to the node's recorded output dtype and
+    /// Both operands promoted to the dtype the op computes in and
     /// broadcast; numeric literals are accepted on either side.
     fn promoted_binary_inputs(&mut self, node: &Node) -> Result<(GraphTensor, GraphTensor)> {
-        let dtype = self.output_meta_dtype(node)?;
+        let dtype = self.compute_dtype(node)?;
         let a = match self.optional_tensor_operand(&node.inputs[0])? {
             Some(tensor) => tensor,
             None => self.scalar(&node.inputs[0], dtype)?,
@@ -144,7 +144,7 @@ impl Translator<'_> {
 
     pub(super) fn translate_copysign(&mut self, node: &Node, scalar: bool) -> Result<GraphTensor> {
         if scalar {
-            let dtype = self.output_meta_dtype(node)?;
+            let dtype = self.compute_dtype(node)?;
             let raw = self.operand(&node.inputs[0])?;
             let magnitude = if raw.dtype == dtype {
                 raw
@@ -241,14 +241,14 @@ impl Translator<'_> {
 
     pub(super) fn translate_exp2(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let dtype = self.output_meta_dtype(node).unwrap_or(x.dtype);
+        let dtype = self.compute_dtype(node).unwrap_or(x.dtype);
         let x = if x.dtype == dtype { x } else { x.cast(dtype) };
         Ok(x.exp2())
     }
 
     pub(super) fn translate_log2(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let dtype = self.output_meta_dtype(node).unwrap_or(x.dtype);
+        let dtype = self.compute_dtype(node).unwrap_or(x.dtype);
         let x = if x.dtype == dtype { x } else { x.cast(dtype) };
         Ok(x.log2())
     }
@@ -260,7 +260,7 @@ impl Translator<'_> {
 
     pub(super) fn translate_leaky_relu(&mut self, node: &Node) -> Result<GraphTensor> {
         let value = self.operand(&node.inputs[0])?;
-        let dtype = self.output_meta_dtype(node).unwrap_or(value.dtype);
+        let dtype = self.compute_dtype(node).unwrap_or(value.dtype);
         let value = if value.dtype == dtype {
             value
         } else {

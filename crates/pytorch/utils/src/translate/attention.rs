@@ -5,11 +5,12 @@
 //! `softmax((Q@K^T)*scale + mask) @ V`. Args are resolved by name so one
 //! body serves every variant; only the first output slot is bound.
 //!
-//! Torch-kernel parity notes: bf16/f16 run the score chain in F32 and the
-//! probabilities return to the value dtype for P@V (torch's kernels compute
-//! in `opmath_type<scalar_t>`); `is_causal` is a top-left iota mask; bool
-//! masks are keep-masks and fully-masked query rows output zeros; grouped
-//! K/V heads are repeat-interleaved (GQA).
+//! Torch-kernel parity notes: Q/K/V arrive at the op's compute dtype (F32
+//! for bf16/f16, the translator's opmath pattern) and the probabilities are
+//! rounded to the operands' dtype before P@V, as the fused kernels do;
+//! `is_causal` is a top-left iota mask; bool masks are keep-masks and
+//! fully-masked query rows output zeros; grouped K/V heads are
+//! repeat-interleaved (GQA).
 
 use anyhow::{Context, Result};
 use luminal::prelude::*;
@@ -77,11 +78,13 @@ impl Translator<'_> {
             }
         }
 
-        // attn_bias (Efficient/Cudnn/Unified) or attn_mask (FlashForCpu/Unified).
+        // attn_bias (Efficient/Cudnn/Unified) or attn_mask (FlashForCpu/Unified),
+        // read as recorded: a Bool mask is a predicate, not an operand of
+        // the score arithmetic.
         let mut additive: Option<GraphTensor> = None;
         for name in ["attn_bias", "attn_mask"] {
             if let Some(input) = named_input(node, name)
-                && let Some(tensor) = self.optional_tensor_operand(input)?
+                && let Some(tensor) = self.optional_raw_operand(input)?
             {
                 additive = Some(tensor);
                 break;
@@ -143,17 +146,10 @@ impl Translator<'_> {
         }
 
         // scores = (Q @ K^T) * scale.
+        // Q/K arrive at the compute dtype, so the scores, the scale, the
+        // masks and the softmax are all F32 for half-precision inputs.
         let (q_for_mm, k_for_mm) =
             util::ensure_same_dtype(query, key.transpose(q_ndim - 2, q_ndim - 1));
-        // torch parity: fused kernels accumulate QK^T in fp32 and never
-        // materialize low-precision scores. Cast Q/K before the matmul;
-        // scale, masks, and softmax inherit F32 from here.
-        let low_precision = matches!(q_for_mm.dtype, DType::Bf16 | DType::F16);
-        let (q_for_mm, k_for_mm) = if low_precision {
-            (q_for_mm.cast(DType::F32), k_for_mm.cast(DType::F32))
-        } else {
-            (q_for_mm, k_for_mm)
-        };
         let scores = q_for_mm.matmul(k_for_mm);
         let scale_const = self.constant_like(scores, scale);
         let mut scores = scores * scale_const;
@@ -183,7 +179,7 @@ impl Translator<'_> {
                 let one = self.cx.constant_f32(1.0).expand_rhs(keep.dims());
                 (one - keep) * self.constant_like(keep, -1e9)
             } else {
-                mask
+                self.widen(mask)
             };
             scores = add_offset(scores, offset);
         }
@@ -194,9 +190,11 @@ impl Translator<'_> {
             let (a, i) = util::broadcast_binary(a, i);
             attn = a * i;
         }
-        // torch parity, part two: probs round back to the input dtype for
-        // the P@V GEMM (keeps V out of an fp32 matmul). No-op on fp32.
-        let out = attn.cast(value.dtype).matmul(value);
+        // torch parity, part two: the fused kernels round the probabilities
+        // to the operands' dtype before the P@V GEMM. No-op on fp32.
+        let operand_dtype = self.opmath.map_or(value.dtype, |opmath| opmath.common);
+        let probabilities = super::convert(super::convert(attn, operand_dtype), value.dtype);
+        let out = probabilities.matmul(value);
 
         // Tuple outputs serialize as one `as_tensors` list or one entry per
         // element — flatten to slot order; slot 0 is the attention output.
@@ -206,7 +204,7 @@ impl Translator<'_> {
             .with_context(|| {
                 format!("SDPA: no output tensor name found on node {}", node.target)
             })?;
-        self.values.insert(name, out);
+        self.bind_value(name, out);
         Ok(())
     }
 }

@@ -121,7 +121,7 @@ impl Translator<'_> {
         let input = self.operand(&node.inputs[0])?;
         let axes = self.reduction_axes(node, 1, input.rank())?;
         let correction = self.variance_correction(node);
-        let dtype = self.output_meta_dtype(node).unwrap_or(input.dtype);
+        let dtype = self.compute_dtype(node).unwrap_or(input.dtype);
         let input = input.cast(dtype);
         let variance = input.var_options(&axes, correction);
         let mean = input.mean(&axes);
@@ -141,51 +141,26 @@ impl Translator<'_> {
         node: &Node,
         variant: AddMmVariant,
     ) -> Result<GraphTensor> {
-        let output_dtype = self.output_meta_dtype(node).unwrap_or(DType::F32);
-        // ATen computes the wide matmul in F32 and rounds once at the end.
-        let compute_dtype = match output_dtype {
-            DType::F16 | DType::Bf16 => DType::F32,
-            dtype => dtype,
-        };
-
-        match variant {
-            AddMmVariant::AddMm => {
-                let input = self.operand(&node.inputs[0])?;
-                let mat1 = self.operand(&node.inputs[1])?;
-                let mat2 = self.operand(&node.inputs[2])?;
-                let (mat1, mat2) = util::ensure_same_dtype(mat1, mat2);
-                let product = mat1.matmul(mat2);
-                let (input, product) = util::ensure_same_dtype(input, product);
-                let (input, product) = util::broadcast_binary(input, product);
-                let input = self.scale_by_named_scalar(node, "beta", input)?;
-                let product = self.scale_by_named_scalar(node, "alpha", product)?;
-                Ok(input + product)
-            }
+        let input = self.operand(&node.inputs[0])?;
+        let lhs = self.operand(&node.inputs[1])?;
+        let rhs = self.operand(&node.inputs[2])?;
+        let product = match variant {
+            AddMmVariant::AddMm => lhs.matmul(rhs),
             AddMmVariant::AddBmm => {
-                let input = self.operand(&node.inputs[0])?.cast(compute_dtype);
-                let batch1 = self.operand(&node.inputs[1])?.cast(compute_dtype);
-                let batch2 = self.operand(&node.inputs[2])?.cast(compute_dtype);
-                anyhow::ensure!(batch1.rank() == 3, "addbmm batch1 must be rank 3");
-                anyhow::ensure!(batch2.rank() == 3, "addbmm batch2 must be rank 3");
-                let product = batch1.matmul(batch2).sum(0);
-                let input = self.scale_by_named_scalar(node, "beta", input)?;
-                let product = self.scale_by_named_scalar(node, "alpha", product)?;
-                let (input, product) = util::broadcast_binary(input, product);
-                Ok((input + product).cast(output_dtype))
+                anyhow::ensure!(lhs.rank() == 3, "addbmm batch1 must be rank 3");
+                anyhow::ensure!(rhs.rank() == 3, "addbmm batch2 must be rank 3");
+                lhs.matmul(rhs).sum(0)
             }
             AddMmVariant::AddMv => {
-                let input = self.operand(&node.inputs[0])?.cast(compute_dtype);
-                let matrix = self.operand(&node.inputs[1])?.cast(compute_dtype);
-                let vector = self.operand(&node.inputs[2])?.cast(compute_dtype);
-                anyhow::ensure!(matrix.rank() == 2, "addmv matrix must be rank 2");
-                anyhow::ensure!(vector.rank() == 1, "addmv vector must be rank 1");
-                let product = matrix.matmul(vector.unsqueeze(1)).squeeze(1);
-                let input = self.scale_by_named_scalar(node, "beta", input)?;
-                let product = self.scale_by_named_scalar(node, "alpha", product)?;
-                let (input, product) = util::broadcast_binary(input, product);
-                Ok((input + product).cast(output_dtype))
+                anyhow::ensure!(lhs.rank() == 2, "addmv matrix must be rank 2");
+                anyhow::ensure!(rhs.rank() == 1, "addmv vector must be rank 1");
+                lhs.matmul(rhs.unsqueeze(1)).squeeze(1)
             }
-        }
+        };
+        let input = self.scale_by_named_scalar(node, "beta", input)?;
+        let product = self.scale_by_named_scalar(node, "alpha", product)?;
+        let (input, product) = util::broadcast_binary(input, product);
+        Ok(input + product)
     }
 
     /// `copy.default(destination, source)`: source broadcast into the

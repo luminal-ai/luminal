@@ -232,7 +232,7 @@ impl Translator<'_> {
         node: &Node,
         magnitude: GraphTensor,
     ) -> Result<GraphTensor> {
-        let output_dtype = self.output_meta_dtype(node)?;
+        let output_dtype = self.compute_dtype(node)?;
         let magnitude = magnitude.cast(output_dtype);
         let rank = magnitude.rank();
         let dims = self.int_list_arg(node, 2)?;
@@ -299,7 +299,8 @@ impl Translator<'_> {
                 let rhs = self.get_input_tensor(node, 1)?;
                 let (lhs, rhs) = util::ensure_same_dtype(lhs, rhs);
                 let (lhs, rhs) = util::broadcast_binary(lhs, rhs);
-                let magnitude = self.real_abs(lhs - rhs).cast(self.output_meta_dtype(node)?);
+                let difference = self.rounded_difference(lhs - rhs);
+                let magnitude = self.real_abs(difference).cast(self.compute_dtype(node)?);
                 let p = self.get_float_arg(node, 2).unwrap_or(2.0);
                 let axes = (0..magnitude.rank()).collect();
                 Ok(self.p_norm(magnitude, p, axes))
@@ -327,7 +328,8 @@ impl Translator<'_> {
                 pair_shape.push(feature);
                 lhs = lhs.expand(pair_shape.clone());
                 rhs = rhs.expand(pair_shape);
-                let magnitude = self.real_abs(lhs - rhs).cast(self.output_meta_dtype(node)?);
+                let difference = self.rounded_difference(lhs - rhs);
+                let magnitude = self.real_abs(difference).cast(self.compute_dtype(node)?);
                 let p = self.get_float_arg(node, 2)?;
                 Ok(self.p_norm(magnitude, p, vec![magnitude.rank() - 1]))
             }
@@ -361,12 +363,23 @@ impl Translator<'_> {
                 let column_positions = self.axis_positions(&pair_shape, 1);
                 let left = input.gather(&[i, column_positions]);
                 let right = input.gather(&[j, column_positions]);
-                let magnitude = self
-                    .real_abs(left - right)
-                    .cast(self.output_meta_dtype(node)?);
+                let difference = self.rounded_difference(left - right);
+                let magnitude = self.real_abs(difference).cast(self.compute_dtype(node)?);
                 let p = self.get_float_arg(node, 1).unwrap_or(2.0);
                 Ok(self.p_norm(magnitude, p, vec![1]))
             }
+        }
+    }
+
+    /// torch forms a distance's pairwise difference in the operand dtype
+    /// and accumulates the norm wide: round the difference to the common
+    /// dtype before it enters the F32 norm.
+    fn rounded_difference(&self, difference: GraphTensor) -> GraphTensor {
+        match self.opmath {
+            Some(opmath) => {
+                super::convert(super::convert(difference, opmath.common), opmath.compute)
+            }
+            None => difference,
         }
     }
 

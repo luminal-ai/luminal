@@ -472,12 +472,13 @@ impl Translator<'_> {
         }
     }
 
-    /// A tensor operand by input name (`None` for absent / non-tensor).
-    fn named_tensor_arg(&mut self, node: &Node, name: &str) -> Result<Option<GraphTensor>> {
+    /// A norm's affine parameter or running statistic by input name: read
+    /// at the compute dtype, never rounded to the input's dtype first.
+    fn named_parameter(&mut self, node: &Node, name: &str) -> Result<Option<GraphTensor>> {
         let Some(index) = node.inputs.iter().position(|input| input.name == name) else {
             return Ok(None);
         };
-        self.optional_tensor_operand(&node.inputs[index])
+        self.optional_operand_at_compute(&node.inputs[index])
     }
 
     /// A zero tensor in the dtype/shape the named output declares.
@@ -503,7 +504,7 @@ impl Translator<'_> {
             values.len()
         );
         for (name, value) in names.into_iter().zip(values.iter().copied()) {
-            self.values.insert(name, value);
+            self.bind_value(name, value);
         }
         Ok(())
     }
@@ -532,8 +533,8 @@ impl Translator<'_> {
         // Inference is legal whenever stored running statistics exist
         // (`batch_norm.default` training=false); only the stat-less native
         // spellings truly require training.
-        let running_mean = self.named_tensor_arg(node, "running_mean")?;
-        let running_var = self.named_tensor_arg(node, "running_var")?;
+        let running_mean = self.named_parameter(node, "running_mean")?;
+        let running_var = self.named_parameter(node, "running_var")?;
         anyhow::ensure!(
             training
                 || functional
@@ -584,13 +585,13 @@ impl Translator<'_> {
         let mean_expanded = mean.expand_to_shape_on_axes(compute.dims(), axes.clone());
         let invstd_expanded = invstd.expand_to_shape_on_axes(compute.dims(), axes.clone());
         let mut output = (compute - mean_expanded) * invstd_expanded;
-        if let Some(weight) = self.named_tensor_arg(node, "weight")? {
+        if let Some(weight) = self.named_parameter(node, "weight")? {
             let weight = weight
                 .cast(compute_dtype)
                 .expand_to_shape_on_axes(output.dims(), axes.clone());
             output *= weight;
         }
-        if let Some(bias) = self.named_tensor_arg(node, "bias")? {
+        if let Some(bias) = self.named_parameter(node, "bias")? {
             let bias = bias
                 .cast(compute_dtype)
                 .expand_to_shape_on_axes(output.dims(), axes.clone());
@@ -663,7 +664,7 @@ impl Translator<'_> {
         let eps = self.get_float_arg(node, 3).unwrap_or(f32::EPSILON as f64) as f32;
         let out_dtype = input.dtype;
         let mut result = input.cast(DType::F32).std_norm(axes, eps);
-        if let Some(weight) = self.named_tensor_arg(node, "weight")? {
+        if let Some(weight) = self.named_parameter(node, "weight")? {
             let weight = weight.cast(DType::F32);
             let (result_b, weight) = broadcast_binary(result, weight);
             result = result_b * weight;
@@ -739,13 +740,13 @@ impl Translator<'_> {
 
         // Per-channel affine on axis 1.
         let non_channel_axes = (0..ndim).filter(|&axis| axis != 1).collect::<Vec<_>>();
-        if let Some(weight) = self.named_tensor_arg(node, "weight")? {
+        if let Some(weight) = self.named_parameter(node, "weight")? {
             let weight = weight
                 .cast(compute_dtype)
                 .expand_to_shape_on_axes(t.dims(), non_channel_axes.clone());
             t *= weight;
         }
-        if let Some(bias) = self.named_tensor_arg(node, "bias")? {
+        if let Some(bias) = self.named_parameter(node, "bias")? {
             let bias = bias
                 .cast(compute_dtype)
                 .expand_to_shape_on_axes(t.dims(), non_channel_axes);

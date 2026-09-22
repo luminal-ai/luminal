@@ -35,7 +35,15 @@ impl Translator<'_> {
         let b = if let Some(t) = self.optional_tensor_operand(&node.inputs[1])? {
             t
         } else {
-            self.scalar(&node.inputs[1], a.dtype)?
+            // Unlike arithmetic, torch rounds a comparison's scalar to the
+            // operands' common dtype before comparing.
+            match self.opmath {
+                Some(opmath) => {
+                    let literal = self.scalar(&node.inputs[1], opmath.common)?;
+                    super::convert(literal, opmath.compute)
+                }
+                None => self.scalar(&node.inputs[1], a.dtype)?,
+            }
         };
         let (a, b) = util::broadcast_binary(a, b);
         Ok(cmp(a, b))
@@ -74,9 +82,11 @@ impl Translator<'_> {
     }
 
     pub(super) fn pow_scalar_base(&mut self, node: &Node) -> Result<GraphTensor> {
-        let base = self.get_float_arg(node, 0)? as f32;
+        let base = self.get_float_arg(node, 0)?;
         let b = self.operand(&node.inputs[1])?;
-        let log_base = self.cx.constant_f32(base.ln());
+        let log_base = self
+            .floating_scalar(base.ln(), b.dtype)
+            .expand_rhs(b.dims());
         Ok((b * log_base).exp())
     }
 
@@ -434,11 +444,16 @@ impl Translator<'_> {
     ) -> Result<GraphTensor> {
         let condition = self.operand(&node.inputs[0])?;
         let a = self.operand(&node.inputs[1])?;
+        // torch promotes the two branches to the result dtype; the
+        // condition is a mask and is never promoted with them.
+        let dtype = self.output_meta_dtype(node).unwrap_or(a.dtype);
         let b = if scalar_other {
-            self.scalar(&node.inputs[2], a.dtype)?
+            self.scalar(&node.inputs[2], dtype)?
         } else {
             self.operand(&node.inputs[2])?
         };
+        let a = super::convert(a, dtype);
+        let b = super::convert(b, dtype);
         Ok(self.select(condition, a, b))
     }
 
@@ -537,8 +552,8 @@ impl Translator<'_> {
         let normalized: Vec<i64> = self
             .get_ints_arg(node, 1)
             .unwrap_or_else(|_| vec![x.rank() as i64]);
-        let weight = self.optional_tensor_operand(&node.inputs[2])?;
-        let bias = self.optional_tensor_operand(&node.inputs[3])?;
+        let weight = self.optional_operand_at_compute(&node.inputs[2])?;
+        let bias = self.optional_operand_at_compute(&node.inputs[3])?;
         let eps = self.get_float_arg(node, 4).unwrap_or(1e-5) as f32;
         let rank = x.rank();
         let n = normalized.len().min(rank);
@@ -556,9 +571,11 @@ impl Translator<'_> {
         let var = x.var_options(axes.clone(), 0);
         let eps_const = self.cx.constant_f32(eps).expand_rhs(var.dims());
         let rstd = (var + eps_const).sqrt().reciprocal();
-        // `native_layer_norm` returns (out, mean, rstd); `layer_norm`
-        // returns just `out`.
+        // `native_layer_norm` returns (out, mean, rstd) with the normalized
+        // axes kept as size-1 extents; `layer_norm` returns just `out`.
         if node.outputs.len() > 1 {
+            let mean = keep_axes(mean, &axes);
+            let rstd = keep_axes(rstd, &axes);
             self.bind_outputs(node, vec![out, mean, rstd])
         } else {
             self.bind_outputs(node, vec![out])
