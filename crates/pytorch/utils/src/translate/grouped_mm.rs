@@ -32,6 +32,9 @@ impl Translator<'_> {
         let weight = self.operand(&node.inputs[1])?;
         let offs = self.operand(&node.inputs[2])?;
         let out_dtype = self.output_meta_dtype(node)?;
+        // Exact-class op (`offs` is an int index tensor), so the arm states
+        // torch's opmath itself: the GEMM runs wide and rounds once.
+        let compute_dtype = super::opmath_compute(out_dtype);
 
         anyhow::ensure!(
             input.rank() == 2,
@@ -88,18 +91,15 @@ impl Translator<'_> {
         let exp_within = within.expand_dim(0, s);
         let flat_idx = exp_base + exp_within;
 
-        // Gather -> [S, K, N], then normalize both operands to the op's
-        // declared output dtype before matmul. Using the PT2 output metadata
-        // keeps the matmul dtype aligned with the exported contract without
-        // upcasting the full expert weight bank.
-        let weight_gathered = weight.gather1d(flat_idx).cast(out_dtype);
-        let input = input.cast(out_dtype);
+        // Gather -> [S, K, N], then meet both operands at the compute dtype.
+        // Gathering first keeps a half-precision widening on [S, K, N] and
+        // off the whole expert weight bank.
+        let weight_gathered = weight.gather1d(flat_idx).cast(compute_dtype);
+        let input = input.cast(compute_dtype);
 
         // Per-token matmul: [S, 1, K] @ [S, K, N] -> [S, 1, N] -> [S, N].
-        // Operands stay in their native dtype — no F32 cast on the gathered
-        // weight or the input.
         let result = input.unsqueeze(1).matmul(weight_gathered).squeeze(1);
 
-        Ok(result.cast(out_dtype))
+        Ok(super::convert(result, out_dtype))
     }
 }

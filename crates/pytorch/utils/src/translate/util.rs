@@ -67,13 +67,13 @@ pub(super) fn broadcast_binary(
     (a.expand(a_target), b.expand(b_target))
 }
 
-/// Promote two tensors to a common dtype following torch's promotion
-/// lattice (wider wins; floats beat ints; f16/bf16 mixed promotes to f32).
-pub(super) fn ensure_same_dtype(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
-    if a.dtype == b.dtype {
-        return (a, b);
+/// Torch's promotion lattice over two dtypes (wider wins; floats beat
+/// ints; f16/bf16 mixed promotes to f32).
+pub(super) fn promote(a: DType, b: DType) -> DType {
+    if a == b {
+        return a;
     }
-    let target = match (a.dtype, b.dtype) {
+    match (a, b) {
         (DType::F64, _) | (_, DType::F64) => DType::F64,
         (DType::F32, _) | (_, DType::F32) => DType::F32,
         (DType::F16, DType::Bf16) | (DType::Bf16, DType::F16) => DType::F32,
@@ -82,7 +82,15 @@ pub(super) fn ensure_same_dtype(a: GraphTensor, b: GraphTensor) -> (GraphTensor,
         (DType::I64, _) | (_, DType::I64) => DType::I64,
         (DType::Int, _) | (_, DType::Int) => DType::Int,
         _ => DType::F32,
-    };
+    }
+}
+
+/// Promote two tensors to their common dtype (see [`promote`]).
+pub(super) fn ensure_same_dtype(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
+    if a.dtype == b.dtype {
+        return (a, b);
+    }
+    let target = promote(a.dtype, b.dtype);
     (
         if a.dtype == target { a } else { a.cast(target) },
         if b.dtype == target { b } else { b.cast(target) },

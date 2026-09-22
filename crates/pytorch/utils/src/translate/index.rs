@@ -1135,9 +1135,11 @@ impl Translator<'_> {
         let cols = self
             .cx
             .iota(vec![bag_count, index_count, embedding_size], |c| c[2]);
-        let gathered = weight.gather(&[rows, cols]);
+        // Bags accumulate at torch's opmath dtype and round once at the store.
+        let accumulate = super::opmath_compute(weight.dtype);
+        let gathered = weight.gather(&[rows, cols]).cast(accumulate);
         let membership_values = membership.expand_dim(2, embedding_size);
-        let zero_values = self.full_tensor(gathered.dims(), weight.dtype, 0.0);
+        let zero_values = self.full_tensor(gathered.dims(), accumulate, 0.0);
         let mut selected = self.idx_cond(membership_values, gathered, zero_values);
         if let Some(index) = node
             .inputs
@@ -1149,7 +1151,7 @@ impl Translator<'_> {
                 bail!("per-sample weights require embedding_bag sum mode");
             }
             let scale = per_sample
-                .cast(weight.dtype)
+                .cast(accumulate)
                 .expand_dim(0, bag_count)
                 .expand_dim(2, embedding_size);
             selected *= scale;
@@ -1163,11 +1165,11 @@ impl Translator<'_> {
             1 => {
                 let one = self.full_tensor(vec![bag_count], DType::I64, 1.0);
                 let safe_counts = self.idx_cond(nonempty, counts, one);
-                let divisor = safe_counts.cast(weight.dtype).expand_dim(1, embedding_size);
+                let divisor = safe_counts.cast(accumulate).expand_dim(1, embedding_size);
                 (sum / divisor, counts)
             }
             _ => {
-                let lowest = self.full_tensor(gathered.dims(), weight.dtype, f64::NEG_INFINITY);
+                let lowest = self.full_tensor(gathered.dims(), accumulate, f64::NEG_INFINITY);
                 let candidates = self.idx_cond(membership_values, gathered, lowest);
                 let selected_positions = candidates.stable_argsort(1, true).slice_along(0..1, 1);
                 let values = self
@@ -1179,7 +1181,7 @@ impl Translator<'_> {
                     .squeeze(1)
                     .cast(DType::I64);
                 let output_nonempty = nonempty.expand_dim(1, embedding_size);
-                let zero_output = self.full_tensor(values.dims(), weight.dtype, 0.0);
+                let zero_output = self.full_tensor(values.dims(), accumulate, 0.0);
                 let zero_indices = self.cx.constant_i64(0).expand_rhs(selected_indices.dims());
                 (
                     self.idx_cond(output_nonempty, values, zero_output),
@@ -1206,6 +1208,7 @@ impl Translator<'_> {
         } else {
             counts
         };
+        let output = super::convert(output, weight.dtype);
         self.bind_outputs(node, vec![output, offset_to_bag, bag_size, max_indices])
     }
 }
