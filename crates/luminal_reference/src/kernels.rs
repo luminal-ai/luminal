@@ -170,7 +170,7 @@ pub(crate) fn move_gathered(
                 dest[flat] = data[*index];
             }
         }
-        (TypedBuffer::F8E4M3(data), TypedBuffer::F8E4M3(dest)) => {
+        (TypedBuffer::F8E4M3FN(data), TypedBuffer::F8E4M3FN(dest)) => {
             for (flat, index) in index_of.iter().enumerate() {
                 dest[flat] = data[*index];
             }

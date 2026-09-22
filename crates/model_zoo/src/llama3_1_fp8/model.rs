@@ -5,7 +5,7 @@
 //! example omitted this; we don't) and per-tensor E4M3FN quantization
 //! of every layer linear with static input scales (modelopt
 //! calibration). Quantization is MODEL DEFINITION: the weights stage
-//! and store as F8E4M3 buffers and the quantize/dequant chain is
+//! and store as F8E4M3FN buffers and the quantize/dequant chain is
 //! spelled in model text ([`luminal_nn::fp8_linear`]). Embeddings and
 //! the (untied) lm_head are bf16 in the checkpoint — numeric tensors,
 //! not quantization — staged f32 like every zoo example.

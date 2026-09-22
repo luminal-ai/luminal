@@ -137,8 +137,8 @@ impl TorchDType {
 }
 
 /// PyTorch dtype → luminal `DType`. `Err(self)` for variants luminal's IR
-/// doesn't model as first-class types — uint16, the complex family, and the
-/// float8 NUZ variants. PyTorch's three common narrow integer storage dtypes
+/// doesn't model as first-class types — uint16 and the complex family. The
+/// four fp8 encodings (fn, fnuz, e5m2, e5m2fnuz) each map to their own dtype. PyTorch's three common narrow integer storage dtypes
 /// map one-to-one to native luminal IR dtypes.
 /// Boundary code panics with the variant name on `Err`; cf.
 /// `typed_data::from_pytorch_bytes`, `pt2_util::torch_dtype_int_to_luminal`.
@@ -156,15 +156,15 @@ impl TryFrom<TorchDType> for DType {
             TorchDType::Double => DType::F64,
             TorchDType::Bool => DType::Bool,
             TorchDType::BFloat16 => DType::Bf16,
-            TorchDType::Float8E4m3Fn => DType::F8E4M3,
+            TorchDType::Float8E4m3Fn => DType::F8E4M3FN,
+            TorchDType::Float8E4m3Fnuz => DType::F8E4M3FNUZ,
             TorchDType::Float8E5m2 => DType::F8E5M2,
+            TorchDType::Float8E5m2Fnuz => DType::F8E5M2FNUZ,
             TorchDType::Uint16
             | TorchDType::Unknown
             | TorchDType::ComplexHalf
             | TorchDType::ComplexFloat
-            | TorchDType::ComplexDouble
-            | TorchDType::Float8E4m3Fnuz
-            | TorchDType::Float8E5m2Fnuz => return Err(t),
+            | TorchDType::ComplexDouble => return Err(t),
         })
     }
 }
@@ -193,8 +193,10 @@ impl TryFrom<DType> for TorchDType {
             DType::U8 => TorchDType::Byte,
             DType::I16 => TorchDType::Short,
             DType::Bool => TorchDType::Bool,
-            DType::F8E4M3 => TorchDType::Float8E4m3Fn,
+            DType::F8E4M3FN => TorchDType::Float8E4m3Fn,
+            DType::F8E4M3FNUZ => TorchDType::Float8E4m3Fnuz,
             DType::F8E5M2 => TorchDType::Float8E5m2,
+            DType::F8E5M2FNUZ => TorchDType::Float8E5m2Fnuz,
             _ => return Err(d),
         })
     }
@@ -227,6 +229,10 @@ mod tests {
             DType::U8,
             DType::I16,
             DType::Bool,
+            DType::F8E4M3FN,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2,
+            DType::F8E5M2FNUZ,
         ] {
             let t = TorchDType::try_from(d).expect("known DType");
             let back = DType::try_from(t).expect("known TorchDType");
@@ -245,6 +251,18 @@ mod tests {
         ] {
             assert!(TorchDType::try_from(d).is_err(), "expected Err for {d:?}");
         }
+    }
+
+    /// The fp8 encodings are distinct dtypes: the same byte decodes to
+    /// different values under `fn` and `fnuz`, so neither may alias the other.
+    #[test]
+    fn fp8_encodings_are_distinct_dtypes() {
+        assert_eq!(DType::try_from(TorchDType::Float8E4m3Fn).unwrap(), DType::F8E4M3FN);
+        assert_eq!(DType::try_from(TorchDType::Float8E4m3Fnuz).unwrap(), DType::F8E4M3FNUZ);
+        assert_eq!(DType::try_from(TorchDType::Float8E5m2).unwrap(), DType::F8E5M2);
+        assert_ne!(DType::F8E4M3FN, DType::F8E4M3FNUZ);
+        assert_eq!(DType::try_from(TorchDType::Float8E5m2Fnuz).unwrap(), DType::F8E5M2FNUZ);
+        assert_ne!(DType::F8E5M2, DType::F8E5M2FNUZ);
     }
 
     #[test]

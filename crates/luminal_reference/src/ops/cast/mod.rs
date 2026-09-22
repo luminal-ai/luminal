@@ -236,7 +236,7 @@ pub(crate) fn kernel(
         // (the clamp handles the crate's non-FN overflow behavior;
         // agreement with the checkpoint codec is pinned exhaustively
         // by test). Widening back is exact.
-        (TypedBuffer::F32(input), TypedBuffer::F8E4M3(dest)) => {
+        (TypedBuffer::F32(input), TypedBuffer::F8E4M3FN(dest)) => {
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
             for (out, value) in dest.iter_mut().zip(input) {
                 *out = if value.is_nan() {
@@ -246,13 +246,13 @@ pub(crate) fn kernel(
                 };
             }
         }
-        (TypedBuffer::F8E4M3(input), TypedBuffer::F32(dest)) => {
+        (TypedBuffer::F8E4M3FN(input), TypedBuffer::F32(dest)) => {
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
             for (out, code) in dest.iter_mut().zip(input) {
                 *out = code.to_f32();
             }
         }
-        (TypedBuffer::F8E4M3(input), TypedBuffer::F8E4M3(dest)) => {
+        (TypedBuffer::F8E4M3FN(input), TypedBuffer::F8E4M3FN(dest)) => {
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
             dest.copy_from_slice(input);
         }
