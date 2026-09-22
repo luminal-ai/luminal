@@ -191,9 +191,10 @@ impl ReferenceRuntime {
             .native
             .as_mut()
             .ok_or_else(|| anyhow!("bind before load"))?;
+        let var_literal = var.egglog_literal();
         spec.binding_seeds.push_str(&format!(
-            "(set (lower-bound-of (IntVar \"{var}\")) (bigint {lower}))\n\
-             (set (upper-bound-of (IntVar \"{var}\")) (bigint {upper}))\n"
+            "(set (lower-bound-of (IntVar {var_literal})) (bigint {lower}))\n\
+             (set (upper-bound-of (IntVar {var_literal})) (bigint {upper}))\n"
         ));
         // EVERY range binding is remembered, so `bind_dim_buckets` can
         // refuse this dim whatever the interval was.
@@ -1198,6 +1199,42 @@ mod tests {
             // execution below at both pins is the proof.
             let ours = run_reference(&cx2, &[(x2.id, data_x.into()), (y2.id, data_y.into())]);
             assert_close(ours.get_f32(out2.id).unwrap(), &expected);
+        }
+    }
+
+    /// A dimension is addressed by whatever its frontend called it. The
+    /// name is quoted into egglog and read back out of the serialized
+    /// e-graph, so a spelling that is not an identifier, and one that
+    /// needs escaping, must both render, saturate and execute.
+    #[test]
+    fn dynamic_dim_names_are_arbitrary_strings() {
+        for name in ["_batch", "a.b", "q\"uote\\back"] {
+            let dim = luminal::shape::Symbol::new(name);
+            let mut cx = Graph::new();
+            cx.set_dim(dim, 3);
+            let shape = vec![
+                luminal::shape::IntExpr::from(dim),
+                luminal::shape::IntExpr::from(2usize),
+            ];
+            let x = cx.tensor(shape.clone(), DType::F32);
+            let y = cx.tensor(shape, DType::F32);
+            let out = x * y;
+            let bound = crate::bindings::ReferenceBindings::leaves(&cx.logical)
+                .bind(&cx.logical)
+                .expect("native program");
+            let literal = format!("(IntVar {})", dim.egglog_literal());
+            assert!(
+                bound.text().contains(&literal),
+                "the model spells the dimension as {literal}:\n{}",
+                bound.text()
+            );
+            let data_x: Vec<f32> = (0..6).map(|v| v as f32 + 1.0).collect();
+            let data_y: Vec<f32> = (0..6).map(|v| (v as f32) * 0.5 - 1.0).collect();
+            let ours = run_reference(&cx, &[(x.id, data_x.into()), (y.id, data_y.into())]);
+            assert_close(
+                ours.get_f32(out.id).unwrap(),
+                &[-1.0, -1.0, 0.0, 2.0, 5.0, 9.0],
+            );
         }
     }
 

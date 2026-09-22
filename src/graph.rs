@@ -454,7 +454,7 @@ impl LogicalGraph {
             [Term::Num(n)] => Ok(format!("(IntLit {n})")),
             // Symbolic dims stay IntVar unconditionally — pins are
             // BINDING-side bounds seeds, never model content.
-            [Term::Var(c)] => Ok(format!("(IntVar \"{c}\")")),
+            [Term::Var(c)] => Ok(format!("(IntVar {})", c.egglog_literal())),
             // Compound dims render as full IntExpr trees (ruling
             // 2026-08-12: dims are any arbitrary IntExpr — extents are
             // structure, not identity; spellings that stall a
@@ -1382,7 +1382,7 @@ pub(crate) fn int_expr_term(expr: &IntExpr, coord_terms: &[String], at: &str) ->
             // BINDING-side bounds seeds, never model content (same rule
             // as dim_term; the R3 fix, 2026-08-06). No character is
             // special: 'z' is an ordinary named symbol (P1, 2026-08-07).
-            Term::Var(c) => stack.push(format!("(IntVar \"{c}\")")),
+            Term::Var(c) => stack.push(format!("(IntVar {})", c.egglog_literal())),
             // Coordinate atoms substitute their axis's CoordVar term; an
             // out-of-range axis is a coord IntExpr that leaked out of
             // its own iota — refuse loudly.

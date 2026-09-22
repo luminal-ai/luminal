@@ -242,7 +242,9 @@ pub fn extract_expr<'a>(
             // quoted literal node (`"s21"`), which the `MVar` arm lands on
             // directly. Parse it into the same `Symbol` the boxed form yields.
             op if op.starts_with('"') && op.ends_with('"') => {
-                IntExpr::from(crate::shape::Symbol::new(op.trim_matches('"')))
+                let name = crate::shape::Symbol::decode_serialized(op)
+                    .unwrap_or_else(|| panic!("malformed M-var {op:?}"));
+                IntExpr::from(crate::shape::Symbol::new(name))
             }
             op => op
                 .parse::<i64>()

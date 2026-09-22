@@ -166,9 +166,10 @@ impl MetalRuntime {
             .native
             .as_mut()
             .ok_or_else(|| anyhow!("load before bind"))?;
+        let name_literal = name.egglog_literal();
         native.binding_seeds.push_str(&format!(
-            "(set (lower-bound-of (IntVar \"{name}\")) (bigint {lower}))\n\
-             (set (upper-bound-of (IntVar \"{name}\")) (bigint {upper}))\n"
+            "(set (lower-bound-of (IntVar {name_literal})) (bigint {lower}))\n\
+             (set (upper-bound-of (IntVar {name_literal})) (bigint {upper}))\n"
         ));
         self.range_bound.insert(name, (lower, upper));
         if lower == upper {

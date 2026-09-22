@@ -335,9 +335,10 @@ impl CudaRuntime {
             .native
             .as_mut()
             .ok_or_else(|| anyhow!("load before bind"))?;
+        let name_literal = name.egglog_literal();
         native.binding_seeds.push_str(&format!(
-            "(set (lower-bound-of (IntVar \"{name}\")) (bigint {lower}))\n\
-             (set (upper-bound-of (IntVar \"{name}\")) (bigint {upper}))\n"
+            "(set (lower-bound-of (IntVar {name_literal})) (bigint {lower}))\n\
+             (set (upper-bound-of (IntVar {name_literal})) (bigint {upper}))\n"
         ));
         // EVERY range binding is remembered, so `bind_dim_buckets` can
         // refuse this dim whatever the interval was.
