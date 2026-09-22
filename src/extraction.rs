@@ -2612,10 +2612,10 @@ impl<'a> ClassRenderer<'a> {
                 self.node_with_op(class, "IntVar").and_then(|node_id| {
                     let node = self.egraph.nodes.get(node_id)?;
                     let name_class = child_class(self.egraph, node, 0)?;
+                    let rendered = self.render_class_prefer(&name_class, 2, None);
                     Some(
-                        self.render_class_prefer(&name_class, 2, None)
-                            .trim_matches('"')
-                            .to_string(),
+                        crate::shape::Symbol::decode_serialized(&rendered)
+                            .unwrap_or_else(|| rendered.trim_matches('"').to_string()),
                     )
                 })
             })

@@ -335,7 +335,7 @@ impl IntegerExpression {
         for term in self.terms.read().iter() {
             let new_symbol = match term {
                 Term::Num(n) => format!("(MNum {n})"),
-                Term::Var(c) => format!("(MVar \"{c}\")"),
+                Term::Var(c) => format!("(MVar {})", c.egglog_literal()),
                 Term::Coord(k) => format!("(MVar \"#{k}\")"),
                 Term::Max => format!(
                     "(MMax {} {})",

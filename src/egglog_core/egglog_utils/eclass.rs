@@ -175,14 +175,11 @@ impl<'g> EClass<'g> {
             .find_map(|n| n.op().parse::<i64>().ok())
     }
 
-    /// Any node in the class whose op is a quoted string literal.
+    /// Any node in the class whose op is a quoted string literal, unescaped.
     pub fn string_literal(&self) -> Option<String> {
-        self.nodes().into_iter().find_map(|n| {
-            n.op()
-                .strip_prefix('"')?
-                .strip_suffix('"')
-                .map(str::to_string)
-        })
+        self.nodes()
+            .into_iter()
+            .find_map(|n| crate::shape::Symbol::decode_serialized(n.op()))
     }
 
     // ---- typed, registry-free: the call site names the constructor ----

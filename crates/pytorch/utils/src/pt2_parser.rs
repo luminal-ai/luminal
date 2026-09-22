@@ -187,13 +187,12 @@ impl ParsedPT2 {
         let mut sym_names: Vec<String> = sym_set.into_iter().collect();
         sym_names.sort();
 
-        // A name we cannot use is remapped, not dropped: a symbol absent from
-        // this map never gets a value, so its dim would freeze at the export
-        // hint while torch, told it was dynamic, declines to recompile.
-        //
-        // Counted rather than derived, because deriving is not injective —
-        // `a.b` and `a-b` both sanitize to `a_b`, putting two dims on one
-        // symbol. Loops because `Dim("pt2_dim_0")` is legal input.
+        // Every spelling torch uses is kept verbatim. The one name the
+        // recorder refuses (the empty string) is remapped, not dropped: a
+        // symbol absent from this map never gets a value, so its dim would
+        // freeze at the export hint while torch, told it was dynamic,
+        // declines to recompile. Counted rather than derived, and looping
+        // because `Dim("pt2_dim_0")` is legal input.
         let mut minted = 0usize;
         for name in &sym_names {
             let symbol = Symbol::try_new_dim(name).unwrap_or_else(|e| {
@@ -454,45 +453,56 @@ mod tests {
         );
     }
 
-    /// torch lets a user write `Dim("_batch")` or `Dim("a__b")` — ordinary
-    /// Python names that are not usable C++ identifiers. Every one of them
-    /// still has to produce a *dynamic* dim: dropping the symbol freezes it
-    /// at the export-time hint (or 1) with nothing to correct it later, and
-    /// torch will not recompile. (`z` is an ordinary named symbol on this
-    /// branch — the HLIR loop index that reserved it is gone — so it is not
-    /// among the rejects.)
+    /// torch lets a user write `Dim("_batch")`, `Dim("a__b")` or any other
+    /// string, and torch's own symbols are `s77`/`u0`. Every spelling is
+    /// kept verbatim and stays a *dynamic* dim: dropping or renaming the
+    /// symbol would freeze it at the export-time hint with nothing to
+    /// correct it later, and torch will not recompile. (`z` is an ordinary
+    /// named symbol on this branch — the HLIR loop index that reserved it
+    /// is gone.)
     #[test]
-    fn build_sym_dim_map_remaps_unusable_names_and_keeps_them_dynamic() {
-        let names = ["s77", "u0", "batch", "_batch", "a__b", "z"];
+    fn build_sym_dim_map_keeps_every_torch_spelling() {
+        let names = [
+            "s77", "u0", "batch", "_batch", "a__b", "a.b", "seq len", "z",
+        ];
         let map = program_with_dim_symbols(&names).build_sym_dim_map();
 
-        assert_eq!(map.sym_to_symbol.len(), 6, "no dim may be dropped");
+        assert_eq!(
+            map.sym_to_symbol.len(),
+            names.len(),
+            "no dim may be dropped"
+        );
         for name in names {
-            assert!(map.sym_to_symbol.contains_key(name), "{name} addressable");
-        }
-        // Usable names keep their spelling; only the rejects are renamed.
-        for ok in ["s77", "u0", "batch", "z"] {
-            assert_eq!(map.sym_to_symbol[ok].to_string(), ok);
-        }
-        for rejected in ["_batch", "a__b"] {
-            assert_ne!(map.sym_to_symbol[rejected].to_string(), rejected);
+            assert_eq!(
+                map.sym_to_symbol
+                    .get(name)
+                    .map(|s| s.to_string())
+                    .as_deref(),
+                Some(name),
+                "{name} is addressed by its own spelling"
+            );
         }
 
         let distinct: std::collections::HashSet<_> =
             map.sym_to_symbol.values().map(|s| s.to_string()).collect();
-        assert_eq!(distinct.len(), 6, "two dims must never share a symbol");
+        assert_eq!(
+            distinct.len(),
+            names.len(),
+            "two dims must never share a symbol"
+        );
     }
 
-    /// Minting must not collide with a name the user actually wrote. Deriving
-    /// the replacement from the rejected name would also collapse `a.b` and
-    /// `a-b` onto one symbol, which is why it is counted instead.
+    /// The empty string is the one name the recorder refuses; it is minted
+    /// a replacement, and minting must not collide with a name the user
+    /// actually wrote.
     #[test]
     fn build_sym_dim_map_mints_around_a_name_the_user_already_used() {
-        let map = program_with_dim_symbols(&["pt2_dim_0", "z"]).build_sym_dim_map();
+        let map = program_with_dim_symbols(&["pt2_dim_0", ""]).build_sym_dim_map();
 
         assert_eq!(map.sym_to_symbol["pt2_dim_0"].to_string(), "pt2_dim_0");
+        assert!(map.sym_to_symbol.contains_key(""), "the dim is not dropped");
         assert_ne!(
-            map.sym_to_symbol["z"].to_string(),
+            map.sym_to_symbol[""].to_string(),
             "pt2_dim_0",
             "minted name must not steal the one the user declared"
         );
