@@ -527,25 +527,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         data.insert(kv_cache.k_caches[i].id, vec![0.0f32; cache_elements].into());
         data.insert(kv_cache.v_caches[i].id, vec![0.0f32; cache_elements].into());
     }
-    data.insert(input.id, vec![1i32; search_s].into());
-    data.insert(q_pos_t.id, (0..search_s as i32).collect::<Vec<_>>().into());
-    data.insert(
-        scatter_idx_t.id,
-        (0..search_s as i32).collect::<Vec<_>>().into(),
-    );
-    data.insert(
-        gather_idx_t.id,
-        (0..search_c as i32).collect::<Vec<_>>().into(),
-    );
-    data.insert(attn_mask_t.id, vec![0.0f32; search_s * search_c].into());
+    // Every Cartesian bucket representative needs matching transient inputs.
+    // Weights and KV caches stay shared across all profiling assignments.
+    let profile_inputs: Vec<(luminal::shape::DynMap, _)> = [1, search_s]
+        .into_iter()
+        .flat_map(|s| {
+            [1, search_c].into_iter().map(move |c| {
+                let inputs = [
+                    (input.id, HostBuffer::from(vec![1i32; s])),
+                    (q_pos_t.id, (0..s as i32).collect::<Vec<_>>().into()),
+                    (scatter_idx_t.id, (0..s as i32).collect::<Vec<_>>().into()),
+                    (gather_idx_t.id, (0..c as i32).collect::<Vec<_>>().into()),
+                    (attn_mask_t.id, vec![0.0f32; s * c].into()),
+                ]
+                .into_iter()
+                .collect::<luminal::prelude::FxHashMap<_, _>>();
+                (
+                    [('s'.into(), s), ('c'.into(), c)].into_iter().collect(),
+                    inputs,
+                )
+            })
+        })
+        .collect();
     for spec in cx.logical.input_specs() {
-        if !data.contains_key(&spec.id) {
+        if !data.contains_key(&spec.id) && !profile_inputs[0].1.contains_key(&spec.id) {
             return Err(format!("missing model input {}", spec.label).into());
         }
     }
     println!("Compiling...");
     let compile_start = Instant::now();
-    runtime.search(&data, &compile_options)?;
+    runtime.search_with_profile_inputs(&data, &profile_inputs, &compile_options)?;
     for (id, values) in data {
         runtime.set_data(id, values);
     }
