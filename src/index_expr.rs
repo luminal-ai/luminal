@@ -169,9 +169,9 @@ fn parse_int_expr_uncached(
             .nodes_of(&name_class)
             .iter()
             .filter_map(|id| site.egraph.nodes.get(id))
-            .find_map(|n| n.op.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+            .find_map(|n| crate::shape::Symbol::decode_serialized(&n.op))
         {
-            return Some(IotaExpr::Var(name.to_string()));
+            return Some(IotaExpr::Var(name));
         }
     }
     for coord in site.nodes_in_class_value(class, "CoordVar") {

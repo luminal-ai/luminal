@@ -1094,9 +1094,10 @@ fn bucket_renders(
     let seeds_text = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| {
         let mut text = String::new();
         for (var, (lower, upper)) in seeds {
+            let var = var.egglog_literal();
             text.push_str(&format!(
-                "(set (lower-bound-of (IntVar \"{var}\")) (bigint {lower}))\n\
-                 (set (upper-bound-of (IntVar \"{var}\")) (bigint {upper}))\n"
+                "(set (lower-bound-of (IntVar {var})) (bigint {lower}))\n\
+                 (set (upper-bound-of (IntVar {var})) (bigint {upper}))\n"
             ));
         }
         text
