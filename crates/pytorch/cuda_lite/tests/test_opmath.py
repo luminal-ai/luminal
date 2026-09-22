@@ -275,7 +275,12 @@ def test_attention_bool_mask_excludes_keys():
     is exactly that key's value."""
 
     def fn(q, k, v, m):
-        return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=m)
+        # Eager returns the attention as a transposed view; the plan cannot
+        # yet write a boundary output at those strides, so hand back a
+        # contiguous copy (the value under test is unchanged).
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=m
+        ).contiguous()
 
     torch.manual_seed(0)
     q = torch.randn(2, 2, 4, 8, device="cuda", dtype=torch.float16)
