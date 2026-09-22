@@ -33,6 +33,9 @@ pub struct CompileOptions {
     /// Maximum arena size, capped by the device's maximum buffer length.
     /// Applied before search to materializations and to candidate allocations.
     pub device_budget_bytes: Option<usize>,
+    /// Prune individual intermediate materializations above this size before
+    /// extraction, preserving boundary storage and zero-copy view alternatives.
+    pub max_intermediate_bytes: Option<usize>,
     /// Custom edits after serialization and before mandatory memory pruning.
     pub serialized_graph_passes: Vec<crate::egraph_postpass::SerializedGraphPostPass>,
     pub shapes: crate::symbolic::ShapeEnv,
@@ -52,6 +55,7 @@ impl Default for CompileOptions {
             candidate_timeout: None,
             keep_finalists: 4,
             device_budget_bytes: None,
+            max_intermediate_bytes: None,
             serialized_graph_passes: Vec::new(),
             shapes: Default::default(),
             algebra_match_budget: Some(crate::saturation::DEFAULT_ALGEBRA_MATCH_BUDGET),
@@ -280,6 +284,8 @@ pub fn search_implementations(
             decoders: &decoders,
             bounds: &options.shapes.bounds,
             arena_budget_bytes,
+            max_intermediate_bytes: options.max_intermediate_bytes,
+            matchers,
         },
         &options.serialized_graph_passes,
     )?;

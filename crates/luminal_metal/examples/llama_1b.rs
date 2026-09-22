@@ -468,9 +468,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         generation_size: SEARCH_GRAPHS / 10,
         candidate_timeout: Some(Duration::from_secs(10)),
         device_budget_bytes: Some(8 * 1024 * 1024 * 1024),
+        // Keep multi-GiB broadcast products out of the e-graph while retaining
+        // large checkpoint inputs and composed, zero-copy layouts.
+        max_intermediate_bytes: Some(64 * 1024 * 1024),
         ..Default::default()
     };
-    let mut runtime = MetalRuntime::load(&cx)?;
+    // Cache updates are consumed by attention, so they are not graph leaves.
+    // Bind them explicitly because the generation loop reads them back.
+    let outputs: Vec<_> = std::iter::once(logits.id)
+        .chain(cache_outputs.iter().flat_map(|(k, v)| [k.id, v.id]))
+        .collect();
+    let bindings = luminal_metal::bindings::MetalBindings::dense(&cx.logical, &outputs);
+    let mut runtime = MetalRuntime::load_with(&cx, bindings, luminal_metal::metal_registry())?;
     runtime.bind_dim_buckets(
         's',
         vec![

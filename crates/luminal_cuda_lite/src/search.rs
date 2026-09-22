@@ -68,6 +68,9 @@ pub struct CompileOptions {
     /// materializations, and rejects candidate arenas over the limit before
     /// allocation. The finalist lattice also enforces the requested set budget.
     pub device_budget_bytes: Option<usize>,
+    /// Prune individual intermediate materializations above this size before
+    /// extraction, preserving boundary storage and zero-copy view alternatives.
+    pub max_intermediate_bytes: Option<usize>,
     /// Custom edits after serialization and before mandatory memory pruning.
     pub serialized_graph_passes: Vec<crate::egraph_postpass::SerializedGraphPostPass>,
     /// Shape environment for lower-level search callers. The runtime fills this from bindings.
@@ -86,6 +89,7 @@ impl Default for CompileOptions {
             candidate_timeout: None,
             keep_finalists: 4,
             device_budget_bytes: None,
+            max_intermediate_bytes: None,
             serialized_graph_passes: Vec::new(),
             shapes: Default::default(),
         }
@@ -439,6 +443,8 @@ pub fn search_implementations(
             decoders: &decoders,
             bounds: &options.shapes.bounds,
             arena_budget_bytes,
+            max_intermediate_bytes: options.max_intermediate_bytes,
+            matchers,
         },
         &options.serialized_graph_passes,
     )?;

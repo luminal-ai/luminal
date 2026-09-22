@@ -17,6 +17,10 @@ pub struct PostPassContext<'a> {
     pub decoders: &'a ConstructorRegistry,
     pub bounds: &'a crate::symbolic::Bounds,
     pub arena_budget_bytes: usize,
+    /// Optional cap on a single non-boundary materialization. Boundary inputs
+    /// and outputs still obey the total arena budget.
+    pub max_intermediate_bytes: Option<usize>,
+    pub matchers: &'a [Box<dyn luminal::layout_ir::OpMatcher>],
 }
 
 /// Runtime extension point. Passes edit the serialized graph before extraction;
@@ -36,31 +40,45 @@ pub fn run(
         graph.class_data = edited.class_data;
         graph.root_eclasses = edited.root_eclasses;
     }
-    prune_oversized_materializations(
+    let capacity = |layout: &DecodedLayout| {
+        layout
+            .spellings
+            .iter()
+            .find_map(|spelling| spelling.span_elements())
+            .map(|span| {
+                let width = usize::try_from(layout.width_bits())?.div_ceil(8);
+                crate::symbolic::Expr(span)
+                    .capacity(context.bounds)?
+                    .checked_mul(width)
+                    .ok_or_else(|| anyhow!("materialized tensor capacity overflow"))
+            })
+            .transpose()
+    };
+    let mut report = prune_oversized_materializations(
         graph,
         context.decoders,
         context.arena_budget_bytes,
-        |layout| {
-            layout
-                .spellings
-                .iter()
-                .find_map(|spelling| spelling.span_elements())
-                .map(|span| {
-                    let width = usize::try_from(layout.width_bits())?.div_ceil(8);
-                    crate::symbolic::Expr(span)
-                        .capacity(context.bounds)?
-                        .checked_mul(width)
-                        .ok_or_else(|| anyhow!("materialized tensor capacity overflow"))
-                })
-                .transpose()
-        },
+        capacity,
     )
     .map_err(|error| {
         anyhow!(
             "{}-byte arena budget: {error:#}",
             context.arena_budget_bytes
         )
-    })
+    })?;
+    if let Some(limit) = context.max_intermediate_bytes {
+        let transparent = transparent_producers(graph, context.matchers);
+        let intermediate =
+            prune_materializations(graph, context.decoders, limit, capacity, true, &transparent)
+                .map_err(|error| anyhow!("{limit}-byte intermediate budget: {error:#}"))?;
+        report.oversized_tensors += intermediate.oversized_tensors;
+        report.producer_classes += intermediate.producer_classes;
+        report.removed_nodes += intermediate.removed_nodes;
+        report.largest_tensor_bytes = report
+            .largest_tensor_bytes
+            .max(intermediate.largest_tensor_bytes);
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,11 +99,64 @@ pub fn prune_oversized_materializations(
     budget: usize,
     capacity: impl Fn(&DecodedLayout) -> Result<Option<usize>>,
 ) -> Result<MemoryPruning> {
+    prune_materializations(graph, decoders, budget, capacity, false, &BTreeSet::new())
+}
+
+fn transparent_producers(
+    graph: &EGraph,
+    matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
+) -> BTreeSet<ClassId> {
+    use luminal::layout_ir::{ExtractionSite, SerializedIndex};
+    let registry: BTreeMap<_, _> = matchers
+        .iter()
+        .map(|m| (m.egglog_constructor(), m))
+        .collect();
+    let index = SerializedIndex::new(graph);
+    graph
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            if node.subsumed {
+                return None;
+            }
+            let matcher = registry.get(node.op.as_str())?;
+            let op = matcher.extract(&ExtractionSite {
+                egraph: graph,
+                node_id: id,
+                node,
+                index: &index,
+            });
+            crate::plan_transparent(op.as_ref()).then(|| node.eclass.clone())
+        })
+        .collect()
+}
+
+fn prune_materializations(
+    graph: &mut EGraph,
+    decoders: &ConstructorRegistry,
+    budget: usize,
+    capacity: impl Fn(&DecodedLayout) -> Result<Option<usize>>,
+    preserve_boundaries: bool,
+    transparent: &BTreeSet<ClassId>,
+) -> Result<MemoryPruning> {
+    // Before bufferization, BufferTensorLit declarations describe boundary
+    // storage. Keep those exact tensor classes, not every layout with the same
+    // shape: a temporary with a boundary's layout still needs the tighter cap.
+    let boundaries: BTreeSet<_> = graph
+        .nodes
+        .values()
+        .filter(|node| node.op == "BufferTensorLit")
+        .filter_map(|node| node.children.first())
+        .map(|id| graph.nodes[id].eclass.clone())
+        .collect();
     let view = EGraphView::new(graph, decoders);
     let mut sizes = BTreeMap::new();
     let mut oversized = BTreeSet::new();
     let mut largest = 0;
     for node in graph.nodes.values().filter(|n| n.op == "LayoutTensorLit") {
+        if preserve_boundaries && boundaries.contains(&node.eclass) {
+            continue;
+        }
         let layout_id = node
             .children
             .get(1)
@@ -127,15 +198,44 @@ pub fn prune_oversized_materializations(
         .nodes
         .values()
         .filter(|node| {
-            node.op == "LayoutTensorOpLit" && bad_lists.contains(child_class(&node.children[1]))
+            node.op == "LayoutTensorOpLit"
+                && !transparent.contains(&node.eclass)
+                && bad_lists.contains(child_class(&node.children[1]))
         })
         .map(|node| node.eclass.clone())
         .collect();
-    let mut removed = oversized.clone();
+    // A view can disclose a large backing span without allocating it. Retain
+    // its output tensor classes, while still pruning allocating producers of
+    // those classes. This classification comes from registered op effects.
+    let mut view_lists: Vec<_> = graph
+        .nodes
+        .values()
+        .filter(|node| node.op == "LayoutTensorOpLit" && transparent.contains(&node.eclass))
+        .map(|node| child_class(&node.children[1]).clone())
+        .collect();
+    let mut view_tensors = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    while let Some(class) = view_lists.pop() {
+        if !seen.insert(class.clone()) {
+            continue;
+        }
+        for node in graph.classes()[&class]
+            .nodes
+            .iter()
+            .map(|id| &graph.nodes[id])
+        {
+            if node.op == "LayoutTensorCons" {
+                view_tensors.insert(child_class(&node.children[0]).clone());
+                view_lists.push(child_class(&node.children[1]).clone());
+            }
+        }
+    }
+    let mut removed: BTreeSet<_> = oversized.difference(&view_tensors).cloned().collect();
+    let oversized_tensors = removed.len();
     removed.extend(producers.iter().cloned());
     let removed_nodes = remove_classes(graph, &removed)?;
     Ok(MemoryPruning {
-        oversized_tensors: oversized.len(),
+        oversized_tensors,
         producer_classes: producers.len(),
         removed_nodes,
         largest_tensor_bytes: largest,
@@ -361,6 +461,8 @@ mod tests {
             decoders: &decoders,
             bounds: &bounds,
             arena_budget_bytes: 1024 * 1024,
+            max_intermediate_bytes: None,
+            matchers: &[],
         };
         let mut graph = materializations();
         let report = run(&mut graph, &context, &[]).unwrap();
@@ -387,6 +489,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.removed_nodes, 0);
+    }
+
+    #[test]
+    fn intermediate_cap_preserves_boundary_storage_but_not_same_layout_temporaries() {
+        let decoders = ConstructorRegistry::new(luminal::egglog_snippet::core_decoders()).unwrap();
+        let bounds = [('q'.into(), (2, 128))].into();
+        let mut graph = materializations();
+        add(
+            &mut graph,
+            "input_logical",
+            "input_logical",
+            "LogicalInput",
+            &[],
+        );
+        add(
+            &mut graph,
+            "input_tensor",
+            "input_tensor",
+            "LayoutTensorLit",
+            &["input_logical", "dense"],
+        );
+        add(&mut graph, "buffer", "buffer", "BufferLit", &[]);
+        add(
+            &mut graph,
+            "input_storage",
+            "input_storage",
+            "BufferTensorLit",
+            &["input_tensor", "buffer"],
+        );
+        add(
+            &mut graph,
+            "input",
+            "input",
+            "BufferInputLit",
+            &["input_storage"],
+        );
+        let context = PostPassContext {
+            decoders: &decoders,
+            bounds: &bounds,
+            arena_budget_bytes: 4 * 1024 * 1024,
+            max_intermediate_bytes: Some(1024 * 1024),
+            matchers: &[],
+        };
+        let report = run(&mut graph, &context, &[]).unwrap();
+        assert_eq!(report.oversized_tensors, 1);
+        assert!(graph.nodes.contains_key(&NodeId::from("input_tensor")));
+        assert!(graph.nodes.contains_key(&NodeId::from("broadcast")));
+        assert!(!graph.nodes.contains_key(&NodeId::from("large")));
+        assert!(!graph.nodes.contains_key(&NodeId::from("implementation")));
+        // The tighter intermediate cap never exempts a boundary from the
+        // mandatory total arena budget.
+        let error = run(
+            &mut graph,
+            &PostPassContext {
+                arena_budget_bytes: 1024 * 1024,
+                ..context
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("required BufferInputLit"));
     }
 
     #[test]
@@ -420,6 +583,8 @@ mod tests {
                 decoders: &decoders,
                 bounds: &BTreeMap::new(),
                 arena_budget_bytes: 1024,
+                max_intermediate_bytes: None,
+                matchers: &[],
             },
             &[edit],
         )
