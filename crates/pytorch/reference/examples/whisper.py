@@ -203,24 +203,6 @@ class Whisper(torch.nn.Module):
         return self.decoder(tokens, xa)
 
 
-class DecoderWithFixedXa(torch.nn.Module):
-    """Wraps the decoder with the encoder output stored as a buffer.
-
-    The audio is fixed for the whole utterance, so ``xa`` is a constant relative
-    to the per-token decode loop. Storing it as a buffer lets us compile the
-    decoder once with a single dynamic-length ``tokens`` input, avoiding a full
-    recompilation at every step as the sequence grows.
-    """
-
-    def __init__(self, decoder: WhisperDecoder, xa: torch.Tensor):
-        super().__init__()
-        self.decoder = decoder
-        self.register_buffer("xa", xa)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.decoder(tokens, self.xa)
-
-
 # ---------------------------------------------------------------------------
 # Weight loading: HF state_dict -> our model
 # ---------------------------------------------------------------------------
@@ -448,10 +430,8 @@ def main() -> None:
     with torch.no_grad():
         xa = model.encoder(mel)
 
-    # 2. Wrap the decoder so its only varying input is `tokens`, then compile
-    #    once with a dynamic length dim. Subsequent calls reuse the same
-    #    compiled graph — no recompile per token.
-    decoder_only = DecoderWithFixedXa(model.decoder, xa).eval().to(device)
+    # 2. Compile the decoder with a dynamic token length. The encoder output
+    #    stays fixed for this utterance but is an ordinary decoder input.
     example_tokens = torch.tensor(
         [TOKEN_SOT, TOKEN_NO_TIMESTAMPS], dtype=torch.long, device=device
     )
@@ -459,7 +439,7 @@ def main() -> None:
     compile_start = time.time()
     seq = ShapeVar("seq", min=2, max=N_TEXT_CTX, optimization_hint=2)
     compiled_decoder = torch.compile(
-        decoder_only,
+        model.decoder,
         backend=Compiler(
             search_iterations=10,
             search_log=True,
@@ -471,11 +451,16 @@ def main() -> None:
             },
         ),
         fullgraph=True,
-        dynamic_shapes=ShapesSpec(params={"tokens": TensorSpec([seq])}),
+        dynamic_shapes=ShapesSpec(
+            params={
+                "tokens": TensorSpec([seq]),
+                "xa": TensorSpec([N_AUDIO_CTX, D_MODEL]),
+            }
+        ),
     )
     # torch.compile is lazy. Reuse the first call's logits for the first token.
     with torch.no_grad():
-        first_logits = compiled_decoder(example_tokens)
+        first_logits = compiled_decoder(example_tokens, xa)
     print(f"Compiled in {time.time() - compile_start:.1f}s")
 
     tokens = [TOKEN_SOT, TOKEN_NO_TIMESTAMPS]
@@ -485,7 +470,9 @@ def main() -> None:
     for step in range(max_new_tokens):
         decoder_input_ids = torch.tensor(tokens, dtype=torch.long, device=device)
         with torch.no_grad():
-            logits = first_logits if step == 0 else compiled_decoder(decoder_input_ids)
+            logits = (
+                first_logits if step == 0 else compiled_decoder(decoder_input_ids, xa)
+            )
 
         next_token = greedy_decode(logits[-1], suppress_first_eot=(step == 0))
         if next_token == TOKEN_EOT:
