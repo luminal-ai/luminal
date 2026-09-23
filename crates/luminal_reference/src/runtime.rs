@@ -31,52 +31,6 @@ pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 /// Default per-intermediate allocation ceiling (2 GiB), excluding boundary buffers.
 pub const DEFAULT_MAX_INTERMEDIATE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// Validate the whole plan before allocating any of its tensor storage.
-/// Boundary buffers are identified by their actual input/output slots, not
-/// ownership (an internally allocated buffer can also back an output).
-pub(crate) fn check_intermediate_allocations(
-    plan: &BufferIrGraph<DecodedLayout>,
-    dims: &luminal::shape::DynMap,
-    limit: usize,
-) -> Result<()> {
-    let mut boundary = rustc_hash::FxHashSet::default();
-    for node in plan.dag.node_weights() {
-        match node {
-            BufferNode::BufferInput { slots } => {
-                boundary.extend(slots.iter().map(|slot| slot.buffer.clone()));
-            }
-            BufferNode::BufferOutput { slots } => {
-                boundary.extend(slots.iter().map(|slot| slot.buffer.clone()));
-            }
-            _ => {}
-        }
-    }
-    for (id, buffer) in &plan.buffers {
-        if boundary.contains(id) {
-            continue;
-        }
-        let elements = buffer.layout.span_with(dims)?;
-        let dtype = buffer
-            .layout
-            .dtype
-            .ok_or_else(|| anyhow!("buffer {} has no dtype", buffer.label))?;
-        // Bool is byte-backed in TypedBuffer, despite its one-bit logical dtype.
-        let width = usize::try_from(dtype.egglog_bits())?.div_ceil(8);
-        let bytes = elements.checked_mul(width).ok_or_else(|| {
-            anyhow!(
-                "reference intermediate {} allocation size overflow",
-                buffer.label
-            )
-        })?;
-        ensure!(
-            bytes <= limit,
-            "reference intermediate {} requires {bytes} bytes, exceeding max_intermediate_bytes={limit}",
-            buffer.label
-        );
-    }
-    Ok(())
-}
-
 /// Conservative tensor-payload scratch bound for the unchanged reference
 /// kernels. All currently registered kernels either clone operands, allocate
 /// index/coordinate columns, or use only rank-sized metadata. This is allocation
@@ -234,7 +188,6 @@ struct NativeSpec {
 
 #[derive(Default)]
 pub struct ReferenceRuntime {
-    max_intermediate_bytes: Option<usize>,
     memory_budget_bytes: Option<usize>,
     peak_live_bytes: usize,
     plan: Option<BufferIrGraph<DecodedLayout>>,
@@ -284,11 +237,6 @@ impl ReferenceRuntime {
 
     pub fn peak_live_bytes(&self) -> usize {
         self.peak_live_bytes
-    }
-
-    /// Set the per-intermediate buffer limit. Applied again at every dynamic shape.
-    pub fn set_max_intermediate_bytes(&mut self, bytes: usize) {
-        self.max_intermediate_bytes = Some(bytes);
     }
 
     /// Register the tensor→buffer role maps from the boundary bindings.
@@ -514,7 +462,6 @@ impl ReferenceRuntime {
              SIZE — one fixed data map cannot stage them all, and staging the \
              wrong size is exactly the silent mis-fit this refuses"
         );
-        self.set_max_intermediate_bytes(options.max_intermediate_bytes);
         self.set_memory_budget_bytes(options.memory_budget_bytes);
         let spec = self
             .native
@@ -557,20 +504,22 @@ impl ReferenceRuntime {
             }
             return Err(anyhow!("native saturation failed: {err}"));
         }
+        crate::search::check_interrupt()?;
         // THE ASSEMBLY TRIPWIRE: every constructor of a decoded sort in
         // this program has exactly one decoder, checked against the LIVE
         // schema before anything reads a serialized class.
         crate::decoder_registry().check(&egraph)?;
         let saturation_nanos = saturation_start.elapsed().as_nanos();
         let serialize_start = std::time::Instant::now();
-        let serialized = egraph
+        let mut serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
             .egraph;
         let serialize_nanos = serialize_start.elapsed().as_nanos();
         let mut outcome = crate::search::search_implementations_with_ops(
-            &serialized,
+            &mut serialized,
             &program,
             input_data,
+            &self.dims,
             &self.dims,
             options,
             spec.ops,
@@ -611,7 +560,6 @@ impl ReferenceRuntime {
             !self.dim_buckets.is_empty(),
             "no dim buckets are bound: call search"
         );
-        self.set_max_intermediate_bytes(options.max_intermediate_bytes);
         self.set_memory_budget_bytes(options.memory_budget_bytes);
         let spec = self
             .native
@@ -730,13 +678,6 @@ impl ReferenceRuntime {
             }
         }
 
-        check_intermediate_allocations(
-            plan,
-            &self.dims,
-            self.max_intermediate_bytes
-                .unwrap_or(DEFAULT_MAX_INTERMEDIATE_BYTES),
-        )?;
-
         // Evaluate all geometry and dtype contracts without allocating tensor
         // payloads. A depth-first walk of prerequisites retains every DAG edge,
         // including WAR anti-dependencies and effects.
@@ -836,6 +777,7 @@ impl ReferenceRuntime {
         let mut live = staged_bytes;
         self.peak_live_bytes = live;
         for (step, index) in order.into_iter().enumerate() {
+            crate::search::check_interrupt()?;
             match &plan.dag[index] {
                 BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. } => {}
                 BufferNode::BufferCopy { src, dst } => {
@@ -1230,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn intermediate_limit_rejects_search_and_execute() {
+    fn intermediate_limit_prunes_before_search() {
         let mut graph = Graph::new();
         let x = graph.tensor(4, DType::F32);
         let out = x.sin().cos();
@@ -1258,15 +1200,10 @@ mod tests {
         runtime.set_data(x.id, vec![0.0f32; 4]);
         runtime.execute().unwrap();
         assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![1.0; 4]);
-        runtime.set_max_intermediate_bytes(15);
-        let error = runtime.execute().unwrap_err().to_string();
-        assert!(error.contains("requires 16 bytes"), "{error}");
-        // Refusal happens before replacing the previous successful storage.
-        assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![1.0; 4]);
     }
 
     #[test]
-    fn intermediate_limit_checks_dynamic_execution_size() {
+    fn intermediate_pruning_uses_bucket_capacity() {
         use luminal::{graph::DimBucket, shape::Symbol};
         let mut graph = Graph::new();
         graph.set_dim('a', 2);
@@ -1278,6 +1215,23 @@ mod tests {
             .unwrap();
         let mut options = crate::search::harness_search_options();
         options.max_intermediate_bytes = 16;
+        // A plan must serve the entire bucket. The 8-element intermediate
+        // needs 32 bytes even though the representative needs only 8.
+        let mut rejected = ReferenceRuntime::load(&graph).unwrap();
+        rejected
+            .bind_dim_buckets('a', vec![DimBucket::new(1, 8).representative(2)])
+            .unwrap();
+        let error = rejected
+            .search_buckets(
+                |dims| {
+                    FxHashMap::from_iter([(x.id, vec![0.0f32; dims[&Symbol::from('a')]].into())])
+                },
+                &options,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_intermediate_bytes=16"), "{error}");
+        options.max_intermediate_bytes = 32;
         runtime
             .search_buckets(
                 |dims| {
@@ -1290,16 +1244,8 @@ mod tests {
         runtime.set_data(x.id, vec![0.0f32; 4]);
         runtime.execute().unwrap();
         assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![1.0; 4]);
-        runtime.set_dim('a', 5);
-        runtime.set_data(x.id, vec![0.0f32; 5]);
-        let error = runtime.execute().unwrap_err().to_string();
-        assert!(error.contains("requires 20 bytes"), "{error}");
         // The aggregate budget is also re-evaluated at the current shape.
-        runtime.set_max_intermediate_bytes(usize::MAX);
         runtime.set_memory_budget_bytes(runtime.peak_live_bytes());
-        runtime.set_dim('a', 4);
-        runtime.set_data(x.id, vec![0.0f32; 4]);
-        runtime.execute().unwrap();
         runtime.set_dim('a', 5);
         runtime.set_data(x.id, vec![0.0f32; 5]);
         assert!(
@@ -1312,44 +1258,18 @@ mod tests {
     }
 
     #[test]
-    fn intermediate_limit_excludes_boundary_buffers() {
-        use super::{BufferNode, check_intermediate_allocations};
+    fn intermediate_pruning_preserves_boundary_buffers() {
         let mut graph = Graph::new();
         let x = graph.tensor(4, DType::F32);
-        let _out = x.sin();
+        let out = x.sin();
         let data = FxHashMap::from_iter([(x.id, vec![0.0f32; 4].into())]);
+        let mut options = crate::search::harness_search_options();
+        options.max_intermediate_bytes = 0;
         let mut runtime = ReferenceRuntime::load(&graph).unwrap();
-        runtime
-            .search(&data, &crate::search::harness_search_options())
-            .unwrap();
-        // Remove boundary nodes to show that the same buffers are charged
-        // when they do not represent an external input/output.
-        let plan = runtime.plan.as_ref().unwrap();
-        check_intermediate_allocations(plan, &runtime.dims, 16).unwrap();
-        let mut internal = plan.clone();
-        internal.dag.retain_nodes(|g, n| {
-            !matches!(
-                g[n],
-                BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. }
-            )
-        });
-        assert!(check_intermediate_allocations(&internal, &runtime.dims, 0).is_err());
-        // A boundary-only plan needs no intermediate budget.
-        let mut boundary_only = plan.clone();
-        let mut boundary = rustc_hash::FxHashSet::default();
-        for node in boundary_only.dag.node_weights() {
-            match node {
-                BufferNode::BufferInput { slots } => {
-                    boundary.extend(slots.iter().map(|s| s.buffer.clone()))
-                }
-                BufferNode::BufferOutput { slots } => {
-                    boundary.extend(slots.iter().map(|s| s.buffer.clone()))
-                }
-                _ => {}
-            }
-        }
-        boundary_only.buffers.retain(|id, _| boundary.contains(id));
-        check_intermediate_allocations(&boundary_only, &runtime.dims, 0).unwrap();
+        runtime.search(&data, &options).unwrap();
+        runtime.set_data(x.id, vec![0.0f32; 4]);
+        runtime.execute().unwrap();
+        assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![0.0; 4]);
     }
 
     #[test]

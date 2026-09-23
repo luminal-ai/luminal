@@ -435,7 +435,7 @@ def main() -> None:
     example_tokens = torch.tensor(
         [TOKEN_SOT, TOKEN_NO_TIMESTAMPS], dtype=torch.long, device=device
     )
-    print("Compiling decoder with dynamic seq dim (search_iters=10)...")
+    print("Compiling decoder...")
     compile_start = time.time()
     seq = ShapeVar("seq", min=2, max=N_TEXT_CTX, optimization_hint=2)
     compiled_decoder = torch.compile(

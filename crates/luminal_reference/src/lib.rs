@@ -19,6 +19,7 @@ pub mod bindings;
 /// matcher list and it names no runtime type. Kept under this crate's
 /// old module name so call sites read the same.
 pub use luminal::extraction as extractor;
+mod egraph_postpass;
 pub mod harness;
 pub mod kernels;
 pub mod layouts;

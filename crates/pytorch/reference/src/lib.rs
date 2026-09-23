@@ -20,6 +20,9 @@ use rustc_hash::FxHashMap;
 type BucketSpecs = HashMap<String, Vec<(usize, usize, usize)>>;
 
 fn to_py(err: anyhow::Error) -> PyErr {
+    if let Some(py_err) = err.chain().find_map(|cause| cause.downcast_ref::<PyErr>()) {
+        return Python::attach(|py| py_err.clone_ref(py));
+    }
     PyRuntimeError::new_err(format!("{err:#}"))
 }
 
@@ -422,89 +425,97 @@ impl CompiledGraph {
             options.memory_budget_bytes = bytes;
         }
         options.search_log = search_log;
-        if self.dims.is_empty() {
-            // Static program: one concrete plan at the exported shapes.
-            self.runtime.search(&data, &options).map_err(to_py)?;
-        } else {
-            // Search each Cartesian combination of buckets. Winning plans
-            // keep symbolic spans, so every later call
-            // whose dims fall in the bucket re-renders without re-searching.
-            for (name, entries) in &resolved {
-                let symbol = self.translation.symbols[name];
-                let buckets = entries
+        let search = || {
+            if self.dims.is_empty() {
+                // Static program: one concrete plan at the exported shapes.
+                self.runtime.search(&data, &options).map_err(to_py)?;
+            } else {
+                // Search each Cartesian combination of buckets. Winning plans
+                // keep symbolic spans, so every later call
+                // whose dims fall in the bucket re-renders without re-searching.
+                for (name, entries) in &resolved {
+                    let symbol = self.translation.symbols[name];
+                    let buckets = entries
+                        .iter()
+                        .map(|&(lo, hi, representative)| {
+                            DimBucket::new(lo, hi).representative(representative)
+                        })
+                        .collect();
+                    self.runtime
+                        .bind_dim_buckets(symbol, buckets)
+                        .map_err(to_py)?;
+                }
+                let inputs_meta: Vec<(NodeIndex, DType, Vec<IntExpr>)> = self
+                    .translation
+                    .inputs
                     .iter()
-                    .map(|&(lo, hi, representative)| {
-                        DimBucket::new(lo, hi).representative(representative)
-                    })
+                    .map(|input| (input.tensor, input.dtype, input.shape.clone()))
                     .collect();
+                // Refuse oversized profiling inputs before allocating any bucket's
+                // synthetic data. Search's runtime budget protects later intermediates.
+                let dimensions: Vec<_> = resolved.iter().collect();
+                let combinations = dimensions.iter().try_fold(1usize, |n, (_, b)| {
+                    n.checked_mul(b.len())
+                        .ok_or_else(|| PyRuntimeError::new_err("bucket combination count overflow"))
+                })?;
+                for combination in 0..combinations {
+                    let mut remainder = combination;
+                    let mut representative = self.dims.clone();
+                    for (name, entries) in &dimensions {
+                        let entry = entries[remainder % entries.len()];
+                        remainder /= entries.len();
+                        representative.insert(self.translation.symbols[*name], entry.2);
+                    }
+                    let mut bytes = 0usize;
+                    for (_, dtype, shape) in &inputs_meta {
+                        let elements = shape.iter().try_fold(1usize, |n, dim| {
+                            let extent = dim.exec(&representative).ok_or_else(|| {
+                                PyRuntimeError::new_err("unresolved bucket input extent")
+                            })?;
+                            n.checked_mul(extent).ok_or_else(|| {
+                                PyRuntimeError::new_err("bucket input size overflow")
+                            })
+                        })?;
+                        bytes = elements
+                            .checked_mul(dtype.bits().div_ceil(8))
+                            .and_then(|n| bytes.checked_add(n))
+                            .ok_or_else(|| {
+                                PyRuntimeError::new_err("bucket input byte size overflow")
+                            })?;
+                    }
+                    if bytes > options.memory_budget_bytes {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "bucket profiling inputs require {bytes} bytes, exceeding live memory budget {}",
+                            options.memory_budget_bytes
+                        )));
+                    }
+                }
+                let data_for = move |representative: &DynMap| {
+                    inputs_meta
+                        .iter()
+                        .map(|(tensor, dtype, shape)| {
+                            let elements = shape
+                                .iter()
+                                .map(|dim| {
+                                    dim.exec(representative)
+                                        .or_else(|| dim.to_usize())
+                                        .unwrap_or(0)
+                                })
+                                .product();
+                            (*tensor, zero_buffer(*dtype, elements))
+                        })
+                        .collect()
+                };
                 self.runtime
-                    .bind_dim_buckets(symbol, buckets)
+                    .search_buckets(data_for, &options)
                     .map_err(to_py)?;
             }
-            let inputs_meta: Vec<(NodeIndex, DType, Vec<IntExpr>)> = self
-                .translation
-                .inputs
-                .iter()
-                .map(|input| (input.tensor, input.dtype, input.shape.clone()))
-                .collect();
-            // Refuse oversized profiling inputs before allocating any bucket's
-            // synthetic data. Search's runtime budget protects later intermediates.
-            let dimensions: Vec<_> = resolved.iter().collect();
-            let combinations = dimensions.iter().try_fold(1usize, |n, (_, b)| {
-                n.checked_mul(b.len())
-                    .ok_or_else(|| PyRuntimeError::new_err("bucket combination count overflow"))
-            })?;
-            for combination in 0..combinations {
-                let mut remainder = combination;
-                let mut representative = self.dims.clone();
-                for (name, entries) in &dimensions {
-                    let entry = entries[remainder % entries.len()];
-                    remainder /= entries.len();
-                    representative.insert(self.translation.symbols[*name], entry.2);
-                }
-                let mut bytes = 0usize;
-                for (_, dtype, shape) in &inputs_meta {
-                    let elements = shape.iter().try_fold(1usize, |n, dim| {
-                        let extent = dim.exec(&representative).ok_or_else(|| {
-                            PyRuntimeError::new_err("unresolved bucket input extent")
-                        })?;
-                        n.checked_mul(extent)
-                            .ok_or_else(|| PyRuntimeError::new_err("bucket input size overflow"))
-                    })?;
-                    bytes = elements
-                        .checked_mul(dtype.bits().div_ceil(8))
-                        .and_then(|n| bytes.checked_add(n))
-                        .ok_or_else(|| {
-                            PyRuntimeError::new_err("bucket input byte size overflow")
-                        })?;
-                }
-                if bytes > options.memory_budget_bytes {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "bucket profiling inputs require {bytes} bytes, exceeding live memory budget {}",
-                        options.memory_budget_bytes
-                    )));
-                }
-            }
-            let data_for = move |representative: &DynMap| {
-                inputs_meta
-                    .iter()
-                    .map(|(tensor, dtype, shape)| {
-                        let elements = shape
-                            .iter()
-                            .map(|dim| {
-                                dim.exec(representative)
-                                    .or_else(|| dim.to_usize())
-                                    .unwrap_or(0)
-                            })
-                            .product();
-                        (*tensor, zero_buffer(*dtype, elements))
-                    })
-                    .collect()
-            };
-            self.runtime
-                .search_buckets(data_for, &options)
-                .map_err(to_py)?;
-        }
+            Ok(())
+        };
+        luminal_reference::search::with_interrupt_check(
+            || Python::attach(|py| py.check_signals().map_err(anyhow::Error::from)),
+            search,
+        )?;
         self.buckets = resolved;
         self.searched = true;
         Ok(())
@@ -532,7 +543,10 @@ impl CompiledGraph {
             self.runtime.set_data(tensor, buffer);
         }
         self.dirty.clear();
-        self.runtime.execute().map_err(to_py)
+        luminal_reference::search::with_interrupt_check(
+            || Python::attach(|py| py.check_signals().map_err(anyhow::Error::from)),
+            || self.runtime.execute().map_err(to_py),
+        )
     }
 
     /// Raw bytes of one output, in its native storage width.

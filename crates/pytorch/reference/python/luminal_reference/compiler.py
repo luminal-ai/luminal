@@ -18,4 +18,7 @@ class Compiler(ReferenceAOTBackend):
     ``dim_buckets`` maps PyTorch ``ShapeVar`` objects to sequences of
     ``DimBucket`` values. Reuse those objects in ``torch.compile``'s
     ``dynamic_shapes=ShapesSpec(...)``; bounds come from PyTorch.
+    ``search_iterations`` selects one candidate per iteration for each
+    local graph and each dimension-bucket combination. Each candidate
+    executes a warmup and a timed profile run.
     """

@@ -31,6 +31,7 @@
 //! duplicates reuse the cached measurement instead of burning profile
 //! time (the plan-hash dedup ruling, 2026-07-27).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -40,6 +41,51 @@ use rand::rngs::StdRng;
 use rustc_hash::FxHashMap;
 
 use crate::typed_buffer::TypedBuffer;
+
+type InterruptCheck = Box<dyn Fn() -> Result<()>>;
+
+#[derive(Debug)]
+pub struct SearchInterrupted(pub anyhow::Error);
+
+impl std::fmt::Display for SearchInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SearchInterrupted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+thread_local! {
+    static INTERRUPT_CHECK: RefCell<Option<InterruptCheck>> = RefCell::new(None);
+}
+
+/// Run a search with a caller-owned interruption check on the current thread.
+/// The reference runtime also checks it between operations while profiling.
+pub fn with_interrupt_check<T>(
+    check: impl Fn() -> Result<()> + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<InterruptCheck>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INTERRUPT_CHECK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = INTERRUPT_CHECK.with(|slot| slot.borrow_mut().replace(Box::new(check)));
+    let _restore = Restore(previous);
+    run()
+}
+
+pub(crate) fn check_interrupt() -> Result<()> {
+    INTERRUPT_CHECK.with(|slot| match slot.borrow().as_ref() {
+        Some(check) => check().map_err(|err| SearchInterrupted(err).into()),
+        None => Ok(()),
+    })
+}
 use luminal::bufferize::BufferIrGraph;
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::egraph_serialize;
@@ -147,10 +193,8 @@ fn profile_on_reference_runtime(
     dims: &luminal::shape::DynMap,
     trials: usize,
     best_so_far: Option<u128>,
-    max_intermediate_bytes: usize,
     memory_budget_bytes: usize,
 ) -> Result<u128> {
-    crate::runtime::check_intermediate_allocations(plan, dims, max_intermediate_bytes)?;
     let input_bytes = input_data.values().try_fold(0usize, |n, v| {
         n.checked_add(v.byte_len())
             .ok_or_else(|| anyhow::anyhow!("input size overflow"))
@@ -161,7 +205,6 @@ fn profile_on_reference_runtime(
     );
 
     let mut runtime = ReferenceRuntime::default();
-    runtime.set_max_intermediate_bytes(max_intermediate_bytes);
     runtime.set_memory_budget_bytes(memory_budget_bytes);
     runtime.load_plan(plan.clone());
     // The plan's spans/extents may be SYMBOLIC (`Var("a")`), so the
@@ -209,13 +252,26 @@ fn profile_on_reference_runtime(
 /// ALLOWABLE-OPS inventory (M3 Step 2: per-runtime, unstandardized);
 /// `None` keeps the reference runtime's own allow list.
 pub fn search_implementations_with_ops(
-    egraph: &egraph_serialize::EGraph,
+    egraph: &mut egraph_serialize::EGraph,
     program: &SearchProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     dims: &luminal::shape::DynMap,
+    capacity_dims: &luminal::shape::DynMap,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
 ) -> Result<SearchOutcome> {
+    let pruning = crate::egraph_postpass::run(
+        egraph,
+        capacity_dims,
+        options.max_intermediate_bytes,
+        options.memory_budget_bytes,
+    )?;
+    if options.search_log_enabled() && pruning.oversized_tensors > 0 {
+        eprintln!(
+            "Reference memory pass: removed {} oversized tensors and {} producer classes ({} nodes)",
+            pruning.oversized_tensors, pruning.producer_classes, pruning.removed_nodes
+        );
+    }
     let matchers = crate::ops::built_in_matchers();
     let allow_override = allow_override.or_else(|| Some(reference_allow_list()));
     // Tensor-keyed at the boundary (the retired-HLIR-keyspace design);
@@ -298,6 +354,7 @@ pub fn search_implementations_with_ops(
         .then(|| SearchProgress::new(CaptureAwareStderr));
 
     for generation in 0..options.generations {
+        check_interrupt()?;
         let mut candidates: Vec<Genome> = Vec::with_capacity(options.generation_size);
         match &best {
             None => {
@@ -314,6 +371,7 @@ pub fn search_implementations_with_ops(
         }
 
         for genome in candidates {
+            check_interrupt()?;
             // Extraction failure = invalid genome (cycle, contract breach):
             // discard; the next generation's fresh mutations are the repair.
             let extract_start = Instant::now();
@@ -420,12 +478,13 @@ pub fn search_implementations_with_ops(
                         dims,
                         options.trials,
                         best_so_far,
-                        options.max_intermediate_bytes,
                         options.memory_budget_bytes,
                     );
                     timings.profile_nanos += profile_start.elapsed().as_nanos();
+                    check_interrupt()?;
                     let nanos = match profiled {
                         Ok(nanos) => nanos,
+                        Err(err) if err.is::<SearchInterrupted>() => return Err(err),
                         Err(err) => {
                             breakdown.execute_refusals += 1;
                             if refusals.len() < 8 {
@@ -489,7 +548,16 @@ pub fn search_implementations_with_ops(
         progress.finish();
     }
     let (best_nanos, best_genome, best_plan) = best.ok_or_else(|| {
-        anyhow!("no candidate genome produced an executable plan; refusals: {refusals:#?}")
+        anyhow!(
+            "no candidate genome produced an executable plan after memory pruning \
+             (max_intermediate_bytes={}, memory_budget_bytes={}, removed {} oversized tensors \
+             and {} producer classes, largest pruned tensor {} bytes); refusals: {refusals:#?}",
+            options.max_intermediate_bytes,
+            options.memory_budget_bytes,
+            pruning.oversized_tensors,
+            pruning.producer_classes,
+            pruning.largest_tensor_bytes,
+        )
     })?;
     let _ = program; // binding tables travel with the caller; kept for future bucket plumbing
     Ok(SearchOutcome {
@@ -572,21 +640,37 @@ pub fn bucketed_search_implementations(
     ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
     let mut plans = Vec::new();
     for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
+        check_interrupt()?;
         let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
         egraph
             .parse_and_run_program(None, &text)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
+        check_interrupt()?;
         crate::decoder_registry().check(&egraph)?;
-        let serialized = egraph
+        let mut serialized = egraph
             .serialize(luminal::prelude::egglog::SerializeConfig::default())
             .egraph;
         let data = input_data(&representative);
+        let mut capacity_dims = representative.clone();
+        for (symbol, (min, max)) in &ranges {
+            // An absent PyTorch upper bound is represented by i64::MAX-1.
+            // It cannot certify a finite per-intermediate ceiling. Prune
+            // only choices already oversized at the minimum, and leave
+            // aggregate live-memory accounting to execution.
+            let capacity = if *max >= (i64::MAX - 1) as usize {
+                *min
+            } else {
+                *max
+            };
+            capacity_dims.insert(*symbol, capacity);
+        }
         let outcome = search_implementations_with_ops(
-            &serialized,
+            &mut serialized,
             &program,
             &data,
             &representative,
+            &capacity_dims,
             options,
             allow_override.clone(),
         )?;
@@ -721,7 +805,7 @@ pub fn harness_search_options() -> CompileOptions {
         max_intermediate_bytes: crate::runtime::DEFAULT_MAX_INTERMEDIATE_BYTES,
         memory_budget_bytes: crate::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
         generations: 2,
-        generation_size: 4,
+        generation_size: 1,
         mutations: 2,
         trials: 1,
         seed: 0,
@@ -735,7 +819,7 @@ pub fn harness_search_options() -> CompileOptions {
 /// plans evaluate with an empty map (see
 /// [`search_implementations_with_ops`] for the bucketed/symbolic path).
 pub fn search_implementations(
-    egraph: &egraph_serialize::EGraph,
+    egraph: &mut egraph_serialize::EGraph,
     program: &SearchProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     options: &CompileOptions,
@@ -745,6 +829,7 @@ pub fn search_implementations(
         program,
         input_data,
         &luminal::shape::DynMap::default(),
+        &luminal::shape::DynMap::default(),
         options,
         None,
     )
@@ -752,6 +837,9 @@ pub fn search_implementations(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use luminal::prelude::egglog::SerializeConfig;
     use rustc_hash::FxHashMap;
 
@@ -760,6 +848,30 @@ mod tests {
 
     use super::{CompileOptions, SearchProgram, search_implementations};
     use crate::ReferenceRuntime;
+
+    #[test]
+    fn interrupt_check_is_scoped_and_restored() {
+        let calls = Rc::new(Cell::new(0));
+        let observed = calls.clone();
+        super::with_interrupt_check(
+            move || {
+                observed.set(observed.get() + 1);
+                anyhow::bail!("interrupted")
+            },
+            || {
+                let err = super::check_interrupt().unwrap_err();
+                assert!(err.is::<super::SearchInterrupted>());
+                assert_eq!(err.to_string(), "interrupted");
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(super::check_interrupt().is_ok());
+    }
+
+    #[test]
+    fn python_search_preset_prices_one_candidate_per_iteration() {
+        assert_eq!(super::harness_search_options().generation_size, 1);
+    }
 
     /// A REAL selection space (x+y and x*y from shared inputs offers the
     /// fused kernel vs the pair, plus commuted and mutating variants): the
@@ -797,14 +909,18 @@ mod tests {
         egraph
             .parse_and_run_program(None, &text)
             .expect("program runs");
-        let serialized = egraph.serialize(SerializeConfig::default()).egraph;
+        let mut serialized = egraph.serialize(SerializeConfig::default()).egraph;
 
         let mut inputs = FxHashMap::default();
         inputs.insert(x2.id, x_data.clone().into());
         inputs.insert(y2.id, y_data.clone().into());
-        let outcome =
-            search_implementations(&serialized, &program, &inputs, &CompileOptions::default())
-                .expect("search finds an executable plan");
+        let outcome = search_implementations(
+            &mut serialized,
+            &program,
+            &inputs,
+            &CompileOptions::default(),
+        )
+        .expect("search finds an executable plan");
 
         assert!(
             outcome.fingerprint_hits > 0,
