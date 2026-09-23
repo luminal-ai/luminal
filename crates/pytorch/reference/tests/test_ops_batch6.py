@@ -1,17 +1,16 @@
 """Translator batch 7/8: elementwise specials, squeeze/triangle, reductions,
 and the addmm family."""
 
+import luminal_reference
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import luminal_reference
 
 
 def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-4) -> None:
     torch.manual_seed(0)
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())
     out = compiled(*inputs)
     inputs = tuple(t.clone() for t in inputs)
     if isinstance(eager, (tuple, list)):

@@ -1,28 +1,28 @@
 """The luminal_reference torch.compile backend.
 
-The backend self-exports the incoming GraphModule with ``torch.export``,
-saves the program to a temporary ``.pt2``, hands it to the Rust extension
-for translation and reference-runtime search, and returns a callable that
-binds caller tensors per invocation.
+The public entry point uses AOTAutograd for inference and training. Its local
+compiler exports each ATen region to PT2 for translation and reference-runtime
+search, then binds caller tensors and symbolic dimensions on each invocation.
 """
 
-import concurrent.futures
 import os
 import tempfile
-from typing import Any, Callable, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import torch
-from torch.export import Dim, export
+from torch.export import export
 
 from . import _luminal
+from .dimensions import export_specs, remap_buckets
 from .export_utils import (
-    private_graph_copy,
     _box_scalar_graph_outputs,
     _decomp_table,
     _drop_dead_data_dependent_ops,
     _drop_input_guards,
     _lower_sym_sum,
     _register_cache_serialization,
+    private_graph_copy,
 )
 
 # torch._export.serde.schema.ScalarType codes we can round-trip today.
@@ -49,7 +49,11 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
 def _output_tensor(raw: bytes, dtype_code: int, shape: Sequence[int]) -> torch.Tensor:
     dtype = _PT2_TO_TORCH.get(dtype_code)
     if dtype is None:
-        raise RuntimeError(f"luminal_reference cannot materialize PT2 dtype code {dtype_code}")
+        raise RuntimeError(
+            f"luminal_reference cannot materialize PT2 dtype code {dtype_code}"
+        )
+    if 0 in shape and not raw:
+        return torch.empty(tuple(shape), dtype=dtype, device="cpu")
     tensor = torch.frombuffer(bytearray(raw), dtype=dtype)
     return tensor.reshape(tuple(shape)).clone()
 
@@ -62,7 +66,7 @@ class CompiledModel:
         graph: Any,
         ep: Any,
         scalar_output_positions: Sequence[int] = (),
-        held: Optional[dict] = None,
+        held: dict | None = None,
     ):
         self._graph = graph
         self._ep = ep
@@ -79,6 +83,16 @@ class CompiledModel:
         self._output_dtypes = graph.output_dtypes
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
+
+    @property
+    def writeback_inputs(self):
+        return {
+            name: mutation
+            for name, mutation in zip(
+                self._graph.output_names, self._graph.output_mutations
+            )
+            if mutation is not None
+        }
 
     def __call__(self, *args: torch.Tensor) -> Any:
         # Under dynamic shapes Dynamo's wrapper passes the graph's symbolic
@@ -148,7 +162,9 @@ def _is_dynamic(size: Any) -> bool:
     return isinstance(size, torch.SymInt) and not size.node.expr.is_number
 
 
-def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> Any:
+def _dynamic_export(
+    gm: torch.fx.GraphModule, example_inputs: Sequence[Any], symbol_buckets=None
+) -> Any:
     """Export a Dynamo GraphModule, preserving its symbolic dimensions.
 
     Dynamo hands each free symbolic dimension to the backend as an explicit
@@ -171,16 +187,21 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     gm = private_graph_copy(gm)
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
 
+    all_shapes = [
+        getattr(n.meta.get("example_value", v), "shape", ())
+        for n, v in zip(placeholders, example_inputs)
+    ]
+    axis_specs = export_specs(all_shapes)
     records: list[tuple[str, torch.fx.Node, Any]] = []
     tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
-    for node, value in zip(placeholders, example_inputs):
+    for node, value, dim_spec in zip(placeholders, example_inputs, axis_specs):
         if isinstance(value, torch.SymInt):
             records.append(("sym", node, value))
             continue
         shape = getattr(node.meta.get("example_value"), "shape", None)
         if shape is None:
             shape = getattr(value, "shape", ())
-        dims = {dim: Dim.AUTO for dim, size in enumerate(shape) if _is_dynamic(size)}
+        dims = dim_spec
         for dim, size in enumerate(shape):
             if _is_dynamic(size):
                 tensor_dims.setdefault(size.node.expr, (node, dim))
@@ -227,27 +248,36 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
 
     dynamic_shapes = {"args": tuple(specs)} if any_dynamic else None
 
-    # `torch.export` runs its own Dynamo pass. Running that inside the caller's
-    # compile pollutes the caller's guard manager (the inner frame's `args`
-    # guards leak into the outer sanity check), so isolate the nested compile
-    # on its own thread with a fresh Dynamo compile context.
-    def _export():
-        return export(gm, tuple(inputs), dynamic_shapes=dynamic_shapes, strict=False)
+    # The AOT local compiler isolates FakeTensor and TracingContext before
+    # entering here. Keep export on the owning thread: native reference graphs
+    # are unsendable, and cyclic GC in an export worker could destroy them.
+    ep = export(gm, tuple(inputs), dynamic_shapes=dynamic_shapes, strict=False)
+    original_shapes = [
+        getattr(n.meta.get("example_value", v), "shape", ())
+        for (_, n, _), v in zip(records, example_inputs)
+        if id(n) not in erased
+    ]
+    return ep, inputs, remap_buckets(ep, original_shapes, symbol_buckets)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        ep = pool.submit(_export).result()
-    return ep, inputs
 
-
-def luminal_reference(
+def _compile_local_graph(
     gm: torch.fx.GraphModule,
     example_inputs: Sequence[Any],
-    options: Optional[dict] = None,
-    search_iterations: Optional[int] = None,
+    options: dict | None = None,
+    search_iterations: int | None = None,
+    search_log: bool = False,
+    max_intermediate_bytes: int | None = None,
+    memory_budget_bytes: int | None = None,
+    symbol_buckets=None,
 ) -> CompiledModel:
-    """The torch.compile backend entry point."""
+    """Compile one local ATen graph after AOT partitioning."""
     if options:
         search_iterations = options.get("search_iterations", search_iterations)
+        search_log = options.get("search_log", search_log)
+        max_intermediate_bytes = options.get(
+            "max_intermediate_bytes", max_intermediate_bytes
+        )
+        memory_budget_bytes = options.get("memory_budget_bytes", memory_budget_bytes)
 
     # HF DynamicCache must be pytree-registered before torch.export capture so
     # use_cache=True models can export. Idempotent.
@@ -264,7 +294,7 @@ def luminal_reference(
     # The graph-module preprocessing above runs first; `_dynamic_export` then
     # rewrites the SymInt placeholders onto `sym_size` and runs the nested
     # `torch.export`, so the exported program keeps its symbolic dims.
-    ep, export_inputs = _dynamic_export(gm, example_inputs)
+    ep, export_inputs, dim_buckets = _dynamic_export(gm, example_inputs, symbol_buckets)
     # LUM-499: drop dynamo-emitted input guards before run_decompositions calls
     # ep.module(), which would otherwise emit a `_guards_fn` containing
     # data-dependent .item() calls and unresolved `L[...]` references.
@@ -292,6 +322,31 @@ def luminal_reference(
     _drop_dead_data_dependent_ops(ep.graph_module)
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
+
+    return compile_exported(
+        ep,
+        export_inputs,
+        search_iterations,
+        scalar_output_positions,
+        search_log=search_log,
+        max_intermediate_bytes=max_intermediate_bytes,
+        memory_budget_bytes=memory_budget_bytes,
+        dim_buckets=dim_buckets,
+    )
+
+
+def compile_exported(
+    ep,
+    export_inputs,
+    search_iterations=None,
+    scalar_output_positions=(),
+    *,
+    search_log=False,
+    max_intermediate_bytes=None,
+    memory_budget_bytes=None,
+    dim_buckets=None,
+):
+    """Compile a functional ExportedProgram with the native runtime."""
 
     def _save_and_compile(program: Any) -> Any:
         with tempfile.TemporaryDirectory() as tmp:
@@ -339,6 +394,13 @@ def luminal_reference(
             # The export's own tensor, not the caller's module buffer: mutated
             # state persists across calls on the input's runtime buffer.
             held[name] = value
+        from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
+
+        if isinstance(value, FakeTensor):
+            with unset_fake_temporarily():
+                value = torch.ones(
+                    tuple(int(d) for d in value.shape), dtype=value.dtype
+                )
         graph.set_input(name, _tensor_bytes(value), list(value.shape))
 
     if user_index != len(export_inputs):
@@ -346,12 +408,11 @@ def luminal_reference(
             f"export consumed {user_index} of {len(export_inputs)} example_inputs"
         )
 
-    graph.search(search_iterations)
+    graph.search(
+        search_iterations,
+        search_log=search_log,
+        max_intermediate_bytes=max_intermediate_bytes,
+        memory_budget_bytes=memory_budget_bytes,
+        dim_buckets=dim_buckets,
+    )
     return CompiledModel(graph, ep, scalar_output_positions, held)
-
-
-def register_backend() -> None:
-    """Register ``"luminal_reference"`` so ``backend="luminal_reference"`` works."""
-    if "luminal_reference" in torch._dynamo.list_backends():
-        return
-    torch._dynamo.register_backend(luminal_reference, name="luminal_reference")

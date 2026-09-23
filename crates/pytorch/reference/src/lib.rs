@@ -11,14 +11,13 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::{DType, DimBucket, DynMap, IntExpr, NodeIndex, Symbol};
 
-/// Largest value a dynamic dimension's bucket covers (the searched plan stays
-/// symbolic inside it, so one compile serves every covered context length).
-const MAX_DYNAMIC_DIM: usize = 4096;
 use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
 use luminal_reference::{CompileOptions, ReferenceBindings, ReferenceRuntime, TypedBuffer};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
+
+type BucketSpecs = HashMap<String, Vec<(usize, usize, usize)>>;
 
 fn to_py(err: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(format!("{err:#}"))
@@ -85,6 +84,61 @@ pub struct CompiledGraph {
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
     dims: DynMap,
+    dim_bounds: HashMap<String, (usize, usize)>,
+    buckets: BucketSpecs,
+}
+
+/// Solve a boundary extent `a * symbol + b = value` exactly. Never bind
+/// every symbol to the whole extent: e.g. the size of `3*s` is not `s`.
+fn bind_extent(expr: &IntExpr, value: usize) -> Result<Option<(Symbol, usize)>> {
+    use luminal::shape::Term;
+    let mut symbols = expr.to_symbols();
+    symbols.sort();
+    symbols.dedup();
+    if symbols.is_empty() {
+        ensure!(
+            expr.to_usize() == Some(value),
+            "input extent {value} does not match {expr:?}"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        symbols.len() == 1,
+        "cannot bind multivariate input extent {expr:?}"
+    );
+    let mut stack: Vec<(i128, i128)> = Vec::new();
+    for term in expr.terms.read().iter() {
+        match term {
+            Term::Num(n) => stack.push((0, i128::from(*n))),
+            Term::Var(_) => stack.push((1, 0)),
+            op => {
+                let (a, b) = stack.pop().ok_or_else(|| anyhow!("malformed extent"))?;
+                let (c, d) = stack.pop().ok_or_else(|| anyhow!("malformed extent"))?;
+                let pair = match op {
+                    Term::Add => a.checked_add(c).zip(b.checked_add(d)),
+                    Term::Sub => a.checked_sub(c).zip(b.checked_sub(d)),
+                    Term::Mul if c == 0 => a.checked_mul(d).zip(b.checked_mul(d)),
+                    Term::Mul if a == 0 => c.checked_mul(b).zip(d.checked_mul(b)),
+                    Term::Div if c == 0 && d != 0 && a % d == 0 && b % d == 0 => {
+                        Some((a / d, b / d))
+                    }
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    anyhow!("input extent {expr:?} is not a supported affine dimension")
+                })?;
+                stack.push(pair);
+            }
+        }
+    }
+    let (scale, offset) = stack.pop().ok_or_else(|| anyhow!("empty extent"))?;
+    let numerator = value as i128 - offset;
+    ensure!(
+        scale > 0 && numerator >= 0 && numerator % scale == 0,
+        "input extent {value} violates {expr:?}"
+    );
+    let root = usize::try_from(numerator / scale)?;
+    Ok(Some((symbols[0], root)))
 }
 
 /// Resolve a symbolic recorder shape to concrete extents. Literals and
@@ -223,12 +277,23 @@ impl CompiledGraph {
                 .iter()
                 .find(|input| input.graph_name == name)
                 .ok_or_else(|| PyRuntimeError::new_err(format!("unknown input {name:?}")))?;
+            if input.shape.len() != shape.len() {
+                return Err(PyRuntimeError::new_err(
+                    "input rank differs from exported rank",
+                ));
+            }
             let mut bindings = Vec::new();
-            for (axis, dim) in input.shape.iter().enumerate() {
-                if let Some(value) = shape.get(axis) {
-                    for symbol in dim.to_symbols() {
-                        bindings.push((*value, symbol));
+            for (dim, value) in input.shape.iter().zip(&shape) {
+                if let Some((symbol, root)) = bind_extent(dim, *value).map_err(to_py)? {
+                    if bindings
+                        .iter()
+                        .any(|&(prior, s)| s == symbol && prior != root)
+                    {
+                        return Err(PyRuntimeError::new_err(
+                            "input axes sharing a dimension must have equal sizes",
+                        ));
                     }
+                    bindings.push((root, symbol));
                 }
             }
             (input.dtype, bindings)
@@ -287,9 +352,52 @@ impl CompiledGraph {
             .collect()
     }
 
+    #[getter]
+    fn dim_buckets(&self) -> BucketSpecs {
+        self.buckets.clone()
+    }
+
     /// Saturate and search. Every input must be staged first.
-    #[pyo3(signature = (generations = None))]
-    fn search(&mut self, generations: Option<usize>) -> PyResult<()> {
+    #[pyo3(signature = (generations = None, *, max_intermediate_bytes = None, memory_budget_bytes = None, search_log = false, dim_buckets = None))]
+    fn search(
+        &mut self,
+        generations: Option<usize>,
+        max_intermediate_bytes: Option<usize>,
+        memory_budget_bytes: Option<usize>,
+        search_log: bool,
+        dim_buckets: Option<BucketSpecs>,
+    ) -> PyResult<()> {
+        if self.searched {
+            return Err(PyRuntimeError::new_err("search() already completed"));
+        }
+        let supplied = dim_buckets.unwrap_or_default();
+        for name in supplied.keys() {
+            if !self.translation.symbols.contains_key(name) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unknown bucket dimension {name}"
+                )));
+            }
+        }
+        let mut resolved = HashMap::new();
+        for (name, symbol) in &self.translation.symbols {
+            let (lo, hi) = self.dim_bounds[name];
+            let hint = self.dims[symbol].clamp(lo, hi);
+            let entries = supplied
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| vec![(lo, hi, hint)]);
+            if entries.is_empty()
+                || entries
+                    .iter()
+                    .any(|&(a, b, r)| a < lo || b > hi || a > b || r < a || r > b)
+                || entries.windows(2).any(|pair| pair[0].1 >= pair[1].0)
+            {
+                return Err(PyRuntimeError::new_err(format!(
+                    "invalid buckets for {name} within exported bounds [{lo}, {hi}]"
+                )));
+            }
+            resolved.insert(name.clone(), entries);
+        }
         let data: FxHashMap<_, _> = self
             .translation
             .inputs
@@ -307,20 +415,30 @@ impl CompiledGraph {
         if let Some(generations) = generations {
             options.generations = generations;
         }
-        options.search_log = false;
+        if let Some(bytes) = max_intermediate_bytes {
+            options.max_intermediate_bytes = bytes;
+        }
+        if let Some(bytes) = memory_budget_bytes {
+            options.memory_budget_bytes = bytes;
+        }
+        options.search_log = search_log;
         if self.dims.is_empty() {
             // Static program: one concrete plan at the exported shapes.
             self.runtime.search(&data, &options).map_err(to_py)?;
         } else {
-            // Dynamic program: bind one bucket per symbolic dim and search it
-            // ONCE. The winning plan keeps symbolic spans, so every later call
+            // Search each Cartesian combination of buckets. Winning plans
+            // keep symbolic spans, so every later call
             // whose dims fall in the bucket re-renders without re-searching.
-            let hints: Vec<(Symbol, usize)> = self.dims.iter().map(|(s, v)| (*s, *v)).collect();
-            for (symbol, hint) in hints {
-                let representative = hint.clamp(1, MAX_DYNAMIC_DIM);
-                let bucket = DimBucket::new(1, MAX_DYNAMIC_DIM).representative(representative);
+            for (name, entries) in &resolved {
+                let symbol = self.translation.symbols[name];
+                let buckets = entries
+                    .iter()
+                    .map(|&(lo, hi, representative)| {
+                        DimBucket::new(lo, hi).representative(representative)
+                    })
+                    .collect();
                 self.runtime
-                    .bind_dim_buckets(symbol, vec![bucket])
+                    .bind_dim_buckets(symbol, buckets)
                     .map_err(to_py)?;
             }
             let inputs_meta: Vec<(NodeIndex, DType, Vec<IntExpr>)> = self
@@ -329,6 +447,44 @@ impl CompiledGraph {
                 .iter()
                 .map(|input| (input.tensor, input.dtype, input.shape.clone()))
                 .collect();
+            // Refuse oversized profiling inputs before allocating any bucket's
+            // synthetic data. Search's runtime budget protects later intermediates.
+            let dimensions: Vec<_> = resolved.iter().collect();
+            let combinations = dimensions.iter().try_fold(1usize, |n, (_, b)| {
+                n.checked_mul(b.len())
+                    .ok_or_else(|| PyRuntimeError::new_err("bucket combination count overflow"))
+            })?;
+            for combination in 0..combinations {
+                let mut remainder = combination;
+                let mut representative = self.dims.clone();
+                for (name, entries) in &dimensions {
+                    let entry = entries[remainder % entries.len()];
+                    remainder /= entries.len();
+                    representative.insert(self.translation.symbols[*name], entry.2);
+                }
+                let mut bytes = 0usize;
+                for (_, dtype, shape) in &inputs_meta {
+                    let elements = shape.iter().try_fold(1usize, |n, dim| {
+                        let extent = dim.exec(&representative).ok_or_else(|| {
+                            PyRuntimeError::new_err("unresolved bucket input extent")
+                        })?;
+                        n.checked_mul(extent)
+                            .ok_or_else(|| PyRuntimeError::new_err("bucket input size overflow"))
+                    })?;
+                    bytes = elements
+                        .checked_mul(dtype.bits().div_ceil(8))
+                        .and_then(|n| bytes.checked_add(n))
+                        .ok_or_else(|| {
+                            PyRuntimeError::new_err("bucket input byte size overflow")
+                        })?;
+                }
+                if bytes > options.memory_budget_bytes {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "bucket profiling inputs require {bytes} bytes, exceeding live memory budget {}",
+                        options.memory_budget_bytes
+                    )));
+                }
+            }
             let data_for = move |representative: &DynMap| {
                 inputs_meta
                     .iter()
@@ -349,6 +505,7 @@ impl CompiledGraph {
                 .search_buckets(data_for, &options)
                 .map_err(to_py)?;
         }
+        self.buckets = resolved;
         self.searched = true;
         Ok(())
     }
@@ -471,6 +628,16 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
     let translation = translate(&parsed).map_err(to_py)?;
+    let dim_bounds = translation
+        .symbols
+        .keys()
+        .map(|name| {
+            let range = parsed.program.range_constraints.get(name);
+            let lo = range.and_then(|r| r.min_val).unwrap_or(0).max(0) as usize;
+            let hi = range.and_then(|r| r.max_val).unwrap_or(i64::MAX - 1).max(0) as usize;
+            (name.clone(), (lo, hi))
+        })
+        .collect();
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let (bindings, output_buffers) = bind(&translation)
         .context("binding the translated program's boundary")
@@ -496,12 +663,40 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         dirty: HashSet::new(),
         searched: false,
         dims,
+        dim_bounds,
+        buckets: HashMap::new(),
     })
+}
+
+#[pyfunction]
+fn _torch_dtype_codes() -> HashMap<&'static str, u32> {
+    TorchDType::ALL
+        .iter()
+        .map(|dtype| (dtype.name(), dtype.code()))
+        .collect()
 }
 
 #[pymodule]
 fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledGraph>()?;
+    m.add_function(wrap_pyfunction!(_torch_dtype_codes, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+
+    #[test]
+    fn affine_input_extent_binds_root_not_full_size() {
+        let s = IntExpr::from('s');
+        let symbol = Symbol::from('s');
+        assert_eq!(bind_extent(&(3 * s), 18).unwrap(), Some((symbol, 6)));
+        assert_eq!(bind_extent(&(3 * s - 3), 18).unwrap(), Some((symbol, 7)));
+        assert_eq!(bind_extent(&(2 * s + 1), 9).unwrap(), Some((symbol, 4)));
+        assert!(bind_extent(&(3 * s), 19).is_err());
+        assert!(bind_extent(&(s * s), 9).is_err());
+        assert!(bind_extent(&IntExpr::from(4), 5).is_err());
+    }
 }

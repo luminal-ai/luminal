@@ -1,16 +1,15 @@
 """Translator batch 2: movement, reductions, creation, where/clamp, softmax,
 embedding, layer norm, power, comparisons."""
 
+import luminal_reference
 import torch
 import torch.nn as nn
-
-import luminal_reference
 
 
 def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-5) -> None:
     torch.manual_seed(0)
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())
     out = compiled(*inputs)
     assert out.shape == eager.shape, f"{out.shape} != {eager.shape}"
     assert torch.allclose(out, eager, atol=atol), f"{out} != {eager}"
@@ -235,13 +234,13 @@ def test_max_dim_values_and_indices() -> None:
     torch.manual_seed(0)
     x = torch.randn(3, 4)
     model = nn.Identity()
-    compiled = torch.compile(model, backend=luminal_reference)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())
     # max.dim is exercised through the exported tuple-returning wrapper.
     class MaxDim(nn.Module):
         def forward(self, x):
             return torch.max(x, dim=1)
 
-    out = torch.compile(MaxDim(), backend=luminal_reference)(x)
+    out = torch.compile(MaxDim(), backend=luminal_reference.Compiler())(x)
     eager = torch.max(x, dim=1)
     assert torch.allclose(out.values, eager.values)
     assert torch.equal(out.indices, eager.indices)

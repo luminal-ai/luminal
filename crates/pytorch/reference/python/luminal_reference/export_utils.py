@@ -156,7 +156,7 @@ def _box_scalar_graph_outputs(gm):
     boxed_outputs = []
     for value in flat_outputs:
         example = (
-            value.meta.get("example_value")
+            value.meta.get("example_value", value.meta.get("val"))
             if isinstance(value, torch.fx.Node)
             else value
         )
@@ -353,14 +353,14 @@ def _drop_dead_data_dependent_ops(gm):
 
 
 __all__ = [
-    "flatten_dynamic_cache",
-    "unflatten_dynamic_cache",
-    "flatten_with_keys_dynamic_cache",
-    "_get_cache_dict",
-    "_register_cache_serialization",
     "_box_scalar_graph_outputs",
     "_decomp_table",
-    "_lower_sym_sum",
-    "_drop_input_guards",
     "_drop_dead_data_dependent_ops",
+    "_drop_input_guards",
+    "_get_cache_dict",
+    "_lower_sym_sum",
+    "_register_cache_serialization",
+    "flatten_dynamic_cache",
+    "flatten_with_keys_dynamic_cache",
+    "unflatten_dynamic_cache",
 ]

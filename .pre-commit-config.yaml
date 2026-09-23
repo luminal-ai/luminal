@@ -4,10 +4,10 @@ repos:
     hooks:
       - id: ruff-check
         name: ruff check
-        files: ^crates/luminal_python/.*\.py$
+        files: ^crates/pytorch/.*\.py$
       - id: ruff-format
         name: ruff format
-        files: ^crates/luminal_python/.*\.py$
+        files: ^crates/pytorch/.*\.py$
   - repo: local
     hooks:
       - id: cargo-fmt

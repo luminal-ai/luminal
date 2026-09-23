@@ -13,7 +13,7 @@
 //! folding, so two callers passing the operands in different orders
 //! produce identical `IntExpr`s.
 //!
-//! Lives in `luminal_python` (rather than upstream `luminal::shape`) so
+//! Lives in `luminal_pytorch_utils` (rather than upstream `luminal::shape`) so
 //! the change is contained to the translator. luminal-core callers of
 //! `gather_elements` / `scatter_elements` / `scatter_nd` historically
 //! pass concrete dims, so they don't need this; the translator-local

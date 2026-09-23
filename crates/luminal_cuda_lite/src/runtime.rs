@@ -1128,6 +1128,16 @@ impl CudaRuntime {
     /// Run the plan on the CUDA device. Requires the `device` feature
     /// and an available device; refuses loudly otherwise.
     pub fn execute(&mut self) -> Result<()> {
+        self.execute_mode(false)
+    }
+
+    /// Enqueue an already-warmed, zero-copy plan without synchronizing the
+    /// borrowed stream. The caller keeps every boundary and arena alive.
+    pub fn execute_async(&mut self) -> Result<()> {
+        self.execute_mode(true)
+    }
+
+    fn execute_mode(&mut self, asynchronous: bool) -> Result<()> {
         // A boundary this runtime cannot address is refused before anything
         // else: the statement is the bindings', not the device's.
         self.ensure_external_pointers()?;
@@ -1187,7 +1197,13 @@ impl CudaRuntime {
                     )
                 })
                 .collect();
-            let outputs = device.execute_external(bucket, &staged, &self.dims, &external)?;
+            let outputs = device.execute_external_mode(
+                bucket,
+                &staged,
+                &self.dims,
+                &external,
+                asynchronous,
+            )?;
             self.outputs_host = outputs;
             // Zero-copy inputs are not staged, so nothing to clear; host-staged
             // residents are kept for the (owned-slab) reuse path.
@@ -1197,6 +1213,7 @@ impl CudaRuntime {
         }
         #[cfg(not(feature = "device"))]
         {
+            let _ = asynchronous;
             let _ = self
                 .plan()
                 .ok_or_else(|| anyhow!("search before execute"))?;

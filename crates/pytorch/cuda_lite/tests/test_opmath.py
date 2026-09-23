@@ -69,7 +69,7 @@ def test_single_op_is_bit_exact(dtype, op):
     a = torch.randn(64, 64, device="cuda", dtype=dtype)
     b = torch.randn(64, 64, device="cuda", dtype=dtype)
     ref = fn(a, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(a, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(a, b)
     assert bits_equal(got, ref)
 
 
@@ -86,7 +86,7 @@ def test_chain_rounds_once_per_op(dtype):
     x = torch.randn(64, 64, device="cuda", dtype=dtype)
     y = torch.randn(64, 64, device="cuda", dtype=dtype)
     ref = fn(x, y)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x, y)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, y)
     assert bits_equal(got, ref)
 
 
@@ -100,7 +100,7 @@ def test_python_scalar_is_read_at_f32(dtype):
 
     x = torch.linspace(-1.0, 1.0, 256, device="cuda").to(dtype)
     ref = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     assert bits_equal(got, ref)
 
 
@@ -116,7 +116,7 @@ def test_int_tensor_operand_is_rounded_to_the_common_dtype_first(dtype):
     x = torch.tensor([0.5, 0.25, 1.5, -0.5], device="cuda", dtype=dtype)
     i = torch.tensor([2049, 3, 2049, 7], device="cuda", dtype=torch.int32)
     ref = fn(x, i)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x, i)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, i)
     assert bits_equal(got, ref)
 
 
@@ -131,7 +131,7 @@ def test_add_of_bf16_and_f32_is_f32():
     a = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(64, 64, device="cuda")
     ref = fn(a, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(a, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(a, b)
     assert got.dtype == torch.float32
     assert bits_equal(got, ref)
 
@@ -148,7 +148,7 @@ def test_sum_of_ones_accumulates_in_f32(dtype):
 
     x = torch.ones(3000, device="cuda", dtype=dtype)
     ref = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     assert bits_equal(got, ref)
     assert got.item() == (3000.0 if dtype == torch.float16 else 3008.0)
 
@@ -166,7 +166,7 @@ def test_scalar_comparisons_round_the_literal_to_the_half_dtype(dtype):
         [0.1, 0.2, 0.3, 0.5, 0.7, 0.9, -0.1, 0.0], device="cuda", dtype=dtype
     )
     ref = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     for g, r in zip(got, ref):
         assert g.dtype == torch.bool
         assert torch.equal(g, r)
@@ -179,7 +179,7 @@ def test_int_tensor_against_a_float_literal_compares_at_f32():
 
     i = torch.arange(6, device="cuda", dtype=torch.int32)
     ref = fn(i)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(i)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(i)
     assert got.dtype == torch.bool
     assert torch.equal(got, ref)
 
@@ -195,7 +195,7 @@ def test_maximum_minimum_are_exact(dtype, op):
     a = torch.randn(64, 64, device="cuda", dtype=dtype)
     b = torch.randn(64, 64, device="cuda", dtype=dtype)
     ref = fn(a, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(a, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(a, b)
     assert bits_equal(got, ref)
 
 
@@ -207,7 +207,7 @@ def test_clamp_and_neg_carry_the_operand_bits(dtype):
 
     x = torch.linspace(-1.0, 1.0, 256, device="cuda").to(dtype)
     ref = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     for g, r in zip(got, ref):
         assert bits_equal(g, r)
 
@@ -226,7 +226,7 @@ def test_where_over_a_half_and_an_f32_branch_is_f32(dtype):
     b = torch.randn(4, 16, device="cuda")
     mask = torch.arange(64, device="cuda").reshape(4, 16) % 2 == 0
     ref = fn(mask, a, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(mask, a, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(mask, a, b)
     assert got.dtype == torch.float32
     assert bits_equal(got, ref)
 
@@ -245,7 +245,7 @@ def test_native_layer_norm_statistics_stay_f32(dtype):
     w = torch.randn(16, device="cuda", dtype=dtype)
     b = torch.randn(16, device="cuda", dtype=dtype)
     ref = fn(x, w, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x, w, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, w, b)
     assert got[0].dtype == dtype
     assert got[1].dtype == torch.float32
     assert got[2].dtype == torch.float32
@@ -264,7 +264,7 @@ def test_sum_with_an_explicit_dtype_returns_f32(dtype):
     torch.manual_seed(0)
     x = torch.randn(4, 16, device="cuda", dtype=dtype)
     ref = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     assert got.dtype == torch.float32
     torch.testing.assert_close(got, ref)
 
@@ -287,7 +287,7 @@ def test_attention_bool_mask_excludes_keys():
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     m = torch.tensor([[True, False, False, False]] * 4, device="cuda")
-    got = torch.compile(fn, backend=luminal_cuda_lite)(q, k, v, m)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(q, k, v, m)
     assert got.dtype == torch.float16
     assert bits_equal(got, v[:, :, :1].expand(2, 2, 4, 8))
 
@@ -308,7 +308,7 @@ def test_division_is_the_widened_pattern(dtype):
     a = torch.randn(64, 64, device="cuda", dtype=dtype)
     b = torch.randn(64, 64, device="cuda", dtype=dtype).abs() + 0.5
     ref = fn(a, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(a, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(a, b)
     close_half(got, ref)
 
 
@@ -327,7 +327,7 @@ def test_unary_math_is_the_widened_pattern(dtype, op):
     torch.manual_seed(0)
     x = torch.randn(64, 64, device="cuda", dtype=dtype)
     ref = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     close_half(got, ref)
 
 
@@ -341,7 +341,7 @@ def test_longer_chain_stores_at_every_op(dtype):
     x = torch.randn(64, 64, device="cuda", dtype=dtype)
     y = torch.randn(64, 64, device="cuda", dtype=dtype)
     ref = fn(x, y)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x, y)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, y)
     close_half(got, ref)
 
 
@@ -359,7 +359,7 @@ def test_reductions_accumulate_wide(dtype, op):
     torch.manual_seed(0)
     x = torch.randn(4, 4096, device="cuda", dtype=dtype)
     ref = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     close_half(got, ref)
 
 
@@ -375,7 +375,7 @@ def test_softmax_family_computes_wide(dtype, op):
     torch.manual_seed(0)
     x = torch.randn(4, 256, device="cuda", dtype=dtype)
     ref = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     close_half(got, ref)
 
 
@@ -390,7 +390,7 @@ def test_layer_norm_computes_wide(dtype):
     w = torch.randn(256, device="cuda", dtype=dtype)
     b = torch.randn(256, device="cuda", dtype=dtype)
     ref = fn(x, w, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x, w, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, w, b)
     close_half(got, ref)
 
 
@@ -410,7 +410,7 @@ def test_batch_norm_reads_f32_parameters_unrounded(dtype):
     w = torch.randn(3, device="cuda") * 1.001
     b = torch.randn(3, device="cuda") * 1.001
     ref = fn(x, rm, rv, w, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x, rm, rv, w, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, rm, rv, w, b)
     close_half(got, ref)
 
 
@@ -425,7 +425,7 @@ def test_matmul_accumulates_wide(dtype):
     a = torch.randn(4, 16, device="cuda", dtype=dtype)
     b = torch.randn(16, 8, device="cuda", dtype=dtype)
     ref = fn(a, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(a, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(a, b)
     close_half(got, ref)
 
 
@@ -434,7 +434,7 @@ def test_matmul_accumulates_wide(dtype):
 def test_linear_accumulates_wide(dtype):
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).to("cuda", dtype).eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite)
+    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
     with torch.no_grad():
         x = torch.randn(4, 16, device="cuda", dtype=dtype)
         ref = model(x)

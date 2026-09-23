@@ -260,6 +260,16 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
     // Export node name of each mutation row -> index in `regular`.
     let mut writeback_by_name: HashMap<String, usize> = HashMap::new();
     for (position, tref) in parsed.program.graph_module.graph.outputs.iter().enumerate() {
+        // Literal user outputs have no runtime storage. The Python boundary
+        // restores them from the export signature, retaining their positions.
+        if let Some(crate::pt2_schema::OutputSpec::Other(spec)) = output_specs.get(position)
+            && let Some(arg) = spec.get("user_output").and_then(|output| output.get("arg"))
+            && ["as_none", "as_int", "as_float", "as_bool", "as_string"]
+                .iter()
+                .any(|key| arg.get(key).is_some())
+        {
+            continue;
+        }
         let name = tref
             .value_name()
             .ok_or_else(|| anyhow!("graph output has no tensor name: {tref:?}"))?
@@ -641,6 +651,24 @@ impl Translator<'_> {
             target,
             "_assert_tensor_metadata.default" | "_assert_scalar.default" | "sym_size.int"
         ) {
+            return Ok(());
+        }
+
+        // Symbolic integer arithmetic has no tensor dataflow. Its exported
+        // expression is consumed by shape arguments and scalar_tensor below.
+        if !node.outputs.is_empty()
+            && node.outputs.iter().all(|out| out.as_sym_int.is_some())
+            && node.outputs.iter().all(|out| {
+                self.resolve_sym_int(&out.as_sym_int.as_ref().unwrap().as_name)
+                    .is_some()
+            })
+        {
+            return Ok(());
+        }
+
+        // Shape comparisons feed export's scalar assertions. They contain no
+        // tensor data; Dynamo/export owns their guards at the call boundary.
+        if !node.outputs.is_empty() && node.outputs.iter().all(|out| out.as_sym_bool.is_some()) {
             return Ok(());
         }
 
@@ -1030,7 +1058,12 @@ impl Translator<'_> {
                     .arg
                     .as_tensors()
                     .ok_or_else(|| anyhow!("cat: first operand is not a tensor list"))?;
-                let raw_axis = self.int_arg(&n[1])?;
+                // Export omits the schema default dim=0.
+                let raw_axis = n
+                    .get(1)
+                    .map(|arg| self.int_arg(arg))
+                    .transpose()?
+                    .unwrap_or(0);
                 let mut values = Vec::with_capacity(tensors.len());
                 for t in tensors {
                     values.push(
@@ -1053,7 +1086,13 @@ impl Translator<'_> {
                     .filter(|a| *a < rank)
                     .ok_or_else(|| anyhow!("cat: axis {raw_axis} out of range for rank {rank}"))?;
                 for next in iter {
-                    acc = acc.concat_along(next, axis);
+                    // An empty concatenation axis contributes no elements. Do
+                    // not construct indexing expressions into its empty range.
+                    if acc.dims()[axis].to_usize() == Some(0) {
+                        acc = next;
+                    } else if next.dims()[axis].to_usize() != Some(0) {
+                        acc = acc.concat_along(next, axis);
+                    }
                 }
                 acc
             }

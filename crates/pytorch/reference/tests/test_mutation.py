@@ -9,10 +9,9 @@ import os
 import tempfile
 from typing import Any, Tuple
 
+import luminal_reference
 import torch
 import torch.nn as nn
-
-import luminal_reference
 from luminal_reference.backend import CompiledModel, _tensor_bytes
 
 
@@ -82,7 +81,7 @@ def _run(cls: type, inputs: Tuple[torch.Tensor, ...]) -> Tuple[Any, ...]:
     eager_inputs = [t.clone() for t in inputs]
     eager = model(*eager_inputs)
 
-    compiled = torch.compile(model, backend=luminal_reference)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())
     compiled_inputs = [t.clone() for t in base]
     out = compiled(*compiled_inputs)
 
@@ -135,7 +134,7 @@ def test_buffer_mutation() -> None:
     eager = eager_model(x.clone())
 
     model = BufferAdd()
-    compiled = torch.compile(model, backend=luminal_reference)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())
     out = compiled(x.clone())
 
     assert torch.allclose(out, eager, atol=1e-5)
@@ -159,7 +158,7 @@ def test_buffer_mutation_spec_writes_back() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "model.pt2")
         torch.export.save(ep, path)
-        graph = luminal_reference.compile(path)
+        graph = luminal_reference._luminal.compile(path)
 
     names = list(graph.input_names)
     kinds = list(graph.input_kinds)

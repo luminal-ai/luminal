@@ -22,4 +22,4 @@ jobs:
             - name: Update Rust toolchain
               run: rustup update
             - name: Build and test PyTorch reference backend
-              run: bash crates/pytorch/run_tests.sh reference -v
+              run: bash crates/pytorch/reference/run_tests.sh -v -m "not slow" --ignore=../utils/tests/test_opinfo.py

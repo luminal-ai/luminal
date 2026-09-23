@@ -337,9 +337,21 @@ impl CompiledGraph {
     }
 
     /// Saturate and search.
-    #[pyo3(signature = (generations = None))]
-    fn search(&mut self, generations: Option<usize>) -> PyResult<()> {
-        self.run_search(generations).map_err(to_py)
+    #[pyo3(signature = (generations = None, *, search_log = false, device_budget_bytes = None, max_intermediate_bytes = None))]
+    fn search(
+        &mut self,
+        generations: Option<usize>,
+        search_log: bool,
+        device_budget_bytes: Option<usize>,
+        max_intermediate_bytes: Option<usize>,
+    ) -> PyResult<()> {
+        self.run_search(
+            generations,
+            search_log,
+            device_budget_bytes,
+            max_intermediate_bytes,
+        )
+        .map_err(to_py)
     }
 
     fn execute(&mut self) -> PyResult<()> {
@@ -349,6 +361,15 @@ impl CompiledGraph {
             ));
         }
         self.runtime.execute().map_err(to_py)
+    }
+
+    fn execute_async(&mut self) -> PyResult<()> {
+        if !self.searched {
+            return Err(PyRuntimeError::new_err(
+                "search() must run before execute_async()",
+            ));
+        }
+        self.runtime.execute_async().map_err(to_py)
     }
 
     /// The runtime's cumulative counters, or None before it touched a device.
@@ -398,7 +419,13 @@ impl CompiledGraph {
 
     /// Saturate and search. What this states is what Python reads: the
     /// `search` method maps it through [`to_py`] unchanged.
-    fn run_search(&mut self, generations: Option<usize>) -> Result<()> {
+    fn run_search(
+        &mut self,
+        generations: Option<usize>,
+        search_log: bool,
+        device_budget_bytes: Option<usize>,
+        max_intermediate_bytes: Option<usize>,
+    ) -> Result<()> {
         // NO PAYLOAD CROSSES HERE. The default evaluator ranks candidates by
         // the device-free heuristic, which runs nothing; only a
         // device-profiling search consumes boundary bytes, and this backend's
@@ -408,7 +435,9 @@ impl CompiledGraph {
         if let Some(generations) = generations {
             options.generations = generations;
         }
-        options.search_log = false;
+        options.search_log = search_log;
+        options.device_budget_bytes = device_budget_bytes;
+        options.max_intermediate_bytes = max_intermediate_bytes;
         if !self.dims.is_empty() {
             // Dynamic program: bind one bucket per symbolic dim and search it
             // ONCE. The winning plan keeps symbolic spans, so every later call
@@ -1360,7 +1389,7 @@ mod tests {
         )]
         .into();
         let err = compiled_with(translation, &layouts)
-            .run_search(Some(1))
+            .run_search(Some(1), false, None, None)
             .expect_err("no kernel writes a left-major destination");
         let text = format!("{err:#}");
         assert!(text.contains(&format!("v{out_value}")), "{text}");

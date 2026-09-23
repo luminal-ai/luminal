@@ -165,6 +165,7 @@ pub struct CudaDevice {
     /// not destroy it, and the outer owner is responsible for ordering work
     /// submitted through it.
     stream_is_borrowed: bool,
+    pending_async: bool,
     cache: HashMap<String, Module>,
     stream: Arc<CudaStream>,
     ctx: Arc<CudaContext>,
@@ -182,6 +183,7 @@ impl CudaDevice {
             slab: None,
             external_arena: None,
             stream_is_borrowed: false,
+            pending_async: false,
             cache: HashMap::new(),
             stream,
             ctx,
@@ -194,6 +196,10 @@ impl CudaDevice {
     /// non-owning, so dropping the device does not destroy it.
     pub fn use_borrowed_stream(&mut self, raw_stream: u64) -> Result<()> {
         let raw = raw_stream as usize as cu::CUstream;
+        if self.pending_async && self.stream.cu_stream() != raw {
+            self.stream.synchronize()?;
+            self.pending_async = false;
+        }
         // SAFETY: the caller owns the stream and keeps it alive for as long
         // as this device may run.
         let stream = unsafe { self.ctx.wrap_borrowed_stream(raw) };
@@ -202,6 +208,10 @@ impl CudaDevice {
         Ok(())
     }
     pub fn use_owned_stream(&mut self) -> Result<()> {
+        if self.pending_async {
+            self.stream.synchronize()?;
+            self.pending_async = false;
+        }
         self.stream = self.ctx.new_stream()?;
         self.stream_is_borrowed = false;
         Ok(())
@@ -220,6 +230,10 @@ impl CudaDevice {
             );
         }
         let changed = self.external_arena.map(|(p, _)| p) != Some(ptr);
+        if changed && self.pending_async {
+            self.stream.synchronize()?;
+            self.pending_async = false;
+        }
         self.external_arena = Some((ptr, bytes));
         if !self.installed.is_empty() {
             self.stats.arena_base = ptr;
@@ -234,7 +248,7 @@ impl CudaDevice {
     /// next execution installs again on the owned slab.
     pub fn clear_external_arena(&mut self) {
         if self.external_arena.take().is_some() && !self.installed.is_empty() {
-            // Every public launch is synchronous, including error paths.
+            // Drain any asynchronous launch before retiring its arena.
             let _ = self.stream.synchronize();
             self.installed.clear();
             self.stats.arena_base = 0;
@@ -429,7 +443,7 @@ impl CudaDevice {
     }
     /// Search candidates release both graphs and arena, retaining compiled code.
     pub fn release_slab(&mut self) {
-        // Every public launch is synchronous, including error paths.
+        // Drain any asynchronous launch before retiring its arena.
         let _ = self.stream.synchronize();
         self.installed.clear();
         self.residents.clear();
@@ -459,6 +473,17 @@ impl CudaDevice {
         staged: &FxHashMap<i64, &HostBuffer>,
         dims: &DynMap,
         external_ptrs: &FxHashMap<i64, ExternalPtr>,
+    ) -> Result<Outputs> {
+        self.execute_external_mode(bucket, staged, dims, external_ptrs, false)
+    }
+
+    pub fn execute_external_mode(
+        &mut self,
+        bucket: usize,
+        staged: &FxHashMap<i64, &HostBuffer>,
+        dims: &DynMap,
+        external_ptrs: &FxHashMap<i64, ExternalPtr>,
+        asynchronous: bool,
     ) -> Result<Outputs> {
         self.ctx.bind_to_thread()?;
         self.upload_residents(staged)?;
@@ -492,6 +517,16 @@ impl CudaDevice {
                 || c.external.len() != external.len()
                 || !external.keys().all(|id| c.external.contains_key(id))
         });
+        if self.pending_async
+            && (stale
+                || installed
+                    .compiled
+                    .as_ref()
+                    .is_some_and(|plan| plan.last_dims != *dims))
+        {
+            self.stream.synchronize()?;
+            self.pending_async = false;
+        }
         if stale {
             installed.compiled = Some(CompiledPlan::compile(
                 &installed.plan,
@@ -511,11 +546,12 @@ impl CudaDevice {
         // Move the executable out while updating it. An error or unwind drops
         // any partially patched state before a later invocation can reuse it.
         let mut compiled = installed.compiled.take().unwrap();
+        let dimensions_changed = compiled.last_dims != *dims;
         compiled.update(dims, &mut self.stats)?;
         // A plan compiled this execution already addresses these pointers.
-        // Every later execution re-addresses every node and re-records every
-        // library call: that cost is the library call's, and it is timed.
-        if !stale {
+        // Rebind when the caller addresses or dimensions change; stable
+        // addresses retain the executable for external graph capture.
+        if !stale && (compiled.external != external || dimensions_changed) {
             compiled.rebind_addresses(
                 &installed.plan,
                 &installed.storage,
@@ -532,8 +568,15 @@ impl CudaDevice {
             self.staging.as_mut().unwrap(),
             &self.stream,
             &mut self.stats,
+            asynchronous,
         );
         installed.compiled = Some(compiled);
+        if result.is_err() {
+            self.stream.synchronize()?;
+            self.pending_async = false;
+        } else {
+            self.pending_async = asynchronous;
+        }
         result
     }
 }
@@ -695,6 +738,7 @@ struct CompiledPlan {
     schema: Vec<Symbol>,
     deps: BTreeMap<Symbol, Vec<usize>>,
     last_dims: DynMap,
+    parameter_dims: Option<DynMap>,
     /// Caller device pointers the nodes currently address; rewritten in place
     /// by `rebind_addresses`. A changed SET of buffers recompiles.
     external: ExternalBuffers,
@@ -905,6 +949,7 @@ impl CompiledPlan {
             schema,
             deps: BTreeMap::new(),
             last_dims: dims.clone(),
+            parameter_dims: None,
             external: external.clone(),
             base,
         };
@@ -1453,10 +1498,34 @@ impl CompiledPlan {
         staging: &mut Pinned,
         stream: &Arc<CudaStream>,
         stats: &mut GraphStats,
+        asynchronous: bool,
     ) -> Result<Outputs> {
-        for (i, s) in self.schema.iter().enumerate() {
-            self.params.bytes_mut(staging)[i * 8..i * 8 + 8]
-                .copy_from_slice(&i64::try_from(dims[s])?.to_ne_bytes());
+        if asynchronous {
+            ensure!(
+                self.inputs.is_empty() && self.outputs.is_empty(),
+                "asynchronous execution requires entirely external input/output storage"
+            );
+            ensure!(
+                self.parameter_dims.as_ref() == Some(dims),
+                "warm up this shape synchronously before asynchronous execution"
+            );
+        } else {
+            // An earlier asynchronous launch can still read pinned dimensions.
+            // Drain it before rewriting those bytes for a different shape.
+            if self
+                .parameter_dims
+                .as_ref()
+                .is_some_and(|previous| previous != dims)
+            {
+                stream.synchronize()?;
+            }
+            if self.parameter_dims.as_ref() != Some(dims) {
+                for (i, symbol) in self.schema.iter().enumerate() {
+                    self.params.bytes_mut(staging)[i * 8..i * 8 + 8]
+                        .copy_from_slice(&i64::try_from(dims[symbol])?.to_ne_bytes());
+                }
+                self.parameter_dims = Some(dims.clone());
+            }
         }
         for input in &mut self.inputs {
             let bytes = input.size.eval(dims)?;
@@ -1478,10 +1547,15 @@ impl CompiledPlan {
             }
         }
         let launched = self.executable.as_ref().unwrap().launch(stream);
-        // Synchronize even on launch failure before staging/resources can be reused.
-        let completed = stream.synchronize();
-        launched?;
-        completed?;
+        // Ordinary callers consume host outputs immediately. Async callers
+        // retain external buffers and order access on the borrowed stream.
+        if !asynchronous || launched.is_err() {
+            let completed = stream.synchronize();
+            launched?;
+            completed?;
+        } else {
+            launched?;
+        }
         stats.launches += 1;
         let mut outputs = FxHashMap::default();
         for output in &self.outputs {

@@ -1,38 +1,14 @@
-"""Luminal's reference-backend torch.compile integration.
+"""Reference compiler for ``torch.compile``.
 
-Usage::
-
-    import luminal_reference
-    compiled = torch.compile(model, backend=luminal_reference)
+from luminal_reference import Compiler
+compiled = torch.compile(model, backend=Compiler())
 """
 
-import sys
-import types
+from . import _torch_version as _torch_version
 
-from ._luminal import compile as _compile
-from .backend import CompiledModel, luminal_reference, register_backend
+# Validate PyTorch before importing the native extension.
+# isort: split
+from .compiler import Compiler
+from .dimensions import DimBucket
 
-__all__ = [
-    "CompiledModel",
-    "luminal_reference",
-    "register_backend",
-    "compile",
-]
-
-# Register the backend string form (`backend="luminal_reference"`) on import.
-register_backend()
-
-
-def compile(*args, **kwargs):
-    """Compile a saved ``.pt2`` file on the reference backend."""
-    return _compile(*args, **kwargs)
-
-
-class _CallableModule(types.ModuleType):
-    """Make the module itself usable as a torch.compile backend callable."""
-
-    def __call__(self, gm, example_inputs, **kwargs):
-        return luminal_reference(gm, example_inputs, **kwargs)
-
-
-sys.modules[__name__].__class__ = _CallableModule
+__all__ = ["Compiler", "DimBucket"]

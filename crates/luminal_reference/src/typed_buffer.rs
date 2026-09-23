@@ -232,6 +232,32 @@ impl TypedBuffer {
 
     /// A fresh zero-filled buffer of the same variant and length —
     /// the executor's dest-allocation shape.
+    pub fn byte_len(&self) -> usize {
+        let width = match self {
+            Self::F64(_) | Self::I64(_) => 8,
+            Self::F32(_) | Self::I32(_) => 4,
+            Self::I16(_) => 2,
+            _ => 1,
+        };
+        self.len() * width
+    }
+
+    pub(crate) fn zeroed(dtype: luminal::dtype::PlanDtype, n: usize) -> Result<Self> {
+        use luminal::dtype::PlanDtype as D;
+        Ok(match dtype {
+            D::F32 => Self::F32(vec![0.; n]),
+            D::F64 => Self::F64(vec![0.; n]),
+            D::Int => Self::I32(vec![0; n]),
+            D::Int64 => Self::I64(vec![0; n]),
+            D::I8 => Self::I8(vec![0; n]),
+            D::U8 => Self::U8(vec![0; n]),
+            D::I16 => Self::I16(vec![0; n]),
+            D::Bool | D::Bool8 => Self::Bool8(vec![0; n]),
+            D::F8E4M3FN => Self::F8E4M3FN(vec![float8::F8E4M3::from_bits(0); n]),
+            _ => anyhow::bail!("reference runtime cannot allocate {dtype:?}"),
+        })
+    }
+
     pub fn zeroed_like(&self) -> TypedBuffer {
         match self {
             TypedBuffer::F32(values) => TypedBuffer::F32(vec![0.0; values.len()]),
@@ -298,8 +324,9 @@ impl From<Vec<float8::F8E4M3>> for TypedBuffer {
 }
 
 /// One reference-kernel invocation's storage view: alias-safe by
-/// construction — operand contents are CLONED before any destination is
-/// written, so in-place forms read consistent pre-op data; the runtime
+/// construction — operands remain owned and unchanged while separate destinations
+/// are written. The runtime moves unique intermediate operands into the context
+/// and restores surviving values afterwards; duplicate slots require copies. The runtime
 /// writes `dests` back to the result buffers afterwards. Storage is typed
 /// ([`TypedBuffer`]); geometry comes from the plan's annotated buffers.
 #[derive(Debug)]

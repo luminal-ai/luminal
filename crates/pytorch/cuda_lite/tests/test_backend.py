@@ -24,7 +24,7 @@ def test_linear_roundtrip_repeated_calls():
     and outputs are separate tensors, so every call must still be exact."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite)
+    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
     with torch.no_grad():
         for _ in range(5):
             x = torch.randn(4, 16, device="cuda")
@@ -35,7 +35,7 @@ def test_linear_roundtrip_repeated_calls():
 def test_dynamic_batch():
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite, dynamic=True)
+    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler(), dynamic=True)
     with torch.no_grad():
         for n in (1, 3, 7, 2):
             x = torch.randn(n, 16, device="cuda")
@@ -55,7 +55,7 @@ def test_select_backed_activations(activation):
     model = torch.nn.Sequential(
         torch.nn.Linear(16, 32), activation, torch.nn.Linear(32, 8)
     ).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite)
+    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
     with torch.no_grad():
         x = torch.randn(4, 16, device="cuda")
         torch.testing.assert_close(compiled(x), model(x), atol=1e-3, rtol=1e-3)
@@ -80,7 +80,7 @@ def test_half_and_double_dtypes(dtype, atol):
         .to("cuda", dtype)
         .eval()
     )
-    compiled = torch.compile(model, backend=luminal_cuda_lite)
+    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
     with torch.no_grad():
         x = torch.randn(4, 16, device="cuda", dtype=dtype)
         got = compiled(x)
@@ -95,7 +95,7 @@ def test_repeated_calls_reuse_input_tensors():
     result."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite)
+    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
     x = torch.randn(4, 16, device="cuda")
     with torch.no_grad():
         for _ in range(5):
@@ -116,7 +116,7 @@ def test_writeback_after_read():
     x = torch.randn(4, 8, device="cuda")
     expected_y = x * 2
     expected_x = x + 1
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     torch.testing.assert_close(got, expected_y)
     torch.testing.assert_close(x, expected_x)
 
@@ -137,7 +137,7 @@ def test_returned_clone_of_a_mutated_value_is_fresh_storage():
     torch.manual_seed(0)
     x = torch.randn(4, 8, device="cuda")
     expected = x + 1
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     torch.testing.assert_close(got, expected)
     torch.testing.assert_close(x, expected)
     assert got.data_ptr() != x.data_ptr()
@@ -158,7 +158,7 @@ def test_writeback_consumed_downstream():
     x = torch.randn(4, 8, device="cuda")
     expected_x = x + 1
     expected = expected_x * 2
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     torch.testing.assert_close(got, expected)
     torch.testing.assert_close(x, expected_x)
 
@@ -183,7 +183,7 @@ def test_transposed_input_binds_zero_copy():
     x = torch.randn(8, 4, device="cuda").t()
     assert not x.is_contiguous()
     expected = fn(x)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
     torch.testing.assert_close(got, expected)
 
 
@@ -200,7 +200,7 @@ def test_output_is_returned_at_eagers_strides():
     x = torch.randn(4, 8, device="cuda")
     y = torch.randn(4, 8, device="cuda")
     expected = fn(x, y)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(x, y)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, y)
     assert got.stride() == expected.stride()
     torch.testing.assert_close(got, expected)
 
@@ -212,7 +212,7 @@ def test_dynamic_batch_output_is_returned_at_eagers_strides():
     compile, every extent in the bucket."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite, dynamic=True)
+    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler(), dynamic=True)
     with torch.no_grad():
         for n in (3, 7):
             x = torch.randn(n, 16, device="cuda")
@@ -237,7 +237,7 @@ def test_transposed_output_keeps_eagers_strides():
     a = torch.randn(8, 4, device="cuda")
     b = torch.randn(8, 4, device="cuda")
     expected = fn(a, b)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(a, b)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(a, b)
     assert got.stride() == expected.stride()
     torch.testing.assert_close(got, expected)
 
@@ -259,7 +259,7 @@ def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
     with pytest.raises(
         Exception, match=r"no plan writes the bound outputs: v\d+ at Strided"
     ):
-        torch.compile(fn, backend=luminal_cuda_lite)(x)
+        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -275,7 +275,7 @@ def test_read_only_aliasing_binds_two_buffers_on_one_address():
     torch.manual_seed(0)
     x = torch.randn(4, 8, device="cuda")
     torch.testing.assert_close(
-        torch.compile(fn, backend=luminal_cuda_lite)(x, x[:]), x * x
+        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[:]), x * x
     )
 
 
@@ -292,7 +292,7 @@ def test_aliased_inputs_with_a_writeback_are_refused():
     torch.manual_seed(0)
     x = torch.randn(4, 8, device="cuda")
     with pytest.raises(Exception, match="share device storage"):
-        torch.compile(fn, backend=luminal_cuda_lite)(x, x[:])
+        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[:])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -307,7 +307,7 @@ def test_int32_and_bool_inputs_bind_external():
     values = torch.arange(32, device="cuda", dtype=torch.int32).reshape(4, 8)
     mask = (torch.arange(32, device="cuda") % 2 == 0).reshape(4, 8)
     expected = fn(values, mask)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(values, mask)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(values, mask)
     assert got.dtype == torch.int32
     torch.testing.assert_close(got, expected)
 
@@ -329,7 +329,7 @@ def test_transposed_dynamic_batch_input():
         return x * 2 + 1
 
     torch.manual_seed(0)
-    compiled = torch.compile(fn, backend=luminal_cuda_lite, dynamic=True)
+    compiled = torch.compile(fn, backend=luminal_cuda_lite.Compiler(), dynamic=True)
     for n in (3, 7, 2):
         x = torch.randn(16, n, device="cuda").t()
         assert not x.is_contiguous()
@@ -353,7 +353,7 @@ def test_permuted_dynamic_view_states_its_size_derived_strides():
         return x * 2 + 1
 
     torch.manual_seed(0)
-    compiled = torch.compile(fn, backend=luminal_cuda_lite, dynamic=True)
+    compiled = torch.compile(fn, backend=luminal_cuda_lite.Compiler(), dynamic=True)
     for a, b, c in ((3, 5, 7), (4, 5, 7), (3, 6, 7)):
         x = torch.randn(a, b, c, device="cuda").permute(2, 0, 1)
         assert x.stride() == (1, b * c, c)
@@ -372,7 +372,7 @@ def test_stride_only_symbol_is_refused_by_name():
         return x * 2 + 1
 
     torch.manual_seed(0)
-    compiled = torch.compile(fn, backend=luminal_cuda_lite, dynamic=True)
+    compiled = torch.compile(fn, backend=luminal_cuda_lite.Compiler(), dynamic=True)
     x = torch.randn(16, 6, device="cuda").t()[:, ::2]
     with pytest.raises(Exception, match=r"stride on axis 1.*does not declare"):
         compiled(x)
@@ -393,7 +393,7 @@ def test_offset_input_is_refused_by_name():
     x = base[1:]
     assert x.storage_offset() == 8
     with pytest.raises(Exception, match="storage offset 8"):
-        torch.compile(fn, backend=luminal_cuda_lite)(x)
+        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -409,7 +409,7 @@ def test_expanded_input_is_a_broadcast_read_map():
     assert x.stride() == (0, 1)
     y = torch.randn(4, 8, device="cuda")
     torch.testing.assert_close(
-        torch.compile(fn, backend=luminal_cuda_lite)(x, y), fn(x, y)
+        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, y), fn(x, y)
     )
 
 
@@ -431,7 +431,7 @@ def test_stride_zero_mutation_target_finds_no_plan_naming_the_output():
     with pytest.raises(
         Exception, match=r"no plan writes the bound outputs: v\d+ at Strided"
     ):
-        torch.compile(fn, backend=luminal_cuda_lite)(x)
+        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -483,7 +483,7 @@ def test_a_parameter_whose_storage_moved_is_read_at_its_new_address():
     module's."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite)
+    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
     x = torch.randn(4, 16, device="cuda")
     with torch.no_grad():
         torch.testing.assert_close(compiled(x), model(x))

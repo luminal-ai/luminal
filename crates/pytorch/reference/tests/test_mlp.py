@@ -1,9 +1,8 @@
-"""End-to-end MLP via `torch.compile(backend=luminal_reference)`."""
-
-import torch
-import torch.nn as nn
+"""End-to-end MLP via `torch.compile(backend=luminal_reference.Compiler())`."""
 
 import luminal_reference
+import torch
+import torch.nn as nn
 
 
 class MLP(nn.Module):
@@ -16,47 +15,23 @@ class MLP(nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
-def test_mlp_matches_eager_module_backend() -> None:
+def test_mlp_matches_eager_compiler() -> None:
     torch.manual_seed(0)
     model = MLP()
     x = torch.randn(3, 4)
     eager = model(x)
 
-    compiled = torch.compile(model, backend=luminal_reference)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())
     out = compiled(x)
 
     assert out.shape == eager.shape
     assert torch.allclose(out, eager, atol=1e-5)
 
 
-def test_mlp_matches_eager_function_backend() -> None:
-    torch.manual_seed(0)
-    model = MLP()
-    x = torch.randn(3, 4)
-    eager = model(x)
-
-    compiled = torch.compile(model, backend=luminal_reference.luminal_reference)
-    out = compiled(x)
-
-    assert torch.allclose(out, eager, atol=1e-5)
-
-
-def test_mlp_matches_eager_backend_string() -> None:
-    torch.manual_seed(0)
-    model = MLP()
-    x = torch.randn(3, 4)
-    eager = model(x)
-
-    compiled = torch.compile(model, backend="luminal_reference")
-    out = compiled(x)
-
-    assert torch.allclose(out, eager, atol=1e-5)
-
-
 def test_mlp_rebinds_new_inputs_without_recompile() -> None:
     torch.manual_seed(0)
     model = MLP()
-    compiled = torch.compile(model, backend=luminal_reference)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())
 
     for _ in range(3):
         x = torch.randn(3, 4)

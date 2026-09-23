@@ -1,16 +1,15 @@
 """Translator batch 6: attention (SDPA) and upsample / resize."""
 
+import luminal_reference
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import luminal_reference
 
 
 def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-4) -> None:
     torch.manual_seed(0)
     eager = model(*inputs)
-    compiled = torch.compile(model, backend=luminal_reference)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())
     out = compiled(*inputs)
     assert out.shape == eager.shape, f"{out.shape} != {eager.shape}"
     assert torch.allclose(out.to(torch.float32), eager.to(torch.float32), atol=atol), (

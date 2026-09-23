@@ -36,7 +36,7 @@ def _same_as_eager(fn, *make_inputs):
     eager_inputs = [make() for make in make_inputs]
     compiled_inputs = [make() for make in make_inputs]
     eager = fn(*eager_inputs)
-    got = torch.compile(fn, backend=luminal_cuda_lite)(*compiled_inputs)
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(*compiled_inputs)
     eager_list = list(eager) if isinstance(eager, (tuple, list)) else [eager]
     got_list = list(got) if isinstance(got, (tuple, list)) else [got]
     assert len(got_list) == len(eager_list)
@@ -180,7 +180,7 @@ def test_module_buffer_slice_write():
 
     eager_model, model = Cache(), Cache()
     eager = eager_model(_x())
-    got = torch.compile(model, backend=luminal_cuda_lite)(_x())
+    got = torch.compile(model, backend=luminal_cuda_lite.Compiler())(_x())
     torch.testing.assert_close(got, eager)
     torch.testing.assert_close(model.kv, eager_model.kv, msg="the buffer's rows 1:3 hold x")
 
@@ -193,7 +193,7 @@ def test_writes_through_storage_sharing_inputs_are_refused_by_name():
 
     x = _x()
     with pytest.raises(Exception, match="share device storage"):
-        torch.compile(fn, backend=luminal_cuda_lite)(x, x[0])
+        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x, x[0])
 
 
 @cuda
@@ -205,7 +205,7 @@ def test_returned_view_at_a_storage_offset_is_refused_by_name():
         return x[1]
 
     with pytest.raises(Exception, match="storage offset"):
-        torch.compile(fn, backend=luminal_cuda_lite)(_x())
+        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(_x())
 
 
 def test_functionalising_without_decomposing_keeps_linear():

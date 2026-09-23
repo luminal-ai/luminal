@@ -44,10 +44,22 @@ accounts for the bytes and can reuse the block on the next call.
 import concurrent.futures
 import os
 import tempfile
-from typing import Any, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import torch
+from luminal_reference.export_utils import (
+    _box_scalar_graph_outputs,
+    _decomp_table,
+    _drop_dead_data_dependent_ops,
+    _drop_input_guards,
+    _lower_sym_sum,
+    _register_cache_serialization,
+    private_graph_copy,
+)
+from torch.export import Dim, export
 
+from . import _luminal
 from .boundary import (
     Binding,
     UnsupportedBoundary,
@@ -61,19 +73,6 @@ from .boundary import (
     layout_spec,
     storage_span,
 )
-from torch.export import Dim, export
-
-from luminal_reference.export_utils import (
-    private_graph_copy,
-    _box_scalar_graph_outputs,
-    _decomp_table,
-    _drop_dead_data_dependent_ops,
-    _drop_input_guards,
-    _lower_sym_sum,
-    _register_cache_serialization,
-)
-
-from . import _luminal
 
 # torch._export.serde.schema.ScalarType codes we can round-trip today.
 _PT2_TO_TORCH = {
@@ -93,13 +92,17 @@ _PT2_TO_TORCH = {
 # (a buffer mutation, a gradient, a token) would reach the translator as an
 # ordinary returned tensor, because the PT2 signature reader models only
 # ``user_input_mutation``.
-_BOUND_OUTPUT_KINDS = frozenset({"USER_OUTPUT", "USER_INPUT_MUTATION", "BUFFER_MUTATION"})
+_BOUND_OUTPUT_KINDS = frozenset(
+    {"USER_OUTPUT", "USER_INPUT_MUTATION", "BUFFER_MUTATION"}
+)
 
 
 def _torch_dtype(dtype_code: int) -> torch.dtype:
     dtype = _PT2_TO_TORCH.get(dtype_code)
     if dtype is None:
-        raise RuntimeError(f"luminal_cuda_lite cannot materialize PT2 dtype code {dtype_code}")
+        raise RuntimeError(
+            f"luminal_cuda_lite cannot materialize PT2 dtype code {dtype_code}"
+        )
     return dtype
 
 
@@ -136,7 +139,9 @@ def _boundary_tensors(
         name = getattr(spec.arg, "name", None)
         kind = spec.kind.name
         if name is None:
-            raise UnsupportedBoundary(f"graph input {kind.lower()} {spec.target!r} is not a tensor")
+            raise UnsupportedBoundary(
+                f"graph input {kind.lower()} {spec.target!r} is not a tensor"
+            )
         if kind == "USER_INPUT":
             if user_index >= len(export_inputs):
                 raise RuntimeError(
@@ -152,15 +157,21 @@ def _boundary_tensors(
             value = ep.state_dict[spec.target]
         elif kind == "CONSTANT_TENSOR":
             if spec.target not in ep.constants:
-                raise RuntimeError(f"{name}: {spec.target!r} is not in the exported constants")
+                raise RuntimeError(
+                    f"{name}: {spec.target!r} is not in the exported constants"
+                )
             value = ep.constants[spec.target]
         else:
             raise UnsupportedBoundary(
                 f"{name}: graph inputs of kind {kind.lower()} are not bound by luminal_cuda_lite"
             )
         if not isinstance(value, torch.Tensor):
-            raise UnsupportedBoundary(f"{name}: graph input {spec.target!r} is not a tensor")
-        rows.append((name, kind, value, fakes.get(name) if kind == "USER_INPUT" else None))
+            raise UnsupportedBoundary(
+                f"{name}: graph input {spec.target!r} is not a tensor"
+            )
+        rows.append(
+            (name, kind, value, fakes.get(name) if kind == "USER_INPUT" else None)
+        )
     if user_index != len(export_inputs):
         raise RuntimeError(
             f"export consumed {user_index} of {len(export_inputs)} example_inputs"
@@ -240,7 +251,9 @@ def _output_alias_rows(ep: Any) -> list[tuple[str, str, int]]:
     from op names."""
     fakes = _node_fakes(ep)
     names: list[str] = []
-    for spec in list(ep.graph_signature.input_specs) + list(ep.graph_signature.output_specs):
+    for spec in list(ep.graph_signature.input_specs) + list(
+        ep.graph_signature.output_specs
+    ):
         name = getattr(spec.arg, "name", None)
         if name is not None and name not in names:
             names.append(name)
@@ -347,9 +360,9 @@ class CompiledModel:
         input_bindings: Sequence[Binding],
         output_bindings: Sequence[Binding],
         scalar_output_positions: Sequence[int] = (),
-        held_tensors: Optional[dict[str, torch.Tensor]] = None,
+        held_tensors: dict[str, torch.Tensor] | None = None,
         held_bindings: Sequence[Binding] = (),
-        output_aliases: Optional[dict[str, tuple[str, int]]] = None,
+        output_aliases: dict[str, tuple[str, int]] | None = None,
     ):
         self._graph = graph
         # Output name -> (the boundary tensor whose storage it is a view of,
@@ -374,7 +387,8 @@ class CompiledModel:
         # The runtime always launches captured CUDA graphs, which the legacy
         # default stream cannot host, so it runs on a dedicated side stream
         # ordered against the caller's stream with events.
-        self._side_stream: Optional[torch.cuda.Stream] = None
+        self._side_stream: torch.cuda.Stream | None = None
+        self._region_execution_state = {}
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
         # The graph inputs this program writes back into. While it is
@@ -388,7 +402,7 @@ class CompiledModel:
         self,
         name: str,
         inputs: Sequence[torch.Tensor],
-        out_tensors: Sequence[Optional[torch.Tensor]],
+        out_tensors: Sequence[torch.Tensor | None],
     ) -> torch.Tensor:
         """The live tensor a boundary name stands for on this call: a user
         input, a held parameter/buffer, a writeback's destination, or an
@@ -424,6 +438,27 @@ class CompiledModel:
             "input nor a held parameter/buffer"
         )
 
+    def configure_region(self, *, static_outputs=False, external_cuda_graph=False):
+        """Give a region its own persistent PyTorch-owned boundary storage."""
+        if external_cuda_graph and not static_outputs:
+            raise ValueError("external CUDA graph capture requires static_outputs=True")
+        self._region_current = True
+        self._region_static = static_outputs
+        self._region_external_capture = external_cuda_graph
+        self._region_allocations = {}
+        self._region_mutations = {}
+        self._region_arena = None
+
+    @property
+    def writeback_inputs(self):
+        return {
+            name: mutation
+            for name, mutation in zip(
+                self._graph.output_names, self._graph.output_mutations
+            )
+            if mutation is not None
+        }
+
     def __call__(self, *args: torch.Tensor) -> Any:
         # Under dynamic shapes Dynamo's wrapper passes the graph's symbolic
         # shape values alongside the tensor inputs (as SymInt or int). The
@@ -445,9 +480,31 @@ class CompiledModel:
                     f"{device} and {value.device}"
                 )
         stream = torch.cuda.current_stream(device)
-        if self._side_stream is None:
-            self._side_stream = torch.cuda.Stream(device=device)
-        side = self._side_stream
+        if getattr(self, "_region_current", False):
+            side = stream
+        else:
+            if self._side_stream is None:
+                self._side_stream = torch.cuda.Stream(device=device)
+            side = self._side_stream
+        static = getattr(self, "_region_static", False)
+        signature = tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in inputs)
+        execution_key = (id(self), signature, side.cuda_stream)
+        warmed = self._region_execution_state.get("last") == execution_key
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and (not static or not warmed):
+            raise RuntimeError(
+                "warm up each region shape with static_outputs=True before CUDA capture"
+            )
+        if static:
+            for binding, value in zip(self._input_bindings, inputs):
+                if binding.name in self._writebacks:
+                    previous = self._region_mutations.setdefault(
+                        binding.name, value.data_ptr()
+                    )
+                    if previous != value.data_ptr():
+                        raise ValueError(
+                            "static region mutation target allocation changed"
+                        )
 
         # CHECK EVERYTHING BEFORE ADDRESSING ANYTHING: every tensor this
         # call binds — inputs, held tensors, freshly allocated outputs — is
@@ -490,11 +547,11 @@ class CompiledModel:
         # target input's. Allocate under the side stream so the caching
         # allocator records the stream that will write them.
         with torch.cuda.stream(side):
-            out_tensors: list[Optional[torch.Tensor]] = []
+            out_tensors: list[torch.Tensor | None] = []
             # What each output's buffer is addressed with: the base of its
             # storage and the byte span the plan writes through it, which is
             # the tensor's own span only when the plan writes it densely.
-            out_spans: list[Optional[tuple[int, int]]] = []
+            out_spans: list[tuple[int, int] | None] = []
             for index, binding in enumerate(self._output_bindings):
                 if self._output_mutations[index] is not None:
                     out_tensors.append(None)
@@ -531,9 +588,17 @@ class CompiledModel:
                 # dimensions: the allocation is sized to it, never to the
                 # tensor alone.
                 span = self._graph.output_span_bytes(name)
-                tensor, base_ptr, base_bytes = _allocate_output(
-                    binding, shape, declared, span, device
+                allocation_key = (index, shape, declared, span)
+                allocation = (
+                    self._region_allocations.get(allocation_key) if static else None
                 )
+                if allocation is None:
+                    allocation = _allocate_output(
+                        binding, shape, declared, span, device
+                    )
+                    if static:
+                        self._region_allocations[allocation_key] = allocation
+                tensor, base_ptr, base_bytes = allocation
                 # The allocation is checked against the binding the runtime
                 # writes through — rank, extents, element strides — so a
                 # disagreement is refused by name rather than written past.
@@ -543,12 +608,21 @@ class CompiledModel:
 
         # Order the side stream after everything the caller enqueued: this is
         # what makes reading the caller's inputs safe without a host sync.
-        side.wait_stream(stream)
+        if side != stream:
+            side.wait_stream(stream)
 
         # Per-execution intermediate arena from PyTorch's caching allocator,
         # associated with the stream that uses it.
         arena_bytes = max(self._arena_bytes, 1)
-        arena = torch.cuda.caching_allocator_alloc(arena_bytes, device, side)
+        if static:
+            if self._region_arena is None:
+                self._region_arena = torch.empty(
+                    arena_bytes, dtype=torch.uint8, device=device
+                )
+            self._region_arena.record_stream(side)
+            arena = self._region_arena.data_ptr()
+        else:
+            arena = torch.cuda.caching_allocator_alloc(arena_bytes, device, side)
         self._graph.use_borrowed_stream(side.cuda_stream)
         self._graph.set_arena(arena, arena_bytes)
         # EVERY CHECK IS BEHIND US: the addresses go in here and come out in
@@ -581,9 +655,17 @@ class CompiledModel:
                 self._graph.set_device_ptr(binding.buffer, base_ptr, base_bytes)
                 per_call.append(binding.buffer)
 
-            self._graph.execute()
+            if static and warmed:
+                for value in [*inputs, *self._held.values(), *out_tensors]:
+                    if value is not None:
+                        value.record_stream(side)
+                self._graph.execute_async()
+            else:
+                self._graph.execute()
+            self._region_execution_state["last"] = execution_key
         finally:
-            torch.cuda.caching_allocator_delete(arena)
+            if not static:
+                torch.cuda.caching_allocator_delete(arena)
             # These addresses belong to this call only: forget them, so an
             # execute that skipped a binding refuses by name instead of
             # reading storage the caller has released.
@@ -591,7 +673,8 @@ class CompiledModel:
                 self._graph.clear_device_ptr(buffer)
 
         # Hand ordering back to the caller's stream for the returned tensors.
-        stream.wait_stream(side)
+        if stream != side:
+            stream.wait_stream(side)
 
         results = []
         for index, mutation in enumerate(self._output_mutations):
@@ -615,7 +698,9 @@ class CompiledModel:
                     owner = self._boundary_tensor(owner_name, inputs, out_tensors)
                     shape = tuple(output_shapes[index])
                     strides = tuple(declared_strides(binding, shape, dims))
-                    tensor = owner.as_strided(shape, strides, owner.storage_offset() + offset)
+                    tensor = owner.as_strided(
+                        shape, strides, owner.storage_offset() + offset
+                    )
                 # Scalar graph outputs were boxed into rank-zero tensors before
                 # export; restore the Python scalar backend contract here.
                 if position in self._scalar_output_positions:
@@ -728,15 +813,23 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     return ep, inputs
 
 
-def luminal_cuda_lite(
+def _compile_graph(
     gm: torch.fx.GraphModule,
     example_inputs: Sequence[Any],
-    options: Optional[dict] = None,
-    search_iterations: Optional[int] = None,
+    options: dict | None = None,
+    search_iterations: int | None = None,
+    search_log: bool = False,
+    device_budget_bytes: int | None = None,
+    max_intermediate_bytes: int | None = None,
 ) -> CompiledModel:
     """The torch.compile backend entry point."""
     if options:
         search_iterations = options.get("search_iterations", search_iterations)
+        search_log = options.get("search_log", search_log)
+        device_budget_bytes = options.get("device_budget_bytes", device_budget_bytes)
+        max_intermediate_bytes = options.get(
+            "max_intermediate_bytes", max_intermediate_bytes
+        )
 
     # HF DynamicCache must be pytree-registered before torch.export capture so
     # use_cache=True models can export. Idempotent.
@@ -782,12 +875,37 @@ def luminal_cuda_lite(
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
 
+    return compile_exported(
+        ep,
+        export_inputs,
+        search_iterations,
+        scalar_output_positions,
+        search_log=search_log,
+        device_budget_bytes=device_budget_bytes,
+        max_intermediate_bytes=max_intermediate_bytes,
+    )
+
+
+def compile_exported(
+    ep,
+    export_inputs,
+    search_iterations=None,
+    scalar_output_positions=(),
+    *,
+    search_log=False,
+    device_budget_bytes=None,
+    max_intermediate_bytes=None,
+):
+    """Compile a functional ExportedProgram with the native runtime."""
+
     def _save_and_compile(program: Any) -> Any:
         # Read every boundary tensor's element strides and declare them with
         # the program: the runtime binds what the caller has, or refuses it.
         _refuse_unbound_outputs(program)
         rows = _boundary_tensors(program, export_inputs)
-        layouts = {name: boundary_layout(name, value, fake) for name, _, value, fake in rows}
+        layouts = {
+            name: boundary_layout(name, value, fake) for name, _, value, fake in rows
+        }
         shapes = {name: boundary_shape(value, fake) for name, _, value, fake in rows}
         declared = []
         for name, _, _, _ in rows:
@@ -805,10 +923,19 @@ def luminal_cuda_lite(
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
             graph = _luminal.compile(
-                pt2_path, declared, declared_outputs, [(name, owner) for name, owner, _ in aliases]
+                pt2_path,
+                declared,
+                declared_outputs,
+                [(name, owner) for name, owner, _ in aliases],
             )
         tensors = {name: value for name, _, value, _ in rows}
-        return graph, tensors, layouts, shapes, {name: (owner, offset) for name, owner, offset in aliases}
+        return (
+            graph,
+            tensors,
+            layouts,
+            shapes,
+            {name: (owner, offset) for name, owner, offset in aliases},
+        )
 
     try:
         graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
@@ -847,8 +974,12 @@ def luminal_cuda_lite(
                 f"the translated program names an input {name!r} the export signature "
                 f"does not declare (declared: {sorted(tensors)})"
             )
-    graph.bind_input_shapes([(name, list(tensors[name].shape)) for name in graph.input_names])
-    for name, kind, buffer in zip(graph.input_names, graph.input_kinds, graph.input_buffers):
+    graph.bind_input_shapes(
+        [(name, list(tensors[name].shape)) for name in graph.input_names]
+    )
+    for name, kind, buffer in zip(
+        graph.input_names, graph.input_kinds, graph.input_buffers
+    ):
         value = tensors[name]
         binding = Binding(name, buffer, value.dtype, shapes[name], layouts[name])
         if kind == "user_input":
@@ -858,7 +989,12 @@ def luminal_cuda_lite(
         held_bindings.append(binding)
         held[name] = value
 
-    graph.search(search_iterations)
+    graph.search(
+        search_iterations,
+        search_log=search_log,
+        device_budget_bytes=device_budget_bytes,
+        max_intermediate_bytes=max_intermediate_bytes,
+    )
 
     # WHICH OUTPUTS THE PROGRAM HAS IS THE TRANSLATION'S TO SAY, not the
     # export signature's: the translator resolves a returned alias of a
@@ -901,10 +1037,3 @@ def luminal_cuda_lite(
         held_bindings,
         aliases,
     )
-
-
-def register_backend() -> None:
-    """Register ``"luminal_cuda_lite"`` so ``backend="luminal_cuda_lite"`` works."""
-    if "luminal_cuda_lite" in torch._dynamo.list_backends():
-        return
-    torch._dynamo.register_backend(luminal_cuda_lite, name="luminal_cuda_lite")

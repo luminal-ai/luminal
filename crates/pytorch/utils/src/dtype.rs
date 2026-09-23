@@ -7,7 +7,7 @@
 //! risk when PyTorch renumbers or adds a code. This module collapses those
 //! sites onto one typed enum and pins the numbering with a parity test that
 //! asserts every Rust variant matches `torch._export.serde.schema.ScalarType`
-//! at CI time (see `crates/luminal_python/tests/test_torch_dtype_parity.py`).
+//! at CI time (see `crates/pytorch/utils/tests/test_torch_dtype_parity.py`).
 //!
 //! Note: PyTorch's C++ `c10::ScalarType` uses a different numbering than the
 //! PT2 schema (PT2 reserves 0 for `Unknown`); we bind to the **PT2 schema**,
@@ -40,6 +40,9 @@ pub enum TorchDType {
     Float8E5m2 = 30,
     Float8E4m3Fnuz = 31,
     Float8E5m2Fnuz = 32,
+    Float8E8m0Fnu = 33,
+    Uint32 = 34,
+    Uint64 = 35,
 }
 
 impl TorchDType {
@@ -65,6 +68,9 @@ impl TorchDType {
         TorchDType::Float8E5m2,
         TorchDType::Float8E4m3Fnuz,
         TorchDType::Float8E5m2Fnuz,
+        TorchDType::Float8E8m0Fnu,
+        TorchDType::Uint32,
+        TorchDType::Uint64,
     ];
 
     /// Canonical wire code (matches `ScalarType.<name>.value` in Python).
@@ -92,6 +98,9 @@ impl TorchDType {
             TorchDType::Bool => "BOOL",
             TorchDType::BFloat16 => "BFLOAT16",
             TorchDType::Uint16 => "UINT16",
+            TorchDType::Uint32 => "UINT32",
+            TorchDType::Uint64 => "UINT64",
+            TorchDType::Float8E8m0Fnu => "FLOAT8E8M0FNU",
             TorchDType::Float8E4m3Fn => "FLOAT8E4M3FN",
             TorchDType::Float8E5m2 => "FLOAT8E5M2",
             TorchDType::Float8E4m3Fnuz => "FLOAT8E4M3FNUZ",
@@ -161,6 +170,9 @@ impl TryFrom<TorchDType> for DType {
             TorchDType::Float8E5m2 => DType::F8E5M2,
             TorchDType::Float8E5m2Fnuz => DType::F8E5M2FNUZ,
             TorchDType::Uint16
+            | TorchDType::Uint32
+            | TorchDType::Uint64
+            | TorchDType::Float8E8m0Fnu
             | TorchDType::Unknown
             | TorchDType::ComplexHalf
             | TorchDType::ComplexFloat

@@ -38,3 +38,11 @@ dist/
 build/
 uv.lock
 crates/luminal_training/examples/mnist_data/
+
+.pytest_cache/
+
+.venv/
+
+# Downloaded audio for the backend-owned Whisper examples
+/crates/pytorch/reference/examples/assets/
+/crates/pytorch/cuda_lite/examples/assets/

@@ -3,8 +3,8 @@
 //! Bare symbols and compound sympy expressions (`Add`, `Mul`, `FloorDiv`,
 //! `Mod`, `Min`, `Max`) map to recorder `IntExpr`s so dynamic dims survive
 //! as expressions instead of freezing at the export hint. Torch's exported
-//! range constraints feed the bounds simplifier; anything unresolved falls
-//! back to the exported hint, which keeps static programs exact.
+//! range constraints feed the bounds simplifier; anything unresolved
+//! fails translation; a sample hint must never freeze a dynamic dimension.
 #![allow(dead_code)]
 
 use luminal::prelude::*;
@@ -21,14 +21,11 @@ impl Translator<'_> {
             .get("as_expr")
             .and_then(|e| e.get("expr_str"))
             .and_then(|s| s.as_str())
-            && let Some(expr) = self.resolve_expr_str(expr_str)
         {
-            return Some(expr);
+            return self.resolve_expr_str(expr_str);
         }
         value
-            .get("as_expr")
-            .and_then(|e| e.get("hint"))
-            .and_then(|h| h.get("as_int"))
+            .get("as_int")
             .and_then(|v| v.as_i64())
             .map(IntExpr::from)
     }
@@ -76,12 +73,7 @@ impl Translator<'_> {
     }
 
     pub(super) fn resolve_expr_value(&self, expr: &ExprValue) -> Option<IntExpr> {
-        self.resolve_expr_str(&expr.expr_str).or_else(|| {
-            expr.hint
-                .as_ref()
-                .and_then(|h| h.as_int())
-                .map(IntExpr::from)
-        })
+        self.resolve_expr_str(&expr.expr_str)
     }
 
     /// Shape of a node operand from PT2 metadata, for ops whose output

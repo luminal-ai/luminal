@@ -324,32 +324,30 @@ impl Translator<'_> {
 
     pub(super) fn translate_triangular(&mut self, node: &Node, upper: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let diagonal = self.get_int_arg(node, 1).unwrap_or(0) as i32;
+        let diagonal = self.get_int_arg(node, 1).unwrap_or(0);
         let dims = x.dims();
         anyhow::ensure!(dims.len() >= 2, "tril/triu requires a matrix input");
         let rows = dims[dims.len() - 2];
         let cols = dims[dims.len() - 1];
-        let (row_count, col_count) = match (rows.to_usize(), cols.to_usize()) {
-            (Some(rows), Some(cols)) => (rows, cols),
-            _ => anyhow::bail!("tril/triu requires concrete matrix dimensions"),
-        };
-        let size = row_count.max(col_count);
-        let mask = if upper {
-            self.cx.triu(size, diagonal)
-        } else {
-            self.cx.tril(size, diagonal)
-        };
-        let mask = if rows != cols {
-            mask.slice_along(0..row_count, 0)
-                .slice_along(0..col_count, 1)
-        } else {
-            mask
-        };
-        let mut mask = mask.cast(x.dtype);
+        // Compare coordinates inside the iota expression: extents remain symbolic,
+        // and only the 0/1 predicate is materialized (no floating-point indices).
+        let mut mask = self
+            .cx
+            .iota((rows, cols), |c| {
+                let offset = c[1] - c[0];
+                if upper {
+                    offset.gte(diagonal)
+                } else {
+                    IntExpr::from(diagonal).gte(offset)
+                }
+            })
+            .cast(DType::Bool);
         for i in (0..dims.len() - 2).rev() {
             mask = mask.expand_dim(0, dims[i]);
         }
-        Ok(x * mask)
+        let zero = self.cx.constant_i32(0).cast(x.dtype).expand_rhs(dims);
+        // Multiplication would leak masked NaNs/infinities and lose signed zero.
+        Ok(mask.select(x, zero))
     }
 }
 

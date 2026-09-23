@@ -18,11 +18,186 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use petgraph::algo::toposort;
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 
 use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode, OutputBinding};
 
 use luminal::layouts::DecodedLayout;
+
+/// Default live tensor payload and scratch budget (8 GiB), excluding compiler state.
+pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+/// Default per-intermediate allocation ceiling (2 GiB), excluding boundary buffers.
+pub const DEFAULT_MAX_INTERMEDIATE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Validate the whole plan before allocating any of its tensor storage.
+/// Boundary buffers are identified by their actual input/output slots, not
+/// ownership (an internally allocated buffer can also back an output).
+pub(crate) fn check_intermediate_allocations(
+    plan: &BufferIrGraph<DecodedLayout>,
+    dims: &luminal::shape::DynMap,
+    limit: usize,
+) -> Result<()> {
+    let mut boundary = rustc_hash::FxHashSet::default();
+    for node in plan.dag.node_weights() {
+        match node {
+            BufferNode::BufferInput { slots } => {
+                boundary.extend(slots.iter().map(|slot| slot.buffer.clone()));
+            }
+            BufferNode::BufferOutput { slots } => {
+                boundary.extend(slots.iter().map(|slot| slot.buffer.clone()));
+            }
+            _ => {}
+        }
+    }
+    for (id, buffer) in &plan.buffers {
+        if boundary.contains(id) {
+            continue;
+        }
+        let elements = buffer.layout.span_with(dims)?;
+        let dtype = buffer
+            .layout
+            .dtype
+            .ok_or_else(|| anyhow!("buffer {} has no dtype", buffer.label))?;
+        // Bool is byte-backed in TypedBuffer, despite its one-bit logical dtype.
+        let width = usize::try_from(dtype.egglog_bits())?.div_ceil(8);
+        let bytes = elements.checked_mul(width).ok_or_else(|| {
+            anyhow!(
+                "reference intermediate {} allocation size overflow",
+                buffer.label
+            )
+        })?;
+        ensure!(
+            bytes <= limit,
+            "reference intermediate {} requires {bytes} bytes, exceeding max_intermediate_bytes={limit}",
+            buffer.label
+        );
+    }
+    Ok(())
+}
+
+/// Conservative tensor-payload scratch bound for the unchanged reference
+/// kernels. All currently registered kernels either clone operands, allocate
+/// index/coordinate columns, or use only rank-sized metadata. This is allocation
+/// accounting, never op selection or graph rewriting.
+fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> {
+    let sum = |values: Vec<usize>| {
+        values.into_iter().try_fold(0usize, |a, b| {
+            a.checked_add(b)
+                .ok_or_else(|| anyhow!("kernel scratch size overflow"))
+        })
+    };
+    let mut bytes = sum(ctx.operands.iter().map(TypedBuffer::byte_len).collect())?;
+    let n = ctx.operands.first().map_or(0, TypedBuffer::len);
+    let out = ctx.dests.first().map_or(0, TypedBuffer::len);
+    let extra = match label {
+        "IndexMapApplyMaterialize" => out.checked_mul(std::mem::size_of::<usize>()),
+        "GatherGeneric" => {
+            let columns = sum(ctx.operands.iter().skip(1).map(TypedBuffer::len).collect())?;
+            columns.checked_mul(8).and_then(|v| {
+                out.checked_mul(std::mem::size_of::<usize>())
+                    .and_then(|w| v.checked_add(w))
+            })
+        }
+        "ScatterFunctionalGeneric" => {
+            let columns = sum(ctx.operands.iter().skip(2).map(TypedBuffer::len).collect())?;
+            let src = ctx.operands.get(1).map_or(0, TypedBuffer::len);
+            columns
+                .checked_mul(8)
+                .and_then(|v| {
+                    src.checked_mul(std::mem::size_of::<usize>())
+                        .and_then(|w| v.checked_add(w))
+                })
+                .and_then(|v| v.checked_add(out))
+        }
+        "CastGeneric" => n.checked_mul(8),
+
+        "AddFunctionalGeneric"
+        | "CeilFunctionalGeneric"
+        | "ConstantGeneric"
+        | "DivFunctionalGeneric"
+        | "Exp2FunctionalGeneric"
+        | "ExpFunctionalGeneric"
+        | "FloorFunctionalGeneric"
+        | "IotaGeneric"
+        | "LessThanGeneric"
+        | "Log2FunctionalGeneric"
+        | "ModFunctionalGeneric"
+        | "MulFunctionalGeneric"
+        | "RecipFunctionalGeneric"
+        | "ReduceMaxGeneric"
+        | "ReduceSumGeneric"
+        | "RoundFunctionalGeneric"
+        | "SelectFunctionalGeneric"
+        | "SinFunctionalGeneric"
+        | "SqrtFunctionalGeneric"
+        | "TruncCastGeneric"
+        | "TruncDivFunctionalGeneric"
+        | "TruncFunctionalGeneric"
+        | "TruncRemFunctionalGeneric"
+        | "BufferAlloc"
+        | "BufferFree" => Some(0),
+        _ => anyhow::bail!("reference kernel {label} has no scratch allocation bound"),
+    }
+    .ok_or_else(|| anyhow!("kernel scratch size overflow"))?;
+    bytes = bytes
+        .checked_add(extra)
+        .ok_or_else(|| anyhow!("kernel scratch size overflow"))?;
+    Ok(bytes)
+}
+
+fn is_storage_marker(op: &dyn luminal::buffer_tensor_ir::BufferTensorIrOp) -> bool {
+    op.as_any().is::<luminal::buffer_tensor_ir::BufferAlloc>()
+        || op.as_any().is::<luminal::buffer_tensor_ir::BufferFree>()
+}
+
+fn reserve_live(live: &mut usize, bytes: usize, budget: usize, peak: &mut usize) -> Result<()> {
+    let needed = live
+        .checked_add(bytes)
+        .ok_or_else(|| anyhow!("live allocation size overflow"))?;
+    ensure!(
+        needed <= budget,
+        "reference live memory budget exceeded: {live} live + {bytes} requested = {needed} bytes, budget={budget}"
+    );
+    *live = needed;
+    *peak = (*peak).max(needed);
+    Ok(())
+}
+
+fn depth_first_order(
+    plan: &BufferIrGraph<DecodedLayout>,
+) -> Result<Vec<petgraph::graph::NodeIndex>> {
+    toposort(&plan.dag, None).map_err(|_| anyhow!("bufferized plan has a cycle"))?;
+    let roots = plan
+        .dag
+        .node_indices()
+        .filter(|i| matches!(plan.dag[*i], BufferNode::BufferOutput { .. }))
+        .chain(plan.dag.node_indices());
+    let mut done = rustc_hash::FxHashSet::default();
+    let mut order = Vec::new();
+    for root in roots {
+        let mut stack = vec![(root, false)];
+        while let Some((node, exiting)) = stack.pop() {
+            if done.contains(&node) {
+                continue;
+            }
+            if exiting {
+                done.insert(node);
+                order.push(node);
+            } else {
+                stack.push((node, true));
+                let mut deps: Vec<_> = plan
+                    .dag
+                    .neighbors_directed(node, petgraph::Direction::Incoming)
+                    .collect();
+                deps.sort_by_key(|n| n.index());
+                stack.extend(deps.into_iter().rev().map(|n| (n, false)));
+            }
+        }
+    }
+    Ok(order)
+}
 
 /// The reference backend's implementation inventory, DERIVED from the
 /// kernel registry: a matcher's op is claimed iff a kernel bearing its
@@ -59,6 +234,9 @@ struct NativeSpec {
 
 #[derive(Default)]
 pub struct ReferenceRuntime {
+    max_intermediate_bytes: Option<usize>,
+    memory_budget_bytes: Option<usize>,
+    peak_live_bytes: usize,
     plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Caller-staged data by numeric `BufferLit` id, consumed at `execute`.
     staged: FxHashMap<i64, TypedBuffer>,
@@ -98,6 +276,21 @@ pub struct ReferenceRuntime {
 }
 
 impl ReferenceRuntime {
+    /// Bound live tensor payloads: staged inputs, live buffers, destinations,
+    /// and tensor-sized kernel scratch. Does not include compiler/Python memory.
+    pub fn set_memory_budget_bytes(&mut self, bytes: usize) {
+        self.memory_budget_bytes = Some(bytes);
+    }
+
+    pub fn peak_live_bytes(&self) -> usize {
+        self.peak_live_bytes
+    }
+
+    /// Set the per-intermediate buffer limit. Applied again at every dynamic shape.
+    pub fn set_max_intermediate_bytes(&mut self, bytes: usize) {
+        self.max_intermediate_bytes = Some(bytes);
+    }
+
     /// Register the tensor→buffer role maps from the boundary bindings.
     pub fn stage_bindings(
         &mut self,
@@ -321,6 +514,8 @@ impl ReferenceRuntime {
              SIZE — one fixed data map cannot stage them all, and staging the \
              wrong size is exactly the silent mis-fit this refuses"
         );
+        self.set_max_intermediate_bytes(options.max_intermediate_bytes);
+        self.set_memory_budget_bytes(options.memory_budget_bytes);
         let spec = self
             .native
             .take()
@@ -416,6 +611,8 @@ impl ReferenceRuntime {
             !self.dim_buckets.is_empty(),
             "no dim buckets are bound: call search"
         );
+        self.set_max_intermediate_bytes(options.max_intermediate_bytes);
+        self.set_memory_budget_bytes(options.memory_budget_bytes);
         let spec = self
             .native
             .take()
@@ -533,177 +730,132 @@ impl ReferenceRuntime {
             }
         }
 
-        // Materialize every buffer by ASSIGNMENT LOOKUP: the buffer backs
-        // one tensor, whose carried layout gives the span (elements) and
-        // the typed representation (the dtype fact rides the runtime's
-        // own DecodedLayout — width alone cannot pick a variant:
-        // bits-of(Int) == bits-of(F32)). Staged caller data is
-        // variant-checked against that dtype and length-checked against
-        // the span; zeros otherwise. A staged payload of the wrong
-        // variant is a loud refusal, never a conversion.
-        let mut storage: FxHashMap<BufferId, TypedBuffer> = FxHashMap::default();
+        check_intermediate_allocations(
+            plan,
+            &self.dims,
+            self.max_intermediate_bytes
+                .unwrap_or(DEFAULT_MAX_INTERMEDIATE_BYTES),
+        )?;
+
+        // Evaluate all geometry and dtype contracts without allocating tensor
+        // payloads. A depth-first walk of prerequisites retains every DAG edge,
+        // including WAR anti-dependencies and effects.
+        let order = depth_first_order(plan)?;
+        let mut geometry = FxHashMap::default();
         for (id, buffer) in &plan.buffers {
-            // Exact per-call geometry: a symbolic plan's span is evaluated
-            // under the runtime's CURRENT dims, so one searched plan runs
-            // at every value of its declared dynamic domain. Storage is
-            // reallocated fresh each call, which is what makes exactness
-            // (not a capacity bound) the correctness argument here.
-            let numel = buffer.layout.span_with(&self.dims).map_err(|err| {
-                anyhow!(
-                    "buffer {} (backing {}) has no evaluable span: {err:#}",
-                    buffer.label,
-                    buffer.backs
-                )
-            })?;
-            let dtype = buffer.layout.dtype.ok_or_else(|| {
-                anyhow!(
-                    "buffer {} (backing {}) carries no dtype fact — cannot \
-                     pick a typed representation",
-                    buffer.label,
-                    buffer.backs
-                )
-            })?;
-            let staged = buffer.lit.and_then(|lit| self.staged.get(&lit));
-            if let Some(staged) = staged {
-                ensure!(
-                    staged.len() == numel,
-                    "staged data for {} has {} elements, buffer holds {numel}",
-                    buffer.label,
-                    staged.len()
-                );
-            }
-            use luminal::dtype::PlanDtype;
-            let data = match (dtype, staged) {
-                (PlanDtype::F32, Some(TypedBuffer::F32(values))) => {
-                    TypedBuffer::F32(values.clone())
-                }
-                (PlanDtype::F32, None) => TypedBuffer::F32(vec![0.0; numel]),
-                // F64 is EXECUTABLE here (ruling 2026-09-02, main #398's
-                // f64 unary kernels re-expressed): a double-precision
-                // model runs in double precision, never on an F32 bridge.
-                (PlanDtype::F64, Some(TypedBuffer::F64(values))) => {
-                    TypedBuffer::F64(values.clone())
-                }
-                (PlanDtype::F64, None) => TypedBuffer::F64(vec![0.0; numel]),
-                (PlanDtype::Int, Some(TypedBuffer::I32(values))) => {
-                    TypedBuffer::I32(values.clone())
-                }
-                (PlanDtype::Int, None) => TypedBuffer::I32(vec![0; numel]),
-                (PlanDtype::Int64, Some(TypedBuffer::I64(values))) => {
-                    TypedBuffer::I64(values.clone())
-                }
-                (PlanDtype::Int64, None) => TypedBuffer::I64(vec![0; numel]),
-                // Narrow ints (ruling 2026-09-02, main #399): stored at
-                // their OWN width, never widened to i32 on the way in.
-                (PlanDtype::I8, Some(TypedBuffer::I8(values))) => TypedBuffer::I8(values.clone()),
-                (PlanDtype::I8, None) => TypedBuffer::I8(vec![0; numel]),
-                (PlanDtype::U8, Some(TypedBuffer::U8(values))) => TypedBuffer::U8(values.clone()),
-                (PlanDtype::U8, None) => TypedBuffer::U8(vec![0; numel]),
-                (PlanDtype::I16, Some(TypedBuffer::I16(values))) => {
-                    TypedBuffer::I16(values.clone())
-                }
-                (PlanDtype::I16, None) => TypedBuffer::I16(vec![0; numel]),
-                (PlanDtype::F8E4M3FN, Some(TypedBuffer::F8E4M3FN(codes))) => {
-                    TypedBuffer::F8E4M3FN(codes.clone())
-                }
-                (PlanDtype::F8E4M3FN, None) => {
-                    TypedBuffer::F8E4M3FN(vec![float8::F8E4M3::from_bits(0); numel])
-                }
-                // 1-bit logical Bool and byte-code Bool8 both live as
-                // Bool8 codes in reference storage; staged codes were
-                // validated at the TypedBuffer::bool8 door.
-                (PlanDtype::Bool | PlanDtype::Bool8, Some(TypedBuffer::Bool8(codes))) => {
-                    TypedBuffer::Bool8(codes.clone())
-                }
-                (PlanDtype::Bool | PlanDtype::Bool8, None) => TypedBuffer::Bool8(vec![0u8; numel]),
-                (expected, Some(staged)) => anyhow::bail!(
-                    "buffer {} is {expected:?}; staged {} data is the wrong \
-                     type (staging never converts)",
-                    buffer.label,
-                    staged.type_name()
-                ),
-                (other, None) => anyhow::bail!(
-                    "buffer {} has dtype {other:?}, which the reference \
-                     runtime cannot execute (f32, f64, i8, u8, i16, i32, \
-                     i64, bool only)",
-                    buffer.label
-                ),
-            };
-            storage.insert(id.clone(), data);
+            let numel = buffer.layout.span_with(&self.dims)?;
+            let dtype = buffer
+                .layout
+                .dtype
+                .ok_or_else(|| anyhow!("buffer {} has no dtype", buffer.label))?;
+            let empty = TypedBuffer::zeroed(dtype, 0)?;
+            let bytes = numel
+                .checked_mul(usize::try_from(dtype.egglog_bits())?.div_ceil(8))
+                .ok_or_else(|| anyhow!("buffer {} size overflow", buffer.label))?;
+            geometry.insert(id.clone(), (numel, dtype, bytes, empty.type_name()));
         }
-
-        // Inputs that the plan reads MUST have been staged — zeros would be
-        // silently wrong numbers, and silence is the one forbidden failure.
-        for node in plan.dag.node_weights() {
-            if let BufferNode::BufferInput { slots } = node {
-                for slot in slots {
-                    let buffer = plan
-                        .buffers
-                        .get(&slot.buffer)
-                        .ok_or_else(|| anyhow!("input slot references unknown buffer"))?;
-                    let lit = buffer.lit.ok_or_else(|| {
-                        anyhow!(
-                            "input buffer {} has no BufferLit id to bind by",
-                            buffer.label
-                        )
-                    })?;
-                    ensure!(
-                        self.staged.contains_key(&lit),
-                        "input buffer {} (BufferLit {lit}) was never set_data",
-                        buffer.label
-                    );
+        let mut outputs = rustc_hash::FxHashSet::default();
+        let mut last_use = FxHashMap::default();
+        let mut storage: FxHashMap<BufferId, Cow<'_, TypedBuffer>> = FxHashMap::default();
+        for (step, index) in order.iter().enumerate() {
+            match &plan.dag[*index] {
+                BufferNode::BufferInput { slots } => {
+                    for slot in slots {
+                        let buffer = &plan.buffers[&slot.buffer];
+                        let data = buffer
+                            .lit
+                            .and_then(|lit| self.staged.get(&lit))
+                            .ok_or_else(|| {
+                                anyhow!("input buffer {} was never set_data", buffer.label)
+                            })?;
+                        let (numel, _, _, name) = geometry[&slot.buffer];
+                        ensure!(
+                            data.len() == numel,
+                            "staged data for {} has {} elements, buffer holds {numel}",
+                            buffer.label,
+                            data.len()
+                        );
+                        ensure!(
+                            data.type_name() == name,
+                            "buffer {} expects {name}; staged {} data is the wrong type (staging never converts)",
+                            buffer.label,
+                            data.type_name()
+                        );
+                        storage.insert(slot.buffer.clone(), Cow::Borrowed(data));
+                        last_use.insert(slot.buffer.clone(), step);
+                    }
+                }
+                BufferNode::BufferOutput { slots } => {
+                    outputs.extend(slots.iter().map(|slot| slot.buffer.clone()));
+                    for slot in slots {
+                        last_use.insert(slot.buffer.clone(), step);
+                    }
+                }
+                BufferNode::Compute {
+                    op, reads, writes, ..
+                } => {
+                    if is_storage_marker(op.as_ref()) {
+                        continue;
+                    }
+                    for id in reads
+                        .iter()
+                        .enumerate()
+                        .filter(|(k, _)| op.operand_reads_memory(*k))
+                        .map(|(_, id)| id)
+                        .chain(writes)
+                    {
+                        last_use.insert(id.clone(), step);
+                    }
+                }
+                BufferNode::BufferCopy { src, dst } => {
+                    last_use.insert(src.clone(), step);
+                    last_use.insert(dst.clone(), step);
                 }
             }
         }
-
-        // Execute in dependency order (anti-edges are real edges, so WAR
-        // ordering rides the same toposort).
-        let order =
-            toposort(&plan.dag, None).map_err(|_| anyhow!("bufferized plan has a cycle"))?;
-        for index in order {
+        let mut releases: Vec<Vec<BufferId>> = vec![Vec::new(); order.len()];
+        for (id, step) in last_use {
+            if !outputs.contains(&id) {
+                releases[step].push(id);
+            }
+        }
+        let budget = self
+            .memory_budget_bytes
+            .unwrap_or(DEFAULT_MEMORY_BUDGET_BYTES);
+        let staged_bytes = self.staged.values().try_fold(0usize, |n, data| {
+            n.checked_add(data.byte_len())
+                .ok_or_else(|| anyhow!("staged byte count overflow"))
+        })?;
+        ensure!(
+            staged_bytes <= budget,
+            "reference live memory budget exceeded: staged inputs require {staged_bytes} bytes, budget={budget}"
+        );
+        // Old outputs are invalidated on execution; keeping them would double
+        // storage across calls. Inputs remain borrowed from self.staged.
+        self.storage.clear();
+        let mut live = staged_bytes;
+        self.peak_live_bytes = live;
+        for (step, index) in order.into_iter().enumerate() {
             match &plan.dag[index] {
                 BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. } => {}
                 BufferNode::BufferCopy { src, dst } => {
-                    // THE BUFFERCOPY CONTRACT, executor side (Austin, ruled
-                    // 2026-08-31 — see `bufferize::BufferNode::BufferCopy`):
-                    //
-                    // * The node carries ONLY {src, dst}. Nothing else is
-                    //   read here, because nothing else exists.
-                    // * Semantics: a DUMB EXACT-SIZE WHOLE-BUFFER copy.
-                    //   "If a runtime chooses to do resource reuse and do
-                    //   unequal sized buffer that is an entirely runtime
-                    //   owned choice" — THIS runtime makes no such choice,
-                    //   so it holds itself to exact size and refuses
-                    //   otherwise (the length/type check below is this
-                    //   executor's own discipline, not a re-check of an
-                    //   e-graph premise: copies are bufferizer-authored).
-                    // * ORDERING IS THIS RUNTIME'S OBLIGATION. The plan gave
-                    //   us dependency structure only (data edges + WAR
-                    //   anti-edges); we discharge the obligation by
-                    //   executing the toposort of that dag above, which puts
-                    //   every dependent op after this copy and every prior
-                    //   reader of `dst` before it. A runtime with real
-                    //   concurrency would need barriers here; this one is
-                    //   sequential, and that IS its scheduling answer.
-                    // * The three causes a copy exists (conflict repair,
-                    //   boundary placement, lifetime repair) are the
-                    //   bufferizer's business; the executor treats all three
-                    //   identically — move the bytes.
-                    let data = storage
+                    let source = storage
                         .get(src)
-                        .ok_or_else(|| anyhow!("copy reads unknown buffer"))?
-                        .clone();
-                    let dest = storage
-                        .get_mut(dst)
-                        .ok_or_else(|| anyhow!("copy writes unknown buffer"))?;
-                    ensure!(data.len() == dest.len(), "copy length mismatch");
+                        .ok_or_else(|| anyhow!("copy reads missing buffer"))?;
+                    let (n, _, bytes, name) = geometry[dst];
                     ensure!(
-                        data.type_name() == dest.type_name(),
-                        "copy between {} and {} buffers",
-                        data.type_name(),
-                        dest.type_name()
+                        source.len() == n && source.type_name() == name,
+                        "copy length/type mismatch"
                     );
-                    *dest = data;
+                    reserve_live(&mut live, bytes, budget, &mut self.peak_live_bytes)?;
+                    let copy = source.as_ref().clone();
+                    if let Some(Cow::Owned(old)) = storage.insert(dst.clone(), Cow::Owned(copy)) {
+                        live -= old.byte_len();
+                    }
+                }
+                BufferNode::Compute { op, .. } if is_storage_marker(op.as_ref()) => {
+                    // Allocation/free nodes retain their ordering edges. Physical
+                    // storage is allocated at the writer and freed at last use.
                 }
                 BufferNode::Compute {
                     op,
@@ -712,78 +864,60 @@ impl ReferenceRuntime {
                     operand_info,
                     ..
                 } => {
-                    let mut operands = Vec::with_capacity(reads.len());
+                    let mut operands: Vec<TypedBuffer> = Vec::with_capacity(reads.len());
+                    let mut restore = Vec::with_capacity(reads.len());
+                    let mut taken: FxHashMap<BufferId, usize> = FxHashMap::default();
                     let mut operand_dims = Vec::with_capacity(reads.len());
                     for (k, id) in reads.iter().enumerate() {
-                        operands.push(
-                            storage
-                                .get(id)
-                                .ok_or_else(|| anyhow!("{} reads unknown buffer", op.label()))?
-                                .clone(),
-                        );
-                        // Per-slot VALUE geometry from the slot's own
-                        // carried layout — the layout's DOMAIN is the
-                        // value's shape, which is all a flat kernel needs.
-                        //
-                        // WHY NO LAYOUT-SPELLING FENCE HERE. This executor
-                        // is layout-agnostic BY CONSISTENCY, not by
-                        // assumption: it allocates one span-of-layout
-                        // buffer per BACKED TENSOR and both writes and
-                        // reads that buffer in the backed tensor's own
-                        // element order. Whatever function the e-graph
-                        // elected — right-major, left-major, strided — the
-                        // producer and every consumer of that same tensor
-                        // agree on it, so the numbers are right. Demanding
-                        // RightMajor would refuse perfectly consistent
-                        // plans (a left-major class with no right-major
-                        // spelling is a legal election, not an error).
-                        //
-                        // THE REAL HAZARD is reading someone ELSE's bytes
-                        // through a DIFFERENT function — a FOLDED operand.
-                        // The plan does not (and should not) label folds:
-                        // a folded view and an in-place cohabitant are
-                        // both just "this value lives in this buffer". The
-                        // difference is entirely in the LAYOUT, so that is
-                        // the test: the operand's carried `L` must be the
-                        // one the buffer was allocated for. A DPS
-                        // in-place cohabitant passes by construction (the
-                        // poison destination clones its tied result's
-                        // layout); a view does not (its composed layout is
-                        // a different function over the same bytes) and is
-                        // a LOUD capability refusal — this executor lowers
-                        // no composed read path.
-                        //
-                        // Layout EQUALITY is a runtime-side operation on
-                        // the runtime's OWN type. Core never compares
-                        // layouts (`PlanLayout` has no `PartialEq`).
                         let slot = operand_info.get(k).ok_or_else(|| {
                             anyhow!("{} operand {k} lacks its slot descriptor", op.label())
                         })?;
-                        if op.operand_reads_memory(k) && slot.layout != plan.buffers[id].layout {
-                            anyhow::bail!(
-                                "{} operand {k} READS value {} through a layout that is not \
-                                 the one buffer {} was allocated for — a folded read this \
-                                 executor does not lower (it reads each buffer in one \
-                                 element order). Fail-closed, never a silent flat misread.",
-                                op.label(),
-                                slot.value,
-                                plan.buffers[id].label,
-                            );
-                        }
-                        let dims = slot.layout.extents_with(&self.dims).map_err(|err| {
-                            anyhow!(
-                                "{} operand {k} extents cannot be evaluated: {err:#}",
+                        if op.operand_reads_memory(k) {
+                            ensure!(
+                                slot.layout == plan.buffers[id].layout,
+                                "{} operand {k} reads through a folded read this executor does not lower",
                                 op.label()
-                            )
-                        })?;
-                        operand_dims.push(dims);
+                            );
+                            if let Some(&first) = taken.get(id) {
+                                reserve_live(
+                                    &mut live,
+                                    operands[first].byte_len(),
+                                    budget,
+                                    &mut self.peak_live_bytes,
+                                )?;
+                                operands.push(operands[first].clone());
+                                restore.push(None);
+                            } else {
+                                let data = storage.remove(id).ok_or_else(|| {
+                                    anyhow!("{} reads missing buffer {id:?}", op.label())
+                                })?;
+                                let borrowed = match &data {
+                                    Cow::Borrowed(data) => {
+                                        reserve_live(
+                                            &mut live,
+                                            data.byte_len(),
+                                            budget,
+                                            &mut self.peak_live_bytes,
+                                        )?;
+                                        Some(*data)
+                                    }
+                                    Cow::Owned(_) => None,
+                                };
+                                taken.insert(id.clone(), operands.len());
+                                operands.push(data.into_owned());
+                                restore.push(Some((id.clone(), borrowed)));
+                            }
+                        } else {
+                            operands.push(TypedBuffer::F32(Vec::new()));
+                            restore.push(None);
+                        }
+                        operand_dims.push(slot.layout.extents_with(&self.dims)?);
                     }
                     let mut dests = Vec::with_capacity(writes.len());
                     for id in writes {
-                        let existing = storage
-                            .get(id)
-                            .ok_or_else(|| anyhow!("{} writes unknown buffer", op.label()))?;
-                        dests.push(existing.zeroed_like());
+                        let (n, dtype, bytes, _) = geometry[id];
+                        reserve_live(&mut live, bytes, budget, &mut self.peak_live_bytes)?;
+                        dests.push(TypedBuffer::zeroed(dtype, n)?);
                     }
                     let mut ctx = ReferenceKernelCtx {
                         operands,
@@ -791,19 +925,66 @@ impl ReferenceRuntime {
                         dests,
                         dims: self.dims.clone(),
                     };
-                    match crate::kernels::kernel_for(op.as_ref()) {
-                        Some(kernel) => (kernel.execute)(op.as_ref(), &mut ctx)
-                            .with_context(|| format!("executing {}", op.label()))?,
-                        None => anyhow::bail!("no reference kernel for {}", op.label()),
+                    // Kernels keep their existing owned-buffer ABI and bodies.
+                    // Reserve a conservative bound for their tensor-sized
+                    // scratch before entering them; metadata is not payload.
+                    let scratch = kernel_scratch_bytes(op.label(), &ctx)?;
+                    reserve_live(&mut live, scratch, budget, &mut self.peak_live_bytes)?;
+                    let kernel = crate::kernels::kernel_for(op.as_ref())
+                        .ok_or_else(|| anyhow!("no reference kernel for {}", op.label()))?;
+                    (kernel.execute)(op.as_ref(), &mut ctx)
+                        .with_context(|| format!("executing {}", op.label()))?;
+                    live -= scratch;
+                    let ReferenceKernelCtx {
+                        operands,
+                        dests: results,
+                        ..
+                    } = ctx;
+                    for (data, slot) in operands.into_iter().zip(restore) {
+                        match slot {
+                            Some((id, None)) => {
+                                storage.insert(id, Cow::Owned(data));
+                            }
+                            Some((id, Some(original))) => {
+                                live -= data.byte_len();
+                                storage.insert(id, Cow::Borrowed(original));
+                            }
+                            None => {
+                                live -= data.byte_len();
+                            }
+                        }
                     }
-                    for (id, data) in writes.iter().zip(ctx.dests) {
-                        *storage.get_mut(id).expect("write buffer exists") = data;
+                    for (id, data) in writes.iter().zip(results) {
+                        if let Some(Cow::Owned(old)) = storage.insert(id.clone(), Cow::Owned(data))
+                        {
+                            live -= old.byte_len();
+                        }
                     }
                 }
             }
+            for id in &releases[step] {
+                if let Some(Cow::Owned(data)) = storage.remove(id) {
+                    live -= data.byte_len();
+                }
+            }
         }
-
-        self.storage = storage;
+        let mut result = FxHashMap::default();
+        for id in outputs {
+            let data = storage
+                .remove(&id)
+                .ok_or_else(|| anyhow!("output buffer {id:?} was not produced"))?;
+            // A passthrough output borrowed from staging needs an owned copy.
+            if let Cow::Borrowed(data) = &data {
+                reserve_live(
+                    &mut live,
+                    data.byte_len(),
+                    budget,
+                    &mut self.peak_live_bytes,
+                )?;
+            }
+            result.insert(id, data.into_owned());
+        }
+        self.storage = result;
         Ok(())
     }
 
@@ -1045,6 +1226,207 @@ mod tests {
                 "the reference runtime is out-of-place and view-free; {} cannot have a kernel",
                 kernel.label
             );
+        }
+    }
+
+    #[test]
+    fn intermediate_limit_rejects_search_and_execute() {
+        let mut graph = Graph::new();
+        let x = graph.tensor(4, DType::F32);
+        let out = x.sin().cos();
+        let data = FxHashMap::from_iter([(x.id, vec![0.0f32; 4].into())]);
+        let mut options = crate::search::harness_search_options();
+        options.max_intermediate_bytes = 15;
+        let mut rejected = ReferenceRuntime::load(&graph).unwrap();
+        let error = rejected.search(&data, &options).unwrap_err().to_string();
+        assert!(error.contains("max_intermediate_bytes=15"), "{error}");
+
+        options.max_intermediate_bytes = 16;
+        options.memory_budget_bytes = 31;
+        let mut rejected = ReferenceRuntime::load(&graph).unwrap();
+        assert!(
+            rejected
+                .search(&data, &options)
+                .unwrap_err()
+                .to_string()
+                .contains("live memory budget exceeded")
+        );
+        options.memory_budget_bytes = super::DEFAULT_MEMORY_BUDGET_BYTES;
+
+        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
+        runtime.search(&data, &options).unwrap();
+        runtime.set_data(x.id, vec![0.0f32; 4]);
+        runtime.execute().unwrap();
+        assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![1.0; 4]);
+        runtime.set_max_intermediate_bytes(15);
+        let error = runtime.execute().unwrap_err().to_string();
+        assert!(error.contains("requires 16 bytes"), "{error}");
+        // Refusal happens before replacing the previous successful storage.
+        assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![1.0; 4]);
+    }
+
+    #[test]
+    fn intermediate_limit_checks_dynamic_execution_size() {
+        use luminal::{graph::DimBucket, shape::Symbol};
+        let mut graph = Graph::new();
+        graph.set_dim('a', 2);
+        let x = graph.tensor('a', DType::F32);
+        let out = x.sin().cos();
+        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
+        runtime
+            .bind_dim_buckets('a', vec![DimBucket::new(1, 8).representative(2)])
+            .unwrap();
+        let mut options = crate::search::harness_search_options();
+        options.max_intermediate_bytes = 16;
+        runtime
+            .search_buckets(
+                |dims| {
+                    FxHashMap::from_iter([(x.id, vec![0.0f32; dims[&Symbol::from('a')]].into())])
+                },
+                &options,
+            )
+            .unwrap();
+        runtime.set_dim('a', 4);
+        runtime.set_data(x.id, vec![0.0f32; 4]);
+        runtime.execute().unwrap();
+        assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![1.0; 4]);
+        runtime.set_dim('a', 5);
+        runtime.set_data(x.id, vec![0.0f32; 5]);
+        let error = runtime.execute().unwrap_err().to_string();
+        assert!(error.contains("requires 20 bytes"), "{error}");
+        // The aggregate budget is also re-evaluated at the current shape.
+        runtime.set_max_intermediate_bytes(usize::MAX);
+        runtime.set_memory_budget_bytes(runtime.peak_live_bytes());
+        runtime.set_dim('a', 4);
+        runtime.set_data(x.id, vec![0.0f32; 4]);
+        runtime.execute().unwrap();
+        runtime.set_dim('a', 5);
+        runtime.set_data(x.id, vec![0.0f32; 5]);
+        assert!(
+            runtime
+                .execute()
+                .unwrap_err()
+                .to_string()
+                .contains("live memory budget exceeded")
+        );
+    }
+
+    #[test]
+    fn intermediate_limit_excludes_boundary_buffers() {
+        use super::{BufferNode, check_intermediate_allocations};
+        let mut graph = Graph::new();
+        let x = graph.tensor(4, DType::F32);
+        let _out = x.sin();
+        let data = FxHashMap::from_iter([(x.id, vec![0.0f32; 4].into())]);
+        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
+        runtime
+            .search(&data, &crate::search::harness_search_options())
+            .unwrap();
+        // Remove boundary nodes to show that the same buffers are charged
+        // when they do not represent an external input/output.
+        let plan = runtime.plan.as_ref().unwrap();
+        check_intermediate_allocations(plan, &runtime.dims, 16).unwrap();
+        let mut internal = plan.clone();
+        internal.dag.retain_nodes(|g, n| {
+            !matches!(
+                g[n],
+                BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. }
+            )
+        });
+        assert!(check_intermediate_allocations(&internal, &runtime.dims, 0).is_err());
+        // A boundary-only plan needs no intermediate budget.
+        let mut boundary_only = plan.clone();
+        let mut boundary = rustc_hash::FxHashSet::default();
+        for node in boundary_only.dag.node_weights() {
+            match node {
+                BufferNode::BufferInput { slots } => {
+                    boundary.extend(slots.iter().map(|s| s.buffer.clone()))
+                }
+                BufferNode::BufferOutput { slots } => {
+                    boundary.extend(slots.iter().map(|s| s.buffer.clone()))
+                }
+                _ => {}
+            }
+        }
+        boundary_only.buffers.retain(|id, _| boundary.contains(id));
+        check_intermediate_allocations(&boundary_only, &runtime.dims, 0).unwrap();
+    }
+
+    #[test]
+    fn live_budget_releases_a_long_chain_and_repeated_outputs() {
+        let mut graph = Graph::new();
+        let x = graph.tensor(4, DType::F32);
+        let mut out = x;
+        for _ in 0..20 {
+            out = out.sin();
+        }
+        let data = FxHashMap::from_iter([(x.id, vec![0.3f32; 4].into())]);
+        let mut rt = ReferenceRuntime::load(&graph).unwrap();
+        rt.search(&data, &crate::search::harness_search_options())
+            .unwrap();
+        let all_bytes: usize = rt
+            .plan
+            .as_ref()
+            .unwrap()
+            .buffers
+            .values()
+            .map(|b| b.layout.span_with(&rt.dims).unwrap() * 4)
+            .sum();
+        assert!(all_bytes > 128);
+        rt.set_memory_budget_bytes(128);
+        let mut expected = 0.3f32;
+        for _ in 0..20 {
+            expected = expected.sin();
+        }
+        for _ in 0..3 {
+            rt.set_data(x.id, vec![0.3f32; 4]);
+            rt.execute().unwrap();
+            assert_eq!(rt.get_f32(out.id).unwrap(), &vec![expected; 4]);
+            assert!(rt.peak_live_bytes() <= 128);
+            assert_eq!(rt.storage.len(), 1, "only output survives execution");
+        }
+        rt.set_memory_budget_bytes(31);
+        assert!(
+            rt.execute()
+                .unwrap_err()
+                .to_string()
+                .contains("live memory budget exceeded")
+        );
+    }
+
+    #[test]
+    fn depth_first_schedule_preserves_all_edges_and_shared_values() {
+        use petgraph::visit::EdgeRef;
+        let mut graph = Graph::new();
+        let x = graph.tensor(4, DType::F32);
+        let shared = x.sin();
+        let out = shared.cos() + shared.sin();
+        let data = FxHashMap::from_iter([(x.id, vec![0.3f32; 4].into())]);
+        let mut rt = ReferenceRuntime::load(&graph).unwrap();
+        rt.search(&data, &crate::search::harness_search_options())
+            .unwrap();
+        let plan = rt.plan.as_ref().unwrap();
+        let order = super::depth_first_order(plan).unwrap();
+        let positions: FxHashMap<_, _> = order.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        for edge in plan.dag.edge_references() {
+            assert!(positions[&edge.source()] < positions[&edge.target()]);
+        }
+        rt.set_data(x.id, vec![0.3f32; 4]);
+        rt.execute().unwrap();
+        let v = 0.3f32.sin();
+        assert_eq!(rt.get_f32(out.id).unwrap(), &vec![v.cos() + v.sin(); 4]);
+    }
+
+    #[test]
+    fn every_registered_kernel_has_a_scratch_bound() {
+        let ctx = crate::typed_buffer::ReferenceKernelCtx {
+            operands: Vec::new(),
+            operand_dims: Vec::new(),
+            dests: Vec::new(),
+            dims: Default::default(),
+        };
+        for kernel in crate::kernels::reference_kernels() {
+            super::kernel_scratch_bytes(kernel.label, &ctx).unwrap();
         }
     }
 

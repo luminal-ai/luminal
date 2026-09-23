@@ -118,7 +118,19 @@ impl Translator<'_> {
             Some(target) => target,
             None => self.get_int_exprs_arg(node, 1)?,
         };
-        let dims = util::resolve_neg1_dim_exprs(&target, &x.dims());
+        // Export already solved the inferred dimension under its shape
+        // guards. Preserve that expression instead of introducing a quotient
+        // such as (s * 8) / s which obscures exact divisibility in the recorder.
+        let dims = if target.contains(&IntExpr::from(-1i32)) {
+            let name = Self::tensor_output_names(node)
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("view has no output metadata"))?;
+            let meta = self.tensor_meta(&name)?.clone();
+            self.boundary_shape(&meta, &name)?
+        } else {
+            target
+        };
         Ok(util::reshape_tensor(x, &dims))
     }
 
@@ -147,16 +159,18 @@ impl Translator<'_> {
         let rank = x.rank();
         let dim = normalize_dim(self.get_int_arg(node, 1)?, rank);
         let start = match node.inputs.get(2) {
-            Some(input) => {
+            Some(input) if !matches!(&input.arg, crate::pt2_schema::Argument::Other(value) if value.get("as_none").is_some()) =>
+            {
                 let expr = self
                     .resolve_arg_as_expression(&input.arg)
                     .ok_or_else(|| anyhow::anyhow!("slice start is not an expression"))?;
                 util::normalize_slice_bound(expr, x.dims()[dim])
             }
-            None => IntExpr::from(0),
+            _ => IntExpr::from(0),
         };
         let end = match node.inputs.get(3) {
-            Some(input) => {
+            Some(input) if !matches!(&input.arg, crate::pt2_schema::Argument::Other(value) if value.get("as_none").is_some()) =>
+            {
                 let expr = self
                     .resolve_arg_as_expression(&input.arg)
                     .ok_or_else(|| anyhow::anyhow!("slice end is not an expression"))?;
@@ -167,7 +181,7 @@ impl Translator<'_> {
                     _ => util::normalize_slice_bound(expr, x.dims()[dim]),
                 }
             }
-            None => x.dims()[dim],
+            _ => x.dims()[dim],
         };
         let step = node.inputs.get(4).and_then(|i| i.arg.as_int()).unwrap_or(1);
         if step != 1 {
@@ -388,11 +402,7 @@ impl Translator<'_> {
             let meta = self.output_meta_dtype(node).unwrap_or(x.dtype);
             (x.dims(), meta, self.get_number_arg(node, 1)?)
         } else {
-            let shape: Vec<IntExpr> = self
-                .get_ints_arg(node, 0)?
-                .into_iter()
-                .map(|v| IntExpr::from(v as usize))
-                .collect();
+            let shape = self.get_int_exprs_arg(node, 0)?;
             (
                 shape,
                 self.output_meta_dtype(node)?,
@@ -402,20 +412,50 @@ impl Translator<'_> {
         Ok(self.full_tensor(shape, dtype, value))
     }
 
-    pub(super) fn translate_arange(&mut self, node: &Node, kind: u8) -> Result<GraphTensor> {
+    pub(super) fn translate_arange(&mut self, node: &Node, _kind: u8) -> Result<GraphTensor> {
         let dtype = self.output_meta_dtype(node)?;
-        // Resolve by schema name first: PT2 drops defaulted args (e.g.
-        // `step`) and shifts later kwargs, so positional indices are not
-        // reliable (`arange.start_step` can arrive as start,end,layout,...).
-        let start = self.named_float_arg(node, "start").unwrap_or(0.0);
-        let end = self
-            .named_float_arg(node, "end")
-            .or_else(|| self.get_float_arg(node, if kind == 0 { 0 } else { 1 }).ok())
-            .ok_or_else(|| anyhow::anyhow!("{}: missing end", node.target))?;
-        let step = self.named_float_arg(node, "step").unwrap_or(1.0);
+        // PT2 omits default arguments. Read by schema name, and preserve
+        // symbolic scalar operands rather than interpreting them as literals.
+        let argument = |name: &str, default: i64| -> Result<IntExpr> {
+            let Some(input) = node.inputs.iter().find(|input| input.name == name) else {
+                return Ok(IntExpr::from(default));
+            };
+            self.resolve_arg_as_expression(&input.arg)
+                .or_else(|| {
+                    input
+                        .arg
+                        .as_float()
+                        .filter(|v| {
+                            v.is_finite()
+                                && v.fract() == 0.0
+                                && *v >= i64::MIN as f64
+                                && *v < -(i64::MIN as f64)
+                        })
+                        .map(|v| IntExpr::from(v as i64))
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: {name} must be an integer or supported symbolic integer",
+                        node.target
+                    )
+                })
+        };
+        let start = argument("start", 0)?;
+        let step = argument("step", 1)?;
+        if step.as_num() == Some(0) {
+            bail!("arange step must be nonzero");
+        }
+        // Export provides the exact extent, including ceil division for
+        // non-divisible steps and descending ranges. No hint is substituted.
+        let name = Self::tensor_output_names(node)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("arange has no output metadata"))?;
+        let meta = self.tensor_meta(&name)?.clone();
+        let shape = self.boundary_shape(&meta, &name)?;
         let arange = self
             .cx
-            .arange_options(start as i64, end as i64, step as i64);
+            .iota(shape, move |coordinates| coordinates[0] * step + start);
         Ok(arange.cast(dtype))
     }
 

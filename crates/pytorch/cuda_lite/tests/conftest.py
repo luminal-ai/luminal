@@ -35,3 +35,15 @@ def deterministic_full_precision_eager():
             backend.fp32_precision = "ieee"
     torch.use_deterministic_algorithms(True)
     yield
+
+
+@pytest.fixture
+def device():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA backend tests require a CUDA GPU")
+    return torch.device("cuda")
+
+
+def pytest_configure(config):
+    os.environ["LUMINAL_TEST_BACKEND"] = "cuda_lite"
+    os.environ["LUMINAL_TEST_DEVICE"] = "cuda"

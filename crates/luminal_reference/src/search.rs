@@ -59,6 +59,10 @@ pub use luminal::search_support::{
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
+    /// Maximum size of one non-boundary buffer, checked before profiling or execution.
+    pub max_intermediate_bytes: usize,
+    /// Aggregate live tensor payload and kernel scratch ceiling.
+    pub memory_budget_bytes: usize,
     pub generations: usize,
     pub generation_size: usize,
     /// Point mutations per offspring. Mutations hit ANY producer class —
@@ -77,6 +81,8 @@ pub struct CompileOptions {
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
+            max_intermediate_bytes: crate::runtime::DEFAULT_MAX_INTERMEDIATE_BYTES,
+            memory_budget_bytes: crate::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
             generations: 8,
             generation_size: 8,
             mutations: 2,
@@ -141,8 +147,22 @@ fn profile_on_reference_runtime(
     dims: &luminal::shape::DynMap,
     trials: usize,
     best_so_far: Option<u128>,
+    max_intermediate_bytes: usize,
+    memory_budget_bytes: usize,
 ) -> Result<u128> {
+    crate::runtime::check_intermediate_allocations(plan, dims, max_intermediate_bytes)?;
+    let input_bytes = input_data.values().try_fold(0usize, |n, v| {
+        n.checked_add(v.byte_len())
+            .ok_or_else(|| anyhow::anyhow!("input size overflow"))
+    })?;
+    ensure!(
+        input_bytes <= memory_budget_bytes,
+        "reference live memory budget exceeded: inputs require {input_bytes} bytes, budget={memory_budget_bytes}"
+    );
+
     let mut runtime = ReferenceRuntime::default();
+    runtime.set_max_intermediate_bytes(max_intermediate_bytes);
+    runtime.set_memory_budget_bytes(memory_budget_bytes);
     runtime.load_plan(plan.clone());
     // The plan's spans/extents may be SYMBOLIC (`Var("a")`), so the
     // profiling runtime must hold the representative assignment before it
@@ -400,6 +420,8 @@ pub fn search_implementations_with_ops(
                         dims,
                         options.trials,
                         best_so_far,
+                        options.max_intermediate_bytes,
+                        options.memory_budget_bytes,
                     );
                     timings.profile_nanos += profile_start.elapsed().as_nanos();
                     let nanos = match profiled {
@@ -696,6 +718,8 @@ pub fn select_bucket<'a>(
 /// PRODUCTION-PATH helper (the CL examples call it), not a test fixture.
 pub fn harness_search_options() -> CompileOptions {
     CompileOptions {
+        max_intermediate_bytes: crate::runtime::DEFAULT_MAX_INTERMEDIATE_BYTES,
+        memory_budget_bytes: crate::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
         generations: 2,
         generation_size: 4,
         mutations: 2,

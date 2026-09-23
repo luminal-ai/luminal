@@ -6,20 +6,19 @@ requires-python = ">=3.10"
 # The PT2 export-preparation helpers are shared with the reference backend;
 # `luminal_reference` is a build-time/runtime dependency until they are lifted
 # into a backend-neutral package.
-dependencies = ["torch>=2.10.0", "luminal_reference"]
+dependencies = ["torch>=2.14.0", "luminal_reference"]
 
-# torch comes from the CUDA 12.8 index, matching crates/luminal_python: the
-# default index's newest builds target CUDA 13 and cannot run on a 12.8 driver.
+# PyTorch 2.14 wheels require the CUDA 13.0 index; cu128 stops before 2.14.
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-luminal_reference = { path = "../reference" }
+luminal_reference = { path = "../reference", editable = true }
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
@@ -36,6 +35,9 @@ features = ["device"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [".", "..", "../utils/tests"]
+addopts = "--import-mode=importlib"
+markers = ["slow: full-model or expensive operation coverage requiring explicit selection"]
 
 [dependency-groups]
-dev = ["pytest>=8", "maturin>=1.0,<2.0"]
+dev = ["pytest>=9", "maturin>=1,<2", "expecttest>=0.3", "hypothesis", "pytest-profiling", "pytest-subtests", "transformers>=4.40,<5.11", "diffusers>=0.35", "modal>=1.3.5", "safetensors"]

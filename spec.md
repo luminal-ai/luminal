@@ -36,7 +36,7 @@ Frontends have two roles:
 - Provide a convenient interface to construct HLIR graphs.
 - Interface with the backend through the Runtime API.
 
-An example frontend is luminal_python (PyTorch), which uses the torch.compile machinery to export a Core Aten IR graph, which is then decomposed to an HLIR graph. It also gives the user a way to drive the runtime through the Runtime API.
+An example frontend is the PyTorch integration in `crates/pytorch` (with the `luminal_reference` and `luminal_cuda_lite` Python packages), which uses the torch.compile machinery to export a Core Aten IR graph, which is then decomposed to an HLIR graph. It also gives the user a way to drive the runtime through the Runtime API.
 
 Inputs and outputs specified from the frontend must have physical layouts, all other HLIR does not have physical layouts.
 
