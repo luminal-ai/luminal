@@ -94,17 +94,30 @@ mod tests {
                 ],
             )
             .unwrap();
+        // `input` is sized by `n`, so its payload has to follow each bucket's
+        // representative: 1 for (1, 1) and 3 for (2, 4). A single shared
+        // payload fits only one of them and the other bucket refuses every
+        // candidate with "input 2 has 12 bytes, expected 4".
+        let shared: FxHashMap<_, crate::host_buffer::HostBuffer> = [
+            (weights.id, vec![1f32; 4].into()),
+            (state.id, vec![0f32; 4].into()),
+        ]
+        .into_iter()
+        .collect();
+        let profiles: Vec<(
+            luminal::shape::DynMap,
+            FxHashMap<_, crate::host_buffer::HostBuffer>,
+        )> = [1usize, 3]
+            .into_iter()
+            .map(|n| {
+                (
+                    [('n'.into(), n)].into_iter().collect(),
+                    [(input.id, vec![1f32; n].into())].into_iter().collect(),
+                )
+            })
+            .collect();
         runtime
-            .search(
-                &[
-                    (weights.id, vec![1f32; 4].into()),
-                    (state.id, vec![0f32; 4].into()),
-                    (input.id, vec![1f32; 3].into()),
-                ]
-                .into_iter()
-                .collect(),
-                &harness_search_options(),
-            )
+            .search_with_profile_inputs(&shared, &profiles, &harness_search_options())
             .unwrap();
         let weights = runtime.input_buffer(weights.id).unwrap();
         let state = runtime.input_buffer(state.id).unwrap();
