@@ -1,8 +1,5 @@
 # CUDA-lite on the NATIVE LADDER (M4 re-seat, started 2026-08-17).
-# The predecessor targeting the deleted HLIR pipeline is parked at
-# ../luminal_cuda_lite_hlir as a parts library (NVRTC plumbing, kernel
-# codegen patterns, cuBLASLt/FlashInfer/MoE estates) — salvage source,
-# not scaffolding.
+# The predecessor targeting the deleted HLIR pipeline has been removed.
 #
 # The `device` feature gates everything that touches cudarc: with it
 # OFF (the default on macOS) the crate builds everywhere and the

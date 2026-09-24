@@ -1,0 +1,85 @@
+{
+  "model": "gemma3",
+  "checkpoint_revision": "bf46152c47f5dd20b896357cb51abc4c03b8ee8c",
+  "backend": "metal",
+  "prefill_chunk": 8,
+  "max_context": 62,
+  "atol": 0.004999999888241291,
+  "rtol": 0.0005000000237487257,
+  "search_generations": 2,
+  "search_population": 4,
+  "seed": 0,
+  "passed": true,
+  "cases": [
+    {
+      "case": "arithmetic_1",
+      "passed": true,
+      "text": "4\n",
+      "error": null,
+      "steps": 6,
+      "resets": 1,
+      "max_abs_error": 0.0005931854248046875,
+      "max_tolerance_ratio": 0.10136536508798599
+    },
+    {
+      "case": "arithmetic_2",
+      "passed": true,
+      "text": "12\n",
+      "error": null,
+      "steps": 10,
+      "resets": 1,
+      "max_abs_error": 0.0005426406860351562,
+      "max_tolerance_ratio": 0.08278273791074753
+    },
+    {
+      "case": "memory_1",
+      "passed": true,
+      "text": "Okay, Pixel! 😊",
+      "error": null,
+      "steps": 9,
+      "resets": 1,
+      "max_abs_error": 0.0005207061767578125,
+      "max_tolerance_ratio": 0.06475064903497696
+    },
+    {
+      "case": "memory_2",
+      "passed": true,
+      "text": "Pixel",
+      "error": null,
+      "steps": 5,
+      "resets": 0,
+      "max_abs_error": 0.00041866302490234375,
+      "max_tolerance_ratio": 0.07036715745925903
+    },
+    {
+      "case": "translation_1",
+      "passed": true,
+      "text": "Bonjour !",
+      "error": null,
+      "steps": 6,
+      "resets": 1,
+      "max_abs_error": 0.0004405975341796875,
+      "max_tolerance_ratio": 0.06742815673351288
+    },
+    {
+      "case": "translation_2",
+      "passed": true,
+      "text": "Merci !",
+      "error": null,
+      "steps": 6,
+      "resets": 0,
+      "max_abs_error": 0.0004405975341796875,
+      "max_tolerance_ratio": 0.08040045201778412
+    },
+    {
+      "case": "reset_replay_1",
+      "passed": true,
+      "text": "4\n",
+      "error": null,
+      "steps": 6,
+      "resets": 1,
+      "max_abs_error": 0.0005931854248046875,
+      "max_tolerance_ratio": 0.10136536508798599
+    }
+  ]
+}

@@ -81,12 +81,6 @@ members = [
     "crates/pytorch/reference",
     "crates/pytorch/cuda_lite",
 ]
-# Parked crates are not members. luminal_bench is excluded explicitly so it
-# still builds standalone (`cargo build --manifest-path
-# crates/luminal_bench/Cargo.toml`); it reaches egglog through the prelude,
-# so its lock cannot drift the rev above.
-exclude = ["crates/luminal_bench"]
-
 # Dependencies compile optimized even in dev builds: egglog's saturation
 # engine at opt-level 0 is ~17x slower on search-heavy tests (mini_gemma3
 # 559s debug vs 32s release), and deps are pinned so this cost is paid
