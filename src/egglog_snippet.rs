@@ -123,17 +123,20 @@ pub fn new_egraph() -> egglog::EGraph {
     egglog::add_primitive!(&mut egraph, "bigint-to-i64" = |a: Z| -?> i64 {
         i64::try_from(&*a).ok()
     });
-    // The vendored substitution primitive (egglog-experimental PR #60):
-    // the preamble's subst road calls it from a :naive rule. The skip
-    // set names the MEMO constructors the walk must treat as opaque
-    // metadata rather than term structure (int-subst-of is the only
-    // one — the transform-style census).
+    // The vendored substitution primitive (egglog-experimental PR #60) and
+    // its one-snapshot wrapper: the preamble's subst road calls the latter
+    // from a :naive rule. The skip set names the MEMO constructors the walk
+    // must treat as opaque metadata rather than term structure (int-subst-of
+    // is the only one — the transform-style census).
+    let subst_skip: std::collections::HashSet<_> =
+        ["int-subst-of".to_string()].into_iter().collect();
     egraph.add_full_primitive(
         crate::subst_primitive::Subst {
-            skip: ["int-subst-of".to_string()].into_iter().collect(),
+            skip: subst_skip.clone(),
         },
         None,
     );
+    egraph.add_full_primitive(crate::subst_primitive::MemoizedSubst::new(subst_skip), None);
     egraph
 }
 

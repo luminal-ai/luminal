@@ -3836,7 +3836,7 @@
 
 ; ================= THE SUBSTITUTION WALK (landed 2026-08-17) ============
 ; Images are built by ONE call per composition site to the vendored
-; `unstable-subst` primitive (egglog-experimental #60, vendored in
+; `unstable-subst-once` primitive (egglog-experimental #60, vendored in
 ; src/subst_primitive.rs with three audited deltas: subsumed source
 ; rows copy BORN-RETIRED via the local add_subsumed engine patch; memo
 ; constructors are skipped as term structure; walk errors print their
@@ -3844,10 +3844,11 @@
 ; spelling at once, simultaneous by construction — from a :naive rule
 ; in the subst-walk ruleset. The schedule runs that ruleset as an
 ; OUTER STRATUM ((saturate (saturate (run) (run prop)) (run subst-walk))): the
-; ring saturates between walk generations, so re-walks happen per
-; GENERATION, not per round. Both halves are load-bearing: per-round
-; re-walks cost 2-9x on model-scale searches, and per-generation
-; arrival is what lets the rejoin family saturate.
+; ring saturates before newly arrived demands are walked. Each (root, sigma)
+; pair snapshots once. Re-copying a completed pair after its source class has
+; acquired image spellings feeds the image back into itself and makes large
+; regions grow combinatorially; ordinary congruence saturation already
+; handles equalities discovered after the snapshot.
 ;
 ; DEMANDS ARE ROOT-ONLY (the old operand-demand decomposition is gone
 ; — it was the divergence's transmission channel: every ring-bred
@@ -4056,7 +4057,7 @@
   ((int-subst-demand ?expr ?map)
    (int-subst-closed ?expr ?map)
    (= ?sigma (sigma-out ?map)))
-  ((union (int-subst-of ?expr ?map) (unstable-subst ?expr ?sigma)))
+  ((union (int-subst-of ?expr ?map) (unstable-subst-once ?expr ?sigma)))
   :ruleset subst-walk
   :naive
 )
