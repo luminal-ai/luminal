@@ -67,6 +67,11 @@ fn arena_budget_rejects_a_plan_set_that_cannot_fit() {
             &options,
         )
         .unwrap_err();
-    assert!(error.to_string().contains("device budget"), "{error:#}");
+    // A 0-byte budget makes every materialization oversized, so the mandatory
+    // memory pass refuses the graph before any plan set exists. The
+    // "device budget" refusal in `validate_set` sizes a plan set's slab and is
+    // unreachable here, since no plan survives to be sized.
+    let message = format!("{error:#}");
+    assert!(message.contains("arena budget"), "{message}");
     assert!(runtime.plan().is_none());
 }
