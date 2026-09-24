@@ -23,6 +23,7 @@ from .export_utils import (
     _drop_input_guards,
     _lower_sym_sum,
     _register_cache_serialization,
+    _strip_data_attr,
 )
 
 # torch._export.serde.schema.ScalarType codes we can round-trip today.
@@ -259,6 +260,7 @@ def luminal_reference(
     # mutating it here would corrupt that bookkeeping. The copy shares the
     # module's weights (see private_graph_copy).
     gm = private_graph_copy(gm)
+    _strip_data_attr(gm)
     scalar_output_positions = _box_scalar_graph_outputs(gm)
 
     # The graph-module preprocessing above runs first; `_dynamic_export` then
@@ -289,6 +291,7 @@ def luminal_reference(
             "graph inputs share device storage and the program writes one of them: "
             "the export cannot functionalise a write through aliased inputs"
         ) from exc
+    _drop_input_guards(ep)
     _drop_dead_data_dependent_ops(ep.graph_module)
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
@@ -310,7 +313,9 @@ def luminal_reference(
         # un-decomposed graph.
         if "unsupported ATen op" not in str(exc):
             raise
+        _drop_input_guards(ep)
         ep = ep.run_decompositions(_decomp_table())
+        _drop_input_guards(ep)
         _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
         graph = _save_and_compile(ep)

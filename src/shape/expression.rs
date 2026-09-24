@@ -1330,6 +1330,19 @@ mod tests {
     }
 
     #[test]
+    fn test_interval_simplification_cancels_nonzero_shape_factor() {
+        let s = expr('s');
+        let intervals = [(crate::shape::Symbol::from('s'), DimInterval::new(2, 8))]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            ((s * 256) / (s * 64)).simplify_with_intervals(&intervals),
+            expr(4)
+        );
+    }
+
+    #[test]
     fn test_add_num_does_not_fold_into_nested_num() {
         // Regression: adding an integer to `(a*b) + rest` must not fold the
         // integer into the `a` of the multiplication. `(11*16) + 15` is 191,

@@ -228,13 +228,22 @@ def test_a_tensor_subclass_is_refused_by_name():
     with pytest.raises(boundary.UnsupportedBoundary, match="expected a CUDA tensor"):
         boundary.boundary_layout("w", torch.nn.Parameter(torch.empty(4, 4)))
 
+    class _StorageParameter(torch.nn.Parameter):
+        pass
+
+    # A real Parameter subclass is still ordinary strided parameter storage;
+    # subclasses such as vLLM's ModelWeightParameter add loading metadata.
+    with pytest.raises(boundary.UnsupportedBoundary, match="expected a CUDA tensor"):
+        boundary.boundary_layout("w", _StorageParameter(torch.empty(4, 4)))
+
 
 def test_a_parameter_of_a_custom_tensor_type_is_refused_by_name():
     """``Parameter`` of a custom tensor type IS that custom type, flagged:
     ``isinstance(t, torch.nn.Parameter)`` answers yes for any tensor
     carrying ``_is_param`` while its sizes and strides still describe
     something other than the storage a binding would name. The gate is the
-    exact type, so the subclass is refused naming itself."""
+    actual class hierarchy, so merely setting ``_is_param`` does not make an
+    arbitrary tensor subclass safe storage."""
 
     class _Exotic(torch.Tensor):
         pass

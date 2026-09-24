@@ -153,7 +153,11 @@ pub(super) fn resolve_neg1_dim(target: &[i64], current_dims: &[IntExpr]) -> Vec<
 }
 
 /// `-1` resolution for targets already carrying `IntExpr` extents.
-pub(super) fn resolve_neg1_dim_exprs(target: &[IntExpr], current_dims: &[IntExpr]) -> Vec<IntExpr> {
+pub(super) fn resolve_neg1_dim_exprs(
+    target: &[IntExpr],
+    current_dims: &[IntExpr],
+    symbol_ranges: &rustc_hash::FxHashMap<Symbol, super::sympy::ExprBounds>,
+) -> Vec<IntExpr> {
     let neg1 = IntExpr::from(-1i32);
     let Some(idx) = target.iter().position(|e| *e == neg1) else {
         return target.to_vec();
@@ -167,7 +171,8 @@ pub(super) fn resolve_neg1_dim_exprs(target: &[IntExpr], current_dims: &[IntExpr
         .filter(|(i, _)| *i != idx)
         .fold(IntExpr::from(1), |acc, (_, d)| acc * *d);
     let mut result = target.to_vec();
-    result[idx] = (input_product / known_product).simplify();
+    result[idx] =
+        super::sympy::simplify_expr_with_ranges(input_product / known_product, symbol_ranges);
     result
 }
 
@@ -506,6 +511,7 @@ impl Translator<'_> {
 #[cfg(test)]
 mod reshape_order_tests {
     use super::*;
+    use crate::translate::sympy::ExprBounds;
 
     #[test]
     fn reshape_preserves_target_order() {
@@ -538,6 +544,28 @@ mod reshape_order_tests {
                 IntExpr::from(3usize),
                 IntExpr::from(4usize)
             ]
+        );
+    }
+
+    #[test]
+    fn reshape_infers_neg1_after_cancelling_a_positive_symbol() {
+        let s = Symbol::try_new_dim("s").unwrap();
+        let dynamic = IntExpr::from(s);
+        let ranges = [(
+            s,
+            ExprBounds {
+                min: Some(2),
+                max: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let target = [dynamic, IntExpr::from(-1), IntExpr::from(64)];
+        let input = [dynamic, IntExpr::from(256)];
+
+        assert_eq!(
+            resolve_neg1_dim_exprs(&target, &input, &ranges),
+            vec![dynamic, IntExpr::from(4), IntExpr::from(64)]
         );
     }
 }

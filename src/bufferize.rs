@@ -104,7 +104,7 @@ impl<T: Clone + std::fmt::Debug> PlanLayout for T {}
 /// Storage identity. Boundary buffers are pinned by the program (identified by
 /// the BufferId e-class they came from); interior buffers are minted by the
 /// planner at compile time and owned by the system.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BufferId {
     /// Caller-specified buffer at an input/output boundary.
     Boundary(ClassId),
@@ -113,7 +113,7 @@ pub enum BufferId {
 }
 
 /// Who is responsible for a buffer's lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Owner {
     /// Provided/consumed by the caller; never freed by the planner.
     Caller,
@@ -210,7 +210,7 @@ pub struct InputBinding {
 }
 
 /// How an edge constrains execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EdgeKind {
     /// A value flows from producer to consumer (dataflow dependence).
     Data,

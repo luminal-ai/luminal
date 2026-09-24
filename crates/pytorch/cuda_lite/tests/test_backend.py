@@ -12,10 +12,30 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("luminal_cuda_lite")
 
 import luminal_cuda_lite  # noqa: E402
+from luminal_cuda_lite.backend import _dynamic_export, _same_layout_on_shape  # noqa: E402
 
 
 def test_backend_registered():
     assert "luminal_cuda_lite" in torch._dynamo.list_backends()
+
+
+def test_enclosing_dynamic_range_is_ignored_for_a_static_region():
+    class Region(torch.nn.Module):
+        def forward(self, value):
+            return value + 1
+
+    graph = torch.fx.symbolic_trace(Region())
+    exported, inputs, effective_range = _dynamic_export(
+        graph, [torch.ones(4, 8)], dynamic_range=(1, 32)
+    )
+    assert inputs[0].shape == (4, 8)
+    assert not exported.range_constraints
+    assert effective_range is None
+
+
+def test_stride_differences_on_size_one_axes_are_layout_equivalent():
+    assert _same_layout_on_shape((1, 4, 128), (512, 128, 1), (5120, 128, 1))
+    assert not _same_layout_on_shape((2, 4, 128), (512, 128, 1), (5120, 128, 1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -164,17 +184,12 @@ def test_writeback_consumed_downstream():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.xfail(
-    strict=True,
-    reason="LUM-830: eager's pointwise output inherits the operand layout; "
-    "no strided-destination write yet",
-)
 def test_transposed_input_binds_zero_copy():
     """A transposed input is bound at the strides it has — (1, 8) — never
     copied and never reinterpreted; that the chain is column-major is the
     e-graph's discovery. Eager gives the pointwise output the operand's
-    layout too, so the output is bound at that chain and the search refuses
-    by name until a strided-destination write lands."""
+    layout too; the selected materializing copy writes through that injective
+    destination rather than changing the returned ABI."""
 
     def fn(x):
         return x * 2 + 1
@@ -223,12 +238,10 @@ def test_dynamic_batch_output_is_returned_at_eagers_strides():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.xfail(strict=True, reason="LUM-830: no strided-destination write yet")
 def test_transposed_output_keeps_eagers_strides():
     """Eager lays this output out the way its operands are laid out, so it
     is column-major, and the output is bound at those exact strides. No
-    elected op writes a non-row-major destination today: the search refuses
-    by name until the layout-changing copy into the bound output lands."""
+    materializing copy writes the injective non-row-major destination."""
 
     def fn(a, b):
         return a.t() + b.t()
@@ -243,12 +256,11 @@ def test_transposed_output_keeps_eagers_strides():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
+def test_writeback_into_transposed_input_preserves_layout_and_values():
     """A writeback is bound at its target's chain — here the transposed
     strides — and whether any kernel writes that layout is the SEARCH's
-    question, never a prior taken at bind. Today none does, so the search
-    plans nothing and says which output, at which layout, it found no plan
-    for."""
+    question, never a prior taken at bind. The materializing copy writes this
+    injective destination and the mutation remains visible to the caller."""
 
     def fn(x):
         x.add_(1)
@@ -256,10 +268,11 @@ def test_writeback_into_transposed_input_finds_no_plan_naming_the_output():
 
     torch.manual_seed(0)
     x = torch.randn(8, 4, device="cuda").t()
-    with pytest.raises(
-        Exception, match=r"no plan writes the bound outputs: v\d+ at Strided"
-    ):
-        torch.compile(fn, backend=luminal_cuda_lite)(x)
+    expected_x = x + 1
+    got = torch.compile(fn, backend=luminal_cuda_lite)(x)
+    assert x.stride() == (1, 4)
+    torch.testing.assert_close(x, expected_x)
+    torch.testing.assert_close(got, expected_x * 2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -313,17 +326,11 @@ def test_int32_and_bool_inputs_bind_external():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.xfail(
-    strict=True,
-    reason="LUM-830: eager's pointwise output inherits the operand layout; "
-    "no strided-destination write yet",
-)
 def test_transposed_dynamic_batch_input():
     """The transposed input's element stride IS the dynamic batch dimension,
     so the binding states that dimension rather than the number one example
     call had: one compile serves every extent in the bucket. Eager's output
-    is column-major here, so the search refuses by name until a
-    strided-destination write lands."""
+    is column-major and the materializing copy preserves that layout."""
 
     def fn(x):
         return x * 2 + 1
@@ -339,8 +346,7 @@ def test_transposed_dynamic_batch_input():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 @pytest.mark.xfail(
     strict=True,
-    reason="LUM-830: eager's pointwise output inherits the operand layout; "
-    "no strided-destination write yet",
+    reason="symbolic non-contiguous strides do not yet carry an injectivity proof",
 )
 def test_permuted_dynamic_view_states_its_size_derived_strides():
     """A permuted view is neither row- nor column-major, and every one of

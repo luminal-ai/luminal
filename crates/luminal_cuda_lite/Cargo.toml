@@ -31,6 +31,8 @@ rustc-hash = "2"
 petgraph = "0.6.4"
 rand = "0.9.2"
 colored = "2.0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # The Luminal cudarc fork (rev a42f389) adds borrowed-stream support
 # (`CudaContext::wrap_borrowed_stream`, `owned: false`), which the PyTorch
 # backend needs to run on `torch.cuda.current_stream()`. crates.io 0.19.8 has

@@ -49,6 +49,35 @@ def private_graph_copy(gm):
     return private
 
 
+def _strip_data_attr(gm):
+    """Treat ``Tensor.data`` as identity in an inference-only FX region.
+
+    Dynamo spells ``tensor.data`` with its private ``_get_data_attr`` op.
+    Nested export can otherwise lift that alias as a tensor constant; under
+    AOT compilation the constant is only a FakeTensor and has neither value
+    nor device address. The alias has the same observable value and storage
+    as its source when autograd is out of scope, so keep the source input in
+    the boundary instead.
+    """
+    import torch
+
+    target = getattr(torch._C._autograd, "_get_data_attr", None)
+    if target is None:
+        return
+    changed = False
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not target:
+            continue
+        if len(node.args) != 1 or node.kwargs:
+            raise RuntimeError("unexpected _get_data_attr invocation")
+        node.replace_all_uses_with(node.args[0])
+        gm.graph.erase_node(node)
+        changed = True
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+
+
 def _get_cache_dict(cache):
     """Flatten a DynamicCache to a dict of parallel key/value lists."""
     return {
@@ -358,6 +387,7 @@ __all__ = [
     "flatten_with_keys_dynamic_cache",
     "_get_cache_dict",
     "_register_cache_serialization",
+    "_strip_data_attr",
     "_box_scalar_graph_outputs",
     "_decomp_table",
     "_lower_sym_sum",

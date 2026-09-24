@@ -73,6 +73,52 @@ impl BoundaryLayout {
             }
         })
     }
+
+    /// Prove a literal-stride boundary has no overlapping coordinates.
+    /// Axes are ordered by stride, making the nested-span test invariant to
+    /// transposes. A symbolic extent is allowed only on the outermost axis:
+    /// its stride separates every repetition, and no later comparison needs
+    /// its total span.
+    fn proves_injective_strides(&self, dims: &[IntExpr]) -> bool {
+        let Self::Strided { strides } = self else {
+            return false;
+        };
+        let Some(mut axes) = strides
+            .iter()
+            .zip(dims)
+            .map(|(stride, extent)| Some((literal_stride(stride)?, extent.to_usize())))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        if axes.iter().any(|(stride, _)| *stride < 0) {
+            return false;
+        }
+        axes.sort_by_key(|(stride, _)| *stride);
+        let mut span = 1i128;
+        for (index, (stride, extent)) in axes.iter().enumerate() {
+            if *extent == Some(0) || *extent == Some(1) {
+                continue;
+            }
+            let stride = i128::from(*stride);
+            if stride < span {
+                return false;
+            }
+            match extent {
+                Some(extent) => {
+                    let Some(next) = stride
+                        .checked_mul((*extent as i128) - 1)
+                        .and_then(|outer| outer.checked_add(span))
+                    else {
+                        return false;
+                    };
+                    span = next;
+                }
+                None => return index + 1 == axes.len(),
+            }
+        }
+        true
+    }
 }
 
 /// A stride's value where the caller stated a literal one; `None` for a
@@ -535,6 +581,14 @@ impl CudaBindings {
                 bound.layout.term(&shape, &width)?,
                 bound.buffer
             ));
+            if bound
+                .layout
+                .proves_injective_strides(graph.value_dims(bound.value))
+            {
+                prefix.push_str(&format!(
+                    "(set (injectivity-of {stem}_layout_tensor) (Injective))\n"
+                ));
+            }
             input_tensors.push(format!("{stem}_buffer_tensor"));
             let_names.insert(bound.value, logical);
         }
@@ -573,6 +627,14 @@ impl CudaBindings {
                 bound.layout.term(&shape, &width)?,
                 bound.buffer
             ));
+            if bound
+                .layout
+                .proves_injective_strides(graph.value_dims(bound.value))
+            {
+                prefix.push_str(&format!(
+                    "(set (injectivity-of {stem}_layout_tensor) (Injective))\n"
+                ));
+            }
             output_tensors.push(format!("{stem}_buffer_tensor"));
             let_names.entry(bound.value).or_insert(value_name);
         }
@@ -684,6 +746,34 @@ mod tests {
              (IntAffineExprNil))) (bits-of (F32)))"
         );
         assert!(prefix.contains(&expected), "{prefix}");
+    }
+
+    #[test]
+    fn a_gapped_strided_boundary_is_certified_injective() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(('n', 512usize), DType::F32);
+        let mut bindings = CudaBindings::new();
+        bindings.input(x.id);
+        bindings.output_with(x.id, BoundaryLayout::strided_literal([5120, 1]));
+        let prefix = bindings.bind(&cx.logical).unwrap().prefix;
+        assert!(
+            prefix.contains("(set (injectivity-of natout0_layout_tensor) (Injective))"),
+            "{prefix}"
+        );
+    }
+
+    #[test]
+    fn an_overlapping_strided_boundary_is_not_certified() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor((4usize, 4usize), DType::F32);
+        let mut bindings = CudaBindings::new();
+        bindings.input(x.id);
+        bindings.output_with(x.id, BoundaryLayout::strided_literal([3, 1]));
+        let prefix = bindings.bind(&cx.logical).unwrap().prefix;
+        assert!(
+            !prefix.contains("(set (injectivity-of natout0_layout_tensor) (Injective))"),
+            "{prefix}"
+        );
     }
 
     /// TWO PLACEMENTS ON ONE BUFFER ARE REFUSED. The constructors cannot

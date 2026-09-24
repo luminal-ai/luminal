@@ -118,7 +118,8 @@ impl Translator<'_> {
             Some(target) => target,
             None => self.get_int_exprs_arg(node, 1)?,
         };
-        let dims = util::resolve_neg1_dim_exprs(&target, &x.dims());
+        let symbol_ranges = super::sympy::sym_char_ranges(&self.symbols, &self.ranges);
+        let dims = util::resolve_neg1_dim_exprs(&target, &x.dims(), &symbol_ranges);
         Ok(util::reshape_tensor(x, &dims))
     }
 

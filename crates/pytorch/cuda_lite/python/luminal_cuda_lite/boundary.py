@@ -86,10 +86,15 @@ def _reads_as_plain_storage(value: Any) -> bool:
     # Imported here because the fake tensor lives in a private torch module.
     from torch._subclasses.fake_tensor import FakeTensor
 
-    return type(value) in (torch.Tensor, torch.nn.Parameter, FakeTensor)
+    value_type = type(value)
+    return value_type in (torch.Tensor, FakeTensor) or issubclass(
+        value_type, torch.nn.Parameter
+    )
 
 
-def _refuse_unreadable(name: str, value: Any) -> None:
+def _refuse_unreadable(
+    name: str, value: Any, *, allow_storage_offset: bool = False
+) -> None:
     """Refuse a boundary value whose storage a binding cannot state: a
     tensor subclass, a layout that is not dense strides, or storage whose
     base the binding cannot name."""
@@ -104,7 +109,7 @@ def _refuse_unreadable(name: str, value: Any) -> None:
             "element strides over dense storage"
         )
     offset = _extent(value.storage_offset())
-    if offset != 0:
+    if offset != 0 and not allow_storage_offset:
         raise UnsupportedBoundary(
             f"{name}: storage offset {offset} is not bound today; a binding names a "
             "buffer's base, and two bindings on one buffer share that base"
@@ -119,7 +124,11 @@ def boundary_shape(tensor: torch.Tensor, fake: Optional[Any] = None) -> tuple[An
 
 
 def boundary_layout(
-    name: str, tensor: torch.Tensor, fake: Optional[Any] = None
+    name: str,
+    tensor: torch.Tensor,
+    fake: Optional[Any] = None,
+    *,
+    allow_storage_offset: bool = False,
 ) -> Strided:
     """The element strides a boundary tensor is bound at, or a refusal.
 
@@ -131,9 +140,9 @@ def boundary_layout(
     classified here and nothing is reinterpreted: a tensor this boundary
     cannot state is an error naming it and the offending fact.
     """
-    _refuse_unreadable(name, tensor)
+    _refuse_unreadable(name, tensor, allow_storage_offset=allow_storage_offset)
     if fake is not None:
-        _refuse_unreadable(name, fake)
+        _refuse_unreadable(name, fake, allow_storage_offset=allow_storage_offset)
     if not tensor.is_cuda:
         raise UnsupportedBoundary(f"{name}: expected a CUDA tensor, got device {tensor.device}")
     if tensor.dtype not in SUPPORTED_DTYPES:

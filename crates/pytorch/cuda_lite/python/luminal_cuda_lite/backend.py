@@ -42,6 +42,8 @@ accounts for the bytes and can reuse the block on the next call.
 """
 
 import concurrent.futures
+import hashlib
+import inspect
 import os
 import tempfile
 from typing import Any, Optional, Sequence
@@ -71,9 +73,12 @@ from luminal_reference.export_utils import (
     _drop_input_guards,
     _lower_sym_sum,
     _register_cache_serialization,
+    _strip_data_attr,
 )
 
 from . import _luminal
+from .artifacts import artifact_path, load_artifact, save_artifact
+from .plan_cache import get_or_create, structural_fingerprint
 
 # torch._export.serde.schema.ScalarType codes we can round-trip today.
 _PT2_TO_TORCH = {
@@ -225,7 +230,13 @@ def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
             continue
         fake = _output_fake(name, fakes)
         stated.add(name)
-        tag, strides = layout_spec(boundary_layout(name, fake))
+        # A returned view of another boundary tensor is reconstructed from
+        # that owner by `_output_alias_rows`. A view of internal temporary
+        # storage is materialized into fresh output storage, so its original
+        # offset is not part of the boundary address in either case.
+        tag, strides = layout_spec(
+            boundary_layout(name, fake, allow_storage_offset=True)
+        )
         rows.append((name, tag, list(strides)))
     return rows
 
@@ -282,7 +293,18 @@ def _refuse_overlapping_writebacks(
     identity, not storage overlap, so a program compiled on distinct
     tensors can be called as ``fn(x, x[:])``.
     """
-    spans = [(name, *storage_span(tensor)) for name, tensor in named]
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    # AOT compilers such as vLLM invoke backends with FakeTensor examples.
+    # They carry every shape/layout fact needed to compile, but deliberately
+    # have no address. The same check runs again on the real tensors before
+    # each execution, which is the only point where storage overlap exists as
+    # an observable fact.
+    spans = [
+        (name, *storage_span(tensor))
+        for name, tensor in named
+        if not isinstance(tensor, FakeTensor)
+    ]
     for index, (name, start, stop) in enumerate(spans):
         for other, other_start, other_stop in spans[index + 1 :]:
             if start >= other_stop or other_start >= stop:
@@ -409,6 +431,11 @@ class CompiledModel:
             f"luminal_cuda_lite: {name!r} is not a boundary tensor this call holds"
         )
 
+    @property
+    def exported_program(self) -> Any:
+        """The normalized program retained for diagnostics and integration."""
+        return self._ep
+
     def _mutation_destination(
         self, mutation: str, inputs: Sequence[torch.Tensor]
     ) -> torch.Tensor:
@@ -514,7 +541,7 @@ class CompiledModel:
                     )
                 declared = tuple(declared_strides(binding, shape, dims))
                 elected = tuple(self._graph.output_elected_strides(name))
-                if elected != declared:
+                if not _same_layout_on_shape(shape, elected, declared):
                     raise RuntimeError(
                         f"luminal_cuda_lite: output {name!r} is elected at element "
                         f"strides {elected}, and eager's are {declared}. This backend "
@@ -637,7 +664,34 @@ def _is_dynamic(size: Any) -> bool:
     return isinstance(size, torch.SymInt) and not size.node.expr.is_number
 
 
-def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> Any:
+def _example_int(value: Any) -> int:
+    """Read an example integer without guarding Dynamo's live ShapeEnv."""
+    if isinstance(value, torch.SymInt):
+        expr = value.node.expr
+        if expr.is_number:
+            return int(expr)
+        hint = value.node.hint
+        if hint is None:
+            raise RuntimeError(f"symbolic export value {expr} has no example hint")
+        return int(hint)
+    return int(value)
+
+
+def _same_layout_on_shape(
+    shape: Sequence[int], left: Sequence[int], right: Sequence[int]
+) -> bool:
+    """Whether two stride vectors address every coordinate identically."""
+    return len(left) == len(right) == len(shape) and all(
+        extent <= 1 or left_stride == right_stride
+        for extent, left_stride, right_stride in zip(shape, left, right)
+    )
+
+
+def _dynamic_export(
+    gm: torch.fx.GraphModule,
+    example_inputs: Sequence[Any],
+    dynamic_range: Optional[tuple[int, int]] = None,
+) -> Any:
     """Export a Dynamo GraphModule, preserving its symbolic dimensions.
 
     Dynamo hands each free symbolic dimension to the backend as an explicit
@@ -660,16 +714,50 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     gm = private_graph_copy(gm)
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
 
+    dynamic_exprs = {
+        size.node.expr
+        for node, value in zip(placeholders, example_inputs)
+        if not isinstance(value, torch.SymInt)
+        for size in getattr(node.meta.get("example_value"), "shape", getattr(value, "shape", ()))
+        if _is_dynamic(size)
+    }
+    if dynamic_range is not None and len(dynamic_exprs) > 1:
+        raise RuntimeError(
+            "an explicit dynamic range supports at most one symbolic dimension, "
+            f"found {len(dynamic_exprs)}"
+        )
+    # vLLM attaches the enclosing token range to every piecewise subgraph.
+    # Some pieces are shape-invariant (for example a fixed-size attention
+    # projection) and therefore contain no symbolic tensor dimension. Compile
+    # those as static artifacts instead of inventing a dimension to range.
+    effective_dynamic_range = dynamic_range if dynamic_exprs else None
+    dim_specs: dict[Any, Any] = {}
+    if effective_dynamic_range is not None:
+        minimum, maximum = effective_dynamic_range
+        minimum = max(2, minimum)
+        if maximum < minimum:
+            raise RuntimeError(
+                f"dynamic range [{effective_dynamic_range[0]}, {maximum}] has no values "
+                "supported by torch.export; sizes 0 and 1 require exact artifacts"
+            )
+        expr = next(iter(dynamic_exprs))
+        dim_specs[expr] = Dim("luminal_dynamic_dim", min=minimum, max=maximum)
+
     records: list[tuple[str, torch.fx.Node, Any]] = []
     tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
     for node, value in zip(placeholders, example_inputs):
-        if isinstance(value, torch.SymInt):
-            records.append(("sym", node, value))
+        example = node.meta.get("example_value", value)
+        if isinstance(example, torch.SymInt):
+            records.append(("sym", node, example))
             continue
-        shape = getattr(node.meta.get("example_value"), "shape", None)
+        shape = getattr(example, "shape", None)
         if shape is None:
             shape = getattr(value, "shape", ())
-        dims = {dim: Dim.AUTO for dim, size in enumerate(shape) if _is_dynamic(size)}
+        dims = {
+            dim: dim_specs.get(size.node.expr, Dim.AUTO)
+            for dim, size in enumerate(shape)
+            if _is_dynamic(size)
+        }
         for dim, size in enumerate(shape):
             if _is_dynamic(size):
                 tensor_dims.setdefault(size.node.expr, (node, dim))
@@ -714,7 +802,13 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
         else:
             specs.append(None)
 
-    dynamic_shapes = {"args": tuple(specs)} if any_dynamic else None
+    has_varargs = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+        for parameter in inspect.signature(gm.forward).parameters.values()
+    )
+    dynamic_shapes = None
+    if any_dynamic:
+        dynamic_shapes = {"args": tuple(specs)} if has_varargs else tuple(specs)
 
     # `torch.export` runs its own Dynamo pass. Running that inside the caller's
     # compile pollutes the caller's guard manager (the inner frame's `args`
@@ -725,7 +819,7 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         ep = pool.submit(_export).result()
-    return ep, inputs
+    return ep, inputs, effective_dynamic_range
 
 
 def luminal_cuda_lite(
@@ -733,10 +827,18 @@ def luminal_cuda_lite(
     example_inputs: Sequence[Any],
     options: Optional[dict] = None,
     search_iterations: Optional[int] = None,
+    dynamic_range: Optional[tuple[int, int]] = None,
+    artifact_dir: Optional[str] = None,
+    artifact_prefix: str = "",
+    disable_cache: bool = False,
 ) -> CompiledModel:
     """The torch.compile backend entry point."""
     if options:
         search_iterations = options.get("search_iterations", search_iterations)
+        dynamic_range = options.get("dynamic_range", dynamic_range)
+        artifact_dir = options.get("artifact_dir", artifact_dir)
+        artifact_prefix = options.get("artifact_prefix", artifact_prefix)
+        disable_cache = options.get("disable_cache", disable_cache)
 
     # HF DynamicCache must be pytree-registered before torch.export capture so
     # use_cache=True models can export. Idempotent.
@@ -748,12 +850,15 @@ def luminal_cuda_lite(
     # mutating it here would corrupt that bookkeeping. The copy shares the
     # module's weights (see private_graph_copy).
     gm = private_graph_copy(gm)
+    _strip_data_attr(gm)
     scalar_output_positions = _box_scalar_graph_outputs(gm)
 
     # The graph-module preprocessing above runs first; `_dynamic_export` then
     # rewrites the SymInt placeholders onto `sym_size` and runs the nested
     # `torch.export`, so the exported program keeps its symbolic dims.
-    ep, export_inputs = _dynamic_export(gm, example_inputs)
+    ep, export_inputs, dynamic_range = _dynamic_export(
+        gm, example_inputs, dynamic_range
+    )
     # LUM-499: drop dynamo-emitted input guards before run_decompositions calls
     # ep.module(), which would otherwise emit a `_guards_fn` containing
     # data-dependent .item() calls and unresolved `L[...]` references.
@@ -778,6 +883,7 @@ def luminal_cuda_lite(
             "graph inputs share device storage and the program writes one of them: "
             "the export cannot functionalise a write through aliased inputs"
         ) from exc
+    _drop_input_guards(ep)
     _drop_dead_data_dependent_ops(ep.graph_module)
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
@@ -797,10 +903,10 @@ def luminal_cuda_lite(
         # read from the traced fake value exactly like an input: what the
         # caller receives has the strides the uncompiled program hands back,
         # never a contiguous substitute.
-        declared_outputs = _output_layout_rows(program)
         # An output that is a view of another boundary tensor is bound on
         # that tensor's buffer; the caller receives a view of what it holds.
         aliases = _output_alias_rows(program)
+        declared_outputs = _output_layout_rows(program)
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
@@ -808,7 +914,8 @@ def luminal_cuda_lite(
                 pt2_path, declared, declared_outputs, [(name, owner) for name, owner, _ in aliases]
             )
         tensors = {name: value for name, _, value, _ in rows}
-        return graph, tensors, layouts, shapes, {name: (owner, offset) for name, owner, offset in aliases}
+        alias_map = {name: (owner, offset) for name, owner, offset in aliases}
+        return graph, tensors, layouts, shapes, alias_map
 
     try:
         graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
@@ -821,7 +928,9 @@ def luminal_cuda_lite(
         # un-decomposed graph.
         if "unsupported ATen op" not in str(exc):
             raise
+        _drop_input_guards(ep)
         ep = ep.run_decompositions(_decomp_table())
+        _drop_input_guards(ep)
         _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
         graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
@@ -847,7 +956,12 @@ def luminal_cuda_lite(
                 f"the translated program names an input {name!r} the export signature "
                 f"does not declare (declared: {sorted(tensors)})"
             )
-    graph.bind_input_shapes([(name, list(tensors[name].shape)) for name in graph.input_names])
+    graph.bind_input_shapes(
+        [
+            (name, [_example_int(dim) for dim in tensors[name].shape])
+            for name in graph.input_names
+        ]
+    )
     for name, kind, buffer in zip(graph.input_names, graph.input_kinds, graph.input_buffers):
         value = tensors[name]
         binding = Binding(name, buffer, value.dtype, shapes[name], layouts[name])
@@ -858,7 +972,54 @@ def luminal_cuda_lite(
         held_bindings.append(binding)
         held[name] = value
 
-    graph.search(search_iterations)
+    input_layout_rows = []
+    for name in graph.input_names:
+        tag, strides = layout_spec(layouts[name])
+        input_layout_rows.append((name, tag, list(strides)))
+    output_layout_rows = _output_layout_rows(ep)
+    alias_rows = _output_alias_rows(ep)
+    plan_key = structural_fingerprint(
+        ep,
+        input_layout_rows,
+        output_layout_rows,
+        alias_rows,
+        search_iterations=search_iterations,
+        dynamic_range=dynamic_range,
+        search_configuration=_luminal.search_configuration(search_iterations),
+    )
+
+    def search_plan():
+        graph.search(search_iterations)
+        return graph.export_plan_template()
+
+    # Layout expressions in the selected plan still carry PT2's concrete
+    # symbol spellings. The structural digest alpha-normalizes them for the
+    # future persistent format; until plan decoding grows symbol substitution,
+    # keep incompatible spellings in separate in-process variants.
+    symbol_abi = hashlib.sha256(repr(tuple(graph.dim_symbols)).encode()).hexdigest()
+    cache_key = f"{plan_key}-{symbol_abi}"
+    path = (
+        artifact_path(artifact_dir, artifact_prefix, cache_key)
+        if artifact_dir is not None and not disable_cache
+        else None
+    )
+    artifact_loaded = False
+
+    def load_or_search():
+        nonlocal artifact_loaded
+        if path is not None and path.exists():
+            artifact_loaded = True
+            return load_artifact(path, plan_key)
+        template = search_plan()
+        if path is not None:
+            save_artifact(path, plan_key, template)
+        return template
+
+    # `disable_cache` means no persistent files. Structural reuse remains a
+    # compiler optimization inside this process, just like a module/JIT cache.
+    template, cache_hit = get_or_create(cache_key, load_or_search)
+    if cache_hit or artifact_loaded:
+        graph.install_plan_template(template)
 
     # WHICH OUTPUTS THE PROGRAM HAS IS THE TRANSLATION'S TO SAY, not the
     # export signature's: the translator resolves a returned alias of a
@@ -891,7 +1052,7 @@ def luminal_cuda_lite(
             graph.output_layouts,
         )
     ]
-    return CompiledModel(
+    compiled = CompiledModel(
         graph,
         ep,
         input_bindings,
@@ -901,6 +1062,10 @@ def luminal_cuda_lite(
         held_bindings,
         aliases,
     )
+    compiled.plan_fingerprint = plan_key
+    compiled.plan_cache_hit = cache_hit or artifact_loaded
+    compiled.artifact_handle = str(path) if path is not None else None
+    return compiled
 
 
 def register_backend() -> None:

@@ -102,6 +102,7 @@ fn codegen_emits_wellformed_sources() {
         // all three are dense row-major, so every read simplifies to the
         // identity and the body collapses to the pre-Option-B text.
         operand_layouts: vec![rm_layout(&[2, 3]), rm_layout(&[2, 3]), rm_layout(&[2, 3])],
+        dest_layouts: vec![rm_layout(&[2, 3])],
     };
     let add = luminal_cuda_lite::ops::add::AddFunctionalDps;
     let kernel = luminal_cuda_lite::as_kernel_op(&add).expect("add implements KernelOp");

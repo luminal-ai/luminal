@@ -640,7 +640,9 @@ impl Translator<'_> {
                         .map(IntExpr::from)
                         .collect(),
                 };
-                let dims = resolve_neg1_dim_exprs(&target_shape, &value.real.dims());
+                let symbol_ranges = super::sympy::sym_char_ranges(&self.symbols, &self.ranges);
+                let dims =
+                    resolve_neg1_dim_exprs(&target_shape, &value.real.dims(), &symbol_ranges);
                 let value = value.map(|component| reshape_tensor(component, &dims));
                 let value = if target == "view_copy.default" {
                     value.map(materialize_tensor)

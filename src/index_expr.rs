@@ -10,7 +10,7 @@ use crate::layout_ir::ExtractionSite;
 type BinaryIotaBuilder = fn(Box<IotaExpr>, Box<IotaExpr>) -> IotaExpr;
 
 /// A numeric IntExpr tree for reference evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IotaExpr {
     Lit(i64),
     /// A runtime dimension, retained when extraction uses interval bounds.

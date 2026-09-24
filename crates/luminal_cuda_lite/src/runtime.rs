@@ -25,6 +25,21 @@ struct NativeParts {
     binding_seeds: String,
 }
 
+/// The boundary-independent result of one completed search.
+///
+/// A template contains no device, stream, arena, pointer, staged payload, or
+/// captured CUDA graph.  It is therefore safe to clone into a freshly loaded
+/// runtime whose boundary bindings name different caller allocations.  The
+/// current CUDA-lite PyTorch frontend installs one bucket spanning every
+/// dynamic dimension, so one plan and its capacity bounds are the complete
+/// reusable search result.
+#[derive(Debug, Clone)]
+pub struct SearchedPlanTemplate {
+    pub plan: crate::layouts::CudaPlan,
+    pub bounds: crate::symbolic::Bounds,
+    pub device_budget_bytes: Option<usize>,
+}
+
 /// A `Default` instance holds NO program and NO op vocabulary: every
 /// ladder method past `load` refuses it by name (`load before search`),
 /// so the empty registry a default carries is never the thing a caller
@@ -304,6 +319,43 @@ impl CudaRuntime {
         if let Some(device) = &mut self.device {
             device.release_slab();
         }
+    }
+
+    /// Clone the installed search result without any live CUDA or boundary
+    /// state.  The PyTorch frontend currently searches exactly one Cartesian
+    /// bucket (one interval per dimension); refusing a future multi-bucket
+    /// configuration here prevents an incomplete cache entry from silently
+    /// dropping plans.
+    pub fn searched_plan_template(&self) -> Result<SearchedPlanTemplate> {
+        let mut plans = self.install_plans()?;
+        ensure!(
+            plans.len() == 1,
+            "plan-template reuse currently requires exactly one installed plan, got {}",
+            plans.len()
+        );
+        let (plan, bounds) = plans.pop().unwrap();
+        Ok(SearchedPlanTemplate {
+            plan,
+            bounds,
+            device_budget_bytes: self.device_budget_bytes,
+        })
+    }
+
+    /// Install a prior search result into this freshly loaded runtime.
+    /// Boundary buffer literals must already have been remapped by the caller;
+    /// everything owned by a live execution remains fresh on this runtime.
+    pub fn install_searched_plan_template(&mut self, template: SearchedPlanTemplate) -> Result<()> {
+        self.ensure_not_installed("installing a searched plan template")?;
+        self.invalidate_plans();
+        self.dim_buckets.clear();
+        self.range_bound = template
+            .bounds
+            .iter()
+            .map(|(symbol, (lo, hi))| Ok((*symbol, (u64::try_from(*lo)?, u64::try_from(*hi)?))))
+            .collect::<Result<_>>()?;
+        self.device_budget_bytes = template.device_budget_bytes;
+        self.plan = Some(template.plan);
+        Ok(())
     }
 
     /// Seed interval bounds for a dynamic dimension (facts, never pins:
