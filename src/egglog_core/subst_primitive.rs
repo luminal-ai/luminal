@@ -55,6 +55,7 @@
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use egglog::api::RawValues;
 use egglog::ast::Span;
@@ -67,6 +68,7 @@ use egglog::{
 
 /// The name of the primitive, as written in an egglog program.
 pub const SUBST: &str = "unstable-subst";
+pub const MEMOIZED_SUBST: &str = "unstable-subst-once";
 
 /// A constructor the walk can follow.
 type Constructor<'a> = &'a FuncType;
@@ -599,13 +601,40 @@ pub struct Subst {
     pub skip: std::collections::HashSet<String>,
 }
 
+/// A substitution primitive that snapshots each `(root, map)` pair once.
+///
+/// Egglog's `:naive` full-primitive rule is reconsidered in every outer
+/// saturation generation. Re-walking an existing pair after its source class
+/// has acquired the image's ring spellings feeds those spellings back through
+/// substitution and creates a positive feedback loop. A completed
+/// substitution is already a valid representative of the image; later
+/// equalities are handled by the ordinary congruence rules. New roots and maps
+/// still get their own snapshot when their demand arrives.
+#[derive(Clone)]
+pub struct MemoizedSubst {
+    skip: std::collections::HashSet<String>,
+    images: Arc<Mutex<HashMap<(Value, Value), Value>>>,
+}
+
+impl MemoizedSubst {
+    pub fn new(skip: std::collections::HashSet<String>) -> Self {
+        Self {
+            skip,
+            images: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
 impl Primitive for Subst {
     fn name(&self) -> &str {
         SUBST
     }
 
     fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
-        Box::new(SubstTypeConstraint { span: span.clone() })
+        Box::new(SubstTypeConstraint {
+            span: span.clone(),
+            name: SUBST,
+        })
     }
 }
 
@@ -632,6 +661,50 @@ impl FullPrim for Subst {
     }
 }
 
+impl Primitive for MemoizedSubst {
+    fn name(&self) -> &str {
+        MEMOIZED_SUBST
+    }
+
+    fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
+        Box::new(SubstTypeConstraint {
+            span: span.clone(),
+            name: MEMOIZED_SUBST,
+        })
+    }
+}
+
+impl FullPrim for MemoizedSubst {
+    fn apply<'a, 'db>(&self, mut state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        let [root, map] = args else { return None };
+        let key = (*root, *map);
+        if let Some(image) = self
+            .images
+            .lock()
+            .expect("substitution memo poisoned")
+            .get(&key)
+        {
+            return Some(*image);
+        }
+
+        let entries = state.value_to_container::<MapContainer>(*map)?.data.clone();
+        match substitute(&mut state, *root, &entries, &self.skip) {
+            Ok(image) => {
+                self.images
+                    .lock()
+                    .expect("substitution memo poisoned")
+                    .insert(key, image);
+                Some(image)
+            }
+            Err(err) => {
+                eprintln!("[{MEMOIZED_SUBST}] {err}");
+                state.panic();
+                None
+            }
+        }
+    }
+}
+
 /// `(unstable-subst root map) : (R, Map<K, K>) -> R` for any eq-sort `R`.
 ///
 /// `R` is free rather than pinned to `K` because a substitution reaches through
@@ -641,6 +714,7 @@ impl FullPrim for Subst {
 /// produce an ill-typed row.
 struct SubstTypeConstraint {
     span: Span,
+    name: &'static str,
 }
 
 impl TypeConstraint for SubstTypeConstraint {
@@ -654,7 +728,7 @@ impl TypeConstraint for SubstTypeConstraint {
                 ImpossibleConstraint::ArityMismatch {
                     atom: Atom {
                         span: self.span.clone(),
-                        head: SUBST.to_owned(),
+                        head: self.name.to_owned(),
                         args: arguments.to_vec(),
                     },
                     expected: 3,
