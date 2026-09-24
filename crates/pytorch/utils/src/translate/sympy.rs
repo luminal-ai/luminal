@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use luminal::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::pt2_parser::SymDimMap;
 use crate::pt2_schema::RangeConstraint;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,15 +51,31 @@ pub(super) fn parse_sympy_expr_with_ranges(
     sym_to_symbol: &HashMap<String, Symbol>,
     ranges: &HashMap<String, RangeConstraint>,
 ) -> Option<IntExpr> {
-    parse_sympy_expr_inner(expr, sym_to_symbol, ranges).map(|parsed| parsed.expr)
+    let parsed = parse_sympy_expr_inner(expr, sym_to_symbol, ranges)?;
+    let intervals = ranges
+        .iter()
+        .filter_map(|(name, range)| {
+            let symbol = *sym_to_symbol.get(name)?;
+            // PT2 commonly leaves AUTO dimensions unbounded above.  The
+            // interval engine represents that open end with i64::MAX; a
+            // finite upper bound is not required to prove the lower-bound
+            // nonzero fact used by shape division.
+            let min = range.min_val.unwrap_or(0);
+            let max = range.max_val.unwrap_or(i64::MAX);
+            (min <= max).then_some((symbol, DimInterval::new(min, max)))
+        })
+        .collect();
+    Some(parsed.expr.simplify_with_intervals(&intervals))
 }
 
-pub(super) fn sym_char_ranges(sym_map: &SymDimMap) -> FxHashMap<Symbol, ExprBounds> {
-    sym_map
-        .sym_to_symbol
+pub(super) fn sym_char_ranges(
+    symbols: &HashMap<String, Symbol>,
+    ranges: &HashMap<String, RangeConstraint>,
+) -> FxHashMap<Symbol, ExprBounds> {
+    symbols
         .iter()
         .map(|(sym_name, sym_char)| {
-            let range = sym_map.ranges.get(sym_name);
+            let range = ranges.get(sym_name);
             let min = range
                 .and_then(|range| range.min_val)
                 .map(|min| min.max(0))
@@ -180,7 +195,8 @@ fn parse_sympy_expr_inner(
                 return None;
             }
             Some(ParsedExpr {
-                expr: lhs.expr / rhs.expr,
+                expr: cancel_shared_nonzero_scale(lhs.expr, rhs.expr, rhs.bounds)
+                    .unwrap_or_else(|| lhs.expr / rhs.expr),
                 bounds: div_bounds(lhs.bounds, rhs.bounds),
             })
         }
@@ -216,6 +232,65 @@ fn infer_symbol_bounds(body: &str, range: Option<&RangeConstraint>) -> ExprBound
         bounds.max = range.max_val;
     }
     bounds
+}
+
+/// Cancel `(scale * numerator) / (scale * denominator)` when both residual
+/// factors are literals and the parsed divisor bounds prove it cannot be
+/// zero. PT2's decompositions can drop the top-level range table while
+/// retaining `positive=True` on SymPy shape symbols, so this proof belongs at
+/// the expression boundary as well as in the interval e-graph.
+fn cancel_shared_nonzero_scale(
+    lhs_expr: IntExpr,
+    rhs_expr: IntExpr,
+    rhs_bounds: ExprBounds,
+) -> Option<IntExpr> {
+    let divisor_excludes_zero =
+        rhs_bounds.min.is_some_and(|min| min > 0) || rhs_bounds.max.is_some_and(|max| max < 0);
+    if !divisor_excludes_zero {
+        return None;
+    }
+    let (lhs_scale, numerator) = split_literal_scale(lhs_expr)?;
+    let (rhs_scale, denominator) = split_literal_scale(rhs_expr)?;
+    if denominator == 0 || !(lhs_scale == rhs_scale || lhs_scale.egglog_equal(rhs_scale)) {
+        return None;
+    }
+    Some(IntExpr::from(numerator / denominator))
+}
+
+fn split_literal_scale(expr: IntExpr) -> Option<(IntExpr, i64)> {
+    let (lhs, rhs) = split_root_mul(expr)?;
+    match (lhs.as_num(), rhs.as_num()) {
+        (Some(literal), None) => Some((rhs, literal)),
+        (None, Some(literal)) => Some((lhs, literal)),
+        _ => None,
+    }
+}
+
+fn split_root_mul(expr: IntExpr) -> Option<(IntExpr, IntExpr)> {
+    let terms = expr.terms.read();
+    if terms.len() < 3 || terms.last() != Some(&Term::Mul) {
+        return None;
+    }
+    let mut needed = 1usize;
+    let mut rhs_start = None;
+    for index in (0..terms.len() - 1).rev() {
+        match terms[index] {
+            Term::Num(_) | Term::Var(_) | Term::Coord(_) => needed -= 1,
+            _ => needed += 1,
+        }
+        if needed == 0 {
+            rhs_start = Some(index);
+            break;
+        }
+    }
+    let rhs_start = rhs_start?;
+    if rhs_start == 0 {
+        return None;
+    }
+    Some((
+        IntExpr::new(terms[..rhs_start].to_vec()),
+        IntExpr::new(terms[rhs_start..terms.len() - 1].to_vec()),
+    ))
 }
 
 fn exact_expr(value: i64) -> BoundedExpr {
@@ -585,7 +660,10 @@ fn simplify_bound_expr(expr: IntExpr, sym_ranges: &FxHashMap<Symbol, ExprBounds>
                             lhs / rhs
                         })
                     }
-                    (Term::Div, _, _) => normalize_expr(lhs.expr / rhs.expr),
+                    (Term::Div, _, _) => {
+                        cancel_shared_nonzero_scale(lhs.expr, rhs.expr, rhs.bounds)
+                            .unwrap_or_else(|| normalize_expr(lhs.expr / rhs.expr))
+                    }
                     (Term::CeilDiv, _, _) => normalize_expr(lhs.expr.ceil_div(rhs.expr)),
                     _ => unreachable!(),
                 };
@@ -776,5 +854,55 @@ mod tests {
         let expr = parse_sympy_expr_with_ranges("Symbol('s0', integer=True)", &sym_map(), &ranges)
             .expect("bounded symbol should parse");
         assert_eq!(expr, IntExpr::from(Symbol::try_new_dim("a").unwrap()));
+    }
+
+    #[test]
+    fn positive_range_cancels_a_shared_shape_factor() {
+        let ranges = HashMap::from([(
+            "s0".to_string(),
+            RangeConstraint {
+                min_val: Some(2),
+                max_val: Some(8),
+            },
+        )]);
+        let expr = parse_sympy_expr_with_ranges(
+            "Mul(Integer(64), FloorDiv(Mul(Symbol('s0', integer=True), Integer(256)), Mul(Symbol('s0', integer=True), Integer(64))))",
+            &sym_map(),
+            &ranges,
+        )
+        .expect("bounded shape ratio should parse");
+
+        assert_eq!(expr, IntExpr::from(256));
+    }
+
+    #[test]
+    fn positive_unbounded_range_cancels_a_shared_shape_factor() {
+        let ranges = HashMap::from([(
+            "s0".to_string(),
+            RangeConstraint {
+                min_val: Some(2),
+                max_val: None,
+            },
+        )]);
+        let expr = parse_sympy_expr_with_ranges(
+            "FloorDiv(Mul(Symbol('s0', integer=True), Integer(256)), Mul(Symbol('s0', integer=True), Integer(64)))",
+            &sym_map(),
+            &ranges,
+        )
+        .expect("positive unbounded shape ratio should parse");
+
+        assert_eq!(expr, IntExpr::from(4));
+    }
+
+    #[test]
+    fn positive_sympy_symbol_cancels_without_a_range_table() {
+        let expr = parse_sympy_expr_with_ranges(
+            "FloorDiv(Mul(Symbol('s0', positive=True, integer=True), Integer(256)), Mul(Symbol('s0', positive=True, integer=True), Integer(64)))",
+            &sym_map(),
+            &HashMap::new(),
+        )
+        .expect("positive symbolic shape ratio should parse");
+
+        assert_eq!(expr, IntExpr::from(4));
     }
 }

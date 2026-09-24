@@ -29,6 +29,8 @@ pub struct CodegenCtx {
     /// Read layouts in the same order as `operand_dims`.
     /// View layouts include the full mapping to the underlying buffer.
     pub operand_layouts: Vec<DecodedLayout>,
+    /// Write layouts in the same order as `dest_dims`.
+    pub dest_layouts: Vec<DecodedLayout>,
 }
 
 impl CodegenCtx {
@@ -51,10 +53,6 @@ impl CodegenCtx {
             .iter()
             .map(|s| dims_of(s, "dest"))
             .collect::<Result<_>>()?;
-        // Kernels write `out[i]`. The rules in `ops/*/match_functional.egg`
-        // require contiguous row-major destinations; enforce this there, not here.
-        // Views write nothing, and cuBLASLt checks its own destination requirements.
-        // See `tests/view_admission.rs` for coverage.
         Ok(CodegenCtx {
             operand_dims: operand_info
                 .iter()
@@ -70,6 +68,7 @@ impl CodegenCtx {
                 .map(|s| dtype_of(s, "dest"))
                 .collect::<Result<_>>()?,
             operand_layouts: operand_info.iter().map(|s| s.layout.clone()).collect(),
+            dest_layouts: result_info.iter().map(|s| s.layout.clone()).collect(),
         })
     }
 
@@ -501,7 +500,6 @@ pub(crate) fn cuda_type(dtype: PlanDtype) -> Result<&'static str> {
 /// The NVRTC `#include` directives a kernel needs for the dtypes it mentions.
 /// `cuda_fp16.h`/`cuda_bf16.h` are not built into NVRTC; the build script
 /// embeds the toolkit's header closure so these always resolve.
-#[cfg(feature = "device")]
 pub(crate) fn dtype_includes(dtypes: &[PlanDtype]) -> String {
     let mut includes = String::new();
     if dtypes.contains(&PlanDtype::F16) {
@@ -580,11 +578,12 @@ pub(crate) fn ternary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>>
 
 /// Generate one thread per output element, reading inputs through their layouts.
 /// The template must refer to each input as `name[i]`; these tokens are replaced
-/// with the indices from [`layout_read_index`]. Omit coordinate calculations
-/// when every read simplifies to `name[i]`.
+/// with the indices from [`layout_read_index`]. The destination is indexed
+/// through its elected layout as well. Omit coordinate calculations when every
+/// access simplifies to the flat index.
 ///
-/// Inputs must match the output shape. Egglog rules require contiguous
-/// row-major destinations.
+/// Inputs must match the output shape. Egglog rules decide which destination
+/// layouts are writable by a particular op.
 fn elementwise(
     ctx: &CodegenCtx,
     expr: &str,
@@ -621,13 +620,20 @@ fn elementwise(
         }
         rendered = rendered.replace(&flat, &format!("{name}[{idx}]"));
     }
+    let (out_code, out_idx) = layout_read_index(
+        "out",
+        &ctx.dest_layouts[0],
+        out_dims,
+        Coords::FlatIndex { prefix: "c" },
+    )?;
+    chains.push_str(&out_code);
     if chains.is_empty() {
         // All reads use `i`, so no coordinate calculations are needed.
         let source = format!(
             r#"extern "C" __global__ void k({sig}, {to}* out, const long long* params) {{
     const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = {rendered};
+    if (i < n) out[{out_idx}] = {rendered};
 }}"#
         );
         return Ok(vec![KernelSource::plain(source, n)]);
@@ -638,7 +644,7 @@ fn elementwise(
     const unsigned long long n = {n};
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-{prelude}{chains}    out[i] = {rendered};
+{prelude}{chains}    out[{out_idx}] = {rendered};
 }}"#
     );
     Ok(vec![KernelSource::plain(source, n)])

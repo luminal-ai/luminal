@@ -811,6 +811,43 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
 
     if use_interval_analysis {
         // ---- Interval analysis and interval-guarded simplifications ----
+        // Cancel a shared, provably-nonzero symbolic scale when the remaining
+        // factors are literals. Keeping this narrower than the general
+        // `(a*b)/(a*c) -> b/c` rule avoids the recursive match explosion that
+        // rule causes on deep index expressions, while covering symbolic
+        // shape ratios such as `(s*256)/(s*64)`.
+        p.add_rule(
+            rewrite(
+                "div-cancel-nonzero-scaled-literals-positive",
+                div(
+                    mul(v("?scale"), num(v("?numerator"))),
+                    mul(v("?scale"), num(v("?denominator"))),
+                ),
+                div(num(v("?numerator")), num(v("?denominator"))),
+            )
+            .when(vec![
+                peq(v("?scale_lower"), interval_lower(v("?scale"))),
+                pgte(v("?scale_lower"), i64(1)),
+                pneq(i64(0), v("?denominator")),
+            ])
+            .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "div-cancel-nonzero-scaled-literals-negative",
+                div(
+                    mul(v("?scale"), num(v("?numerator"))),
+                    mul(v("?scale"), num(v("?denominator"))),
+                ),
+                div(num(v("?numerator")), num(v("?denominator"))),
+            )
+            .when(vec![
+                peq(v("?scale_upper"), interval_upper(v("?scale"))),
+                plt(v("?scale_upper"), i64(0)),
+                pneq(i64(0), v("?denominator")),
+            ])
+            .ruleset("interval_expr"),
+        );
         p.add_rule(
             Rule::new()
                 .fact(peq(v("?e"), num(v("?n"))))

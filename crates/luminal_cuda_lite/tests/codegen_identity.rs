@@ -113,6 +113,10 @@ fn sources_via_buffer_table(
                 .iter()
                 .map(|id| plan.buffers[id].layout.clone())
                 .collect(),
+            dest_layouts: writes
+                .iter()
+                .map(|id| plan.buffers[id].layout.clone())
+                .collect(),
         };
         out.push((
             label,
