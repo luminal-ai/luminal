@@ -443,6 +443,21 @@ pub(crate) fn binary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> 
     elementwise(ctx, expr, &["a", "b"], &sig, to)
 }
 
+/// Read the condition and both branches through their own layouts.
+pub(crate) fn ternary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
+    let [c, a, b, _dest] = ctx.operand_dtypes.as_slice() else {
+        bail!(
+            "ternary op expects three operands + dest, got {}",
+            ctx.operand_dtypes.len()
+        );
+    };
+    let tc = metal_type(*c)?;
+    let (ta, tb) = (metal_type(*a)?, metal_type(*b)?);
+    let to = metal_type(ctx.dest_dtypes[0])?;
+    let sig = format!("device const {tc}* c, device const {ta}* a, device const {tb}* b");
+    elementwise(ctx, expr, &["c", "a", "b"], &sig, to)
+}
+
 pub(crate) fn unary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
     let ta = metal_type(ctx.operand_dtypes[0])?;
     let to = metal_type(ctx.dest_dtypes[0])?;

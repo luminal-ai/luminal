@@ -67,6 +67,17 @@ fn arena_budget_rejects_a_plan_set_that_cannot_fit() {
             &options,
         )
         .unwrap_err();
-    assert!(error.to_string().contains("device budget"), "{error:#}");
+    // The memory pass now rejects an impossible boundary before profiling
+    // candidates or assembling a device plan.
+    assert!(
+        error.to_string().contains("0-byte arena budget"),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("required BufferInputLit boundary"),
+        "{error:#}"
+    );
     assert!(runtime.plan().is_none());
 }

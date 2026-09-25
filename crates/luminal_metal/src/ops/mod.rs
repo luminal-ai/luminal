@@ -25,6 +25,7 @@ pub mod reduce_max;
 pub mod reduce_sum;
 pub mod round;
 pub mod scatter;
+pub mod select;
 pub mod sin;
 pub mod sqrt;
 pub mod trunc;
@@ -117,6 +118,7 @@ pub fn metal_registry() -> Vec<RegisteredOp> {
         reg(modulo::ModFunctionalMatcher, modulo::ModFunctional),
         reg(less_than::LessThanMatcher, less_than::LessThan),
         reg(cast::CastMatcher, cast::Cast),
+        reg(select::SelectFunctionalMatcher, select::SelectFunctional),
         reg(
             index_map_apply_materialize::IndexMapApplyMaterializeMatcher,
             index_map_apply_materialize::IndexMapApplyMaterialize { entries: None },

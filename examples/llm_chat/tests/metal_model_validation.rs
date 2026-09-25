@@ -68,6 +68,9 @@ fn check_model(model: ModelConfig) {
                     match v {
                         TensorData::F32(v) => v.into(),
                         TensorData::I32(v) => v.into(),
+                        TensorData::BF16(_) | TensorData::F16(_) => {
+                            panic!("the reference fixture is explicitly F32")
+                        }
                     },
                 )
             })

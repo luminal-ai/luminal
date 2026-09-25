@@ -94,15 +94,26 @@ mod tests {
                 ],
             )
             .unwrap();
+        // Search executes each bucket at its representative shape. Only the
+        // dynamic input varies; weights and mutable state are shared.
+        let profiles = [1usize, 3]
+            .into_iter()
+            .map(|n| {
+                (
+                    [('n'.into(), n)].into_iter().collect(),
+                    [(input.id, vec![1f32; n].into())].into_iter().collect(),
+                )
+            })
+            .collect::<Vec<_>>();
         runtime
-            .search(
+            .search_with_profile_inputs(
                 &[
                     (weights.id, vec![1f32; 4].into()),
                     (state.id, vec![0f32; 4].into()),
-                    (input.id, vec![1f32; 3].into()),
                 ]
                 .into_iter()
                 .collect(),
+                &profiles,
                 &harness_search_options(),
             )
             .unwrap();

@@ -127,6 +127,9 @@ fn prefill_and_decode_use_resident_state_and_match_reference() {
                     match v {
                         TensorData::F32(v) => v.into(),
                         TensorData::I32(v) => v.into(),
+                        TensorData::BF16(_) | TensorData::F16(_) => {
+                            panic!("the reference fixture is explicitly F32")
+                        }
                     },
                 )
             })
