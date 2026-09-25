@@ -3,7 +3,7 @@
 use crate::{
     arena::{ArenaPlan, ArenaSlice, ArenaStep},
     cuda_graph::{CopyKind, Executable, Graph, Node, Pinned, PinnedRange, copy_params},
-    host::{DeviceRange, HostOpContext, PreparedHostOp},
+    host::{CaptureCtx, DeviceRange, HostOpContext, PreparedHostOp},
     host_buffer::HostBuffer,
     kernels::{CodegenCtx, KernelLaunch},
     layouts::CudaPlan,
@@ -40,6 +40,10 @@ pub struct ExternalPtr {
 /// the bufferized plan's `BufferId`. Empty for the ordinary arena-only path.
 pub type ExternalBuffers = FxHashMap<BufferId, ExternalPtr>;
 const HOST_VARIANTS: usize = 8;
+// Outer runtimes capture a finite family of shape-specialized graphs. Reserve
+// immutable pinned parameter slots before capture begins; CUDA forbids host
+// allocation while a stream is being captured.
+const EXTERNAL_CAPTURE_PARAMETER_SLOTS: usize = 4096;
 
 /// The CUDA half/bfloat header closure embedded at build time (see `build.rs`).
 /// Materialized once into a temp directory so NVRTC can use it on a machine
@@ -156,6 +160,9 @@ pub struct CudaDevice {
     // Executables/resources must die before their arena or modules.
     installed: Vec<Installed>,
     staging: Option<Pinned>,
+    capture_parameters: Option<Pinned>,
+    capture_parameter_stride: usize,
+    capture_parameter_next: usize,
     slab: Option<CudaSlice<u8>>,
     /// CALLER-OWNED ARENA: when set, `install` reserves no slab and the
     /// per-execution base is this address. The caller frees it; this device
@@ -179,6 +186,9 @@ impl CudaDevice {
         Ok(Self {
             installed: vec![],
             staging: None,
+            capture_parameters: None,
+            capture_parameter_stride: 0,
+            capture_parameter_next: 0,
             slab: None,
             external_arena: None,
             stream_is_borrowed: false,
@@ -352,6 +362,26 @@ impl CudaDevice {
             self.staging = Some(Pinned::new(&self.ctx, staging_bytes)?);
         }
         self.stats.staging_bytes = self.staging.as_ref().unwrap().bytes().len();
+        let capture_parameter_bytes = installed
+            .iter()
+            .map(|p| p.storage.staging_parameters.bytes)
+            .max()
+            .unwrap_or(0);
+        self.capture_parameter_stride = (capture_parameter_bytes + 7) & !7;
+        self.capture_parameter_next = 0;
+        if self.capture_parameter_stride != 0 {
+            let bytes = self
+                .capture_parameter_stride
+                .checked_mul(EXTERNAL_CAPTURE_PARAMETER_SLOTS)
+                .ok_or_else(|| anyhow!("capture parameter staging size overflow"))?;
+            if self
+                .capture_parameters
+                .as_ref()
+                .is_none_or(|p| p.bytes().len() < bytes)
+            {
+                self.capture_parameters = Some(Pinned::new(&self.ctx, bytes)?);
+            }
+        }
         if let Some((arena_ptr, arena_bytes)) = self.external_arena {
             // CALLER-OWNED ARENA: reserve nothing. The caller sizes and frees
             // this block (one per execution); we only check it is large enough
@@ -436,6 +466,9 @@ impl CudaDevice {
         self.resident_initialized.clear();
         self.slab = None;
         self.staging = None;
+        self.capture_parameters = None;
+        self.capture_parameter_stride = 0;
+        self.capture_parameter_next = 0;
         self.stats.staging_bytes = 0;
         self.stats.arena_bytes = 0;
         self.stats.arena_base = 0;
@@ -506,6 +539,7 @@ impl CudaDevice {
                 &mut self.cache,
                 &mut self.stats,
                 &self.residents,
+                true,
             )?);
         }
         // Move the executable out while updating it. An error or unwind drops
@@ -535,6 +569,129 @@ impl CudaDevice {
         );
         installed.compiled = Some(compiled);
         result
+    }
+
+    /// Enqueue the selected plan's individual operations on the borrowed
+    /// stream.  This is the embedding-runtime path: an outer owner such as
+    /// vLLM may capture these launches in its own CUDA graph, so this method
+    /// neither launches Luminal's materialized graph nor synchronizes.
+    pub fn execute_external_direct(
+        &mut self,
+        bucket: usize,
+        staged: &FxHashMap<i64, &HostBuffer>,
+        dims: &DynMap,
+        external_ptrs: &FxHashMap<i64, ExternalPtr>,
+    ) -> Result<Outputs> {
+        self.ctx
+            .bind_to_thread()
+            .context("direct execution bind CUDA context")?;
+        ensure!(
+            self.stream_is_borrowed,
+            "direct CUDA execution requires a caller-owned stream"
+        );
+        self.upload_residents(staged)
+            .context("direct execution upload residents")?;
+        let parameter_bytes = self
+            .installed
+            .get(bucket)
+            .ok_or_else(|| anyhow!("CUDA bucket {bucket} is not installed"))?
+            .storage
+            .staging_parameters
+            .bytes;
+        let capturing = self.stream.capture_status().is_ok_and(|status| {
+            status == cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        });
+        let capture_parameter_range = if capturing && parameter_bytes != 0 {
+            let end = self
+                .capture_parameter_next
+                .checked_add(self.capture_parameter_stride)
+                .ok_or_else(|| anyhow!("capture parameter staging offset overflow"))?;
+            let capacity = self.capture_parameters.as_ref().unwrap().bytes().len();
+            ensure!(
+                end <= capacity,
+                "external CUDA graph capture exceeded {} parameter slots",
+                EXTERNAL_CAPTURE_PARAMETER_SLOTS
+            );
+            let range = ArenaSlice {
+                offset: self.capture_parameter_next,
+                bytes: parameter_bytes,
+            };
+            self.capture_parameter_next = end;
+            Some(range)
+        } else {
+            None
+        };
+        let installed = self
+            .installed
+            .get_mut(bucket)
+            .ok_or_else(|| anyhow!("CUDA bucket {bucket} is not installed"))?;
+        for (dim, (lo, hi)) in &installed.bounds {
+            let value = dims
+                .get(dim)
+                .ok_or_else(|| anyhow!("dimension `{dim}` is unset"))?;
+            ensure!(
+                value >= lo && value <= hi,
+                "dimension `{dim}`={value} is outside [{lo}, {hi}]"
+            );
+        }
+        let mut external = ExternalBuffers::default();
+        for (id, buffer) in &installed.plan.buffers {
+            if let Some(lit) = buffer.lit
+                && let Some(ptr) = external_ptrs.get(&lit)
+            {
+                external.insert(id.clone(), *ptr);
+            }
+        }
+        let stale = installed.compiled.as_ref().is_none_or(|compiled| {
+            compiled.base != self.stats.arena_base
+                || compiled.external.len() != external.len()
+                || !external.keys().all(|id| compiled.external.contains_key(id))
+        });
+        if stale {
+            installed.compiled = Some(CompiledPlan::compile(
+                &installed.plan,
+                &installed.storage,
+                &installed.bounds,
+                dims,
+                self.stats.arena_base,
+                &external,
+                &self.ctx,
+                &self.stream,
+                self.staging.as_ref().unwrap(),
+                &mut self.cache,
+                &mut self.stats,
+                &self.residents,
+                false,
+            )?);
+        }
+        let compiled = installed.compiled.as_mut().unwrap();
+        compiled
+            .update_direct(dims, &mut self.stats)
+            .context("direct execution update dimensions")?;
+        compiled
+            .rebind_addresses_direct(
+                &installed.plan,
+                &installed.storage,
+                dims,
+                self.stats.arena_base,
+                &external,
+                &mut self.stats,
+            )
+            .context("direct execution rebind addresses")?;
+        compiled
+            .launch_direct(
+                &installed.plan,
+                &installed.storage,
+                dims,
+                self.stats.arena_base,
+                &external,
+                self.staging.as_mut().unwrap(),
+                capture_parameter_range
+                    .map(|range| (self.capture_parameters.as_mut().unwrap(), range)),
+                &self.stream,
+                &mut self.stats,
+            )
+            .context("direct execution enqueue actions")
     }
 }
 impl Drop for CudaDevice {
@@ -688,6 +845,9 @@ struct CompiledPlan {
     cached: VecDeque<CachedGraph>,
     source_resources: Vec<Rc<HostVariant>>,
     live_resources: Vec<Rc<HostVariant>>,
+    // Library descriptors/algorithms used while recording directly into an
+    // embedding runtime's graph must outlive every replay of that graph.
+    captured_resources: Vec<Box<dyn PreparedHostOp>>,
     actions: Vec<Action>,
     inputs: Vec<Input>,
     outputs: Vec<Output>,
@@ -884,6 +1044,7 @@ impl CompiledPlan {
         cache: &mut HashMap<String, Module>,
         stats: &mut GraphStats,
         residents: &BTreeMap<i64, ResidentHome>,
+        materialize_graph: bool,
     ) -> Result<Self> {
         let schema: Vec<_> = bounds.keys().copied().collect();
         ensure!(
@@ -898,6 +1059,7 @@ impl CompiledPlan {
             cached: VecDeque::new(),
             source_resources: vec![],
             live_resources: vec![],
+            captured_resources: vec![],
             actions: vec![],
             inputs: vec![],
             outputs: vec![],
@@ -1032,9 +1194,11 @@ impl CompiledPlan {
                                 variants: VecDeque::new(),
                                 resource_slot: out.live_resources.len(),
                             };
-                            host.select(plan, storage, dims, base, external, stream, stats)?;
-                            out.live_resources
-                                .push(host.variants.front().unwrap().clone());
+                            if materialize_graph {
+                                host.select(plan, storage, dims, base, external, stream, stats)?;
+                                out.live_resources
+                                    .push(host.variants.front().unwrap().clone());
+                            }
                             out.actions.push(Action::Host(host));
                         } else if let Some(kernel) = crate::as_kernel_op(op.as_ref()) {
                             let codegen =
@@ -1173,7 +1337,9 @@ impl CompiledPlan {
                 out.deps.entry(s).or_default().push(i);
             }
         }
-        out.rebuild(ctx, stats)?;
+        if materialize_graph {
+            out.rebuild(ctx, stats)?;
+        }
         Ok(out)
     }
     fn rebuild(&mut self, ctx: &Arc<CudaContext>, stats: &mut GraphStats) -> Result<()> {
@@ -1351,6 +1517,234 @@ impl CompiledPlan {
         }
         self.last_dims = dims.clone();
         Ok(())
+    }
+
+    /// Update launch metadata without touching Luminal's private graph exec.
+    /// The next direct launch is itself recorded by the enclosing capture.
+    fn update_direct(&mut self, dims: &DynMap, stats: &mut GraphStats) -> Result<()> {
+        if self.last_dims == *dims {
+            return Ok(());
+        }
+        let mut affected: BTreeSet<usize> = BTreeSet::new();
+        for (symbol, nodes) in &self.deps {
+            if self.last_dims.get(symbol) != dims.get(symbol) {
+                affected.extend(nodes.iter().copied());
+            }
+        }
+        for &index in &affected {
+            match &mut self.actions[index] {
+                Action::Copy {
+                    size,
+                    other_size,
+                    bytes,
+                    ..
+                } => {
+                    let next = size.eval(dims)?;
+                    if let Some(other) = other_size {
+                        ensure!(next == other.eval(dims)?, "dynamic copy length mismatch");
+                    }
+                    if *bytes != next {
+                        *bytes = next;
+                        stats.node_updates += 1;
+                    }
+                }
+                Action::Kernel {
+                    geometry: Some(spec),
+                    launch,
+                    ..
+                } => {
+                    let next = Launch::eval(spec, dims)?;
+                    if *launch != next {
+                        *launch = next;
+                        stats.node_updates += 1;
+                    }
+                }
+                Action::Kernel { .. } | Action::Host(_) => {}
+            }
+        }
+        for output in &mut self.outputs {
+            output.bytes = output.size.eval(dims)?;
+            output.resolved.layout = symbolic::resolve_layout(&output.slot.layout, dims)?;
+        }
+        self.last_dims = dims.clone();
+        Ok(())
+    }
+
+    fn rebind_addresses_direct(
+        &mut self,
+        plan: &CudaPlan,
+        storage: &ArenaPlan,
+        dims: &DynMap,
+        base: u64,
+        external: &ExternalBuffers,
+        stats: &mut GraphStats,
+    ) -> Result<()> {
+        for action in &mut self.actions {
+            match action {
+                Action::Copy {
+                    src,
+                    dst,
+                    src_ref,
+                    dst_ref,
+                    ..
+                } => {
+                    *src = resolve(src_ref, plan, storage, base, external, dims)?;
+                    *dst = resolve(dst_ref, plan, storage, base, external, dims)?;
+                }
+                Action::Kernel { args, refs, .. } => {
+                    for (arg, address) in args.iter_mut().zip(refs.iter()) {
+                        *arg = resolve(address, plan, storage, base, external, dims)?;
+                    }
+                }
+                Action::Host(_) => {}
+            }
+            stats.address_rebinds += 1;
+        }
+        self.base = base;
+        self.external = external.clone();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_direct(
+        &mut self,
+        plan: &CudaPlan,
+        storage: &ArenaPlan,
+        dims: &DynMap,
+        base: u64,
+        external: &ExternalBuffers,
+        staging: &mut Pinned,
+        mut capture_parameters: Option<(&mut Pinned, ArenaSlice)>,
+        stream: &Arc<CudaStream>,
+        stats: &mut GraphStats,
+    ) -> Result<Outputs> {
+        let capturing = stream.capture_status().is_ok_and(|status| {
+            status == cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        });
+        let captured_parameter_ptr = capture_parameters
+            .as_ref()
+            .map(|(buffer, range)| range.ptr(buffer));
+        let parameter_bytes = capture_parameters.as_mut().map_or_else(
+            || self.params.bytes_mut(staging),
+            |(buffer, range)| range.bytes_mut(buffer),
+        );
+        for (index, symbol) in self.schema.iter().enumerate() {
+            parameter_bytes[index * 8..index * 8 + 8]
+                .copy_from_slice(&i64::try_from(dims[symbol])?.to_ne_bytes());
+        }
+        ensure!(
+            self.inputs.is_empty(),
+            "direct CUDA execution requires device-bound inputs"
+        );
+        ensure!(
+            self.outputs.is_empty(),
+            "direct CUDA execution requires device-bound outputs"
+        );
+
+        for (action_index, action) in self.actions.iter_mut().enumerate() {
+            match action {
+                Action::Copy {
+                    src,
+                    dst,
+                    kind,
+                    bytes,
+                    ..
+                } if *bytes != 0 => unsafe {
+                    match kind {
+                        CopyKind::HtoD => {
+                            // Action zero is the dimension-parameter upload
+                            // installed by `compile`. During an outer capture,
+                            // record it from this capture's immutable pinned
+                            // allocation rather than shared staging.
+                            let source_ptr = if action_index == 0 {
+                                captured_parameter_ptr.unwrap_or(*src)
+                            } else {
+                                *src
+                            };
+                            let source =
+                                std::slice::from_raw_parts(source_ptr as *const u8, *bytes);
+                            result::memcpy_htod_async(*dst, source, stream.cu_stream())
+                                .context("direct HtoD copy")?;
+                        }
+                        CopyKind::DtoH => {
+                            let destination =
+                                std::slice::from_raw_parts_mut(*dst as *mut u8, *bytes);
+                            result::memcpy_dtoh_async(destination, *src, stream.cu_stream())
+                                .context("direct DtoH copy")?;
+                        }
+                        CopyKind::DtoD => {
+                            result::memcpy_dtod_async(*dst, *src, *bytes, stream.cu_stream())
+                                .context("direct DtoD copy")?;
+                        }
+                    }
+                },
+                Action::Copy { .. } => {}
+                Action::Kernel {
+                    func, args, launch, ..
+                } if launch.enabled() => {
+                    let mut pointers: Vec<_> = args
+                        .iter_mut()
+                        .map(|argument| (argument as *mut u64).cast())
+                        .collect();
+                    unsafe {
+                        result::launch_kernel(
+                            *func,
+                            (launch.grid[0], launch.grid[1], launch.grid[2]),
+                            (launch.block[0], launch.block[1], launch.block[2]),
+                            launch.shared,
+                            stream.cu_stream(),
+                            &mut pointers,
+                        )
+                        .context("direct kernel launch")?;
+                    }
+                }
+                Action::Kernel { .. } => {}
+                Action::Host(host_node) => {
+                    let BufferNode::Compute {
+                        op,
+                        reads,
+                        writes,
+                        operand_info,
+                        result_info,
+                        ..
+                    } = &plan.dag[host_node.source]
+                    else {
+                        unreachable!()
+                    };
+                    let host = crate::as_host_op(op.as_ref()).unwrap();
+                    let inputs = reads[..reads.len() - writes.len()]
+                        .iter()
+                        .map(|id| range(plan, storage, id, base, external, dims))
+                        .collect::<Result<Vec<_>>>()?;
+                    let workspace = storage
+                        .workspaces
+                        .get(&host_node.source)
+                        .copied()
+                        .unwrap_or_default();
+                    let context = HostOpContext {
+                        stream,
+                        inputs: &inputs,
+                        dest: range(plan, storage, &writes[0], base, external, dims)?,
+                        workspace: DeviceRange {
+                            ptr: base + workspace.offset as u64,
+                            bytes: workspace.bytes,
+                        },
+                        dims,
+                        operand_info: &resolve_slots(operand_info, dims)?,
+                        result_info: &resolve_slots(result_info, dims)?,
+                    };
+                    let prepared = unsafe { host.prepare(&context) }
+                        .with_context(|| format!("prepare {}", op.label()))?;
+                    unsafe { prepared.record(&CaptureCtx { stream }) }
+                        .with_context(|| format!("record {}", op.label()))?;
+                    if capturing {
+                        self.captured_resources.push(prepared);
+                    }
+                }
+            }
+        }
+        stats.launches += 1;
+        Ok(FxHashMap::default())
     }
     /// Re-resolve every address against the current arena base and caller
     /// pointers, rewrite the kernel and copy nodes in place, and re-record

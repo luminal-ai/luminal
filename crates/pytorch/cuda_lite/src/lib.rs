@@ -27,11 +27,11 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
-use luminal::prelude::{DType, DimBucket, DynMap, IntExpr, NodeIndex, Symbol};
+use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
-/// Largest value a dynamic dimension's bucket covers (the searched plan stays
-/// symbolic inside it, so one compile serves every covered context length).
-const MAX_DYNAMIC_DIM: usize = 4096;
+/// Search envelope for a symbol whose PT2 program supplies no upper bound.
+const UNBOUNDED_DYNAMIC_DIM_MAX: usize = 4096;
+const DYNAMIC_BUCKET_POLICY: &str = "pt2-upper-bound-or-4096-v1";
 use luminal_cuda_lite::bindings::{BoundaryLayout, CudaBindings};
 use luminal_cuda_lite::{
     CompileOptions, CudaRuntime, HostBuffer, SearchedPlanTemplate, harness_search_options,
@@ -342,6 +342,13 @@ impl CompiledGraph {
         self.runtime.use_owned_stream();
     }
 
+    /// Enqueue Luminal's prepared operations directly on the borrowed stream
+    /// so an enclosing runtime (for example vLLM) owns CUDA graph capture.
+    #[cfg(feature = "device")]
+    fn set_external_cuda_graph(&mut self, enabled: bool) {
+        self.runtime.set_external_cuda_graph(enabled);
+    }
+
     /// Override a dynamic dimension's value before `search`, by PT2 symbol
     /// name (e.g. `"s77"`). The value becomes the dim's bucket
     /// representative, so it steers the searched plan without narrowing the
@@ -541,8 +548,9 @@ impl CompiledGraph {
             // whose dims fall in the bucket re-renders without re-searching.
             let hints: Vec<(Symbol, usize)> = self.dims.iter().map(|(s, v)| (*s, *v)).collect();
             for (symbol, hint) in hints {
-                let representative = hint.clamp(1, MAX_DYNAMIC_DIM);
-                let bucket = DimBucket::new(1, MAX_DYNAMIC_DIM).representative(representative);
+                let bucket = self
+                    .translation
+                    .dim_bucket(symbol, hint, UNBOUNDED_DYNAMIC_DIM_MAX);
                 self.runtime.bind_dim_buckets(symbol, vec![bucket])?;
             }
         }
@@ -921,7 +929,7 @@ fn search_configuration(generations: Option<usize>) -> String {
         options.generations = generations;
     }
     format!(
-        "generations={};generation_size={};mutations={};trials={};seed={};candidate_timeout_ns={:?};keep_finalists={};device_budget_bytes={:?};max_intermediate_bytes={:?};serialized_graph_passes={}",
+        "generations={};generation_size={};mutations={};trials={};seed={};candidate_timeout_ns={:?};keep_finalists={};device_budget_bytes={:?};max_intermediate_bytes={:?};serialized_graph_passes={};dynamic_bucket_policy={}",
         options.generations,
         options.generation_size,
         options.mutations,
@@ -932,6 +940,7 @@ fn search_configuration(generations: Option<usize>) -> String {
         options.device_budget_bytes,
         options.max_intermediate_bytes,
         options.serialized_graph_passes.len(),
+        DYNAMIC_BUCKET_POLICY,
     )
 }
 
@@ -988,6 +997,7 @@ mod tests {
             outputs,
             dims: std::collections::HashMap::new(),
             symbols: std::collections::HashMap::new(),
+            dim_maxima: std::collections::HashMap::new(),
         }
     }
 
@@ -1063,6 +1073,7 @@ mod tests {
             }],
             dims: HashMap::new(),
             symbols: HashMap::new(),
+            dim_maxima: HashMap::new(),
         }
     }
 
@@ -1505,6 +1516,7 @@ mod tests {
             }],
             dims: HashMap::new(),
             symbols: HashMap::new(),
+            dim_maxima: HashMap::new(),
         };
         let layouts: HashMap<String, DeclaredLayout> = [(
             "x".to_string(),

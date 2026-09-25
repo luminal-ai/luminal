@@ -12,18 +12,23 @@ feature (the packaged wheel always is; a bare ``cargo build`` is not).
 import sys
 import types
 
-from ._luminal import PlanTemplate, compile as _compile
+from ._luminal import PlanTemplate, search_configuration
+from ._luminal import compile as _compile
+from .arena_pool import arena_pool_stats, clear_arena_pool
 from .backend import CompiledModel, luminal_cuda_lite, register_backend
 from .plan_cache import cache_stats, clear_plan_cache
 
 __all__ = [
     "CompiledModel",
+    "PlanTemplate",
+    "arena_pool_stats",
+    "cache_stats",
+    "clear_arena_pool",
+    "clear_plan_cache",
+    "compile",
     "luminal_cuda_lite",
     "register_backend",
-    "compile",
-    "cache_stats",
-    "clear_plan_cache",
-    "PlanTemplate",
+    "search_configuration",
 ]
 
 # Register the backend string form (`backend="luminal_cuda_lite"`) on import.

@@ -90,6 +90,23 @@ pub struct Translation {
     pub dims: HashMap<Symbol, usize>,
     /// PT2 symbol name -> recorder dim symbol, for runtime `set_dim` by name.
     pub symbols: HashMap<String, Symbol>,
+    /// Recorder dim symbol -> PT2's inclusive upper bound. Symbols without an
+    /// exported maximum are absent and use the frontend's unbounded fallback.
+    pub dim_maxima: HashMap<Symbol, usize>,
+}
+
+impl Translation {
+    /// The one search bucket for a dynamic dimension. PT2's upper constraint
+    /// is authoritative when present; a genuinely unbounded symbol uses the
+    /// frontend fallback, widened to include its export-time hint.
+    pub fn dim_bucket(&self, symbol: Symbol, hint: usize, unbounded_maximum: usize) -> DimBucket {
+        let maximum = self
+            .dim_maxima
+            .get(&symbol)
+            .copied()
+            .unwrap_or(unbounded_maximum.max(hint));
+        DimBucket::new(1, maximum).representative(hint.clamp(1, maximum))
+    }
 }
 
 /// The dtypes a torch op performs its math in: tensor operands meet at
@@ -336,13 +353,40 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
 
     let outputs = regular;
 
+    let dim_maxima = translated_dim_maxima(&t.symbols, &t.ranges)?;
+
     Ok(Translation {
         graph: t.cx,
         inputs,
         outputs,
         dims: t.dims,
         symbols: t.symbols,
+        dim_maxima,
     })
+}
+
+fn translated_dim_maxima(
+    symbols: &HashMap<String, Symbol>,
+    ranges: &HashMap<String, RangeConstraint>,
+) -> Result<HashMap<Symbol, usize>> {
+    symbols
+        .iter()
+        .filter_map(|(name, symbol)| {
+            ranges
+                .get(name)
+                .and_then(|range| range.max_val)
+                .map(|maximum| (*symbol, name, maximum))
+        })
+        .map(|(symbol, name, maximum)| {
+            let maximum = usize::try_from(maximum).with_context(|| {
+                format!("dynamic dimension {name:?} has invalid maximum {maximum}")
+            })?;
+            if maximum == 0 {
+                bail!("dynamic dimension {name:?} has invalid maximum 0");
+            }
+            Ok((symbol, maximum))
+        })
+        .collect()
 }
 
 fn dtype_of(code: u32) -> Result<DType> {
@@ -1527,7 +1571,27 @@ mod dim_expr_tests {
                 .iter()
                 .map(|name| ((*name).to_string(), Symbol::new(*name)))
                 .collect(),
+            dim_maxima: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn exported_upper_bound_controls_the_runtime_bucket() {
+        let symbol = Symbol::new("s26");
+        let symbols = HashMap::from([("s26".to_string(), symbol)]);
+        let ranges = HashMap::from([(
+            "s26".to_string(),
+            RangeConstraint {
+                min_val: Some(2),
+                max_val: Some(8192),
+            },
+        )]);
+        let maxima = translated_dim_maxima(&symbols, &ranges).unwrap();
+        let mut translation = translation(&["s26"]);
+        translation.dim_maxima = maxima;
+
+        let bucket = translation.dim_bucket(symbol, 2, 4096);
+        assert_eq!((bucket.min, bucket.max), (1, 8192));
     }
 
     #[test]

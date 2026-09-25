@@ -9,11 +9,10 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
-use luminal::prelude::{DType, DimBucket, DynMap, IntExpr, NodeIndex, Symbol};
+use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
-/// Largest value a dynamic dimension's bucket covers (the searched plan stays
-/// symbolic inside it, so one compile serves every covered context length).
-const MAX_DYNAMIC_DIM: usize = 4096;
+/// Search envelope for a symbol whose PT2 program supplies no upper bound.
+const UNBOUNDED_DYNAMIC_DIM_MAX: usize = 4096;
 use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
 use luminal_reference::{CompileOptions, ReferenceBindings, ReferenceRuntime, TypedBuffer};
 use pyo3::exceptions::PyRuntimeError;
@@ -317,8 +316,9 @@ impl CompiledGraph {
             // whose dims fall in the bucket re-renders without re-searching.
             let hints: Vec<(Symbol, usize)> = self.dims.iter().map(|(s, v)| (*s, *v)).collect();
             for (symbol, hint) in hints {
-                let representative = hint.clamp(1, MAX_DYNAMIC_DIM);
-                let bucket = DimBucket::new(1, MAX_DYNAMIC_DIM).representative(representative);
+                let bucket = self
+                    .translation
+                    .dim_bucket(symbol, hint, UNBOUNDED_DYNAMIC_DIM_MAX);
                 self.runtime
                     .bind_dim_buckets(symbol, vec![bucket])
                     .map_err(to_py)?;

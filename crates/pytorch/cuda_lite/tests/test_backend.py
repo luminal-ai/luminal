@@ -203,6 +203,163 @@ def test_transposed_input_binds_zero_copy():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_external_cuda_graph_is_captured_and_replayed_by_pytorch():
+    """The embedding path contributes raw launches to the caller's graph.
+
+    Capture uses different allocations from warmup, matching vLLM's capture
+    buffers, and replay observes new contents without re-entering Python.
+    """
+
+    def fn(left, right):
+        return left + right
+
+    held = []
+
+    def backend(gm, example_inputs, **kwargs):
+        model = luminal_cuda_lite(
+            gm,
+            example_inputs,
+            external_cuda_graph=True,
+            **kwargs,
+        )
+        held.append(model)
+        return model
+
+    compiled = torch.compile(fn, backend=backend)
+    warm_left = torch.ones((2, 4), device="cuda")
+    warm_right = torch.full_like(warm_left, 2)
+    torch.testing.assert_close(compiled(warm_left, warm_right), warm_left + warm_right)
+    torch.cuda.synchronize()
+
+    capture_left = torch.full_like(warm_left, 3)
+    capture_right = torch.full_like(warm_left, 4)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = compiled(capture_left, capture_right)
+
+    capture_left.fill_(5)
+    capture_right.fill_(6)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, torch.full_like(actual, 11))
+    assert held
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_external_cuda_graph_captures_cublaslt_region():
+    """Prepared library calls are recorded into the owner's graph too."""
+
+    def fn(left, right):
+        return left @ right
+
+    def backend(gm, example_inputs, **kwargs):
+        return luminal_cuda_lite(
+            gm,
+            example_inputs,
+            external_cuda_graph=True,
+            **kwargs,
+        )
+
+    compiled = torch.compile(fn, backend=backend)
+    left = torch.randn((16, 16), device="cuda")
+    right = torch.randn((16, 16), device="cuda")
+    compiled(left, right)
+    torch.cuda.synchronize()
+
+    capture_left = torch.randn_like(left)
+    capture_right = torch.randn_like(right)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = compiled(capture_left, capture_right)
+
+    capture_left.copy_(torch.randn_like(capture_left))
+    capture_right.copy_(torch.randn_like(capture_right))
+    expected = capture_left @ capture_right
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_external_cuda_graph_replays_chain_of_compiled_regions():
+    """An embedding graph may contain several independently compiled regions.
+
+    Their capture resources and shared scratch storage must remain valid after
+    capture-time Python temporaries have been released.
+    """
+
+    def backend(gm, example_inputs, **kwargs):
+        return luminal_cuda_lite(
+            gm,
+            example_inputs,
+            external_cuda_graph=True,
+            **kwargs,
+        )
+
+    regions = []
+    for _ in range(8):
+        def region(x, weight):
+            return torch.relu(x @ weight)
+
+        regions.append(torch.compile(region, backend=backend))
+
+    value = torch.randn((128, 128), device="cuda")
+    weights = [torch.randn_like(value) for _ in regions]
+    warm = value
+    for region, weight in zip(regions, weights):
+        warm = region(warm, weight)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = value
+        for region, weight in zip(regions, weights):
+            actual = region(actual, weight)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_external_cuda_graph_replays_earlier_dynamic_capture():
+    """Later shape captures must not invalidate an earlier captured bucket."""
+
+    def fn(x, weight):
+        return torch.relu(x @ weight)
+
+    def backend(gm, example_inputs, **kwargs):
+        return luminal_cuda_lite(
+            gm,
+            example_inputs,
+            external_cuda_graph=True,
+            **kwargs,
+        )
+
+    compiled = torch.compile(fn, backend=backend, dynamic=True)
+    weight = torch.randn((128, 128), device="cuda")
+    small = torch.randn((32, 128), device="cuda")
+    large = torch.randn((64, 128), device="cuda")
+    compiled(small, weight)
+    compiled(large, weight)
+    torch.cuda.synchronize()
+
+    small_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(small_graph):
+        small_output = compiled(small, weight)
+
+    large_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(large_graph):
+        compiled(large, weight)
+
+    small_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(small_output, fn(small, weight))
+
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_output_is_returned_at_eagers_strides():
     """A user-visible output is bound at the strides EAGER gives it and
     allocated at them, so the tensor the caller receives is laid out the way

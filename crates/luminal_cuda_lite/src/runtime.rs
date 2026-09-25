@@ -134,6 +134,10 @@ pub struct CudaRuntime {
     /// a stream this runtime owns.
     #[cfg(feature = "device")]
     borrowed_stream: Option<u64>,
+    /// Enqueue individual operations instead of launching Luminal's private
+    /// graph. The embedding runtime owns capture and completion ordering.
+    #[cfg(feature = "device")]
+    external_cuda_graph: bool,
 }
 
 impl CudaRuntime {
@@ -1019,6 +1023,13 @@ impl CudaRuntime {
         self.borrowed_stream = None;
     }
 
+    /// Select the capture-safe embedding path. The caller must also provide a
+    /// borrowed stream; execution is asynchronous and never host-synchronizes.
+    #[cfg(feature = "device")]
+    pub fn set_external_cuda_graph(&mut self, enabled: bool) {
+        self.external_cuda_graph = enabled;
+    }
+
     /// Bind a caller-allocated arena for subsequent executions. Called once
     /// per execution when the arena is allocated and freed per call;
     /// `clear_arena` reverts to the owned slab.
@@ -1204,12 +1215,16 @@ impl CudaRuntime {
                 // The borrowed stream is rebound every execution because
                 // the caller's current stream is thread-local and may change.
                 if let Some(raw) = self.borrowed_stream {
-                    device.use_borrowed_stream(raw)?;
+                    device
+                        .use_borrowed_stream(raw)
+                        .context("bind caller CUDA stream")?;
                 } else if device.stream_is_borrowed() {
                     device.use_owned_stream()?;
                 }
                 if let Some((ptr, bytes)) = self.external_arena {
-                    device.set_external_arena(ptr, bytes)?;
+                    device
+                        .set_external_arena(ptr, bytes)
+                        .context("bind caller CUDA arena")?;
                 } else {
                     device.clear_external_arena();
                 }
@@ -1239,7 +1254,13 @@ impl CudaRuntime {
                     )
                 })
                 .collect();
-            let outputs = device.execute_external(bucket, &staged, &self.dims, &external)?;
+            let outputs = if self.external_cuda_graph {
+                device
+                    .execute_external_direct(bucket, &staged, &self.dims, &external)
+                    .context("execute external CUDA graph path")?
+            } else {
+                device.execute_external(bucket, &staged, &self.dims, &external)?
+            };
             self.outputs_host = outputs;
             // Zero-copy inputs are not staged, so nothing to clear; host-staged
             // residents are kept for the (owned-slab) reuse path.
