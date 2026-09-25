@@ -2,9 +2,10 @@
 
 transformers' StaticLayer.update mutates the cache tensors (and its
 cumulative_length counter) in place; torch.export functionalizes those
-mutations into extra outputs declared by the graph signature. CompiledModel
-applies them back to the caller's tensors and returns only the user outputs,
-matching eager semantics and torch.compile's calling contract.
+mutations into extra outputs declared by the graph signature. The CUDA
+boundary aliases those outputs to their input buffers; CompiledModel consumes
+the mutation-only outputs and returns only user outputs, matching eager
+semantics and torch.compile's calling contract.
 """
 
 import torch
