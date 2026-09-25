@@ -8,7 +8,9 @@ from luminal_reference import _torch_version as _torch_version
 
 # Validate PyTorch before importing the native extension.
 # isort: split
-from ._luminal import PlanTemplate, compile as _compile
+from ._luminal import PlanTemplate, search_configuration
+from ._luminal import compile as _compile
+from .arena_pool import arena_pool_stats, clear_arena_pool
 from .backend import CompiledModel, luminal_cuda_lite, register_backend
 from .compiler import Compiler
 from .plan_cache import cache_stats, clear_plan_cache
@@ -16,12 +18,15 @@ from .plan_cache import cache_stats, clear_plan_cache
 __all__ = [
     "Compiler",
     "CompiledModel",
+    "PlanTemplate",
+    "arena_pool_stats",
+    "cache_stats",
+    "clear_arena_pool",
+    "clear_plan_cache",
+    "compile",
     "luminal_cuda_lite",
     "register_backend",
-    "compile",
-    "cache_stats",
-    "clear_plan_cache",
-    "PlanTemplate",
+    "search_configuration",
 ]
 
 # Register the backend string form (`backend="luminal_cuda_lite"`) on import.
@@ -39,4 +44,3 @@ def compile(*args, **kwargs):
     mutates.
     """
     return _compile(*args, **kwargs)
-

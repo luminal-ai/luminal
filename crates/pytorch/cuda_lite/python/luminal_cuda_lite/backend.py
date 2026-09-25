@@ -29,16 +29,12 @@ storage offset is non-zero among them, is refused by name. Aliasing has
 one spelling: two bindings naming one buffer id, which is how a writeback
 and the input it mutates share a pointer.
 
-STREAM AND ARENA: the runtime always launches captured CUDA graphs, which
-the legacy default stream cannot host, so it runs on a dedicated
-``torch.cuda.Stream`` borrowed through ``use_borrowed_stream`` and ordered
-against the caller's stream with ``side.wait_stream(caller)`` before the
-launch and ``caller.wait_stream(side)`` after. The intermediate-scratch
-arena is PyTorch's, not the runtime's: ``arena_bytes()`` is the searched
-plan set's requirement, the wrapper ``caching_allocator_alloc``s exactly
-that against the side stream, binds it with ``set_arena``, and
-``caching_allocator_delete``s it right after ``execute`` — so PyTorch
-accounts for the bytes and can reuse the block on the next call.
+STREAM AND ARENA: standalone execution launches Luminal's graph on a side
+stream. Embedding runtimes select ``external_cuda_graph`` instead: Luminal
+enqueues the prepared operations directly on the caller's current stream so
+the caller owns capture and completion ordering. The intermediate-scratch
+arena is PyTorch's, not the runtime's. It grows to the largest searched-plan
+requirement observed during warmup and then retains a capture-stable address.
 """
 
 import concurrent.futures
@@ -76,6 +72,7 @@ from .boundary import (
     layout_spec,
     storage_span,
 )
+from .arena_pool import acquire_arena
 from .artifacts import artifact_path, load_artifact, save_artifact
 from .plan_cache import get_or_create, structural_fingerprint
 
@@ -385,6 +382,7 @@ class CompiledModel:
         held_tensors: dict[str, torch.Tensor] | None = None,
         held_bindings: Sequence[Binding] = (),
         output_aliases: dict[str, tuple[str, int]] | None = None,
+        external_cuda_graph: bool = False,
     ):
         self._graph = graph
         # Output name -> (the boundary tensor whose storage it is a view of,
@@ -404,11 +402,13 @@ class CompiledModel:
         # program that still passes every guard.
         self._held: dict[str, torch.Tensor] = dict(held_tensors or {})
         self._held_bindings = list(held_bindings)
-        # Fixed once a plan set is searched; the per-execution arena sizes to it.
+        # Fixed once a plan set is searched; the device/lane high-water pool
+        # grows to it once and every later execution reuses that allocation.
         self._arena_bytes = graph.arena_bytes()
-        # The runtime always launches captured CUDA graphs, which the legacy
-        # default stream cannot host, so it runs on a dedicated side stream
-        # ordered against the caller's stream with events.
+        self._external_cuda_graph = external_cuda_graph
+        self._graph.set_external_cuda_graph(external_cuda_graph)
+        # Standalone execution launches Luminal's graph on a dedicated side
+        # stream. The embedding path uses the caller's current stream instead.
         self._side_stream: torch.cuda.Stream | None = None
         self._region_execution_state = {}
         self._output_mutations = graph.output_mutations
@@ -507,7 +507,9 @@ class CompiledModel:
                     f"{device} and {value.device}"
                 )
         stream = torch.cuda.current_stream(device)
-        if getattr(self, "_region_current", False):
+        if self._external_cuda_graph or getattr(self, "_region_current", False):
+            # The embedding runtime owns ordering and CUDA graph capture. All
+            # Luminal work must therefore be visible on its current stream.
             side = stream
         else:
             if self._side_stream is None:
@@ -638,20 +640,18 @@ class CompiledModel:
         if side != stream:
             side.wait_stream(stream)
 
-        # Per-execution intermediate arena from PyTorch's caching allocator,
-        # associated with the stream that uses it.
-        arena_bytes = max(self._arena_bytes, 1)
-        if static:
-            if self._region_arena is None:
-                self._region_arena = torch.empty(
-                    arena_bytes, dtype=torch.uint8, device=device
-                )
-            self._region_arena.record_stream(side)
-            arena = self._region_arena.data_ptr()
-        else:
-            arena = torch.cuda.caching_allocator_alloc(arena_bytes, device, side)
+        # Every compiled region on this caller execution lane shares one
+        # PyTorch-owned, grow-only arena. `record_stream` in the pool makes
+        # raw-pointer use visible to the caching allocator.
+        arena = acquire_arena(
+            self._arena_bytes,
+            device,
+            stream,
+            side,
+            device_wide=self._external_cuda_graph,
+        )
         self._graph.use_borrowed_stream(side.cuda_stream)
-        self._graph.set_arena(arena, arena_bytes)
+        self._graph.set_arena(arena.data_ptr(), arena.numel())
         # EVERY CHECK IS BEHIND US: the addresses go in here and come out in
         # `finally`, so no refusal of this call can leave one standing.
         per_call: list[int] = []
@@ -691,8 +691,6 @@ class CompiledModel:
                 self._graph.execute()
             self._region_execution_state["last"] = execution_key
         finally:
-            if not static:
-                torch.cuda.caching_allocator_delete(arena)
             # These addresses belong to this call only: forget them, so an
             # execute that skipped a binding refuses by name instead of
             # reading storage the caller has released.
@@ -775,7 +773,7 @@ def _same_layout_on_shape(
 def _dynamic_export(
     gm: torch.fx.GraphModule,
     example_inputs: Sequence[Any],
-    dynamic_range: Optional[tuple[int, int]] = None,
+    dynamic_range: tuple[int, int] | None = None,
 ) -> Any:
     """Export a Dynamo GraphModule, preserving its symbolic dimensions.
 
@@ -919,6 +917,7 @@ def _compile_graph(
     artifact_dir: str | None = None,
     artifact_prefix: str = "",
     disable_cache: bool = False,
+    external_cuda_graph: bool = False,
 ) -> CompiledModel:
     """The torch.compile backend entry point."""
     if options:
@@ -932,6 +931,9 @@ def _compile_graph(
         artifact_dir = options.get("artifact_dir", artifact_dir)
         artifact_prefix = options.get("artifact_prefix", artifact_prefix)
         disable_cache = options.get("disable_cache", disable_cache)
+        external_cuda_graph = options.get(
+            "external_cuda_graph", external_cuda_graph
+        )
 
     # HF DynamicCache must be pytree-registered before torch.export capture so
     # use_cache=True models can export. Idempotent.
@@ -1204,6 +1206,7 @@ def compile_exported(
         held,
         held_bindings,
         aliases,
+        external_cuda_graph=external_cuda_graph,
     )
     compiled.plan_fingerprint = plan_key
     compiled.plan_cache_hit = cache_hit or artifact_loaded
