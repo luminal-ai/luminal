@@ -4,7 +4,7 @@ use clap::Parser;
 use llm_chat::{
     backend::cuda::CudaBackend,
     checkpoint,
-    graph::{LlmGraph, ModelConfig, ModelType},
+    graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
     sampling::Sampler,
     session::Session,
     tokenizer::{ChatTokenizer, Message},
@@ -92,18 +92,19 @@ fn main() -> Result<()> {
         "input length differs"
     );
     let capacity = args.input_tokens + args.output_tokens;
-    let graph = LlmGraph::build(
+    let graph = LlmGraph::build_with_parameter_dtype(
         ModelConfig::from_checkpoint(args.model, &config)?,
+        checkpoint_dtype(&config)?,
         capacity,
         args.prefill_chunk,
     )?;
     let weight_bytes: usize = graph
         .parameters
         .iter()
-        .map(|p| p.shape.iter().product::<usize>() * 4)
+        .map(|p| p.shape.iter().product::<usize>() * p.dtype.bits().div_ceil(8))
         .sum();
     eprintln!(
-        "Loading {} tensors ({weight_bytes} FP32 bytes)",
+        "Loading {} tensors ({weight_bytes} native-precision bytes)",
         graph.parameters.len()
     );
     let weights = checkpoint::load(&args.checkpoint, &graph.parameters)?;
@@ -249,7 +250,9 @@ fn main() -> Result<()> {
         checkpoint::read_json(&args.checkpoint.join("BENCH_SOURCE.json")).ok();
     let report = json!({
         "model": format!("{:?}", args.model), "checkpoint": args.checkpoint,
-        "source": source, "backend": "cuda_lite", "dtype": "F32", "batch_size": 1,
+        "source": source, "backend": "cuda_lite",
+        "parameter_dtype": format!("{:?}", checkpoint_dtype(&config)?), "compute_dtype": "F32",
+        "batch_size": 1,
         "input_tokens": args.input_tokens, "output_tokens": args.output_tokens,
         "max_context": capacity, "prefill_chunk": args.prefill_chunk,
         "search_generations": args.search_generations, "search_population": args.search_population,
@@ -257,7 +260,7 @@ fn main() -> Result<()> {
         "seed": 0, "temperature": 0, "thinking": false, "ignore_eos": true,
         "warmups": 1, "repetitions": args.repetitions,
         "load_seconds": load_seconds, "compile_seconds": compile_seconds,
-        "fp32_weight_bytes": weight_bytes, "user_prompt": user_prompt, "prompt_tokens": prompt_ids,
+        "native_weight_bytes": weight_bytes, "user_prompt": user_prompt, "prompt_tokens": prompt_ids,
         "measurement": "Host wall clock through the real Session::generate callback, including chat tokenization, input staging, synchronized logits readback, sampling and stream decoding. Excludes initial loading/compiler search, reset allocation and terminal I/O. Session ingests each sampled token before emitting it, so TTFT includes one decode step. Warm requests reset KV state; resident-cache reset uploads remain inside the timed execution. TPOT=(last emission-first emission)/(output tokens-1).",
         "median_ttft_ms": med("ttft_ms"), "median_tpot_ms": med("tpot_ms"),
         "median_decode_tokens_per_second": med("decode_tokens_per_second"),

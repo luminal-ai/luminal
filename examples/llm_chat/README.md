@@ -30,9 +30,10 @@ The checkpoint directory must contain:
 
 Use a local, immutable checkpoint snapshot while loading. The example does not
 download weights, execute remote model code, or supply replacement weights.
-It reads F32, F16, and BF16 checkpoints into the zoo's F32 parameter tensors.
-Weights, KV caches, and intermediate tensors therefore require F32 memory,
-regardless of checkpoint dtype. Quantized/FP8 checkpoints are unsupported.
+It reads F32, F16, and BF16 checkpoints and keeps parameter inputs in the
+native `torch_dtype` declared by `config.json`. The chat adapter inserts
+explicit FP32 compute casts, keeps KV state and RoPE inputs in FP32, and reads
+FP32 logits for sampling. Quantized/FP8 checkpoints are unsupported.
 
 ## Model selection
 

@@ -5,8 +5,11 @@ use crate::{
     graph::{LlmGraph, StateBinding},
 };
 use anyhow::Result;
-use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::*;
+use luminal::{
+    dtype::PlanDtype,
+    layout_ir::{Access, FreedBy},
+};
 use luminal_metal::{
     CompileOptions, HostBuffer, MetalRuntime, bindings::MetalBindings, metal_registry,
 };
@@ -107,8 +110,10 @@ impl MetalBackend {
     /// home, which is the storage the KV outputs have been mutating.
     pub fn reset(&mut self) -> Result<()> {
         for state in &self.state {
-            self.runtime
-                .set_data(state.input, vec![0f32; state.elements]);
+            self.runtime.set_data(
+                state.input,
+                host(TensorData::zeros(state.dtype, state.elements)?),
+            );
         }
         Ok(())
     }
@@ -116,8 +121,17 @@ impl MetalBackend {
 fn host(value: TensorData) -> HostBuffer {
     match value {
         TensorData::F32(v) => v.into(),
+        TensorData::BF16(v) => HostBuffer {
+            dtype: PlanDtype::Bf16,
+            bytes: u16_bytes(&v),
+        },
+        TensorData::F16(v) => HostBuffer::new(PlanDtype::F16, u16_bytes(&v)).unwrap(),
         TensorData::I32(v) => v.into(),
     }
+}
+
+fn u16_bytes(values: &[u16]) -> Vec<u8> {
+    values.iter().flat_map(|x| x.to_ne_bytes()).collect()
 }
 
 impl super::Backend for MetalBackend {

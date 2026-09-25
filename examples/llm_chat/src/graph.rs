@@ -1,6 +1,6 @@
 //! Application-owned adapters around the zoo's logical model APIs.
 use crate::{Inputs, TensorData, checkpoint::Parameter};
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use clap::ValueEnum;
 use luminal::prelude::*;
 use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};
@@ -28,6 +28,20 @@ pub enum ModelConfig {
     Qwen3Moe(Qwen3MoeDims),
 }
 
+pub fn checkpoint_dtype(root: &Value) -> Result<DType> {
+    let config = root.get("text_config").unwrap_or(root);
+    let name = config["torch_dtype"]
+        .as_str()
+        .or_else(|| root["torch_dtype"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("config.json: missing torch_dtype"))?;
+    match name {
+        "bfloat16" | "bf16" => Ok(DType::Bf16),
+        "float16" | "half" | "fp16" => Ok(DType::F16),
+        "float32" | "float" | "fp32" => Ok(DType::F32),
+        _ => bail!("config.json: unsupported torch_dtype {name}"),
+    }
+}
+
 fn number(config: &Value, key: &str) -> Result<usize> {
     let n = config[key]
         .as_u64()
@@ -53,6 +67,7 @@ fn equal(config: &Value, key: &str, expected: usize) -> Result<()> {
 
 impl ModelConfig {
     pub fn from_checkpoint(kind: ModelType, root: &Value) -> Result<Self> {
+        checkpoint_dtype(root)?;
         let config = root.get("text_config").unwrap_or(root);
         let expected = match kind {
             ModelType::Llama3 => "llama",
@@ -251,6 +266,7 @@ pub struct StateBinding {
     pub input: NodeIndex,
     pub output: NodeIndex,
     pub elements: usize,
+    pub dtype: DType,
 }
 struct RopeInputs {
     cos: GraphTensor,
@@ -259,6 +275,7 @@ struct RopeInputs {
     width: usize,
     theta: f32,
     scale: f32,
+    dtype: DType,
 }
 impl RopeInputs {
     fn new(
@@ -267,14 +284,16 @@ impl RopeInputs {
         theta: f32,
         scale: f32,
         rotation: Option<GraphTensor>,
+        dtype: DType,
     ) -> Self {
         Self {
-            cos: cx.tensor(('q', width), DType::F32),
-            sin: cx.tensor(('q', width), DType::F32),
-            rot: rotation.unwrap_or_else(|| cx.tensor((width, width), DType::F32)),
+            cos: cx.tensor(('q', width), dtype),
+            sin: cx.tensor(('q', width), dtype),
+            rot: rotation.unwrap_or_else(|| cx.tensor((width, width), dtype)),
             width,
             theta,
             scale,
+            dtype,
         }
     }
 }
@@ -297,6 +316,19 @@ pub struct LlmGraph {
 }
 impl LlmGraph {
     pub fn build(config: ModelConfig, capacity: usize, chunk_size: usize) -> Result<Self> {
+        Self::build_with_parameter_dtype(config, DType::F32, capacity, chunk_size)
+    }
+
+    pub fn build_with_parameter_dtype(
+        config: ModelConfig,
+        weight_dtype: DType,
+        capacity: usize,
+        chunk_size: usize,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(weight_dtype, DType::F32 | DType::F16 | DType::Bf16),
+            "chat supports F32, F16, and BF16 model precision"
+        );
         ensure!(
             capacity > 0
                 && capacity <= i32::MAX as usize
@@ -339,7 +371,14 @@ impl LlmGraph {
         let mut ropes: Vec<RopeInputs> = vec![];
         for (width, theta, scale) in roles {
             let rotation = ropes.iter().find(|r| r.width == width).map(|r| r.rot);
-            ropes.push(RopeInputs::new(&mut cx, width, theta, scale, rotation));
+            ropes.push(RopeInputs::new(
+                &mut cx,
+                width,
+                theta,
+                scale,
+                rotation,
+                DType::F32,
+            ));
         }
         let pool = named_heterogeneous_kv_cache_pool(
             &mut cx,
@@ -350,34 +389,39 @@ impl LlmGraph {
         );
         let r = &ropes[0];
         let (logits, caches) = match config {
-            ModelConfig::Llama3(d) => Llama3::init(&mut cx, &d).forward(
-                tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
-            ),
-            ModelConfig::Qwen3(d) => Qwen::init(&mut cx, &d).forward(
-                tokens,
-                positions,
-                r.cos,
-                r.sin,
-                r.rot,
-                &pool.layers,
-                gather,
-                scatter,
-            ),
-            ModelConfig::Gemma3(d) => Gemma3::init(&mut cx, &d).forward(
-                tokens,
-                positions,
-                (r.cos, r.sin),
-                (ropes[1].cos, ropes[1].sin),
-                r.rot,
-                &pool,
-                gather,
-                scatter,
-            ),
-            ModelConfig::Qwen3Moe(d) => Qwen3Moe::init(&mut cx, &d).forward(
-                tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
-            ),
+            ModelConfig::Llama3(d) => Llama3::init_with_parameter_dtype(&mut cx, &d, weight_dtype)
+                .forward(
+                    tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
+                ),
+            ModelConfig::Qwen3(d) => Qwen::init_with_parameter_dtype(&mut cx, &d, weight_dtype)
+                .forward(
+                    tokens,
+                    positions,
+                    r.cos,
+                    r.sin,
+                    r.rot,
+                    &pool.layers,
+                    gather,
+                    scatter,
+                ),
+            ModelConfig::Gemma3(d) => Gemma3::init_with_parameter_dtype(&mut cx, &d, weight_dtype)
+                .forward(
+                    tokens,
+                    positions,
+                    (r.cos, r.sin),
+                    (ropes[1].cos, ropes[1].sin),
+                    r.rot,
+                    &pool,
+                    gather,
+                    scatter,
+                ),
+            ModelConfig::Qwen3Moe(d) => {
+                Qwen3Moe::init_with_parameter_dtype(&mut cx, &d, weight_dtype).forward(
+                    tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
+                )
+            }
         };
-        let logits = luminal_nn::gather_rows(logits, last).id;
+        let logits = luminal_nn::gather_rows(logits, last).cast(DType::F32).id;
         let state: Vec<_> = pool
             .layers
             .iter()
@@ -389,11 +433,13 @@ impl LlmGraph {
                         input: ki.id,
                         output: ko.id,
                         elements: capacity * w,
+                        dtype: DType::F32,
                     },
                     StateBinding {
                         input: vi.id,
                         output: vo.id,
                         elements: capacity * w,
+                        dtype: DType::F32,
                     },
                 ]
             })
@@ -452,11 +498,16 @@ impl LlmGraph {
     pub fn initial_inputs(&self) -> Inputs {
         let mut out = Inputs::default();
         for s in &self.state {
-            out.insert(s.input, TensorData::F32(vec![0.; s.elements]));
+            out.insert(
+                s.input,
+                TensorData::zeros(s.dtype, s.elements).expect("validated chat dtype"),
+            );
         }
         for r in &self.ropes {
-            out.entry(r.rot.id)
-                .or_insert_with(|| TensorData::F32(rope_pairing_matrix(r.width, false)));
+            out.entry(r.rot.id).or_insert_with(|| {
+                TensorData::from_f32(r.dtype, rope_pairing_matrix(r.width, false))
+                    .expect("validated chat dtype")
+            });
         }
         out
     }
@@ -490,8 +541,8 @@ impl LlmGraph {
         let positions: Vec<f32> = (offset..end).map(|p| p as f32).collect();
         for r in &self.ropes {
             let (cos, sin) = rope_tables_split_half(&positions, r.width, r.theta, r.scale);
-            out.insert(r.cos.id, TensorData::F32(cos));
-            out.insert(r.sin.id, TensorData::F32(sin));
+            out.insert(r.cos.id, TensorData::from_f32(r.dtype, cos)?);
+            out.insert(r.sin.id, TensorData::from_f32(r.dtype, sin)?);
         }
         Ok(out)
     }
@@ -530,6 +581,25 @@ mod tests {
             assert!(graph.step_inputs(&[1, 2], 7).is_err());
         }
     }
+
+    #[test]
+    fn native_weight_storage_keeps_explicit_f32_compute_inputs() {
+        let graph = LlmGraph::build_with_parameter_dtype(
+            ModelConfig::Qwen3(QwenDims::tiny()),
+            DType::Bf16,
+            8,
+            2,
+        )
+        .unwrap();
+        assert!(graph.parameters.iter().all(|p| p.dtype == DType::Bf16));
+        assert!(graph.state.iter().all(|s| s.dtype == DType::F32));
+        assert!(
+            graph
+                .initial_inputs()
+                .values()
+                .all(|value| matches!(value, TensorData::F32(_)))
+        );
+    }
     #[test]
     fn incompatible_checkpoint_architecture_is_rejected_before_loading() {
         let config = serde_json::json!({"model_type":"llama","hidden_size":16,"num_attention_heads":4,"num_key_value_heads":2,"vocab_size":29,"num_hidden_layers":2,"hidden_act":"silu","intermediate_size":24,"rope_theta":10000.,"rms_norm_eps":1e-5,"rope_scaling":{"factor":8.}});
@@ -539,7 +609,7 @@ mod tests {
 
     #[test]
     fn gemma_checkpoint_uses_its_default_tied_embeddings_and_rejects_untied() {
-        let mut root = serde_json::json!({"model_type":"gemma3", "text_config": {
+        let mut root = serde_json::json!({"model_type":"gemma3", "torch_dtype":"bfloat16", "text_config": {
             "model_type":"gemma3_text", "hidden_size":2560, "vocab_size":262208,
             "num_hidden_layers":34, "intermediate_size":10240,
             "num_attention_heads":8, "num_key_value_heads":4, "head_dim":256,

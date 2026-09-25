@@ -80,26 +80,26 @@ pub struct Qwen3MoeFfn {
 }
 
 impl Qwen3MoeFfn {
-    fn new(mlp: &Namespace, d: &Qwen3MoeDims, cx: &mut Graph) -> Self {
+    fn new(mlp: &Namespace, d: &Qwen3MoeDims, dtype: DType, cx: &mut Graph) -> Self {
         let experts = mlp.child("experts");
         Self {
-            router: Linear::new(
+            router: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.experts,
                 false,
-                DType::F32,
+                dtype,
                 &mlp.child("gate"),
                 cx,
             ),
             gate_up: cx.named_tensor(
                 experts.leaf("gate_up_proj"),
                 (d.experts, 2 * d.moe_intermediate, d.hidden),
-                DType::F32,
+                dtype,
             ),
             down: cx.named_tensor(
                 experts.leaf("down_proj"),
                 (d.experts, d.hidden, d.moe_intermediate),
-                DType::F32,
+                dtype,
             ),
             top_k: d.top_k,
             intermediate: d.moe_intermediate,
@@ -111,7 +111,7 @@ impl Qwen3MoeFfn {
         let expert_ids = probabilities.topk_indexes(self.top_k, 1);
         let routes = TopKRoutes::from_scores(probabilities, expert_ids).normalize();
 
-        let gate_up = routes.select(self.gate_up);
+        let gate_up = routes.select(self.gate_up).cast(DType::F32);
         let projected = routes
             .dispatch(input)
             .expand_dim(2, 1)
@@ -121,7 +121,7 @@ impl Qwen3MoeFfn {
         let up = projected.slice_along(self.intermediate.., 2);
         let hidden_states = gate.silu() * up;
 
-        let down = routes.select(self.down);
+        let down = routes.select(self.down).cast(DType::F32);
         let routed_output = hidden_states
             .expand_dim(2, 1)
             .matmul(down.permute((0, 1, 3, 2)))
@@ -146,66 +146,70 @@ pub struct Qwen3MoeBlock {
 }
 
 impl Qwen3MoeBlock {
-    fn new(l: usize, d: &Qwen3MoeDims, cx: &mut Graph) -> Self {
+    fn new(l: usize, d: &Qwen3MoeDims, dtype: DType, cx: &mut Graph) -> Self {
         let ns = Namespace::root().child("model").child("layers").index(l);
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         Self {
-            attn_norm: LayerNorm::new(
+            attn_norm: LayerNorm::new_with_storage_dtype(
                 d.hidden,
                 true,
                 false,
                 false,
                 d.rms_eps,
-                DType::F32,
+                dtype,
                 &ns.child("input_layernorm"),
                 cx,
             ),
-            wq: Linear::new(
+            wq: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.q_dim(),
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("q_proj"),
                 cx,
             ),
-            wk: Linear::new(
+            wk: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.kv_dim(),
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("k_proj"),
                 cx,
             ),
-            wv: Linear::new(
+            wv: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.kv_dim(),
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("v_proj"),
                 cx,
             ),
-            wo: Linear::new(
+            wo: Linear::new_with_storage_dtype(
                 d.q_dim(),
                 d.hidden,
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("o_proj"),
                 cx,
             ),
-            q_norm: cx.named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, DType::F32),
-            k_norm: cx.named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, DType::F32),
-            ffn_norm: LayerNorm::new(
+            q_norm: cx
+                .named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, dtype)
+                .cast(DType::F32),
+            k_norm: cx
+                .named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, dtype)
+                .cast(DType::F32),
+            ffn_norm: LayerNorm::new_with_storage_dtype(
                 d.hidden,
                 true,
                 false,
                 false,
                 d.rms_eps,
-                DType::F32,
+                dtype,
                 &ns.child("post_attention_layernorm"),
                 cx,
             ),
-            moe: Qwen3MoeFfn::new(&mlp, d, cx),
+            moe: Qwen3MoeFfn::new(&mlp, d, dtype, cx),
             n_heads: d.n_heads,
             n_kv_heads: d.n_kv_heads,
             head_dim: d.head_dim,
@@ -267,34 +271,38 @@ pub struct Qwen3Moe {
 
 impl Qwen3Moe {
     pub fn init(cx: &mut Graph, dims: &Qwen3MoeDims) -> Self {
+        Self::init_with_parameter_dtype(cx, dims, DType::F32)
+    }
+
+    pub fn init_with_parameter_dtype(cx: &mut Graph, dims: &Qwen3MoeDims, dtype: DType) -> Self {
         let blocks = (0..dims.layers)
-            .map(|l| Qwen3MoeBlock::new(l, dims, cx))
+            .map(|l| Qwen3MoeBlock::new(l, dims, dtype, cx))
             .collect();
         Self {
             dims: dims.clone(),
-            embed: Embedding::new(
+            embed: Embedding::new_with_storage_dtype(
                 dims.vocab,
                 dims.hidden,
-                DType::F32,
+                dtype,
                 &Namespace::root().child("model").child("embed_tokens"),
                 cx,
             ),
             blocks,
-            final_norm: LayerNorm::new(
+            final_norm: LayerNorm::new_with_storage_dtype(
                 dims.hidden,
                 true,
                 false,
                 false,
                 dims.rms_eps,
-                DType::F32,
+                dtype,
                 &Namespace::root().child("model").child("norm"),
                 cx,
             ),
-            lm_head: Linear::new(
+            lm_head: Linear::new_with_storage_dtype(
                 dims.hidden,
                 dims.vocab,
                 false,
-                DType::F32,
+                dtype,
                 &Namespace::root().child("lm_head"),
                 cx,
             ),

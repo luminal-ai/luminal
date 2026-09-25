@@ -2,7 +2,7 @@
 //! resolved graph bindings and never inspect checkpoint names.
 use crate::{Inputs, TensorData, graph::ModelType};
 use anyhow::{Context, Result, bail, ensure};
-use luminal::{graph::InputSpec, prelude::NodeIndex};
+use luminal::{dtype::DType, graph::InputSpec, prelude::NodeIndex};
 use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde_json::Value;
@@ -18,13 +18,15 @@ pub struct Parameter {
     pub namespace: String,
     pub checkpoint_name: String,
     pub shape: Vec<usize>,
+    pub dtype: DType,
     pub transpose: bool,
 }
 impl Parameter {
     pub fn from_namespace(_model: ModelType, input: &InputSpec) -> Result<Self> {
         ensure!(
-            input.dtype == luminal::dtype::DType::F32,
-            "the chat adapter expects F32 parameter {}",
+            matches!(input.dtype, DType::F32 | DType::F16 | DType::Bf16),
+            "the chat adapter does not support {:?} parameter {}",
+            input.dtype,
             input.label
         );
         let namespace = input.label.clone();
@@ -63,6 +65,7 @@ impl Parameter {
             checkpoint_name: namespace.clone(),
             namespace,
             shape,
+            dtype: input.dtype,
             transpose,
         })
     }
@@ -80,35 +83,9 @@ impl Parameter {
             tensor.shape(),
             expected
         );
-        let values = match tensor.dtype() {
-            Dtype::F32 => tensor
-                .data()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes(*b))
-                .collect::<Vec<_>>(),
-            Dtype::F16 => tensor
-                .data()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| half::f16::from_bits(u16::from_le_bytes(*b)).to_f32())
-                .collect(),
-            Dtype::BF16 => tensor
-                .data()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| half::bf16::from_bits(u16::from_le_bytes(*b)).to_f32())
-                .collect(),
-            dtype => bail!(
-                "{}: checkpoint dtype {dtype:?} is unsupported by this F32 model adapter",
-                self.checkpoint_name
-            ),
-        };
+        let values = decode_f32(&self.checkpoint_name, tensor)?;
         if !self.transpose {
-            return Ok(TensorData::F32(values));
+            return TensorData::from_f32(self.dtype, values);
         }
         let (rows, cols) = (expected[0], expected[1]);
         let mut transposed = vec![0.; values.len()];
@@ -117,8 +94,37 @@ impl Parameter {
                 transposed[c * rows + r] = values[r * cols + c];
             }
         }
-        Ok(TensorData::F32(transposed))
+        TensorData::from_f32(self.dtype, transposed)
     }
+}
+
+fn decode_f32(name: &str, tensor: &TensorView<'_>) -> Result<Vec<f32>> {
+    Ok(match tensor.dtype() {
+        Dtype::F32 => tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect(),
+        Dtype::F16 => tensor
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::f16::from_bits(u16::from_le_bytes(*b)).to_f32())
+            .collect(),
+        Dtype::BF16 => tensor
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_bits(u16::from_le_bytes(*b)).to_f32())
+            .collect(),
+        dtype => {
+            bail!("{name}: checkpoint dtype {dtype:?} is unsupported by this chat adapter")
+        }
+    })
 }
 
 pub fn read_json(path: &Path) -> Result<Value> {
@@ -159,14 +165,21 @@ pub fn load(directory: &Path, parameters: &[Parameter]) -> Result<Inputs> {
             .collect()
     };
     let mut shards: BTreeMap<&str, Vec<&Parameter>> = BTreeMap::new();
+    let mut split_expert_banks = Vec::new();
     for p in parameters {
-        let shard = index.get(&p.checkpoint_name).ok_or_else(|| {
-            anyhow::anyhow!(
+        let Some(shard) = index.get(&p.checkpoint_name) else {
+            if p.namespace.ends_with(".experts.gate_up_proj")
+                || p.namespace.ends_with(".experts.down_proj")
+            {
+                split_expert_banks.push(p);
+                continue;
+            }
+            bail!(
                 "checkpoint index has no {} (model {})",
                 p.checkpoint_name,
                 p.namespace
-            )
-        })?;
+            );
+        };
         ensure!(
             Path::new(shard)
                 .components()
@@ -190,7 +203,84 @@ pub fn load(directory: &Path, parameters: &[Parameter]) -> Result<Inputs> {
             inputs.insert(p.input, p.decode(&tensor)?);
         }
     }
+    for p in split_expert_banks {
+        inputs.insert(p.input, load_split_expert_bank(directory, &index, p)?);
+    }
     Ok(inputs)
+}
+
+/// Stack Qwen's per-expert checkpoint matrices into the rank-3 banks used by
+/// the logical model. This is a layout conversion only; expert and row order
+/// are preserved exactly.
+fn load_split_expert_bank(
+    directory: &Path,
+    index: &BTreeMap<String, String>,
+    parameter: &Parameter,
+) -> Result<TensorData> {
+    ensure!(parameter.shape.len() == 3, "expert bank must be rank 3");
+    let experts = parameter.shape[0];
+    let gate_up = parameter.namespace.ends_with(".experts.gate_up_proj");
+    let suffix = if gate_up { "gate_up_proj" } else { "down_proj" };
+    let prefix = parameter
+        .checkpoint_name
+        .strip_suffix(suffix)
+        .ok_or_else(|| anyhow::anyhow!("invalid expert bank name {}", parameter.checkpoint_name))?;
+    let kinds: &[&str] = if gate_up {
+        &["gate_proj.weight", "up_proj.weight"]
+    } else {
+        &["down_proj.weight"]
+    };
+    let rows_per_part = if gate_up {
+        parameter.shape[1] / 2
+    } else {
+        parameter.shape[1]
+    };
+    ensure!(
+        !gate_up || parameter.shape[1].is_multiple_of(2),
+        "gate/up bank rows must be even"
+    );
+    let cols = parameter.shape[2];
+    let part_elements = rows_per_part * cols;
+    let expert_elements = parameter.shape[1] * cols;
+    let mut requests: BTreeMap<&str, Vec<(String, usize)>> = BTreeMap::new();
+    for expert in 0..experts {
+        for (part, kind) in kinds.iter().enumerate() {
+            let name = format!("{prefix}{expert}.{kind}");
+            let shard = index.get(&name).ok_or_else(|| {
+                anyhow::anyhow!("checkpoint index has no {name} for {}", parameter.namespace)
+            })?;
+            ensure!(
+                Path::new(shard)
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_))),
+                "invalid checkpoint shard path {shard}"
+            );
+            requests
+                .entry(shard)
+                .or_default()
+                .push((name, expert * expert_elements + part * part_elements));
+        }
+    }
+    let mut values = vec![0.; experts * expert_elements];
+    for (shard, tensors_in_shard) in requests {
+        let path = directory.join(shard);
+        let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        // SAFETY: see the ordinary shard loader above.
+        let mapped = unsafe { MmapOptions::new().map(&file)? };
+        let tensors = SafeTensors::deserialize(&mapped).with_context(|| format!("read {shard}"))?;
+        for (name, offset) in tensors_in_shard {
+            let tensor = tensors.tensor(&name).with_context(|| name.clone())?;
+            ensure!(
+                tensor.shape() == [rows_per_part, cols],
+                "{name}: checkpoint shape {:?}, expected {:?}",
+                tensor.shape(),
+                [rows_per_part, cols]
+            );
+            let part = decode_f32(&name, &tensor)?;
+            values[offset..offset + part_elements].copy_from_slice(&part);
+        }
+    }
+    TensorData::from_f32(parameter.dtype, values)
 }
 
 #[cfg(test)]
@@ -202,6 +292,7 @@ mod tests {
             namespace: "model.proj.weight".into(),
             checkpoint_name: "checkpoint.w".into(),
             shape: vec![2, 3],
+            dtype: DType::F32,
             transpose,
         }
     }
@@ -225,12 +316,38 @@ mod tests {
         assert_eq!(values, vec![1., 3., 5., 2., 4., 6.]);
         assert!(param(false).decode(&view).is_err());
         assert!(apply_name_map(&mut parameters, &[("x".into(), "unknown".into())].into()).is_err());
+
+        let mut native = param(false);
+        native.dtype = DType::Bf16;
+        let f32_bytes: Vec<_> = [1f32, 2., 3., 4., 5., 6.]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let view = TensorView::new(Dtype::F32, vec![2, 3], &f32_bytes).unwrap();
+        let TensorData::BF16(values) = native.decode(&view).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            values,
+            (1..=6)
+                .map(|x| half::bf16::from_f32(x as f32).to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 }
 
 #[cfg(test)]
 mod shard_tests {
     use super::*;
+    fn f32_view(shape: Vec<usize>, values: &[f32]) -> TensorView<'static> {
+        let bytes = values
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<_>>()
+            .leak();
+        TensorView::new(Dtype::F32, shape, bytes).unwrap()
+    }
+
     #[test]
     fn indexed_shards_load_through_application_name_mapping() {
         let dir = tempfile::tempdir().unwrap();
@@ -257,6 +374,7 @@ mod shard_tests {
                 namespace: "model.proj.weight".into(),
                 checkpoint_name: "model.proj.weight".into(),
                 shape: vec![2, 3],
+                dtype: DType::F32,
                 transpose: true,
             },
             Parameter {
@@ -264,6 +382,7 @@ mod shard_tests {
                 namespace: "model.embed_tokens.weight".into(),
                 checkpoint_name: "model.embed_tokens.weight".into(),
                 shape: vec![2, 3],
+                dtype: DType::F32,
                 transpose: false,
             },
         ];
@@ -287,5 +406,77 @@ mod shard_tests {
         assert_eq!(embed, &[1., 2., 3., 4., 5., 6.]);
         parameters[0].checkpoint_name = "missing".into();
         assert!(load(dir.path(), &parameters).is_err());
+    }
+
+    #[test]
+    fn split_qwen_experts_are_stacked_in_expert_gate_up_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = [
+            (
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+                f32_view(vec![2, 3], &[1., 2., 3., 4., 5., 6.]),
+            ),
+            (
+                "model.layers.0.mlp.experts.0.up_proj.weight",
+                f32_view(vec![2, 3], &[7., 8., 9., 10., 11., 12.]),
+            ),
+            (
+                "model.layers.0.mlp.experts.1.gate_proj.weight",
+                f32_view(vec![2, 3], &[13., 14., 15., 16., 17., 18.]),
+            ),
+            (
+                "model.layers.0.mlp.experts.1.up_proj.weight",
+                f32_view(vec![2, 3], &[19., 20., 21., 22., 23., 24.]),
+            ),
+            (
+                "model.layers.0.mlp.experts.0.down_proj.weight",
+                f32_view(vec![3, 2], &[25., 26., 27., 28., 29., 30.]),
+            ),
+            (
+                "model.layers.0.mlp.experts.1.down_proj.weight",
+                f32_view(vec![3, 2], &[31., 32., 33., 34., 35., 36.]),
+            ),
+        ];
+        let weight_map = tensors
+            .iter()
+            .map(|(name, _)| (*name, "experts.safetensors"))
+            .collect::<BTreeMap<_, _>>();
+        std::fs::write(
+            dir.path().join("experts.safetensors"),
+            safetensors::serialize(tensors, None).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map": weight_map}).to_string(),
+        )
+        .unwrap();
+        let parameters = [
+            Parameter {
+                input: NodeIndex::new(1),
+                namespace: "model.layers.0.mlp.experts.gate_up_proj".into(),
+                checkpoint_name: "model.layers.0.mlp.experts.gate_up_proj".into(),
+                shape: vec![2, 4, 3],
+                dtype: DType::F32,
+                transpose: false,
+            },
+            Parameter {
+                input: NodeIndex::new(2),
+                namespace: "model.layers.0.mlp.experts.down_proj".into(),
+                checkpoint_name: "model.layers.0.mlp.experts.down_proj".into(),
+                shape: vec![2, 3, 2],
+                dtype: DType::F32,
+                transpose: false,
+            },
+        ];
+        let loaded = load(dir.path(), &parameters).unwrap();
+        let TensorData::F32(gate_up) = &loaded[&NodeIndex::new(1)] else {
+            panic!()
+        };
+        let TensorData::F32(down) = &loaded[&NodeIndex::new(2)] else {
+            panic!()
+        };
+        assert_eq!(gate_up, &(1..=24).map(|x| x as f32).collect::<Vec<_>>());
+        assert_eq!(down, &(25..=36).map(|x| x as f32).collect::<Vec<_>>());
     }
 }

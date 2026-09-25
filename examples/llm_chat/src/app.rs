@@ -2,7 +2,7 @@
 use crate::{
     backend::{CompileOptions, GpuBackend},
     checkpoint,
-    graph::{LlmGraph, ModelConfig, ModelType},
+    graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
     sampling::Sampler,
     session::Session,
     tokenizer::{ChatTokenizer, Message},
@@ -81,8 +81,10 @@ fn run(args: Args) -> Result<()> {
         );
     }
     let model = ModelConfig::from_checkpoint(args.model, &config)?;
+    let dtype = checkpoint_dtype(&config)?;
     let tokenizer = ChatTokenizer::load(&args.checkpoint, &config)?;
-    let mut graph = LlmGraph::build(model, args.max_context, args.prefill_chunk)?;
+    let mut graph =
+        LlmGraph::build_with_parameter_dtype(model, dtype, args.max_context, args.prefill_chunk)?;
     ensure!(
         tokenizer
             .tokenizer

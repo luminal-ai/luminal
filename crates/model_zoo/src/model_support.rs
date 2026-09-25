@@ -68,8 +68,27 @@ impl Linear {
         }
     }
 
+    pub fn new_with_storage_dtype(
+        inp: usize,
+        out: usize,
+        bias: bool,
+        storage_dtype: DType,
+        ns: &Namespace,
+        cx: &mut Graph,
+    ) -> Self {
+        Self::new(inp, out, bias, storage_dtype, ns, cx).cast_parameters(DType::F32)
+    }
+
     pub fn forward(&self, input: GraphTensor) -> GraphTensor {
         luminal_nn::linear(input, self.weight, self.bias)
+    }
+
+    /// Keep the named parameter inputs in their checkpoint storage dtype while
+    /// making the model's arithmetic precision explicit in the logical graph.
+    pub fn cast_parameters(mut self, dtype: DType) -> Self {
+        self.weight = self.weight.cast(dtype);
+        self.bias = self.bias.map(|bias| bias.cast(dtype));
+        self
     }
 }
 
@@ -91,12 +110,27 @@ impl Embedding {
         }
     }
 
+    pub fn new_with_storage_dtype(
+        n_embeddings: usize,
+        embedding_dim: usize,
+        storage_dtype: DType,
+        ns: &Namespace,
+        cx: &mut Graph,
+    ) -> Self {
+        Self::new(n_embeddings, embedding_dim, storage_dtype, ns, cx).cast_parameters(DType::F32)
+    }
+
     pub fn forward(&self, input: GraphTensor) -> GraphTensor {
         luminal_nn::embedding(input, self.weight)
     }
 
     pub fn reverse(&self, input: GraphTensor) -> GraphTensor {
         luminal_nn::embedding_projection(input, self.weight)
+    }
+
+    pub fn cast_parameters(mut self, dtype: DType) -> Self {
+        self.weight = self.weight.cast(dtype);
+        self
     }
 }
 
@@ -130,8 +164,29 @@ impl LayerNorm {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_storage_dtype(
+        dim: usize,
+        weight: bool,
+        bias: bool,
+        mean_norm: bool,
+        epsilon: f32,
+        storage_dtype: DType,
+        ns: &Namespace,
+        cx: &mut Graph,
+    ) -> Self {
+        Self::new(dim, weight, bias, mean_norm, epsilon, storage_dtype, ns, cx)
+            .cast_parameters(DType::F32)
+    }
+
     pub fn with_unit_offset(mut self) -> Self {
         self.unit_offset = true;
+        self
+    }
+
+    pub fn cast_parameters(mut self, dtype: DType) -> Self {
+        self.weight = self.weight.map(|weight| weight.cast(dtype));
+        self.bias = self.bias.map(|bias| bias.cast(dtype));
         self
     }
 

@@ -4,7 +4,7 @@ use clap::Parser;
 use llm_chat::{
     backend::cuda::CudaBackend,
     checkpoint,
-    graph::{LlmGraph, ModelConfig, ModelType},
+    graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
     sampling::Sampler,
     tokenizer::{ChatTokenizer, Message},
 };
@@ -178,6 +178,7 @@ fn main() -> Result<()> {
     );
     let config = checkpoint::read_json(&args.checkpoint.join("config.json"))?;
     let model = ModelConfig::from_checkpoint(args.model, &config)?;
+    let dtype = checkpoint_dtype(&config)?;
     let suite: Option<Suite> = args
         .suite
         .as_ref()
@@ -186,7 +187,7 @@ fn main() -> Result<()> {
     let capacity = suite.as_ref().map_or(128, |s| s.max_context);
     // A reference suite can intentionally use a smaller context.
     let prefill_chunk = args.prefill_chunk.min(capacity);
-    let graph = LlmGraph::build(model, capacity, prefill_chunk)?;
+    let graph = LlmGraph::build_with_parameter_dtype(model, dtype, capacity, prefill_chunk)?;
     if args.inspect {
         let index = checkpoint::read_json(&args.checkpoint.join("model.safetensors.index.json"))?;
         let names = index["weight_map"]

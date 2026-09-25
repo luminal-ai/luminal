@@ -1,12 +1,10 @@
 //! Qwen3 as PURE LOGICAL OPS (conversion directive 2026-08-10; this
 //! crate is the zoo's exemplar): the model is authored entirely through
 //! luminal_nn constructs on the native recorder — no residency markers,
-//! no HLIR, no backend types, no in-graph dtype juggling. Weight-ness is
-//! not authored (a weight is an ordinary named input; storage residency
-//! is runtime-binding business), and the reference runtime computes in
-//! f32, so the checkpoint's bf16 is a HOST staging concern (see
-//! `weights.rs`). Numeric-precision policy (bf16 matmuls, f32 norms)
-//! returns with the backend re-seat as binding/runtime configuration.
+//! no HLIR and no backend types. Weight-ness is not authored (a weight is
+//! an ordinary named input; storage residency is runtime-binding business).
+//! `init_with_parameter_dtype` can keep those inputs in checkpoint-native storage while
+//! explicit casts preserve this model's FP32 arithmetic semantics.
 //!
 //! RoPE is the concat-free pairing-matrix spelling ([`luminal_nn::rotary_apply`])
 //! with host-precomputed tables — the rejoin-divergence workaround — and
@@ -160,26 +158,32 @@ pub struct Qwen {
 
 impl Qwen {
     pub fn init(cx: &mut Graph, dims: &QwenDims) -> Self {
-        let blocks = (0..dims.layers).map(|l| Self::block(l, dims, cx)).collect();
+        Self::init_with_parameter_dtype(cx, dims, DType::F32)
+    }
+
+    pub fn init_with_parameter_dtype(cx: &mut Graph, dims: &QwenDims, dtype: DType) -> Self {
+        let blocks = (0..dims.layers)
+            .map(|l| Self::block(l, dims, dtype, cx))
+            .collect();
         Self {
             dims: dims.clone(),
             // HF stores embed_tokens as (vocab, hidden) — the natural
             // Embedding orientation; `reverse` is the tied lm head.
-            embed: Embedding::new(
+            embed: Embedding::new_with_storage_dtype(
                 dims.vocab,
                 dims.hidden,
-                DType::F32,
+                dtype,
                 &Namespace::root().child("model").child("embed_tokens"),
                 cx,
             ),
             blocks,
-            final_norm: LayerNorm::new(
+            final_norm: LayerNorm::new_with_storage_dtype(
                 dims.hidden,
                 true,
                 false,
                 false,
                 dims.rms_eps,
-                DType::F32,
+                dtype,
                 &Namespace::root().child("model").child("norm"),
                 cx,
             ),
@@ -189,86 +193,90 @@ impl Qwen {
     /// Qwen3 uses decoupled head dimensions and learned norm weights.
     /// `Linear::new` records Luminal's canonical
     /// (in, out) orientation; checkpoint staging transposes HF weights.
-    fn block(l: usize, d: &QwenDims, cx: &mut Graph) -> QwenLayer {
+    fn block(l: usize, d: &QwenDims, dtype: DType, cx: &mut Graph) -> QwenLayer {
         let ns = Namespace::root().child("model").child("layers").index(l);
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         QwenLayer {
-            attn_norm: LayerNorm::new(
+            attn_norm: LayerNorm::new_with_storage_dtype(
                 d.hidden,
                 true,
                 false,
                 false,
                 d.rms_eps,
-                DType::F32,
+                dtype,
                 &ns.child("input_layernorm"),
                 cx,
             ),
-            wq: Linear::new(
+            wq: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.q_dim(),
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("q_proj"),
                 cx,
             ),
-            wk: Linear::new(
+            wk: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.kv_dim(),
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("k_proj"),
                 cx,
             ),
-            wv: Linear::new(
+            wv: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.kv_dim(),
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("v_proj"),
                 cx,
             ),
-            wo: Linear::new(
+            wo: Linear::new_with_storage_dtype(
                 d.q_dim(),
                 d.hidden,
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("o_proj"),
                 cx,
             ),
-            q_norm: cx.named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, DType::F32),
-            k_norm: cx.named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, DType::F32),
-            ffn_norm: LayerNorm::new(
+            q_norm: cx
+                .named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, dtype)
+                .cast(DType::F32),
+            k_norm: cx
+                .named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, dtype)
+                .cast(DType::F32),
+            ffn_norm: LayerNorm::new_with_storage_dtype(
                 d.hidden,
                 true,
                 false,
                 false,
                 d.rms_eps,
-                DType::F32,
+                dtype,
                 &ns.child("post_attention_layernorm"),
                 cx,
             ),
-            gate: Linear::new(
+            gate: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.intermediate,
                 false,
-                DType::F32,
+                dtype,
                 &mlp.child("gate_proj"),
                 cx,
             ),
-            up: Linear::new(
+            up: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.intermediate,
                 false,
-                DType::F32,
+                dtype,
                 &mlp.child("up_proj"),
                 cx,
             ),
-            down: Linear::new(
+            down: Linear::new_with_storage_dtype(
                 d.intermediate,
                 d.hidden,
                 false,
-                DType::F32,
+                dtype,
                 &mlp.child("down_proj"),
                 cx,
             ),

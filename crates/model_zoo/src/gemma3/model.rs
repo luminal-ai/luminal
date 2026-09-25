@@ -170,25 +170,31 @@ pub struct Gemma3 {
 
 impl Gemma3 {
     pub fn init(cx: &mut Graph, dims: &Gemma3Dims) -> Self {
+        Self::init_with_parameter_dtype(cx, dims, DType::F32)
+    }
+
+    pub fn init_with_parameter_dtype(cx: &mut Graph, dims: &Gemma3Dims, dtype: DType) -> Self {
         let text = Namespace::root().child("language_model").child("model");
-        let blocks = (0..dims.layers).map(|l| Self::block(l, dims, cx)).collect();
+        let blocks = (0..dims.layers)
+            .map(|l| Self::block(l, dims, dtype, cx))
+            .collect();
         Self {
             dims: dims.clone(),
-            embed: Embedding::new(
+            embed: Embedding::new_with_storage_dtype(
                 dims.vocab,
                 dims.hidden,
-                DType::F32,
+                dtype,
                 &text.child("embed_tokens"),
                 cx,
             ),
             blocks,
-            final_norm: LayerNorm::new(
+            final_norm: LayerNorm::new_with_storage_dtype(
                 dims.hidden,
                 true,
                 false,
                 false,
                 dims.rms_eps,
-                DType::F32,
+                dtype,
                 &text.child("norm"),
                 cx,
             )
@@ -196,7 +202,7 @@ impl Gemma3 {
         }
     }
 
-    fn block(l: usize, d: &Gemma3Dims, cx: &mut Graph) -> Gemma3Layer {
+    fn block(l: usize, d: &Gemma3Dims, dtype: DType, cx: &mut Graph) -> Gemma3Layer {
         let local = d.is_local(l);
         let ns = Namespace::root()
             .child("language_model")
@@ -206,69 +212,75 @@ impl Gemma3 {
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         let rms = |ns: &Namespace, cx: &mut Graph| {
-            LayerNorm::new(d.hidden, true, false, false, d.rms_eps, DType::F32, ns, cx)
-                .with_unit_offset()
+            LayerNorm::new_with_storage_dtype(
+                d.hidden, true, false, false, d.rms_eps, dtype, ns, cx,
+            )
+            .with_unit_offset()
         };
         Gemma3Layer {
             input_norm: rms(&ns.child("input_layernorm"), cx),
             post_attn_norm: rms(&ns.child("post_attention_layernorm"), cx),
             pre_ff_norm: rms(&ns.child("pre_feedforward_layernorm"), cx),
             post_ff_norm: rms(&ns.child("post_feedforward_layernorm"), cx),
-            wq: Linear::new(
+            wq: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.n_heads * d.head_dim,
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("q_proj"),
                 cx,
             ),
-            wk: Linear::new(
+            wk: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.kv_dim(),
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("k_proj"),
                 cx,
             ),
-            wv: Linear::new(
+            wv: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.kv_dim(),
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("v_proj"),
                 cx,
             ),
-            wo: Linear::new(
+            wo: Linear::new_with_storage_dtype(
                 d.n_heads * d.head_dim,
                 d.hidden,
                 false,
-                DType::F32,
+                dtype,
                 &attn.child("o_proj"),
                 cx,
             ),
-            q_norm: cx.named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, DType::F32),
-            k_norm: cx.named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, DType::F32),
-            gate: Linear::new(
+            q_norm: cx
+                .named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, dtype)
+                .cast(DType::F32),
+            k_norm: cx
+                .named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, dtype)
+                .cast(DType::F32),
+            gate: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.intermediate,
                 false,
-                DType::F32,
+                dtype,
                 &mlp.child("gate_proj"),
                 cx,
             ),
-            up: Linear::new(
+            up: Linear::new_with_storage_dtype(
                 d.hidden,
                 d.intermediate,
                 false,
-                DType::F32,
+                dtype,
                 &mlp.child("up_proj"),
                 cx,
             ),
-            down: Linear::new(
+            down: Linear::new_with_storage_dtype(
                 d.intermediate,
                 d.hidden,
                 false,
-                DType::F32,
+                dtype,
                 &mlp.child("down_proj"),
                 cx,
             ),

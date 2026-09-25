@@ -5,10 +5,10 @@ use llm_chat::{
     TensorData,
     backend::cuda::bindings,
     checkpoint,
-    graph::{LlmGraph, ModelConfig, ModelType},
+    graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
 };
-use luminal::{bufferize::BufferNode, prelude::FxHashMap};
-use luminal_cuda_lite::{CompileOptions, CudaRuntime, cuda_registry};
+use luminal::{bufferize::BufferNode, dtype::PlanDtype, prelude::FxHashMap};
+use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, cuda_registry};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -119,8 +119,9 @@ fn candidate_audit(
 fn main() -> Result<()> {
     let args = Args::parse();
     let config = checkpoint::read_json(&args.checkpoint.join("config.json"))?;
-    let graph = LlmGraph::build(
+    let graph = LlmGraph::build_with_parameter_dtype(
         ModelConfig::from_checkpoint(args.model, &config)?,
+        checkpoint_dtype(&config)?,
         256,
         llm_chat::search::DEFAULT_PREFILL_CHUNK,
     )?;
@@ -171,6 +172,16 @@ fn main() -> Result<()> {
                 id,
                 match v {
                     TensorData::F32(v) => v.into(),
+                    TensorData::BF16(v) => HostBuffer::new(
+                        PlanDtype::Bf16,
+                        v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+                    )
+                    .unwrap(),
+                    TensorData::F16(v) => HostBuffer::new(
+                        PlanDtype::F16,
+                        v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+                    )
+                    .unwrap(),
                     TensorData::I32(v) => v.into(),
                 },
             )
