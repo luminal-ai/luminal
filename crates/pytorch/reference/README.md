@@ -20,7 +20,7 @@ multiply on two CPU ranks. It launches both ranks automatically, using a tempora
 file for rendezvous and the local loopback interface for Gloo communication
 (`lo0` on macOS, `lo` on Linux), without hostname discovery. It checks the result against dense PyTorch and prints
 the output and local shard shapes. Local computation executes through
-ReferenceRuntime, with collectives lowered to P2P schedules.
+ReferenceRuntime, while PyTorch executes the collectives.
 
 ## Backend API
 
@@ -33,7 +33,7 @@ from luminal_reference import Compiler
 
 compiler = Compiler(
     search_iterations=10,
-    search_log=True,
+    log=True,
     max_intermediate_bytes=2 * 1024**3,
     memory_budget_bytes=8 * 1024**3,
 )
@@ -42,19 +42,19 @@ with torch.no_grad():
     output = compiled(inputs)
 ```
 
-`search_log` defaults to `False`. When enabled, actual searches print `Start`,
+`log` defaults to `False`. When enabled, actual searches print `Start`,
 `Faster`, and `Slower` to stderr. `Start` appears after the first candidate finishes
 profiling, not when compilation begins. Cached graphs do not rerun search or print
 search progress. The existing core `SEARCH_LOG`/`LUMINAL_LOG` environment settings
 still take precedence when set.
 
-The compiler exposes `graphs` (phase, FX source, collective targets), `regions`
-(local shapes, ATen targets, execution count), and `communications` (P2P schedules).
+The compiler exposes `graphs` (phase, FX source, collective targets) and `regions`
+(local shapes, ATen targets, execution count).
 One compiler instance can compile multiple graphs. `Compiler` is the only public
 compilation entry point; pass it to `torch.compile`.
 
 CUDA users import `Compiler` from `luminal_cuda_lite`. It accepts `search_iterations`,
-`search_log`, `device_budget_bytes`, and `max_intermediate_bytes`; it retains the
+`log`, `device_budget_bytes`, and `max_intermediate_bytes`; it retains the
 CUDA backend's existing compilation path.
 
 ## Named dimensions and buckets
@@ -135,25 +135,10 @@ compiled(x, w).square().sum().backward()
 
 The backend partitions the AOT FX graph at communication boundaries. Every
 compute region goes through PT2 translation, egglog search, and ReferenceRuntime;
-there is no eager compute fallback. After AOTAutograd differentiates the original
-collectives, a separate communication lowering decomposes `all_reduce`,
-`all_gather_into_tensor`, `reduce_scatter_tensor`, `all_to_all_single`, and
-`broadcast` into ordered send, receive, wait, and compiled local-compute steps.
-Gloo provides only point-to-point transport. Reductions, slices, and concatenation
-compile through ReferenceRuntime. `wait_tensor` remains a completion boundary.
-No communication enters Luminal's algebraic rewrites, and no Rust graph post-pass
-selects operations.
-
-These are deliberately simple synchronous schedules: reductions gather at group
-rank zero and distribute the result; gathers and all-to-all exchange directly
-between peers. Supported reductions are sum, average, product, minimum, and
-maximum. All-to-all accepts static or symbolic uneven splits, including zero-sized messages.
-Subgroups use group-relative ranks. Send buffers stay alive until their requests
-complete, and received tensors cannot be consumed before a wait. Calls must follow
-the same collective order on every participating rank. Concurrent compiled
-communication calls within a process are rejected; Gloo tags `[2**30, 2**31)`
-are reserved for this adapter. Transport failures require restarting the distributed
-job; schedules do not retry or recover a failed process group.
+there is no eager compute fallback. PyTorch executes functional collectives and
+`wait_tensor` in their original FX order. Communication does not enter Luminal's
+algebraic rewrites or reference plans. The process group and PyTorch own the
+collective algorithms, synchronization, and transport.
 
 Compilation uses synthetic tensors derived from local FakeTensor metadata,
 never reads fake storage, and never executes a collective. Real parameters and
@@ -162,6 +147,21 @@ constants, missing gradients, and forwarded inputs/opaque DTensor metadata.
 The reference binding copies computed outputs into independently owned tensors,
 so later forwards do not overwrite saved activations.
 
+When a multi-rank Gloo process group is active, each participating rank exports
+its local regions for an AOT compilation round. The group's rank zero searches
+each distinct region request and sends the selected reference plans to their owning
+ranks. Followers translate their local PT2 boundary metadata and install the
+received plans without saturation, extraction, search, or profiling. The plans
+include all dynamic-shape buckets and remap boundary slots to the follower's
+local graph values. The cache key keeps graph contents, constants, input specs,
+buckets, and compile options while ignoring process-local node provenance IDs.
+The compiler's
+`leader_compilations` count is positive only on the rank that actually searches.
+Artifact exchange and boundary synchronization use a separate Gloo process group,
+so they do not interleave with PyTorch's model collectives.
+Participating ranks must enter compilation rounds in the same order; a failed
+rank or process group must be restarted.
+
 Static and input-backed symbolic CPU shapes are supported in forward, backward,
 and inference, including input dimensions declared with `ShapesSpec`.
 Use `dynamic=True` or `torch._dynamo.mark_dynamic` to request
@@ -169,8 +169,8 @@ symbolic dimensions; default PyTorch automatic dynamism is also supported.
 Shape-only scalar outputs are evaluated from runtime shape bindings. Saved scalar
 dimensions enter local PT2 graphs through zero-storage shape carriers, so backward
 does not need to retain an activation merely to recover its dimensions.
-P2P receive shapes and split sizes are resolved on every invocation, while group
-membership, rank topology, and communication order stay fixed.
+PyTorch resolves communication shapes and split sizes on every invocation, while
+group membership, rank topology, and communication order stay fixed.
 
 Data-dependent unbacked dimensions and changing tensor rank are outside this
 contract. Shape-dependent branches may require separate guarded graphs. CUDA,
@@ -208,7 +208,7 @@ compiler state, allocator overhead, and rank-sized kernel metadata are excluded.
 From the repository root:
 
 ```sh
-bash crates/pytorch/reference/run_tests.sh -q -k "aot or spmd or p2p or dynamic_shapes or symbolic_shapes"
+bash crates/pytorch/reference/run_tests.sh -q -k "aot or spmd or collectives or dynamic_shapes or symbolic_shapes"
 ```
 
 The two-rank Gloo test uses real DTensors and checks forward results, input and
@@ -218,11 +218,9 @@ local shard dimensions and ReferenceRuntime execution in
 both AOT phases. Single-process tests also exercise two outstanding forwards
 before backward, output structure, and parameter rebinding.
 
-The three-rank P2P test covers every supported collective and reduction, repeated
+The three-rank collective test covers reductions, repeated
 execution, all-gather/reduce-scatter/all-to-all gradients, uneven and empty peer
-payloads, subgroups, a singleton group, and a collective with no output consumers. A
-dispatch guard rejects native collectives inside compiled executables, ensuring
-that the tests exercise the P2P schedules.
+payloads, subgroups, and a singleton group.
 
 Dynamic tests assert graph reuse across changing sizes, including DTensor
 inference, collective gradients, symbolic all-to-all splits, and backward graphs

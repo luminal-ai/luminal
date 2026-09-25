@@ -19,7 +19,7 @@
 //! carries — the two runtimes share no files.
 
 use luminal::prelude::petgraph;
-use luminal::test_support::bufferize_mock;
+use test_runtime::test_support::bufferize_mock;
 
 /// THE MUTATING TIER, end to end: extraction restricted to
 /// SqrtMutatingGeneric proves the one-buffer kernel through analysis and

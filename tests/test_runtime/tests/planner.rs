@@ -13,7 +13,7 @@
 //! and correct (its 28 differential tests against candle), and everything
 //! that exercises `Bufferizable` / `ToDps` / the planner lives here.
 
-use luminal::test_support::bufferize_mock;
+use test_runtime::test_support::bufferize_mock;
 
 /// Idempotency: DPS forms answer to_dps() = None, so a second rewrite is a
 /// no-op (same node and edge counts).

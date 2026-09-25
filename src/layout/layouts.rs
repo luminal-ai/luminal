@@ -55,7 +55,7 @@ use std::sync::Arc;
 /// decoded into. A direct transliteration of the preamble's `IntExpr`
 /// subset that appears inside layouts; construction only, no evaluation
 /// and no rewriting.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IntExprTerm {
     /// `(IntLit n)`.
     Lit(i64),
@@ -108,7 +108,7 @@ impl IntExprTerm {
 
 /// The domain: `(ShapeLit IntExprList)`, one extent expression per axis,
 /// outermost first (list order).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShapeTerm(pub Vec<IntExprTerm>);
 
 impl ShapeTerm {
@@ -127,7 +127,7 @@ impl ShapeTerm {
 }
 
 /// The element access width: `(BitWidthLit i64)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BitWidthTerm(pub i64);
 
 // =============================================================================
@@ -135,14 +135,14 @@ pub struct BitWidthTerm(pub i64);
 // =============================================================================
 
 /// `(RightMajorContiguousElementLayoutLit Shape BitWidth)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RightMajorContiguousElementLayout {
     pub shape: ShapeTerm,
     pub width: BitWidthTerm,
 }
 
 /// `(LeftMajorContiguousElementLayoutLit Shape BitWidth)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeftMajorContiguousElementLayout {
     pub shape: ShapeTerm,
     pub width: BitWidthTerm,
@@ -152,7 +152,7 @@ pub struct LeftMajorContiguousElementLayout {
 /// affine CHAIN: one summand per axis FROM THE END, each canonically
 /// `(IntMul (CoordVar shape axis) stride)`, with the doctrine's residues
 /// (`(IntLit 0)` for a dead axis, the bare coordinate for stride 1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StridedElementLayout {
     pub shape: ShapeTerm,
     pub chain: Vec<IntExprTerm>,
@@ -160,7 +160,7 @@ pub struct StridedElementLayout {
 }
 
 /// `(ElementOffsetExpressionLayoutLit IntExpr Shape BitWidth)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ElementOffsetExpressionLayout {
     pub offset: IntExprTerm,
     pub shape: ShapeTerm,
@@ -168,7 +168,7 @@ pub struct ElementOffsetExpressionLayout {
 }
 
 /// `(BitOffsetExpressionLayoutLit IntExpr Shape BitWidth)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BitOffsetExpressionLayout {
     pub offset: IntExprTerm,
     pub shape: ShapeTerm,

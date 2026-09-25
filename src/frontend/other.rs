@@ -11,7 +11,7 @@ impl Graph {
     /// An EXACT scalar `I64` constant, assembled from 16-bit limbs.
     ///
     /// `constant_i32` records a `LogicalIota`, and
-    /// `src/logical_op/iota/dtype.egg` pins every iota's dtype to `(Int)` —
+    /// `src/logical/op/iota/dtype.egg` pins every iota's dtype to `(Int)` —
     /// 32 bits — unconditionally. So a literal wider than `i32` cannot be
     /// minted directly: the reference kernel's `luminal_reference::TypedBuffer::I32`
     /// arm does `i32::try_from(value)` and REFUSES ("iota value {value}

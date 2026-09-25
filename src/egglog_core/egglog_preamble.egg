@@ -426,7 +426,7 @@
 ; recorder's `LogicalNode.dtype` (src/graph.rs) — and reaches the estate
 ; either as the dtype field of `LogicalTensorInputLit` or as the target of
 ; `LogicalCast`. Every OTHER value's dtype is concluded by a rule keyed on
-; its OWN constructor (`src/logical_op/*/dtype.egg`: iota -> (Int),
+; its OWN constructor (`src/logical/op/*/dtype.egg`: iota -> (Int),
 ; less_than -> (Bool), cast -> the carried target, gather -> the data
 ; operand's, add/mul -> both operands duplicatively as a tripwire). The
 ; estate must therefore never carry a GENERIC first-input dtype propagation

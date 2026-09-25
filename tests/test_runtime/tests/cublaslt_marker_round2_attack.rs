@@ -3982,7 +3982,7 @@ fn attack_u3_bufferize_duplicate_operand_accumulate() {
         "dest is not the C operand"
     );
 
-    let plan = luminal::test_support::bufferize_mock(&dps)
+    let plan = test_runtime::test_support::bufferize_mock(&dps)
         .unwrap_or_else(|err| panic!("u3: bufferizer REFUSED a duplicate-operand op: {err}"));
     let summary = plan.summary();
     println!("u3: bufferized a c==a Accumulate\n{summary}");

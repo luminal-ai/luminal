@@ -19,7 +19,7 @@ Branch: `feat/eclass-decoder` (this worktree). Standalone PR into
 **Summary.** Core's `luminal::layouts::decode_layout` walks one `Layout` e-class of
 the serialized e-graph and returns *one* spelling as a `MirrorLayout` enum, chosen
 by a FIXED preference order baked into the decoder (RightMajor > LeftMajor >
-Strided > ElementOffset > BitOffset; VERIFIED `src/layouts.rs:427-535`). That
+Strided > ElementOffset > BitOffset; VERIFIED `src/layout/layouts.rs:427-535`). That
 decoder is replaced by a small, open API over the serialized e-graph —
 `EGraphView` / `EClass` / `ENode` — where every egglog constructor has a Rust
 struct implementing `EgglogConstructor` (decode one e-node of that constructor),
@@ -49,7 +49,7 @@ estate's bias decorators mint a bias form only on the LeftMajor spelling
 (VERIFIED `crates/luminal_cuda_lite/src/ops/cublaslt/egg/cublaslt_marker_decorate.egg:182`,
 premise `(= ?inner_L (LeftMajorContiguousElementLayoutLit ?ishape ?d_bits2))`);
 the decoder, asked for "the" layout of that class, returned RightMajor by
-preference (`src/layouts.rs:432-444`); `bind_destination` built a ROW descriptor
+preference (`src/layout/layouts.rs:432-444`); `bind_destination` built a ROW descriptor
 (`crates/luminal_cuda_lite/src/ops/cublaslt/exec.rs:344-346`); the coherence
 fence `assert_bias_destination_order` (`exec.rs:380-397`) refused every candidate
 genome, and the search died with "no candidate genome produced an executable
@@ -68,9 +68,9 @@ the spelling is there. No arm, no degenerate-extent special case.
 | Item | File | Crate |
 |---|---|---|
 | `EGraphView`, `EClass`, `ENode`, `Sort`, `DynFacts`, `EgglogConstructor`, `ConstructorDecoder`, `ConstructorRegistry`, `Spellings` | NEW `src/egglog_core/egglog_utils/eclass.rs`, declared `pub mod eclass;` in `src/egglog_core/egglog_utils/mod.rs` (reachable as `luminal::egglog_utils::eclass::*`; `egglog_utils` is `#[path]`-mounted at `src/lib.rs:7-8`, VERIFIED) | core |
-| `Layout` sort marker, `LayoutFacts`, the five constructor structs with their `EgglogConstructor` + `LayoutFacts` impls, the term decoders (`shape_term`, `bit_width`, `affine_chain`, `int_expr`), `layout_decoders()`, `DecodedLayout`, `LayoutDecodeCache`, `decode_layout_table` | `src/layouts.rs` | core |
-| `core_decoders()`, `decoder_registry_for(matchers)` (mirrors `assembled_program_for`) | `src/egglog_snippet.rs` | core |
-| `OpMatcher::decoders()` default method | `src/layout_ir/mod.rs` (trait at :518-547, VERIFIED) | core |
+| `Layout` sort marker, `LayoutFacts`, the five constructor structs with their `EgglogConstructor` + `LayoutFacts` impls, the term decoders (`shape_term`, `bit_width`, `affine_chain`, `int_expr`), `layout_decoders()`, `DecodedLayout`, `LayoutDecodeCache`, `decode_layout_table` | `src/layout/layouts.rs` | core |
+| `core_decoders()`, `decoder_registry_for(matchers)` (mirrors `assembled_program_for`) | `src/egglog_core/egglog_snippet.rs` | core |
+| `OpMatcher::decoders()` default method | `src/layout/ir.rs` (trait at :518-547, VERIFIED) | core |
 | `RegisteredOp::decoders()` delegating to its matcher | `crates/luminal_cuda_lite/src/ops/mod.rs` (struct at :74-77) | CUDA-lite |
 | `luminal_reference::decoder_registry()` (`OnceLock`, like `assembled_program()` at `crates/luminal_reference/src/lib.rs:42-47`) | `crates/luminal_reference/src/lib.rs` | reference |
 | CUDA-lite-declared constructors of decoded sorts | none today (VERIFIED: `cublaslt_marker_constructors.egg` declares datatypes `CublasLt*` and four `LayoutTensorOp*` constructors, no `Layout` constructor; no other CL op egg declares a constructor) — the plumbing exists for when one appears | CUDA-lite |
@@ -96,7 +96,7 @@ OUTPUT value's class, and whose `children[i]` is a node inside argument i's clas
 (:204-215); every class touched gets `class_data[..].typ = Some(sort.name())`
 (:393); primitives are rendered with `{:?}` of the base value (:353-362), so i64
 literals are digit strings and strings are quoted — exactly what the old Reader
-parsed (`src/layouts.rs:395-418`).
+parsed (`src/layout/layouts.rs:395-418`).
 
 ```rust
 // src/egglog_core/egglog_utils/eclass.rs                                — SPEC
@@ -125,7 +125,7 @@ impl<'g> EClass<'g> {
     /// `class_data[id].typ` — the egglog sort name the serializer stamped.
     pub fn sort_name(&self) -> Option<&'g str>;
     /// Every e-node in the class: UNSUBSUMED FIRST, then by `NodeId` (the
-    /// order the old Reader used, `src/layouts.rs:359-364,388-398`).
+    /// order the old Reader used, `src/layout/layouts.rs:359-364,388-398`).
     pub fn nodes(&self) -> Vec<ENode<'g>>;
     pub fn nodes_named(&self, op: &str) -> impl Iterator<Item = ENode<'g>> + '_;
     /// Every distinct `op` in the class, in `nodes()` order (diagnostics).
@@ -272,7 +272,7 @@ Contracts, one line each:
 * `EClass::nodes()` is the ONLY place ordering is decided; everything above it
   inherits "unsubsumed first, then `NodeId`". Subsumed nodes are kept because a
   subsumed constructor is still a true member of its class (the slice_pad lesson,
-  `src/layouts.rs:380-384`).
+  `src/layout/layouts.rs:380-384`).
 * `first::<C>()` is registry-free and generic: `nodes_named(C::NAME)` →
   `C::decode` → first `Ok`. This is what the cuBLASLt fence uses.
 * `spellings::<S>()` iterates `decoders.constructors_of(S::NAME)` in registry
@@ -283,7 +283,7 @@ Contracts, one line each:
 ### 2.3 `layouts.rs` — the `Layout` sort and its five constructors
 
 ```rust
-// src/layouts.rs                                                          — SPEC
+// src/layout/layouts.rs                                                          — SPEC
 pub struct Layout;
 impl Sort for Layout { const NAME: &'static str = "Layout"; type Facts = dyn LayoutFacts; }
 
@@ -307,7 +307,7 @@ pub trait LayoutFacts: DynFacts {
 impl PartialEq for dyn LayoutFacts { fn eq(&self, o: &Self) -> bool { self.dyn_eq(o as &dyn Any) } }
 impl Eq for dyn LayoutFacts {}
 
-// The five structs (unchanged fields, `src/layouts.rs:129-167`) each get:
+// The five structs (unchanged fields, `src/layout/layouts.rs:129-167`) each get:
 impl EgglogConstructor for RightMajorContiguousElementLayout {
     const NAME: &'static str = "RightMajorContiguousElementLayoutLit";
     type Sort = Layout;
@@ -367,7 +367,7 @@ carries every decoded spelling; the class id is kept for diagnostics and as the
 cache key; the dtype fact rides along as today.
 
 ```rust
-// src/layouts.rs                                                          — SPEC
+// src/layout/layouts.rs                                                          — SPEC
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedLayout {
     /// The layout e-class this was decoded from (serialized id; diagnostics
@@ -407,7 +407,7 @@ impl DecodedLayout {
 pub type LayoutDecodeCache = HashMap<(ClassId, Option<PlanDtype>), DecodedLayout>;   // unchanged
 
 /// Signature change: the view replaces the bare e-graph. Body as today
-/// (`src/layouts.rs:830-873`) with `decode_layout(egraph, &class)` replaced by
+/// (`src/layout/layouts.rs:830-873`) with `decode_layout(egraph, &class)` replaced by
 /// `DecodedLayout::from_class(&view.class(&value.layout.eclass), value.dtype_enum)`.
 pub fn decode_layout_table(
     view: &EGraphView<'_>,
@@ -417,7 +417,7 @@ pub fn decode_layout_table(
 ) -> Result<HashMap<ClassId, DecodedLayout>>;
 ```
 
-`PlanLayout` requires only `Clone + Debug` (VERIFIED `src/bufferize.rs:99-100`);
+`PlanLayout` requires only `Clone + Debug` (VERIFIED `src/buffer/bufferize.rs:99-100`);
 `PartialEq` is used by the reference executor's fold check
 (`crates/luminal_reference/src/runtime.rs:767`) and the transport pin
 (`src/test_support.rs:1497`) — both keep working: equal classes decode to equal
@@ -476,7 +476,7 @@ neither. Concrete sites (`impl PartialEq for dyn LayoutFacts`) upcast directly.
 ### 3.1 Registration rides on the matchers
 
 DECISION: decoders travel on `OpMatcher`, not as a new field on `RegisteredOp`.
-`OpMatcher::snippets()` (`src/layout_ir/mod.rs:534-542`) is where a constructor's
+`OpMatcher::snippets()` (`src/layout/ir.rs:534-542`) is where a constructor's
 DECLARATION travels; the decoder for that constructor belongs beside it, and the
 matcher is the one type all three registries share (`RegisteredOp.matcher`,
 `ReferenceOp.matcher: fn() -> Box<dyn OpMatcher>` at
@@ -484,7 +484,7 @@ matcher is the one type all three registries share (`RegisteredOp.matcher`,
 A `RegisteredOp` field would leave the reference runtime with no path.
 
 ```rust
-// src/layout_ir/mod.rs, in `pub trait OpMatcher` after `snippets()`      — SPEC
+// src/layout/ir.rs, in `pub trait OpMatcher` after `snippets()`      — SPEC
 /// Decoders for every constructor this matcher's snippets DECLARE for a
 /// decoded sort. Mirrors `snippets()`: the declaration and its decoder
 /// travel together. Default empty — no matcher declares one today.
@@ -493,7 +493,7 @@ fn decoders(&self) -> Vec<crate::egglog_utils::eclass::ConstructorDecoder> { Vec
 // crates/luminal_cuda_lite/src/ops/mod.rs, impl RegisteredOp             — SPEC
 pub fn decoders(&self) -> Vec<ConstructorDecoder> { self.matcher.decoders() }
 
-// src/egglog_snippet.rs, beside `assembled_program_for`                   — SPEC
+// src/egglog_core/egglog_snippet.rs, beside `assembled_program_for`                   — SPEC
 /// What core's own preamble declares and decodes: the five Layout constructors.
 pub fn core_decoders() -> Vec<ConstructorDecoder> { crate::layouts::layout_decoders() }
 /// The registry for a runtime's matcher set — the same shape as
@@ -515,7 +515,7 @@ pub fn decoder_registry() -> &'static ConstructorRegistry {
 
 | Function | Today | New | Who constructs the view |
 |---|---|---|---|
-| `luminal::layouts::decode_layout_table` (`src/layouts.rs:830`) | `(egraph: &EGraph, graph, who, cache)` | `(view: &EGraphView<'_>, graph, who, cache)` | callers below |
+| `luminal::layouts::decode_layout_table` (`src/layout/layouts.rs:830`) | `(egraph: &EGraph, graph, who, cache)` | `(view: &EGraphView<'_>, graph, who, cache)` | callers below |
 | `luminal::layouts::decode_layout` / `decode_layout_for` (:343, :773) | exist | DELETED | — |
 | `src/test_support.rs:1478` | `decode_layout_table(&egraph, &graph, "dtype row test", &mut LayoutDecodeCache::new())` | `let view = EGraphView::new(&egraph, luminal_reference::decoder_registry()); decode_layout_table(&view, …)` | core test (already depends on `luminal_reference`, :2431) |
 | `crates/luminal_reference/src/harness.rs:209` | `(&serialized, &dps, "plain plan", …)` | `EGraphView::new(&serialized, crate::decoder_registry())` | harness |
@@ -793,11 +793,11 @@ estate fence.
 
 | SITE | NOW | NEW |
 |---|---|---|
-| `src/layouts.rs:1-35` module doc | five mirror structs + `MirrorLayout` + preference decoder | rewrite per §2.3/§2.4 |
-| `src/layouts.rs:176-183 MirrorLayout`, :286-333 `impl MirrorLayout`, :339-345 `decode_layout`, :347-769 `Reader` (+ `ParseMemo`), :771-774 `decode_layout_for`, :999-1015 test `mirror_layout_equality_is_structural` | — | DELETE (term-decoding bodies move to the §2.3 free functions; the equality test becomes `decoded_layout_equality_is_structural` over `DecodedLayout::of`) |
+| `src/layout/layouts.rs:1-35` module doc | five mirror structs + `MirrorLayout` + preference decoder | rewrite per §2.3/§2.4 |
+| `src/layout/layouts.rs:176-183 MirrorLayout`, :286-333 `impl MirrorLayout`, :339-345 `decode_layout`, :347-769 `Reader` (+ `ParseMemo`), :771-774 `decode_layout_for`, :999-1015 test `mirror_layout_equality_is_structural` | — | DELETE (term-decoding bodies move to the §2.3 free functions; the equality test becomes `decoded_layout_equality_is_structural` over `DecodedLayout::of`) |
 | `src/lib.rs:56-61` comment on `pub mod layouts` | "Convenience mirrors … + decode_layout" | "the `Layout` sort's constructor structs, `LayoutFacts`, `DecodedLayout` and the value-keyed table; THE BUFFERIZER NEVER CALLS ANY OF THIS" |
 | `src/lib.rs:25` comment | `layouts::decode_layout_table` | unchanged name |
-| `src/bufferize.rs:96, 1538, 1550` comments | reference `decode_layout_table` | unchanged |
+| `src/buffer/bufferize.rs:96, 1538, 1550` comments | reference `decode_layout_table` | unchanged |
 | `src/test_support.rs:1461-1469` doc | "`DecodedLayout { mirror, dtype }`" | "`DecodedLayout { class, dtype, spellings }`" |
 | `src/test_support.rs:1478-1483` | `decode_layout_table(&egraph, …)` | §3.2 |
 | `src/test_support.rs:3829-3862` `rm_layout`, `transpose_strided_layout` | `DecodedLayout { mirror: MirrorLayout::RightMajor(..), dtype }` literals | `DecodedLayout::of(RightMajorContiguousElementLayout { shape, width }, Some(F32))`, `DecodedLayout::of(StridedElementLayout { .. }, Some(F32))` |
@@ -838,7 +838,7 @@ the 9 recorded-untouched lines.
 
 ## 5. What is deleted
 
-* `MirrorLayout` (`src/layouts.rs:176-183`) and `impl MirrorLayout` (:286-333). Its
+* `MirrorLayout` (`src/layout/layouts.rs:176-183`) and `impl MirrorLayout` (:286-333). Its
   four facts (`shape`, `width_bits`, `literal_extents`, `literal_span_elements`)
   become `DecodedLayout` methods (class-invariant, §2.4).
 * `DecodedLayout.mirror`: replaced by `spellings: Spellings<Layout>` plus
@@ -912,7 +912,7 @@ graph and use `core_decoders()` = empty until S2a — or land S1 and S2a's
 `layout_decoders()` together; DECISION: land S1 with the hand-built-graph tests
 only, move the tripwire tests to S2a). Gate: G-build (core only), G-core, G-fmt.
 
-**S2a — core: the vocabulary, shimmed.** In `src/layouts.rs`: `Layout`,
+**S2a — core: the vocabulary, shimmed.** In `src/layout/layouts.rs`: `Layout`,
 `LayoutFacts`, the five `EgglogConstructor`/`LayoutFacts` impls, the term
 decoders on `EClass`, `IntExprTerm::eval_at`, `layout_decoders()`;
 `DecodedLayout` gains `class` and `spellings` and KEEPS `mirror` for this step,
@@ -956,7 +956,7 @@ eclass_decoder_demo` prints the §7 lines.
 **S6 — sweep.** Doc comments listed in §4 (kernels.rs:145, exec.rs module doc,
 CL layouts.rs and lib.rs:21, reference layouts.rs, search.rs:243-249 both
 runtimes, src/lib.rs:56-61, test_support.rs:1461, codegen_identity.rs:670-680);
-`grep -rn "preference" src/layouts.rs` returns nothing; G-clippy, G-fmt; then
+`grep -rn "preference" src/layout/layouts.rs` returns nothing; G-clippy, G-fmt; then
 the full gate detached (`cargo test --workspace`) — failures become follow-ups,
 not blockers, per the 2026-09-03 ruling.
 
@@ -1048,7 +1048,7 @@ constructor exists in a checked program.
 **8.4 Decode failures are skipped, recorded, and only fatal in aggregate.** A
 constructor node whose fields do not parse (foreign-shape `CoordVar` under the
 owner-shape guard, a cons spine with no parsing spelling, a cycle) is skipped
-exactly as the old Reader skipped it (`continue` at `src/layouts.rs:440,454,468-477`),
+exactly as the old Reader skipped it (`continue` at `src/layout/layouts.rs:440,454,468-477`),
 but now lands in `Spellings::failed` with a reason. `from_class` refuses when
 NOTHING decoded, printing `present` and `failed`. `has::<C>()` means decodable;
 `present()` means named. The fence therefore refuses a class that holds an
@@ -1113,7 +1113,7 @@ already was. Permutation-invariance is preserved.
 
 **8.11 Performance** is explicitly not a concern (Austin). For the record the new
 path is cheaper: the old `Reader::new` indexed every node of the serialized graph
-per decode (`src/layouts.rs:357-370`); `EGraphView` uses the graph's own
+per decode (`src/layout/layouts.rs:357-370`); `EGraphView` uses the graph's own
 `classes()` index, built once behind a `OnceCell`.
 
 **8.12 #507 sequencing.** Recommend closing #507 in favour of this PR (its
@@ -1124,10 +1124,10 @@ also deletes the arm; nothing else changes.
 
 ## Appendix A — Verified-facts ledger (file:line, trunk 1f101d62 unless noted)
 
-* Decoder preference loop: `src/layouts.rs:427-535`; class index per decode
+* Decoder preference loop: `src/layout/layouts.rs:427-535`; class index per decode
   :357-370; spelling order :380-398; literal parsing :395-418; `MirrorLayout`
   :176-183 and :286-333; `DecodedLayout` :796-800; cache :806; table :830-873.
-* `MirrorLayout` uses outside `src/layouts.rs`: `src/test_support.rs` (3834-3855, 3983-3985),
+* `MirrorLayout` uses outside `src/layout/layouts.rs`: `src/test_support.rs` (3834-3855, 3983-3985),
   `crates/luminal_cuda_lite/src/{layouts.rs:69, kernels.rs:145,366,517,540-584, ops/cublaslt/exec.rs:324}`,
   CL tests (`view_admission.rs:217`, `plan_smoke.rs:78-82`, `codegen_identity.rs:274-315,561,727,863-908`,
   `cublaslt_contracts_cpu.rs:8,360-491`, `composed_read_families.rs:524-548`, `cublaslt_bias_premise.rs:173`),
@@ -1144,9 +1144,9 @@ also deletes the arm; nothing else changes.
 * Saturation→serialize sites: CL `runtime.rs:432-456`, `search.rs:931-934`; reference `runtime.rs:332-365`,
   `search.rs:536-538`, `harness.rs:82-84, 186-190`, `runtime.rs:1672-1674`, `search.rs:737-739`;
   core `extraction.rs:4309-4311`; `test_runtime/src/lib.rs:144-146`.
-* `OpMatcher` trait: `src/layout_ir/mod.rs:518-547`; `RegisteredOp`: `crates/luminal_cuda_lite/src/ops/mod.rs:74-77`;
-  `ReferenceOp`: `crates/luminal_reference/src/ops/mod.rs:144-150`; `assembled_program_for`: `src/egglog_snippet.rs:142-152`.
-* `PlanLayout: Clone + Debug`: `src/bufferize.rs:99-100`. `rust-version = "1.91"`: `Cargo.toml:5`
+* `OpMatcher` trait: `src/layout/ir.rs:518-547`; `RegisteredOp`: `crates/luminal_cuda_lite/src/ops/mod.rs:74-77`;
+  `ReferenceOp`: `crates/luminal_reference/src/ops/mod.rs:144-150`; `assembled_program_for`: `src/egglog_core/egglog_snippet.rs:142-152`.
+* `PlanLayout: Clone + Debug`: `src/buffer/bufferize.rs:99-100`. `rust-version = "1.91"`: `Cargo.toml:5`
   (raised from "1.85" on 2026-09-05 with the §2.5 amendment; let-chains already needed 1.88).
 * egglog fork rev 1bb30831 (`Cargo.toml:30-31`): `functions_iter` `src/lib.rs:1236`, `get_function` :2318,
   `Function::func_type` :342, `type_info(&mut self)` :589, `pub use typechecking::FuncType` :74,

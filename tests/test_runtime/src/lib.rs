@@ -39,6 +39,10 @@ pub use luminal::search_support as sampler;
 pub mod bindings;
 pub mod ops;
 pub mod test_equality;
+pub mod test_support;
+
+// Core unit tests compile the same helpers against their local core types.
+use luminal::{buffer_tensor_ir, bufferize, index_expr, layout_ir, prelude};
 
 pub use bindings::{BoundProgram, TestRuntimeBindings};
 

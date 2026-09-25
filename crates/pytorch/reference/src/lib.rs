@@ -360,6 +360,72 @@ impl CompiledGraph {
         self.buckets.clone()
     }
 
+    /// The elected reference plans, including all dynamic-shape buckets.
+    fn serialize_compiled(&self) -> PyResult<Vec<u8>> {
+        if !self.searched {
+            return Err(PyRuntimeError::new_err(
+                "search() must run before serialization",
+            ));
+        }
+        let inputs: Vec<_> = self
+            .translation
+            .inputs
+            .iter()
+            .map(|input| input.tensor)
+            .collect();
+        self.runtime
+            .serialize_compiled(&inputs, &self.output_buffers)
+            .map_err(to_py)
+    }
+
+    /// Install leader-selected plans without running search on this rank.
+    #[pyo3(signature = (artifact, *, memory_budget_bytes = None))]
+    fn load_compiled(
+        &mut self,
+        artifact: &[u8],
+        memory_budget_bytes: Option<usize>,
+    ) -> PyResult<()> {
+        if self.searched {
+            return Err(PyRuntimeError::new_err("compiled plan already installed"));
+        }
+        let inputs: Vec<_> = self
+            .translation
+            .inputs
+            .iter()
+            .map(|input| input.tensor)
+            .collect();
+        let outputs: Vec<_> = self
+            .translation
+            .outputs
+            .iter()
+            .map(|output| output.tensor)
+            .collect();
+        for (&symbol, &value) in &self.dims {
+            self.runtime.set_dim(symbol, value);
+        }
+        self.output_buffers = self
+            .runtime
+            .deserialize_compiled(
+                artifact,
+                &inputs,
+                &outputs,
+                memory_budget_bytes
+                    .unwrap_or(luminal_reference::runtime::DEFAULT_MEMORY_BUDGET_BYTES),
+            )
+            .map_err(to_py)?;
+        let mut by_tensor: HashMap<NodeIndex, HashSet<i64>> = HashMap::new();
+        for (output, &buffer) in self.translation.outputs.iter().zip(&self.output_buffers) {
+            by_tensor.entry(output.tensor).or_default().insert(buffer);
+        }
+        self.shared_outputs = by_tensor
+            .into_iter()
+            .filter(|(_, buffers)| buffers.len() > 1)
+            .map(|(tensor, _)| tensor)
+            .collect();
+        self.searched = true;
+        Ok(())
+    }
+
     /// Saturate and search. Every input must be staged first.
     #[pyo3(signature = (generations = None, *, max_intermediate_bytes = None, memory_budget_bytes = None, search_log = false, dim_buckets = None))]
     fn search(

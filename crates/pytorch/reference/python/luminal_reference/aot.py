@@ -1,23 +1,25 @@
 """AOTAutograd integration for local CPU programs and DTensor SPMD.
 
 DTensor owns sharding; AOTAutograd owns differentiation. This adapter compiles
-local ATen regions and lowers functional collectives to CPU/Gloo point-to-point
-communication schedules after differentiation. Symbolic CPU shapes are retained
-through compilation and bound at execution; communication is synchronous.
+local ATen regions between functional collectives, which PyTorch executes.
+Symbolic CPU shapes are retained through compilation and bound at execution.
 """
 
 from dataclasses import dataclass, field
 from functools import partial
 
 import torch
+import torch.distributed as dist
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
+from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.fx.passes.split_module import split_module
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from .backend import _compile_local_graph
-from .communication import SUPPORTED, communication_scope, lower_collective
 from .dimensions import normalize_buckets, profile_value, resolve_policies
+from .distributed_compile import DeferredRegion, RegionBatch
+from .distributed_compile import enabled as distributed_compile_enabled
 from .export_utils import private_graph_copy
 
 
@@ -41,17 +43,30 @@ class GraphRecord:
 
 def _collective(node):
     target = str(node.target)
-    if target.startswith(("_c10d_functional.", "_c10d_functional_autograd.")):
-        if target.split(".")[1] not in SUPPORTED:
-            raise RuntimeError(
-                f"unsupported communication op in AOT reference graph: {target}"
-            )
-        return True
-    if "c10d" in target:
-        raise RuntimeError(
-            f"unsupported communication op in AOT reference graph: {target}"
+    return "c10d" in target
+
+
+def _compile_group(gm, communication):
+    """Use the collective's participants for compilation as well as execution."""
+    groups = []
+    for node in communication:
+        arguments = dict(
+            zip((a.name for a in node.target._schema.arguments), node.args)
         )
-    return False
+        arguments.update(node.kwargs)
+        if "group_name" not in arguments:
+            continue  # wait_tensor has no process group
+        group = arguments["group_name"]
+        if isinstance(group, torch.fx.Node) and group.op == "get_attr":
+            group = getattr(gm, group.target)
+        group = _resolve_process_group(group) if isinstance(group, str) else group
+        if not isinstance(group, dist.ProcessGroup):
+            raise TypeError("reference compilation requires a static process group")
+        if all(group is not prior for prior in groups):
+            groups.append(group)
+    if len(groups) > 1:
+        raise RuntimeError("one AOT graph spans multiple communication groups")
+    return groups[0] if groups else None
 
 
 def _compile_region(
@@ -64,6 +79,7 @@ def _compile_region(
     max_intermediate_bytes=None,
     memory_budget_bytes=None,
     dim_buckets=None,
+    compile_local=None,
 ):
     graph = private_graph_copy(gm)
     placeholders = [n for n in graph.graph.nodes if n.op == "placeholder"]
@@ -182,7 +198,8 @@ def _compile_region(
                 else v
                 for v in local_inputs
             ]
-            compiled = _compile_local_graph(
+            compiler = compile_local or _compile_local_graph
+            compiled = compiler(
                 graph,
                 examples,
                 search_iterations=search_iterations,
@@ -191,7 +208,10 @@ def _compile_region(
                 memory_budget_bytes=memory_budget_bytes,
                 symbol_buckets=resolve_policies(shape_env, dim_buckets or {}),
             )
-            record.buckets = compiled._graph.dim_buckets
+            if isinstance(compiled, DeferredRegion):
+                compiled.record = record
+            else:
+                record.buckets = compiled._graph.dim_buckets
         records.append(record)
 
     def run(*args):
@@ -240,7 +260,7 @@ class ReferenceAOTBackend:
         self,
         *,
         search_iterations=1,
-        search_log=False,
+        log=False,
         max_intermediate_bytes=None,
         memory_budget_bytes=None,
         dim_buckets=None,
@@ -248,12 +268,12 @@ class ReferenceAOTBackend:
         self.dim_buckets = normalize_buckets(dim_buckets)
         self.regions: list[RegionRecord] = []
         self.graphs: list[GraphRecord] = []
-        self.communications = []
+        self.leader_compilations = 0
         self.search_iterations = search_iterations
-        self.search_log = search_log
+        self.search_log = log
         self.compile_options = {
             "search_iterations": search_iterations,
-            "search_log": search_log,
+            "search_log": log,
             "max_intermediate_bytes": max_intermediate_bytes,
             "memory_budget_bytes": memory_budget_bytes,
             "dim_buckets": self.dim_buckets,
@@ -317,19 +337,23 @@ class ReferenceAOTBackend:
         communication = [
             n for n in gm.graph.nodes if n.op == "call_function" and _collective(n)
         ]
+        group = _compile_group(gm, communication)
+        batch = RegionBatch(group) if distributed_compile_enabled(group) else None
+        compile_region = partial(
+            _compile_region,
+            compile_local=batch.enqueue if batch is not None else None,
+        )
         self.graphs.append(
             GraphRecord(phase, gm.code, tuple(str(n.target) for n in communication))
         )
         if not communication:
-            return make_boxed_func(
-                _compile_region(
-                    gm,
-                    example_inputs,
-                    phase,
-                    self.regions,
-                    **self.compile_options,
-                )
+            compiled = compile_region(
+                gm, example_inputs, phase, self.regions, **self.compile_options
             )
+            if batch is not None:
+                batch.resolve()
+                self.leader_compilations += batch.compilations
+            return make_boxed_func(compiled)
 
         # Contiguous topological regions keep collective ordering explicit.
         # This is a frontend boundary, not an extracted-Luminal graph rewrite.
@@ -348,37 +372,14 @@ class ReferenceAOTBackend:
 
         split = split_module(gm, gm, assign, keep_original_order=True)
         compiled_regions = {}
-        communication_plans = {}
         for name, module in split.named_children():
             index = int(name.removeprefix("submod_"))
             if kinds[index]:
-                plans = {}
-                for node in module.graph.nodes:
-                    if (
-                        node.op != "call_function"
-                        or str(node.target).split(".")[1] == "wait_tensor"
-                    ):
-                        continue
-                    plan = lower_collective(
-                        node,
-                        module,
-                        phase,
-                        lambda graph, inputs: _compile_region(
-                            graph,
-                            inputs,
-                            phase,
-                            self.regions,
-                            **self.compile_options,
-                        ),
-                    )
-                    plans[node.name] = plan
-                    self.communications.append(plan)
-                communication_plans[name] = plans
                 continue
             inputs = [
                 n.meta["val"] for n in module.graph.nodes if n.op == "placeholder"
             ]
-            compiled_regions[name] = _compile_region(
+            compiled_regions[name] = compile_region(
                 module,
                 inputs,
                 phase,
@@ -386,56 +387,26 @@ class ReferenceAOTBackend:
                 **self.compile_options,
             )
 
-        class CommunicationExecutor(torch.fx.Interpreter):
-            def __init__(self, module, plans, bindings):
-                super().__init__(module)
-                self.plans = plans
-                self.bindings = bindings
-
-            def run_node(self, node):
-                if node.name in self.plans:
-                    args, kwargs = self.fetch_args_kwargs_from_env(node)
-                    value = args[0] if args else kwargs["input"]
-                    return self.plans[node.name](value, self.bindings)
-                # wait_tensor remains valid for externally produced async inputs;
-                # outputs of our schedules have already completed their P2P work.
-                return super().run_node(node)
-
         class Executor(torch.fx.Interpreter):
-            def __init__(self, module, bindings):
-                super().__init__(module)
-                self.bindings = bindings
-
             def call_module(self, target, args, kwargs):
                 if target in compiled_regions:
                     return compiled_regions[target](*args, **kwargs)
-                if kwargs:
-                    raise RuntimeError(
-                        "unexpected keyword arguments in communication region"
-                    )
-                return CommunicationExecutor(
-                    self.fetch_attr(target), communication_plans[target], self.bindings
-                ).run(*args)
-
-        from torch._guards import detect_fake_mode
-
-        mode = detect_fake_mode(example_inputs)
-        shape_env = mode.shape_env if mode is not None else None
-        symbolic_positions = [
-            i
-            for i, v in enumerate(example_inputs)
-            if isinstance(v, (torch.Tensor, torch.SymInt))
-        ]
-        metadata = [example_inputs[i] for i in symbolic_positions]
+                if batch is not None:
+                    # A functional collective can complete locally before its
+                    # peers have left the preceding AOT region. Fence the
+                    # communication boundary on the separate coordination
+                    # group so a faster rank cannot start the next compile
+                    # round against a slower rank's model collective.
+                    dist.barrier(group=batch.group)
+                result = super().call_module(target, args, kwargs)
+                if batch is not None:
+                    dist.barrier(group=batch.group)
+                return result
 
         def run(*args):
-            # Bind the original AOT signature, including saved scalar dimensions.
-            bindings = (
-                shape_env.bind_symbols(metadata, [args[i] for i in symbolic_positions])
-                if shape_env is not None
-                else {}
-            )
-            with communication_scope():
-                return Executor(split, bindings).run(*args)
+            return Executor(split).run(*args)
 
+        if batch is not None:
+            batch.resolve()
+            self.leader_compilations += batch.compilations
         return make_boxed_func(run)

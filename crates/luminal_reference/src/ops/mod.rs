@@ -75,7 +75,7 @@ pub use index_map_apply_materialize::IndexMapApplyMaterialize;
 pub use iota::Iota;
 pub use less_than::LessThan;
 pub use log2::Log2Functional;
-pub use luminal::poison::Poison;
+pub use luminal::buffer_tensor_ir::Poison;
 pub use modulo::ModFunctional;
 pub use mul::MulFunctional;
 pub use recip::RecipFunctional;

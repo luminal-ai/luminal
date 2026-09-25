@@ -8,6 +8,8 @@ pub mod dtype;
 pub mod egglog_utils;
 pub mod frontend;
 pub mod graph;
+#[path = "logical/ir.rs"]
+pub mod logical_ir;
 pub mod shape;
 
 // The logical-SSA layout compiler. Egglog program assembly and registries live
@@ -43,16 +45,23 @@ pub mod shape;
 // "describes vs decides". A genome is drawn the same way everywhere; a
 // genome is PRICED differently everywhere, and pricing happens in the
 // middle of the loop — which is why the loop is not here.
+#[path = "buffer/arena.rs"]
 pub mod arena;
+#[path = "buffer/buffer_tensor_ir.rs"]
 pub mod buffer_tensor_ir;
+#[path = "buffer/bufferize.rs"]
 pub mod bufferize;
+#[path = "layout/dps.rs"]
 pub mod dps;
+#[path = "egglog_core/egglog_snippet.rs"]
 pub mod egglog_snippet;
 pub mod extraction;
 pub mod index_expr;
+#[path = "layout/ir.rs"]
 pub mod layout_ir;
-pub mod poison;
+#[path = "buffer/resident.rs"]
 pub mod resident;
+#[path = "egglog_core/subst_primitive.rs"]
 pub mod subst_primitive;
 // The `Layout` sort's constructor structs, `LayoutFacts`, `DecodedLayout`
 // and the value-keyed table, for runtimes to pull from one place. THE
@@ -60,11 +69,16 @@ pub mod subst_primitive;
 // opaque layout type, and backends may ignore this module entirely
 // (Austin's fold-into-core amendment, resident-geometry cleanup
 // 2026-08-31).
+#[path = "layout/layouts.rs"]
 pub mod layouts;
+#[path = "logical/helper/mod.rs"]
 pub mod logical_helper;
+#[path = "logical/op/mod.rs"]
 pub mod logical_op;
 pub mod search_support;
-pub mod test_support;
+#[cfg(test)]
+#[path = "../tests/test_runtime/src/test_support.rs"]
+mod test_support;
 pub mod visualization;
 
 #[cfg(test)]

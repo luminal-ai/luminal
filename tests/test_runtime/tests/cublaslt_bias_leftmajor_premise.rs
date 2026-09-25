@@ -13,7 +13,7 @@
 //!     boundary out2 bound to a PADDED strided layout (ld = n + 1 = 4).
 //!     FINDING, recorded rather than wished away: the boundary binding
 //!     does NOT gate the mint, because layout tensors flow FORWARD from
-//!     the row-major inputs (`src/logical_op/*/forward_layout.egg`: a
+//!     the row-major inputs (`src/logical/op/*/forward_layout.egg`: a
 //!     ReduceSum out is always minted row-major; Add forwards each
 //!     operand's layout to its out), so `y_outer` and `out2` carry a
 //!     right-major layout tensor whatever the boundary says, and the

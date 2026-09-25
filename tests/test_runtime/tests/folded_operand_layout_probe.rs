@@ -30,8 +30,8 @@
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::test_support::MockLayout;
 use std::collections::HashMap;
+use test_runtime::test_support::MockLayout;
 
 type FoldedSlot = (String, usize, MockLayout);
 
@@ -58,8 +58,8 @@ fn folded_slots(
 ) {
     let (graph, _) = test_runtime::extract_fixture_with_genome(text, prefer);
     let dps = luminal::dps::dps_rewrite(&graph);
-    let table = luminal::test_support::mock_layout_table(&dps);
-    let plan = luminal::test_support::bufferize_mock(&dps).expect("bufferize");
+    let table = test_runtime::test_support::mock_layout_table(&dps);
+    let plan = test_runtime::test_support::bufferize_mock(&dps).expect("bufferize");
     let mut found = Vec::new();
     for node in plan.dag.node_weights() {
         if let BufferNode::Compute {

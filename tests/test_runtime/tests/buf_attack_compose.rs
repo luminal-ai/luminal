@@ -30,12 +30,12 @@ use luminal::layout_ir::{
     Provenance,
 };
 use luminal::prelude::petgraph;
-use luminal::test_support::{EmptyOp, MockOp, MockView, TestGraph};
 use petgraph::algo::has_path_connecting;
 use petgraph::graph::NodeIndex;
+use test_runtime::test_support::{EmptyOp, MockOp, MockView, TestGraph};
 
 fn computes(
-    plan: &luminal::bufferize::BufferIrGraph<luminal::test_support::MockLayout>,
+    plan: &luminal::bufferize::BufferIrGraph<test_runtime::test_support::MockLayout>,
     label: &str,
 ) -> Vec<(NodeIndex, Vec<BufferId>, Vec<BufferId>)> {
     plan.dag
@@ -50,7 +50,7 @@ fn computes(
 }
 
 fn copies(
-    plan: &luminal::bufferize::BufferIrGraph<luminal::test_support::MockLayout>,
+    plan: &luminal::bufferize::BufferIrGraph<test_runtime::test_support::MockLayout>,
 ) -> Vec<(NodeIndex, BufferId, BufferId)> {
     plan.dag
         .node_indices()
@@ -115,8 +115,8 @@ fn diamond_bound_buffer_is_alias_parent_and_survives_writer_attack() {
     g.output(&r, "D"); // seed proposal: e -> D
     g.output(&c, "E");
     g.output(&a, "F");
-    let plan =
-        luminal::test_support::bufferize_mock(&g.build()).expect("the diamond must still certify");
+    let plan = test_runtime::test_support::bufferize_mock(&g.build())
+        .expect("the diamond must still certify");
     println!("{}", plan.summary());
 
     // (i) seed applied; the view's value resides in the BOUND buffer.
@@ -211,7 +211,8 @@ fn seed_into_cohabited_input_buffer_needs_may_permit() {
         )
         .remove(0);
     g.output(&r, "D");
-    let plan = luminal::test_support::bufferize_mock(&g.build()).expect("must certify (degraded)");
+    let plan =
+        test_runtime::test_support::bufferize_mock(&g.build()).expect("must certify (degraded)");
     println!("no-permit:\n{}", plan.summary());
     assert!(
         matches!(plan.value_buffer[&r], BufferId::Allocated(_)),
@@ -243,7 +244,8 @@ fn seed_into_cohabited_input_buffer_needs_may_permit() {
         )
         .remove(0);
     g.output(&r, "D");
-    let plan = luminal::test_support::bufferize_mock(&g.build()).expect("must certify (admitted)");
+    let plan =
+        test_runtime::test_support::bufferize_mock(&g.build()).expect("must certify (admitted)");
     println!("with-permit:\n{}", plan.summary());
     assert!(
         matches!(plan.value_buffer[&r], BufferId::Boundary(_)),
@@ -289,8 +291,8 @@ fn chain_with_interior_view_and_terminal_bound_write_certifies() {
         )
         .remove(0);
     g.output(&m2, "D");
-    let plan =
-        luminal::test_support::bufferize_mock(&g.build()).expect("composed chain must certify");
+    let plan = test_runtime::test_support::bufferize_mock(&g.build())
+        .expect("composed chain must certify");
     println!("{}", plan.summary());
 
     assert_eq!(copies(&plan).len(), 0, "zero copies:\n{}", plan.summary());
@@ -530,8 +532,8 @@ fn caller_buffer_assignment_is_deterministic() {
         );
         g.output(&c.eclass, "E");
         let graph = g.build();
-        let table = luminal::test_support::mock_layout_table(&graph);
-        let plan = luminal::test_support::bufferize_mock(&graph).expect("bufferizes");
+        let table = test_runtime::test_support::mock_layout_table(&graph);
+        let plan = test_runtime::test_support::bufferize_mock(&graph).expect("bufferizes");
         // sanity: the view really is resident in x's caller buffer
         let xbuf = plan.value_buffer[&x.eclass].clone();
         assert!(matches!(xbuf, BufferId::Boundary(_)));
@@ -590,7 +592,7 @@ fn disagreeing_residents_no_longer_hit_a_geometry_door() {
     );
     g.output(&r.eclass, "E");
     let graph = g.build();
-    let plan = luminal::test_support::bufferize_mock(&graph)
+    let plan = test_runtime::test_support::bufferize_mock(&graph)
         .expect("no geometry door remains: the plan is the assignment");
     println!("{}", plan.summary());
     // Every buffer has exactly ONE assignment row — the whole of what a
@@ -631,8 +633,8 @@ fn every_compute_node_carries_filled_slot_descriptors() {
     );
     g.output(&c.eclass, "E");
     let graph = g.build();
-    let table = luminal::test_support::mock_layout_table(&graph);
-    let plan = luminal::test_support::bufferize_mock(&graph).expect("bufferizes");
+    let table = test_runtime::test_support::mock_layout_table(&graph);
+    let plan = test_runtime::test_support::bufferize_mock(&graph).expect("bufferizes");
 
     let mut computes = 0usize;
     for node in plan.dag.node_weights() {
@@ -764,7 +766,7 @@ fn output_slot_bound_to_view_of_poison_current_behavior() {
         g.build()
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        luminal::test_support::bufferize_mock(&graph)
+        test_runtime::test_support::bufferize_mock(&graph)
     }));
     match result {
         Ok(Ok(plan)) => panic!(

@@ -654,11 +654,12 @@ pub fn bucketed_search_implementations(
         let data = input_data(&representative);
         let mut capacity_dims = representative.clone();
         for (symbol, (min, max)) in &ranges {
-            // An absent PyTorch upper bound is represented by i64::MAX-1.
-            // It cannot certify a finite per-intermediate ceiling. Prune
-            // only choices already oversized at the minimum, and leave
-            // aggregate live-memory accounting to execution.
-            let capacity = if *max >= (i64::MAX - 1) as usize {
+            // PyTorch can encode an absent upper bound as i64::MAX-1, or
+            // derive another enormous finite upper bound from it. Such
+            // extents cannot fit the live arena and can overflow products
+            // with other dimensions. Use the minimum for pruning there;
+            // concrete allocations remain guarded at execution.
+            let capacity = if *max > options.memory_budget_bytes {
                 *min
             } else {
                 *max

@@ -778,7 +778,7 @@ fn an_input_terminal_keeps_its_buffer_input_and_never_a_producer() {
         // AND THE PLAN IS ACYCLIC: the cycle this bug produced was only
         // ever caught here, by bufferize's toposort.
         let dps = luminal::dps::dps_rewrite(&graph);
-        luminal::test_support::bufferize_mock(&dps)
+        test_runtime::test_support::bufferize_mock(&dps)
             .unwrap_or_else(|err| panic!("seed {seed}: bufferize refused the plan: {err:#}"));
     }
 }

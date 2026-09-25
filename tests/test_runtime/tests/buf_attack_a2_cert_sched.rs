@@ -56,8 +56,8 @@ fn report(name: &str, text: &str) {
     // recorded alloc+copy+free baseline: ZERO copies, no free of the
     // escaping backing buffer, the view slot backed by minted storage
     // handed to the caller, and the layout disclosed on the binding.
-    let plan = luminal::test_support::bufferize_mock(&dps).expect("the view output escapes");
-    let table = luminal::test_support::mock_layout_table(&dps);
+    let plan = test_runtime::test_support::bufferize_mock(&dps).expect("the view output escapes");
+    let table = test_runtime::test_support::mock_layout_table(&dps);
     let summary = plan.summary();
     println!("[{name}] plan:\n{summary}");
     use luminal::bufferize::{BufferId, BufferNode};

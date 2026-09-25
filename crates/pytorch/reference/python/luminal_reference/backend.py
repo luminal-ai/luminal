@@ -260,24 +260,12 @@ def _dynamic_export(
     return ep, inputs, remap_buckets(ep, original_shapes, symbol_buckets)
 
 
-def _compile_local_graph(
+def _prepare_local_graph(
     gm: torch.fx.GraphModule,
     example_inputs: Sequence[Any],
-    options: dict | None = None,
-    search_iterations: int | None = None,
-    search_log: bool = False,
-    max_intermediate_bytes: int | None = None,
-    memory_budget_bytes: int | None = None,
     symbol_buckets=None,
-) -> CompiledModel:
-    """Compile one local ATen graph after AOT partitioning."""
-    if options:
-        search_iterations = options.get("search_iterations", search_iterations)
-        search_log = options.get("search_log", search_log)
-        max_intermediate_bytes = options.get(
-            "max_intermediate_bytes", max_intermediate_bytes
-        )
-        memory_budget_bytes = options.get("memory_budget_bytes", memory_budget_bytes)
+) -> tuple:
+    """Export one local ATen graph after AOT partitioning."""
 
     # HF DynamicCache must be pytree-registered before torch.export capture so
     # use_cache=True models can export. Idempotent.
@@ -323,6 +311,30 @@ def _compile_local_graph(
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
 
+    return ep, export_inputs, scalar_output_positions, dim_buckets
+
+
+def _compile_local_graph(
+    gm: torch.fx.GraphModule,
+    example_inputs: Sequence[Any],
+    options: dict | None = None,
+    search_iterations: int | None = None,
+    search_log: bool = False,
+    max_intermediate_bytes: int | None = None,
+    memory_budget_bytes: int | None = None,
+    symbol_buckets=None,
+) -> CompiledModel:
+    """Compile one local ATen graph after AOT partitioning."""
+    if options:
+        search_iterations = options.get("search_iterations", search_iterations)
+        search_log = options.get("search_log", search_log)
+        max_intermediate_bytes = options.get(
+            "max_intermediate_bytes", max_intermediate_bytes
+        )
+        memory_budget_bytes = options.get("memory_budget_bytes", memory_budget_bytes)
+    ep, export_inputs, scalar_output_positions, dim_buckets = _prepare_local_graph(
+        gm, example_inputs, symbol_buckets
+    )
     return compile_exported(
         ep,
         export_inputs,
@@ -345,6 +357,7 @@ def compile_exported(
     max_intermediate_bytes=None,
     memory_budget_bytes=None,
     dim_buckets=None,
+    artifact=None,
 ):
     """Compile a functional ExportedProgram with the native runtime."""
 
@@ -408,11 +421,14 @@ def compile_exported(
             f"export consumed {user_index} of {len(export_inputs)} example_inputs"
         )
 
-    graph.search(
-        search_iterations,
-        search_log=search_log,
-        max_intermediate_bytes=max_intermediate_bytes,
-        memory_budget_bytes=memory_budget_bytes,
-        dim_buckets=dim_buckets,
-    )
+    if artifact is None:
+        graph.search(
+            search_iterations,
+            search_log=search_log,
+            max_intermediate_bytes=max_intermediate_bytes,
+            memory_budget_bytes=memory_budget_bytes,
+            dim_buckets=dim_buckets,
+        )
+    else:
+        graph.load_compiled(artifact, memory_budget_bytes=memory_budget_bytes)
     return CompiledModel(graph, ep, scalar_output_positions, held)

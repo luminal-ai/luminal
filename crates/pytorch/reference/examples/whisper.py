@@ -442,7 +442,7 @@ def main() -> None:
         model.decoder,
         backend=Compiler(
             search_iterations=10,
-            search_log=True,
+            log=True,
             dim_buckets={
                 seq: [
                     DimBucket(min=2, max=32, representative=2),

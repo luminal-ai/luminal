@@ -1,4 +1,4 @@
-"""Three-rank integration coverage for post-AOT P2P communication schedules."""
+"""Three-rank integration coverage for PyTorch collectives between local regions."""
 
 import time
 from datetime import timedelta
@@ -7,32 +7,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from luminal_reference import Compiler
-from torch.utils._python_dispatch import TorchDispatchMode
-
-
-class NoNativeCollectives(TorchDispatchMode):
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if str(func).startswith("_c10d_functional.") and "wait_tensor" not in str(func):
-            raise AssertionError(f"native collective executed: {func}")
-        return func(*args, **(kwargs or {}))
-
-
-class GuardedBackend(Compiler):
-    def _compile(self, gm, example_inputs, *, phase):
-        executable = super()._compile(gm, example_inputs, phase=phase)
-
-        def run(args):
-            with NoNativeCollectives():
-                return executable(args)
-
-        run._boxed_call = True
-        return run
 
 
 def _check(model, value, expected, gradient=None):
     if gradient is not None:
         value = value.detach().requires_grad_()
-    backend = GuardedBackend()
+    backend = Compiler()
     compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
     first = compiled(value)
     torch.testing.assert_close(first, expected)
@@ -40,19 +20,15 @@ def _check(model, value, expected, gradient=None):
         first.square().sum().backward()
         torch.testing.assert_close(value.grad, gradient)
         value.grad = None
-    # Exercise the cached executable under a dispatch guard: no native collective
-    # may run, although native point-to-point transport and waits are allowed.
     result = compiled(value)
     torch.testing.assert_close(result, expected)
     if gradient is not None:
         result.square().sum().backward()
         torch.testing.assert_close(value.grad, gradient)
-        assert {plan.phase for plan in backend.communications} == {
-            "forward",
-            "backward",
-        }
-    assert backend.communications
-    assert all(plan.executions == 2 for plan in backend.communications)
+    assert any(graph.collectives for graph in backend.graphs)
+    assert all(
+        "c10d" not in target for region in backend.regions for target in region.targets
+    )
     assert all(region.executions == 2 for region in backend.regions)
     assert result.data_ptr() != value.data_ptr() or not value.numel()
 
@@ -114,8 +90,7 @@ def _worker(rank, rendezvous):
             pieces.append(source[start : start + counts[peer][rank]])
         _check(exchange, value, torch.cat(pieces), 2 * value)
 
-        # Reuse forward/backward schedules as leading dimensions and split
-        # sizes change. No native collectives may run in these executables.
+        # Reuse forward/backward regions as leading dimensions and split sizes change.
         def dynamic_reduce(value):
             return ops.wait_tensor(ops.all_reduce(value, "sum", group))
 
@@ -145,7 +120,7 @@ def _worker(rank, rendezvous):
                 dynamic_uneven_exchange,
             )
         ):
-            backend = GuardedBackend()
+            backend = Compiler()
             compiled = torch.compile(
                 model, backend=backend, fullgraph=True, dynamic=True
             )
@@ -184,23 +159,7 @@ def _worker(rank, rendezvous):
                 result.square().sum().backward()
                 torch.testing.assert_close(value.grad, gradient)
             assert len(backend.graphs) == 2, (kind, len(backend.graphs))
-            assert all(plan.executions == 3 for plan in backend.communications)
-
-        # Communication is effectful even if its result has no local consumers.
-        graph = torch.fx.Graph()
-        arg = graph.placeholder("value")
-        arg.meta["val"] = x
-        collective = graph.call_function(ops.all_reduce.default, (arg, "sum", group))
-        collective.meta["val"] = x
-        graph.output((arg,))
-        backend = GuardedBackend()
-        executable = backend._compile(
-            torch.fx.GraphModule({}, graph), [x], phase="inference"
-        )
-        (result,) = executable([x])
-        torch.testing.assert_close(result, x)
-        assert len(backend.communications) == 1
-        assert backend.communications[0].executions == 1
+            assert all(region.executions == 3 for region in backend.regions)
 
         # Group-relative source differs from global source; nonmembers skip work.
         subgroup = dist.new_group([0, 2], backend="gloo")
@@ -225,7 +184,7 @@ def _worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
-def test_three_rank_p2p(tmp_path):
+def test_three_rank_collectives(tmp_path):
     context = mp.spawn(
         _worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=3, join=False
     )
@@ -233,7 +192,7 @@ def test_three_rank_p2p(tmp_path):
     try:
         while not context.join(timeout=1):
             if time.monotonic() > deadline:
-                raise TimeoutError("three-rank P2P test exceeded 180 seconds")
+                raise TimeoutError("three-rank collective test exceeded 180 seconds")
     finally:
         for process in context.processes:
             if process.is_alive():

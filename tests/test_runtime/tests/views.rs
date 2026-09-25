@@ -14,7 +14,7 @@
 //! `basic_program.egg`. Nothing here reaches into the core script tree.
 
 use luminal::layout_ir::Access;
-use luminal::test_support::{MockOp, TestGraph, bufferize_mock};
+use test_runtime::test_support::{MockOp, TestGraph, bufferize_mock};
 
 /// THE REAL VIEW OP, plan level (Step 3): `IndexMapApplyView` feeding a
 /// compute op contributes ZERO plan nodes — the result binds its parent's
@@ -128,7 +128,7 @@ fn real_view_op_to_output_slot_escapes_zero_copy() {
         "the slot is backed by the INPUT buffer:\n{}",
         plan.summary()
     );
-    let table = luminal::test_support::mock_layout_table(&graph);
+    let table = test_runtime::test_support::mock_layout_table(&graph);
     assert_eq!(
         &slot.layout, &table[&v],
         "the binding discloses the elected view layout, verbatim"

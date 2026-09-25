@@ -7,21 +7,6 @@
 //! an implementation, so none of it is runtime-specific: it lives here
 //! beside [`crate::extraction`], and each runtime's `search` module
 //! imports it.
-//!
-//! WHAT IS NOT HERE, and why. The GA loop stays in each runtime,
-//! because it must PRICE a plan in the middle of every iteration — the
-//! reference runtime executes the candidate and times it, CUDA-lite
-//! profiles on the device — and pricing is the
-//! decision. Core would have to call back out to get it, which is the
-//! seam the 2026-09-03 no-trait ruling closed. So the loop, the option
-//! knobs, the outcome shape, the evaluators, the bucketed drivers and
-//! CUDA-lite's finalist/lattice policy all stay runtime-local; what
-//! moved here is what was byte-identical in every copy.
-//!
-//! (#420/#422 rejoin Phase 8, 2026-09-04. The sampler had three
-//! identical copies — `luminal_reference::search`,
-//! `luminal_cuda_lite::search`, `test_runtime::sampler` — and the
-//! reporting plumbing two.)
 
 use std::collections::BTreeMap;
 

@@ -214,6 +214,8 @@ pub struct ReferenceRuntime {
     dim_buckets: std::collections::BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
     /// One finished plan per Cartesian bucket combination.
     bucket_plans: Vec<crate::search::BucketPlan>,
+    /// Plans received from a peer. These are executable without a search.
+    loaded_bucket_plans: Vec<crate::compiled_artifact::CompiledBucket>,
     /// The dim values this runtime currently holds — every `[n, n]`
     /// `bind_dyn_range` pin, plus whatever [`Self::set_dim`] sets. With
     /// buckets bound this is what picks the plan at execute time.
@@ -402,6 +404,99 @@ impl ReferenceRuntime {
     /// The finished per-bucket plans (empty until `search_buckets`).
     pub fn bucket_plans(&self) -> &[crate::search::BucketPlan] {
         &self.bucket_plans
+    }
+
+    /// Serialize selected reference plans using caller-provided boundary slot
+    /// order. Internal node IDs never cross the process boundary.
+    pub fn serialize_compiled(
+        &self,
+        inputs: &[petgraph::graph::NodeIndex],
+        outputs: &[i64],
+    ) -> Result<Vec<u8>> {
+        let buckets = if self.bucket_plans.is_empty() {
+            let plan = self
+                .plan
+                .as_ref()
+                .ok_or_else(|| anyhow!("no selected plan"))?;
+            vec![crate::compiled_artifact::CompiledBucket {
+                ranges: Default::default(),
+                input_buffers: inputs
+                    .iter()
+                    .map(|id| {
+                        self.input_buffers
+                            .get(id)
+                            .copied()
+                            .ok_or_else(|| anyhow!("input {id:?} has no boundary binding"))
+                    })
+                    .collect::<Result<_>>()?,
+                output_buffers: outputs.to_vec(),
+                plan: plan.clone(),
+            }]
+        } else {
+            self.bucket_plans
+                .iter()
+                .map(|bucket| {
+                    Ok(crate::compiled_artifact::CompiledBucket {
+                        ranges: bucket
+                            .ranges
+                            .iter()
+                            .map(|(s, r)| (s.to_string(), *r))
+                            .collect(),
+                        input_buffers: bucket.program.inputs.iter().map(|b| b.buffer).collect(),
+                        output_buffers: bucket.program.outputs.iter().map(|b| b.buffer).collect(),
+                        plan: bucket.outcome.best_plan.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        crate::compiled_artifact::serialize(&buckets)
+    }
+
+    /// Install selected plans without saturation or profiling. The lists map
+    /// artifact boundary positions onto this process's translated values.
+    pub fn deserialize_compiled(
+        &mut self,
+        bytes: &[u8],
+        inputs: &[petgraph::graph::NodeIndex],
+        outputs: &[petgraph::graph::NodeIndex],
+        memory_budget_bytes: usize,
+    ) -> Result<Vec<i64>> {
+        let buckets = crate::compiled_artifact::deserialize(bytes)?;
+        let first = &buckets[0];
+        ensure!(
+            first.input_buffers.len() == inputs.len()
+                && first.output_buffers.len() == outputs.len(),
+            "reference artifact boundary arity differs from local translation"
+        );
+        for bucket in &buckets {
+            ensure!(
+                bucket.input_buffers == first.input_buffers
+                    && bucket.output_buffers == first.output_buffers,
+                "reference artifact buckets have inconsistent boundary assignments"
+            );
+        }
+        let input_bindings: Vec<_> = inputs
+            .iter()
+            .zip(&first.input_buffers)
+            .map(|(&value, &buffer)| crate::bindings::Bound { value, buffer })
+            .collect();
+        let output_bindings: Vec<_> = outputs
+            .iter()
+            .zip(&first.output_buffers)
+            .map(|(&value, &buffer)| crate::bindings::Bound { value, buffer })
+            .collect();
+        self.stage_bindings(&input_bindings, &output_bindings);
+        self.set_memory_budget_bytes(memory_budget_bytes);
+        let output_buffers = first.output_buffers.clone();
+        self.native = None;
+        self.bucket_plans.clear();
+        self.loaded_bucket_plans = buckets;
+        // A tracing hint need not fall inside any requested bucket. Select
+        // symbolic plans only after the caller binds its actual input dims.
+        if self.loaded_bucket_plans.len() == 1 && self.loaded_bucket_plans[0].ranges.is_empty() {
+            self.select_bucket_plan()?;
+        }
+        Ok(output_buffers)
     }
 
     /// BINDING: declare an Int input tensor's VALUE range (typed-buffers
@@ -600,6 +695,23 @@ impl ReferenceRuntime {
     /// picks the plan by bucket coverage and prices it during search, but
     /// it no longer constrains what the loaded plan can execute.
     fn select_bucket_plan(&mut self) -> Result<()> {
+        if !self.loaded_bucket_plans.is_empty() {
+            let bucket = self
+                .loaded_bucket_plans
+                .iter()
+                .find(|bucket| {
+                    bucket.ranges.iter().all(|(name, &(lo, hi))| {
+                        self.dims
+                            .get(&luminal::shape::Symbol::from(name.as_str()))
+                            .is_some_and(|&value| lo <= value && value <= hi)
+                    })
+                })
+                .ok_or_else(|| {
+                    anyhow!("no serialized reference plan covers dims {:?}", self.dims)
+                })?;
+            self.load_plan(bucket.plan.clone());
+            return Ok(());
+        }
         let Some(plan) = crate::search::select_bucket(&self.bucket_plans, &self.dims) else {
             let covered: Vec<_> = self.bucket_plans.iter().map(|p| p.ranges.clone()).collect();
             anyhow::bail!(
@@ -637,7 +749,7 @@ impl ReferenceRuntime {
         // With buckets bound, the plan is chosen HERE, from the current
         // dims (see [`Self::select_bucket_plan`] for the static-plan
         // refusal). Without them nothing changes.
-        if !self.bucket_plans.is_empty() {
+        if !self.bucket_plans.is_empty() || !self.loaded_bucket_plans.is_empty() {
             self.select_bucket_plan()?;
         }
         let plan = self

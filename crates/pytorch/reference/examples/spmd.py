@@ -1,9 +1,3 @@
-"""Two-rank CPU inference: DTensor sharding + Luminal local compilation.
-
-Run from crates/pytorch/reference:
-    uv run python examples/spmd.py
-"""
-
 import os
 import socket
 import tempfile
@@ -41,7 +35,7 @@ def worker(rank, rendezvous):
         x = distribute_tensor(full_x, mesh, [Shard(1)])
         weight = distribute_tensor(full_weight, mesh, [Shard(0)])
         compiled = torch.compile(
-            model, backend=Compiler(), fullgraph=True, dynamic=True
+            model, backend=Compiler(log=True), fullgraph=True, dynamic=True
         )
         with torch.no_grad():
             output = compiled(x, weight)

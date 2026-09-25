@@ -29,7 +29,7 @@ fn genome_fused_choice_dedups_one_instance_claiming_both_slots() {
         .filter(|node| matches!(node, ExtractedNode::LayoutOp(_)))
         .count();
     assert_eq!(computes, 1, "instance dedup across both claimed slots");
-    let plan = luminal::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
+    let plan = test_runtime::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
         .expect("bufferizes");
     let allocs = plan
         .buffers
@@ -67,7 +67,7 @@ fn genome_mixed_choice_mints_a_waste_destination() {
         .filter(|node| matches!(node, ExtractedNode::LayoutOp(_)))
         .count();
     assert_eq!(computes, 2, "fused kernel + standalone mul");
-    let plan = luminal::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
+    let plan = test_runtime::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
         .expect("bufferizes");
     let summary = plan.summary();
     assert!(summary.contains("AddMulFusedGeneric"), "{summary}");
@@ -127,7 +127,7 @@ fn golden_plans_are_pinned() {
             "LayoutTensorOpMulFunctionalGeneric",
         ],
     );
-    let plan = luminal::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
+    let plan = test_runtime::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
         .expect("add_mul_fused");
     let golden = fs::read_to_string(golden_path)
         .unwrap_or_else(|_| panic!("{golden_path} missing — run regenerate_golden_plans by name"));
@@ -152,7 +152,7 @@ fn regenerate_golden_plans() {
             "LayoutTensorOpMulFunctionalGeneric",
         ],
     );
-    let plan = luminal::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
+    let plan = test_runtime::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
         .expect("add_mul_fused");
     fs::write("golden/add_mul_fused.bufferized.txt", plan.summary()).expect("golden writes");
 }
@@ -163,7 +163,7 @@ fn regenerate_golden_plans() {
 #[test]
 fn fixture_extraction_does_not_overwrite_another_selected_producer() {
     let graph = test_runtime::extract_fixture(ADD_MUL_FUSED);
-    let plan = luminal::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
+    let plan = test_runtime::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
         .expect("each value has one selected producer; unclaimed results use scratch");
     assert!(plan.summary().contains("AddMulFusedGeneric"));
     assert!(plan.summary().contains("AddFunctionalGeneric"));

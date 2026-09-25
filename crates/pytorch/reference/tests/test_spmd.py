@@ -70,8 +70,7 @@ def _worker(rank, rendezvous):
                 optimizer.zero_grad()
             torch.testing.assert_close(weight.full_tensor(), dense_weight)
 
-        assert backend.communications
-        assert all(plan.executions >= 2 for plan in backend.communications)
+        assert (backend.leader_compilations > 0) == (rank == 0)
         assert {r.phase for r in backend.regions} == {"forward", "backward"}
         assert all(r.executions >= 2 for r in backend.regions)
         forward_shapes = {
@@ -109,7 +108,10 @@ def _worker(rank, rendezvous):
                     dynamic_compiled(sharded, weight), dense_input @ dense_weight
                 )
         assert len(dynamic_backend.graphs) == 1
-        assert all(plan.executions == 3 for plan in dynamic_backend.communications)
+        assert len(dynamic_backend.regions) == 1
+        assert dynamic_backend.regions[0].targets == ("aten.mm.default",)
+        assert dynamic_backend.leader_compilations == (1 if rank == 0 else 0)
+        assert all(region.executions == 3 for region in dynamic_backend.regions)
     finally:
         dist.destroy_process_group()
 

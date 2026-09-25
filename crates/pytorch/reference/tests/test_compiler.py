@@ -24,7 +24,7 @@ def isolated_compiler(monkeypatch):
 
 @pytest.mark.parametrize("logging", [None, False, True])
 def test_compiler_logging_and_aot(logging, capfd):
-    options = {} if logging is None else {"search_log": logging}
+    options = {} if logging is None else {"log": logging}
     compiler = Compiler(**options)
     model = Model().eval()
     x = torch.tensor([[0.1, 0.2], [0.3, 0.4]])

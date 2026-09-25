@@ -603,7 +603,7 @@ fn r10_debug_bufferize() {
     // alloc ESCAPES — the slot is backed by it (FreedBy::Caller, no free),
     // zero copies — and the binding discloses the weld's layout for the
     // caller to interpret the bytes under.
-    let plan = luminal::test_support::bufferize_mock(&dps).expect("the view output escapes");
+    let plan = test_runtime::test_support::bufferize_mock(&dps).expect("the view output escapes");
     println!("{}", plan.summary());
     use luminal::bufferize::{BufferId, BufferNode};
     assert!(
@@ -634,7 +634,7 @@ fn r10_debug_bufferize() {
     );
     assert_eq!(
         Some(&slot.layout),
-        luminal::test_support::mock_layout_table(&dps).get(&slot.value),
+        test_runtime::test_support::mock_layout_table(&dps).get(&slot.value),
         "the binding discloses the slot value's own elected (weld) layout"
     );
 }

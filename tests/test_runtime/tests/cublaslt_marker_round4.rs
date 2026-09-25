@@ -174,7 +174,7 @@ fn t6a_bufferize_all_four_forms() {
             "{name}: dest tie present"
         );
 
-        let plan = luminal::test_support::bufferize_mock(&dps_graph)
+        let plan = test_runtime::test_support::bufferize_mock(&dps_graph)
             .unwrap_or_else(|err| panic!("T6a {name}: bufferizer REFUSED: {err}"));
         let summary = plan.summary();
         let allocs = plan
@@ -232,7 +232,7 @@ fn t6a_bufferize_all_four_forms() {
         // (the escaping buffer backs a real tensor whose buffer is the
         // slot's). Element-level walkability of real decoded layouts is
         // pinned in `test_runtime::test_equality`'s own tests.
-        let table = luminal::test_support::mock_layout_table(&dps_graph);
+        let table = test_runtime::test_support::mock_layout_table(&dps_graph);
         assert_eq!(
             &slot.layout,
             table
@@ -279,7 +279,7 @@ fn t6a_accumulate_intermediate_c_donation_observed() {
             .any(|(op, _)| op.form == CublasLtForm::Accumulate),
         "the Accumulate contract elected"
     );
-    let plan = luminal::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
+    let plan = test_runtime::test_support::bufferize_mock(&luminal::dps::dps_rewrite(&graph))
         .unwrap_or_else(|err| panic!("T6a-donation: bufferizer REFUSED: {err}"));
     let allocs = plan
         .buffers

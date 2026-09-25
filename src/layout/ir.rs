@@ -681,7 +681,7 @@ pub struct LayoutInfo {
 /// its prior contents are then destroyed. Callers who want their bytes
 /// back unchanged bind `ReadOnly`; callers who want results delivered
 /// into their storage declare an output binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Access {
     ReadOnly,
     ReadWrite,
@@ -695,7 +695,7 @@ pub enum Access {
 /// (donated): the program must free it exactly once, after its last use.
 /// There is NO undeclared default: input-program validation requires every
 /// boundary buffer to declare its responsibility explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FreedBy {
     Caller,
     Program,

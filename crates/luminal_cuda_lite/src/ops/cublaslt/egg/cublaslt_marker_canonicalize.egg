@@ -222,7 +222,7 @@
 ; are NEW values every generation and saturation never closes; once they
 ; do, every next-generation chain term hash-conses into the original and
 ; the sandwich closes in two generations. Core's transpose involution
-; (src/logical_helper/matrix_transpose) provides that for the helper
+; (src/logical/helper/matrix_transpose) provides that for the helper
 ; spellings the sandwich mints today; this rule provides it for raw
 ; transpose maps (tests/r11_collapse_revert_probe.rs pins that the walk
 ; converges with and without it). The same collapse closes the

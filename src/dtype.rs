@@ -142,7 +142,7 @@ impl DType {
 /// `bits-of` rows (information content — `Bool` is ONE bit), not Rust
 /// storage widths. This is the dtype a plan `Buffer` carries and the
 /// executor dispatches on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PlanDtype {
     F32,
     F64,

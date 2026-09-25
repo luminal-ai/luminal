@@ -1,4 +1,4 @@
-//! THE EXTRACTOR — a core utility every runtime calls with its own
+//! A core utility every runtime calls with its own
 //! matcher list.
 //!
 //! It decides nothing. Given a saturated e-graph and a genome (a choice
@@ -9,24 +9,6 @@
 //! that arrives as an argument of a core trait type
 //! (`&[Box<dyn crate::layout_ir::OpMatcher>]`) — there is no runtime
 //! type in this file, so there is nothing here to specialize.
-//!
-//! RUNTIME-SPECIFIC IS SELECTION, NOT THE WALK (#420/#422 rejoin Phase
-//! 8, 2026-09-04). Each runtime keeps what chooses: its op registry,
-//! its allow list, its evaluator (how a plan is priced), its option
-//! knobs and outcome shape, its finalist/lattice policy, and the search
-//! loop that runs them. This module and [`crate::search_support`] hold
-//! the two halves that decide nothing — turning a genome into a graph,
-//! and drawing genomes.
-//!
-//! History: the walk left core in Phase 1 ("move extractor.rs to each
-//! runtime. Maybe if there are some core utilities, they can belong in
-//! core, but for now just do a simple duplication in each runtime") and
-//! was duplicated into `luminal_reference`, `luminal_cuda_lite` and
-//! `test_runtime`. Seven phases later the three copies differed by one
-//! API-shape hunk and zero logic lines, so the "maybe" clause was
-//! taken: this is that one copy, in the borrowed-matcher form Phase 2
-//! gave the CUDA-lite runtime. The runtime modules named `extractor`
-//! are now aliases for this one.
 
 use once_cell::unsync::Lazy;
 

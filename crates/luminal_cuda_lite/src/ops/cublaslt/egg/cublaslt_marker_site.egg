@@ -31,7 +31,7 @@
 ; --- THE canonical form, named by the core helper -------------------------
 ; (LogicalHelperMatrixMultiply ?a ?b) is the whole canonical chain — the two
 ; broadcasts, the elementwise multiply, the reduction over k — recognized
-; and expanded in core (src/logical_helper/matrix_multiply). Both operand
+; and expanded in core (src/logical/helper/matrix_multiply). Both operand
 ; storages reach it: an operand stored transposed arrives as a
 ; LogicalHelperMatrixTranspose of the stored tensor, and the site names
 ; the [m,k] and [k,n] operands either way.

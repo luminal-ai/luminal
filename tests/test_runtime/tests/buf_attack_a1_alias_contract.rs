@@ -17,17 +17,17 @@
 //!   (4) a mutating consumer reaching a bound value THROUGH a view: vetoed
 //!       (END_OF_PROGRAM read never happens-before) and repaired.
 //!
-//! Hand-authored graphs via luminal::test_support, per the assignment rule:
+//! Hand-authored graphs via test_runtime::test_support, per the assignment rule:
 //! these shapes are defined by the Bufferizable interface (Must ties, May
 //! permits, poison roots), which have no egglog surface.
 use luminal::bufferize::{BufferId, BufferNode, EdgeKind};
 use luminal::layout_ir::Access;
 use luminal::prelude::petgraph;
-use luminal::test_support::{EmptyOp, MockOp, MockView, TestGraph};
 use petgraph::visit::EdgeRef;
+use test_runtime::test_support::{EmptyOp, MockOp, MockView, TestGraph};
 
 fn copies(
-    plan: &luminal::bufferize::BufferIrGraph<luminal::test_support::MockLayout>,
+    plan: &luminal::bufferize::BufferIrGraph<test_runtime::test_support::MockLayout>,
 ) -> Vec<(BufferId, BufferId)> {
     plan.dag
         .node_weights()
@@ -38,7 +38,9 @@ fn copies(
         .collect()
 }
 
-fn war_antis(plan: &luminal::bufferize::BufferIrGraph<luminal::test_support::MockLayout>) -> usize {
+fn war_antis(
+    plan: &luminal::bufferize::BufferIrGraph<test_runtime::test_support::MockLayout>,
+) -> usize {
     plan.dag
         .edge_references()
         .filter(|e| e.weight().kind == EdgeKind::Anti)
@@ -73,7 +75,7 @@ fn a1_cohabiting_input_refuses_seed_without_permit() {
         )
         .remove(0);
     g.output(&r, "B");
-    let plan = luminal::test_support::bufferize_mock(&g.build()).expect("bufferize");
+    let plan = test_runtime::test_support::bufferize_mock(&g.build()).expect("bufferize");
     println!("{}", plan.summary());
 
     assert!(
@@ -115,7 +117,7 @@ fn a1_cohabiting_input_admitted_with_trusted_permit_writes_bound_in_kernel() {
         )
         .remove(0);
     g.output(&r, "B");
-    let plan = luminal::test_support::bufferize_mock(&g.build()).expect("bufferize");
+    let plan = test_runtime::test_support::bufferize_mock(&g.build()).expect("bufferize");
     println!("{}", plan.summary());
 
     assert!(
@@ -158,7 +160,7 @@ fn a1_readonly_cohabitant_rejects_program_even_with_permit() {
         )
         .remove(0);
     g.output(&r, "B");
-    let err = luminal::test_support::bufferize_mock(&g.build()).unwrap_err();
+    let err = test_runtime::test_support::bufferize_mock(&g.build()).unwrap_err();
     println!("rejected: {err:#}");
     assert!(err.to_string().contains("read-only buffer"), "{err}");
 }
@@ -189,8 +191,8 @@ fn a1_value_plus_view_to_two_outputs_direct_slot_first() {
     g.output(&y, "D");
     g.output(&v, "E");
     let graph = g.build();
-    let table = luminal::test_support::mock_layout_table(&graph);
-    let plan = luminal::test_support::bufferize_mock(&graph).expect("bufferize");
+    let table = test_runtime::test_support::mock_layout_table(&graph);
+    let plan = test_runtime::test_support::bufferize_mock(&graph).expect("bufferize");
     println!("{}", plan.summary());
 
     assert!(
@@ -266,8 +268,8 @@ fn a1_value_plus_view_to_two_outputs_view_slot_first() {
     g.output(&v, "D");
     g.output(&y, "E");
     let graph = g.build();
-    let table = luminal::test_support::mock_layout_table(&graph);
-    let plan = luminal::test_support::bufferize_mock(&graph).expect("bufferize");
+    let table = test_runtime::test_support::mock_layout_table(&graph);
+    let plan = test_runtime::test_support::bufferize_mock(&graph).expect("bufferize");
     println!("{}", plan.summary());
 
     assert!(
@@ -350,7 +352,7 @@ fn a1_unordered_reader_of_cohabited_buffer_hazard_gone_under_escape() {
     // bytes) is GONE, not tolerated: x's buffer is never written, the
     // WAR edge the old pin measured has nothing to order, and only s's
     // dense delivery into E copies.
-    let plan = luminal::test_support::bufferize_mock(&g.build()).expect("bufferize");
+    let plan = test_runtime::test_support::bufferize_mock(&g.build()).expect("bufferize");
     println!("{}", plan.summary());
     assert!(matches!(plan.value_buffer[&y], BufferId::Allocated(_)));
     let slot = plan
@@ -437,8 +439,8 @@ fn a1_mutating_consumer_through_view_of_bound_value_vetoed_and_repaired() {
     g.output(&y, "D");
     g.output(&r, "E");
     let graph = g.build();
-    let table = luminal::test_support::mock_layout_table(&graph);
-    let plan = luminal::test_support::bufferize_mock(&graph).expect("bufferize");
+    let table = test_runtime::test_support::mock_layout_table(&graph);
+    let plan = test_runtime::test_support::bufferize_mock(&graph).expect("bufferize");
     println!("{}", plan.summary());
 
     // y seeded into D; the accumulator must NOT write D.
