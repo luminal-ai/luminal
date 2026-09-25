@@ -430,10 +430,20 @@ def _cuda_sleep_ms(stream: torch.cuda.Stream) -> float:
 @pytest.mark.skipif(
     _CUDA_SKIP_REASON is not None, reason=_CUDA_SKIP_REASON or "CUDA is unavailable"
 )
-def test_non_static_writeback_accepts_changed_target() -> None:
+def test_cuda_writeback_uses_aliased_input_binding() -> None:
     from types import SimpleNamespace
 
-    copies = []
+    current_target = [None]
+
+    def set_input_device_ptr(_name, pointer, _nbytes):
+        assert pointer == current_target[0].data_ptr()
+
+    def run(*_args):
+        current_target[0].fill_(7)
+
+    def unexpected_copy(_copies):
+        raise AssertionError("an aliased CUDA writeback must not be copied")
+
     graph = SimpleNamespace(
         input_names=["target"],
         input_dtypes=[7],
@@ -445,18 +455,21 @@ def test_non_static_writeback_accepts_changed_target() -> None:
         device_type="cuda",
         device_index=0,
         supports_device_ptrs=True,
-        set_input_device_ptr=lambda *args: None,
-        run=lambda *args: None,
-        copy_outputs_to_device_ptrs_at=lambda value: copies.append(value),
+        set_input_device_ptr=set_input_device_ptr,
+        run=run,
+        copy_outputs_to_device_ptrs_at=unexpected_copy,
     )
     model = CompiledModel(graph)
     first = torch.zeros(2, device="cuda")
     second = torch.zeros(2, device="cuda")
 
-    model(first)
-    model(second)
+    current_target[0] = first
+    assert model(first) == ()
+    current_target[0] = second
+    assert model(second) == ()
 
-    assert [copy[0][1] for copy in copies] == [first.data_ptr(), second.data_ptr()]
+    assert torch.equal(first, torch.full_like(first, 7))
+    assert torch.equal(second, torch.full_like(second, 7))
 
 
 @pytest.mark.skipif(

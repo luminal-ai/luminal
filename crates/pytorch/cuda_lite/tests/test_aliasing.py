@@ -186,6 +186,54 @@ def test_module_buffer_slice_write():
 
 
 @cuda
+def test_attention_writes_kv_directly_into_the_callers_cache():
+    """A decode-shaped attention step writes K/V into caller-owned cache
+    storage and consumes those writes without a post-execution writeback."""
+
+    def fn(query, key, value, key_cache, value_cache, positions):
+        key_cache[:, :, positions, :] = key
+        value_cache[:, :, positions, :] = value
+        scores = query @ key_cache.transpose(-2, -1)
+        weights = torch.softmax(scores, dim=-1)
+        return weights @ value_cache, key_cache, value_cache
+
+    def query():
+        return torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4)
+
+    def key():
+        return (
+            torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4)
+            / 8
+        )
+
+    def value():
+        return (
+            torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4)
+            + 1
+        )
+
+    def cache():
+        return torch.zeros(1, 2, 8, 4, device="cuda")
+
+    def positions():
+        return torch.tensor([3], dtype=torch.int64, device="cuda")
+
+    (attention, returned_keys, returned_values), compiled_inputs = _same_as_eager(
+        fn,
+        query,
+        key,
+        value,
+        cache,
+        cache,
+        positions,
+    )
+    key_cache, value_cache = compiled_inputs[3:5]
+    assert attention.shape == (1, 2, 1, 4)
+    assert returned_keys.data_ptr() == key_cache.data_ptr()
+    assert returned_values.data_ptr() == value_cache.data_ptr()
+
+
+@cuda
 def test_writes_through_storage_sharing_inputs_are_refused_by_name():
     def fn(a, b):
         a.add_(1)

@@ -101,11 +101,6 @@ class CompiledModel:
         # CUDA bindings are persistent in the runtime; only changed metadata
         # needs to cross PyO3 on subsequent calls.
         self._cuda_input_bindings = {}
-        # output position -> (device, pointer, required bytes, dtype, strong tensor ref).
-        # Functionalized mutation outputs normally target long-lived state
-        # tensors, so their durable registrations cross PyO3 only when the
-        # actual storage changes.
-        self._cuda_writeback_bindings = {}
         # Expected input dtypes from graph. Every declared input MUST
         # have a dtype code — refuse to silently default to float32 if
         # the Rust side returned a shorter list than `input_names`.
@@ -187,6 +182,11 @@ class CompiledModel:
         # For CUDA inputs, keep references alive so the caching allocator doesn't
         # recycle GPU memory before run() reads the pointers.
         _input_refs = []
+        # A CUDA mutation output is bound by the compiler to its input's buffer.
+        # Remember the exact tensor whose pointer crossed the boundary so the
+        # post-run path can distinguish direct aliasing from a contiguous
+        # temporary made for a noncontiguous caller tensor.
+        _bound_cuda_inputs = {}
         for name, tensor, expected_dtype in zip(
             self._input_names, user_inputs, self._input_dtypes
         ):
@@ -222,6 +222,7 @@ class CompiledModel:
                 # until the replacement has crossed the boundary.
                 self._cuda_input_bindings[name] = (*signature, t)
                 _input_refs.append(t)
+                _bound_cuda_inputs[name] = t
             else:
                 t = tensor.detach().cpu().contiguous()
                 n_bytes = t.numel() * t.element_size()
@@ -287,32 +288,6 @@ class CompiledModel:
             torch.uint8: ("get_output_u8", torch.uint8),
             torch.bool: ("get_output_bool", torch.bool),
         }
-
-        if self._static_outputs:
-            for i in self._writeback_by_pos:
-                name = self._output_names[i]
-                target = user_inputs[self._writeback_input_pos[i]]
-                out_dtype = output_torch_dtypes[i]
-                expected_numel = math.prod(output_shapes[i])
-                if not (
-                    hasattr(self._graph, "copy_outputs_to_device_ptrs_at")
-                    and target.is_cuda
-                    and target.is_contiguous()
-                    and target.dtype == out_dtype
-                    and target.numel() == expected_numel
-                ):
-                    raise ValueError(
-                        f"static writeback '{name}' requires a contiguous CUDA "
-                        f"tensor with dtype {out_dtype} and {expected_numel} elements"
-                    )
-                n_bytes = target.numel() * target.element_size()
-                signature = _cuda_input_binding_signature(target, n_bytes)
-                previous = self._cuda_writeback_bindings.get(i)
-                if previous is not None and previous[:4] != signature:
-                    raise ValueError(
-                        f"static writeback '{name}' target allocation changed"
-                    )
-                self._cuda_writeback_bindings[i] = (*signature, target)
 
         def _read_typed_output(
             position: int, name: str, shape, out_dtype
@@ -393,12 +368,9 @@ class CompiledModel:
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
                 out_dtype = output_torch_dtypes[i]
                 if i in self._writeback_by_pos:
-                    # A functionalized mutation output may share its producer
-                    # with another positional output. Output registrations are
-                    # keyed by producer node, so binding such positions up
-                    # front can redirect one cache writeback into another.
-                    # Preserve positional semantics with the batched post-run
-                    # device copies below.
+                    # The compiler binds this output on its mutated input's
+                    # buffer. Registering a separate output pointer would break
+                    # that alias and is both unnecessary and incorrect.
                     output_tensors.append(None)
                     continue
                 if self._static_outputs:
@@ -431,31 +403,20 @@ class CompiledModel:
             self._graph.run()
 
         outputs = []
-        gpu_writebacks = []
         for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
             out_dtype = output_torch_dtypes[i]
             if i in self._writeback_by_pos:
-                # In-place input mutation: copy the computed state back into
-                # the caller's tensor (the same object the model would have
-                # mutated eagerly); it is not part of the returned tuple.
+                # The CUDA boundary binds this mutation output on the input's
+                # buffer, so execution has already updated a directly-bound
+                # caller tensor. Only a noncontiguous input needs a copy from
+                # the contiguous tensor whose pointer we actually registered.
+                input_name = self._writeback_by_pos[i]
                 target = user_inputs[self._writeback_input_pos[i]]
-                expected_numel = math.prod(shape)
-                can_copy_on_device = (
-                    self._supports_device_ptrs
-                    and hasattr(self._graph, "copy_outputs_to_device_ptrs_at")
-                    and target.is_cuda
-                    and target.is_contiguous()
-                    and target.dtype == out_dtype
-                    and target.numel() == expected_numel
-                )
-                if can_copy_on_device:
-                    gpu_writebacks.append(
-                        (
-                            i,
-                            target.data_ptr(),
-                            target.numel() * target.element_size(),
-                        )
-                    )
+                bound = _bound_cuda_inputs.get(input_name)
+                if bound is target:
+                    pass
+                elif bound is not None:
+                    target.copy_(bound)
                 else:
                     target.copy_(_read_typed_output(i, name, shape, out_dtype))
                 continue
@@ -468,9 +429,6 @@ class CompiledModel:
             else:
                 out = _read_typed_output(i, name, shape, out_dtype)
             outputs.append(out)
-
-        if gpu_writebacks:
-            self._graph.copy_outputs_to_device_ptrs_at(gpu_writebacks)
 
         flat_outputs = tuple(
             output.item() if i in self._scalar_output_positions else output
