@@ -332,8 +332,6 @@ def test_hf_llama3_large_full(device: torch.device):
 # ========== Dynamic Dimension Tests ==========
 
 
-
-
 @pytest.mark.slow
 def test_hf_llama38b_full(device: torch.device):
     """HuggingFace LlamaForCausalLM — full Llama-3.1-8B-Instruct with real pretrained weights.
@@ -360,8 +358,6 @@ def test_hf_llama38b_full(device: torch.device):
         ref = model(input_ids)
         out = compiled(input_ids)
     _assert_bf16_logits_match(out.logits, ref.logits)
-
-
 
 
 def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):

@@ -2,11 +2,11 @@ import pytest
 import torch
 import torch._dynamo
 from luminal_cuda_lite import Compiler
-
-luminal_backend = Compiler()
 from reference.tests.models.test_qwen3_moe import (
     _make_qwen3_moe_config,
 )
+
+luminal_backend = Compiler()
 
 
 @pytest.mark.skipif(

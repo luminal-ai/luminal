@@ -3,9 +3,9 @@
 import pytest
 import torch
 from luminal_reference import Compiler
+from test_dtype_boundary import BoundaryNoopModel, EmptyWeightModel
 
 luminal_backend = Compiler()
-from test_dtype_boundary import BoundaryNoopModel, EmptyWeightModel
 
 
 @pytest.mark.parametrize(

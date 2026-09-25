@@ -235,6 +235,7 @@ def test_max_dim_values_and_indices() -> None:
     x = torch.randn(3, 4)
     model = nn.Identity()
     compiled = torch.compile(model, backend=luminal_reference.Compiler())
+
     # max.dim is exercised through the exported tuple-returning wrapper.
     class MaxDim(nn.Module):
         def forward(self, x):

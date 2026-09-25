@@ -52,9 +52,11 @@ def test_select_backed_activations(activation):
     """ReLU/GELU lower through the native ternary select op; before it existed
     their graphs dead-ended extraction and the backend refused to compile."""
     torch.manual_seed(0)
-    model = torch.nn.Sequential(
-        torch.nn.Linear(16, 32), activation, torch.nn.Linear(32, 8)
-    ).cuda().eval()
+    model = (
+        torch.nn.Sequential(torch.nn.Linear(16, 32), activation, torch.nn.Linear(32, 8))
+        .cuda()
+        .eval()
+    )
     compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
     with torch.no_grad():
         x = torch.randn(4, 16, device="cuda")

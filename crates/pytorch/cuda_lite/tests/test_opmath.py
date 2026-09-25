@@ -60,7 +60,9 @@ def close_half(got, ref):
 
 @cuda
 @halves
-@pytest.mark.parametrize("op", [torch.add, torch.sub, torch.mul], ids=["add", "sub", "mul"])
+@pytest.mark.parametrize(
+    "op", [torch.add, torch.sub, torch.mul], ids=["add", "sub", "mul"]
+)
 def test_single_op_is_bit_exact(dtype, op):
     def fn(a, b):
         return op(a, b)
@@ -186,7 +188,9 @@ def test_int_tensor_against_a_float_literal_compares_at_f32():
 
 @cuda
 @halves
-@pytest.mark.parametrize("op", [torch.maximum, torch.minimum], ids=["maximum", "minimum"])
+@pytest.mark.parametrize(
+    "op", [torch.maximum, torch.minimum], ids=["maximum", "minimum"]
+)
 def test_maximum_minimum_are_exact(dtype, op):
     def fn(a, b):
         return op(a, b)

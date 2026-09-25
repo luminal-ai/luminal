@@ -15,6 +15,7 @@ import luminal_cuda_lite  # noqa: E402
 
 # Full float32 on both sides (see conftest), over a three-matmul stack.
 
+
 @pytest.fixture(autouse=True)
 def _fresh_dynamo():
     """Every test compiles the same module classes; without a reset the
@@ -23,6 +24,7 @@ def _fresh_dynamo():
     torch._dynamo.reset()
     yield
     torch._dynamo.reset()
+
 
 ATOL = 1e-3
 RTOL = 1e-3
@@ -69,9 +71,7 @@ def test_outputs_held_across_calls_stay_correct(build):
             x = torch.randn(8, 64, device="cuda")
             calls.append((x, compiled(x)))
         pointers = [got.data_ptr() for _, got in calls]
-        assert len(set(pointers)) == len(pointers), (
-            "two held outputs share an address"
-        )
+        assert len(set(pointers)) == len(pointers), "two held outputs share an address"
         for x, got in calls:
             torch.testing.assert_close(got, model(x), atol=ATOL, rtol=RTOL)
 

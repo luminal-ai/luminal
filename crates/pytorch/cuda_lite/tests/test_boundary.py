@@ -156,7 +156,9 @@ def test_a_layout_that_is_not_dense_strides_is_refused_by_name():
     dense storage, so there is no chain to state: refused naming the
     boundary and the layout it arrived with."""
     with pytest.raises(boundary.UnsupportedBoundary) as refusal:
-        boundary.boundary_layout("x", _Boundary((4, 4), (4, 1), layout=torch.sparse_coo))
+        boundary.boundary_layout(
+            "x", _Boundary((4, 4), (4, 1), layout=torch.sparse_coo)
+        )
     message = str(refusal.value)
     assert "x:" in message, message
     assert "sparse_coo" in message, message

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import pytest
 import torch
 from backend_test_utils import luminal_backend
-from luminal_reference.dtype_util import torch_dtype_code
 
 
 class BoundaryNoopModel(torch.nn.Module):
@@ -245,10 +244,6 @@ def test_narrow_integer_abs_preserves_wrapping_semantics(case: DTypeCase) -> Non
     assert torch.equal(actual, expected)
 
 
-
-
-
-
 def test_float64_add_without_alpha_matches_eager() -> None:
     """An omitted alpha stays a direct add rather than adding a multiply."""
     model = AddWithoutAlphaModel()
@@ -367,8 +362,6 @@ def test_arange_uses_exported_shape_and_declared_dtype(
 
     assert actual.dtype == dtype
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
-
-
 
 
 @pytest.mark.parametrize(

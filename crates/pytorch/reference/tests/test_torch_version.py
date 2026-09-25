@@ -62,7 +62,14 @@ for package in ("luminal_reference", "luminal_cuda_lite"):
 
 def test_no_generic_luminal_package():
     result = subprocess.run(
-        [sys.executable, "-c", "import importlib.util; assert importlib.util.find_spec('luminal') is None"],
-        capture_output=True, text=True, timeout=30, check=False,
+        [
+            sys.executable,
+            "-c",
+            "import importlib.util; assert importlib.util.find_spec('luminal') is None",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
     )
     assert result.returncode == 0, result.stderr

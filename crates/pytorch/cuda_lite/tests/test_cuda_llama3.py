@@ -2,9 +2,9 @@ import pytest
 import torch
 import torch._dynamo
 from luminal_cuda_lite import Compiler
+from reference.tests.models.test_llama3 import _assert_bf16_logits_match
 
 luminal_backend = Compiler()
-from reference.tests.models.test_llama3 import _assert_bf16_logits_match
 
 
 @pytest.mark.skipif(

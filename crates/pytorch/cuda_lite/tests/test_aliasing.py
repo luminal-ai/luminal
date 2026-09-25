@@ -44,7 +44,9 @@ def _same_as_eager(fn, *make_inputs):
         torch.testing.assert_close(g, e)
         assert g.stride() == e.stride()
     for c, e in zip(compiled_inputs, eager_inputs):
-        torch.testing.assert_close(c, e, msg="the caller's tensor holds what eager leaves in it")
+        torch.testing.assert_close(
+            c, e, msg="the caller's tensor holds what eager leaves in it"
+        )
     return got_list, compiled_inputs
 
 
@@ -55,7 +57,9 @@ def test_mutation_through_a_view_reaches_the_callers_storage():
         return x
 
     (out,), (x,) = _same_as_eager(fn, _x)
-    assert out.data_ptr() == x.data_ptr(), "returning the mutated input returns its storage"
+    assert out.data_ptr() == x.data_ptr(), (
+        "returning the mutated input returns its storage"
+    )
 
 
 @cuda
@@ -182,7 +186,9 @@ def test_module_buffer_slice_write():
     eager = eager_model(_x())
     got = torch.compile(model, backend=luminal_cuda_lite.Compiler())(_x())
     torch.testing.assert_close(got, eager)
-    torch.testing.assert_close(model.kv, eager_model.kv, msg="the buffer's rows 1:3 hold x")
+    torch.testing.assert_close(
+        model.kv, eager_model.kv, msg="the buffer's rows 1:3 hold x"
+    )
 
 
 @cuda

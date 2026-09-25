@@ -36,6 +36,7 @@ class Conv(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv = nn.Conv2d(3, 4, kernel_size=3, stride=1, padding=1)
+
     def forward(self, x):
         return self.conv(x)
 
@@ -44,6 +45,7 @@ class GroupedConv(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv = nn.Conv2d(4, 4, kernel_size=3, padding=1, groups=2)
+
     def forward(self, x):
         return self.conv(x)
 
@@ -52,6 +54,7 @@ class BatchNorm(nn.Module):
     def __init__(self):
         super().__init__()
         self.bn = nn.BatchNorm2d(3)
+
     def forward(self, x):
         return self.bn(x)
 
@@ -60,6 +63,7 @@ class GroupNorm(nn.Module):
     def __init__(self):
         super().__init__()
         self.gn = nn.GroupNorm(2, 4)
+
     def forward(self, x):
         return self.gn(x)
 

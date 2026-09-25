@@ -135,9 +135,13 @@ def boundary_layout(
     if fake is not None:
         _refuse_unreadable(name, fake)
     if not tensor.is_cuda:
-        raise UnsupportedBoundary(f"{name}: expected a CUDA tensor, got device {tensor.device}")
+        raise UnsupportedBoundary(
+            f"{name}: expected a CUDA tensor, got device {tensor.device}"
+        )
     if tensor.dtype not in SUPPORTED_DTYPES:
-        raise UnsupportedBoundary(f"{name}: dtype {tensor.dtype} has no CUDA-lite storage dtype")
+        raise UnsupportedBoundary(
+            f"{name}: dtype {tensor.dtype} has no CUDA-lite storage dtype"
+        )
     source = fake if fake is not None else tensor
     strides = tuple(_extent(stride) for stride in source.stride())
     for axis, stride in enumerate(strides):
@@ -175,7 +179,9 @@ def buffer_nbytes(tensor: torch.Tensor) -> int:
     offset zero, so ``data_ptr()`` is the base of that span."""
     if tensor.numel() == 0:
         return 0
-    span = 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
+    span = 1 + sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
     return span * tensor.element_size()
 
 
@@ -245,7 +251,11 @@ def declared_strides(
     for axis, spelling in enumerate(binding.layout.strides):
         expr = sympy.sympify(spelling)
         expr = expr.subs(
-            {symbol: dims[symbol.name] for symbol in expr.free_symbols if symbol.name in dims}
+            {
+                symbol: dims[symbol.name]
+                for symbol in expr.free_symbols
+                if symbol.name in dims
+            }
         )
         if not expr.is_number:
             free = ", ".join(sorted(symbol.name for symbol in expr.free_symbols))
@@ -322,7 +332,9 @@ def check_binding(
     # inductor's `significant_strides_equal`: an axis of extent 0 or 1 has
     # no significant stride, and one empty axis makes every stride
     # insignificant, because the tensor addresses no element at all.
-    if any(size == 0 for size in shape) or any(declared == 0 for declared in binding.shape):
+    if any(size == 0 for size in shape) or any(
+        declared == 0 for declared in binding.shape
+    ):
         return
     for axis, (want, got, size) in enumerate(zip(expected, actual, shape)):
         if size <= 1 or want == got:

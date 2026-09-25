@@ -179,9 +179,7 @@ def _growing_decode(
         step_logits.append(next_token_logits)
         nxt = int(next_token_logits.argmax())
         generated.append(nxt)
-        tokens = torch.cat(
-            [tokens, torch.tensor([[nxt]], dtype=torch.long)], dim=1
-        )
+        tokens = torch.cat([tokens, torch.tensor([[nxt]], dtype=torch.long)], dim=1)
     return generated, torch.stack(step_logits)
 
 

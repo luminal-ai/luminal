@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
-import textwrap
-import time
 
 import luminal_reference.region_compile as region_compile_module
 import pytest

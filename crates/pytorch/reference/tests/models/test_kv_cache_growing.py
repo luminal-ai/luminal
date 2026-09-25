@@ -12,7 +12,6 @@ sequence dimension grow: (1, n_kv_heads, 4, head_dim) -> (1, n_kv_heads, 5, ...)
 Verifies luminal output matches PyTorch reference at every step.
 """
 
-import pytest
 import torch
 import torch._dynamo
 from backend_test_utils import luminal_backend
@@ -93,10 +92,6 @@ def test_kv_cache_growing():
         f"\nAll {NUM_DECODE_STEPS} decode steps passed. "
         f"Cache grew from seq_len={input_ids.shape[1]} to {expected_seq}."
     )
-
-
-
-
 
 
 def _print_cache_shapes(label, ref_cache, lum_cache):

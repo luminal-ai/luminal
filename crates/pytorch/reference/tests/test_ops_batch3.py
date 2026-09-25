@@ -20,7 +20,9 @@ def _check_exact(model: nn.Module, *inputs: torch.Tensor) -> None:
     eager = model(*inputs)
     compiled = torch.compile(model, backend=luminal_reference.Compiler())
     out = compiled(*inputs)
-    assert torch.equal(out.to(torch.float32), eager.to(torch.float32)), f"{out} != {eager}"
+    assert torch.equal(out.to(torch.float32), eager.to(torch.float32)), (
+        f"{out} != {eager}"
+    )
 
 
 class ExpM1(nn.Module):
