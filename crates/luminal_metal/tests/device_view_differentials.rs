@@ -19,12 +19,9 @@ fn walked_dense(rt: &MetalRuntime, out: NodeIndex) -> Vec<f32> {
 }
 
 fn view_search_options() -> CompileOptions {
-    // Same reasoning as the CUDA-lite gate: the folded-view and
-    // materializing plans are both in the e-graph and semantically
-    // identical, and the heuristic ranks the fold cheaper, but the genetic
-    // search needs enough generations to leave a materializing local
-    // optimum. Budgets >= 16 reach the fold; smaller ones can fail the
-    // structural assertion for search reasons, not compiler reasons.
+    // Search still chooses among valid compute plans, but the registry below
+    // forces movement through views so GPU timings cannot change the path
+    // this differential test covers.
     CompileOptions {
         generations: 16,
         generation_size: 8,
@@ -49,8 +46,12 @@ fn run_differential(
     let reference = luminal_reference::harness::run_reference(cx, &staged);
     let want = reference.get_f32(out).expect("reference output").clone();
 
-    let mut rt =
-        MetalRuntime::load_with_registry(cx, luminal_metal::metal_registry()).expect("metal load");
+    // Both movement routes are legal. Require the view implementation here
+    // instead of assuming it wins device profiling on every GPU. The reference
+    // runtime above supplies the independent materializing route.
+    let registry =
+        luminal_metal::metal_registry_filtered(|op| op.label() != "IndexMapApplyMaterialize");
+    let mut rt = MetalRuntime::load_with_registry(cx, registry).expect("metal load");
     let data: FxHashMap<NodeIndex, HostBuffer> = inputs
         .iter()
         .map(|(id, v)| (*id, v.clone().into()))
