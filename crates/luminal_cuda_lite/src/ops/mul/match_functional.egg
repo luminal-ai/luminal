@@ -27,6 +27,7 @@
       (LayoutTensorOpMulFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/mul/match_functional: Mul functional match, non-Int dtypes"
 )
 
 ; Int: WRAPS, and mints unproven (LUM-833, temporary). torch
@@ -58,6 +59,7 @@
       (LayoutTensorOpMulFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/mul/match_functional: Mul functional match, Int wraps unproven"
 )
 
 ; Int64: WRAPS, and mints unproven (LUM-833, temporary). torch
@@ -89,4 +91,5 @@
       (LayoutTensorOpMulFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/mul/match_functional: Mul functional match, Int64 wraps unproven"
 )

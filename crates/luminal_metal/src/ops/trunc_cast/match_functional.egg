@@ -14,4 +14,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpTruncCastGeneric ?in_layout_tensor ?target_dtype ?out_layout))
   )
+  :ruleset main_ruleset :name "metal/trunc_cast/match_functional: TruncCast functional match at the target dtype"
 )

@@ -19,4 +19,5 @@
     (union ?layout_tensor_op (LayoutTensorOpExpFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/exp/match_functional: Exp functional match on an injective out"
 )

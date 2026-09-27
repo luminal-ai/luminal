@@ -16,4 +16,5 @@
       (LayoutTensorOpGatherGeneric ?data_layout_tensor ?coordinate_layout_tensors ?out_layout))
   )
   :ruleset backend
+  :name "metal/gather/match_functional: Gather match over data plus coordinate layout tensors"
 )

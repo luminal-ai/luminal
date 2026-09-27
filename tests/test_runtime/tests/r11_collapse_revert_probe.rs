@@ -14,7 +14,7 @@
 //! recognizer names every rank-2 transpose view, and its involution rule
 //! unions a transpose of a transpose with the base, so core anchors the
 //! sandwich on its own. The probe runs a BOUNDED schedule ((run-schedule
-//! (repeat K (seq (run) (run backend) (run prop))))) at increasing K WITH
+//! (repeat K (seq (run main_ruleset) (run backend) (run prop))))) at increasing K WITH
 //! and WITHOUT the collapse rule
 //! (removed by exact string surgery on the assembled program) and
 //! requires both to reach the same flat node count inside the range: the
@@ -49,7 +49,7 @@ fn bounded_program(iters: usize, with_collapse: bool) -> String {
     );
     program = program.replace(
         sat,
-        &format!("(run-schedule (saturate (run prop)) (repeat {iters} (seq (run) (run backend) (run prop))))"),
+        &format!("(run-schedule (saturate (run prop)) (repeat {iters} (seq (run main_ruleset) (run backend) (run prop))))"),
     );
 
     if !with_collapse {

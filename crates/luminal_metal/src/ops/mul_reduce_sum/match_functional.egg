@@ -17,4 +17,5 @@
      (LayoutTensorCons ?out_lt (LayoutTensorNil))))
    (union ?op (LayoutTensorOpMulReduceSumGeneric ?a_lt ?b_lt ?axis ?out_layout)))
   :ruleset backend
+  :name "metal/mul_reduce_sum/match_functional: Fused MulReduceSum for dot reductions, F32 only"
 )

@@ -23,4 +23,5 @@
       (LayoutTensorOpGatherGeneric ?data_layout_tensor ?coordinate_layout_tensors ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/gather/match_functional: Gather match: data plus one coordinate per axis"
 )

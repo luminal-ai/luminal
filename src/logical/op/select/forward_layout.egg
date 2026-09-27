@@ -12,4 +12,5 @@
     (let ?out_layout_tensor2 (LayoutTensorLit ?out_logical ?true_layout))
     (let ?out_layout_tensor3 (LayoutTensorLit ?out_logical ?false_layout))
   )
+  :ruleset main_ruleset :name "select/forward_layout: select result in any of its three inputs' layouts"
 )

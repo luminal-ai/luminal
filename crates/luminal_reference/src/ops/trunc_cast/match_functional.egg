@@ -15,4 +15,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpTruncCastGeneric ?in_layout_tensor ?target_dtype ?out_layout))
   )
+  :ruleset main_ruleset :name "reference/trunc_cast/match_functional: TruncCastGeneric mint, the lossy narrowing conversion"
 )

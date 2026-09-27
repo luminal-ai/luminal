@@ -21,4 +21,5 @@
       (LayoutTensorOpCastGeneric ?in_layout_tensor ?target_dtype ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/cast/match_functional: Cast functional match: dtype-changing materializer"
 )

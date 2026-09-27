@@ -8,4 +8,5 @@
     (set (dtype-of ?out_logical_tensor) ?dtype)
   )
   :ruleset prop
+  :name "log2/dtype: LogicalLog2 preserves the input dtype"
 )

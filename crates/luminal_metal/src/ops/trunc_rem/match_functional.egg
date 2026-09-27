@@ -25,6 +25,7 @@
       (LayoutTensorOpTruncRemFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "metal/trunc_rem/match_functional: TruncRem match, Int output, positive divisor"
 )
 
 (rule
@@ -54,6 +55,7 @@
       (LayoutTensorOpTruncRemFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "metal/trunc_rem/match_functional: TruncRem match, Int output, negative divisor"
 )
 
 (rule
@@ -83,6 +85,7 @@
       (LayoutTensorOpTruncRemFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "metal/trunc_rem/match_functional: TruncRem match, Int64 output, positive divisor"
 )
 
 (rule
@@ -112,4 +115,5 @@
       (LayoutTensorOpTruncRemFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "metal/trunc_rem/match_functional: TruncRem match, Int64 output, negative divisor"
 )

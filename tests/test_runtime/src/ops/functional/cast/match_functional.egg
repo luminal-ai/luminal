@@ -16,4 +16,5 @@
       (LayoutTensorOpCastGeneric ?in_layout_tensor ?target_dtype ?out_layout))
   )
   :ruleset backend
+  :name "test_runtime/ops/functional/cast/match_functional: Cast materializer mint, never a view"
 )

@@ -15,4 +15,5 @@
     (= (shape-of ?bT) (ShapeLit (IntExprCons ?n (IntExprCons ?k (IntExprNil)))))
   )
   ((union ?out (LogicalHelperMatrixMultiply ?a (LogicalHelperMatrixTranspose ?bT))))
+  :ruleset main_ruleset :name "helper/matrix_multiply/recognize: reduce-sum of broadcast muls is a MatrixMultiply"
 )

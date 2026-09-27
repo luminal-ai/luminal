@@ -7,4 +7,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "index_map_apply/shape: LogicalIndexMapApply shape is carried in the term"
 )

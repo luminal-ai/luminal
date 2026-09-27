@@ -8,4 +8,5 @@
     (coordinate-shape-lock ?src_logical ?coordinate_list)
   )
   :ruleset fixpoint-invariants
+  :name "scatter/fixpoint: src shape locked to the coordinate tensors'"
 )

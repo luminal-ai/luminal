@@ -5,4 +5,5 @@
   (
     (coordinate-tensor-list ?coordinate_list)
   )
+  :ruleset main_ruleset :name "gather/seed_2: seed coordinate-tensor-list from a LogicalGather"
 )

@@ -14,4 +14,5 @@
     (union ?layout_tensor_op (LayoutTensorOpSinMutatingGeneric ?in_layout_tensor))
   )
   :ruleset backend
+  :name "test_runtime/ops/mutating/sin/match_mutating: Sin mutating in-place on its one operand"
 )

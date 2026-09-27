@@ -11,4 +11,5 @@
   (
     (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit ?shape ?bits)))
   )
+  :ruleset main_ruleset :name "trunc_cast/forward_layout: canonical layout at the new bit width, not forwarded"
 )

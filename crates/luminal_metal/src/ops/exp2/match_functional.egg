@@ -14,4 +14,5 @@
     (union ?layout_tensor_op (LayoutTensorOpExp2FunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "metal/exp2/match_functional: Exp2 functional match at a right-major output layout"
 )

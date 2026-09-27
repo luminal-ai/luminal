@@ -8,4 +8,5 @@
     (set (shape-of ?out_logical) ?common_shape)
   )
   :ruleset prop
+  :name "gather/shape: the coords common shape is the LogicalGather shape"
 )

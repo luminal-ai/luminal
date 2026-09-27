@@ -9,4 +9,5 @@
   (
     (panic "LogicalScatter with an empty coordinate list (rank-0 init) is ill-formed; a whole-scalar overwrite is a copy")
   )
+  :ruleset main_ruleset :name "scatter/seed: empty coordinate list refused as ill-formed"
 )

@@ -9,4 +9,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "less_than/shape: shape of LogicalLessThan at proven-equal operand shapes"
 )

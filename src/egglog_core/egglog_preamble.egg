@@ -470,6 +470,10 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Helper Functions For IntExpr Lists
+; The program's own rules, named so strata can later be carved out of it
+; and recombined.
+(ruleset main_ruleset)
+
 (ruleset layout-tensor-op-metadata)
 ; Copy candidates mint AGAINST SETTLED CLASSES (Austin's ruling
 ; 2026-08-03): the copy matcher's (!=) is a per-iteration snapshot on
@@ -578,6 +582,7 @@
     (input-buffer-tensor-list ?list)
   )
   :ruleset cleanup
+  :name "core: input binding's buffer-tensor list is a walk root"
 )
 ; ...walk its spine...
 (rule
@@ -589,6 +594,7 @@
     (input-buffer-tensor-list ?rest)
   )
   :ruleset cleanup
+  :name "core: walk the input binding's buffer-tensor spine"
 )
 ; ...and every layout tensor it binds a buffer to is a leaf. The
 ; LogicalTensorInputLit conjunct is the belt: a binding may only name a
@@ -605,6 +611,7 @@
     (input-leaf-layout-tensor ?layout_tensor)
   )
   :ruleset cleanup
+  :name "core: a bound layout tensor over an input is a leaf"
 )
 
 ; Base: the head is a leaf.
@@ -617,6 +624,7 @@
     (list-holds-input-layout-tensor ?list)
   )
   :ruleset cleanup
+  :name "core: list holds an input leaf, base case: the head"
 )
 
 ; Step: the tail holds one, so the cons does.
@@ -629,6 +637,7 @@
     (list-holds-input-layout-tensor ?list)
   )
   :ruleset cleanup
+  :name "core: list holds an input leaf, inductive step: the tail"
 )
 
 ; The stratum's one conclusion: mark the op, retire the generic spelling.
@@ -642,6 +651,7 @@
     (subsume (LayoutTensorOpLit ?ins ?outs))
   )
   :ruleset cleanup
+  :name "core: mark input-producer and subsume LayoutTensorOpLit"
 )
 
 (function expr-list-length-of (IntExprList) i64 :no-merge) ; I think these can be no merge
@@ -655,6 +665,7 @@
     (= ?nil (IntExprNil))
   )
   ((set (expr-list-length-of ?nil) 0))
+  :ruleset main_ruleset :name "core: length of IntExprNil is zero"
 )
 
 ; Increase length for each element
@@ -666,6 +677,7 @@
   (
     (set (expr-list-length-of ?cons) (+ ?prev_length 1))
   )
+  :ruleset main_ruleset :name "core: length of an IntExprCons is the tail's plus one"
 )
 
 ; nth from end : ZERO-BASED (user ruling 2026-07-24, luminal alignment):
@@ -680,6 +692,7 @@
   (
     (set (expr-list-nth-from-end ?cons ?tail_length) ?item)
   )
+  :ruleset main_ruleset :name "core: nth-from-end of IntExprCons: head at tail length"
 )
 
 ; nth from end : set for the next cons node in the list, heading up only
@@ -692,6 +705,7 @@
   (
     (set (expr-list-nth-from-end ?prior_cons ?tail_length) ?item)
   )
+  :ruleset main_ruleset :name "core: nth-from-end lifted to the parent IntExprCons"
 )
 
 ; nth from end : an entry visible at a suffix is visible at every longer
@@ -705,6 +719,7 @@
   (
     (set (expr-list-nth-from-end ?prior_cons ?index) ?item)
   )
+  :ruleset main_ruleset :name "core: nth-from-end is suffix-invariant across longer lists"
 )
 
 ; Demand scaling for the tail first.
@@ -715,6 +730,7 @@
   (
     (expr-list-scale-demand ?factor ?tail)
   )
+  :ruleset main_ruleset :name "core: scale demand propagates to the IntExprList tail"
 )
 
 ; Scaling an empty list is empty.
@@ -725,6 +741,7 @@
   (
     (set (expr-list-scale-of ?factor (IntExprNil)) (IntExprNil))
   )
+  :ruleset main_ruleset :name "core: scaling IntExprNil yields IntExprNil"
 )
 
 ; Scale each expression in a list by the same factor.
@@ -739,6 +756,7 @@
       (expr-list-scale-of ?factor ?list)
       (IntExprCons (IntMul ?factor ?item) ?scaled_tail))
   )
+  :ruleset main_ruleset :name "core: scale each IntExpr in a list by one factor"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -753,6 +771,7 @@
     (= ?nil (LayoutTensorNil))
   )
   ((set (layout-tensor-list-length-of ?nil) 0))
+  :ruleset main_ruleset :name "core: length of LayoutTensorNil is zero"
 )
 
 ; Increase length for each element
@@ -764,6 +783,7 @@
   (
     (set (layout-tensor-list-length-of ?cons) (+ ?prev_length 1))
   )
+  :ruleset main_ruleset :name "core: length of a LayoutTensorCons is the tail's plus one"
 )
 
 ; nth from end : ZERO-BASED (see the expr-list twin above).
@@ -775,6 +795,7 @@
   (
     (set (layout-tensor-list-nth-from-end ?cons ?tail_length) ?layout_tensor)
   )
+  :ruleset main_ruleset :name "core: nth-from-end of LayoutTensorCons: head at tail length"
 )
 
 ; nth from end : set for the next cons node in the list, heading up only
@@ -787,6 +808,7 @@
   (
     (set (layout-tensor-list-nth-from-end ?prior_cons ?tail_length) ?layout_tensor)
   )
+  :ruleset main_ruleset :name "core: nth-from-end lifted to the parent LayoutTensorCons"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -806,6 +828,7 @@
   (
     (expr-list-remove-axis-demand ?dims ?axis)
   )
+  :ruleset main_ruleset :name "core: root remove-axis demand becomes a walk demand"
 )
 
 ; Propagate demand towards nil.
@@ -816,6 +839,7 @@
   (
     (expr-list-remove-axis-demand ?tail ?axis_to_remove)
   )
+  :ruleset main_ruleset :name "core: remove-axis demand propagates towards IntExprNil"
 )
 
 ; Empty suffix: no axis consumed, no dimension removed, empty kept list.
@@ -827,6 +851,7 @@
     (set (expr-list-remove-axis-state-of (IntExprNil) ?axis_to_remove)
       (ExprListRemoveAxisStateLit 0 0 (IntExprNil)))
   )
+  :ruleset main_ruleset :name "core: remove-axis base state at IntExprNil"
 )
 
 ; Current dimension is the reduction axis, so drop it.
@@ -842,6 +867,7 @@
     (set (expr-list-remove-axis-state-of ?list ?axis_to_remove)
       (ExprListRemoveAxisStateLit (+ ?axis_from_end 1) 1 ?kept_tail))
   )
+  :ruleset main_ruleset :name "core: remove-axis: drop the dimension at the requested axis"
 )
 
 ; Current dimension is not the reduction axis, so copy it.
@@ -860,6 +886,7 @@
         ?removed
         (IntExprCons ?dim ?kept_tail)))
   )
+  :ruleset main_ruleset :name "core: remove-axis: keep a dimension that is not the axis"
 )
 
 ; Publish the filtered list only if the requested axis was actually removed.
@@ -872,6 +899,7 @@
   (
     (set (expr-list-remove-axis-from-end ?dims ?axis_to_remove) ?kept_dims)
   )
+  :ruleset main_ruleset :name "core: publish expr-list-remove-axis-from-end once removed"
 )
 
 ; Only root demands are invalid-axis errors; recursive suffixes may not remove anything.
@@ -884,6 +912,7 @@
   (
     (panic "reduction axis out of bounds")
   )
+  :ruleset main_ruleset :name "core: root remove-axis demand out of bounds is a panic"
 )
 
 
@@ -897,7 +926,7 @@
 ; rule, the input-literal rule below, and every op's shape.egg and
 ; dtype.egg). These are pure derived-attribute rules that never mint
 ; terms. They run to saturation BEFORE the main loop and again alongside
-; the default ruleset inside it, so a schedule that runs (run) must also
+; the default ruleset inside it, so a schedule that runs (run main_ruleset) must also
 ; run (run prop); rules whose actions are only such sets belong here (a
 ; test in egglog_snippet.rs pins both directions). Pre-saturating them
 ; cut saturation wall time 2.5x at gemma3 depth: the tables stop churning,
@@ -912,6 +941,7 @@
     (set (rank-of ?shape) ?rank)
   )
   :ruleset prop
+  :name "core: rank-of a ShapeLit from its dim list length"
 )
 
 ; Propagate dtype-of , shape-of
@@ -924,10 +954,11 @@
     (set (shape-of ?logical_tensor) ?shape)
   )
   :ruleset prop
+  :name "core: dtype-of and shape-of a LogicalTensorInputLit"
 )
 
 ; Eager bits-of entries: top-level SETS, not rules — fixture lets evaluate
-; (bits-of <dtype>) at load time, before any (run), and an unset function
+; (bits-of <dtype>) at load time, before any (run main_ruleset), and an unset function
 ; lookup in an action is a loud panic. Bool is ONE bit — a dtype's width is
 ; its information content. Byte-backed booleans are the Bool8 DTYPE
 ; (ruling 2026-07-30, superseding the earlier layout-widening note that
@@ -967,6 +998,7 @@
     (set (logical-of m) ?logical)
     (set (layout-of m) ?layout)
   )
+  :ruleset main_ruleset :name "core: logical-of and layout-of a LayoutTensorLit"
 )
 
 ; Propagate input-layout-tensor-list-of, output-layout-tensor-list-of
@@ -979,6 +1011,7 @@
     (set (output-layout-tensor-list-of ?layout_tensor_op) ?output_list)
   )
   :ruleset layout-tensor-op-metadata
+  :name "core: input/output layout-tensor lists of LayoutTensorOpLit"
 )
 
 
@@ -991,6 +1024,7 @@
     (set (layout-tensor-of ?buffer_tensor) ?layout_tensor)
     (set (buffer-id-of ?buffer_tensor) ?buffer_id)
   )
+  :ruleset main_ruleset :name "core: layout-tensor-of and buffer-id-of a BufferTensorLit"
 )
 
 
@@ -1027,6 +1061,7 @@
   (
     (coordinate-tensor-list ?rest_list)
   )
+  :ruleset main_ruleset :name "core: coordinate-tensor-list propagates to the list tail"
 )
 
 
@@ -1039,6 +1074,7 @@
   (
     (panic "gather/scatter coordinate tensors must be Int")
   )
+  :ruleset main_ruleset :name "core: non-Int coordinate tensor dtype is a panic"
 )
 
 
@@ -1075,6 +1111,7 @@
   (
     (set (coords-common-shape ?coordinate_list) ?only_shape)
   )
+  :ruleset main_ruleset :name "core: coords-common-shape of a singleton coordinate list"
 )
 (rule
   (
@@ -1086,6 +1123,7 @@
   (
     (set (coords-common-shape ?coordinate_list) ?shape)
   )
+  :ruleset main_ruleset :name "core: coords-common-shape when head and tail shapes agree"
 )
 
 ; The coordinate LAYOUT-tensor lists for a gather's coordinate list: one
@@ -1103,6 +1141,7 @@
   (
     (coordinate-layout-tensors ?coordinate_list (LayoutTensorNil))
   )
+  :ruleset main_ruleset :name "core: coordinate-layout-tensors of the empty coordinate list"
 )
 (rule
   (
@@ -1115,6 +1154,7 @@
     (coordinate-layout-tensors ?coordinate_list
       (LayoutTensorCons ?head_layout_tensor ?rest_layout_tensors))
   )
+  :ruleset main_ruleset :name "core: coordinate-layout-tensors of a cons coordinate list"
 )
 
 ;; @SPLICE seed
@@ -1296,16 +1336,16 @@
 ; identity rules without re-running the attack ladder.
 
 ; Additive Identity
-(rewrite (IntAdd ?expr (IntLit 0)) ?expr :subsume)
-(rewrite (IntAdd (IntLit 0) ?expr) ?expr :subsume)
+(rewrite (IntAdd ?expr (IntLit 0)) ?expr :subsume :ruleset main_ruleset :name "core: additive identity, IntAdd with a zero on the right")
+(rewrite (IntAdd (IntLit 0) ?expr) ?expr :subsume :ruleset main_ruleset :name "core: additive identity, IntAdd with a zero on the left")
 
 ; Multiplicative Identity
-(rewrite (IntMul ?expr (IntLit 1)) ?expr :subsume)
-(rewrite (IntMul (IntLit 1) ?expr) ?expr :subsume)
+(rewrite (IntMul ?expr (IntLit 1)) ?expr :subsume :ruleset main_ruleset :name "core: multiplicative identity, IntMul by one on the right")
+(rewrite (IntMul (IntLit 1) ?expr) ?expr :subsume :ruleset main_ruleset :name "core: multiplicative identity, IntMul by one on the left")
 
 ; Constant Folding (no :subsume — see the discipline note above)
-(rewrite (IntAdd (IntLit ?lhs) (IntLit ?rhs)) (IntLit (+ ?lhs ?rhs)))
-(rewrite (IntMul (IntLit ?lhs) (IntLit ?rhs)) (IntLit (* ?lhs ?rhs)))
+(rewrite (IntAdd (IntLit ?lhs) (IntLit ?rhs)) (IntLit (+ ?lhs ?rhs)) :ruleset main_ruleset :name "core: constant folding of IntAdd literals")
+(rewrite (IntMul (IntLit ?lhs) (IntLit ?rhs)) (IntLit (* ?lhs ?rhs)) :ruleset main_ruleset :name "core: constant folding of IntMul literals")
 
 ; Division constant folding (Stage D1; no :subsume, same discipline).
 ; Every fold is gated on the LITERAL divisor being nonzero — a primitive
@@ -1319,10 +1359,12 @@
 (rule
   ((= ?expr (IntTruncDiv (IntLit ?dividend) (IntLit ?divisor))) (!= ?divisor 0))
   ((union ?expr (IntLit (/ ?dividend ?divisor))))
+  :ruleset main_ruleset :name "core: constant folding of IntTruncDiv literals"
 )
 (rule
   ((= ?expr (IntTruncRem (IntLit ?dividend) (IntLit ?divisor))) (!= ?divisor 0))
   ((union ?expr (IntLit (% ?dividend ?divisor))))
+  :ruleset main_ruleset :name "core: constant folding of IntTruncRem literals"
 )
 ; ceil, exact division: the trunc quotient is already the ceiling...
 (rule
@@ -1332,6 +1374,7 @@
     (= 0 (% ?dividend ?divisor))
   )
   ((union ?expr (IntLit (/ ?dividend ?divisor))))
+  :ruleset main_ruleset :name "core: IntCeilDiv folding, exact division"
 )
 ; ...inexact with agreeing signs (positive true quotient): trunc + 1...
 (rule
@@ -1342,6 +1385,7 @@
     (> ?dividend 0) (> ?divisor 0)
   )
   ((union ?expr (IntLit (+ (/ ?dividend ?divisor) 1))))
+  :ruleset main_ruleset :name "core: IntCeilDiv folding, inexact and both operands positive"
 )
 (rule
   (
@@ -1351,15 +1395,18 @@
     (< ?dividend 0) (< ?divisor 0)
   )
   ((union ?expr (IntLit (+ (/ ?dividend ?divisor) 1))))
+  :ruleset main_ruleset :name "core: IntCeilDiv folding, inexact and both operands negative"
 )
 ; Lattice-pair constant folding (Stage M1; total, no gates needed).
 (rule
   ((= ?expr (IntMin (IntLit ?lhs) (IntLit ?rhs))))
   ((union ?expr (IntLit (min ?lhs ?rhs))))
+  :ruleset main_ruleset :name "core: constant folding of IntMin literals"
 )
 (rule
   ((= ?expr (IntMax (IntLit ?lhs) (IntLit ?rhs))))
   ((union ?expr (IntLit (max ?lhs ?rhs))))
+  :ruleset main_ruleset :name "core: constant folding of IntMax literals"
 )
 
 ; ...inexact with opposing signs (negative true quotient): truncation
@@ -1372,6 +1419,7 @@
     (> ?dividend 0) (< ?divisor 0)
   )
   ((union ?expr (IntLit (/ ?dividend ?divisor))))
+  :ruleset main_ruleset :name "core: IntCeilDiv folding, inexact with negative divisor"
 )
 (rule
   (
@@ -1381,6 +1429,7 @@
     (< ?dividend 0) (> ?divisor 0)
   )
   ((union ?expr (IntLit (/ ?dividend ?divisor))))
+  :ruleset main_ruleset :name "core: IntCeilDiv folding, inexact with negative dividend"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1390,22 +1439,26 @@
 (rewrite
   (IntAdd ?lhs ?rhs)
   (IntAdd ?rhs ?lhs)
+  :ruleset main_ruleset :name "core: commutativity of IntAdd"
 )
 
 ; Commutativity : IntMul
 (rewrite
   (IntMul ?lhs ?rhs)
   (IntMul ?rhs ?lhs)
+  :ruleset main_ruleset :name "core: commutativity of IntMul"
 )
 
 ; Commutativity : IntMin / IntMax (permutation-only, hash-cons bounded)
 (rewrite
   (IntMin ?lhs ?rhs)
   (IntMin ?rhs ?lhs)
+  :ruleset main_ruleset :name "core: commutativity of IntMin"
 )
 (rewrite
   (IntMax ?lhs ?rhs)
   (IntMax ?rhs ?lhs)
+  :ruleset main_ruleset :name "core: commutativity of IntMax"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1494,6 +1547,7 @@
     (set (lower-bound-of ?expr) (bigint ?value))
     (set (upper-bound-of ?expr) (bigint ?value))
   )
+  :ruleset main_ruleset :name "core: bounds of an IntLit are the literal itself"
 )
 
 ; THE CONVERSE — the [n,n] pin collapse (ruling 2026-07-27). Bounds
@@ -1515,6 +1569,7 @@
     (= ?value (bigint-to-i64 ?bound))
   )
   ((union ?expr (IntLit ?value)))
+  :ruleset main_ruleset :name "core: pin collapse, bounds [n, n] make the class IntLit n"
 )
 
 ; A coordinate ranges over [0, extent-1]. Reading the EXTENT's bounds
@@ -1538,6 +1593,7 @@
     (set (lower-bound-of ?coord) (bigint 0))
     (set (upper-bound-of ?coord) (- ?extent_upper (bigint 1)))
   )
+  :ruleset main_ruleset :name "core: bounds of a CoordVar over a nonempty extent"
 )
 
 ; Interval addition.
@@ -1548,6 +1604,7 @@
     (= ?rhs_lower (lower-bound-of ?rhs))
   )
   ((set (lower-bound-of ?sum) (+ ?lhs_lower ?rhs_lower)))
+  :ruleset main_ruleset :name "core: lower bound of IntAdd"
 )
 (rule
   (
@@ -1556,6 +1613,7 @@
     (= ?rhs_upper (upper-bound-of ?rhs))
   )
   ((set (upper-bound-of ?sum) (+ ?lhs_upper ?rhs_upper)))
+  :ruleset main_ruleset :name "core: upper bound of IntAdd"
 )
 
 ; Interval multiplication: four-corner min/max (sound for mixed signs).
@@ -1575,6 +1633,7 @@
       (max (max (* ?lhs_lower ?rhs_lower) (* ?lhs_lower ?rhs_upper))
            (max (* ?lhs_upper ?rhs_lower) (* ?lhs_upper ?rhs_upper))))
   )
+  :ruleset main_ruleset :name "core: bounds of IntMul, four-corner min/max"
 )
 
 ; Interval division (Stage D1). The divisor's bounds must EXCLUDE zero —
@@ -1602,6 +1661,7 @@
       (max (max (/ ?dividend_lower ?divisor_lower) (/ ?dividend_lower ?divisor_upper))
            (max (/ ?dividend_upper ?divisor_lower) (/ ?dividend_upper ?divisor_upper))))
   )
+  :ruleset main_ruleset :name "core: bounds of IntTruncDiv, positive divisor"
 )
 (rule
   (
@@ -1620,6 +1680,7 @@
       (max (max (/ ?dividend_lower ?divisor_lower) (/ ?dividend_lower ?divisor_upper))
            (max (/ ?dividend_upper ?divisor_lower) (/ ?dividend_upper ?divisor_upper))))
   )
+  :ruleset main_ruleset :name "core: bounds of IntTruncDiv, negative divisor"
 )
 
 ; Ceiling quotient bounds ride the truncating corners: ceil is within
@@ -1644,6 +1705,7 @@
          (max (max (/ ?dividend_lower ?divisor_lower) (/ ?dividend_lower ?divisor_upper))
               (max (/ ?dividend_upper ?divisor_lower) (/ ?dividend_upper ?divisor_upper)))))
   )
+  :ruleset main_ruleset :name "core: bounds of IntCeilDiv, positive divisor"
 )
 (rule
   (
@@ -1663,6 +1725,7 @@
          (max (max (/ ?dividend_lower ?divisor_lower) (/ ?dividend_lower ?divisor_upper))
               (max (/ ?dividend_upper ?divisor_lower) (/ ?dividend_upper ?divisor_upper)))))
   )
+  :ruleset main_ruleset :name "core: bounds of IntCeilDiv, negative divisor"
 )
 
 ; Truncating remainder bounds: magnitude strictly below the divisor's
@@ -1678,6 +1741,7 @@
     (set (lower-bound-of ?remainder) (- (bigint 1) ?divisor_upper))
     (set (upper-bound-of ?remainder) (- ?divisor_upper (bigint 1)))
   )
+  :ruleset main_ruleset :name "core: bounds of IntTruncRem, positive divisor"
 )
 (rule
   (
@@ -1690,6 +1754,7 @@
     (set (lower-bound-of ?remainder) (+ ?divisor_lower (bigint 1)))
     (set (upper-bound-of ?remainder) (- (bigint -1) ?divisor_lower))
   )
+  :ruleset main_ruleset :name "core: bounds of IntTruncRem, negative divisor"
 )
 ; The nonnegative-dividend refinement — THE tile-coordinate fact: for a
 ; nonnegative dividend and positive divisor, the remainder sits in
@@ -1710,6 +1775,7 @@
     (set (upper-bound-of ?remainder)
       (min ?dividend_upper (- ?divisor_upper (bigint 1))))
   )
+  :ruleset main_ruleset :name "core: IntTruncRem refinement for a nonnegative dividend"
 )
 
 ; Lattice-pair bounds (Stage M1): min/max are monotone in both
@@ -1722,6 +1788,7 @@
     (= ?rhs_lower (lower-bound-of ?rhs))
   )
   ((set (lower-bound-of ?minimum) (min ?lhs_lower ?rhs_lower)))
+  :ruleset main_ruleset :name "core: lower bound of IntMin"
 )
 (rule
   (
@@ -1730,6 +1797,7 @@
     (= ?rhs_upper (upper-bound-of ?rhs))
   )
   ((set (upper-bound-of ?minimum) (min ?lhs_upper ?rhs_upper)))
+  :ruleset main_ruleset :name "core: upper bound of IntMin"
 )
 (rule
   (
@@ -1738,6 +1806,7 @@
     (= ?rhs_lower (lower-bound-of ?rhs))
   )
   ((set (lower-bound-of ?maximum) (max ?lhs_lower ?rhs_lower)))
+  :ruleset main_ruleset :name "core: lower bound of IntMax"
 )
 (rule
   (
@@ -1746,6 +1815,7 @@
     (= ?rhs_upper (upper-bound-of ?rhs))
   )
   ((set (upper-bound-of ?maximum) (max ?lhs_upper ?rhs_upper)))
+  :ruleset main_ruleset :name "core: upper bound of IntMax"
 )
 
 ; ============================================================
@@ -1776,6 +1846,7 @@
     (= ?lower (lower-bound-of ?expr))
   )
   ((set (value-lower-bound-of ?tensor) ?lower))
+  :ruleset main_ruleset :name "core: value lower bound of LogicalIota from its index expr"
 )
 (rule
   (
@@ -1783,6 +1854,7 @@
     (= ?upper (upper-bound-of ?expr))
   )
   ((set (value-upper-bound-of ?tensor) ?upper))
+  :ruleset main_ruleset :name "core: value upper bound of LogicalIota from its index expr"
 )
 
 ; BOOL-BRIDGE RULES (Austin's design, 2026-07-29; constructors in the
@@ -1793,6 +1865,7 @@
     (set (lower-bound-of ?cast) (bigint 0))
     (set (upper-bound-of ?cast) (bigint 1))
   )
+  :ruleset main_ruleset :name "core: IntCastFromBool is bounded to [0, 1]"
 )
 ; A comparison DECIDED by value-level bounds is a constant function over
 ; the whole box, so the comparison class IS its literal — function-equality
@@ -1808,6 +1881,7 @@
     (< ?lhs_upper ?rhs_lower)
   )
   ((union ?comparison (BoolLit true)))
+  :ruleset main_ruleset :name "core: BoolLessThanInt decided true by value bounds"
 )
 (rule
   (
@@ -1817,10 +1891,11 @@
     (>= ?lhs_lower ?rhs_upper)
   )
   ((union ?comparison (BoolLit false)))
+  :ruleset main_ruleset :name "core: BoolLessThanInt decided false by value bounds"
 )
 ; The cast maps bool literals to the ring's indicators.
-(rewrite (IntCastFromBool (BoolLit true)) (IntLit 1))
-(rewrite (IntCastFromBool (BoolLit false)) (IntLit 0))
+(rewrite (IntCastFromBool (BoolLit true)) (IntLit 1) :ruleset main_ruleset :name "core: IntCastFromBool of true is the literal 1")
+(rewrite (IntCastFromBool (BoolLit false)) (IntLit 0) :ruleset main_ruleset :name "core: IntCastFromBool of false is the literal 0")
 
 ; Tripwire (see triage above; the CoordVar gate keeps legal empty axes
 ; from ever reaching it, so both remaining arms are authoring/soundness
@@ -1832,6 +1907,7 @@
     (> ?lower ?upper)
   )
   ((panic "crossed IntExpr bounds: unsound union or inconsistent seed"))
+  :ruleset main_ruleset :name "core: crossed IntExpr bounds tripwire"
 )
 
 ; Negative-extent trap: size ZERO is a legal empty tensor, but a negative
@@ -1848,6 +1924,7 @@
     (< ?extent_value 0)
   )
   ((panic "CoordVar with negative extent: malformed shape"))
+  :ruleset main_ruleset :name "core: CoordVar with a literal negative extent is malformed"
 )
 (rule
   (
@@ -1858,6 +1935,7 @@
     (<= ?extent_upper (bigint -1))
   )
   ((panic "CoordVar with provably negative extent: malformed shape"))
+  :ruleset main_ruleset :name "core: CoordVar with provably negative extent is malformed"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1955,10 +2033,12 @@
 (rule
   ((= ?lower (lower-bound-of ?expr)) (> ?lower (bigint 0)))
   ((provably-cannot-union-with-zero ?expr))
+  :ruleset main_ruleset :name "core: nonzero certificate: positive lower bound"
 )
 (rule
   ((= ?upper (upper-bound-of ?expr)) (< ?upper (bigint 0)))
   ((provably-cannot-union-with-zero ?expr))
+  :ruleset main_ruleset :name "core: nonzero certificate: negative upper bound"
 )
 
 ; --- the coordinate route (regated Stage C1: certificate only when the
@@ -1973,6 +2053,7 @@
     (>= ?extent_lower (bigint 2))
   )
   ((provably-cannot-union-with-zero ?coord))
+  :ruleset main_ruleset :name "core: nonzero certificate: CoordVar with extent at least 2"
 )
 
 ; Support is a CLASS-LEVEL SEMANTIC claim ("the axis occurs in this
@@ -1996,6 +2077,7 @@
     (>= ?extent_lower (bigint 2))
   )
   ((axis-in-support ?coord ?axis))
+  :ruleset main_ruleset :name "core: axis-in-support base case: CoordVar of extent 2 or more"
 )
 
 ; --- THE EXTENT-1 COLLAPSE (Stage C1, user-ratified): a coordinate whose
@@ -2021,6 +2103,7 @@
     (<= ?extent_upper (bigint 1))
   )
   ((union ?coord (IntLit 0)))
+  :ruleset main_ruleset :name "core: CoordVar of extent exactly 1 collapses to zero"
 )
 
 ; --- R3: product route ---
@@ -2031,6 +2114,7 @@
     (provably-cannot-union-with-zero ?rhs)
   )
   ((provably-cannot-union-with-zero ?product))
+  :ruleset main_ruleset :name "core: nonzero certificate: product of nonzero factors"
 )
 
 ; --- R4: sum route, plus the support propagation it rides on ---
@@ -2038,10 +2122,12 @@
 (rule
   ((= ?sum (IntAdd ?lhs ?rhs)) (axis-in-support ?lhs ?axis))
   ((axis-free-demand ?rhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand on the right summand of IntAdd"
 )
 (rule
   ((= ?sum (IntAdd ?lhs ?rhs)) (axis-in-support ?rhs ?axis))
   ((axis-free-demand ?lhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand on the left summand of IntAdd"
 )
 (rule
   (
@@ -2053,6 +2139,7 @@
     (provably-cannot-union-with-zero ?sum)
     (axis-in-support ?sum ?axis)
   )
+  :ruleset main_ruleset :name "core: nonzero certificate: IntAdd with support only in lhs"
 )
 (rule
   (
@@ -2064,6 +2151,7 @@
     (provably-cannot-union-with-zero ?sum)
     (axis-in-support ?sum ?axis)
   )
+  :ruleset main_ruleset :name "core: nonzero certificate: IntAdd with support only in rhs"
 )
 ; Support survives multiplication by a certified cofactor.
 (rule
@@ -2073,6 +2161,7 @@
     (provably-cannot-union-with-zero ?rhs)
   )
   ((axis-in-support ?product ?axis))
+  :ruleset main_ruleset :name "core: axis-in-support through IntMul, rhs cofactor certified"
 )
 (rule
   (
@@ -2081,16 +2170,19 @@
     (provably-cannot-union-with-zero ?lhs)
   )
   ((axis-in-support ?product ?axis))
+  :ruleset main_ruleset :name "core: axis-in-support through IntMul, lhs cofactor certified"
 )
 
 ; --- axis-free: demand-driven structural recursion ---
 (rule
   ((axis-free-demand ?expr ?axis) (= ?expr (IntLit ?value)))
   ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of an IntLit"
 )
 (rule
   ((axis-free-demand ?expr ?axis) (= ?expr (IntVar ?dim_name)))
   ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of an IntVar"
 )
 ; Primitive axis disequality is stable (primitives never merge).
 (rule
@@ -2100,10 +2192,12 @@
     (!= ?other_axis ?axis)
   )
   ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of a CoordVar on a different axis"
 )
 (rule
   ((axis-free-demand ?expr ?axis) (= ?expr (IntAdd ?lhs ?rhs)))
   ((axis-free-demand ?lhs ?axis) (axis-free-demand ?rhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand descends into IntAdd operands"
 )
 (rule
   (
@@ -2113,10 +2207,12 @@
     (axis-free ?rhs ?axis)
   )
   ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of IntAdd when both summands are axis-free"
 )
 (rule
   ((axis-free-demand ?expr ?axis) (= ?expr (IntMul ?lhs ?rhs)))
   ((axis-free-demand ?lhs ?axis) (axis-free-demand ?rhs ?axis))
+  :ruleset main_ruleset :name "core: axis-free-demand descends into IntMul operands"
 )
 (rule
   (
@@ -2126,6 +2222,7 @@
     (axis-free ?rhs ?axis)
   )
   ((axis-free ?expr ?axis))
+  :ruleset main_ruleset :name "core: axis-free of IntMul when both factors are axis-free"
 )
 
 ; --- certificate tripwires (LOUD, never silence them) ---
@@ -2134,11 +2231,13 @@
 (rule
   ((provably-cannot-union-with-zero ?expr) (= ?expr (IntLit 0)))
   ((panic "provably-cannot-union-with-zero certified the zero class: certificate or union unsound"))
+  :ruleset main_ruleset :name "core: nonzero certificate on the zero class tripwire"
 )
 ; Contradictory support facts mean a support rule or a union lied.
 (rule
   ((axis-in-support ?expr ?axis) (axis-free ?expr ?axis))
   ((panic "axis support contradiction: unsound union or broken support rule"))
+  :ruleset main_ruleset :name "core: axis-in-support and axis-free contradiction tripwire"
 )
 ; Two distinct integer literals in one class is the canonical downstream
 ; face of ANY unsound IntExpr union: bounds pins and literal folds drag
@@ -2149,6 +2248,7 @@
 (rule
   ((= ?expr (IntLit ?a)) (= ?expr (IntLit ?b)) (!= ?a ?b))
   ((panic "distinct integer literals unioned: unsound IntExpr equality"))
+  :ruleset main_ruleset :name "core: distinct IntLit values in one class tripwire"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2183,6 +2283,7 @@
     (<= ?upper (bigint 0))
   )
   ((union ?expr (IntLit 0)))
+  :ruleset main_ruleset :name "core: bounds [0, 0] union the class into IntLit 0"
 )
 
 ; THE ABSORPTION UNION (Stage Z1): a product with a provably-zero
@@ -2193,10 +2294,12 @@
 (rule
   ((= ?product (IntMul ?lhs ?rhs)) (= ?lhs (IntLit 0)))
   ((union ?product (IntLit 0)))
+  :ruleset main_ruleset :name "core: IntMul absorbs into zero, zero factor on the left"
 )
 (rule
   ((= ?product (IntMul ?lhs ?rhs)) (= ?rhs (IntLit 0)))
   ((union ?product (IntLit 0)))
+  :ruleset main_ruleset :name "core: IntMul absorbs into zero, zero factor on the right"
 )
 
 ; Tripwire: the two certificates are mutually exclusive by construction;
@@ -2207,6 +2310,7 @@
     (provably-cannot-union-with-zero ?expr)
   )
   ((panic "zero and nonzero certificates on one class: route or union unsound"))
+  :ruleset main_ruleset :name "core: zero and nonzero certificates on one class tripwire"
 )
 
 
@@ -2234,6 +2338,7 @@
     (= 0 (% ?dividend_value ?divisor_value))
   )
   ((provably-exact-division-expression ?dividend ?divisor))
+  :ruleset main_ruleset :name "core: exact division: both operands literal, remainder 0"
 )
 ; The multiple route: a dividend whose class contains IntMul(x, d) is
 ; divisible by d as a function — for SYMBOLIC x, where intervals know
@@ -2241,20 +2346,24 @@
 (rule
   ((= ?dividend (IntMul ?x ?divisor)))
   ((provably-exact-division-expression ?dividend ?divisor))
+  :ruleset main_ruleset :name "core: exact division: dividend is IntMul by the divisor"
 )
 ; The self route: x divides x wherever the division is defined. Driven
 ; from the division nodes that make the fact consumable.
 (rule
   ((= ?quotient (IntTruncDiv ?x ?x)))
   ((provably-exact-division-expression ?x ?x))
+  :ruleset main_ruleset :name "core: exact division: x by x, demanded by IntTruncDiv"
 )
 (rule
   ((= ?remainder (IntTruncRem ?x ?x)))
   ((provably-exact-division-expression ?x ?x))
+  :ruleset main_ruleset :name "core: exact division: x by x, demanded by IntTruncRem"
 )
 (rule
   ((= ?quotient (IntCeilDiv ?x ?x)))
   ((provably-exact-division-expression ?x ?x))
+  :ruleset main_ruleset :name "core: exact division: x by x, demanded by IntCeilDiv"
 )
 ; The zero route: a provably-zero dividend is divisible by anything;
 ; driven from division nodes.
@@ -2264,6 +2373,7 @@
     (= ?dividend (IntLit 0))
   )
   ((provably-exact-division-expression ?dividend ?divisor))
+  :ruleset main_ruleset :name "core: exact division: zero dividend under IntTruncDiv"
 )
 (rule
   (
@@ -2271,6 +2381,7 @@
     (= ?dividend (IntLit 0))
   )
   ((provably-exact-division-expression ?dividend ?divisor))
+  :ruleset main_ruleset :name "core: exact division: zero dividend under IntTruncRem"
 )
 (rule
   (
@@ -2278,6 +2389,7 @@
     (= ?dividend (IntLit 0))
   )
   ((provably-exact-division-expression ?dividend ?divisor))
+  :ruleset main_ruleset :name "core: exact division: zero dividend under IntCeilDiv"
 )
 ; The sum route: divisibility is closed under addition.
 (rule
@@ -2287,6 +2399,7 @@
     (provably-exact-division-expression ?rhs ?divisor)
   )
   ((provably-exact-division-expression ?sum ?divisor))
+  :ruleset main_ruleset :name "core: exact division: closed under IntAdd of exact summands"
 )
 
 ; REMAINDER ELIMINATION: an exact remainder is the zero function. The
@@ -2306,6 +2419,7 @@
     (union ?remainder (IntLit 0))
     (subsume (IntTruncRem ?dividend ?divisor))
   )
+  :ruleset main_ruleset :name "core: exact IntTruncRem is zero, positive divisor"
 )
 (rule
   (
@@ -2318,6 +2432,7 @@
     (union ?remainder (IntLit 0))
     (subsume (IntTruncRem ?dividend ?divisor))
   )
+  :ruleset main_ruleset :name "core: exact IntTruncRem is zero, negative divisor"
 )
 
 ; QUOTIENT COLLAPSE: (x * d) divided by d is x — the tiling round-trip
@@ -2337,6 +2452,7 @@
     (union ?quotient ?x)
     (subsume (IntTruncDiv ?dividend ?divisor))
   )
+  :ruleset main_ruleset :name "core: IntTruncDiv cancels the divisor, positive divisor"
 )
 (rule
   (
@@ -2349,6 +2465,7 @@
     (union ?quotient ?x)
     (subsume (IntTruncDiv ?dividend ?divisor))
   )
+  :ruleset main_ruleset :name "core: IntTruncDiv cancels the divisor, negative divisor"
 )
 (rule
   (
@@ -2361,6 +2478,7 @@
     (union ?quotient ?x)
     (subsume (IntCeilDiv ?dividend ?divisor))
   )
+  :ruleset main_ruleset :name "core: IntCeilDiv cancels the divisor, positive divisor"
 )
 (rule
   (
@@ -2373,6 +2491,7 @@
     (union ?quotient ?x)
     (subsume (IntCeilDiv ?dividend ?divisor))
   )
+  :ruleset main_ruleset :name "core: IntCeilDiv cancels the divisor, negative divisor"
 )
 
 ; EXACT AGREEMENT: where the division is exact and defined, the trunc
@@ -2387,6 +2506,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?trunc_quotient ?ceil_quotient))
+  :ruleset main_ruleset :name "core: exact division: trunc and ceil agree, positive divisor"
 )
 (rule
   (
@@ -2397,6 +2517,7 @@
     (<= ?divisor_upper (bigint -1))
   )
   ((union ?trunc_quotient ?ceil_quotient))
+  :ruleset main_ruleset :name "core: exact division: trunc and ceil agree, negative divisor"
 )
 
 ; DIVISOR-ONE IDENTITIES: dividing by the literal 1 is the identity,
@@ -2409,6 +2530,7 @@
     (union ?quotient ?operand)
     (subsume (IntTruncDiv ?operand (IntLit 1)))
   )
+  :ruleset main_ruleset :name "core: IntTruncDiv by the literal 1 is the identity"
 )
 (rule
   ((= ?quotient (IntCeilDiv ?operand (IntLit 1))))
@@ -2416,6 +2538,7 @@
     (union ?quotient ?operand)
     (subsume (IntCeilDiv ?operand (IntLit 1)))
   )
+  :ruleset main_ruleset :name "core: IntCeilDiv by the literal 1 is the identity"
 )
 (rule
   ((= ?remainder (IntTruncRem ?operand (IntLit 1))))
@@ -2423,6 +2546,7 @@
     (union ?remainder (IntLit 0))
     (subsume (IntTruncRem ?operand (IntLit 1)))
   )
+  :ruleset main_ruleset :name "core: IntTruncRem by the literal 1 is zero"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2459,6 +2583,7 @@
     (<= ?upper (bigint 1))
   )
   ((union ?expr (IntLit 1)))
+  :ruleset main_ruleset :name "core: point bounds [1, 1] join the literal-one class"
 )
 (rule
   (
@@ -2467,6 +2592,7 @@
     (>= ?x_lower (bigint 1))
   )
   ((union ?quotient (IntLit 1)))
+  :ruleset main_ruleset :name "core: IntTruncDiv of x by x is one, positive x"
 )
 (rule
   (
@@ -2475,6 +2601,7 @@
     (<= ?x_upper (bigint -1))
   )
   ((union ?quotient (IntLit 1)))
+  :ruleset main_ruleset :name "core: IntTruncDiv of x by x is one, negative x"
 )
 (rule
   (
@@ -2483,6 +2610,7 @@
     (>= ?x_lower (bigint 1))
   )
   ((union ?quotient (IntLit 1)))
+  :ruleset main_ruleset :name "core: IntCeilDiv of x by x is one, positive x"
 )
 (rule
   (
@@ -2491,6 +2619,7 @@
     (<= ?x_upper (bigint -1))
   )
   ((union ?quotient (IntLit 1)))
+  :ruleset main_ruleset :name "core: IntCeilDiv of x by x is one, negative x"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2535,6 +2664,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?quotient (IntAdd (IntTruncDiv ?offset ?divisor) ?scale)))
+  :ruleset main_ruleset :name "core: divisor multiple shifts out of an IntTruncDiv dividend"
 )
 ; ...and the rem side: the remainder is periodic in divisor-multiples.
 (rule
@@ -2551,6 +2681,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?remainder (IntTruncRem ?offset ?divisor)))
+  :ruleset main_ruleset :name "core: divisor multiple drops out of an IntTruncRem dividend"
 )
 
 ; SMALL DIVIDEND: a dividend provably inside [0, divisor) divides to
@@ -2570,6 +2701,7 @@
     (union ?quotient (IntLit 0))
     (subsume (IntTruncDiv ?dividend ?divisor))
   )
+  :ruleset main_ruleset :name "core: small dividend truncates to zero"
 )
 (rule
   (
@@ -2584,6 +2716,7 @@
     (union ?remainder ?dividend)
     (subsume (IntTruncRem ?dividend ?divisor))
   )
+  :ruleset main_ruleset :name "core: small dividend survives IntTruncRem whole"
 )
 
 ; RECOMPOSITION (the pairing law read as a collapse): d*(n tdiv d) plus
@@ -2609,6 +2742,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?sum ?n))
+  :ruleset main_ruleset :name "core: div/rem recomposition of the dividend, positive divisor"
 )
 (rule
   (
@@ -2617,6 +2751,7 @@
     (<= ?divisor_upper (bigint -1))
   )
   ((union ?sum ?n))
+  :ruleset main_ruleset :name "core: div/rem recomposition of the dividend, negative divisor"
 )
 
 ; FUSION: dividing twice by positive divisors is dividing once by the
@@ -2634,6 +2769,7 @@
     (>= ?outer_lower (bigint 1))
   )
   ((union ?outer_quotient (IntTruncDiv ?n (IntMul ?inner_divisor ?outer_divisor))))
+  :ruleset main_ruleset :name "core: nested IntTruncDiv fuses into one product divisor"
 )
 
 ; CEIL -> TRUNC BRIDGES: every ceiling term earns a truncating (device-
@@ -2652,6 +2788,7 @@
   )
   ((union ?quotient
      (IntTruncDiv (IntAdd ?dividend (IntAdd ?divisor (IntLit -1))) ?divisor)))
+  :ruleset main_ruleset :name "core: IntCeilDiv to IntTruncDiv bridge, nonnegative dividend"
 )
 ; ...nonpositive dividend: truncation already rounds up.
 (rule
@@ -2665,6 +2802,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?quotient (IntTruncDiv ?dividend ?divisor)))
+  :ruleset main_ruleset :name "core: IntCeilDiv is IntTruncDiv at nonpositive dividends"
 )
 
 ; DIVIDEND NEGATION: truncation is sign-symmetric in the dividend (both
@@ -2680,6 +2818,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?quotient (IntMul (IntLit -1) (IntTruncDiv ?n ?divisor))))
+  :ruleset main_ruleset :name "core: dividend negation exits IntTruncDiv, positive divisor"
 )
 (rule
   (
@@ -2691,6 +2830,7 @@
     (<= ?divisor_upper (bigint -1))
   )
   ((union ?quotient (IntMul (IntLit -1) (IntTruncDiv ?n ?divisor))))
+  :ruleset main_ruleset :name "core: dividend negation exits IntTruncDiv, negative divisor"
 )
 (rule
   (
@@ -2702,6 +2842,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?remainder (IntMul (IntLit -1) (IntTruncRem ?n ?divisor))))
+  :ruleset main_ruleset :name "core: dividend negation exits IntTruncRem, positive divisor"
 )
 (rule
   (
@@ -2713,6 +2854,7 @@
     (<= ?divisor_upper (bigint -1))
   )
   ((union ?remainder (IntMul (IntLit -1) (IntTruncRem ?n ?divisor))))
+  :ruleset main_ruleset :name "core: dividend negation exits IntTruncRem, negative divisor"
 )
 
 ; DIVISOR NEGATION (the normalization that makes the negative-divisor
@@ -2731,6 +2873,7 @@
   )
   ((union ?quotient
      (IntMul (IntLit -1) (IntTruncDiv ?n (IntLit (- 0 ?negative_divisor))))))
+  :ruleset main_ruleset :name "core: negative literal divisor flips the IntTruncDiv sign"
 )
 (rule
   (
@@ -2741,6 +2884,7 @@
     (< ?n_lower ?n_upper)
   )
   ((union ?remainder (IntTruncRem ?n (IntLit (- 0 ?negative_divisor)))))
+  :ruleset main_ruleset :name "core: negative literal divisor drops out of IntTruncRem"
 )
 (rule
   (
@@ -2752,6 +2896,7 @@
   )
   ((union ?quotient
      (IntCeilDiv (IntMul (IntLit -1) ?n) (IntLit (- 0 ?negative_divisor)))))
+  :ruleset main_ruleset :name "core: IntCeilDiv by a negative literal negates the dividend"
 )
 (rule
   (
@@ -2763,6 +2908,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?quotient (IntMul (IntLit -1) (IntTruncDiv ?n ?divisor))))
+  :ruleset main_ruleset :name "core: symbolic -1 divisor flips the IntTruncDiv sign"
 )
 (rule
   (
@@ -2774,6 +2920,7 @@
     (>= ?divisor_lower (bigint 1))
   )
   ((union ?remainder (IntTruncRem ?n ?divisor)))
+  :ruleset main_ruleset :name "core: symbolic -1 divisor drops out of IntTruncRem"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2789,6 +2936,7 @@
     (union ?minimum ?x)
     (subsume (IntMin ?x ?x))
   )
+  :ruleset main_ruleset :name "core: idempotency of IntMin"
 )
 (rule
   ((= ?maximum (IntMax ?x ?x)))
@@ -2796,6 +2944,7 @@
     (union ?maximum ?x)
     (subsume (IntMax ?x ?x))
   )
+  :ruleset main_ruleset :name "core: idempotency of IntMax"
 )
 
 ; BOUNDS-DECIDED COLLAPSES — the rule family the lattice makes possible:
@@ -2818,6 +2967,7 @@
     (subsume (IntMin ?lhs ?rhs))
     (subsume (IntMin ?rhs ?lhs))
   )
+  :ruleset main_ruleset :name "core: IntMin collapses when bounds decide the winner"
 )
 (rule
   (
@@ -2831,6 +2981,7 @@
     (subsume (IntMax ?lhs ?rhs))
     (subsume (IntMax ?rhs ?lhs))
   )
+  :ruleset main_ruleset :name "core: IntMax collapses when bounds decide the winner"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2870,6 +3021,7 @@
   )
   ((union ?expr (IntAdd ?lhs (IntAdd ?rhs ?outer))))
   :name "int-add-associate"
+  :ruleset main_ruleset
 )
 
 ; Associativity : IntMul
@@ -2885,6 +3037,7 @@
   )
   ((union ?expr (IntMul ?lhs (IntMul ?rhs ?outer))))
   :name "int-mul-associate"
+  :ruleset main_ruleset
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2948,6 +3101,7 @@
   )
   ((union ?expr (IntAdd (IntMul ?lhs ?factor) (IntMul ?rhs ?factor))))
   :name "int-distribute-expand"
+  :ruleset main_ruleset
 )
 
 ; Distributivity : factor
@@ -2960,6 +3114,7 @@
   )
   ((union ?expr (IntMul (IntAdd ?lhs ?rhs) ?factor)))
   :name "int-distribute-factor"
+  :ruleset main_ruleset
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2995,6 +3150,7 @@
     (subsume (IntAdd ?lhs_product ?rhs_product))
     (subsume (IntAdd ?rhs_product ?lhs_product))
   )
+  :ruleset main_ruleset :name "core: like terms with literal coefficients summing to 0"
 )
 ; coefficient sum = 1: the sum IS x — IntMul(x, 1) is never materialized.
 (rule
@@ -3010,6 +3166,7 @@
     (subsume (IntAdd ?lhs_product ?rhs_product))
     (subsume (IntAdd ?rhs_product ?lhs_product))
   )
+  :ruleset main_ruleset :name "core: like terms with literal coefficients summing to 1"
 )
 ; any other sum: the combined multiple.
 (rule
@@ -3026,6 +3183,7 @@
     (subsume (IntAdd ?lhs_product ?rhs_product))
     (subsume (IntAdd ?rhs_product ?lhs_product))
   )
+  :ruleset main_ruleset :name "core: like terms with literal coefficients: combined multiple"
 )
 
 ; Implicit-coefficient companions: x + c*x (bare x carries coefficient 1).
@@ -3041,6 +3199,7 @@
     (subsume (IntAdd ?x ?rhs_product))
     (subsume (IntAdd ?rhs_product ?x))
   )
+  :ruleset main_ruleset :name "core: x + c*x with implicit coefficient, sum 0"
 )
 (rule
   (
@@ -3054,6 +3213,7 @@
     (subsume (IntAdd ?x ?rhs_product))
     (subsume (IntAdd ?rhs_product ?x))
   )
+  :ruleset main_ruleset :name "core: x + c*x with implicit coefficient, sum 1"
 )
 (rule
   (
@@ -3068,6 +3228,7 @@
     (subsume (IntAdd ?x ?rhs_product))
     (subsume (IntAdd ?rhs_product ?x))
   )
+  :ruleset main_ruleset :name "core: x + c*x with implicit coefficient, combined multiple"
 )
 
 ; Doubling: x + x = 2*x.
@@ -3077,6 +3238,7 @@
     (union ?sum (IntMul ?x (IntLit 2)))
     (subsume (IntAdd ?x ?x))
   )
+  :ruleset main_ruleset :name "core: doubling: IntAdd of x with itself is 2*x"
 )
 
 ; SYMBOLIC-coefficient like terms: c1*x + c2*x -> (c1+c2)*x where the
@@ -3105,6 +3267,7 @@
     (subsume (IntAdd ?lhs_product ?rhs_product))
     (subsume (IntAdd ?rhs_product ?lhs_product))
   )
+  :ruleset main_ruleset :name "core: symbolic like terms, both coefficient lowers positive"
 )
 (rule
   (
@@ -3120,6 +3283,7 @@
     (subsume (IntAdd ?lhs_product ?rhs_product))
     (subsume (IntAdd ?rhs_product ?lhs_product))
   )
+  :ruleset main_ruleset :name "core: symbolic like terms, both coefficient uppers negative"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3144,6 +3308,7 @@
   (
     (right-major-strides-demand ?dims)
   )
+  :ruleset main_ruleset :name "core: demand right-major contiguous strides fold"
 )
 
 ; Propagate demand towards nil.
@@ -3154,6 +3319,7 @@
   (
     (right-major-strides-demand ?tail)
   )
+  :ruleset main_ruleset :name "core: propagate right-major strides demand to the tail"
 )
 
 ; Empty suffix:
@@ -3169,6 +3335,7 @@
       (right-major-strides-state-of (IntExprNil))
       (RightMajorStridesFoldStateLit 0 (IntLit 1) (IntExprNil)))
   )
+  :ruleset main_ruleset :name "core: right-major strides fold state of the empty suffix"
 )
 
 ; Non-empty suffix:
@@ -3189,6 +3356,7 @@
         (IntMul ?size ?total-elements)
         (IntExprCons ?total-elements ?strides)))
   )
+  :ruleset main_ruleset :name "core: right-major strides fold state of a cons suffix"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3208,10 +3376,12 @@
 (rule
   ((affine-zip-demand ?sh (IntExprCons ?d ?dt) (IntExprCons ?s ?st)))
   ((affine-zip-demand ?sh ?dt ?st))
+  :ruleset main_ruleset :name "core: propagate affine-zip demand to the list tails"
 )
 (rule
   ((affine-zip-demand ?sh (IntExprNil) (IntExprNil)))
   ((affine-zip-out ?sh (IntExprNil) (IntExprNil) (IntAffineExprNil)))
+  :ruleset main_ruleset :name "core: affine-zip of empty dim and stride lists"
 )
 (rule
   (
@@ -3221,10 +3391,12 @@
   )
   ((affine-zip-out ?sh (IntExprCons ?d ?dt) (IntExprCons ?s ?st)
     (IntAffineExprCons (IntMul (CoordVar ?sh ?axis) ?s) ?tail)))
+  :ruleset main_ruleset :name "core: affine-zip cons: one IntMul CoordVar stride summand"
 )
 (rule
   ((strided-lists ?layout ?shape ?dims ?strides ?bits))
   ((affine-zip-demand ?shape ?dims ?strides))
+  :ruleset main_ruleset :name "core: strided-lists seam demands its affine zip"
 )
 (rule
   (
@@ -3232,6 +3404,7 @@
     (affine-zip-out ?shape ?dims ?strides ?chain)
   )
   ((union ?layout (StridedElementLayoutLit ?shape ?chain ?bits)))
+  :ruleset main_ruleset :name "core: strided-lists seam equals StridedElementLayoutLit"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3245,6 +3418,7 @@
   (
     (strided-lists ?right_major_layout (ShapeLit ?dims) ?dims ?strides ?bits)
   )
+  :ruleset main_ruleset :name "core: right-major contiguous layout is a strided-lists seam"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3263,6 +3437,7 @@
   (
     (left-major-strides-demand ?dims)
   )
+  :ruleset main_ruleset :name "core: demand left-major contiguous strides fold"
 )
 
 ; Propagate demand towards nil.
@@ -3273,6 +3448,7 @@
   (
     (left-major-strides-demand ?tail)
   )
+  :ruleset main_ruleset :name "core: propagate left-major strides demand to the tail"
 )
 
 ; Empty suffix:
@@ -3288,6 +3464,7 @@
       (left-major-strides-state-of (IntExprNil))
       (LeftMajorStridesFoldStateLit 0 (IntLit 1) (IntExprNil)))
   )
+  :ruleset main_ruleset :name "core: left-major strides fold state of the empty suffix"
 )
 
 ; Non-empty suffix:
@@ -3303,6 +3480,7 @@
   (
     (expr-list-scale-demand ?size ?tail_strides)
   )
+  :ruleset main_ruleset :name "core: left-major cons suffix demands the tail stride scaling"
 )
 
 (rule
@@ -3321,6 +3499,7 @@
         (IntMul ?size ?total-elements)
         (IntExprCons (IntLit 1) ?scaled_tail_strides)))
   )
+  :ruleset main_ruleset :name "core: left-major strides fold state of a cons suffix"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3334,6 +3513,7 @@
   (
     (strided-lists ?left_major_layout (ShapeLit ?dims) ?dims ?strides ?bits)
   )
+  :ruleset main_ruleset :name "core: left-major contiguous layout is a strided-lists seam"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3354,6 +3534,7 @@
 (rule
   ((strided-lists ?layout ?shape ?dims ?strides ?bits))
   ((strided-indexing-foldr-demand ?shape ?dims ?strides))
+  :ruleset main_ruleset :name "core: strided-lists seam demands the element offset fold"
 )
 
 ; Propagate demand towards nil while zipping shape and stride suffixes.
@@ -3366,6 +3547,7 @@
   (
     (strided-indexing-foldr-demand ?root_shape ?dim_tail ?stride_tail)
   )
+  :ruleset main_ruleset :name "core: propagate offset fold demand along shape and strides"
 )
 
 ; Empty suffixes: no axis remains and the accumulated element offset is zero.
@@ -3378,6 +3560,7 @@
       (strided-indexing-foldr-state-of ?root_shape (IntExprNil) (IntExprNil))
       (StridedIndexingFoldRStateLit 0 (IntLit 0)))
   )
+  :ruleset main_ruleset :name "core: offset fold state of the empty suffixes is zero"
 )
 
 ; One list ended before the other, so the strided layout is malformed.
@@ -3388,6 +3571,7 @@
   (
     (panic "StridedElementLayoutLit shape and stride ranks differ")
   )
+  :ruleset main_ruleset :name "core: rank mismatch tripwire: dims ended before strides"
 )
 
 (rule
@@ -3397,6 +3581,7 @@
   (
     (panic "StridedElementLayoutLit shape and stride ranks differ")
   )
+  :ruleset main_ruleset :name "core: rank mismatch tripwire: strides ended before dims"
 )
 
 ; Non-empty suffix:
@@ -3450,6 +3635,7 @@
             ?stride)
           ?linear)))
   )
+  :ruleset main_ruleset :name "core: offset fold cons arm mints CoordVar times the stride"
 )
 ; The skip fires on the ZERO CERTIFICATE, not literal zero-class
 ; membership: a compound stride over a pinned-empty dim (IntMul(4, n) with
@@ -3474,6 +3660,7 @@
         (+ ?axis 1)
         ?linear))
   )
+  :ruleset main_ruleset :name "core: offset fold skips a zero-certified stride axis"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3487,6 +3674,7 @@
   (
     (union ?layout (ElementOffsetExpressionLayoutLit ?indexing_expr ?shape ?bits))
   )
+  :ruleset main_ruleset :name "core: strided-lists seam equals an element offset layout"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3501,6 +3689,7 @@
   (
     (union ?element_array_layout (BitOffsetExpressionLayoutLit (IntMul ?index_layout (IntLit ?bits)) ?shape ?bit_width))
   )
+  :ruleset main_ruleset :name "core: element offset layout equals bit offset times width"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3537,6 +3726,7 @@
     (right-major-strides-demand ?dims)
     (left-major-strides-demand ?dims)
   )
+  :ruleset main_ruleset :name "core: strided layout demands both contiguous strides folds"
 )
 (rule
   (
@@ -3546,6 +3736,7 @@
       (RightMajorStridesFoldStateLit ?rank ?total ?strides))
   )
   ((affine-zip-demand ?shape ?dims ?strides))
+  :ruleset main_ruleset :name "core: strided layout demands the right-major affine zip"
 )
 (rule
   (
@@ -3558,6 +3749,7 @@
   (
     (union ?layout (RightMajorContiguousElementLayoutLit ?shape ?bits))
   )
+  :ruleset main_ruleset :name "core: right-major contiguous discovery from the chain class"
 )
 (rule
   (
@@ -3567,6 +3759,7 @@
       (LeftMajorStridesFoldStateLit ?rank ?total ?strides))
   )
   ((affine-zip-demand ?shape ?dims ?strides))
+  :ruleset main_ruleset :name "core: strided layout demands the left-major affine zip"
 )
 (rule
   (
@@ -3579,6 +3772,7 @@
   (
     (union ?layout (LeftMajorContiguousElementLayoutLit ?shape ?bits))
   )
+  :ruleset main_ruleset :name "core: left-major contiguous discovery from the chain class"
 )
 
 ; --- (3c) Bit -> Element discovery, layout-intrinsic ---
@@ -3593,6 +3787,7 @@
   (
     (union ?layout (ElementOffsetExpressionLayoutLit ?expr ?shape ?bit_width))
   )
+  :ruleset main_ruleset :name "core: bit offset layout divides its width out"
 )
 
 ; --- (3b) STRIDED PRESENTATIONS: existential testimony, never recovery ---
@@ -3706,6 +3901,7 @@
 (rule
   ((int-subst-demand ?expr ?map) (= ?expr (IntLit ?value)))
   ((union (int-subst-of ?expr ?map) (IntLit ?value)))
+  :ruleset main_ruleset :name "core: int-subst image of an IntLit is itself"
 )
 ; A IntVar is coordinate-free (maps bind coordinates, not unknowns), so substitution is the
 ; identity on it — without this case a symbolic stride anywhere in the
@@ -3714,6 +3910,7 @@
 (rule
   ((int-subst-demand ?expr ?map) (= ?expr (IntVar ?dim_name)))
   ((union (int-subst-of ?expr ?map) ?expr))
+  :ruleset main_ruleset :name "core: int-subst is the identity on an IntVar"
 )
 (rule
   (
@@ -3753,6 +3950,7 @@
     (<= ?entry_upper (- ?extent_lower (bigint 1)))
   )
   ((union (int-subst-of ?expr ?map) ?entry))
+  :ruleset main_ruleset :name "core: int-subst of a CoordVar, in-range by interval bounds"
 )
 ; STRUCTURAL IN-RANGE ARM (deep-dive item 1): an entry that IS a
 ; coordinate over the SAME extent class is in-box by construction —
@@ -3776,6 +3974,7 @@
     (= ?entry_extent ?extent)
   )
   ((union (int-subst-of ?expr ?map) ?entry))
+  :ruleset main_ruleset :name "core: int-subst of a CoordVar, entry is a same-extent CoordVar"
 )
 ; IntMul images are ZERO-AWARE (the foldr zero-stride precedent, one level
 ; up): a zero factor image collapses the product image to (IntLit 0) DIRECTLY
@@ -3806,6 +4005,7 @@
     (= ?lhs_image (IntLit 0))
   )
   ((union (int-subst-of ?expr ?map) (IntLit 0)))
+  :ruleset main_ruleset :name "core: int-subst of IntMul collapses on a zero left image"
 )
 (rule
   (
@@ -3815,6 +4015,7 @@
     (= ?rhs_image (IntLit 0))
   )
   ((union (int-subst-of ?expr ?map) (IntLit 0)))
+  :ruleset main_ruleset :name "core: int-subst of IntMul collapses on a zero right image"
 )
 
 ; Division-family descent (Stage D3): substitution commutes with every
@@ -3843,7 +4044,7 @@
 ; reason). The walk copies the reachable region under σ — every
 ; spelling at once, simultaneous by construction — from a :naive rule
 ; in the subst-walk ruleset. The schedule runs that ruleset as an
-; OUTER STRATUM ((saturate (saturate (run) (run prop)) (run subst-walk))): the
+; OUTER STRATUM ((saturate (saturate (run main_ruleset) (run prop)) (run subst-walk))): the
 ; ring saturates between walk generations, so re-walks happen per
 ; GENERATION, not per round. Both halves are load-bearing: per-round
 ; re-walks cost 2-9x on model-scale searches, and per-generation
@@ -3889,30 +4090,30 @@
 ; without the old decomposition's image-minting.
 (relation int-subst-closed-demand (IntExpr IndexMap))
 (relation bool-subst-closed-demand (BoolExpr IndexMap))
-(rule ((int-subst-demand ?e ?m)) ((int-subst-closed-demand ?e ?m)))
+(rule ((int-subst-demand ?e ?m)) ((int-subst-closed-demand ?e ?m)) :ruleset main_ruleset :name "core: closedness demand seeded by int-subst-demand")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntAdd ?l ?r)))
-      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)))
+      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)) :ruleset main_ruleset :name "core: closedness demand descends into IntAdd operands")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntMul ?l ?r)))
-      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)))
+      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)) :ruleset main_ruleset :name "core: closedness demand descends into IntMul operands")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntTruncDiv ?l ?r)))
-      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)))
+      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)) :ruleset main_ruleset :name "core: closedness demand descends into IntTruncDiv operands")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntTruncRem ?l ?r)))
-      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)))
+      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)) :ruleset main_ruleset :name "core: closedness demand descends into IntTruncRem operands")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntCeilDiv ?l ?r)))
-      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)))
+      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)) :ruleset main_ruleset :name "core: closedness demand descends into IntCeilDiv operands")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntMin ?l ?r)))
-      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)))
+      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)) :ruleset main_ruleset :name "core: closedness demand descends into IntMin operands")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntMax ?l ?r)))
-      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)))
+      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)) :ruleset main_ruleset :name "core: closedness demand descends into IntMax operands")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntCastFromBool ?b)))
-      ((bool-subst-closed-demand ?b ?m)))
+      ((bool-subst-closed-demand ?b ?m)) :ruleset main_ruleset :name "core: closedness demand crosses IntCastFromBool into the bool")
 (rule ((bool-subst-closed-demand ?b ?m) (= ?b (BoolLessThanInt ?l ?r)))
-      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)))
+      ((int-subst-closed-demand ?l ?m) (int-subst-closed-demand ?r ?m)) :ruleset main_ruleset :name "core: closedness demand descends into BoolLessThanInt operands")
 ; leaf closedness witnesses (the memo arms only serve leaf ROOTS now):
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntLit ?v)))
-      ((int-subst-closed ?e ?m)))
+      ((int-subst-closed ?e ?m)) :ruleset main_ruleset :name "core: IntLit leaf is closed under any map")
 (rule ((int-subst-closed-demand ?e ?m) (= ?e (IntVar ?n)))
-      ((int-subst-closed ?e ?m)))
+      ((int-subst-closed ?e ?m)) :ruleset main_ruleset :name "core: IntVar leaf is closed under any map")
 (rule ((int-subst-closed-demand ?e ?m)
        (= ?e (CoordVar ?source_shape ?axis))
        (= ?m (IndexMapLit ?entries ?source_shape))
@@ -3924,7 +4125,7 @@
        (>= ?entry_lower (bigint 0))
        (= ?extent_lower (lower-bound-of ?extent))
        (<= ?entry_upper (- ?extent_lower (bigint 1))))
-      ((int-subst-closed ?e ?m)))
+      ((int-subst-closed ?e ?m)) :ruleset main_ruleset :name "core: in-domain CoordVar is closed, interval minbox arm")
 (rule ((int-subst-closed-demand ?e ?m)
        (= ?e (CoordVar ?source_shape ?axis))
        (= ?m (IndexMapLit ?entries ?source_shape))
@@ -3935,7 +4136,7 @@
        (= ?entry_shape (ShapeLit ?entry_dims))
        (= ?entry_extent (expr-list-nth-from-end ?entry_dims ?entry_axis))
        (= ?entry_extent ?extent))
-      ((int-subst-closed ?e ?m)))
+      ((int-subst-closed ?e ?m)) :ruleset main_ruleset :name "core: in-domain CoordVar is closed, same-extent arm")
 (relation bool-subst-closed (BoolExpr IndexMap))
 (sort SigmaMap (Map IntExpr IntExpr))
 (relation sigma-walk (IndexMap IntExprList i64 SigmaMap))
@@ -3946,6 +4147,7 @@
 (rule
   ((int-subst-demand ?expr ?map) (= ?img (int-subst-of ?expr ?map)))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: closedness base arm: an int-subst-of memo row exists"
 )
 ; --- compound witnesses: closed over closed children, one arm per
 ; constructor the old combine family covered ---
@@ -3953,41 +4155,49 @@
   ((int-subst-closed-demand ?expr ?map) (= ?expr (IntAdd ?lhs ?rhs))
    (int-subst-closed ?lhs ?map) (int-subst-closed ?rhs ?map))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: IntAdd closed when both operands are closed"
 )
 (rule
   ((int-subst-closed-demand ?expr ?map) (= ?expr (IntMul ?lhs ?rhs))
    (int-subst-closed ?lhs ?map) (int-subst-closed ?rhs ?map))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: IntMul closed when both operands are closed"
 )
 (rule
   ((int-subst-closed-demand ?expr ?map) (= ?expr (IntTruncDiv ?lhs ?rhs))
    (int-subst-closed ?lhs ?map) (int-subst-closed ?rhs ?map))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: IntTruncDiv closed when both operands are closed"
 )
 (rule
   ((int-subst-closed-demand ?expr ?map) (= ?expr (IntTruncRem ?lhs ?rhs))
    (int-subst-closed ?lhs ?map) (int-subst-closed ?rhs ?map))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: IntTruncRem closed when both operands are closed"
 )
 (rule
   ((int-subst-closed-demand ?expr ?map) (= ?expr (IntCeilDiv ?lhs ?rhs))
    (int-subst-closed ?lhs ?map) (int-subst-closed ?rhs ?map))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: IntCeilDiv closed when both operands are closed"
 )
 (rule
   ((int-subst-closed-demand ?expr ?map) (= ?expr (IntMin ?lhs ?rhs))
    (int-subst-closed ?lhs ?map) (int-subst-closed ?rhs ?map))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: IntMin closed when both operands are closed"
 )
 (rule
   ((int-subst-closed-demand ?expr ?map) (= ?expr (IntMax ?lhs ?rhs))
    (int-subst-closed ?lhs ?map) (int-subst-closed ?rhs ?map))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: IntMax closed when both operands are closed"
 )
 (rule
   ((int-subst-closed-demand ?expr ?map) (= ?expr (IntCastFromBool ?bool))
    (bool-subst-closed ?bool ?map))
   ((int-subst-closed ?expr ?map))
+  :ruleset main_ruleset :name "core: IntCastFromBool closed when its BoolExpr is closed"
 )
 ; --- the bool mirror is now witness-only (bool-subst-of and its image
 ; arms are deleted; the WALK crosses the cast natively — it traverses
@@ -3995,11 +4205,13 @@
 (rule
   ((bool-subst-closed-demand ?bool ?map) (= ?bool (BoolLit ?value)))
   ((bool-subst-closed ?bool ?map))
+  :ruleset main_ruleset :name "core: BoolLit leaf is closed under any map"
 )
 (rule
   ((bool-subst-closed-demand ?bool ?map) (= ?bool (BoolLessThanInt ?lhs ?rhs))
    (int-subst-closed ?lhs ?map) (int-subst-closed ?rhs ?map))
   ((bool-subst-closed ?bool ?map))
+  :ruleset main_ruleset :name "core: BoolLessThanInt closed when both operands are closed"
 )
 
 ; --- the σ fold ---
@@ -4007,6 +4219,7 @@
   ((int-subst-demand ?expr ?map) (= ?map (IndexMapLit ?entries ?src))
    (= ?rank (rank-of ?src)))
   ((sigma-walk ?map ?entries (- ?rank 1) (map-empty)))
+  :ruleset main_ruleset :name "core: seed the σ fold at the source shape's highest axis"
 )
 ; Each fold step ADMITS its entry through the same two guard arms as
 ; the CoordVar memo arms above — σ exists only if EVERY entry is legal.
@@ -4031,6 +4244,7 @@
    (= ?extent_lower (lower-bound-of ?extent))
    (<= ?entry_upper (- ?extent_lower (bigint 1))))
   ((sigma-walk ?map ?et (- ?axis 1) (map-insert ?m (CoordVar ?src ?axis) ?e)))
+  :ruleset main_ruleset :name "core: σ fold admits an entry, interval minbox arm"
 )
 (rule
   ((sigma-walk ?map (IntExprCons ?e ?et) ?axis ?m)
@@ -4042,10 +4256,12 @@
    (= ?entry_extent (expr-list-nth-from-end ?entry_dims ?entry_axis))
    (= ?entry_extent ?extent))
   ((sigma-walk ?map ?et (- ?axis 1) (map-insert ?m (CoordVar ?src ?axis) ?e)))
+  :ruleset main_ruleset :name "core: σ fold admits an entry, same-extent CoordVar arm"
 )
 (rule
   ((sigma-walk ?map (IntExprNil) -1 ?m))
   ((set (sigma-out ?map) ?m))
+  :ruleset main_ruleset :name "core: σ fold complete: sigma-out for the map"
 )
 
 ; --- the walk: one image per demanded closed class — all spellings of
@@ -4059,6 +4275,7 @@
   ((union (int-subst-of ?expr ?map) (unstable-subst ?expr ?sigma)))
   :ruleset subst-walk
   :naive
+  :name "core: the walk: int-subst-of is unstable-subst under σ"
 )
 ; ================== END SUBST-PRIMITIVE ROAD BLOCK ==================
 
@@ -4085,6 +4302,7 @@
   (
     (int-subst-demand ?bit_expr ?map)
   )
+  :ruleset main_ruleset :name "core: demand substitution of the parent bit offset by the map"
 )
 
 ; ...and when it completes, DERIVE the view's LayoutTensor: its layout is
@@ -4107,6 +4325,7 @@
     (let view_lt (LayoutTensorLit ?out_logical view_layout))
     (bit-to-element-demand view_layout)
   )
+  :ruleset main_ruleset :name "core: view LayoutTensor from the substituted bit offset"
 )
 
 
@@ -4134,21 +4353,23 @@
 ; --- chain length (a head's from-end axis = its tail's length) ---
 (relation affine-len-demand (IntAffineExprList))
 (relation affine-len-out (IntAffineExprList i64))
-(rule ((affine-len-demand (IntAffineExprCons ?h ?t))) ((affine-len-demand ?t)))
-(rule ((affine-len-demand (IntAffineExprNil))) ((affine-len-out (IntAffineExprNil) 0)))
+(rule ((affine-len-demand (IntAffineExprCons ?h ?t))) ((affine-len-demand ?t)) :ruleset main_ruleset :name "core: chain length demand descends to the tail")
+(rule ((affine-len-demand (IntAffineExprNil))) ((affine-len-out (IntAffineExprNil) 0)) :ruleset main_ruleset :name "core: chain length of the empty chain is 0")
 (rule
   ((affine-len-demand (IntAffineExprCons ?h ?t)) (affine-len-out ?t ?n))
   ((affine-len-out (IntAffineExprCons ?h ?t) (+ ?n 1)))
+  :ruleset main_ruleset :name "core: chain length of a cons is its tail's length plus one"
 )
 
 ; --- the all-zero chain of a given rank (the walk's blank canvas) ---
 (relation affine-zeros-demand (i64))
 (relation affine-zeros-out (i64 IntAffineExprList))
-(rule ((affine-zeros-demand ?n) (> ?n 0)) ((affine-zeros-demand (- ?n 1))))
-(rule ((affine-zeros-demand 0)) ((affine-zeros-out 0 (IntAffineExprNil))))
+(rule ((affine-zeros-demand ?n) (> ?n 0)) ((affine-zeros-demand (- ?n 1))) :ruleset main_ruleset :name "core: zero-chain demand descends to rank minus one")
+(rule ((affine-zeros-demand 0)) ((affine-zeros-out 0 (IntAffineExprNil))) :ruleset main_ruleset :name "core: zero chain of rank 0 is the empty chain")
 (rule
   ((affine-zeros-demand ?n) (> ?n 0) (affine-zeros-out (- ?n 1) ?tail))
   ((affine-zeros-out ?n (IntAffineExprCons (IntLit 0) ?tail)))
+  :ruleset main_ruleset :name "core: zero chain of rank n conses IntLit 0 onto rank n-1"
 )
 
 ; --- place a summand at a from-end position; VIRGIN slots only (a
@@ -4158,6 +4379,7 @@
 (rule
   ((affine-place-demand (IntAffineExprCons ?h ?t) ?pos ?v))
   ((affine-len-demand ?t))
+  :ruleset main_ruleset :name "core: place fold demands the tail length of the chain"
 )
 (rule
   (
@@ -4166,6 +4388,7 @@
     (> ?tl ?pos)
   )
   ((affine-place-demand ?t ?pos ?v))
+  :ruleset main_ruleset :name "core: place fold descends past a slot above the position"
 )
 (rule
   (
@@ -4174,6 +4397,7 @@
     (= ?h (IntLit 0))
   )
   ((affine-place-out (IntAffineExprCons ?h ?t) ?pos ?v (IntAffineExprCons ?v ?t)))
+  :ruleset main_ruleset :name "core: place fold fills a virgin IntLit 0 slot"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -4215,6 +4439,7 @@
   )
   ((affine-place-out (IntAffineExprCons ?h ?t) ?pos ?v
     (IntAffineExprCons (IntMul (CoordVar ?osh ?pos) (IntAdd ?s_old ?s_new)) ?t)))
+  :ruleset main_ruleset :name "core: diagonal accumulate: stride sum of two product summands"
 )
 (rule
   (
@@ -4229,6 +4454,7 @@
   )
   ((affine-place-out (IntAffineExprCons ?h ?t) ?pos ?v
     (IntAffineExprCons (IntMul (CoordVar ?osh ?pos) (IntAdd ?s_old (IntLit 1))) ?t)))
+  :ruleset main_ruleset :name "core: diagonal accumulate: product slot plus bare coordinate"
 )
 (rule
   (
@@ -4243,6 +4469,7 @@
   )
   ((affine-place-out (IntAffineExprCons ?h ?t) ?pos ?v
     (IntAffineExprCons (IntMul (CoordVar ?osh ?pos) (IntAdd (IntLit 1) ?s_new)) ?t)))
+  :ruleset main_ruleset :name "core: diagonal accumulate: bare-coordinate slot plus product"
 )
 (rule
   (
@@ -4257,6 +4484,7 @@
   )
   ((affine-place-out (IntAffineExprCons ?h ?t) ?pos ?v
     (IntAffineExprCons (IntMul (CoordVar ?osh ?pos) (IntLit 2)) ?t)))
+  :ruleset main_ruleset :name "core: diagonal accumulate: two bare coordinates give stride 2"
 )
 ; END OPTIONAL BLOCK — DIAGONAL ACCUMULATE ARMS
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -4268,6 +4496,7 @@
     (affine-place-out ?t ?pos ?v ?placed)
   )
   ((affine-place-out (IntAffineExprCons ?h ?t) ?pos ?v (IntAffineExprCons ?h ?placed)))
+  :ruleset main_ruleset :name "core: place fold rebuilds the chain around the placed tail"
 )
 
 ; --- the walk: (view_layout, out_shape, in_shape,
@@ -4288,6 +4517,7 @@
     (= ?rank (rank-of ?shape))
   )
   ((affine-zeros-demand ?rank))
+  :ruleset main_ruleset :name "core: chain walk seed: demand the view's all-zero chain"
 )
 (rule
   (
@@ -4304,6 +4534,7 @@
     (let view_layout (BitOffsetExpressionLayoutLit ?composed ?shape ?bit_width))
     (affine-view-state view_layout ?shape ?in_shape ?pchain ?entries ?zeros)
   )
+  :ruleset main_ruleset :name "core: chain walk seed: the initial affine-view-state"
 )
 
 ; Every live state demands its chain-suffix tail length (arm S's
@@ -4311,6 +4542,7 @@
 (rule
   ((affine-view-state ?vl ?shape ?ish (IntAffineExprCons ?m ?mt) ?es ?partial))
   ((affine-len-demand ?mt))
+  :ruleset main_ruleset :name "core: every chain-walk state demands its suffix tail length"
 )
 
 ; Arm 0: literal-zero entry — the parent axis is read at a pinned 0, so
@@ -4322,6 +4554,7 @@
     (= ?e (IntLit 0))
   )
   ((affine-view-state ?vl ?shape ?ish ?mt ?et ?partial))
+  :ruleset main_ruleset :name "core: chain walk arm 0: a literal-0 entry drops both heads"
 )
 
 ; Arm Z: zero-class parent summand — contributes nothing whatever the
@@ -4334,6 +4567,7 @@
     (= ?m (IntLit 0))
   )
   ((affine-view-state ?vl ?shape ?ish ?mt ?et ?partial))
+  :ruleset main_ruleset :name "core: chain walk arm Z: zero-class parent summand dropped"
 )
 
 ; Arm S: selection entry over a live summand — swap the parent
@@ -4347,6 +4581,7 @@
     (= ?m (IntMul (CoordVar ?ish ?paxis) ?s))
   )
   ((affine-place-demand ?partial ?k (IntMul (CoordVar ?shape ?k) ?s)))
+  :ruleset main_ruleset :name "core: chain walk arm S: place the selected stride summand"
 )
 (rule
   (
@@ -4358,6 +4593,7 @@
     (affine-place-out ?partial ?k (IntMul (CoordVar ?shape ?k) ?s) ?placed)
   )
   ((affine-view-state ?vl ?shape ?ish ?mt ?et ?placed))
+  :ruleset main_ruleset :name "core: chain walk arm S: advance once the stride is placed"
 )
 
 ; Arm S-unit: a BARE-COORDINATE summand is the stride-1 summand — the
@@ -4376,6 +4612,7 @@
     (= ?m (CoordVar ?ish ?paxis))
   )
   ((affine-place-demand ?partial ?k (CoordVar ?shape ?k)))
+  :ruleset main_ruleset :name "core: chain walk arm S-unit: place the stride-1 summand"
 )
 (rule
   (
@@ -4387,6 +4624,7 @@
     (affine-place-out ?partial ?k (CoordVar ?shape ?k) ?placed)
   )
   ((affine-view-state ?vl ?shape ?ish ?mt ?et ?placed))
+  :ruleset main_ruleset :name "core: chain walk arm S-unit: advance once placed"
 )
 
 ; Finale: both suffixes exhausted — the accumulated chain IS the view's
@@ -4398,6 +4636,7 @@
     (= ?vl (BitOffsetExpressionLayoutLit ?ce ?shape ?bits))
   )
   ((union ?vl (StridedElementLayoutLit ?shape ?final ?bits)))
+  :ruleset main_ruleset :name "core: chain walk finale: the view's strided element layout"
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -4438,6 +4677,7 @@
   (
     (set (injectivity-of ?layout_tensor) (Injective))
   )
+  :ruleset main_ruleset :name "core: injectivity of a right-major contiguous layout tensor"
 )
 (rule
   (
@@ -4448,6 +4688,7 @@
   (
     (set (injectivity-of ?layout_tensor) (Injective))
   )
+  :ruleset main_ruleset :name "core: injectivity of a left-major contiguous layout tensor"
 )
 
 ; STRIDED NO-OVERLAP FOLD: DELETED (Austin's ruling, 2026-08-05). The
@@ -4502,6 +4743,7 @@
   (
     (let ?new_layout_tensor (LayoutTensorLit ?logical (RightMajorContiguousElementLayoutLit ?shape ?bits)))
   )
+  :ruleset main_ruleset :name "core: right-major contiguous LayoutTensor for every logical"
 )
 
 
@@ -4510,8 +4752,8 @@
 ; matchers and the cuBLASLt estate) carries `:ruleset backend`. The
 ; schedule saturates the core rulesets and the logical helpers first,
 ; then saturates everything together:
-;   (saturate (saturate (run) (run prop)) (run subst-walk))
-;   (saturate (saturate (run) (run backend) (run prop)) (run subst-walk))
+;   (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk))
+;   (saturate (saturate (run main_ruleset) (run backend) (run prop)) (run subst-walk))
 ; The second stratum runs every ruleset, so the fixpoint is the one the
 ; interleaved loop reached; the first keeps the wide matcher rules from
 ; being re-evaluated while the layout tables are still churning.
@@ -4562,7 +4804,7 @@
 ; every invariant lives in egglog; nothing is checked in the extractor).
 ;
 ; This ruleset runs to saturation ONLY AFTER the main run has saturated:
-;   (run-schedule (saturate (run prop)) (saturate (run) (run prop)) (saturate (run) (run backend) (run prop)) ... (saturate (run fixpoint-invariants)))
+;   (run-schedule (saturate (run prop)) (saturate (run main_ruleset) (run prop)) (saturate (run main_ruleset) (run backend) (run prop)) ... (saturate (run fixpoint-invariants)))
 ; That ordering is what makes its optimistic rules LEGAL. The main
 ; stratum is the prover; by its fixpoint every provable equality has
 ; landed and every bound is final. Rules here may therefore do what
@@ -4592,6 +4834,7 @@
     (coordinate-shape-lock ?out_logical ?rest_list)
   )
   :ruleset fixpoint-invariants
+  :name "core: coordinate shape lock walks to the rest of the list"
 )
 (rule
   (
@@ -4602,6 +4845,7 @@
     (set (shape-of ?out_logical) ?head_shape)
   )
   :ruleset fixpoint-invariants
+  :name "core: coordinate shape lock: out shape from a coordinate"
 )
 (rule
   (
@@ -4612,6 +4856,7 @@
     (set (shape-of ?head_logical) ?out_shape)
   )
   :ruleset fixpoint-invariants
+  :name "core: coordinate shape lock: coordinate shape from the out"
 )
 
 ; SHAPE CONTRACTS: conditions the recorder states about an extent it
@@ -4631,6 +4876,7 @@
     (panic "shape contract: an axis contracted to a fixed extent may exceed it under this binding (squeeze) — bucket or pin the dim to that extent")
   )
   :ruleset fixpoint-invariants
+  :name "core: extent-eq tripwire: upper bound exceeds the extent"
 )
 (rule
   (
@@ -4642,6 +4888,7 @@
     (panic "shape contract: an axis contracted to a fixed extent may fall below it under this binding (squeeze) — bucket or pin the dim to that extent")
   )
   :ruleset fixpoint-invariants
+  :name "core: extent-eq tripwire: lower bound falls below the extent"
 )
 (rule
   (
@@ -4653,6 +4900,7 @@
     (panic "shape contract: an axis extent may fall below its minimum under this binding (an empty reduce_max axis, or an unfold kernel that does not fit) — bind the dim's range to exclude smaller values")
   )
   :ruleset fixpoint-invariants
+  :name "core: extent-at-least tripwire: lower bound below the minimum"
 )
 
 ; VIEW ARITY LOCK: an index map's entry count IS the rank of its
@@ -4684,6 +4932,7 @@
   )
   ((panic "IndexMapLit entry count disagrees with the rank of its source-shape tag"))
   :ruleset fixpoint-invariants
+  :name "core: view arity lock: IndexMapLit entries versus tag rank"
 )
 
 ; COORDINATE-EXTENT LOCK: DELETED (scoped-CoordVar spike). A
@@ -4714,11 +4963,13 @@
   )
   ((map-range-walk ?entries ?pdims))
   :ruleset fixpoint-invariants
+  :name "core: map-entry range lock: seed the walk at every apply"
 )
 (rule
   ((map-range-walk (IntExprCons ?e ?et) (IntExprCons ?d ?dt)))
   ((map-range-walk ?et ?dt))
   :ruleset fixpoint-invariants
+  :name "core: map-entry range lock: walk to the next entry and dim"
 )
 (rule
   (
@@ -4729,6 +4980,7 @@
   )
   ((panic "map-entry range lock: literal entry >= parent axis extent"))
   :ruleset fixpoint-invariants
+  :name "core: map-entry range lock: literal entry past the extent"
 )
 (rule
   (
@@ -4738,6 +4990,7 @@
   )
   ((panic "map-entry range lock: negative literal entry"))
   :ruleset fixpoint-invariants
+  :name "core: map-entry range lock: negative literal entry"
 )
 (rule
   (
@@ -4751,6 +5004,7 @@
   )
   ((panic "map-entry range lock: coordinate ranges past the parent axis extent"))
   :ruleset fixpoint-invariants
+  :name "core: map-entry range lock: coordinate past parent, literals"
 )
 (rule
   (
@@ -4764,6 +5018,7 @@
   )
   ((panic "map-entry range lock: coordinate extent provably exceeds parent axis extent"))
   :ruleset fixpoint-invariants
+  :name "core: map-entry range lock: coordinate past parent, bounds arm"
 )
 
 ; MAP-TAG COHERENCE (IndexMapLit source-shape tagging, ruling
@@ -4783,6 +5038,7 @@
   )
   ((panic "IndexMapLit source tag disagrees with the apply's parent shape"))
   :ruleset fixpoint-invariants
+  :name "core: map-tag coherence: tag disagrees with the parent shape"
 )
 
 ;; @SPLICE fixpoint

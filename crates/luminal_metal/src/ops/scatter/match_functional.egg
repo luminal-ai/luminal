@@ -20,4 +20,5 @@
       (LayoutTensorOpScatterFunctionalGeneric ?init_layout_tensor ?src_layout_tensor ?coordinate_layout_tensors ?out_layout))
   )
   :ruleset backend
+  :name "metal/scatter/match_functional: Scatter match, coordinates share the source shape"
 )

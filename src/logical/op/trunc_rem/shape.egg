@@ -9,4 +9,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "trunc_rem/shape: shape of LogicalTruncRem at agreeing operand shapes"
 )

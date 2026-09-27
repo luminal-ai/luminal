@@ -14,6 +14,7 @@
       (LayoutTensorOpConstantGeneric ?constant_value ?out_layout))
   )
   :ruleset backend
+  :name "metal/constant/match_functional: Constant match from LogicalConstant"
 )
 
 ; The exact-F64 scalar source lowers through the same constant op.
@@ -32,4 +33,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpConstantGeneric ?constant_value ?out_layout))
   )
+  :ruleset main_ruleset :name "metal/constant/match_functional: Constant match from the exact-F64 scalar source"
 )

@@ -19,4 +19,5 @@
     (union ?layout_tensor_op (LayoutTensorOpSqrtFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/sqrt/match_functional: Sqrt functional match on an injective out"
 )

@@ -10,4 +10,5 @@
     (set (dtype-of ?out_logical_tensor) ?in2_dtype) ; DUPLICATIVE This is to trigger no merge runtime errors
   )
   :ruleset prop
+  :name "trunc_rem/dtype: dtype of LogicalTruncRem from both operands"
 )

@@ -10,4 +10,5 @@
     (let oshape (ShapeLit (IntExprCons ?e (IntExprCons ?d1 (IntExprCons ?d0 (IntExprNil))))))
     (union ?h (LogicalIndexMapApply ?p (IndexMapLit (IntExprCons (CoordVar oshape 1) (IntExprCons (CoordVar oshape 0) (IntExprNil))) ?ishape) oshape))
   )
+  :ruleset main_ruleset :name "helper/broadcast_axis/expand_rank2_pos2: expansion to an apply, parent rank 2, new axis at 2"
 )

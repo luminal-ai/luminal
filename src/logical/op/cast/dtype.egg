@@ -7,4 +7,5 @@
     (set (dtype-of ?out_logical_tensor) ?target_dtype)
   )
   :ruleset prop
+  :name "cast/dtype: dtype of LogicalCast is its target dtype"
 )

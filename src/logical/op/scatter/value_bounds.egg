@@ -7,6 +7,7 @@
     (= ?src_lower (value-lower-bound-of ?src))
   )
   ((set (value-lower-bound-of ?out) (min ?init_lower ?src_lower)))
+  :ruleset main_ruleset :name "scatter/value_bounds: lower bound is the min over init and src"
 )
 (rule
   (
@@ -15,4 +16,5 @@
     (= ?src_upper (value-upper-bound-of ?src))
   )
   ((set (value-upper-bound-of ?out) (max ?init_upper ?src_upper)))
+  :ruleset main_ruleset :name "scatter/value_bounds: upper bound is the max over init and src"
 )

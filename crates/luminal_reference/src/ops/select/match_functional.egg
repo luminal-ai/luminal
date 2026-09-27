@@ -22,4 +22,5 @@
       (LayoutTensorOpSelectFunctionalGeneric ?cond_layout_tensor ?true_layout_tensor ?false_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "reference/select/match_functional: SelectFunctionalGeneric mint over two value branches"
 )

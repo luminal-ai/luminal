@@ -9,4 +9,5 @@
     (set (shape-of ?out_logical) ?in2_shape)
   )
   :ruleset fixpoint-invariants
+  :name "mul/fixpoint: shape of LogicalMul closed from the operands"
 )

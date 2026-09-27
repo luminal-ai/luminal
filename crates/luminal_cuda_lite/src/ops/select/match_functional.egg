@@ -27,4 +27,5 @@
       (LayoutTensorOpSelectFunctionalGeneric ?cond_layout_tensor ?true_layout_tensor ?false_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/select/match_functional: Select functional match over two value branches"
 )

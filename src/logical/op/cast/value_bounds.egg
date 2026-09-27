@@ -10,6 +10,7 @@
     (set (value-lower-bound-of ?out) (bigint 0))
     (set (value-upper-bound-of ?out) (bigint 1))
   )
+  :ruleset main_ruleset :name "cast/value_bounds: Bool to Int cast is the indicator [0, 1]"
 )
 (rule
   (
@@ -20,6 +21,7 @@
     (set (value-lower-bound-of ?out) (bigint 0))
     (set (value-upper-bound-of ?out) (bigint 1))
   )
+  :ruleset main_ruleset :name "cast/value_bounds: Bool to Int64 cast is the indicator [0, 1]"
 )
 (rule
   (
@@ -28,6 +30,7 @@
     (= ?lower (value-lower-bound-of ?in))
   )
   ((set (value-lower-bound-of ?out) ?lower))
+  :ruleset main_ruleset :name "cast/value_bounds: Int to Int64 cast carries the lower bound"
 )
 (rule
   (
@@ -36,6 +39,7 @@
     (= ?upper (value-upper-bound-of ?in))
   )
   ((set (value-upper-bound-of ?out) ?upper))
+  :ruleset main_ruleset :name "cast/value_bounds: Int to Int64 cast carries the upper bound"
 )
 (rule
   (
@@ -44,6 +48,7 @@
     (= ?lower (value-lower-bound-of ?in))
   )
   ((set (value-lower-bound-of ?out) ?lower))
+  :ruleset main_ruleset :name "cast/value_bounds: Int64 to Int cast carries the lower bound"
 )
 (rule
   (
@@ -52,4 +57,5 @@
     (= ?upper (value-upper-bound-of ?in))
   )
   ((set (value-upper-bound-of ?out) ?upper))
+  :ruleset main_ruleset :name "cast/value_bounds: Int64 to Int cast carries the upper bound"
 )

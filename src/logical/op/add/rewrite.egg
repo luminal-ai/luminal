@@ -2,4 +2,5 @@
 (rewrite
   (LogicalAdd ?lhs ?rhs)
   (LogicalAdd ?rhs ?lhs)
+  :ruleset main_ruleset :name "add/rewrite: commutativity of LogicalAdd"
 )

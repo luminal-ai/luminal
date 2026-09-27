@@ -325,7 +325,7 @@ mod tests {
             "(let d (IntVar \"s0\"))\n\
              (set (upper-bound-of d) (bigint 64))\n\
              {}\
-             (run 1)\n",
+             (run main_ruleset 1)\n",
             program.before_schedule
         );
         let err = run(&text).expect_err("crossed bounds must refuse");

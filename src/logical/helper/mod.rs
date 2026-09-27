@@ -46,7 +46,7 @@ pub fn logical_helper_for(constructor: &str) -> Option<&'static (dyn LogicalOp +
 mod tests {
     use crate::egglog_snippet::{assembled_program_for, new_egraph};
 
-    const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)))";
+    const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)) (saturate (saturate (run main_ruleset) (run backend) (run prop)) (run subst-walk)))";
 
     /// Run `script` under the core program (no runtime matchers) — its
     /// `check`s are the assertions.

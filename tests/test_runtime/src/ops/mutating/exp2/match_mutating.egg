@@ -14,4 +14,5 @@
     (union ?layout_tensor_op (LayoutTensorOpExp2MutatingGeneric ?in_layout_tensor))
   )
   :ruleset backend
+  :name "test_runtime/ops/mutating/exp2/match_mutating: Exp2 mutating in-place on its one operand"
 )

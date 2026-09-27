@@ -6,4 +6,5 @@
     (coordinate-shape-lock ?out_logical ?coordinate_list)
   )
   :ruleset fixpoint-invariants
+  :name "gather/fixpoint: coordinate-shape-lock on every LogicalGather"
 )

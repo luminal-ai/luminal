@@ -6,6 +6,7 @@
     (= ?lower (value-lower-bound-of ?data))
   )
   ((set (value-lower-bound-of ?out) ?lower))
+  :ruleset main_ruleset :name "gather/value_bounds: LogicalGather carries the data lower bound"
 )
 (rule
   (
@@ -13,4 +14,5 @@
     (= ?upper (value-upper-bound-of ?data))
   )
   ((set (value-upper-bound-of ?out) ?upper))
+  :ruleset main_ruleset :name "gather/value_bounds: LogicalGather carries the data upper bound"
 )

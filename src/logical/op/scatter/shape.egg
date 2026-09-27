@@ -10,4 +10,5 @@
     (set (shape-of ?out_logical) ?init_shape)
   )
   :ruleset prop
+  :name "scatter/shape: shape of LogicalScatter is init's shape"
 )

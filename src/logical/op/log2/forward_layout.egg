@@ -7,4 +7,5 @@
   (
     (let new_out_layout_tensor (LayoutTensorLit ?out_logical ?in_layout)) ; Forward Propagation
   )
+  :ruleset main_ruleset :name "log2/forward_layout: LogicalLog2 forwards the input layout"
 )

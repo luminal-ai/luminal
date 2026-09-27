@@ -8,4 +8,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "recip/shape: shape of LogicalRecip from its operand"
 )

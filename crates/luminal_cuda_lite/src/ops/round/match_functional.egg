@@ -18,4 +18,5 @@
         (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
     (union ?layout_tensor_op (LayoutTensorOpRoundFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
+  :ruleset main_ruleset :name "cuda_lite/round/match_functional: Round functional match on an injective out"
 )

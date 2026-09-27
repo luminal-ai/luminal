@@ -8,4 +8,5 @@
   (
     (panic "LogicalLessThan operands must share one dtype")
   )
+  :ruleset main_ruleset :name "less_than/dtype_2: refuse LogicalLessThan on disagreeing operand dtypes"
 )

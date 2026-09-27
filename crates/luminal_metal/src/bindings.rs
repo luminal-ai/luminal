@@ -96,7 +96,7 @@ impl ProgramSeams for MetalBindings {
 impl MetalBindings {
     /// The schedule every Metal program runs: core rulesets saturate
     /// first, then everything with the `backend` matchers.
-    pub const SCHEDULE: &'static str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run cleanup)) (saturate (run fixpoint-invariants)))\n\n";
+    pub const SCHEDULE: &'static str = "(run-schedule (saturate (run prop)) (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)) (saturate (saturate (run main_ruleset) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run cleanup)) (saturate (run fixpoint-invariants)))\n\n";
 
     pub fn new() -> Self {
         Self::default()

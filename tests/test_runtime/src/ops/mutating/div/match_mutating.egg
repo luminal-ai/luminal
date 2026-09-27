@@ -17,4 +17,5 @@
       (LayoutTensorOpDivMutatingGeneric ?in1_layout_tensor ?in2_layout_tensor))
   )
   :ruleset backend
+  :name "test_runtime/ops/mutating/div/match_mutating: Div mutating in-place on operand 1, operand 2 anywhere"
 )

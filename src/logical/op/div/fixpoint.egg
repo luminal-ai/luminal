@@ -9,4 +9,5 @@
     (set (shape-of ?out_logical) ?in2_shape)
   )
   :ruleset fixpoint-invariants
+  :name "div/fixpoint: LogicalDiv shape closure, operands to output"
 )

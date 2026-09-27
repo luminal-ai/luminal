@@ -12,4 +12,5 @@
     (set (shape-of ?out_logical) ?in2_shape)
   )
   :ruleset fixpoint-invariants
+  :name "add/fixpoint: LogicalAdd shape closure, operands to output"
 )

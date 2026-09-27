@@ -32,4 +32,5 @@
       (CublasLtEpilogueDefault)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_assemble: base CublasLt op from one coherent reading set"
 )

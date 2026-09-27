@@ -19,4 +19,5 @@
       (LayoutTensorOpIotaGeneric ?index_expression ?shape ?out_layout))
   )
   :ruleset backend
+  :name "reference/iota/match_functional: IotaGeneric mint, a zero-input source with no operands"
 )

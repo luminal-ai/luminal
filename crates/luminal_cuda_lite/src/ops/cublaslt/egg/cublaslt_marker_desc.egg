@@ -85,6 +85,7 @@
   ((let ?reading (CublasLtOperandADescriptor ?site ?a_lt
      (CublasLtOperationN))))
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_desc: A descriptor: unit stride on m, operation N"
 )
 ; --- A reading (site's a[m,k]): the k axis carries the unit stride -> T ---
 (rule
@@ -110,6 +111,7 @@
   ((let ?reading (CublasLtOperandADescriptor ?site ?a_lt
      (CublasLtOperationT))))
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_desc: A descriptor: unit stride on k, operation T"
 )
 ; --- B reading (site's b[k,n]): the k axis carries the unit stride -> N ---
 (rule
@@ -135,6 +137,7 @@
   ((let ?reading (CublasLtOperandBDescriptor ?site ?b_lt
      (CublasLtOperationN))))
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_desc: B descriptor: unit stride on k, operation N"
 )
 ; --- B reading (site's b[k,n]): the n axis carries the unit stride -> T ---
 (rule
@@ -160,6 +163,7 @@
   ((let ?reading (CublasLtOperandBDescriptor ?site ?b_lt
      (CublasLtOperationT))))
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_desc: B descriptor: unit stride on n, operation T"
 )
 ; --- D reading (site's out): the layout presents out in COLUMN order -------
 ; COL m x n over the out's own bytes: the rank-2 chain has its unit stride
@@ -205,5 +209,6 @@
   )
   ((let ?reading (CublasLtOutputDDescriptor ?site ?out_lt)))
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_desc: D descriptor: the out presented in column order"
 )
 ; ============================================================================

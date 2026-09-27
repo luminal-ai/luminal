@@ -77,7 +77,7 @@ pub(crate) fn run_program(egraph: &mut EGraph, text: &str, budget: Option<usize>
             let mut changed = false;
             loop {
                 let mut updated = egraph
-                    .step_rules_with_scheduler(scheduler, "")
+                    .step_rules_with_scheduler(scheduler, "main_ruleset")
                     .map_err(|err| anyhow!(err))?
                     .updated;
                 for ruleset in extra.iter().copied().chain(["prop"]) {

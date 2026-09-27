@@ -8,4 +8,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "trunc/shape: shape of LogicalTrunc from its operand"
 )

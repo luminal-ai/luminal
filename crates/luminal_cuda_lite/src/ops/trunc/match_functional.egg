@@ -18,4 +18,5 @@
         (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
     (union ?layout_tensor_op (LayoutTensorOpTruncFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
+  :ruleset main_ruleset :name "cuda_lite/trunc/match_functional: Trunc functional match on an injective out"
 )

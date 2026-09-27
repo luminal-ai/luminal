@@ -19,4 +19,5 @@
     (union ?layout_tensor_op (LayoutTensorOpRecipFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/recip/match_functional: Recip functional match on an injective out"
 )

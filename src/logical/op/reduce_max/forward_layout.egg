@@ -9,4 +9,5 @@
   (
     (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit ?shape ?bits)))
   )
+  :ruleset main_ruleset :name "reduce_max/forward_layout: canonical right-major layout for the reduced result"
 )

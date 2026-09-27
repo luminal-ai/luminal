@@ -19,4 +19,5 @@
       (LayoutTensorOpIotaGeneric ?index_expression ?shape ?out_layout))
   )
   :ruleset backend
+  :name "test_runtime/ops/functional/iota/match_functional: Iota mint, zero-input index-expression source"
 )

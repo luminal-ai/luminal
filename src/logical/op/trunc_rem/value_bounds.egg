@@ -13,6 +13,7 @@
     (set (value-upper-bound-of ?out)
       (- (max ?rhs_upper (- (bigint 0) ?rhs_lower)) (bigint 1)))
   )
+  :ruleset main_ruleset :name "trunc_rem/value_bounds: symmetric magnitude bound, positive divisor"
 )
 (rule
   (
@@ -27,6 +28,7 @@
     (set (value-upper-bound-of ?out)
       (- (max ?rhs_upper (- (bigint 0) ?rhs_lower)) (bigint 1)))
   )
+  :ruleset main_ruleset :name "trunc_rem/value_bounds: symmetric magnitude bound, negative divisor"
 )
 
 ; Tighter sign-aware bounds (merge monotonically with the symmetric rules
@@ -47,6 +49,7 @@
     (set (value-lower-bound-of ?out) (bigint 0))
     (set (value-upper-bound-of ?out) (- ?rhs_upper (bigint 1)))
   )
+  :ruleset main_ruleset :name "trunc_rem/value_bounds: sign-aware bound, dividend >= 0 and divisor > 0"
 )
 ; non-positive dividend, positive divisor: [-(div_max - 1), 0]
 (rule
@@ -62,6 +65,7 @@
     (set (value-lower-bound-of ?out) (- (bigint 0) (- ?rhs_upper (bigint 1))))
     (set (value-upper-bound-of ?out) (bigint 0))
   )
+  :ruleset main_ruleset :name "trunc_rem/value_bounds: sign-aware bound, dividend <= 0 and divisor > 0"
 )
 ; non-negative dividend, negative divisor: [0, |div_min| - 1]
 (rule
@@ -77,6 +81,7 @@
     (set (value-lower-bound-of ?out) (bigint 0))
     (set (value-upper-bound-of ?out) (- (- (bigint 0) ?rhs_lower) (bigint 1)))
   )
+  :ruleset main_ruleset :name "trunc_rem/value_bounds: sign-aware bound, dividend >= 0 and divisor < 0"
 )
 ; non-positive dividend, negative divisor: [div_min + 1, 0]
 (rule
@@ -92,4 +97,5 @@
     (set (value-lower-bound-of ?out) (+ ?rhs_lower (bigint 1)))
     (set (value-upper-bound-of ?out) (bigint 0))
   )
+  :ruleset main_ruleset :name "trunc_rem/value_bounds: sign-aware bound, dividend <= 0 and divisor < 0"
 )

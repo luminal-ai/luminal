@@ -15,4 +15,5 @@
       (LayoutTensorOpCastGeneric ?in_layout_tensor ?target_dtype ?out_layout))
   )
   :ruleset backend
+  :name "metal/cast/match_functional: Cast functional match at the target dtype"
 )

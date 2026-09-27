@@ -8,4 +8,5 @@
     (set (dtype-of ?out_logical_tensor) (Int))
   )
   :ruleset prop
+  :name "iota/dtype: LogicalIota is Int, index data"
 )

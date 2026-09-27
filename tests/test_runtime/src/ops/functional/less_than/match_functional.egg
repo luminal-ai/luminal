@@ -17,4 +17,5 @@
       (LayoutTensorOpLessThanGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "test_runtime/ops/functional/less_than/match_functional: LessThan functional mint, Bool result"
 )

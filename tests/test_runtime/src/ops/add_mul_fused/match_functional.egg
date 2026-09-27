@@ -22,4 +22,5 @@
     )
   )
   :ruleset backend
+  :name "test_runtime/ops/add_mul_fused/match_functional: Add and Mul of one operand pair fused, two outputs"
 )

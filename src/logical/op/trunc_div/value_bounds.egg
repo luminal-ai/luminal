@@ -17,6 +17,7 @@
       (max (max (/ ?lhs_lower ?rhs_lower) (/ ?lhs_lower ?rhs_upper))
            (max (/ ?lhs_upper ?rhs_lower) (/ ?lhs_upper ?rhs_upper))))
   )
+  :ruleset main_ruleset :name "trunc_div/value_bounds: quotient corners, strictly positive divisor"
 )
 (rule
   (
@@ -35,4 +36,5 @@
       (max (max (/ ?lhs_lower ?rhs_lower) (/ ?lhs_lower ?rhs_upper))
            (max (/ ?lhs_upper ?rhs_lower) (/ ?lhs_upper ?rhs_upper))))
   )
+  :ruleset main_ruleset :name "trunc_div/value_bounds: quotient corners, strictly negative divisor"
 )

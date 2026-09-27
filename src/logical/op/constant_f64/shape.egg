@@ -7,4 +7,5 @@
     (set (shape-of ?out_logical) (ShapeLit (IntExprNil)))
   )
   :ruleset prop
+  :name "constant_f64/shape: LogicalConstantF64 is rank 0, the empty shape"
 )

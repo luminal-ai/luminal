@@ -19,4 +19,5 @@
     (union ?layout_tensor_op (LayoutTensorOpLog2FunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/log2/match_functional: Log2 functional match on an injective out"
 )

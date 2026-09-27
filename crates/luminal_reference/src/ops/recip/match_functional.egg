@@ -14,4 +14,5 @@
     (union ?layout_tensor_op (LayoutTensorOpRecipFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "reference/recip/match_functional: RecipFunctionalGeneric mint at an injective destination"
 )

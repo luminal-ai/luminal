@@ -10,4 +10,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "select/shape: shape of LogicalSelect from the agreeing branches"
 )

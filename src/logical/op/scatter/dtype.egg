@@ -15,4 +15,5 @@
     (set (dtype-of ?out_logical_tensor) ?src_dtype)
   )
   :ruleset prop
+  :name "scatter/dtype: dtype of LogicalScatter from init and src"
 )

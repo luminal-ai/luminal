@@ -8,4 +8,5 @@
     (set (dtype-of ?out_logical_tensor) ?dtype)
   )
   :ruleset prop
+  :name "round/dtype: LogicalRound preserves its operand's dtype"
 )

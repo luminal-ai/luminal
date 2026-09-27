@@ -7,4 +7,5 @@
     (set (dtype-of ?out_logical_tensor) ?target_dtype)
   )
   :ruleset prop
+  :name "trunc_cast/dtype: dtype of LogicalTruncCast is the target in the term"
 )

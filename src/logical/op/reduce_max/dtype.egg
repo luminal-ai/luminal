@@ -8,4 +8,5 @@
     (set (dtype-of ?out_logical_tensor) ?in_dtype)
   )
   :ruleset prop
+  :name "reduce_max/dtype: dtype of LogicalReduceMax from its operand"
 )

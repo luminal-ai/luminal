@@ -48,6 +48,7 @@
              (LogicalHelperMatrixTranspose ?a)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_rewrite: transpose sandwich: A x B is transpose of Bt x At"
 )
 ; ============================================================================
 ; TRANSPOSE-VIEW INJECTIVITY TRANSPORT.
@@ -101,5 +102,6 @@
     (set (injectivity-of ?vlt) (Injective))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_rewrite: injectivity transport through a transpose view"
 )
 ; ============================================================================

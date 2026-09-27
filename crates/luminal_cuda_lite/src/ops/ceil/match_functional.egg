@@ -18,4 +18,5 @@
         (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
     (union ?layout_tensor_op (LayoutTensorOpCeilFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
+  :ruleset main_ruleset :name "cuda_lite/ceil/match_functional: Ceil functional match on an injective out"
 )

@@ -2,4 +2,5 @@
 (rewrite
   (LogicalMul ?lhs ?rhs)
   (LogicalMul ?rhs ?lhs)
+  :ruleset main_ruleset :name "mul/rewrite: commutativity of LogicalMul"
 )

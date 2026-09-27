@@ -13,4 +13,5 @@
         (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
     (union ?layout_tensor_op (LayoutTensorOpRoundFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
+  :ruleset main_ruleset :name "metal/round/match_functional: Round functional match at a right-major layout"
 )

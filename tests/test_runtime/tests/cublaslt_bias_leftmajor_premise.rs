@@ -281,6 +281,7 @@ const LEFT_MAJOR_DISCOVERY_RULE: &str = "(rule
   (
     (union ?layout (LeftMajorContiguousElementLayoutLit ?shape ?bits))
   )
+  :ruleset main_ruleset :name \"core: left-major contiguous discovery from the chain class\"
 )";
 
 fn serialize_with_ablated_left_major_discovery(script_text: &str) -> EGraph {

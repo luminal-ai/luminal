@@ -27,4 +27,5 @@
       (LayoutTensorOpSelectFunctionalGeneric ?cond_layout_tensor ?true_layout_tensor ?false_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "metal/select/match_functional: Select functional mint at a right-major contiguous out"
 )

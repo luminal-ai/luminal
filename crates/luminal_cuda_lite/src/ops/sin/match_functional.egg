@@ -19,4 +19,5 @@
     (union ?layout_tensor_op (LayoutTensorOpSinFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/sin/match_functional: Sin functional match on an injective out"
 )

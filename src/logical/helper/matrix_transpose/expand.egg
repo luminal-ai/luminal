@@ -16,4 +16,5 @@
         ?ishape)
       oshape))
   )
+  :ruleset main_ruleset :name "helper/matrix_transpose/expand: transpose expands to the swapped-axis apply"
 )

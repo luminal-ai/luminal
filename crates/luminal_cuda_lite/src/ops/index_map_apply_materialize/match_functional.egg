@@ -21,4 +21,5 @@
       (LayoutTensorOpIndexMapApplyMaterialize ?in_layout_tensor ?index_map ?out_shape ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/index_map_apply_materialize/match_functional: IndexMapApply materialized into an injective out"
 )

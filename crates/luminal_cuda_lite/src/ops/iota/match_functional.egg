@@ -24,4 +24,5 @@
       (LayoutTensorOpIotaGeneric ?index_expression ?shape ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/iota/match_functional: Iota match: the zero-input index source"
 )

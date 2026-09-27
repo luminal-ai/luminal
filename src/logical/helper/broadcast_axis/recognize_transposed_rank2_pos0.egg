@@ -10,4 +10,5 @@
     (= ?os  (ShapeLit (IntExprCons ?q (IntExprCons ?r (IntExprCons ?p (IntExprNil))))))
   )
   ((union ?v (LogicalHelperBroadcastAxis (LogicalHelperMatrixTranspose ?x) 0 ?p)))
+  :ruleset main_ruleset :name "helper/broadcast_axis/recognize_transposed_rank2_pos0: fused transpose-then-broadcast apply, new axis at 0"
 )

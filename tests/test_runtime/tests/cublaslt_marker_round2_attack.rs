@@ -37,7 +37,7 @@ type GraphBuilder = Box<dyn Fn(&mut Graph)>;
 type FormProgram = (&'static str, CublasLtForm, GraphBuilder);
 type EpilogueProgram = (&'static str, CublasLtForm, CuEpilogue, GraphBuilder);
 
-const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
+const SCHEDULE: &str = "(run-schedule (saturate (run prop)) (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)) (saturate (saturate (run main_ruleset) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))";
 
 const PIN: &[&str] = &[
     "LayoutTensorOpCublasLtAccumulateBias",

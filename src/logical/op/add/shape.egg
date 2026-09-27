@@ -16,4 +16,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "add/shape: shape of LogicalAdd at proven-equal operand shapes"
 )

@@ -7,4 +7,5 @@
     (set (dtype-of ?out_logical_tensor) (F64))
   )
   :ruleset prop
+  :name "constant_f64/dtype: LogicalConstantF64 is F64, unconditionally"
 )

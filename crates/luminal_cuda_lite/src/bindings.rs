@@ -210,7 +210,7 @@ impl CudaBindings {
     /// program: core rulesets and logical helpers saturate first, then
     /// everything including the `backend` matchers (the op matchers and
     /// the cuBLASLt estate) saturates together.
-    pub const SCHEDULE: &'static str = "(run-schedule (saturate (run prop)) (saturate (saturate (run) (run prop)) (run subst-walk)) (saturate (saturate (run) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run cleanup)) (saturate (run fixpoint-invariants)))\n\n";
+    pub const SCHEDULE: &'static str = "(run-schedule (saturate (run prop)) (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)) (saturate (saturate (run main_ruleset) (run backend) (run prop)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run cleanup)) (saturate (run fixpoint-invariants)))\n\n";
 
     pub fn new() -> Self {
         Self::default()

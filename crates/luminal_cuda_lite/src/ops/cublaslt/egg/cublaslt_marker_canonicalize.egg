@@ -91,6 +91,7 @@
     (union ?out ?canon_out)
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_canonicalize: b stored [n,k] becomes a [k,n] transpose view"
 )
 ; --- "A[k,m], B[k,n] -> A[m,k], B[k,n]" ------------------------------------
 ; a stored [k,m], read through map (c0 c2). RHS: the a position holds the
@@ -142,6 +143,7 @@
     (union ?out ?canon_out)
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_canonicalize: a stored [k,m] becomes an [m,k] transpose view"
 )
 ; --- "A[k,m], B[n,k] -> A[m,k], B[k,n]" ------------------------------------
 ; Both operands stored transposed to the canonical form; both reach it as
@@ -204,6 +206,7 @@
     (union ?out ?canon_out)
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_canonicalize: both operands stored transposed become views"
 )
 ; ============================================================================
 ; THE DOUBLE-TRANSPOSE COLLAPSE.
@@ -254,5 +257,6 @@
     (union ?w ?x)
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_canonicalize: a transpose view of a transpose view is its base"
 )
 ; ============================================================================

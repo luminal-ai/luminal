@@ -25,6 +25,7 @@
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/reduce_sum/match_functional: ReduceSum functional match, non-Int dtypes"
 )
 
 ; Int: WRAPS, and mints unproven (LUM-833, temporary). torch
@@ -54,6 +55,7 @@
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/reduce_sum/match_functional: ReduceSum functional match, Int wraps unproven"
 )
 
 ; Int64: WRAPS, and mints unproven (LUM-833, temporary). torch
@@ -83,4 +85,5 @@
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/reduce_sum/match_functional: ReduceSum functional match, Int64 wraps unproven"
 )

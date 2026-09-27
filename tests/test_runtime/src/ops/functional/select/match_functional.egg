@@ -22,4 +22,5 @@
       (LayoutTensorOpSelectFunctionalGeneric ?cond_layout_tensor ?true_layout_tensor ?false_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "test_runtime/ops/functional/select/match_functional: Select functional mint at an injective destination"
 )

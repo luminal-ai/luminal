@@ -20,4 +20,5 @@
       (LogicalIndexMapApply ?data_logical
         (IndexMapLit ?entry_expressions ?data_shape) ?common_shape))
   )
+  :ruleset main_ruleset :name "gather/unification_4: all-iota LogicalGather is a LogicalIndexMapApply"
 )

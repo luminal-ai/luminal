@@ -9,4 +9,5 @@
     (set (shape-of ?out_logical) (ShapeLit ?out_dims))
   )
   :ruleset prop
+  :name "reduce_sum/shape: shape of LogicalReduceSum drops the summed axis"
 )

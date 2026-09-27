@@ -8,4 +8,5 @@
   (
     (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit (ShapeLit (IntExprNil)) ?bits)))
   )
+  :ruleset main_ruleset :name "constant_f64/forward_layout: LogicalConstantF64 mints the rank-0 canonical layout"
 )

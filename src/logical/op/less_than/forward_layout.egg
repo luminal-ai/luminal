@@ -12,4 +12,5 @@
   (
     (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit ?shape ?bits)))
   )
+  :ruleset main_ruleset :name "less_than/forward_layout: LogicalLessThan mints a Bool-width output layout"
 )

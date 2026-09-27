@@ -7,6 +7,7 @@
     (= ?false_lower (value-lower-bound-of ?if_false))
   )
   ((set (value-lower-bound-of ?out) (min ?true_lower ?false_lower)))
+  :ruleset main_ruleset :name "select/value_bounds: lower bound is the min over the two branches"
 )
 (rule
   (
@@ -15,6 +16,7 @@
     (= ?false_upper (value-upper-bound-of ?if_false))
   )
   ((set (value-upper-bound-of ?out) (max ?true_upper ?false_upper)))
+  :ruleset main_ruleset :name "select/value_bounds: upper bound is the max over the two branches"
 )
 
 ; Structural refinement: the masked max/min idioms carry tighter bounds than
@@ -36,6 +38,7 @@
     (set (value-lower-bound-of ?out) (max ?a_lower ?b_lower))
     (set (value-upper-bound-of ?out) (max ?a_upper ?b_upper))
   )
+  :ruleset main_ruleset :name "select/value_bounds: tighter bounds for the maximum idiom select(a<b,b,a)"
 )
 (rule
   (
@@ -50,4 +53,5 @@
     (set (value-lower-bound-of ?out) (min ?a_lower ?b_lower))
     (set (value-upper-bound-of ?out) (min ?a_upper ?b_upper))
   )
+  :ruleset main_ruleset :name "select/value_bounds: tighter bounds for the minimum idiom select(b<a,b,a)"
 )

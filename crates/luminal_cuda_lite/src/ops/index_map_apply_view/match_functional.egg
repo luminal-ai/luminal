@@ -37,4 +37,5 @@
       (LayoutTensorOpIndexMapApplyViewGeneric ?in_layout_tensor ?index_map ?out_shape ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/index_map_apply_view/match_functional: IndexMapApply as a view on the composed layout"
 )

@@ -48,5 +48,6 @@
   )
   ((let ?site (CublasLtLogicalMatmulSite ?a ?b ?out)))
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_site: matmul site from the canonical MatrixMultiply helper"
 )
 ; ============================================================================

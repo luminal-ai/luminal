@@ -17,4 +17,5 @@
       (LayoutTensorOpModMutatingGeneric ?in1_layout_tensor ?in2_layout_tensor))
   )
   :ruleset backend
+  :name "test_runtime/ops/mutating/modulo/match_mutating: Mod mutating in-place on operand 1, operand 2 anywhere"
 )

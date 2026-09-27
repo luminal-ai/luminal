@@ -9,4 +9,5 @@
     (set (dtype-of ?out_logical_tensor) (Bool))
   )
   :ruleset prop
+  :name "less_than/dtype: LogicalLessThan is Bool, always"
 )

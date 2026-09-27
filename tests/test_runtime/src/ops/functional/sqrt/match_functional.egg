@@ -14,4 +14,5 @@
     (union ?layout_tensor_op (LayoutTensorOpSqrtFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "test_runtime/ops/functional/sqrt/match_functional: Sqrt functional mint at an injective destination"
 )

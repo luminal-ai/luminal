@@ -8,4 +8,5 @@
     (set (shape-of ?in2_logical) ?out_shape)
   )
   :ruleset fixpoint-invariants
+  :name "mul/fixpoint_2: operand shapes of LogicalMul from the result"
 )

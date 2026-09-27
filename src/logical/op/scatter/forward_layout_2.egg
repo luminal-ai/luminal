@@ -6,4 +6,5 @@
   (
     (let out_in_init_layout_tensor (LayoutTensorLit ?out_logical ?init_layout))
   )
+  :ruleset main_ruleset :name "scatter/forward_layout_2: scatter result in init's own layout, the in-place home"
 )

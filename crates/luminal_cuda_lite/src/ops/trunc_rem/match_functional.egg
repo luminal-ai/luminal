@@ -29,6 +29,7 @@
       (LayoutTensorOpTruncRemFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/trunc_rem/match_functional: TruncRem match, Int, divisor proven positive"
 )
 
 ; TruncRemFunctionalGeneric — Int. The result WRAPS and mints unproven
@@ -62,6 +63,7 @@
       (LayoutTensorOpTruncRemFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/trunc_rem/match_functional: TruncRem match, Int, divisor proven negative"
 )
 
 ; TruncRemFunctionalGeneric — Int64. The result WRAPS and mints unproven
@@ -95,6 +97,7 @@
       (LayoutTensorOpTruncRemFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/trunc_rem/match_functional: TruncRem match, Int64, divisor proven positive"
 )
 
 ; TruncRemFunctionalGeneric — Int64. The result WRAPS and mints unproven
@@ -128,4 +131,5 @@
       (LayoutTensorOpTruncRemFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/trunc_rem/match_functional: TruncRem match, Int64, divisor proven negative"
 )

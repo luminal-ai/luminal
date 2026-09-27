@@ -7,4 +7,5 @@
   (
     (coordinate-tensor-list ?coordinate_list)
   )
+  :ruleset main_ruleset :name "scatter/seed_2: seed the shared coordinate-tensor-list demand"
 )

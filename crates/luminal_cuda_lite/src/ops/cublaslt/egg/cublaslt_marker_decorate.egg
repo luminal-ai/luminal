@@ -101,6 +101,7 @@
       ?c_view_lt (CublasLtEpilogueDefault)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: C-fold: CublasLt to CublasLtAccumulate"
 )
 ; --- C-fold: CublasLtBias -> CublasLtAccumulateBias (c inserted at #2) ----
 (rule
@@ -148,6 +149,7 @@
       ?c_view_lt ?bias_lt (CublasLtEpilogueDefault)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: C-fold: CublasLtBias to CublasLtAccumulateBias"
 )
 ; --- bias: CublasLt -> CublasLtBias ---------------------------------------
 ; The bias vector is the per-output-feature n-vector, recognized by the
@@ -215,6 +217,7 @@
       ?bias_lt (CublasLtEpilogueDefault)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: bias: CublasLt to CublasLtBias"
 )
 ; --- bias: CublasLtAccumulate -> CublasLtAccumulateBias -------------------
 (rule
@@ -278,6 +281,7 @@
       ?c_lt ?bias_lt (CublasLtEpilogueDefault)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: bias: CublasLtAccumulate to CublasLtAccumulateBias"
 )
 ; --- relu: epilogue field rewrite in place, one rule per constructor ------
 ; relu is matched in the RECORDER frame (on ?y_outer) as the frontend spells
@@ -342,6 +346,7 @@
       (CublasLtEpilogueRelu)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLt"
 )
 (rule
   (
@@ -398,6 +403,7 @@
       ?bias_lt (CublasLtEpilogueRelu)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLtBias"
 )
 (rule
   (
@@ -454,6 +460,7 @@
       ?c_lt (CublasLtEpilogueRelu)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLtAccumulate"
 )
 (rule
   (
@@ -510,4 +517,5 @@
       ?c_lt ?bias_lt (CublasLtEpilogueRelu)))
   )
   :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLtAccumulateBias"
 )

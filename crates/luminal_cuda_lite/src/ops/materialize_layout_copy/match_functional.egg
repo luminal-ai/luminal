@@ -19,4 +19,5 @@
     (union ?layout_tensor_op (LayoutTensorOpCopyGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset materializing-copy-mint
+  :name "cuda_lite/materialize_layout_copy/match_functional: Copy match: one value, a fresh injective destination"
 )

@@ -10,4 +10,5 @@
   (
     (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit ?shape ?bits)))
   )
+  :ruleset main_ruleset :name "gather/forward_layout: LogicalGather mints the canonical output layout"
 )

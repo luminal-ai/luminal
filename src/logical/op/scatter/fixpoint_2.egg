@@ -7,4 +7,5 @@
     (set (shape-of ?out_logical) ?init_shape)
   )
   :ruleset fixpoint-invariants
+  :name "scatter/fixpoint_2: shape of LogicalScatter closed from init"
 )

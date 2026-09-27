@@ -9,4 +9,5 @@
   (
     (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit (ShapeLit (IntExprNil)) ?bits)))
   )
+  :ruleset main_ruleset :name "constant/forward_layout: LogicalConstant mints the rank-0 canonical layout"
 )

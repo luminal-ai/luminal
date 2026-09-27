@@ -11,4 +11,5 @@
   (
     (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit ?shape ?bits)))
   )
+  :ruleset main_ruleset :name "cast/forward_layout: LogicalCast mints a canonical layout, width changes"
 )

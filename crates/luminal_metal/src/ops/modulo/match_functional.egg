@@ -17,4 +17,5 @@
       (LayoutTensorOpModFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "metal/modulo/match_functional: Mod functional match at a right-major output layout"
 )

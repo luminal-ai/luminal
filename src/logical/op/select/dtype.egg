@@ -12,4 +12,5 @@
     (set (dtype-of ?out_logical_tensor) ?false_dtype)
   )
   :ruleset prop
+  :name "select/dtype: dtype of LogicalSelect from both branches"
 )

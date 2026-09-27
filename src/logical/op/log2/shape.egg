@@ -8,4 +8,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "log2/shape: shape of LogicalLog2 is the input shape"
 )

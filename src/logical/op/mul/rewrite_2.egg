@@ -10,6 +10,7 @@
   (
     (union ?product (LogicalMul ?lhs (LogicalMul ?rhs ?outer)))
   )
+  :ruleset main_ruleset :name "mul/rewrite_2: associativity of LogicalMul, Int only"
 )
 (rule
   (
@@ -19,4 +20,5 @@
   (
     (union ?product (LogicalMul ?lhs (LogicalMul ?rhs ?outer)))
   )
+  :ruleset main_ruleset :name "mul/rewrite_2: associativity of LogicalMul, Int64 only"
 )

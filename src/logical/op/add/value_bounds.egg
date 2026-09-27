@@ -6,6 +6,7 @@
     (= ?rhs_lower (value-lower-bound-of ?rhs))
   )
   ((set (value-lower-bound-of ?out) (+ ?lhs_lower ?rhs_lower)))
+  :ruleset main_ruleset :name "add/value_bounds: lower bound of LogicalAdd, interval sum"
 )
 (rule
   (
@@ -14,4 +15,5 @@
     (= ?rhs_upper (value-upper-bound-of ?rhs))
   )
   ((set (value-upper-bound-of ?out) (+ ?lhs_upper ?rhs_upper)))
+  :ruleset main_ruleset :name "add/value_bounds: upper bound of LogicalAdd, interval sum"
 )

@@ -14,6 +14,7 @@
   (
     (union ?sum (LogicalAdd ?lhs (LogicalAdd ?rhs ?outer)))
   )
+  :ruleset main_ruleset :name "add/rewrite_2: associativity of LogicalAdd, Int only"
 )
 (rule
   (
@@ -23,4 +24,5 @@
   (
     (union ?sum (LogicalAdd ?lhs (LogicalAdd ?rhs ?outer)))
   )
+  :ruleset main_ruleset :name "add/rewrite_2: associativity of LogicalAdd, Int64 only"
 )

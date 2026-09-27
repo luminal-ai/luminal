@@ -20,4 +20,5 @@
       (LayoutTensorOpReduceMaxGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/reduce_max/match_functional: ReduceMax functional match on an injective out"
 )

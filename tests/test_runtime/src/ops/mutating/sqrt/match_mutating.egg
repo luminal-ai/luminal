@@ -22,4 +22,5 @@
     (union ?layout_tensor_op (LayoutTensorOpSqrtMutatingGeneric ?in_layout_tensor))
   )
   :ruleset backend
+  :name "test_runtime/ops/mutating/sqrt/match_mutating: Sqrt mutating in-place on its one operand"
 )

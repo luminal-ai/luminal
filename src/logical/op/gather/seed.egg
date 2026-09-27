@@ -11,4 +11,5 @@
   (
     (panic "LogicalGather with an empty coordinate list (rank-0 data) is ill-formed; scalar broadcast is the empty-index-map view")
   )
+  :ruleset main_ruleset :name "gather/seed: refuse LogicalGather on an empty coordinate list"
 )

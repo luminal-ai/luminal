@@ -18,4 +18,5 @@
       (LayoutTensorOpGatherGeneric ?data_layout_tensor ?coordinate_layout_tensors ?out_layout))
   )
   :ruleset backend
+  :name "test_runtime/ops/functional/gather/match_functional: Gather mint, data plus a coordinate tensor per axis"
 )

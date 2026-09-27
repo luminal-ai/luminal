@@ -13,4 +13,5 @@
         (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
     (union ?layout_tensor_op (LayoutTensorOpTruncFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
+  :ruleset main_ruleset :name "reference/trunc/match_functional: TruncFunctionalGeneric mint at an injective destination"
 )

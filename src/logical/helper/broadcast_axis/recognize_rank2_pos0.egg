@@ -9,4 +9,5 @@
     (= ?oshape (ShapeLit (IntExprCons ?d1 (IntExprCons ?d0 (IntExprCons ?e (IntExprNil))))))
   )
   ((union ?v (LogicalHelperBroadcastAxis ?p 0 ?e)))
+  :ruleset main_ruleset :name "helper/broadcast_axis/recognize_rank2_pos0: apply recognized as a rank-2 broadcast, new axis at 0"
 )

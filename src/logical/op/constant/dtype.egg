@@ -8,4 +8,5 @@
     (set (dtype-of ?out_logical_tensor) (F32))
   )
   :ruleset prop
+  :name "constant/dtype: LogicalConstant is F32, unconditionally"
 )

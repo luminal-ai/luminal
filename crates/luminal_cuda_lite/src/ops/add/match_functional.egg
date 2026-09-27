@@ -27,6 +27,7 @@
       (LayoutTensorOpAddFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/add/match_functional: Add functional match, non-Int dtypes"
 )
 
 ; Int: WRAPS, and mints unproven (LUM-833, temporary). torch
@@ -58,6 +59,7 @@
       (LayoutTensorOpAddFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/add/match_functional: Add functional match, Int wraps unproven"
 )
 
 ; Int64: WRAPS, and mints unproven (LUM-833, temporary). torch
@@ -89,4 +91,5 @@
       (LayoutTensorOpAddFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/add/match_functional: Add functional match, Int64 wraps unproven"
 )

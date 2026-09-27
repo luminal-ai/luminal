@@ -19,4 +19,5 @@
     (set (value-upper-bound-of ?out)
       (max (* ?n_lower ?upper) (* ?n_upper ?upper)))
   )
+  :ruleset main_ruleset :name "reduce_sum/value_bounds: sum bounds scaled by the reduced extent's bounds"
 )

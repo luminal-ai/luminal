@@ -15,4 +15,5 @@
       (LayoutTensorOpReduceMaxGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "reference/reduce_max/match_functional: ReduceMaxGeneric mint over the reduction dim"
 )

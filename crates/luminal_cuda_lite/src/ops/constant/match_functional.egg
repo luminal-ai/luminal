@@ -21,6 +21,7 @@
       (LayoutTensorOpConstantGeneric ?constant_value ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/constant/match_functional: Constant match: the zero-input scalar source"
 )
 
 ; The exact-F64 scalar source lowers through the same constant op.
@@ -39,4 +40,5 @@
     (union ?layout_tensor_op
       (LayoutTensorOpConstantGeneric ?constant_value ?out_layout))
   )
+  :ruleset main_ruleset :name "cuda_lite/constant/match_functional: ConstantF64 lowers through the same constant op"
 )

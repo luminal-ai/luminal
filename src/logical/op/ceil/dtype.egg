@@ -8,4 +8,5 @@
     (set (dtype-of ?out_logical_tensor) ?dtype)
   )
   :ruleset prop
+  :name "ceil/dtype: LogicalCeil preserves the input dtype"
 )

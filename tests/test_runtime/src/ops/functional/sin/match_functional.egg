@@ -14,4 +14,5 @@
     (union ?layout_tensor_op (LayoutTensorOpSinFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "test_runtime/ops/functional/sin/match_functional: Sin functional mint at an injective destination"
 )

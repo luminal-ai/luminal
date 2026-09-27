@@ -5,4 +5,5 @@
     (= ?v (LogicalHelperMatrixTranspose ?x))
   )
   ((union ?w ?x))
+  :ruleset main_ruleset :name "helper/matrix_transpose/involution: transpose of a transpose is the tensor itself"
 )

@@ -22,4 +22,5 @@
       (LayoutTensorOpLessThanGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "cuda_lite/less_than/match_functional: LessThan functional match on an injective out"
 )

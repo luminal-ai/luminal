@@ -12,4 +12,5 @@
         (LogicalHelperBroadcastAxis ?a 1 ?n)
         (LogicalHelperBroadcastAxis (LogicalHelperMatrixTranspose ?b) 2 ?m))
       0)))
+  :ruleset main_ruleset :name "helper/matrix_multiply/expand: matrix product expands to broadcasts, mul, reduce-sum"
 )

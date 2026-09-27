@@ -8,4 +8,5 @@
     (set (dtype-of ?out_logical_tensor) ?dtype)
   )
   :ruleset prop
+  :name "floor/dtype: LogicalFloor preserves the input dtype"
 )

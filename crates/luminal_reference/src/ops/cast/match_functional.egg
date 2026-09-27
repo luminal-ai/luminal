@@ -16,4 +16,5 @@
       (LayoutTensorOpCastGeneric ?in_layout_tensor ?target_dtype ?out_layout))
   )
   :ruleset backend
+  :name "reference/cast/match_functional: CastGeneric mint at an injective destination"
 )

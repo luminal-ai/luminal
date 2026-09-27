@@ -9,4 +9,5 @@
     (let ?out_layout_tensor1 (LayoutTensorLit ?out_logical ?in1_layout))
     (let ?out_layout_tensor2 (LayoutTensorLit ?out_logical ?in2_layout))
   )
+  :ruleset main_ruleset :name "modulo/forward_layout: LogicalMod result in each operand's layout"
 )

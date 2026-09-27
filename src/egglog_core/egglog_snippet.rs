@@ -235,7 +235,7 @@ mod tests {
     /// The `prop` ruleset holds exactly the shape-of / dtype-of / rank-of
     /// propagation rules: every default-ruleset rule does something else,
     /// and every `prop` rule does nothing else. The schedule runs `prop`
-    /// to saturation before the main loop and alongside `(run)` inside
+    /// to saturation before the main loop and alongside `(run main_ruleset)` inside
     /// it, so a propagation rule left in the default ruleset would lose
     /// the pre-pass and a minting rule tagged `prop` would run in it.
     #[test]

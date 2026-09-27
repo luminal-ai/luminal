@@ -17,4 +17,5 @@
       (LayoutTensorOpDivFunctionalGeneric ?in1_layout_tensor ?in2_layout_tensor ?out_layout))
   )
   :ruleset backend
+  :name "reference/div/match_functional: DivFunctionalGeneric mint at an injective destination"
 )

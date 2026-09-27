@@ -15,4 +15,5 @@
       (LayoutTensorOpReduceMaxGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "metal/reduce_max/match_functional: ReduceMax match over the reduction dim"
 )

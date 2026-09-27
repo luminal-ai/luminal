@@ -9,4 +9,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "mul/shape: shape of LogicalMul at agreeing operand shapes"
 )

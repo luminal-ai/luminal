@@ -12,6 +12,7 @@
   (
     (union ?t (LogicalAdd (LogicalMul ?lhs ?shared_factor) (LogicalMul ?rhs ?shared_factor)))
   )
+  :ruleset main_ruleset :name "mul/rewrite_3: LogicalMul distributes over LogicalAdd, Int"
 )
 (rule
   (
@@ -21,6 +22,7 @@
   (
     (union ?t (LogicalMul (LogicalAdd ?lhs ?rhs) ?shared_factor))
   )
+  :ruleset main_ruleset :name "mul/rewrite_3: factoring a shared LogicalMul factor out, Int"
 )
 (rule
   (
@@ -30,6 +32,7 @@
   (
     (union ?t (LogicalAdd (LogicalMul ?lhs ?shared_factor) (LogicalMul ?rhs ?shared_factor)))
   )
+  :ruleset main_ruleset :name "mul/rewrite_3: LogicalMul distributes over LogicalAdd, Int64"
 )
 (rule
   (
@@ -39,4 +42,5 @@
   (
     (union ?t (LogicalMul (LogicalAdd ?lhs ?rhs) ?shared_factor))
   )
+  :ruleset main_ruleset :name "mul/rewrite_3: factoring a shared LogicalMul factor out, Int64"
 )

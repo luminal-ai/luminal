@@ -16,4 +16,5 @@
       (LayoutTensorOpConstantGeneric ?constant_value ?out_layout))
   )
   :ruleset backend
+  :name "test_runtime/ops/functional/constant/match_functional: Constant mint, zero-input scalar source"
 )

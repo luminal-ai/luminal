@@ -9,4 +9,5 @@
   (
     (expr-list-remove-axis-root-demand ?dims ?reduction_index)
   )
+  :ruleset main_ruleset :name "reduce_sum/seed: demand removal of the summed axis from the dims"
 )

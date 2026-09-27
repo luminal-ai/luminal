@@ -14,4 +14,5 @@
       (LayoutTensorOpIotaGeneric ?index_expression ?shape ?out_layout))
   )
   :ruleset backend
+  :name "metal/iota/match_functional: Iota match from its index expression and shape"
 )

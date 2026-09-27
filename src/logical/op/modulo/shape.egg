@@ -9,4 +9,5 @@
     (set (shape-of ?out_logical) ?shape)
   )
   :ruleset prop
+  :name "modulo/shape: shape of LogicalMod at agreeing operand shapes"
 )

@@ -5,6 +5,7 @@
     (= ?lower (value-lower-bound-of ?in))
   )
   ((set (value-lower-bound-of ?out) ?lower))
+  :ruleset main_ruleset :name "reduce_max/value_bounds: lower bound of a max is the operand's lower bound"
 )
 (rule
   (
@@ -12,4 +13,5 @@
     (= ?upper (value-upper-bound-of ?in))
   )
   ((set (value-upper-bound-of ?out) ?upper))
+  :ruleset main_ruleset :name "reduce_max/value_bounds: upper bound of a max is the operand's upper bound"
 )

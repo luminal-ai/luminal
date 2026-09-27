@@ -13,4 +13,5 @@
         (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
     (union ?layout_tensor_op (LayoutTensorOpFloorFunctionalGeneric ?in_layout_tensor ?out_layout))
   )
+  :ruleset main_ruleset :name "reference/floor/match_functional: FloorFunctionalGeneric mint at an injective destination"
 )

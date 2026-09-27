@@ -96,6 +96,24 @@ Egglog should be the only phase where rewriting and pattern matching happens. Ev
   for patterns, fuse kernels, or choose backend ops after extraction.
 - HLIR ops are deleted as a final `cleanup` ruleset phase so they are not present during extraction.
 
+### Rule conventions
+
+- Every rule, rewrite, and birewrite belongs to a named ruleset. The unnamed
+  default ruleset is never used: egglog cannot include it in a combined
+  ruleset, so nothing may live there. The program's own rules are
+  `:ruleset main_ruleset`; schedules run `(run main_ruleset)`, never `(run)`,
+  and a hand-stepped loop steps `"main_ruleset"`, never `""`.
+- Every rule carries `:name`. The name is `<file stem>: <title>`, where the
+  title is a short noun phrase for what the rule derives, rewrites, marks, or
+  refuses (`mul/dtype: Dtype Propagation : LogicalMul`,
+  `core: length of an IntExprCons is the tail's plus one`). Names are unique
+  within a ruleset and contain no double quotes or backslashes. Run reports are
+  keyed by these names, so a profile reads without decoding rule text.
+- A rule's actions must not name many global `let`s: egglog hoists each one
+  into the rule's query as an atom, so the join deepens per global and its
+  cost grows superlinearly. State facts as top-level commands, or bind values
+  locally inside the rule.
+
 ## Search
 
 Search samples choices from the saturated e-graph using a genetic algorithm, extracts LLIR candidates, and profiles them with the runtime. Every extractable LLIR graph must be valid. Validity / output checking is _not_ part of the search process, as outputs are assumed to be correct.

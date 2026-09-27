@@ -20,6 +20,7 @@
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "reference/reduce_sum/match_functional: ReduceSumGeneric mint, non-Int dtypes ungated"
 )
 
 ; Int: PROOF-GATED (non-wrapping ruling 2026-08-11) — mints
@@ -48,6 +49,7 @@
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "reference/reduce_sum/match_functional: ReduceSumGeneric mint, Int in-width proof"
 )
 
 ; Int64: PROOF-GATED (non-wrapping ruling 2026-08-11) — mints
@@ -76,4 +78,5 @@
       (LayoutTensorOpReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
   )
   :ruleset backend
+  :name "reference/reduce_sum/match_functional: ReduceSumGeneric mint, Int64 in-width proof"
 )
