@@ -19,6 +19,7 @@
 //! executions, an external one is the caller's own device allocation.
 
 use luminal::dtype::DType;
+use luminal::egglog_snippet::ProgramSeams;
 use luminal::graph::{LogicalGraph, ValueId};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::shape::{IntExpr, Term};
@@ -131,6 +132,8 @@ pub struct CudaBindings {
     outputs: Vec<Bound>,
     buffers: BTreeMap<i64, BufferDecl>,
     next: i64,
+    facts: String,
+    checks: Vec<(String, String)>,
 }
 
 /// The bound program's parts. The seeds a runtime binds after load
@@ -189,6 +192,16 @@ impl BoundProgram {
                 .map(|bound| bound.buffer)
                 .collect(),
         }
+    }
+}
+
+impl ProgramSeams for CudaBindings {
+    fn before_schedule(&mut self, text: &str) {
+        self.facts.push_str(text);
+    }
+
+    fn after_schedule(&mut self, label: &str, text: &str) {
+        self.checks.push((label.to_string(), text.to_string()));
     }
 }
 
@@ -588,6 +601,10 @@ impl CudaBindings {
             join(&input_tensors),
             join(&output_tensors)
         ));
+        if !self.facts.is_empty() {
+            prefix.push_str(&self.facts);
+            prefix.push('\n');
+        }
 
         // Post-schedule checks: the recorder's shape contracts, then the
         // declaration invariants — every buffer states its access and its
@@ -601,6 +618,10 @@ impl CudaBindings {
             );
             post_checks.push_str(&text);
             labeled_checks.push((format!("buffer {k} declares access and freed-by"), text));
+        }
+        for (label, text) in &self.checks {
+            post_checks.push_str(text);
+            labeled_checks.push((label.clone(), text.clone()));
         }
         Ok(BoundProgram {
             prefix,

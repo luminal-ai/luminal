@@ -870,6 +870,8 @@ mod tests {
                 TensorMeta {
                     dtype: *dtype,
                     sizes: sizes(shape),
+                    layout: None,
+                    device: None,
                 },
             );
         }
@@ -1074,6 +1076,8 @@ mod tests {
             TensorMeta {
                 dtype: 7,
                 sizes: sizes(&[2, 2]),
+                layout: None,
+                device: None,
             },
         );
         inner_values.insert(
@@ -1081,6 +1085,8 @@ mod tests {
             TensorMeta {
                 dtype: 7,
                 sizes: sizes(&[2, 2]),
+                layout: None,
+                device: None,
             },
         );
         let subgraph = SubGraph {

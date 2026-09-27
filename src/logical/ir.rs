@@ -1237,8 +1237,13 @@ impl LogicalGraph {
     pub fn let_name(&self, id: ValueId) -> String {
         match (&self.graph[id].op, self.graph[id].dtype) {
             (LogicalOp::Input { .. }, DType::Bool) => format!("input_wire_v{}", id.index()),
-            _ => format!("v{}", id.index()),
+            _ => self.value_name(id),
         }
+    }
+
+    /// The egglog `let` of a model value.
+    pub fn value_name(&self, id: ValueId) -> String {
+        format!("v{}", id.index())
     }
 
     /// The value's dims as a `ShapeLit` term.

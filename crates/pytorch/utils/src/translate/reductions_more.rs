@@ -353,6 +353,8 @@ mod tests {
                 TensorMeta {
                     dtype: *dtype,
                     sizes: sizes(shape),
+                    layout: None,
+                    device: None,
                 },
             );
         }

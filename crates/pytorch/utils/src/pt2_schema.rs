@@ -363,11 +363,26 @@ impl Argument {
     }
 }
 
-/// Tensor metadata (shape, dtype, strides).
+/// Tensor metadata (shape, dtype, layout).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TensorMeta {
     pub dtype: u32,
     pub sizes: Vec<DimSize>,
+    /// Torch's storage-kind code; see [`crate::torch_layout::TorchLayout`].
+    #[serde(default)]
+    pub layout: Option<u32>,
+    /// The device the tensor lives on; see [`crate::torch_device::TorchDevice`].
+    #[serde(default)]
+    pub device: Option<Device>,
+}
+
+/// A torch device as exported: `{"type": "cuda", "index": 0}`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Device {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub index: Option<i64>,
 }
 
 /// A dimension size — either a concrete integer or a symbolic expression.

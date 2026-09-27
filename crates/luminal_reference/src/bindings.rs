@@ -12,6 +12,7 @@
 //! width, booleans crossing as Bool8 bytes, caller-owned storage.
 
 use luminal::dtype::DType;
+use luminal::egglog_snippet::ProgramSeams;
 use luminal::graph::{LogicalGraph, ValueId};
 use luminal::layout_ir::{Access, FreedBy};
 use rustc_hash::FxHashMap;
@@ -37,6 +38,8 @@ pub struct ReferenceBindings {
     outputs: Vec<Bound>,
     buffers: BTreeMap<i64, BufferDecl>,
     next: i64,
+    facts: String,
+    checks: Vec<(String, String)>,
 }
 
 /// The bound program's parts. The seeds a runtime binds after load
@@ -73,6 +76,16 @@ impl BoundProgram {
     /// runtime re-saturates to name which check failed.
     pub fn text_unchecked_with_seeds(&self, seeds: &str) -> String {
         format!("{}{seeds}{}", self.prefix, ReferenceBindings::SCHEDULE)
+    }
+}
+
+impl ProgramSeams for ReferenceBindings {
+    fn before_schedule(&mut self, text: &str) {
+        self.facts.push_str(text);
+    }
+
+    fn after_schedule(&mut self, label: &str, text: &str) {
+        self.checks.push((label.to_string(), text.to_string()));
     }
 }
 
@@ -304,6 +317,10 @@ impl ReferenceBindings {
             join(&input_tensors),
             join(&output_tensors)
         ));
+        if !self.facts.is_empty() {
+            prefix.push_str(&self.facts);
+            prefix.push('\n');
+        }
 
         // Post-schedule checks: the declaration invariants — every buffer
         // states its access and its deallocation responsibility,
@@ -317,6 +334,10 @@ impl ReferenceBindings {
             );
             post_checks.push_str(&text);
             labeled_checks.push((format!("buffer {k} declares access and freed-by"), text));
+        }
+        for (label, text) in &self.checks {
+            post_checks.push_str(text);
+            labeled_checks.push((label.clone(), text.clone()));
         }
         Ok(BoundProgram {
             prefix,

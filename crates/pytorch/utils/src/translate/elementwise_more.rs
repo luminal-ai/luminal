@@ -429,6 +429,8 @@ mod tests {
             TensorMeta {
                 dtype,
                 sizes: sizes(in_shape),
+                layout: None,
+                device: None,
             },
         );
         tensor_values.insert(
@@ -436,6 +438,8 @@ mod tests {
             TensorMeta {
                 dtype,
                 sizes: sizes(out_shape),
+                layout: None,
+                device: None,
             },
         );
         let program = ExportedProgram {

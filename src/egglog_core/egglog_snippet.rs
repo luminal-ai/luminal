@@ -106,6 +106,16 @@ pub fn assemble(core: &str, snippets: &[EgglogSnippet]) -> String {
     out
 }
 
+/// Where a frontend splices its own egglog text into a runtime's bound
+/// program.
+pub trait ProgramSeams {
+    /// Text rendered after the model and boundary, before the schedule.
+    fn before_schedule(&mut self, text: &str);
+    /// A post-schedule unit: `text` runs after the schedule; `label` names
+    /// it when a runtime isolates a failing unit.
+    fn after_schedule(&mut self, label: &str, text: &str);
+}
+
 /// THE sanctioned `EGraph` constructor: registers the harness-side
 /// primitives the core preamble contracts for. `(bigint-to-i64 z)` is the
 /// bounds lattice's only way back out of BigInt — PARTIAL, unmatched

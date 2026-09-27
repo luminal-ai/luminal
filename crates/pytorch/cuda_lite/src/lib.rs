@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
-use luminal::prelude::{DType, DimBucket, DynMap, IntExpr, NodeIndex, Symbol};
+use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
 /// Largest value a dynamic dimension's bucket covers (the searched plan stays
 /// symbolic inside it, so one compile serves every covered context length).
@@ -439,13 +439,19 @@ impl CompiledGraph {
         options.device_budget_bytes = device_budget_bytes;
         options.max_intermediate_bytes = max_intermediate_bytes;
         if !self.dims.is_empty() {
-            // Dynamic program: bind one bucket per symbolic dim and search it
+            // Dynamic program: bind one bucket per symbolic dim — torch's
+            // exported range met with this runtime's ceiling — and search it
             // ONCE. The winning plan keeps symbolic spans, so every later call
             // whose dims fall in the bucket re-renders without re-searching.
             let hints: Vec<(Symbol, usize)> = self.dims.iter().map(|(s, v)| (*s, *v)).collect();
             for (symbol, hint) in hints {
-                let representative = hint.clamp(1, MAX_DYNAMIC_DIM);
-                let bucket = DimBucket::new(1, MAX_DYNAMIC_DIM).representative(representative);
+                let bucket = luminal_pytorch_utils::dim_bucket(
+                    symbol,
+                    self.translation.dim_ranges.get(&symbol).copied(),
+                    1,
+                    MAX_DYNAMIC_DIM,
+                    hint,
+                )?;
                 self.runtime.bind_dim_buckets(symbol, vec![bucket])?;
             }
         }
@@ -761,6 +767,11 @@ fn bind(
         output_buffers.push(buffer);
         spellings.push(layout.spelling());
     }
+    luminal_pytorch_utils::declare(
+        &mut bindings,
+        translation,
+        luminal_pytorch_utils::Placement::default(),
+    );
     Ok(Boundary {
         bindings,
         input_buffers,
@@ -864,6 +875,9 @@ mod tests {
             outputs,
             dims: std::collections::HashMap::new(),
             symbols: std::collections::HashMap::new(),
+            declared_dtypes: Vec::new(),
+            dim_ranges: Default::default(),
+            device: None,
         }
     }
 
@@ -939,6 +953,9 @@ mod tests {
             }],
             dims: HashMap::new(),
             symbols: HashMap::new(),
+            declared_dtypes: Vec::new(),
+            dim_ranges: Default::default(),
+            device: None,
         }
     }
 
@@ -1382,6 +1399,9 @@ mod tests {
             }],
             dims: HashMap::new(),
             symbols: HashMap::new(),
+            declared_dtypes: Vec::new(),
+            dim_ranges: Default::default(),
+            device: None,
         };
         let layouts: HashMap<String, DeclaredLayout> = [(
             "x".to_string(),

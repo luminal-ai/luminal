@@ -39,6 +39,8 @@ mod reductions_more;
 mod special;
 mod stats_more;
 mod sympy;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod unary;
 mod upsample;
 mod util;
@@ -47,6 +49,8 @@ use ops::ReductionOp;
 use reductions_more::AddMmVariant;
 use stats_more::DistVariant;
 
+use crate::declared_dtype::DeclaredDtype;
+use crate::dim_range::{self, DimRange};
 use crate::dtype::TorchDType;
 use crate::pt2_parser::{InputKind, ParsedPT2};
 use crate::pt2_schema::{DimSize, Node, NodeInput, RangeConstraint, TensorMeta};
@@ -90,6 +94,15 @@ pub struct Translation {
     pub dims: HashMap<Symbol, usize>,
     /// PT2 symbol name -> recorder dim symbol, for runtime `set_dim` by name.
     pub symbols: HashMap<String, Symbol>,
+    /// The dtype torch declared for every tensor value the translator
+    /// bound. See the declared_dtype module.
+    pub declared_dtypes: Vec<DeclaredDtype>,
+    /// The range torch exported for each dynamic dimension the program
+    /// names. See the dim_range module.
+    pub dim_ranges: std::collections::BTreeMap<Symbol, DimRange>,
+    /// The one device every tensor lives on; `None` when the export states
+    /// no device. See the torch_device module.
+    pub device: Option<crate::torch_device::TorchDevice>,
 }
 
 /// The dtypes a torch op performs its math in: tensor operands meet at
@@ -152,6 +165,18 @@ pub fn parse_dim_expr(translation: &Translation, expr: &str) -> Result<IntExpr> 
 
 /// Translate a parsed PT2 program into the recorder frontend.
 pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
+    let mut tensors: Vec<(&String, &TensorMeta)> = parsed
+        .program
+        .graph_module
+        .graph
+        .tensor_values
+        .iter()
+        .collect();
+    tensors.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, meta) in tensors {
+        crate::torch_layout::check_strided(name, meta.layout)?;
+    }
+    let device = crate::torch_device::program_device(parsed)?;
     let sym_dim_map = parsed.build_sym_dim_map();
     let mut t = Translator {
         cx: Graph::new(),
@@ -346,12 +371,52 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
 
     let outputs = regular;
 
+    // 4. The dtype torch declared for each bound value. A name torch
+    //    declares with a dtype our IR has no type for (the complex family,
+    //    carried as two real components) declares nothing.
+    let mut producers: HashMap<&str, &str> = HashMap::new();
+    for node in &parsed.program.graph_module.graph.nodes {
+        for output in &node.outputs {
+            if let Some(name) = output.value_name() {
+                producers.insert(name, node.target.as_str());
+            }
+        }
+    }
+    let mut declared_dtypes: Vec<DeclaredDtype> = Vec::new();
+    for (name, value) in &t.values {
+        let Ok(meta) = t.tensor_meta(name) else {
+            continue;
+        };
+        let Ok(dtype) = dtype_of(meta.dtype) else {
+            continue;
+        };
+        declared_dtypes.push(DeclaredDtype {
+            tensor: value.id,
+            graph_name: name.clone(),
+            producer: producers
+                .get(name.as_str())
+                .map(|target| (*target).to_string()),
+            dtype,
+        });
+    }
+    declared_dtypes.sort_by(|a, b| {
+        a.tensor
+            .index()
+            .cmp(&b.tensor.index())
+            .then_with(|| a.graph_name.cmp(&b.graph_name))
+    });
+
+    let dim_ranges = dim_range::dim_ranges(&t.ranges, &t.symbols);
+
     Ok(Translation {
         graph: t.cx,
         inputs,
         outputs,
         dims: t.dims,
         symbols: t.symbols,
+        declared_dtypes,
+        dim_ranges,
+        device,
     })
 }
 
@@ -1041,7 +1106,7 @@ impl Translator<'_> {
                 return Ok(());
             }
             // ---- cast ----
-            "to.dtype" | "_to_copy.default" => {
+            "to.dtype" | "to.dtype_layout" | "_to_copy.default" => {
                 let x = self.operand(&n[0])?;
                 let dtype = self.scalar_type_arg(&n[1])?;
                 // Lossless casts go through `cast`; float -> int is the
@@ -1566,6 +1631,9 @@ mod dim_expr_tests {
                 .iter()
                 .map(|name| ((*name).to_string(), Symbol::new(*name)))
                 .collect(),
+            declared_dtypes: Vec::new(),
+            dim_ranges: Default::default(),
+            device: None,
         }
     }
 
