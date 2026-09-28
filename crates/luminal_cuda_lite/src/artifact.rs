@@ -663,3 +663,58 @@ impl OpWire {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::cublaslt::{CublasLt, CublasLtDps, CublasLtForm};
+
+    #[test]
+    fn every_artifact_op_codec_round_trips() {
+        let wires = vec![
+            OpWire::Add,
+            OpWire::Cast,
+            OpWire::Ceil,
+            OpWire::Div,
+            OpWire::Exp,
+            OpWire::Exp2,
+            OpWire::Floor,
+            OpWire::LessThan,
+            OpWire::Log2,
+            OpWire::Copy,
+            OpWire::Mod,
+            OpWire::Mul,
+            OpWire::Recip,
+            OpWire::Round,
+            OpWire::Select,
+            OpWire::Sin,
+            OpWire::Sqrt,
+            OpWire::Trunc,
+            OpWire::TruncCast,
+            OpWire::TruncDiv,
+            OpWire::TruncRem,
+            OpWire::ReduceMax(1),
+            OpWire::ReduceSum(2),
+            OpWire::Gather(3),
+            OpWire::Scatter(4),
+            OpWire::Constant(1.25),
+            OpWire::Iota(None),
+            OpWire::IndexMap(None),
+            OpWire::CublasLt(Box::new(CublasLtDps {
+                op: CublasLt {
+                    form: CublasLtForm::Base,
+                    spec: None,
+                },
+            })),
+            OpWire::BufferAlloc,
+            OpWire::BufferFree,
+        ];
+
+        for wire in wires {
+            let expected = serde_json::to_value(&wire).unwrap();
+            let decoded = wire.decode().unwrap();
+            let round_tripped = OpWire::encode(decoded.as_ref()).unwrap();
+            assert_eq!(serde_json::to_value(round_tripped).unwrap(), expected);
+        }
+    }
+}

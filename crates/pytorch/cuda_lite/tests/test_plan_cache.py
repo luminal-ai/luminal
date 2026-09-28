@@ -1,5 +1,8 @@
 import base64
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -112,6 +115,41 @@ def test_get_or_create_is_single_flight():
     assert (stats.hits, stats.misses, stats.entries) == (3, 1, 1)
 
 
+def test_get_or_create_recovers_after_creator_failure():
+    calls = 0
+
+    def fail():
+        nonlocal calls
+        calls += 1
+        raise ValueError("failed search")
+
+    with pytest.raises(ValueError, match="failed search"):
+        get_or_create("retry", fail)
+
+    value = object()
+    actual, hit = get_or_create("retry", lambda: value)
+    assert actual is value
+    assert not hit
+    assert calls == 1
+
+
+def test_get_or_create_evicts_the_least_recently_used_entry(monkeypatch):
+    monkeypatch.setenv("LUMINAL_PLAN_CACHE_SIZE", "2")
+    first = object()
+    second = object()
+    third = object()
+
+    assert get_or_create("first", lambda: first) == (first, False)
+    assert get_or_create("second", lambda: second) == (second, False)
+    # A hit makes `first` most-recently used, so inserting `third` evicts
+    # `second`, not merely the oldest key by creation time.
+    assert get_or_create("first", lambda: object()) == (first, True)
+    assert get_or_create("third", lambda: third) == (third, False)
+    replacement = object()
+    assert get_or_create("second", lambda: replacement) == (replacement, False)
+    assert cache_stats().entries == 2
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_isomorphic_modules_share_search_but_keep_distinct_weight_bindings(tmp_path):
     torch.manual_seed(0)
@@ -138,9 +176,103 @@ def test_isomorphic_modules_share_search_but_keep_distinct_weight_bindings(tmp_p
     assert "kernel_sources" in native
     with pytest.raises(RuntimeError, match="wrong structural fingerprint"):
         load_artifact(Path(first_compiled.artifact_handle), "not-the-fingerprint")
+
+    def corrupted_artifact(name, mutate):
+        document = json.loads(Path(first_compiled.artifact_handle).read_text())
+        native_document = json.loads(base64.b64decode(document["plan"]))
+        mutate(native_document)
+        document["plan"] = base64.b64encode(
+            json.dumps(native_document).encode()
+        ).decode()
+        path = tmp_path / name
+        path.write_text(json.dumps(document))
+        return path
+
+    bad_schema = corrupted_artifact(
+        "bad-schema.json", lambda document: document.__setitem__("schema", 999)
+    )
+    with pytest.raises(RuntimeError, match="schema 999 is not supported"):
+        load_artifact(bad_schema, outer["fingerprint"])
+
+    bad_abi = corrupted_artifact(
+        "bad-abi.json",
+        lambda document: document.__setitem__("op_registry_abi", 999),
+    )
+    with pytest.raises(RuntimeError, match="op-registry ABI 999 is not supported"):
+        load_artifact(bad_abi, outer["fingerprint"])
+
+    bad_kernels = corrupted_artifact(
+        "bad-kernels.json",
+        lambda document: document["kernel_sources"].append(
+            {"node": 999, "label": "wrong", "sources": ["wrong"]}
+        ),
+    )
+    with pytest.raises(RuntimeError, match="kernel sources do not match"):
+        load_artifact(bad_kernels, outer["fingerprint"])
+
     with torch.no_grad():
         first_output = first_compiled(x)[0]
         second_output = second_compiled(x)[0]
         torch.testing.assert_close(first_output, first(x), atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(second_output, second(x), atol=1e-4, rtol=1e-4)
         assert not torch.equal(first_output, second_output)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_persistent_artifact_loads_in_a_fresh_process(tmp_path):
+    """Process B must execute process A's artifact without an in-memory hit."""
+    program = r'''
+import json
+import sys
+
+import torch
+import torch.fx as fx
+
+from luminal_cuda_lite.backend import luminal_cuda_lite
+
+
+class Add(torch.nn.Module):
+    def forward(self, left, right):
+        return left + right
+
+
+graph = fx.symbolic_trace(Add())
+left = torch.arange(12, device="cuda", dtype=torch.float32).reshape(3, 4)
+right = torch.full_like(left, 7)
+compiled = luminal_cuda_lite(
+    graph,
+    [left, right],
+    search_iterations=1,
+    artifact_dir=sys.argv[1],
+)
+actual = compiled(left, right)[0]
+torch.cuda.synchronize()
+torch.testing.assert_close(actual, left + right)
+print("LUMINAL_RESULT=" + json.dumps({
+    "cache_hit": compiled.plan_cache_hit,
+    "artifact": compiled.artifact_handle,
+}))
+'''
+
+    def run_process():
+        completed = subprocess.run(
+            [sys.executable, "-c", program, str(tmp_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            timeout=180,
+        )
+        line = next(
+            row.removeprefix("LUMINAL_RESULT=")
+            for row in completed.stdout.splitlines()
+            if row.startswith("LUMINAL_RESULT=")
+        )
+        return json.loads(line)
+
+    first = run_process()
+    second = run_process()
+    assert not first["cache_hit"]
+    assert second["cache_hit"]
+    assert second["artifact"] == first["artifact"]
+    assert Path(first["artifact"]).is_file()
