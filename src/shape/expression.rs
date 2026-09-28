@@ -415,6 +415,33 @@ impl Expression {
     /// how each dynamic dim is spelled — Metal names them by buffer slot rather
     /// than by `const_<name>`.
     pub fn to_kernel_with(&self, index_var: &str, dim: &dyn Fn(&Symbol) -> String) -> String {
+        self.to_kernel_with_ty(index_var, dim, "int")
+    }
+
+    /// As [`to_kernel_with_index`](Self::to_kernel_with_index), for a kernel
+    /// whose index arithmetic is wider than `int`; see
+    /// [`to_kernel_with_ty`](Self::to_kernel_with_ty).
+    pub fn to_kernel_with_index_ty(&self, index_var: &str, int_ty: &str) -> String {
+        self.to_kernel_with_ty(index_var, &kernel_const_name, int_ty)
+    }
+
+    /// As [`to_kernel_with`](Self::to_kernel_with), with the operands of
+    /// `min`/`max` cast to `int_ty`.
+    ///
+    /// The cast is required: C-family kernel languages resolve `max(x, 0)`
+    /// with mixed operand types to an `int` overload (or not at all), and on
+    /// a backend with an unsigned thread index it is what makes `row - 1`
+    /// negative instead of huge. But it also fixes the width of everything
+    /// multiplied by the result: a clamped row times its stride is computed
+    /// in `int_ty`. A kernel indexing past 2^31 must therefore pass its own
+    /// 64-bit signed type here (`"long long"` for CUDA/HIP), or a pad's
+    /// `clamp(row - 1) * stride` wraps and reads out of bounds.
+    pub fn to_kernel_with_ty(
+        &self,
+        index_var: &str,
+        dim: &dyn Fn(&Symbol) -> String,
+        int_ty: &str,
+    ) -> String {
         let mut symbols = vec![];
         for term in self.terms.read().iter() {
             let new_symbol = match term {
@@ -422,12 +449,12 @@ impl Expression {
                 Term::Var(c) if c.is_reserved() => index_var.to_string(),
                 Term::Var(c) => dim(c),
                 Term::Max => format!(
-                    "max((int){}, (int){})",
+                    "max(({int_ty}){}, ({int_ty}){})",
                     symbols.pop().unwrap(),
                     symbols.pop().unwrap()
                 ),
                 Term::Min => format!(
-                    "min((int){}, (int){})",
+                    "min(({int_ty}){}, ({int_ty}){})",
                     symbols.pop().unwrap(),
                     symbols.pop().unwrap()
                 ),
@@ -1392,6 +1419,45 @@ mod tests {
             (((z * 6 + 5) / 6) * 6 + ((z * 6 + 5) % 6)).simplify(),
             z * 6 + 5
         );
+    }
+
+    /// A symbolic product divided by one of its factors is that other factor:
+    /// what `split_dims((h*w), w)` and every merged-view index need to prove
+    /// once H and W are dynamic dims.
+    #[test]
+    fn test_symbolic_product_division_cancels() {
+        let (h, w) = (expr('h'), expr('w'));
+        assert_eq!(((h * w) / w).simplify(), h);
+        assert_eq!(((h * w) / h).simplify(), w);
+        assert_eq!(((h * w) % w).simplify(), expr(0));
+        assert_eq!(((w * 8) / 8).simplify(), w);
+        assert_eq!(((w * 8) / 2).simplify(), w * 4);
+        assert_eq!((((h * 8) + 1 - 3) / 2 + 1).simplify(), h * 4);
+        assert_eq!((h / h).simplify(), expr(1));
+        assert!(((h * w) / w * w).simplify().egglog_equal((h * w).simplify()));
+    }
+
+    /// The bounds a `slice` over a dynamic sequence produces: a `RangeFrom`
+    /// spells its end as `i64::MAX`, a split of a concat subtracts the
+    /// prefix's own length back out. These must fold, or every downstream
+    /// shape carries a `min`/`sub` chain the kernels then evaluate per index.
+    #[test]
+    fn test_symbolic_slice_bounds_fold() {
+        let (t, n) = (expr('t'), expr('n'));
+        assert_eq!(((t + n) - t).simplify(), n);
+        assert_eq!((((t + n) + 4) - t).simplify(), n + 4);
+        assert_eq!((t + n).min(t + n).simplify(), (t + n).simplify());
+        assert_eq!(((t + n).min(i64::MAX) - t).simplify(), n);
+        // A prefix slice of a concat: `min(total, prefix)` folds because the
+        // rest of the total is dims (non-negative)...
+        let c = expr('c');
+        assert_eq!((t + n).min(t).simplify(), t);
+        assert_eq!((t + (n + c)).min(t).simplify(), t);
+        assert_eq!((n + c).min(n).simplify(), n);
+        assert_eq!((n + (c * 4)).min(n).simplify(), n);
+        // ...and must not fold for a negative literal.
+        let shifted = (t + expr(-3)).min(t).simplify();
+        assert_ne!(shifted, t, "{shifted}");
     }
 
     #[test]

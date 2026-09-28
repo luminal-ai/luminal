@@ -11,7 +11,12 @@ impl Add for GraphTensor {
     type Output = GraphTensor;
 
     fn add(self, rhs: GraphTensor) -> Self::Output {
-        assert_eq!(self.dims(), rhs.dims(), "Dims must match to add tensors.");
+        assert!(
+            dims_match(&self.dims(), &rhs.dims()),
+            "Dims must match to add tensors. Got {:?} and {:?}",
+            self.dims(),
+            rhs.dims()
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to add tensors. Got {:?} and {:?}",
@@ -74,10 +79,11 @@ impl Mul for GraphTensor {
     type Output = GraphTensor;
 
     fn mul(self, rhs: GraphTensor) -> Self::Output {
-        assert_eq!(
+        assert!(
+            dims_match(&self.dims(), &rhs.dims()),
+            "Dims must match to multiply tensors. Got {:?} and {:?}",
             self.dims(),
-            rhs.dims(),
-            "Dims must match to multiply tensors."
+            rhs.dims()
         );
         assert_eq!(
             self.dtype, rhs.dtype,
@@ -143,7 +149,12 @@ impl Rem<GraphTensor> for GraphTensor {
     type Output = GraphTensor;
 
     fn rem(self, rhs: GraphTensor) -> Self::Output {
-        assert_eq!(self.dims(), rhs.dims(), "Dims must match to mod tensors.");
+        assert!(
+            dims_match(&self.dims(), &rhs.dims()),
+            "Dims must match to mod tensors. Got {:?} and {:?}",
+            self.dims(),
+            rhs.dims()
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to mod tensors. Got {:?} and {:?}",
@@ -294,7 +305,12 @@ impl<S: Into<Expression>> Rem<S> for GraphTensor {
 impl GraphTensor {
     /// Less than comparison
     pub fn lt(self, rhs: GraphTensor) -> GraphTensor {
-        assert_eq!(self.dims(), rhs.dims(), "Dims must match to lt tensors.");
+        assert!(
+            dims_match(&self.dims(), &rhs.dims()),
+            "Dims must match to lt tensors. Got {:?} and {:?}",
+            self.dims(),
+            rhs.dims()
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to compare tensors. Got {:?} and {:?}",

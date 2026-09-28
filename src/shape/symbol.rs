@@ -294,6 +294,21 @@ mod tests {
         assert_eq!((expr('z') + expr('a')).to_kernel(), "(const_z+const_a)");
     }
 
+    /// A pad clamps its source row with `min`/`max` and multiplies the result
+    /// by a stride; that product is computed in the cast type, so a kernel
+    /// indexing past 2^31 must be able to ask for a 64-bit one. The default
+    /// spelling is unchanged for every other caller.
+    #[test]
+    fn min_max_cast_to_the_requested_index_type() {
+        let clamp = (expr('z') - 1).max(0).min(8063) * 774144;
+        let narrow = clamp.to_kernel();
+        assert!(narrow.contains("min((int)max((int)"), "{narrow}");
+        let wide = clamp.to_kernel_with_index_ty("chunk", "long long");
+        assert!(wide.contains("min((long long)max((long long)"), "{wide}");
+        assert!(!wide.contains("(int)"), "{wide}");
+        assert!(wide.contains("chunk") && !wide.contains("const_z"), "{wide}");
+    }
+
     /// Generated kernels declare a local `long long const_z` for the thread
     /// index, so a dim may never be named `z` — it would `#define` over that
     /// local.

@@ -6,6 +6,7 @@ pub mod graph;
 pub mod hlir;
 pub mod mask_events;
 pub mod op;
+pub mod program;
 pub mod search;
 pub mod shape;
 pub mod visualization;

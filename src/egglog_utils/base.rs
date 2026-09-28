@@ -1021,6 +1021,130 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
         rewrite("add-sub-cancel2", add(sub(v("b"), v("a")), v("a")), v("b")).ruleset("expr"),
     );
     p.add_rule(rewrite("sub-self", sub(v("a"), v("a")), num(i64(0))).ruleset("expr"));
+    // The bounds a `slice` over a symbolic sequence produces: splitting a
+    // concat subtracts the prefix's own length back out (`(t+n) - t`), and a
+    // `RangeFrom` spells its end as `i64::MAX` (`min(t+n, MAX)`). Without
+    // these every downstream shape keeps the chain and the kernels evaluate
+    // it per index.
+    p.add_rule(rewrite("sub-add-cancel", sub(add(v("a"), v("b")), v("a")), v("b")).ruleset("expr"));
+    p.add_rule(rewrite("sub-add-cancel2", sub(add(v("b"), v("a")), v("a")), v("b")).ruleset("expr"));
+    // Three-term sums (`(t + n) + c` for text + image + reference tokens):
+    // `add-comm` supplies the other operand orders, so one shape suffices.
+    p.add_rule(
+        rewrite(
+            "sub-add-assoc-cancel",
+            sub(add(add(v("a"), v("b")), v("c")), v("a")),
+            add(v("b"), v("c")),
+        )
+        .ruleset("expr"),
+    );
+    // `min(a + b, a)` folds to `a` when `b` is a sum/product of dims and
+    // non-negative literals — every dynamic dim is a size. This is what a
+    // prefix slice of a symbolic concat needs (`min(t + n, t)` for the text
+    // rows of a joint sequence): without it the shape keeps the `min` and no
+    // downstream equality (`dims_match`, the fold predicates) sees through it.
+    //
+    // The proof is demand-driven: `nonneg_demand` marks the `b` of such a
+    // `min` and its sub-terms, and `nonneg` is derived only for demanded
+    // terms. Deriving it for every term instead crowded the simplifier's
+    // fixed five `expr` iterations and changed unrelated extractions. The
+    // loop index `MIter` is deliberately never non-negative here: index
+    // expressions with subtraction must keep their `min`s.
+    p.add_function(FunctionDef {
+        name: "nonneg_demand".to_string(),
+        args: vec![EXPRESSION.name.to_string()],
+        ret: I64.name.to_string(),
+        merge: Some("(max old new)".to_string()),
+    });
+    p.add_function(FunctionDef {
+        name: "nonneg".to_string(),
+        args: vec![EXPRESSION.name.to_string()],
+        ret: I64.name.to_string(),
+        merge: Some("(max old new)".to_string()),
+    });
+    for (name, rule) in [
+        (
+            "nonneg-demand-min",
+            "((= ?m (MMin (MAdd ?a ?b) ?a))) ((set (nonneg_demand ?b) 1))",
+        ),
+        (
+            "nonneg-demand-min2",
+            "((= ?m (MMin ?a (MAdd ?a ?b)))) ((set (nonneg_demand ?b) 1))",
+        ),
+        (
+            "nonneg-demand-add",
+            "((= 1 (nonneg_demand ?e)) (= ?e (MAdd ?a ?b))) \
+             ((set (nonneg_demand ?a) 1) (set (nonneg_demand ?b) 1))",
+        ),
+        (
+            "nonneg-demand-mul",
+            "((= 1 (nonneg_demand ?e)) (= ?e (MMul ?a ?b))) \
+             ((set (nonneg_demand ?a) 1) (set (nonneg_demand ?b) 1))",
+        ),
+        (
+            "nonneg-var",
+            "((= 1 (nonneg_demand ?e)) (= ?e (MVar ?x))) ((set (nonneg ?e) 1))",
+        ),
+        (
+            "nonneg-num",
+            "((= 1 (nonneg_demand ?e)) (= ?e (MNum ?n)) (>= ?n 0)) ((set (nonneg ?e) 1))",
+        ),
+        (
+            "nonneg-add",
+            "((= 1 (nonneg_demand ?e)) (= ?e (MAdd ?a ?b)) (= 1 (nonneg ?a)) (= 1 (nonneg ?b))) \
+             ((set (nonneg ?e) 1))",
+        ),
+        (
+            "nonneg-mul",
+            "((= 1 (nonneg_demand ?e)) (= ?e (MMul ?a ?b)) (= 1 (nonneg ?a)) (= 1 (nonneg ?b))) \
+             ((set (nonneg ?e) 1))",
+        ),
+        (
+            "min-add-nonneg",
+            "((= ?m (MMin (MAdd ?a ?b) ?a)) (= 1 (nonneg ?b))) ((union ?m ?a))",
+        ),
+        (
+            "min-add-nonneg2",
+            "((= ?m (MMin ?a (MAdd ?a ?b))) (= 1 (nonneg ?b))) ((union ?m ?a))",
+        ),
+    ] {
+        p.add_rule(Rule::raw(format!("(rule {rule} :ruleset expr :name \"{name}\")")));
+    }
+    p.add_rule(rewrite("min-self", min(v("a"), v("a")), v("a")).ruleset("expr"));
+    p.add_rule(rewrite("max-self", max(v("a"), v("a")), v("a")).ruleset("expr"));
+    p.add_rule(rewrite("min-i64-max", min(v("a"), num(i64(i64::MAX))), v("a")).ruleset("expr"));
+    p.add_rule(rewrite("min-i64-max2", min(num(i64(i64::MAX)), v("a")), v("a")).ruleset("expr"));
+    // Exact division of a product by one of its factors. `split_dims` and
+    // `merge_dims` spell a symbolic view's index as `(h*w) / w` and
+    // `(h*w) % w`; without these a dynamic-H/W graph cannot prove that
+    // splitting `(h*w)` by `w` is exact, and every unfold index keeps the
+    // div/mod chain instead of collapsing to the dim. Integer-exact for any
+    // non-zero divisor, and a zero divisor is undefined in the original too.
+    p.add_rule(rewrite("mul-div-cancel", div(mul(v("a"), v("b")), v("b")), v("a")).ruleset("expr"));
+    p.add_rule(rewrite("mul-div-cancel2", div(mul(v("b"), v("a")), v("b")), v("a")).ruleset("expr"));
+    p.add_rule(
+        rewrite("mul-mod-cancel", modd(mul(v("a"), v("b")), v("b")), num(i64(0))).ruleset("expr"),
+    );
+    p.add_rule(
+        rewrite("mul-mod-cancel2", modd(mul(v("b"), v("a")), v("b")), num(i64(0))).ruleset("expr"),
+    );
+    p.add_rule(rewrite("mod-self", modd(v("a"), v("a")), num(i64(0))).ruleset("expr"));
+    // `(a*8)/2 -> a*4`: a strided window over a pixel extent that is a
+    // multiple of the stride (`8*latent` for the VAE downsamplers) has an
+    // output extent that is a plain multiple again, which is what lets a
+    // stride-2 conv's `h_out` and `h_in` be related structurally.
+    p.add_rule(
+        rewrite(
+            "mul-div-const-exact",
+            div(mul(v("a"), num(v("?b"))), num(v("?c"))),
+            mul(v("a"), num(pdiv(v("?b"), v("?c")))),
+        )
+        .when(vec![
+            pgte(v("?c"), i64(1)),
+            peq(pmod(v("?b"), v("?c")), i64(0)),
+        ])
+        .ruleset("expr"),
+    );
     p.add_rule(
         rewrite(
             "add-sub-const",

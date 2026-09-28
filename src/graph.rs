@@ -93,7 +93,7 @@ impl<'a> From<&'a BucketLLIR> for BucketLLIRRef<'a> {
 
 /// A bucket for a dynamic dimension, defining a range of valid values.
 /// For an exact value, use `min == max` (zero-length range).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DimBucket {
     pub min: usize,
     pub max: usize,
@@ -416,7 +416,7 @@ impl Graph {
         Graph::default()
     }
 
-    fn run_auto_loop_rolling_prepass(&mut self, options: &CompileOptions) {
+    pub(crate) fn run_auto_loop_rolling_prepass(&mut self, options: &CompileOptions) {
         let log = options.rolling_log_enabled();
         let before = self.graph.node_count();
         // Roll to a fixpoint. Each pass rolls the single best repeated
@@ -1592,25 +1592,45 @@ impl Graph {
         let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
         let extra_egglog = Rt::extra_egglog();
+        let backend_placement = Rt::egglog_backend_ruleset_placement();
 
         let (program, root) = hlir_to_egglog(self);
+        let enode_limits = Rt::enode_resource_limits();
         let buckets = bucket_index_combinations(&dim_buckets)
             .into_iter()
             .map(|bucket_indices| {
                 let intervals = self.bucket_intervals(&dim_buckets, &bucket_indices);
                 let (contextual_program, use_interval_analysis) =
                     self.egglog_program_with_interval_facts(&program, &intervals);
-                let egraph = run_egglog_with_late_passes_interval_analysis_and_log(
+                let mut egraph = run_egglog_with_late_passes_interval_analysis_and_log(
                     &contextual_program,
                     &root,
                     &ops,
                     Rt::CLEANUP_HLIR,
                     &late_passes,
                     &extra_egglog,
+                    backend_placement,
                     use_interval_analysis,
                     options.egglog_log_enabled(),
                 )
                 .unwrap();
+                // Drop every lowering whose own output tensor the device can
+                // never hold or dispatch, measured at this bucket's maxima so
+                // a dynamic dim is bounded by its bucket. The static egglog
+                // prunes only fire on literal shapes; this is what keeps the
+                // `Sum(Mul)` matmul spelling out of a symbolic-H/W search.
+                if !enode_limits.is_unbounded() {
+                    let bucket_max_dyn_map = self.bucket_max_dyn_map(&dim_buckets, &bucket_indices);
+                    let report = crate::egglog_utils::prune_oversized_enodes(
+                        &mut egraph,
+                        &ops,
+                        enode_limits,
+                        &bucket_max_dyn_map,
+                    );
+                    if options.search_log_enabled() && (report.pruned_anything() || report.reverted) {
+                        println!("   resource prune: {}", report.summary());
+                    }
+                }
                 BucketSearchSpace {
                     egraph,
                     bucket_indices,
@@ -1667,6 +1687,21 @@ impl Graph {
         } else {
             (format!("{facts}\n{program}"), true)
         }
+    }
+
+    /// The graph's dyn map with each bucketed dim at *this* bucket
+    /// combination's maximum: the largest shape the bucket's program must
+    /// serve, which is what per-e-node resource ceilings are measured at.
+    fn bucket_max_dyn_map(
+        &self,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
+        bucket_indices: &DynMap,
+    ) -> DynMap {
+        let mut dyn_map = self.dyn_map.clone();
+        for (&dim, &idx) in bucket_indices {
+            dyn_map.insert(dim, dim_buckets[&dim][idx].max);
+        }
+        dyn_map
     }
 
     /// Dyn map handed to backend late passes: bucket maxima override the

@@ -43,6 +43,30 @@ pub trait Runtime {
     {
         String::new()
     }
+    /// Where the main saturation schedule steps the backend-selection
+    /// rulesets (`matmul_backend`, `glumoe`). Core keeps the historical
+    /// in-loop placement; a backend whose selection rules are wide joins can
+    /// opt into stepping them once per outer iteration, which reaches the
+    /// same fixed point at a fraction of the search cost. See
+    /// [`crate::egglog_utils::BackendRulesetPlacement`].
+    fn egglog_backend_ruleset_placement() -> crate::egglog_utils::BackendRulesetPlacement
+    where
+        Self: Sized,
+    {
+        crate::egglog_utils::BackendRulesetPlacement::Inner
+    }
+    /// Per-e-node output ceilings for the device, applied to every bucket's
+    /// saturated e-graph before the search sees it
+    /// ([`crate::egglog_utils::prune_oversized_enodes`]). Shapes are measured
+    /// at the bucket's *maximum* dyn values, so a dynamic dim is bounded by
+    /// its bucket rather than left unmeasured. Unbounded (the default)
+    /// disables the pass.
+    fn enode_resource_limits() -> crate::egglog_utils::EnodeResourceLimits
+    where
+        Self: Sized,
+    {
+        crate::egglog_utils::EnodeResourceLimits::default()
+    }
     fn initialize(arg: Self::CompileArg) -> Self;
     /// Choose one program per bucket of `space` — by any strategy — and leave
     /// the runtime ready to [`Runtime::execute`].

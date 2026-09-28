@@ -21,7 +21,7 @@ pub struct PackedLLIRGraph {
     pub outgoing_targets: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LlirFingerprint(u64, u64);
 
 struct LlirFingerprintHasher {

@@ -798,6 +798,12 @@ fn action_to_egglog(action: &Action) -> String {
 }
 
 fn rule_to_egglog(rule: &Rule) -> String {
+    // A pre-formatted rule renders verbatim here too, not only through
+    // `Rule::to_egglog_string`; otherwise a raw rule added to a `Program`
+    // came out as the empty `(rule () ())`.
+    if let Some(raw) = &rule.raw {
+        return raw.clone();
+    }
     let facts: Vec<_> = rule.facts.iter().map(term_to_egglog).collect();
     let actions: Vec<_> = rule.actions.iter().map(action_to_egglog).collect();
     let mut out = format!("(rule ({}) ({})", facts.join(" "), actions.join(" "));

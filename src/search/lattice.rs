@@ -18,6 +18,7 @@ use rustc_hash::FxHashSet;
 use super::finalist::{FinalistValidator, Finalists};
 use super::{BucketLLIR, BucketLLIRRef};
 use crate::graph::CompileOptions;
+use crate::program::{BucketSelection, ProgramSelection};
 
 /// Combines one metric per bucket into the value the lattice walk minimizes.
 pub type AggregateFn<'a, M> = Box<dyn Fn(&[M]) -> M + 'a>;
@@ -230,6 +231,13 @@ impl<'a, M: PartialOrd + Clone + Debug> BucketLattice<'a, M> {
     /// `LLIR_DUMP_DIR`) as `(bucket_indices, representative_dyn_map, llir)`
     /// per bucket.
     pub fn select(self, set: BucketSet) -> Vec<BucketLLIR> {
+        self.select_with_program(set).0
+    }
+
+    /// [`Self::select`], also returning the selection in its saveable form:
+    /// the genome of every chosen finalist as stable e-graph ids, which
+    /// [`crate::program::save_program`] writes next to the e-graphs.
+    pub fn select_with_program(self, set: BucketSet) -> (Vec<BucketLLIR>, ProgramSelection) {
         if self.search_log && self.rejections > 0 {
             println!(
                 "   {:>6}  aggregate fallback: selected per-bucket finalist ranks {:?} after {} rejection(s)",
@@ -238,19 +246,27 @@ impl<'a, M: PartialOrd + Clone + Debug> BucketLattice<'a, M> {
                 self.rejections,
             );
         }
-        self.buckets
-            .into_iter()
-            .zip(set.indices)
-            .map(|(bucket, idx)| {
-                let ctx = bucket.bucket_context();
-                let finalist = bucket.take(idx);
-                (
-                    ctx.bucket_indices().clone(),
-                    ctx.representative_dyn_map.clone(),
-                    finalist.llir,
-                )
-            })
-            .collect()
+        let mut llirs = Vec::with_capacity(self.buckets.len());
+        let mut selection = Vec::with_capacity(self.buckets.len());
+        for (bucket, idx) in self.buckets.into_iter().zip(set.indices) {
+            let ctx = bucket.bucket_context();
+            let choices = bucket.choice_entries(&bucket.get(idx).genome);
+            let finalist = bucket.take(idx);
+            selection.push(BucketSelection {
+                space_bucket_index: ctx.index,
+                bucket_indices: ctx.bucket_indices().clone(),
+                representative_dyn_map: ctx.representative_dyn_map.clone(),
+                intervals: ctx.bucket().intervals.clone(),
+                choices,
+                fingerprint: finalist.fingerprint,
+            });
+            llirs.push((
+                ctx.bucket_indices().clone(),
+                ctx.representative_dyn_map.clone(),
+                finalist.llir,
+            ));
+        }
+        (llirs, ProgramSelection { buckets: selection })
     }
 
     /// Why no viable set could be proposed.

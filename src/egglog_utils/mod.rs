@@ -19,6 +19,8 @@ pub use egraph_serialize::{ClassId, NodeId};
 
 pub mod api;
 pub mod base;
+pub mod resource_prune;
+pub use resource_prune::{EnodePruneReport, EnodeResourceLimits, prune_oversized_enodes};
 
 pub(crate) fn llir_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -87,6 +89,30 @@ pub fn log_channel_enabled(option_enabled: bool, channel_env: &str) -> bool {
 struct EgglogSchedulePhase {
     name: String,
     schedule: String,
+}
+
+/// Where the main saturation schedule runs the backend-selection rulesets
+/// (`matmul_backend`, `glumoe`). Chosen per backend through
+/// [`crate::op::Runtime::egglog_backend_ruleset_placement`].
+///
+/// Both placements reach the same fixed point: those rulesets only add
+/// facts and e-nodes, and the outer `saturate` re-runs the producer and
+/// fusion loops after every backend pass either way. They differ in cost.
+/// egglog caches one join plan per rule on the rule's first run and then
+/// executes one timestamp-constrained variant of that plan per atom on every
+/// later run, so a wide backend rule (tens of atoms) pays roughly
+/// `atoms x join work` every time its ruleset is stepped. `Inner` steps the
+/// backend rulesets on every pass of the producer loop while the graph is
+/// still being lowered; `Outer` steps them once per outer iteration, after
+/// both inner loops have saturated, so the first pass sees the lowered graph
+/// in one variant and later passes see small deltas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendRulesetPlacement {
+    /// Inside the producer loop (core default).
+    #[default]
+    Inner,
+    /// Once per outer iteration, after the producer and fusion loops.
+    Outer,
 }
 
 pub type EGraphPostprocess = Arc<dyn Fn(&mut SerializedEGraph) + Send + Sync + 'static>;
@@ -201,6 +227,10 @@ pub struct OpTextParts {
     /// spliced after `op_defs` and `op_declarations`, before the rewrite rules.
     /// Empty for core / the reference backend.
     extra_egglog: String,
+    /// Placement of the backend-selection rulesets in the main schedule (see
+    /// [`BackendRulesetPlacement`]); set by the Rt-aware callers like
+    /// `extra_egglog`.
+    backend_placement: BackendRulesetPlacement,
     cleanups: String,
     /// Names of op kinds that are eligible for cleanup (cleanup() == true).
     /// Used by the Rust post-processing pass to safely strip HLIR ops only
@@ -239,6 +269,7 @@ impl OpTextParts {
             // Default empty; the backend's Runtime::extra_egglog() is spliced in
             // by the Rt-aware callers (build_search_space) after construction.
             extra_egglog: String::new(),
+            backend_placement: BackendRulesetPlacement::Inner,
             // The egglog `cleanup` ruleset deletes HLIR ops unconditionally,
             // even when no kernel rewrite fired in their eclass. On large
             // graphs (e.g. YOLO v11) that produces empty eclasses and the
@@ -312,10 +343,14 @@ fn expr_schedule(use_interval_analysis: bool) -> &'static str {
     }
 }
 
-fn egglog_main_cycle_phases(cycle: usize, use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> {
+fn egglog_main_cycle_phases(
+    cycle: usize,
+    use_interval_analysis: bool,
+    backend_placement: BackendRulesetPlacement,
+) -> Vec<EgglogSchedulePhase> {
     vec![EgglogSchedulePhase {
         name: format!("cycle {cycle:03} main"),
-        schedule: egglog_main_schedule(use_interval_analysis),
+        schedule: egglog_main_schedule(use_interval_analysis, backend_placement),
     }]
 }
 
@@ -375,14 +410,18 @@ fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> 
     ]
 }
 
-fn egglog_main_schedule(use_interval_analysis: bool) -> String {
+fn egglog_main_schedule(
+    use_interval_analysis: bool,
+    backend_placement: BackendRulesetPlacement,
+) -> String {
     let expr = expr_schedule(use_interval_analysis);
     // Producer rules create raw alternatives that downstream fusion consumes.
     // Fusion grow/merge only consumes Kernel*/FusionEnd alternatives, so keeping
     // producer discovery saturated before fusion reaches the same fixed point
     // while avoiding repeated expensive pair-discovery scans during growth.
-    format!(
-        "(saturate (seq
+    match backend_placement {
+        BackendRulesetPlacement::Inner => format!(
+            "(saturate (seq
         (saturate (seq
             {expr}
             (saturate dtype_prop)
@@ -402,11 +441,39 @@ fn egglog_main_schedule(use_interval_analysis: bool) -> String {
             (run fusion_merge)
         ))
     ))"
-    )
+        ),
+        // The backend rulesets step once per outer iteration, after both
+        // inner loops have saturated (see `BackendRulesetPlacement::Outer`).
+        BackendRulesetPlacement::Outer => format!(
+            "(saturate (seq
+        (saturate (seq
+            {expr}
+            (saturate dtype_prop)
+            (run matmul_flatten)
+            (run kernel_lower)
+            (run direct_kernel)
+            (run kernel_specialize)
+            (run buffer_reuse)
+            (run fusion_pair)
+        ))
+        (saturate (seq
+            {expr}
+            (saturate dtype_prop)
+            (run fusion_grow)
+            (run fusion_merge)
+        ))
+        (run matmul_backend)
+        (run glumoe)
+    ))"
+        ),
+    }
 }
 
 fn egglog_schedule_program() -> String {
-    let mut schedules = vec![format!("(run-schedule {})", egglog_main_schedule(false))];
+    let mut schedules = vec![format!(
+        "(run-schedule {})",
+        egglog_main_schedule(false, BackendRulesetPlacement::Inner)
+    )];
     schedules.extend(
         egglog_final_phases(false)
             .into_iter()
@@ -457,6 +524,7 @@ use egglog_reports::ReportLevel;
 #[derive(Debug, Clone)]
 ///  This is snapshot of an EGraph with Rust native hash maps and sets for enabling more native traversal / algorithm writing.
 ///  The name comes from the serialize egraph crates, which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SerializedEGraph {
     pub enodes: FxHashMap<NodeId, (String, Vec<ClassId>)>,
     pub eclasses: FxHashMap<ClassId, (String, Vec<NodeId>)>,
@@ -1289,6 +1357,7 @@ pub fn run_egglog_with_report_late_passes_and_interval_analysis(
         cleanup,
         late_passes,
         "",
+        BackendRulesetPlacement::Inner,
         use_interval_analysis,
         log_channel_enabled(false, "EGGLOG_LOG"),
     )
@@ -1303,11 +1372,13 @@ pub fn run_egglog_with_report_late_passes_interval_analysis_and_log(
     cleanup: bool,
     late_passes: &[LateEgglogPass],
     extra_egglog: &str,
+    backend_placement: BackendRulesetPlacement,
     use_interval_analysis: bool,
     log: bool,
 ) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
     let mut op_parts = OpTextParts::new_with_late_passes(ops, cleanup, late_passes);
     op_parts.extra_egglog = extra_egglog.to_string();
+    op_parts.backend_placement = backend_placement;
     run_egglog_with_report_parts_impl(program, root, &op_parts, use_interval_analysis, log)
 }
 
@@ -1396,7 +1467,9 @@ fn run_egglog_with_report_parts_impl(
     let mut reached_fixed_point = false;
     for cycle in 1..=MAIN_SCHEDULE_MAX_CYCLES {
         let mut cycle_updated = false;
-        for phase in egglog_main_cycle_phases(cycle, use_interval_analysis) {
+        for phase in
+            egglog_main_cycle_phases(cycle, use_interval_analysis, op_parts.backend_placement)
+        {
             cycle_updated |= run_schedule_phase(&mut egraph, &mut phases, &phase, log)?;
         }
         if egraph.num_tuples() > MAIN_SCHEDULE_MAX_TUPLES {
@@ -1660,6 +1733,7 @@ pub fn run_egglog_with_late_passes_interval_analysis_and_log(
     cleanup: bool,
     late_passes: &[LateEgglogPass],
     extra_egglog: &str,
+    backend_placement: BackendRulesetPlacement,
     use_interval_analysis: bool,
     log: bool,
 ) -> Result<SerializedEGraph, egglog::Error> {
@@ -1670,6 +1744,7 @@ pub fn run_egglog_with_late_passes_interval_analysis_and_log(
         cleanup,
         late_passes,
         extra_egglog,
+        backend_placement,
         use_interval_analysis,
         log,
     )
@@ -1722,7 +1797,14 @@ pub fn extract_expr_list<'a>(
 }
 
 pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DType {
-    match egraph.enodes[node].0.as_str() {
+    try_extract_dtype(egraph, node)
+        .unwrap_or_else(|| panic!("unknown dtype {}", egraph.enodes[node].0))
+}
+
+/// The dtype an e-node names, or `None` when the e-node is not a dtype
+/// constructor (a `(dtype ?ir)` application sharing the class, say).
+pub fn try_extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> Option<DType> {
+    Some(match egraph.enodes[node].0.as_str() {
         "F32" => DType::F32,
         "F64" => DType::F64,
         "F16" => DType::F16,
@@ -1745,8 +1827,8 @@ pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DTyp
         "I16" => DType::I16,
         "U16" => DType::U16,
         "TF32" => DType::TF32,
-        other => panic!("unknown dtype {other}"),
-    }
+        _ => return None,
+    })
 }
 
 /// Decode the op label of an egglog String-primitive e-node into its name.
@@ -2174,6 +2256,49 @@ impl<'a> LlirExtractor<'a> {
             self.mutation_nodes[class as usize] = Some(pool);
         }
         self.mutation_nodes[class as usize].as_deref().unwrap()
+    }
+
+    /// A genome as stable `(e-class, e-node)` id pairs, sorted by e-class,
+    /// so a selection can be written to disk and re-indexed by another
+    /// process. The dense slots inside [`IndexedChoiceSet`] cannot be: they
+    /// follow hash-map iteration order and change from run to run.
+    pub fn choice_entries(&self, choices: &IndexedChoiceSet) -> Vec<(ClassId, NodeId)> {
+        let mut entries: Vec<(ClassId, NodeId)> = self
+            .indexed_classes
+            .iter()
+            .zip(&choices.choices)
+            .filter(|(_, slot)| **slot != NO_DENSE_INDEX)
+            .map(|(class, &slot)| (class.id.clone(), class.nodes[slot as usize].clone()))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Inverse of [`Self::choice_entries`]: re-index stored pairs against this
+    /// extractor's e-graph. The error names the first pair that does not
+    /// exist in it, which is what a stale or foreign selection looks like.
+    pub fn index_owned_choices(
+        &self,
+        entries: &[(ClassId, NodeId)],
+    ) -> Result<IndexedChoiceSet, String> {
+        let mut indexed = vec![NO_DENSE_INDEX; self.indexed_classes.len()];
+        let mut hash = 0u64;
+        for (class, node) in entries {
+            let Some(&class_index) = self.class_to_index.get(class) else {
+                return Err(format!("e-class {class} is not in the e-graph"));
+            };
+            let nodes = self.indexed_classes[class_index as usize].nodes;
+            let Some(slot) = nodes.iter().position(|candidate| candidate == node) else {
+                return Err(format!("e-node {node} is not in e-class {class}"));
+            };
+            indexed[class_index as usize] =
+                DenseIndex::try_from(slot).map_err(|_| "too many e-nodes in e-class".to_string())?;
+            hash ^= hash_choice_entry(class, node);
+        }
+        Ok(IndexedChoiceSet {
+            choices: indexed,
+            hash,
+        })
     }
 
     pub fn index_choice_set(&self, choices: &EGraphChoiceSet<'a>) -> IndexedChoiceSet {

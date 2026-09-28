@@ -21,6 +21,23 @@ pub fn flatten_strides(range: &[Expression], strides: &[Expression]) -> Expressi
     flat_stride.simplify()
 }
 
+/// Whether two dim lists describe the same shape.
+///
+/// `Expression`'s `PartialEq` is term-vector equality, so two spellings of
+/// one symbolic size — `n+5` from padding the left operand of a concat and
+/// `5+n` from padding the right one — compare unequal even though every
+/// assignment agrees. Static dims and identical spellings short-circuit;
+/// only a genuinely symbolic disagreement pays for the e-graph proof.
+pub fn dims_match(a: &[Expression], b: &[Expression]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x == y || {
+                let (xs, ys) = (x.simplify(), y.simplify());
+                xs == ys || ((xs.is_dynamic() || ys.is_dynamic()) && xs.egglog_equal(ys))
+            }
+        })
+}
+
 fn get_start_bound<D: Into<Expression> + Copy>(bound: Bound<D>) -> Expression {
     match bound {
         Bound::Included(x) => x.into(),

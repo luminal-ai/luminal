@@ -14,9 +14,10 @@ use colored::Colorize;
 
 use super::diagnostics::maybe_dump_selected_llir;
 use super::genetic::Ranked;
+use super::packed::LlirFingerprint;
 use super::unroll::unroll_packed_llir;
 use super::{BucketContext, SearchSpace};
-use crate::egglog_utils::{IndexedChoiceSet, LlirExtractor};
+use crate::egglog_utils::{ClassId, IndexedChoiceSet, LlirExtractor, NodeId};
 use crate::graph::{CompileOptions, LLIRGraph};
 use crate::shape::DynMap;
 
@@ -30,6 +31,11 @@ pub struct Finalist<M> {
     pub llir: LLIRGraph,
     /// Rolled graph before unrolling, kept only under `LLIR_DUMP_PRE_UNROLL`.
     pub pre_unroll: Option<LLIRGraph>,
+    /// The genome `llir` was extracted from, so a selection can be saved as a
+    /// [`crate::program::ProgramSelection`] and re-extracted elsewhere.
+    pub genome: IndexedChoiceSet,
+    /// Fingerprint of the packed (pre-unroll) extraction of `genome`.
+    pub fingerprint: LlirFingerprint,
 }
 
 /// A ranked genome, re-extracted and unrolled, awaiting the hard filter.
@@ -41,6 +47,8 @@ pub struct PendingFinalist<M> {
     /// Dyn values the hard filter should judge the graph at: the bucket
     /// representative when bucketed, otherwise the profiling dyn map.
     pub dyn_map: DynMap,
+    pub genome: IndexedChoiceSet,
+    pub fingerprint: LlirFingerprint,
     pre_unroll: Option<LLIRGraph>,
     started_at: Instant,
 }
@@ -95,6 +103,12 @@ impl<'a, M: Clone + Debug> Finalists<'a, M> {
 
     pub fn bucket_context(&self) -> &'a BucketContext<'a> {
         self.ctx
+    }
+
+    /// `genome` as stable e-graph id pairs (see
+    /// [`LlirExtractor::choice_entries`]).
+    pub fn choice_entries(&self, genome: &IndexedChoiceSet) -> Vec<(ClassId, NodeId)> {
+        self.extractor.choice_entries(genome)
     }
 
     /// Viable finalists materialized so far, fastest first.
@@ -168,15 +182,18 @@ impl<'a, M: Clone + Debug> Finalists<'a, M> {
                     .extractor
                     .extract_indexed_packed(&genome, self.custom_ops);
                 let pre_unroll = self.dump_pre_unroll.then(|| packed.to_stable());
-                (pre_unroll, unroll_packed_llir(packed))
+                let fingerprint = packed.fingerprint();
+                (pre_unroll, fingerprint, unroll_packed_llir(packed))
             }));
             match extracted {
-                Ok((pre_unroll, llir)) => {
+                Ok((pre_unroll, fingerprint, llir)) => {
                     return Some(PendingFinalist {
                         rank,
                         metric,
                         llir,
                         dyn_map: self.filter_dyn_map.clone(),
+                        genome,
+                        fingerprint,
                         pre_unroll,
                         started_at,
                     });
@@ -242,6 +259,8 @@ impl<'a, M: Clone + Debug> Finalists<'a, M> {
             metric: pending.metric,
             pre_unroll: pending.pre_unroll,
             llir: pending.llir,
+            genome: pending.genome,
+            fingerprint: pending.fingerprint,
         });
         true
     }
