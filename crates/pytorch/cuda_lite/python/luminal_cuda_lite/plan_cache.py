@@ -128,7 +128,9 @@ def structural_fingerprint(
     nodes = [
         [
             node.op,
-            _target(node.target) if node.op not in ("placeholder", "output") else node.op,
+            _target(node.target)
+            if node.op not in ("placeholder", "output")
+            else node.op,
             _encode(node.args, node_ids, symbols),
             _encode(node.kwargs, node_ids, symbols),
             _tensor_meta(node.meta.get("val"), symbols),
@@ -260,7 +262,9 @@ def clear_plan_cache() -> None:
     global _hits, _misses
     with _lock:
         if any(isinstance(value, _Pending) for value in _entries.values()):
-            raise RuntimeError("cannot clear the Luminal plan cache while a search is running")
+            raise RuntimeError(
+                "cannot clear the Luminal plan cache while a search is running"
+            )
         _entries.clear()
         _hits = 0
         _misses = 0

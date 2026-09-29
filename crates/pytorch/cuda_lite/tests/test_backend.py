@@ -352,6 +352,7 @@ def test_external_cuda_graph_replays_chain_of_compiled_regions():
 
     regions = []
     for _ in range(8):
+
         def region(x, weight):
             return torch.relu(x @ weight)
 
@@ -409,8 +410,6 @@ def test_external_cuda_graph_replays_earlier_dynamic_capture():
     small_graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(small_output, fn(small, weight))
-
-
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")

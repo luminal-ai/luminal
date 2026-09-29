@@ -31,7 +31,9 @@ def load_artifact(path: Path, fingerprint: str) -> Any:
             f"expected {_FILE_SCHEMA}"
         )
     if document.get("fingerprint") != fingerprint:
-        raise RuntimeError(f"Luminal artifact {path} has the wrong structural fingerprint")
+        raise RuntimeError(
+            f"Luminal artifact {path} has the wrong structural fingerprint"
+        )
     payload = base64.b64decode(document["plan"], validate=True)
     return PlanTemplate.deserialize_artifact(
         payload,

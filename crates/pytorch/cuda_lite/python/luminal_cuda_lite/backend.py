@@ -846,9 +846,7 @@ def _dynamic_export(
         dim_specs[expr] = Dim("luminal_dynamic_dim", min=minimum, max=maximum)
     else:
         for index, (expr, size) in enumerate(dynamic_sizes.items()):
-            dim_specs[expr] = _symbolic_dim_spec(
-                size, f"luminal_dynamic_dim_{index}"
-            )
+            dim_specs[expr] = _symbolic_dim_spec(size, f"luminal_dynamic_dim_{index}")
 
     records: list[tuple[str, torch.fx.Node, Any]] = []
     tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
@@ -955,9 +953,7 @@ def _compile_graph(
         artifact_dir = options.get("artifact_dir", artifact_dir)
         artifact_prefix = options.get("artifact_prefix", artifact_prefix)
         disable_cache = options.get("disable_cache", disable_cache)
-        external_cuda_graph = options.get(
-            "external_cuda_graph", external_cuda_graph
-        )
+        external_cuda_graph = options.get("external_cuda_graph", external_cuda_graph)
 
     # HF DynamicCache must be pytree-registered before torch.export capture so
     # use_cache=True models can export. Idempotent.

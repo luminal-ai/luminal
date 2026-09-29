@@ -41,7 +41,9 @@ class _Mul(torch.nn.Module):
 
 def _fingerprint(module, shape=(2, 3), *, dtype=torch.float32, iterations=3):
     ep = torch.export.export(
-        module, (torch.ones(shape, dtype=dtype), torch.ones(shape, dtype=dtype)), strict=False
+        module,
+        (torch.ones(shape, dtype=dtype), torch.ones(shape, dtype=dtype)),
+        strict=False,
     )
     names = [spec.arg.name for spec in ep.graph_signature.input_specs]
     output = next(
@@ -221,7 +223,7 @@ def test_isomorphic_modules_share_search_but_keep_distinct_weight_bindings(tmp_p
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_persistent_artifact_loads_in_a_fresh_process(tmp_path):
     """Process B must execute process A's artifact without an in-memory hit."""
-    program = r'''
+    program = r"""
 import json
 import sys
 
@@ -252,7 +254,7 @@ print("LUMINAL_RESULT=" + json.dumps({
     "cache_hit": compiled.plan_cache_hit,
     "artifact": compiled.artifact_handle,
 }))
-'''
+"""
 
     def run_process():
         completed = subprocess.run(

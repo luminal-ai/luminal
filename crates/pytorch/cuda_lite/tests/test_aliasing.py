@@ -208,14 +208,12 @@ def test_attention_writes_kv_directly_into_the_callers_cache():
 
     def key():
         return (
-            torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4)
-            / 8
+            torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4) / 8
         )
 
     def value():
         return (
-            torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4)
-            + 1
+            torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4) + 1
         )
 
     def cache():
@@ -252,7 +250,6 @@ def test_writes_through_storage_sharing_inputs_are_refused_by_name():
 
 @cuda
 def test_returned_view_at_a_storage_offset_aliases_the_input():
-
     def fn(x):
         return x[1]
 
