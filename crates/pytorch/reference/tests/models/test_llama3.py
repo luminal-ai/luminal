@@ -142,6 +142,7 @@ def _assert_bf16_logits_match(out_logits, ref_logits, label: str = ""):
     )
 
 
+@pytest.mark.slow
 def test_hf_llama_tiny(device: torch.device):
     """HuggingFace LlamaForCausalLM — tiny (64 hidden, 1 layer, ~70K params)."""
     config = _make_llama_config(
@@ -155,6 +156,7 @@ def test_hf_llama_tiny(device: torch.device):
     _run_hf_llama_test(config, device, atol=1e-5)
 
 
+@pytest.mark.slow
 def test_hf_llama_small(device: torch.device):
     """HuggingFace LlamaForCausalLM — small (256 hidden, 1 layer, ~1.1M params)."""
     config = _make_llama_config(
@@ -168,6 +170,7 @@ def test_hf_llama_small(device: torch.device):
     _run_hf_llama_test(config, device, atol=1e-5)
 
 
+@pytest.mark.slow
 def test_hf_llama_medium(device: torch.device):
     """HuggingFace LlamaForCausalLM — medium (256 hidden, 2 layers, ~1.7M params)."""
     config = _make_llama_config(
@@ -219,6 +222,7 @@ def test_hf_llama3_real_config_1layer(device: torch.device):
     )
 
 
+@pytest.mark.slow
 def test_hf_llama_decode_loop_static(device: torch.device):
     """Decode loop with recompilation each step — validates decode mechanics."""
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -360,6 +364,7 @@ def test_hf_llama38b_full(device: torch.device):
     _assert_bf16_logits_match(out.logits, ref.logits)
 
 
+@pytest.mark.slow
 def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
     """Prototype: luminal's bf16 error stays within the bf16 rounding floor.
 

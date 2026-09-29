@@ -9,9 +9,7 @@ from backend_test_utils import luminal_backend
 
 class BoundaryNoopModel(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype is torch.bool:
-            return x | torch.zeros((), dtype=torch.bool, device=x.device)
-        return x + torch.zeros((), dtype=x.dtype, device=x.device)
+        return x.clone()
 
 
 class AbsModel(torch.nn.Module):
