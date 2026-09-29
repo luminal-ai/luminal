@@ -42,12 +42,12 @@ pub(crate) mod mul;
 pub(crate) mod trunc_div;
 pub(crate) mod trunc_rem;
 // (poison moved to core `luminal::poison` in Step B; re-exported below.)
+pub(crate) mod left_sequential_scan_prod;
+pub(crate) mod left_sequential_scan_sum;
 pub(crate) mod recip;
 pub(crate) mod reduce_max;
 pub(crate) mod reduce_sum;
 pub(crate) mod round;
-pub(crate) mod scan_prod_left_sequential;
-pub(crate) mod scan_sum_left_sequential;
 pub(crate) mod scatter;
 pub(crate) mod select;
 pub(crate) mod sin;
@@ -75,6 +75,8 @@ pub use floor::FloorFunctional;
 pub use gather::Gather;
 pub use index_map_apply_materialize::IndexMapApplyMaterialize;
 pub use iota::Iota;
+pub use left_sequential_scan_prod::LeftSequentialScanProd;
+pub use left_sequential_scan_sum::LeftSequentialScanSum;
 pub use less_than::LessThan;
 pub use log2::Log2Functional;
 pub use luminal::buffer_tensor_ir::Poison;
@@ -84,8 +86,6 @@ pub use recip::RecipFunctional;
 pub use reduce_max::ReduceMax;
 pub use reduce_sum::ReduceSum;
 pub use round::RoundFunctional;
-pub use scan_prod_left_sequential::ScanProdLeftSequential;
-pub use scan_sum_left_sequential::ScanSumLeftSequential;
 pub use scatter::ScatterFunctional;
 pub use sin::SinFunctional;
 pub use sqrt::SqrtFunctional;
@@ -106,6 +106,8 @@ pub use floor::FloorFunctionalDps;
 pub use gather::GatherDps;
 pub use index_map_apply_materialize::IndexMapApplyMaterializeDps;
 pub use iota::{IotaDps, IotaExpr};
+pub use left_sequential_scan_prod::LeftSequentialScanProdDps;
+pub use left_sequential_scan_sum::LeftSequentialScanSumDps;
 pub use less_than::LessThanDps;
 pub use log2::Log2FunctionalDps;
 pub use modulo::ModFunctionalDps;
@@ -114,8 +116,6 @@ pub use recip::RecipFunctionalDps;
 pub use reduce_max::ReduceMaxDps;
 pub use reduce_sum::ReduceSumDps;
 pub use round::RoundFunctionalDps;
-pub use scan_prod_left_sequential::ScanProdLeftSequentialDps;
-pub use scan_sum_left_sequential::ScanSumLeftSequentialDps;
 pub use scatter::ScatterFunctionalDps;
 pub use sin::SinFunctionalDps;
 pub use sqrt::SqrtFunctionalDps;
@@ -133,6 +133,8 @@ pub use floor::FloorFunctionalMatcher;
 pub use gather::GatherMatcher;
 pub use index_map_apply_materialize::IndexMapApplyMaterializeMatcher;
 pub use iota::IotaMatcher;
+pub use left_sequential_scan_prod::LeftSequentialScanProdMatcher;
+pub use left_sequential_scan_sum::LeftSequentialScanSumMatcher;
 pub use less_than::LessThanMatcher;
 pub use log2::Log2FunctionalMatcher;
 pub use modulo::ModFunctionalMatcher;
@@ -141,8 +143,6 @@ pub use recip::RecipFunctionalMatcher;
 pub use reduce_max::ReduceMaxMatcher;
 pub use reduce_sum::ReduceSumMatcher;
 pub use round::RoundFunctionalMatcher;
-pub use scan_prod_left_sequential::ScanProdLeftSequentialMatcher;
-pub use scan_sum_left_sequential::ScanSumLeftSequentialMatcher;
 pub use scatter::ScatterFunctionalMatcher;
 pub use select::{SelectFunctional, SelectFunctionalDps, SelectFunctionalMatcher};
 pub use sin::SinFunctionalMatcher;
@@ -299,17 +299,17 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
                 kernel: entry::<ReduceMaxDps>("ReduceMaxGeneric", reduce_max::kernel),
             },
             ReferenceOp {
-                matcher: || Box::new(ScanSumLeftSequentialMatcher),
-                kernel: entry::<ScanSumLeftSequentialDps>(
-                    "ScanSumLeftSequential",
-                    scan_sum_left_sequential::kernel,
+                matcher: || Box::new(LeftSequentialScanSumMatcher),
+                kernel: entry::<LeftSequentialScanSumDps>(
+                    "LeftSequentialScanSum",
+                    left_sequential_scan_sum::kernel,
                 ),
             },
             ReferenceOp {
-                matcher: || Box::new(ScanProdLeftSequentialMatcher),
-                kernel: entry::<ScanProdLeftSequentialDps>(
-                    "ScanProdLeftSequential",
-                    scan_prod_left_sequential::kernel,
+                matcher: || Box::new(LeftSequentialScanProdMatcher),
+                kernel: entry::<LeftSequentialScanProdDps>(
+                    "LeftSequentialScanProd",
+                    left_sequential_scan_prod::kernel,
                 ),
             },
             // ── data movement ──

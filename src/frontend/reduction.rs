@@ -106,7 +106,7 @@ impl GraphTensor {
             t.graph().logical.contract_extent_at_least(&extent, 1);
             let rank = dims.len();
             let id = t.graph().logical.op(
-                LogicalOp::ScanProdUnspecified {
+                LogicalOp::UnspecifiedOrderScanProd {
                     axis_from_end: rank - 1 - axis,
                 },
                 &[(t.id, dims.clone())],

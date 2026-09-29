@@ -1,0 +1,12 @@
+; Propagate shape — a scan keeps the operand's shape.
+(rule
+  (
+    (= ?out (LogicalUnspecifiedOrderScanSum ?in ?axis))
+    (= ?shape (shape-of ?in))
+  )
+  (
+    (set (shape-of ?out) ?shape)
+  )
+  :ruleset prop
+  :name "unspecified_order_scan_sum/shape: shape of LogicalUnspecifiedOrderScanSum is the operand shape"
+)

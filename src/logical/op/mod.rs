@@ -158,8 +158,6 @@ mod recip;
 mod reduce_max;
 mod reduce_sum;
 mod round;
-mod scan_prod_unspecified;
-mod scan_sum_unspecified;
 mod scatter;
 mod select;
 mod sin;
@@ -168,6 +166,8 @@ mod trunc;
 mod trunc_cast;
 mod trunc_div;
 mod trunc_rem;
+mod unspecified_order_scan_prod;
+mod unspecified_order_scan_sum;
 
 pub use add::LogicalAdd;
 pub use cast::LogicalCast;
@@ -189,8 +189,6 @@ pub use recip::LogicalRecip;
 pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
 pub use round::LogicalRound;
-pub use scan_prod_unspecified::LogicalScanProdUnspecified;
-pub use scan_sum_unspecified::LogicalScanSumUnspecified;
 pub use scatter::LogicalScatter;
 pub use select::LogicalSelect;
 pub use sin::LogicalSin;
@@ -199,6 +197,8 @@ pub use trunc::LogicalTrunc;
 pub use trunc_cast::LogicalTruncCast;
 pub use trunc_div::LogicalTruncDiv;
 pub use trunc_rem::LogicalTruncRem;
+pub use unspecified_order_scan_prod::LogicalUnspecifiedOrderScanProd;
+pub use unspecified_order_scan_sum::LogicalUnspecifiedOrderScanSum;
 
 /// THE registration list for logical ops. Order matters twice: it is the
 /// renderer's preference order when an e-class holds several logical nodes,
@@ -222,8 +222,8 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalDiv),
             Box::new(LogicalReduceSum),
             Box::new(LogicalReduceMax),
-            Box::new(LogicalScanSumUnspecified),
-            Box::new(LogicalScanProdUnspecified),
+            Box::new(LogicalUnspecifiedOrderScanSum),
+            Box::new(LogicalUnspecifiedOrderScanProd),
             Box::new(LogicalExp2),
             Box::new(LogicalLog2),
             Box::new(LogicalSin),

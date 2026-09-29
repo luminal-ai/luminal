@@ -1,2 +1,0 @@
-; Inclusive scan along one axis; the evaluation order is unspecified.
-(constructor LogicalScanSumUnspecified (LogicalTensor i64) LogicalTensor)

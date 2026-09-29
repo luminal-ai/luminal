@@ -1,0 +1,13 @@
+; Forward LayoutTensor Propagation : Logical UnspecifiedOrderScanSum
+(rule
+  (
+    (= ?out_logical (LogicalUnspecifiedOrderScanSum ?in_logical ?axis))
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?bits (bits-of (dtype-of ?out_logical)))
+    (= ?shape (shape-of ?out_logical))
+  )
+  (
+    (let out_layout_tensor (LayoutTensorLit ?out_logical (RightMajorContiguousElementLayoutLit ?shape ?bits)))
+  )
+  :ruleset main_ruleset :name "unspecified_order_scan_sum/forward_layout: canonical right-major layout for the scanned result"
+)

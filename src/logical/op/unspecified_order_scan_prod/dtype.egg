@@ -1,0 +1,12 @@
+;Dtype Propagation : LogicalUnspecifiedOrderScanProd
+(rule
+  (
+    (= ?out_logical_tensor (LogicalUnspecifiedOrderScanProd ?in_logical ?axis))
+    (= ?in_dtype (dtype-of ?in_logical))
+  )
+  (
+    (set (dtype-of ?out_logical_tensor) ?in_dtype)
+  )
+  :ruleset prop
+  :name "unspecified_order_scan_prod/dtype: dtype of LogicalUnspecifiedOrderScanProd from its operand"
+)

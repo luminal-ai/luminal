@@ -523,7 +523,7 @@ impl GraphTensor {
 
     /// Apply a cumulative sum along dimensions — one inclusive scan per axis.
     pub fn cumsum(self, axes: impl ToAxes) -> Self {
-        self.scan_per_axis(axes, |axis_from_end| LogicalOp::ScanSumUnspecified {
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::UnspecifiedOrderScanSum {
             axis_from_end,
         })
     }
@@ -535,7 +535,7 @@ impl GraphTensor {
 
     /// Apply a cumulative product along dimensions — one inclusive scan per axis.
     pub fn cumprod(self, axes: impl ToAxes) -> Self {
-        self.scan_per_axis(axes, |axis_from_end| LogicalOp::ScanProdUnspecified {
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::UnspecifiedOrderScanProd {
             axis_from_end,
         })
     }

@@ -83,8 +83,8 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "ReduceMaxGeneric"
         | "ReduceSumGeneric"
         | "RoundFunctionalGeneric"
-        | "ScanProdLeftSequential"
-        | "ScanSumLeftSequential"
+        | "LeftSequentialScanProd"
+        | "LeftSequentialScanSum"
         | "SelectFunctionalGeneric"
         | "SinFunctionalGeneric"
         | "SqrtFunctionalGeneric"
@@ -1250,6 +1250,8 @@ mod tests {
             "LayoutTensorOpGatherGeneric",
             "LayoutTensorOpIndexMapApplyMaterialize",
             "LayoutTensorOpIotaGeneric",
+            "LayoutTensorOpLeftSequentialScanProd",
+            "LayoutTensorOpLeftSequentialScanSum",
             "LayoutTensorOpLessThanGeneric",
             "LayoutTensorOpLog2FunctionalGeneric",
             "LayoutTensorOpModFunctionalGeneric",
@@ -1258,8 +1260,6 @@ mod tests {
             "LayoutTensorOpReduceMaxGeneric",
             "LayoutTensorOpReduceSumGeneric",
             "LayoutTensorOpRoundFunctionalGeneric",
-            "LayoutTensorOpScanProdLeftSequential",
-            "LayoutTensorOpScanSumLeftSequential",
             "LayoutTensorOpScatterFunctionalGeneric",
             "LayoutTensorOpSelectFunctionalGeneric",
             "LayoutTensorOpSinFunctionalGeneric",
@@ -2741,51 +2741,46 @@ mod tests {
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![1000i32]);
     }
 
-    /// A scan's value bounds must cover its SHORT prefixes, not just the
-    /// full-length one: the k = 1 prefix is the raw element. Here the
-    /// scanned input is attested [-2, -1], so the prefix sums span
-    /// [-8, -1] — zero is excluded, but -1 is in range and
-    /// `i32::MIN / -1` overflows, so the TruncDiv width obligation must
-    /// stay undischarged and the search must refuse.
+    /// Int sum scans need NO attestation: the kernel checks every integer
+    /// addition, so nothing is proof-gated.
     #[test]
-    fn scan_sum_prefix_bounds_gate_trunc_div() {
+    fn int_sum_scan_runs_unattested() {
         let mut cx = luminal::graph::Graph::new();
         let x = cx.tensor(4, DType::Int);
-        let y = cx.tensor(4, DType::Int);
-        let _out = y.trunc_div(x.cumsum(0));
+        let out = x.cumsum(0);
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.bind_value_range(x.id, -2, -1).expect("range binds");
-        rt.bind_value_range(y.id, i32::MIN as i64, i32::MIN as i64)
-            .expect("range binds");
         let mut data = FxHashMap::default();
-        data.insert(x.id, vec![-2i32, -2, -2, -2].into());
-        data.insert(y.id, vec![i32::MIN; 4].into());
-        let err = rt
+        data.insert(x.id, vec![-2i32, 3, -4, 5].into());
+        rt.search(&data, &crate::search::harness_search_options())
+            .expect("unattested int sum scan implements");
+        rt.set_data(x.id, vec![-2i32, 3, -4, 5]);
+        rt.execute().expect("unattested int sum scan executes");
+        assert_eq!(rt.get_i32(out.id).unwrap(), &vec![-2i32, 1, -3, 2]);
+    }
+
+    /// A prefix sum that leaves i32 range refuses loudly instead of
+    /// wrapping. The search profiles by executing, so either step may raise it.
+    #[test]
+    fn int_sum_scan_overflow_fails_loudly() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(4, DType::Int);
+        let _out = x.cumsum(0);
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        let values = vec![i32::MAX, 1, 0, 0];
+        let mut data = FxHashMap::default();
+        data.insert(x.id, values.clone().into());
+        let result = rt
             .search(&data, &crate::search::harness_search_options())
-            .unwrap_err();
+            .and_then(|_| {
+                rt.set_data(x.id, values.clone());
+                rt.execute()
+            });
+        let err = result.expect_err("an overflowing prefix sum must refuse");
         let message = format!("{err:#}");
         assert!(
-            message.contains("do not discharge"),
-            "expected the bounded-but-unproven refusal, got: {message}"
+            message.contains("overflow"),
+            "expected an overflow refusal, got: {message}"
         );
-
-        // Control: a prefix range that excludes -1 proves and executes.
-        let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor(4, DType::Int);
-        let y = cx.tensor(4, DType::Int);
-        let out = y.trunc_div(x.cumsum(0));
-        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.bind_value_range(x.id, 1, 2).expect("range binds");
-        rt.bind_value_range(y.id, 0, 100).expect("range binds");
-        let mut data = FxHashMap::default();
-        data.insert(x.id, vec![1i32, 2, 2, 2].into());
-        data.insert(y.id, vec![100i32; 4].into());
-        rt.search(&data, &crate::search::harness_search_options())
-            .expect("proven prefix-sum divisor implements");
-        rt.set_data(x.id, vec![1i32, 2, 2, 2]);
-        rt.set_data(y.id, vec![100i32; 4]);
-        rt.execute().expect("proven graph executes");
-        assert_eq!(rt.get_i32(out.id).unwrap(), &vec![100i32, 33, 20, 14]);
     }
 
     /// Int prod needs NO attestation: the kernel checks every integer

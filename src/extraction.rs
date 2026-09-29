@@ -379,11 +379,10 @@ impl<'a> ExtractionSession<'a> {
                     .map(|arg| arg.eclass.clone())
             })
             .collect();
-        const PROOF_GATED: [&str; 6] = [
+        const PROOF_GATED: [&str; 5] = [
             "LogicalAdd",
             "LogicalMul",
             "LogicalReduceSum",
-            "LogicalScanSumUnspecified",
             "LogicalTruncDiv",
             "LogicalTruncRem",
         ];

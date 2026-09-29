@@ -42,6 +42,8 @@ pub mod gather;
 pub mod index_map_apply_materialize;
 pub mod index_map_apply_view;
 pub mod iota;
+pub mod left_sequential_scan_prod;
+pub mod left_sequential_scan_sum;
 pub mod less_than;
 pub mod log2;
 pub mod materialize_layout_copy;
@@ -51,8 +53,6 @@ pub mod recip;
 pub mod reduce_max;
 pub mod reduce_sum;
 pub mod round;
-pub mod scan_prod_left_sequential;
-pub mod scan_sum_left_sequential;
 pub mod scatter;
 pub mod select;
 pub mod sin;
@@ -201,12 +201,12 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
             reduce_max::ReduceMax { axis: 0 },
         ),
         reg(
-            scan_sum_left_sequential::ScanSumLeftSequentialMatcher,
-            scan_sum_left_sequential::ScanSumLeftSequential { axis: 0 },
+            left_sequential_scan_sum::LeftSequentialScanSumMatcher,
+            left_sequential_scan_sum::LeftSequentialScanSum { axis: 0 },
         ),
         reg(
-            scan_prod_left_sequential::ScanProdLeftSequentialMatcher,
-            scan_prod_left_sequential::ScanProdLeftSequential { axis: 0 },
+            left_sequential_scan_prod::LeftSequentialScanProdMatcher,
+            left_sequential_scan_prod::LeftSequentialScanProd { axis: 0 },
         ),
         reg(iota::IotaMatcher, iota::Iota { expr: None }),
         reg(gather::GatherMatcher, gather::Gather { rank: 1 }),

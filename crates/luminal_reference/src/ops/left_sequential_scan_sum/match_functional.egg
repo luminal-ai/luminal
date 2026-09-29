@@ -1,0 +1,21 @@
+; EVERY dtype mints: the kernel's integer accumulation is checked, so an
+; overflow is a loud runtime error instead of a static proof obligation.
+; Layout Tensor Op Left Sequential Scan Sum
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_logical (LogicalUnspecifiedOrderScanSum ?in_logical ?axis))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpLeftSequentialScanSum ?in_layout_tensor ?axis ?out_layout))
+  )
+  :ruleset backend
+  :name "reference/left_sequential_scan_sum/match_functional: LeftSequentialScanSum mint, every dtype (kernel checks integer overflow)"
+)

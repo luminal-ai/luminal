@@ -1,0 +1,12 @@
+;Dtype Propagation : LogicalUnspecifiedOrderScanSum
+(rule
+  (
+    (= ?out_logical_tensor (LogicalUnspecifiedOrderScanSum ?in_logical ?axis))
+    (= ?in_dtype (dtype-of ?in_logical))
+  )
+  (
+    (set (dtype-of ?out_logical_tensor) ?in_dtype)
+  )
+  :ruleset prop
+  :name "unspecified_order_scan_sum/dtype: dtype of LogicalUnspecifiedOrderScanSum from its operand"
+)
