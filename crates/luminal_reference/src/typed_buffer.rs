@@ -345,12 +345,14 @@ pub struct ReferenceKernelCtx {
     pub dims: luminal::shape::DynMap,
 }
 
-/// The elementwise-binary and axis-reduce helpers for one narrow integer
-/// width — the I8/U8/I16 twins of [`ReferenceKernelCtx::binary_elementwise_i32`]
-/// and [`ReferenceKernelCtx::reduce_axis_i32`], whose bodies are identical
-/// once the primitive type is fixed.
+/// The elementwise-binary, axis-reduce and axis-scan helpers for one narrow
+/// integer width — the I8/U8/I16 twins of
+/// [`ReferenceKernelCtx::binary_elementwise_i32`],
+/// [`ReferenceKernelCtx::reduce_axis_i32`] and
+/// [`ReferenceKernelCtx::scan_axis_i32`], whose bodies are identical once the
+/// primitive type is fixed.
 macro_rules! narrow_int_kernel_helpers {
-    ($prim:ty, $get:ident, $get_mut:ident, $binary:ident, $reduce:ident) => {
+    ($prim:ty, $get:ident, $get_mut:ident, $binary:ident, $reduce:ident, $scan:ident) => {
         /// dest0[i] = f(operand0[i], operand1[i]) at this narrow width.
         pub fn $binary(&mut self, f: impl Fn($prim, $prim) -> Result<$prim>) -> Result<()> {
             let lhs = self.operands[0].$get()?;
@@ -398,6 +400,43 @@ macro_rules! narrow_int_kernel_helpers {
                         acc = fold(acc, input[o * reduced * inner + r * inner + i])?;
                     }
                     dest[o * inner + i] = acc;
+                }
+            }
+            Ok(())
+        }
+
+        /// Contiguous inclusive scan over one axis at this narrow width
+        /// (axis zero-based FROM THE END, the house convention).
+        pub fn $scan(
+            &mut self,
+            axis_from_end: i64,
+            init: $prim,
+            fold: impl Fn($prim, $prim) -> Result<$prim>,
+        ) -> Result<()> {
+            let dims = &self.operand_dims[0];
+            let rank = dims.len();
+            anyhow::ensure!(
+                (axis_from_end as usize) < rank,
+                "scan axis {axis_from_end} out of rank {rank}"
+            );
+            let axis = rank - 1 - axis_from_end as usize;
+            let reduced = dims[axis];
+            let inner: usize = dims[axis + 1..].iter().product();
+            let outer: usize = dims[..axis].iter().product();
+            let input = self.operands[0].$get()?.clone();
+            let dest = self.dests[0].$get_mut()?;
+            anyhow::ensure!(
+                dest.len() == input.len() && input.len() == outer * reduced * inner,
+                "scan kernel geometry mismatch"
+            );
+            for o in 0..outer {
+                for i in 0..inner {
+                    let mut acc = init;
+                    for r in 0..reduced {
+                        let k = o * reduced * inner + r * inner + i;
+                        acc = fold(acc, input[k])?;
+                        dest[k] = acc;
+                    }
                 }
             }
             Ok(())
@@ -519,14 +558,29 @@ impl ReferenceKernelCtx {
     // trunc-rem kernels refuse it loudly. What each op MEANS shows up at
     // its call site (`Ok(a.wrapping_add(b))`), in its own folder, which
     // is where this branch keeps op semantics.
-    narrow_int_kernel_helpers!(i8, as_i8, as_i8_mut, binary_elementwise_i8, reduce_axis_i8);
-    narrow_int_kernel_helpers!(u8, as_u8, as_u8_mut, binary_elementwise_u8, reduce_axis_u8);
+    narrow_int_kernel_helpers!(
+        i8,
+        as_i8,
+        as_i8_mut,
+        binary_elementwise_i8,
+        reduce_axis_i8,
+        scan_axis_i8
+    );
+    narrow_int_kernel_helpers!(
+        u8,
+        as_u8,
+        as_u8_mut,
+        binary_elementwise_u8,
+        reduce_axis_u8,
+        scan_axis_u8
+    );
     narrow_int_kernel_helpers!(
         i16,
         as_i16,
         as_i16_mut,
         binary_elementwise_i16,
-        reduce_axis_i16
+        reduce_axis_i16,
+        scan_axis_i16
     );
 
     /// Contiguous fold over one axis (zero-based FROM THE END — the house
@@ -596,6 +650,81 @@ impl ReferenceKernelCtx {
                     acc = fold(acc, input[o * reduced * inner + r * inner + i])?;
                 }
                 dest[o * inner + i] = acc;
+            }
+        }
+        Ok(())
+    }
+
+    /// Contiguous inclusive scan over one axis (zero-based FROM THE END —
+    /// the house nth-from-end convention). Every prefix is written, so the
+    /// destination carries the operand's geometry, not a reduced one.
+    pub fn scan_axis(
+        &mut self,
+        axis_from_end: i64,
+        init: f32,
+        fold: impl Fn(f32, f32) -> f32,
+    ) -> Result<()> {
+        let dims = &self.operand_dims[0];
+        let rank = dims.len();
+        anyhow::ensure!(
+            (axis_from_end as usize) < rank,
+            "scan axis {axis_from_end} out of rank {rank}"
+        );
+        let axis = rank - 1 - axis_from_end as usize;
+        let reduced = dims[axis];
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        let input = self.operands[0].as_f32()?;
+        let dest = self.dests[0].as_f32_mut()?;
+        anyhow::ensure!(
+            dest.len() == input.len() && input.len() == outer * reduced * inner,
+            "scan kernel geometry mismatch"
+        );
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut acc = init;
+                for r in 0..reduced {
+                    let k = o * reduced * inner + r * inner + i;
+                    acc = fold(acc, input[k]);
+                    dest[k] = acc;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The i32 twin of [`Self::scan_axis`]; the fold returns Result so
+    /// checked accumulation (non-wrapping Int scans) refuses loudly.
+    pub fn scan_axis_i32(
+        &mut self,
+        axis_from_end: i64,
+        init: i32,
+        fold: impl Fn(i32, i32) -> Result<i32>,
+    ) -> Result<()> {
+        let dims = &self.operand_dims[0];
+        let rank = dims.len();
+        anyhow::ensure!(
+            (axis_from_end as usize) < rank,
+            "scan axis {axis_from_end} out of rank {rank}"
+        );
+        let axis = rank - 1 - axis_from_end as usize;
+        let reduced = dims[axis];
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        let input = self.operands[0].as_i32()?.clone();
+        let dest = self.dests[0].as_i32_mut()?;
+        anyhow::ensure!(
+            dest.len() == input.len() && input.len() == outer * reduced * inner,
+            "scan kernel geometry mismatch"
+        );
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut acc = init;
+                for r in 0..reduced {
+                    let k = o * reduced * inner + r * inner + i;
+                    acc = fold(acc, input[k])?;
+                    dest[k] = acc;
+                }
             }
         }
         Ok(())

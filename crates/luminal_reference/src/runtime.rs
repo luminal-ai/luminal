@@ -83,6 +83,8 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "ReduceMaxGeneric"
         | "ReduceSumGeneric"
         | "RoundFunctionalGeneric"
+        | "ScanProdLeftSequential"
+        | "ScanSumLeftSequential"
         | "SelectFunctionalGeneric"
         | "SinFunctionalGeneric"
         | "SqrtFunctionalGeneric"
@@ -1256,6 +1258,8 @@ mod tests {
             "LayoutTensorOpReduceMaxGeneric",
             "LayoutTensorOpReduceSumGeneric",
             "LayoutTensorOpRoundFunctionalGeneric",
+            "LayoutTensorOpScanProdLeftSequential",
+            "LayoutTensorOpScanSumLeftSequential",
             "LayoutTensorOpScatterFunctionalGeneric",
             "LayoutTensorOpSelectFunctionalGeneric",
             "LayoutTensorOpSinFunctionalGeneric",
@@ -2735,6 +2739,94 @@ mod tests {
         rt.set_data(b.id, vec![300i32]);
         rt.execute().expect("proven add executes");
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![1000i32]);
+    }
+
+    /// A scan's value bounds must cover its SHORT prefixes, not just the
+    /// full-length one: the k = 1 prefix is the raw element. Here the
+    /// scanned input is attested [-2, -1], so the prefix sums span
+    /// [-8, -1] — zero is excluded, but -1 is in range and
+    /// `i32::MIN / -1` overflows, so the TruncDiv width obligation must
+    /// stay undischarged and the search must refuse.
+    #[test]
+    fn scan_sum_prefix_bounds_gate_trunc_div() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(4, DType::Int);
+        let y = cx.tensor(4, DType::Int);
+        let _out = y.trunc_div(x.cumsum(0));
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        rt.bind_value_range(x.id, -2, -1).expect("range binds");
+        rt.bind_value_range(y.id, i32::MIN as i64, i32::MIN as i64)
+            .expect("range binds");
+        let mut data = FxHashMap::default();
+        data.insert(x.id, vec![-2i32, -2, -2, -2].into());
+        data.insert(y.id, vec![i32::MIN; 4].into());
+        let err = rt
+            .search(&data, &crate::search::harness_search_options())
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("do not discharge"),
+            "expected the bounded-but-unproven refusal, got: {message}"
+        );
+
+        // Control: a prefix range that excludes -1 proves and executes.
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(4, DType::Int);
+        let y = cx.tensor(4, DType::Int);
+        let out = y.trunc_div(x.cumsum(0));
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        rt.bind_value_range(x.id, 1, 2).expect("range binds");
+        rt.bind_value_range(y.id, 0, 100).expect("range binds");
+        let mut data = FxHashMap::default();
+        data.insert(x.id, vec![1i32, 2, 2, 2].into());
+        data.insert(y.id, vec![100i32; 4].into());
+        rt.search(&data, &crate::search::harness_search_options())
+            .expect("proven prefix-sum divisor implements");
+        rt.set_data(x.id, vec![1i32, 2, 2, 2]);
+        rt.set_data(y.id, vec![100i32; 4]);
+        rt.execute().expect("proven graph executes");
+        assert_eq!(rt.get_i32(out.id).unwrap(), &vec![100i32, 33, 20, 14]);
+    }
+
+    /// Int prod needs NO attestation: the kernel checks every integer
+    /// multiplication, so nothing is proof-gated.
+    #[test]
+    fn int_prod_runs_unattested() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(4, DType::Int);
+        let out = x.cumprod(0);
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        let mut data = FxHashMap::default();
+        data.insert(x.id, vec![-2i32, 3, -4, 5].into());
+        rt.search(&data, &crate::search::harness_search_options())
+            .expect("unattested int prod implements");
+        rt.set_data(x.id, vec![-2i32, 3, -4, 5]);
+        rt.execute().expect("unattested int prod executes");
+        assert_eq!(rt.get_i32(out.id).unwrap(), &vec![-2i32, -6, 24, 120]);
+    }
+
+    /// A prefix product that leaves i32 range refuses loudly instead of
+    /// wrapping. The search profiles by executing, so either step may raise it.
+    #[test]
+    fn int_prod_overflow_fails_loudly() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(4, DType::Int);
+        let _out = x.cumprod(0);
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        let mut data = FxHashMap::default();
+        data.insert(x.id, vec![65536i32, 65536, 1, 1].into());
+        let err = match rt.search(&data, &crate::search::harness_search_options()) {
+            Err(err) => err,
+            Ok(_) => {
+                rt.set_data(x.id, vec![65536i32, 65536, 1, 1]);
+                rt.execute().expect_err("overflowing int prod refuses")
+            }
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("overflow"),
+            "expected a loud overflow error, got: {message}"
+        );
     }
 
     /// TruncDiv is proof-gated on the divisor excluding zero: with an

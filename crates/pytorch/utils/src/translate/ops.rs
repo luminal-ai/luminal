@@ -281,7 +281,14 @@ impl Translator<'_> {
         let x = self.operand(&node.inputs[0])?;
         let dims = self.optional_int_list(node, 1)?;
         let rank = x.rank();
-        let axes: Vec<usize> = if dims.is_empty() {
+        // A rank-0 value has no axis: the only dims torch accepts there name
+        // nothing, so the reduction and its keepdim are both the identity.
+        if rank == 0
+            && let Some(&dim) = dims.iter().find(|&&d| d != 0 && d != -1)
+        {
+            bail!("dim {dim} is out of range for a rank-0 value");
+        }
+        let axes: Vec<usize> = if rank == 0 || dims.is_empty() {
             (0..rank).collect()
         } else {
             dims.iter().map(|&d| normalize_dim(d, rank)).collect()
@@ -359,7 +366,16 @@ impl Translator<'_> {
 
     pub(super) fn translate_cumulative(&mut self, node: &Node, prod: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let dim = normalize_dim(self.get_int_arg(node, 1)?, x.rank());
+        let dim = self.get_int_arg(node, 1)?;
+        // A rank-0 scan is the identity, and only dims torch accepts there
+        // reach it.
+        if x.rank() == 0 {
+            if dim != 0 && dim != -1 {
+                bail!("dim {dim} is out of range for a rank-0 value");
+            }
+            return Ok(x);
+        }
+        let dim = normalize_dim(dim, x.rank());
         Ok(if prod { x.cumprod(dim) } else { x.cumsum(dim) })
     }
 
@@ -627,11 +643,17 @@ impl Translator<'_> {
         self.named_bool_arg(node, name)
     }
 
-    /// An optional `int[1]?` dim list: absent/None is the empty list.
+    /// An optional `int[1]?` dim list: absent/None is the empty list. A bare
+    /// scalar int named `dim` is the one-element list (`prod.dim_int` spells
+    /// `dim` that way); the name is load-bearing because PT2 drops omitted
+    /// defaults, so at this index another argument (`correction`) can sit.
     fn optional_int_list(&self, node: &Node, idx: usize) -> Result<Vec<i64>> {
         match node.inputs.get(idx) {
             Some(input) if input.arg.as_ints().is_some() || input.arg.as_sym_ints().is_some() => {
                 self.get_ints_arg(node, idx)
+            }
+            Some(input) if input.name == "dim" => {
+                Ok(input.arg.as_int().map_or_else(Vec::new, |dim| vec![dim]))
             }
             _ => Ok(Vec::new()),
         }

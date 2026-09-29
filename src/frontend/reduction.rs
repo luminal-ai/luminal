@@ -65,16 +65,74 @@ impl GraphTensor {
         self.sum(axes) / reduced_elements
     }
 
-    /// Reduce a dimension of the tensor by multiplying all elements along that axis.
+    /// Reduce a dimension of the tensor by multiplying all elements along that
+    /// axis: the exact product is the last position of an inclusive product scan.
     pub fn prod(self, axes: impl ToAxes) -> GraphTensor {
-        self.log().sum(axes).exp()
+        // A rank-0 product is the value itself (torch parity): there is no
+        // axis to scan.
+        if self.dims().is_empty() {
+            return self;
+        }
+        let mut t = self;
+        let mut axes = axes.to_axes();
+        for dim in 0..axes.len() {
+            let axis = axes[dim];
+            let dims = t.dims();
+            let extent = dims[axis];
+            // A product over a statically empty axis is one (torch parity), so
+            // no scan is recorded and the axis carries no contract.
+            if extent.to_usize() == Some(0) {
+                let mut out_dims = dims.clone();
+                out_dims.remove(axis);
+                // The fill must be built in the tensor's own dtype: a float
+                // literal cast to an integer tensor is a refused lossy read.
+                let one = match t.dtype {
+                    DType::F64 => t.graph().constant_f64(1.0),
+                    DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
+                        t.graph().constant_i32(1).cast(t.dtype)
+                    }
+                    _ => t.graph().constant_f32(1.0).cast(t.dtype),
+                };
+                t = one.expand_rhs(out_dims);
+                for ax in &mut axes {
+                    if *ax > axis {
+                        *ax -= 1;
+                    }
+                }
+                continue;
+            }
+            // A product over a symbolically empty axis has no value: the axis
+            // contracts to >= 1 rather than defaulting to one, as `max` does.
+            t.graph().logical.contract_extent_at_least(&extent, 1);
+            let rank = dims.len();
+            let id = t.graph().logical.op(
+                LogicalOp::ScanProdUnspecified {
+                    axis_from_end: rank - 1 - axis,
+                },
+                &[(t.id, dims.clone())],
+                dims.clone(),
+                t.dtype,
+            );
+            t = GraphTensor::from_id(id, dims, t.graph_ref, t.dtype);
+            t = t
+                .slice_along((extent - IntExpr::from(1))..extent, axis)
+                .squeeze(axis);
+            for ax in &mut axes {
+                if *ax > axis {
+                    *ax -= 1;
+                }
+            }
+        }
+        t
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::frontend::unary::tests::test_unary;
+    use crate::tests::assert_exact;
     use candle_core::{Device, Tensor};
+    use luminal::prelude::*;
     use proptest::prelude::*;
 
     proptest! {
@@ -137,5 +195,38 @@ mod tests {
                 },
             );
         }
+    }
+
+    /// The scan-based product is exact: signs multiply and a zero anywhere
+    /// zeroes the result — neither survives an exp/log formulation.
+    #[test]
+    fn prod_signs_and_zeros_are_exact() {
+        let cases: Vec<(Vec<f32>, f32)> = vec![
+            (vec![2.0, 3.0], 6.0),
+            (vec![-2.0, 3.0], -6.0),
+            (vec![-2.0, -3.0], 6.0),
+            (vec![-1.0, -2.0, -3.0], -6.0),
+            (vec![0.0, 5.0], 0.0),
+            (vec![-2.0, 0.0, 3.0], 0.0),
+        ];
+        for (input, expected) in cases {
+            let mut cx = Graph::new();
+            let a = cx.tensor((1, input.len()), DType::F32);
+            let b = a.prod(1);
+            let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
+            assert_exact(rt.get_f32(b.id).unwrap(), &[expected]);
+        }
+    }
+
+    /// The empty product is one (torch parity): no scan is recorded, so the
+    /// axis needs no non-empty contract.
+    #[test]
+    fn prod_over_an_empty_axis_is_one() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 0), DType::F32);
+        let b = a.prod(1);
+        let rt =
+            luminal_reference::harness::run_reference(&cx, &[(a.id, Vec::<f32>::new().into())]);
+        assert_exact(rt.get_f32(b.id).unwrap(), &[1.0, 1.0]);
     }
 }

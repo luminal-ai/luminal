@@ -618,6 +618,13 @@ pub(super) mod tests {
             .collect()
     }
 
+    /// Strictly positive magnitudes: IEEE `pow` answers NaN for a negative
+    /// base with a fractional exponent, where ours answers the documented
+    /// abs-based approximation.
+    pub fn positive_from_zero(v: Vec<f32>) -> Vec<f32> {
+        v.into_iter().map(|x| x.abs() + 1.0).collect()
+    }
+
     pub fn test_binary(
         a_shape: impl ToShape,
         b_shape: impl ToShape,
@@ -914,7 +921,7 @@ pub(super) mod tests {
             27,
             |a, _| a.pow(2.5f32),
             |a, _| a.powf(2.5f64).unwrap(),
-            shift_from_zero,
+            positive_from_zero,
             identity,
         );
     }

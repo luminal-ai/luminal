@@ -145,6 +145,14 @@ pub enum LogicalOp {
     ReduceMax {
         axis_from_end: usize,
     },
+    /// Inclusive scan along one axis, evaluation order unspecified.
+    ScanSumUnspecified {
+        axis_from_end: usize,
+    },
+    /// Inclusive scan along one axis, evaluation order unspecified.
+    ScanProdUnspecified {
+        axis_from_end: usize,
+    },
     Gather,
     Scatter,
     /// Ternary selection: `Select(cond, if_true, if_false)` picks elementwise
@@ -185,6 +193,8 @@ impl LogicalOp {
             Self::Select => "LogicalSelect",
             Self::ReduceSum { .. } => "LogicalReduceSum",
             Self::ReduceMax { .. } => "LogicalReduceMax",
+            Self::ScanSumUnspecified { .. } => "LogicalScanSumUnspecified",
+            Self::ScanProdUnspecified { .. } => "LogicalScanProdUnspecified",
             Self::Gather => "LogicalGather",
             Self::Scatter => "LogicalScatter",
             Self::IndexMapApply { .. } => "LogicalIndexMapApply",
@@ -216,6 +226,8 @@ impl LogicalOp {
             | Self::Recip
             | Self::ReduceSum { .. }
             | Self::ReduceMax { .. }
+            | Self::ScanSumUnspecified { .. }
+            | Self::ScanProdUnspecified { .. }
             | Self::IndexMapApply { .. } => 1,
             Self::Add
             | Self::Mul
@@ -1111,7 +1123,9 @@ impl LogicalGraph {
                         parts.push(Self::dtype_term(*dtype))
                     }
                     LogicalOp::ReduceSum { axis_from_end }
-                    | LogicalOp::ReduceMax { axis_from_end } => {
+                    | LogicalOp::ReduceMax { axis_from_end }
+                    | LogicalOp::ScanSumUnspecified { axis_from_end }
+                    | LogicalOp::ScanProdUnspecified { axis_from_end } => {
                         parts.push(axis_from_end.to_string());
                     }
                     LogicalOp::IndexMapApply { entries } => {

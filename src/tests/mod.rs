@@ -12,10 +12,17 @@ pub fn assert_close(a_vec: &[f32], b_vec: &[f32]) {
     assert_close_precision(a_vec, b_vec, 1e-3);
 }
 
-/// Ensure two arrays are nearly equal to a decimal place
+/// Ensure two arrays are nearly equal to a decimal place. NaN on both sides
+/// agrees; NaN on one side only is a mismatch.
 pub fn assert_close_precision(a_vec: &[f32], b_vec: &[f32], threshold: f32) {
     assert_eq!(a_vec.len(), b_vec.len(), "Number of elements doesn't match");
     for (i, (a, b)) in a_vec.iter().zip(b_vec.iter()).enumerate() {
+        if a.is_nan() && b.is_nan() {
+            continue;
+        }
+        if a.is_nan() != b.is_nan() {
+            panic!("{a} and {b} disagree on NaN, index {i}");
+        }
         if (a - b).abs() > threshold {
             panic!(
                 "{a} is not close to {b}, index {i}, avg distance: {}",

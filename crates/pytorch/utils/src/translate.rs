@@ -36,6 +36,8 @@ mod opmath_tests;
 mod ops;
 mod pooling;
 mod reductions_more;
+#[cfg(test)]
+mod scan_tests;
 mod special;
 mod stats_more;
 mod sympy;

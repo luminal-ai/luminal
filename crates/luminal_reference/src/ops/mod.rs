@@ -46,6 +46,8 @@ pub(crate) mod recip;
 pub(crate) mod reduce_max;
 pub(crate) mod reduce_sum;
 pub(crate) mod round;
+pub(crate) mod scan_prod_left_sequential;
+pub(crate) mod scan_sum_left_sequential;
 pub(crate) mod scatter;
 pub(crate) mod select;
 pub(crate) mod sin;
@@ -82,6 +84,8 @@ pub use recip::RecipFunctional;
 pub use reduce_max::ReduceMax;
 pub use reduce_sum::ReduceSum;
 pub use round::RoundFunctional;
+pub use scan_prod_left_sequential::ScanProdLeftSequential;
+pub use scan_sum_left_sequential::ScanSumLeftSequential;
 pub use scatter::ScatterFunctional;
 pub use sin::SinFunctional;
 pub use sqrt::SqrtFunctional;
@@ -110,6 +114,8 @@ pub use recip::RecipFunctionalDps;
 pub use reduce_max::ReduceMaxDps;
 pub use reduce_sum::ReduceSumDps;
 pub use round::RoundFunctionalDps;
+pub use scan_prod_left_sequential::ScanProdLeftSequentialDps;
+pub use scan_sum_left_sequential::ScanSumLeftSequentialDps;
 pub use scatter::ScatterFunctionalDps;
 pub use sin::SinFunctionalDps;
 pub use sqrt::SqrtFunctionalDps;
@@ -135,6 +141,8 @@ pub use recip::RecipFunctionalMatcher;
 pub use reduce_max::ReduceMaxMatcher;
 pub use reduce_sum::ReduceSumMatcher;
 pub use round::RoundFunctionalMatcher;
+pub use scan_prod_left_sequential::ScanProdLeftSequentialMatcher;
+pub use scan_sum_left_sequential::ScanSumLeftSequentialMatcher;
 pub use scatter::ScatterFunctionalMatcher;
 pub use select::{SelectFunctional, SelectFunctionalDps, SelectFunctionalMatcher};
 pub use sin::SinFunctionalMatcher;
@@ -289,6 +297,20 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(ReduceMaxMatcher),
                 kernel: entry::<ReduceMaxDps>("ReduceMaxGeneric", reduce_max::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(ScanSumLeftSequentialMatcher),
+                kernel: entry::<ScanSumLeftSequentialDps>(
+                    "ScanSumLeftSequential",
+                    scan_sum_left_sequential::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || Box::new(ScanProdLeftSequentialMatcher),
+                kernel: entry::<ScanProdLeftSequentialDps>(
+                    "ScanProdLeftSequential",
+                    scan_prod_left_sequential::kernel,
+                ),
             },
             // ── data movement ──
             ReferenceOp {

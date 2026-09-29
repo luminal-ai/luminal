@@ -158,6 +158,8 @@ mod recip;
 mod reduce_max;
 mod reduce_sum;
 mod round;
+mod scan_prod_unspecified;
+mod scan_sum_unspecified;
 mod scatter;
 mod select;
 mod sin;
@@ -187,6 +189,8 @@ pub use recip::LogicalRecip;
 pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
 pub use round::LogicalRound;
+pub use scan_prod_unspecified::LogicalScanProdUnspecified;
+pub use scan_sum_unspecified::LogicalScanSumUnspecified;
 pub use scatter::LogicalScatter;
 pub use select::LogicalSelect;
 pub use sin::LogicalSin;
@@ -218,6 +222,8 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalDiv),
             Box::new(LogicalReduceSum),
             Box::new(LogicalReduceMax),
+            Box::new(LogicalScanSumUnspecified),
+            Box::new(LogicalScanProdUnspecified),
             Box::new(LogicalExp2),
             Box::new(LogicalLog2),
             Box::new(LogicalSin),

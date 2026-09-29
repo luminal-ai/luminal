@@ -521,9 +521,11 @@ impl GraphTensor {
         self
     }
 
-    /// Apply a cumulative sum along dimensions
+    /// Apply a cumulative sum along dimensions — one inclusive scan per axis.
     pub fn cumsum(self, axes: impl ToAxes) -> Self {
-        self.cumop(axes, |t, axes| t.sum(axes), 0.)
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::ScanSumUnspecified {
+            axis_from_end,
+        })
     }
 
     /// Apply a cumulative max along dimensions
@@ -531,15 +533,38 @@ impl GraphTensor {
         self.cumop(axes, |t, axes| t.max(axes), f32::MIN)
     }
 
-    /// Apply a cumulative product along dimensions
+    /// Apply a cumulative product along dimensions — one inclusive scan per axis.
     pub fn cumprod(self, axes: impl ToAxes) -> Self {
-        self.cumop(axes, |t, axes| t.prod(axes), 1.)
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::ScanProdUnspecified {
+            axis_from_end,
+        })
+    }
+
+    /// One recorded scan per axis, in the given order. A scan keeps the
+    /// operand's dims and dtype, so no axis bookkeeping is needed.
+    fn scan_per_axis(self, axes: impl ToAxes, op: impl Fn(usize) -> LogicalOp) -> Self {
+        let (dims, mut id) = (self.dims(), self.id);
+        let rank = dims.len();
+        // A rank-0 scan is the value itself (torch parity): there is no axis
+        // to fold along, and `rank - 1 - axis` would underflow.
+        if rank == 0 {
+            return self;
+        }
+        for axis in axes.to_axes() {
+            id = self.graph().logical.op(
+                op(rank - 1 - axis),
+                &[(id, dims.clone())],
+                dims.clone(),
+                self.dtype,
+            );
+        }
+        GraphTensor::from_id(id, dims, self.graph_ref, self.dtype)
     }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
-    use crate::tests::{assert_close, random_vec};
+    use crate::tests::{assert_close, assert_exact, random_vec};
     use candle_core::{Device, Tensor};
     use candle_nn::ops::softmax;
     use itertools::Itertools;
@@ -562,6 +587,35 @@ pub(super) mod tests {
                 "abs() on {dtype:?} must be the identity, not a recorded op"
             );
         }
+    }
+
+    /// A cumulative product is exact: the sign of each prefix is carried,
+    /// not reconstructed.
+    #[test]
+    fn cumprod_signs_are_exact() {
+        let input = vec![-1.0f32, 2.0, -3.0, 4.0];
+        let mut cx = Graph::new();
+        let a = cx.tensor(input.len(), DType::F32);
+        let b = a.cumprod(0);
+        let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
+        assert_exact(rt.get_f32(b.id).unwrap(), &[-1.0, -2.0, 6.0, 24.0]);
+    }
+
+    /// The reference runtime's scan IS the left-sequential fold, bit for bit.
+    #[test]
+    fn cumsum_matches_the_sequential_fold() {
+        let input = random_vec(64);
+        let mut expected = Vec::with_capacity(input.len());
+        let mut acc = 0.0f32;
+        for x in &input {
+            acc += *x;
+            expected.push(acc);
+        }
+        let mut cx = Graph::new();
+        let a = cx.tensor(input.len(), DType::F32);
+        let b = a.cumsum(0);
+        let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
+        assert_exact(rt.get_f32(b.id).unwrap(), &expected);
     }
 
     fn cummax_ref_2d(a: Tensor) -> Tensor {

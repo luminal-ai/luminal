@@ -24,6 +24,8 @@ pub mod recip;
 pub mod reduce_max;
 pub mod reduce_sum;
 pub mod round;
+pub mod scan_prod_left_sequential;
+pub mod scan_sum_left_sequential;
 pub mod scatter;
 pub mod select;
 pub mod sin;
@@ -103,6 +105,14 @@ pub fn metal_registry() -> Vec<RegisteredOp> {
         reg(
             reduce_max::ReduceMaxMatcher,
             reduce_max::ReduceMax { axis: 0 },
+        ),
+        reg(
+            scan_sum_left_sequential::ScanSumLeftSequentialMatcher,
+            scan_sum_left_sequential::ScanSumLeftSequential { axis: 0 },
+        ),
+        reg(
+            scan_prod_left_sequential::ScanProdLeftSequentialMatcher,
+            scan_prod_left_sequential::ScanProdLeftSequential { axis: 0 },
         ),
         reg(iota::IotaMatcher, iota::Iota { expr: None }),
         reg(gather::GatherMatcher, gather::Gather { rank: 1 }),

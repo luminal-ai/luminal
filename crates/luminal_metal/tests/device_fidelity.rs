@@ -130,3 +130,53 @@ fn scatter_write() {
     );
     assert_close(&want, &got, "scatter");
 }
+
+/// Scan results are integers in f32 here, so both the reference and the
+/// device must hit them exactly — a fused or reassociated fold would not.
+fn assert_exact_both(want: &[f32], got: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(want, expected, "{what}: reference diverges from the fact");
+    assert_eq!(got, expected, "{what}: device diverges from the fact");
+}
+
+#[test]
+fn cumsum_rank1() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(4usize, DType::F32);
+    let out = a.cumsum(0);
+    let (want, got) = run_both(&cx, &[(a.id, vec![1.0, 2., 3., 4.])], out.id);
+    assert_exact_both(&want, &got, &[1.0, 3., 6., 10.], "cumsum [1,2,3,4]");
+}
+
+#[test]
+fn cumprod_carries_signs() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(4usize, DType::F32);
+    let out = a.cumprod(0);
+    let (want, got) = run_both(&cx, &[(a.id, vec![-1.0, 2., -3., 4.])], out.id);
+    assert_exact_both(&want, &got, &[-1.0, -2., 6., 24.], "cumprod [-1,2,-3,4]");
+}
+
+#[test]
+fn prod_along_rows() {
+    let mut cx = Graph::new();
+    let a = cx.tensor((2usize, 2usize), DType::F32);
+    let out = a.prod(1);
+    let (want, got) = run_both(&cx, &[(a.id, vec![-2.0, 3., -2., -3.])], out.id);
+    assert_exact_both(&want, &got, &[-6.0, 6.], "prod over rows");
+}
+
+/// Axis 0 of a rank-2 value exercises the kernel's outer/inner split: the
+/// scanned axis is not the innermost, so each thread strides by the row.
+#[test]
+fn cumsum_along_the_outer_axis() {
+    let mut cx = Graph::new();
+    let a = cx.tensor((3usize, 2usize), DType::F32);
+    let out = a.cumsum(0);
+    let (want, got) = run_both(&cx, &[(a.id, vec![1.0, 2., 3., 4., 5., 6.])], out.id);
+    assert_exact_both(
+        &want,
+        &got,
+        &[1.0, 2., 4., 6., 9., 12.],
+        "cumsum along axis 0",
+    );
+}

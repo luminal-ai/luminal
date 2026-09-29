@@ -4,7 +4,6 @@
 //! translator implemented on top of ordinary reductions:
 //! `linalg_vector_norm`, `dist`, `_cdist_forward`, `_pdist_forward`,
 //! `segment_reduce`, `var_mean`, and the three `any` overloads.
-#![allow(dead_code)]
 
 use anyhow::{Context, Result, anyhow, bail};
 use luminal::prelude::*;
@@ -37,25 +36,6 @@ fn restore_reduced_dims(mut value: GraphTensor, axes: &[usize], keepdim: bool) -
         }
     }
     value
-}
-
-/// Normalize the axis of a cumulative scan. A rank-0 input has no axis to
-/// scan; `-1`/`0` are accepted there for torch compatibility and reported as
-/// `None`.
-fn cumulative_axis(dim: i64, rank: usize) -> Result<Option<usize>> {
-    if rank == 0 {
-        anyhow::ensure!(
-            matches!(dim, -1 | 0),
-            "Dimension out of range for scalar cumulative op: {dim}"
-        );
-        return Ok(None);
-    }
-    let normalized = if dim < 0 { rank as i64 + dim } else { dim };
-    anyhow::ensure!(
-        (0..rank as i64).contains(&normalized),
-        "Dimension out of range for rank-{rank} cumulative op: {dim}"
-    );
-    Ok(Some(normalized as usize))
 }
 
 /// Normalize an optional ATen reduction-dim list. `None` and `[]` both mean
@@ -304,120 +284,6 @@ impl Translator<'_> {
             .cast(self.output_meta_dtype(node)?);
         let p = self.get_float_arg(node, 1).unwrap_or(2.0);
         Ok(self.p_norm(magnitude, p, vec![1]))
-    }
-
-    // ---------------------------------------------------------------
-    // cumprod
-    // ---------------------------------------------------------------
-
-    /// One Hillis-Steele inclusive-scan step along `axis`: a lane at `i`
-    /// reads `i - offset` (prefix lanes read index 0, then `valid` keeps them
-    /// unchanged), plus the validity mask for those prefix lanes. The gather
-    /// is built from coordinate iotas so no flat Int arithmetic is recorded.
-    fn scan_shift(
-        &mut self,
-        value: GraphTensor,
-        axis: usize,
-        offset: usize,
-    ) -> (GraphTensor, GraphTensor) {
-        let dims = value.dims();
-        let rank = dims.len();
-        let mut positions = self.cx.arange(dims[axis]).cast(DType::Int);
-        for (dim, size) in dims.iter().copied().enumerate() {
-            if dim != axis {
-                positions = positions.expand_dim(dim, size);
-            }
-        }
-        let offset_tensor = self.full_tensor(positions.dims(), DType::Int, offset as f64);
-        let valid = positions.ge(offset_tensor);
-        let zero = self.full_tensor(positions.dims(), DType::Int, 0.0);
-        let shifted = self.ieee_select(valid, positions - offset_tensor, zero);
-
-        let mut coords = Vec::with_capacity(rank);
-        for axis_index in 0..rank {
-            if axis_index == axis {
-                coords.push(shifted);
-            } else {
-                coords.push(self.axis_positions(&dims, axis_index));
-            }
-        }
-        (value.gather(&coords), valid)
-    }
-
-    /// Inclusive multiplication scan along one axis, without log/exp. Shared
-    /// by `cumprod.default` and the axis-wise `prod_scan`. Requires a concrete
-    /// scan extent and bails otherwise.
-    pub(super) fn cumprod_tensor(
-        &mut self,
-        value: GraphTensor,
-        axis: usize,
-    ) -> Result<GraphTensor> {
-        let length = value.dims()[axis]
-            .to_usize()
-            .ok_or_else(|| anyhow!("cumprod currently requires a concrete scan dimension"))?;
-
-        let mut values = value;
-        let mut offset = 1usize;
-        while offset < length {
-            let (shifted, valid) = self.scan_shift(values, axis, offset);
-            values = self.ieee_select(valid, shifted * values, values);
-            offset *= 2;
-        }
-        Ok(values)
-    }
-
-    /// Lower `aten.cumprod.default` as an inclusive multiplication scan.
-    /// Core `GraphTensor::cumprod` rewrites products through log/exp, which
-    /// turns zeros into NaN and mishandles negatives; accumulating with plain
-    /// multiplication keeps ordinary IEEE semantics for zeros, negatives,
-    /// integers, and overflow.
-    pub(super) fn translate_cumprod(&mut self, node: &Node) -> Result<GraphTensor> {
-        let values = self
-            .operand(&node.inputs[0])?
-            .cast(self.output_meta_dtype(node)?);
-        let Some(axis) = cumulative_axis(self.get_int_arg(node, 1)?, values.rank())? else {
-            return Ok(values);
-        };
-        self.cumprod_tensor(values, axis)
-    }
-
-    /// Full product over `axes`, computed as one inclusive multiplication
-    /// scan per axis followed by the final scan position. Unlike core
-    /// `GraphTensor::prod` (log/exp), this keeps zeros and negatives exact.
-    ///
-    /// Axes are deduplicated and processed in descending order so that
-    /// squeezing a reduced axis never shifts the index of a not-yet-reduced
-    /// axis. Each scan needs a concrete extent, which `cumprod_tensor`
-    /// enforces; a symbolic extent therefore bails cleanly.
-    pub(super) fn prod_scan(&mut self, value: GraphTensor, axes: &[usize]) -> Result<GraphTensor> {
-        let mut axes: Vec<usize> = axes.to_vec();
-        axes.sort_unstable();
-        axes.dedup();
-        let mut result = value;
-        for &axis in axes.iter().rev() {
-            anyhow::ensure!(
-                axis < result.rank(),
-                "prod_scan axis {axis} out of range for rank {}",
-                result.rank()
-            );
-            // An empty scan axis has no final position; torch's product over
-            // an empty axis is the multiplicative identity, 1.
-            if result.dims()[axis].to_usize() == Some(0) {
-                let out_shape: Vec<IntExpr> = result
-                    .dims()
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, size)| (index != axis).then_some(size))
-                    .collect();
-                result = self.full_tensor(out_shape, result.dtype, 1.0);
-                continue;
-            }
-            let scanned = self.cumprod_tensor(result, axis)?;
-            let extent = scanned.dims()[axis];
-            let last = scanned.slice_along((extent - IntExpr::from(1))..extent, axis);
-            result = last.squeeze(axis);
-        }
-        Ok(result)
     }
 
     // ---------------------------------------------------------------
