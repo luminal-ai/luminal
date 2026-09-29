@@ -32,7 +32,7 @@ use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 /// Largest value a dynamic dimension's bucket covers when PT2 has no tighter
 /// upper bound.
 const MAX_DYNAMIC_DIM: usize = 4096;
-const DYNAMIC_BUCKET_POLICY: &str = "pt2-upper-bound-or-4096-v1";
+const DYNAMIC_BUCKET_POLICY: &str = "explicit-range-or-pt2-upper-bound-v3";
 use luminal_cuda_lite::bindings::{BoundaryLayout, CudaBindings};
 use luminal_cuda_lite::{
     CompileOptions, CudaRuntime, HostBuffer, SearchedPlanTemplate, harness_search_options,
@@ -59,6 +59,37 @@ fn torch_code(dtype: DType) -> Result<u32> {
     Ok(TorchDType::try_from(dtype)
         .map_err(|d| anyhow!("no torch dtype for {d:?}"))?
         .code())
+}
+
+fn dynamic_dim_ceiling(range: Option<luminal_pytorch_utils::DimRange>) -> usize {
+    range
+        .and_then(|range| range.max)
+        .map(|maximum| usize::try_from(maximum).unwrap_or(usize::MAX))
+        .unwrap_or(MAX_DYNAMIC_DIM)
+}
+
+fn apply_dynamic_range(translation: &mut Translation, range: Option<(usize, usize)>) -> Result<()> {
+    let Some((minimum, maximum)) = range else {
+        return Ok(());
+    };
+    ensure!(
+        minimum <= maximum,
+        "dynamic range [{minimum}, {maximum}] is empty"
+    );
+    ensure!(
+        translation.dims.len() == 1,
+        "an explicit dynamic range requires exactly one symbolic dimension, found {}",
+        translation.dims.len()
+    );
+    let symbol = *translation.dims.keys().next().expect("checked one dim");
+    translation.dim_ranges.insert(
+        symbol,
+        luminal_pytorch_utils::DimRange {
+            min: Some(u64::try_from(minimum)?),
+            max: Some(u64::try_from(maximum)?),
+        },
+    );
+    Ok(())
 }
 
 /// A compiled CUDA-lite graph with its boundary tables.
@@ -579,11 +610,12 @@ impl CompiledGraph {
             // whose dims fall in the bucket re-renders without re-searching.
             let hints: Vec<(Symbol, usize)> = self.dims.iter().map(|(s, v)| (*s, *v)).collect();
             for (symbol, hint) in hints {
+                let range = self.translation.dim_ranges.get(&symbol).copied();
                 let bucket = luminal_pytorch_utils::dim_bucket(
                     symbol,
-                    self.translation.dim_ranges.get(&symbol).copied(),
+                    range,
                     1,
-                    MAX_DYNAMIC_DIM,
+                    dynamic_dim_ceiling(range),
                     hint,
                 )?;
                 self.runtime.bind_dim_buckets(symbol, vec![bucket])?;
@@ -923,16 +955,23 @@ fn bind(
 /// `output_aliases` names each output that shares its storage with an earlier
 /// boundary tensor (`(output, owner)`); it is bound on the owner's buffer.
 #[pyfunction]
+#[pyo3(signature = (pt2_path, input_layouts, output_layouts, output_aliases, dynamic_range = None))]
 fn compile(
     pt2_path: &str,
     input_layouts: Vec<(String, String, Vec<String>)>,
     output_layouts: Vec<(String, String, Vec<String>)>,
     output_aliases: Vec<(String, String)>,
+    dynamic_range: Option<(usize, usize)>,
 ) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
-    let translation = translate(&parsed).map_err(to_py)?;
+    let mut translation = translate(&parsed).map_err(to_py)?;
+    // torch.export deliberately specializes sizes 0 and 1, so its serialized
+    // symbolic constraint starts at 2 even when the embedding compiler owns a
+    // wider piecewise interval. vLLM passes that interval explicitly; it is
+    // the range this region must search and execute over.
+    apply_dynamic_range(&mut translation, dynamic_range).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let inputs = layout_table(&translation, "input", &input_layouts).map_err(to_py)?;
     let outputs = layout_table(&translation, "output", &output_layouts).map_err(to_py)?;
@@ -997,7 +1036,44 @@ fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use luminal::prelude::Graph;
-    use luminal_pytorch_utils::{TranslatedInput, TranslatedOutput};
+    use luminal_pytorch_utils::{DimRange, TranslatedInput, TranslatedOutput};
+
+    #[test]
+    fn exported_upper_bound_sets_dynamic_bucket_ceiling() {
+        assert_eq!(
+            dynamic_dim_ceiling(Some(DimRange {
+                min: Some(2),
+                max: Some(8192),
+            })),
+            8192
+        );
+        assert_eq!(dynamic_dim_ceiling(None), MAX_DYNAMIC_DIM);
+    }
+
+    #[test]
+    fn explicit_dynamic_range_replaces_torch_export_minimum() {
+        let mut translated = translation(&["x"], None);
+        let symbol = Symbol::new("n");
+        translated.dims.insert(symbol, 8);
+        translated.symbols.insert("s0".to_string(), symbol);
+        translated.dim_ranges.insert(
+            symbol,
+            DimRange {
+                min: Some(2),
+                max: Some(16),
+            },
+        );
+
+        apply_dynamic_range(&mut translated, Some((1, 16))).unwrap();
+
+        assert_eq!(
+            translated.dim_ranges.get(&symbol),
+            Some(&DimRange {
+                min: Some(1),
+                max: Some(16),
+            })
+        );
+    }
 
     /// A translation with one 2x3 F32 input per name and one output
     /// value. `mutates` is the graph input that output writes back into.

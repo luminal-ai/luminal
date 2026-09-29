@@ -410,7 +410,9 @@ class CompiledModel:
         # Standalone execution launches Luminal's graph on a dedicated side
         # stream. The embedding path uses the caller's current stream instead.
         self._side_stream: torch.cuda.Stream | None = None
-        self._region_execution_state = {}
+        self._region_execution_state = set()
+        self._region_allocations = {}
+        self._region_mutations = {}
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
         # The graph inputs this program writes back into. While it is
@@ -517,13 +519,11 @@ class CompiledModel:
             side = self._side_stream
         static = getattr(self, "_region_static", False)
         signature = tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in inputs)
-        execution_key = (id(self), signature, side.cuda_stream)
-        warmed = self._region_execution_state.get("last") == execution_key
+        execution_key = (id(self), signature)
+        warmed = execution_key in self._region_execution_state
         capturing = torch.cuda.is_current_stream_capturing()
-        if capturing and (not static or not warmed):
-            raise RuntimeError(
-                "warm up each region shape with static_outputs=True before CUDA capture"
-            )
+        if capturing and not warmed:
+            raise RuntimeError("warm up each region shape before CUDA capture")
         if static:
             for binding, value in zip(self._input_bindings, inputs):
                 if binding.name in self._writebacks:
@@ -689,7 +689,7 @@ class CompiledModel:
                 self._graph.execute_async()
             else:
                 self._graph.execute()
-            self._region_execution_state["last"] = execution_key
+            self._region_execution_state.add(execution_key)
         finally:
             # These addresses belong to this call only: forget them, so an
             # execute that skipped a binding refuses by name instead of
@@ -760,6 +760,22 @@ def _example_int(value: Any) -> int:
     return int(value)
 
 
+def _symbolic_dim_spec(size: torch.SymInt, name: str) -> Any:
+    """Preserve Dynamo's finite bounds when rebuilding export shapes."""
+    value_range = size.node.shape_env.var_to_range.get(size.node.expr)
+    if value_range is None:
+        return Dim.AUTO
+    try:
+        minimum = int(value_range.lower)
+        maximum = int(value_range.upper)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return Dim.AUTO
+    minimum = max(2, minimum)
+    if maximum < minimum:
+        return Dim.AUTO
+    return Dim(name, min=minimum, max=maximum)
+
+
 def _same_layout_on_shape(
     shape: Sequence[int], left: Sequence[int], right: Sequence[int]
 ) -> bool:
@@ -797,23 +813,26 @@ def _dynamic_export(
     gm = private_graph_copy(gm)
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
 
-    dynamic_exprs = {
-        size.node.expr
-        for node, value in zip(placeholders, example_inputs)
-        if not isinstance(value, torch.SymInt)
-        for size in getattr(node.meta.get("example_value"), "shape", getattr(value, "shape", ()))
-        if _is_dynamic(size)
-    }
-    if dynamic_range is not None and len(dynamic_exprs) > 1:
+    dynamic_sizes = {}
+    for node, value in zip(placeholders, example_inputs):
+        if isinstance(value, torch.SymInt):
+            continue
+        shape = getattr(
+            node.meta.get("example_value"), "shape", getattr(value, "shape", ())
+        )
+        for size in shape:
+            if _is_dynamic(size):
+                dynamic_sizes.setdefault(size.node.expr, size)
+    if dynamic_range is not None and len(dynamic_sizes) > 1:
         raise RuntimeError(
             "an explicit dynamic range supports at most one symbolic dimension, "
-            f"found {len(dynamic_exprs)}"
+            f"found {len(dynamic_sizes)}"
         )
     # vLLM attaches the enclosing token range to every piecewise subgraph.
     # Some pieces are shape-invariant (for example a fixed-size attention
     # projection) and therefore contain no symbolic tensor dimension. Compile
     # those as static artifacts instead of inventing a dimension to range.
-    effective_dynamic_range = dynamic_range if dynamic_exprs else None
+    effective_dynamic_range = dynamic_range if dynamic_sizes else None
     dim_specs: dict[Any, Any] = {}
     if effective_dynamic_range is not None:
         minimum, maximum = effective_dynamic_range
@@ -823,8 +842,13 @@ def _dynamic_export(
                 f"dynamic range [{effective_dynamic_range[0]}, {maximum}] has no values "
                 "supported by torch.export; sizes 0 and 1 require exact artifacts"
             )
-        expr = next(iter(dynamic_exprs))
+        expr = next(iter(dynamic_sizes))
         dim_specs[expr] = Dim("luminal_dynamic_dim", min=minimum, max=maximum)
+    else:
+        for index, (expr, size) in enumerate(dynamic_sizes.items()):
+            dim_specs[expr] = _symbolic_dim_spec(
+                size, f"luminal_dynamic_dim_{index}"
+            )
 
     records: list[tuple[str, torch.fx.Node, Any]] = []
     tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
@@ -995,6 +1019,7 @@ def _compile_graph(
         artifact_dir=artifact_dir,
         artifact_prefix=artifact_prefix,
         disable_cache=disable_cache,
+        external_cuda_graph=external_cuda_graph,
     )
 
 
@@ -1011,6 +1036,7 @@ def compile_exported(
     artifact_dir=None,
     artifact_prefix="",
     disable_cache=False,
+    external_cuda_graph=False,
 ):
     """Compile a functional ExportedProgram with the native runtime."""
 
@@ -1043,6 +1069,7 @@ def compile_exported(
                 declared,
                 declared_outputs,
                 [(name, owner) for name, owner, _ in aliases],
+                dynamic_range,
             )
         tensors = {name: value for name, _, value, _ in rows}
         alias_map = {name: (owner, offset) for name, owner, offset in aliases}

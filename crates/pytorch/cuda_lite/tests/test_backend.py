@@ -12,7 +12,11 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("luminal_cuda_lite")
 
 import luminal_cuda_lite  # noqa: E402
-from luminal_cuda_lite.backend import _dynamic_export, _same_layout_on_shape  # noqa: E402
+from luminal_cuda_lite.backend import (  # noqa: E402
+    _dynamic_export,
+    _same_layout_on_shape,
+    luminal_cuda_lite as compile_backend,
+)
 
 
 def test_backend_registered():
@@ -31,6 +35,54 @@ def test_enclosing_dynamic_range_is_ignored_for_a_static_region():
     assert inputs[0].shape == (4, 8)
     assert not exported.range_constraints
     assert effective_range is None
+
+
+def test_dynamic_export_preserves_mark_dynamic_bounds():
+    seen = []
+
+    def backend(graph, inputs):
+        exported, _, _ = _dynamic_export(graph, inputs)
+        seen.extend(exported.range_constraints.values())
+        return graph.forward
+
+    value = torch.ones(8)
+    torch._dynamo.mark_dynamic(value, 0, min=2, max=16)
+    torch.compile(lambda tensor: tensor + 1, backend=backend)(value)
+
+    assert len(seen) == 1
+    assert int(seen[0].lower) == 2
+    assert int(seen[0].upper) == 16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_dynamic_bucket_covers_exported_upper_bound():
+    compiled = torch.compile(
+        lambda tensor: tensor + 1, backend=luminal_cuda_lite.Compiler()
+    )
+    value = torch.ones(8, device="cuda")
+    torch._dynamo.mark_dynamic(value, 0, min=2, max=8192)
+
+    compiled(value)
+    upper = torch.ones(8192, device="cuda")
+    torch.testing.assert_close(compiled(upper), upper + 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_explicit_dynamic_range_includes_size_one():
+    held = []
+
+    def backend(graph, inputs):
+        model = compile_backend(graph, inputs, dynamic_range=(1, 16))
+        held.append(model)
+        return model
+
+    value = torch.ones(8, device="cuda")
+    torch._dynamo.mark_dynamic(value, 0, min=2, max=16)
+    torch.compile(lambda tensor: tensor + 1, backend=backend)(value)
+
+    one = torch.ones(1, device="cuda")
+    (actual,) = held[0](one)
+    torch.testing.assert_close(actual, one + 1)
 
 
 def test_stride_differences_on_size_one_axes_are_layout_equivalent():
@@ -218,7 +270,7 @@ def test_external_cuda_graph_is_captured_and_replayed_by_pytorch():
     held = []
 
     def backend(gm, example_inputs, **kwargs):
-        model = luminal_cuda_lite(
+        model = compile_backend(
             gm,
             example_inputs,
             external_cuda_graph=True,
@@ -255,7 +307,7 @@ def test_external_cuda_graph_captures_cublaslt_region():
         return left @ right
 
     def backend(gm, example_inputs, **kwargs):
-        return luminal_cuda_lite(
+        return compile_backend(
             gm,
             example_inputs,
             external_cuda_graph=True,
@@ -291,7 +343,7 @@ def test_external_cuda_graph_replays_chain_of_compiled_regions():
     """
 
     def backend(gm, example_inputs, **kwargs):
-        return luminal_cuda_lite(
+        return compile_backend(
             gm,
             example_inputs,
             external_cuda_graph=True,
@@ -331,7 +383,7 @@ def test_external_cuda_graph_replays_earlier_dynamic_capture():
         return torch.relu(x @ weight)
 
     def backend(gm, example_inputs, **kwargs):
-        return luminal_cuda_lite(
+        return compile_backend(
             gm,
             example_inputs,
             external_cuda_graph=True,
@@ -619,7 +671,7 @@ def test_a_held_buffer_is_bound_on_the_modules_own_storage():
     held = []
 
     def capture(gm, example_inputs, **kwargs):
-        model = luminal_cuda_lite(gm, example_inputs, **kwargs)
+        model = compile_backend(gm, example_inputs, **kwargs)
         held.append(model)
         return model
 
