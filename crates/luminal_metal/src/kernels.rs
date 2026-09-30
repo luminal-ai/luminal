@@ -426,6 +426,32 @@ pub(crate) fn metal_f64_literal(v: f64) -> String {
     format!("{v:e}")
 }
 
+/// The identity of a maximum in the accumulator's own type: integers name
+/// their minimum and booleans start false; floats start at `-inf`.
+pub(crate) fn max_identity(dtype: PlanDtype) -> String {
+    match dtype {
+        PlanDtype::Int => "(-2147483647 - 1)".to_string(),
+        PlanDtype::Int64 => "(-9223372036854775807L - 1L)".to_string(),
+        PlanDtype::Bool | PlanDtype::Bool8 => "0".to_string(),
+        _ => metal_f64_literal(f64::NEG_INFINITY),
+    }
+}
+
+/// The fold of a maximum: IEEE 754-2019 `maximum` on floats (a NaN on either
+/// side propagates), plain comparison on integers.
+pub(crate) fn max_fold(dtype: PlanDtype) -> Result<String> {
+    Ok(match dtype {
+        PlanDtype::F32 | PlanDtype::F64 | PlanDtype::F16 | PlanDtype::Bf16 | PlanDtype::TF32 => {
+            format!(
+                "(v != v || acc != acc) ? ({ty})({nan}) : (v > acc ? v : acc)",
+                ty = metal_type(dtype)?,
+                nan = metal_f64_literal(f64::NAN)
+            )
+        }
+        _ => "v > acc ? v : acc".to_string(),
+    })
+}
+
 pub(crate) fn numel(dims: &[Expr]) -> Expr {
     dims.iter().product()
 }

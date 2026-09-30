@@ -255,3 +255,52 @@ fn int_cummax_over_negatives() {
     rt.execute().expect("device execute");
     assert_eq!(rt.get_i32(out.id).unwrap(), vec![-7, -7, -3, -3]);
 }
+
+/// Exact equality position by position, where a NaN in `expected` demands a
+/// NaN on both sides.
+fn assert_exact_both_with_nan(want: &[f32], got: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(want.len(), expected.len(), "{what}: reference length");
+    assert_eq!(got.len(), expected.len(), "{what}: device length");
+    for (i, e) in expected.iter().enumerate() {
+        if e.is_nan() {
+            assert!(
+                want[i].is_nan(),
+                "{what}: reference element {i} is {} not NaN",
+                want[i]
+            );
+            assert!(
+                got[i].is_nan(),
+                "{what}: device element {i} is {} not NaN",
+                got[i]
+            );
+        } else {
+            assert_eq!(want[i], *e, "{what}: reference element {i}");
+            assert_eq!(got[i], *e, "{what}: device element {i}");
+        }
+    }
+}
+
+/// `max` is IEEE 754-2019 `maximum`: a NaN in a slice is that slice's maximum.
+#[test]
+fn max_propagates_nan() {
+    let mut cx = Graph::new();
+    let a = cx.tensor((2usize, 2usize), DType::F32);
+    let out = a.max(1);
+    let (want, got) = run_both(&cx, &[(a.id, vec![1.0, f32::NAN, 3., 2.])], out.id);
+    assert_exact_both_with_nan(&want, &got, &[f32::NAN, 3.0], "max over rows with a NaN");
+}
+
+/// Once the running maximum meets a NaN it stays NaN.
+#[test]
+fn cummax_propagates_nan() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(4usize, DType::F32);
+    let out = a.cummax(0);
+    let (want, got) = run_both(&cx, &[(a.id, vec![1.0, f32::NAN, 2., 3.])], out.id);
+    assert_exact_both_with_nan(
+        &want,
+        &got,
+        &[1.0, f32::NAN, f32::NAN, f32::NAN],
+        "cummax after a NaN",
+    );
+}

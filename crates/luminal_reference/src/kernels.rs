@@ -87,6 +87,16 @@ pub fn kernel_for(op: &dyn BufferTensorIrOp) -> Option<&'static ReferenceKernel>
 
 /// Downcast the dispatched op to the kernel's concrete type — a mismatch
 /// means the registry row and the kernel disagree, which refuses loudly.
+/// IEEE 754-2019 `maximum`: a NaN on either side propagates, so a NaN in
+/// the operand can never be hidden by a larger neighbour.
+pub(crate) fn maximum(acc: f32, x: f32) -> f32 {
+    if acc.is_nan() || x.is_nan() {
+        f32::NAN
+    } else {
+        acc.max(x)
+    }
+}
+
 pub(crate) fn expect_op<T: 'static>(op: &dyn BufferTensorIrOp) -> anyhow::Result<&T> {
     op.as_any().downcast_ref::<T>().ok_or_else(|| {
         anyhow::anyhow!(

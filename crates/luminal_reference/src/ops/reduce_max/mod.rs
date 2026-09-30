@@ -149,7 +149,7 @@ pub(crate) fn kernel(
 ) -> anyhow::Result<()> {
     let op = expect_op::<ReduceMaxDps>(op)?;
     match &ctx.operands[0] {
-        TypedBuffer::F32(_) => ctx.reduce_axis(op.axis, f32::NEG_INFINITY, |acc, x| acc.max(x)),
+        TypedBuffer::F32(_) => ctx.reduce_axis(op.axis, f32::NEG_INFINITY, crate::kernels::maximum),
         TypedBuffer::I32(_) => ctx.reduce_axis_i32(op.axis, i32::MIN, |acc, x| Ok(acc.max(x))),
         // Max never leaves the operand range, so there is nothing to
         // wrap and nothing to check at any width.

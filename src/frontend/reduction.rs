@@ -229,4 +229,20 @@ mod tests {
             luminal_reference::harness::run_reference(&cx, &[(a.id, Vec::<f32>::new().into())]);
         assert_exact(rt.get_f32(b.id).unwrap(), &[1.0, 1.0]);
     }
+
+    /// `max` is IEEE 754-2019 `maximum`: a NaN anywhere in the slice is the
+    /// slice's maximum.
+    #[test]
+    fn max_propagates_nan() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 2), DType::F32);
+        let b = a.max(1);
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[(a.id, vec![1.0, f32::NAN, 3.0, 2.0].into())],
+        );
+        let out = rt.get_f32(b.id).unwrap();
+        assert!(out[0].is_nan(), "row with a NaN: got {}", out[0]);
+        assert_eq!(out[1], 3.0);
+    }
 }

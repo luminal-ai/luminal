@@ -11,7 +11,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_f64_literal, reduce};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, max_fold, max_identity, reduce};
 use anyhow::{Context, Result};
 
 /// `ReduceMaxGeneric(input) -> out` — pure dataflow form.
@@ -99,17 +99,8 @@ impl LayoutIrOp for ReduceMaxDps {}
 impl KernelOp for ReduceMaxDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
         let axis = usize::try_from(self.axis).context("negative reduce axis")?;
-        // NVRTC compiles the program with no math headers, so the INFINITY
-        // macro does not exist there and -inf has to be spelled by bit
-        // pattern. That spelling is NOT repeated here: [`cuda_f64_literal`]
-        // is the crate's single place where non-finite literals are written,
-        // and this reduction identity goes through it like any other.
-        reduce(
-            ctx,
-            axis,
-            &cuda_f64_literal(f64::NEG_INFINITY),
-            "v > acc ? v : acc",
-        )
+        let dtype = ctx.operand_dtypes[0];
+        reduce(ctx, axis, &max_identity(dtype), &max_fold(dtype)?)
     }
 }
 

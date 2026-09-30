@@ -151,7 +151,7 @@ pub(crate) fn kernel(
 ) -> anyhow::Result<()> {
     let op = expect_op::<LeftSequentialScanMaxDps>(op)?;
     match &ctx.operands[0] {
-        TypedBuffer::F32(_) => ctx.scan_axis(op.axis, f32::NEG_INFINITY, |acc, x| acc.max(x)),
+        TypedBuffer::F32(_) => ctx.scan_axis(op.axis, f32::NEG_INFINITY, crate::kernels::maximum),
         TypedBuffer::I32(_) => ctx.scan_axis_i32(op.axis, i32::MIN, |acc, x| Ok(acc.max(x))),
         TypedBuffer::I8(_) => ctx.scan_axis_i8(op.axis, i8::MIN, |acc, x| Ok(acc.max(x))),
         TypedBuffer::U8(_) => ctx.scan_axis_u8(op.axis, u8::MIN, |acc, x| Ok(acc.max(x))),

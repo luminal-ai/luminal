@@ -3,7 +3,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, metal_f64_literal, reduce};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, max_fold, max_identity, reduce};
 use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,14 +86,8 @@ impl LayoutIrOp for ReduceMaxDps {}
 impl KernelOp for ReduceMaxDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
         let axis = usize::try_from(self.axis).context("negative reduce axis")?;
-        use luminal::dtype::PlanDtype;
-        let init = match ctx.operand_dtypes[0] {
-            PlanDtype::Int => "(-2147483647 - 1)".to_string(),
-            PlanDtype::Int64 => "(-9223372036854775807L - 1L)".to_string(),
-            PlanDtype::Bool | PlanDtype::Bool8 => "0".to_string(),
-            _ => metal_f64_literal(f64::NEG_INFINITY),
-        };
-        reduce(ctx, axis, &init, "v > acc ? v : acc")
+        let dtype = ctx.operand_dtypes[0];
+        reduce(ctx, axis, &max_identity(dtype), &max_fold(dtype)?)
     }
 }
 

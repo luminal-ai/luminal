@@ -571,6 +571,21 @@ pub(super) mod tests {
     }
 
     /// The reference runtime's scan IS the left-sequential fold, bit for bit.
+    /// Once a NaN is seen, every later running maximum is NaN.
+    #[test]
+    fn cummax_propagates_nan() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(4, DType::F32);
+        let b = a.cummax(0);
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[(a.id, vec![1.0, f32::NAN, 2.0, 3.0].into())],
+        );
+        let out = rt.get_f32(b.id).unwrap();
+        assert_eq!(out[0], 1.0);
+        assert!(out[1..].iter().all(|v| v.is_nan()), "got {out:?}");
+    }
+
     #[test]
     fn cumsum_matches_the_sequential_fold() {
         let input = random_vec(64);

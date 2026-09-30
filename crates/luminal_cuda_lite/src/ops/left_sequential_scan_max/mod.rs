@@ -8,7 +8,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, cuda_f64_literal, scan};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, max_fold, max_identity, scan};
 use anyhow::{Context, Result};
 
 /// `LeftSequentialScanMax(input) -> out` — pure dataflow form.
@@ -96,16 +96,8 @@ impl LayoutIrOp for LeftSequentialScanMaxDps {}
 impl KernelOp for LeftSequentialScanMaxDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
         let axis = usize::try_from(self.axis).context("negative scan axis")?;
-        // The identity is typed: a float -inf converted to an integer
-        // accumulator is undefined, so each integer width names its minimum.
-        use luminal::dtype::PlanDtype;
-        let init = match ctx.operand_dtypes[0] {
-            PlanDtype::Int => "(-2147483647 - 1)".to_string(),
-            PlanDtype::Int64 => "(-9223372036854775807LL - 1LL)".to_string(),
-            PlanDtype::Bool | PlanDtype::Bool8 => "0".to_string(),
-            _ => cuda_f64_literal(f64::NEG_INFINITY),
-        };
-        scan(ctx, axis, &init, "v > acc ? v : acc")
+        let dtype = ctx.operand_dtypes[0];
+        scan(ctx, axis, &max_identity(dtype), &max_fold(dtype)?)
     }
 }
 
@@ -157,7 +149,7 @@ mod tests {
         let source = source_for(&LeftSequentialScanMaxDps { axis: 0 }, &[2, 3]);
         for needle in [
             "float acc = __uint_as_float(0xff800000u);",
-            "acc = v > acc ? v : acc;",
+            "acc = (v != v || acc != acc) ? (float)(__uint_as_float(0x7fc00000u)) : (v > acc ? v : acc);",
             "out[outer_index * 3LL * 1LL + r * 1LL + inner_index] = acc;",
         ] {
             assert!(source.contains(needle), "missing `{needle}`:\n{source}");
@@ -178,6 +170,10 @@ mod tests {
         assert!(
             source.contains("int acc = (-2147483647 - 1);"),
             "missing the integer identity:\n{source}"
+        );
+        assert!(
+            source.contains("acc = v > acc ? v : acc;"),
+            "an integer fold has no NaN to propagate:\n{source}"
         );
     }
 }
