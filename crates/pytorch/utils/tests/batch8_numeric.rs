@@ -36,18 +36,20 @@ impl Input {
 fn run(t: &Translation, inputs: &[Input]) -> (Vec<Vec<f32>>, Vec<Vec<u8>>) {
     assert_eq!(inputs.len(), t.inputs.len(), "input count");
     let mut runtime = ReferenceRuntime::load(&t.graph).expect("load");
-    for (symbol, hint) in &t.dims {
-        runtime
-            .bind_dyn_range(*symbol, *hint as u64, *hint as u64)
-            .expect("bind dyn range");
-        runtime.set_dim(*symbol, *hint);
-    }
+    let dims: luminal::shape::DynMap = t.dims.iter().map(|(s, v)| (*s, *v)).collect();
     let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
     for (input, value) in t.inputs.iter().zip(inputs) {
         data.insert(input.tensor, value.as_typed());
     }
     let options = harness_search_options();
-    runtime.search(&data, &options).expect("search");
+    runtime
+        .search(
+            &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+            &dims,
+            &data,
+            &options,
+        )
+        .expect("search");
     for (input, value) in t.inputs.iter().zip(inputs) {
         runtime.set_data(input.tensor, value.as_typed());
     }

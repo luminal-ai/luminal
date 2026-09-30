@@ -6,6 +6,7 @@
 //! suites; a mini model smoke test only proves that its complete small graph
 //! can be searched, staged, executed, and read back.
 
+mod support;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{GraphTensor, NodeIndex};
@@ -14,6 +15,8 @@ use luminal_metal::HostBuffer;
 use luminal_metal::MetalRuntime;
 use luminal_metal::bindings::MetalBindings;
 use luminal_metal::metal_registry;
+#[cfg(target_os = "macos")]
+use support::TestTransfers;
 
 fn values(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
@@ -66,16 +69,24 @@ fn run(
     )
     .expect("mini load");
     runtime
-        .search(&data, &luminal_metal::harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &luminal_metal::harness_search_options(),
+        )
         .expect("mini graph searches");
+    let mut arena_runtime = support::allocate_arena(&runtime).expect("allocate execution arena");
     for (id, value) in pairs {
-        runtime.set_data(id, value);
+        runtime.upload(&mut arena_runtime, id, value).unwrap();
     }
-    runtime.execute().expect("mini graph executes");
+    runtime
+        .execute(arena_runtime.buffer())
+        .expect("mini graph executes");
     for output in outputs {
         assert!(
             !runtime
-                .get_f32(output.id)
+                .read_f32(&arena_runtime, output.id)
                 .expect("mini output readback")
                 .is_empty(),
             "mini output is empty"

@@ -10,7 +10,7 @@
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::egglog_utils::eclass::EGraphView;
-use luminal::graph::{DimBucket, Graph};
+use luminal::graph::Graph;
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
@@ -102,7 +102,9 @@ fn a_column_major_input_carries_the_left_major_spelling() {
     let rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("column-major load");
 
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
     let x_class = input_class(&egraph, "x");
     assert!(
@@ -134,7 +136,9 @@ fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
     let mut rt =
         CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt()).expect("load");
 
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
     let x_class = input_class(&egraph, "x");
     // The spelling alone does not pin the map — the preamble equates a
@@ -147,8 +151,13 @@ fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
 
     // The host search (heuristic ranking, no device) installs a plan; the
     // buffer the caller stages `x` into carries the layout it stated.
-    rt.search(&Default::default(), &harness_search_options())
-        .expect("host search");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .expect("host search");
     let lit = rt.input_buffer(x.id).expect("x has an input buffer");
     let plan = rt.plan().expect("the search installed a plan");
     let buffer = plan
@@ -191,15 +200,22 @@ fn a_right_major_strides_chain_is_discovered_contiguous() {
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a rendered strides chain loads");
 
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
     let x_class = input_class(&egraph, "x");
     assert!(
         holds_spelling(&view, &x_class, "RightMajorContiguousElementLayoutLit"),
         "the row-major chain's layout class holds no RightMajorContiguousElementLayoutLit"
     );
-    rt.search(&Default::default(), &harness_search_options())
-        .expect("host search over a discovered-contiguous boundary");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .expect("host search over a discovered-contiguous boundary");
 }
 
 /// THE SAME DISCOVERY AT A SYMBOLIC DIM: shape (n, 4) at strides
@@ -224,7 +240,11 @@ fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a symbolic-shape strides chain loads");
 
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(
+            &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
+        )
+        .expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
     let x_class = input_class(&egraph, "x");
     assert!(
@@ -232,16 +252,18 @@ fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
         "the symbolic shape's row-major chain holds no RightMajorContiguousElementLayoutLit"
     );
 
-    rt.bind_dim_buckets('n', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
-        .expect("disjoint sorted buckets bind");
-    rt.search(&Default::default(), &harness_search_options())
-        .expect("host search over a discovered-contiguous symbolic boundary");
-    assert_eq!(rt.bucket_plans().len(), 2, "one plan per bucket");
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
+        &[('n'.into(), 3)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .expect("host search over a discovered-contiguous symbolic boundary");
     for n in [3usize, 7] {
         let mut dims = DynMap::default();
         dims.insert(Symbol::from('n'), n);
         assert!(
-            luminal_cuda_lite::search::select_bucket(rt.bucket_plans(), &dims).is_some(),
+            rt.bounds().validate_values(&dims).is_ok(),
             "no plan covers n = {n}"
         );
     }
@@ -271,7 +293,9 @@ fn an_arbitrary_stride_on_a_degenerate_axis_is_discovered_contiguous() {
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a degenerate-axis strides chain loads");
 
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
     let x_class = input_class(&egraph, "x");
     assert!(
@@ -283,8 +307,13 @@ fn an_arbitrary_stride_on_a_degenerate_axis_is_discovered_contiguous() {
         "the degenerate-axis chain holds no LeftMajorContiguousElementLayoutLit"
     );
 
-    rt.search(&Default::default(), &harness_search_options())
-        .expect("host search over a degenerate-axis boundary");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .expect("host search over a degenerate-axis boundary");
     let lit = rt.input_buffer(x.id).expect("x has an input buffer");
     let plan = rt.plan().expect("the search installed a plan");
     let buffer = plan
@@ -349,8 +378,13 @@ fn a_zero_stride_input_plans_as_a_broadcast_read() {
     bindings.output(out.id);
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a broadcast read map binds");
-    rt.search(&Default::default(), &harness_search_options())
-        .expect("host search over a broadcast read map");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .expect("host search over a broadcast read map");
 
     // THE BROADCAST SURVIVES TO THE READ: the map an elected node reads
     // `x` through spans one row — 1 + (2-1)*0 + (3-1)*1 = 3 — rather than
@@ -401,7 +435,12 @@ fn a_zero_stride_sink_binds_and_the_search_names_it() {
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a stride-0 sink binds");
 
-    let refusal = match rt.search(&Default::default(), &harness_search_options()) {
+    let refusal = match rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    ) {
         Ok(_) => panic!("a broadcast write map must plan nothing"),
         Err(refusal) => format!("{refusal:#}"),
     };
@@ -433,7 +472,12 @@ fn a_column_major_sink_binds_and_the_search_names_it() {
     bindings.output_on_with(out.id, home, BoundaryLayout::ColumnMajor);
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a column-major sink binds");
-    let refusal = match rt.search(&Default::default(), &harness_search_options()) {
+    let refusal = match rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    ) {
         Ok(_) => panic!("no kernel writes a left-major destination today"),
         Err(refusal) => format!("{refusal:#}"),
     };
@@ -467,7 +511,12 @@ fn a_column_major_output_binds_and_the_search_names_it() {
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a column-major output binds");
 
-    let refusal = match rt.search(&Default::default(), &harness_search_options()) {
+    let refusal = match rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    ) {
         Ok(_) => panic!("no kernel writes a left-major destination today"),
         Err(refusal) => format!("{refusal:#}"),
     };
@@ -498,8 +547,13 @@ fn a_row_major_output_bound_external_plans() {
     let buffer = bindings.output_external_with(out.id, BoundaryLayout::RowMajor);
     let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
         .expect("a row-major output binds");
-    rt.search(&Default::default(), &harness_search_options())
-        .expect("host search over a row-major bound output");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .expect("host search over a row-major bound output");
 
     assert_eq!(rt.output_buffer(out.id).expect("out has a buffer"), buffer);
     rt.check_external_outputs()
@@ -535,7 +589,12 @@ fn a_zero_extent_output_at_torchs_contiguous_chain_is_named_by_the_search() {
         let mut rt = CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt())
             .expect("an empty bound output loads");
         let result = rt
-            .search(&Default::default(), &harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &harness_search_options(),
+            )
             .map(|_| ());
         (out.id, result)
     };
@@ -613,8 +672,13 @@ fn an_output_bound_on_a_read_write_input_shares_its_buffer() {
     bindings.output_on(next.id, state_buffer);
     let mut rt =
         CudaRuntime::load_with(&cx, bindings, cuda_registry_without_cublaslt()).expect("load");
-    rt.search(&Default::default(), &harness_search_options())
-        .expect("host search");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .expect("host search");
 
     assert_eq!(
         rt.input_buffer(state.id).expect("state binding"),
@@ -743,7 +807,11 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
 
     // (a) THE SPELLING: the strided literal is in the e-graph, and its
     // chain carries the dim itself, not a number.
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(
+            &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
+        )
+        .expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
     for name in ["x", "w", "v"] {
         let class = input_class(&egraph, name);
@@ -769,16 +837,19 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
 
     // (b) A PLAN AT BOTH DIMS: one search per bucket, each valid over its
     // whole interval, and both dims select one.
-    rt.bind_dim_buckets('n', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
-        .expect("disjoint sorted buckets bind");
-    rt.search(&Default::default(), &harness_search_options())
-        .expect("host search over the symbolic strided boundary");
-    assert_eq!(rt.bucket_plans().len(), 2, "one plan per bucket");
+
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
+        &[('n'.into(), 3)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .expect("host search over the symbolic strided boundary");
     for n in [3usize, 7] {
         let mut dims = DynMap::default();
         dims.insert(Symbol::from('n'), n);
         assert!(
-            luminal_cuda_lite::search::select_bucket(rt.bucket_plans(), &dims).is_some(),
+            rt.bounds().validate_values(&dims).is_ok(),
             "no plan covers n = {n}"
         );
     }
@@ -791,8 +862,8 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
         .map(|id| rt.input_buffer(*id).expect("the input has a buffer"))
         .collect();
     let parameter = symbolic::variable("n");
-    for bucket in rt.bucket_plans() {
-        let layouts = read_layouts(&bucket.plan, &lits);
+    {
+        let layouts = read_layouts(rt.plan().unwrap(), &lits);
         for (_, layout) in &layouts {
             let dims: Vec<Expr> = layout.shape().0.iter().cloned().map(Expr).collect();
             let (code, index) = kernels::layout_read_index(
@@ -811,7 +882,7 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
             assert!(
                 layouts.iter().any(|(read, _)| read == lit),
                 "bucket {:?}: no elected node reads {name}'s own storage",
-                bucket.ranges
+                rt.bounds()
             );
         }
     }

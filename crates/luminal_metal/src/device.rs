@@ -1,18 +1,16 @@
 //! Synchronous Metal command submission over the buffer plan's lifetime schedule.
-//! Buckets share a capacity-sized arena. Uploads and readbacks occur at their
-//! scheduled boundaries, so arena reuse cannot overwrite an escaped output.
+//! One program borrows a capacity-sized device arena. Applications explicitly
+//! initialize inputs and consume outputs; execution performs no tensor transfers.
 use crate::{
     arena::{ArenaPlan, ArenaStep},
-    host_buffer::HostBuffer,
     kernels::{CodegenCtx, KernelSource},
     layouts::MetalPlan,
     symbolic::{self, Bounds},
 };
 use anyhow::{Result, anyhow, bail, ensure};
-use luminal::resident::{ResidentBindings, ResidentHome};
+
 use luminal::{
-    bufferize::{BufferNode, OutputBinding},
-    layouts::DecodedLayout,
+    bufferize::BufferNode,
     prelude::{FxHashMap, NodeIndex},
     shape::DynMap,
 };
@@ -20,18 +18,13 @@ use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device, MTLCommandBufferStatus, MTLResourceOptions,
     MTLSize,
 };
-use std::collections::{BTreeMap, BTreeSet};
 
-type Outputs = FxHashMap<usize, (HostBuffer, OutputBinding<DecodedLayout>)>;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GraphStats {
     pub launches: u64,
     pub kernel_compilations: u64,
-    pub arena_generation: u64,
     pub arena_bytes: usize,
     pub staging_bytes: usize,
-    /// Cumulative bytes uploaded by explicit updates to resident inputs.
-    pub resident_upload_bytes: u64,
 }
 struct Kernel {
     pipeline: ComputePipelineState,
@@ -43,18 +36,24 @@ struct Installed {
     bounds: Bounds,
     kernels: FxHashMap<NodeIndex, Vec<Kernel>>,
 }
+/// Shared Metal device, queue and pipeline cache. Each executable owns its
+/// own selected program and launch state; the application supplies device storage.
+#[derive(Clone)]
 pub struct MetalDevice {
     device: Device,
     queue: CommandQueue,
-    installed: Vec<Installed>,
-    slab: Option<Buffer>,
-    staging: Option<Buffer>,
-    cache: FxHashMap<String, ComputePipelineState>,
-    stats: GraphStats,
-    residents: BTreeMap<i64, ResidentHome>,
-    resident_initialized: BTreeSet<i64>,
+    cache: std::rc::Rc<std::cell::RefCell<FxHashMap<String, ComputePipelineState>>>,
 }
 impl MetalDevice {
+    /// Native device used by this execution context.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+    /// Native queue used by this execution context.
+    pub fn queue(&self) -> &CommandQueue {
+        &self.queue
+    }
+
     pub fn new() -> Result<Self> {
         let device =
             Device::system_default().ok_or_else(|| anyhow!("no Metal device available"))?;
@@ -62,65 +61,96 @@ impl MetalDevice {
         Ok(Self {
             device,
             queue,
-            installed: vec![],
-            slab: None,
-            staging: None,
-            cache: FxHashMap::default(),
-            stats: GraphStats::default(),
-            residents: BTreeMap::new(),
-            resident_initialized: BTreeSet::new(),
+            cache: std::rc::Rc::new(Default::default()),
         })
     }
+    pub fn executable(&self) -> MetalExecutable {
+        MetalExecutable::new(self)
+    }
+}
+
+/// A retained caller-owned Metal buffer region.
+#[derive(Clone)]
+pub struct ExternalBuffer {
+    pub buffer: Buffer,
+    pub offset: usize,
+    pub bytes: usize,
+}
+
+pub struct MetalExecutable {
+    device: Device,
+    queue: CommandQueue,
+    installed: Option<Installed>,
+    cache: std::rc::Rc<std::cell::RefCell<FxHashMap<String, ComputePipelineState>>>,
+    stats: GraphStats,
+}
+impl MetalExecutable {
+    /// Native device used by this execution context.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+    /// Native queue used by this execution context.
+    pub fn queue(&self) -> &CommandQueue {
+        &self.queue
+    }
+
+    /// Fresh launch/storage state sharing the already compiled pipelines.
+    pub fn fork(&self) -> Result<Self> {
+        let device = MetalDevice {
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            cache: self.cache.clone(),
+        };
+        Ok(device.executable())
+    }
+
+    pub fn new(device: &MetalDevice) -> Self {
+        Self {
+            device: device.device.clone(),
+            queue: device.queue.clone(),
+            installed: None,
+            cache: device.cache.clone(),
+            stats: GraphStats::default(),
+        }
+    }
+
     pub fn stats(&self) -> GraphStats {
         self.stats
     }
     pub fn slab_bytes(&self) -> usize {
         self.stats.arena_bytes
     }
+
     pub fn available_arena_bytes(&self) -> Result<usize> {
         Ok(usize::try_from(self.device.max_buffer_length())?)
     }
     pub fn is_installed(&self) -> bool {
-        !self.installed.is_empty()
+        self.installed.is_some()
     }
-    pub fn release_slab(&mut self) {
-        self.installed.clear();
-        self.slab = None;
-        self.staging = None;
-        self.residents.clear();
-        self.resident_initialized.clear();
+    pub fn uninstall(&mut self) {
+        self.installed = None;
         self.stats.arena_bytes = 0;
         self.stats.staging_bytes = 0;
     }
-    pub fn install(&mut self, plans: Vec<(MetalPlan, Bounds)>) -> Result<()> {
-        self.install_resident_with_budget(plans, Default::default(), None)
+    pub fn install(&mut self, program: (MetalPlan, Bounds)) -> Result<()> {
+        self.install_with_bindings(program, Default::default(), None)
     }
-    pub fn install_resident_with_budget(
+    pub fn install_with_bindings(
         &mut self,
-        plans: Vec<(MetalPlan, Bounds)>,
-        bindings: ResidentBindings,
+        program: (MetalPlan, Bounds),
+        bindings: std::collections::BTreeSet<i64>,
         budget: Option<usize>,
     ) -> Result<()> {
-        let allocation = luminal::resident::allocate(
-            plans,
-            bindings,
-            crate::storage::plan_resident,
-            symbolic::capacity_bytes,
-        )?;
-        let bytes = allocation.bytes.max(1);
+        let (plan, bounds) = program;
+        let storage = crate::storage::plan_storage(&plan, &bounds, &bindings)?;
+        let bytes = storage.slab_bytes;
         let limit = usize::try_from(self.device.max_buffer_length())?;
         let limit = budget.map_or(limit, |requested| requested.min(limit));
         ensure!(
             bytes <= limit,
             "Metal arena needs {bytes} bytes, exceeding budget {limit}"
         );
-        let mut installed = vec![];
-        for resident_plan in allocation.plans {
-            let luminal::resident::ResidentPlan {
-                plan,
-                bounds,
-                storage,
-            } = resident_plan;
+        let installed = {
             crate::kernels::validate_plan(&plan)?;
             let mut defines = String::new();
             for (index, name) in bounds.keys().enumerate() {
@@ -153,7 +183,8 @@ impl MetalDevice {
                             symbolic::METAL_HELPERS,
                             source.source
                         );
-                        let pipeline = if let Some(pipeline) = self.cache.get(&text) {
+                        let mut cache = self.cache.borrow_mut();
+                        let pipeline = if let Some(pipeline) = cache.get(&text) {
                             pipeline.clone()
                         } else {
                             let options = metal::CompileOptions::new();
@@ -170,7 +201,7 @@ impl MetalDevice {
                                 .device
                                 .new_compute_pipeline_state_with_function(&function)
                                 .map_err(|e| anyhow!(e))?;
-                            self.cache.insert(text, pipeline.clone());
+                            cache.insert(text, pipeline.clone());
                             self.stats.kernel_compilations += 1;
                             pipeline
                         };
@@ -179,125 +210,50 @@ impl MetalDevice {
                     kernels.insert(*node, compiled);
                 }
             }
-            installed.push(Installed {
+            Installed {
                 plan,
                 storage,
                 bounds,
                 kernels,
-            });
-        }
-        let staging_bytes = installed
-            .iter()
-            .map(|p| p.storage.staging_bytes)
-            .max()
-            .unwrap_or(1)
-            .max(
-                allocation
-                    .homes
-                    .values()
-                    .map(|h| h.data.bytes.min(16 * 1024 * 1024))
-                    .max()
-                    .unwrap_or(1),
-            )
-            .max(1);
-        if self.stats.arena_bytes < bytes {
-            self.slab = Some(
-                self.device
-                    .new_buffer(bytes as u64, MTLResourceOptions::StorageModePrivate),
-            );
-            self.stats.arena_bytes = bytes;
-            self.stats.arena_generation += 1;
-        }
-        if self.stats.staging_bytes < staging_bytes {
-            self.staging = Some(
-                self.device
-                    .new_buffer(staging_bytes as u64, MTLResourceOptions::StorageModeShared),
-            );
-            self.stats.staging_bytes = staging_bytes;
-        }
-        self.installed = installed;
-        self.residents = allocation.homes;
-        self.resident_initialized.clear();
+            }
+        };
+        let staging_bytes = installed.storage.staging_bytes.max(1);
+        self.stats.arena_bytes = bytes;
+        self.stats.staging_bytes = staging_bytes;
+        self.installed = Some(installed);
         Ok(())
     }
-    pub(crate) fn upload_residents(&mut self, staged: &FxHashMap<i64, &HostBuffer>) -> Result<()> {
-        if self.residents.is_empty() {
-            return Ok(());
-        }
-        let slab = self.slab.as_ref().unwrap();
-        let staging = self.staging.as_ref().unwrap();
-        // Resident updates use the same staging allocation before transient
-        // inputs populate it. Validate every resident before updating any one.
-        for (&lit, home) in &self.residents {
-            if let Some(data) = staged.get(&lit) {
-                ensure!(
-                    data.dtype == home.dtype && data.bytes.len() == home.data.bytes,
-                    "resident input {lit} dtype/size mismatch"
-                );
-            } else {
-                ensure!(
-                    self.resident_initialized.contains(&lit),
-                    "set_data required for resident input {lit}"
-                );
-            }
-        }
-        for (&lit, home) in &self.residents {
-            let Some(data) = staged.get(&lit) else {
-                continue;
-            };
-            let chunk_bytes = self.stats.staging_bytes.min(16 * 1024 * 1024);
-            for (index, chunk) in data.bytes.chunks(chunk_bytes).enumerate() {
-                objc::rc::autoreleasepool(|| -> Result<()> {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            chunk.as_ptr(),
-                            staging.contents().cast::<u8>(),
-                            chunk.len(),
-                        );
-                    }
-                    let command = self.queue.new_command_buffer();
-                    let blit = command.new_blit_command_encoder();
-                    blit.copy_from_buffer(
-                        staging,
-                        0,
-                        slab,
-                        (home.data.offset + index * chunk_bytes) as u64,
-                        chunk.len() as u64,
-                    );
-                    blit.end_encoding();
-                    command.commit();
-                    command.wait_until_completed();
-                    ensure!(
-                        command.status() == MTLCommandBufferStatus::Completed,
-                        "Metal resident upload failed: {:?}",
-                        command.status()
-                    );
-                    Ok(())
-                })?;
-                self.stats.resident_upload_bytes += chunk.len() as u64;
-            }
-            self.resident_initialized.insert(lit);
-        }
-        Ok(())
+
+    /// Planned device storage. Inputs must already exist and outputs remain here.
+    pub fn memory_plan(&self) -> Result<&ArenaPlan> {
+        Ok(&self
+            .installed
+            .as_ref()
+            .ok_or_else(|| anyhow!("program is not installed"))?
+            .storage)
     }
-    pub fn execute(
+
+    pub fn execute(&mut self, arena: &Buffer, dims: &DynMap) -> Result<()> {
+        self.execute_external(arena, dims, &Default::default())
+    }
+    pub fn execute_external(
         &mut self,
-        bucket: usize,
-        staged: &FxHashMap<i64, &HostBuffer>,
+        arena: &Buffer,
         dims: &DynMap,
-    ) -> Result<Outputs> {
-        objc::rc::autoreleasepool(|| self.execute_inner(bucket, staged, dims))
+        external: &FxHashMap<i64, ExternalBuffer>,
+    ) -> Result<()> {
+        objc::rc::autoreleasepool(|| self.execute_inner(arena, dims, external))
     }
     fn execute_inner(
         &mut self,
-        bucket: usize,
-        staged: &FxHashMap<i64, &HostBuffer>,
+        arena: &Buffer,
         dims: &DynMap,
-    ) -> Result<Outputs> {
+        external: &FxHashMap<i64, ExternalBuffer>,
+    ) -> Result<()> {
         let p = self
             .installed
-            .get(bucket)
-            .ok_or_else(|| anyhow!("Metal bucket {bucket} is not installed"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow!("Metal program is not installed"))?;
         for (s, (lo, hi)) in &p.bounds {
             let value = dims
                 .get(s)
@@ -312,63 +268,61 @@ impl MetalDevice {
             let bytes = symbolic::bytes(&buffer.layout, dims)?;
             if let Some(home) = p.storage.slices.get(id) {
                 ensure!(bytes <= home.bytes, "live buffer exceeds planned capacity");
+            } else {
+                let binding = buffer
+                    .lit
+                    .and_then(|lit| external.get(&lit))
+                    .ok_or_else(|| anyhow!("missing external buffer {}", buffer.label))?;
+                ensure!(
+                    binding.buffer.device().registry_id() == self.device.registry_id(),
+                    "external buffer belongs to another Metal device"
+                );
+                ensure!(
+                    binding.bytes >= bytes,
+                    "external buffer {} is too small",
+                    buffer.label
+                );
+                let end = binding
+                    .offset
+                    .checked_add(binding.bytes)
+                    .ok_or_else(|| anyhow!("external buffer range overflow"))?;
+                ensure!(
+                    end as u64 <= binding.buffer.length(),
+                    "external buffer range exceeds allocation"
+                );
+                let width = usize::try_from(buffer.layout.width_bits())?.div_ceil(8);
+                ensure!(
+                    binding.offset.is_multiple_of(width),
+                    "misaligned external buffer"
+                );
             }
             sizes.insert(id.clone(), bytes);
         }
-        self.upload_residents(staged)?;
-        let p = &self.installed[bucket];
-        let slab = self.slab.as_ref().unwrap();
-        let staging = self.staging.as_ref().unwrap();
-        // Validate transient uploads before submitting the execution commands.
-        for step in &p.storage.steps {
-            if let ArenaStep::Upload {
-                buffer,
-                staging: home,
-            } = step
-            {
-                let info = &p.plan.buffers[buffer];
-                let lit = info.lit.ok_or_else(|| anyhow!("input has no BufferLit"))?;
-                let Some(data) = staged.get(&lit) else {
-                    ensure!(
-                        info.access != luminal::layout_ir::Access::ReadOnly,
-                        "missing input {lit} ({})",
-                        info.label
-                    );
-                    // Writable output boundary storage has no caller payload.
-                    unsafe {
-                        std::ptr::write_bytes(
-                            staging.contents().cast::<u8>().add(home.offset),
-                            0,
-                            sizes[buffer],
-                        );
-                    }
-                    continue;
-                };
-                ensure!(
-                    Some(data.dtype) == info.layout.dtype,
-                    "input {lit} dtype mismatch: {:?} vs {:?}",
-                    data.dtype,
-                    info.layout.dtype
-                );
-                ensure!(
-                    data.bytes.len() == sizes[buffer],
-                    "input {lit} has {} bytes, expected {}",
-                    data.bytes.len(),
-                    sizes[buffer]
-                );
-                ensure!(
-                    data.bytes.len() <= home.bytes,
-                    "upload exceeds staging capacity"
-                );
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.bytes.as_ptr(),
-                        staging.contents().cast::<u8>().add(home.offset),
-                        data.bytes.len(),
-                    );
-                }
+        let p = self.installed.as_ref().unwrap();
+        ensure!(
+            arena.device().registry_id() == self.device.registry_id(),
+            "arena belongs to another Metal device"
+        );
+        ensure!(
+            arena.length() as usize >= self.stats.arena_bytes,
+            "arena is too small"
+        );
+        let slab = arena;
+        let staging_buffer = self.device.new_buffer(
+            self.stats.staging_bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let staging = &staging_buffer;
+        let resolve = |id: &luminal::bufferize::BufferId| -> Result<(&Buffer, u64)> {
+            if let Some(home) = p.storage.slices.get(id) {
+                return Ok((slab, home.offset as u64));
             }
-        }
+            let binding = p.plan.buffers[id]
+                .lit
+                .and_then(|lit| external.get(&lit))
+                .ok_or_else(|| anyhow!("missing external buffer"))?;
+            Ok((&binding.buffer, binding.offset as u64))
+        };
         let params: Vec<i64> = p.bounds.keys().map(|s| dims[s] as i64).collect();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -394,56 +348,6 @@ impl MetalDevice {
         }
         for step in &p.storage.steps {
             match step {
-                ArenaStep::Upload {
-                    buffer,
-                    staging: home,
-                } => {
-                    let bytes = sizes[buffer];
-                    if bytes == 0 {
-                        continue;
-                    }
-                    let blit = command.new_blit_command_encoder();
-                    blit.copy_from_buffer(
-                        staging,
-                        home.offset as u64,
-                        slab,
-                        p.storage.slices[buffer].offset as u64,
-                        bytes as u64,
-                    );
-                    blit.end_encoding();
-                }
-                ArenaStep::Download {
-                    buffer,
-                    node,
-                    slots: _,
-                    staging: home,
-                } => {
-                    let bytes = sizes[buffer];
-                    if bytes == 0 {
-                        continue;
-                    }
-                    // A resident input's home IS this output's buffer: the
-                    // mutation wrote it in place, so there is nothing to
-                    // copy and nothing to stage for readback.
-                    if p.plan.buffers[buffer]
-                        .lit
-                        .is_some_and(|lit| self.residents.contains_key(&lit))
-                    {
-                        continue;
-                    }
-                    let BufferNode::BufferOutput { .. } = &p.plan.dag[*node] else {
-                        bail!("download without output node")
-                    };
-                    let blit = command.new_blit_command_encoder();
-                    blit.copy_from_buffer(
-                        slab,
-                        p.storage.slices[buffer].offset as u64,
-                        staging,
-                        home.offset as u64,
-                        bytes as u64,
-                    );
-                    blit.end_encoding();
-                }
                 ArenaStep::Node(node) => match &p.plan.dag[*node] {
                     BufferNode::BufferCopy { src, dst } => {
                         let bytes = sizes[src];
@@ -452,11 +356,13 @@ impl MetalDevice {
                             continue;
                         }
                         let blit = command.new_blit_command_encoder();
+                        let (source, source_offset) = resolve(src)?;
+                        let (destination, destination_offset) = resolve(dst)?;
                         blit.copy_from_buffer(
-                            slab,
-                            p.storage.slices[src].offset as u64,
-                            slab,
-                            p.storage.slices[dst].offset as u64,
+                            source,
+                            source_offset,
+                            destination,
+                            destination_offset,
                             bytes as u64,
                         );
                         blit.end_encoding();
@@ -483,11 +389,8 @@ impl MetalDevice {
                             encoder.set_compute_pipeline_state(&kernel.pipeline);
                             // DPS operand order includes destination pointers, matching the kernel ABI.
                             for (i, slot) in operand_info.iter().enumerate() {
-                                encoder.set_buffer(
-                                    i as u64,
-                                    Some(slab),
-                                    p.storage.slices[&slot.buffer].offset as u64,
-                                );
+                                let (buffer, offset) = resolve(&slot.buffer)?;
+                                encoder.set_buffer(i as u64, Some(buffer), offset);
                             }
                             ensure!(
                                 result_info.len() == 1,
@@ -564,53 +467,6 @@ impl MetalDevice {
             bail!("Metal command failed with status {:?}", command.status());
         }
         self.stats.launches += 1;
-        let mut outputs = FxHashMap::default();
-        for step in &p.storage.steps {
-            if let ArenaStep::Download {
-                buffer,
-                node,
-                slots,
-                staging: home,
-            } = step
-            {
-                let BufferNode::BufferOutput { slots: bindings } = &p.plan.dag[*node] else {
-                    bail!("download without output node")
-                };
-                // A resident sink was never blitted to staging.
-                if p.plan.buffers[buffer]
-                    .lit
-                    .is_some_and(|lit| self.residents.contains_key(&lit))
-                {
-                    continue;
-                }
-                let slots: Vec<_> = slots.iter().collect();
-                if slots.is_empty() {
-                    continue;
-                }
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        staging.contents().cast::<u8>().add(home.offset),
-                        sizes[buffer],
-                    )
-                }
-                .to_vec();
-                let dtype = p.plan.buffers[buffer]
-                    .layout
-                    .dtype
-                    .ok_or_else(|| anyhow!("output has no dtype"))?;
-                for index in slots {
-                    let binding = bindings
-                        .get(*index)
-                        .ok_or_else(|| anyhow!("output slot missing"))?;
-                    let mut binding = binding.clone();
-                    binding.layout = symbolic::resolve_layout(&binding.layout, dims)?;
-                    outputs.insert(
-                        binding.index,
-                        (HostBuffer::new(dtype, bytes.clone())?, binding),
-                    );
-                }
-            }
-        }
-        Ok(outputs)
+        Ok(())
     }
 }

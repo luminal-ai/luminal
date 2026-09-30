@@ -143,7 +143,12 @@ fn searched_plan(
     let mut rt =
         CudaRuntime::load_with_registry(&cx, cuda_registry_without_cublaslt()).expect("load");
     let outcome = rt
-        .search(&data, &luminal_cuda_lite::harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &luminal_cuda_lite::harness_search_options(),
+        )
         .expect("search under the CUDA allow list");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
     rt.plan().expect("plan loaded").clone()

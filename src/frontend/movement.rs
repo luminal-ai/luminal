@@ -402,8 +402,8 @@ impl GraphTensor {
             // A SYMBOLIC extent: squeeze is a CONTRACT that this axis
             // is 1 (a data-dependent rank is unrepresentable). Recorded
             // unconditionally; a post-saturation invariant refuses any
-            // binding/bucket that admits values other than 1 (ruling
-            // 2026-08-13, option 3 — bucket the dim to [1,1] to pass).
+            // dimension domain that admits values other than 1 (ruling
+            // 2026-08-13, option 3 — bound the dim to [1,1] to pass).
             None => self.graph().logical.contract_extent_eq(&extent, 1),
         }
         let current_dims = self.dims();
@@ -859,7 +859,7 @@ impl GraphTensor {
         let window_counts = final_shape[..n].to_vec();
         // WINDOW CONTRACTS (ruling 2026-08-13, same rail as squeeze):
         // a symbolic window count must reach 1 — the kernel fits within
-        // dim + padding, or the binding's bucket refuses with the named
+        // dim + padding, or the declared domain refuses with the named
         // door. Static counts are checked right here, loudly.
         for (axis, count) in window_counts.iter().enumerate() {
             match count.to_usize() {

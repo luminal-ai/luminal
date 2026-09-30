@@ -1,50 +1,49 @@
 //! Numerical and resource-lifetime regressions for graph-only dynamic execution.
 #![cfg(feature = "device")]
-use luminal::{
-    dtype::DType,
-    graph::{DimBucket, Graph},
-    shape::IntExpr,
-};
+mod support;
+use luminal::{dtype::DType, graph::Graph, shape::IntExpr};
 use luminal_cuda_lite::{CudaRuntime, harness_search_options};
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 #[test]
-fn bucket_switches_overlay_one_arena_and_replay_cached_graphs() {
+fn shape_changes_reuse_one_arena_and_replay_cached_graphs() {
     let mut g = Graph::new();
     let x = g.tensor(('a', 2), DType::F32);
     let y = g.tensor(('a', 2), DType::F32);
     let out = x * y + x;
     let mut rt = CudaRuntime::load(&g).unwrap();
-    rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
-        .unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+        &[('a'.into(), 3)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
-    let max = rt
-        .bucket_plans()
-        .iter()
-        .map(|p| p.slab_bytes)
-        .max()
-        .unwrap();
+    let max = rt.arena_bytes().unwrap();
     let mut base = None;
     for (iteration, n) in [2, 4, 3, 9, 5, 7, 2, 9].into_iter().enumerate() {
         rt.set_dim('a', n);
         let xdata: Vec<f32> = (0..n * 2).map(|i| (i + iteration) as f32).collect();
         let ydata: Vec<f32> = (0..n * 2).map(|i| i as f32 * 0.25 - 1.).collect();
         let expected: Vec<_> = xdata.iter().zip(&ydata).map(|(x, y)| x * y + x).collect();
-        rt.set_data(x.id, xdata).unwrap();
-        rt.set_data(y.id, ydata).unwrap();
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), expected);
+        rt.upload(&mut arena_rt, x.id, xdata).unwrap();
+        rt.upload(&mut arena_rt, y.id, ydata).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), expected);
         let stats = rt.graph_stats().unwrap();
         assert_eq!(stats.arena_bytes, max);
         assert_eq!(*base.get_or_insert(stats.arena_base), stats.arena_base);
         assert_eq!(stats.arena_generation - before.arena_generation, 1);
     }
     let stats = rt.graph_stats().unwrap();
-    assert_eq!(stats.instantiations - before.instantiations, 2);
+    assert_eq!(stats.instantiations - before.instantiations, 1);
     assert_eq!(stats.launches - before.launches, 8);
     rt.set_dim('a', 10);
-    assert!(rt.execute().is_err());
+    assert!(rt.execute(arena_rt.arena(), &mut staging_arena_rt).is_err());
 }
 
 #[test]
@@ -53,15 +52,21 @@ fn metadata_only_dimension_change_patches_no_nodes() {
     let a = IntExpr::from('a');
     let out = g.iota(5, |c| c[0] + a);
     let mut rt = CudaRuntime::load(&g).unwrap();
-    rt.bind_dyn_range('a', 1, 19).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (1, 19))]).unwrap(),
+        &[('a'.into(), 10)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
     for n in [1, 19, 7, 1] {
         rt.set_dim('a', n);
-        rt.execute().unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
         assert_eq!(
-            rt.get_i32(out.id).unwrap(),
+            rt.read_i32(&arena_rt, out.id).unwrap(),
             (n..n + 5).map(|v| v as i32).collect::<Vec<_>>()
         );
     }
@@ -77,9 +82,15 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
     let x = g.tensor((3, 'a'), DType::F32);
     let out = (x.permute((1, 0)) + 1.).sum(0);
     let mut rt = CudaRuntime::load(&g).unwrap();
-    rt.bind_dyn_range('a', 2, 11).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
+        &[('a'.into(), 6)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
     for n in [2, 11, 5, 2] {
         let data: Vec<_> = (0..3 * n).map(|i| i as f32 / 2.).collect();
@@ -92,9 +103,9 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
             })
             .collect();
         rt.set_dim('a', n);
-        rt.set_data(x.id, data).unwrap();
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), expected);
+        rt.upload(&mut arena_rt, x.id, data).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), expected);
     }
     assert_eq!(
         rt.graph_stats().unwrap().instantiations - before.instantiations,
@@ -113,13 +124,26 @@ fn cublas_geometry_changes_rerecord_the_child_every_execution() {
         luminal_cuda_lite::cuda_registry_filtered(|row| !matches!(row.label(), "ReduceSumGeneric")),
     )
     .unwrap();
-    for s in ['m', 'k', 'n'] {
-        rt.bind_dyn_range(s, 2, 12).unwrap();
-    }
+
     let mut options = harness_search_options();
     options.generations = 4;
     options.generation_size = 12;
-    rt.search(&Default::default(), &options).unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([
+            ('m'.into(), (2, 12)),
+            ('k'.into(), (2, 12)),
+            ('n'.into(), (2, 12)),
+        ])
+        .unwrap(),
+        &[('m'.into(), 7), ('k'.into(), 7), ('n'.into(), 7)]
+            .into_iter()
+            .collect(),
+        &Default::default(),
+        &options,
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
     assert!(rt.plan().unwrap().dag.node_weights().any(|node|matches!(node,luminal::bufferize::BufferNode::Compute{op,..} if luminal_cuda_lite::as_host_op(op.as_ref()).is_some())));
     for (m, n, k) in [(2, 3, 4), (12, 9, 7), (5, 2, 11), (2, 3, 4)] {
@@ -135,10 +159,10 @@ fn cublas_geometry_changes_rerecord_the_child_every_execution() {
         for (s, v) in [('m', m), ('n', n), ('k', k)] {
             rt.set_dim(s, v);
         }
-        rt.set_data(a.id, av).unwrap();
-        rt.set_data(b.id, bv).unwrap();
-        rt.execute().unwrap();
-        let actual = rt.get_f32(out.id).unwrap();
+        rt.upload(&mut arena_rt, a.id, av).unwrap();
+        rt.upload(&mut arena_rt, b.id, bv).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        let actual = rt.read_f32(&arena_rt, out.id).unwrap();
         assert_eq!(actual.len(), expected.len());
         for (a, b) in actual.iter().zip(expected) {
             assert!((a - b).abs() < 1e-4, "{a} != {b}");
@@ -160,20 +184,27 @@ fn profiling_and_serving_share_dynamic_graph_execution() {
     let x = g.tensor('a', DType::F32);
     let out = x + 2.;
     let mut rt = CudaRuntime::load(&g).unwrap();
-    rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
-        .unwrap();
     let data = [(x.id, vec![1f32, 2., 3.].into())].into_iter().collect();
     let mut options = harness_search_options();
 
     options.trials = 2;
-    let outcome = rt.search(&data, &options).unwrap();
+    let outcome = rt
+        .search(
+            &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+            &[('a'.into(), 3)].into_iter().collect(),
+            &data,
+            &options,
+        )
+        .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     assert!(outcome.plans_profiled > 0);
     let before = rt.graph_stats().unwrap();
     assert!(before.launches > before.instantiations);
     rt.set_dim('a', 9);
-    rt.set_data(x.id, vec![7f32; 9]).unwrap();
-    rt.execute().unwrap();
-    assert_eq!(rt.get_f32(out.id).unwrap(), vec![9f32; 9]);
+    rt.upload(&mut arena_rt, x.id, vec![7f32; 9]).unwrap();
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+    assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), vec![9f32; 9]);
 }
 
 #[test]
@@ -182,15 +213,21 @@ fn zero_extents_disable_copies_and_restore_them() {
     let x = g.tensor('a', DType::F32);
     let out = x + 3.;
     let mut rt = CudaRuntime::load(&g).unwrap();
-    rt.bind_dyn_range('a', 0, 9).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (0, 9))]).unwrap(),
+        &[('a'.into(), 4)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
     for n in [0, 9, 0, 2] {
         rt.set_dim('a', n);
-        rt.set_data(x.id, vec![2f32; n]).unwrap();
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; n]);
+        rt.upload(&mut arena_rt, x.id, vec![2f32; n]).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), vec![5f32; n]);
     }
     assert_eq!(
         rt.graph_stats().unwrap().instantiations - before.instantiations,
@@ -208,11 +245,18 @@ fn gather_scatter_update_symbolic_coordinates() {
     let gathered = data.gather(&coords);
     let scattered = (data * 0.).scatter(&coords, data + 1.);
     let mut rt = CudaRuntime::load(&g).unwrap();
-    rt.bind_dyn_range('a', 2, 9).unwrap();
     let mut opts = harness_search_options();
     opts.generations = 4;
     opts.generation_size = 8;
-    rt.search(&Default::default(), &opts).unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+        &[('a'.into(), 5)].into_iter().collect(),
+        &Default::default(),
+        &opts,
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
     for n in [2, 9, 5, 2] {
         let values: Vec<_> = (0..n * 3).map(|i| i as f32 / 4.).collect();
@@ -226,11 +270,17 @@ fn gather_scatter_update_symbolic_coordinates() {
             }
         }
         rt.set_dim('a', n);
-        rt.set_data(data.id, values).unwrap();
-        rt.set_data(rows.id, indices).unwrap();
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(gathered.id).unwrap(), expected_gather);
-        assert_eq!(rt.get_f32(scattered.id).unwrap(), expected_scatter);
+        rt.upload(&mut arena_rt, data.id, values).unwrap();
+        rt.upload(&mut arena_rt, rows.id, indices).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(
+            rt.read_f32(&arena_rt, gathered.id).unwrap(),
+            expected_gather
+        );
+        assert_eq!(
+            rt.read_f32(&arena_rt, scattered.id).unwrap(),
+            expected_scatter
+        );
     }
     assert_eq!(
         rt.graph_stats().unwrap().instantiations - before.instantiations,
@@ -245,22 +295,53 @@ fn installing_larger_plan_invalidates_graphs_before_arena_growth() {
         let mut g = Graph::new();
         let _ = g.iota(n, |c| c[0]);
         let mut rt = CudaRuntime::load(&g).unwrap();
-        rt.search(&Default::default(), &harness_search_options())
-            .unwrap();
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &harness_search_options(),
+        )
+        .unwrap();
         rt.plan().unwrap().clone()
     }
-    let mut device = CudaDevice::new(0).unwrap();
-    device.install(vec![(plan(4), Default::default())]).unwrap();
-    let retained = device
-        .execute(0, &Default::default(), &Default::default())
-        .unwrap();
-    let before = device.stats();
+    let mut device = CudaDevice::new(0).unwrap().executable();
+    let first_plan = plan(4);
     device
-        .install(vec![(plan(4097), Default::default())])
+        .install((first_plan.clone(), Default::default()))
         .unwrap();
-    let result = device
-        .execute(0, &Default::default(), &Default::default())
+    let mut first_arena =
+        support::Allocation::new(device.stream().clone(), device.slab_bytes()).unwrap();
+    let mut staging_first_arena = device
+        .allocate_staging(device.stats().staging_bytes)
         .unwrap();
+    device
+        .execute(
+            first_arena.arena(),
+            &mut staging_first_arena,
+            &Default::default(),
+        )
+        .unwrap();
+    let retained =
+        support::download_plan(&device, &first_plan, &first_arena, &Default::default()).unwrap();
+    let before = device.stats();
+    let second_plan = plan(4097);
+    device
+        .install((second_plan.clone(), Default::default()))
+        .unwrap();
+    let mut second_arena =
+        support::Allocation::new(device.stream().clone(), device.slab_bytes()).unwrap();
+    let mut staging_second_arena = device
+        .allocate_staging(device.stats().staging_bytes)
+        .unwrap();
+    device
+        .execute(
+            second_arena.arena(),
+            &mut staging_second_arena,
+            &Default::default(),
+        )
+        .unwrap();
+    let result =
+        support::download_plan(&device, &second_plan, &second_arena, &Default::default()).unwrap();
     assert_eq!(device.stats().arena_generation, before.arena_generation + 1);
     assert!(device.stats().arena_bytes > before.arena_bytes);
     assert_eq!(
@@ -268,7 +349,7 @@ fn installing_larger_plan_invalidates_graphs_before_arena_growth() {
         (0..4097).collect::<Vec<_>>()
     );
     assert_eq!(retained[&0].0.as_i32().unwrap(), vec![0, 1, 2, 3]);
-    device.release_slab();
+    device.uninstall();
     assert_eq!(device.slab_bytes(), 0);
     assert!(!device.is_installed());
 }
@@ -283,9 +364,13 @@ fn ceil_division_in_dynamic_iota_is_evaluated_on_device() {
     let a = IntExpr::from('a');
     let _ = g.iota(7, |c| c[0] + a);
     let mut rt = CudaRuntime::load(&g).unwrap();
-    rt.bind_dyn_range('a', 1, 12).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (1, 12))]).unwrap(),
+        &[('a'.into(), 6)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .unwrap();
     let mut plan = rt.plan().unwrap().clone();
     let mut found = false;
     for node in plan.dag.node_weights_mut() {
@@ -302,18 +387,31 @@ fn ceil_division_in_dynamic_iota_is_evaluated_on_device() {
         }
     }
     assert!(found);
-    let mut device = luminal_cuda_lite::device::CudaDevice::new(0).unwrap();
+    let mut device = luminal_cuda_lite::device::CudaDevice::new(0)
+        .unwrap()
+        .executable();
     device
-        .install(vec![(plan, [('a'.into(), (1, 12))].into_iter().collect())])
+        .install((plan.clone(), [('a'.into(), (1, 12))].into_iter().collect()))
+        .unwrap();
+    let mut arena = support::Allocation::new(device.stream().clone(), device.slab_bytes()).unwrap();
+    let mut staging_arena = device
+        .allocate_staging(device.stats().staging_bytes)
         .unwrap();
     for n in [1usize, 12, 2] {
-        let outputs = device
+        device
             .execute(
-                0,
-                &Default::default(),
+                arena.arena(),
+                &mut staging_arena,
                 &[('a'.into(), n)].into_iter().collect(),
             )
             .unwrap();
+        let outputs = support::download_plan(
+            &device,
+            &plan,
+            &arena,
+            &[('a'.into(), n)].into_iter().collect(),
+        )
+        .unwrap();
         assert_eq!(
             outputs[&0].0.as_i32().unwrap(),
             (n..n + 7).map(|i| i.div_ceil(3) as i32).collect::<Vec<_>>()
@@ -323,28 +421,33 @@ fn ceil_division_in_dynamic_iota_is_evaluated_on_device() {
 }
 
 #[test]
-fn bucketed_and_range_bound_dimensions_both_stay_symbolic() {
+fn all_bounded_dimensions_stay_symbolic() {
     let mut g = Graph::new();
     let x = g.tensor(('a', 'b'), DType::F32);
     let out = x + 1.;
     let mut rt = CudaRuntime::load(&g).unwrap();
-    rt.bind_dyn_range('b', 2, 8).unwrap();
-    rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
-        .unwrap();
     rt.set_dim('b', 3); // This current value must not narrow the searched interval.
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('b'.into(), (2, 8)), ('a'.into(), (2, 9))])
+            .unwrap(),
+        &[('b'.into(), 3), ('a'.into(), 5)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
     for (a, b) in [(2, 3), (4, 8), (5, 2), (9, 7)] {
         rt.set_dim('a', a);
         rt.set_dim('b', b);
-        rt.set_data(x.id, vec![2f32; a * b]).unwrap();
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), vec![3f32; a * b]);
+        rt.upload(&mut arena_rt, x.id, vec![2f32; a * b]).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), vec![3f32; a * b]);
     }
     assert_eq!(
         rt.graph_stats().unwrap().instantiations - before.instantiations,
-        2
+        1
     );
 }
 
@@ -368,14 +471,21 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
         }),
     )
     .unwrap();
-    for s in ['m', 'n'] {
-        rt.bind_dyn_range(s, 2, 9).unwrap();
-    }
+
     let mut options = harness_search_options();
     options.generations = 12;
     options.generation_size = 16;
     options.mutations = 4;
-    rt.search(&Default::default(), &options).unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('m'.into(), (2, 9)), ('n'.into(), (2, 9))])
+            .unwrap(),
+        &[('m'.into(), 5), ('n'.into(), 5)].into_iter().collect(),
+        &Default::default(),
+        &options,
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
     assert!(rt.plan().unwrap().dag.node_weights().any(|node|matches!(node,luminal::bufferize::BufferNode::Compute{op,..} if luminal_cuda_lite::as_host_op(op.as_ref()).is_some()&&op.label().contains("Bias"))));
     for (m, n) in [(2, 3), (9, 7), (4, 9), (2, 3)] {
@@ -393,11 +503,11 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
             .collect();
         rt.set_dim('m', m);
         rt.set_dim('n', n);
-        rt.set_data(a.id, av).unwrap();
-        rt.set_data(b.id, bv).unwrap();
-        rt.set_data(bias.id, biasv).unwrap();
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), expected);
+        rt.upload(&mut arena_rt, a.id, av).unwrap();
+        rt.upload(&mut arena_rt, b.id, bv).unwrap();
+        rt.upload(&mut arena_rt, bias.id, biasv).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), expected);
     }
     let stats = rt.graph_stats().unwrap();
     assert_eq!(

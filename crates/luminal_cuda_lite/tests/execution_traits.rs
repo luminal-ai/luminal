@@ -1,6 +1,7 @@
 //! External implementations must survive extraction, DPS, and buffer-plan
 //! cloning without an entry in a backend-owned dispatch table.
 
+mod support;
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
@@ -13,6 +14,8 @@ use luminal_cuda_lite::{
     CudaOpInterface, CudaRuntime, KernelOp, RegisteredOp, as_host_op, as_kernel_op,
     cuda_registry_without_cublaslt, harness_search_options,
 };
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 #[derive(Debug, Clone)]
 struct ExternalAdd {
@@ -157,7 +160,20 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     ]
     .into_iter()
     .collect();
-    runtime.search(&data, &harness_search_options()).unwrap();
+    runtime
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
+        .unwrap();
+    #[cfg(feature = "device")]
+    let mut arena_runtime = support::allocate_arena(&runtime).expect("allocate execution arena");
+    #[cfg(feature = "device")]
+    let mut staging_arena_runtime = runtime
+        .allocate_staging()
+        .expect("allocate execution arena");
     let plan = runtime.plan().unwrap().clone();
     let mut found = false;
     for node in plan.dag.node_weights() {
@@ -181,11 +197,13 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     #[cfg(feature = "device")]
     {
         for (id, buffer) in data {
-            runtime.set_data(id, buffer).unwrap();
+            runtime.upload(&mut arena_runtime, id, buffer).unwrap();
         }
-        runtime.execute().unwrap();
+        runtime
+            .execute(arena_runtime.arena(), &mut staging_arena_runtime)
+            .unwrap();
         assert_eq!(
-            runtime.get_f32(out.id).unwrap(),
+            runtime.read_f32(&arena_runtime, out.id).unwrap(),
             vec![11., 22., 33., 44., 55., 66.]
         );
     }
@@ -375,17 +393,27 @@ mod host_graphs {
             Box::new(ExternalHostAdd { dps: false }),
         ));
         let mut rt = CudaRuntime::load_with_registry(&g, registry).unwrap();
-        rt.bind_dyn_range('a', 2, 30).unwrap();
-        rt.search(&Default::default(), &harness_search_options())
-            .unwrap();
+        rt.search(
+            &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 30))]).unwrap(),
+            &[('a'.into(), 16)].into_iter().collect(),
+            &Default::default(),
+            &harness_search_options(),
+        )
+        .unwrap();
+        let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+        let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
         let search_stats = rt.graph_stats().unwrap();
         let initial = RECORDS.load(Ordering::SeqCst);
         for n in [3, 4, 3, 4, 4] {
             rt.set_dim('a', n);
-            rt.set_data(a.id, vec![n as f32; n * 2]).unwrap();
-            rt.set_data(b.id, vec![1f32; n * 2]).unwrap();
-            rt.execute().unwrap();
-            assert_eq!(rt.get_f32(out.id).unwrap(), vec![n as f32 + 1.; n * 2]);
+            rt.upload(&mut arena_rt, a.id, vec![n as f32; n * 2])
+                .unwrap();
+            rt.upload(&mut arena_rt, b.id, vec![1f32; n * 2]).unwrap();
+            rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+            assert_eq!(
+                rt.read_f32(&arena_rt, out.id).unwrap(),
+                vec![n as f32 + 1.; n * 2]
+            );
         }
         let stats = rt.graph_stats().unwrap();
         // One recording at compile, then one on every later execution.
@@ -402,10 +430,14 @@ mod host_graphs {
         // (including their CUDA modules) must survive cache eviction.
         for n in 9..=20 {
             rt.set_dim('a', n);
-            rt.set_data(a.id, vec![n as f32; n * 2]).unwrap();
-            rt.set_data(b.id, vec![1f32; n * 2]).unwrap();
-            rt.execute().unwrap();
-            assert_eq!(rt.get_f32(out.id).unwrap(), vec![n as f32 + 1.; n * 2]);
+            rt.upload(&mut arena_rt, a.id, vec![n as f32; n * 2])
+                .unwrap();
+            rt.upload(&mut arena_rt, b.id, vec![1f32; n * 2]).unwrap();
+            rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+            assert_eq!(
+                rt.read_f32(&arena_rt, out.id).unwrap(),
+                vec![n as f32 + 1.; n * 2]
+            );
         }
         // The source graphs still refer to their compile-time preparations
         // for 3 and 4, so at least one preparation of each survives eviction.
@@ -415,25 +447,35 @@ mod host_graphs {
                 "every preparation for a={dim} was dropped while a source graph refers to one"
             );
         }
-        rt.set_data(a.id, vec![4f32; 8]).unwrap();
-        rt.set_data(b.id, vec![1f32; 8]).unwrap();
+        rt.upload(&mut arena_rt, a.id, vec![4f32; 8]).unwrap();
+        rt.upload(&mut arena_rt, b.id, vec![1f32; 8]).unwrap();
         rt.set_dim('a', 6);
         assert!(
-            format!("{:#}", rt.execute().unwrap_err()).contains("injected preparation failure")
+            format!(
+                "{:#}",
+                rt.execute(arena_rt.arena(), &mut staging_arena_rt)
+                    .unwrap_err()
+            )
+            .contains("injected preparation failure")
         );
         rt.set_dim('a', 4);
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; 8]);
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), vec![5f32; 8]);
         let before = rt.graph_stats().unwrap().instantiations;
         rt.set_dim('a', 7);
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.execute())).is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || rt.execute(arena_rt.arena(), &mut staging_arena_rt)
+            ))
+            .is_err()
+        );
         rt.set_dim('a', 4);
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; 8]);
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), vec![5f32; 8]);
         assert_eq!(rt.graph_stats().unwrap().instantiations, before + 1);
         let captures = rt.graph_stats().unwrap().host_captures;
         rt.set_dim("external_mode", 1);
-        rt.execute().unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
         assert_eq!(
             rt.graph_stats().unwrap().host_captures,
             captures + 1,
@@ -467,16 +509,22 @@ fn external_kernel_launch_geometry_updates_without_reinstantiation() {
         }),
     ));
     let mut rt = CudaRuntime::load_with_registry(&graph, registry).unwrap();
-    rt.bind_dyn_range('a', 0, 1025).unwrap();
-    rt.search(&Default::default(), &harness_search_options())
-        .unwrap();
+    rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (0, 1025))]).unwrap(),
+        &[('a'.into(), 512)].into_iter().collect(),
+        &Default::default(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let search_stats = rt.graph_stats().unwrap();
     for n in [0, 1025, 2, 0, 257] {
         rt.set_dim('a', n);
-        rt.set_data(a.id, vec![2f32; n]).unwrap();
-        rt.set_data(b.id, vec![3f32; n]).unwrap();
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; n]);
+        rt.upload(&mut arena_rt, a.id, vec![2f32; n]).unwrap();
+        rt.upload(&mut arena_rt, b.id, vec![3f32; n]).unwrap();
+        rt.execute(arena_rt.arena(), &mut staging_arena_rt).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), vec![5f32; n]);
     }
     let stats = rt.graph_stats().unwrap();
     assert_eq!(stats.instantiations - search_stats.instantiations, 1);

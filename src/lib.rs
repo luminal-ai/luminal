@@ -3,6 +3,8 @@
 // type even though the key's hash and ordering never change.
 #![allow(clippy::mutable_key_type)]
 
+// Application composition utilities; compilation still handles one program.
+pub mod bucketing;
 pub mod dtype;
 #[path = "egglog_core/egglog_utils/mod.rs"]
 pub mod egglog_utils;
@@ -59,8 +61,8 @@ pub mod extraction;
 pub mod index_expr;
 #[path = "layout/ir.rs"]
 pub mod layout_ir;
-#[path = "buffer/resident.rs"]
-pub mod resident;
+#[path = "buffer/memory.rs"]
+pub mod memory;
 #[path = "egglog_core/subst_primitive.rs"]
 pub mod subst_primitive;
 // The `Layout` sort's constructor structs, `LayoutFacts`, `DecodedLayout`
@@ -77,6 +79,8 @@ pub mod logical_helper;
 pub mod logical_op;
 pub mod search_support;
 #[cfg(test)]
+// This shared fixture module also contains ops used only by test_runtime.
+#[allow(dead_code)]
 #[path = "../tests/test_runtime/src/test_support.rs"]
 mod test_support;
 pub mod visualization;

@@ -14,8 +14,8 @@ def test_dynamic_triangular(upper, diagonal, device):
 
     model = Model().eval()
     example = torch.randn(2, 4, 7, device=device)
-    torch._dynamo.mark_dynamic(example, 1)
-    torch._dynamo.mark_dynamic(example, 2)
+    torch._dynamo.mark_dynamic(example, 1, min=2, max=8)
+    torch._dynamo.mark_dynamic(example, 2, min=2, max=8)
     compiler = _backend((example,)).Compiler()
     compiled = torch.compile(model, backend=compiler, fullgraph=True)
     with torch.no_grad():

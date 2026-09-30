@@ -1,27 +1,18 @@
 #![cfg(target_os = "macos")]
-
-use luminal::graph::DimBucket;
+mod support;
 use luminal::prelude::*;
+use luminal::shape::DimensionBounds;
 use luminal_metal::{CompileOptions, HostBuffer, MetalRuntime};
+#[cfg(target_os = "macos")]
+use support::TestTransfers;
 
 #[test]
-fn representative_payloads_override_shared_inputs_in_search_and_finalist_validation() {
+fn explicit_profile_payload_and_assignment() {
     let mut graph = Graph::new();
     let input = graph.tensor('q', DType::F32);
     let output = input + 1.;
-    let create = || {
-        let mut runtime = MetalRuntime::load(&graph).unwrap();
-        runtime
-            .bind_dim_buckets(
-                'q',
-                vec![
-                    DimBucket::new(1, 1),
-                    DimBucket::new(2, 128).representative(128),
-                ],
-            )
-            .unwrap();
-        runtime
-    };
+    let bounds = DimensionBounds::from_ranges([('q'.into(), (1, 128))]).unwrap();
+    let dims = [('q'.into(), 128)].into_iter().collect();
     let options = CompileOptions {
         generations: 1,
         generation_size: 1,
@@ -29,42 +20,41 @@ fn representative_payloads_override_shared_inputs_in_search_and_finalist_validat
         search_log: false,
         ..Default::default()
     };
-    // This fallback has the wrong dtype: success proves each representative
-    // and its finalist received the override, not resized fallback data.
-    let shared: FxHashMap<_, HostBuffer> = [(input.id, vec![0i32].into())].into_iter().collect();
-    let profiles: Vec<(luminal::shape::DynMap, FxHashMap<_, HostBuffer>)> = [1usize, 128]
-        .into_iter()
-        .map(|q| {
-            (
-                [('q'.into(), q)].into_iter().collect(),
-                [(input.id, vec![q as f32; q].into())].into_iter().collect(),
-            )
-        })
-        .collect();
-    let mut runtime = create();
-    runtime
-        .search_with_profile_inputs(&shared, &profiles, &options)
-        .unwrap();
-    assert_eq!(runtime.bucket_plans().len(), 2);
-    assert_eq!(runtime.graph_stats().unwrap().launches, 6);
+    let data: FxHashMap<_, HostBuffer> =
+        [(input.id, vec![128f32; 128].into())].into_iter().collect();
+    let mut runtime = MetalRuntime::load(&graph).unwrap();
+    runtime.search(&bounds, &dims, &data, &options).unwrap();
+    let mut arena_runtime = support::allocate_arena(&runtime).expect("allocate execution arena");
+    assert_eq!(runtime.graph_stats().unwrap().launches, 3);
     for q in [128usize, 1, 7] {
         runtime.set_dim('q', q);
-        runtime.set_data(input.id, vec![q as f32; q]);
-        runtime.execute().unwrap();
-        assert_eq!(runtime.get_f32(output.id).unwrap(), vec![q as f32 + 1.; q]);
+        runtime
+            .upload(&mut arena_runtime, input.id, vec![q as f32; q])
+            .unwrap();
+        runtime.execute(arena_runtime.buffer()).unwrap();
+        assert_eq!(
+            runtime.read_f32(&arena_runtime, output.id).unwrap(),
+            vec![q as f32 + 1.; q]
+        );
     }
-    assert_eq!(shared[&input.id].as_i32().unwrap(), vec![0]);
-    let missing = create()
-        .search_with_profile_inputs(&shared, &profiles[..1], &options)
+    let too_short = [(input.id, vec![1f32].into())].into_iter().collect();
+    let error = MetalRuntime::load(&graph)
+        .unwrap()
+        .search(&bounds, &dims, &too_short, &options)
         .unwrap_err();
-    assert!(format!("{missing:#}").contains("no profiling inputs"));
-    let duplicate = [
-        profiles[0].clone(),
-        profiles[0].clone(),
-        profiles[1].clone(),
-    ];
-    let ambiguous = create()
-        .search_with_profile_inputs(&shared, &duplicate, &options)
-        .unwrap_err();
-    assert!(format!("{ambiguous:#}").contains("ambiguous profiling inputs"));
+    assert!(
+        format!("{error:#}").contains("profiling shape requires"),
+        "{error:#}"
+    );
+    assert!(
+        MetalRuntime::load(&graph)
+            .unwrap()
+            .search(
+                &bounds,
+                &[('q'.into(), 129)].into_iter().collect(),
+                &data,
+                &options
+            )
+            .is_err()
+    );
 }

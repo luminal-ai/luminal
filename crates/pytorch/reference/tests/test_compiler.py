@@ -39,7 +39,7 @@ def test_compiler_logging_and_aot(logging, capfd):
 def test_only_compiler_is_public():
     import luminal_reference
 
-    assert luminal_reference.__all__ == ["Compiler", "DimBucket"]
+    assert luminal_reference.__all__ == ["Compiler"]
     assert not callable(luminal_reference)
     for removed in (
         "compile_model",

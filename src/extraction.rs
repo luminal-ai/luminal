@@ -928,8 +928,8 @@ impl<'a> Extractor<'a> {
     ) -> Self {
         // THE MATCHER SET IS LENT, NOT OWNED (Phase 2, 2026-09-03): the
         // vocabulary belongs to the runtime INSTANCE that was loaded
-        // with it, and one instance runs many extractions (every genome
-        // of every bucket). Borrowing is what lets the runtime hold the
+        // with it, and one instance extracts many candidate genomes.
+        // Borrowing is what lets the runtime hold the
         // list once instead of rebuilding it per call — `dyn OpMatcher`
         // is not `Clone` and the registry is chosen at `load`, so there
         // is nothing to rebuild it FROM down here.

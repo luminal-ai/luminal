@@ -1,7 +1,10 @@
+mod support;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::prelude::FxHashMap;
 use luminal_metal::{MetalRuntime, kernels};
+#[cfg(target_os = "macos")]
+use support::TestTransfers;
 
 #[test]
 #[cfg_attr(
@@ -22,8 +25,15 @@ fn search_produces_a_codegen_complete_plan() {
     .into_iter()
     .collect();
     let outcome = rt
-        .search(&data, &luminal_metal::harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &luminal_metal::harness_search_options(),
+        )
         .expect("search under the Metal allow list");
+    #[cfg(target_os = "macos")]
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
 
     let plan = rt.plan().expect("plan loaded");
@@ -43,8 +53,6 @@ fn search_produces_a_codegen_complete_plan() {
     }
     assert!(computes > 0, "plan has no compute nodes");
 
-    rt.set_data(a.id, vec![1.0f32, 2., 3., 4., 5., 6.]);
-    rt.set_data(b.id, vec![10.0f32, 20., 30., 40., 50., 60.]);
     #[cfg(not(target_os = "macos"))]
     {
         let err = rt
@@ -57,8 +65,12 @@ fn search_produces_a_codegen_complete_plan() {
     }
     #[cfg(target_os = "macos")]
     {
-        rt.execute().expect("device execute");
-        let got = rt.get_f32(_out.id).expect("output payload");
+        rt.upload(&mut arena_rt, a.id, vec![1.0f32, 2., 3., 4., 5., 6.])
+            .unwrap();
+        rt.upload(&mut arena_rt, b.id, vec![10.0f32, 20., 30., 40., 50., 60.])
+            .unwrap();
+        rt.execute(arena_rt.buffer()).expect("device execute");
+        let got = rt.read_f32(&arena_rt, _out.id).expect("output payload");
         assert_eq!(got, vec![11.0f32, 44., 99., 176., 275., 396.]);
     }
 }
@@ -106,10 +118,15 @@ fn search_refuses_without_a_device() {
     let _out = input + 1.;
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     runtime
-        .saturated_egraph()
+        .saturated_egraph(&Default::default())
         .expect("graph inspection needs no GPU");
     let error = runtime
-        .search(&Default::default(), &Default::default())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
         .unwrap_err();
     assert!(
         error.to_string().contains("candidate search requires"),

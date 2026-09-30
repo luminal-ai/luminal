@@ -18,6 +18,7 @@ pub struct PendingFinalist {
 }
 
 pub struct Finalists<'a> {
+    bindings: std::collections::BTreeSet<i64>,
     shapes: crate::symbolic::ShapeEnv,
     label: String,
     egraph: &'a egraph_serialize::EGraph,
@@ -44,6 +45,7 @@ impl<'a> Finalists<'a> {
     ) -> Self {
         Self {
             shapes: Default::default(),
+            bindings: Default::default(),
             label: label.into(),
             egraph,
             session: None,
@@ -61,6 +63,11 @@ impl<'a> Finalists<'a> {
 
     pub fn with_shapes(mut self, shapes: crate::symbolic::ShapeEnv) -> Self {
         self.shapes = shapes;
+        self
+    }
+
+    pub fn with_external_bindings(mut self, bindings: std::collections::BTreeSet<i64>) -> Self {
+        self.bindings = bindings;
         self
     }
 
@@ -111,7 +118,7 @@ impl<'a> Finalists<'a> {
                 self.build_plan(genome)?
             }
         };
-        let arena = crate::storage::plan(&plan, &self.shapes.bounds)
+        let arena = crate::storage::plan_storage(&plan, &self.shapes.bounds, &self.bindings)
             .map_err(|err| format!("arena: {err:#}"))?;
         Ok(PendingFinalist {
             shapes: self.shapes.clone(),
@@ -196,5 +203,48 @@ impl<'a> Finalists<'a> {
             return None;
         }
         Some(self.accepted.swap_remove(index))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use luminal::prelude::*;
+
+    #[test]
+    fn advances_to_next_rank_when_final_validation_refuses() {
+        let mut graph = Graph::new();
+        let x = graph.tensor(4, DType::F32);
+        let _ = x + 1.;
+        let runtime = crate::MetalRuntime::load(&graph).unwrap();
+        let egraph = runtime.saturated_egraph(&Default::default()).unwrap();
+        let matchers = crate::ops::metal_matchers();
+        let session = extractor::ExtractionSession::new_with_matcher_set(&egraph, None, &matchers);
+        let index = session.producer_index();
+        let space = session.sampling_space(&index);
+        let (genome, _) = luminal::search_support::sample_genome_with_seed(&index, &space, 0);
+        let mut finalists = Finalists::new(
+            "program",
+            &egraph,
+            None,
+            &matchers,
+            vec![(10, genome.clone()), (20, genome)],
+            None,
+        );
+        let mut visited = Vec::new();
+        assert!(finalists.ensure(0, &mut |candidate| {
+            visited.push(candidate.rank);
+            if candidate.rank == 1 {
+                Err("first candidate failed warmup".into())
+            } else {
+                Ok(())
+            }
+        }));
+        assert_eq!(visited, vec![1, 2]);
+        assert_eq!(finalists.rejections(), 1);
+        let selected = finalists.take(0).unwrap();
+        assert_eq!(selected.rank, 2);
+        assert_eq!(selected.metric, 20);
+        assert!(selected.plan.dag.node_count() > 0);
     }
 }

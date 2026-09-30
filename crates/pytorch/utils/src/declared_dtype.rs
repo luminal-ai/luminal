@@ -190,7 +190,12 @@ mod tests {
         data.insert(translation.inputs[0].tensor, TypedBuffer::F32(vec![1.0; 4]));
         data.insert(translation.inputs[1].tensor, TypedBuffer::F32(vec![2.0; 4]));
         runtime
-            .search(&data, &harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &harness_search_options(),
+            )
             .map(|_| ())
             .map_err(|err| format!("{err:#}"))
     }

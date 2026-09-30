@@ -56,7 +56,12 @@ fn plan_for(
     .expect("cuda load");
     let data: FxHashMap<NodeIndex, HostBuffer> = inputs.iter().cloned().collect();
     let outcome = rt
-        .search(&data, &view_search_options(seed))
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &view_search_options(seed),
+        )
         .expect("cuda search");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
     rt.plan().expect("plan loaded").clone()

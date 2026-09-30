@@ -1,7 +1,6 @@
 //! CUDA-lite on the native ladder.
 //!
-//! The same six-method ladder as the reference `ReferenceRuntime`
-//! (`load → bind_* → search → set_data → execute → get_*`), consuming
+//! `load → search → bind device storage → execute`, consuming
 //! the same `BufferIrGraph` plans, claiming ops through the same
 //! allow-list seam — but executing on a CUDA device with
 //! NVRTC-compiled kernels instead of host loops.
@@ -20,8 +19,8 @@
 //! — core keeps the shared machinery (program, assembly, `dps_rewrite`,
 //! `decode_layout_table`, `bufferize`) and nothing that decides which
 //! implementation wins. Candidates rank only by measured device time.
-//! Host payloads are [`host_buffer::HostBuffer`],
-//! not the reference runtime's `TypedBuffer`.
+//! Profiling harness payloads use [`host_buffer::HostBuffer`]. Execution accepts
+//! device storage only; applications own tensor uploads and readbacks.
 //!
 //! Stage discipline (M4 kickoff ruling, 2026-08-17: "just focus on
 //! getting cuda lite up and running"):
@@ -36,18 +35,12 @@
 //!   mirroring the reference evaluator's design —
 //!   candidates are compiled, warmed and timed on the device ([`profile`]).
 //!   Search requires the `device` feature and a CUDA GPU.
-//! - CL-6 (#420/#422 rejoin Phase 5, 2026-09-03): FINALISTS AND THE
-//!   BUCKET LATTICE ([`finalists`], [`lattice`]). The search keeps a
-//!   ranked list of genomes and the plan that gets INSTALLED is chosen by
-//!   a best-first walk over the buckets' finalist ranks under one
-//!   aggregate constraint — `CompileOptions::device_budget_bytes` bounds
-//!   the arena slab the runtime will hold. Unconstrained (the default)
-//!   the walk installs the search's own winner and costs nothing.
+//! - Ranked finalists are validated one at a time under this program's budget.
 //!
 //! Execution always launches CUDA graphs. Owned kernels and copies are parent
 //! graph nodes; HostOps prepare library calls and capture opaque child graphs.
-//! Dynamic dimensions live in an arena-resident parameter block. Buckets overlay
-//! one capacity-sized arena, including boundary device copies and host-op scratch.
+//! Dynamic dimensions live in an arena-resident parameter block. Each executable
+//! uses one domain-sized arena, including boundary copies and host-op scratch.
 //! Input staging and output readback are graph nodes backed by one shared pinned
 //! host allocation. Returned outputs own their host bytes.
 //!
@@ -66,19 +59,15 @@ pub mod egraph_postpass;
 pub use luminal::extraction as extractor;
 #[cfg(feature = "device")]
 mod cuda_graph;
-/// FINALISTS (Phase 5 of the #420/#422 rejoin): a bucket's ranked
+/// FINALISTS: a program's ranked
 /// genomes, re-materialized one at a time under a hard filter.
 pub mod finalists;
 pub mod host;
 pub mod host_buffer;
 pub mod kernels;
-/// THE BUCKET LATTICE (Phase 5): best-first selection of ONE finalist
-/// per bucket under a coordinate-monotone aggregate.
-pub mod lattice;
 pub mod layouts;
 pub mod op;
 pub mod ops;
-pub mod resident;
 pub mod runtime;
 pub mod search;
 mod storage;
@@ -100,7 +89,7 @@ pub use op::{CudaOpInterface, as_host_op, as_kernel_op};
 pub use ops::{
     RegisteredOp, cuda_registry, cuda_registry_filtered, cuda_registry_without_cublaslt,
 };
-pub use runtime::CudaRuntime;
+pub use runtime::{CudaArena, CudaRuntime};
 pub use search::{CompileOptions, Evaluator, SearchOutcome, harness_search_options};
 
 /// PLAN-TRANSPARENT (M4 Phase 5): claimable WITHOUT a kernel iff the
@@ -148,3 +137,7 @@ pub fn cuda_allow_list() -> Vec<&'static str> {
         })
         .collect()
 }
+
+#[cfg(all(test, feature = "device"))]
+#[path = "../tests/support/memory.rs"]
+mod test_memory;

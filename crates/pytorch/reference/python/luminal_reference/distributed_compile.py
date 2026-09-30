@@ -59,7 +59,7 @@ def _canonical_model_json(data):
     return json.dumps(normalize(model), sort_keys=True, separators=(",", ":")).encode()
 
 
-def _semantic_program_digest(program, specs, buckets, options):
+def _semantic_program_digest(program, specs, options):
     """Hash PT2 contents, excluding derived archive and node provenance IDs."""
     digest = hashlib.sha256()
     with ZipFile(io.BytesIO(program)) as archive:
@@ -82,7 +82,7 @@ def _semantic_program_digest(program, specs, buckets, options):
             digest.update(name_bytes)
             digest.update(len(payload).to_bytes(8, "big"))
             digest.update(payload)
-    digest.update(repr((specs, buckets, options)).encode())
+    digest.update(repr((specs, options)).encode())
     return digest.digest()
 
 
@@ -128,9 +128,8 @@ class RegionBatch:
         self.leader = dist.get_global_rank(self.group, 0)
 
     def enqueue(self, gm, examples, **options):
-        symbol_buckets = options.pop("symbol_buckets", None)
         try:
-            prepared = _prepare_local_graph(gm, examples, symbol_buckets)
+            prepared = _prepare_local_graph(gm, examples)
             job = DeferredRegion(prepared, options)
         except Exception as exc:  # noqa: BLE001
             # Defer the error until every rank can observe it together.
@@ -142,15 +141,15 @@ class RegionBatch:
     def _request(job):
         if job.prepare_error is not None:
             return False, job.prepare_error
-        ep, inputs, _scalars, buckets = job.prepared
+        ep, inputs, _scalars = job.prepared
         output = io.BytesIO()
         torch.export.save(ep, output)
         specs = [(tuple(int(d) for d in value.shape), value.dtype) for value in inputs]
-        return True, (output.getvalue(), specs, buckets, job.options)
+        return True, (output.getvalue(), specs, job.options)
 
     @staticmethod
     def _compile(request):
-        program, specs, buckets, options = request
+        program, specs, options = request
         ep = torch.export.load(io.BytesIO(program))
         inputs = [
             torch.ones(shape, dtype=dtype, device="cpu") for shape, dtype in specs
@@ -162,7 +161,6 @@ class RegionBatch:
             search_log=options.get("search_log", False),
             max_intermediate_bytes=options.get("max_intermediate_bytes"),
             memory_budget_bytes=options.get("memory_budget_bytes"),
-            dim_buckets=buckets,
         )
         return model, bytes(model._graph.serialize_compiled())
 
@@ -198,8 +196,8 @@ class RegionBatch:
                             raise RuntimeError(
                                 f"rank {owner} region {index} export failed: {request}"
                             )
-                        program, specs, buckets, options = request
-                        key = _semantic_program_digest(program, specs, buckets, options)
+                        program, specs, options = request
+                        key = _semantic_program_digest(program, specs, options)
                         if key not in cache:
                             try:
                                 _model, artifact = self._compile(request)
@@ -229,7 +227,7 @@ class RegionBatch:
                     "leader returned a different number of reference regions"
                 )
             for index, (job, (_ok, artifact)) in enumerate(zip(self.jobs, result)):
-                ep, inputs, scalars, buckets = job.prepared
+                ep, inputs, scalars = job.prepared
                 job.model = compile_exported(
                     ep,
                     inputs,
@@ -238,11 +236,10 @@ class RegionBatch:
                     search_log=job.options.get("search_log", False),
                     max_intermediate_bytes=job.options.get("max_intermediate_bytes"),
                     memory_budget_bytes=job.options.get("memory_budget_bytes"),
-                    dim_buckets=buckets,
                     artifact=artifact,
                 )
                 if job.record is not None:
-                    job.record.buckets = job.model._graph.dim_buckets
+                    job.record.bounds = job.model._graph.dim_bounds
         except Exception as exc:  # noqa: BLE001
             installation_error = f"rank {rank} failed to install leader plan: {exc}"
         installation_errors = [None] * dist.get_world_size(self.group)

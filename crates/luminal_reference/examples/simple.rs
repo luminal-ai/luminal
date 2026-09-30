@@ -17,7 +17,12 @@ fn main() -> Result<()> {
     let data = pairs.iter().cloned().collect();
 
     let mut runtime = ReferenceRuntime::load(&cx)?;
-    runtime.search(&data, &luminal_reference::harness_search_options())?;
+    runtime.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &luminal_reference::harness_search_options(),
+    )?;
     for (id, value) in pairs {
         runtime.set_data(id, value);
     }

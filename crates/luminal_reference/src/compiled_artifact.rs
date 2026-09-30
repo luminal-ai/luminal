@@ -23,86 +23,68 @@ use serde::{Deserialize, Serialize};
 
 use crate::ops;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct Artifact {
     version: u32,
-    plans: Vec<BucketWire>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct BucketWire {
-    ranges: BTreeMap<String, (usize, usize)>,
+    bounds: BTreeMap<String, (usize, usize)>,
     input_buffers: Vec<i64>,
     output_buffers: Vec<i64>,
     plan: PlanWire,
 }
 
-/// One selected plan and its boundary slots. `ranges` is empty for a static
-/// graph. The slot lists are declaration-order buffer literals, independent
-/// of the compiling process's graph node indices.
-pub struct CompiledBucket {
-    pub ranges: BTreeMap<String, (usize, usize)>,
+/// One selected program. Slot identities are local to this artifact;
+/// declaration order maps them onto a receiving process's graph bindings.
+#[derive(Clone)]
+pub struct CompiledProgram {
+    pub bounds: luminal::shape::DimensionBounds,
     pub input_buffers: Vec<i64>,
     pub output_buffers: Vec<i64>,
     pub plan: BufferIrGraph<DecodedLayout>,
 }
 
-pub fn serialize(buckets: &[CompiledBucket]) -> Result<Vec<u8>> {
-    ensure!(
-        !buckets.is_empty(),
-        "no compiled reference plans to serialize"
-    );
-    let plans = buckets
-        .iter()
-        .map(|bucket| {
-            Ok(BucketWire {
-                ranges: bucket.ranges.clone(),
-                input_buffers: bucket.input_buffers.clone(),
-                output_buffers: bucket.output_buffers.clone(),
-                plan: PlanWire::from_plan(&bucket.plan)?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+pub fn serialize(program: &CompiledProgram) -> Result<Vec<u8>> {
     serde_json::to_vec(&Artifact {
         version: SCHEMA_VERSION,
-        plans,
+        bounds: program
+            .bounds
+            .iter()
+            .map(|(s, r)| (s.to_string(), (r.min(), r.max())))
+            .collect(),
+        input_buffers: program.input_buffers.clone(),
+        output_buffers: program.output_buffers.clone(),
+        plan: PlanWire::from_plan(&program.plan)?,
     })
     .context("serializing reference plan")
 }
 
-pub fn deserialize(data: &[u8]) -> Result<Vec<CompiledBucket>> {
+pub fn deserialize(data: &[u8]) -> Result<CompiledProgram> {
+    // Check the version before decoding fields that changed with the schema.
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let version: Version =
+        serde_json::from_slice(data).context("parsing reference plan version")?;
+    ensure!(
+        version.version == SCHEMA_VERSION,
+        "unsupported reference plan schema {}",
+        version.version
+    );
     let artifact: Artifact =
         serde_json::from_slice(data).context("parsing reference plan artifact")?;
-    ensure!(
-        artifact.version == SCHEMA_VERSION,
-        "unsupported reference plan schema {}",
-        artifact.version
-    );
-    ensure!(
-        !artifact.plans.is_empty(),
-        "reference plan artifact contains no plans"
-    );
-    artifact
-        .plans
+    let ranges = artifact
+        .bounds
         .into_iter()
-        .map(|bucket| {
-            for (name, &(lo, hi)) in &bucket.ranges {
-                luminal::shape::Symbol::try_new_dim(name)?;
-                ensure!(
-                    lo <= hi,
-                    "invalid reference plan bucket range {name}={lo}..{hi}"
-                );
-            }
-            Ok(CompiledBucket {
-                ranges: bucket.ranges,
-                input_buffers: bucket.input_buffers,
-                output_buffers: bucket.output_buffers,
-                plan: bucket.plan.into_plan()?,
-            })
-        })
-        .collect()
+        .map(|(name, range)| Ok((luminal::shape::Symbol::try_new_dim(name)?, range)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(CompiledProgram {
+        bounds: luminal::shape::DimensionBounds::from_ranges(ranges)?,
+        input_buffers: artifact.input_buffers,
+        output_buffers: artifact.output_buffers,
+        plan: artifact.plan.into_plan()?,
+    })
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -609,7 +591,12 @@ mod tests {
         .into_iter()
         .collect();
         leader
-            .search(&data, &crate::harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &crate::harness_search_options(),
+            )
             .unwrap();
         let output_buffer = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
         let bytes = leader
@@ -633,37 +620,65 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_bucket_plans_round_trip_and_select_by_runtime_dims() {
-        use luminal::graph::DimBucket;
-        use luminal::shape::Symbol;
-
+    fn bounded_scan_program_round_trips_without_search() {
+        use luminal::shape::DimensionBounds;
         let mut graph = Graph::new();
-        graph.set_dim('s', 3);
+        let x = graph.tensor(('n', 2), DType::F32);
+        // Axis 1 must survive serialization; folding axis 0 changes the result.
+        let out = x.cumsum(1).cumprod(1).cummax(1);
+        let output = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
+        let bounds = DimensionBounds::from_ranges([('n'.into(), (1, 4))]).unwrap();
+        let dims = [('n'.into(), 2)].into_iter().collect();
+        let data = [(x.id, TypedBuffer::F32(vec![-1., 3., -2., 5.]))]
+            .into_iter()
+            .collect();
+        let mut leader = ReferenceRuntime::load(&graph).unwrap();
+        leader
+            .search(&bounds, &dims, &data, &crate::harness_search_options())
+            .unwrap();
+        let bytes = leader.serialize_compiled(&[x.id], &[output]).unwrap();
+        let mut follower = ReferenceRuntime::default();
+        follower
+            .deserialize_compiled(
+                &bytes,
+                &[x.id],
+                &[out.id],
+                crate::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
+            )
+            .unwrap();
+        assert_eq!(follower.bounds(), &bounds);
+        for extent in [1, 4] {
+            follower.set_dim('n', extent);
+            follower.set_data(x.id, [-1., 3.].repeat(extent));
+            follower.execute().unwrap();
+            assert_eq!(
+                follower.get_f32(out.id).unwrap(),
+                &[-1., -1.].repeat(extent)
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_program_round_trip_without_search() {
+        use luminal::shape::{DimensionBounds, DynMap};
+        let mut graph = Graph::new();
         let x = graph.tensor(('s', 2), DType::F32);
         let y = graph.tensor(('s', 2), DType::F32);
         let out = x + y;
-        let output_buffer = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
+        let output = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
         let mut leader = ReferenceRuntime::load(&graph).unwrap();
+        let bounds = DimensionBounds::from_ranges([('s'.into(), (2, 8))]).unwrap();
+        let dims: DynMap = [('s'.into(), 3)].into_iter().collect();
+        let data = [
+            (x.id, TypedBuffer::F32(vec![1.; 6])),
+            (y.id, TypedBuffer::F32(vec![2.; 6])),
+        ]
+        .into_iter()
+        .collect();
         leader
-            .bind_dim_buckets('s', vec![DimBucket::new(2, 4), DimBucket::new(5, 8)])
+            .search(&bounds, &dims, &data, &crate::harness_search_options())
             .unwrap();
-        leader
-            .search_buckets(
-                |dims| {
-                    let n = dims[&Symbol::from('s')] * 2;
-                    [
-                        (x.id, TypedBuffer::F32(vec![1.; n])),
-                        (y.id, TypedBuffer::F32(vec![2.; n])),
-                    ]
-                    .into_iter()
-                    .collect()
-                },
-                &crate::harness_search_options(),
-            )
-            .unwrap();
-        let bytes = leader
-            .serialize_compiled(&[x.id, y.id], &[output_buffer])
-            .unwrap();
+        let bytes = leader.serialize_compiled(&[x.id, y.id], &[output]).unwrap();
         let mut follower = ReferenceRuntime::default();
         follower
             .deserialize_compiled(
@@ -673,6 +688,7 @@ mod tests {
                 crate::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
             )
             .unwrap();
+        assert_eq!(follower.bounds(), &bounds);
         for size in [4, 7] {
             follower.set_dim('s', size);
             follower.set_data(x.id, vec![3.; size * 2]);
@@ -680,5 +696,20 @@ mod tests {
             follower.execute().unwrap();
             assert_eq!(follower.get_f32(out.id).unwrap(), &vec![7.; size * 2]);
         }
+        follower.set_dim('s', 9);
+        assert!(
+            follower
+                .execute()
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
+        assert!(
+            super::deserialize(br#"{"version":1,"plans":[]}"#)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unsupported reference plan schema 1")
+        );
     }
 }

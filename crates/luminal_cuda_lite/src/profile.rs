@@ -1,13 +1,17 @@
 //! Search profiling uses the serving graph path. Preparation/instantiation is
-//! outside the timed trials; transient staging, graph replay, and readback are timed.
-//! Resident inputs upload once; writable resident state is restored outside timing.
+//! outside the timed trials. Trials measure device execution and synchronization.
+//! The profiling caller owns candidate storage and restores staged inputs per trial.
+use anyhow::{Result, anyhow, ensure};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use std::sync::Arc;
+
 use std::time::{Duration, Instant};
 
 use luminal::bufferize::BufferIrGraph;
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::FxHashMap;
 
-use crate::device::CudaDevice;
+use crate::device::CudaExecutable;
 use crate::host_buffer::HostBuffer;
 use crate::search::early_stop_exceeded;
 
@@ -60,15 +64,16 @@ impl std::fmt::Display for ProfileFailure {
 }
 
 /// Compile and instantiate once, warm up once, then time the same execution
-/// path used for serving: host staging, graph launch, synchronization, readback.
+/// path used for serving: parameter binding, graph launch, synchronization.
+/// The profiling harness restores tensor inputs before each timed trial.
 /// Timeouts cover timed trials only. The caller releases candidate graphs and
 /// arena afterwards, retaining the shared context and compiled module cache.
 #[allow(clippy::too_many_arguments)]
 pub fn profile_candidate_at(
-    device: &mut CudaDevice,
+    device: &mut CudaExecutable,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &HostBuffer>,
-    residents: &luminal::resident::ResidentBindings,
+
     trials: usize,
     best_so_far: Option<u128>,
     candidate_timeout: Option<Duration>,
@@ -76,41 +81,28 @@ pub fn profile_candidate_at(
     arena_budget: Option<usize>,
 ) -> Result<Measurement, ProfileFailure> {
     // 1. PREPARE: compile + stage + one untimed run (warmup + validity).
-    let staged = prepare_candidate(device, plan, staged, residents, shapes, arena_budget)
+    let staged = prepare_candidate(device, plan, staged, shapes, arena_budget)
         .map_err(ProfileFailure::Prepare)?;
-    let staged: FxHashMap<_, _> = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+    let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())
+        .map_err(ProfileFailure::Prepare)?;
+    let mut staging = device
+        .allocate_staging(device.stats().staging_bytes)
+        .map_err(ProfileFailure::Prepare)?;
+    initialize_inputs(device, plan, &mut arena, &staged, &shapes.values)
+        .map_err(ProfileFailure::Prepare)?;
     device
-        .execute(0, &staged, &shapes.values)
+        .execute(arena.arena(), &mut staging, &shapes.values)
         .map_err(ProfileFailure::Prepare)?;
 
-    // Match serving: uploaded residents are absent from subsequent staging.
-    // ReadWrite permission includes transient scratch reuse, even without a
-    // bound mutation output. Restore every writable resident before each trial
-    // so warmup and earlier trials cannot change the measured input state.
-    let reset: FxHashMap<_, _> = plan
-        .buffers
-        .values()
-        .filter(|buffer| buffer.access == luminal::layout_ir::Access::ReadWrite)
-        .filter_map(|buffer| buffer.lit)
-        .filter(|lit| residents.inputs.contains(lit))
-        .filter_map(|lit| staged.get(&lit).map(|data| (lit, *data)))
-        .collect();
-    let transient = staged
-        .into_iter()
-        .filter(|(lit, _)| !residents.inputs.contains(lit))
-        .collect();
-
-    // 2. Accumulate execution time only; preparation does not spend the budget.
     let total = trials.max(1);
     let mut sum = 0u128;
     for trial in 0..total {
-        // State restoration is preparation, outside both ranking and timeout.
-        device
-            .upload_residents(&reset)
-            .map_err(ProfileFailure::Execute)?;
+        // Mutable/donated inputs are restored by the profiling harness, not the executable.
+        initialize_inputs(device, plan, &mut arena, &staged, &shapes.values)
+            .map_err(ProfileFailure::Prepare)?;
         let start = Instant::now();
         device
-            .execute(0, &transient, &shapes.values)
+            .execute(arena.arena(), &mut staging, &shapes.values)
             .map_err(ProfileFailure::Execute)?;
         sum += start.elapsed().as_nanos();
         let completed = trial + 1;
@@ -149,10 +141,10 @@ pub fn profile_candidate_at(
 
 /// Static-plan entry point retained for lower-level callers.
 pub fn profile_candidate(
-    device: &mut CudaDevice,
+    device: &mut CudaExecutable,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &HostBuffer>,
-    residents: &luminal::resident::ResidentBindings,
+
     trials: usize,
     best: Option<u128>,
     timeout: Option<Duration>,
@@ -161,7 +153,6 @@ pub fn profile_candidate(
         device,
         plan,
         staged,
-        residents,
         trials,
         best,
         timeout,
@@ -170,14 +161,13 @@ pub fn profile_candidate(
     )
 }
 
-/// Search probes geometry at a bucket's representative. If supplied dynamic
-/// input data belongs to another size, preserve its prefix and zero-fill the
-/// rest for timing. Serving always requires exact payload sizes.
-pub(crate) fn prepare_candidate<'a>(
-    device: &mut CudaDevice,
+/// Prepare a candidate at its explicit profiling assignment. Supplied payloads
+/// must cover that shape; the profiling harness explicitly initializes absent payloads.
+fn prepare_candidate<'a>(
+    device: &mut CudaExecutable,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &'a HostBuffer>,
-    residents: &luminal::resident::ResidentBindings,
+
     shapes: &crate::symbolic::ShapeEnv,
     arena_budget: Option<usize>,
 ) -> anyhow::Result<FxHashMap<i64, std::borrow::Cow<'a, HostBuffer>>> {
@@ -186,32 +176,101 @@ pub(crate) fn prepare_candidate<'a>(
         if let Some(lit) = buffer.lit
             && let Some(data) = staged.get(&lit)
         {
-            let mut data = std::borrow::Cow::Borrowed(*data);
-            let mut vars = std::collections::BTreeSet::new();
-            crate::symbolic::vars(&crate::symbolic::span(&buffer.layout)?.0, &mut vars);
-            if vars
-                .iter()
-                .any(|s| shapes.bounds.get(s).is_some_and(|(lo, hi)| lo != hi))
-            {
-                let bytes = crate::symbolic::bytes(&buffer.layout, &shapes.values)?;
-                if bytes != data.bytes.len() {
-                    data.to_mut().bytes.resize(bytes, 0);
-                }
-            }
+            let bytes = crate::symbolic::bytes(&buffer.layout, &shapes.values)?;
+            anyhow::ensure!(
+                data.bytes.len() >= bytes,
+                "profiling input {lit} has {} bytes but its declared profiling shape requires {bytes}",
+                data.bytes.len()
+            );
+            let data = std::borrow::Cow::Borrowed(*data);
             owned.insert(lit, data);
         }
     }
-    // Search receives host payloads rather than caller-owned device pointers.
-    // External boundaries keep their existing private staged stand-ins; only
-    // resident inputs use the serving placement during candidate profiling.
-    let bindings = luminal::resident::ResidentBindings {
-        inputs: residents.inputs.clone(),
-        externals: Default::default(),
-    };
-    device.install_resident_with_budget(
-        vec![(plan.clone(), shapes.bounds.clone())],
+    // Profiling supplies host stand-ins for external boundaries. Their storage
+    // belongs to this profiling invocation, not the installed executable.
+    let bindings = Default::default();
+    device.install_with_bindings(
+        (plan.clone(), shapes.bounds.clone()),
         bindings,
         arena_budget,
     )?;
     Ok(owned)
+}
+
+/// Profiling owns data preparation. Missing payloads are explicit synthetic zeros
+/// here; the executable never fabricates or uploads tensor data.
+fn initialize_inputs(
+    device: &CudaExecutable,
+    plan: &BufferIrGraph<DecodedLayout>,
+    arena: &mut ProfilingMemory,
+    inputs: &FxHashMap<i64, std::borrow::Cow<'_, HostBuffer>>,
+    dims: &luminal::shape::DynMap,
+) -> anyhow::Result<()> {
+    for buffer in plan.buffers.values().filter(|b| b.lit.is_some()) {
+        let Some(home) = device.memory_plan()?.slices.get(&buffer.id) else {
+            continue;
+        };
+        let bytes = crate::symbolic::bytes(&buffer.layout, dims)?;
+        if let Some(data) = inputs.get(&buffer.lit.unwrap()) {
+            anyhow::ensure!(
+                Some(data.dtype) == buffer.layout.dtype,
+                "profiling input dtype mismatch"
+            );
+            anyhow::ensure!(data.bytes.len() == bytes, "profiling input size mismatch");
+            arena.write(home.offset, &data.bytes)?;
+        } else {
+            arena.write(home.offset, &vec![0; bytes])?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate a finalist using a private profiling environment.
+pub(crate) fn warmup_candidate(
+    device: &mut CudaExecutable,
+    plan: &BufferIrGraph<DecodedLayout>,
+    inputs: &FxHashMap<i64, &HostBuffer>,
+    shapes: &crate::symbolic::ShapeEnv,
+    arena_budget: Option<usize>,
+) -> anyhow::Result<()> {
+    let inputs = prepare_candidate(device, plan, inputs, shapes, arena_budget)?;
+    let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())?;
+    initialize_inputs(device, plan, &mut arena, &inputs, &shapes.values)?;
+    let mut staging = device.allocate_staging(device.stats().staging_bytes)?;
+    device.execute(arena.arena(), &mut staging, &shapes.values)
+}
+
+use crate::CudaArena;
+struct ProfilingMemory {
+    buffer: CudaSlice<u8>,
+    stream: Arc<CudaStream>,
+}
+impl ProfilingMemory {
+    fn new(stream: Arc<CudaStream>, bytes: usize) -> Result<Self> {
+        // SAFETY: the caller initializes inputs; program operations initialize destinations.
+        let buffer = unsafe { stream.alloc(bytes.max(1))? };
+        Ok(Self { buffer, stream })
+    }
+
+    fn arena(&mut self) -> CudaArena<'_> {
+        // SAFETY: this exclusive borrow keeps the allocation alive through execution.
+        unsafe { CudaArena::from_raw(self.ptr(), self.bytes()) }
+    }
+    fn ptr(&self) -> u64 {
+        self.buffer.device_ptr(&self.stream).0
+    }
+    fn bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| anyhow!("upload range overflow"))?;
+        ensure!(end <= self.bytes(), "upload exceeds allocation");
+        self.stream
+            .memcpy_htod(data, &mut self.buffer.slice_mut(offset..end))?;
+        self.stream.synchronize()?;
+        Ok(())
+    }
 }

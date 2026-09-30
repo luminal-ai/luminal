@@ -14,7 +14,7 @@ fn registry_matches_claims_and_decodes_its_live_schema() {
     }
     let runtime = MetalRuntime::load_with_registry(&g, rows).unwrap();
     assert_eq!(runtime.active_allow_list(), MetalRuntime::allow_list());
-    runtime.saturated_egraph().unwrap();
+    runtime.saturated_egraph(&Default::default()).unwrap();
 }
 
 #[test]
@@ -40,6 +40,8 @@ fn filtered_vocabulary_cannot_elect_an_unregistered_operation() {
     assert!(
         runtime
             .search(
+                &Default::default(),
+                &Default::default(),
                 &[(x.id, vec![1f32; 3].into()), (y.id, vec![2f32; 3].into())]
                     .into_iter()
                     .collect(),
@@ -63,6 +65,8 @@ fn arena_budget_rejects_a_plan_set_that_cannot_fit() {
     options.device_budget_bytes = Some(0);
     let error = runtime
         .search(
+            &Default::default(),
+            &Default::default(),
             &[(x.id, vec![1f32; 3].into())].into_iter().collect(),
             &options,
         )

@@ -13,26 +13,37 @@ use luminal::{
 };
 
 /// Remove producer alternatives that cannot fit either memory ceiling.
-/// `capacity_dims` is the conservative size assignment for this bucket.
+/// Bound expression intervals, preserving live-budgeted execution for domains
+/// whose symbolic capacity exceeds the reference runtime's allocation budget.
 pub fn run(
     graph: &mut EGraph,
-    capacity_dims: &luminal::shape::DynMap,
+    bounds: &luminal::shape::DimensionBounds,
     max_intermediate_bytes: usize,
     memory_budget_bytes: usize,
 ) -> Result<MemoryPruning> {
+    let intervals = bounds.signed_intervals();
     let capacity = |layout: &DecodedLayout| {
-        layout
+        let Some(span) = layout
             .spellings
             .iter()
             .find_map(|spelling| spelling.span_elements())
-            .map(|_| {
-                let width = usize::try_from(layout.width_bits())?.div_ceil(8);
-                layout
-                    .span_with(capacity_dims)?
-                    .checked_mul(width)
-                    .ok_or_else(|| anyhow!("materialized tensor capacity overflow"))
-            })
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        // Broad exported domains already use per-invocation allocation guards.
+        // Never claim a profiling/minimum assignment proves their capacity.
+        if span.eval_literal().is_none()
+            && bounds.iter().any(|(_, r)| r.max() > memory_budget_bytes)
+        {
+            return Ok(None);
+        }
+        let (_, upper) = span.interval(&intervals)?;
+        let width = usize::try_from(layout.width_bits())?.div_ceil(8);
+        Ok(Some(
+            usize::try_from(upper)?
+                .checked_mul(width)
+                .ok_or_else(|| anyhow!("materialized tensor capacity overflow"))?,
+        ))
     };
     let mut report = prune_oversized_materializations(
         graph,
@@ -70,7 +81,7 @@ pub struct MemoryPruning {
 }
 
 /// Remove materializations whose physical storage capacity exceeds the entire
-/// arena budget. `capacity` is the runtime's sizing policy over the bucket's
+/// arena budget. `capacity` is the runtime's sizing policy over the program's
 /// full bounds; `None` means the layout discloses no allocation (e.g. a view).
 /// Logical tensor volume is deliberately not an allocation size.
 pub fn prune_oversized_materializations(

@@ -9,6 +9,5 @@ from . import _torch_version as _torch_version
 # Validate PyTorch before importing the native extension.
 # isort: split
 from .compiler import Compiler
-from .dimensions import DimBucket
 
-__all__ = ["Compiler", "DimBucket"]
+__all__ = ["Compiler"]

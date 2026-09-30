@@ -15,10 +15,8 @@ class Compiler(ReferenceAOTBackend):
     ``None`` memory limits select the runtime defaults (2 GiB per intermediate,
     8 GiB live payload). ``graphs`` and ``regions`` retain compilation
     diagnostics. One compiler can compile multiple graphs.
-    ``dim_buckets`` maps PyTorch ``ShapeVar`` objects to sequences of
-    ``DimBucket`` values. Reuse those objects in ``torch.compile``'s
-    ``dynamic_shapes=ShapesSpec(...)``; bounds come from PyTorch.
-    ``search_iterations`` selects one candidate per iteration for each
-    local graph and each dimension-bucket combination. Each candidate
-    executes a warmup and a timed profile run.
+    Each local graph compiles once over its PyTorch-declared shape bounds.
+    Applications can use ``torch.compile(..., isolate_recompiles=True)`` to create independently bounded callables and
+    dispatch among them. ``search_iterations`` selects the number of candidates
+    to profile for each local graph.
     """

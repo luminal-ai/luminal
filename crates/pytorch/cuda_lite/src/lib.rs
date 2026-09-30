@@ -21,7 +21,7 @@
 //!
 //! The runtime also runs on a borrowed `CUstream` and takes its
 //! intermediate-scratch arena from the caller per execution
-//! (`use_borrowed_stream`, `arena_bytes`/`set_arena`).
+//! (`use_borrowed_stream`, `arena_bytes`/`execute`).
 
 use std::collections::HashMap;
 
@@ -29,9 +29,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
-/// Largest value a dynamic dimension's bucket covers (the searched plan stays
-/// symbolic inside it, so one compile serves every covered context length).
-const MAX_DYNAMIC_DIM: usize = 4096;
+use luminal::shape::DimensionBounds;
 use luminal_cuda_lite::bindings::{BoundaryLayout, CudaBindings};
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, harness_search_options};
 use luminal_pytorch_utils::translate::parse_dim_expr;
@@ -58,10 +56,17 @@ fn torch_code(dtype: DType) -> Result<u32> {
         .code())
 }
 
+/// Host transfer storage owned by the Python application wrapper.
+#[pyclass(unsendable)]
+pub struct ExecutionStaging {
+    #[cfg(feature = "device")]
+    inner: luminal_cuda_lite::device::CudaStaging,
+}
+
 /// A compiled CUDA-lite graph with its boundary tables.
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
-    translation: Translation,
+    translation: std::rc::Rc<Translation>,
     runtime: CudaRuntime,
     /// The buffer each translation input was bound on, by input index.
     input_buffers: Vec<i64>,
@@ -76,6 +81,7 @@ pub struct CompiledGraph {
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
     dims: DynMap,
+    bounds: DimensionBounds,
 }
 
 /// Resolve a symbolic recorder shape to concrete extents. Literals and
@@ -94,6 +100,23 @@ fn resolve_shape(shape: &[IntExpr], dims: &DynMap) -> Vec<usize> {
 
 #[pymethods]
 impl CompiledGraph {
+    /// A new binding of the selected program, with no native compilation.
+    fn fork(&self) -> PyResult<Self> {
+        if !self.searched {
+            return Err(PyRuntimeError::new_err("search before fork"));
+        }
+        Ok(Self {
+            translation: self.translation.clone(),
+            runtime: self.runtime.fork().map_err(to_py)?,
+            input_buffers: self.input_buffers.clone(),
+            output_buffers: self.output_buffers.clone(),
+            output_layouts: self.output_layouts.clone(),
+            dims: self.dims.clone(),
+            bounds: self.bounds.clone(),
+            searched: true,
+        })
+    }
+
     #[getter]
     fn input_names(&self) -> Vec<String> {
         self.translation
@@ -267,22 +290,18 @@ impl CompiledGraph {
 
     /// Bytes of intermediate-scratch arena the selected plan set needs for one
     /// execution. The Python layer allocates exactly this from PyTorch's
-    /// caching allocator, passes it to [`Self::set_arena`], and frees it after.
+    /// caching allocator, passes it to [`Self::execute`], and frees it after.
     #[cfg(feature = "device")]
     fn arena_bytes(&self) -> PyResult<usize> {
         self.runtime.arena_bytes().map_err(to_py)
     }
 
-    /// Bind the per-execution arena (a device address from PyTorch's caching
-    /// allocator). Never freed by the runtime.
+    /// Allocate a host staging object owned by the Python wrapper.
     #[cfg(feature = "device")]
-    fn set_arena(&mut self, ptr: u64, bytes: usize) {
-        self.runtime.set_arena(ptr, bytes);
-    }
-
-    #[cfg(feature = "device")]
-    fn clear_arena(&mut self) {
-        self.runtime.clear_arena();
+    fn allocate_staging(&mut self) -> PyResult<ExecutionStaging> {
+        Ok(ExecutionStaging {
+            inner: self.runtime.allocate_staging().map_err(to_py)?,
+        })
     }
 
     /// Run on PyTorch's current stream (`torch.cuda.current_stream().cuda_stream`).
@@ -297,10 +316,8 @@ impl CompiledGraph {
     }
 
     /// Override a dynamic dimension's value before `search`, by PT2 symbol
-    /// name (e.g. `"s77"`). The value becomes the dim's bucket
-    /// representative, so it steers the searched plan without narrowing the
-    /// bucket. Hints are seeded at compile time, so static graphs need no
-    /// call.
+    /// name (e.g. `"s77"`). The profiling value steers candidate measurement
+    /// without narrowing the exported domain. Exported hints are the default.
     fn set_dim(&mut self, name: &str, value: usize) -> PyResult<()> {
         if self.searched {
             return Err(PyRuntimeError::new_err(
@@ -313,8 +330,7 @@ impl CompiledGraph {
             .get(name)
             .copied()
             .ok_or_else(|| PyRuntimeError::new_err(format!("unknown dim symbol {name:?}")))?;
-        // The bucket binding owns the runtime's dims until `search` runs;
-        // recording the value here is what reaches it.
+        // Search receives this profiling assignment separately from bounds.
         self.dims.insert(symbol, value);
         Ok(())
     }
@@ -354,22 +370,50 @@ impl CompiledGraph {
         .map_err(to_py)
     }
 
-    fn execute(&mut self) -> PyResult<()> {
+    #[cfg_attr(not(feature = "device"), allow(unused_variables, unused_mut))]
+    fn execute(
+        &mut self,
+        arena_ptr: u64,
+        arena_bytes: usize,
+        mut staging: PyRefMut<'_, ExecutionStaging>,
+    ) -> PyResult<()> {
         if !self.searched {
             return Err(PyRuntimeError::new_err(
                 "search() must run before execute()",
             ));
         }
-        self.runtime.execute().map_err(to_py)
+        // SAFETY: the Python wrapper holds this PyTorch allocation through completion.
+        let arena = unsafe { luminal_cuda_lite::CudaArena::from_raw(arena_ptr, arena_bytes) };
+        self.runtime
+            .execute(
+                arena,
+                #[cfg(feature = "device")]
+                &mut staging.inner,
+            )
+            .map_err(to_py)
     }
 
-    fn execute_async(&mut self) -> PyResult<()> {
+    #[cfg_attr(not(feature = "device"), allow(unused_variables, unused_mut))]
+    fn execute_async(
+        &mut self,
+        arena_ptr: u64,
+        arena_bytes: usize,
+        mut staging: PyRefMut<'_, ExecutionStaging>,
+    ) -> PyResult<()> {
         if !self.searched {
             return Err(PyRuntimeError::new_err(
                 "search() must run before execute_async()",
             ));
         }
-        self.runtime.execute_async().map_err(to_py)
+        // SAFETY: the capture wrapper owns the arena until its GPU work completes.
+        unsafe {
+            self.runtime.execute_async(
+                luminal_cuda_lite::CudaArena::from_raw(arena_ptr, arena_bytes),
+                #[cfg(feature = "device")]
+                &mut staging.inner,
+            )
+        }
+        .map_err(to_py)
     }
 
     /// The runtime's cumulative counters, or None before it touched a device.
@@ -390,10 +434,6 @@ impl CompiledGraph {
                     ("arena_base".to_string(), stats.arena_base),
                     ("arena_bytes".to_string(), stats.arena_bytes as u64),
                     ("staging_bytes".to_string(), stats.staging_bytes as u64),
-                    (
-                        "resident_upload_bytes".to_string(),
-                        stats.resident_upload_bytes,
-                    ),
                 ])
             })
         }
@@ -426,10 +466,8 @@ impl CompiledGraph {
         device_budget_bytes: Option<usize>,
         max_intermediate_bytes: Option<usize>,
     ) -> Result<()> {
-        // NO PAYLOAD CROSSES HERE. The default evaluator ranks candidates by
-        // the device-free heuristic, which runs nothing; only a
-        // device-profiling search consumes boundary bytes, and this backend's
-        // boundary is the caller's device memory, never host bytes to copy.
+        // Profiling allocates synthetic boundary storage. Actual executions use
+        // the caller's device allocations and PyTorch-provided scratch arena.
         let data: FxHashMap<NodeIndex, HostBuffer> = FxHashMap::default();
         let mut options: CompileOptions = harness_search_options();
         if let Some(generations) = generations {
@@ -438,24 +476,8 @@ impl CompiledGraph {
         options.search_log = search_log;
         options.device_budget_bytes = device_budget_bytes;
         options.max_intermediate_bytes = max_intermediate_bytes;
-        if !self.dims.is_empty() {
-            // Dynamic program: bind one bucket per symbolic dim — torch's
-            // exported range met with this runtime's ceiling — and search it
-            // ONCE. The winning plan keeps symbolic spans, so every later call
-            // whose dims fall in the bucket re-renders without re-searching.
-            let hints: Vec<(Symbol, usize)> = self.dims.iter().map(|(s, v)| (*s, *v)).collect();
-            for (symbol, hint) in hints {
-                let bucket = luminal_pytorch_utils::dim_bucket(
-                    symbol,
-                    self.translation.dim_ranges.get(&symbol).copied(),
-                    1,
-                    MAX_DYNAMIC_DIM,
-                    hint,
-                )?;
-                self.runtime.bind_dim_buckets(symbol, vec![bucket])?;
-            }
-        }
-        self.runtime.search(&data, &options)?;
+        self.runtime
+            .search(&self.bounds, &self.dims, &data, &options)?;
         self.searched = true;
         Ok(())
     }
@@ -535,8 +557,7 @@ impl CompiledGraph {
 
         for (symbol, value) in call {
             self.dims.insert(symbol, value);
-            // Before search the bucket binding owns the dims; setting them now
-            // would make `bind_dim_buckets` refuse as "already set".
+            // Keep profiling values separate from runtime values until search completes.
             if self.searched {
                 self.runtime.set_dim(symbol, value);
             }
@@ -799,6 +820,7 @@ fn compile(
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
     let translation = translate(&parsed).map_err(to_py)?;
+    let bounds = luminal_pytorch_utils::dimension_bounds(&translation, &parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let inputs = layout_table(&translation, "input", &input_layouts).map_err(to_py)?;
     let outputs = layout_table(&translation, "output", &output_layouts).map_err(to_py)?;
@@ -814,19 +836,21 @@ fn compile(
     .context("loading the translated graph on the cuda-lite runtime")
     .map_err(to_py)?;
     Ok(CompiledGraph {
-        translation,
+        translation: std::rc::Rc::new(translation),
         runtime,
         input_buffers: boundary.input_buffers,
         output_buffers: boundary.output_buffers,
         output_layouts: boundary.output_layouts,
         searched: false,
         dims,
+        bounds,
     })
 }
 
 #[pymodule]
 fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledGraph>()?;
+    m.add_class::<ExecutionStaging>()?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     Ok(())
 }
@@ -1001,12 +1025,13 @@ mod tests {
         )
         .expect("the synthetic program loads");
         CompiledGraph {
-            translation,
+            translation: std::rc::Rc::new(translation),
             runtime,
             input_buffers: boundary.input_buffers,
             output_buffers: boundary.output_buffers,
             output_layouts: boundary.output_layouts,
             searched: false,
+            bounds: DimensionBounds::exact(&dims).unwrap(),
             dims,
         }
     }

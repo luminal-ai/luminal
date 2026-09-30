@@ -17,7 +17,7 @@ from torch.fx.passes.split_module import split_module
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from .backend import _compile_local_graph
-from .dimensions import normalize_buckets, profile_value, resolve_policies
+from .dimensions import profile_value
 from .distributed_compile import DeferredRegion, RegionBatch
 from .distributed_compile import enabled as distributed_compile_enabled
 from .export_utils import private_graph_copy
@@ -31,7 +31,7 @@ class RegionRecord:
     input_shapes: tuple[tuple[int, ...], ...]
     targets: tuple[str, ...]
     executions: int = 0
-    buckets: dict = field(default_factory=dict)
+    bounds: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -78,7 +78,6 @@ def _compile_region(
     search_log=False,
     max_intermediate_bytes=None,
     memory_budget_bytes=None,
-    dim_buckets=None,
     compile_local=None,
 ):
     graph = private_graph_copy(gm)
@@ -206,12 +205,11 @@ def _compile_region(
                 search_log=search_log,
                 max_intermediate_bytes=max_intermediate_bytes,
                 memory_budget_bytes=memory_budget_bytes,
-                symbol_buckets=resolve_policies(shape_env, dim_buckets or {}),
             )
             if isinstance(compiled, DeferredRegion):
                 compiled.record = record
             else:
-                record.buckets = compiled._graph.dim_buckets
+                record.bounds = compiled._graph.dim_bounds
         records.append(record)
 
     def run(*args):
@@ -263,9 +261,7 @@ class ReferenceAOTBackend:
         log=False,
         max_intermediate_bytes=None,
         memory_budget_bytes=None,
-        dim_buckets=None,
     ):
-        self.dim_buckets = normalize_buckets(dim_buckets)
         self.regions: list[RegionRecord] = []
         self.graphs: list[GraphRecord] = []
         self.leader_compilations = 0
@@ -276,7 +272,6 @@ class ReferenceAOTBackend:
             "search_log": log,
             "max_intermediate_bytes": max_intermediate_bytes,
             "memory_budget_bytes": memory_budget_bytes,
-            "dim_buckets": self.dim_buckets,
         }
         if not isinstance(search_iterations, int) or search_iterations < 1:
             raise ValueError("search_iterations must be a positive integer")
@@ -293,45 +288,7 @@ class ReferenceAOTBackend:
         )
 
     def __call__(self, gm, example_inputs):
-        from torch._guards import detect_fake_mode
-
-        mode = detect_fake_mode(example_inputs)
-        policies = (
-            resolve_policies(mode.shape_env, self.dim_buckets)
-            if self.dim_buckets
-            else {}
-        )
-        axes = {}
-        for index, node in enumerate(
-            n for n in gm.graph.nodes if n.op == "placeholder"
-        ):
-            value = node.meta.get("example_value")
-            if isinstance(value, torch.Tensor):
-                for axis, size in enumerate(value.shape):
-                    if isinstance(size, torch.SymInt):
-                        expr = size.node.shape_env.replace(size.node.expr)
-                        if expr in policies:
-                            axes.setdefault(expr, []).append((index, axis))
-        compiled = self._backend(gm, example_inputs)
-        if not axes:
-            return compiled
-
-        def run(*args):
-            for symbol, positions in axes.items():
-                values = [args[index].shape[axis] for index, axis in positions]
-                if any(value != values[0] for value in values[1:]):
-                    raise ValueError(
-                        f"axes sharing ShapeVar {symbol} must have equal sizes"
-                    )
-                if not any(
-                    bucket.min <= values[0] <= bucket.max for bucket in policies[symbol]
-                ):
-                    raise ValueError(
-                        f"dimension {symbol}={values[0]} is outside its configured buckets"
-                    )
-            return compiled(*args)
-
-        return run
+        return self._backend(gm, example_inputs)
 
     def _compile(self, gm, example_inputs, *, phase):
         communication = [

@@ -9,7 +9,7 @@ fn available_arena_includes_unused_cuda_pool_reservations() {
     if !context.has_async_alloc() {
         return;
     }
-    let device = CudaDevice::new(0).unwrap();
+    let device = CudaDevice::new(0).unwrap().executable();
     let stream = context.new_stream().unwrap();
     let pool = unsafe { result::device::get_mem_pool(context.cu_device()).unwrap() };
     struct RestoreThreshold(sys::CUmemoryPool, u64);

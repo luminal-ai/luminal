@@ -1,5 +1,5 @@
-//! The range torch exported for each dynamic dimension, the bucket a
-//! runtime searches it over, and the declaration that states it.
+//! The range torch exported for each dynamic dimension and the declaration
+//! that states it to the e-graph. Compilation domains preserve these bounds.
 //!
 //! Only bare symbols are read. A compound key (`2*s77`, torch's infix
 //! spelling of a derived input dim) restates its root symbol's range,
@@ -13,9 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Result, ensure};
 use luminal::egglog_snippet::ProgramSeams;
-use luminal::graph::DimBucket;
 use luminal::shape::Symbol;
 
 use crate::declaration::{Declaration, Declarations, Placement, RULESET};
@@ -56,27 +54,6 @@ pub(crate) fn dim_ranges(
         );
     }
     out
-}
-
-/// The bucket a runtime searches `symbol` over: torch's range met with the
-/// runtime's own `[floor, ceiling]`, profiled at `hint` clamped inside it.
-pub fn dim_bucket(
-    symbol: Symbol,
-    range: Option<DimRange>,
-    floor: usize,
-    ceiling: usize,
-    hint: usize,
-) -> Result<DimBucket> {
-    let range = range.unwrap_or_default();
-    let to_usize = |bound: Option<u64>| bound.map(|b| usize::try_from(b).unwrap_or(usize::MAX));
-    let min = to_usize(range.min).map_or(floor, |m| m.max(floor));
-    let max = to_usize(range.max).map_or(ceiling, |m| m.min(ceiling));
-    ensure!(
-        min <= max,
-        "dimension `{symbol}`: torch's exported range {range} does not meet the runtime's \
-         [{floor}, {ceiling}]"
-    );
-    Ok(DimBucket::new(min, max).representative(hint.clamp(min, max)))
 }
 
 /// The relations and the two rules that apply them.
@@ -202,55 +179,48 @@ mod tests {
     }
 
     #[test]
-    fn the_bucket_is_torchs_range_met_with_the_runtimes() {
-        let s = Symbol::new("s77");
-        let bucket = dim_bucket(s, Some(range(Some(3), Some(64))), 1, 4096, 4).unwrap();
+    fn compilation_preserves_zero_and_bounds_above_the_old_runtime_ceiling() {
+        let mut parsed = symbolic_program();
+        parsed
+            .program
+            .range_constraints
+            .insert("s0".into(), constraint(Some(0), Some(8192)));
+        let translation = crate::translate::translate(&parsed).unwrap();
+        let bounds = crate::dimension_bounds(&translation, &parsed).unwrap();
+        let range = bounds.get(&translation.symbols["s0"]).unwrap();
+        assert_eq!((range.min(), range.max()), (0, 8192));
+    }
+
+    #[test]
+    fn profiling_hints_do_not_narrow_an_unbounded_export() {
+        let mut parsed = symbolic_program();
+        parsed
+            .program
+            .range_constraints
+            .insert("s0".into(), constraint(Some(2), None));
+        let mut translation = crate::translate::translate(&parsed).unwrap();
+        let symbol = translation.symbols["s0"];
+        let bounds = crate::dimension_bounds(&translation, &parsed).unwrap();
+        assert_eq!(bounds.get(&symbol).unwrap().max(), (i64::MAX - 1) as usize);
+        translation.dims.insert(symbol, 6000);
         assert_eq!(
-            (bucket.min, bucket.max, bucket.representative_value()),
-            (3, 64, 4)
-        );
-        let bucket = dim_bucket(s, Some(range(Some(2), None)), 1, 4096, 4).unwrap();
-        assert_eq!((bucket.min, bucket.max), (2, 4096));
-        let bucket = dim_bucket(s, None, 1, 4096, 4).unwrap();
-        assert_eq!(
-            (bucket.min, bucket.max, bucket.representative_value()),
-            (1, 4096, 4)
+            crate::dimension_bounds(&translation, &parsed).unwrap(),
+            bounds
         );
     }
 
     #[test]
-    fn the_hint_is_profiled_inside_the_bucket() {
-        let s = Symbol::new("s77");
-        let torch = Some(range(Some(3), Some(64)));
-        assert_eq!(
-            dim_bucket(s, torch, 1, 4096, 200)
-                .unwrap()
-                .representative_value(),
-            64
-        );
-        assert_eq!(
-            dim_bucket(s, torch, 1, 4096, 1)
-                .unwrap()
-                .representative_value(),
-            3
-        );
-    }
-
-    #[test]
-    fn a_range_outside_the_runtimes_is_refused() {
-        let err = dim_bucket(
-            Symbol::new("s77"),
-            Some(range(Some(5000), None)),
-            1,
-            4096,
-            4,
-        )
-        .expect_err("empty meet must refuse")
-        .to_string();
-        assert!(
-            err.contains("`s77`") && err.contains("[5000, inf]"),
-            "{err}"
-        );
+    fn crossed_exported_bounds_are_refused_before_search() {
+        let mut parsed = symbolic_program();
+        let translation = crate::translate::translate(&parsed).unwrap();
+        parsed
+            .program
+            .range_constraints
+            .insert("s0".into(), constraint(Some(9), Some(3)));
+        let err = crate::dimension_bounds(&translation, &parsed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("s0") && err.contains("[9, 3]"), "{err}");
     }
 
     #[test]
@@ -348,8 +318,7 @@ mod tests {
         assert_eq!(label, LABEL);
     }
 
-    #[test]
-    fn the_translation_carries_the_exported_ranges_and_declares_them() {
+    fn symbolic_program() -> crate::pt2_parser::ParsedPT2 {
         let symbolic = DimSize::Expr(DimExpr {
             as_expr: ExprValue {
                 expr_str: "Symbol('s0', integer=True, positive=True)".to_string(),
@@ -391,13 +360,18 @@ mod tests {
             },
             range_constraints,
         };
-        let parsed = crate::pt2_parser::ParsedPT2 {
+        crate::pt2_parser::ParsedPT2 {
             program,
             constants_config: None,
             weights_config: None,
             archive_prefix: "test".to_string(),
             pt2_path: String::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn the_translation_carries_the_exported_ranges_and_declares_them() {
+        let parsed = symbolic_program();
         let translation = crate::translate::translate(&parsed).expect("translate");
         let s0 = translation.symbols["s0"];
         assert_eq!(
@@ -424,5 +398,40 @@ mod tests {
         luminal::egglog_snippet::new_egraph()
             .parse_and_run_program(None, &text)
             .unwrap_or_else(|err| panic!("{err}"));
+
+        // The declared facts and the compiler's complete domain agree, while
+        // the profiling assignment remains independent of later executions.
+        let bounds = crate::dimension_bounds(&translation, &parsed).unwrap();
+        let dims = translation.dims.iter().map(|(&s, &v)| (s, v)).collect();
+        let input = translation.inputs[0].tensor;
+        let output = translation.outputs[0].tensor;
+        let data = [(input, luminal_reference::TypedBuffer::F32(vec![1.; 16]))]
+            .into_iter()
+            .collect();
+        let mut runtime =
+            luminal_reference::ReferenceRuntime::load_with(&translation.graph, bindings).unwrap();
+        runtime
+            .search(
+                &bounds,
+                &dims,
+                &data,
+                &luminal_reference::harness_search_options(),
+            )
+            .unwrap();
+        assert_eq!(runtime.bounds(), &bounds);
+        for extent in [3, 64] {
+            runtime.set_dim(s0, extent);
+            runtime.set_data(input, vec![2.; extent * 4]);
+            runtime.execute().unwrap();
+            assert_eq!(runtime.get_f32(output).unwrap(), &vec![-2.; extent * 4]);
+        }
+        runtime.set_dim(s0, 65);
+        assert!(
+            runtime
+                .execute()
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
     }
 }

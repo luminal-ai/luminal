@@ -1,7 +1,10 @@
 #![cfg(target_os = "macos")]
 
+mod support;
 use luminal::prelude::*;
 use luminal_metal::{MetalRuntime, harness_search_options};
+#[cfg(target_os = "macos")]
+use support::TestTransfers;
 
 /// The full-checkpoint rotary path exposed unbounded ring expansion when the
 /// two sliced halves rejoin and their head/sequence axes are transposed back.
@@ -19,16 +22,16 @@ fn rotary_split_rejoin_with_dynamic_sequence_matches_scalar() {
         .merge_dims(1, 2);
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     runtime
-        .bind_dim_buckets('s', vec![DimBucket::new(2, 64).representative(30)])
-        .unwrap();
-    runtime
         .search(
+            &luminal::shape::DimensionBounds::from_ranges([('s'.into(), (2, 64))]).unwrap(),
+            &[('s'.into(), 30)].into_iter().collect(),
             &[(input.id, vec![1f32; 30 * 2048].into())]
                 .into_iter()
                 .collect(),
             &harness_search_options(),
         )
         .unwrap();
+    let mut arena_runtime = support::allocate_arena(&runtime).expect("allocate execution arena");
     for sequence in [2, 30, 64] {
         let values: Vec<f32> = (0..sequence * 2048)
             .map(|i| (i % 251) as f32 / 128. - 1.)
@@ -43,9 +46,11 @@ fn rotary_split_rejoin_with_dynamic_sequence_matches_scalar() {
             }
         }
         runtime.set_dim('s', sequence);
-        runtime.set_data(input.id, values);
-        runtime.execute().unwrap();
-        let (data, binding) = runtime.fetch(output.id).unwrap();
+        runtime
+            .upload(&mut arena_runtime, input.id, values)
+            .unwrap();
+        runtime.execute(arena_runtime.buffer()).unwrap();
+        let (data, binding) = runtime.download(&arena_runtime, output.id).unwrap();
         let actual =
             luminal_metal::layouts::dense_f32(&data.as_f32().unwrap(), &binding.layout).unwrap();
         assert_eq!(actual, expected, "sequence length {sequence}");

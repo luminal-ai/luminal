@@ -21,7 +21,12 @@ fn select_picks_branches_elementwise() {
     data.insert(if_true.id, TypedBuffer::F32(vec![1.0, 2.0, 3.0, 4.0]));
     data.insert(if_false.id, TypedBuffer::F32(vec![10.0, 20.0, 30.0, 40.0]));
     runtime
-        .search(&data, &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect("search");
 
     runtime.set_data(condition.id, TypedBuffer::bool8(vec![1, 0, 1, 0]).unwrap());
@@ -50,7 +55,12 @@ fn select_does_not_leak_unselected_nan() {
     data.insert(if_true.id, TypedBuffer::F32(vec![1.0, 2.0]));
     data.insert(if_false.id, TypedBuffer::F32(vec![f32::NAN, f32::NAN]));
     runtime
-        .search(&data, &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect("search");
 
     runtime.set_data(condition.id, TypedBuffer::bool8(vec![1, 0]).unwrap());
@@ -79,7 +89,12 @@ fn abs_uses_select_and_runs() {
     let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
     data.insert(x.id, TypedBuffer::F32(values.clone()));
     runtime
-        .search(&data, &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect("search");
     runtime.set_data(x.id, TypedBuffer::F32(values));
     runtime.execute().expect("execute");
@@ -104,7 +119,12 @@ fn select_i64_branches() {
     data.insert(if_true.id, TypedBuffer::I64(vec![7, 8, 9]));
     data.insert(if_false.id, TypedBuffer::I64(vec![-1, -2, -3]));
     runtime
-        .search(&data, &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect("search");
     runtime.set_data(condition.id, TypedBuffer::bool8(vec![1, 0, 1]).unwrap());
     runtime.set_data(if_true.id, TypedBuffer::I64(vec![7, 8, 9]));

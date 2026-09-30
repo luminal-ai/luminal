@@ -1,10 +1,8 @@
 //! Device-measured implementation search. Candidate selection requires a GPU.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, ensure};
-use colored::Colorize;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -53,28 +51,19 @@ pub struct CompileOptions {
     /// happened to hit a cold cache would time out plans for a cost
     /// their successors do not pay.
     pub candidate_timeout: Option<Duration>,
-    /// HOW MANY RANKED GENOMES THE SEARCH KEEPS (Phase 5, 2026-09-03),
-    /// fastest first, for [`crate::finalists::Finalists`] to fall back
-    /// through. 1 reproduces the pre-Phase-5 behaviour exactly (only the
-    /// winner is ever installable); the default 4 gives the bucket
-    /// lattice three runners-up per bucket to walk into when a set-level
-    /// constraint refuses the fastest.
-    ///
-    /// It costs NOTHING when nothing refuses: finalists past rank 0 are
-    /// extracted only if the walk reaches them.
+    /// Ranked candidates retained for per-program fallback. Additional plans
+    /// are extracted only when an earlier candidate fails final validation.
     pub keep_finalists: usize,
     /// Maximum bytes for the entire arena. Search caps this by available CUDA
     /// memory (or uses that capacity when None), prunes individually impossible
     /// materializations, and rejects candidate arenas over the limit before
-    /// allocation. The finalist lattice also enforces the requested set budget.
+    /// allocation. Final validation enforces the same per-program budget.
     pub device_budget_bytes: Option<usize>,
     /// Prune individual intermediate materializations above this size before
     /// extraction, preserving boundary storage and zero-copy view alternatives.
     pub max_intermediate_bytes: Option<usize>,
     /// Custom edits after serialization and before mandatory memory pruning.
     pub serialized_graph_passes: Vec<crate::egraph_postpass::SerializedGraphPostPass>,
-    /// Shape environment for lower-level search callers. The runtime fills this from bindings.
-    pub shapes: crate::symbolic::ShapeEnv,
 }
 
 impl Default for CompileOptions {
@@ -91,7 +80,6 @@ impl Default for CompileOptions {
             device_budget_bytes: None,
             max_intermediate_bytes: None,
             serialized_graph_passes: Vec::new(),
-            shapes: Default::default(),
         }
     }
 }
@@ -126,68 +114,31 @@ pub struct SearchOutcome {
     /// What rejected genomes were rejected FOR (diagnosis ruling
     /// 2026-08-07: understand the breakdown, no auto-repair).
     pub refusal_breakdown: RefusalBreakdown,
-    /// THE RANKED MEASURED GENOMES (Phase 5), fastest first, at most
-    /// `CompileOptions::keep_finalists` of them. `ranked[0]` is the
-    /// winner — the same genome as `best_genome`, by construction.
-    ///
-    /// This is the raw material for [`crate::finalists::Finalists`]: the
-    /// runner-ups a set-level constraint can fall back to. Genomes, not
-    /// plans, because a plan is the expensive half and the walk may
-    /// never need it.
+    /// Measured candidates, fastest first. `best_*` identifies the finalized
+    /// candidate at `finalist_rank`, which can differ from the first measurement.
     pub ranked: Vec<(u128, Genome)>,
-    /// HOW MANY PLAN SETS THE BUCKET LATTICE REJECTED before installing
-    /// one (Phase 5). 0 means the search's own winner (per bucket) was
-    /// installed unchanged — which is what every unconstrained search
-    /// reports. Stamped by the runtime after the lattice runs; the
-    /// genetic search itself always leaves it 0.
-    pub lattice_rejections: usize,
+    /// Candidates refused during finalization of this program.
+    pub finalist_rejections: usize,
+    /// Rank of the finalized program in the measured candidate ordering.
+    pub finalist_rank: usize,
 }
 
-/// Representative-specific host payloads, borrowed without copying model weights.
-pub type ProfileInputs<'a> = (
-    luminal::shape::DynMap,
-    FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
-);
-
-#[cfg(feature = "device")]
-fn staged_at<'a>(
-    staged: &FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
-    profiles: &[ProfileInputs<'a>],
-    dims: &luminal::shape::DynMap,
-) -> Result<FxHashMap<i64, &'a crate::host_buffer::HostBuffer>> {
-    let mut data = staged.clone();
-    if !profiles.is_empty() {
-        let mut matches = profiles.iter().filter(|(shape, _)| shape == dims);
-        let (_, inputs) = matches
-            .next()
-            .ok_or_else(|| anyhow!("no profiling inputs for {dims:?}"))?;
-        ensure!(
-            matches.next().is_none(),
-            "ambiguous profiling inputs for {dims:?}"
-        );
-        data.extend(inputs.iter().map(|(id, data)| (*id, *data)));
-    }
-    Ok(data)
-}
-
-/// A persistent device and borrowed inputs for candidate measurements.
+/// Borrowed device and input data for one compilation.
 pub enum Evaluator<'a> {
     /// ON-DEVICE MEASUREMENT ([`crate::profile::profile_candidate`]) on
     /// a persistent device — the module cache and the slab are the
     /// runtime's, so kernel compilation is paid once per distinct source
     /// across the search rather than once per candidate.
     ///
-    /// `staged` is BORROWED, by BufferLit id, exactly as
-    /// [`crate::device::execute_plan`] wants it. It is a map of
+    /// The profiling harness borrows `staged` by BufferLit id and explicitly
+    /// uploads it before timed execution. It is a map of
     /// references and not of payloads on purpose: a full-size model's
     /// weights are gigabytes on the host and the search must not hold a
     /// second copy of them.
     #[cfg(feature = "device")]
     Device {
-        device: &'a mut crate::device::CudaDevice,
+        device: &'a mut crate::device::CudaExecutable,
         staged: &'a FxHashMap<i64, &'a crate::host_buffer::HostBuffer>,
-        residents: &'a luminal::resident::ResidentBindings,
-        profile_inputs: &'a [ProfileInputs<'a>],
     },
     /// The lifetime placeholder for builds WITHOUT the `device` feature,
     /// so [`search_implementations`]'s signature is the same in both.
@@ -216,32 +167,23 @@ impl Evaluator<'_> {
         &mut self,
         plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
         options: &CompileOptions,
+        shapes: &crate::symbolic::ShapeEnv,
         best_nanos: Option<u128>,
     ) -> Priced {
         #[cfg(feature = "device")]
         {
-            let Self::Device {
-                device,
-                staged,
-                residents,
-                profile_inputs,
-            } = self;
-            let staged = match staged_at(staged, profile_inputs, &options.shapes.values) {
-                Ok(staged) => staged,
-                Err(error) => return Priced::PrepareFailed(format!("{error:#}")),
-            };
+            let Self::Device { device, staged } = self;
             let measured = crate::profile::profile_candidate_at(
                 device,
                 plan,
-                &staged,
-                residents,
+                staged,
                 options.trials,
                 best_nanos,
                 options.candidate_timeout,
-                &options.shapes,
+                shapes,
                 options.device_budget_bytes,
             );
-            device.release_slab();
+            device.uninstall();
             match measured {
                 Ok(crate::profile::Measurement::Timed { mean_nanos, .. }) => {
                     Priced::Cost(mean_nanos)
@@ -264,30 +206,20 @@ impl Evaluator<'_> {
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = (plan, options, best_nanos);
+            let _ = (plan, options, shapes, best_nanos);
             Priced::PrepareFailed(
                 "candidate search requires the `device` feature and a CUDA GPU".into(),
             )
         }
     }
 
-    /// Lend this evaluator to a nested search (the bucketed entry runs
+    /// Lend this evaluator to the search driver (which runs
     /// one search per Cartesian combination and must hand the SAME
     /// device to each).
     pub fn reborrow(&mut self) -> Evaluator<'_> {
         match self {
             #[cfg(feature = "device")]
-            Evaluator::Device {
-                device,
-                staged,
-                residents,
-                profile_inputs,
-            } => Evaluator::Device {
-                device,
-                staged,
-                residents,
-                profile_inputs,
-            },
+            Evaluator::Device { device, staged } => Evaluator::Device { device, staged },
             #[cfg(not(feature = "device"))]
             Evaluator::NoDevice(marker) => Evaluator::NoDevice(*marker),
         }
@@ -410,7 +342,7 @@ fn external_placement_feasible(
 /// the runtime INSTANCE, chosen when it was loaded (see
 /// [`crate::CudaRuntime::load_with_registry`]), not of this crate. The
 /// vocabulary is BORROWED: one instance runs many extractions (every
-/// genome, and with buckets every combination), and `dyn OpMatcher` is
+/// genome), and `dyn OpMatcher` is
 /// not clonable, so the list lives in the runtime and is lent here.
 /// Deterministic for a fixed seed.
 ///
@@ -421,6 +353,7 @@ fn external_placement_feasible(
 pub fn search_implementations(
     egraph: &mut egraph_serialize::EGraph,
     program: &SearchProgram,
+    shapes: &crate::symbolic::ShapeEnv,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
@@ -441,7 +374,7 @@ pub fn search_implementations(
         egraph,
         &crate::egraph_postpass::PostPassContext {
             decoders: &decoders,
-            bounds: &options.shapes.bounds,
+            bounds: &shapes.bounds,
             arena_budget_bytes,
             max_intermediate_bytes: options.max_intermediate_bytes,
             matchers,
@@ -515,7 +448,7 @@ pub fn search_implementations(
     // THE RANKED MEASURED GENOMES (Phase 5): the finalist fallback list.
     // Only NEWLY PROFILED candidates enter it — a fingerprint cache hit
     // is the same plan under a different genome, and two identical
-    // finalists at two ranks would waste the lattice's depth on one
+    // finalists at two ranks would waste the retained candidates on one
     // choice.
     let mut ranked: Vec<(u128, Genome)> = Vec::new();
     let mut best: Option<Best> = None;
@@ -653,6 +586,7 @@ pub fn search_implementations(
                     let priced = evaluator.measure(
                         &plan,
                         options,
+                        shapes,
                         best.as_ref().map(|incumbent| incumbent.nanos),
                     );
                     timings.profile_nanos += profile_start.elapsed().as_nanos();
@@ -758,7 +692,7 @@ pub fn search_implementations(
     let best = best.ok_or_else(|| {
         anyhow!("no candidate genome produced an executable plan; refusals: {refusals:#?}")
     })?;
-    let _ = program; // binding tables travel with the caller; kept for future bucket plumbing
+    let _ = program; // Boundary metadata is retained by the runtime.
     Ok(SearchOutcome {
         best_plan: best.plan,
         best_genome: best.genome,
@@ -769,14 +703,14 @@ pub fn search_implementations(
         timings,
         refusal_breakdown: breakdown,
         ranked,
-        // The lattice has not run yet; the runtime stamps this once it
-        // has (see [`select_finalist_set`]).
-        lattice_rejections: 0,
+        // Final validation has not run yet; the runtime fills these fields.
+        finalist_rejections: 0,
+        finalist_rank: 1,
     })
 }
 
 // ===========================================================================
-// PHASE 5: FINALISTS AND THE BUCKET LATTICE — how a searched winner becomes
+// PHASE 5: FINALIST VALIDATION — how a searched winner becomes
 // an INSTALLED plan.
 // ===========================================================================
 
@@ -789,27 +723,15 @@ pub fn finalist_validate(
 ) -> Result<(), String> {
     #[cfg(feature = "device")]
     {
-        let Evaluator::Device {
+        let Evaluator::Device { device, staged } = evaluator;
+        let ran = crate::profile::warmup_candidate(
             device,
+            &pending.plan,
             staged,
-            residents,
-            profile_inputs,
-        } = evaluator;
-        let ran = staged_at(staged, profile_inputs, &pending.shapes.values).and_then(|staged| {
-            crate::profile::prepare_candidate(
-                device,
-                &pending.plan,
-                &staged,
-                residents,
-                &pending.shapes,
-                _options.device_budget_bytes,
-            )
-            .and_then(|staged| {
-                let borrowed = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
-                device.execute(0, &borrowed, &pending.shapes.values)
-            })
-        });
-        device.release_slab();
+            &pending.shapes,
+            _options.device_budget_bytes,
+        );
+        device.uninstall();
         ran.map_err(|err| format!("device warmup of ranked #{}: {err:#}", pending.rank))?;
         Ok(())
     }
@@ -820,66 +742,31 @@ pub fn finalist_validate(
     }
 }
 
-/// Bound the maximum resident arena across the installed bucket set. Each
-/// bucket includes temporaries, boundary device copies, metadata, and HostOp
-/// scratch. Their offsets overlay one allocation because launches are serial.
-fn validate_set(slab_bytes: &[usize], options: &CompileOptions) -> Result<(), String> {
-    let Some(budget) = options.device_budget_bytes else {
-        return Ok(());
-    };
-    let peak = slab_bytes.iter().copied().max().unwrap_or(0);
-    if peak > budget {
-        return Err(format!(
-            "the set's plans need an arena slab of {peak} bytes (per-bucket \
-             {slab_bytes:?}), over the {budget}-byte device budget"
-        ));
-    }
-    Ok(())
-}
-
-/// RUN THE BUCKET LATTICE and return the installed finalist per bucket,
-/// plus how many sets were rejected on the way.
-///
-/// The driver loop is main's (`§2.7`), minus the LLIR compile step this
-/// branch does not have: propose the cheapest untried set, check the
-/// aggregate constraint over it, install it or reject it and let the
-/// lattice open the one-coordinate-slower successors.
-///
-/// UNBUCKETED CALLERS PASS ONE BUCKET. That is main's "one designed
-/// difference" and it is deliberate here too: there is one selection
-/// path, and an unbucketed install is a set of one.
-pub fn select_finalist_set(
-    buckets: Vec<crate::finalists::Finalists<'_>>,
+/// Select one program's first feasible ranked candidate. Budgets belong to
+/// this search; applications compose independently selected programs.
+pub fn select_finalist(
+    mut finalists: crate::finalists::Finalists<'_>,
     options: &CompileOptions,
     evaluator: &mut Evaluator<'_>,
-) -> Result<(Vec<(usize, crate::finalists::PendingFinalist)>, usize)> {
-    let lattice = crate::lattice::BucketLattice::new(buckets, crate::lattice::sum_metrics);
-    let mut validate = |pending: &crate::finalists::PendingFinalist| -> Result<(), String> {
-        finalist_validate(pending, options, evaluator)
+) -> Result<(crate::finalists::PendingFinalist, usize)> {
+    let mut validate = |candidate: &crate::finalists::PendingFinalist| {
+        if let Some(budget) = options.device_budget_bytes
+            && candidate.arena.slab_bytes > budget
+        {
+            return Err(format!(
+                "program requires {} arena bytes, budget {budget}",
+                candidate.arena.slab_bytes
+            ));
+        }
+        finalist_validate(candidate, options, evaluator)
     };
-    let mut validate_slabs = |slabs: &[usize]| validate_set(slabs, options);
-    let crate::lattice::Installed {
-        selected,
-        rejections,
-        ranks,
-    } = lattice
-        .drive(&mut validate, &mut validate_slabs)
-        .map_err(|message| anyhow!("{message}"))?;
-    if rejections > 0 && options.search_log_enabled() {
-        // MAIN'S FALLBACK LINE ("aggregate fallback: selected per-bucket
-        // finalist ranks …"): the one moment the installed plan is NOT
-        // the search's winner is worth saying out loud.
-        eprintln!(
-            "   {} finalist ranks {:?} after {rejections} rejection(s)",
-            "Fallback".yellow().bold(),
-            ranks
-        );
+    if !finalists.ensure(0, &mut validate) {
+        return Err(anyhow!(finalists.failure_message()));
     }
-    Ok((selected, rejections))
+    let rejections = finalists.rejections();
+    Ok((finalists.take(0).expect("validated finalist"), rejections))
 }
 
-/// The program a search runs: its text, plus the boundary bindings the
-/// tensor-keyed caller data maps through.
 #[derive(Debug, Clone)]
 pub struct SearchProgram {
     pub text: String,
@@ -887,303 +774,7 @@ pub struct SearchProgram {
     pub outputs: Vec<crate::bindings::Bound>,
 }
 
-/// One bucket combination's finished search: the dim ranges it covers, the
-/// representative pins it was searched at, and the plan the bucket
-/// lattice INSTALLED for it.
-#[derive(Debug)]
-pub struct BucketPlan {
-    pub ranges: BTreeMap<luminal::shape::Symbol, (usize, usize)>,
-    pub representative: luminal::shape::DynMap,
-    pub program: SearchProgram,
-    /// This bucket's own genetic search — its winner, its accounting,
-    /// its ranked finalists. It is the SEARCH's report and is left
-    /// exactly as the search wrote it.
-    pub outcome: SearchOutcome,
-    /// THE INSTALLED PLAN (Phase 5): the finalist the bucket lattice
-    /// selected. It is `outcome.best_plan` whenever nothing refused the
-    /// search's winner — which is every unconstrained search — and a
-    /// runner-up when the aggregate device budget refused the faster
-    /// set. `execute` loads THIS.
-    pub plan: crate::layouts::CudaPlan,
-    /// The installed finalist's 1-BASED rank in `outcome.ranked`. 1 =
-    /// the search's own winner.
-    pub finalist_rank: usize,
-    /// The installed plan's arena high-water mark, in bytes — what the
-    /// budget was checked against.
-    pub slab_bytes: usize,
-}
-
-/// The pre-search program parts a bucketed search re-renders from — the
-/// runtime's own `load`-time capture. The MODEL TEXT never changes
-/// across buckets; only the bounds seeds do, which is the whole point of
-/// the bucket model.
-pub struct BucketAssembly<'a> {
-    /// The runtime's assembled egglog preamble (matchers + registry).
-    pub assembled_program: &'a str,
-    /// The bound program before the schedule: model text plus boundary.
-    pub prefix: &'a str,
-    /// The caller's own `bind_*` seeds — for the dims that are NOT
-    /// bucketed. Buckets and range bindings refuse each other in BOTH
-    /// orders (a range-bound dim is refused buckets, a bucketed dim is
-    /// refused a range binding), so these never collide with the
-    /// per-bucket seeds appended after them.
-    pub binding_seeds: &'a str,
-    /// The runtime's schedule text.
-    pub schedule: &'a str,
-    /// The authoring-contract checks. THEY RUN IN THE BUCKET-WIDE
-    /// VALIDATION RENDER TOO: the base logical program must be valid over
-    /// the WHOLE interval, not merely at the representative (Austin,
-    /// 2026-09-03).
-    pub post_checks: &'a str,
-    pub inputs: &'a [crate::bindings::Bound],
-    pub outputs: &'a [crate::bindings::Bound],
-    /// The runtime's placement statement — which boundary buffers the arena
-    /// keeps and which are the caller's device memory. Every bucket's
-    /// finalists are sized under it, so a bucket's budget and its installed
-    /// plan agree.
-    pub residents: &'a crate::resident::ResidentBindings,
-    /// Values for profiling non-bucket dimensions. These never narrow the
-    /// range facts already present in binding_seeds.
-    pub base_dims: &'a luminal::shape::DynMap,
-    /// The runtime's `(sort, constructor)` decoders — what every
-    /// bucket's saturated program is checked against by the assembly
-    /// tripwire, and what its layout decodes read through.
-    pub decoders: &'a luminal::egglog_utils::eclass::ConstructorRegistry,
-}
-
-/// Search one range-seeded e-graph per Cartesian bucket combination. Both
-/// authoring checks and implementation selection use the entire interval.
-/// Representatives are used only to measure candidates; the installed plans
-/// retain symbolic geometry and are capacity-planned over their full bounds.
-pub fn bucketed_search_implementations(
-    assembly: &BucketAssembly<'_>,
-    dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
-    options: &CompileOptions,
-    allow_override: Option<Vec<&'static str>>,
-    matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
-    mut evaluator: Evaluator<'_>,
-) -> Result<Vec<BucketPlan>> {
-    ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
-    // The per-combination e-graphs are kept ALIVE across the whole
-    // routine, not dropped at the end of each search: Phase 5's
-    // finalists re-extract from them once every bucket has been
-    // searched. They are locals rather than fields of [`BucketPlan`] so
-    // they go away when this function returns — a serialized e-graph for
-    // a real model is large, and nothing after selection reads it.
-    let mut egraphs: Vec<egraph_serialize::EGraph> = Vec::new();
-    let mut searched: Vec<SearchedBucket> = Vec::new();
-    for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
-        if options.search_log_enabled() {
-            eprintln!(
-                "Searching bucket {ranges:?}, representative {representative:?}: {} x {} candidate attempts",
-                options.generations, options.generation_size
-            );
-        }
-        let mut bucket_options = options.clone();
-        bucket_options.shapes.values = representative.clone();
-        bucket_options
-            .shapes
-            .bounds
-            .extend(ranges.iter().map(|(k, v)| (*k, *v)));
-        let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
-        let mut egraph = luminal::egglog_snippet::new_egraph();
-        egraph
-            .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} range render fails: {err}"))?;
-        assembly.decoders.check(&egraph)?;
-        let mut serialized = egraph
-            .serialize(luminal::prelude::egglog::SerializeConfig::default())
-            .egraph;
-        let outcome = search_implementations(
-            &mut serialized,
-            &program,
-            &bucket_options,
-            allow_override.clone(),
-            matchers,
-            // Every bucket's search prices on the SAME device: the
-            // module cache and the staged payloads are shared across
-            // combinations, so the evaluator is lent, not rebuilt.
-            evaluator.reborrow(),
-        )?;
-        egraphs.push(serialized);
-        searched.push((ranges, representative, program, outcome));
-    }
-
-    // PHASE 5: the buckets' ranked genomes become finalists, and the
-    // lattice picks one SET of them under the aggregate budget.
-    let (selected, rejections) = {
-        let buckets: Vec<crate::finalists::Finalists<'_>> = searched
-            .iter()
-            .zip(&egraphs)
-            .enumerate()
-            .map(|(index, ((ranges, representative, _, outcome), egraph))| {
-                let mut shapes = options.shapes.clone();
-                shapes.bounds.extend(ranges.iter().map(|(k, v)| (*k, *v)));
-                shapes.values = representative.clone();
-                crate::finalists::Finalists::new(
-                    bucket_label(index, ranges),
-                    egraph,
-                    allow_override.clone(),
-                    matchers,
-                    outcome.ranked.clone(),
-                    Some(outcome.best_plan.clone()),
-                )
-                .with_shapes(shapes)
-                .with_resident_bindings(assembly.residents.clone())
-            })
-            .collect();
-        select_finalist_set(buckets, options, &mut evaluator)?
-    };
-
-    let mut installed: BTreeMap<usize, crate::finalists::PendingFinalist> =
-        selected.into_iter().collect();
-    let mut plans = Vec::new();
-    for (index, (ranges, representative, program, mut outcome)) in searched.into_iter().enumerate()
-    {
-        let finalist = installed
-            .remove(&index)
-            .ok_or_else(|| anyhow!("the lattice selected no plan for bucket {index}"))?;
-        outcome.lattice_rejections = rejections;
-        plans.push(BucketPlan {
-            ranges,
-            representative,
-            program,
-            outcome,
-            slab_bytes: finalist.arena.slab_bytes,
-            finalist_rank: finalist.rank,
-            plan: finalist.plan,
-        });
-    }
-    Ok(plans)
-}
-
-/// One combination after its genetic search, before the lattice has
-/// chosen which of its finalists to install: `(ranges, representative,
-/// range-valid render, the search's report)`.
-type SearchedBucket = (
-    BTreeMap<luminal::shape::Symbol, (usize, usize)>,
-    luminal::shape::DynMap,
-    SearchProgram,
-    SearchOutcome,
-);
-
-/// How a bucket names itself in a lattice failure message —
-/// `"bucket 0 (a in [2, 4])"`.
-pub(crate) fn bucket_label(
-    index: usize,
-    ranges: &BTreeMap<luminal::shape::Symbol, (usize, usize)>,
-) -> String {
-    let dims: Vec<String> = ranges
-        .iter()
-        .map(|(dim, (min, max))| format!("{dim} in [{min}, {max}]"))
-        .collect();
-    format!("bucket {index} ({})", dims.join(", "))
-}
-
-/// One combination's ranges, profiling dimensions, and range-valid program.
-type BucketRender = (
-    BTreeMap<luminal::shape::Symbol, (usize, usize)>,
-    luminal::shape::DynMap,
-    SearchProgram,
-);
-
-fn bucket_renders(
-    assembly: &BucketAssembly<'_>,
-    dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
-) -> Result<Vec<BucketRender>> {
-    let seeds_text = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| {
-        let mut text = String::new();
-        for (var, (lower, upper)) in seeds {
-            let var = var.egglog_literal();
-            text.push_str(&format!(
-                "(set (lower-bound-of (IntVar {var})) (bigint {lower}))\n\
-                 (set (upper-bound-of (IntVar {var})) (bigint {upper}))\n"
-            ));
-        }
-        text
-    };
-    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| SearchProgram {
-        text: format!(
-            "{}{}{}{}{}",
-            assembly.prefix,
-            assembly.binding_seeds,
-            seeds_text(seeds),
-            assembly.schedule,
-            assembly.post_checks
-        ),
-        inputs: assembly.inputs.to_vec(),
-        outputs: assembly.outputs.to_vec(),
-    };
-
-    // Cartesian combinations, dims in sorted order.
-    let dims: Vec<&luminal::shape::Symbol> = dim_buckets.keys().collect();
-    let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
-    for dim in &dims {
-        let count = dim_buckets[*dim].len();
-        combos = combos
-            .into_iter()
-            .flat_map(|combo| {
-                (0..count).map(move |index| {
-                    let mut next = combo.clone();
-                    next.push(index);
-                    next
-                })
-            })
-            .collect();
-    }
-
-    let mut renders = Vec::new();
-    for combo in combos {
-        let mut ranges = BTreeMap::new();
-        let mut representative = assembly.base_dims.clone();
-        for (dim, bucket_index) in dims.iter().zip(&combo) {
-            let bucket = &dim_buckets[*dim][*bucket_index];
-            ranges.insert(**dim, (bucket.min, bucket.max));
-            representative.insert(**dim, bucket.representative_value());
-        }
-
-        // BUCKET-WIDE SOUNDNESS: the range-seeded render must run its
-        // whole fixpoint over the interval.
-        let mut validation_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
-        for (dim, (min, max)) in &ranges {
-            validation_seeds.insert(*dim, (*min as u64, *max as u64));
-        }
-        let validation = assemble(&validation_seeds);
-        let text = format!("{}\n\n{}", assembly.assembled_program, validation.text);
-        luminal::egglog_snippet::new_egraph()
-            .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
-
-        // Extract from the range-valid fixpoint; pinning here can select an
-        // implementation whose guards do not hold at other bucket dimensions.
-        renders.push((ranges, representative, validation));
-    }
-    Ok(renders)
-}
-
-/// The covering bucket plan for a concrete dim assignment, if any.
-pub fn select_bucket<'a>(
-    plans: &'a [BucketPlan],
-    dims: &luminal::shape::DynMap,
-) -> Option<&'a BucketPlan> {
-    plans.iter().find(|plan| {
-        plan.ranges.iter().all(|(dim, (min, max))| {
-            dims.get(dim)
-                .is_some_and(|value| value >= min && value <= max)
-        })
-    })
-}
-
-/// The test/example harness's search budget — the SAME genetic algorithm
-/// as the module-level ladder tests, sized for a suite of hundreds of
-/// graphs. Deterministic (fixed seed); 2 generations x 4 genomes
-/// exercises random genomes plus the mutation step without profiling 64
-/// candidates per differential.
-///
-/// Moved out of core `test_support` with the search itself: it is a
-/// PRODUCTION-PATH helper (this crate's examples call it), not a test
-/// fixture. Duplicated from `luminal_reference::search` per the
-/// duplication ruling.
+/// Small deterministic search configuration for tests and examples.
 pub fn harness_search_options() -> CompileOptions {
     CompileOptions {
         generations: 2,

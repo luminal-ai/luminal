@@ -1,7 +1,8 @@
-import modal
-import subprocess
 import os
 import shlex
+import subprocess
+
+import modal
 
 gpu_type = os.environ.get("GPU_TYPE", "T4")
 modal_timeout = int(os.environ.get("MODAL_TIMEOUT", "7200"))

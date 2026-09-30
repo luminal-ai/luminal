@@ -60,7 +60,20 @@ fn a_device_pointer_is_refused_for_a_buffer_that_is_not_external() {
 fn execute_refuses_an_external_buffer_with_no_pointer() {
     let (mut runtime, external, _) = runtime();
     assert_eq!(runtime.missing_external_pointers(), vec![external]);
-    let refusal = runtime.execute().unwrap_err().to_string();
+    #[cfg(feature = "device")]
+    let mut staging = luminal_cuda_lite::device::CudaDevice::new(0)
+        .unwrap()
+        .executable()
+        .allocate_staging(1)
+        .unwrap();
+    let refusal = runtime
+        .execute(
+            luminal_cuda_lite::CudaArena::empty(),
+            #[cfg(feature = "device")]
+            &mut staging,
+        )
+        .unwrap_err()
+        .to_string();
     assert!(
         refusal.contains(&format!("External buffer {external}"))
             && refusal.contains("has no device pointer"),
@@ -89,43 +102,6 @@ fn a_sink_and_its_target_share_one_external_buffer() {
     assert_eq!(runtime.missing_external_pointers().len(), 2);
 }
 
-/// STAGING AN EXTERNAL BUFFER IS REFUSED BY NAME: an External buffer has
-/// no upload step, so bytes handed to `set_data` would vanish.
-#[test]
-fn set_data_on_an_external_binding_is_refused() {
-    let mut cx = Graph::new();
-    let a = cx.tensor(4, DType::F32);
-    let b = cx.tensor(4, DType::F32);
-    let sum = a + b;
-    let mut bindings = CudaBindings::new();
-    let external = bindings.input_external(a.id);
-    bindings.input(b.id);
-    bindings.output(sum.id);
-    let mut runtime =
-        CudaRuntime::load_with(&cx, bindings, luminal_cuda_lite::cuda_registry()).unwrap();
-
-    let refusal = runtime
-        .set_data(a.id, vec![1f32; 4])
-        .unwrap_err()
-        .to_string();
-    assert!(
-        refusal.contains(&format!("External buffer {external}"))
-            && refusal.contains("set_device_ptr"),
-        "{refusal}"
-    );
-    runtime
-        .set_data(b.id, vec![1f32; 4])
-        .expect("a host-staged input takes its payload");
-    assert!(
-        runtime
-            .set_data(sum.id, vec![1f32; 4])
-            .unwrap_err()
-            .to_string()
-            .contains("no input binding"),
-        "an unbound tensor is refused, not panicked on"
-    );
-}
-
 /// THE EXTERNAL OUTPUT GUARD, ON ANY HOST: an output bound External is
 /// written in place, so the plan must have elected the caller's own
 /// buffer rather than a view of it. That fact — the plan buffer under
@@ -148,7 +124,12 @@ fn an_external_output_slot_sits_on_the_bound_buffer() {
     let mut runtime =
         CudaRuntime::load_with(&cx, bindings, luminal_cuda_lite::cuda_registry()).unwrap();
     runtime
-        .search(&Default::default(), &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &harness_search_options(),
+        )
         .expect("host search");
 
     let plan = runtime.plan().expect("the search installed a plan");
@@ -202,7 +183,12 @@ fn an_external_output_may_be_a_view_of_an_escape_cell() {
     )
     .expect("a matmul with a caller-owned output loads");
     runtime
-        .search(&FxHashMap::default(), &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &FxHashMap::default(),
+            &harness_search_options(),
+        )
         .expect("a plan that fulfils the caller-owned output exists");
 
     runtime

@@ -37,7 +37,7 @@ pub struct MetalBindings {
     inputs: Vec<Bound>,
     outputs: Vec<Bound>,
     buffers: BTreeMap<i64, BufferDecl>,
-    residents: BTreeSet<i64>,
+    externals: BTreeSet<i64>,
     next: i64,
     facts: String,
     checks: Vec<(String, String)>,
@@ -56,8 +56,8 @@ pub struct BoundProgram {
     pub labeled_checks: Vec<(String, String)>,
     pub inputs: Vec<Bound>,
     pub outputs: Vec<Bound>,
-    /// Input buffers that stay in the device arena between executions.
-    pub residents: BTreeSet<i64>,
+    /// Boundary buffers addressed through application-supplied device storage.
+    pub externals: BTreeSet<i64>,
     /// The egglog `let` each bound value's boundary attaches to.
     pub let_names: FxHashMap<ValueId, String>,
 }
@@ -148,24 +148,10 @@ impl MetalBindings {
         self.inputs.push(Bound { value, buffer });
     }
 
-    /// Keep this bound input's buffer in the shared device arena between
-    /// executions; its shape must be static. An output bound on the same
-    /// buffer is a mutation sink: its writes land in the arena home and
-    /// are neither copied nor read back. `set_data` re-uploads a resident
-    /// input only when the caller stages it again.
-    pub fn resident(&mut self, value: ValueId) -> Result<i64, String> {
-        let buffer = self
-            .buffer_of_input(value)
-            .ok_or_else(|| format!("v{} has no input binding to make resident", value.index()))?;
-        self.residents.insert(buffer);
-        Ok(buffer)
-    }
-
-    /// Bind an input on a fresh read-only, caller-owned buffer that stays
-    /// in the device arena between executions.
-    pub fn input_resident(&mut self, value: ValueId) -> i64 {
+    /// Input storage supplied by the application on each invocation.
+    pub fn input_external(&mut self, value: ValueId) -> i64 {
         let buffer = self.input(value);
-        self.residents.insert(buffer);
+        self.externals.insert(buffer);
         buffer
     }
 
@@ -195,10 +181,6 @@ impl MetalBindings {
         &self.buffers
     }
 
-    pub fn residents(&self) -> &BTreeSet<i64> {
-        &self.residents
-    }
-
     pub fn buffer_of_input(&self, value: ValueId) -> Option<i64> {
         self.inputs
             .iter()
@@ -218,7 +200,7 @@ impl MetalBindings {
     /// then the boundary. Refuses, by name, an input binding on a
     /// non-input value, an output on an undeclared buffer, a reachable
     /// input left unbound, an output bound twice on one buffer, a
-    /// resident buffer that is not an input's, and an empty output set.
+    /// external buffer that is not an input's, and an empty output set.
     pub fn bind(&self, graph: &LogicalGraph) -> Result<BoundProgram, String> {
         if self.outputs.is_empty() {
             return Err("bindings name no output".to_string());
@@ -250,13 +232,7 @@ impl MetalBindings {
                 ));
             }
         }
-        for buffer in &self.residents {
-            if !self.inputs.iter().any(|b| b.buffer == *buffer) {
-                return Err(format!(
-                    "buffer {buffer} is declared resident but carries no input binding"
-                ));
-            }
-        }
+
         let roots: Vec<ValueId> = self
             .outputs
             .iter()
@@ -381,7 +357,7 @@ impl MetalBindings {
             labeled_checks,
             inputs: self.inputs.clone(),
             outputs: self.outputs.clone(),
-            residents: self.residents.clone(),
+            externals: self.externals.clone(),
             let_names,
         })
     }

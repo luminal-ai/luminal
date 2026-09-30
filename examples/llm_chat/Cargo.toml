@@ -8,10 +8,13 @@ publish = false
 default = []
 cuda = ["cuda_lite"]
 # Keep the original shared example's feature spelling as an alias.
-cuda_lite = ["luminal_cuda_lite/device"]
-metal = ["dep:luminal_metal"]
+cuda_lite = ["luminal_cuda_lite/device", "dep:cudarc"]
+metal = ["dep:luminal_metal", "dep:metal", "dep:objc"]
 
 [dependencies]
+cudarc = { git = "https://github.com/luminal-ai/cudarc.git", rev = "a42f3897b6d00aded8e6ac7ad258c72d8bad5596", optional = true, features = ["cuda-version-from-build-system", "fallback-latest"] }
+metal = { version = "0.31", optional = true }
+objc = { version = "0.2", optional = true }
 luminal = { path = "../.." }
 luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite", optional = true }
 luminal_metal = { path = "../../crates/luminal_metal", optional = true }

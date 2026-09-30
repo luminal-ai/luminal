@@ -33,7 +33,9 @@ fn saturated(cx: &Graph) -> (CudaRuntime, EGraph) {
     let rt =
         CudaRuntime::load_with_registry(cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
             .expect("cuda load");
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
     (rt, egraph)
 }
 

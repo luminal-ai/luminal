@@ -35,8 +35,8 @@ the legacy default stream cannot host, so it runs on a dedicated
 against the caller's stream with ``side.wait_stream(caller)`` before the
 launch and ``caller.wait_stream(side)`` after. The intermediate-scratch
 arena is PyTorch's, not the runtime's: ``arena_bytes()`` is the searched
-plan set's requirement, the wrapper ``caching_allocator_alloc``s exactly
-that against the side stream, binds it with ``set_arena``, and
+program's requirement, the wrapper ``caching_allocator_alloc``s exactly
+that against the side stream, passes it to ``execute``, and
 ``caching_allocator_delete``s it right after ``execute`` — so PyTorch
 accounts for the bytes and can reuse the block on the next call.
 """
@@ -48,6 +48,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
+from luminal_reference.dimensions import export_specs, profile_value
 from luminal_reference.export_utils import (
     _box_scalar_graph_outputs,
     _decomp_table,
@@ -57,7 +58,7 @@ from luminal_reference.export_utils import (
     _register_cache_serialization,
     private_graph_copy,
 )
-from torch.export import Dim, export
+from torch.export import export
 
 from . import _luminal
 from .boundary import (
@@ -382,8 +383,9 @@ class CompiledModel:
         # program that still passes every guard.
         self._held: dict[str, torch.Tensor] = dict(held_tensors or {})
         self._held_bindings = list(held_bindings)
-        # Fixed once a plan set is searched; the per-execution arena sizes to it.
+        # Fixed once a program is searched; the per-execution arena sizes to it.
         self._arena_bytes = graph.arena_bytes()
+        self._host_staging = graph.allocate_staging()
         # The runtime always launches captured CUDA graphs, which the legacy
         # default stream cannot host, so it runs on a dedicated side stream
         # ordered against the caller's stream with events.
@@ -396,6 +398,18 @@ class CompiledModel:
         # need no per-call check.
         self._writebacks = frozenset(
             mutation for mutation in self._output_mutations if mutation is not None
+        )
+
+    def __copy__(self):
+        return type(self)(
+            self._graph.fork(),
+            self._ep,
+            self._input_bindings,
+            self._output_bindings,
+            self._scalar_output_positions,
+            self._held,
+            self._held_bindings,
+            self._output_aliases,
         )
 
     def _boundary_tensor(
@@ -624,7 +638,6 @@ class CompiledModel:
         else:
             arena = torch.cuda.caching_allocator_alloc(arena_bytes, device, side)
         self._graph.use_borrowed_stream(side.cuda_stream)
-        self._graph.set_arena(arena, arena_bytes)
         # EVERY CHECK IS BEHIND US: the addresses go in here and come out in
         # `finally`, so no refusal of this call can leave one standing.
         per_call: list[int] = []
@@ -659,9 +672,9 @@ class CompiledModel:
                 for value in [*inputs, *self._held.values(), *out_tensors]:
                     if value is not None:
                         value.record_stream(side)
-                self._graph.execute_async()
+                self._graph.execute_async(arena, arena_bytes, self._host_staging)
             else:
-                self._graph.execute()
+                self._graph.execute(arena, arena_bytes, self._host_staging)
             self._region_execution_state["last"] = execution_key
         finally:
             if not static:
@@ -745,16 +758,21 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     gm = private_graph_copy(gm)
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
 
+    shapes = [
+        getattr(n.meta.get("example_value", v), "shape", ())
+        for n, v in zip(placeholders, example_inputs)
+    ]
+    axis_specs = export_specs(shapes)
     records: list[tuple[str, torch.fx.Node, Any]] = []
     tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
-    for node, value in zip(placeholders, example_inputs):
+    for node, value, dim_spec in zip(placeholders, example_inputs, axis_specs):
         if isinstance(value, torch.SymInt):
             records.append(("sym", node, value))
             continue
         shape = getattr(node.meta.get("example_value"), "shape", None)
         if shape is None:
             shape = getattr(value, "shape", ())
-        dims = {dim: Dim.AUTO for dim, size in enumerate(shape) if _is_dynamic(size)}
+        dims = dim_spec
         for dim, size in enumerate(shape):
             if _is_dynamic(size):
                 tensor_dims.setdefault(size.node.expr, (node, dim))
@@ -975,7 +993,10 @@ def compile_exported(
                 f"does not declare (declared: {sorted(tensors)})"
             )
     graph.bind_input_shapes(
-        [(name, list(tensors[name].shape)) for name in graph.input_names]
+        [
+            (name, [profile_value(size) for size in tensors[name].shape])
+            for name in graph.input_names
+        ]
     )
     for name, kind, buffer in zip(
         graph.input_names, graph.input_kinds, graph.input_buffers

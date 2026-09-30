@@ -47,16 +47,12 @@ fn check_model(model: ModelConfig) {
             luminal_reference::ReferenceBindings::dense(&graph.graph.logical, &read_back);
         let mut reference =
             luminal_reference::ReferenceRuntime::load_with(&graph.graph, bindings).unwrap();
-        reference
-            .bind_dyn_range('q', tokens.len() as u64, tokens.len() as u64)
-            .unwrap();
-        reference
-            .bind_dyn_range(
-                'c',
-                (offset + tokens.len()) as u64,
-                (offset + tokens.len()) as u64,
-            )
-            .unwrap();
+        let dims = [
+            ('q'.into(), tokens.len()),
+            ('c'.into(), offset + tokens.len()),
+        ]
+        .into_iter()
+        .collect();
         let mut data = weights.clone();
         data.extend(reference_state.clone());
         data.extend(step.clone());
@@ -76,7 +72,12 @@ fn check_model(model: ModelConfig) {
             })
             .collect();
         reference
-            .search(&data, &luminal_reference::harness_search_options())
+            .search(
+                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &dims,
+                &data,
+                &luminal_reference::harness_search_options(),
+            )
             .unwrap();
         for (id, data) in data {
             reference.set_data(id, data);

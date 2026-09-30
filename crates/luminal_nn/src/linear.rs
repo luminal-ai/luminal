@@ -70,8 +70,13 @@ mod tests {
         data.insert(x.id, x_data.clone().into());
         data.insert(weight.id, w_data.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&data, &CompileOptions::default())
-            .expect("search finds a plan");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &CompileOptions::default(),
+        )
+        .expect("search finds a plan");
         rt.set_data(x.id, x_data);
         rt.set_data(weight.id, w_data);
         rt.execute().expect("winner executes");
@@ -105,8 +110,13 @@ mod tests {
         data.insert(weight.id, w_data.clone().into());
         data.insert(bias.id, b_data.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&data, &CompileOptions::default())
-            .expect("search finds a plan");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &CompileOptions::default(),
+        )
+        .expect("search finds a plan");
         rt.set_data(x.id, x_data);
         rt.set_data(weight.id, w_data);
         rt.set_data(bias.id, b_data);

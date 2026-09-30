@@ -9,13 +9,26 @@ CUDA-free CI job should not go red over a missing device.
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("luminal_cuda_lite")
+luminal_cuda_lite = pytest.importorskip("luminal_cuda_lite")
 
-import luminal_cuda_lite  # noqa: E402
+from torch.fx.experimental.dynamic_spec import (  # noqa: E402
+    ShapesSpec,
+    ShapeVar,
+    TensorSpec,
+)
 
 
-def test_backend_registered():
-    assert "luminal_cuda_lite" in torch._dynamo.list_backends()
+def _bounded_compile(model, shape, parameter="x"):
+    return torch.compile(
+        model,
+        backend=luminal_cuda_lite.Compiler(),
+        dynamic_shapes=ShapesSpec(params={parameter: TensorSpec(shape)}),
+        isolate_recompiles=True,
+    )
+
+
+def test_compiler_available():
+    assert callable(luminal_cuda_lite.Compiler())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -35,7 +48,8 @@ def test_linear_roundtrip_repeated_calls():
 def test_dynamic_batch():
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler(), dynamic=True)
+    batch = ShapeVar("batch", min=1, max=7, optimization_hint=3)
+    compiled = _bounded_compile(model, [batch, 16], "input")
     with torch.no_grad():
         for n in (1, 3, 7, 2):
             x = torch.randn(n, 16, device="cuda")
@@ -211,10 +225,11 @@ def test_output_is_returned_at_eagers_strides():
 def test_dynamic_batch_output_is_returned_at_eagers_strides():
     """The output's declared extents are the program's own dimensions, so
     each call allocates at the strides eager gives THAT batch size — one
-    compile, every extent in the bucket."""
+    compile, every extent in the declared domain."""
     torch.manual_seed(0)
     model = torch.nn.Linear(16, 8).cuda().eval()
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler(), dynamic=True)
+    batch = ShapeVar("batch", min=2, max=7, optimization_hint=3)
+    compiled = _bounded_compile(model, [batch, 16], "input")
     with torch.no_grad():
         for n in (3, 7):
             x = torch.randn(n, 16, device="cuda")
@@ -323,7 +338,7 @@ def test_int32_and_bool_inputs_bind_external():
 def test_transposed_dynamic_batch_input():
     """The transposed input's element stride IS the dynamic batch dimension,
     so the binding states that dimension rather than the number one example
-    call had: one compile serves every extent in the bucket. Eager's output
+    call had: one compile serves every extent in the domain. Eager's output
     is column-major here, so the search refuses by name until a
     strided-destination write lands."""
 
@@ -331,7 +346,8 @@ def test_transposed_dynamic_batch_input():
         return x * 2 + 1
 
     torch.manual_seed(0)
-    compiled = torch.compile(fn, backend=luminal_cuda_lite.Compiler(), dynamic=True)
+    batch = ShapeVar("batch", min=2, max=7, optimization_hint=3)
+    compiled = _bounded_compile(fn, [batch, 16])
     for n in (3, 7, 2):
         x = torch.randn(16, n, device="cuda").t()
         assert not x.is_contiguous()
@@ -348,14 +364,16 @@ def test_permuted_dynamic_view_states_its_size_derived_strides():
     """A permuted view is neither row- nor column-major, and every one of
     its strides is a product of the program's own dimensions: the binding
     states those expressions, so one searched plan serves every extent in
-    the bucket. Eager's output carries the same permuted strides, so the
+    the domain. Eager's output carries the same permuted strides, so the
     search refuses by name until a strided-destination write lands."""
 
     def fn(x):
         return x * 2 + 1
 
     torch.manual_seed(0)
-    compiled = torch.compile(fn, backend=luminal_cuda_lite.Compiler(), dynamic=True)
+    a = ShapeVar("a", min=2, max=4, optimization_hint=3)
+    b = ShapeVar("b", min=2, max=6, optimization_hint=5)
+    compiled = _bounded_compile(fn, [7, a, b])
     for a, b, c in ((3, 5, 7), (4, 5, 7), (3, 6, 7)):
         x = torch.randn(a, b, c, device="cuda").permute(2, 0, 1)
         assert x.stride() == (1, b * c, c)

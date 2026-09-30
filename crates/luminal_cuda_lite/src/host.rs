@@ -45,7 +45,7 @@ pub trait HostOp: BufferTensorIrOp {
     /// Scratch reserved in the runtime's shared arena, exclusively for this
     /// operation's captured GPU work. Its contents must not be read or written
     /// during preparation or retained after that work completes. Other nodes
-    /// and buckets may reuse the same bytes. All device scratch comes from here.
+    /// and programs may reuse the same bytes. All device scratch comes from here.
     fn workspace_bytes(&self, _bounds: &crate::symbolic::Bounds) -> anyhow::Result<usize> {
         Ok(0)
     }

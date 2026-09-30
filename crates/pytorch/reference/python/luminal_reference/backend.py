@@ -14,7 +14,7 @@ import torch
 from torch.export import export
 
 from . import _luminal
-from .dimensions import export_specs, remap_buckets
+from .dimensions import export_specs, profile_value
 from .export_utils import (
     _box_scalar_graph_outputs,
     _decomp_table,
@@ -83,6 +83,14 @@ class CompiledModel:
         self._output_dtypes = graph.output_dtypes
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
+
+    def __copy__(self):
+        model = type(self)(
+            self._graph.fork(), self._ep, self._scalar_output_positions, self._held
+        )
+        for name, value in self._held.items():
+            model._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+        return model
 
     @property
     def writeback_inputs(self):
@@ -162,9 +170,7 @@ def _is_dynamic(size: Any) -> bool:
     return isinstance(size, torch.SymInt) and not size.node.expr.is_number
 
 
-def _dynamic_export(
-    gm: torch.fx.GraphModule, example_inputs: Sequence[Any], symbol_buckets=None
-) -> Any:
+def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> Any:
     """Export a Dynamo GraphModule, preserving its symbolic dimensions.
 
     Dynamo hands each free symbolic dimension to the backend as an explicit
@@ -252,18 +258,12 @@ def _dynamic_export(
     # entering here. Keep export on the owning thread: native reference graphs
     # are unsendable, and cyclic GC in an export worker could destroy them.
     ep = export(gm, tuple(inputs), dynamic_shapes=dynamic_shapes, strict=False)
-    original_shapes = [
-        getattr(n.meta.get("example_value", v), "shape", ())
-        for (_, n, _), v in zip(records, example_inputs)
-        if id(n) not in erased
-    ]
-    return ep, inputs, remap_buckets(ep, original_shapes, symbol_buckets)
+    return ep, inputs
 
 
 def _prepare_local_graph(
     gm: torch.fx.GraphModule,
     example_inputs: Sequence[Any],
-    symbol_buckets=None,
 ) -> tuple:
     """Export one local ATen graph after AOT partitioning."""
 
@@ -282,7 +282,7 @@ def _prepare_local_graph(
     # The graph-module preprocessing above runs first; `_dynamic_export` then
     # rewrites the SymInt placeholders onto `sym_size` and runs the nested
     # `torch.export`, so the exported program keeps its symbolic dims.
-    ep, export_inputs, dim_buckets = _dynamic_export(gm, example_inputs, symbol_buckets)
+    ep, export_inputs = _dynamic_export(gm, example_inputs)
     # LUM-499: drop dynamo-emitted input guards before run_decompositions calls
     # ep.module(), which would otherwise emit a `_guards_fn` containing
     # data-dependent .item() calls and unresolved `L[...]` references.
@@ -311,7 +311,7 @@ def _prepare_local_graph(
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
 
-    return ep, export_inputs, scalar_output_positions, dim_buckets
+    return ep, export_inputs, scalar_output_positions
 
 
 def _compile_local_graph(
@@ -322,7 +322,6 @@ def _compile_local_graph(
     search_log: bool = False,
     max_intermediate_bytes: int | None = None,
     memory_budget_bytes: int | None = None,
-    symbol_buckets=None,
 ) -> CompiledModel:
     """Compile one local ATen graph after AOT partitioning."""
     if options:
@@ -332,8 +331,8 @@ def _compile_local_graph(
             "max_intermediate_bytes", max_intermediate_bytes
         )
         memory_budget_bytes = options.get("memory_budget_bytes", memory_budget_bytes)
-    ep, export_inputs, scalar_output_positions, dim_buckets = _prepare_local_graph(
-        gm, example_inputs, symbol_buckets
+    ep, export_inputs, scalar_output_positions = _prepare_local_graph(
+        gm, example_inputs
     )
     return compile_exported(
         ep,
@@ -343,7 +342,6 @@ def _compile_local_graph(
         search_log=search_log,
         max_intermediate_bytes=max_intermediate_bytes,
         memory_budget_bytes=memory_budget_bytes,
-        dim_buckets=dim_buckets,
     )
 
 
@@ -356,7 +354,6 @@ def compile_exported(
     search_log=False,
     max_intermediate_bytes=None,
     memory_budget_bytes=None,
-    dim_buckets=None,
     artifact=None,
 ):
     """Compile a functional ExportedProgram with the native runtime."""
@@ -412,7 +409,7 @@ def compile_exported(
         if isinstance(value, FakeTensor):
             with unset_fake_temporarily():
                 value = torch.ones(
-                    tuple(int(d) for d in value.shape), dtype=value.dtype
+                    tuple(profile_value(d) for d in value.shape), dtype=value.dtype
                 )
         graph.set_input(name, _tensor_bytes(value), list(value.shape))
 
@@ -427,7 +424,6 @@ def compile_exported(
             search_log=search_log,
             max_intermediate_bytes=max_intermediate_bytes,
             memory_budget_bytes=memory_budget_bytes,
-            dim_buckets=dim_buckets,
         )
     else:
         graph.load_compiled(artifact, memory_budget_bytes=memory_budget_bytes)

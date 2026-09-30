@@ -64,7 +64,12 @@ fn gcd_plans_and_runs_with_declared_ranges() {
     data.insert(user_inputs[0].tensor, TypedBuffer::I64(a.clone()));
     data.insert(user_inputs[1].tensor, TypedBuffer::I64(b.clone()));
     runtime
-        .search(&data, &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect("gcd plans once ranges are declared");
 
     runtime.set_data(user_inputs[0].tensor, TypedBuffer::I64(a.clone()));

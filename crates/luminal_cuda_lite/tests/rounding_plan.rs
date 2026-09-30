@@ -26,8 +26,13 @@ fn rounding_and_trunc_cast_plan_with_kernel_interfaces() {
     let data: FxHashMap<_, _> = [(x.id, vec![1.9f32, 1.5, 0.5, -0.5, -1.5, -1.9].into())]
         .into_iter()
         .collect();
-    rt.search(&data, &harness_search_options())
-        .expect("search under the CUDA allow list");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &harness_search_options(),
+    )
+    .expect("search under the CUDA allow list");
 
     let plan = rt.plan().expect("plan loaded");
     let labels: Vec<String> = plan

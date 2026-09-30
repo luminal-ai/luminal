@@ -10,8 +10,12 @@ pub trait Backend {
 
 #[cfg(feature = "luminal_cuda_lite")]
 pub mod cuda;
+#[cfg(feature = "luminal_cuda_lite")]
+mod cuda_memory;
 #[cfg(feature = "metal")]
 pub mod metal;
+#[cfg(feature = "metal")]
+mod metal_memory;
 
 // Both adapters may be built for tests. The CLI requires exactly one
 // execution backend; CUDA wins this type alias only to keep all-features

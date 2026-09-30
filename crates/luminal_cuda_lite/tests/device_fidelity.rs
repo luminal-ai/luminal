@@ -6,12 +6,15 @@
 //! the elementwise/reduce core.
 #![cfg(feature = "device")]
 
+mod support;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::HostBuffer;
 use luminal_reference::TypedBuffer;
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 /// Read the device output DENSELY through its RETURNED LAYOUT
 /// (escape-and-disclose + the corrected contract, 2026-08-31): a
@@ -21,8 +24,10 @@ use luminal_reference::TypedBuffer;
 /// gone with the hop machinery; the reader is this runtime evaluating
 /// its OWN vocabulary (`layouts::dense_f32`). A dense election evaluates
 /// the identity, so this stays the universal readback.
-fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
-    let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
+fn walked_dense(rt: &CudaRuntime, arena_rt: &support::Allocation, out: NodeIndex) -> Vec<f32> {
+    let (data, binding) = rt
+        .download(arena_rt, out)
+        .expect("escape-and-disclose fetch");
     let bytes = data
         .as_f32()
         .unwrap_or_else(|err| panic!("output is not f32: {err}"));
@@ -51,13 +56,21 @@ fn run_both(cx: &Graph, inputs: &[(NodeIndex, Vec<f32>)], out: NodeIndex) -> (Ve
         .iter()
         .map(|(id, v)| (*id, v.clone().into()))
         .collect();
-    rt.search(&data, &luminal_cuda_lite::harness_search_options())
-        .expect("cuda search");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &luminal_cuda_lite::harness_search_options(),
+    )
+    .expect("cuda search");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone()).unwrap();
+        rt.upload(&mut arena_rt, *id, v.clone()).unwrap();
     }
-    rt.execute().expect("device execute");
-    let got = walked_dense(&rt, out);
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt)
+        .expect("device execute");
+    let got = walked_dense(&rt, &arena_rt, out);
     (want, got)
 }
 
@@ -249,11 +262,19 @@ fn int_cummax_over_negatives() {
     let mut rt = CudaRuntime::load(&cx).expect("device load");
     let data: FxHashMap<NodeIndex, HostBuffer> =
         [(a.id, input.clone().into())].into_iter().collect();
-    rt.search(&data, &luminal_cuda_lite::harness_search_options())
-        .expect("device search");
-    rt.set_data(a.id, input).unwrap();
-    rt.execute().expect("device execute");
-    assert_eq!(rt.get_i32(out.id).unwrap(), vec![-7, -7, -3, -3]);
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &luminal_cuda_lite::harness_search_options(),
+    )
+    .expect("device search");
+    let mut arena = support::allocate_arena(&rt).expect("allocate execution arena");
+    rt.upload(&mut arena, a.id, input).expect("upload input");
+    let mut staging = rt.allocate_staging().expect("dimension staging");
+    rt.execute(arena.arena(), &mut staging)
+        .expect("device execute");
+    assert_eq!(rt.read_i32(&arena, out.id).unwrap(), vec![-7, -7, -3, -3]);
 }
 
 /// Exact equality position by position, where a NaN in `expected` demands a
@@ -303,4 +324,47 @@ fn cummax_propagates_nan() {
         &[1.0, f32::NAN, f32::NAN, f32::NAN],
         "cummax after a NaN",
     );
+}
+
+/// Scan loops and row strides use the live dimension while storage covers the
+/// entire declared domain. The test owns and reuses that device allocation.
+#[test]
+fn scan_chain_runs_across_one_declared_domain() {
+    let mut graph = Graph::new();
+    let x = graph.tensor(('n', 2), DType::F32);
+    let out = x.cumsum(0).cumprod(0).cummax(0);
+    let bounds = luminal::shape::DimensionBounds::from_ranges([('n'.into(), (1, 6))]).unwrap();
+    let dims = [('n'.into(), 3)].into_iter().collect();
+    let data = [(x.id, HostBuffer::from([-1f32, 2.].repeat(3)))]
+        .into_iter()
+        .collect();
+    let mut rt = CudaRuntime::load(&graph).unwrap();
+    rt.search(
+        &bounds,
+        &dims,
+        &data,
+        &luminal_cuda_lite::harness_search_options(),
+    )
+    .unwrap();
+    let mut arena = support::allocate_arena(&rt).unwrap();
+    let mut staging = rt.allocate_staging().unwrap();
+    for extent in [1, 6, 2, 5] {
+        let input = [-1f32, 2.].repeat(extent);
+        let mut sum = [0f32; 2];
+        let mut prod = [1f32; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        let mut expected = Vec::new();
+        for row in input.chunks_exact(2) {
+            for col in 0..2 {
+                sum[col] += row[col];
+                prod[col] *= sum[col];
+                max[col] = max[col].max(prod[col]);
+                expected.push(max[col]);
+            }
+        }
+        rt.set_dim('n', extent);
+        rt.upload(&mut arena, x.id, input).unwrap();
+        rt.execute(arena.arena(), &mut staging).unwrap();
+        assert_eq!(walked_dense(&rt, &arena, out.id), expected);
+    }
 }

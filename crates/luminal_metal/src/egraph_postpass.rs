@@ -90,7 +90,7 @@ pub struct MemoryPruning {
 }
 
 /// Remove materializations whose physical storage capacity exceeds the entire
-/// arena budget. `capacity` is the runtime's sizing policy over the bucket's
+/// arena budget. `capacity` is the runtime's sizing policy over the program's
 /// full bounds; `None` means the layout discloses no allocation (e.g. a view).
 /// Logical tensor volume is deliberately not an allocation size.
 pub fn prune_oversized_materializations(
@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn full_bucket_capacity_prunes_materializations_and_all_producer_spellings_but_keeps_views() {
+    fn full_domain_capacity_prunes_materializations_and_all_producer_spellings_but_keeps_views() {
         let decoders = ConstructorRegistry::new(luminal::egglog_snippet::core_decoders()).unwrap();
         let bounds = [('q'.into(), (2, 128))].into();
         let context = PostPassContext {

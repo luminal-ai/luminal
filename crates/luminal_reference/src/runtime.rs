@@ -183,6 +183,7 @@ pub fn reference_allow_list() -> Vec<&'static str> {
 /// What `load` captured from a recorded Graph: the bound program (model
 /// text, this runtime's boundary, the post-schedule checks) plus whatever
 /// the binding calls accumulate before `search` assembles and saturates.
+#[derive(Clone)]
 struct NativeSpec {
     bound: crate::bindings::BoundProgram,
     binding_seeds: String,
@@ -211,29 +212,31 @@ pub struct ReferenceRuntime {
     output_buffers: FxHashMap<petgraph::graph::NodeIndex, Vec<i64>>,
     /// M3 Step 2 native-ladder state (`load` → bind → `with_ops` → `search`).
     native: Option<NativeSpec>,
-    /// BUCKETS (D7, 2026-09-03): per-dim intervals a single search
-    /// covers, bound before `search_buckets`. Empty = the ordinary
-    /// single-pin ladder, unchanged in every respect.
-    dim_buckets: std::collections::BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
-    /// One finished plan per Cartesian bucket combination.
-    bucket_plans: Vec<crate::search::BucketPlan>,
-    /// Plans received from a peer. These are executable without a search.
-    loaded_bucket_plans: Vec<crate::compiled_artifact::CompiledBucket>,
-    /// The dim values this runtime currently holds — every `[n, n]`
-    /// `bind_dyn_range` pin, plus whatever [`Self::set_dim`] sets. With
-    /// buckets bound this is what picks the plan at execute time.
+    /// The immutable domain of the selected program.
+    bounds: luminal::shape::DimensionBounds,
+    /// Concrete values for the next invocation.
     dims: luminal::shape::DynMap,
-    /// EVERY dim [`Self::bind_dyn_range`] has bound, tight or not, with
-    /// the interval it was given. `dims` records only the `[n, n]` pins,
-    /// so it cannot answer the exclusivity question: buckets and range
-    /// bindings must refuse each other in BOTH orders, and a non-tight
-    /// range under a later bucket would otherwise seed the same `IntVar`
-    /// twice and INTERSECT under the bounds lattice's merge rather than
-    /// refuse.
-    range_bound: std::collections::BTreeMap<luminal::shape::Symbol, (u64, u64)>,
 }
 
 impl ReferenceRuntime {
+    /// A fresh execution binding for the selected program. No search or data
+    /// storage is copied; callers stage their own inputs and dimension values.
+    pub fn fork(&self) -> Result<Self> {
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("search before fork"))?;
+        let mut runtime = Self {
+            memory_budget_bytes: self.memory_budget_bytes,
+            input_buffers: self.input_buffers.clone(),
+            output_buffers: self.output_buffers.clone(),
+            dims: self.dims.clone(),
+            ..Default::default()
+        };
+        runtime.load_plan(plan.clone(), self.bounds.clone());
+        Ok(runtime)
+    }
+
     /// Bound live tensor payloads: staged inputs, live buffers, destinations,
     /// and tensor-sized kernel scratch. Does not include compiler/Python memory.
     pub fn set_memory_budget_bytes(&mut self, bytes: usize) {
@@ -281,7 +284,12 @@ impl ReferenceRuntime {
     ///
     /// Boundary bindings likewise ride the plan: `Buffer::lit` is the
     /// numeric `BufferLit` key caller data binds by, indexed here.
-    pub fn load_plan(&mut self, plan: BufferIrGraph<DecodedLayout>) {
+    pub fn load_plan(
+        &mut self,
+        plan: BufferIrGraph<DecodedLayout>,
+        bounds: luminal::shape::DimensionBounds,
+    ) {
+        self.bounds = bounds;
         self.lit_index = plan
             .buffers
             .values()
@@ -320,144 +328,42 @@ impl ReferenceRuntime {
         Ok(runtime)
     }
 
-    /// BINDING: seed a dynamic dim's range (bounds-on-vars — never a pin).
-    pub fn bind_dyn_range(
-        &mut self,
-        var: impl Into<luminal::shape::Symbol>,
-        lower: u64,
-        upper: u64,
-    ) -> Result<()> {
-        let var = var.into();
-        ensure!(
-            !self.dim_buckets.contains_key(&var),
-            "dim `{var}` has buckets bound; a bucketed dim is seeded per bucket \
-             and must not carry a second range binding"
-        );
-        let spec = self
-            .native
-            .as_mut()
-            .ok_or_else(|| anyhow!("bind before load"))?;
-        let var_literal = var.egglog_literal();
-        spec.binding_seeds.push_str(&format!(
-            "(set (lower-bound-of (IntVar {var_literal})) (bigint {lower}))\n\
-             (set (upper-bound-of (IntVar {var_literal})) (bigint {upper}))\n"
-        ));
-        // EVERY range binding is remembered, so `bind_dim_buckets` can
-        // refuse this dim whatever the interval was.
-        self.range_bound.insert(var, (lower, upper));
-        // A tight [n, n] binding IS a pin: remember it too, so a bucketed
-        // plan's representative map records the whole assignment and
-        // `select_bucket` sees every dim.
-        if lower == upper {
-            self.dims.insert(var, lower as usize);
-        }
-        Ok(())
-    }
-
-    /// BIND BUCKETS for a dynamic dimension (D7, 2026-09-03): a set of
-    /// disjoint intervals, each of which gets its own searched plan.
-    /// `search_buckets` then runs one search per Cartesian combination
-    /// and `execute` picks the covering plan from the current dims.
-    ///
-    /// THE BUCKETS MUST PARTITION CLEANLY: non-empty, sorted by `min`,
-    /// and pairwise disjoint. Overlap is REFUSED rather than resolved
-    /// first-wins — two plans that both claim a value is an ambiguity in
-    /// the caller's model, and picking one silently is how a graph ends
-    /// up running the plan its author did not mean.
-    pub fn bind_dim_buckets(
-        &mut self,
-        dim: impl Into<luminal::shape::Symbol>,
-        buckets: Vec<luminal::graph::DimBucket>,
-    ) -> Result<()> {
-        let dim = dim.into();
-        ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
-        if let Some((lo, hi)) = self.range_bound.get(&dim) {
-            anyhow::bail!(
-                "dim `{dim}` already carries a range binding [{lo}, {hi}] from \
-                 bind_dyn_range; a bucketed dim is seeded per bucket and must not \
-                 carry a second range binding"
-            );
-        }
-        ensure!(
-            !self.dims.contains_key(&dim),
-            "dim `{dim}` already has a value from set_dim; bind buckets before \
-             setting the execution dim"
-        );
-        for pair in buckets.windows(2) {
-            ensure!(
-                pair[0].max < pair[1].min,
-                "dim `{dim}` buckets must be sorted and disjoint, but [{}, {}] and \
-                 [{}, {}] are not",
-                pair[0].min,
-                pair[0].max,
-                pair[1].min,
-                pair[1].max
-            );
-        }
-        self.dim_buckets.insert(dim, buckets);
-        Ok(())
-    }
-
-    /// Set a dynamic dimension's value for EXECUTION (D7). With buckets
-    /// bound this is what selects the plan; without them it is a
-    /// record-keeping no-op on a runtime whose plan is already pinned.
+    /// Set a dimension for the next invocation. This does not change bounds.
     pub fn set_dim(&mut self, dim: impl Into<luminal::shape::Symbol>, value: usize) {
         self.dims.insert(dim.into(), value);
     }
 
-    /// The finished per-bucket plans (empty until `search_buckets`).
-    pub fn bucket_plans(&self) -> &[crate::search::BucketPlan] {
-        &self.bucket_plans
+    pub fn bounds(&self) -> &luminal::shape::DimensionBounds {
+        &self.bounds
     }
 
-    /// Serialize selected reference plans using caller-provided boundary slot
-    /// order. Internal node IDs never cross the process boundary.
+    /// Serialize one selected program in declaration-order boundary slots.
     pub fn serialize_compiled(
         &self,
         inputs: &[petgraph::graph::NodeIndex],
         outputs: &[i64],
     ) -> Result<Vec<u8>> {
-        let buckets = if self.bucket_plans.is_empty() {
-            let plan = self
+        crate::compiled_artifact::serialize(&crate::compiled_artifact::CompiledProgram {
+            bounds: self.bounds.clone(),
+            input_buffers: inputs
+                .iter()
+                .map(|id| {
+                    self.input_buffers
+                        .get(id)
+                        .copied()
+                        .ok_or_else(|| anyhow!("input {id:?} has no boundary binding"))
+                })
+                .collect::<Result<_>>()?,
+            output_buffers: outputs.to_vec(),
+            plan: self
                 .plan
                 .as_ref()
-                .ok_or_else(|| anyhow!("no selected plan"))?;
-            vec![crate::compiled_artifact::CompiledBucket {
-                ranges: Default::default(),
-                input_buffers: inputs
-                    .iter()
-                    .map(|id| {
-                        self.input_buffers
-                            .get(id)
-                            .copied()
-                            .ok_or_else(|| anyhow!("input {id:?} has no boundary binding"))
-                    })
-                    .collect::<Result<_>>()?,
-                output_buffers: outputs.to_vec(),
-                plan: plan.clone(),
-            }]
-        } else {
-            self.bucket_plans
-                .iter()
-                .map(|bucket| {
-                    Ok(crate::compiled_artifact::CompiledBucket {
-                        ranges: bucket
-                            .ranges
-                            .iter()
-                            .map(|(s, r)| (s.to_string(), *r))
-                            .collect(),
-                        input_buffers: bucket.program.inputs.iter().map(|b| b.buffer).collect(),
-                        output_buffers: bucket.program.outputs.iter().map(|b| b.buffer).collect(),
-                        plan: bucket.outcome.best_plan.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
-        crate::compiled_artifact::serialize(&buckets)
+                .ok_or_else(|| anyhow!("no selected plan"))?
+                .clone(),
+        })
     }
 
-    /// Install selected plans without saturation or profiling. The lists map
-    /// artifact boundary positions onto this process's translated values.
+    /// Load one compiled program without saturation or profiling.
     pub fn deserialize_compiled(
         &mut self,
         bytes: &[u8],
@@ -465,42 +371,27 @@ impl ReferenceRuntime {
         outputs: &[petgraph::graph::NodeIndex],
         memory_budget_bytes: usize,
     ) -> Result<Vec<i64>> {
-        let buckets = crate::compiled_artifact::deserialize(bytes)?;
-        let first = &buckets[0];
+        let program = crate::compiled_artifact::deserialize(bytes)?;
         ensure!(
-            first.input_buffers.len() == inputs.len()
-                && first.output_buffers.len() == outputs.len(),
+            program.input_buffers.len() == inputs.len()
+                && program.output_buffers.len() == outputs.len(),
             "reference artifact boundary arity differs from local translation"
         );
-        for bucket in &buckets {
-            ensure!(
-                bucket.input_buffers == first.input_buffers
-                    && bucket.output_buffers == first.output_buffers,
-                "reference artifact buckets have inconsistent boundary assignments"
-            );
-        }
         let input_bindings: Vec<_> = inputs
             .iter()
-            .zip(&first.input_buffers)
+            .zip(&program.input_buffers)
             .map(|(&value, &buffer)| crate::bindings::Bound { value, buffer })
             .collect();
         let output_bindings: Vec<_> = outputs
             .iter()
-            .zip(&first.output_buffers)
+            .zip(&program.output_buffers)
             .map(|(&value, &buffer)| crate::bindings::Bound { value, buffer })
             .collect();
         self.stage_bindings(&input_bindings, &output_bindings);
         self.set_memory_budget_bytes(memory_budget_bytes);
-        let output_buffers = first.output_buffers.clone();
         self.native = None;
-        self.bucket_plans.clear();
-        self.loaded_bucket_plans = buckets;
-        // A tracing hint need not fall inside any requested bucket. Select
-        // symbolic plans only after the caller binds its actual input dims.
-        if self.loaded_bucket_plans.len() == 1 && self.loaded_bucket_plans[0].ranges.is_empty() {
-            self.select_bucket_plan()?;
-        }
-        Ok(output_buffers)
+        self.load_plan(program.plan, program.bounds);
+        Ok(program.output_buffers)
     }
 
     /// BINDING: declare an Int input tensor's VALUE range (typed-buffers
@@ -551,23 +442,24 @@ impl ReferenceRuntime {
     /// plan on this runtime with the given data; the winner loads.
     pub fn search(
         &mut self,
+        bounds: &luminal::shape::DimensionBounds,
+        profile_dims: &luminal::shape::DynMap,
         input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
         options: &crate::search::CompileOptions,
     ) -> Result<crate::search::SearchOutcome> {
-        ensure!(
-            self.dim_buckets.is_empty(),
-            "dim buckets are bound: call search_buckets instead. Each bucket is \
-             searched at its OWN representative, so its inputs are a different \
-             SIZE — one fixed data map cannot stage them all, and staging the \
-             wrong size is exactly the silent mis-fit this refuses"
-        );
-        self.set_memory_budget_bytes(options.memory_budget_bytes);
         let spec = self
             .native
-            .take()
-            .ok_or_else(|| anyhow!("search before load"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow!("search before load"))?
+            .clone();
+        bounds.validate_symbols(&luminal::shape::program_dimensions(&format!(
+            "{}{}",
+            spec.bound.prefix, spec.bound.post_checks
+        ))?)?;
+        bounds.validate_values(profile_dims)?;
+        let seeds = format!("{}{}", spec.binding_seeds, bounds.egglog_seeds());
         let program = crate::search::SearchProgram {
-            text: spec.bound.text_with_seeds(&spec.binding_seeds),
+            text: spec.bound.text_with_seeds(&seeds),
             inputs: spec.bound.inputs.clone(),
             outputs: spec.bound.outputs.clone(),
         };
@@ -584,7 +476,7 @@ impl ReferenceRuntime {
             let unchecked = format!(
                 "{}\n\n{}",
                 crate::assembled_program(),
-                spec.bound.text_unchecked_with_seeds(&spec.binding_seeds)
+                spec.bound.text_unchecked_with_seeds(&seeds)
             );
             let mut probe = luminal::egglog_snippet::new_egraph();
             if probe.parse_and_run_program(None, &unchecked).is_ok() {
@@ -618,116 +510,18 @@ impl ReferenceRuntime {
             &mut serialized,
             &program,
             input_data,
-            &self.dims,
-            &self.dims,
+            profile_dims,
+            bounds,
             options,
             spec.ops,
         )?;
         outcome.timings.saturation_nanos = saturation_nanos;
         outcome.timings.serialize_nanos = serialize_nanos;
         self.stage_bindings(&program.inputs, &program.outputs);
-        self.load_plan(outcome.best_plan.clone());
-        Ok(outcome)
-    }
-
-    /// BUCKETED SEARCH (D7, 2026-09-03): one search per Cartesian
-    /// combination of the bound [`Self::bind_dim_buckets`] intervals.
-    /// Each combination is rendered RANGE-seeded: its whole fixpoint
-    /// (authoring checks included) must pass, proving the base logical
-    /// program valid over the WHOLE interval, and the plan is extracted
-    /// from that range-valid fixpoint so its spans/extents stay symbolic.
-    /// The representative assignment is used only to STAGE and PRICE the
-    /// plan during profiling; the resulting plan executes at every value
-    /// in the bucket.
-    ///
-    /// `input_data` is a FUNCTION of the pins because it has to be: a
-    /// bucket profiled at `a = 3` and one profiled at `a = 7` want
-    /// differently sized payloads. It is called once per combination with
-    /// that combination's representative map.
-    ///
-    /// The plans are kept; [`Self::execute`] selects among them from the
-    /// current dims. Nothing is loaded here unless the runtime's dims
-    /// already name a covering bucket.
-    pub fn search_buckets(
-        &mut self,
-        input_data: impl Fn(
-            &luminal::shape::DynMap,
-        ) -> FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
-        options: &crate::search::CompileOptions,
-    ) -> Result<&[crate::search::BucketPlan]> {
-        ensure!(
-            !self.dim_buckets.is_empty(),
-            "no dim buckets are bound: call search"
-        );
+        self.load_plan(outcome.best_plan.clone(), bounds.clone());
+        self.dims = profile_dims.clone();
         self.set_memory_budget_bytes(options.memory_budget_bytes);
-        let spec = self
-            .native
-            .take()
-            .ok_or_else(|| anyhow!("search_buckets before load"))?;
-        let assembly = crate::search::BucketAssembly {
-            assembled_program: crate::assembled_program(),
-            prefix: &spec.bound.prefix,
-            binding_seeds: &spec.binding_seeds,
-            schedule: crate::bindings::ReferenceBindings::SCHEDULE,
-            post_checks: &spec.bound.post_checks,
-            inputs: &spec.bound.inputs,
-            outputs: &spec.bound.outputs,
-            base_dims: &self.dims,
-        };
-        self.bucket_plans = crate::search::bucketed_search_implementations(
-            &assembly,
-            &self.dim_buckets,
-            input_data,
-            options,
-            spec.ops.clone(),
-        )?;
-        self.stage_bindings(&spec.bound.inputs, &spec.bound.outputs);
-        // Load eagerly when the runtime already sits inside a bucket at
-        // its representative; otherwise `execute` will select.
-        let _ = self.select_bucket_plan();
-        Ok(&self.bucket_plans)
-    }
-
-    /// Pick and load the bucket plan covering the current dims.
-    ///
-    /// SYMBOLIC PLANS (the Phase 1 limitation, lifted): a bucket's winning
-    /// plan is searched over the bucket's RANGE-seeded render, so its
-    /// spans and extents stay expressions (`Var("a")`) rather than the
-    /// representative's literals. `execute` evaluates them under the
-    /// runtime's current [`Self::dims`], so the one plan runs correctly at
-    /// every value in the bucket — no re-search. The representative still
-    /// picks the plan by bucket coverage and prices it during search, but
-    /// it no longer constrains what the loaded plan can execute.
-    fn select_bucket_plan(&mut self) -> Result<()> {
-        if !self.loaded_bucket_plans.is_empty() {
-            let bucket = self
-                .loaded_bucket_plans
-                .iter()
-                .find(|bucket| {
-                    bucket.ranges.iter().all(|(name, &(lo, hi))| {
-                        self.dims
-                            .get(&luminal::shape::Symbol::from(name.as_str()))
-                            .is_some_and(|&value| lo <= value && value <= hi)
-                    })
-                })
-                .ok_or_else(|| {
-                    anyhow!("no serialized reference plan covers dims {:?}", self.dims)
-                })?;
-            self.load_plan(bucket.plan.clone());
-            return Ok(());
-        }
-        let Some(plan) = crate::search::select_bucket(&self.bucket_plans, &self.dims) else {
-            let covered: Vec<_> = self.bucket_plans.iter().map(|p| p.ranges.clone()).collect();
-            anyhow::bail!(
-                "no bucket covers dims {:?}; the searched buckets are {covered:?}",
-                self.dims
-            );
-        };
-        let chosen = plan.outcome.best_plan.clone();
-        let (inputs, outputs) = (plan.program.inputs.clone(), plan.program.outputs.clone());
-        self.stage_bindings(&inputs, &outputs);
-        self.load_plan(chosen);
-        Ok(())
+        Ok(outcome)
     }
 
     /// Stage caller data for an INPUT tensor — TYPED (2026-08-11): the
@@ -750,12 +544,7 @@ impl ReferenceRuntime {
     }
 
     pub fn execute(&mut self) -> Result<()> {
-        // With buckets bound, the plan is chosen HERE, from the current
-        // dims (see [`Self::select_bucket_plan`] for the static-plan
-        // refusal). Without them nothing changes.
-        if !self.bucket_plans.is_empty() || !self.loaded_bucket_plans.is_empty() {
-            self.select_bucket_plan()?;
-        }
+        self.bounds.validate_values(&self.dims)?;
         let plan = self
             .plan
             .as_ref()
@@ -1206,7 +995,12 @@ mod tests {
 
         let mut runtime = ReferenceRuntime::load(&cx).expect("load");
         runtime
-            .search(&FxHashMap::default(), &crate::harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &FxHashMap::default(),
+                &crate::harness_search_options(),
+            )
             .expect("search a constant-only graph");
         runtime.execute().expect("execute");
 
@@ -1299,7 +1093,10 @@ mod tests {
         let mut options = crate::search::harness_search_options();
         options.max_intermediate_bytes = 15;
         let mut rejected = ReferenceRuntime::load(&graph).unwrap();
-        let error = rejected.search(&data, &options).unwrap_err().to_string();
+        let error = rejected
+            .search(&Default::default(), &Default::default(), &data, &options)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("max_intermediate_bytes=15"), "{error}");
 
         options.max_intermediate_bytes = 16;
@@ -1307,7 +1104,7 @@ mod tests {
         let mut rejected = ReferenceRuntime::load(&graph).unwrap();
         assert!(
             rejected
-                .search(&data, &options)
+                .search(&Default::default(), &Default::default(), &data, &options)
                 .unwrap_err()
                 .to_string()
                 .contains("live memory budget exceeded")
@@ -1315,55 +1112,38 @@ mod tests {
         options.memory_budget_bytes = super::DEFAULT_MEMORY_BUDGET_BYTES;
 
         let mut runtime = ReferenceRuntime::load(&graph).unwrap();
-        runtime.search(&data, &options).unwrap();
+        runtime
+            .search(&Default::default(), &Default::default(), &data, &options)
+            .unwrap();
         runtime.set_data(x.id, vec![0.0f32; 4]);
         runtime.execute().unwrap();
         assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![1.0; 4]);
     }
 
     #[test]
-    fn intermediate_pruning_uses_bucket_capacity() {
-        use luminal::{graph::DimBucket, shape::Symbol};
+    fn intermediate_pruning_uses_domain_capacity() {
+        use luminal::shape::{DimensionBounds, DynMap};
         let mut graph = Graph::new();
-        graph.set_dim('a', 2);
         let x = graph.tensor('a', DType::F32);
         let out = x.sin().cos();
-        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
-        runtime
-            .bind_dim_buckets('a', vec![DimBucket::new(1, 8).representative(2)])
-            .unwrap();
+        let bounds = DimensionBounds::from_ranges([('a'.into(), (1, 8))]).unwrap();
+        let dims: DynMap = [('a'.into(), 2)].into_iter().collect();
+        let data = [(x.id, vec![0.0f32; 2].into())].into_iter().collect();
         let mut options = crate::search::harness_search_options();
         options.max_intermediate_bytes = 16;
-        // A plan must serve the entire bucket. The 8-element intermediate
-        // needs 32 bytes even though the representative needs only 8.
-        let mut rejected = ReferenceRuntime::load(&graph).unwrap();
-        rejected
-            .bind_dim_buckets('a', vec![DimBucket::new(1, 8).representative(2)])
-            .unwrap();
-        let error = rejected
-            .search_buckets(
-                |dims| {
-                    FxHashMap::from_iter([(x.id, vec![0.0f32; dims[&Symbol::from('a')]].into())])
-                },
-                &options,
-            )
+        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
+        let error = runtime
+            .search(&bounds, &dims, &data, &options)
             .unwrap_err()
             .to_string();
         assert!(error.contains("max_intermediate_bytes=16"), "{error}");
         options.max_intermediate_bytes = 32;
-        runtime
-            .search_buckets(
-                |dims| {
-                    FxHashMap::from_iter([(x.id, vec![0.0f32; dims[&Symbol::from('a')]].into())])
-                },
-                &options,
-            )
-            .unwrap();
+        // Failed search must leave the graph available for retry.
+        runtime.search(&bounds, &dims, &data, &options).unwrap();
         runtime.set_dim('a', 4);
         runtime.set_data(x.id, vec![0.0f32; 4]);
         runtime.execute().unwrap();
         assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![1.0; 4]);
-        // The aggregate budget is also re-evaluated at the current shape.
         runtime.set_memory_budget_bytes(runtime.peak_live_bytes());
         runtime.set_dim('a', 5);
         runtime.set_data(x.id, vec![0.0f32; 5]);
@@ -1385,7 +1165,9 @@ mod tests {
         let mut options = crate::search::harness_search_options();
         options.max_intermediate_bytes = 0;
         let mut runtime = ReferenceRuntime::load(&graph).unwrap();
-        runtime.search(&data, &options).unwrap();
+        runtime
+            .search(&Default::default(), &Default::default(), &data, &options)
+            .unwrap();
         runtime.set_data(x.id, vec![0.0f32; 4]);
         runtime.execute().unwrap();
         assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![0.0; 4]);
@@ -1401,8 +1183,13 @@ mod tests {
         }
         let data = FxHashMap::from_iter([(x.id, vec![0.3f32; 4].into())]);
         let mut rt = ReferenceRuntime::load(&graph).unwrap();
-        rt.search(&data, &crate::search::harness_search_options())
-            .unwrap();
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .unwrap();
         let all_bytes: usize = rt
             .plan
             .as_ref()
@@ -1442,8 +1229,13 @@ mod tests {
         let out = shared.cos() + shared.sin();
         let data = FxHashMap::from_iter([(x.id, vec![0.3f32; 4].into())]);
         let mut rt = ReferenceRuntime::load(&graph).unwrap();
-        rt.search(&data, &crate::search::harness_search_options())
-            .unwrap();
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .unwrap();
         let plan = rt.plan.as_ref().unwrap();
         let order = super::depth_first_order(plan).unwrap();
         let positions: FxHashMap<_, _> = order.iter().enumerate().map(|(i, n)| (*n, i)).collect();
@@ -1584,7 +1376,7 @@ mod tests {
     /// DYNAMIC DIMS over the bounds interface: the model declares
     /// `(IntVar "a")`, the binding seeds tight bounds from set_dim, the
     /// [n,n] collapse delivers the literal to the geometry walk — and the
-    /// SAME symbolic graph shape re-renders per pin (the per-bucket model).
+    /// SAME symbolic graph shape re-renders per pin (independent bounded compilation).
     #[test]
     fn differential_dynamic_dim_against_reference_runtime() {
         for pin in [3usize, 5usize] {
@@ -2177,7 +1969,7 @@ mod tests {
         let plan = luminal::bufferize::bufferize(&dps, &layouts).expect("bufferizes");
         let mut rt = crate::ReferenceRuntime::default();
         rt.stage_bindings(&bound.inputs, &bound.outputs);
-        rt.load_plan(plan);
+        rt.load_plan(plan, Default::default());
         rt.set_data(dest.id, (0..6).map(|v| v as f32).collect::<Vec<f32>>());
         rt.set_data(idx.id, vec![1i32, 4, 1]); // 1 appears twice — conflict
         rt.set_data(src.id, vec![10.0, 20.0, 30.0]);
@@ -2522,7 +2314,12 @@ mod tests {
         let mut data = FxHashMap::default();
         data.insert(x.id, TypedBuffer::I64(vec![i64::from(i32::MAX) + 1]));
         let err = rt
-            .search(&data, &crate::search::harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &crate::search::harness_search_options(),
+            )
             .unwrap_err();
         let message = format!("{err:#}");
         assert!(
@@ -2665,8 +2462,13 @@ mod tests {
         let mut data = FxHashMap::default();
         data.insert(mask2.id, TypedBuffer::bool8(vec![1u8, 0, 1, 0]).unwrap());
         data.insert(x2.id, x_vals.clone().into());
-        rt2.search(&data, &crate::search::harness_search_options())
-            .expect("search finds a plan");
+        rt2.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("search finds a plan");
         rt2.set_data(mask2.id, vec![1.0f32, 0.0, 1.0, 0.0]);
         rt2.set_data(x2.id, x_vals);
         let err = rt2.execute().unwrap_err();
@@ -2688,8 +2490,13 @@ mod tests {
         rt.bind_value_range(idx.id, 0, 4).expect("range binds");
         let mut data = FxHashMap::default();
         data.insert(idx.id, vec![0i32, 1, 2, 3, 4].into());
-        rt.search(&data, &crate::search::harness_search_options())
-            .expect("proven mul implements");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("proven mul implements");
         rt.set_data(idx.id, vec![0i32, 1, 2, 3, 4]);
         rt.execute().expect("executes");
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![0i32, 3, 6, 9, 12]);
@@ -2714,7 +2521,12 @@ mod tests {
         data.insert(a.id, vec![1i32].into());
         data.insert(b.id, vec![2i32].into());
         let err = rt
-            .search(&data, &crate::search::harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &crate::search::harness_search_options(),
+            )
             .unwrap_err();
         let message = format!("{err:#}");
         assert!(
@@ -2735,8 +2547,13 @@ mod tests {
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.bind_value_range(a.id, 0, 1000).expect("range binds");
         rt.bind_value_range(b.id, 0, 1000).expect("range binds");
-        rt.search(&data, &crate::search::harness_search_options())
-            .expect("proven add implements");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("proven add implements");
         rt.set_data(a.id, vec![700i32]);
         rt.set_data(b.id, vec![300i32]);
         rt.execute().expect("proven add executes");
@@ -2753,8 +2570,13 @@ mod tests {
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
         data.insert(x.id, vec![-2i32, 3, -4, 5].into());
-        rt.search(&data, &crate::search::harness_search_options())
-            .expect("unattested int sum scan implements");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("unattested int sum scan implements");
         rt.set_data(x.id, vec![-2i32, 3, -4, 5]);
         rt.execute().expect("unattested int sum scan executes");
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![-2i32, 1, -3, 2]);
@@ -2772,7 +2594,12 @@ mod tests {
         let mut data = FxHashMap::default();
         data.insert(x.id, values.clone().into());
         let result = rt
-            .search(&data, &crate::search::harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &crate::search::harness_search_options(),
+            )
             .and_then(|_| {
                 rt.set_data(x.id, values.clone());
                 rt.execute()
@@ -2795,8 +2622,13 @@ mod tests {
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
         data.insert(x.id, vec![-2i32, 3, -4, 5].into());
-        rt.search(&data, &crate::search::harness_search_options())
-            .expect("unattested int prod implements");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("unattested int prod implements");
         rt.set_data(x.id, vec![-2i32, 3, -4, 5]);
         rt.execute().expect("unattested int prod executes");
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![-2i32, -6, 24, 120]);
@@ -2812,8 +2644,13 @@ mod tests {
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
         data.insert(x.id, vec![3i32, -7, 5, 4].into());
-        rt.search(&data, &crate::search::harness_search_options())
-            .expect("unattested int max scan implements");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("unattested int max scan implements");
         rt.set_data(x.id, vec![3i32, -7, 5, 4]);
         rt.execute().expect("unattested int max scan executes");
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![3i32, 3, 5, 5]);
@@ -2829,7 +2666,12 @@ mod tests {
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
         data.insert(x.id, vec![65536i32, 65536, 1, 1].into());
-        let err = match rt.search(&data, &crate::search::harness_search_options()) {
+        let err = match rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        ) {
             Err(err) => err,
             Ok(_) => {
                 rt.set_data(x.id, vec![65536i32, 65536, 1, 1]);
@@ -2859,8 +2701,13 @@ mod tests {
         let mut data = FxHashMap::default();
         data.insert(a.id, vec![7i32, -7, 100, -1].into());
         data.insert(b.id, vec![2i32, 2, 3, 4].into());
-        rt.search(&data, &crate::search::harness_search_options())
-            .expect("proven trunc-div implements");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("proven trunc-div implements");
         rt.set_data(a.id, vec![7i32, -7, 100, -1]);
         rt.set_data(b.id, vec![2i32, 2, 3, 4]);
         rt.execute().expect("proven trunc-div executes");
@@ -2877,333 +2724,106 @@ mod tests {
         data.insert(a.id, vec![7i32].into());
         data.insert(b.id, vec![2i32].into());
         let err = rt
-            .search(&data, &crate::search::harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &crate::search::harness_search_options(),
+            )
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("no candidate genome"),
             "expected the unattested refusal, got: {err:#}"
         );
     }
-    /// BUCKETED (D7, moved here from core's `implementation_search` as a
-    /// RUNTIME-LEVEL test, #420/#422 rejoin Phase 1): two buckets over
-    /// 'a', each validated bucket-wide (range seeds) and searched at its
-    /// representative; selection covers runtime dims; each bucket's plan
-    /// agrees with the runtime at its representative.
     #[test]
-    fn bucketed_search_validates_searches_and_selects() {
-        use luminal::graph::DimBucket;
-        use luminal::shape::Symbol;
-
-        let mut cx = Graph::new();
-        cx.set_dim('a', 3);
-        let x = cx.tensor(('a', 2), DType::F32);
-        let y = cx.tensor(('a', 2), DType::F32);
-        let out = x * y;
-
-        let data_for = |rep: &luminal::shape::DynMap| {
-            let n = rep[&Symbol::from('a')] * 2;
-            let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
-            data.insert(
-                x.id,
-                (0..n).map(|v| v as f32 + 1.0).collect::<Vec<f32>>().into(),
-            );
-            data.insert(
-                y.id,
-                (0..n).map(|v| v as f32 * 0.5).collect::<Vec<f32>>().into(),
-            );
-            data
-        };
-
-        let mut rt = ReferenceRuntime::load(&cx).expect("records + loads");
-        rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
-            .expect("disjoint sorted buckets bind");
-        let plans = rt
-            .search_buckets(data_for, &crate::search::harness_search_options())
-            .expect("bucketed search completes");
-        assert_eq!(plans.len(), 2, "one plan per bucket");
-
-        // Selection covers each bucket; out-of-range dims select nothing.
-        let ranges: Vec<_> = plans.iter().map(|plan| plan.ranges.clone()).collect();
-        let mut dims = luminal::shape::DynMap::default();
-        dims.insert(Symbol::from('a'), 3usize);
-        assert_eq!(
-            crate::search::select_bucket(rt.bucket_plans(), &dims)
-                .unwrap()
-                .ranges[&Symbol::from('a')],
-            (2, 4),
-            "{ranges:?}"
-        );
-        dims.insert(Symbol::from('a'), 7usize);
-        assert_eq!(
-            crate::search::select_bucket(rt.bucket_plans(), &dims)
-                .unwrap()
-                .ranges[&Symbol::from('a')],
-            (5, 9)
-        );
-        dims.insert(Symbol::from('a'), 20usize);
-        assert!(crate::search::select_bucket(rt.bucket_plans(), &dims).is_none());
-
-        // Numeric agreement at each bucket's representative, through the
-        // ladder: set_dim picks the plan, execute runs it.
-        let representatives: Vec<usize> = rt
-            .bucket_plans()
-            .iter()
-            .map(|plan| plan.representative[&Symbol::from('a')])
-            .collect();
-        for rep in representatives {
-            // GOLDEN (computed: out = x * y with x[i] = i+1, y[i] = i*0.5
-            // — the data_for closure's values at this representative).
-            let n = rep * 2;
-            let expected: Vec<f32> = (0..n)
-                .map(|v| (v as f32 + 1.0) * (v as f32 * 0.5))
-                .collect();
-
-            rt.set_dim('a', rep);
-            let mut pins = luminal::shape::DynMap::default();
-            pins.insert(Symbol::from('a'), rep);
-            for (id, values) in data_for(&pins) {
-                rt.set_data(id, values);
-            }
-            rt.execute()
-                .expect("bucket plan executes at representative");
-            let ours = rt.get_f32(out.id).unwrap();
-            assert_eq!(ours.len(), expected.len());
-            for (index, (lhs, rhs)) in ours.iter().zip(&expected).enumerate() {
-                assert!(
-                    (lhs - rhs).abs() <= 1e-5 * rhs.abs().max(1.0),
-                    "representative {rep} element {index}: ours {lhs} vs theirs {rhs}"
-                );
+    fn bounded_program_runs_multiple_dimensions_and_preserves_other_ranges() {
+        use luminal::shape::{DimensionBounds, DynMap};
+        let mut graph = Graph::new();
+        let x = graph.tensor(('a', 'b'), DType::F32);
+        let out = x * x + x;
+        let bounds =
+            DimensionBounds::from_ranges([('a'.into(), (2, 9)), ('b'.into(), (2, 5))]).unwrap();
+        let dims: DynMap = [('a'.into(), 3), ('b'.into(), 2)].into_iter().collect();
+        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
+        let data = [(x.id, vec![1.0f32; 6].into())].into_iter().collect();
+        runtime
+            .search(&bounds, &dims, &data, &crate::harness_search_options())
+            .unwrap();
+        for (a, b) in [(2, 2), (4, 3), (9, 5)] {
+            runtime.set_dim('a', a);
+            runtime.set_dim('b', b);
+            let values: Vec<_> = (0..a * b).map(|v| v as f32 / 10.0).collect();
+            let expected: Vec<_> = values.iter().map(|v| v * v + v).collect();
+            runtime.set_data(x.id, values);
+            runtime.execute().unwrap();
+            for (actual, expected) in runtime.get_f32(out.id).unwrap().iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-4);
             }
         }
-
-        // SYMBOLIC PLANS (the Phase 1 limitation, lifted): a bucket's
-        // plan stays an expression in `a`, so a NON-representative value
-        // inside the same bucket now executes correctly instead of being
-        // refused. `a = 4` sits in the first bucket [2, 4] but is not its
-        // representative (3).
-        let non_representative = 4usize;
-        rt.set_dim('a', non_representative);
-        let mut pins = luminal::shape::DynMap::default();
-        pins.insert(Symbol::from('a'), non_representative);
-        for (id, values) in data_for(&pins) {
-            rt.set_data(id, values);
-        }
-        rt.execute()
-            .expect("a symbolic bucket plan executes at a non-representative value");
-        let n = non_representative * 2;
-        let expected: Vec<f32> = (0..n)
-            .map(|v| (v as f32 + 1.0) * (v as f32 * 0.5))
-            .collect();
-        let ours = rt.get_f32(out.id).unwrap();
-        assert_eq!(ours.len(), expected.len());
-        for (index, (lhs, rhs)) in ours.iter().zip(&expected).enumerate() {
-            assert!(
-                (lhs - rhs).abs() <= 1e-5 * rhs.abs().max(1.0),
-                "a = {non_representative} element {index}: ours {lhs} vs theirs {rhs}"
-            );
-        }
-    }
-
-    /// DEFINITION OF DONE for symbolic plans: ONE bucketed search produces
-    /// a plan whose spans/extents stay expressions in the symbolic dim,
-    /// and that single plan then executes at SEVERAL dim values with NO
-    /// re-search. The values cross bucket boundaries, so this also proves
-    /// [`crate::search::select_bucket`] picks the covering symbolic plan
-    /// per execution while the searched plans stay fixed.
-    ///
-    /// Golden values are computed INDEPENDENTLY from the scalar formula
-    /// `out[i] = x[i] * y[i] + x[i]` with `x[i] = i + 1`, `y[i] = i / 2`.
-    #[test]
-    fn one_searched_symbolic_plan_executes_at_many_dim_values() {
-        use luminal::graph::DimBucket;
-        use luminal::shape::Symbol;
-
-        let mut cx = Graph::new();
-        cx.set_dim('a', 3);
-        let x = cx.tensor(('a', 2), DType::F32);
-        let y = cx.tensor(('a', 2), DType::F32);
-        let out = x * y + x;
-
-        let data_for = |n: usize| {
-            let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
-            data.insert(
-                x.id,
-                (0..n).map(|v| v as f32 + 1.0).collect::<Vec<f32>>().into(),
-            );
-            data.insert(
-                y.id,
-                (0..n).map(|v| v as f32 * 0.5).collect::<Vec<f32>>().into(),
-            );
-            data
-        };
-
-        let mut rt = ReferenceRuntime::load(&cx).expect("records + loads");
-        rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
-            .expect("disjoint sorted buckets bind");
-        rt.search_buckets(
-            |rep| data_for(rep[&Symbol::from('a')] * 2),
-            &crate::search::harness_search_options(),
-        )
-        .expect("bucketed search completes ONCE");
-        assert_eq!(rt.bucket_plans().len(), 2, "one searched plan per bucket");
-
-        // SEVERAL values per bucket, representatives and non-representatives
-        // alike. Nothing below searches again: set_dim + set_data + execute
-        // only, so every value after the initial search reuses a searched
-        // symbolic plan.
-        for a in [2usize, 3, 4, 5, 6, 7, 8, 9] {
-            rt.set_dim('a', a);
-            for (id, values) in data_for(a * 2) {
-                rt.set_data(id, values);
-            }
-            rt.execute()
-                .expect("the searched symbolic plan executes at every dim value");
-            assert_eq!(rt.bucket_plans().len(), 2, "execution must never re-search");
-            // INDEPENDENT GOLDEN: scalar formula, not another runtime.
-            let expected: Vec<f32> = (0..a * 2)
-                .map(|v| {
-                    let xv = v as f32 + 1.0;
-                    let yv = v as f32 * 0.5;
-                    xv * yv + xv
-                })
-                .collect();
-            let ours = rt.get_f32(out.id).unwrap();
-            assert_eq!(ours.len(), expected.len(), "a = {a}");
-            for (index, (lhs, rhs)) in ours.iter().zip(&expected).enumerate() {
-                assert!(
-                    (lhs - rhs).abs() <= 1e-5 * rhs.abs().max(1.0),
-                    "a = {a} element {index}: ours {lhs} vs theirs {rhs}"
-                );
-            }
-        }
-    }
-
-    /// OP-RECORD GEOMETRY audit: an `arange` whose extent (and iota
-    /// expression) is the symbolic dim retains `Var("a")` in the searched
-    /// op record. One bucketed search then serves every value because the
-    /// kernel evaluates that expression against the runtime's PER-CALL
-    /// dims instead of a representative's literals.
-    #[test]
-    fn symbolic_iota_reuses_one_plan_across_dims() {
-        use luminal::graph::DimBucket;
-        use luminal::shape::IntExpr;
-
-        let mut cx = Graph::new();
-        cx.set_dim('a', 5);
-        let out = cx.arange(IntExpr::from('a'));
-
-        let mut rt = ReferenceRuntime::load(&cx).expect("records + loads");
-        rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
-            .expect("buckets bind");
-        rt.search_buckets(
-            |_| FxHashMap::default(),
-            &crate::search::harness_search_options(),
-        )
-        .expect("bucketed search completes once");
-        assert_eq!(rt.bucket_plans().len(), 2, "one plan per bucket");
-        // The searched plan must actually be symbolic, or this test would
-        // pass by way of a literal plan and prove nothing about the
-        // op-record path.
+        runtime.set_dim('a', 10);
         assert!(
-            rt.bucket_plans()[0]
-                .outcome
+            runtime
+                .execute()
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
+    }
+
+    #[test]
+    fn symbolic_iota_reuses_one_program_across_dims() {
+        use luminal::shape::{DimensionBounds, DynMap, IntExpr};
+        let mut graph = Graph::new();
+        let out = graph.arange(IntExpr::from('a'));
+        let bounds = DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap();
+        let dims: DynMap = [('a'.into(), 3)].into_iter().collect();
+        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
+        let result = runtime
+            .search(
+                &bounds,
+                &dims,
+                &Default::default(),
+                &crate::harness_search_options(),
+            )
+            .unwrap();
+        assert!(
+            result
                 .best_plan
                 .buffers
                 .values()
-                .any(|buffer| buffer.layout.literal_span_elements().is_none()),
-            "the searched arange plan must keep a symbolic span"
+                .any(|b| b.layout.literal_span_elements().is_none())
         );
-
-        for a in [2usize, 3, 4, 5, 7, 9] {
-            rt.set_dim('a', a);
-            rt.execute().expect("symbolic iota plan executes");
-            // INDEPENDENT GOLDEN: arange(a) is 0..a.
-            let expected: Vec<i32> = (0..a as i32).collect();
-            assert_eq!(rt.get_i32(out.id).unwrap(), &expected, "a = {a}");
+        for a in [2, 3, 4, 7, 9] {
+            runtime.set_dim('a', a);
+            runtime.execute().unwrap();
+            assert_eq!(
+                runtime.get_i32(out.id).unwrap(),
+                &(0..a as i32).collect::<Vec<_>>()
+            );
         }
     }
 
-    /// Buckets must partition: overlap is refused, not resolved
-    /// first-wins, and neither is an unsorted pair.
     #[test]
-    fn overlapping_or_unsorted_buckets_are_refused() {
-        use luminal::graph::DimBucket;
-
-        let mut cx = Graph::new();
-        cx.set_dim('a', 3);
-        let x = cx.tensor(('a', 2), DType::F32);
-        let _out = x * x;
-
-        let mut rt = ReferenceRuntime::load(&cx).expect("records + loads");
-        let err = rt
-            .bind_dim_buckets('a', vec![DimBucket::new(2, 6), DimBucket::new(5, 9)])
-            .expect_err("overlapping buckets must refuse");
+    fn exact_dimensions_remain_guarded_after_specialization() {
+        use luminal::shape::{DimensionBounds, DynMap};
+        let mut graph = Graph::new();
+        let x = graph.tensor('n', DType::F32);
+        let _out = x + x;
+        let dims: DynMap = [('n'.into(), 1)].into_iter().collect();
+        let bounds = DimensionBounds::exact(&dims).unwrap();
+        let data = [(x.id, vec![2.0f32].into())].into_iter().collect();
+        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
+        runtime
+            .search(&bounds, &dims, &data, &crate::harness_search_options())
+            .unwrap();
+        runtime.set_dim('n', 2);
         assert!(
-            format!("{err:#}").contains("sorted and disjoint"),
-            "{err:#}"
+            runtime
+                .execute()
+                .unwrap_err()
+                .to_string()
+                .contains("outside [1, 1]")
         );
-
-        let err = rt
-            .bind_dim_buckets('a', vec![DimBucket::new(5, 9), DimBucket::new(2, 4)])
-            .expect_err("unsorted buckets must refuse");
-        assert!(
-            format!("{err:#}").contains("sorted and disjoint"),
-            "{err:#}"
-        );
-
-        let err = rt
-            .bind_dim_buckets('a', vec![])
-            .expect_err("an empty bucket list must refuse");
-        assert!(format!("{err:#}").contains("no buckets"), "{err:#}");
-    }
-
-    /// BUCKETS AND RANGE BINDINGS ARE EXCLUSIVE PER DIM, BOTH ORDERS,
-    /// LOUDLY — and the range need not be tight. Both seed the same
-    /// `IntVar`'s `lower-bound-of` / `upper-bound-of`, which MERGE
-    /// (`max` / `min`) rather than error, so two seed sets on one dim
-    /// would silently INTERSECT: a bucket [5, 9] under a prior range
-    /// [2, 8] would be validated over [5, 8] while the plan claims 9.
-    #[test]
-    fn a_dim_cannot_be_both_range_bound_and_bucketed() {
-        use luminal::graph::DimBucket;
-
-        let graph = || {
-            let mut cx = Graph::new();
-            cx.set_dim('a', 3);
-            let x = cx.tensor(('a', 2), DType::F32);
-            let _out = x * x;
-            cx
-        };
-
-        // A NON-TIGHT range, then buckets: the case `dims` could not see.
-        let mut rt = ReferenceRuntime::load(&graph()).expect("records + loads");
-        rt.bind_dyn_range('a', 2, 8).expect("range binds");
-        let err = rt
-            .bind_dim_buckets('a', vec![DimBucket::new(5, 9)])
-            .expect_err("a range-bound dim must not take buckets");
-        assert!(
-            format!("{err:#}").contains("already carries a range binding [2, 8]"),
-            "{err:#}"
-        );
-
-        // A tight [n, n] pin is a range binding too.
-        let mut rt = ReferenceRuntime::load(&graph()).expect("records + loads");
-        rt.bind_dyn_range('a', 3, 3).expect("pin binds");
-        let err = rt
-            .bind_dim_buckets('a', vec![DimBucket::new(2, 4)])
-            .expect_err("a pinned dim must not take buckets");
-        assert!(
-            format!("{err:#}").contains("already carries a range binding [3, 3]"),
-            "{err:#}"
-        );
-
-        // And the other order.
-        let mut rt = ReferenceRuntime::load(&graph()).expect("records + loads");
-        rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4)])
-            .expect("buckets bind");
-        let err = rt
-            .bind_dyn_range('a', 2, 8)
-            .expect_err("a bucketed dim must not take a range binding");
-        assert!(format!("{err:#}").contains("has buckets bound"), "{err:#}");
     }
 }

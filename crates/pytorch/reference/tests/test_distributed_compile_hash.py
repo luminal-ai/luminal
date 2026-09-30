@@ -31,9 +31,7 @@ def _pt2(*, graph_id, op="aten.mm.default", constant=b"weight", archive_id=b"id"
 
 def test_pt2_digest_ignores_only_node_provenance_ids():
     def digest(program, *, options=None):
-        return _semantic_program_digest(
-            program, [((4, 4), "float32")], {}, options or {}
-        )
+        return _semantic_program_digest(program, [((4, 4), "float32")], options or {})
 
     first = digest(_pt2(graph_id=1, archive_id=b"one"))
     assert first == digest(_pt2(graph_id=2, archive_id=b"two"))

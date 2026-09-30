@@ -29,16 +29,11 @@ def luminal_backend(gm, example_inputs, options=None):
     return _backend(example_inputs).Compiler(**(options or {}))(gm, example_inputs)
 
 
-def compile_for_test(
-    model, examples, *, dynamic_shapes=None, dynamic_dim=None, **options
-):
+def compile_for_test(model, examples, *, dynamic_shapes=None, **options):
     """Internal PT2 translator harness; public API coverage uses Compiler directly."""
     from luminal_reference.export_utils import _drop_input_guards
 
     inputs = tuple(examples) if isinstance(examples, (tuple, list)) else (examples,)
-    if dynamic_dim is not None:
-        dims = (dynamic_dim,) if isinstance(dynamic_dim, int) else dynamic_dim
-        dynamic_shapes = ({dim: torch.export.Dim(f"dim_{dim}", min=2) for dim in dims},)
     program = torch.export.export(
         model,
         inputs,

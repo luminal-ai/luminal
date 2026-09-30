@@ -125,30 +125,26 @@ fn main() -> Result<()> {
         256,
         llm_chat::search::DEFAULT_PREFILL_CHUNK,
     )?;
-    let buckets = llm_chat::search::query_buckets(&graph);
+    let buckets = llm_chat::search::buckets(&graph)?;
     let bucket = &buckets[match args.phase {
         Phase::Decode => 0,
         Phase::Prefill => 1,
     }];
-    let query = bucket.representative_value();
+    let query = bucket.profile_dims()[&'q'.into()];
     let context = llm_chat::search::context_representative(&graph);
     let registry = cuda_registry();
     let registered: Vec<_> = registry.iter().map(|op| op.label().to_owned()).collect();
     let mut runtime = CudaRuntime::load_with(&graph.graph, bindings(&graph), registry)?;
-    runtime.bind_dyn_range('q', bucket.min as u64, bucket.max as u64)?;
-    runtime.bind_dyn_range('c', 1, graph.capacity as u64)?;
-    runtime.set_dim('q', query);
-    runtime.set_dim('c', context);
     eprintln!(
         "Searching {:?} {:?}: q={}..{}, representative q={query}, c={context}, generations={}, population={}",
         args.model,
         args.phase,
-        bucket.min,
-        bucket.max,
+        bucket.bounds().get(&'q'.into()).unwrap().min(),
+        bucket.bounds().get(&'q'.into()).unwrap().max(),
         args.search_generations,
         args.search_population
     );
-    let mut options = CompileOptions {
+    let options = CompileOptions {
         generations: args.search_generations,
         generation_size: args.search_population,
         seed: 0,
@@ -160,7 +156,7 @@ fn main() -> Result<()> {
     // to a saturation run and must not be joined across fresh assemblies.
     let mut egraph = args
         .audit_candidates
-        .then(|| runtime.saturated_egraph())
+        .then(|| runtime.saturated_egraph(bucket.bounds()))
         .transpose()?;
     let mut weights = checkpoint::load(&args.checkpoint, &graph.parameters)?;
     weights.extend(graph.initial_inputs());
@@ -193,40 +189,35 @@ fn main() -> Result<()> {
         let bound = bindings(&graph)
             .bind(&graph.graph.logical)
             .map_err(anyhow::Error::msg)?;
-        let residents = bound.residents();
         let program = SearchProgram {
             text: String::new(),
             inputs: bound.inputs.clone(),
             outputs: bound.outputs,
         };
-        options
-            .shapes
-            .bounds
-            .insert('q'.into(), (bucket.min, bucket.max));
-        options.shapes.bounds.insert('c'.into(), (1, 256));
-        options.shapes.values.insert('q'.into(), query);
-        options.shapes.values.insert('c'.into(), context);
+        let shapes = luminal_cuda_lite::symbolic::ShapeEnv {
+            bounds: bucket.bounds().ranges(),
+            values: bucket.profile_dims().clone(),
+        };
         let staged = bound
             .inputs
             .iter()
             .filter_map(|b| data.get(&b.value).map(|v| (b.buffer, v)))
             .collect();
-        let mut device = luminal_cuda_lite::device::CudaDevice::new(0)?;
+        let mut device = luminal_cuda_lite::device::CudaDevice::new(0)?.executable();
         search_implementations(
             egraph,
             &program,
+            &shapes,
             &options,
             Some(CudaRuntime::allow_list()),
             &luminal_cuda_lite::ops::cuda_matchers(),
             Evaluator::Device {
                 device: &mut device,
                 staged: &staged,
-                residents: &residents,
-                profile_inputs: &[],
             },
         )?
     } else {
-        runtime.search(&data, &options)?
+        runtime.search(bucket.bounds(), bucket.profile_dims(), &data, &options)?
     };
     let plan = if args.audit_candidates {
         &outcome.best_plan
@@ -276,7 +267,7 @@ fn main() -> Result<()> {
         "layers": text_config["num_hidden_layers"], "hidden_size": text_config["hidden_size"],
         "registered_ops": registered, "selected_counts": counts, "nodes": nodes,
         "search_seconds": search_seconds, "candidate_audit":audit,
-        "search_settings": {"phase":format!("{:?}", args.phase), "q_range": [bucket.min,bucket.max], "c_range": [1,256], "initial_q":query, "initial_c":context,
+        "search_settings": {"phase":format!("{:?}", args.phase), "q_range": [bucket.bounds().get(&'q'.into()).unwrap().min(),bucket.bounds().get(&'q'.into()).unwrap().max()], "c_range": [1,256], "initial_q":query, "initial_c":context,
             "generations":args.search_generations, "population":args.search_population, "seed":0, "ranking":"device_time"},
         "best_nanos": outcome.best_nanos.to_string(),
         "memory_pruning": {

@@ -1,5 +1,6 @@
 #![cfg(target_os = "macos")]
 
+mod support;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
@@ -8,9 +9,13 @@ use luminal_metal::CompileOptions;
 use luminal_metal::HostBuffer;
 use luminal_metal::MetalRuntime;
 use luminal_reference::TypedBuffer;
+#[cfg(target_os = "macos")]
+use support::TestTransfers;
 
-fn walked_dense(rt: &MetalRuntime, out: NodeIndex) -> Vec<f32> {
-    let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
+fn walked_dense(rt: &MetalRuntime, arena_rt: &support::Allocation, out: NodeIndex) -> Vec<f32> {
+    let (data, binding) = rt
+        .download(arena_rt, out)
+        .expect("escape-and-disclose fetch");
     let bytes = data
         .as_f32()
         .unwrap_or_else(|err| panic!("output is not f32: {err}"));
@@ -56,8 +61,14 @@ fn run_differential(
         .iter()
         .map(|(id, v)| (*id, v.clone().into()))
         .collect();
-    rt.search(&data, &view_search_options())
-        .expect("metal search");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &view_search_options(),
+    )
+    .expect("metal search");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
 
     let plan = rt.plan().expect("plan loaded");
     let mut folded_slots = 0usize;
@@ -89,10 +100,10 @@ fn run_differential(
     );
 
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone());
+        rt.upload(&mut arena_rt, *id, v.clone()).unwrap();
     }
-    rt.execute().expect("device execute");
-    let got = walked_dense(&rt, out);
+    rt.execute(arena_rt.buffer()).expect("device execute");
+    let got = walked_dense(&rt, &arena_rt, out);
     (want, got)
 }
 

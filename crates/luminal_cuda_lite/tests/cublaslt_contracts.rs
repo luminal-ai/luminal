@@ -20,17 +20,22 @@
 //!    `assert_close` for the reduction-order contract.
 #![cfg(feature = "device")]
 
+mod support;
 use cudarc::driver::{CudaContext, CudaSlice};
 use luminal::bufferize::BufferNode;
 use luminal::prelude::{DType, FxHashMap, NodeIndex};
 use luminal_cuda_lite::HostBuffer;
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 /// The universal escape-and-disclose readback (the device_fidelity
 /// pattern): fetch the backing bytes + binding, walk each output
 /// element through the disclosed layout. Dense elections walk the
 /// identity, view elections the composed chain.
-fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
-    let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
+fn walked_dense(rt: &CudaRuntime, arena_rt: &support::Allocation, out: NodeIndex) -> Vec<f32> {
+    let (data, binding) = rt
+        .download(arena_rt, out)
+        .expect("escape-and-disclose fetch");
     let bytes = data
         .as_f32()
         .unwrap_or_else(|err| panic!("output is not f32: {err}"));
@@ -426,8 +431,13 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
         // BEFORE THE FIX this call is where whisper died: every genome
         // carrying the bias form was refused at prepare, so the search
         // reported "no candidate genome produced an executable plan".
-        rt.search(&data_for(x, w, b), &options)
-            .unwrap_or_else(|e| panic!("DEGENERATE-D seed {seed}: fused search: {e:#}"));
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data_for(x, w, b),
+            &options,
+        )
+        .unwrap_or_else(|e| panic!("DEGENERATE-D seed {seed}: fused search: {e:#}"));
         let elected_bias = rt.plan().expect("plan").dag.node_weights().any(|n| {
             matches!(n, BufferNode::Compute { op, .. }
                 if op.label().starts_with("CublasLt") && op.label().contains("Bias"))
@@ -446,13 +456,17 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
          binding at all",
     );
     println!("DEGENERATE-D: executing the plan searched at seed {seed}");
-    fused.set_data(x, weights(STATE, 1)).unwrap();
-    fused.set_data(w, weights(STATE * STATE, 2)).unwrap();
-    fused.set_data(b, weights(STATE, 3)).unwrap();
+    let mut arena = support::allocate_arena(&fused).unwrap();
+    fused.upload(&mut arena, x, weights(STATE, 1)).unwrap();
     fused
-        .execute()
+        .upload(&mut arena, w, weights(STATE * STATE, 2))
+        .unwrap();
+    fused.upload(&mut arena, b, weights(STATE, 3)).unwrap();
+    let mut staging_arena = fused.allocate_staging().unwrap();
+    fused
+        .execute(arena.arena(), &mut staging_arena)
         .expect("fused execute (bias epilogue under a degenerate COL D)");
-    let got = walked_dense(&fused, out);
+    let got = walked_dense(&fused, &arena, out);
 
     // THE DECOMPOSED ROUTE ON PURPOSE (the default registry carries the
     // marker since 2026-09-04, so this side asks for the plain one).
@@ -462,15 +476,27 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
             .expect("load plain");
     plain
         .search(
+            &Default::default(),
+            &Default::default(),
             &data_for(x, w, b),
             &luminal_cuda_lite::harness_search_options(),
         )
         .expect("plain search");
-    plain.set_data(x, weights(STATE, 1)).unwrap();
-    plain.set_data(w, weights(STATE * STATE, 2)).unwrap();
-    plain.set_data(b, weights(STATE, 3)).unwrap();
-    plain.execute().expect("plain execute");
-    let want = walked_dense(&plain, out);
+    let mut arena_plain = support::allocate_arena(&plain).expect("allocate execution arena");
+    let mut staging_arena_plain = plain.allocate_staging().expect("allocate execution arena");
+    plain
+        .upload(&mut arena_plain, x, weights(STATE, 1))
+        .unwrap();
+    plain
+        .upload(&mut arena_plain, w, weights(STATE * STATE, 2))
+        .unwrap();
+    plain
+        .upload(&mut arena_plain, b, weights(STATE, 3))
+        .unwrap();
+    plain
+        .execute(arena_plain.arena(), &mut staging_arena_plain)
+        .expect("plain execute");
+    let want = walked_dense(&plain, &arena_plain, out);
 
     assert_close(&want, &got, "marker(bias) vs decomposed 1x384x384 + b[384]");
 }
@@ -516,7 +542,11 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
     )
     .expect("load fused");
     let data = data_for(a.id, b.id);
-    fused.search(&data, &options).expect("fused search");
+    fused
+        .search(&Default::default(), &Default::default(), &data, &options)
+        .expect("fused search");
+    let mut arena_fused = support::allocate_arena(&fused).expect("allocate execution arena");
+    let mut staging_arena_fused = fused.allocate_staging().expect("allocate execution arena");
     let elected =
         fused.plan().expect("plan").dag.node_weights().any(
             |n| matches!(n, BufferNode::Compute { op, .. } if op.label().starts_with("CublasLt")),
@@ -525,13 +555,19 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
         elected,
         "the fused route must actually elect the marker for this comparison"
     );
-    fused.set_data(a.id, weights(32, 1)).unwrap();
-    fused.set_data(b.id, weights(24, 2)).unwrap();
-    fused.execute().expect("fused execute");
+    fused
+        .upload(&mut arena_fused, a.id, weights(32, 1))
+        .unwrap();
+    fused
+        .upload(&mut arena_fused, b.id, weights(24, 2))
+        .unwrap();
+    fused
+        .execute(arena_fused.arena(), &mut staging_arena_fused)
+        .expect("fused execute");
     // The marker-elected output is the sandwich's sibling VIEW — it
     // escapes with a composed layout, so the honest readback walks the
     // disclosed layout (get_f32 refuses non-row-major backings by design).
-    let got = walked_dense(&fused, out.id);
+    let got = walked_dense(&fused, &arena_fused, out.id);
 
     // Decomposed route ON PURPOSE — the registry with no marker in the
     // assembly. (The DEFAULT registry carries the marker since
@@ -543,12 +579,25 @@ fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
             .expect("load plain");
     let data = data_for(a.id, b.id);
     plain
-        .search(&data, &luminal_cuda_lite::harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &luminal_cuda_lite::harness_search_options(),
+        )
         .expect("plain search");
-    plain.set_data(a.id, weights(32, 1)).unwrap();
-    plain.set_data(b.id, weights(24, 2)).unwrap();
-    plain.execute().expect("plain execute");
-    let want = walked_dense(&plain, out.id);
+    let mut arena_plain = support::allocate_arena(&plain).expect("allocate execution arena");
+    let mut staging_arena_plain = plain.allocate_staging().expect("allocate execution arena");
+    plain
+        .upload(&mut arena_plain, a.id, weights(32, 1))
+        .unwrap();
+    plain
+        .upload(&mut arena_plain, b.id, weights(24, 2))
+        .unwrap();
+    plain
+        .execute(arena_plain.arena(), &mut staging_arena_plain)
+        .expect("plain execute");
+    let want = walked_dense(&plain, &arena_plain, out.id);
 
     // TOLERANCE-BASED, never bit-equality (reduction-order contract).
     assert_close(&want, &got, "marker vs decomposed 4x8x3");

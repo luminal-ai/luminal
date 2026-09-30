@@ -30,16 +30,9 @@ fn run_f32(
     inputs: &[(&str, Vec<f32>)],
 ) -> Vec<Vec<f32>> {
     let mut runtime = ReferenceRuntime::load(&t.graph).expect("load");
-    for (symbol, hint) in &t.dims {
-        // The reference planner needs a literal span: pin each dynamic dim to
-        // the exported hint (a [n, n] range is a pin).
-        runtime
-            .bind_dyn_range(*symbol, *hint as u64, *hint as u64)
-            .expect("bind dyn range");
-        runtime.set_dim(*symbol, *hint);
-    }
+    let mut dims: luminal::shape::DynMap = t.dims.iter().map(|(s, v)| (*s, *v)).collect();
     for (symbol, value) in dim_overrides {
-        runtime.set_dim(*symbol, *value);
+        dims.insert(*symbol, *value);
     }
 
     // `search` prices candidates with the staged data; `set_data` is only
@@ -54,7 +47,14 @@ fn run_f32(
         data.insert(input.tensor, TypedBuffer::F32(values.clone()));
     }
     let options = harness_search_options();
-    runtime.search(&data, &options).expect("search");
+    runtime
+        .search(
+            &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+            &dims,
+            &data,
+            &options,
+        )
+        .expect("search");
     for (name, values) in inputs {
         let input = t.inputs.iter().find(|i| &i.graph_name == name).unwrap();
         runtime.set_data(input.tensor, TypedBuffer::F32(values.clone()));

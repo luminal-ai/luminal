@@ -238,11 +238,6 @@ pub(crate) fn copy_params(src: u64, dst: u64, bytes: usize, kind: CopyKind) -> c
             p.srcHost = src as *const _;
             p.srcDevice = 0;
         }
-        CopyKind::DtoH => {
-            p.dstMemoryType = cu::CUmemorytype::CU_MEMORYTYPE_HOST;
-            p.dstHost = dst as *mut _;
-            p.dstDevice = 0;
-        }
         CopyKind::DtoD => {}
     }
     p
@@ -250,12 +245,11 @@ pub(crate) fn copy_params(src: u64, dst: u64, bytes: usize, kind: CopyKind) -> c
 #[derive(Clone, Copy)]
 pub(crate) enum CopyKind {
     HtoD,
-    DtoH,
     DtoD,
 }
 
-/// A bucket's view into the runtime's shared pinned staging allocation.
-/// The runtime serializes launches and completes readback before reusing it.
+/// A program's view into caller-owned pinned staging memory.
+/// Synchronous launches complete before this storage is reused.
 pub(crate) trait PinnedRange {
     fn ptr(self, staging: &Pinned) -> u64;
     fn bytes(self, staging: &Pinned) -> &[u8];

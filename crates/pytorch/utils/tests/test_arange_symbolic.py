@@ -48,7 +48,10 @@ def test_whisper_position_embedding_changes_with_sequence_length():
     torch.manual_seed(19)
     model = Model().eval()
     compiled = compile_for_test(
-        model, torch.zeros(2, dtype=torch.int64), search_iterations=1, dynamic_dim=0
+        model,
+        torch.zeros(2, dtype=torch.int64),
+        search_iterations=1,
+        dynamic_shapes=({0: torch.export.Dim("length", min=2, max=448)},),
     )
     for length in (2, 3, 7):
         tokens = torch.zeros(length, dtype=torch.int64)
@@ -66,7 +69,10 @@ def test_whisper_causal_mask_changes_with_sequence_length():
 
     model = Model()
     compiled = compile_for_test(
-        model, torch.zeros(2, dtype=torch.int64), search_iterations=1, dynamic_dim=0
+        model,
+        torch.zeros(2, dtype=torch.int64),
+        search_iterations=1,
+        dynamic_shapes=({0: torch.export.Dim("length", min=2, max=448)},),
     )
     for length in (2, 3, 7):
         tokens = torch.zeros(length, dtype=torch.int64)

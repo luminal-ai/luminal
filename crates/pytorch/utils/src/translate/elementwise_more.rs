@@ -495,17 +495,17 @@ mod tests {
         let parsed = program(target, args, dtype, shape, shape);
         let translation = crate::translate::translate(&parsed).expect("translate");
         let mut runtime = ReferenceRuntime::load(&translation.graph).expect("load");
-        for (symbol, hint) in &translation.dims {
-            runtime
-                .bind_dyn_range(*symbol, *hint as u64, *hint as u64)
-                .expect("bind dyn range");
-            runtime.set_dim(*symbol, *hint);
-        }
+        let dims: luminal::shape::DynMap = translation.dims.iter().map(|(s, v)| (*s, *v)).collect();
         let input = &translation.inputs[0];
         let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
         data.insert(input.tensor, TypedBuffer::F32(x.to_vec()));
         runtime
-            .search(&data, &harness_search_options())
+            .search(
+                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &dims,
+                &data,
+                &harness_search_options(),
+            )
             .expect("search");
         runtime.set_data(input.tensor, TypedBuffer::F32(x.to_vec()));
         runtime.execute().expect("execute");

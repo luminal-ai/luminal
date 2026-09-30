@@ -174,7 +174,9 @@ fn op_lit_outputs(egraph: &EGraph) -> Vec<(ClassId, Vec<ClassId>)> {
 fn cleanup_marks_exactly_the_ops_that_produce_an_input_layout_tensor() {
     let (cx, _a, _b) = marker_matmul();
     let rt = CudaRuntime::load(&cx).expect("load");
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
 
     let marked = input_producer_ops(&egraph);
     let lits = op_lit_outputs(&egraph);
@@ -265,7 +267,9 @@ fn cleanup_marks_exactly_the_ops_that_produce_an_input_layout_tensor() {
 fn marked_ops_produce_only_input_terminals() {
     let (cx, _a, _b) = marker_matmul();
     let rt = CudaRuntime::load(&cx).expect("load");
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
 
     let marked = input_producer_ops(&egraph);
     assert!(
@@ -292,7 +296,9 @@ fn marked_ops_produce_only_input_terminals() {
 fn the_producer_index_offers_no_producer_for_an_input_terminal() {
     let (cx, _a, _b) = marker_matmul();
     let rt = CudaRuntime::load(&cx).expect("load");
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
 
     let index = luminal_cuda_lite::extractor::producer_index_with_matchers(
         &egraph,
@@ -358,7 +364,7 @@ fn sampled_genomes_never_hand_bufferize_a_cyclic_graph() {
                 .collect();
         let mut options = luminal_cuda_lite::harness_search_options();
         options.seed = seed;
-        match rt.search(&data, &options) {
+        match rt.search(&Default::default(), &Default::default(), &data, &options) {
             Ok(outcome) => {
                 let breakdown = &outcome.refusal_breakdown;
                 bufferize_refusals += breakdown.plan_build_refusals;
@@ -521,7 +527,9 @@ fn subsumed_ops(egraph: &EGraph) -> BTreeMap<String, usize> {
 fn named_input_keeps_its_name_bearing_spellings() {
     let cx = named_marker_matmul();
     let rt = CudaRuntime::load(&cx).expect("load");
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
 
     // ---- (a) the name-bearing spellings are present and LIVE. ----
     let spellings = name_bearing_spellings(&egraph);

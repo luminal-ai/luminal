@@ -1,48 +1,6 @@
-//! FINALISTS — the ranked genomes of ONE bucket, re-materialized lazily
-//! under a hard filter.
-//!
-//! PHASE 5 OF THE #420/#422 REJOIN (2026-09-03), the "then add" half of
-//! Austin's D8 (*"defer temporarily, but then add"*): Phase 4 landed the
-//! device evaluator and explicitly deferred main's `Finalists` /
-//! `BucketLattice` pair. This is that pair, re-expressed for this
-//! branch.
-//!
-//! # What a finalist is, and why the GA's winner is not simply installed
-//!
-//! The genetic search ([`crate::search::search_implementations`]) ranks
-//! candidates and today hands back exactly one — the fastest. That is
-//! enough while nothing can REFUSE the winner after the fact. The moment
-//! a constraint applies to the INSTALLED plan rather than to a candidate
-//! in isolation — a device budget the serving slab must fit inside, a
-//! warmup that has to survive — the search needs a runner-up to fall
-//! back to, and the one after that.
-//!
-//! So the GA now keeps a RANKED LIST (`CompileOptions::keep_finalists`,
-//! default 4) of `(metric, Genome)` pairs, fastest first, and this type
-//! turns them into deployment plans ONE AT A TIME. Rank k is extracted,
-//! DPS-rewritten, layout-decoded, bufferized and arena-planned only when
-//! the selection actually reaches it (main's own words: "extract a full
-//! graph only when the selection reaches its rank"). A refusal at ANY of
-//! those steps is a rejection with a recorded reason, and the walk moves
-//! to rank k+1.
-//!
-//! # The hard filter
-//!
-//! `ensure(target, validate)` is the door. `validate` is the RUNTIME's
-//! (see [`crate::search::finalist_validate`]): it runs one warmup execution
-//! of the candidate plan on the device before installation.
-//!
-//! # What is NOT here (main's version, minus LLIR)
-//!
-//! Main's `Finalists` carries `pre_unroll` graphs, the `LLIR_DUMP_DIR` /
-//! `LLIR_DUMP_PRE_UNROLL` dump machinery, and a `search_time_limit` /
-//! `candidate_timeout` clock over the finalization itself. This branch
-//! has no LLIR and no loop unrolling, so the dumps and the pre-unroll
-//! field have nothing to dump; and its one timeout
-//! (`CompileOptions::candidate_timeout`) is documented to cover a TIMED
-//! DEVICE RUN and nothing else (Phase 4's ruling, *"timeout should just
-//! cover run"*), so it is not re-purposed here as a finalization budget.
-//! Re-extraction on this branch is a host-side graph walk, not a search.
+//! Lazily materialize and validate one program's ranked candidates.
+//! A rejected candidate advances the walk to the next measured rank. Selection
+//! applies this program's memory budget and validates through the serving path.
 
 use anyhow::Result;
 
@@ -65,46 +23,21 @@ pub struct PendingFinalist {
     pub genome: Genome,
     pub plan: CudaPlan,
     /// The arena plan for `plan` — the issue order and the slab layout.
-    /// `slab_bytes` is what the aggregate device-budget check reads.
+    /// `slab_bytes` is what the program device-budget check reads.
     pub arena: ArenaPlan,
     pub shapes: crate::symbolic::ShapeEnv,
 }
 
-#[cfg(test)]
-impl PendingFinalist {
-    /// TEST-ONLY: a finalist with an empty plan and only the numbers the
-    /// lattice reads.
-    pub(crate) fn synthetic(rank: usize, metric: u128, slab_bytes: usize) -> Self {
-        Self {
-            rank,
-            metric,
-            genome: Genome::default(),
-            plan: CudaPlan {
-                dag: Default::default(),
-                buffers: Default::default(),
-                value_buffer: Default::default(),
-                outputs: Default::default(),
-            },
-            arena: ArenaPlan {
-                slab_bytes,
-                ..Default::default()
-            },
-            shapes: Default::default(),
-        }
-    }
-}
-
-/// The ranked finalists of one bucket, materialized lazily.
+/// The ranked finalists of one program, materialized lazily.
 pub struct Finalists<'a> {
     shapes: crate::symbolic::ShapeEnv,
-    /// THE RUNTIME'S PLACEMENT STATEMENT: which boundary buffers the arena
-    /// keeps between executions and which are the caller's own device memory.
-    /// A finalist's `slab_bytes` is what the aggregate device budget is
+    /// Which boundary buffers use the supplied arena and which use separate
+    /// caller-owned device allocations.
+    /// A finalist's `slab_bytes` is what the program device budget is
     /// checked against, so it must be planned under the same statement the
-    /// installed plan is (see `storage::plan_resident`).
-    bindings: crate::resident::ResidentBindings,
-    /// How this bucket names itself in a failure message (`"bucket 0
-    /// (a in [2, 4])"`, or `"the search"` when unbucketed).
+    /// installed plan is (see `storage::plan_storage`).
+    bindings: std::collections::BTreeSet<i64>,
+    /// Program label used in refusal messages.
     label: String,
     egraph: &'a egraph_serialize::EGraph,
     /// The extraction session, built ON FIRST USE. Constructing one runs
@@ -130,8 +63,7 @@ pub struct Finalists<'a> {
     ranked: Vec<(u128, Genome)>,
     /// How far down `ranked` [`Finalists::extract_next`] has walked.
     next_ranked: usize,
-    /// The VIABLE finalists, in rank order — the lattice indexes into
-    /// this.
+    /// The viable finalists, in rank order.
     accepted: Vec<PendingFinalist>,
     rejections: usize,
     last_rejection: Option<String>,
@@ -142,7 +74,7 @@ pub struct Finalists<'a> {
 }
 
 impl<'a> Finalists<'a> {
-    /// Build the finalist walk for one bucket.
+    /// Build the finalist walk for one program.
     ///
     /// `winner_plan` is the plan the genetic search already built for
     /// `ranked[0]` — pass it, and rank 1 costs one arena plan instead of
@@ -177,34 +109,17 @@ impl<'a> Finalists<'a> {
         }
     }
 
-    /// TEST-ONLY: a bucket whose finalists are given outright as
-    /// `(metric, slab_bytes)` pairs, fastest first, with empty plans —
-    /// what the lattice unit tests walk over, so their preconditions hold
-    /// by construction.
-    #[cfg(test)]
-    pub(crate) fn synthetic(
-        label: impl Into<String>,
-        egraph: &'a egraph_serialize::EGraph,
-        ranked: &[(u128, usize)],
-    ) -> Self {
-        let mut bucket = Self::new(label, egraph, None, &[], Vec::new(), None);
-        for (offset, (metric, slab_bytes)) in ranked.iter().enumerate() {
-            bucket.accept(PendingFinalist::synthetic(offset + 1, *metric, *slab_bytes));
-        }
-        bucket
-    }
-
     pub fn with_shapes(mut self, shapes: crate::symbolic::ShapeEnv) -> Self {
         self.shapes = shapes;
         self
     }
 
-    pub fn with_resident_bindings(mut self, bindings: crate::resident::ResidentBindings) -> Self {
+    pub fn with_external_bindings(mut self, bindings: std::collections::BTreeSet<i64>) -> Self {
         self.bindings = bindings;
         self
     }
 
-    /// This bucket's label, as failure messages spell it.
+    /// This program's label, as failure messages spell it.
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -270,7 +185,7 @@ impl<'a> Finalists<'a> {
                 self.build_plan(genome)?
             }
         };
-        let arena = crate::storage::plan_resident(&plan, &self.shapes.bounds, &self.bindings)
+        let arena = crate::storage::plan_storage(&plan, &self.shapes.bounds, &self.bindings)
             .map_err(|err| format!("arena: {err:#}"))?;
         Ok(PendingFinalist {
             shapes: self.shapes.clone(),
@@ -331,7 +246,7 @@ impl<'a> Finalists<'a> {
 
     /// MATERIALIZE DOWN TO `target`: keep extracting and validating
     /// until `accepted[target]` exists. Returns false when the ranked
-    /// list runs out first — which is what makes a lattice coordinate
+    /// list runs out first — which makes a candidate index
     /// "cannot go one step slower".
     ///
     /// `validate` is the hard filter; an `Err(reason)` rejects the
@@ -353,8 +268,7 @@ impl<'a> Finalists<'a> {
         true
     }
 
-    /// Why this bucket could supply no further finalist — the text the
-    /// lattice quotes into its own failure message.
+    /// Why this program could supply no further finalist.
     pub fn failure_message(&self) -> String {
         match &self.last_rejection {
             Some(reason) => format!(
@@ -378,5 +292,48 @@ impl<'a> Finalists<'a> {
             return None;
         }
         Some(self.accepted.swap_remove(index))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use luminal::prelude::*;
+
+    #[test]
+    fn advances_to_next_rank_when_final_validation_refuses() {
+        let mut graph = Graph::new();
+        let x = graph.tensor(4, DType::F32);
+        let _ = x + 1.;
+        let runtime = crate::CudaRuntime::load(&graph).unwrap();
+        let egraph = runtime.saturated_egraph(&Default::default()).unwrap();
+        let matchers = crate::ops::cuda_matchers();
+        let session = extractor::ExtractionSession::new_with_matcher_set(&egraph, None, &matchers);
+        let index = session.producer_index();
+        let space = session.sampling_space(&index);
+        let (genome, _) = luminal::search_support::sample_genome_with_seed(&index, &space, 0);
+        let mut finalists = Finalists::new(
+            "program",
+            &egraph,
+            None,
+            &matchers,
+            vec![(10, genome.clone()), (20, genome)],
+            None,
+        );
+        let mut visited = Vec::new();
+        assert!(finalists.ensure(0, &mut |candidate| {
+            visited.push(candidate.rank);
+            if candidate.rank == 1 {
+                Err("first candidate failed warmup".into())
+            } else {
+                Ok(())
+            }
+        }));
+        assert_eq!(visited, vec![1, 2]);
+        assert_eq!(finalists.rejections(), 1);
+        let selected = finalists.take(0).unwrap();
+        assert_eq!(selected.rank, 2);
+        assert_eq!(selected.metric, 20);
+        assert!(selected.plan.dag.node_count() > 0);
     }
 }

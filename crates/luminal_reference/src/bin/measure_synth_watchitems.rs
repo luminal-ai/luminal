@@ -71,7 +71,12 @@ fn measure_plan(
         let data = pairs.iter().cloned().collect();
         let t = Instant::now();
         let outcome = rt
-            .search(&data, &luminal_reference::harness_search_options())
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &luminal_reference::harness_search_options(),
+            )
             .expect("search finds a plan");
         let search_ms = t.elapsed().as_millis();
         println!(

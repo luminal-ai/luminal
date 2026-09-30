@@ -32,6 +32,7 @@
 //!     but denotes the wrong number shows up in the readback bits.
 #![cfg(feature = "device")]
 
+mod support;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
@@ -39,6 +40,8 @@ use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::HostBuffer;
 use luminal_cuda_lite::ops::constant::ConstantDps;
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 /// Read the device output DENSELY through its RETURNED LAYOUT
 /// (escape-and-disclose, 2026-08-31) — the same universal readback
@@ -47,8 +50,10 @@ use luminal_cuda_lite::ops::constant::ConstantDps;
 /// evaluates to the same backing element at every coordinate. Either
 /// way the caller sees the value at each output coordinate, which is
 /// what these assertions are about.
-fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
-    let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
+fn walked_dense(rt: &CudaRuntime, arena_rt: &support::Allocation, out: NodeIndex) -> Vec<f32> {
+    let (data, binding) = rt
+        .download(arena_rt, out)
+        .expect("escape-and-disclose fetch");
     let bytes = data
         .as_f32()
         .unwrap_or_else(|err| panic!("output is not f32: {err}"));
@@ -106,15 +111,22 @@ fn run_on_device(
         .iter()
         .map(|(id, v)| (*id, v.clone().into()))
         .collect();
-    rt.search(&data, &luminal_cuda_lite::harness_search_options())
-        .expect("cuda search");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &luminal_cuda_lite::harness_search_options(),
+    )
+    .expect("cuda search");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     assert_constant_reaches_the_device(&rt, expected_constant, what);
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone()).unwrap();
+        rt.upload(&mut arena_rt, *id, v.clone()).unwrap();
     }
-    rt.execute()
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt)
         .expect("device execute (NVRTC compiles the constant kernel here)");
-    walked_dense(&rt, out)
+    walked_dense(&rt, &arena_rt, out)
 }
 
 /// `zeros + broadcast(constant(value))` over 8 elements. Adding a

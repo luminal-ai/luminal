@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
-use luminal::prelude::{DType, DimBucket, DynMap, IntExpr, NodeIndex, Symbol};
+use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
 use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
 use luminal_reference::{CompileOptions, ReferenceBindings, ReferenceRuntime, TypedBuffer};
@@ -17,7 +17,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
 
-type BucketSpecs = HashMap<String, Vec<(usize, usize, usize)>>;
+use luminal::shape::DimensionBounds;
 
 fn to_py(err: anyhow::Error) -> PyErr {
     if let Some(py_err) = err.chain().find_map(|cause| cause.downcast_ref::<PyErr>()) {
@@ -73,7 +73,7 @@ fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
 /// A compiled reference-backend graph with its boundary tables.
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
-    translation: Translation,
+    translation: std::rc::Rc<Translation>,
     runtime: ReferenceRuntime,
     /// The buffer each output was bound on, parallel to
     /// `translation.outputs`.
@@ -87,8 +87,7 @@ pub struct CompiledGraph {
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
     dims: DynMap,
-    dim_bounds: HashMap<String, (usize, usize)>,
-    buckets: BucketSpecs,
+    bounds: DimensionBounds,
 }
 
 /// Solve a boundary extent `a * symbol + b = value` exactly. Never bind
@@ -158,25 +157,26 @@ fn resolve_shape(shape: &[IntExpr], dims: &DynMap) -> Vec<usize> {
         .collect()
 }
 
-/// A zero-filled buffer of `dtype` with `elements` entries. Used only to
-/// profile a symbolic bucket at its representative; the values are irrelevant
-/// to the search.
-fn zero_buffer(dtype: DType, elements: usize) -> TypedBuffer {
-    match dtype {
-        DType::F32 => TypedBuffer::F32(vec![0.0; elements]),
-        DType::F64 => TypedBuffer::F64(vec![0.0; elements]),
-        DType::Int => TypedBuffer::I32(vec![0; elements]),
-        DType::I64 => TypedBuffer::I64(vec![0; elements]),
-        DType::I8 => TypedBuffer::I8(vec![0; elements]),
-        DType::U8 => TypedBuffer::U8(vec![0; elements]),
-        DType::I16 => TypedBuffer::I16(vec![0; elements]),
-        DType::Bool => TypedBuffer::bool8(vec![0; elements]).expect("zero bool8 is well-formed"),
-        other => panic!("reference backend has no zero buffer for {other:?}"),
-    }
-}
-
 #[pymethods]
 impl CompiledGraph {
+    /// A new binding of the selected program, with no native compilation.
+    fn fork(&self) -> PyResult<Self> {
+        if !self.searched {
+            return Err(PyRuntimeError::new_err("search before fork"));
+        }
+        Ok(Self {
+            translation: self.translation.clone(),
+            runtime: self.runtime.fork().map_err(to_py)?,
+            output_buffers: self.output_buffers.clone(),
+            shared_outputs: self.shared_outputs.clone(),
+            staged: HashMap::new(),
+            dirty: HashSet::new(),
+            dims: self.dims.clone(),
+            bounds: self.bounds.clone(),
+            searched: true,
+        })
+    }
+
     #[getter]
     fn input_names(&self) -> Vec<String> {
         self.translation
@@ -303,8 +303,7 @@ impl CompiledGraph {
         };
         for (value, symbol) in bindings {
             self.dims.insert(symbol, value);
-            // Before search the bucket/range binding owns the dims; setting
-            // them now would make `bind_dim_buckets` refuse as "already set".
+            // Before search these are profiling values; afterward they are execution values.
             if self.searched {
                 self.runtime.set_dim(symbol, value);
             }
@@ -316,10 +315,8 @@ impl CompiledGraph {
     }
 
     /// Override a dynamic dimension's value before `search`, by PT2 symbol
-    /// name (e.g. `"s77"`). The value becomes the dim's bucket
-    /// representative, so it steers the searched plan without narrowing the
-    /// bucket. Hints are seeded at compile time, so static graphs need no
-    /// call.
+    /// name (e.g. `"s77"`). This selects the profiling shape without narrowing
+    /// the exported domain. Static graphs need no call.
     fn set_dim(&mut self, name: &str, value: usize) -> PyResult<()> {
         if self.searched {
             return Err(PyRuntimeError::new_err(
@@ -332,8 +329,7 @@ impl CompiledGraph {
             .get(name)
             .copied()
             .ok_or_else(|| PyRuntimeError::new_err(format!("unknown dim symbol {name:?}")))?;
-        // The bucket binding owns the runtime's dims until `search` runs;
-        // recording the value here is what reaches it.
+        // Search receives the profiling assignment independently of the bounds.
         self.dims.insert(symbol, value);
         Ok(())
     }
@@ -356,11 +352,21 @@ impl CompiledGraph {
     }
 
     #[getter]
-    fn dim_buckets(&self) -> BucketSpecs {
-        self.buckets.clone()
+    fn dim_bounds(&self) -> HashMap<String, (usize, usize)> {
+        self.translation
+            .symbols
+            .iter()
+            .map(|(name, symbol)| {
+                let range = self
+                    .bounds
+                    .get(symbol)
+                    .expect("translated dimension bounds");
+                (name.clone(), (range.min(), range.max()))
+            })
+            .collect()
     }
 
-    /// The elected reference plans, including all dynamic-shape buckets.
+    /// The selected reference program and its declared dimension bounds.
     fn serialize_compiled(&self) -> PyResult<Vec<u8>> {
         if !self.searched {
             return Err(PyRuntimeError::new_err(
@@ -427,45 +433,16 @@ impl CompiledGraph {
     }
 
     /// Saturate and search. Every input must be staged first.
-    #[pyo3(signature = (generations = None, *, max_intermediate_bytes = None, memory_budget_bytes = None, search_log = false, dim_buckets = None))]
+    #[pyo3(signature = (generations = None, *, max_intermediate_bytes = None, memory_budget_bytes = None, search_log = false))]
     fn search(
         &mut self,
         generations: Option<usize>,
         max_intermediate_bytes: Option<usize>,
         memory_budget_bytes: Option<usize>,
         search_log: bool,
-        dim_buckets: Option<BucketSpecs>,
     ) -> PyResult<()> {
         if self.searched {
             return Err(PyRuntimeError::new_err("search() already completed"));
-        }
-        let supplied = dim_buckets.unwrap_or_default();
-        for name in supplied.keys() {
-            if !self.translation.symbols.contains_key(name) {
-                return Err(PyRuntimeError::new_err(format!(
-                    "unknown bucket dimension {name}"
-                )));
-            }
-        }
-        let mut resolved = HashMap::new();
-        for (name, symbol) in &self.translation.symbols {
-            let (lo, hi) = self.dim_bounds[name];
-            let hint = self.dims[symbol].clamp(lo, hi);
-            let entries = supplied
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| vec![(lo, hi, hint)]);
-            if entries.is_empty()
-                || entries
-                    .iter()
-                    .any(|&(a, b, r)| a < lo || b > hi || a > b || r < a || r > b)
-                || entries.windows(2).any(|pair| pair[0].1 >= pair[1].0)
-            {
-                return Err(PyRuntimeError::new_err(format!(
-                    "invalid buckets for {name} within exported bounds [{lo}, {hi}]"
-                )));
-            }
-            resolved.insert(name.clone(), entries);
         }
         let data: FxHashMap<_, _> = self
             .translation
@@ -491,98 +468,16 @@ impl CompiledGraph {
             options.memory_budget_bytes = bytes;
         }
         options.search_log = search_log;
-        let search = || {
-            if self.dims.is_empty() {
-                // Static program: one concrete plan at the exported shapes.
-                self.runtime.search(&data, &options).map_err(to_py)?;
-            } else {
-                // Search each Cartesian combination of buckets. Winning plans
-                // keep symbolic spans, so every later call
-                // whose dims fall in the bucket re-renders without re-searching.
-                for (name, entries) in &resolved {
-                    let symbol = self.translation.symbols[name];
-                    let buckets = entries
-                        .iter()
-                        .map(|&(lo, hi, representative)| {
-                            DimBucket::new(lo, hi).representative(representative)
-                        })
-                        .collect();
-                    self.runtime
-                        .bind_dim_buckets(symbol, buckets)
-                        .map_err(to_py)?;
-                }
-                let inputs_meta: Vec<(NodeIndex, DType, Vec<IntExpr>)> = self
-                    .translation
-                    .inputs
-                    .iter()
-                    .map(|input| (input.tensor, input.dtype, input.shape.clone()))
-                    .collect();
-                // Refuse oversized profiling inputs before allocating any bucket's
-                // synthetic data. Search's runtime budget protects later intermediates.
-                let dimensions: Vec<_> = resolved.iter().collect();
-                let combinations = dimensions.iter().try_fold(1usize, |n, (_, b)| {
-                    n.checked_mul(b.len())
-                        .ok_or_else(|| PyRuntimeError::new_err("bucket combination count overflow"))
-                })?;
-                for combination in 0..combinations {
-                    let mut remainder = combination;
-                    let mut representative = self.dims.clone();
-                    for (name, entries) in &dimensions {
-                        let entry = entries[remainder % entries.len()];
-                        remainder /= entries.len();
-                        representative.insert(self.translation.symbols[*name], entry.2);
-                    }
-                    let mut bytes = 0usize;
-                    for (_, dtype, shape) in &inputs_meta {
-                        let elements = shape.iter().try_fold(1usize, |n, dim| {
-                            let extent = dim.exec(&representative).ok_or_else(|| {
-                                PyRuntimeError::new_err("unresolved bucket input extent")
-                            })?;
-                            n.checked_mul(extent).ok_or_else(|| {
-                                PyRuntimeError::new_err("bucket input size overflow")
-                            })
-                        })?;
-                        bytes = elements
-                            .checked_mul(dtype.bits().div_ceil(8))
-                            .and_then(|n| bytes.checked_add(n))
-                            .ok_or_else(|| {
-                                PyRuntimeError::new_err("bucket input byte size overflow")
-                            })?;
-                    }
-                    if bytes > options.memory_budget_bytes {
-                        return Err(PyRuntimeError::new_err(format!(
-                            "bucket profiling inputs require {bytes} bytes, exceeding live memory budget {}",
-                            options.memory_budget_bytes
-                        )));
-                    }
-                }
-                let data_for = move |representative: &DynMap| {
-                    inputs_meta
-                        .iter()
-                        .map(|(tensor, dtype, shape)| {
-                            let elements = shape
-                                .iter()
-                                .map(|dim| {
-                                    dim.exec(representative)
-                                        .or_else(|| dim.to_usize())
-                                        .unwrap_or(0)
-                                })
-                                .product();
-                            (*tensor, zero_buffer(*dtype, elements))
-                        })
-                        .collect()
-                };
-                self.runtime
-                    .search_buckets(data_for, &options)
-                    .map_err(to_py)?;
-            }
+        let search = || -> PyResult<()> {
+            self.runtime
+                .search(&self.bounds, &self.dims, &data, &options)
+                .map_err(to_py)?;
             Ok(())
         };
         luminal_reference::search::with_interrupt_check(
             || Python::attach(|py| py.check_signals().map_err(anyhow::Error::from)),
             search,
         )?;
-        self.buckets = resolved;
         self.searched = true;
         Ok(())
     }
@@ -708,16 +603,7 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
     let translation = translate(&parsed).map_err(to_py)?;
-    let dim_bounds = translation
-        .symbols
-        .keys()
-        .map(|name| {
-            let range = parsed.program.range_constraints.get(name);
-            let lo = range.and_then(|r| r.min_val).unwrap_or(0).max(0) as usize;
-            let hi = range.and_then(|r| r.max_val).unwrap_or(i64::MAX - 1).max(0) as usize;
-            (name.clone(), (lo, hi))
-        })
-        .collect();
+    let bounds = luminal_pytorch_utils::dimension_bounds(&translation, &parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let (bindings, output_buffers) = bind(&translation)
         .context("binding the translated program's boundary")
@@ -735,7 +621,7 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         .context("loading the translated graph on the reference runtime")
         .map_err(to_py)?;
     Ok(CompiledGraph {
-        translation,
+        translation: std::rc::Rc::new(translation),
         runtime,
         output_buffers,
         shared_outputs,
@@ -743,8 +629,7 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         dirty: HashSet::new(),
         searched: false,
         dims,
-        dim_bounds,
-        buckets: HashMap::new(),
+        bounds,
     })
 }
 
@@ -765,7 +650,7 @@ fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(test)]
-mod bucket_tests {
+mod dimension_tests {
     use super::*;
 
     #[test]

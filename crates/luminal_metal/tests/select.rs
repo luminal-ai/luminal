@@ -1,7 +1,10 @@
 #![cfg(target_os = "macos")]
 
+mod support;
 use luminal::{dtype::DType, graph::Graph};
 use luminal_metal::{MetalRuntime, harness_search_options};
+#[cfg(target_os = "macos")]
+use support::TestTransfers;
 
 #[test]
 fn select_preserves_branch_bits_through_strided_views() {
@@ -19,6 +22,8 @@ fn select_preserves_branch_bits_through_strided_views() {
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     runtime
         .search(
+            &Default::default(),
+            &Default::default(),
             &[
                 (condition.id, condition_values.clone().into()),
                 (a.id, a_values.clone().into()),
@@ -29,11 +34,18 @@ fn select_preserves_branch_bits_through_strided_views() {
             &harness_search_options(),
         )
         .unwrap();
-    runtime.set_data(condition.id, condition_values.clone());
-    runtime.set_data(a.id, a_values.clone());
-    runtime.set_data(b.id, b_values.clone());
-    runtime.execute().unwrap();
-    let actual = runtime.get_f32(output.id).unwrap();
+    let mut arena_runtime = support::allocate_arena(&runtime).expect("allocate execution arena");
+    runtime
+        .upload(&mut arena_runtime, condition.id, condition_values.clone())
+        .unwrap();
+    runtime
+        .upload(&mut arena_runtime, a.id, a_values.clone())
+        .unwrap();
+    runtime
+        .upload(&mut arena_runtime, b.id, b_values.clone())
+        .unwrap();
+    runtime.execute(arena_runtime.buffer()).unwrap();
+    let actual = runtime.read_f32(&arena_runtime, output.id).unwrap();
     for row in 0..2 {
         for col in 0..3 {
             let src = col * 2 + row;

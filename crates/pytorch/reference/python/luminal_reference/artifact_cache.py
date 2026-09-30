@@ -177,9 +177,10 @@ def clear_artifact_cache() -> None:
 class CompiledArtifact:
     """Native plan plus a portable, versioned PT2 representation.
 
-    Serialized artifacts contain the exported program, not device pointers or
-    a legacy HLIR plan. Loading compiles once for the receiving runtime; the
-    process cache then reuses that plan for subsequent bindings.
+    The current wire format stores an exported program and recompiles on load.
+    This is a legacy limitation. Complete executable serialization belongs to
+    the separate Rust serialization feature; this cache only reuses artifacts
+    within the process and creates independent execution bindings.
     """
 
     SCHEMA_VERSION = 3

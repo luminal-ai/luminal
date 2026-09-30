@@ -84,14 +84,14 @@ fn search_and_count_opts(
         }),
     )
     .expect("load");
-    let mut vars: Vec<_> = cx.dyn_map.iter().collect();
-    vars.sort();
-    for (var, value) in vars {
-        rt.bind_dyn_range(*var, *value as u64, *value as u64)
-            .expect("dyn pin");
-    }
+
     let data: FxHashMap<NodeIndex, HostBuffer> = pairs.iter().cloned().collect();
-    let outcome = match rt.search(&data, options) {
+    let outcome = match rt.search(
+        &luminal::shape::DimensionBounds::exact(&cx.dyn_map).unwrap(),
+        &cx.dyn_map,
+        &data,
+        options,
+    ) {
         Ok(outcome) => outcome,
         Err(e) => {
             let msg = format!("{e:#}");

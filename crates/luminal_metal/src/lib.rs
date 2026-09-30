@@ -6,7 +6,6 @@ pub mod egraph_postpass;
 pub mod finalists;
 pub mod host_buffer;
 pub mod kernels;
-pub mod lattice;
 pub mod layouts;
 pub mod op;
 pub mod ops;
@@ -51,3 +50,7 @@ pub fn metal_allow_list() -> Vec<&'static str> {
         .map(|s| s.strip_prefix("LayoutTensorOp").unwrap_or(s))
         .collect()
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/memory.rs"]
+mod test_memory;

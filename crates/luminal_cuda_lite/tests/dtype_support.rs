@@ -4,11 +4,14 @@
 //! NVRTC) and the `recip` half-overload workaround, which a graph or a
 //! PyTorch model over these dtypes depends on.
 
+mod support;
 use half::{bf16, f16};
 use luminal::dtype::PlanDtype;
 use luminal::prelude::*;
 use luminal_cuda_lite::{CudaRuntime, HostBuffer, harness_search_options};
 use rustc_hash::FxHashMap;
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 fn host(dtype: PlanDtype, bytes: Vec<u8>) -> HostBuffer {
     HostBuffer::new(dtype, bytes).expect("well-formed dtype payload")
@@ -40,12 +43,24 @@ fn mul_device(dtype: DType, a: HostBuffer, b: HostBuffer) -> Vec<u8> {
         .into_iter()
         .collect();
     let mut rt = CudaRuntime::load(&cx).expect("load");
-    rt.search(&data, &harness_search_options())
-        .expect("search dtype mul");
-    rt.set_data(ta.id, a).unwrap();
-    rt.set_data(tb.id, b).unwrap();
-    rt.execute().expect("execute");
-    rt.fetch(out.id).expect("fetch").0.bytes.clone()
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &harness_search_options(),
+    )
+    .expect("search dtype mul");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
+    rt.upload(&mut arena_rt, ta.id, a).unwrap();
+    rt.upload(&mut arena_rt, tb.id, b).unwrap();
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt)
+        .expect("execute");
+    rt.download(&arena_rt, out.id)
+        .expect("fetch")
+        .0
+        .bytes
+        .clone()
 }
 
 #[test]
@@ -78,11 +93,24 @@ fn f64_reciprocal_round_trips() {
     let out = t.reciprocal();
     let data: FxHashMap<_, _> = [(t.id, a.clone())].into_iter().collect();
     let mut rt = CudaRuntime::load(&cx).expect("load");
-    rt.search(&data, &harness_search_options())
-        .expect("search f64 reciprocal");
-    rt.set_data(t.id, a).unwrap();
-    rt.execute().expect("execute");
-    let bytes = rt.fetch(out.id).expect("fetch").0.bytes.clone();
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &harness_search_options(),
+    )
+    .expect("search f64 reciprocal");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
+    rt.upload(&mut arena_rt, t.id, a).unwrap();
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt)
+        .expect("execute");
+    let bytes = rt
+        .download(&arena_rt, out.id)
+        .expect("fetch")
+        .0
+        .bytes
+        .clone();
     let got: Vec<f64> = bytes
         .as_chunks::<8>()
         .0
@@ -101,11 +129,24 @@ fn f16_reciprocal_round_trips() {
     let out = t.reciprocal();
     let data: FxHashMap<_, _> = [(t.id, a.clone())].into_iter().collect();
     let mut rt = CudaRuntime::load(&cx).expect("load");
-    rt.search(&data, &harness_search_options())
-        .expect("search f16 reciprocal");
-    rt.set_data(t.id, a).unwrap();
-    rt.execute().expect("execute");
-    let bytes = rt.fetch(out.id).expect("fetch").0.bytes.clone();
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &harness_search_options(),
+    )
+    .expect("search f16 reciprocal");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
+    rt.upload(&mut arena_rt, t.id, a).unwrap();
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt)
+        .expect("execute");
+    let bytes = rt
+        .download(&arena_rt, out.id)
+        .expect("fetch")
+        .0
+        .bytes
+        .clone();
     assert_eq!(bytes, f16_bytes(&[0.25, 0.5, 1.0, 0.125]));
 }
 

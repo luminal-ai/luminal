@@ -42,7 +42,12 @@ fn conv_example_graph_searches_with_zero_refusals() {
 
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let outcome = rt
-        .search(&data, &luminal_cuda_lite::harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &luminal_cuda_lite::harness_search_options(),
+        )
         .expect("cuda search");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
     let b = &outcome.refusal_breakdown;

@@ -267,19 +267,20 @@ pub fn run_reference_bound(
 ) -> crate::runtime::ReferenceRuntime {
     let mut rt = crate::runtime::ReferenceRuntime::load_with(cx, bindings)
         .expect("recorder clean for a covered graph");
-    let mut vars: Vec<_> = cx.dyn_map.iter().collect();
-    vars.sort();
-    for (var, value) in vars {
-        rt.bind_dyn_range(*var, *value as u64, *value as u64)
-            .expect("dyn pin binds");
-    }
+    let bounds =
+        luminal::shape::DimensionBounds::exact(&cx.dyn_map).expect("valid exact dimensions");
     for (tensor, lower, upper) in ranges {
         rt.bind_value_range(*tensor, *lower, *upper)
             .expect("value range binds");
     }
     let data: rustc_hash::FxHashMap<_, _> = inputs.iter().cloned().collect();
-    rt.search(&data, &crate::search::harness_search_options())
-        .expect("search finds a plan");
+    rt.search(
+        &bounds,
+        &cx.dyn_map,
+        &data,
+        &crate::search::harness_search_options(),
+    )
+    .expect("search finds a plan");
     for (node, values) in inputs {
         rt.set_data(*node, values.clone());
     }

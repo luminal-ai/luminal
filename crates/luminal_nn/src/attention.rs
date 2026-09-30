@@ -658,8 +658,13 @@ mod tests {
         inputs.insert(data.id, data_vals.clone().into());
         inputs.insert(idx.id, idx_vals.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&inputs, &CompileOptions::default())
-            .expect("search finds a plan");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &inputs,
+            &CompileOptions::default(),
+        )
+        .expect("search finds a plan");
         rt.set_data(data.id, data_vals);
         rt.set_data(idx.id, idx_vals);
         rt.execute().expect("winner executes");
@@ -716,8 +721,13 @@ mod tests {
         inputs.insert(idx.id, idx_vals.clone().into());
         inputs.insert(dest.id, dest_vals.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
-        rt.search(&inputs, &CompileOptions::default())
-            .expect("search finds a plan");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &inputs,
+            &CompileOptions::default(),
+        )
+        .expect("search finds a plan");
         rt.set_data(src.id, src_vals);
         rt.set_data(idx.id, idx_vals);
         rt.set_data(dest.id, dest_vals);

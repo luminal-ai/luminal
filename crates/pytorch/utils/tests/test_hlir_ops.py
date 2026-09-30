@@ -1,4 +1,4 @@
-from typing import Callable
+from collections.abc import Callable
 
 import pytest
 import torch
@@ -2535,10 +2535,10 @@ def test_groupnorm_dynamic_shapes(device: torch.device):
     torch._dynamo.reset()
     compiled: Callable = torch.compile(model, backend=luminal_backend)
     first = torch.randn(2, 4, 8, 8, device=device)
-    torch._dynamo.mark_dynamic(first, 0)  # dynamic batch
-    torch._dynamo.mark_dynamic(first, 2)  # dynamic height
+    torch._dynamo.mark_dynamic(first, 0, min=1, max=3)  # dynamic batch
+    torch._dynamo.mark_dynamic(first, 2, min=8, max=16)  # dynamic height
     for n, h in [(2, 8), (1, 8), (3, 12), (2, 16)]:
-        x = torch.randn(n, 4, h, 8, device=device)
+        x = first if (n, h) == (2, 8) else torch.randn(n, 4, h, 8, device=device)
         with torch.no_grad():
             ref = model(x)
             out = compiled(x)

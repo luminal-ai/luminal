@@ -1,25 +1,12 @@
-//! HOST PAYLOADS for this runtime: bytes plus a dtype tag.
-//!
-//! CL DOES NOT USE `TypedBuffer` (ruling D4, 2026-09-03: "put
-//! TypedBuffer in luminal_reference. CL shouldn't use it for tests").
-//! That type is the REFERENCE executor's storage — a sum over eleven
-//! `Vec<T>` variants, because its kernels read and write typed Rust
-//! slices. This runtime's kernels run on a device: everything staged
-//! here is about to become an H2D copy, and everything read back here
-//! just came from a D2H copy. Bytes plus the dtype the plan says the
-//! buffer holds is the whole of what this side needs, and it makes the
-//! device bridge (`crate::device`) a memcpy instead of a match.
-//!
-//! DIFFERENTIAL TESTS stage BOTH: the CL side of a test builds
-//! `HostBuffer`s, the reference side builds
-//! `luminal_reference::TypedBuffer`s. Two runtimes, two payload types,
-//! one set of numbers to compare — which is the point of the split, not
-//! a hole in it.
+//! Typed CPU payloads for application transfers, profiling, and assertions.
+//! GPU executables never accept or return these payloads. Applications choose
+//! when to copy their bytes to device allocations or read device results back.
+//! Differential tests use this type alongside the reference runtime's TypedBuffer.
 
 use anyhow::{Result, bail, ensure};
 use luminal::dtype::PlanDtype;
 
-/// Bytes this runtime can put on a device, tagged with the dtype they
+/// Bytes an application can transfer to a device, tagged with the dtype they
 /// are bytes OF. Element order is the buffer's own; the layout that
 /// interprets it rides the plan (see `crate::layouts`).
 #[derive(Debug, Clone, PartialEq, Eq)]

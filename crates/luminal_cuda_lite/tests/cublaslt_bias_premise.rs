@@ -127,7 +127,9 @@ fn report_forms(egraph: &EGraph, what: &str) -> (usize, usize, usize, usize) {
 fn linear_with_bias_mints_the_bias_form_on_a_left_major_d() {
     let (cx, _x, _w, _b, _out) = linear_with_bias();
     let rt = CudaRuntime::load(&cx).expect("load");
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
 
     let (base, bias, _acc, _acc_bias) = report_forms(&egraph, "linear(4x8 . 8x3)+b[3]");
     assert!(
@@ -251,7 +253,7 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
             }),
         )
         .expect("load bias-only route");
-        let outcome = match rt.search(&data, &options) {
+        let outcome = match rt.search(&Default::default(), &Default::default(), &data, &options) {
             Ok(outcome) => outcome,
             Err(e) => {
                 println!("BIAS-PREMISE seed {seed}: SEARCH DIED: {e:#}");
@@ -407,7 +409,9 @@ fn degenerate_linear_with_bias() -> (Graph, NodeIndex, NodeIndex, NodeIndex, Nod
 fn a_degenerate_extent_d_holds_both_contiguous_spellings_in_one_class() {
     let (cx, _x, _w, _b, _out) = degenerate_linear_with_bias();
     let rt = CudaRuntime::load(&cx).expect("load");
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
     let (_base, bias, _acc, _acc_bias) = report_forms(&egraph, "linear(1xK . KxN)+b[N]");
     assert!(
         bias > 0,
@@ -482,7 +486,7 @@ fn a_degenerate_extent_bias_election_binds_col_and_is_not_refused() {
             }),
         )
         .expect("load bias-only route");
-        let outcome = match rt.search(&data, &options) {
+        let outcome = match rt.search(&Default::default(), &Default::default(), &data, &options) {
             Ok(outcome) => outcome,
             Err(e) => {
                 // BEFORE THE FIX this is where whisper died: every genome
@@ -589,7 +593,9 @@ fn per_row_bias_does_not_mint_the_bias_form() {
     // sibling's rows = the recorder's COLUMNS).
     let _out = x.matmul(w) + b_rows.expand_dim(1, N);
     let rt = CudaRuntime::load(&cx).expect("load");
-    let egraph = rt.saturated_egraph().expect("saturation");
+    let egraph = rt
+        .saturated_egraph(&Default::default())
+        .expect("saturation");
     let (base, bias, _acc, acc_bias) = report_forms(&egraph, "matmul + per-ROW b[4]");
     assert!(base > 0, "the matmul itself still assembles");
     assert_eq!(

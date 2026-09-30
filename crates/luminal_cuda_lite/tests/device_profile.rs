@@ -17,6 +17,7 @@
 //!   says so by name rather than reporting an execution failure.
 #![cfg(feature = "device")]
 
+mod support;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
@@ -24,6 +25,8 @@ use luminal::shape::IntExpr;
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer};
 use luminal_reference::TypedBuffer;
 use model_zoo::mini::llama3::MiniLlama3;
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 /// The examples' seeding discipline, verbatim.
 fn weights(n: usize, seed: usize) -> Vec<f32> {
@@ -81,8 +84,10 @@ fn mini_llama3_fixture() -> MiniLlama3Fixture {
 
 /// Read a device output through its RETURNED LAYOUT (the
 /// escape-and-disclose contract; `device_fidelity.rs`'s `walked_dense`).
-fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
-    let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
+fn walked_dense(rt: &CudaRuntime, arena_rt: &support::Allocation, out: NodeIndex) -> Vec<f32> {
+    let (data, binding) = rt
+        .download(arena_rt, out)
+        .expect("escape-and-disclose fetch");
     let bytes = data
         .as_f32()
         .unwrap_or_else(|err| panic!("output is not f32: {err}"));
@@ -138,8 +143,10 @@ fn device_profiled_search_ranks_by_measurement_and_keeps_the_numbers() {
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let start = std::time::Instant::now();
     let outcome = rt
-        .search(&data, &options)
+        .search(&Default::default(), &Default::default(), &data, &options)
         .expect("device-profiled search finds a plan");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let search_ms = start.elapsed().as_millis();
 
     println!(
@@ -184,13 +191,14 @@ fn device_profiled_search_ranks_by_measurement_and_keeps_the_numbers() {
 
     // The plan the measurement elected still computes the same thing.
     for (id, v) in &floats {
-        rt.set_data(*id, v.clone()).unwrap();
+        rt.upload(&mut arena_rt, *id, v.clone()).unwrap();
     }
     for (id, v) in &ints {
-        rt.set_data(*id, v.clone()).unwrap();
+        rt.upload(&mut arena_rt, *id, v.clone()).unwrap();
     }
-    rt.execute().expect("device execute of the profiled winner");
-    let got = walked_dense(&rt, out);
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt)
+        .expect("device execute of the profiled winner");
+    let got = walked_dense(&rt, &arena_rt, out);
     assert_close(&want, &got, "device-profiled mini-llama3 logits");
 }
 
@@ -216,7 +224,7 @@ fn a_zero_budget_times_every_candidate_out_and_says_so() {
     };
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let err = rt
-        .search(&data, &options)
+        .search(&Default::default(), &Default::default(), &data, &options)
         .expect_err("a zero timed-run budget leaves no candidate ranked");
     let text = format!("{err:#}");
     assert!(
@@ -249,6 +257,8 @@ fn the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced() {
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let err = rt
         .search(
+            &Default::default(),
+            &Default::default(),
             &data,
             &CompileOptions {
                 keep_finalists: 3,
@@ -272,6 +282,8 @@ fn the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced() {
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let outcome = rt
         .search(
+            &Default::default(),
+            &Default::default(),
             &data,
             &CompileOptions {
                 keep_finalists: 3,
@@ -280,16 +292,18 @@ fn the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced() {
             },
         )
         .expect("a budget nothing exceeds installs the winner");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     assert_eq!(
-        outcome.lattice_rejections, 0,
+        outcome.finalist_rejections, 0,
         "an unreachable budget must reject nothing"
     );
     for (id, v) in &floats {
-        rt.set_data(*id, v.clone()).unwrap();
+        rt.upload(&mut arena_rt, *id, v.clone()).unwrap();
     }
     for (id, v) in &ints {
-        rt.set_data(*id, v.clone()).unwrap();
+        rt.upload(&mut arena_rt, *id, v.clone()).unwrap();
     }
-    rt.execute()
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt)
         .expect("the plan the lattice installed executes on the device");
 }

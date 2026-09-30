@@ -14,7 +14,7 @@
 //! for now. Don't worry about doing this generic thing" — the
 //! `PlanProfiler` trait is GONE). So the loop lives here, and with it
 //! this crate's option knobs, outcome shape, allow-list defaults and
-//! bucketed driver.
+//! runtime.
 //!
 //! WHAT DOES NOT: drawing genomes, counting refusals, attributing
 //! wall-clock and printing progress decide nothing, were byte-identical
@@ -32,7 +32,6 @@
 //! time (the plan-hash dedup ruling, 2026-07-27).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, ensure};
@@ -206,11 +205,11 @@ fn profile_on_reference_runtime(
 
     let mut runtime = ReferenceRuntime::default();
     runtime.set_memory_budget_bytes(memory_budget_bytes);
-    runtime.load_plan(plan.clone());
+    runtime.load_plan(plan.clone(), luminal::shape::DimensionBounds::exact(dims)?);
     // The plan's spans/extents may be SYMBOLIC (`Var("a")`), so the
     // profiling runtime must hold the representative assignment before it
     // can allocate or index anything. This is the whole point of pricing a
-    // symbolic plan: it is a valid plan for the whole bucket, and the
+    // symbolic plan: it is a valid plan for the whole declared domain, and the
     // representative is only where it gets measured.
     for (symbol, value) in dims {
         runtime.set_dim(*symbol, *value);
@@ -256,13 +255,13 @@ pub fn search_implementations_with_ops(
     program: &SearchProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     dims: &luminal::shape::DynMap,
-    capacity_dims: &luminal::shape::DynMap,
+    bounds: &luminal::shape::DimensionBounds,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
 ) -> Result<SearchOutcome> {
     let pruning = crate::egraph_postpass::run(
         egraph,
-        capacity_dims,
+        bounds,
         options.max_intermediate_bytes,
         options.memory_budget_bytes,
     )?;
@@ -559,7 +558,6 @@ pub fn search_implementations_with_ops(
             pruning.largest_tensor_bytes,
         )
     })?;
-    let _ = program; // binding tables travel with the caller; kept for future bucket plumbing
     Ok(SearchOutcome {
         best_plan,
         best_genome,
@@ -578,218 +576,6 @@ pub struct SearchProgram {
     pub text: String,
     pub inputs: Vec<crate::bindings::Bound>,
     pub outputs: Vec<crate::bindings::Bound>,
-}
-
-/// One bucket combination's finished search: the dim ranges it covers, the
-/// representative pins it was searched at, and the winning plan.
-#[derive(Debug)]
-pub struct BucketPlan {
-    pub ranges: BTreeMap<luminal::shape::Symbol, (usize, usize)>,
-    pub representative: luminal::shape::DynMap,
-    pub program: SearchProgram,
-    pub outcome: SearchOutcome,
-}
-
-/// The pre-search program parts a bucketed search re-renders from — the
-/// runtime's own `load`-time capture. The MODEL TEXT never changes
-/// across buckets; only the bounds seeds do, which is the whole point of
-/// the bucket model.
-pub struct BucketAssembly<'a> {
-    /// The runtime's assembled egglog preamble (matchers + registry).
-    pub assembled_program: &'a str,
-    /// The bound program before the schedule: model text plus boundary.
-    pub prefix: &'a str,
-    /// The caller's own `bind_*` seeds — for the dims that are NOT
-    /// bucketed. Buckets and range bindings refuse each other in BOTH
-    /// orders (a range-bound dim is refused buckets, a bucketed dim is
-    /// refused a range binding), so these never collide with the
-    /// per-bucket seeds appended after them.
-    pub binding_seeds: &'a str,
-    /// The runtime's schedule text.
-    pub schedule: &'a str,
-    /// The authoring-contract checks. THEY RUN IN THE BUCKET-WIDE
-    /// VALIDATION RENDER TOO: the base logical program must be valid over
-    /// the WHOLE interval, not merely at the representative (Austin,
-    /// 2026-09-03).
-    pub post_checks: &'a str,
-    pub inputs: &'a [crate::bindings::Bound],
-    pub outputs: &'a [crate::bindings::Bound],
-    /// Dim values the runtime already holds, carried into every bucket's
-    /// representative map so a plan records the full pin it was searched
-    /// at.
-    pub base_dims: &'a luminal::shape::DynMap,
-}
-
-/// Range-seeded bucketed search: one Cartesian combination of
-/// `DimBucket`s per search, each combination run as a bucket-wide
-/// RANGE-seeded render whose WHOLE FIXPOINT (authoring checks included)
-/// must pass, proving the base logical program valid over the entire
-/// interval. The EXTRACTION comes from that range-valid fixpoint (matching
-/// CUDA Lite), so the winning plan's spans and extents stay expressions
-/// (`Var("a")`) and it executes at every value in the bucket without a
-/// re-search — the representative only selects the plan by bucket coverage
-/// and prices it during profiling. [`select_bucket`] picks the covering
-/// plan at execute time.
-pub fn bucketed_search_implementations(
-    assembly: &BucketAssembly<'_>,
-    dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
-    input_data: impl Fn(&luminal::shape::DynMap) -> FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
-    options: &CompileOptions,
-    allow_override: Option<Vec<&'static str>>,
-) -> Result<Vec<BucketPlan>> {
-    ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
-    let mut plans = Vec::new();
-    for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
-        check_interrupt()?;
-        let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
-        let mut egraph = luminal::egglog_snippet::new_egraph();
-        egraph
-            .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
-        check_interrupt()?;
-        crate::decoder_registry().check(&egraph)?;
-        let mut serialized = egraph
-            .serialize(luminal::prelude::egglog::SerializeConfig::default())
-            .egraph;
-        let data = input_data(&representative);
-        let mut capacity_dims = representative.clone();
-        for (symbol, (min, max)) in &ranges {
-            // PyTorch can encode an absent upper bound as i64::MAX-1, or
-            // derive another enormous finite upper bound from it. Such
-            // extents cannot fit the live arena and can overflow products
-            // with other dimensions. Use the minimum for pruning there;
-            // concrete allocations remain guarded at execution.
-            let capacity = if *max > options.memory_budget_bytes {
-                *min
-            } else {
-                *max
-            };
-            capacity_dims.insert(*symbol, capacity);
-        }
-        let outcome = search_implementations_with_ops(
-            &mut serialized,
-            &program,
-            &data,
-            &representative,
-            &capacity_dims,
-            options,
-            allow_override.clone(),
-        )?;
-        plans.push(BucketPlan {
-            ranges,
-            representative,
-            program,
-            outcome,
-        });
-    }
-    Ok(plans)
-}
-
-/// One bucket combination's `(ranges, representative pins, pinned
-/// render)`, in sorted-dim Cartesian order. Each combination's
-/// BUCKET-WIDE VALIDATION render runs here, before its pinned render is
-/// handed back to be searched: the range-seeded program's whole fixpoint
-/// — authoring-contract checks included — must pass, which is what makes
-/// "the base logical program is valid over the whole bucket" a checked
-/// claim rather than an assumption. Ranges are seeded as intervals and
-/// do NOT collapse; only the representative render pins `[n, n]`.
-type BucketRender = (
-    BTreeMap<luminal::shape::Symbol, (usize, usize)>,
-    luminal::shape::DynMap,
-    SearchProgram,
-);
-
-fn bucket_renders(
-    assembly: &BucketAssembly<'_>,
-    dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
-) -> Result<Vec<BucketRender>> {
-    let seeds_text = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| {
-        let mut text = String::new();
-        for (var, (lower, upper)) in seeds {
-            let var = var.egglog_literal();
-            text.push_str(&format!(
-                "(set (lower-bound-of (IntVar {var})) (bigint {lower}))\n\
-                 (set (upper-bound-of (IntVar {var})) (bigint {upper}))\n"
-            ));
-        }
-        text
-    };
-    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| SearchProgram {
-        text: format!(
-            "{}{}{}{}{}",
-            assembly.prefix,
-            assembly.binding_seeds,
-            seeds_text(seeds),
-            assembly.schedule,
-            assembly.post_checks
-        ),
-        inputs: assembly.inputs.to_vec(),
-        outputs: assembly.outputs.to_vec(),
-    };
-
-    // Cartesian combinations, dims in sorted order.
-    let dims: Vec<&luminal::shape::Symbol> = dim_buckets.keys().collect();
-    let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
-    for dim in &dims {
-        let count = dim_buckets[*dim].len();
-        combos = combos
-            .into_iter()
-            .flat_map(|combo| {
-                (0..count).map(move |index| {
-                    let mut next = combo.clone();
-                    next.push(index);
-                    next
-                })
-            })
-            .collect();
-    }
-
-    let mut renders = Vec::new();
-    for combo in combos {
-        let mut ranges = BTreeMap::new();
-        let mut representative = assembly.base_dims.clone();
-        for (dim, bucket_index) in dims.iter().zip(&combo) {
-            let bucket = &dim_buckets[*dim][*bucket_index];
-            ranges.insert(**dim, (bucket.min, bucket.max));
-            representative.insert(**dim, bucket.representative_value());
-        }
-
-        // BUCKET-WIDE SOUNDNESS: the range-seeded render must run its
-        // whole fixpoint over the interval.
-        let mut validation_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
-        for (dim, value) in &representative {
-            validation_seeds.insert(*dim, (*value as u64, *value as u64));
-        }
-        for (dim, (min, max)) in &ranges {
-            validation_seeds.insert(*dim, (*min as u64, *max as u64));
-        }
-        let validation = assemble(&validation_seeds);
-        let text = format!("{}\n\n{}", assembly.assembled_program, validation.text);
-        luminal::egglog_snippet::new_egraph()
-            .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
-
-        // Extract from the range-valid fixpoint (matching CUDA Lite): the
-        // bucket's dimensional seeds stay INTERVALS, so the winning plan's
-        // spans and extents remain expressions (`Var("a")`) and one plan
-        // serves the whole bucket. Pinning here would collapse them to the
-        // representative's literals and reintroduce the static-plan limit.
-        renders.push((ranges, representative, validation));
-    }
-    Ok(renders)
-}
-
-/// The covering bucket plan for a concrete dim assignment, if any.
-pub fn select_bucket<'a>(
-    plans: &'a [BucketPlan],
-    dims: &luminal::shape::DynMap,
-) -> Option<&'a BucketPlan> {
-    plans.iter().find(|plan| {
-        plan.ranges.iter().all(|(dim, (min, max))| {
-            dims.get(dim)
-                .is_some_and(|value| value >= min && value <= max)
-        })
-    })
 }
 
 /// The test/example harness's search budget — the SAME genetic algorithm
@@ -819,7 +605,7 @@ pub fn harness_search_options() -> CompileOptions {
 /// reference runtime, profiling with the given caller data.
 /// Deterministic for a fixed seed. No dimension assignment: literal-only
 /// plans evaluate with an empty map (see
-/// [`search_implementations_with_ops`] for the bucketed/symbolic path).
+/// [`search_implementations_with_ops`] for the symbolic path).
 pub fn search_implementations(
     egraph: &mut egraph_serialize::EGraph,
     program: &SearchProgram,
@@ -831,7 +617,7 @@ pub fn search_implementations(
         program,
         input_data,
         &luminal::shape::DynMap::default(),
-        &luminal::shape::DynMap::default(),
+        &luminal::shape::DimensionBounds::default(),
         options,
         None,
     )
@@ -934,7 +720,7 @@ mod tests {
 
         let mut runtime = ReferenceRuntime::default();
         runtime.stage_bindings(&bound.inputs, &bound.outputs);
-        runtime.load_plan(outcome.best_plan.clone());
+        runtime.load_plan(outcome.best_plan.clone(), Default::default());
         runtime.set_data(x2.id, x_data);
         runtime.set_data(y2.id, y_data);
         runtime.execute().expect("best plan executes");

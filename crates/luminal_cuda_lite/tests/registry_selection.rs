@@ -126,7 +126,12 @@ fn a_filtered_registry_withholds_the_op_and_the_search_refuses() {
         narrowed.active_allow_list()
     );
     let err = narrowed
-        .search(&data, &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect_err("a graph that needs add must not plan without the add op");
     // The whole chain: the runtime names the bound outputs, the search names
     // the blockage.
@@ -145,7 +150,12 @@ fn a_filtered_registry_withholds_the_op_and_the_search_refuses() {
     let mut default = CudaRuntime::load(&cx).expect("load");
     assert!(default.active_allow_list().contains(&ADD));
     let outcome = default
-        .search(&data, &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect("the default registry plans a + b");
     assert!(outcome.plans_profiled > 0, "no plans profiled");
 }
@@ -292,7 +302,7 @@ fn the_cuda_registry_declares_no_constructor_it_cannot_decode() {
     let rt = CudaRuntime::load(&cx).expect("load with the default registry");
     // `saturated_egraph` runs the tripwire internally; this asserts on
     // the registry directly too, so the failure names the constructor.
-    rt.saturated_egraph()
+    rt.saturated_egraph(&Default::default())
         .expect("the assembled program saturates and every constructor decodes");
     let decoders = rt.decoders();
     assert!(

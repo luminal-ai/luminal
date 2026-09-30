@@ -1,21 +1,20 @@
-//! Persistent graph-only executor. Buckets overlay one arena, and all GPU work
-//! (including staging/readback) is submitted by the same graph launch path.
+//! Persistent graph-only executor for one program. All GPU work
+//! is submitted against caller-supplied device buffers. Tensor transfers are explicit caller work.
 use crate::{
     arena::{ArenaPlan, ArenaSlice, ArenaStep},
     cuda_graph::{CopyKind, Executable, Graph, Node, Pinned, PinnedRange, copy_params},
     host::{DeviceRange, HostOpContext, PreparedHostOp},
-    host_buffer::HostBuffer,
     kernels::{CodegenCtx, KernelLaunch},
     layouts::CudaPlan,
     symbolic::{self, Bounds, Expr},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cudarc::{
-    driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, result, sys as cu},
+    driver::{CudaContext, CudaStream, result, sys as cu},
     nvrtc::{CompileOptions, compile_ptx_with_opts},
 };
 use luminal::{
-    bufferize::{BufferId, BufferNode, OutputBinding, SlotDescriptor},
+    bufferize::{BufferId, BufferNode, SlotDescriptor},
     layouts::DecodedLayout,
     prelude::{FxHashMap, NodeIndex},
     shape::{DynMap, Symbol},
@@ -27,7 +26,6 @@ use std::{
     sync::Arc,
 };
 
-type Outputs = FxHashMap<usize, (HostBuffer, OutputBinding<DecodedLayout>)>;
 /// A caller-owned device allocation bound to one plan buffer for the
 /// duration of one execution: the kernel reads/writes the caller's storage
 /// directly and no arena range is involved.
@@ -115,7 +113,7 @@ fn nvrtc_compile_options() -> CompileOptions {
 /// Cumulative counters for inspecting replay, dynamic updates, and arena reuse.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GraphStats {
-    /// Execution-plan replays; resident initialization transfers are separate.
+    /// Execution-plan replays.
     pub launches: u64,
     pub instantiations: u64,
     pub graph_cache_hits: u64,
@@ -130,7 +128,6 @@ pub struct GraphStats {
     pub arena_base: u64,
     pub arena_bytes: usize,
     pub staging_bytes: usize,
-    pub resident_upload_bytes: u64,
 }
 struct Module {
     raw: cu::CUmodule,
@@ -151,46 +148,86 @@ struct Installed {
     bounds: Bounds,
     compiled: Option<CompiledPlan>,
 }
-use crate::resident::ResidentHome;
+use crate::CudaArena;
+/// Shared CUDA context, stream and compiled-module cache. It owns no program
+/// or execution arena. Executables created from it have independent state.
+#[derive(Clone)]
 pub struct CudaDevice {
-    // Executables/resources must die before their arena or modules.
-    installed: Vec<Installed>,
-    staging: Option<Pinned>,
-    slab: Option<CudaSlice<u8>>,
-    /// CALLER-OWNED ARENA: when set, `install` reserves no slab and the
-    /// per-execution base is this address. The caller frees it; this device
-    /// never does.
-    external_arena: Option<(u64, usize)>,
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    cache: Rc<std::cell::RefCell<HashMap<String, Module>>>,
+}
+impl CudaDevice {
+    /// Native stream/context dependency. Applications use cudarc directly for storage.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    pub fn new(ordinal: usize) -> Result<Self> {
+        let ctx = CudaContext::new(ordinal)?;
+        let stream = ctx.new_stream()?;
+        Ok(Self {
+            ctx,
+            stream,
+            cache: Rc::new(Default::default()),
+        })
+    }
+    pub fn executable(&self) -> CudaExecutable {
+        CudaExecutable::new(self)
+    }
+}
+
+/// Caller-owned pinned host storage for runtime dimension parameters only.
+/// Keep it alive through completion, just like the device arena.
+pub struct CudaStaging {
+    storage: Pinned,
+    identity: Rc<()>,
+}
+impl CudaStaging {
+    pub fn bytes(&self) -> usize {
+        self.storage.bytes().len()
+    }
+}
+
+pub struct CudaExecutable {
+    // Retire graph resources before cached modules. Caller storage is borrowed.
+    installed: Option<Installed>,
     /// True when `stream` was borrowed from another library; the device must
     /// not destroy it, and the outer owner is responsible for ordering work
     /// submitted through it.
     stream_is_borrowed: bool,
     pending_async: bool,
-    cache: HashMap<String, Module>,
+    cache: Rc<std::cell::RefCell<HashMap<String, Module>>>,
     stream: Arc<CudaStream>,
     ctx: Arc<CudaContext>,
     stats: GraphStats,
-    residents: BTreeMap<i64, ResidentHome>,
-    resident_initialized: BTreeSet<i64>,
 }
-impl CudaDevice {
-    pub fn new(ordinal: usize) -> Result<Self> {
-        let ctx = CudaContext::new(ordinal)?;
-        let stream = ctx.new_stream()?;
-        Ok(Self {
-            installed: vec![],
-            staging: None,
-            slab: None,
-            external_arena: None,
+impl CudaExecutable {
+    /// Native stream/context dependency. Applications use cudarc directly for storage.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// Fresh launch/storage state sharing the already compiled device modules.
+    pub fn fork(&self) -> Result<Self> {
+        let device = CudaDevice {
+            ctx: self.ctx.clone(),
+            stream: self.ctx.new_stream()?,
+            cache: self.cache.clone(),
+        };
+        Ok(device.executable())
+    }
+
+    pub fn new(device: &CudaDevice) -> Self {
+        Self {
+            installed: None,
             stream_is_borrowed: false,
             pending_async: false,
-            cache: HashMap::new(),
-            stream,
-            ctx,
+            cache: device.cache.clone(),
+            stream: device.stream.clone(),
+            ctx: device.ctx.clone(),
             stats: GraphStats::default(),
-            residents: BTreeMap::new(),
-            resident_initialized: BTreeSet::new(),
-        })
+        }
     }
     /// Run on a stream owned by another library. The wrapped stream is
     /// non-owning, so dropping the device does not destroy it.
@@ -216,47 +253,16 @@ impl CudaDevice {
         self.stream_is_borrowed = false;
         Ok(())
     }
-    /// Bind a caller-allocated arena for subsequent installs/executions. The
-    /// caller keeps ownership: `release_slab` and `Drop` will not free it.
-    /// A new base invalidates the arena-resident bytes, so they are re-uploaded
-    /// on the next execution. A block smaller than the installed plan set
-    /// needs is REFUSED here rather than written past its end.
-    pub fn set_external_arena(&mut self, ptr: u64, bytes: usize) -> Result<()> {
-        if !self.installed.is_empty() {
-            ensure!(
-                bytes >= self.stats.arena_bytes,
-                "external arena is {bytes} bytes, installed plan set needs {}",
-                self.stats.arena_bytes
-            );
-        }
-        let changed = self.external_arena.map(|(p, _)| p) != Some(ptr);
-        if changed && self.pending_async {
-            self.stream.synchronize()?;
-            self.pending_async = false;
-        }
-        self.external_arena = Some((ptr, bytes));
-        if !self.installed.is_empty() {
-            self.stats.arena_base = ptr;
-            if changed {
-                self.resident_initialized.clear();
-            }
-        }
-        Ok(())
-    }
-    /// Revert to the device's own slab. The installed plans were based at the
-    /// caller's block, which it is free to release, so they are dropped: the
-    /// next execution installs again on the owned slab.
-    pub fn clear_external_arena(&mut self) {
-        if self.external_arena.take().is_some() && !self.installed.is_empty() {
-            // Drain any asynchronous launch before retiring its arena.
-            let _ = self.stream.synchronize();
-            self.installed.clear();
-            self.stats.arena_base = 0;
-            self.stats.arena_bytes = 0;
-        }
-    }
+
     pub fn stream_is_borrowed(&self) -> bool {
         self.stream_is_borrowed
+    }
+
+    pub fn allocate_staging(&self, bytes: usize) -> Result<CudaStaging> {
+        Ok(CudaStaging {
+            storage: Pinned::new(&self.ctx, bytes.max(1))?,
+            identity: Rc::new(()),
+        })
     }
     pub fn stats(&self) -> GraphStats {
         self.stats
@@ -266,13 +272,10 @@ impl CudaDevice {
     }
     /// Current capacity available to this runtime's entire arena.
     pub fn available_arena_bytes(&self) -> Result<usize> {
-        if let Some((_, bytes)) = self.external_arena {
-            return Ok(bytes);
-        }
         // A dropped CudaSlice queues cuMemFreeAsync. Complete those frees
         // before reading capacity, and include unused pool reservations: the
         // next cuMemAllocAsync can reuse them even though cuMemGetInfo counts
-        // them as occupied. The currently owned slab is also replaceable.
+        // them as occupied. Executables themselves retain no allocation.
         self.stream.synchronize()?;
         let (free, total) = self.ctx.mem_get_info()?;
         let reusable = if self.ctx.has_async_alloc() {
@@ -297,170 +300,70 @@ impl CudaDevice {
         } else {
             0
         };
-        Ok(free
-            .saturating_add(reusable)
-            .saturating_add(self.slab_bytes())
-            .min(total))
+        Ok(free.saturating_add(reusable).min(total))
     }
     /// Validate all capacities first, then reserve their maximum once. Replacing
-    /// the plan set invalidates every executable before any pointer can change.
-    pub fn install(&mut self, plans: Vec<(CudaPlan, Bounds)>) -> Result<()> {
-        self.install_resident(plans, Default::default())
+    /// the program invalidates every executable before any pointer can change.
+    pub fn install(&mut self, program: (CudaPlan, Bounds)) -> Result<()> {
+        self.install_with_bindings(program, Default::default(), None)
     }
-    pub fn install_resident(
+
+    pub fn install_with_bindings(
         &mut self,
-        plans: Vec<(CudaPlan, Bounds)>,
-        bindings: crate::resident::ResidentBindings,
-    ) -> Result<()> {
-        self.install_resident_with_budget(plans, bindings, None)
-    }
-    pub fn install_resident_with_budget(
-        &mut self,
-        plans: Vec<(CudaPlan, Bounds)>,
-        bindings: crate::resident::ResidentBindings,
+        program: (CudaPlan, Bounds),
+        bindings: std::collections::BTreeSet<i64>,
         budget: Option<usize>,
     ) -> Result<()> {
-        let allocation = crate::resident::allocate(plans, bindings)?;
-        let bytes = allocation.bytes;
-        let available = self.available_arena_bytes()?;
-        let budget = budget.map_or(available, |limit| limit.min(available));
+        let (plan, bounds) = program;
+        let storage = crate::storage::plan_storage(&plan, &bounds, &bindings)?;
+        let bytes = storage.slab_bytes;
         ensure!(
-            bytes <= budget,
-            "resident CUDA arena requires {bytes} bytes ({:.2} GiB), exceeding budget {budget} bytes ({:.2} GiB)",
-            bytes as f64 / 1073741824.0,
-            budget as f64 / 1073741824.0,
+            budget.is_none_or(|limit| bytes <= limit),
+            "CUDA arena needs {bytes} bytes, exceeding budget {budget:?}"
         );
-        let installed: Vec<_> = allocation
-            .plans
-            .into_iter()
-            .map(|p| Installed {
-                plan: p.plan,
-                storage: p.storage,
-                bounds: p.bounds,
-                compiled: None,
-            })
-            .collect();
         self.stream.synchronize()?;
-        self.installed.clear();
-        self.residents = allocation.homes;
-        self.resident_initialized.clear();
+        self.pending_async = false;
+        self.installed = None;
+        self.stats.staging_bytes = storage.staging_bytes.max(1);
+        self.stats.arena_bytes = bytes;
+        self.installed = Some(Installed {
+            plan,
+            storage,
+            bounds,
+            compiled: None,
+        });
+        Ok(())
+    }
 
-        let staging_bytes = installed
-            .iter()
-            .map(|p| p.storage.staging_bytes)
-            .max()
-            .unwrap_or(1)
-            .max(
-                self.residents
-                    .values()
-                    .map(|home| home.data.bytes.min(16 * 1024 * 1024))
-                    .max()
-                    .unwrap_or(1),
-            );
-        if self
-            .staging
+    /// Device offsets and capacities. The caller initializes inputs before execution
+    /// and consumes outputs afterwards; execution performs no tensor transfers.
+    pub fn memory_plan(&self) -> Result<&ArenaPlan> {
+        Ok(&self
+            .installed
             .as_ref()
-            .is_none_or(|p| p.bytes().len() < staging_bytes)
-        {
-            self.staging = None;
-            self.staging = Some(Pinned::new(&self.ctx, staging_bytes)?);
-        }
-        self.stats.staging_bytes = self.staging.as_ref().unwrap().bytes().len();
-        if let Some((arena_ptr, arena_bytes)) = self.external_arena {
-            // CALLER-OWNED ARENA: reserve nothing. The caller sizes and frees
-            // this block (one per execution); we only check it is large enough
-            // for the plan set and record its base.
-            ensure!(
-                arena_bytes >= bytes,
-                "external arena is {arena_bytes} bytes, plan set needs {bytes}"
-            );
-            self.slab = None;
-            self.stats.arena_base = arena_ptr;
-            self.stats.arena_bytes = bytes;
-            self.stats.arena_generation += 1;
-        } else if self.slab_bytes() < bytes {
-            self.slab = None;
-            self.stats.arena_bytes = 0;
-            self.stats.arena_base = 0;
-            let slab = self.stream.alloc_zeros::<u8>(bytes).with_context(|| {
-                format!(
-                    "shared CUDA arena: requested {bytes} bytes ({:.2} GiB)",
-                    bytes as f64 / 1073741824.0
-                )
-            })?;
-            self.stats.arena_base = slab.device_ptr(&self.stream).0;
-            self.stats.arena_bytes = bytes;
-            self.stats.arena_generation += 1;
-            self.slab = Some(slab);
-        }
-        self.installed = installed;
-        Ok(())
+            .ok_or_else(|| anyhow!("program is not installed"))?
+            .storage)
     }
-    pub(crate) fn upload_residents(&mut self, staged: &FxHashMap<i64, &HostBuffer>) -> Result<()> {
-        for (&lit, home) in &self.residents {
-            let Some(data) = staged.get(&lit) else {
-                ensure!(
-                    self.resident_initialized.contains(&lit),
-                    "set_data required for resident input {lit}"
-                );
-                continue;
-            };
-            ensure!(
-                data.dtype == home.dtype && data.bytes.len() == home.data.bytes,
-                "resident input {lit} dtype/size mismatch"
-            );
-            let pinned = self.staging.as_mut().unwrap();
-            let chunk_size = pinned.bytes().len().min(16 * 1024 * 1024);
-            let mut transfer = None;
-            for (i, chunk) in data.bytes.chunks(chunk_size).enumerate() {
-                pinned.bytes_mut()[..chunk.len()].copy_from_slice(chunk);
-                let params = copy_params(
-                    pinned.bytes().as_ptr() as u64,
-                    self.stats.arena_base + home.data.offset as u64 + (i * chunk_size) as u64,
-                    chunk.len(),
-                    CopyKind::HtoD,
-                );
-                if transfer.is_none() {
-                    let graph = Graph::new(&self.ctx)?;
-                    let node = graph.copy(&[], &params)?;
-                    let executable = graph.instantiate()?;
-                    transfer = Some((graph, node, executable));
-                }
-                let (_, node, executable) = transfer.as_ref().unwrap();
-                executable.copy(*node, &params)?;
-                let launched = executable.launch(&self.stream);
-                let completed = self.stream.synchronize();
-                launched?;
-                completed?;
-                self.stats.resident_upload_bytes += chunk.len() as u64;
-            }
-            self.resident_initialized.insert(lit);
-        }
-        Ok(())
-    }
+
     pub fn is_installed(&self) -> bool {
-        !self.installed.is_empty()
+        self.installed.is_some()
     }
-    /// Search candidates release both graphs and arena, retaining compiled code.
-    pub fn release_slab(&mut self) {
-        // Drain any asynchronous launch before retiring its arena.
+    /// Retire installed graphs, retaining compiled code. Caller storage is untouched.
+    pub fn uninstall(&mut self) {
+        // Drain any asynchronous launch before retiring graph resources.
         let _ = self.stream.synchronize();
-        self.installed.clear();
-        self.residents.clear();
-        self.resident_initialized.clear();
-        self.slab = None;
-        self.staging = None;
+        self.installed = None;
         self.stats.staging_bytes = 0;
         self.stats.arena_bytes = 0;
         self.stats.arena_base = 0;
     }
     pub fn execute(
         &mut self,
-        bucket: usize,
-        staged: &FxHashMap<i64, &HostBuffer>,
+        arena: CudaArena<'_>,
+        staging: &mut CudaStaging,
         dims: &DynMap,
-    ) -> Result<Outputs> {
-        self.execute_external(bucket, staged, dims, &Default::default())
+    ) -> Result<()> {
+        self.execute_external(arena, staging, dims, &Default::default())
     }
     /// Execute with zero-copy boundaries: `external_ptrs` maps a boundary
     /// buffer's `BufferLit` id to the caller's device storage. Those buffers
@@ -469,28 +372,49 @@ impl CudaDevice {
     /// input's buffer resolves to the same address the input reads.
     pub fn execute_external(
         &mut self,
-        bucket: usize,
-        staged: &FxHashMap<i64, &HostBuffer>,
+        arena: CudaArena<'_>,
+        staging: &mut CudaStaging,
         dims: &DynMap,
         external_ptrs: &FxHashMap<i64, ExternalPtr>,
-    ) -> Result<Outputs> {
-        self.execute_external_mode(bucket, staged, dims, external_ptrs, false)
+    ) -> Result<()> {
+        self.execute_external_mode(arena, staging, dims, external_ptrs, false)
     }
 
-    pub fn execute_external_mode(
+    pub(crate) fn execute_external_mode(
         &mut self,
-        bucket: usize,
-        staged: &FxHashMap<i64, &HostBuffer>,
+        arena: CudaArena<'_>,
+        staging: &mut CudaStaging,
         dims: &DynMap,
         external_ptrs: &FxHashMap<i64, ExternalPtr>,
         asynchronous: bool,
-    ) -> Result<Outputs> {
+    ) -> Result<()> {
         self.ctx.bind_to_thread()?;
-        self.upload_residents(staged)?;
+        ensure!(
+            staging.bytes() >= self.stats.staging_bytes,
+            "host staging is too small"
+        );
+        ensure!(
+            arena.bytes >= self.stats.arena_bytes,
+            "arena has {} bytes, program needs {}",
+            arena.bytes,
+            self.stats.arena_bytes
+        );
+        ensure!(
+            arena.ptr != 0 && arena.ptr.is_multiple_of(crate::arena::ARENA_ALIGN as u64),
+            "arena pointer must be non-null and 256-byte aligned"
+        );
+        if self.stats.arena_base != arena.ptr {
+            if self.pending_async {
+                self.stream.synchronize()?;
+                self.pending_async = false;
+            }
+            self.stats.arena_generation += 1;
+        }
+        self.stats.arena_base = arena.ptr;
         let installed = self
             .installed
-            .get_mut(bucket)
-            .ok_or_else(|| anyhow!("CUDA bucket {bucket} is not installed"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow!("Cuda program is not installed"))?;
         for (dim, (lo, hi)) in &installed.bounds {
             let value = dims
                 .get(dim)
@@ -500,6 +424,7 @@ impl CudaDevice {
                 "dimension `{dim}`={value} is outside [{lo}, {hi}]"
             );
         }
+        let installed = self.installed.as_mut().unwrap();
         // Resolve the caller's buffer ids to the plan's buffer ids.
         let mut external = ExternalBuffers::default();
         for (id, buffer) in &installed.plan.buffers {
@@ -514,15 +439,17 @@ impl CudaDevice {
         // `rebind_addresses`, which runs on every execution.
         let stale = installed.compiled.as_ref().is_none_or(|c| {
             c.base != self.stats.arena_base
+                || !c.staging_identity.ptr_eq(&Rc::downgrade(&staging.identity))
                 || c.external.len() != external.len()
                 || !external.keys().all(|id| c.external.contains_key(id))
         });
         if self.pending_async
-            && (stale
+            && (!asynchronous
+                || stale
                 || installed
                     .compiled
                     .as_ref()
-                    .is_some_and(|plan| plan.last_dims != *dims))
+                    .is_some_and(|plan| plan.last_dims != *dims || plan.external != external))
         {
             self.stream.synchronize()?;
             self.pending_async = false;
@@ -537,10 +464,10 @@ impl CudaDevice {
                 &external,
                 &self.ctx,
                 &self.stream,
-                self.staging.as_ref().unwrap(),
-                &mut self.cache,
+                &staging.storage,
+                Rc::downgrade(&staging.identity),
+                &mut self.cache.borrow_mut(),
                 &mut self.stats,
-                &self.residents,
             )?);
         }
         // Move the executable out while updating it. An error or unwind drops
@@ -563,9 +490,8 @@ impl CudaDevice {
             )?;
         }
         let result = compiled.launch(
-            staged,
             dims,
-            self.staging.as_mut().unwrap(),
+            &mut staging.storage,
             &self.stream,
             &mut self.stats,
             asynchronous,
@@ -580,21 +506,10 @@ impl CudaDevice {
         result
     }
 }
-impl Drop for CudaDevice {
+impl Drop for CudaExecutable {
     fn drop(&mut self) {
         let _ = self.stream.synchronize();
     }
-}
-
-/// Standalone static-plan convenience. Serving and profiling install once and
-/// call CudaDevice::execute repeatedly to retain the executable.
-pub fn execute_plan(
-    device: &mut CudaDevice,
-    plan: &CudaPlan,
-    staged: &FxHashMap<i64, &HostBuffer>,
-) -> Result<Outputs> {
-    device.install(vec![(plan.clone(), Bounds::new())])?;
-    device.execute(0, staged, &DynMap::default())
 }
 
 struct HostVariant {
@@ -709,20 +624,6 @@ struct CachedGraph {
     source_resources: Vec<Rc<HostVariant>>,
     live_resources: Vec<Rc<HostVariant>>,
 }
-struct Input {
-    lit: i64,
-    pinned: ArenaSlice,
-    size: Expr,
-    dtype: luminal::dtype::PlanDtype,
-}
-struct Output {
-    slot: OutputBinding<DecodedLayout>,
-    resolved: OutputBinding<DecodedLayout>,
-    pinned: ArenaSlice,
-    size: Expr,
-    bytes: usize,
-    dtype: luminal::dtype::PlanDtype,
-}
 struct CompiledPlan {
     // Declared first so graph handles are destroyed before captured resources.
     executable: Option<Executable>,
@@ -732,8 +633,6 @@ struct CompiledPlan {
     source_resources: Vec<Rc<HostVariant>>,
     live_resources: Vec<Rc<HostVariant>>,
     actions: Vec<Action>,
-    inputs: Vec<Input>,
-    outputs: Vec<Output>,
     params: ArenaSlice,
     schema: Vec<Symbol>,
     deps: BTreeMap<Symbol, Vec<usize>>,
@@ -744,6 +643,7 @@ struct CompiledPlan {
     external: ExternalBuffers,
     /// The arena base the nodes currently address; a change recompiles.
     base: u64,
+    staging_identity: std::rc::Weak<()>,
 }
 fn size(layout: &DecodedLayout) -> Result<Expr> {
     Ok(symbolic::span(layout)?
@@ -779,7 +679,10 @@ fn range(
         .slices
         .get(id)
         .ok_or_else(|| anyhow!("unbound buffer {id:?}"))?;
-    ensure!(bytes <= slice.bytes, "buffer exceeded its bucket capacity");
+    ensure!(
+        bytes <= slice.bytes,
+        "buffer exceeded its declared domain capacity"
+    );
     Ok(DeviceRange {
         ptr: base + slice.offset as u64,
         bytes,
@@ -925,9 +828,9 @@ impl CompiledPlan {
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         staging: &Pinned,
+        staging_identity: std::rc::Weak<()>,
         cache: &mut HashMap<String, Module>,
         stats: &mut GraphStats,
-        residents: &BTreeMap<i64, ResidentHome>,
     ) -> Result<Self> {
         let schema: Vec<_> = bounds.keys().copied().collect();
         ensure!(
@@ -943,8 +846,6 @@ impl CompiledPlan {
             source_resources: vec![],
             live_resources: vec![],
             actions: vec![],
-            inputs: vec![],
-            outputs: vec![],
             params,
             schema,
             deps: BTreeMap::new(),
@@ -952,6 +853,7 @@ impl CompiledPlan {
             parameter_dims: None,
             external: external.clone(),
             base,
+            staging_identity,
         };
         out.actions.push(Action::Copy {
             src: out.params.ptr(staging),
@@ -965,88 +867,6 @@ impl CompiledPlan {
         });
         for step in &storage.steps {
             match step {
-                ArenaStep::Upload {
-                    buffer: id,
-                    staging: pinned,
-                } => {
-                    // ZERO-COPY INPUT: the caller's storage already holds the
-                    // bytes on the device, so there is no pinned H2D and no
-                    // `Input` staging entry. `range` resolves the reads to the
-                    // caller pointer.
-                    if external.contains_key(id) {
-                        continue;
-                    }
-                    let buffer = &plan.buffers[id];
-                    let size = size(&buffer.layout)?;
-                    out.actions.push(Action::Copy {
-                        src: pinned.ptr(staging),
-                        dst: range(plan, storage, id, base, external, dims)?.ptr,
-                        src_ref: Addr::Fixed(pinned.ptr(staging)),
-                        dst_ref: Addr::Buffer(id.clone()),
-                        kind: CopyKind::HtoD,
-                        bytes: size.eval(dims)?,
-                        size: size.clone(),
-                        other_size: None,
-                    });
-                    out.inputs.push(Input {
-                        lit: buffer.lit.unwrap(),
-                        pinned: *pinned,
-                        size,
-                        dtype: buffer.layout.dtype.unwrap(),
-                    });
-                }
-                ArenaStep::Download {
-                    buffer: id,
-                    node,
-                    slots: indices,
-                    staging: pinned,
-                } => {
-                    let BufferNode::BufferOutput { slots } = &plan.dag[*node] else {
-                        unreachable!()
-                    };
-                    // A resident input's home IS this output's buffer: the
-                    // mutation wrote it in place, so there is nothing to
-                    // copy and nothing to stage for readback.
-                    if plan.buffers[id]
-                        .lit
-                        .is_some_and(|lit| residents.contains_key(&lit))
-                    {
-                        continue;
-                    }
-                    // ZERO-COPY OUTPUT: the compute node wrote straight into
-                    // the caller's storage (via `range`). There is no D2H and
-                    // no host `HostBuffer`; the caller's own allocation IS the
-                    // result.
-                    if external.contains_key(id) {
-                        continue;
-                    }
-                    let buffer = &plan.buffers[id];
-                    let range = range(plan, storage, id, base, external, dims)?;
-                    let size = size(&buffer.layout)?;
-                    out.actions.push(Action::Copy {
-                        src: range.ptr,
-                        dst: pinned.ptr(staging),
-                        src_ref: Addr::Buffer(id.clone()),
-                        dst_ref: Addr::Fixed(pinned.ptr(staging)),
-                        kind: CopyKind::DtoH,
-                        size: size.clone(),
-                        other_size: None,
-                        bytes: range.bytes,
-                    });
-                    for &i in indices {
-                        let slot = &slots[i];
-                        let mut resolved = slot.clone();
-                        resolved.layout = symbolic::resolve_layout(&slot.layout, dims)?;
-                        out.outputs.push(Output {
-                            slot: slot.clone(),
-                            resolved,
-                            pinned: *pinned,
-                            size: size.clone(),
-                            bytes: range.bytes,
-                            dtype: buffer.layout.dtype.unwrap(),
-                        });
-                    }
-                }
                 ArenaStep::Node(node) => match &plan.dag[*node] {
                     BufferNode::Compute {
                         op,
@@ -1390,10 +1210,6 @@ impl CompiledPlan {
                 Action::Kernel { .. } | Action::Host(_) => {}
             }
         }
-        for out in &mut self.outputs {
-            out.bytes = out.size.eval(dims)?;
-            out.resolved.layout = symbolic::resolve_layout(&out.slot.layout, dims)?;
-        }
         self.last_dims = dims.clone();
         Ok(())
     }
@@ -1493,62 +1309,37 @@ impl CompiledPlan {
     }
     fn launch(
         &mut self,
-        staged: &FxHashMap<i64, &HostBuffer>,
         dims: &DynMap,
         staging: &mut Pinned,
         stream: &Arc<CudaStream>,
         stats: &mut GraphStats,
         asynchronous: bool,
-    ) -> Result<Outputs> {
+    ) -> Result<()> {
         if asynchronous {
-            ensure!(
-                self.inputs.is_empty() && self.outputs.is_empty(),
-                "asynchronous execution requires entirely external input/output storage"
-            );
             ensure!(
                 self.parameter_dims.as_ref() == Some(dims),
                 "warm up this shape synchronously before asynchronous execution"
             );
+            for (i, symbol) in self.schema.iter().enumerate() {
+                let expected = i64::try_from(dims[symbol])?.to_ne_bytes();
+                ensure!(
+                    self.params.bytes(staging)[i * 8..i * 8 + 8] == expected,
+                    "host staging changed; warm up synchronously before asynchronous execution"
+                );
+            }
         } else {
-            // An earlier asynchronous launch can still read pinned dimensions.
-            // Drain it before rewriting those bytes for a different shape.
-            if self
-                .parameter_dims
-                .as_ref()
-                .is_some_and(|previous| previous != dims)
-            {
-                stream.synchronize()?;
+            // Caller-owned parameter staging may have been used by another
+            // program. Never assume its bytes
+            // persist between executions, even when dimensions are unchanged.
+            for (i, symbol) in self.schema.iter().enumerate() {
+                self.params.bytes_mut(staging)[i * 8..i * 8 + 8]
+                    .copy_from_slice(&i64::try_from(dims[symbol])?.to_ne_bytes());
             }
-            if self.parameter_dims.as_ref() != Some(dims) {
-                for (i, symbol) in self.schema.iter().enumerate() {
-                    self.params.bytes_mut(staging)[i * 8..i * 8 + 8]
-                        .copy_from_slice(&i64::try_from(dims[symbol])?.to_ne_bytes());
-                }
-                self.parameter_dims = Some(dims.clone());
-            }
-        }
-        for input in &mut self.inputs {
-            let bytes = input.size.eval(dims)?;
-            if let Some(data) = staged.get(&input.lit) {
-                ensure!(
-                    data.bytes.len() == bytes,
-                    "staged buffer {} is {} bytes, plan expects {bytes}",
-                    input.lit,
-                    data.bytes.len()
-                );
-                ensure!(
-                    data.dtype == input.dtype,
-                    "staged buffer {} dtype mismatch",
-                    input.lit
-                );
-                input.pinned.bytes_mut(staging)[..bytes].copy_from_slice(&data.bytes);
-            } else {
-                input.pinned.bytes_mut(staging)[..bytes].fill(0);
-            }
+            self.parameter_dims = Some(dims.clone());
         }
         let launched = self.executable.as_ref().unwrap().launch(stream);
-        // Ordinary callers consume host outputs immediately. Async callers
-        // retain external buffers and order access on the borrowed stream.
+        // Synchronous callers regain storage when device work completes.
+        // Async callers retain storage and order access on the borrowed stream.
         if !asynchronous || launched.is_err() {
             let completed = stream.synchronize();
             launched?;
@@ -1557,17 +1348,6 @@ impl CompiledPlan {
             launched?;
         }
         stats.launches += 1;
-        let mut outputs = FxHashMap::default();
-        for output in &self.outputs {
-            let bytes = output.pinned.bytes(staging)[..output.bytes].to_vec();
-            let host = match output.dtype {
-                luminal::dtype::PlanDtype::Bool | luminal::dtype::PlanDtype::Bool8 => {
-                    HostBuffer::bool8(bytes)?
-                }
-                dtype => HostBuffer::new(dtype, bytes)?,
-            };
-            outputs.insert(output.slot.index, (host, output.resolved.clone()));
-        }
-        Ok(outputs)
+        Ok(())
     }
 }

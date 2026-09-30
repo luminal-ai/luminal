@@ -17,6 +17,7 @@
 //! within tolerance.
 #![cfg(feature = "device")]
 
+mod support;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
@@ -25,6 +26,8 @@ use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::HostBuffer;
 use luminal_reference::TypedBuffer;
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 /// Read the device output DENSELY through its RETURNED LAYOUT
 /// (escape-and-disclose + the corrected contract, 2026-08-31): a
@@ -39,8 +42,10 @@ use luminal_reference::TypedBuffer;
 ///
 /// A dense election evaluates the identity, so this stays the universal
 /// readback: no fixture assumes dense.
-fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
-    let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
+fn walked_dense(rt: &CudaRuntime, arena_rt: &support::Allocation, out: NodeIndex) -> Vec<f32> {
+    let (data, binding) = rt
+        .download(arena_rt, out)
+        .expect("escape-and-disclose fetch");
     let bytes = data
         .as_f32()
         .unwrap_or_else(|err| panic!("output is not f32: {err}"));
@@ -102,8 +107,15 @@ fn run_differential(
         .iter()
         .map(|(id, v)| (*id, v.clone().into()))
         .collect();
-    rt.search(&data, &view_search_options())
-        .expect("cuda search");
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &data,
+        &view_search_options(),
+    )
+    .expect("cuda search");
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+    let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
 
     // The plan must have ELECTED AND FOLDED the view: no materialize
     // computes, and at least one consumer READS THROUGH A LAYOUT THAT IS
@@ -139,10 +151,11 @@ fn run_differential(
     );
 
     for (id, v) in inputs {
-        rt.set_data(*id, v.clone()).unwrap();
+        rt.upload(&mut arena_rt, *id, v.clone()).unwrap();
     }
-    rt.execute().expect("device execute");
-    let got = walked_dense(&rt, out);
+    rt.execute(arena_rt.arena(), &mut staging_arena_rt)
+        .expect("device execute");
+    let got = walked_dense(&rt, &arena_rt, out);
     (want, got)
 }
 

@@ -2342,9 +2342,14 @@ mod subst_guard_study {
             [(x.id, luminal_reference::TypedBuffer::from(vec![0.0f32; 6]))]
                 .into_iter()
                 .collect();
-        rt.bind_dyn_range('s', 2, 2).expect("bind");
+        let dims = [('s'.into(), 2)].into_iter().collect();
         let err = rt
-            .search(&data, &luminal_reference::CompileOptions::default())
+            .search(
+                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &dims,
+                &data,
+                &luminal_reference::CompileOptions::default(),
+            )
             .expect_err("extent 2 violates the squeeze contract");
         assert!(
             format!("{err:#}").contains("shape contract"),
@@ -2400,9 +2405,14 @@ mod subst_guard_study {
             [(x.id, luminal_reference::TypedBuffer::from(vec![0.0f32; 2]))]
                 .into_iter()
                 .collect();
-        rt.bind_dyn_range('s', 2, 2).expect("bind");
+        let dims = [('s'.into(), 2)].into_iter().collect();
         let err = rt
-            .search(&data, &luminal_reference::CompileOptions::default())
+            .search(
+                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &dims,
+                &data,
+                &luminal_reference::CompileOptions::default(),
+            )
             .expect_err("kernel 3 cannot fit in extent 2");
         assert!(
             format!("{err:#}").contains("shape contract"),
@@ -3366,7 +3376,7 @@ mod escape_execution_tests {
     #[test]
     fn escaped_output_executes_and_reads_through_the_held_layout() {
         let mut rt = ReferenceRuntime::default();
-        rt.load_plan(escaped_plan(FreedBy::Caller));
+        rt.load_plan(escaped_plan(FreedBy::Caller), Default::default());
         let staged: Vec<f32> = (0..6).map(|n| n as f32 * 10.0).collect();
         rt.set_data_buffer(7, staged.clone());
         rt.execute().expect("an escaping output executes");
@@ -3421,7 +3431,7 @@ mod escape_execution_tests {
     #[test]
     fn executor_refuses_minted_non_escaping_output_backing() {
         let mut rt = ReferenceRuntime::default();
-        rt.load_plan(escaped_plan(FreedBy::Program));
+        rt.load_plan(escaped_plan(FreedBy::Program), Default::default());
         rt.set_data_buffer(7, vec![0.0f32; 6]);
         let err = rt.execute().expect_err("the escape guard must refuse");
         assert!(
@@ -3447,7 +3457,7 @@ mod escape_execution_tests {
             }
         }
         let mut rt = ReferenceRuntime::default();
-        rt.load_plan(plan);
+        rt.load_plan(plan, Default::default());
         rt.set_data_buffer(7, vec![0.0f32; 6]);
         let err = rt
             .execute()

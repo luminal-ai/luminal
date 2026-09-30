@@ -24,17 +24,17 @@ fn output_dims(t: &Translation) -> Vec<usize> {
 /// read back the first output.
 fn run_f32(t: &Translation, x: &[f32]) -> Vec<f32> {
     let mut runtime = ReferenceRuntime::load(&t.graph).expect("load");
-    for (symbol, hint) in &t.dims {
-        runtime
-            .bind_dyn_range(*symbol, *hint as u64, *hint as u64)
-            .expect("bind dyn range");
-        runtime.set_dim(*symbol, *hint);
-    }
+    let dims = t
+        .dims
+        .iter()
+        .map(|(&symbol, &hint)| (symbol, hint))
+        .collect();
+    let bounds = luminal::shape::DimensionBounds::exact(&dims).unwrap();
     let input = t.inputs[0].tensor;
     let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
     data.insert(input, TypedBuffer::F32(x.to_vec()));
     runtime
-        .search(&data, &harness_search_options())
+        .search(&bounds, &dims, &data, &harness_search_options())
         .expect("search");
     runtime.set_data(input, TypedBuffer::F32(x.to_vec()));
     runtime.execute().expect("execute");

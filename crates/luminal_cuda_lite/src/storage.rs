@@ -9,43 +9,21 @@ use anyhow::{Result, anyhow};
 use luminal::bufferize::{BufferId, BufferNode};
 use luminal::prelude::FxHashSet;
 
-pub(crate) fn plan_resident(
+pub(crate) fn plan_storage(
     plan: &CudaPlan,
     bounds: &Bounds,
-    bindings: &crate::resident::ResidentBindings,
+    bindings: &std::collections::BTreeSet<i64>,
 ) -> Result<ArenaPlan> {
-    // Output slots whose buffer IS a resident input are mutation sinks:
-    // the binding put them on the input's buffer, so their writes already
-    // land in the arena home and they reserve no pinned staging.
-    let device_outputs: std::collections::BTreeSet<usize> = plan
-        .dag
-        .node_weights()
-        .filter_map(|node| match node {
-            BufferNode::BufferOutput { slots } => Some(slots),
-            _ => None,
-        })
-        .flatten()
-        .filter(|slot| {
-            plan.buffers[&slot.buffer]
-                .lit
-                .is_some_and(|lit| bindings.inputs.contains(&lit))
-        })
-        .map(|slot| slot.index)
-        .collect();
     // A buffer the bindings declared External is the caller's own device
     // memory: it must not be packed into the slab, or the arena would
     // reserve a range no kernel ever writes through.
     let external_buffers: FxHashSet<BufferId> = plan
         .buffers
         .values()
-        .filter(|buffer| {
-            buffer
-                .lit
-                .is_some_and(|lit| bindings.externals.contains(&lit))
-        })
+        .filter(|buffer| buffer.lit.is_some_and(|lit| bindings.contains(&lit)))
         .map(|buffer| buffer.id.clone())
         .collect();
-    crate::arena::plan_resident_over(
+    crate::arena::plan_external_over(
         plan,
         |buffer| capacity_bytes(&buffer.layout, bounds),
         |node| match &plan.dag[node] {
@@ -60,8 +38,6 @@ pub(crate) fn plan_resident(
             .ok_or_else(|| anyhow!("parameter size overflow"))?
             .max(8),
         crate::arena::issue_order(plan)?,
-        &bindings.inputs,
-        &device_outputs,
         &external_buffers,
     )
 }
@@ -69,7 +45,7 @@ pub(crate) fn plan_resident(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::{ARENA_ALIGN, ArenaStep};
+    use crate::arena::ARENA_ALIGN;
     use luminal::{
         buffer_tensor_ir::{BufferAlloc, BufferFree, BufferTensorIrOp, OpSlotNames},
         bufferize::{
@@ -288,29 +264,18 @@ mod tests {
             .filter_map(|buffer| buffer.lit)
             .collect();
         assert!(!lits.is_empty(), "copy_plan has boundary buffers");
-        let bindings = crate::resident::ResidentBindings {
-            externals: lits.clone(),
-            ..Default::default()
-        };
+        let bindings = lits.clone();
         let external: Vec<BufferId> = graph
             .buffers
             .values()
             .filter(|buffer| buffer.lit.is_some_and(|lit| lits.contains(&lit)))
             .map(|buffer| buffer.id.clone())
             .collect();
-        let base = plan_resident(&graph, &bounds(128), &Default::default()).unwrap();
-        let ext = plan_resident(&graph, &bounds(128), &bindings).unwrap();
-        let transferred = |plan: &ArenaPlan, id: &BufferId| {
-            plan.steps.iter().any(|step| match step {
-                ArenaStep::Upload { buffer, .. } | ArenaStep::Download { buffer, .. } => {
-                    buffer == id
-                }
-                _ => false,
-            })
-        };
+        let base = plan_storage(&graph, &bounds(128), &Default::default()).unwrap();
+        let ext = plan_storage(&graph, &bounds(128), &bindings).unwrap();
         for id in &external {
             assert!(
-                base.slices.contains_key(id) && transferred(&base, id),
+                base.slices.contains_key(id),
                 "the arena-only plan keeps {id:?} in the slab and transfers it"
             );
             assert!(
@@ -318,10 +283,6 @@ mod tests {
                 "external buffer {id:?} must reserve no slab range"
             );
             assert!(ext.externals.contains(id));
-            assert!(
-                !transferred(&ext, id),
-                "external buffer {id:?} must not be staged or read back"
-            );
         }
         assert!(
             ext.slab_bytes < base.slab_bytes,
@@ -332,107 +293,45 @@ mod tests {
     }
 
     #[test]
-    fn all_storage_classes_share_physical_ranges_and_transfer_lifetimes() {
+    fn outputs_survive_until_return_and_late_inputs_exist_at_entry() {
         let (graph, ids) = copy_plan();
-        let p = plan_resident(&graph, &bounds(128), &Default::default()).unwrap();
+        let p = plan_storage(&graph, &bounds(128), &Default::default()).unwrap();
         let overlaps = |a: crate::arena::ArenaSlice, b: crate::arena::ArenaSlice| {
             a.offset < b.offset + b.reserved() && b.offset < a.offset + a.reserved()
         };
         let scratch = *p.workspaces.values().next().unwrap();
         assert!(
-            overlaps(scratch, p.slices[&ids[0]]) || overlaps(scratch, p.slices[&ids[1]]),
-            "scratch recycles donation/early output"
+            !overlaps(scratch, p.slices[&ids[1]]),
+            "early result survives later scratch use"
         );
         assert!(
-            overlaps(p.slices[&ids[0]], p.slices[&ids[5]])
-                || overlaps(p.slices[&ids[1]], p.slices[&ids[5]]),
-            "late input reuses an earlier device copy"
+            !overlaps(p.slices[&ids[0]], p.slices[&ids[5]]),
+            "late input exists at entry"
         );
-        assert!(!overlaps(scratch, p.slices[&ids[3]]));
-        assert!(!overlaps(scratch, p.slices[&ids[4]]));
-        let uploads: Vec<_> = p
-            .steps
-            .iter()
-            .enumerate()
-            .filter_map(|(t, s)| match s {
-                ArenaStep::Upload { buffer, staging } => Some((t, buffer, staging)),
-                _ => None,
-            })
-            .collect();
-        let downloads: Vec<_> = p
-            .steps
-            .iter()
-            .enumerate()
-            .filter_map(|(t, s)| match s {
-                ArenaStep::Download {
-                    buffer,
-                    slots,
-                    staging,
-                    ..
-                } => Some((t, buffer, slots, staging)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            downloads.len(),
-            3,
-            "two aliased output slots use one transfer"
-        );
-        assert_eq!(downloads[0].2.len(), 2);
-        assert!(
-            downloads[0].0 < uploads.last().unwrap().0,
-            "early readback precedes late upload"
-        );
-        // Host inputs are all populated before launch: early downloads must
-        // not overwrite an input which has yet to be uploaded.
-        for (dt, _, _, dst) in &downloads {
-            for (ut, _, src) in &uploads {
-                if ut >= dt {
-                    assert!(
-                        dst.offset + dst.bytes <= src.offset
-                            || src.offset + src.bytes <= dst.offset
-                    );
-                }
-            }
-        }
-        let naive: usize = p.slices.values().map(|s| s.reserved()).sum::<usize>()
-            + scratch.reserved()
-            + ARENA_ALIGN;
-        assert!(
-            p.slab_bytes * 2 < naive,
-            "physical packing should more than halve this fixture: {} vs {naive}",
-            p.slab_bytes
-        );
-        assert_eq!(p.peak_live_bytes, p.slab_bytes);
+        assert!(!overlaps(p.slices[&ids[1]], p.slices[&ids[5]]));
+        assert_eq!(p.staging_bytes, 8, "tensor payloads reserve no staging");
+        assert!(p.parameters.reserved() >= ARENA_ALIGN);
     }
 
     #[cfg(feature = "device")]
     #[test]
-    fn replay_preserves_early_outputs_and_late_inputs_across_shapes_and_buckets() {
+    fn replay_preserves_early_outputs_and_late_inputs_across_shapes() {
         use crate::{device::CudaDevice, host_buffer::HostBuffer};
         use luminal::prelude::FxHashMap;
         let (graph, _) = copy_plan();
-        let capacities = [32, 128];
-        let expected_bytes = capacities
-            .iter()
-            .map(|&hi| {
-                plan_resident(&graph, &bounds(hi), &Default::default())
-                    .unwrap()
-                    .slab_bytes
-            })
-            .max()
-            .unwrap();
-        let mut device = CudaDevice::new(0).unwrap();
-        device
-            .install(
-                capacities
-                    .iter()
-                    .map(|&hi| (graph.clone(), bounds(hi)))
-                    .collect(),
-            )
+        let expected_bytes = plan_storage(&graph, &bounds(128), &Default::default())
+            .unwrap()
+            .slab_bytes;
+        let mut device = CudaDevice::new(0).unwrap().executable();
+        device.install((graph.clone(), bounds(128))).unwrap();
+        let mut arena =
+            crate::test_memory::Allocation::new(device.stream().clone(), device.slab_bytes())
+                .unwrap();
+        let mut staging = device
+            .allocate_staging(device.stats().staging_bytes)
             .unwrap();
         let mut retained = None;
-        for (bucket, n) in [(0, 7), (1, 128), (0, 0), (1, 13), (0, 32), (0, 7)] {
+        for n in [7, 128, 0, 13, 32, 7] {
             let a: Vec<_> = (0..n * 4).map(|i| i as f32 + 1.).collect();
             let b: Vec<_> = (0..n).map(|i| i as f32 - 1000.).collect();
             let c = vec![99f32; n * 4];
@@ -443,10 +342,35 @@ mod tests {
             ]
             .into_iter()
             .collect();
-            let staged = data.iter().map(|(&k, v)| (k, v)).collect();
-            let outputs = device
-                .execute(bucket, &staged, &[('n'.into(), n)].into_iter().collect())
-                .unwrap();
+            let dims = [('n'.into(), n)].into_iter().collect();
+            for buffer in graph.buffers.values() {
+                if let Some(data) = buffer.lit.and_then(|lit| data.get(&lit)) {
+                    let home = device.memory_plan().unwrap().slices[&buffer.id];
+                    arena.write(home.offset, &data.bytes).unwrap();
+                }
+            }
+            device.execute(arena.arena(), &mut staging, &dims).unwrap();
+            let mut outputs = FxHashMap::default();
+            for node in graph.dag.node_weights() {
+                if let BufferNode::BufferOutput { slots } = node {
+                    for slot in slots {
+                        let buffer = &graph.buffers[&slot.buffer];
+                        let home = device.memory_plan().unwrap().slices[&slot.buffer];
+                        let bytes = crate::symbolic::bytes(&buffer.layout, &dims).unwrap();
+                        outputs.insert(
+                            slot.index,
+                            (
+                                HostBuffer::new(
+                                    PlanDtype::F32,
+                                    arena.read(home.offset, bytes).unwrap(),
+                                )
+                                .unwrap(),
+                                slot.clone(),
+                            ),
+                        );
+                    }
+                }
+            }
             assert_eq!(outputs[&0].0.as_f32().unwrap(), a);
             assert_eq!(outputs[&1].0.as_f32().unwrap(), a);
             assert_eq!(outputs[&2].0.as_f32().unwrap(), b);

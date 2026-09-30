@@ -10,7 +10,7 @@ the self-contained repo-side summary.
 
 - This crate is the CUDA backend on the NATIVE ladder — same six
   methods as `luminal::reference::ReferenceRuntime`
-  (`load → bind_dyn_range → search → set_data → execute → get_f32`),
+  (`load → search(bounds, profile_dims, data, options) → bind device buffers → execute`),
   same `BufferIrGraph` plans, allow-list claiming via the public
   `search_implementations_with_ops` seam.
 - `src/kernels.rs`: the `KernelOp` codegen trait and shared helpers.
@@ -23,18 +23,17 @@ the self-contained repo-side summary.
   Search requires the `device` feature and a CUDA GPU. There is no static
   byte-cost ranking or profiling option. Loading, saturation, and kernel
   code generation can still be inspected on a host without CUDA.
-  Profiling and finalist validation honor resident input bindings. Warmup uploads
-  them once; timed trials stage only transient inputs. Writable residents reset
-  from the supplied payloads outside the execution timer and timeout budget.
-  Candidate teardown releases their homes, retaining compiled modules.
+  Profiling owns the device arena and pinned staging outside the executor.
+  Serving supplies both per call; persistent tensors are application-owned
+  external bindings. Candidate teardown retains compiled modules only.
 - Before extraction, `CompileOptions::serialized_graph_passes` can edit the
   received serialized e-graph. CUDA owns these passes, their context/report
   types, and the memory policy in `egraph_postpass`; core does not prune it.
   The mandatory memory pass then removes tensors whose
-  physical capacity over the full bucket exceeds the arena budget, and all
+  physical capacity over the full declared domain exceeds the arena budget, and all
   their producer implementations. Required boundaries cannot disappear.
   The default limit includes available CUDA memory and reusable allocation-pool
-  reservations; `device_budget_bytes` can lower it. Complete resident candidate
+  reservations; `device_budget_bytes` can lower it. Complete candidate
   arenas are checked against the same limit before allocation.
 - Both search and execution refuse without the `device` feature.
 - The predecessor crate targeting the deleted HLIR pipeline is parked
@@ -51,34 +50,16 @@ section are retired — see `vendor/README.md`.
 
 ## CL-2: device bring-up (the work on the CUDA machine)
 
-1. Write `src/device.rs` (`#[cfg(feature = "device")]`,
-   `execute_plan(plan, staged: &FxHashMap<i64, HostBuffer>) ->
-   Result<FxHashMap<usize, (HostBuffer, OutputBinding<DecodedLayout>)>>`,
-   keyed by output slot):
-   - Phase 1 — materialize: for every plan `Buffer`, require
-     `dims`+`dtype` (loud on `None`), device-alloc `numel × bytes`;
-     H2D staged `lit` buffers (length/dtype-checked, no conversion);
-     zero-fill the rest. `BufferAlloc`/`BufferFree` compute nodes can
-     be real device alloc/free honoring `Owner`/`FreedBy` — or no-ops
-     in the first cut, exactly like the reference.
-   - Phase 2 — toposort `plan.dag` INCLUDING `Anti` edges (WAR
-     ordering is load-bearing; `EdgeKind::Anti` rides petgraph).
-   - Phase 3 — dispatch: `BufferCopy` = D2D memcpy (length+dtype
-     checked); `Compute` = `as_kernel_op(op).codegen(ctx)` → NVRTC compile
-     (cache by source hash) → launch over `n` with 256-thread blocks,
-     operand device pointers in slot order then dest pointers then
-     `n`. OUT-OF-PLACE: allocate fresh dests (mirrors the reference
-     alias-safety convention; `ties` honored only as ordering).
-   - Phase 4 — D2H every output-role buffer into `HostBuffer`s
-     (`src/host_buffer.rs`; CL does not use the reference runtime's
-     `TypedBuffer`, ruling D4).
-   - Salvage: NVRTC compile-to-CUBIN with header-version probing is
-     `../luminal_cuda_lite_hlir/src/lib.rs`
-     (`compile_module_image_for_current_device`); kernel-cache and
-     launch patterns are in its `runtime.rs`.
+1. `src/device.rs` executes an installed plan against caller-supplied device
+   storage. The application initializes input buffers before execution and reads
+   results afterwards. `memory_plan()` exposes offsets and capacities; no tensor
+   upload, zero fill, or readback is implicit in execution. Runtime dimension
+   parameters use a separate small host-to-device copy. `BufferCopy` operations
+   remain explicit device-to-device copies in the compiled program.
+
 2. Fidelity gate: run the reference and CUDA runtimes over the same
    tiny graphs (start with `tests/plan_smoke.rs`'s `(a+b)*a`, then
-   the elementwise/reduce corpus) and compare `get_f32` outputs
+   the elementwise/reduce corpus) and compare explicitly downloaded outputs
    elementwise. Then the mini battery.
 3. CL-1b (either machine): IotaExpr→CUDA lowering unlocks the
    expression-carrying ops (`Iota`, `IndexMapApplyMaterialize`,

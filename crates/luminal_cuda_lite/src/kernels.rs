@@ -422,7 +422,7 @@ pub fn layout_read_index(
 /// CUDA source for one launch of kernel `k`, with `n` threads.
 /// ABI: input pointers, output pointer, then `const long long* params`.
 /// The runtime defines each dimension's identifier (`symbolic::variable`) as
-/// params[index]. Default launches cover the bucket capacity; the kernel must
+/// params[index]. Default launches cover the domain capacity; the kernel must
 /// guard threads against its live `n`. Custom geometry can depend on dimensions.
 #[derive(Debug)]
 pub struct KernelSource {

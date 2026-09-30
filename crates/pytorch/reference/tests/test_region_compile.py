@@ -223,6 +223,11 @@ def test_shared_artifact_rebinds_inputs_between_models():
     first = compile_region(region)
     second = compile_region(region)
     assert first.artifact is second.artifact
+    assert first._graph is not second._graph
+    first(*inputs)
+    first_output = first._graph.output_bytes(0)
+    second(*(torch.zeros_like(t) for t in inputs))
+    assert first._graph.output_bytes(0) == first_output
     for model, values in [
         (first, inputs),
         (second, [torch.ones_like(t) for t in inputs]),
@@ -269,3 +274,32 @@ def test_compiled_model_restores_region_output_structure():
     output = compiled(*inputs)
     assert output["optional"] is None
     torch.testing.assert_close(output["result"], inputs[0] * 2)
+
+
+def test_equal_profiles_with_different_domains_do_not_share_artifacts():
+    from luminal_reference.frontend import compile_exported
+
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            return x.sin()
+
+    clear_artifact_cache()
+    programs = [
+        torch.export.export(
+            Model(),
+            (torch.ones(4),),
+            dynamic_shapes={"x": {0: torch.export.Dim("n", min=2, max=hi)}},
+        )
+        for hi in (8, 16)
+    ]
+    models = [compile_exported(program) for program in programs]
+    assert models[0].artifact is not models[1].artifact
+    assert compile_exported(programs[0]).artifact is models[0].artifact
+    assert artifact_cache_stats().searches == 2
+    for model, hi in zip(models, (8, 16)):
+        x = torch.randn(hi)
+        (actual,) = model(x)
+        torch.testing.assert_close(actual, x.sin())
+    with pytest.raises(RuntimeError, match="<= 8"):
+        models[0](torch.ones(9))
+    clear_artifact_cache()

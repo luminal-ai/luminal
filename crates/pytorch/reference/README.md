@@ -57,59 +57,49 @@ CUDA users import `Compiler` from `luminal_cuda_lite`. It accepts `search_iterat
 `log`, `device_budget_bytes`, and `max_intermediate_bytes`; it retains the
 CUDA backend's existing compilation path.
 
-## Named dimensions and buckets
+## Named dimensions and application bucketing
 
-Use PyTorch 2.14 `ShapeVar` objects as bucket keys and reuse those objects in
-`ShapesSpec`. No `mark_dynamic` calls are needed with this API:
+Each local program compiles over its PyTorch-declared bounds. Reuse `ShapeVar`
+objects to tie input axes together; the name is only diagnostic. Profiling uses
+the tracing or optimization hint, or a small valid size if neither exists.
+There is no implicit 4096 limit. `compiler.regions[i].bounds` reports the local
+exported symbol intervals. Data-dependent sizes remain unsupported.
+
+Applications can compile separate domains with isolated Dynamo caches and
+choose which callable to invoke:
 
 ```python
+import torch
 from torch.fx.experimental.dynamic_spec import ShapeVar, ShapesSpec, TensorSpec
-from luminal_reference import Compiler, DimBucket
+from luminal_reference import Compiler
 
-s = ShapeVar("s", min=2, max=64, optimization_hint=8)
-compiler = Compiler(dim_buckets={s: [
-    DimBucket(min=2, max=16),  # representative defaults to 9
-    DimBucket(min=17, max=64, representative=32),
-]})
+def model(x):
+    return x.sin()
 
-def model(x, y):
-    return y @ x
+callables = []
+for lo, hi, hint in [(2, 16, 8), (17, 64, 32)]:
+    s = ShapeVar("s", min=lo, max=hi, optimization_hint=hint)
+    compiled = torch.compile(
+        model, backend=Compiler(), fullgraph=True, isolate_recompiles=True,
+        dynamic_shapes=ShapesSpec(params={"x": TensorSpec([s])}),
+    )
+    callables.append((lo, hi, compiled))
 
-compiled = torch.compile(
-    model, backend=compiler, fullgraph=True,
-    dynamic_shapes=ShapesSpec(params={
-        "x": TensorSpec([s, s]),
-        "y": TensorSpec([4, s]),
-    }),
-)
-output = compiled(torch.randn(8, 8), torch.randn(4, 8))
-output = compiled(torch.randn(32, 32), torch.randn(4, 32))
+def dispatch(x):
+    for lo, hi, compiled in callables:
+        if lo <= x.shape[0] <= hi:
+            return compiled(x)
+    raise ValueError("no application bucket covers input")
 ```
 
-`ShapeVar` object identity connects the bucket policy to PyTorch's shape
-specification. Its name is diagnostic: separate objects with the same name are
-independent. Reusing an object ties axes together, including axes of one tensor.
-PyTorch validates the shared sizes and declared bounds.
+The application owns overlap/gap policy, dispatch, and each compiler's budget.
+The backend searches one domain per region. CUDA obtains intermediate scratch
+through PyTorch; its explicit static arena/capture mode remains available for
+one program. A GPU program must fit its entire declared domain; a reference
+program also checks its live memory budget at execution.
 
-`DimBucket` bounds are inclusive. Its optional representative defaults to
-`(min + max) // 2`. Buckets must be sorted, disjoint, and within the ShapeVar's
-bounds; gaps are allowed, but execution in a gap fails. Each Cartesian combination
-of dimension buckets receives a separately searched symbolic plan. Crossing a
-bucket boundary selects a plan without retracing or searching again. More buckets
-increase compilation work. Profiling allocations are checked against the memory
-budget before allocating.
-
-Without an explicit policy, a dynamic dimension gets one bucket using its
-PyTorch bounds, including bounds supplied by `mark_dynamic`. There is no 4096
-limit. An unbounded upper range uses the maximum representable signed extent
-(`2**63 - 2`). Profiling uses the tracing hint or `ShapeVar.optimization_hint`;
-without either, it uses a small valid size. `compiler.regions[i].buckets` exposes
-the resolved native intervals and representatives, keyed by local PT2 symbols.
-This API supports input shape symbols, not sizes computed from tensor data.
-
-The reference [Whisper example](examples/whisper.py) uses one `seq` ShapeVar and
-two sequence-length buckets. The CUDA Python compiler does not yet expose this
-bucket API.
+The [Whisper example](examples/whisper.py) uses separate decoder callables for
+short and long token sequences and dispatches at the application layer.
 
 ## Initial SPMD contract
 
@@ -152,9 +142,9 @@ its local regions for an AOT compilation round. The group's rank zero searches
 each distinct region request and sends the selected reference plans to their owning
 ranks. Followers translate their local PT2 boundary metadata and install the
 received plans without saturation, extraction, search, or profiling. The plans
-include all dynamic-shape buckets and remap boundary slots to the follower's
-local graph values. The cache key keeps graph contents, constants, input specs,
-buckets, and compile options while ignoring process-local node provenance IDs.
+include the complete dimension bounds and remap boundary slots to the follower's
+local graph values. The cache key keeps graph contents, declared bounds, constants,
+input specs, and compile options while ignoring process-local node provenance IDs.
 The compiler's
 `leader_compilations` count is positive only on the rank that actually searches.
 Artifact exchange and boundary synchronization use a separate Gloo process group,

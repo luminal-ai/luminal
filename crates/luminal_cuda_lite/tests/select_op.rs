@@ -3,9 +3,12 @@
 //! that closes the ReLU/GELU epilogue gap: without it, a graph lowering
 //! `maximum`/`where`/`erf` dead-ends extraction and the search finds no plan.
 
+mod support;
 use luminal::prelude::*;
 use luminal_cuda_lite::{CudaRuntime, HostBuffer, harness_search_options};
 use rustc_hash::FxHashMap;
+#[cfg(feature = "device")]
+use support::TestTransfers;
 
 /// Build `select(condition, if_true, if_false)`, search, execute, read back.
 fn run(condition: HostBuffer, if_true: HostBuffer, if_false: HostBuffer) -> Vec<f32> {
@@ -25,13 +28,32 @@ fn run(condition: HostBuffer, if_true: HostBuffer, if_false: HostBuffer) -> Vec<
 
     let mut runtime = CudaRuntime::load(&cx).expect("load");
     runtime
-        .search(&data, &harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect("search finds a Select plan");
-    runtime.set_data(condition_t.id, condition).unwrap();
-    runtime.set_data(if_true_t.id, if_true).unwrap();
-    runtime.set_data(if_false_t.id, if_false).unwrap();
-    runtime.execute().expect("execute");
-    runtime.get_f32(out.id).expect("f32 output")
+    let mut arena_runtime = support::allocate_arena(&runtime).expect("allocate execution arena");
+    let mut staging_arena_runtime = runtime
+        .allocate_staging()
+        .expect("allocate execution arena");
+    runtime
+        .upload(&mut arena_runtime, condition_t.id, condition)
+        .unwrap();
+    runtime
+        .upload(&mut arena_runtime, if_true_t.id, if_true)
+        .unwrap();
+    runtime
+        .upload(&mut arena_runtime, if_false_t.id, if_false)
+        .unwrap();
+    runtime
+        .execute(arena_runtime.arena(), &mut staging_arena_runtime)
+        .expect("execute");
+    runtime
+        .read_f32(&arena_runtime, out.id)
+        .expect("f32 output")
 }
 
 #[test]

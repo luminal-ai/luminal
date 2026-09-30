@@ -1,5 +1,7 @@
 pub mod symbol;
 pub use symbol::{DynMap, InvalidSymbolName, Symbol};
+mod bounds;
+pub use bounds::{DimensionBounds, DimensionRange, program_dimensions};
 mod expression;
 
 pub use expression::*;

@@ -142,7 +142,7 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
     };
     let start = std::time::Instant::now();
     let outcome = rt
-        .search(&data, &budget)
+        .search(&Default::default(), &Default::default(), &data, &budget)
         .unwrap_or_else(|e| panic!("L{layers} d{d}: SEARCH REFUSED: {e:#}"));
     let b = &outcome.refusal_breakdown;
     eprintln!(

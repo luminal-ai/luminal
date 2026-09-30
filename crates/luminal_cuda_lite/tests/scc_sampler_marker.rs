@@ -50,7 +50,7 @@ fn canonical_2d_matmul_searches_green_at_the_harness_budget() {
 
     let options = luminal_cuda_lite::harness_search_options();
     let outcome = rt
-        .search(&data, &options)
+        .search(&Default::default(), &Default::default(), &data, &options)
         .unwrap_or_else(|e| panic!("the marker 2-cycle must not exhaust the 2x4 budget: {e:#}"));
 
     let breakdown = &outcome.refusal_breakdown;

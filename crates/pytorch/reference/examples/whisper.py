@@ -402,7 +402,7 @@ def download_default_audio() -> Path:
 
 
 def main() -> None:
-    from luminal_reference import Compiler, DimBucket
+    from luminal_reference import Compiler
     from torch.fx.experimental.dynamic_spec import ShapesSpec, ShapeVar, TensorSpec
 
     device = torch.device("cpu")
@@ -437,27 +437,29 @@ def main() -> None:
     )
     print("Compiling decoder...")
     compile_start = time.time()
-    seq = ShapeVar("seq", min=2, max=N_TEXT_CTX, optimization_hint=2)
-    compiled_decoder = torch.compile(
-        model.decoder,
-        backend=Compiler(
-            search_iterations=10,
-            log=True,
-            dim_buckets={
-                seq: [
-                    DimBucket(min=2, max=32, representative=2),
-                    DimBucket(min=33, max=N_TEXT_CTX, representative=64),
-                ]
-            },
-        ),
-        fullgraph=True,
-        dynamic_shapes=ShapesSpec(
-            params={
-                "tokens": TensorSpec([seq]),
-                "xa": TensorSpec([N_AUDIO_CTX, D_MODEL]),
-            }
-        ),
-    )
+    decoders = []
+    for lo, hi, hint in [(2, 32, 2), (33, N_TEXT_CTX, 64)]:
+        seq = ShapeVar("seq", min=lo, max=hi, optimization_hint=hint)
+        decoder = torch.compile(
+            model.decoder,
+            backend=Compiler(search_iterations=10, log=True),
+            fullgraph=True,
+            isolate_recompiles=True,
+            dynamic_shapes=ShapesSpec(
+                params={
+                    "tokens": TensorSpec([seq]),
+                    "xa": TensorSpec([N_AUDIO_CTX, D_MODEL]),
+                }
+            ),
+        )
+        decoders.append((lo, hi, decoder))
+
+    def compiled_decoder(tokens, xa):
+        for lo, hi, decoder in decoders:
+            if lo <= tokens.shape[0] <= hi:
+                return decoder(tokens, xa)
+        raise ValueError(f"no decoder bucket covers {tokens.shape[0]} tokens")
+
     # torch.compile is lazy. Reuse the first call's logits for the first token.
     with torch.no_grad():
         first_logits = compiled_decoder(example_tokens, xa)

@@ -62,7 +62,12 @@ fn run(
         ReferenceRuntime::load_with(&cx, ReferenceBindings::dense(&cx.logical, &readbacks))
             .expect("reference load");
     runtime
-        .search(&data, &luminal_reference::harness_search_options())
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &luminal_reference::harness_search_options(),
+        )
         .expect("mini graph searches");
     for (id, value) in pairs {
         runtime.set_data(id, value);

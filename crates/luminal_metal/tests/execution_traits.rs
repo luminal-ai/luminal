@@ -1,6 +1,7 @@
 //! External implementations must survive extraction, DPS, and buffer-plan
 //! cloning without an entry in a backend-owned dispatch table.
 
+mod support;
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
@@ -13,6 +14,8 @@ use luminal_metal::{
     KernelOp, MetalOpInterface, MetalRuntime, RegisteredOp, as_kernel_op, harness_search_options,
     metal_registry,
 };
+#[cfg(target_os = "macos")]
+use support::TestTransfers;
 
 #[derive(Debug, Clone)]
 struct ExternalAdd {
@@ -157,7 +160,15 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     ]
     .into_iter()
     .collect();
-    runtime.search(&data, &harness_search_options()).unwrap();
+    runtime
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &harness_search_options(),
+        )
+        .unwrap();
+    let mut arena_runtime = support::allocate_arena(&runtime).expect("allocate execution arena");
     let plan = runtime.plan().unwrap().clone();
     let mut found = false;
     for node in plan.dag.node_weights() {
@@ -180,11 +191,11 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     #[cfg(target_os = "macos")]
     {
         for (id, buffer) in data {
-            runtime.set_data(id, buffer);
+            runtime.upload(&mut arena_runtime, id, buffer).unwrap();
         }
-        runtime.execute().unwrap();
+        runtime.execute(arena_runtime.buffer()).unwrap();
         assert_eq!(
-            runtime.get_f32(out.id).unwrap(),
+            runtime.read_f32(&arena_runtime, out.id).unwrap(),
             vec![11., 22., 33., 44., 55., 66.]
         );
     }
@@ -224,8 +235,9 @@ fn external_kernel_launch_geometry_updates_reuse_compiled_pipeline() {
         }),
     ));
     let mut rt = MetalRuntime::load_with_registry(&graph, registry).unwrap();
-    rt.bind_dyn_range('a', 0, 1025).unwrap();
     rt.search(
+        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (0, 1025))]).unwrap(),
+        &[('a'.into(), 512)].into_iter().collect(),
         &[
             (a.id, vec![2f32; 512].into()),
             (b.id, vec![3f32; 512].into()),
@@ -235,12 +247,13 @@ fn external_kernel_launch_geometry_updates_reuse_compiled_pipeline() {
         &harness_search_options(),
     )
     .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
     for n in [0, 1025, 2, 0, 257] {
         rt.set_dim('a', n);
-        rt.set_data(a.id, vec![2f32; n]);
-        rt.set_data(b.id, vec![3f32; n]);
-        rt.execute().unwrap();
-        assert_eq!(rt.get_f32(out.id).unwrap(), vec![5f32; n]);
+        rt.upload(&mut arena_rt, a.id, vec![2f32; n]).unwrap();
+        rt.upload(&mut arena_rt, b.id, vec![3f32; n]).unwrap();
+        rt.execute(arena_rt.buffer()).unwrap();
+        assert_eq!(rt.read_f32(&arena_rt, out.id).unwrap(), vec![5f32; n]);
     }
     let stats = rt.graph_stats().unwrap();
     assert_eq!(stats.kernel_compilations, 1);

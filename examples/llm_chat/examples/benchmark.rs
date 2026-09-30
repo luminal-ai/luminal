@@ -143,7 +143,11 @@ fn main() -> Result<()> {
                 "removed_nodes":bucket.outcome.memory_pruning.removed_nodes,
                 "largest_tensor_bytes":bucket.outcome.memory_pruning.largest_tensor_bytes}})
     }).collect();
-    let plan = backend.plan().context("missing selected plan")?;
+    let plan = &backend
+        .bucket_plans()
+        .first()
+        .context("missing decode plan")?
+        .plan;
     let mut selected_counts = BTreeMap::<String, usize>::new();
     let mut nodes = Vec::new();
     for id in plan.dag.node_indices() {

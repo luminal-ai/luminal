@@ -1,8 +1,7 @@
-//! Physical storage planning for graph execution. One schedule places uploads,
-//! bufferized nodes, and readbacks; one interval allocator packs device tensors,
-//! operation scratch, parameters, and pinned staging. Logical ownership remains
-//! in the bufferized plan: the arena holds private device copies, and returned
-//! outputs own their host bytes.
+//! Physical storage planning for graph execution. The serial adapter packs
+//! device tensors, operation scratch, and parameters. Boundary storage is
+//! supplied by the application; outputs remain on the device until return.
+//! Tensor uploads and readbacks are never part of this schedule.
 
 use crate::bufferize::{Buffer, BufferId, BufferIrGraph, BufferNode, Owner, PlanLayout};
 use crate::layout_ir::FreedBy;
@@ -10,6 +9,165 @@ use crate::prelude::{FxHashMap, FxHashSet, NodeIndex, petgraph};
 use anyhow::{Result, anyhow, bail, ensure};
 use petgraph::visit::{EdgeRef, NodeIndexable};
 use std::collections::{BTreeMap, BinaryHeap};
+
+/// Placement policy for a bounded slab. First fit is deterministic in request
+/// order and may fail even when a different placement would fit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SlabAlgorithm {
+    #[default]
+    FirstFit,
+}
+
+/// A physical buffer is live at, and between, all of these DAG nodes. Include
+/// every read, write, transfer, and any use outside the computation itself.
+/// IDs are application-defined; independent programs may namespace their IDs.
+#[derive(Debug, Clone)]
+pub struct SlabBuffer<Id> {
+    pub id: Id,
+    pub bytes: usize,
+    pub uses: Vec<NodeIndex>,
+}
+
+/// Assign aligned offsets within `capacity` without changing DAG parallelism.
+/// Two buffers may alias only if every use of one strictly precedes every use
+/// of the other. Unordered branches and operands of the same node cannot alias.
+/// The result follows request order and contains no execution schedule.
+///
+/// `alignment` applies to the entire plan, including reserved sizes. Empty
+/// tensors reserve one aligned unit so their addresses remain distinct while
+/// live. The caller owns the slab and must provide an aligned base address.
+/// A capacity error means this algorithm did not find a placement, not that no
+/// possible placement exists. This function makes no tensor geometry or access
+/// permission assumptions.
+pub fn plan_slab<N, E, Id: Clone + Eq + std::hash::Hash>(
+    dag: &petgraph::graph::DiGraph<N, E>,
+    buffers: &[SlabBuffer<Id>],
+    capacity: usize,
+    alignment: usize,
+    algorithm: SlabAlgorithm,
+) -> Result<Vec<(Id, usize)>> {
+    ensure!(alignment > 0, "slab alignment must be positive");
+    let order = petgraph::algo::toposort(dag, None)
+        .map_err(|_| anyhow!("slab lifetime graph must be acyclic"))?;
+    let mut ids = std::collections::HashSet::new();
+    let sizes: Vec<_> = buffers
+        .iter()
+        .map(|buffer| {
+            ensure!(ids.insert(&buffer.id), "duplicate slab buffer ID");
+            ensure!(!buffer.uses.is_empty(), "slab buffer has no lifetime nodes");
+            ensure!(
+                buffer.uses.iter().all(|&n| dag.node_weight(n).is_some()),
+                "slab lifetime references an absent DAG node"
+            );
+            aligned_size(buffer.bytes, alignment)
+        })
+        .collect::<Result<_>>()?;
+    // Transitive closure of the supplied dependency DAG, never an invented
+    // topological execution order. Bitsets keep queries cheap for large plans.
+    let words = dag.node_bound().div_ceil(64);
+    let mut after = vec![vec![0u64; words]; dag.node_bound()];
+    for &node in order.iter().rev() {
+        for next in dag.neighbors(node) {
+            after[node.index()][next.index() / 64] |= 1 << (next.index() % 64);
+            let [current, successor] = after
+                .get_disjoint_mut([node.index(), next.index()])
+                .unwrap();
+            for (word, &reachable) in current.iter_mut().zip(successor.iter()) {
+                *word |= reachable;
+            }
+        }
+    }
+    let precedes = |a: &SlabBuffer<Id>, b: &SlabBuffer<Id>| {
+        a.uses.iter().all(|u| {
+            b.uses
+                .iter()
+                .all(|v| after[u.index()][v.index() / 64] & (1 << (v.index() % 64)) != 0)
+        })
+    };
+    let mut offsets = Vec::with_capacity(buffers.len());
+    match algorithm {
+        SlabAlgorithm::FirstFit => {
+            for (i, buffer) in buffers.iter().enumerate() {
+                let mut occupied: Vec<_> = (0..i)
+                    .filter(|&j| !precedes(buffer, &buffers[j]) && !precedes(&buffers[j], buffer))
+                    .map(|j| (offsets[j], sizes[j]))
+                    .collect();
+                occupied.sort_unstable();
+                let mut offset = 0usize;
+                for (start, bytes) in occupied {
+                    if offset.checked_add(sizes[i]).is_some_and(|end| end <= start) {
+                        break;
+                    }
+                    offset = offset.max(start + bytes);
+                }
+                ensure!(
+                    offset
+                        .checked_add(sizes[i])
+                        .is_some_and(|end| end <= capacity),
+                    "slab capacity {capacity} exceeded while placing request {i} ({} bytes)",
+                    buffer.bytes
+                );
+                offsets.push(offset);
+            }
+        }
+    }
+    Ok(buffers
+        .iter()
+        .zip(offsets)
+        .map(|(buffer, offset)| (buffer.id.clone(), offset))
+        .collect())
+}
+
+/// Describe physical buffer uses using the bufferizer's own DAG node IDs.
+/// Applications may filter caller-owned boundaries before planning or add
+/// transfer nodes when their execution protocol extends these lifetimes.
+pub fn buffer_lifetimes<L: PlanLayout>(
+    plan: &BufferIrGraph<L>,
+    bytes_of: impl Fn(&Buffer<L>) -> Result<usize>,
+) -> Result<Vec<SlabBuffer<BufferId>>> {
+    let mut buffers: Vec<SlabBuffer<BufferId>> = Vec::new();
+    let mut indices = FxHashMap::default();
+    for node in plan.dag.node_indices() {
+        let ids: Vec<_> = match &plan.dag[node] {
+            BufferNode::BufferInput { slots } => slots.iter().map(|s| &s.buffer).collect(),
+            BufferNode::Compute { reads, writes, .. } => reads.iter().chain(writes).collect(),
+            BufferNode::BufferCopy { src, dst } => vec![src, dst],
+            BufferNode::BufferOutput { slots } => slots.iter().map(|s| &s.buffer).collect(),
+        };
+        for id in ids {
+            let index = if let Some(&index) = indices.get(id) {
+                index
+            } else {
+                let index = buffers.len();
+                let buffer = plan
+                    .buffers
+                    .get(id)
+                    .ok_or_else(|| anyhow!("unknown buffer {id:?}"))?;
+                buffers.push(SlabBuffer {
+                    id: id.clone(),
+                    bytes: bytes_of(buffer)?,
+                    uses: vec![],
+                });
+                indices.insert(id.clone(), index);
+                index
+            };
+            if buffers[index].uses.last() != Some(&node) {
+                buffers[index].uses.push(node);
+            }
+        }
+    }
+    Ok(buffers)
+}
+
+fn aligned_size(bytes: usize, alignment: usize) -> Result<usize> {
+    ensure!(alignment > 0, "slab alignment must be positive");
+    bytes
+        .max(1)
+        .checked_add(alignment - 1)
+        .map(|v| v / alignment * alignment)
+        .ok_or_else(|| anyhow!("slab alignment overflow"))
+}
 
 /// Device allocations are 256-byte aligned, so every slab range is too:
 /// a sub-range handed to a kernel must satisfy the same alignment the
@@ -38,27 +196,16 @@ impl ArenaSlice {
     }
 }
 
-/// The exact schedule consumed by graph construction. Transfers of multiple
-/// output views sharing a buffer are grouped within each output boundary.
+/// An operation in the serial device schedule. Tensor transfers belong to callers.
 #[derive(Debug, Clone)]
 pub enum ArenaStep {
-    Upload {
-        buffer: BufferId,
-        staging: ArenaSlice,
-    },
     Node(NodeIndex),
-    Download {
-        buffer: BufferId,
-        node: NodeIndex,
-        slots: Vec<usize>,
-        staging: ArenaSlice,
-    },
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ArenaPlan {
     /// A topological order respecting data and anti-dependencies, with late
-    /// allocations and eager frees. `steps` expands this order with transfers.
+    /// allocations and eager frees. `steps` contains only device operations.
     pub order: Vec<NodeIndex>,
     pub steps: Vec<ArenaStep>,
     pub slab_bytes: usize,
@@ -326,7 +473,14 @@ struct Lifetime {
 
 /// The same allocator serves device memory and pinned host memory. Only their
 /// alignment and lifetimes differ. Returned slices follow request order.
-fn pack(lifetimes: &[Lifetime], alignment: usize) -> Result<(Vec<ArenaSlice>, usize, usize)> {
+fn pack(
+    lifetimes: &[Lifetime],
+    alignment: usize,
+    capacity: usize,
+    algorithm: SlabAlgorithm,
+) -> Result<(Vec<ArenaSlice>, usize, usize)> {
+    ensure!(alignment > 0, "slab alignment must be positive");
+    let SlabAlgorithm::FirstFit = algorithm;
     let mut events = Vec::with_capacity(lifetimes.len() * 2);
     for (id, life) in lifetimes.iter().enumerate() {
         ensure!(life.start < life.end, "empty physical lifetime");
@@ -348,6 +502,10 @@ fn pack(lifetimes: &[Lifetime], alignment: usize) -> Result<(Vec<ArenaSlice>, us
             .ok_or_else(|| anyhow!("arena alignment overflow"))?;
         if alloc {
             let offset = free_list.alloc(need)?;
+            ensure!(
+                free_list.top <= capacity,
+                "slab capacity {capacity} exceeded"
+            );
             ensure!(
                 live.range(..=offset)
                     .next_back()
@@ -379,8 +537,8 @@ fn pack(lifetimes: &[Lifetime], alignment: usize) -> Result<(Vec<ArenaSlice>, us
     Ok((slices, free_list.top, peak))
 }
 
-/// Plan private device copies of a bufferized program. Unlike logical caller
-/// storage, these ranges only need to survive through their GPU uses/readbacks.
+/// Plan device storage for a bufferized program. Caller boundary storage stays
+/// live through the call; intermediate ranges can be reused after their last use.
 /// The CUDA adapter also supplies parameter and per-operation scratch sizes.
 pub fn plan_arena<L: PlanLayout>(
     plan: &BufferIrGraph<L>,
@@ -411,36 +569,27 @@ fn plan_arena_over<L: PlanLayout>(
     parameter_bytes: usize,
     order: Vec<NodeIndex>,
 ) -> Result<ArenaPlan> {
-    plan_resident_over(
+    plan_external_over(
         plan,
         bytes_of,
         scratch_of,
         parameter_bytes,
         order,
         &Default::default(),
-        &Default::default(),
-        &Default::default(),
     )
 }
 
-/// Reserve resident boundaries separately from the per-launch lifetimes. State
-/// readbacks retain their schedule position but need no pinned host allocation.
+/// Plan a serial execution schedule, excluding caller-owned device boundaries.
+/// Executors must obey the returned steps for these offsets to remain valid.
 #[allow(clippy::too_many_arguments)]
-pub fn plan_resident_over<L: PlanLayout>(
+pub fn plan_external_over<L: PlanLayout>(
     plan: &BufferIrGraph<L>,
     bytes_of: impl Fn(&Buffer<L>) -> Result<usize>,
     scratch_of: impl Fn(NodeIndex) -> Result<usize>,
     parameter_bytes: usize,
     order: Vec<NodeIndex>,
-    resident_inputs: &std::collections::BTreeSet<i64>,
-    device_outputs: &std::collections::BTreeSet<usize>,
     external_buffers: &FxHashSet<BufferId>,
 ) -> Result<ArenaPlan> {
-    let is_resident = |id: &BufferId| {
-        plan.buffers[id]
-            .lit
-            .is_some_and(|lit| resident_inputs.contains(&lit))
-    };
     let is_external = |id: &BufferId| external_buffers.contains(id);
     let mut allocs = FxHashMap::default();
     let mut frees = FxHashMap::default();
@@ -474,67 +623,34 @@ pub fn plan_resident_over<L: PlanLayout>(
         .filter(|id| !allocs.contains_key(*id))
         .cloned()
         .collect();
-    let mut uploaded = std::collections::HashSet::new();
     let mut steps = vec![];
     for &node in &order {
         let op = &plan.dag[node];
         if let Some(id) = allocated(op) {
             ensure!(live.insert(id.clone()), "alloc of live buffer {id:?}");
         }
-        let mut touched: Vec<&BufferId> = match op {
+        let touched: Vec<&BufferId> = match op {
             BufferNode::Compute { reads, writes, .. } => reads.iter().chain(writes).collect(),
             BufferNode::BufferCopy { src, dst } => vec![src, dst],
-            BufferNode::BufferOutput { slots } => slots.iter().map(|s| &s.buffer).collect(),
-            BufferNode::BufferInput { .. } => vec![],
+            BufferNode::BufferOutput { slots } => {
+                for slot in slots {
+                    ensure!(
+                        plan.buffers[&slot.buffer].freed_by == FreedBy::Caller,
+                        "output slot {} has NON-ESCAPING buffer",
+                        slot.index
+                    );
+                }
+                slots.iter().map(|s| &s.buffer).collect()
+            }
+            BufferNode::BufferInput { slots } => slots.iter().map(|s| &s.buffer).collect(),
         };
-        // Preserve operand order, deduplicating tied operands/results.
-        let mut seen = std::collections::HashSet::new();
-        touched.retain(|id| seen.insert((*id).clone()));
         for id in touched {
             ensure!(
                 live.contains(id),
                 "node {node:?} touches non-live buffer {id:?}"
             );
-            if plan.buffers[id].lit.is_some()
-                && !is_resident(id)
-                && !is_external(id)
-                && uploaded.insert(id.clone())
-            {
-                steps.push(ArenaStep::Upload {
-                    buffer: id.clone(),
-                    staging: ArenaSlice::default(),
-                });
-            }
         }
         steps.push(ArenaStep::Node(node));
-        if let BufferNode::BufferOutput { slots } = op {
-            let mut groups: Vec<(BufferId, Vec<usize>)> = vec![];
-            for (i, slot) in slots.iter().enumerate() {
-                ensure!(
-                    plan.buffers[&slot.buffer].freed_by == FreedBy::Caller,
-                    "output slot {} has NON-ESCAPING buffer",
-                    slot.index
-                );
-                if let Some((_, indices)) = groups.iter_mut().find(|(id, _)| id == &slot.buffer) {
-                    indices.push(i);
-                } else {
-                    groups.push((slot.buffer.clone(), vec![i]));
-                }
-            }
-            for (buffer, slots) in groups {
-                // A caller-owned output is written in place by its producer;
-                // there is no readback and no pinned staging to reserve.
-                if is_external(&buffer) {
-                    continue;
-                }
-                steps.push(ArenaStep::Download {
-                    buffer,
-                    node,
-                    slots,
-                    staging: ArenaSlice::default(),
-                });
-            }
-        }
         if let Some(id) = freed(op) {
             ensure!(live.remove(id), "free of non-live buffer {id:?}");
         }
@@ -552,7 +668,7 @@ pub fn plan_resident_over<L: PlanLayout>(
         0
     });
     let mut touch = |id: &BufferId, at: usize, intervals: &mut Vec<Lifetime>| -> Result<()> {
-        if is_resident(id) || is_external(id) {
+        if is_external(id) {
             return Ok(());
         }
         if let Some(&i) = buffers.get(id) {
@@ -569,9 +685,6 @@ pub fn plan_resident_over<L: PlanLayout>(
     };
     for (at, step) in steps.iter().enumerate() {
         match step {
-            ArenaStep::Upload { buffer, .. } | ArenaStep::Download { buffer, .. } => {
-                touch(buffer, at, &mut intervals)?
-            }
             ArenaStep::Node(node) => {
                 match &plan.dag[*node] {
                     BufferNode::Compute { reads, writes, .. } => {
@@ -583,7 +696,16 @@ pub fn plan_resident_over<L: PlanLayout>(
                         touch(src, at, &mut intervals)?;
                         touch(dst, at, &mut intervals)?;
                     }
-                    _ => {}
+                    BufferNode::BufferInput { slots } => {
+                        for slot in slots {
+                            touch(&slot.buffer, at, &mut intervals)?;
+                        }
+                    }
+                    BufferNode::BufferOutput { slots } => {
+                        for slot in slots {
+                            touch(&slot.buffer, at, &mut intervals)?;
+                        }
+                    }
                 }
                 let scratch = scratch_of(*node)?;
                 if scratch > 0 {
@@ -597,7 +719,18 @@ pub fn plan_resident_over<L: PlanLayout>(
             }
         }
     }
-    let (slices, slab_bytes, peak_live_bytes) = pack(&intervals, ARENA_ALIGN)?;
+    // Inputs exist before the first operation; escaped results must survive
+    // until return. No implicit upload/readback can shorten these lifetimes.
+    for (id, &i) in &buffers {
+        if plan.buffers[id].owner == Owner::Caller {
+            intervals[i].start = 0;
+        }
+        if plan.buffers[id].freed_by == FreedBy::Caller {
+            intervals[i].end = steps.len().max(1);
+        }
+    }
+    let (slices, slab_bytes, peak_live_bytes) =
+        pack(&intervals, ARENA_ALIGN, usize::MAX, SlabAlgorithm::FirstFit)?;
     let parameters = parameter.map(|i| slices[i]).unwrap_or_default();
     let buffers: FxHashMap<_, _> = buffers.into_iter().map(|(id, i)| (id, slices[i])).collect();
     let workspaces = workspaces
@@ -605,57 +738,6 @@ pub fn plan_resident_over<L: PlanLayout>(
         .map(|(node, i)| (node, slices[i]))
         .collect();
 
-    // All host inputs are populated before launch and must survive until their
-    // upload; each output survives from readback through host result collection.
-    // A separate time 0 represents the parameter upload preceding `steps`.
-    let mut staging = vec![];
-    let staging_parameter = parameter.map(|_| {
-        staging.push(Lifetime {
-            start: 0,
-            end: 1,
-            bytes: parameter_bytes,
-        });
-        0
-    });
-    let mut transfers = vec![];
-    for (at, step) in steps.iter().enumerate() {
-        let (buffer, start, end) = match step {
-            ArenaStep::Upload { buffer, .. } => (buffer, 0, at + 2),
-            ArenaStep::Download {
-                buffer,
-                node,
-                slots,
-                ..
-            } => {
-                let BufferNode::BufferOutput { slots: bindings } = &plan.dag[*node] else {
-                    unreachable!()
-                };
-                if slots
-                    .iter()
-                    .all(|&i| device_outputs.contains(&bindings[i].index))
-                {
-                    continue;
-                }
-                (buffer, at + 1, steps.len() + 2)
-            }
-            ArenaStep::Node(_) => continue,
-        };
-        transfers.push((at, staging.len()));
-        staging.push(Lifetime {
-            start,
-            end,
-            bytes: bytes_of(&plan.buffers[buffer])?,
-        });
-    }
-    let (staging_slices, staging_bytes, _) = pack(&staging, 1)?;
-    for (at, i) in transfers {
-        match &mut steps[at] {
-            ArenaStep::Upload { staging, .. } | ArenaStep::Download { staging, .. } => {
-                *staging = staging_slices[i]
-            }
-            ArenaStep::Node(_) => unreachable!(),
-        }
-    }
     Ok(ArenaPlan {
         order,
         steps,
@@ -664,10 +746,11 @@ pub fn plan_resident_over<L: PlanLayout>(
         slices: buffers,
         workspaces,
         parameters,
-        staging_parameters: staging_parameter
-            .map(|i| staging_slices[i])
-            .unwrap_or_default(),
-        staging_bytes,
+        staging_parameters: ArenaSlice {
+            offset: 0,
+            bytes: parameter_bytes,
+        },
+        staging_bytes: parameter_bytes,
         externals: external_buffers.clone(),
     })
 }
@@ -678,6 +761,129 @@ mod tests {
     use crate::index_expr::IotaExpr;
     use crate::layout_ir::Access;
     use crate::test_support::{MockLayout, MockOp, MockViewWithMap, TestGraph, bufferize_mock};
+
+    #[test]
+    fn slab_preserves_parallel_branches_and_reuses_after_join() {
+        let mut dag = petgraph::graph::DiGraph::<(), ()>::new();
+        let a = dag.add_node(());
+        let b = dag.add_node(());
+        let join = dag.add_node(());
+        dag.add_edge(a, join, ());
+        dag.add_edge(b, join, ());
+        let requests = vec![
+            SlabBuffer {
+                id: "a",
+                bytes: 257,
+                uses: vec![a],
+            },
+            SlabBuffer {
+                id: "b",
+                bytes: 256,
+                uses: vec![b],
+            },
+            SlabBuffer {
+                id: "joined",
+                bytes: 512,
+                uses: vec![join],
+            },
+        ];
+        assert!(plan_slab(&dag, &requests, 767, 256, SlabAlgorithm::FirstFit).is_err());
+        assert_eq!(
+            plan_slab(&dag, &requests, 768, 256, SlabAlgorithm::FirstFit).unwrap(),
+            vec![("a", 0), ("b", 512), ("joined", 0)]
+        );
+    }
+
+    #[test]
+    fn slab_lifetime_includes_all_uses_and_gaps_between_them() {
+        let mut dag = petgraph::graph::DiGraph::<(), ()>::new();
+        let start = dag.add_node(());
+        let middle = dag.add_node(());
+        let end = dag.add_node(());
+        dag.add_edge(start, middle, ());
+        dag.add_edge(middle, end, ());
+        let requests = vec![
+            SlabBuffer {
+                id: 0,
+                bytes: 16,
+                uses: vec![start, end],
+            },
+            SlabBuffer {
+                id: 1,
+                bytes: 16,
+                uses: vec![middle],
+            },
+            SlabBuffer {
+                id: 2,
+                bytes: 16,
+                uses: vec![end],
+            },
+        ];
+        assert_eq!(
+            plan_slab(&dag, &requests, 32, 16, SlabAlgorithm::FirstFit).unwrap(),
+            vec![(0, 0), (1, 16), (2, 16)]
+        );
+        assert!(plan_slab(&dag, &requests, 31, 16, SlabAlgorithm::FirstFit).is_err());
+    }
+
+    #[test]
+    fn slab_rejects_invalid_requests() {
+        let mut dag = petgraph::graph::DiGraph::<(), ()>::new();
+        let node = dag.add_node(());
+        let request = SlabBuffer {
+            id: 0,
+            bytes: 1,
+            uses: vec![node],
+        };
+        assert!(
+            plan_slab(
+                &dag,
+                std::slice::from_ref(&request),
+                1,
+                0,
+                SlabAlgorithm::FirstFit
+            )
+            .is_err()
+        );
+        assert!(
+            plan_slab(
+                &dag,
+                &[request.clone(), request.clone()],
+                8,
+                1,
+                SlabAlgorithm::FirstFit
+            )
+            .is_err()
+        );
+        assert!(
+            plan_slab(
+                &dag,
+                &[SlabBuffer {
+                    bytes: usize::MAX,
+                    ..request.clone()
+                }],
+                usize::MAX,
+                256,
+                SlabAlgorithm::FirstFit
+            )
+            .is_err()
+        );
+        assert!(
+            plan_slab(
+                &dag,
+                &[SlabBuffer {
+                    uses: vec![],
+                    ..request.clone()
+                }],
+                8,
+                1,
+                SlabAlgorithm::FirstFit
+            )
+            .is_err()
+        );
+        dag.add_edge(node, node, ());
+        assert!(plan_slab(&dag, &[request], 8, 1, SlabAlgorithm::FirstFit).is_err());
+    }
 
     /// Every buffer is the same size, so the numbers below are counts of
     /// buffers and nothing else.
@@ -757,8 +963,8 @@ mod tests {
         let sum: usize = arena.slices.values().map(|s| align_up(s.bytes)).sum();
         assert_eq!(
             arena.slab_bytes,
-            2 * RESERVED,
-            "producer + consumer are the only pair ever live together \
+            4 * RESERVED,
+            "two boundary buffers plus producer + consumer remain live \
              ({members} members, sum {sum}):\n{}",
             plan.summary()
         );
@@ -801,8 +1007,7 @@ mod tests {
         );
     }
 
-    /// Escaping storage keeps its logical ownership, while its private device
-    /// copy participates in physical packing through the output readback.
+    /// Escaping storage remains in the device arena until the caller consumes it.
     #[test]
     fn escaping_minted_storage_is_packed_without_a_logical_free() {
         let mut g = TestGraph::new();
@@ -835,8 +1040,8 @@ mod tests {
         let arena = plan_arena(&plan, unit_bytes).expect("arena plans");
         assert!(arena.slices.contains_key(&escaping));
         assert!(plan.dag.node_weights().all(|n| freed(n) != Some(&escaping)));
-        assert!(arena.steps.iter().any(|step| matches!(step,
-            ArenaStep::Download { buffer, .. } if buffer == &escaping)));
+        assert!(plan.dag.node_weights().any(|node| matches!(node,
+            BufferNode::BufferOutput { slots } if slots.iter().any(|slot| slot.buffer == escaping))));
     }
 
     /// Donation's explicit free remains authoritative, and the private copy
@@ -901,9 +1106,6 @@ mod tests {
                 .enumerate()
                 .filter_map(|(i, step)| {
                     let touches = match step {
-                        ArenaStep::Upload { buffer, .. } | ArenaStep::Download { buffer, .. } => {
-                            buffer == id
-                        }
                         ArenaStep::Node(node) => match &plan.dag[*node] {
                             BufferNode::Compute { reads, writes, .. } => {
                                 reads.contains(id) || writes.contains(id)
@@ -988,7 +1190,8 @@ mod tests {
                         }
                     })
                     .collect();
-                let (slices, total, peak) = pack(&lives, alignment).unwrap();
+                let (slices, total, peak) =
+                    pack(&lives, alignment, usize::MAX, SlabAlgorithm::FirstFit).unwrap();
                 let reservation = |bytes: usize| bytes.max(1).div_ceil(alignment) * alignment;
                 let expected_peak = (0..55)
                     .map(|t| {
@@ -1021,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn scratch_reuses_tensor_storage_and_staging_reuses_uploaded_inputs() {
+    fn scratch_reuses_dead_tensor_storage_without_tensor_staging() {
         let plan = chain(6);
         let nodes: Vec<_> = plan
             .dag
@@ -1056,19 +1259,9 @@ mod tests {
             arena.slab_bytes, baseline.slab_bytes,
             "scratch fits inside the existing high-water mark"
         );
-        let staging_sum: usize = arena
-            .steps
-            .iter()
-            .map(|s| match s {
-                ArenaStep::Upload { staging, .. } | ArenaStep::Download { staging, .. } => {
-                    staging.bytes
-                }
-                _ => 0,
-            })
-            .sum();
-        assert!(
-            arena.staging_bytes < staging_sum + 8,
-            "staging must reuse completed uploads"
+        assert_eq!(
+            arena.staging_bytes, 8,
+            "only dimension parameters use staging"
         );
     }
 
@@ -1081,7 +1274,9 @@ mod tests {
                     end: 1,
                     bytes: usize::MAX
                 }],
-                ARENA_ALIGN
+                ARENA_ALIGN,
+                usize::MAX,
+                SlabAlgorithm::FirstFit
             )
             .is_err()
         );
@@ -1092,7 +1287,9 @@ mod tests {
                     end: 2,
                     bytes: 1
                 }],
-                1
+                1,
+                usize::MAX,
+                SlabAlgorithm::FirstFit
             )
             .is_err()
         );

@@ -1,5 +1,5 @@
 //! The CUDA-lite runtime: the reference ladder
-//! (`load → bind_* → search → set_data → execute → get_*`) with the
+//! (`load → search → bind device storage → execute`) with the
 //! search claiming only this backend's codegen inventory and execution
 //! delegated to the `device` module.
 //!
@@ -17,9 +17,44 @@ use luminal::layouts::DecodedLayout;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal::shape;
 
+/// A slab borrowed for one synchronous execution. The owner determines whether
+/// the same allocation survives between calls.
+#[derive(Debug)]
+pub struct CudaArena<'a> {
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    pub(crate) ptr: u64,
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    pub(crate) bytes: usize,
+    _borrow: std::marker::PhantomData<&'a mut [u8]>,
+}
+impl<'a> CudaArena<'a> {
+    /// An empty arena. Execution rejects it if the program needs any storage.
+    pub fn empty() -> Self {
+        Self {
+            ptr: 0,
+            bytes: 0,
+            _borrow: std::marker::PhantomData,
+        }
+    }
+    /// Borrow foreign device memory (for example, PyTorch allocator storage).
+    ///
+    /// # Safety
+    /// `ptr` must be a live, 256-byte-aligned allocation of at least `bytes` on
+    /// the execution device, exclusively available for the returned lifetime.
+    /// For asynchronous execution it must remain live until GPU completion.
+    pub unsafe fn from_raw(ptr: u64, bytes: usize) -> Self {
+        Self {
+            ptr,
+            bytes,
+            _borrow: std::marker::PhantomData,
+        }
+    }
+}
+
 /// What `load` captured: the bound program (model text, this runtime's
 /// boundary, the post-schedule checks) plus whatever the `bind_*` calls
 /// accumulate before `search` assembles and saturates.
+#[derive(Clone)]
 struct NativeParts {
     bound: crate::bindings::BoundProgram,
     binding_seeds: String,
@@ -43,9 +78,9 @@ pub struct CudaRuntime {
     ///
     /// The matchers are HELD rather than rebuilt because `dyn OpMatcher`
     /// is not clonable and one instance runs many extractions (every
-    /// genome, and with buckets every Cartesian combination); everything
+    /// genome); everything
     /// downstream borrows this slice.
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: std::rc::Rc<Vec<Box<dyn luminal::layout_ir::OpMatcher>>>,
     /// The claim set derived from that same registry — see
     /// [`CudaRuntime::allow_list_over`] for the three classes.
     allow: Vec<&'static str>,
@@ -54,25 +89,18 @@ pub struct CudaRuntime {
     /// Every layout decode in this runtime reads through these, and the
     /// assembly tripwire checks each saturated program against them. A
     /// `Default` runtime carries an empty registry, like `matchers`.
-    decoders: luminal::egglog_utils::eclass::ConstructorRegistry,
+    decoders: std::rc::Rc<luminal::egglog_utils::eclass::ConstructorRegistry>,
     plan: Option<BufferIrGraph<DecodedLayout>>,
-    /// Host-staged input payloads by BufferLit id, H2D'd at execute.
-    staged: FxHashMap<i64, HostBuffer>,
-    /// WHERE EACH BOUNDARY BUFFER'S STORAGE LIVES, stated by the bindings
-    /// at load ([`crate::bindings::Placement`]): the arena's resident set,
-    /// and the buffers that are the caller's own device memory.
-    residents: crate::resident::ResidentBindings,
+    storage: Option<crate::arena::ArenaPlan>,
+    /// Boundaries supplied as caller-owned device pointers.
+    externals: std::collections::BTreeSet<i64>,
     device_budget_bytes: Option<usize>,
     /// The caller's device address for each External buffer, supplied before
     /// each execution ([`Self::set_device_ptr`]). Keyed by buffer id, which
     /// is also how the bindings spell aliasing: a mutation sink and its
     /// target share one buffer and therefore one pointer.
     device_ptrs: FxHashMap<i64, (u64, usize)>,
-    /// Host copies of each output slot's BACKING buffer plus its elected
-    /// layout, filled by execute (D2H) — the escape-and-disclose fetch,
-    /// keyed by slot index (an escaped slot's backing buffer is a minted
-    /// allocation with no BufferLit, so slot order is the stable key).
-    outputs_host: FxHashMap<usize, (HostBuffer, luminal::bufferize::OutputBinding<DecodedLayout>)>,
+    /// Logical input values mapped to device boundary buffers.
     input_buffers: FxHashMap<NodeIndex, i64>,
     /// Bound output tensor → its buffer ids, in binding order. A value bound
     /// on two buffers has two, and [`Self::output_buffer`] refuses rather
@@ -83,38 +111,12 @@ pub struct CudaRuntime {
     /// by tensor: [`Self::output_slot_index`] refuses the ambiguity
     /// rather than picking one.
     output_slots: FxHashMap<NodeIndex, Vec<usize>>,
-    /// BUCKETS (D7, 2026-09-03): per-dim intervals one search covers.
-    /// Empty = the ordinary single-pin ladder, unchanged.
-    dim_buckets: std::collections::BTreeMap<shape::Symbol, Vec<graph::DimBucket>>,
-    /// One finished plan per Cartesian bucket combination.
-    bucket_plans: Vec<crate::search::BucketPlan>,
-    selected_bucket: Option<usize>,
-    /// The dim values this runtime currently holds — every `[n, n]`
-    /// `bind_dyn_range` pin plus whatever [`Self::set_dim`] sets. With
-    /// buckets bound this is what picks the plan at execute time.
+    bounds: shape::DimensionBounds,
     dims: shape::DynMap,
-    /// EVERY dim [`Self::bind_dyn_range`] has bound, tight or not, with
-    /// the interval it was given. `dims` records only the `[n, n]` pins,
-    /// so it cannot answer the exclusivity question: buckets and range
-    /// bindings must refuse each other in BOTH orders, and a non-tight
-    /// range under a later bucket would otherwise seed the same `IntVar`
-    /// twice and INTERSECT under the bounds lattice's merge rather than
-    /// refuse.
-    range_bound: std::collections::BTreeMap<shape::Symbol, (u64, u64)>,
-    /// THE PERSISTENT DEVICE (#422, rejoin Phase 3): context, stream,
-    /// NVRTC module cache and the arena slab, created lazily — by the
-    /// first device-profiled [`Self::search`] (Phase 4) or by the first
-    /// [`Self::execute`], whichever comes first — and kept for the
-    /// runtime's life, "each runtime remembers its own buffer hygiene".
-    /// `None` until then, so `Default` still gives a device-free runtime
-    /// that can load, bind and inspect saturated graphs on any host.
+    /// Live execution context and code/graph caches, attached explicitly or lazily.
+    /// This is runtime state, not a portable serialized program.
     #[cfg(feature = "device")]
-    device: Option<crate::device::CudaDevice>,
-    /// A caller-allocated arena for the NEXT execution. `None` means the
-    /// device allocates and owns its slab, the pre-existing standalone
-    /// behaviour.
-    #[cfg(feature = "device")]
-    external_arena: Option<(u64, usize)>,
+    device: Option<crate::device::CudaExecutable>,
     /// Raw `CUstream` to run on (the caller's current stream). `None` runs on
     /// a stream this runtime owns.
     #[cfg(feature = "device")]
@@ -122,6 +124,37 @@ pub struct CudaRuntime {
 }
 
 impl CudaRuntime {
+    /// Bind the selected program to independent execution state. Device code
+    /// caches are shared; inputs, output buffers, arenas and captures are fresh.
+    pub fn fork(&self) -> Result<Self> {
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("search before fork"))?;
+        Ok(Self {
+            native: self.native.clone(),
+            matchers: self.matchers.clone(),
+            allow: self.allow.clone(),
+            decoders: self.decoders.clone(),
+            plan: Some(plan.clone()),
+            storage: self.storage.clone(),
+            bounds: self.bounds.clone(),
+            dims: self.dims.clone(),
+            input_buffers: self.input_buffers.clone(),
+            output_buffers: self.output_buffers.clone(),
+            output_slots: self.output_slots.clone(),
+            externals: self.externals.clone(),
+            device_budget_bytes: self.device_budget_bytes,
+            #[cfg(feature = "device")]
+            device: self
+                .device
+                .as_ref()
+                .map(|device| device.fork())
+                .transpose()?,
+            ..Default::default()
+        })
+    }
+
     /// Record the graph's native program under the DEFAULT op registry
     /// ([`crate::ops::cuda_registry`]) — which since the 2026-09-04
     /// ruling INCLUDES the four cuBLASLt marker contracts, so a default
@@ -133,7 +166,7 @@ impl CudaRuntime {
     /// [`crate::ops::cuda_registry_without_cublaslt`].
     ///
     /// THE DEFAULT BINDING is dense: every input read-only and
-    /// host-staged on its own row-major buffer, every leaf read-write on
+    /// stored in its own row-major arena range, every leaf read-write on
     /// its own. [`CudaRuntime::load_with`] takes the caller's instead.
     pub fn load(graph: &graph::Graph) -> Result<Self> {
         Self::load_with_registry(graph, crate::ops::cuda_registry())
@@ -174,9 +207,9 @@ impl CudaRuntime {
 
     /// LOAD a recorded graph under the CALLER's binding — which values
     /// enter and leave, through which buffers, at which layout, and
-    /// which of them stay device-resident. The tensor→buffer maps are
-    /// live from here, so [`Self::set_data`] needs no search first, and
-    /// the resident set is known before the first plan is priced.
+    /// which of them use caller device storage. The tensor→buffer maps are
+    /// available immediately, and
+    /// external placement is known before the first plan is priced.
     pub fn load_with(
         graph: &graph::Graph,
         bindings: crate::bindings::CudaBindings,
@@ -238,19 +271,19 @@ impl CudaRuntime {
                 .or_default()
                 .push(bound.buffer);
         }
-        let residents = bound.residents();
+        let externals = bound.externals();
         Ok(Self {
             native: Some(NativeParts {
                 bound,
                 binding_seeds: String::new(),
             }),
-            matchers,
+            matchers: std::rc::Rc::new(matchers),
             allow,
-            decoders,
+            decoders: std::rc::Rc::new(decoders),
             input_buffers,
             output_slots,
             output_buffers,
-            residents,
+            externals,
             ..Self::default()
         })
     }
@@ -278,153 +311,24 @@ impl CudaRuntime {
         &self.allow
     }
 
-    /// Refuse a reconfiguration that would throw away installed device
-    /// state. The arena slab holds the installed graphs and every
-    /// resident input's uploaded home, and anything that invalidates
-    /// plans releases it — so once the device is installed, a caller who
-    /// wants a different program wants a different runtime.
-    fn ensure_not_installed(&self, what: &str) -> Result<()> {
-        #[cfg(feature = "device")]
-        anyhow::ensure!(
-            self.device.as_ref().is_none_or(|d| !d.is_installed()),
-            "{what} after execution: create a new runtime — the device arena holds \
-             the installed plans and the resident inputs' data"
-        );
-        #[cfg(not(feature = "device"))]
-        let _ = what;
-        Ok(())
+    /// Use a shared device context/cache while keeping this program's state separate.
+    #[cfg(feature = "device")]
+    pub fn with_device(mut self, device: &crate::device::CudaDevice) -> Result<Self> {
+        self.device = Some(device.executable());
+        self.device_ptrs.clear();
+        self.borrowed_stream = None;
+        Ok(self)
     }
 
-    fn invalidate_plans(&mut self) {
-        self.plan = None;
-        self.bucket_plans.clear();
-        self.selected_bucket = None;
-        self.outputs_host.clear();
-        #[cfg(feature = "device")]
-        if let Some(device) = &mut self.device {
-            device.release_slab();
-        }
-    }
-
-    /// Seed interval bounds for a dynamic dimension (facts, never pins:
-    /// `[n, n]` is how a caller pins).
-    pub fn bind_dyn_range(
-        &mut self,
-        var: impl Into<shape::Symbol>,
-        lower: u64,
-        upper: u64,
-    ) -> Result<()> {
-        self.ensure_not_installed("binding a dimension range")?;
-        let name = var.into();
-        let (lower, upper) = self
-            .range_bound
-            .get(&name)
-            .map(|(lo, hi)| (lower.max(*lo), upper.min(*hi)))
-            .unwrap_or((lower, upper));
-        anyhow::ensure!(
-            lower <= upper,
-            "empty dimension range for `{name}`: [{lower}, {upper}]"
-        );
-        anyhow::ensure!(upper <= i64::MAX as u64, "dimension range exceeds i64");
-        anyhow::ensure!(
-            !self.dim_buckets.contains_key(&name),
-            "dim `{name}` has buckets bound; a bucketed dim is seeded per bucket \
-             and must not carry a second range binding"
-        );
-        let native = self
-            .native
-            .as_mut()
-            .ok_or_else(|| anyhow!("load before bind"))?;
-        let name_literal = name.egglog_literal();
-        native.binding_seeds.push_str(&format!(
-            "(set (lower-bound-of (IntVar {name_literal})) (bigint {lower}))\n\
-             (set (upper-bound-of (IntVar {name_literal})) (bigint {upper}))\n"
-        ));
-        // EVERY range binding is remembered, so `bind_dim_buckets` can
-        // refuse this dim whatever the interval was.
-        self.range_bound.insert(name, (lower, upper));
-        // A tight [n, n] binding IS a pin: remember it too, so a bucketed
-        // plan's representative records the whole assignment.
-        if lower == upper {
-            self.dims.insert(name, lower as usize);
-        }
-        self.invalidate_plans();
-        Ok(())
-    }
-
-    /// BIND BUCKETS for a dynamic dimension (D7, 2026-09-03): a set of
-    /// disjoint intervals, each of which gets its own searched plan.
-    /// `search` then runs one search per Cartesian combination and
-    /// `execute` picks the covering plan from the current dims.
-    ///
-    /// THE BUCKETS MUST PARTITION CLEANLY: non-empty, sorted by `min`,
-    /// and pairwise disjoint. Overlap is REFUSED rather than resolved
-    /// first-wins — two plans that both claim a value is an ambiguity in
-    /// the caller's model, and picking one silently is how a graph ends
-    /// up running the plan its author did not mean.
-    pub fn bind_dim_buckets(
-        &mut self,
-        dim: impl Into<shape::Symbol>,
-        buckets: Vec<graph::DimBucket>,
-    ) -> Result<()> {
-        self.ensure_not_installed("binding dimension buckets")?;
-        let dim = dim.into();
-        anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
-        if let Some((lo, hi)) = self.range_bound.get(&dim) {
-            anyhow::bail!(
-                "dim `{dim}` already carries a range binding [{lo}, {hi}] from \
-                 bind_dyn_range; a bucketed dim is seeded per bucket and must not \
-                 carry a second range binding"
-            );
-        }
-        anyhow::ensure!(
-            !self.dims.contains_key(&dim),
-            "dim `{dim}` already has a value from set_dim; bind buckets before \
-             setting the execution dim"
-        );
-        for pair in buckets.windows(2) {
-            anyhow::ensure!(
-                pair[0].max < pair[1].min,
-                "dim `{dim}` buckets must be sorted and disjoint, but [{}, {}] and \
-                 [{}, {}] are not",
-                pair[0].min,
-                pair[0].max,
-                pair[1].min,
-                pair[1].max
-            );
-        }
-        self.dim_buckets.insert(dim, buckets);
-        self.invalidate_plans();
-        Ok(())
-    }
-
-    /// Set a dynamic dimension's value for EXECUTION (D7). With buckets
-    /// bound this is what selects the plan.
+    /// Execution values never change a program's compiled domain.
     pub fn set_dim(&mut self, dim: impl Into<shape::Symbol>, value: usize) {
         self.dims.insert(dim.into(), value);
     }
 
-    /// The finished per-bucket plans (empty until a bucketed `search`).
-    pub fn bucket_plans(&self) -> &[crate::search::BucketPlan] {
-        &self.bucket_plans
+    pub fn bounds(&self) -> &shape::DimensionBounds {
+        &self.bounds
     }
 
-    /// Pick the range-valid plan covering the current dimensions.
-    fn select_bucket_plan(&mut self) -> Result<()> {
-        let index = self
-            .bucket_plans
-            .iter()
-            .position(|p| {
-                p.ranges
-                    .iter()
-                    .all(|(s, (lo, hi))| self.dims.get(s).is_some_and(|v| v >= lo && v <= hi))
-            })
-            .ok_or_else(|| anyhow!("no bucket covers dims {:?}", self.dims))?;
-        self.selected_bucket = Some(index);
-        Ok(())
-    }
-
-    /// Cumulative graph/arena counters, available after first device use.
     #[cfg(feature = "device")]
     pub fn graph_stats(&self) -> Option<crate::device::GraphStats> {
         self.device.as_ref().map(|d| d.stats())
@@ -477,8 +381,11 @@ impl CudaRuntime {
     /// test seam: estate pins assert on the e-graph the search sees
     /// (which constructors were minted, which spellings a layout class
     /// holds) rather than on an election that depends on the budget.
-    pub fn saturated_egraph(&self) -> Result<luminal::prelude::egraph_serialize::EGraph> {
-        let (serialized, _program) = self.assemble_and_saturate()?;
+    pub fn saturated_egraph(
+        &self,
+        bounds: &shape::DimensionBounds,
+    ) -> Result<luminal::prelude::egraph_serialize::EGraph> {
+        let (serialized, _program) = self.assemble_and_saturate(bounds)?;
         Ok(serialized)
     }
 
@@ -490,6 +397,7 @@ impl CudaRuntime {
     /// mirroring the reference runtime.
     fn assemble_and_saturate(
         &self,
+        bounds: &shape::DimensionBounds,
     ) -> Result<(
         luminal::prelude::egraph_serialize::EGraph,
         crate::search::SearchProgram,
@@ -498,8 +406,13 @@ impl CudaRuntime {
             .native
             .as_ref()
             .ok_or_else(|| anyhow!("load before search"))?;
+        bounds.validate_symbols(&shape::program_dimensions(&format!(
+            "{}{}",
+            native.bound.prefix, native.bound.post_checks
+        ))?)?;
+        let seeds = format!("{}{}", native.binding_seeds, bounds.egglog_seeds());
         let program = crate::search::SearchProgram {
-            text: native.bound.text_with_seeds(&native.binding_seeds),
+            text: native.bound.text_with_seeds(&seeds),
             inputs: native.bound.inputs.clone(),
             outputs: native.bound.outputs.clone(),
         };
@@ -516,9 +429,7 @@ impl CudaRuntime {
             let unchecked = format!(
                 "{}\n\n{}",
                 luminal::egglog_snippet::assembled_program_for(self.matchers()),
-                native
-                    .bound
-                    .text_unchecked_with_seeds(&native.binding_seeds)
+                native.bound.text_unchecked_with_seeds(&seeds)
             );
             let mut probe = luminal::egglog_snippet::new_egraph();
             if probe.parse_and_run_program(None, &unchecked).is_ok() {
@@ -549,157 +460,64 @@ impl CudaRuntime {
     /// by measured execution time.
     pub fn search(
         &mut self,
+        bounds: &shape::DimensionBounds,
+        profile_dims: &shape::DynMap,
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
-        self.search_with_profile_inputs(input_data, &[], options)
-    }
-
-    /// Search with host input overrides for each complete profiling dimension
-    /// assignment. Entries borrow the shared inputs (including weights) and
-    /// override only the supplied tensors. Every representative, including
-    /// finalist validation, must have exactly one entry when overrides are used.
-    pub fn search_with_profile_inputs(
-        &mut self,
-        input_data: &FxHashMap<NodeIndex, HostBuffer>,
-        profile_inputs: &[(shape::DynMap, FxHashMap<NodeIndex, HostBuffer>)],
-        options: &CompileOptions,
-    ) -> Result<SearchOutcome> {
-        ensure!(
-            cfg!(feature = "device"),
-            "candidate search requires the `device` feature and a CUDA GPU"
-        );
-        self.ensure_not_installed("re-searching")?;
-        self.invalidate_plans();
-        let mut resolved_options = options.clone();
-        resolved_options.shapes.bounds = self
-            .range_bound
-            .iter()
-            .map(|(s, (lo, hi))| Ok((*s, (usize::try_from(*lo)?, usize::try_from(*hi)?))))
-            .collect::<Result<_>>()?;
-        resolved_options.shapes.values = self.dims.clone();
-        for (s, (lo, hi)) in &resolved_options.shapes.bounds {
-            resolved_options
-                .shapes
-                .values
-                .entry(*s)
-                .or_insert(lo + (hi - lo) / 2);
+        #[cfg(feature = "device")]
+        if let Some(device) = self.device.as_mut() {
+            device.uninstall();
         }
-        let options = &resolved_options;
+        bounds.validate_values(profile_dims)?;
         let native = self
             .native
             .as_ref()
             .ok_or_else(|| anyhow!("load before search"))?;
-
-        // Check the caller's payloads against the load-time input bindings.
+        bounds.validate_symbols(&shape::program_dimensions(&format!(
+            "{}{}",
+            native.bound.prefix, native.bound.post_checks
+        ))?)?;
+        ensure!(
+            cfg!(feature = "device"),
+            "candidate search requires a CUDA GPU"
+        );
+        let (mut serialized, program) = self.assemble_and_saturate(bounds)?;
+        let shapes = crate::symbolic::ShapeEnv {
+            bounds: bounds.ranges(),
+            values: profile_dims.clone(),
+        };
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("load before search"))?;
         for tensor in input_data.keys() {
-            assert!(
+            ensure!(
                 native.bound.inputs.iter().any(|b| b.value == *tensor),
                 "tensor {tensor:?} is not a bound input"
             );
         }
-
-        // THE SEARCH-TIME STAGING (Phase 4), by BufferLit id and BY
-        // REFERENCE — the ladder's `set_data` staging is a separate,
-        // later step and is untouched. A full-size model's weights are
-        // gigabytes; the search must borrow them, never copy them.
         #[cfg(feature = "device")]
-        let staged_for_search: FxHashMap<i64, &HostBuffer> = {
-            native
-                .bound
-                .inputs
-                .iter()
-                .filter_map(|bound| {
-                    input_data
-                        .get(&bound.value)
-                        .map(|data| (bound.buffer, data))
-                })
-                .collect()
-        };
-        #[cfg(feature = "device")]
-        let profile_inputs: Vec<crate::search::ProfileInputs<'_>> = profile_inputs
+        let staged: FxHashMap<i64, &HostBuffer> = native
+            .bound
+            .inputs
             .iter()
-            .map(|(dims, inputs)| {
-                let inputs = inputs
-                    .iter()
-                    .map(|(tensor, data)| {
-                        let bound = native
-                            .bound
-                            .inputs
-                            .iter()
-                            .find(|bound| bound.value == *tensor)
-                            .ok_or_else(|| {
-                                anyhow!("profiling tensor {tensor:?} is not a bound input")
-                            })?;
-                        Ok((bound.buffer, data))
-                    })
-                    .collect::<Result<_>>()?;
-                Ok((dims.clone(), inputs))
+            .filter_map(|bound| {
+                input_data
+                    .get(&bound.value)
+                    .map(|data| (bound.buffer, data))
             })
-            .collect::<Result<_>>()?;
-        #[cfg(not(feature = "device"))]
-        let _ = profile_inputs;
-        // Keep the device and compiled modules across candidate measurements.
+            .collect();
         #[cfg(feature = "device")]
         if self.device.is_none() {
-            self.device = Some(crate::device::CudaDevice::new(0)?);
+            self.device = Some(crate::device::CudaDevice::new(0)?.executable());
         }
-
-        // THE BASE PROGRAM IS RENDERED AND SATURATED ONLY FOR THE
-        // SINGLE-PIN LADDER. A bucketed dim carries no seeds in this
-        // render — `bind_dyn_range` is refused on it, and the intervals
-        // are seeded per bucket inside `bucketed_search_implementations`
-        // — so an unbucketed render validates nothing the bucketed
-        // search will use, and an authoring check that NEEDS bounds
-        // (`reduce_max`'s `require_extent_at_least`, an iota's value
-        // bounds) would refuse the whole bucketed search over a program
-        // every per-bucket render accepts. It is also a full fixpoint
-        // whose result the bucketed arm discards. The reference ladder's
-        // `search_buckets` never rendered one.
-        //
-        // Computed HERE, before the evaluator borrows `self.device`
-        // mutably: `assemble_and_saturate` takes `&self`.
-        let base = if self.dim_buckets.is_empty() {
-            Some(self.assemble_and_saturate()?)
-        } else {
-            None
-        };
-
-        // A search that finds nothing has found nothing that WRITES these,
-        // so a refusal states them: whether a kernel can write a bound
-        // layout is the search's question, never bind's.
-        let bound_outputs = native
-            .bound
-            .outputs
-            .iter()
-            .map(|bound| {
-                format!(
-                    "v{} at {:?} on buffer {}",
-                    bound.value.index(),
-                    bound.layout,
-                    bound.buffer
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let no_plan = || format!("no plan writes the bound outputs: {bound_outputs}");
-
-        // THIS INSTANCE's claim set, derived at load from THIS
-        // instance's registry — no crate-level default is consulted.
-        let allow = self.allow.clone();
-        // FIELD BORROWS, not `self.matchers()`: the device evaluator
-        // holds `&mut self.device` at the same time, and only disjoint
-        // FIELD borrows can coexist — a `&self` method would borrow the
-        // whole runtime.
-        let matchers = &self.matchers;
         let mut evaluator = {
             #[cfg(feature = "device")]
             {
                 crate::search::Evaluator::Device {
                     device: self.device.as_mut().expect("device initialized"),
-                    staged: &staged_for_search,
-                    residents: &self.residents,
-                    profile_inputs: &profile_inputs,
+                    staged: &staged,
                 }
             }
             #[cfg(not(feature = "device"))]
@@ -707,126 +525,49 @@ impl CudaRuntime {
                 crate::search::Evaluator::NoDevice(std::marker::PhantomData)
             }
         };
-
-        // Own matchers, own allow list, own ranking: nothing in this
-        // search touches another runtime.
-        //
-        // WHAT `search` RETURNS is a pair: the outcome to report, and the
-        // plan to install. They are no longer the same thing (Phase 5):
-        // the outcome is the genetic search's report, while the installed
-        // plan is whichever FINALIST the bucket lattice selected under the
-        // aggregate device budget. With no budget set they coincide,
-        // which is why every existing caller sees the trajectory it had.
-        let (outcome, unbucketed_plan, searched_buckets) =
-            if let Some((mut serialized, program)) = base {
-                let mut outcome = crate::search::search_implementations(
-                    &mut serialized,
-                    &program,
-                    options,
-                    Some(allow.clone()),
-                    matchers,
-                    evaluator.reborrow(),
-                )
-                .with_context(no_plan)?;
-                // THE UNBUCKETED LATTICE (Phase 5) — a lattice over ONE
-                // bucket, so unbucketed and bucketed installs run the same
-                // code. Main's "one designed difference" from its pre-#420
-                // behaviour, adopted for the same reason: whether the
-                // installed plan fits the caller's device budget is a
-                // property of what is installed, and an unbucketed install is
-                // a set of one.
-                let finalists = vec![
-                    crate::finalists::Finalists::new(
-                        "the search",
-                        &serialized,
-                        Some(allow.clone()),
-                        matchers,
-                        outcome.ranked.clone(),
-                        Some(outcome.best_plan.clone()),
-                    )
-                    .with_shapes(options.shapes.clone())
-                    .with_resident_bindings(self.residents.clone()),
-                ];
-                let (selected, rejections) =
-                    crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
-                outcome.lattice_rejections = rejections;
-                let (_, finalist) = selected
-                    .into_iter()
-                    .next()
-                    .expect("a one-bucket lattice selects exactly one finalist");
-                (outcome, Some(finalist.plan), Vec::new())
-            } else {
-                // BUCKETED (D7): one search per Cartesian combination, each
-                // searched and validated over the complete interval. The caller's data is staged ONCE and every
-                // bucket's search borrows the same map — a bucket only
-                // changes the dim seeds, never the payloads.
-                let assembly = crate::search::BucketAssembly {
-                    assembled_program: &luminal::egglog_snippet::assembled_program_for(matchers),
-                    prefix: &native.bound.prefix,
-                    binding_seeds: &native.binding_seeds,
-                    schedule: crate::bindings::CudaBindings::SCHEDULE,
-                    post_checks: &native.bound.post_checks,
-                    inputs: &native.bound.inputs,
-                    outputs: &native.bound.outputs,
-                    residents: &self.residents,
-                    base_dims: &options.shapes.values,
-                    decoders: &self.decoders,
-                };
-                let plans = crate::search::bucketed_search_implementations(
-                    &assembly,
-                    &self.dim_buckets,
-                    options,
-                    Some(allow),
-                    matchers,
-                    evaluator,
-                )
-                .with_context(no_plan)?;
-                let first = plans
-                    .first()
-                    .map(|plan| plan.outcome.clone())
-                    .ok_or_else(|| anyhow!(no_plan()))?;
-                (first, None, plans)
-            };
-        // CALLER STORAGE BECOMES THE ESCAPE CELL, before anything reads the
-        // plan: every later guard (`check_external_outputs`, the arena's
-        // external set, execute's pointer map) reads the retargeted plan.
-        let (mut unbucketed_plan, mut searched_buckets) = (unbucketed_plan, searched_buckets);
-        if let Some(plan) = unbucketed_plan.as_mut() {
-            Self::retarget_external_outputs(plan, &native.bound.outputs)?;
-        }
-        for bucket in &mut searched_buckets {
-            Self::retarget_external_outputs(&mut bucket.plan, &native.bound.outputs)?;
-        }
+        let mut outcome = crate::search::search_implementations(
+            &mut serialized,
+            &program,
+            &shapes,
+            options,
+            Some(self.allow.clone()),
+            &self.matchers,
+            evaluator.reborrow(),
+        )?;
+        let finalists = crate::finalists::Finalists::new(
+            "program",
+            &serialized,
+            Some(self.allow.clone()),
+            &self.matchers,
+            outcome.ranked.clone(),
+            Some(outcome.best_plan.clone()),
+        )
+        .with_shapes(shapes)
+        .with_external_bindings(self.externals.clone());
+        let (finalist, rejections) =
+            crate::search::select_finalist(finalists, options, &mut evaluator)?;
+        outcome.finalist_rejections = rejections;
+        outcome.finalist_rank = finalist.rank;
+        outcome.best_plan = finalist.plan;
+        outcome.best_genome = finalist.genome;
+        outcome.best_nanos = finalist.metric;
+        Self::retarget_external_outputs(&mut outcome.best_plan, &native.bound.outputs)?;
+        self.storage = Some(crate::storage::plan_storage(
+            &outcome.best_plan,
+            &bounds.ranges(),
+            &self.externals,
+        )?);
+        self.plan = Some(outcome.best_plan.clone());
+        self.bounds = bounds.clone();
+        self.dims = profile_dims.clone();
         self.device_budget_bytes = options.device_budget_bytes;
-        self.bucket_plans = searched_buckets;
-        self.selected_bucket = None;
-        // The tensor→buffer and tensor→slot maps were built at LOAD from
-        // the same bindings every bucket renders; a search changes which
-        // implementation runs, never which value crosses where.
-        if let Some(plan) = unbucketed_plan {
-            // THE LATTICE'S CHOICE, not `outcome.best_plan` (Phase 5).
-            // Unconstrained they are the same plan — the rank-0 finalist
-            // re-extracts the winning genome — but the installed one is
-            // the one that passed the aggregate check.
-            self.plan = Some(plan);
-        } else {
-            // With buckets the plan is chosen at execute time; load
-            // eagerly only if the runtime already sits at a covered pin.
-            let _ = self.select_bucket_plan();
-        }
         Ok(outcome)
-    }
-
-    /// The buffers the bindings declared device-resident — the arena's
-    /// homes, readable on any host.
-    pub fn residents(&self) -> &std::collections::BTreeSet<i64> {
-        &self.residents.inputs
     }
 
     /// The buffers the bindings declared CALLER-OWNED device memory — the
     /// ones [`Self::set_device_ptr`] must address before every execute.
     pub fn externals(&self) -> &std::collections::BTreeSet<i64> {
-        &self.residents.externals
+        &self.externals
     }
 
     /// Resolve public graph handles to this compiled program's boundary IDs.
@@ -867,26 +608,6 @@ impl CudaRuntime {
         }
     }
 
-    /// Stage input payload for a bound tensor (host side; H2D happens
-    /// inside execute). Refused by name for a tensor with no input
-    /// binding, and for one bound on caller device memory: an External
-    /// buffer has no staging step, so bytes handed over here would
-    /// silently never reach the device.
-    pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) -> Result<()> {
-        let buffer = *self
-            .input_buffers
-            .get(&tensor)
-            .ok_or_else(|| anyhow!("set_data on {tensor:?}, which has no input binding"))?;
-        anyhow::ensure!(
-            !self.residents.externals.contains(&buffer),
-            "v{} is bound on External buffer {buffer}: its storage is the caller's, so \
-             it is addressed with set_device_ptr, never staged",
-            tensor.index()
-        );
-        self.staged.insert(buffer, data.into());
-        Ok(())
-    }
-
     /// Address an EXTERNAL buffer for the next execution: the storage every
     /// binding on that buffer names lives at `ptr`, so the kernels read and
     /// write it directly and neither H2D nor D2H runs for it. One pointer per
@@ -902,7 +623,7 @@ impl CudaRuntime {
     /// bound on the buffer.
     pub unsafe fn set_device_ptr(&mut self, buffer: i64, ptr: u64, bytes: usize) -> Result<()> {
         anyhow::ensure!(
-            self.residents.externals.contains(&buffer),
+            self.externals.contains(&buffer),
             "buffer {buffer} is not bound External; a device pointer may only \
              be supplied for an External buffer"
         );
@@ -924,8 +645,7 @@ impl CudaRuntime {
     /// The External buffers with no address for the next execution — what
     /// `execute` refuses on, in buffer order.
     pub fn missing_external_pointers(&self) -> Vec<i64> {
-        self.residents
-            .externals
+        self.externals
             .iter()
             .filter(|buffer| !self.device_ptrs.contains_key(buffer))
             .copied()
@@ -968,34 +688,21 @@ impl CudaRuntime {
         self.borrowed_stream = None;
     }
 
-    /// Bind a caller-allocated arena for subsequent executions. Called once
-    /// per execution when the arena is allocated and freed per call;
-    /// `clear_arena` reverts to the owned slab.
-    #[cfg(feature = "device")]
-    pub fn set_arena(&mut self, ptr: u64, bytes: usize) {
-        self.external_arena = Some((ptr, bytes));
-    }
-
-    #[cfg(feature = "device")]
-    pub fn clear_arena(&mut self) {
-        self.external_arena = None;
-    }
-
-    /// The slab size the currently selected plan set requires. The caller
+    /// The slab size the currently selected program requires. The caller
     /// allocates at least this many bytes and passes the pointer to
-    /// [`Self::set_arena`]. Device-free: it packs lifetimes but touches no
+    /// [`Self::execute`]. Device-free: it packs lifetimes but touches no
     /// CUDA API.
     #[cfg(feature = "device")]
     pub fn arena_bytes(&self) -> Result<usize> {
-        let plans = self.install_plans()?;
-        Ok(crate::resident::allocate(plans, self.residents.clone())?.bytes)
+        let program = self.install_program()?;
+        Ok(crate::storage::plan_storage(&program.0, &program.1, &self.externals)?.slab_bytes)
     }
 
     /// The searched plan re-asked of the External output bindings, on any
     /// host: [`Self::ensure_external_output_slots_are_literal`] over the
     /// plans `execute` would install.
     pub fn check_external_outputs(&self) -> Result<()> {
-        self.ensure_external_output_slots_are_literal(&self.install_plans()?)
+        self.ensure_external_output_slots_are_literal(&self.install_program()?)
     }
 
     /// THE CALLER'S STORAGE IS THE ESCAPE CELL: an External output elected on
@@ -1066,13 +773,14 @@ impl CudaRuntime {
     /// another buffer's bytes under the caller's tensor.
     fn ensure_external_output_slots_are_literal(
         &self,
-        plans: &[(crate::layouts::CudaPlan, crate::symbolic::Bounds)],
+        program: &(crate::layouts::CudaPlan, crate::symbolic::Bounds),
     ) -> Result<()> {
         let native = self
             .native
             .as_ref()
             .ok_or_else(|| anyhow!("load before execute"))?;
-        for (plan, _) in plans {
+        let (plan, _) = program;
+        {
             for node in plan.dag.node_weights() {
                 let luminal::bufferize::BufferNode::BufferOutput { slots } = node else {
                     continue;
@@ -1082,7 +790,7 @@ impl CudaRuntime {
                         native.bound.outputs.get(slot.index).ok_or_else(|| {
                             anyhow!("plan output slot {} has no binding", slot.index)
                         })?;
-                    if !self.residents.externals.contains(&bound.buffer) {
+                    if !self.externals.contains(&bound.buffer) {
                         continue;
                     }
                     anyhow::ensure!(
@@ -1099,65 +807,94 @@ impl CudaRuntime {
         Ok(())
     }
 
-    /// The `(plan, bounds)` set `execute` installs — the single unpinned plan,
-    /// or one per bucket. Factored out so `arena_bytes` can size the slab
-    /// without a device.
-    fn install_plans(&self) -> Result<Vec<(crate::layouts::CudaPlan, crate::symbolic::Bounds)>> {
-        let base_bounds: crate::symbolic::Bounds = self
-            .range_bound
-            .iter()
-            .map(|(s, (lo, hi))| Ok((*s, (usize::try_from(*lo)?, usize::try_from(*hi)?))))
-            .collect::<Result<_>>()?;
-        Ok(if self.bucket_plans.is_empty() {
-            let plan = self
-                .plan
-                .as_ref()
-                .ok_or_else(|| anyhow!("search before reading the installed plans"))?;
-            vec![(plan.clone(), base_bounds)]
-        } else {
-            self.bucket_plans
-                .iter()
-                .map(|p| {
-                    let mut bounds = base_bounds.clone();
-                    bounds.extend(p.ranges.iter().map(|(k, v)| (*k, *v)));
-                    (p.plan.clone(), bounds)
-                })
-                .collect()
-        })
+    fn install_program(&self) -> Result<(crate::layouts::CudaPlan, crate::symbolic::Bounds)> {
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("search before installing a program"))?;
+        Ok((plan.clone(), self.bounds.ranges()))
     }
 
-    /// Run the plan on the CUDA device. Requires the `device` feature
-    /// and an available device; refuses loudly otherwise.
-    pub fn execute(&mut self) -> Result<()> {
-        self.execute_mode(false)
+    /// Native CUDA stream after attaching a device or searching. Tensor storage
+    /// and CPU/device transfers are entirely the caller's responsibility.
+    #[cfg(feature = "device")]
+    pub fn cuda_stream(&self) -> Result<&std::sync::Arc<cudarc::driver::CudaStream>> {
+        Ok(self
+            .device
+            .as_ref()
+            .ok_or_else(|| anyhow!("attach a device or search first"))?
+            .stream())
+    }
+    /// Pinned host bytes needed for this program's runtime dimension parameters.
+    pub fn staging_bytes(&self) -> Result<usize> {
+        let program = self.install_program()?;
+        Ok(
+            crate::storage::plan_storage(&program.0, &program.1, &self.externals)?
+                .staging_bytes
+                .max(1),
+        )
+    }
+
+    #[cfg(feature = "device")]
+    pub fn allocate_staging(&mut self) -> Result<crate::device::CudaStaging> {
+        let bytes = self.staging_bytes()?;
+        if self.device.is_none() {
+            self.device = Some(crate::device::CudaDevice::new(0)?.executable());
+        }
+        self.device.as_ref().unwrap().allocate_staging(bytes)
+    }
+
+    /// Run with borrowed device and host storage; neither is retained or freed.
+    pub fn execute(
+        &mut self,
+        arena: CudaArena<'_>,
+        #[cfg(feature = "device")] staging: &mut crate::device::CudaStaging,
+    ) -> Result<()> {
+        self.execute_mode(
+            arena,
+            #[cfg(feature = "device")]
+            staging,
+            false,
+        )
     }
 
     /// Enqueue an already-warmed, zero-copy plan without synchronizing the
     /// borrowed stream. The caller keeps every boundary and arena alive.
-    pub fn execute_async(&mut self) -> Result<()> {
-        self.execute_mode(true)
+    /// # Safety
+    /// The caller must retain all memory and the stream until GPU completion,
+    /// and must not modify or reuse that storage while GPU work is in flight.
+    /// Outer graph captures require these bindings to remain valid for replay.
+    pub unsafe fn execute_async(
+        &mut self,
+        arena: CudaArena<'_>,
+        #[cfg(feature = "device")] staging: &mut crate::device::CudaStaging,
+    ) -> Result<()> {
+        self.execute_mode(
+            arena,
+            #[cfg(feature = "device")]
+            staging,
+            true,
+        )
     }
 
-    fn execute_mode(&mut self, asynchronous: bool) -> Result<()> {
+    fn execute_mode(
+        &mut self,
+        arena: CudaArena<'_>,
+        #[cfg(feature = "device")] staging: &mut crate::device::CudaStaging,
+        asynchronous: bool,
+    ) -> Result<()> {
         // A boundary this runtime cannot address is refused before anything
         // else: the statement is the bindings', not the device's.
         self.ensure_external_pointers()?;
         // Select a range-valid plan using the current dimensions.
-        if !self.bucket_plans.is_empty() {
-            self.select_bucket_plan()?;
-        }
+        self.bounds.validate_values(&self.dims)?;
         #[cfg(feature = "device")]
         {
-            // The device is created ONCE and reused: the module cache
-            // keeps every NVRTC compilation from the previous calls, and
-            // the arena slab keeps the bytes (grow-only, never parked).
+            // Cache live device modules and launch handles independently of storage.
             if self.device.is_none() {
-                self.device = Some(crate::device::CudaDevice::new(0)?);
+                self.device = Some(crate::device::CudaDevice::new(0)?.executable());
             }
-            anyhow::ensure!(
-                self.plan.is_some() || !self.bucket_plans.is_empty(),
-                "search before execute"
-            );
+            anyhow::ensure!(self.plan.is_some(), "search before execute");
             {
                 let device = self.device.as_mut().unwrap();
                 // The borrowed stream is rebound every execution because
@@ -1167,24 +904,18 @@ impl CudaRuntime {
                 } else if device.stream_is_borrowed() {
                     device.use_owned_stream()?;
                 }
-                if let Some((ptr, bytes)) = self.external_arena {
-                    device.set_external_arena(ptr, bytes)?;
-                } else {
-                    device.clear_external_arena();
-                }
             }
             if !self.device.as_ref().unwrap().is_installed() {
-                let plans = self.install_plans()?;
-                self.ensure_external_output_slots_are_literal(&plans)?;
-                self.device.as_mut().unwrap().install_resident_with_budget(
-                    plans,
-                    self.residents.clone(),
+                let program = self.install_program()?;
+                self.ensure_external_output_slots_are_literal(&program)?;
+                self.device.as_mut().unwrap().install_with_bindings(
+                    program,
+                    self.externals.clone(),
                     self.device_budget_bytes,
                 )?;
             }
             let device = self.device.as_mut().unwrap();
-            let bucket = self.selected_bucket.unwrap_or(0);
-            let staged = self.staged.iter().map(|(lit, data)| (*lit, data)).collect();
+
             let external: FxHashMap<i64, crate::device::ExternalPtr> = self
                 .device_ptrs
                 .iter()
@@ -1198,23 +929,12 @@ impl CudaRuntime {
                     )
                 })
                 .collect();
-            let outputs = device.execute_external_mode(
-                bucket,
-                &staged,
-                &self.dims,
-                &external,
-                asynchronous,
-            )?;
-            self.outputs_host = outputs;
-            // Zero-copy inputs are not staged, so nothing to clear; host-staged
-            // residents are kept for the (owned-slab) reuse path.
-            self.staged
-                .retain(|lit, _| !self.residents.inputs.contains(lit));
+            device.execute_external_mode(arena, staging, &self.dims, &external, asynchronous)?;
             Ok(())
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = asynchronous;
+            let _ = (arena, asynchronous);
             let _ = self
                 .plan()
                 .ok_or_else(|| anyhow!("search before execute"))?;
@@ -1225,96 +945,75 @@ impl CudaRuntime {
         }
     }
 
-    /// Read back an output tensor's f32 payload (already D2H'd by
-    /// execute), interpreting it as row-major over the value's dims.
-    ///
-    /// NO DENSENESS CHECK HERE (ruling 2026-09-01). This is the record.
-    ///
-    /// What was checked: that the output binding's elected layout is the
-    /// flat index over the value's dims, so element `k` of the value is
-    /// at flat index `k` of the backing and this `Vec<f32>` IS the value.
-    /// A view-elected (escaped) output was refused loudly and directed to
-    /// [`Self::fetch`] + [`Self::output_layout`].
-    ///
-    /// Why it went. Austin, 2026-09-01, ruling the CL-4b write fence out
-    /// of the backend: "this is something that needs to be expressed in
-    /// egglog by matching only only to right major contiguous layouts
-    /// ouputs or something, we should not have it in the codebase here.
-    /// delete it. same with the get_f32 path."
-    ///
-    /// WHAT THE LANDED EGGLOG CONSTRAINT DOES AND DOES NOT COVER. The
-    /// write-capability guard (same day) makes non-dense KERNEL
-    /// destinations unelectable. It deliberately does NOT constrain
-    /// output slots: a view remains electable as an output
-    /// (escape-and-disclose), and on such an output this dense-shaped
-    /// signature hands over the BACKING bytes silently — a same-numel
-    /// weld such as a transpose has the right LENGTH and the wrong
-    /// ORDER, so the caller reads plausible, wrong numbers. The
-    /// escape-and-disclose path ([`Self::fetch`] under
-    /// [`Self::output_layout`], read by [`crate::layouts::dense_f32`])
-    /// remains correct for every layout and is what callers that cannot
-    /// assume a dense output should use.
-    pub fn get_f32(&self, tensor: NodeIndex) -> Result<Vec<f32>> {
-        let (payload, _) = self.fetch(tensor)?;
-        payload.as_f32()
-    }
-
-    /// [`Self::get_f32`] for 32-bit integer outputs.
-    pub fn get_i32(&self, tensor: NodeIndex) -> Result<Vec<i32>> {
-        let (payload, _) = self.fetch(tensor)?;
-        payload.as_i32()
-    }
-
-    /// [`Self::get_f32`] for 64-bit integer outputs.
-    pub fn get_i64(&self, tensor: NodeIndex) -> Result<Vec<i64>> {
-        let (payload, _) = self.fetch(tensor)?;
-        payload.as_i64()
-    }
-
-    /// [`Self::get_f32`] for boolean outputs: the two-legal-code bytes.
-    pub fn get_bool8(&self, tensor: NodeIndex) -> Result<&[u8]> {
-        let (payload, _) = self.fetch(tensor)?;
-        payload.as_bool8()
-    }
-
-    /// The universal escape-and-disclose fetch: the output slot's backing
-    /// bytes plus its [`luminal::bufferize::OutputBinding`] (the elected
-    /// layout).
-    pub fn fetch(
-        &self,
-        tensor: NodeIndex,
-    ) -> Result<(
-        &HostBuffer,
-        &luminal::bufferize::OutputBinding<DecodedLayout>,
-    )> {
-        let index = self.output_slot_index(tensor)?;
-        if let Some((data, binding)) = self.outputs_host.get(&index) {
-            return Ok((data, binding));
-        }
-        // An output written straight into caller device memory is never
-        // read back, so it is absent here on a perfectly good execution.
-        if let Some(bound) = self
-            .native
+    /// Live input range within the supplied arena. External inputs have no range.
+    pub fn input_arena_range(&self, tensor: NodeIndex) -> Result<crate::arena::ArenaSlice> {
+        let lit = self.input_buffer(tensor)?;
+        let plan = self
+            .plan
             .as_ref()
-            .and_then(|native| native.bound.outputs.get(index))
-            && self.residents.externals.contains(&bound.buffer)
-        {
-            bail!(
-                "output v{} is bound External on buffer {}: its bytes are in the \
-                 caller's device memory, not readable through fetch",
-                bound.value.index(),
-                bound.buffer
-            );
-        }
-        bail!("execute before fetch")
+            .ok_or_else(|| anyhow!("search before inspecting storage"))?;
+        let buffer = plan
+            .buffers
+            .values()
+            .find(|b| b.lit == Some(lit))
+            .ok_or_else(|| anyhow!("input is absent from the selected plan"))?;
+        self.buffer_arena_range(&buffer.id)
     }
 
-    /// The slot's elected layout alone (see [`Self::fetch`]).
+    /// Live output backing range. Its elected view is available through `output_layout`.
+    pub fn output_arena_range(&self, tensor: NodeIndex) -> Result<crate::arena::ArenaSlice> {
+        self.buffer_arena_range(&self.output_layout(tensor)?.buffer)
+    }
+
+    fn buffer_arena_range(
+        &self,
+        id: &luminal::bufferize::BufferId,
+    ) -> Result<crate::arena::ArenaSlice> {
+        self.bounds.validate_values(&self.dims)?;
+        let memory = self.memory_plan()?;
+        let mut range = *memory
+            .slices
+            .get(id)
+            .ok_or_else(|| anyhow!("buffer has external device storage"))?;
+        range.bytes =
+            crate::symbolic::bytes(&self.plan.as_ref().unwrap().buffers[id].layout, &self.dims)?;
+        Ok(range)
+    }
+
+    /// Current dimension assignment, used to resolve device buffer layouts.
+    pub fn dimensions(&self) -> &shape::DynMap {
+        &self.dims
+    }
+
+    /// Offsets/capacities in the caller's device arena. External bindings are excluded.
+    pub fn memory_plan(&self) -> Result<&crate::arena::ArenaPlan> {
+        self.storage
+            .as_ref()
+            .ok_or_else(|| anyhow!("search before inspecting storage"))
+    }
+
+    /// Elected output layout at the current dimensions. Does not access tensor data.
     pub fn output_layout(
         &self,
         tensor: NodeIndex,
-    ) -> Result<&luminal::bufferize::OutputBinding<DecodedLayout>> {
-        Ok(self.fetch(tensor)?.1)
+    ) -> Result<luminal::bufferize::OutputBinding<DecodedLayout>> {
+        let index = self.output_slot_index(tensor)?;
+        let mut slot = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("search before inspecting output"))?
+            .dag
+            .node_weights()
+            .filter_map(|node| match node {
+                luminal::bufferize::BufferNode::BufferOutput { slots } => Some(slots.iter()),
+                _ => None,
+            })
+            .flatten()
+            .find(|slot| slot.index == index)
+            .ok_or_else(|| anyhow!("missing output slot {index}"))?
+            .clone();
+        slot.layout = crate::symbolic::resolve_layout(&slot.layout, &self.dims)?;
+        Ok(slot)
     }
 
     /// The buffer id the installed plan writes this output's bytes into —
@@ -1395,11 +1094,8 @@ impl CudaRuntime {
         &luminal::bufferize::OutputBinding<DecodedLayout>,
     )> {
         let plan = self
-            .selected_bucket
-            .and_then(|i| self.bucket_plans.get(i))
-            .or_else(|| self.bucket_plans.first())
-            .map(|bucket| &bucket.plan)
-            .or(self.plan.as_ref())
+            .plan
+            .as_ref()
             .ok_or_else(|| anyhow!("search before reading an output's backing storage"))?;
         let slot = plan
             .dag
@@ -1416,10 +1112,7 @@ impl CudaRuntime {
 
     /// The searched plan, for inspection and tests.
     pub fn plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
-        self.selected_bucket
-            .and_then(|i| self.bucket_plans.get(i))
-            .map(|p| &p.plan)
-            .or(self.plan.as_ref())
+        self.plan.as_ref()
     }
 }
 
@@ -1482,4 +1175,136 @@ fn elected_strides(layout: &DecodedLayout) -> Option<Vec<i64>> {
         }
     }
     strides.into_iter().collect()
+}
+
+#[cfg(all(test, feature = "device"))]
+mod caller_memory_tests {
+    use super::*;
+    use luminal::layout_ir::{Access, FreedBy};
+    use luminal::prelude::*;
+
+    #[test]
+    fn host_staging_can_be_shared_between_programs() {
+        let mut graph = Graph::new();
+        let output = graph.iota('n', |coords| coords[0]);
+        let mut first = CudaRuntime::load(&graph).unwrap();
+        first
+            .search(
+                &shape::DimensionBounds::from_ranges([('n'.into(), (1, 8))]).unwrap(),
+                &[('n'.into(), 4)].into_iter().collect(),
+                &Default::default(),
+                &crate::harness_search_options(),
+            )
+            .unwrap();
+        let mut second = first.fork().unwrap();
+        first.set_dim('n', 4);
+        second.set_dim('n', 7);
+        let mut first_arena = crate::test_memory::Allocation::new(
+            first.cuda_stream().unwrap().clone(),
+            first.arena_bytes().unwrap(),
+        )
+        .unwrap();
+        let mut second_arena = crate::test_memory::Allocation::new(
+            second.cuda_stream().unwrap().clone(),
+            second.arena_bytes().unwrap(),
+        )
+        .unwrap();
+        let mut staging = first.allocate_staging().unwrap();
+        first.execute(first_arena.arena(), &mut staging).unwrap();
+        second.execute(second_arena.arena(), &mut staging).unwrap();
+        first.execute(first_arena.arena(), &mut staging).unwrap();
+        for (runtime, arena, expected) in [(&first, &first_arena, 4), (&second, &second_arena, 7)] {
+            let range = runtime.output_arena_range(output.id).unwrap();
+            let result = HostBuffer::new(
+                luminal::dtype::PlanDtype::Int,
+                arena.read(range.offset, range.bytes).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result.as_i32().unwrap(), (0..expected).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn application_state_survives_replaced_execution_storage() {
+        let mut graph = Graph::new();
+        let state = graph.tensor(4, DType::F32);
+        let increment = graph.tensor(4, DType::F32);
+        let previous = state.sum(0);
+        let next = state + increment;
+        let mut bindings = crate::bindings::CudaBindings::new();
+        let state_id = bindings.input_external(state.id);
+        bindings.declare(state_id, Access::ReadWrite, FreedBy::Caller);
+        bindings.input(increment.id);
+        bindings.output(previous.id);
+        bindings.output_on(next.id, state_id);
+        let device = crate::device::CudaDevice::new(0).unwrap();
+        let mut runtime = CudaRuntime::load_with(
+            &graph,
+            bindings,
+            crate::ops::cuda_registry_without_cublaslt(),
+        )
+        .unwrap()
+        .with_device(&device)
+        .unwrap();
+        runtime
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &[
+                    (state.id, vec![0f32; 4].into()),
+                    (increment.id, vec![1f32; 4].into()),
+                ]
+                .into_iter()
+                .collect(),
+                &crate::harness_search_options(),
+            )
+            .unwrap();
+        let mut state_memory =
+            crate::test_memory::Allocation::new(device.stream().clone(), 16).unwrap();
+        state_memory.write(0, &[0; 16]).unwrap();
+        // SAFETY: the application retains this allocation until execution completes.
+        unsafe { runtime.set_device_ptr(state_id, state_memory.ptr(), state_memory.bytes()) }
+            .unwrap();
+        let mut first = crate::test_memory::Allocation::new(
+            runtime.cuda_stream().unwrap().clone(),
+            runtime.arena_bytes().unwrap(),
+        )
+        .unwrap();
+        let mut second = crate::test_memory::Allocation::new(
+            runtime.cuda_stream().unwrap().clone(),
+            runtime.arena_bytes().unwrap(),
+        )
+        .unwrap();
+        let input_range = runtime.input_arena_range(increment.id).unwrap();
+        let output_range = runtime.output_arena_range(previous.id).unwrap();
+        let increment_data = HostBuffer::from(vec![1f32; 4]);
+        first
+            .write(input_range.offset, &increment_data.bytes)
+            .unwrap();
+        second
+            .write(input_range.offset, &increment_data.bytes)
+            .unwrap();
+        let read_previous = |arena: &crate::test_memory::Allocation| {
+            HostBuffer::new(
+                luminal::dtype::PlanDtype::F32,
+                arena.read(output_range.offset, output_range.bytes).unwrap(),
+            )
+            .unwrap()
+            .as_f32()
+            .unwrap()
+        };
+        let mut staging = runtime.allocate_staging().unwrap();
+        runtime.execute(first.arena(), &mut staging).unwrap();
+        assert_eq!(read_previous(&first), vec![0.]);
+        runtime.execute(second.arena(), &mut staging).unwrap();
+        assert_eq!(read_previous(&second), vec![4.]);
+        let mut too_small =
+            crate::test_memory::Allocation::new(device.stream().clone(), 1).unwrap();
+        assert!(runtime.execute(too_small.arena(), &mut staging).is_err());
+        let mut replacement_staging = runtime.allocate_staging().unwrap();
+        runtime
+            .execute(first.arena(), &mut replacement_staging)
+            .unwrap();
+        assert_eq!(read_previous(&first), vec![8.]);
+    }
 }

@@ -29,6 +29,7 @@ pub fn require_device(example: &str) {
 
 #[cfg(feature = "device")]
 pub mod device {
+    use super::memory::Allocation;
     use anyhow::{Context, Result, anyhow, bail};
     use luminal::bufferize::BufferNode;
     use luminal::graph::Graph;
@@ -79,8 +80,13 @@ pub mod device {
     /// EVALUATES that layout — `luminal_cuda_lite::layouts::dense_f32`,
     /// this runtime reading its own vocabulary. A dense election
     /// evaluates the identity, so this is the universal readback.
-    fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Result<Vec<f32>> {
-        let (data, binding) = rt.fetch(out).context("escape-and-disclose fetch")?;
+    fn walked_dense(rt: &CudaRuntime, arena: &Allocation, out: NodeIndex) -> Result<Vec<f32>> {
+        let range = rt.output_arena_range(out)?;
+        let binding = rt.output_layout(out)?;
+        let data = HostBuffer::new(
+            luminal::dtype::PlanDtype::F32,
+            arena.read(range.offset, range.bytes)?,
+        )?;
         let bytes = data
             .as_f32()
             .with_context(|| format!("output is {}, not f32", data.type_name()))?;
@@ -144,12 +150,7 @@ pub mod device {
     ) -> Result<()> {
         // 1. CUDA-lite: record → search (harness budget) → plan.
         let mut rt = CudaRuntime::load(cx).context("cuda load")?;
-        let mut vars: Vec<_> = cx.dyn_map.iter().collect();
-        vars.sort();
-        for (var, value) in vars {
-            rt.bind_dyn_range(*var, *value as u64, *value as u64)
-                .context("cuda dyn pin")?;
-        }
+
         // Own one copy of the hardware-sized parameter set. Search BORROWS
         // it (a device-profiled search stages by reference, never copying
         // a full-size model's weights); staging then moves the same
@@ -157,7 +158,14 @@ pub mod device {
         let mut data: FxHashMap<NodeIndex, HostBuffer> = pairs.into_iter().collect();
         let options = luminal_cuda_lite::harness_search_options();
         let t = std::time::Instant::now();
-        let outcome = rt.search(&data, &options).context("cuda search")?;
+        let outcome = rt
+            .search(
+                &luminal::shape::DimensionBounds::exact(&cx.dyn_map).unwrap(),
+                &cx.dyn_map,
+                &data,
+                &options,
+            )
+            .context("cuda search")?;
         let search_ms = t.elapsed().as_millis();
         println!(
             "{name}: search {search_ms} ms | plans profiled {} | [{}]",
@@ -185,17 +193,22 @@ pub mod device {
             stats.kernels, stats.copies, stats.buffers, stats.outputs
         );
 
-        // 3. Execute on device; fetch through the disclosed layout.
+        // The application explicitly uploads inputs, executes, then reads results.
+        let mut arena = Allocation::new(rt.cuda_stream()?.clone(), rt.arena_bytes()?)?;
+        let mut staging_arena = rt.allocate_staging()?;
         for (id, value) in data.drain() {
-            rt.set_data(id, value)?;
+            let range = rt.input_arena_range(id)?;
+            anyhow::ensure!(range.bytes == value.bytes.len(), "input size mismatch");
+            arena.write(range.offset, &value.bytes)?;
         }
         let t = std::time::Instant::now();
-        rt.execute().context("device execute")?;
+        rt.execute(arena.arena(), &mut staging_arena)
+            .context("device execute")?;
         let execute_ms = t.elapsed().as_millis();
         println!("{name}: execute {execute_ms} ms");
 
         for (label, id) in outputs {
-            let got = walked_dense(&rt, *id).with_context(|| format!("device {label}"))?;
+            let got = walked_dense(&rt, &arena, *id).with_context(|| format!("device {label}"))?;
             if let Some((index, value)) = got
                 .iter()
                 .copied()
@@ -214,3 +227,6 @@ pub mod device {
         Ok(())
     }
 }
+
+#[cfg(feature = "device")]
+mod memory;
