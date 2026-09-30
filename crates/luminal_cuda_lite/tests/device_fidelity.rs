@@ -333,7 +333,7 @@ fn scan_chain_runs_across_one_declared_domain() {
     let mut graph = Graph::new();
     let x = graph.tensor(('n', 2), DType::F32);
     let out = x.cumsum(0).cumprod(0).cummax(0);
-    let bounds = luminal::shape::DimensionBounds::from_ranges([('n'.into(), (1, 6))]).unwrap();
+    let bounds = luminal::shape::SymbolBounds::from_ranges([('n'.into(), (1, 6))]).unwrap();
     let dims = [('n'.into(), 3)].into_iter().collect();
     let data = [(x.id, HostBuffer::from([-1f32, 2.].repeat(3)))]
         .into_iter()

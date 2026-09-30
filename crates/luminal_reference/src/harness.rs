@@ -267,8 +267,7 @@ pub fn run_reference_bound(
 ) -> crate::runtime::ReferenceRuntime {
     let mut rt = crate::runtime::ReferenceRuntime::load_with(cx, bindings)
         .expect("recorder clean for a covered graph");
-    let bounds =
-        luminal::shape::DimensionBounds::exact(&cx.dyn_map).expect("valid exact dimensions");
+    let bounds = luminal::shape::SymbolBounds::exact(&cx.dyn_map).expect("valid exact dimensions");
     for (tensor, lower, upper) in ranges {
         rt.bind_value_range(*tensor, *lower, *upper)
             .expect("value range binds");

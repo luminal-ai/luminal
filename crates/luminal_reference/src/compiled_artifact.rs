@@ -38,7 +38,7 @@ struct Artifact {
 /// declaration order maps them onto a receiving process's graph bindings.
 #[derive(Clone)]
 pub struct CompiledProgram {
-    pub bounds: luminal::shape::DimensionBounds,
+    pub bounds: luminal::shape::SymbolBounds,
     pub input_buffers: Vec<i64>,
     pub output_buffers: Vec<i64>,
     pub plan: BufferIrGraph<DecodedLayout>,
@@ -80,7 +80,7 @@ pub fn deserialize(data: &[u8]) -> Result<CompiledProgram> {
         .map(|(name, range)| Ok((luminal::shape::Symbol::try_new_dim(name)?, range)))
         .collect::<Result<Vec<_>>>()?;
     Ok(CompiledProgram {
-        bounds: luminal::shape::DimensionBounds::from_ranges(ranges)?,
+        bounds: luminal::shape::SymbolBounds::from_ranges(ranges)?,
         input_buffers: artifact.input_buffers,
         output_buffers: artifact.output_buffers,
         plan: artifact.plan.into_plan()?,
@@ -621,13 +621,13 @@ mod tests {
 
     #[test]
     fn bounded_scan_program_round_trips_without_search() {
-        use luminal::shape::DimensionBounds;
+        use luminal::shape::SymbolBounds;
         let mut graph = Graph::new();
         let x = graph.tensor(('n', 2), DType::F32);
         // Axis 1 must survive serialization; folding axis 0 changes the result.
         let out = x.cumsum(1).cumprod(1).cummax(1);
         let output = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
-        let bounds = DimensionBounds::from_ranges([('n'.into(), (1, 4))]).unwrap();
+        let bounds = SymbolBounds::from_ranges([('n'.into(), (1, 4))]).unwrap();
         let dims = [('n'.into(), 2)].into_iter().collect();
         let data = [(x.id, TypedBuffer::F32(vec![-1., 3., -2., 5.]))]
             .into_iter()
@@ -660,14 +660,14 @@ mod tests {
 
     #[test]
     fn bounded_program_round_trip_without_search() {
-        use luminal::shape::{DimensionBounds, DynMap};
+        use luminal::shape::{DynMap, SymbolBounds};
         let mut graph = Graph::new();
         let x = graph.tensor(('s', 2), DType::F32);
         let y = graph.tensor(('s', 2), DType::F32);
         let out = x + y;
         let output = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
         let mut leader = ReferenceRuntime::load(&graph).unwrap();
-        let bounds = DimensionBounds::from_ranges([('s'.into(), (2, 8))]).unwrap();
+        let bounds = SymbolBounds::from_ranges([('s'.into(), (2, 8))]).unwrap();
         let dims: DynMap = [('s'.into(), 3)].into_iter().collect();
         let data = [
             (x.id, TypedBuffer::F32(vec![1.; 6])),

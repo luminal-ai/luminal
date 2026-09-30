@@ -8,14 +8,14 @@ fn invalid_search_domains_are_rejected_before_device_work() {
     let x = graph.tensor(('a', 2), DType::F32);
     let _ = x + 1.;
     for (bounds, dims, message) in [
-        (DimensionBounds::default(), DynMap::default(), "missing"),
+        (SymbolBounds::default(), DynMap::default(), "missing"),
         (
-            DimensionBounds::from_ranges([('a'.into(), (2, 9)), ('b'.into(), (1, 1))]).unwrap(),
+            SymbolBounds::from_ranges([('a'.into(), (2, 9)), ('b'.into(), (1, 1))]).unwrap(),
             [('a'.into(), 3), ('b'.into(), 1)].into_iter().collect(),
             "unused",
         ),
         (
-            DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+            SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
             [('a'.into(), 10)].into_iter().collect(),
             "outside",
         ),
@@ -42,7 +42,7 @@ fn bounded_plan_retains_symbolic_capacity_and_satisfies_authoring_checks() {
     let mut graph = Graph::new();
     let x = graph.tensor(('a', 2), DType::F32);
     let _ = x.max(0);
-    let bounds = DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap();
+    let bounds = SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap();
     let dims = [('a'.into(), 3)].into_iter().collect();
     let mut runtime = CudaRuntime::load(&graph).unwrap();
     let outcome = runtime

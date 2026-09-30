@@ -32,20 +32,27 @@ There is no separate application crate or integration-test directory for them.
 
 ## Concrete API changes
 
-### Core dimension contracts
+### Core symbol bounds
 
 `src/shape/bounds.rs` introduces:
 
 - `DimensionRange::new(min, max)` and `exact(value)`: checked inclusive intervals
   with `min <= max <= i64::MAX`. Accessors, membership, and checked intersection
   do not carry any representative or bucket identity.
-- `DimensionBounds::new`, `from_ranges`, and `exact`: deterministic complete
+- `SymbolBounds::new`, `from_ranges`, and `exact`: deterministic complete
   symbol maps. Duplicate symbols are rejected. `project` selects a subset;
   `validate_symbols` rejects missing or unused bounds; `validate_values` checks
   all required concrete assignments while allowing unrelated application values.
 - `program_dimensions`: collects `IntVar` references from the parsed bound
   program before saturation, including metadata, indexing, strides, and contracts.
 - `egglog_seeds`: ordinary lower/upper function sets, with escaped symbol names.
+
+Symbol names occupy a flat namespace. Applications own name qualification and
+reuse the same symbol across inputs when their dimensions should be shared.
+Shapes may contain compound `IntExpr` values, such as `prefix + query`. Bounds
+are supplied for the free symbols, and interval analysis derives bounds for the
+expression. `SymbolBounds` does not add separate expression constraints or
+relations between independently supplied symbols.
 
 The former `graph::DimBucket` and its prelude export are gone. `Graph::set_dim`
 remains a concrete-value convenience for graph users and tests; it is not an
@@ -89,7 +96,7 @@ is removed as a competing source of shape configuration.
 
 | Removed API/state | Replacement |
 | --- | --- |
-| `bind_dyn_range`, `bind_dim_buckets` | Complete `DimensionBounds` argument to each search |
+| `bind_dyn_range`, `bind_dim_buckets` | Complete `SymbolBounds` argument to each search |
 | Reference `search_buckets` | Ordinary single-program `search` |
 | `search_with_profile_inputs` and profile override lists | One profiling assignment and input map |
 | `BucketAssembly`, bucket rendering/search functions | One ordinary assembly with bounds seeds |

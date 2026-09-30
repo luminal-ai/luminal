@@ -14,7 +14,7 @@ let x = graph.tensor(3, DType::F32);
 let out = x + 2.;
 let mut runtime = MetalRuntime::load(&graph)?;
 let data = [(x.id, vec![1f32, 2., 3.].into())].into_iter().collect();
-runtime.search(&DimensionBounds::default(), &DynMap::default(), &data, &harness_search_options())?;
+runtime.search(&SymbolBounds::default(), &DynMap::default(), &data, &harness_search_options())?;
 // The application allocates and initializes Metal storage directly.
 let arena = runtime.metal_device()?.new_buffer(
     runtime.arena_bytes()? as u64, metal::MTLResourceOptions::StorageModeShared);
@@ -49,7 +49,7 @@ keeps address-expression optimization bounded on full model graphs.
 External operations implement `KernelOp` and expose `MetalOpInterface` through
 their DPS operation's `runtime_interface`.
 
-Pass a complete `DimensionBounds` map and a concrete profiling `DynMap` to
+Pass a complete `SymbolBounds` map and a concrete profiling `DynMap` to
 `search`, then use `set_dim` for execution values within that domain. Each
 search selects one program under its own `device_budget_bytes`. That limit
 includes scratch and boundary storage in the supplied arena, and excludes external storage, host staging,

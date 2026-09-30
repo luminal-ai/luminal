@@ -2,7 +2,7 @@
 use crate::{Inputs, graph::LlmGraph};
 use anyhow::Result;
 use luminal::bucketing::BucketSpec;
-use luminal::shape::{DimensionBounds, DynMap};
+use luminal::shape::{DynMap, SymbolBounds};
 
 pub const DEFAULT_SEARCH_GENERATIONS: usize = 10;
 pub const DEFAULT_SEARCH_POPULATION: usize = 10;
@@ -24,7 +24,7 @@ pub fn buckets(graph: &LlmGraph) -> Result<Vec<BucketSpec>> {
         .into_iter()
         .map(|(lo, hi, query)| {
             BucketSpec::new(
-                DimensionBounds::from_ranges([
+                SymbolBounds::from_ranges([
                     ('q'.into(), (lo, hi)),
                     ('c'.into(), (1, graph.capacity)),
                 ])?,

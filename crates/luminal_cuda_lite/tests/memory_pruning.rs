@@ -46,7 +46,7 @@ fn oversized_products_are_pruned_before_search_and_cublas_matches_reference() {
     };
     let outcome = runtime
         .search(
-            &luminal::shape::DimensionBounds::from_ranges([('q'.into(), (1, 128))]).unwrap(),
+            &luminal::shape::SymbolBounds::from_ranges([('q'.into(), (1, 128))]).unwrap(),
             &[('q'.into(), 128)].into_iter().collect(),
             &data,
             &options,

@@ -130,7 +130,7 @@ fn a_budget_nothing_meets_refuses_and_names_it() {
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let err = rt
         .search(
-            &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
+            &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
             &[('a'.into(), 3)].into_iter().collect(),
             &Default::default(),
             &bounded_options(Some(0)),

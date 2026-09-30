@@ -14,7 +14,7 @@ fn shape_changes_reuse_one_arena_and_replay_cached_graphs() {
     let out = x * y + x;
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
         &[('a'.into(), 3)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),
@@ -53,7 +53,7 @@ fn metadata_only_dimension_change_patches_no_nodes() {
     let out = g.iota(5, |c| c[0] + a);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (1, 19))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (1, 19))]).unwrap(),
         &[('a'.into(), 10)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),
@@ -83,7 +83,7 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
     let out = (x.permute((1, 0)) + 1.).sum(0);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
         &[('a'.into(), 6)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),
@@ -129,7 +129,7 @@ fn cublas_geometry_changes_rerecord_the_child_every_execution() {
     options.generations = 4;
     options.generation_size = 12;
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([
+        &luminal::shape::SymbolBounds::from_ranges([
             ('m'.into(), (2, 12)),
             ('k'.into(), (2, 12)),
             ('n'.into(), (2, 12)),
@@ -190,7 +190,7 @@ fn profiling_and_serving_share_dynamic_graph_execution() {
     options.trials = 2;
     let outcome = rt
         .search(
-            &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+            &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
             &[('a'.into(), 3)].into_iter().collect(),
             &data,
             &options,
@@ -214,7 +214,7 @@ fn zero_extents_disable_copies_and_restore_them() {
     let out = x + 3.;
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (0, 9))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (0, 9))]).unwrap(),
         &[('a'.into(), 4)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),
@@ -249,7 +249,7 @@ fn gather_scatter_update_symbolic_coordinates() {
     opts.generations = 4;
     opts.generation_size = 8;
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
         &[('a'.into(), 5)].into_iter().collect(),
         &Default::default(),
         &opts,
@@ -365,7 +365,7 @@ fn ceil_division_in_dynamic_iota_is_evaluated_on_device() {
     let _ = g.iota(7, |c| c[0] + a);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (1, 12))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (1, 12))]).unwrap(),
         &[('a'.into(), 6)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),
@@ -428,7 +428,7 @@ fn all_bounded_dimensions_stay_symbolic() {
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.set_dim('b', 3); // This current value must not narrow the searched interval.
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('b'.into(), (2, 8)), ('a'.into(), (2, 9))])
+        &luminal::shape::SymbolBounds::from_ranges([('b'.into(), (2, 8)), ('a'.into(), (2, 9))])
             .unwrap(),
         &[('b'.into(), 3), ('a'.into(), 5)].into_iter().collect(),
         &Default::default(),
@@ -477,7 +477,7 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
     options.generation_size = 16;
     options.mutations = 4;
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('m'.into(), (2, 9)), ('n'.into(), (2, 9))])
+        &luminal::shape::SymbolBounds::from_ranges([('m'.into(), (2, 9)), ('n'.into(), (2, 9))])
             .unwrap(),
         &[('m'.into(), 5), ('n'.into(), 5)].into_iter().collect(),
         &Default::default(),

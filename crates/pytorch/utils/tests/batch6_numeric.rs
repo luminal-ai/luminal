@@ -49,7 +49,7 @@ fn run_f32(
     let options = harness_search_options();
     runtime
         .search(
-            &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+            &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
             &dims,
             &data,
             &options,

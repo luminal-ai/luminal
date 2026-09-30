@@ -160,7 +160,7 @@ pub mod device {
         let t = std::time::Instant::now();
         let outcome = rt
             .search(
-                &luminal::shape::DimensionBounds::exact(&cx.dyn_map).unwrap(),
+                &luminal::shape::SymbolBounds::exact(&cx.dyn_map).unwrap(),
                 &cx.dyn_map,
                 &data,
                 &options,

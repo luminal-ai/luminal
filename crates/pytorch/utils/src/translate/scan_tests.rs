@@ -29,7 +29,7 @@ fn run_f32(t: &Translation, x: &[f32]) -> Vec<f32> {
         .iter()
         .map(|(&symbol, &hint)| (symbol, hint))
         .collect();
-    let bounds = luminal::shape::DimensionBounds::exact(&dims).unwrap();
+    let bounds = luminal::shape::SymbolBounds::exact(&dims).unwrap();
     let input = t.inputs[0].tensor;
     let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
     data.insert(input, TypedBuffer::F32(x.to_vec()));

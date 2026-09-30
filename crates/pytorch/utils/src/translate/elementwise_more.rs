@@ -501,7 +501,7 @@ mod tests {
         data.insert(input.tensor, TypedBuffer::F32(x.to_vec()));
         runtime
             .search(
-                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
                 &dims,
                 &data,
                 &harness_search_options(),

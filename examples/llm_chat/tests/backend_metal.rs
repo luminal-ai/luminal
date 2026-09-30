@@ -132,7 +132,7 @@ fn prefill_and_decode_use_resident_state_and_match_reference() {
             .collect();
         reference
             .search(
-                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
                 &dims,
                 &data,
                 &luminal_reference::harness_search_options(),

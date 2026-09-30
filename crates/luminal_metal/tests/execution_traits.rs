@@ -236,7 +236,7 @@ fn external_kernel_launch_geometry_updates_reuse_compiled_pipeline() {
     ));
     let mut rt = MetalRuntime::load_with_registry(&graph, registry).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (0, 1025))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (0, 1025))]).unwrap(),
         &[('a'.into(), 512)].into_iter().collect(),
         &[
             (a.id, vec![2f32; 512].into()),

@@ -205,7 +205,7 @@ fn profile_on_reference_runtime(
 
     let mut runtime = ReferenceRuntime::default();
     runtime.set_memory_budget_bytes(memory_budget_bytes);
-    runtime.load_plan(plan.clone(), luminal::shape::DimensionBounds::exact(dims)?);
+    runtime.load_plan(plan.clone(), luminal::shape::SymbolBounds::exact(dims)?);
     // The plan's spans/extents may be SYMBOLIC (`Var("a")`), so the
     // profiling runtime must hold the representative assignment before it
     // can allocate or index anything. This is the whole point of pricing a
@@ -255,7 +255,7 @@ pub fn search_implementations_with_ops(
     program: &SearchProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
     dims: &luminal::shape::DynMap,
-    bounds: &luminal::shape::DimensionBounds,
+    bounds: &luminal::shape::SymbolBounds,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
 ) -> Result<SearchOutcome> {
@@ -617,7 +617,7 @@ pub fn search_implementations(
         program,
         input_data,
         &luminal::shape::DynMap::default(),
-        &luminal::shape::DimensionBounds::default(),
+        &luminal::shape::SymbolBounds::default(),
         options,
         None,
     )

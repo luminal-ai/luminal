@@ -213,7 +213,7 @@ pub struct ReferenceRuntime {
     /// M3 Step 2 native-ladder state (`load` → bind → `with_ops` → `search`).
     native: Option<NativeSpec>,
     /// The immutable domain of the selected program.
-    bounds: luminal::shape::DimensionBounds,
+    bounds: luminal::shape::SymbolBounds,
     /// Concrete values for the next invocation.
     dims: luminal::shape::DynMap,
 }
@@ -287,7 +287,7 @@ impl ReferenceRuntime {
     pub fn load_plan(
         &mut self,
         plan: BufferIrGraph<DecodedLayout>,
-        bounds: luminal::shape::DimensionBounds,
+        bounds: luminal::shape::SymbolBounds,
     ) {
         self.bounds = bounds;
         self.lit_index = plan
@@ -333,7 +333,7 @@ impl ReferenceRuntime {
         self.dims.insert(dim.into(), value);
     }
 
-    pub fn bounds(&self) -> &luminal::shape::DimensionBounds {
+    pub fn bounds(&self) -> &luminal::shape::SymbolBounds {
         &self.bounds
     }
 
@@ -442,7 +442,7 @@ impl ReferenceRuntime {
     /// plan on this runtime with the given data; the winner loads.
     pub fn search(
         &mut self,
-        bounds: &luminal::shape::DimensionBounds,
+        bounds: &luminal::shape::SymbolBounds,
         profile_dims: &luminal::shape::DynMap,
         input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
         options: &crate::search::CompileOptions,
@@ -1122,11 +1122,11 @@ mod tests {
 
     #[test]
     fn intermediate_pruning_uses_domain_capacity() {
-        use luminal::shape::{DimensionBounds, DynMap};
+        use luminal::shape::{DynMap, SymbolBounds};
         let mut graph = Graph::new();
         let x = graph.tensor('a', DType::F32);
         let out = x.sin().cos();
-        let bounds = DimensionBounds::from_ranges([('a'.into(), (1, 8))]).unwrap();
+        let bounds = SymbolBounds::from_ranges([('a'.into(), (1, 8))]).unwrap();
         let dims: DynMap = [('a'.into(), 2)].into_iter().collect();
         let data = [(x.id, vec![0.0f32; 2].into())].into_iter().collect();
         let mut options = crate::search::harness_search_options();
@@ -2738,12 +2738,12 @@ mod tests {
     }
     #[test]
     fn bounded_program_runs_multiple_dimensions_and_preserves_other_ranges() {
-        use luminal::shape::{DimensionBounds, DynMap};
+        use luminal::shape::{DynMap, SymbolBounds};
         let mut graph = Graph::new();
         let x = graph.tensor(('a', 'b'), DType::F32);
         let out = x * x + x;
         let bounds =
-            DimensionBounds::from_ranges([('a'.into(), (2, 9)), ('b'.into(), (2, 5))]).unwrap();
+            SymbolBounds::from_ranges([('a'.into(), (2, 9)), ('b'.into(), (2, 5))]).unwrap();
         let dims: DynMap = [('a'.into(), 3), ('b'.into(), 2)].into_iter().collect();
         let mut runtime = ReferenceRuntime::load(&graph).unwrap();
         let data = [(x.id, vec![1.0f32; 6].into())].into_iter().collect();
@@ -2773,10 +2773,10 @@ mod tests {
 
     #[test]
     fn symbolic_iota_reuses_one_program_across_dims() {
-        use luminal::shape::{DimensionBounds, DynMap, IntExpr};
+        use luminal::shape::{DynMap, IntExpr, SymbolBounds};
         let mut graph = Graph::new();
         let out = graph.arange(IntExpr::from('a'));
-        let bounds = DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap();
+        let bounds = SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap();
         let dims: DynMap = [('a'.into(), 3)].into_iter().collect();
         let mut runtime = ReferenceRuntime::load(&graph).unwrap();
         let result = runtime
@@ -2806,12 +2806,12 @@ mod tests {
 
     #[test]
     fn exact_dimensions_remain_guarded_after_specialization() {
-        use luminal::shape::{DimensionBounds, DynMap};
+        use luminal::shape::{DynMap, SymbolBounds};
         let mut graph = Graph::new();
         let x = graph.tensor('n', DType::F32);
         let _out = x + x;
         let dims: DynMap = [('n'.into(), 1)].into_iter().collect();
-        let bounds = DimensionBounds::exact(&dims).unwrap();
+        let bounds = SymbolBounds::exact(&dims).unwrap();
         let data = [(x.id, vec![2.0f32].into())].into_iter().collect();
         let mut runtime = ReferenceRuntime::load(&graph).unwrap();
         runtime

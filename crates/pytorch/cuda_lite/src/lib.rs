@@ -29,7 +29,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
-use luminal::shape::DimensionBounds;
+use luminal::shape::SymbolBounds;
 use luminal_cuda_lite::bindings::{BoundaryLayout, CudaBindings};
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, harness_search_options};
 use luminal_pytorch_utils::translate::parse_dim_expr;
@@ -81,7 +81,7 @@ pub struct CompiledGraph {
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
     dims: DynMap,
-    bounds: DimensionBounds,
+    bounds: SymbolBounds,
 }
 
 /// Resolve a symbolic recorder shape to concrete extents. Literals and
@@ -820,7 +820,7 @@ fn compile(
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
     let translation = translate(&parsed).map_err(to_py)?;
-    let bounds = luminal_pytorch_utils::dimension_bounds(&translation, &parsed).map_err(to_py)?;
+    let bounds = luminal_pytorch_utils::symbol_bounds(&translation, &parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let inputs = layout_table(&translation, "input", &input_layouts).map_err(to_py)?;
     let outputs = layout_table(&translation, "output", &output_layouts).map_err(to_py)?;
@@ -1031,7 +1031,7 @@ mod tests {
             output_buffers: boundary.output_buffers,
             output_layouts: boundary.output_layouts,
             searched: false,
-            bounds: DimensionBounds::exact(&dims).unwrap(),
+            bounds: SymbolBounds::exact(&dims).unwrap(),
             dims,
         }
     }

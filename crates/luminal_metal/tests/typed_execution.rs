@@ -105,7 +105,7 @@ fn empty_reduction_and_replay_initialize_recycled_storage() {
     let out = x.sum(1);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (0, 4))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('n'.into(), (0, 4))]).unwrap(),
         &[('n'.into(), 2)].into_iter().collect(),
         &[(x.id, vec![1f32; 6].into())].into_iter().collect(),
         &harness_search_options(),

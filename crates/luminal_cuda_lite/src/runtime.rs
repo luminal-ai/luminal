@@ -111,7 +111,7 @@ pub struct CudaRuntime {
     /// by tensor: [`Self::output_slot_index`] refuses the ambiguity
     /// rather than picking one.
     output_slots: FxHashMap<NodeIndex, Vec<usize>>,
-    bounds: shape::DimensionBounds,
+    bounds: shape::SymbolBounds,
     dims: shape::DynMap,
     /// Live execution context and code/graph caches, attached explicitly or lazily.
     /// This is runtime state, not a portable serialized program.
@@ -325,7 +325,7 @@ impl CudaRuntime {
         self.dims.insert(dim.into(), value);
     }
 
-    pub fn bounds(&self) -> &shape::DimensionBounds {
+    pub fn bounds(&self) -> &shape::SymbolBounds {
         &self.bounds
     }
 
@@ -383,7 +383,7 @@ impl CudaRuntime {
     /// holds) rather than on an election that depends on the budget.
     pub fn saturated_egraph(
         &self,
-        bounds: &shape::DimensionBounds,
+        bounds: &shape::SymbolBounds,
     ) -> Result<luminal::prelude::egraph_serialize::EGraph> {
         let (serialized, _program) = self.assemble_and_saturate(bounds)?;
         Ok(serialized)
@@ -397,7 +397,7 @@ impl CudaRuntime {
     /// mirroring the reference runtime.
     fn assemble_and_saturate(
         &self,
-        bounds: &shape::DimensionBounds,
+        bounds: &shape::SymbolBounds,
     ) -> Result<(
         luminal::prelude::egraph_serialize::EGraph,
         crate::search::SearchProgram,
@@ -460,7 +460,7 @@ impl CudaRuntime {
     /// by measured execution time.
     pub fn search(
         &mut self,
-        bounds: &shape::DimensionBounds,
+        bounds: &shape::SymbolBounds,
         profile_dims: &shape::DynMap,
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
@@ -1190,7 +1190,7 @@ mod caller_memory_tests {
         let mut first = CudaRuntime::load(&graph).unwrap();
         first
             .search(
-                &shape::DimensionBounds::from_ranges([('n'.into(), (1, 8))]).unwrap(),
+                &shape::SymbolBounds::from_ranges([('n'.into(), (1, 8))]).unwrap(),
                 &[('n'.into(), 4)].into_iter().collect(),
                 &Default::default(),
                 &crate::harness_search_options(),

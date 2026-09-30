@@ -44,7 +44,7 @@ fn run(t: &Translation, inputs: &[Input]) -> (Vec<Vec<f32>>, Vec<Vec<u8>>) {
     let options = harness_search_options();
     runtime
         .search(
-            &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+            &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
             &dims,
             &data,
             &options,

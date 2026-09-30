@@ -17,7 +17,7 @@ use luminal::{
 /// whose symbolic capacity exceeds the reference runtime's allocation budget.
 pub fn run(
     graph: &mut EGraph,
-    bounds: &luminal::shape::DimensionBounds,
+    bounds: &luminal::shape::SymbolBounds,
     max_intermediate_bytes: usize,
     memory_budget_bytes: usize,
 ) -> Result<MemoryPruning> {

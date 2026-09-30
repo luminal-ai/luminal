@@ -87,7 +87,7 @@ fn search_and_count_opts(
 
     let data: FxHashMap<NodeIndex, HostBuffer> = pairs.iter().cloned().collect();
     let outcome = match rt.search(
-        &luminal::shape::DimensionBounds::exact(&cx.dyn_map).unwrap(),
+        &luminal::shape::SymbolBounds::exact(&cx.dyn_map).unwrap(),
         &cx.dyn_map,
         &data,
         options,

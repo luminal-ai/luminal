@@ -1,4 +1,4 @@
-//! The dimension domain of one compiled program.
+//! The symbolic dimension domain of one compiled program.
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow, ensure};
@@ -39,12 +39,15 @@ impl DimensionRange {
     }
 }
 
-/// Complete bounds for the symbolic dimensions of one program.
+/// Complete bounds keyed by the symbols used by one program.
+///
+/// Symbol names share a flat namespace. Applications supply any qualification
+/// needed to distinguish independent symbols; all uses of a name share a bound.
 /// Profiling and execution assignments are supplied separately.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DimensionBounds(BTreeMap<Symbol, DimensionRange>);
+pub struct SymbolBounds(BTreeMap<Symbol, DimensionRange>);
 
-impl DimensionBounds {
+impl SymbolBounds {
     pub fn new(ranges: impl IntoIterator<Item = (Symbol, DimensionRange)>) -> Result<Self> {
         let mut result = BTreeMap::new();
         for (symbol, range) in ranges {
@@ -192,7 +195,7 @@ mod tests {
         assert!(DimensionRange::new(9, 2).is_err());
         assert!(DimensionRange::new(0, usize::MAX).is_err());
         let bounds =
-            DimensionBounds::from_ranges([("n".into(), (0, 9)), ("exact".into(), (1, 1))]).unwrap();
+            SymbolBounds::from_ranges([("n".into(), (0, 9)), ("exact".into(), (1, 1))]).unwrap();
         assert!(
             bounds
                 .validate_values(&[("n".into(), 0), ("exact".into(), 1)].into_iter().collect())
@@ -229,14 +232,9 @@ mod tests {
         );
         let symbols = program_dimensions(&text).unwrap();
         assert_eq!(symbols, [symbol, "n".into()].into_iter().collect());
-        let bounds =
-            DimensionBounds::from_ranges([(symbol, (1, 8)), ("n".into(), (2, 9))]).unwrap();
+        let bounds = SymbolBounds::from_ranges([(symbol, (1, 8)), ("n".into(), (2, 9))]).unwrap();
         bounds.validate_symbols(&symbols).unwrap();
         assert_eq!(program_dimensions(&bounds.egglog_seeds()).unwrap(), symbols);
-        assert!(
-            DimensionBounds::default()
-                .validate_symbols(&symbols)
-                .is_err()
-        );
+        assert!(SymbolBounds::default().validate_symbols(&symbols).is_err());
     }
 }

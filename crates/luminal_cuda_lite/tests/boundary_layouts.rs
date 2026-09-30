@@ -242,7 +242,7 @@ fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
 
     let egraph = rt
         .saturated_egraph(
-            &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
+            &luminal::shape::SymbolBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
         )
         .expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
@@ -253,7 +253,7 @@ fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
     );
 
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
         &[('n'.into(), 3)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),
@@ -809,7 +809,7 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
     // chain carries the dim itself, not a number.
     let egraph = rt
         .saturated_egraph(
-            &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
+            &luminal::shape::SymbolBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
         )
         .expect("saturation");
     let view = EGraphView::new(&egraph, rt.decoders());
@@ -839,7 +839,7 @@ fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
     // whole interval, and both dims select one.
 
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('n'.into(), (2, 9))]).unwrap(),
         &[('n'.into(), 3)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),

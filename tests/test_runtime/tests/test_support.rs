@@ -2345,7 +2345,7 @@ mod subst_guard_study {
         let dims = [('s'.into(), 2)].into_iter().collect();
         let err = rt
             .search(
-                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
                 &dims,
                 &data,
                 &luminal_reference::CompileOptions::default(),
@@ -2408,7 +2408,7 @@ mod subst_guard_study {
         let dims = [('s'.into(), 2)].into_iter().collect();
         let err = rt
             .search(
-                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
                 &dims,
                 &data,
                 &luminal_reference::CompileOptions::default(),

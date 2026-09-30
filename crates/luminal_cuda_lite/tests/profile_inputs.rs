@@ -1,7 +1,7 @@
 #![cfg(feature = "device")]
 mod support;
 use luminal::prelude::*;
-use luminal::shape::DimensionBounds;
+use luminal::shape::SymbolBounds;
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer};
 #[cfg(feature = "device")]
 use support::TestTransfers;
@@ -11,7 +11,7 @@ fn explicit_profile_payload_and_assignment() {
     let mut graph = Graph::new();
     let input = graph.tensor('q', DType::F32);
     let output = input + 1.;
-    let bounds = DimensionBounds::from_ranges([('q'.into(), (1, 128))]).unwrap();
+    let bounds = SymbolBounds::from_ranges([('q'.into(), (1, 128))]).unwrap();
     let dims = [('q'.into(), 128)].into_iter().collect();
     let options = CompileOptions {
         generations: 1,

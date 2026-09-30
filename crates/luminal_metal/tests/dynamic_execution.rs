@@ -13,7 +13,7 @@ fn shape_changes_reuse_one_arena() {
     let out = x * y + x;
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
         &[('a'.into(), 3)].into_iter().collect(),
         &[(x.id, vec![1f32; 6].into()), (y.id, vec![2f32; 6].into())]
             .into_iter()
@@ -49,7 +49,7 @@ fn metadata_only_dimension_changes_reuse_compiled_kernel() {
     let out = g.iota(5, |c| c[0] + a);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (1, 19))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (1, 19))]).unwrap(),
         &[('a'.into(), 10)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),
@@ -75,7 +75,7 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
     let out = (x.permute((1, 0)) + 1.).sum(0);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
         &[('a'.into(), 6)].into_iter().collect(),
         &[(x.id, vec![1f32; 18].into())].into_iter().collect(),
         &harness_search_options(),
@@ -111,7 +111,7 @@ fn profiling_and_serving_share_dynamic_graph_execution() {
     options.trials = 2;
     let outcome = rt
         .search(
-            &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
+            &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap(),
             &[('a'.into(), 3)].into_iter().collect(),
             &data,
             &options,

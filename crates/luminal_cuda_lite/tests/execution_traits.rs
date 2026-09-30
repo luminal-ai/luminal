@@ -394,7 +394,7 @@ mod host_graphs {
         ));
         let mut rt = CudaRuntime::load_with_registry(&g, registry).unwrap();
         rt.search(
-            &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (2, 30))]).unwrap(),
+            &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 30))]).unwrap(),
             &[('a'.into(), 16)].into_iter().collect(),
             &Default::default(),
             &harness_search_options(),
@@ -510,7 +510,7 @@ fn external_kernel_launch_geometry_updates_without_reinstantiation() {
     ));
     let mut rt = CudaRuntime::load_with_registry(&graph, registry).unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('a'.into(), (0, 1025))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (0, 1025))]).unwrap(),
         &[('a'.into(), 512)].into_iter().collect(),
         &Default::default(),
         &harness_search_options(),

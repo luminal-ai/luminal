@@ -1,16 +1,16 @@
 //! Validated application domains and dispatch of independently compiled values.
-use crate::shape::{DimensionBounds, DynMap};
+use crate::shape::{DynMap, SymbolBounds};
 use anyhow::{Result, anyhow, ensure};
 
 #[derive(Clone, Debug)]
 pub struct BucketSpec {
     pub label: String,
-    bounds: DimensionBounds,
+    bounds: SymbolBounds,
     profile_dims: DynMap,
 }
 
 impl BucketSpec {
-    pub fn new(bounds: DimensionBounds, profile_dims: DynMap) -> Result<Self> {
+    pub fn new(bounds: SymbolBounds, profile_dims: DynMap) -> Result<Self> {
         bounds.validate_values(&profile_dims)?;
         ensure!(
             profile_dims.len() == bounds.symbols().len(),
@@ -28,7 +28,7 @@ impl BucketSpec {
         self
     }
 
-    pub fn bounds(&self) -> &DimensionBounds {
+    pub fn bounds(&self) -> &SymbolBounds {
         &self.bounds
     }
     pub fn profile_dims(&self) -> &DynMap {
@@ -97,7 +97,7 @@ mod tests {
 
     fn spec(q: (usize, usize), c: (usize, usize)) -> BucketSpec {
         BucketSpec::new(
-            DimensionBounds::from_ranges([("q".into(), q), ("c".into(), c)]).unwrap(),
+            SymbolBounds::from_ranges([("q".into(), q), ("c".into(), c)]).unwrap(),
             [("q".into(), q.0), ("c".into(), c.0)].into_iter().collect(),
         )
         .unwrap()
@@ -141,7 +141,7 @@ mod tests {
         assert!(BucketSet::<()>::new(vec![]).is_err());
         assert!(
             BucketSpec::new(
-                DimensionBounds::from_ranges([("q".into(), (2, 3))]).unwrap(),
+                SymbolBounds::from_ranges([("q".into(), (2, 3))]).unwrap(),
                 [("q".into(), 1)].into_iter().collect()
             )
             .is_err()

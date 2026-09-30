@@ -23,7 +23,7 @@ fn rotary_split_rejoin_with_dynamic_sequence_matches_scalar() {
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     runtime
         .search(
-            &luminal::shape::DimensionBounds::from_ranges([('s'.into(), (2, 64))]).unwrap(),
+            &luminal::shape::SymbolBounds::from_ranges([('s'.into(), (2, 64))]).unwrap(),
             &[('s'.into(), 30)].into_iter().collect(),
             &[(input.id, vec![1f32; 30 * 2048].into())]
                 .into_iter()

@@ -17,7 +17,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
 
-use luminal::shape::DimensionBounds;
+use luminal::shape::SymbolBounds;
 
 fn to_py(err: anyhow::Error) -> PyErr {
     if let Some(py_err) = err.chain().find_map(|cause| cause.downcast_ref::<PyErr>()) {
@@ -87,7 +87,7 @@ pub struct CompiledGraph {
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
     dims: DynMap,
-    bounds: DimensionBounds,
+    bounds: SymbolBounds,
 }
 
 /// Solve a boundary extent `a * symbol + b = value` exactly. Never bind
@@ -603,7 +603,7 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
     let translation = translate(&parsed).map_err(to_py)?;
-    let bounds = luminal_pytorch_utils::dimension_bounds(&translation, &parsed).map_err(to_py)?;
+    let bounds = luminal_pytorch_utils::symbol_bounds(&translation, &parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let (bindings, output_buffers) = bind(&translation)
         .context("binding the translated program's boundary")

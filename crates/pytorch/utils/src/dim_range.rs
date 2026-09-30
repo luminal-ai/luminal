@@ -186,7 +186,7 @@ mod tests {
             .range_constraints
             .insert("s0".into(), constraint(Some(0), Some(8192)));
         let translation = crate::translate::translate(&parsed).unwrap();
-        let bounds = crate::dimension_bounds(&translation, &parsed).unwrap();
+        let bounds = crate::symbol_bounds(&translation, &parsed).unwrap();
         let range = bounds.get(&translation.symbols["s0"]).unwrap();
         assert_eq!((range.min(), range.max()), (0, 8192));
     }
@@ -200,13 +200,10 @@ mod tests {
             .insert("s0".into(), constraint(Some(2), None));
         let mut translation = crate::translate::translate(&parsed).unwrap();
         let symbol = translation.symbols["s0"];
-        let bounds = crate::dimension_bounds(&translation, &parsed).unwrap();
+        let bounds = crate::symbol_bounds(&translation, &parsed).unwrap();
         assert_eq!(bounds.get(&symbol).unwrap().max(), (i64::MAX - 1) as usize);
         translation.dims.insert(symbol, 6000);
-        assert_eq!(
-            crate::dimension_bounds(&translation, &parsed).unwrap(),
-            bounds
-        );
+        assert_eq!(crate::symbol_bounds(&translation, &parsed).unwrap(), bounds);
     }
 
     #[test]
@@ -217,7 +214,7 @@ mod tests {
             .program
             .range_constraints
             .insert("s0".into(), constraint(Some(9), Some(3)));
-        let err = crate::dimension_bounds(&translation, &parsed)
+        let err = crate::symbol_bounds(&translation, &parsed)
             .unwrap_err()
             .to_string();
         assert!(err.contains("s0") && err.contains("[9, 3]"), "{err}");
@@ -401,7 +398,7 @@ mod tests {
 
         // The declared facts and the compiler's complete domain agree, while
         // the profiling assignment remains independent of later executions.
-        let bounds = crate::dimension_bounds(&translation, &parsed).unwrap();
+        let bounds = crate::symbol_bounds(&translation, &parsed).unwrap();
         let dims = translation.dims.iter().map(|(&s, &v)| (s, v)).collect();
         let input = translation.inputs[0].tensor;
         let output = translation.outputs[0].tensor;

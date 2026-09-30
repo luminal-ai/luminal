@@ -73,7 +73,7 @@ fn check_model(model: ModelConfig) {
             .collect();
         reference
             .search(
-                &luminal::shape::DimensionBounds::exact(&dims).unwrap(),
+                &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
                 &dims,
                 &data,
                 &luminal_reference::harness_search_options(),

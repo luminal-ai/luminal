@@ -34,7 +34,7 @@ pub struct MetalRuntime {
     device_budget_bytes: Option<usize>,
     input_buffers: FxHashMap<NodeIndex, i64>,
     output_index: FxHashMap<NodeIndex, usize>,
-    bounds: shape::DimensionBounds,
+    bounds: shape::SymbolBounds,
     dims: shape::DynMap,
     #[cfg(target_os = "macos")]
     device: Option<crate::device::MetalExecutable>,
@@ -149,7 +149,7 @@ impl MetalRuntime {
         self.dims.insert(dim.into(), value);
     }
 
-    pub fn bounds(&self) -> &shape::DimensionBounds {
+    pub fn bounds(&self) -> &shape::SymbolBounds {
         &self.bounds
     }
 
@@ -180,7 +180,7 @@ impl MetalRuntime {
 
     pub fn saturated_egraph(
         &self,
-        bounds: &shape::DimensionBounds,
+        bounds: &shape::SymbolBounds,
     ) -> Result<luminal::prelude::egraph_serialize::EGraph> {
         let (serialized, _program) = self.assemble_and_saturate(
             bounds,
@@ -191,7 +191,7 @@ impl MetalRuntime {
 
     fn assemble_and_saturate(
         &self,
-        bounds: &shape::DimensionBounds,
+        bounds: &shape::SymbolBounds,
         algebra_match_budget: Option<usize>,
     ) -> Result<(
         luminal::prelude::egraph_serialize::EGraph,
@@ -245,7 +245,7 @@ impl MetalRuntime {
 
     pub fn search(
         &mut self,
-        bounds: &shape::DimensionBounds,
+        bounds: &shape::SymbolBounds,
         profile_dims: &shape::DynMap,
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,

@@ -18,7 +18,7 @@ fn fused_dot_handles_broadcast_views_and_dynamic_contraction() {
     )
     .unwrap();
     rt.search(
-        &luminal::shape::DimensionBounds::from_ranges([('k'.into(), (0, 7))]).unwrap(),
+        &luminal::shape::SymbolBounds::from_ranges([('k'.into(), (0, 7))]).unwrap(),
         &[('k'.into(), 3)].into_iter().collect(),
         &[(a.id, vec![1f32; 9].into()), (b.id, vec![1f32; 6].into())]
             .into_iter()

@@ -26,12 +26,12 @@ pub use translate::{TranslatedInput, TranslatedOutput, Translation, translate};
 
 /// Preserve the exported domain for every translated dimension. Missing finite
 /// endpoints retain PyTorch's signed shape range; profiling hints never narrow it.
-pub fn dimension_bounds(
+pub fn symbol_bounds(
     translation: &Translation,
     parsed: &ParsedPT2,
-) -> anyhow::Result<luminal::shape::DimensionBounds> {
+) -> anyhow::Result<luminal::shape::SymbolBounds> {
     use anyhow::ensure;
-    luminal::shape::DimensionBounds::from_ranges(
+    luminal::shape::SymbolBounds::from_ranges(
         translation
             .symbols
             .iter()

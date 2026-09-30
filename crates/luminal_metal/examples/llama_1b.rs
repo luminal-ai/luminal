@@ -5,7 +5,7 @@ use luminal::prelude::FxHashMap;
 use luminal::{
     bucketing::{BucketSet, BucketSpec},
     memory::{PersistentBinding, ProgramMemory, ResourceId, SharedArenaPlan},
-    shape::{DimensionBounds, DynMap},
+    shape::{DynMap, SymbolBounds},
 };
 use luminal_metal::device::{ExternalBuffer, MetalDevice};
 
@@ -573,7 +573,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (slo, shi, s) in [(1, 1, 1), (2, max_prefill, search_s)] {
         for (clo, chi, c) in [(1, 1, 1), (2, max_context, search_c)] {
             let spec = BucketSpec::new(
-                DimensionBounds::from_ranges([('s'.into(), (slo, shi)), ('c'.into(), (clo, chi))])?,
+                SymbolBounds::from_ranges([('s'.into(), (slo, shi)), ('c'.into(), (clo, chi))])?,
                 [('s'.into(), s), ('c'.into(), c)].into_iter().collect(),
             )?;
             let mut bindings = luminal_metal::bindings::MetalBindings::new();
