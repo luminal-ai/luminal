@@ -1,0 +1,2 @@
+; Scan Ops
+(constructor LayoutTensorOpLeftSequentialScanMax (LayoutTensor i64 Layout) LayoutTensorOp)

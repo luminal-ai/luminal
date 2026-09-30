@@ -1,7 +1,7 @@
 //! THE PLAIN FUNCTIONAL OPS — forked from the reference registry.
 //!
 //! One folder per op, matcher and `.egg` rewrites together, kernels
-//! omitted (this runtime never executes). These are the same 25 spellings
+//! omitted (this runtime never executes). These are the same 26 spellings
 //! the reference runtime ships, carried here so the TestRuntime depends
 //! on no other runtime crate.
 //!
@@ -23,6 +23,7 @@ pub mod exp2;
 pub mod gather;
 pub mod index_map_apply_materialize;
 pub mod iota;
+pub mod left_sequential_scan_max;
 pub mod left_sequential_scan_prod;
 pub mod left_sequential_scan_sum;
 pub mod less_than;
@@ -62,6 +63,7 @@ pub fn functional_matchers() -> Vec<Box<dyn luminal::layout_ir::OpMatcher>> {
         Box::new(reduce_sum::ReduceSumMatcher),
         Box::new(left_sequential_scan_sum::LeftSequentialScanSumMatcher),
         Box::new(left_sequential_scan_prod::LeftSequentialScanProdMatcher),
+        Box::new(left_sequential_scan_max::LeftSequentialScanMaxMatcher),
         Box::new(scatter::ScatterFunctionalMatcher),
         Box::new(select::SelectFunctionalMatcher),
         Box::new(sin::SinFunctionalMatcher),

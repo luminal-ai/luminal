@@ -1,6 +1,6 @@
 //! Synthetic watch-item blocks at sizes where execute cost is visible:
-//! cumsum/unfold-family (conv-shaped windowed reduce), top-k (MoE routing
-//! scaffold), and a rank-4 scalar-broadcast chain. Identical source in
+//! cumsum (an inclusive scan), top-k (MoE routing scaffold), and a rank-4
+//! scalar-broadcast chain. Identical source in
 //! the baseline and transparent worktrees; measurement-only.
 
 use luminal::prelude::*;
@@ -123,9 +123,7 @@ fn measure_plan(
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_default();
 
-    // Watch item 1 stand-in: cumsum/unfold family at visible size.
-    // (4,4,64,64) cumsum over the last axis — the windowed-expand
-    // scaffold materializes O(n^2) on that axis.
+    // Watch item 1 stand-in: (4,4,64,64) cumsum over the last axis.
     if which.is_empty() || which == "cumsum_big" {
         let t0 = Instant::now();
         let mut cx = Graph::new();

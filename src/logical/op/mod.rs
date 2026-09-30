@@ -166,6 +166,7 @@ mod trunc;
 mod trunc_cast;
 mod trunc_div;
 mod trunc_rem;
+mod unspecified_order_scan_max;
 mod unspecified_order_scan_prod;
 mod unspecified_order_scan_sum;
 
@@ -197,6 +198,7 @@ pub use trunc::LogicalTrunc;
 pub use trunc_cast::LogicalTruncCast;
 pub use trunc_div::LogicalTruncDiv;
 pub use trunc_rem::LogicalTruncRem;
+pub use unspecified_order_scan_max::LogicalUnspecifiedOrderScanMax;
 pub use unspecified_order_scan_prod::LogicalUnspecifiedOrderScanProd;
 pub use unspecified_order_scan_sum::LogicalUnspecifiedOrderScanSum;
 
@@ -224,6 +226,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalReduceMax),
             Box::new(LogicalUnspecifiedOrderScanSum),
             Box::new(LogicalUnspecifiedOrderScanProd),
+            Box::new(LogicalUnspecifiedOrderScanMax),
             Box::new(LogicalExp2),
             Box::new(LogicalLog2),
             Box::new(LogicalSin),

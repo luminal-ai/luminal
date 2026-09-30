@@ -207,8 +207,7 @@ mod tests {
     /// The defect this closes: `Display` formatted `f32::MIN as f64` as
     /// `-340282346638528860000000000000000000000` (an integer literal
     /// too large for any C type) and `-inf` as the non-token `-inf`.
-    /// The frontend reaches both — `cummax` seeds with `f32::MIN`
-    /// (`src/frontend/unary.rs`), attention masks fill with `-inf`.
+    /// Attention masks fill with `-inf`.
     #[test]
     fn constant_literal_is_a_valid_c_token_for_extreme_and_non_finite_values() {
         let extreme = source_for(f32::MIN as f64);

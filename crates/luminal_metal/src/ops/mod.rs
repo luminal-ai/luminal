@@ -14,6 +14,7 @@ pub mod gather;
 pub mod index_map_apply_materialize;
 pub mod index_map_apply_view;
 pub mod iota;
+pub mod left_sequential_scan_max;
 pub mod left_sequential_scan_prod;
 pub mod left_sequential_scan_sum;
 pub mod less_than;
@@ -113,6 +114,10 @@ pub fn metal_registry() -> Vec<RegisteredOp> {
         reg(
             left_sequential_scan_prod::LeftSequentialScanProdMatcher,
             left_sequential_scan_prod::LeftSequentialScanProd { axis: 0 },
+        ),
+        reg(
+            left_sequential_scan_max::LeftSequentialScanMaxMatcher,
+            left_sequential_scan_max::LeftSequentialScanMax { axis: 0 },
         ),
         reg(iota::IotaMatcher, iota::Iota { expr: None }),
         reg(gather::GatherMatcher, gather::Gather { rank: 1 }),

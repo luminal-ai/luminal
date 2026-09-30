@@ -1,0 +1,20 @@
+; EVERY dtype mints: a maximum never leaves the operand range.
+; Layout Tensor Op Left Sequential Scan Max
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_logical (LogicalUnspecifiedOrderScanMax ?in_logical ?axis))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpLeftSequentialScanMax ?in_layout_tensor ?axis ?out_layout))
+  )
+  :ruleset backend
+  :name "test_runtime/ops/functional/left_sequential_scan_max/match_functional: LeftSequentialScanMax mint, every dtype"
+)

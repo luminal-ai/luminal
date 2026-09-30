@@ -1,0 +1,19 @@
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?out_rm_shape ?out_rm_bits))
+    (= ?out_logical (LogicalUnspecifiedOrderScanMax ?in_logical ?axis))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpLeftSequentialScanMax ?in_layout_tensor ?axis ?out_layout))
+  )
+  :ruleset backend
+  :name "metal/left_sequential_scan_max/match_functional: LeftSequentialScanMax match along the scan axis"
+)

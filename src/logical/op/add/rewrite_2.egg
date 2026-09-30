@@ -1,8 +1,7 @@
 ; Logical Associativity : Add — EXACT DTYPES ONLY (ruling 2026-08-06).
 ; f32 addition is NOT associative: reassociating x·ind + fill + (−fill·ind)
-; with fill = −3.4e38 absorbs x entirely (ULP(3.4e38) ≈ 3.9e31), which the
-; genetic search surfaced as timing-flaky all-zero cummax outputs (repro:
-; rrx_float_assoc_absorption). Integer addition reassociates exactly, so
+; with fill = −3.4e38 absorbs x entirely (ULP(3.4e38) ≈ 3.9e31).
+; Integer addition reassociates exactly, so
 ; the weld fires only on classes whose dtype is PROVEN integral — one rule
 ; per exact dtype (fail-safe: an underived dtype fires nothing). A future
 ; fast-math tier may reintroduce the float weld as an opt-in.

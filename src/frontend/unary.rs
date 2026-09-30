@@ -487,40 +487,6 @@ impl GraphTensor {
         self.gather_elements(top_k_idx, axis)
     }
 
-    /// Apply a cumulative reduction operation along dimensions
-    ///
-    /// See `cumsum` or `cummax` for usage examples.
-    pub fn cumop(
-        mut self,
-        axes: impl ToAxes,
-        op: impl Fn(GraphTensor, usize) -> GraphTensor,
-        pad_elem: f32,
-    ) -> Self {
-        let n_dims = self.rank();
-        for axis in axes.to_axes() {
-            // Pad out length
-            let mut kernel = vec![1.into(); n_dims];
-            let mut padding = vec![(IntExpr::from(0), IntExpr::from(0)); n_dims];
-            let orig_length = self.dims()[axis];
-            padding[axis] = (orig_length - 1, 0.into());
-            kernel[axis] = orig_length;
-            self = self.pad(padding, pad_elem);
-            // Unfold + removal of the non-cumulative kernel dimensions:
-            // ONE macro construct, ONE apply (ruling 2026-08-26) — the
-            // squeezes compose into the unfold's own map.
-            let mut chain = self.unfold_view(kernel, vec![1; n_dims], vec![1; n_dims]);
-            for i in (0..n_dims).rev() {
-                if i != axis {
-                    chain = chain.squeeze(n_dims + i);
-                }
-            }
-            self = chain.finish();
-            // apply operation along cumulative dimensions
-            self = op(self, n_dims);
-        }
-        self
-    }
-
     /// Apply a cumulative sum along dimensions — one inclusive scan per axis.
     pub fn cumsum(self, axes: impl ToAxes) -> Self {
         self.scan_per_axis(axes, |axis_from_end| LogicalOp::UnspecifiedOrderScanSum {
@@ -528,9 +494,11 @@ impl GraphTensor {
         })
     }
 
-    /// Apply a cumulative max along dimensions
+    /// Apply a cumulative max along dimensions — one inclusive scan per axis.
     pub fn cummax(self, axes: impl ToAxes) -> Self {
-        self.cumop(axes, |t, axes| t.max(axes), f32::MIN)
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::UnspecifiedOrderScanMax {
+            axis_from_end,
+        })
     }
 
     /// Apply a cumulative product along dimensions — one inclusive scan per axis.
@@ -551,6 +519,7 @@ impl GraphTensor {
             return self;
         }
         for axis in axes.to_axes() {
+            assert!(axis < rank, "scan axis {axis} out of range for rank {rank}");
             id = self.graph().logical.op(
                 op(rank - 1 - axis),
                 &[(id, dims.clone())],
@@ -616,6 +585,20 @@ pub(super) mod tests {
         let b = a.cumsum(0);
         let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
         assert_exact(rt.get_f32(b.id).unwrap(), &expected);
+    }
+
+    /// The running maximum carries each prefix's largest value exactly.
+    #[test]
+    fn cummax_is_the_running_maximum() {
+        let input = vec![-5.0f32, -3.0, -9.0, -1.0, -7.0, -2.0, -8.0, -4.0];
+        let mut cx = Graph::new();
+        let a = cx.tensor(input.len(), DType::F32);
+        let b = a.cummax(0);
+        let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
+        assert_exact(
+            rt.get_f32(b.id).unwrap(),
+            &[-5.0, -3.0, -3.0, -1.0, -1.0, -1.0, -1.0, -1.0],
+        );
     }
 
     fn cummax_ref_2d(a: Tensor) -> Tensor {

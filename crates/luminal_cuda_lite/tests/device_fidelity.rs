@@ -181,6 +181,24 @@ fn cumprod_carries_signs() {
 }
 
 #[test]
+fn cummax_is_the_running_maximum() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(8usize, DType::F32);
+    let out = a.cummax(0);
+    let (want, got) = run_both(
+        &cx,
+        &[(a.id, vec![-5.0, -3., -9., -1., -7., -2., -8., -4.])],
+        out.id,
+    );
+    assert_exact_both(
+        &want,
+        &got,
+        &[-5.0, -3., -3., -1., -1., -1., -1., -1.],
+        "cummax [-5,-3,-9,-1,-7,-2,-8,-4]",
+    );
+}
+
+#[test]
 fn prod_along_rows() {
     let mut cx = Graph::new();
     let a = cx.tensor((2usize, 2usize), DType::F32);
@@ -203,4 +221,37 @@ fn cumsum_along_the_outer_axis() {
         &[1.0, 2., 4., 6., 9., 12.],
         "cumsum along axis 0",
     );
+}
+
+/// The scanned axis is the outer one, so each thread strides by the row.
+#[test]
+fn cummax_along_the_outer_axis() {
+    let mut cx = Graph::new();
+    let a = cx.tensor((3usize, 2usize), DType::F32);
+    let out = a.cummax(0);
+    let (want, got) = run_both(&cx, &[(a.id, vec![-1.0, 6., 3., -2., 2., 5.])], out.id);
+    assert_exact_both(
+        &want,
+        &got,
+        &[-1.0, 6., 3., 6., 3., 6.],
+        "cummax along axis 0",
+    );
+}
+
+/// All-negative integers separate a correct identity from a zero or a
+/// converted float one: any seed above the inputs would reach the output.
+#[test]
+fn int_cummax_over_negatives() {
+    let input = vec![-7i32, -9, -3, -5];
+    let mut cx = Graph::new();
+    let a = cx.tensor(4usize, DType::Int);
+    let out = a.cummax(0);
+    let mut rt = CudaRuntime::load(&cx).expect("device load");
+    let data: FxHashMap<NodeIndex, HostBuffer> =
+        [(a.id, input.clone().into())].into_iter().collect();
+    rt.search(&data, &luminal_cuda_lite::harness_search_options())
+        .expect("device search");
+    rt.set_data(a.id, input).unwrap();
+    rt.execute().expect("device execute");
+    assert_eq!(rt.get_i32(out.id).unwrap(), vec![-7, -7, -3, -3]);
 }

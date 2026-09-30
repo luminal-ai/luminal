@@ -83,6 +83,7 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "ReduceMaxGeneric"
         | "ReduceSumGeneric"
         | "RoundFunctionalGeneric"
+        | "LeftSequentialScanMax"
         | "LeftSequentialScanProd"
         | "LeftSequentialScanSum"
         | "SelectFunctionalGeneric"
@@ -1250,6 +1251,7 @@ mod tests {
             "LayoutTensorOpGatherGeneric",
             "LayoutTensorOpIndexMapApplyMaterialize",
             "LayoutTensorOpIotaGeneric",
+            "LayoutTensorOpLeftSequentialScanMax",
             "LayoutTensorOpLeftSequentialScanProd",
             "LayoutTensorOpLeftSequentialScanSum",
             "LayoutTensorOpLessThanGeneric",
@@ -2798,6 +2800,23 @@ mod tests {
         rt.set_data(x.id, vec![-2i32, 3, -4, 5]);
         rt.execute().expect("unattested int prod executes");
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![-2i32, -6, 24, 120]);
+    }
+
+    /// Int running maximum needs NO attestation: a maximum never leaves the
+    /// operand range, so nothing is proof-gated.
+    #[test]
+    fn int_max_scan_runs_unattested() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(4, DType::Int);
+        let out = x.cummax(0);
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        let mut data = FxHashMap::default();
+        data.insert(x.id, vec![3i32, -7, 5, 4].into());
+        rt.search(&data, &crate::search::harness_search_options())
+            .expect("unattested int max scan implements");
+        rt.set_data(x.id, vec![3i32, -7, 5, 4]);
+        rt.execute().expect("unattested int max scan executes");
+        assert_eq!(rt.get_i32(out.id).unwrap(), &vec![3i32, 3, 5, 5]);
     }
 
     /// A prefix product that leaves i32 range refuses loudly instead of

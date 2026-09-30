@@ -21,7 +21,7 @@
 //!     folded the constant away, or that reached codegen with some
 //!     other number, fails loudly instead of passing vacuously. Steps
 //!     1-3 were confirmed on a device-free host before this file
-//!     landed: all four graphs plan, every elected op has a codegen
+//!     landed: all three graphs plan, every elected op has a codegen
 //!     row, and the plans carry `-3.4028234663852886e38`, `-inf` and
 //!     `NaN` unchanged. Steps 4-5 are what only a device can settle.
 //!  4. `ops::constant::codegen` formats the value through
@@ -30,13 +30,6 @@
 //!     C token fails to compile HERE (the pre-fix `-inf` / `NaN` and the
 //!     39-digit integer-literal forms all did); a literal that compiles
 //!     but denotes the wrong number shows up in the readback bits.
-//!
-//! CUMULATIVE MAX is the frontend-reachable witness: `GraphTensor::cummax`
-//! seeds its window with `f32::MIN` (src/frontend/unary.rs), which `pad`
-//! mints as exactly this constant (src/frontend/movement.rs `pad` ->
-//! `constant_f32(elem)`). It runs here as a fourth case with a host
-//! reference, so the motivating caller is covered end to end and not
-//! only the synthetic constant.
 #![cfg(feature = "device")]
 
 use luminal::bufferize::BufferNode;
@@ -145,7 +138,7 @@ fn constant_plus_zero(value: f32) -> Vec<f32> {
     got
 }
 
-/// `f32::MIN` — the value `cummax` seeds with. Its `Display` form is a
+/// `f32::MIN` — the most negative finite f32. Its `Display` form is a
 /// 39-digit run with no decimal point and no exponent, which C reads as
 /// an integer literal too large for any integer type: pre-fix this did
 /// not compile. Bitwise equality is the bar, since `{:e}` must
@@ -184,40 +177,4 @@ fn nan_constant_survives_nvrtc() {
     for (i, g) in constant_plus_zero(f32::NAN).iter().enumerate() {
         assert!(g.is_nan(), "element {i}: expected NaN, got {g}");
     }
-}
-
-/// THE FRONTEND-REACHABLE CASE. `cummax` pads its window with
-/// `f32::MIN` (src/frontend/unary.rs), `pad` mints that as
-/// `constant_f32(f32::MIN)` (src/frontend/movement.rs), and the
-/// windowed max then selects over it. The seed is the reduction
-/// identity: it must be smaller than every real element, so a literal
-/// that compiled to the wrong magnitude would show up as a wrong
-/// running maximum rather than as a compile error.
-///
-/// The reference is the running maximum computed on the host. `max` is
-/// exact selection — no arithmetic — so equality is exact, not
-/// tolerant.
-#[test]
-fn cummax_seed_constant_survives_nvrtc() {
-    let input = vec![-5.0f32, -3., -9., -1., -7., -2., -8., -4.];
-    let mut cx = Graph::new();
-    let a = cx.tensor(input.len(), DType::F32);
-    let out = a.cummax(0);
-    let got = run_on_device(
-        &cx,
-        &[(a.id, input.clone())],
-        out.id,
-        f32::MIN as f64,
-        "cummax seed",
-    );
-
-    let mut running = f32::NEG_INFINITY;
-    let want: Vec<f32> = input
-        .iter()
-        .map(|v| {
-            running = running.max(*v);
-            running
-        })
-        .collect();
-    assert_eq!(got, want, "cummax over {input:?}");
 }

@@ -106,28 +106,3 @@ fn nan_constant_survives_msl() {
         assert!(g.is_nan(), "element {i}: expected NaN, got {g}");
     }
 }
-
-#[test]
-fn cummax_seed_constant_survives_msl() {
-    let input = vec![-5.0f32, -3., -9., -1., -7., -2., -8., -4.];
-    let mut cx = Graph::new();
-    let a = cx.tensor(input.len(), DType::F32);
-    let out = a.cummax(0);
-    let got = run_on_device(
-        &cx,
-        &[(a.id, input.clone())],
-        out.id,
-        f32::MIN as f64,
-        "cummax seed",
-    );
-
-    let mut running = f32::NEG_INFINITY;
-    let want: Vec<f32> = input
-        .iter()
-        .map(|v| {
-            running = running.max(*v);
-            running
-        })
-        .collect();
-    assert_eq!(got, want, "cummax over {input:?}");
-}
