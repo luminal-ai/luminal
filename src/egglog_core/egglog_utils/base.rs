@@ -679,6 +679,32 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
     // It rewrites to an operand of the matched term, so unlike
     // `div-cancel-factor` it creates nothing for itself to match again.
     p.add_rule(rewrite("div-mul-var-self", div(mul(v("?x"), v("?y")), v("?y")), v("?x")).ruleset("expr"));
+    // `div-mul-num-self` for a literal that divides the cofactor:
+    // (x*a)/b → x*(a/b) when b divides a (a merged 2-wide pair over a
+    // pinned extent, (H*4)/2). It rewrites to a product with a smaller
+    // literal and no division, so it cannot feed itself.
+    p.add_rule(
+        rewrite(
+            "div-mul-num-divisor",
+            div(mul(v("?x"), num(v("?a"))), num(v("?b"))),
+            mul(v("?x"), num(pdiv(v("?a"), v("?b")))),
+        )
+        .when(vec![pgte(v("?b"), i64(1)), peq(i64(0), pmod(v("?a"), v("?b")))])
+        .ruleset("expr"),
+    );
+    // `div-cancel-factor` narrowed to literal cofactors: (x*a)/(x*b) → a/b
+    // when b divides a, so a split of a merge over a pinned extent is exact
+    // (an upsampled (2*1)*(2W) = W*4 split by 2W). It rewrites to a literal,
+    // so it creates nothing for itself to match again.
+    p.add_rule(
+        rewrite(
+            "div-mul-common-factor",
+            div(mul(v("?x"), num(v("?a"))), mul(v("?x"), num(v("?b")))),
+            num(pdiv(v("?a"), v("?b"))),
+        )
+        .when(vec![pgte(v("?b"), i64(1)), peq(i64(0), pmod(v("?a"), v("?b")))])
+        .ruleset("expr"),
+    );
     p.add_rule(
         rewrite(
             "div-mul-num-plus-rem",
