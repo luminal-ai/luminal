@@ -1142,6 +1142,17 @@ mod tests {
     use luminal::prelude::*;
     use proptest::prelude::*;
 
+    /// A merged symbolic extent splits back (`div-mul-var-self` proves
+    /// `(H*W)/W * W = H*W`), and the split recovers the outer extent.
+    #[test]
+    fn test_split_merged_symbolic_dims() {
+        let mut cx = Graph::new();
+        let x = cx.named_tensor("x", ('h', 'w', 'c'), DType::F32);
+        let y = x.merge_dims(0, 1).split_dims(0, 'w');
+        assert_eq!(y.dims().len(), 3);
+        assert!(y.dims()[0].simplify().egglog_equal(IntExpr::from('h')));
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
