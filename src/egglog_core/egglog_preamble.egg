@@ -2106,6 +2106,46 @@
   :ruleset main_ruleset :name "core: CoordVar of extent exactly 1 collapses to zero"
 )
 
+; --- A COORDINATE OVER ITS OWN EXTENT: a coordinate of an axis lies in
+; [0, extent) by construction, so dividing it by that extent gives 0 and
+; the remainder is the coordinate, whatever the extent's value. The value
+; route decides the same thing only from a numeric upper bound on the
+; extent, which a symbolic extent (seeded [1, inf)) does not have; the
+; extent rides in the coordinate's own term, so this is structural. Gated
+; on the extent being provably nonempty (an empty axis has no coordinate
+; values; see the extent-1 collapse above), and the division subsumed as
+; the value route subsumes it.
+(rule
+  (
+    (= ?quotient (IntTruncDiv ?coord ?extent))
+    (= ?coord (CoordVar ?shape ?axis))
+    (= ?shape (ShapeLit ?dims))
+    (= ?extent (expr-list-nth-from-end ?dims ?axis))
+    (= ?extent_lower (lower-bound-of ?extent))
+    (>= ?extent_lower (bigint 1))
+  )
+  (
+    (union ?quotient (IntLit 0))
+    (subsume (IntTruncDiv ?coord ?extent))
+  )
+  :ruleset main_ruleset :name "core: a CoordVar divided by its own extent is zero"
+)
+(rule
+  (
+    (= ?remainder (IntTruncRem ?coord ?extent))
+    (= ?coord (CoordVar ?shape ?axis))
+    (= ?shape (ShapeLit ?dims))
+    (= ?extent (expr-list-nth-from-end ?dims ?axis))
+    (= ?extent_lower (lower-bound-of ?extent))
+    (>= ?extent_lower (bigint 1))
+  )
+  (
+    (union ?remainder ?coord)
+    (subsume (IntTruncRem ?coord ?extent))
+  )
+  :ruleset main_ruleset :name "core: a CoordVar modulo its own extent is itself"
+)
+
 ; --- R3: product route ---
 (rule
   (
