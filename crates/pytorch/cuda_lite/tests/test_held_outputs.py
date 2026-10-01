@@ -115,7 +115,7 @@ def test_no_reinstantiation_when_only_pointers_move():
     models = []
 
     def capture(gm, example_inputs, **kwargs):
-        compiled = luminal_cuda_lite(gm, example_inputs, **kwargs)
+        compiled = luminal_cuda_lite.Compiler()(gm, example_inputs)
         models.append(compiled)
         return compiled
 

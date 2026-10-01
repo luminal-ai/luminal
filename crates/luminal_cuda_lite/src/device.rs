@@ -120,8 +120,8 @@ pub struct GraphStats {
     pub host_captures: u64,
     pub host_cache_hits: u64,
     pub node_updates: u64,
-    /// Nodes rewritten or library calls re-recorded because an address moved
-    /// or because every execution re-records them.
+    /// Nodes rewritten or library calls re-recorded after addresses or
+    /// dimensions change.
     pub address_rebinds: u64,
     pub kernel_compilations: u64,
     pub arena_generation: u64,
@@ -436,7 +436,7 @@ impl CudaExecutable {
         }
         // A changed arena base or a changed SET of caller buffers invalidates
         // the compiled plan. Changed caller addresses are patched in place by
-        // `rebind_addresses`, which runs on every execution.
+        // `rebind_addresses` when addresses or dimensions change.
         let stale = installed.compiled.as_ref().is_none_or(|c| {
             c.base != self.stats.arena_base
                 || !c.staging_identity.ptr_eq(&Rc::downgrade(&staging.identity))
@@ -1160,7 +1160,7 @@ impl CompiledPlan {
     }
     /// Dimension changes only: copy lengths, kernel geometry, node enables
     /// and the outputs' resolved layouts. Node parameters are written by
-    /// `rebind_addresses`, which runs after this on every execution.
+    /// `rebind_addresses`, which runs after this when dimensions change.
     fn update(&mut self, dims: &DynMap, stats: &mut GraphStats) -> Result<()> {
         if self.last_dims == *dims {
             return Ok(());
@@ -1215,7 +1215,7 @@ impl CompiledPlan {
     }
     /// Re-resolve every address against the current arena base and caller
     /// pointers, rewrite the kernel and copy nodes in place, and re-record
-    /// every library call. Runs on every execution after the first; a
+    /// every library call. Runs when addresses or dimensions change; a
     /// refused in-place edit rebuilds instead.
     #[allow(clippy::too_many_arguments)]
     fn rebind_addresses(

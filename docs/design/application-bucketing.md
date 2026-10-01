@@ -210,7 +210,8 @@ contiguity, or access equality. Applications supply sharing identities and own
 their meaning. It owns no allocations. Concurrent invocations need disjoint
 scratch or application synchronization.
 
-The [chat backends](../../examples/llm_chat/src/backend) and
+The [CUDA chat](../../examples/llm_chat_cuda/src/backend.rs),
+[Metal chat](../../examples/llm_chat_metal/src/backend.rs), and
 [Metal example](../../crates/luminal_metal/examples/llama_1b.rs) show allocation,
 binding, dispatch, and reset. Each application shares a device/code cache across
 independently compiled programs, builds the shared arena from their requirements,
@@ -220,7 +221,7 @@ work on borrowed streams before updating or releasing shared memory.
 
 ## Consumer migration
 
-`llm_chat` builds complete decode/prefill domains, including the context interval
+`llm_chat_cuda` and `llm_chat_metal` build complete decode/prefill domains, including the context interval
 in each. It searches them independently on one device, using valid model-specific
 profiling inputs. Weights, RoPE tables and KV state use explicit shared resource
 identities. The application owns the arena, uploads persistent data once, chooses
@@ -251,9 +252,14 @@ Applications call `torch.compile(..., isolate_recompiles=True)` for separately
 bounded callables and dispatch themselves. The Whisper example follows this
 pattern. PyTorch ordinary CUDA calls still supply intermediate scratch through
 its caching allocator per call and pass it, plus a wrapper-owned host-staging
-object, into Rust. Existing static-arena/capture mode retains a PyTorch byte tensor
-in the Python wrapper. That allocation can cover all bounded dynamic sizes;
-ordinary CUDA graph replay still requires the captured shape/address contracts.
+object, into Rust. Existing static-arena mode retains a PyTorch byte tensor in
+the Python wrapper. That allocation covers the bounded dynamic sizes, with
+output allocations retained separately per concrete shape.
+
+External PyTorch CUDA graph capture is not currently functional: the runtime
+uses `cuGraphLaunch`, which CUDA rejects inside an active stream capture. This
+pre-existing limitation requires a separate graph-composition implementation;
+ordinary execution through Luminal's own CUDA graphs works independently of it.
 
 A retained byte tensor is sufficient for a static Torch-owned arena; an outer
 Inductor compile is unnecessary. `torch.cuda.MemPool` / `use_mem_pool` route
@@ -311,34 +317,3 @@ Coverage belongs at the owning layer:
 Core CI runs the inline utility tests as part of `luminal`. CUDA execution
 validation requires an NVIDIA GPU; device-feature compilation on another host
 is not a substitute for those tests.
-
-### Verified before PR submission
-
-After integration with the dtype/dimension declaration, named-ruleset, and exact
-scan changes on main, validation on macOS completed with:
-
-- 922 passing Rust tests and 57 ignored across `luminal`, `luminal_reference`,
-  `luminal_cuda_lite`, `test_runtime`, `luminal_nn`, `luminal_pytorch_utils`, and
-  `luminal_metal`.
-- Two passing `llm_chat` Metal integration tests, including prefill/decode,
-  shared state, history reuse, and reset.
-- 34 passing Python reference domain/compiler/region/distributed-hash tests and
-  three passing CUDA export/domain tests, plus the CUDA compiler import smoke
-  test, using PyTorch 2.14.
-- Clippy with all targets and warnings denied for core, reference, PyTorch
-  utilities, Metal, and the chat application; a separate CUDA device-feature
-  run covering the CUDA runtime, both Python bridges, and CUDA chat.
-- Both native Python extensions rebuilt, Rust formatting checked, and the Git
-  diff checked for whitespace errors. Ruff lint and format checks passed across
-  all 96 Python files under `crates/pytorch`, using the CI-pinned version.
-
-Regression coverage includes changing scan dimensions inside one declared
-domain, scan axis/bounds preservation through native reference serialization,
-PyTorch bounds above the former 4096 limit, and caller-owned GPU storage.
-
-CUDA execution requires NVIDIA hardware and was not run on this host. The full
-Python suite is not certified by these targeted checks: earlier broader runs
-encountered empty-input dtype translation failures, an `aten.cat` rank error,
-and prolonged max-pool saturation. The U8 cast and model rank failures were also
-reproduced with the original Python sources and unchanged translator path,
-before native search. Those issues remain outside this refactor.

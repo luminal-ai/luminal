@@ -2,12 +2,12 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use llm_chat::{
-    backend::cuda::CudaBackend,
     checkpoint,
     graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
     sampling::Sampler,
     tokenizer::{ChatTokenizer, Message},
 };
+use llm_chat_cuda::backend::CudaBackend;
 use luminal_cuda_lite::CompileOptions;
 use memmap2::{Mmap, MmapOptions};
 use safetensors::{Dtype, SafeTensors};
@@ -162,12 +162,8 @@ impl Checked {
         Ok(generated)
     }
 }
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     let args = Args::parse();
-    ensure!(
-        cfg!(feature = "cuda_lite"),
-        "build with --features cuda: this validator executes on a CUDA GPU"
-    );
     ensure!(
         args.atol.is_finite() && args.atol > 0. && args.rtol.is_finite() && args.rtol >= 0.,
         "invalid tolerances"

@@ -2,13 +2,13 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
 use llm_chat::{
-    backend::cuda::CudaBackend,
     checkpoint,
     graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
     sampling::Sampler,
     session::Session,
     tokenizer::{ChatTokenizer, Message},
 };
+use llm_chat_cuda::backend::CudaBackend;
 use luminal::bufferize::BufferNode;
 use luminal_cuda_lite::CompileOptions;
 use serde_json::{Value, json};
@@ -72,9 +72,8 @@ fn median(values: impl Iterator<Item = f64>) -> f64 {
     }
 }
 
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     let args = Args::parse();
-    ensure!(cfg!(feature = "cuda_lite"), "requires --features cuda");
     ensure!(args.repetitions > 0, "repetitions must be positive");
     ensure!(args.output_tokens > 1, "need at least two output tokens");
     ensure!(

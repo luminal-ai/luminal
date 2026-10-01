@@ -26,7 +26,7 @@ Then compare the chat runner at multiple prefill chunk sizes:
 
 ```sh
 for chunk in 1 4 8; do
-  cargo run --release -p llm_chat --features cuda --example validate -- \
+  cargo run --release -p llm_chat_cuda --example validate -- \
     --model qwen3 --checkpoint /path/to/Qwen3-0.6B \
     --suite /tmp/qwen-reference/suite.json --prefill-chunk "$chunk" \
     --report "/tmp/qwen-reference/cuda-chunk${chunk}.json"
@@ -53,7 +53,7 @@ For a sharded checkpoint, `--inspect` checks its configuration and tensor names
 without loading its weights:
 
 ```sh
-cargo run -p llm_chat --features cuda --example validate -- \
+cargo run -p llm_chat_cuda --example validate -- \
   --model gemma3 --checkpoint /path/to/gemma-3-4b-it --inspect
 ```
 
@@ -66,5 +66,5 @@ small result reports can be retained alongside a validation summary.
 See [recorded results](RESULTS.md) for the tested checkpoints and coverage.
 
 Historical reports retain the package names and options used at their recorded
-commits. Current commands use `llm_chat --features cuda`; search always profiles
+commits. Current commands use `llm_chat_cuda`; search always profiles
 on the device.

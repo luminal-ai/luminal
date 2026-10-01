@@ -1,11 +1,11 @@
 //! Small instances of all chat model families, with deterministic weights.
 //! These test GPU semantics, not checkpoint loading or language quality.
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(target_os = "macos")]
 use llm_chat::{
     Inputs, TensorData,
-    backend::GpuBackend,
     graph::{LlmGraph, ModelConfig},
 };
+use llm_chat_metal::backend::MetalBackend as GpuBackend;
 use luminal::prelude::*;
 use luminal_metal::harness_search_options;
 use model_zoo::{gemma3::Gemma3Dims, llama3::Llama3Dims, qwen3::QwenDims, qwen3_moe::Qwen3MoeDims};

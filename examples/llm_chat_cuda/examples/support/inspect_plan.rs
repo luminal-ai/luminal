@@ -2,11 +2,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use llm_chat::{
-    TensorData,
-    backend::cuda::bindings,
-    checkpoint,
+    TensorData, checkpoint,
     graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
 };
+use llm_chat_cuda::backend::bindings;
 use luminal::{bufferize::BufferNode, dtype::PlanDtype, prelude::FxHashMap};
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, cuda_registry};
 use serde_json::json;
@@ -116,7 +115,7 @@ fn candidate_audit(
     )
 }
 
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     let args = Args::parse();
     let config = checkpoint::read_json(&args.checkpoint.join("config.json"))?;
     let graph = LlmGraph::build_with_parameter_dtype(

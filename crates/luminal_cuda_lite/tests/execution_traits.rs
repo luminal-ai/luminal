@@ -416,8 +416,10 @@ mod host_graphs {
             );
         }
         let stats = rt.graph_stats().unwrap();
-        // One recording at compile, then one on every later execution.
-        assert_eq!(stats.host_captures, stats.launches);
+        // Each changed shape records against the current bindings; the final
+        // unchanged shape replays its existing capture. Exclude profiling.
+        assert_eq!(stats.host_captures - search_stats.host_captures, 4);
+        assert_eq!(stats.launches - search_stats.launches, 5);
         assert_eq!(stats.instantiations - search_stats.instantiations, 2);
         assert_eq!(stats.graph_cache_hits, 2);
         assert_eq!(
@@ -447,8 +449,11 @@ mod host_graphs {
                 "every preparation for a={dim} was dropped while a source graph refers to one"
             );
         }
-        rt.upload(&mut arena_rt, a.id, vec![4f32; 8]).unwrap();
-        rt.upload(&mut arena_rt, b.id, vec![1f32; 8]).unwrap();
+        // Initialize enough caller storage for both injected failures and
+        // the subsequent smaller successful shape before invoking either.
+        rt.set_dim('a', 7);
+        rt.upload(&mut arena_rt, a.id, vec![4f32; 14]).unwrap();
+        rt.upload(&mut arena_rt, b.id, vec![1f32; 14]).unwrap();
         rt.set_dim('a', 6);
         assert!(
             format!(

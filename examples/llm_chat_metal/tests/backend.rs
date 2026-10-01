@@ -1,10 +1,10 @@
 //! The Metal chat backend, against the reference runtime.
-#![cfg(feature = "metal")]
+#![cfg(target_os = "macos")]
 use llm_chat::{
     Inputs, TensorData,
-    backend::metal::MetalBackend,
     graph::{LlmGraph, ModelConfig},
 };
+use llm_chat_metal::backend::MetalBackend;
 use model_zoo::llama3::Llama3Dims;
 
 fn fixture() -> (LlmGraph, Inputs) {
@@ -45,19 +45,9 @@ fn fixture_with_shape(capacity: usize, chunk: usize) -> (LlmGraph, Inputs) {
     (graph, weights)
 }
 
-#[cfg(not(target_os = "macos"))]
-#[test]
-fn metal_search_requires_a_device() {
-    let (graph, weights) = fixture();
-    let error = MetalBackend::compile(&graph, weights, &luminal_metal::harness_search_options())
-        .err()
-        .expect("search must require Metal");
-    assert!(error.to_string().contains("macOS"));
-}
-
 #[cfg(target_os = "macos")]
 #[test]
-fn prefill_and_decode_use_resident_state_and_match_reference() {
+fn prefill_and_decode_share_application_state_and_match_reference() {
     use luminal::prelude::*;
     let (graph, weights) = fixture_with_shape(256, 128);
     let options = luminal_metal::CompileOptions {

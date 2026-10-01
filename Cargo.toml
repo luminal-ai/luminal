@@ -74,6 +74,8 @@ members = [
     "crates/luminal_nn",
     "crates/model_zoo",
     "examples/llm_chat",
+    "examples/llm_chat_cuda",
+    "examples/llm_chat_metal",
     "crates/luminal_tracing",
     "tests/scalar_refs",
     "tests/test_runtime",

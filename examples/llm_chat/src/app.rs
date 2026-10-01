@@ -1,6 +1,7 @@
 //! This example's chat CLI.
 use crate::{
-    backend::{CompileOptions, GpuBackend},
+    Inputs,
+    backend::Backend,
     checkpoint,
     graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
     sampling::Sampler,
@@ -16,7 +17,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(about = "Chat with a model-zoo LLM. Select CUDA or Metal with Cargo features.")]
+#[command(about = "Chat with a model-zoo LLM.")]
 struct Args {
     #[arg(long, value_enum)]
     model: ModelType,
@@ -53,19 +54,23 @@ struct Args {
     search_population: usize,
 }
 
-pub fn main() -> Result<()> {
-    let args = Args::parse();
-    ensure!(
-        cfg!(feature = "cuda_lite") ^ cfg!(feature = "metal"),
-        "enable exactly one backend: --features cuda (or cuda_lite) or --features metal"
-    );
-    ensure!(
-        !cfg!(feature = "metal") || cfg!(target_os = "macos"),
-        "the Metal backend requires macOS"
-    );
-    run(args)
+pub struct SearchOptions {
+    pub generations: usize,
+    pub population: usize,
+    pub seed: u64,
 }
-fn run(args: Args) -> Result<()> {
+
+pub fn main<B: Backend>(
+    device: &str,
+    compile: impl FnOnce(&LlmGraph, Inputs, SearchOptions) -> Result<B>,
+) -> Result<()> {
+    run(Args::parse(), device, compile)
+}
+fn run<B: Backend>(
+    args: Args,
+    device: &str,
+    compile: impl FnOnce(&LlmGraph, Inputs, SearchOptions) -> Result<B>,
+) -> Result<()> {
     ensure!(args.max_new_tokens > 0, "max-new-tokens must be positive");
     ensure!(
         args.search_generations > 0 && args.search_population > 0,
@@ -110,23 +115,13 @@ fn run(args: Args) -> Result<()> {
         args.checkpoint.display()
     );
     let weights = checkpoint::load(&args.checkpoint, &graph.parameters)?;
-    eprintln!(
-        "Compiling {:?} for {}...",
-        args.model,
-        if cfg!(feature = "metal") {
-            "Metal"
-        } else {
-            "CUDA Lite"
-        }
-    );
-    let options = CompileOptions {
-        search_log: true,
+    eprintln!("Compiling {:?} for {device}...", args.model);
+    let options = SearchOptions {
         generations: args.search_generations,
-        generation_size: args.search_population,
+        population: args.search_population,
         seed: args.seed,
-        ..Default::default()
     };
-    let backend = GpuBackend::compile(&graph, weights, &options).context("compile chat graph")?;
+    let backend = compile(&graph, weights, options).context("compile chat graph")?;
     let mut session = Session::new(graph, backend);
     let mut history = vec![];
     if let Some(system) = &args.system {
@@ -176,12 +171,12 @@ fn run(args: Args) -> Result<()> {
     }
     Ok(())
 }
-fn turn(
+fn turn<B: Backend>(
     args: &Args,
     prompt: &str,
     tokenizer: &ChatTokenizer,
     history: &mut Vec<Message>,
-    session: &mut Session<GpuBackend>,
+    session: &mut Session<B>,
     sampler: &mut Sampler,
 ) -> Result<()> {
     let mut messages = history.clone();

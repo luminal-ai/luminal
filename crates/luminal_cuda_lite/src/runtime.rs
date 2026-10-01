@@ -533,7 +533,23 @@ impl CudaRuntime {
             Some(self.allow.clone()),
             &self.matchers,
             evaluator.reborrow(),
-        )?;
+        )
+        .with_context(|| {
+            let outputs = program
+                .outputs
+                .iter()
+                .map(|bound| {
+                    format!(
+                        "v{} at {:?} on buffer {}",
+                        bound.value.index(),
+                        bound.layout,
+                        bound.buffer
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("no plan writes the bound outputs: {outputs}")
+        })?;
         let finalists = crate::finalists::Finalists::new(
             "program",
             &serialized,
@@ -796,8 +812,8 @@ impl CudaRuntime {
                     anyhow::ensure!(
                         plan.buffers[&slot.buffer].lit == Some(bound.buffer),
                         "output v{} is bound External on buffer {} but the searched plan \
-                         elected a view of it (escape-and-disclose); bind it Staged and read \
-                         it back through fetch/output_layout",
+                         elected a view of it (escape-and-disclose); bind it in the arena \
+                         and use output_layout to access the supplied allocation",
                         bound.value.index(),
                         bound.buffer
                     );

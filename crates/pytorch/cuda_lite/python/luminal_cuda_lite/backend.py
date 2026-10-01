@@ -48,6 +48,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 from luminal_reference.dimensions import export_specs, profile_value
 from luminal_reference.export_utils import (
     _box_scalar_graph_outputs,
@@ -978,7 +979,18 @@ def compile_exported(
     writebacks = frozenset(
         mutation for mutation in graph.output_mutations if mutation is not None
     )
-    _refuse_overlapping_writebacks(list(tensors.items()), writebacks)
+    # Region inputs can be metadata-only FakeTensors. Check the real storage
+    # available now; __call__ checks every actual input and held tensor before
+    # installing addresses, including pairs involving these placeholders.
+    if writebacks:
+        _refuse_overlapping_writebacks(
+            [
+                (name, value)
+                for name, value in tensors.items()
+                if not isinstance(value, FakeTensor)
+            ],
+            writebacks,
+        )
 
     # Seed the symbolic dims from the declared shapes, address the parameter
     # and buffer pointers once (they outlive every call), and keep one

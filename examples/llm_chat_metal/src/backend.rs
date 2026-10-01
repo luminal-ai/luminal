@@ -1,10 +1,10 @@
 //! The Metal runtime's boundary statement for this example's chat graph,
 //! and the execution loop over it.
-use crate::{
+use anyhow::{Result, ensure};
+use llm_chat::{
     Inputs, TensorData,
     graph::{LlmGraph, StateBinding},
 };
-use anyhow::{Result, ensure};
 use luminal::prelude::*;
 use luminal::{
     bucketing::BucketSet,
@@ -50,7 +50,7 @@ pub fn bindings(graph: &LlmGraph) -> MetalBindings {
 }
 
 pub type BucketPlan =
-    crate::search::BucketPlan<luminal_metal::layouts::MetalPlan, luminal_metal::SearchOutcome>;
+    llm_chat::search::BucketPlan<luminal_metal::layouts::MetalPlan, luminal_metal::SearchOutcome>;
 
 pub struct MetalBackend {
     programs: BucketSet<(MetalRuntime, FxHashMap<i64, ExternalBuffer>)>,
@@ -59,7 +59,7 @@ pub struct MetalBackend {
     logits: NodeIndex,
     memory: SharedArenaPlan,
     // Programs drop before the memory their executable addresses refer to.
-    arena: super::metal_memory::Allocation,
+    arena: crate::memory::Allocation,
 }
 impl MetalBackend {
     pub fn compile(
@@ -75,7 +75,7 @@ impl MetalBackend {
         let mut programs = Vec::new();
         let mut reports = Vec::new();
         let mut requirements = Vec::new();
-        for spec in crate::search::buckets(graph)? {
+        for spec in llm_chat::search::buckets(graph)? {
             let q = spec.profile_dims()[&'q'.into()];
             let c = spec.profile_dims()[&'c'.into()];
             for (id, value) in graph.step_inputs(&vec![0; q], c - q)? {
@@ -112,7 +112,7 @@ impl MetalBackend {
         }
         let memory = SharedArenaPlan::build(&requirements, usize::MAX)?;
         let mut arena =
-            super::metal_memory::Allocation::new(device.device(), device.queue(), memory.bytes)?;
+            crate::memory::Allocation::new(device.device(), device.queue(), memory.bytes)?;
         for id in resources {
             let home = memory.homes[&ResourceId(id.index() as u64)];
             let buffer = &data[&id];
@@ -195,7 +195,7 @@ fn u16_bytes(values: &[u16]) -> Vec<u8> {
     values.iter().flat_map(|x| x.to_ne_bytes()).collect()
 }
 
-impl super::Backend for MetalBackend {
+impl llm_chat::backend::Backend for MetalBackend {
     fn step(&mut self, inputs: Inputs, query: usize, context: usize) -> Result<Vec<f32>> {
         self.step(inputs, query, context)
     }

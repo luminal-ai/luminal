@@ -71,7 +71,7 @@ def test_select_backed_activations(activation):
         .cuda()
         .eval()
     )
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
+    compiled = _bounded_compile(model, [4, 16], "input")
     with torch.no_grad():
         x = torch.randn(4, 16, device="cuda")
         torch.testing.assert_close(compiled(x), model(x), atol=1e-3, rtol=1e-3)
@@ -96,7 +96,7 @@ def test_half_and_double_dtypes(dtype, atol):
         .to("cuda", dtype)
         .eval()
     )
-    compiled = torch.compile(model, backend=luminal_cuda_lite.Compiler())
+    compiled = _bounded_compile(model, [4, 16], "input")
     with torch.no_grad():
         x = torch.randn(4, 16, device="cuda", dtype=dtype)
         got = compiled(x)
@@ -458,9 +458,9 @@ def test_stride_zero_mutation_target_finds_no_plan_naming_the_output():
 def test_a_held_buffer_is_bound_on_the_modules_own_storage():
     """A parameter or buffer is the CALLER's memory too: it is bound at the
     address the module's own tensor has, never at a copy the backend made
-    while preparing the graph. Asked of the module Dynamo does not inline,
-    which is the configuration that hands the backend a graph holding the
-    tensors as attributes."""
+    while preparing the graph. Compile the export directly so its buffer
+    remains held state instead of being lifted into a Dynamo call argument."""
+    from luminal_cuda_lite.backend import compile_exported
 
     class Counter(torch.nn.Module):
         def __init__(self):
@@ -471,28 +471,20 @@ def test_a_held_buffer_is_bound_on_the_modules_own_storage():
             self.state.add_(1)
             return x + self.state
 
-    held = []
-
-    def capture(gm, example_inputs, **kwargs):
-        model = luminal_cuda_lite(gm, example_inputs, **kwargs)
-        held.append(model)
-        return model
-
     module = Counter()
     before = module.state.clone()
-    with torch._dynamo.config.patch(inline_inbuilt_nn_modules=False):
-        compiled = torch.compile(module, backend=capture)
-        out = compiled(torch.zeros(4, device="cuda"))
+    inputs = (torch.zeros(4, device="cuda"),)
+    program = torch.export.export(module, inputs).run_decompositions({})
+    compiled = compile_exported(program, inputs)
+    (out,) = compiled(*inputs)
 
     torch.testing.assert_close(module.state, before + 1)
     torch.testing.assert_close(out, module.state)
-    bound = [model for model in held if model._held]
-    assert bound, "the backend bound no held tensor"
-    for model in bound:
-        for name, tensor in model._held.items():
-            assert tensor.data_ptr() == module.state.data_ptr(), (
-                f"{name} is bound on a copy of the module's storage"
-            )
+    assert compiled._held, "the backend bound no held tensor"
+    for name, tensor in compiled._held.items():
+        assert tensor.data_ptr() == module.state.data_ptr(), (
+            f"{name} is bound on a copy of the module's storage"
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")

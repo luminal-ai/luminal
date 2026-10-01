@@ -249,6 +249,7 @@ def test_compile_region_can_be_captured_by_pytorch() -> None:
 
     compiled = compile_region(
         region,
+        device_type="cuda",
         search_iterations=1,
         static_outputs=True,
         external_cuda_graph=True,
@@ -256,15 +257,17 @@ def test_compile_region_can_be_captured_by_pytorch() -> None:
     left = torch.ones((2, 4), device="cuda", dtype=torch.float16)
     right = torch.full((2, 4), 2, device="cuda", dtype=torch.float16)
 
-    # Prepare every Luminal resource before capture.
-    compiled(left, right)
+    # Prepare every Luminal resource on the stream that will capture it.
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.stream(capture_stream):
+        compiled(left, right)
     torch.cuda.synchronize()
 
     # vLLM's capture buffers need not have the same addresses as warmup.
     capture_left = torch.full_like(left, 3)
     capture_right = torch.full_like(right, 4)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=capture_stream):
         (actual,) = compiled(capture_left, capture_right)
 
     capture_left.fill_(5)
@@ -272,6 +275,32 @@ def test_compile_region_can_be_captured_by_pytorch() -> None:
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, torch.full_like(actual, 11))
+
+
+@pytest.mark.skipif(
+    _CUDA_SKIP_REASON is not None, reason=_CUDA_SKIP_REASON or "CUDA is unavailable"
+)
+def test_fake_metadata_defers_writeback_overlap_check_to_execution() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    graph = fx.Graph()
+    target = graph.placeholder("target")
+    update = graph.placeholder("update")
+    result = graph.call_function(torch.ops.aten.add_.Tensor, (target, update))
+    graph.output((result,))
+    module = fx.GraphModule(torch.nn.Module(), graph)
+    with FakeTensorMode():
+        region = export_region(
+            module, [torch.empty(4, device="cuda"), torch.empty(4, device="cuda")]
+        )
+    compiled = compile_region(region, device_type="cuda")
+    target_value = torch.ones(4, device="cuda")
+    with pytest.raises(RuntimeError, match="share device storage.*written back"):
+        compiled(target_value, target_value)
+    torch.testing.assert_close(target_value, torch.ones_like(target_value))
+    (actual,) = compiled(target_value, torch.full_like(target_value, 2))
+    torch.testing.assert_close(actual, torch.full_like(target_value, 3))
+    torch.testing.assert_close(target_value, actual)
 
 
 @pytest.mark.skipif(
@@ -320,8 +349,10 @@ def test_static_writeback_uses_stable_target_on_current_stream() -> None:
     stream.synchronize()
     torch.testing.assert_close(target_value, torch.full_like(target_value, 3))
 
-    with pytest.raises(ValueError, match="requires a contiguous CUDA tensor"):
-        compiled(target_value.t(), torch.ones_like(target_value.t()))
+    # Keep the same allocation and shape while violating the declared strides.
+    wrong_layout = target_value.as_strided((2, 4), (1, 2))
+    with pytest.raises(RuntimeError, match="element stride"):
+        compiled(wrong_layout, torch.ones_like(wrong_layout))
 
     with pytest.raises(ValueError, match="target allocation changed"):
         compiled(torch.zeros_like(target_value), torch.ones_like(target_value))
@@ -360,24 +391,28 @@ def test_compile_region_enforces_dynamic_range() -> None:
     compiled = compile_region(
         region, device_type="cuda", search_iterations=1, static_outputs=True
     )
-    assert compiled._graph.output_shapes == [[16, 8]]
+    # The profiling assignment is four tokens; bounds still cover up to eight.
+    assert compiled._graph.output_shapes == [[8, 8]]
 
-    output_ptrs = set()
-    for size in (2, 3, 5, 8):
+    output_ptrs = {}
+    arena_ptrs = set()
+    for size in (2, 3, 5, 8, 2, 8, 3):
         left_value = torch.randn((size, 8), device="cuda", dtype=torch.float16)
         right_value = torch.randn((size, 8), device="cuda", dtype=torch.float16)
         (actual,) = compiled(left_value, right_value)
-        output_ptrs.add(actual.data_ptr())
+        # Static outputs retain storage per shape; scratch spans the domain.
+        assert output_ptrs.setdefault(size, actual.data_ptr()) == actual.data_ptr()
+        arena_ptrs.add(compiled._native._region_arena.data_ptr())
         assert actual.shape == (size * 2, 8)
         torch.testing.assert_close(actual, torch.cat((left_value, right_value)))
-    assert len(output_ptrs) == 1
+    assert len(arena_ptrs) == 1
 
     for size in (1, 9):
         value = torch.randn((size, 8), device="cuda", dtype=torch.float16)
-        with pytest.raises(ValueError, match="expected value in"):
+        with pytest.raises(RuntimeError, match="outside|Expected input"):
             compiled(value, value)
 
     left_value = torch.randn((3, 8), device="cuda", dtype=torch.float16)
     right_value = torch.randn((4, 8), device="cuda", dtype=torch.float16)
-    with pytest.raises(ValueError, match="inferred as both 3 and 4"):
+    with pytest.raises(RuntimeError, match="Expected input|one dimension, two extents"):
         compiled(left_value, right_value)

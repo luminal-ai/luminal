@@ -325,7 +325,7 @@ fn scan_chain_runs_across_one_declared_domain() {
         let mut prod = [1f32; 2];
         let mut max = [f32::NEG_INFINITY; 2];
         let mut expected = Vec::new();
-        for row in input.chunks_exact(2) {
+        for row in input.as_chunks::<2>().0 {
             for col in 0..2 {
                 sum[col] += row[col];
                 prod[col] *= sum[col];

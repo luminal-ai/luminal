@@ -1,23 +1,24 @@
 # LLM chat
 
-One chat loop for model-zoo language models, with CUDA and Metal selected by
-Cargo features. The model adapters, checkpoint loading, tokenization, sampling,
-and session logic are shared. Each backend module owns its runtime's binding
-API and device data representation.
+Two applications use the same backend-neutral model adapters, checkpoint loading,
+tokenization, sampling, CLI, and session logic in the `llm_chat` library:
+
+- `llm_chat_cuda` owns CUDA dependencies, bindings, allocations, and transfers on Linux/Windows.
+- `llm_chat_metal` owns Metal dependencies, bindings, allocations, and transfers on macOS.
 
 ```sh
 # NVIDIA GPU and CUDA toolkit:
-cargo run --release -p llm_chat --features cuda -- \
+cargo run --release -p llm_chat_cuda -- \
   --model llama3 --checkpoint /path/to/Meta-Llama-3-8B-Instruct
 
 # Apple GPU on macOS:
-cargo run --release -p llm_chat --features metal -- \
+cargo run --release -p llm_chat_metal -- \
   --model qwen3 --checkpoint /path/to/Qwen3-0.6B
 ```
 
-Enable exactly one execution backend. `cuda_lite` is also accepted as an alias
-for `cuda`. Without either feature the common library and its tests build on
-any host. `--prompt 'Hello'` generates one response and exits.
+The applications have separate Cargo packages and platform-gated dependencies.
+The shared library and its tests build on any host.
+`--prompt 'Hello'` generates one response and exits.
 Otherwise, enter messages interactively; `/reset` clears the conversation
 and KV state, and `/quit` exits.
 
@@ -67,21 +68,19 @@ shapes. Tied embeddings are represented by the zoo graph's shared input.
 ## The boundary
 
 The logical graph states no boundary at all: no value in it is an output,
-and nothing in it aliases anything. `backend::cuda::bindings` and
-`backend::metal::bindings` state it through their respective runtime APIs at load:
+and nothing in it aliases anything. `llm_chat_cuda::backend::bindings` and
+`llm_chat_metal::backend::bindings` state it through their respective runtime APIs at load:
 
-- Every parameter, RoPE pairing matrix and KV state input is bound
-  **resident**: its storage is the device arena's and survives every
-  execution, uploaded once and then only when the application restages it.
-- Tokens, positions, the gather/scatter index maps, the last-row index and
-  the RoPE tables are **staged** from the host before each execution.
-- Each KV cache output is bound **on its input's buffer**, after that
-  buffer is declared `ReadWrite`: that is the one spelling of "this step's
-  cache writes last step's storage", so the new state is never copied and
-  never read back.
-- The logits are the one bound output, and the only value downloaded.
+- The application allocates and uploads parameters, RoPE pairing matrices, and
+  KV state, then binds them as external device storage for each compiled program.
+- The application explicitly uploads tokens, positions, gather/scatter index
+  maps, last-row indices, and RoPE tables before each execution.
+- Each KV cache output is bound **on its input's buffer**, declared `ReadWrite`.
+  Cache updates stay in the application-owned allocation between calls.
+- The application explicitly reads logits for CPU sampling after execution.
 
-`/reset` re-stages zeros into the resident state inputs.
+`/reset` writes zeros into the application's KV state allocation. Executables
+own no tensor allocation and perform no host tensor transfers.
 
 ## Execution
 
@@ -125,18 +124,14 @@ by `prefill-chunk`. A chunk size of 1 uses only the decode bucket. Short final
 prefill chunks use the prefill plan, or the decode plan when one token remains.
 Profiling uses valid per-bucket position, RoPE, gather/scatter, and last-row inputs.
 
-Profiling uses the session's resident bindings: each candidate uploads weights
-once during warmup, then keeps them on the device throughout its timed trials.
-Writable resident state is restored from the supplied inputs before each trial,
-outside its timer, so every trial measures the same starting state. Resident KV
-outputs remain on the device. Candidate preparation and finalist validation use
-fresh resident state; weights are uploaded again for each new candidate.
+Each profiler privately allocates and uploads candidate inputs, restoring writable
+state before every timed trial. Those transfers occur outside execution timing.
 
-Transient storage uses bufferization lifetimes. CUDA submits kernels,
-state copies, and weight uploads through CUDA graphs, and bucket graphs
-share the resident ranges. Explicit weight/state changes trigger new
-uploads. The runtime does not recompile kernels just to change
-query/context lengths within the compiled bounds.
+Transient storage uses bufferization lifetimes. Each application compiles one
+program per bucket, computes shared scratch/resource offsets, owns the allocation,
+and passes it to the selected executable on each call. CUDA graphs are rebuilt
+when execution bindings change. Kernels remain reusable as query/context lengths
+change within their declared bounds.
 
 The runner renders the checkpoint chat template for every turn and compares
 **token prefixes** against the cached history. It resets and prefills when the
@@ -163,16 +158,15 @@ Useful options:
 ```sh
 cargo test -p llm_chat
 # On a CUDA machine:
-cargo test -p llm_chat --features cuda
+cargo test -p llm_chat_cuda
 # On macOS with Metal:
-cargo test -p llm_chat --features metal
+cargo test -p llm_chat_metal
 ```
 
 Each backend’s device test checks the 200-attempt default budget and compares
 128-token prefill, decode, short chunks and reset against ReferenceRuntime using
 a small zoo model. A second test drives the session's chunked
-prefill, history reuse and reset through the real backend. Without the
-feature the suite covers namespace mappings, sharded checkpoints,
+prefill, history reuse and reset through the real backend. The shared library suite covers namespace mappings, sharded checkpoints,
 dtype/layout conversion, templates, sampling, and cache-prefix reuse.
 
 For real-checkpoint comparisons against Transformers across prompts,

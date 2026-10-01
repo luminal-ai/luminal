@@ -1,10 +1,10 @@
 //! The CUDA-lite chat backend, against the reference runtime.
-#![cfg(feature = "cuda_lite")]
+#![cfg(any(target_os = "linux", target_os = "windows"))]
 use llm_chat::{
     Inputs, TensorData,
-    backend::cuda::CudaBackend,
     graph::{LlmGraph, ModelConfig},
 };
+use llm_chat_cuda::backend::CudaBackend;
 use model_zoo::llama3::Llama3Dims;
 
 fn fixture() -> (LlmGraph, Inputs) {
@@ -46,7 +46,7 @@ fn fixture_with_shape(capacity: usize, chunk: usize) -> (LlmGraph, Inputs) {
 }
 
 #[test]
-fn prefill_and_decode_use_resident_state_and_match_reference() {
+fn prefill_and_decode_share_application_state_and_match_reference() {
     use luminal::prelude::*;
     let (graph, weights) = fixture_with_shape(256, 128);
     let options = luminal_cuda_lite::CompileOptions {
