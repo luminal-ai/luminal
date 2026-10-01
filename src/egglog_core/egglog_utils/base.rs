@@ -671,6 +671,14 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
         .when(vec![pgte(v("?n"), i64(1))])
         .ruleset("expr"),
     );
+    // `div-mul-num-self` for a symbolic divisor: (x*y)/y → x, so the
+    // split of a merged symbolic extent is exact ((H*W)/W → H, which
+    // `split_dims` asserts). `mul-comm` puts the divisor on either side of
+    // the product. Unconditional, by `div-self`'s convention: a divisor
+    // that is a factor of an extent is an extent, and extents are positive.
+    // It rewrites to an operand of the matched term, so unlike
+    // `div-cancel-factor` it creates nothing for itself to match again.
+    p.add_rule(rewrite("div-mul-var-self", div(mul(v("?x"), v("?y")), v("?y")), v("?x")).ruleset("expr"));
     p.add_rule(
         rewrite(
             "div-mul-num-plus-rem",
