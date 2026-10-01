@@ -113,6 +113,10 @@ fn sources_via_buffer_table(
                 .iter()
                 .map(|id| plan.buffers[id].layout.clone())
                 .collect(),
+            dest_layouts: writes
+                .iter()
+                .map(|id| plan.buffers[id].layout.clone())
+                .collect(),
         };
         out.push((
             label,
@@ -197,9 +201,10 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal::layouts::
 }
 
 /// The Phase-3 device path: geometry from the node's own descriptors.
-/// The third tuple slot records whether the node read through a fold
-/// (any operand carrying composed access) — the Phase-5 restatement
-/// keys on it.
+/// The third tuple slot records whether the node read through a fold:
+/// an operand's value layout differs from the layout of its resident
+/// buffer. A non-flat layout alone is not a fold; CopyGeneric may read
+/// the same strided layout through both descriptions.
 fn sources_via_descriptors(
     plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
 ) -> Vec<(String, Vec<String>, bool)> {
@@ -235,20 +240,13 @@ fn sources_via_descriptors(
         // old zero-behavior assert (composed_access always None) died
         // with the premise; the caller now pins where divergence from
         // the buffer-table route is required vs forbidden.
-        // Option B: the divergence discriminator is the slot LAYOUT —
-        // an operand whose read does not simplify to the identity.
-        // (A view whose composed layout IS direct would be a flat read
-        // on both routes, correctly.)
-        let folded = operand_info.iter().any(|slot| {
-            let dims = slot
-                .layout
-                .literal_extents()
-                .expect("elected slot layouts are literal in these fixtures");
-            // Ask the PRODUCTION read path: an operand whose expression
-            // simplifies to the bare `i` emits no chain and is the flat
-            // read; anything else (including an unlowerable layout) is a
-            // fold.
-            !reads_flat(&slot.layout, &dims)
+        // Compare layout facts rather than e-class ids: two different
+        // values may carry the same spelling set and dtype. Divergence is
+        // required precisely when the slot carries a view map that the
+        // shared buffer table cannot represent.
+        let folded = operand_info.iter().zip(reads).any(|(slot, buffer)| {
+            let resident = &plan.buffers[buffer].layout;
+            slot.layout.dtype != resident.dtype || slot.layout.spellings != resident.spellings
         });
         let kernel = luminal_cuda_lite::as_kernel_op(op.as_ref())
             .unwrap_or_else(|| panic!("elected op {label} has no kernel interface"));

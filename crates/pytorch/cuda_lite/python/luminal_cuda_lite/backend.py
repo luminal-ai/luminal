@@ -29,19 +29,17 @@ storage offset is non-zero among them, is refused by name. Aliasing has
 one spelling: two bindings naming one buffer id, which is how a writeback
 and the input it mutates share a pointer.
 
-STREAM AND ARENA: the runtime always launches captured CUDA graphs, which
-the legacy default stream cannot host, so it runs on a dedicated
-``torch.cuda.Stream`` borrowed through ``use_borrowed_stream`` and ordered
-against the caller's stream with ``side.wait_stream(caller)`` before the
-launch and ``caller.wait_stream(side)`` after. The intermediate-scratch
-arena is PyTorch's, not the runtime's: ``arena_bytes()`` is the searched
-plan set's requirement, the wrapper ``caching_allocator_alloc``s exactly
-that against the side stream, binds it with ``set_arena``, and
-``caching_allocator_delete``s it right after ``execute`` — so PyTorch
-accounts for the bytes and can reuse the block on the next call.
+STREAM AND ARENA: standalone execution launches Luminal's graph on a side
+stream. Embedding runtimes select ``external_cuda_graph`` instead: Luminal
+enqueues the prepared operations directly on the caller's current stream so
+the caller owns capture and completion ordering. The intermediate-scratch
+arena is PyTorch's, not the runtime's. It grows to the largest searched-plan
+requirement observed during warmup and then retains a capture-stable address.
 """
 
 import concurrent.futures
+import hashlib
+import inspect
 import os
 import tempfile
 from collections.abc import Sequence
@@ -55,6 +53,7 @@ from luminal_reference.export_utils import (
     _drop_input_guards,
     _lower_sym_sum,
     _register_cache_serialization,
+    _strip_data_attr,
     private_graph_copy,
 )
 from torch.export import Dim, export
@@ -73,6 +72,9 @@ from .boundary import (
     layout_spec,
     storage_span,
 )
+from .arena_pool import acquire_arena
+from .artifacts import artifact_path, load_artifact, save_artifact
+from .plan_cache import get_or_create, structural_fingerprint
 
 # torch._export.serde.schema.ScalarType codes we can round-trip today.
 _PT2_TO_TORCH = {
@@ -236,7 +238,13 @@ def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
             continue
         fake = _output_fake(name, fakes)
         stated.add(name)
-        tag, strides = layout_spec(boundary_layout(name, fake))
+        # A returned view of another boundary tensor is reconstructed from
+        # that owner by `_output_alias_rows`. A view of internal temporary
+        # storage is materialized into fresh output storage, so its original
+        # offset is not part of the boundary address in either case.
+        tag, strides = layout_spec(
+            boundary_layout(name, fake, allow_storage_offset=True)
+        )
         rows.append((name, tag, list(strides)))
     return rows
 
@@ -295,7 +303,18 @@ def _refuse_overlapping_writebacks(
     identity, not storage overlap, so a program compiled on distinct
     tensors can be called as ``fn(x, x[:])``.
     """
-    spans = [(name, *storage_span(tensor)) for name, tensor in named]
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    # AOT compilers such as vLLM invoke backends with FakeTensor examples.
+    # They carry every shape/layout fact needed to compile, but deliberately
+    # have no address. The same check runs again on the real tensors before
+    # each execution, which is the only point where storage overlap exists as
+    # an observable fact.
+    spans = [
+        (name, *storage_span(tensor))
+        for name, tensor in named
+        if not isinstance(tensor, FakeTensor)
+    ]
     for index, (name, start, stop) in enumerate(spans):
         for other, other_start, other_stop in spans[index + 1 :]:
             if start >= other_stop or other_start >= stop:
@@ -363,6 +382,7 @@ class CompiledModel:
         held_tensors: dict[str, torch.Tensor] | None = None,
         held_bindings: Sequence[Binding] = (),
         output_aliases: dict[str, tuple[str, int]] | None = None,
+        external_cuda_graph: bool = False,
     ):
         self._graph = graph
         # Output name -> (the boundary tensor whose storage it is a view of,
@@ -382,13 +402,17 @@ class CompiledModel:
         # program that still passes every guard.
         self._held: dict[str, torch.Tensor] = dict(held_tensors or {})
         self._held_bindings = list(held_bindings)
-        # Fixed once a plan set is searched; the per-execution arena sizes to it.
+        # Fixed once a plan set is searched; the device/lane high-water pool
+        # grows to it once and every later execution reuses that allocation.
         self._arena_bytes = graph.arena_bytes()
-        # The runtime always launches captured CUDA graphs, which the legacy
-        # default stream cannot host, so it runs on a dedicated side stream
-        # ordered against the caller's stream with events.
+        self._external_cuda_graph = external_cuda_graph
+        self._graph.set_external_cuda_graph(external_cuda_graph)
+        # Standalone execution launches Luminal's graph on a dedicated side
+        # stream. The embedding path uses the caller's current stream instead.
         self._side_stream: torch.cuda.Stream | None = None
-        self._region_execution_state = {}
+        self._region_execution_state = set()
+        self._region_allocations = {}
+        self._region_mutations = {}
         self._output_mutations = graph.output_mutations
         self._output_returns = graph.output_returns
         # The graph inputs this program writes back into. While it is
@@ -422,6 +446,11 @@ class CompiledModel:
         raise RuntimeError(
             f"luminal_cuda_lite: {name!r} is not a boundary tensor this call holds"
         )
+
+    @property
+    def exported_program(self) -> Any:
+        """The normalized program retained for diagnostics and integration."""
+        return self._ep
 
     def _mutation_destination(
         self, mutation: str, inputs: Sequence[torch.Tensor]
@@ -480,7 +509,9 @@ class CompiledModel:
                     f"{device} and {value.device}"
                 )
         stream = torch.cuda.current_stream(device)
-        if getattr(self, "_region_current", False):
+        if self._external_cuda_graph or getattr(self, "_region_current", False):
+            # The embedding runtime owns ordering and CUDA graph capture. All
+            # Luminal work must therefore be visible on its current stream.
             side = stream
         else:
             if self._side_stream is None:
@@ -488,13 +519,11 @@ class CompiledModel:
             side = self._side_stream
         static = getattr(self, "_region_static", False)
         signature = tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in inputs)
-        execution_key = (id(self), signature, side.cuda_stream)
-        warmed = self._region_execution_state.get("last") == execution_key
+        execution_key = (id(self), signature)
+        warmed = execution_key in self._region_execution_state
         capturing = torch.cuda.is_current_stream_capturing()
-        if capturing and (not static or not warmed):
-            raise RuntimeError(
-                "warm up each region shape with static_outputs=True before CUDA capture"
-            )
+        if capturing and not warmed:
+            raise RuntimeError("warm up each region shape before CUDA capture")
         if static:
             for binding, value in zip(self._input_bindings, inputs):
                 if binding.name in self._writebacks:
@@ -571,7 +600,7 @@ class CompiledModel:
                     )
                 declared = tuple(declared_strides(binding, shape, dims))
                 elected = tuple(self._graph.output_elected_strides(name))
-                if elected != declared:
+                if not _same_layout_on_shape(shape, elected, declared):
                     raise RuntimeError(
                         f"luminal_cuda_lite: output {name!r} is elected at element "
                         f"strides {elected}, and eager's are {declared}. This backend "
@@ -611,20 +640,18 @@ class CompiledModel:
         if side != stream:
             side.wait_stream(stream)
 
-        # Per-execution intermediate arena from PyTorch's caching allocator,
-        # associated with the stream that uses it.
-        arena_bytes = max(self._arena_bytes, 1)
-        if static:
-            if self._region_arena is None:
-                self._region_arena = torch.empty(
-                    arena_bytes, dtype=torch.uint8, device=device
-                )
-            self._region_arena.record_stream(side)
-            arena = self._region_arena.data_ptr()
-        else:
-            arena = torch.cuda.caching_allocator_alloc(arena_bytes, device, side)
+        # Every compiled region on this caller execution lane shares one
+        # PyTorch-owned, grow-only arena. `record_stream` in the pool makes
+        # raw-pointer use visible to the caching allocator.
+        arena = acquire_arena(
+            self._arena_bytes,
+            device,
+            stream,
+            side,
+            device_wide=self._external_cuda_graph,
+        )
         self._graph.use_borrowed_stream(side.cuda_stream)
-        self._graph.set_arena(arena, arena_bytes)
+        self._graph.set_arena(arena.data_ptr(), arena.numel())
         # EVERY CHECK IS BEHIND US: the addresses go in here and come out in
         # `finally`, so no refusal of this call can leave one standing.
         per_call: list[int] = []
@@ -662,10 +689,8 @@ class CompiledModel:
                 self._graph.execute_async()
             else:
                 self._graph.execute()
-            self._region_execution_state["last"] = execution_key
+            self._region_execution_state.add(execution_key)
         finally:
-            if not static:
-                torch.cuda.caching_allocator_delete(arena)
             # These addresses belong to this call only: forget them, so an
             # execute that skipped a binding refuses by name instead of
             # reading storage the caller has released.
@@ -722,7 +747,50 @@ def _is_dynamic(size: Any) -> bool:
     return isinstance(size, torch.SymInt) and not size.node.expr.is_number
 
 
-def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> Any:
+def _example_int(value: Any) -> int:
+    """Read an example integer without guarding Dynamo's live ShapeEnv."""
+    if isinstance(value, torch.SymInt):
+        expr = value.node.expr
+        if expr.is_number:
+            return int(expr)
+        hint = value.node.hint
+        if hint is None:
+            raise RuntimeError(f"symbolic export value {expr} has no example hint")
+        return int(hint)
+    return int(value)
+
+
+def _symbolic_dim_spec(size: torch.SymInt, name: str) -> Any:
+    """Preserve Dynamo's finite bounds when rebuilding export shapes."""
+    value_range = size.node.shape_env.var_to_range.get(size.node.expr)
+    if value_range is None:
+        return Dim.AUTO
+    try:
+        minimum = int(value_range.lower)
+        maximum = int(value_range.upper)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return Dim.AUTO
+    minimum = max(2, minimum)
+    if maximum < minimum:
+        return Dim.AUTO
+    return Dim(name, min=minimum, max=maximum)
+
+
+def _same_layout_on_shape(
+    shape: Sequence[int], left: Sequence[int], right: Sequence[int]
+) -> bool:
+    """Whether two stride vectors address every coordinate identically."""
+    return len(left) == len(right) == len(shape) and all(
+        extent <= 1 or left_stride == right_stride
+        for extent, left_stride, right_stride in zip(shape, left, right)
+    )
+
+
+def _dynamic_export(
+    gm: torch.fx.GraphModule,
+    example_inputs: Sequence[Any],
+    dynamic_range: tuple[int, int] | None = None,
+) -> Any:
     """Export a Dynamo GraphModule, preserving its symbolic dimensions.
 
     Dynamo hands each free symbolic dimension to the backend as an explicit
@@ -745,16 +813,56 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
     gm = private_graph_copy(gm)
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
 
+    dynamic_sizes = {}
+    for node, value in zip(placeholders, example_inputs):
+        if isinstance(value, torch.SymInt):
+            continue
+        shape = getattr(
+            node.meta.get("example_value"), "shape", getattr(value, "shape", ())
+        )
+        for size in shape:
+            if _is_dynamic(size):
+                dynamic_sizes.setdefault(size.node.expr, size)
+    if dynamic_range is not None and len(dynamic_sizes) > 1:
+        raise RuntimeError(
+            "an explicit dynamic range supports at most one symbolic dimension, "
+            f"found {len(dynamic_sizes)}"
+        )
+    # vLLM attaches the enclosing token range to every piecewise subgraph.
+    # Some pieces are shape-invariant (for example a fixed-size attention
+    # projection) and therefore contain no symbolic tensor dimension. Compile
+    # those as static artifacts instead of inventing a dimension to range.
+    effective_dynamic_range = dynamic_range if dynamic_sizes else None
+    dim_specs: dict[Any, Any] = {}
+    if effective_dynamic_range is not None:
+        minimum, maximum = effective_dynamic_range
+        minimum = max(2, minimum)
+        if maximum < minimum:
+            raise RuntimeError(
+                f"dynamic range [{effective_dynamic_range[0]}, {maximum}] has no values "
+                "supported by torch.export; sizes 0 and 1 require exact artifacts"
+            )
+        expr = next(iter(dynamic_sizes))
+        dim_specs[expr] = Dim("luminal_dynamic_dim", min=minimum, max=maximum)
+    else:
+        for index, (expr, size) in enumerate(dynamic_sizes.items()):
+            dim_specs[expr] = _symbolic_dim_spec(size, f"luminal_dynamic_dim_{index}")
+
     records: list[tuple[str, torch.fx.Node, Any]] = []
     tensor_dims: dict[Any, tuple[torch.fx.Node, int]] = {}
     for node, value in zip(placeholders, example_inputs):
-        if isinstance(value, torch.SymInt):
-            records.append(("sym", node, value))
+        example = node.meta.get("example_value", value)
+        if isinstance(example, torch.SymInt):
+            records.append(("sym", node, example))
             continue
-        shape = getattr(node.meta.get("example_value"), "shape", None)
+        shape = getattr(example, "shape", None)
         if shape is None:
             shape = getattr(value, "shape", ())
-        dims = {dim: Dim.AUTO for dim, size in enumerate(shape) if _is_dynamic(size)}
+        dims = {
+            dim: dim_specs.get(size.node.expr, Dim.AUTO)
+            for dim, size in enumerate(shape)
+            if _is_dynamic(size)
+        }
         for dim, size in enumerate(shape):
             if _is_dynamic(size):
                 tensor_dims.setdefault(size.node.expr, (node, dim))
@@ -799,7 +907,13 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
         else:
             specs.append(None)
 
-    dynamic_shapes = {"args": tuple(specs)} if any_dynamic else None
+    has_varargs = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+        for parameter in inspect.signature(gm.forward).parameters.values()
+    )
+    dynamic_shapes = None
+    if any_dynamic:
+        dynamic_shapes = {"args": tuple(specs)} if has_varargs else tuple(specs)
 
     # `torch.export` runs its own Dynamo pass. Running that inside the caller's
     # compile pollutes the caller's guard manager (the inner frame's `args`
@@ -810,7 +924,7 @@ def _dynamic_export(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]) -> 
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         ep = pool.submit(_export).result()
-    return ep, inputs
+    return ep, inputs, effective_dynamic_range
 
 
 def _compile_graph(
@@ -821,6 +935,11 @@ def _compile_graph(
     search_log: bool = False,
     device_budget_bytes: int | None = None,
     max_intermediate_bytes: int | None = None,
+    dynamic_range: tuple[int, int] | None = None,
+    artifact_dir: str | None = None,
+    artifact_prefix: str = "",
+    disable_cache: bool = False,
+    external_cuda_graph: bool = False,
 ) -> CompiledModel:
     """The torch.compile backend entry point."""
     if options:
@@ -830,6 +949,11 @@ def _compile_graph(
         max_intermediate_bytes = options.get(
             "max_intermediate_bytes", max_intermediate_bytes
         )
+        dynamic_range = options.get("dynamic_range", dynamic_range)
+        artifact_dir = options.get("artifact_dir", artifact_dir)
+        artifact_prefix = options.get("artifact_prefix", artifact_prefix)
+        disable_cache = options.get("disable_cache", disable_cache)
+        external_cuda_graph = options.get("external_cuda_graph", external_cuda_graph)
 
     # HF DynamicCache must be pytree-registered before torch.export capture so
     # use_cache=True models can export. Idempotent.
@@ -841,12 +965,15 @@ def _compile_graph(
     # mutating it here would corrupt that bookkeeping. The copy shares the
     # module's weights (see private_graph_copy).
     gm = private_graph_copy(gm)
+    _strip_data_attr(gm)
     scalar_output_positions = _box_scalar_graph_outputs(gm)
 
     # The graph-module preprocessing above runs first; `_dynamic_export` then
     # rewrites the SymInt placeholders onto `sym_size` and runs the nested
     # `torch.export`, so the exported program keeps its symbolic dims.
-    ep, export_inputs = _dynamic_export(gm, example_inputs)
+    ep, export_inputs, dynamic_range = _dynamic_export(
+        gm, example_inputs, dynamic_range
+    )
     # LUM-499: drop dynamo-emitted input guards before run_decompositions calls
     # ep.module(), which would otherwise emit a `_guards_fn` containing
     # data-dependent .item() calls and unresolved `L[...]` references.
@@ -871,6 +998,7 @@ def _compile_graph(
             "graph inputs share device storage and the program writes one of them: "
             "the export cannot functionalise a write through aliased inputs"
         ) from exc
+    _drop_input_guards(ep)
     _drop_dead_data_dependent_ops(ep.graph_module)
     # Serde gap workaround; must run before save. See _lower_sym_sum.
     _lower_sym_sum(ep)
@@ -883,6 +1011,11 @@ def _compile_graph(
         search_log=search_log,
         device_budget_bytes=device_budget_bytes,
         max_intermediate_bytes=max_intermediate_bytes,
+        dynamic_range=dynamic_range,
+        artifact_dir=artifact_dir,
+        artifact_prefix=artifact_prefix,
+        disable_cache=disable_cache,
+        external_cuda_graph=external_cuda_graph,
     )
 
 
@@ -895,6 +1028,11 @@ def compile_exported(
     search_log=False,
     device_budget_bytes=None,
     max_intermediate_bytes=None,
+    dynamic_range=None,
+    artifact_dir=None,
+    artifact_prefix="",
+    disable_cache=False,
+    external_cuda_graph=False,
 ):
     """Compile a functional ExportedProgram with the native runtime."""
 
@@ -915,10 +1053,10 @@ def compile_exported(
         # read from the traced fake value exactly like an input: what the
         # caller receives has the strides the uncompiled program hands back,
         # never a contiguous substitute.
-        declared_outputs = _output_layout_rows(program)
         # An output that is a view of another boundary tensor is bound on
         # that tensor's buffer; the caller receives a view of what it holds.
         aliases = _output_alias_rows(program)
+        declared_outputs = _output_layout_rows(program)
         with tempfile.TemporaryDirectory() as tmp:
             pt2_path = os.path.join(tmp, "model.pt2")
             torch.export.save(program, pt2_path)
@@ -927,15 +1065,11 @@ def compile_exported(
                 declared,
                 declared_outputs,
                 [(name, owner) for name, owner, _ in aliases],
+                dynamic_range,
             )
         tensors = {name: value for name, _, value, _ in rows}
-        return (
-            graph,
-            tensors,
-            layouts,
-            shapes,
-            {name: (owner, offset) for name, owner, offset in aliases},
-        )
+        alias_map = {name: (owner, offset) for name, owner, offset in aliases}
+        return graph, tensors, layouts, shapes, alias_map
 
     try:
         graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
@@ -948,7 +1082,9 @@ def compile_exported(
         # un-decomposed graph.
         if "unsupported ATen op" not in str(exc):
             raise
+        _drop_input_guards(ep)
         ep = ep.run_decompositions(_decomp_table())
+        _drop_input_guards(ep)
         _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
         graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)
@@ -975,7 +1111,10 @@ def compile_exported(
                 f"does not declare (declared: {sorted(tensors)})"
             )
     graph.bind_input_shapes(
-        [(name, list(tensors[name].shape)) for name in graph.input_names]
+        [
+            (name, [_example_int(dim) for dim in tensors[name].shape])
+            for name in graph.input_names
+        ]
     )
     for name, kind, buffer in zip(
         graph.input_names, graph.input_kinds, graph.input_buffers
@@ -989,12 +1128,66 @@ def compile_exported(
         held_bindings.append(binding)
         held[name] = value
 
-    graph.search(
-        search_iterations,
-        search_log=search_log,
-        device_budget_bytes=device_budget_bytes,
-        max_intermediate_bytes=max_intermediate_bytes,
+    input_layout_rows = []
+    for name in graph.input_names:
+        tag, strides = layout_spec(layouts[name])
+        input_layout_rows.append((name, tag, list(strides)))
+    output_layout_rows = _output_layout_rows(ep)
+    alias_rows = _output_alias_rows(ep)
+    search_configuration = repr(
+        (
+            _luminal.search_configuration(search_iterations),
+            device_budget_bytes,
+            max_intermediate_bytes,
+        )
     )
+    plan_key = structural_fingerprint(
+        ep,
+        input_layout_rows,
+        output_layout_rows,
+        alias_rows,
+        search_iterations=search_iterations,
+        dynamic_range=dynamic_range,
+        search_configuration=search_configuration,
+    )
+
+    def search_plan():
+        graph.search(
+            search_iterations,
+            search_log=search_log,
+            device_budget_bytes=device_budget_bytes,
+            max_intermediate_bytes=max_intermediate_bytes,
+        )
+        return graph.export_plan_template()
+
+    # Layout expressions in the selected plan still carry PT2's concrete
+    # symbol spellings. The structural digest alpha-normalizes them for the
+    # future persistent format; until plan decoding grows symbol substitution,
+    # keep incompatible spellings in separate in-process variants.
+    symbol_abi = hashlib.sha256(repr(tuple(graph.dim_symbols)).encode()).hexdigest()
+    cache_key = f"{plan_key}-{symbol_abi}"
+    path = (
+        artifact_path(artifact_dir, artifact_prefix, cache_key)
+        if artifact_dir is not None and not disable_cache
+        else None
+    )
+    artifact_loaded = False
+
+    def load_or_search():
+        nonlocal artifact_loaded
+        if path is not None and path.exists():
+            artifact_loaded = True
+            return load_artifact(path, plan_key)
+        template = search_plan()
+        if path is not None:
+            save_artifact(path, plan_key, template)
+        return template
+
+    # `disable_cache` means no persistent files. Structural reuse remains a
+    # compiler optimization inside this process, just like a module/JIT cache.
+    template, cache_hit = get_or_create(cache_key, load_or_search)
+    if cache_hit or artifact_loaded:
+        graph.install_plan_template(template)
 
     # WHICH OUTPUTS THE PROGRAM HAS IS THE TRANSLATION'S TO SAY, not the
     # export signature's: the translator resolves a returned alias of a
@@ -1027,7 +1220,7 @@ def compile_exported(
             graph.output_layouts,
         )
     ]
-    return CompiledModel(
+    compiled = CompiledModel(
         graph,
         ep,
         input_bindings,
@@ -1036,4 +1229,19 @@ def compile_exported(
         held,
         held_bindings,
         aliases,
+        external_cuda_graph=external_cuda_graph,
     )
+    compiled.plan_fingerprint = plan_key
+    compiled.plan_cache_hit = cache_hit or artifact_loaded
+    compiled.artifact_handle = str(path) if path is not None else None
+    return compiled
+
+
+luminal_cuda_lite = _compile_graph
+
+
+def register_backend() -> None:
+    """Register ``"luminal_cuda_lite"`` so ``backend="luminal_cuda_lite"`` works."""
+    if "luminal_cuda_lite" in torch._dynamo.list_backends():
+        return
+    torch._dynamo.register_backend(luminal_cuda_lite, name="luminal_cuda_lite")

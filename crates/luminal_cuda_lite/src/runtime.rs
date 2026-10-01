@@ -25,6 +25,21 @@ struct NativeParts {
     binding_seeds: String,
 }
 
+/// The boundary-independent result of one completed search.
+///
+/// A template contains no device, stream, arena, pointer, staged payload, or
+/// captured CUDA graph.  It is therefore safe to clone into a freshly loaded
+/// runtime whose boundary bindings name different caller allocations.  The
+/// current CUDA-lite PyTorch frontend installs one bucket spanning every
+/// dynamic dimension, so one plan and its capacity bounds are the complete
+/// reusable search result.
+#[derive(Debug, Clone)]
+pub struct SearchedPlanTemplate {
+    pub plan: crate::layouts::CudaPlan,
+    pub bounds: crate::symbolic::Bounds,
+    pub device_budget_bytes: Option<usize>,
+}
+
 /// A `Default` instance holds NO program and NO op vocabulary: every
 /// ladder method past `load` refuses it by name (`load before search`),
 /// so the empty registry a default carries is never the thing a caller
@@ -119,6 +134,10 @@ pub struct CudaRuntime {
     /// a stream this runtime owns.
     #[cfg(feature = "device")]
     borrowed_stream: Option<u64>,
+    /// Enqueue individual operations instead of launching Luminal's private
+    /// graph. The embedding runtime owns capture and completion ordering.
+    #[cfg(feature = "device")]
+    external_cuda_graph: bool,
 }
 
 impl CudaRuntime {
@@ -304,6 +323,43 @@ impl CudaRuntime {
         if let Some(device) = &mut self.device {
             device.release_slab();
         }
+    }
+
+    /// Clone the installed search result without any live CUDA or boundary
+    /// state.  The PyTorch frontend currently searches exactly one Cartesian
+    /// bucket (one interval per dimension); refusing a future multi-bucket
+    /// configuration here prevents an incomplete cache entry from silently
+    /// dropping plans.
+    pub fn searched_plan_template(&self) -> Result<SearchedPlanTemplate> {
+        let mut plans = self.install_plans()?;
+        ensure!(
+            plans.len() == 1,
+            "plan-template reuse currently requires exactly one installed plan, got {}",
+            plans.len()
+        );
+        let (plan, bounds) = plans.pop().unwrap();
+        Ok(SearchedPlanTemplate {
+            plan,
+            bounds,
+            device_budget_bytes: self.device_budget_bytes,
+        })
+    }
+
+    /// Install a prior search result into this freshly loaded runtime.
+    /// Boundary buffer literals must already have been remapped by the caller;
+    /// everything owned by a live execution remains fresh on this runtime.
+    pub fn install_searched_plan_template(&mut self, template: SearchedPlanTemplate) -> Result<()> {
+        self.ensure_not_installed("installing a searched plan template")?;
+        self.invalidate_plans();
+        self.dim_buckets.clear();
+        self.range_bound = template
+            .bounds
+            .iter()
+            .map(|(symbol, (lo, hi))| Ok((*symbol, (u64::try_from(*lo)?, u64::try_from(*hi)?))))
+            .collect::<Result<_>>()?;
+        self.device_budget_bytes = template.device_budget_bytes;
+        self.plan = Some(template.plan);
+        Ok(())
     }
 
     /// Seed interval bounds for a dynamic dimension (facts, never pins:
@@ -968,6 +1024,13 @@ impl CudaRuntime {
         self.borrowed_stream = None;
     }
 
+    /// Select the capture-safe embedding path. The caller must also provide a
+    /// borrowed stream; execution is asynchronous and never host-synchronizes.
+    #[cfg(feature = "device")]
+    pub fn set_external_cuda_graph(&mut self, enabled: bool) {
+        self.external_cuda_graph = enabled;
+    }
+
     /// Bind a caller-allocated arena for subsequent executions. Called once
     /// per execution when the arena is allocated and freed per call;
     /// `clear_arena` reverts to the owned slab.
@@ -1163,12 +1226,16 @@ impl CudaRuntime {
                 // The borrowed stream is rebound every execution because
                 // the caller's current stream is thread-local and may change.
                 if let Some(raw) = self.borrowed_stream {
-                    device.use_borrowed_stream(raw)?;
+                    device
+                        .use_borrowed_stream(raw)
+                        .context("bind caller CUDA stream")?;
                 } else if device.stream_is_borrowed() {
                     device.use_owned_stream()?;
                 }
                 if let Some((ptr, bytes)) = self.external_arena {
-                    device.set_external_arena(ptr, bytes)?;
+                    device
+                        .set_external_arena(ptr, bytes)
+                        .context("bind caller CUDA arena")?;
                 } else {
                     device.clear_external_arena();
                 }
@@ -1198,13 +1265,19 @@ impl CudaRuntime {
                     )
                 })
                 .collect();
-            let outputs = device.execute_external_mode(
-                bucket,
-                &staged,
-                &self.dims,
-                &external,
-                asynchronous,
-            )?;
+            let outputs = if self.external_cuda_graph {
+                device
+                    .execute_external_direct(bucket, &staged, &self.dims, &external)
+                    .context("execute external CUDA graph path")?
+            } else {
+                device.execute_external_mode(
+                    bucket,
+                    &staged,
+                    &self.dims,
+                    &external,
+                    asynchronous,
+                )?
+            };
             self.outputs_host = outputs;
             // Zero-copy inputs are not staged, so nothing to clear; host-staged
             // residents are kept for the (owned-slab) reuse path.

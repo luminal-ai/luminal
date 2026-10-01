@@ -1127,6 +1127,40 @@ impl GraphTensor {
 
     /// Concat along an existing dimension
     pub fn concat_along(self, rhs: GraphTensor, axis: usize) -> GraphTensor {
+        assert_eq!(
+            self.rank(),
+            rhs.rank(),
+            "Ranks must match to concatenate tensors."
+        );
+        assert!(axis < self.rank(), "Concat axis {axis} is out of bounds");
+        assert_eq!(
+            self.dtype, rhs.dtype,
+            "Dtypes must match to concatenate tensors. Got {:?} and {:?}",
+            self.dtype, rhs.dtype
+        );
+        assert!(
+            self.dims()
+                .iter()
+                .zip(rhs.dims())
+                .enumerate()
+                .all(|(index, (left, right))| index == axis
+                    || left == &right
+                    || left.egglog_equal(right)),
+            "Non-concatenated dimensions must match."
+        );
+
+        // Padding cannot read an empty tensor: there is no in-bounds value
+        // with which to populate its clamped view, even though the arithmetic
+        // mask is zero everywhere. Concatenation with a statically empty
+        // operand is the other operand by definition, so remove it before
+        // constructing the pad maps.
+        if self.dims()[axis].to_usize() == Some(0) {
+            return rhs;
+        }
+        if rhs.dims()[axis].to_usize() == Some(0) {
+            return self;
+        }
+
         // Pad and add
         self.pad_along(0, rhs.dims()[axis], axis, 0.)
             + rhs.pad_along(self.dims()[axis], 0, axis, 0.)
@@ -1463,6 +1497,21 @@ mod tests {
             |a| a.concat_along(a, 0),
             |a| Tensor::cat(&[a.clone(), a], 0).unwrap(),
         );
+    }
+
+    #[test]
+    fn concat_discards_statically_empty_operands_before_padding() {
+        let mut cx = Graph::new();
+        let value = cx.tensor((1, 32, 128), DType::F32);
+        let empty = cx.tensor((1, 32, 0), DType::F32);
+
+        let empty_tail = value.concat_along(empty, 2);
+        let empty_head = empty.concat_along(value, 2);
+
+        assert_eq!(empty_tail.id, value.id);
+        assert_eq!(empty_head.id, value.id);
+        assert_eq!(empty_tail.dims(), value.dims());
+        assert_eq!(empty_head.dims(), value.dims());
     }
 
     // test_gather_and_scatter_inverse / test_scatter_basic /

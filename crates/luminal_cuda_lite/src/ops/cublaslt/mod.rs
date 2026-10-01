@@ -94,7 +94,7 @@ type ClassId = luminal::prelude::egraph_serialize::ClassId;
 // The four runtime contracts
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CublasLtForm {
     Base,
     Bias,
@@ -164,7 +164,7 @@ impl CublasLtForm {
 // Spec structs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CuEpilogue {
     Default,
     Relu,
@@ -174,7 +174,7 @@ pub enum CuEpilogue {
 
 /// A geometry value: a literal the whole class equals, or the symbolic
 /// IntExpr class handle the executor binds from the dyn map at call time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CuDim {
     Literal(i64),
     Symbolic(ClassId),
@@ -205,7 +205,7 @@ impl std::fmt::Display for CuDim {
 }
 
 /// The single Rust endpoint: one struct, every contract and decoration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LtMatmulSpec {
     /// Symbolic geometry decoded before the extraction e-graph is released.
     pub dim_exprs: std::collections::BTreeMap<ClassId, luminal::layouts::IntExprTerm>,
@@ -797,7 +797,7 @@ pub fn parse_spec(site: &ExtractionSite<'_>, form: CublasLtForm) -> Option<LtMat
 
 /// One functional op type for all four contracts; the FORM fixes the
 /// label, the operand names, and the Lit arity.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CublasLt {
     pub form: CublasLtForm,
     pub spec: Option<LtMatmulSpec>,
@@ -843,7 +843,7 @@ impl LayoutIrOp for CublasLt {}
 /// C-fold rule guards C onto the D layout class (identical layouts), which
 /// is exactly the API's C==D precondition. The bufferizer's donation
 /// machinery is the intended consumer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CublasLtDps {
     pub op: CublasLt,
 }

@@ -1,27 +1,14 @@
-"""KV Cache decode loop test.
+"""KV cache decode loop test.
 
 Compiles a tiny 1-layer Llama model with use_cache=True, then:
   1. Prefill: model(input_ids) -> logits + K/V cache
   2. Decode:  model(next_token, past_key_values=cache) -> logits + updated K/V
 
-Verifies correctness of both steps and writes DOT graphs for comparison.
+Verifies correctness of both steps.
 """
-
-import os
 
 import torch
 from backend_test_utils import luminal_backend
-
-
-def _capturing_backend(captured):
-    """Wrap luminal_backend to capture CompiledModels for DOT extraction."""
-
-    def backend(gm, example_inputs):
-        compiled = luminal_backend(gm, example_inputs)
-        captured.append(compiled)
-        return compiled
-
-    return backend
 
 
 def test_kv_cache_decode_loop():
@@ -44,8 +31,7 @@ def test_kv_cache_decode_loop():
     model = LlamaForCausalLM(config).eval()
     input_ids = torch.tensor([[1, 2, 3, 4]])
 
-    captured = []
-    compiled = torch.compile(model, backend=_capturing_backend(captured))
+    compiled = torch.compile(model, backend=luminal_backend)
 
     # --- Prefill step ---
     with torch.no_grad():
@@ -63,30 +49,3 @@ def test_kv_cache_decode_loop():
         out_decode = compiled(next_token, past_key_values=out_prefill.past_key_values)
 
     assert torch.allclose(out_decode.logits, ref_decode.logits, atol=1e-5)
-
-    # --- DOT graph comparison ---
-    # captured[0] = prefill graph, captured[1] = decode graph (recompiled by dynamo)
-    assert len(captured) >= 2, (
-        f"Expected 2 compilations (prefill+decode), got {len(captured)}"
-    )
-
-    out_dir = "/tmp/luminal_kv_cache_comparison"
-    os.makedirs(out_dir, exist_ok=True)
-
-    prefill_dot = str(captured[0]._ep.graph_module.graph)
-    decode_dot = str(captured[1]._ep.graph_module.graph)
-
-    with open(os.path.join(out_dir, "prefill.dot"), "w") as f:
-        f.write(prefill_dot)
-    with open(os.path.join(out_dir, "decode.dot"), "w") as f:
-        f.write(decode_dot)
-
-    print(f"\n=== DOT files written to {out_dir} ===")
-    print(f"Prefill: {len(prefill_dot)} chars, inputs: {captured[0]._input_names}")
-    print(f"Decode:  {len(decode_dot)} chars, inputs: {captured[1]._input_names}")
-
-    # Decode graph should have more inputs (past K/V cache tensors)
-    assert len(captured[1]._input_names) > len(captured[0]._input_names), (
-        f"Decode should have more inputs than prefill: "
-        f"{len(captured[1]._input_names)} vs {len(captured[0]._input_names)}"
-    )

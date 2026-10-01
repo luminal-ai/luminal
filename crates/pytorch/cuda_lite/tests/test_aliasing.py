@@ -192,6 +192,52 @@ def test_module_buffer_slice_write():
 
 
 @cuda
+def test_attention_writes_kv_directly_into_the_callers_cache():
+    """A decode-shaped attention step writes K/V into caller-owned cache
+    storage and consumes those writes without a post-execution writeback."""
+
+    def fn(query, key, value, key_cache, value_cache, positions):
+        key_cache[:, :, positions, :] = key
+        value_cache[:, :, positions, :] = value
+        scores = query @ key_cache.transpose(-2, -1)
+        weights = torch.softmax(scores, dim=-1)
+        return weights @ value_cache, key_cache, value_cache
+
+    def query():
+        return torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4)
+
+    def key():
+        return (
+            torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4) / 8
+        )
+
+    def value():
+        return (
+            torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 2, 1, 4) + 1
+        )
+
+    def cache():
+        return torch.zeros(1, 2, 8, 4, device="cuda")
+
+    def positions():
+        return torch.tensor([3], dtype=torch.int64, device="cuda")
+
+    (attention, returned_keys, returned_values), compiled_inputs = _same_as_eager(
+        fn,
+        query,
+        key,
+        value,
+        cache,
+        cache,
+        positions,
+    )
+    key_cache, value_cache = compiled_inputs[3:5]
+    assert attention.shape == (1, 2, 1, 4)
+    assert returned_keys.data_ptr() == key_cache.data_ptr()
+    assert returned_values.data_ptr() == value_cache.data_ptr()
+
+
+@cuda
 def test_writes_through_storage_sharing_inputs_are_refused_by_name():
     def fn(a, b):
         a.add_(1)
@@ -203,15 +249,27 @@ def test_writes_through_storage_sharing_inputs_are_refused_by_name():
 
 
 @cuda
-def test_returned_view_at_a_storage_offset_is_refused_by_name():
-    """Until the boundary can state a base offset (LUM-852) this is a named
-    refusal, never a tensor holding the wrong row."""
-
+def test_returned_view_at_a_storage_offset_aliases_the_input():
     def fn(x):
         return x[1]
 
-    with pytest.raises(Exception, match="storage offset"):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(_x())
+    x = _x()
+    out = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    assert out.data_ptr() == x[1].data_ptr()
+    out.zero_()
+    assert x[1].abs().sum().item() == 0.0 and x[0].abs().sum().item() != 0.0
+
+
+@cuda
+def test_internal_view_at_a_storage_offset_is_materialized():
+    def fn(x):
+        return (x * 2)[1]
+
+    x = _x()
+    expected = fn(x)
+    out = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    assert out.storage_offset() == 0
+    torch.testing.assert_close(out, expected)
 
 
 def test_functionalising_without_decomposing_keeps_linear():
@@ -235,3 +293,17 @@ def test_functionalising_without_decomposing_keeps_linear():
     kinds = [s.kind.name for s in ep.graph_signature.output_specs]
     assert "USER_INPUT_MUTATION" in kinds
     assert not any(t.split(".")[0].endswith("_") for t in targets), targets
+
+
+def test_fake_compile_examples_defer_overlap_check_until_runtime():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from luminal_cuda_lite.backend import _refuse_overlapping_writebacks
+
+    with FakeTensorMode():
+        fake = torch.empty(8, device="cuda")
+
+    _refuse_overlapping_writebacks(
+        [("input", fake), ("writeback", fake.view(2, 4))],
+        frozenset({"writeback"}),
+    )

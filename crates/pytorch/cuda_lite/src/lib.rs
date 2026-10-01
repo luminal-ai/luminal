@@ -29,11 +29,14 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
-/// Largest value a dynamic dimension's bucket covers (the searched plan stays
-/// symbolic inside it, so one compile serves every covered context length).
+/// Largest value a dynamic dimension's bucket covers when PT2 has no tighter
+/// upper bound.
 const MAX_DYNAMIC_DIM: usize = 4096;
+const DYNAMIC_BUCKET_POLICY: &str = "explicit-range-or-pt2-upper-bound-v3";
 use luminal_cuda_lite::bindings::{BoundaryLayout, CudaBindings};
-use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, harness_search_options};
+use luminal_cuda_lite::{
+    CompileOptions, CudaRuntime, HostBuffer, SearchedPlanTemplate, harness_search_options,
+};
 use luminal_pytorch_utils::translate::parse_dim_expr;
 use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
 use pyo3::exceptions::PyRuntimeError;
@@ -58,6 +61,37 @@ fn torch_code(dtype: DType) -> Result<u32> {
         .code())
 }
 
+fn dynamic_dim_ceiling(range: Option<luminal_pytorch_utils::DimRange>) -> usize {
+    range
+        .and_then(|range| range.max)
+        .map(|maximum| usize::try_from(maximum).unwrap_or(usize::MAX))
+        .unwrap_or(MAX_DYNAMIC_DIM)
+}
+
+fn apply_dynamic_range(translation: &mut Translation, range: Option<(usize, usize)>) -> Result<()> {
+    let Some((minimum, maximum)) = range else {
+        return Ok(());
+    };
+    ensure!(
+        minimum <= maximum,
+        "dynamic range [{minimum}, {maximum}] is empty"
+    );
+    ensure!(
+        translation.dims.len() == 1,
+        "an explicit dynamic range requires exactly one symbolic dimension, found {}",
+        translation.dims.len()
+    );
+    let symbol = *translation.dims.keys().next().expect("checked one dim");
+    translation.dim_ranges.insert(
+        symbol,
+        luminal_pytorch_utils::DimRange {
+            min: Some(u64::try_from(minimum)?),
+            max: Some(u64::try_from(maximum)?),
+        },
+    );
+    Ok(())
+}
+
 /// A compiled CUDA-lite graph with its boundary tables.
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
@@ -76,6 +110,50 @@ pub struct CompiledGraph {
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
     dims: DynMap,
+}
+
+/// An immutable searched plan plus the boundary numbering it was searched
+/// under.  Installing it on another isomorphic graph remaps those literals to
+/// that graph's boundary; no tensor address or CUDA execution state is shared.
+#[pyclass(unsendable)]
+pub struct PlanTemplate {
+    searched: SearchedPlanTemplate,
+    input_buffers: Vec<i64>,
+    output_buffers: Vec<i64>,
+    dim_symbols: Vec<String>,
+}
+
+type SerializedPlanArtifact = (Vec<u8>, Vec<i64>, Vec<i64>, Vec<String>);
+
+#[pymethods]
+impl PlanTemplate {
+    /// Stable logical-plan payload plus the source boundary ABI needed to
+    /// remap its external buffer literals when another graph installs it.
+    fn serialize_artifact(&self, fingerprint: &str) -> PyResult<SerializedPlanArtifact> {
+        Ok((
+            luminal_cuda_lite::artifact::serialize(&self.searched, fingerprint).map_err(to_py)?,
+            self.input_buffers.clone(),
+            self.output_buffers.clone(),
+            self.dim_symbols.clone(),
+        ))
+    }
+
+    #[staticmethod]
+    fn deserialize_artifact(
+        payload: &[u8],
+        fingerprint: &str,
+        input_buffers: Vec<i64>,
+        output_buffers: Vec<i64>,
+        dim_symbols: Vec<String>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            searched: luminal_cuda_lite::artifact::deserialize(payload, fingerprint)
+                .map_err(to_py)?,
+            input_buffers,
+            output_buffers,
+            dim_symbols,
+        })
+    }
 }
 
 /// Resolve a symbolic recorder shape to concrete extents. Literals and
@@ -296,6 +374,13 @@ impl CompiledGraph {
         self.runtime.use_owned_stream();
     }
 
+    /// Enqueue Luminal's prepared operations directly on the borrowed stream
+    /// so an enclosing runtime (for example vLLM) owns CUDA graph capture.
+    #[cfg(feature = "device")]
+    fn set_external_cuda_graph(&mut self, enabled: bool) {
+        self.runtime.set_external_cuda_graph(enabled);
+    }
+
     /// Override a dynamic dimension's value before `search`, by PT2 symbol
     /// name (e.g. `"s77"`). The value becomes the dim's bucket
     /// representative, so it steers the searched plan without narrowing the
@@ -352,6 +437,86 @@ impl CompiledGraph {
             max_intermediate_bytes,
         )
         .map_err(to_py)
+    }
+
+    /// Snapshot the boundary-independent result of `search()`.
+    fn export_plan_template(&self) -> PyResult<PlanTemplate> {
+        if !self.searched {
+            return Err(PyRuntimeError::new_err(
+                "search() must run before export_plan_template()",
+            ));
+        }
+        Ok(PlanTemplate {
+            searched: self.runtime.searched_plan_template().map_err(to_py)?,
+            input_buffers: self.input_buffers.clone(),
+            output_buffers: self.output_buffers.clone(),
+            dim_symbols: self.translation.symbols.keys().cloned().collect(),
+        })
+    }
+
+    /// Install a searched plan on this graph while retaining this graph's own
+    /// tensor bindings and fresh CUDA runtime state.
+    fn install_plan_template(&mut self, template: &PlanTemplate) -> PyResult<()> {
+        if self.searched {
+            return Err(PyRuntimeError::new_err(
+                "install_plan_template() requires an unsearched graph",
+            ));
+        }
+        let dim_symbols: Vec<String> = self.translation.symbols.keys().cloned().collect();
+        if dim_symbols != template.dim_symbols {
+            return Err(PyRuntimeError::new_err(format!(
+                "plan-template dimension ABI mismatch: cached {:?}, graph {:?}",
+                template.dim_symbols, dim_symbols
+            )));
+        }
+        if self.input_buffers.len() != template.input_buffers.len()
+            || self.output_buffers.len() != template.output_buffers.len()
+        {
+            return Err(PyRuntimeError::new_err(format!(
+                "plan-template boundary arity mismatch: cached {}/{} inputs/outputs, graph {}/{}",
+                template.input_buffers.len(),
+                template.output_buffers.len(),
+                self.input_buffers.len(),
+                self.output_buffers.len()
+            )));
+        }
+
+        let mut remap = HashMap::<i64, i64>::new();
+        let mut inverse = HashMap::<i64, i64>::new();
+        for (old, new) in template
+            .input_buffers
+            .iter()
+            .zip(&self.input_buffers)
+            .chain(template.output_buffers.iter().zip(&self.output_buffers))
+        {
+            if let Some(previous) = remap.insert(*old, *new)
+                && previous != *new
+            {
+                return Err(PyRuntimeError::new_err(format!(
+                    "plan-template alias ABI mismatch for cached buffer {old}: target buffers {previous} and {new}"
+                )));
+            }
+            if let Some(previous) = inverse.insert(*new, *old)
+                && previous != *old
+            {
+                return Err(PyRuntimeError::new_err(format!(
+                    "plan-template alias ABI mismatch for target buffer {new}: cached buffers {previous} and {old}"
+                )));
+            }
+        }
+        let mut searched = template.searched.clone();
+        for buffer in searched.plan.buffers.values_mut() {
+            if let Some(lit) = buffer.lit
+                && let Some(mapped) = remap.get(&lit)
+            {
+                buffer.lit = Some(*mapped);
+            }
+        }
+        self.runtime
+            .install_searched_plan_template(searched)
+            .map_err(to_py)?;
+        self.searched = true;
+        Ok(())
     }
 
     fn execute(&mut self) -> PyResult<()> {
@@ -445,11 +610,12 @@ impl CompiledGraph {
             // whose dims fall in the bucket re-renders without re-searching.
             let hints: Vec<(Symbol, usize)> = self.dims.iter().map(|(s, v)| (*s, *v)).collect();
             for (symbol, hint) in hints {
+                let range = self.translation.dim_ranges.get(&symbol).copied();
                 let bucket = luminal_pytorch_utils::dim_bucket(
                     symbol,
-                    self.translation.dim_ranges.get(&symbol).copied(),
+                    range,
                     1,
-                    MAX_DYNAMIC_DIM,
+                    dynamic_dim_ceiling(range),
                     hint,
                 )?;
                 self.runtime.bind_dim_buckets(symbol, vec![bucket])?;
@@ -789,16 +955,23 @@ fn bind(
 /// `output_aliases` names each output that shares its storage with an earlier
 /// boundary tensor (`(output, owner)`); it is bound on the owner's buffer.
 #[pyfunction]
+#[pyo3(signature = (pt2_path, input_layouts, output_layouts, output_aliases, dynamic_range = None))]
 fn compile(
     pt2_path: &str,
     input_layouts: Vec<(String, String, Vec<String>)>,
     output_layouts: Vec<(String, String, Vec<String>)>,
     output_aliases: Vec<(String, String)>,
+    dynamic_range: Option<(usize, usize)>,
 ) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
-    let translation = translate(&parsed).map_err(to_py)?;
+    let mut translation = translate(&parsed).map_err(to_py)?;
+    // torch.export deliberately specializes sizes 0 and 1, so its serialized
+    // symbolic constraint starts at 2 even when the embedding compiler owns a
+    // wider piecewise interval. vLLM passes that interval explicitly; it is
+    // the range this region must search and execute over.
+    apply_dynamic_range(&mut translation, dynamic_range).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let inputs = layout_table(&translation, "input", &input_layouts).map_err(to_py)?;
     let outputs = layout_table(&translation, "output", &output_layouts).map_err(to_py)?;
@@ -824,10 +997,38 @@ fn compile(
     })
 }
 
+/// Canonical description of every search option the Python backend uses.
+/// Keeping this beside `run_search` prevents Python's artifact key from
+/// silently missing a changed Rust default.
+#[pyfunction]
+#[pyo3(signature = (generations = None))]
+fn search_configuration(generations: Option<usize>) -> String {
+    let mut options = harness_search_options();
+    if let Some(generations) = generations {
+        options.generations = generations;
+    }
+    format!(
+        "generations={};generation_size={};mutations={};trials={};seed={};candidate_timeout_ns={:?};keep_finalists={};device_budget_bytes={:?};max_intermediate_bytes={:?};serialized_graph_passes={};dynamic_bucket_policy={}",
+        options.generations,
+        options.generation_size,
+        options.mutations,
+        options.trials,
+        options.seed,
+        options.candidate_timeout.map(|value| value.as_nanos()),
+        options.keep_finalists,
+        options.device_budget_bytes,
+        options.max_intermediate_bytes,
+        options.serialized_graph_passes.len(),
+        DYNAMIC_BUCKET_POLICY,
+    )
+}
+
 #[pymodule]
 fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledGraph>()?;
+    m.add_class::<PlanTemplate>()?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(search_configuration, m)?)?;
     Ok(())
 }
 
@@ -835,7 +1036,44 @@ fn _luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use luminal::prelude::Graph;
-    use luminal_pytorch_utils::{TranslatedInput, TranslatedOutput};
+    use luminal_pytorch_utils::{DimRange, TranslatedInput, TranslatedOutput};
+
+    #[test]
+    fn exported_upper_bound_sets_dynamic_bucket_ceiling() {
+        assert_eq!(
+            dynamic_dim_ceiling(Some(DimRange {
+                min: Some(2),
+                max: Some(8192),
+            })),
+            8192
+        );
+        assert_eq!(dynamic_dim_ceiling(None), MAX_DYNAMIC_DIM);
+    }
+
+    #[test]
+    fn explicit_dynamic_range_replaces_torch_export_minimum() {
+        let mut translated = translation(&["x"], None);
+        let symbol = Symbol::new("n");
+        translated.dims.insert(symbol, 8);
+        translated.symbols.insert("s0".to_string(), symbol);
+        translated.dim_ranges.insert(
+            symbol,
+            DimRange {
+                min: Some(2),
+                max: Some(16),
+            },
+        );
+
+        apply_dynamic_range(&mut translated, Some((1, 16))).unwrap();
+
+        assert_eq!(
+            translated.dim_ranges.get(&symbol),
+            Some(&DimRange {
+                min: Some(1),
+                max: Some(16),
+            })
+        );
+    }
 
     /// A translation with one 2x3 F32 input per name and one output
     /// value. `mutates` is the graph input that output writes back into.
@@ -1371,11 +1609,10 @@ mod tests {
     /// that plans nothing and names the output and the layout it is bound
     /// at, which is the text `search()` hands Python unchanged.
     #[test]
-    fn a_writeback_the_kernels_cannot_write_is_named_by_the_search() {
+    fn a_column_major_writeback_is_planned_through_a_materializing_copy() {
         let mut cx = Graph::new();
         let x = cx.named_tensor("x", (2usize, 3usize), DType::F32);
         let out = x + 1.;
-        let out_value = out.id.index();
         let shape = vec![IntExpr::from(2i64), IntExpr::from(3i64)];
         let translation = Translation {
             graph: cx,
@@ -1408,12 +1645,9 @@ mod tests {
             declared(BoundaryLayout::ColumnMajor, "column_major", &[]),
         )]
         .into();
-        let err = compiled_with(translation, &layouts)
+        compiled_with(translation, &layouts)
             .run_search(Some(1), false, None, None)
-            .expect_err("no kernel writes a left-major destination");
-        let text = format!("{err:#}");
-        assert!(text.contains(&format!("v{out_value}")), "{text}");
-        assert!(text.contains("ColumnMajor"), "{text}");
+            .expect("a materializing copy writes the column-major destination");
     }
 
     /// A SYMBOLIC STRIDE reaches the binding as the program's own dim: a

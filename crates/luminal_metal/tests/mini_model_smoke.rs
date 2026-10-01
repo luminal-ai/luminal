@@ -267,7 +267,6 @@ fn mini_whisper_runs() {
 }
 
 #[test]
-#[ignore = "blocked by the known adaLN rejoin-divergence search issue"]
 fn mini_flux_runs() {
     use model_zoo::mini::flux::MiniDit;
 

@@ -1140,8 +1140,20 @@ impl Translator<'_> {
                             .ok_or_else(|| anyhow!("cat: unknown tensor {}", t.name))?,
                     );
                 }
-                let mut iter = values.into_iter();
-                let mut acc = iter.next().ok_or_else(|| anyhow!("cat: empty list"))?;
+                // PyTorch permits a legacy 1-D empty tensor `(0,)` in a cat
+                // of any rank. It contributes no elements and, in particular,
+                // must not determine the rank used to normalize a negative
+                // axis (DynamicCache starts as `(0,)` before receiving K/V).
+                let legacy_empty = |value: &GraphTensor| {
+                    value.rank() == 1 && value.dims()[0].to_usize() == Some(0)
+                };
+                let first = values
+                    .iter()
+                    .position(|value| !legacy_empty(value))
+                    .unwrap_or(0);
+                let mut acc = *values
+                    .get(first)
+                    .ok_or_else(|| anyhow!("cat: empty list"))?;
                 let rank = acc.rank();
                 let axis = if raw_axis < 0 {
                     raw_axis + rank as i64
@@ -1152,7 +1164,10 @@ impl Translator<'_> {
                     .ok()
                     .filter(|a| *a < rank)
                     .ok_or_else(|| anyhow!("cat: axis {raw_axis} out of range for rank {rank}"))?;
-                for next in iter {
+                for (index, next) in values.into_iter().enumerate() {
+                    if index == first || legacy_empty(&next) {
+                        continue;
+                    }
                     // An empty concatenation axis contributes no elements. Do
                     // not construct indexing expressions into its empty range.
                     if acc.dims()[axis].to_usize() == Some(0) {
@@ -1615,6 +1630,47 @@ fn normalize_axes(axes: &[i64], rank: usize) -> Result<Vec<usize>> {
                 .ok_or_else(|| anyhow!("axis {a} out of range for rank {rank}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod cat_tests {
+    use super::test_support::*;
+    use crate::pt2_schema::{Argument, TensorName, TensorsArg};
+    use luminal::prelude::IntExpr;
+
+    #[test]
+    fn legacy_empty_tensor_does_not_supply_rank_for_negative_axis() {
+        let tensors = Argument::Tensors(TensorsArg {
+            as_tensors: ["empty", "value"]
+                .into_iter()
+                .map(|name| TensorName {
+                    name: name.to_string(),
+                })
+                .collect(),
+        });
+        let translated = translate_one(
+            node(
+                "torch.ops.aten.cat.default",
+                vec![input("tensors", tensors), scalar_int("dim", -2)],
+                &["out"],
+            ),
+            &[
+                ("empty", FLOAT, &[0]),
+                ("value", FLOAT, &[1, 2, 3, 4]),
+                ("out", FLOAT, &[1, 2, 3, 4]),
+            ],
+            &["empty", "value"],
+            &["out"],
+        );
+
+        assert_eq!(
+            translated
+                .graph
+                .logical
+                .value_dims(translated.outputs[0].tensor),
+            [1, 2, 3, 4].map(IntExpr::from)
+        );
+    }
 }
 
 #[cfg(test)]

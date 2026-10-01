@@ -145,6 +145,9 @@ impl OpMatcher for ConstantMatcher {
 mod tests {
     use super::*;
     use luminal::dtype::PlanDtype;
+    use luminal::layouts::{
+        BitWidthTerm, IntExprTerm, RightMajorContiguousElementLayout, ShapeTerm,
+    };
 
     /// The dest-only geometry a constant lowers against: no operands,
     /// one F32 destination.
@@ -155,6 +158,13 @@ mod tests {
             dest_dims: vec![vec![4usize.into()]],
             dest_dtypes: vec![PlanDtype::F32],
             operand_layouts: vec![],
+            dest_layouts: vec![crate::layouts::DecodedLayout::of(
+                RightMajorContiguousElementLayout {
+                    shape: ShapeTerm(vec![IntExprTerm::Lit(4)]),
+                    width: BitWidthTerm(32),
+                },
+                Some(PlanDtype::F32),
+            )],
         }
     }
 
