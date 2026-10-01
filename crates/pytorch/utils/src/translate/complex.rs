@@ -1615,13 +1615,17 @@ impl Translator<'_> {
             .find(|input| input.name != "tensors")
             .and_then(|input| input.arg.as_int())
             .unwrap_or(0);
-        let dim = normalize_dim(dim, values[0].real.rank());
-        let real = values[1..].iter().fold(values[0].real, |acc, value| {
-            acc.concat_along(value.real, dim)
-        });
-        let imag = values[1..].iter().fold(values[0].imag, |acc, value| {
-            acc.concat_along(value.imag, dim)
-        });
+        let component_dtype = dtype.complex_component_dtype().unwrap();
+        let real = super::cat::concatenate(
+            values.iter().map(|value| value.real).collect(),
+            dim,
+            component_dtype,
+        )?;
+        let imag = super::cat::concatenate(
+            values.iter().map(|value| value.imag).collect(),
+            dim,
+            component_dtype,
+        )?;
         self.store_complex(output_name, ComplexTensor::new(real, imag, dtype));
         Ok(())
     }

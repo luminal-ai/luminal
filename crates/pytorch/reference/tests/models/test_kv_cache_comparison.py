@@ -14,11 +14,11 @@ from backend_test_utils import luminal_backend
 
 
 def _capturing_backend(captured):
-    """Wrap luminal_backend to capture CompiledModels for DOT extraction."""
+    """Capture Dynamo's graphs without depending on private callable attributes."""
 
     def backend(gm, example_inputs):
         compiled = luminal_backend(gm, example_inputs)
-        captured.append(compiled)
+        captured.append(gm)
         return compiled
 
     return backend
@@ -73,8 +73,10 @@ def test_kv_cache_decode_loop():
     out_dir = "/tmp/luminal_kv_cache_comparison"
     os.makedirs(out_dir, exist_ok=True)
 
-    prefill_dot = str(captured[0]._ep.graph_module.graph)
-    decode_dot = str(captured[1]._ep.graph_module.graph)
+    prefill_dot = str(captured[0].graph)
+    decode_dot = str(captured[1].graph)
+    prefill_inputs = [n.name for n in captured[0].graph.nodes if n.op == "placeholder"]
+    decode_inputs = [n.name for n in captured[1].graph.nodes if n.op == "placeholder"]
 
     with open(os.path.join(out_dir, "prefill.dot"), "w") as f:
         f.write(prefill_dot)
@@ -82,11 +84,11 @@ def test_kv_cache_decode_loop():
         f.write(decode_dot)
 
     print(f"\n=== DOT files written to {out_dir} ===")
-    print(f"Prefill: {len(prefill_dot)} chars, inputs: {captured[0]._input_names}")
-    print(f"Decode:  {len(decode_dot)} chars, inputs: {captured[1]._input_names}")
+    print(f"Prefill: {len(prefill_dot)} chars, inputs: {prefill_inputs}")
+    print(f"Decode:  {len(decode_dot)} chars, inputs: {decode_inputs}")
 
     # Decode graph should have more inputs (past K/V cache tensors)
-    assert len(captured[1]._input_names) > len(captured[0]._input_names), (
+    assert len(decode_inputs) > len(prefill_inputs), (
         f"Decode should have more inputs than prefill: "
-        f"{len(captured[1]._input_names)} vs {len(captured[0]._input_names)}"
+        f"{len(decode_inputs)} vs {len(prefill_inputs)}"
     )

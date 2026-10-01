@@ -23,6 +23,7 @@ use luminal::prelude::*;
 
 mod array_extra;
 mod attention;
+mod cat;
 mod complex;
 mod conv;
 mod dim_arith;
@@ -1140,28 +1141,7 @@ impl Translator<'_> {
                             .ok_or_else(|| anyhow!("cat: unknown tensor {}", t.name))?,
                     );
                 }
-                let mut iter = values.into_iter();
-                let mut acc = iter.next().ok_or_else(|| anyhow!("cat: empty list"))?;
-                let rank = acc.rank();
-                let axis = if raw_axis < 0 {
-                    raw_axis + rank as i64
-                } else {
-                    raw_axis
-                };
-                let axis = usize::try_from(axis)
-                    .ok()
-                    .filter(|a| *a < rank)
-                    .ok_or_else(|| anyhow!("cat: axis {raw_axis} out of range for rank {rank}"))?;
-                for next in iter {
-                    // An empty concatenation axis contributes no elements. Do
-                    // not construct indexing expressions into its empty range.
-                    if acc.dims()[axis].to_usize() == Some(0) {
-                        acc = next;
-                    } else if next.dims()[axis].to_usize() != Some(0) {
-                        acc = acc.concat_along(next, axis);
-                    }
-                }
-                acc
+                cat::concatenate(values, raw_axis, self.first_output_dtype(node)?)?
             }
             // ---- index / scatter (batch 5) ----
             "index.Tensor" => self.translate_index_tensor(node)?,

@@ -118,6 +118,17 @@ pub(crate) fn translate_nodes(
     inputs: &[&str],
     outputs: &[&str],
 ) -> Translation {
+    crate::translate::translate(&parsed_nodes(nodes, tensors, inputs, outputs))
+        .expect("translation failed")
+}
+
+/// Build a program without translating it, for symbolic metadata and error tests.
+pub(crate) fn parsed_nodes(
+    nodes: Vec<Node>,
+    tensors: &[(&str, u32, &[i64])],
+    inputs: &[&str],
+    outputs: &[&str],
+) -> ParsedPT2 {
     let mut tensor_values = HashMap::new();
     for (name, dtype, shape) in tensors {
         tensor_values.insert(
@@ -146,12 +157,11 @@ pub(crate) fn translate_nodes(
         },
         range_constraints: HashMap::new(),
     };
-    let parsed = ParsedPT2 {
+    ParsedPT2 {
         program,
         constants_config: None,
         weights_config: None,
         archive_prefix: "test".to_string(),
         pt2_path: String::new(),
-    };
-    crate::translate::translate(&parsed).expect("translation failed")
+    }
 }
