@@ -678,7 +678,14 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
     // that is a factor of an extent is an extent, and extents are positive.
     // It rewrites to an operand of the matched term, so unlike
     // `div-cancel-factor` it creates nothing for itself to match again.
-    p.add_rule(rewrite("div-mul-var-self", div(mul(v("?x"), v("?y")), v("?y")), v("?x")).ruleset("expr"));
+    p.add_rule(
+        rewrite(
+            "div-mul-var-self",
+            div(mul(v("?x"), v("?y")), v("?y")),
+            v("?x"),
+        )
+        .ruleset("expr"),
+    );
     // `div-mul-num-self` for a literal that divides the cofactor:
     // (x*a)/b → x*(a/b) when b divides a (a merged 2-wide pair over a
     // pinned extent, (H*4)/2). It rewrites to a product with a smaller
@@ -689,7 +696,10 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
             div(mul(v("?x"), num(v("?a"))), num(v("?b"))),
             mul(v("?x"), num(pdiv(v("?a"), v("?b")))),
         )
-        .when(vec![pgte(v("?b"), i64(1)), peq(i64(0), pmod(v("?a"), v("?b")))])
+        .when(vec![
+            pgte(v("?b"), i64(1)),
+            peq(i64(0), pmod(v("?a"), v("?b"))),
+        ])
         .ruleset("expr"),
     );
     // `div-cancel-factor` narrowed to literal cofactors: (x*a)/(x*b) → a/b
@@ -702,7 +712,10 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
             div(mul(v("?x"), num(v("?a"))), mul(v("?x"), num(v("?b")))),
             num(pdiv(v("?a"), v("?b"))),
         )
-        .when(vec![pgte(v("?b"), i64(1)), peq(i64(0), pmod(v("?a"), v("?b")))])
+        .when(vec![
+            pgte(v("?b"), i64(1)),
+            peq(i64(0), pmod(v("?a"), v("?b"))),
+        ])
         .ruleset("expr"),
     );
     p.add_rule(
