@@ -336,7 +336,18 @@ impl Translator<'_> {
         }
         let x = self.operand(&node.inputs[0])?;
         let rank = x.rank();
-        anyhow::ensure!(rank > 0, "unfold on a rank-0 tensor is not ported");
+        if rank == 0 {
+            let dim = self.get_int_arg(node, 1)?;
+            let size = self.get_int_arg(node, 2)?;
+            let step = self.get_int_arg(node, 3)?;
+            anyhow::ensure!(
+                (dim == 0 || dim == -1) && (0..=1).contains(&size) && step > 0,
+                "invalid scalar unfold arguments"
+            );
+            return Ok(x
+                .expand_dim(0, 1usize)
+                .slice_along(0usize..size as usize, 0));
+        }
         let raw_dim = self.get_int_arg(node, 1)?;
         anyhow::ensure!(
             raw_dim >= -(rank as i64) && raw_dim < rank as i64,

@@ -291,6 +291,25 @@ impl Translator<'_> {
                 self.store_complex(output_name, value.map(materialize_tensor));
             }
 
+            "split_with_sizes.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let sizes = self.get_ints_arg(node, 1)?;
+                let axis = normalize_dim(self.get_int_arg(node, 2).unwrap_or(0), value.real.rank());
+                let names = Self::tensor_output_names(node);
+                anyhow::ensure!(names.len() == sizes.len(), "split output count mismatch");
+                let mut start = 0i64;
+                for (name, size) in names.into_iter().zip(sizes) {
+                    anyhow::ensure!(size >= 0, "negative split size");
+                    let end = start + size;
+                    self.store_complex(
+                        &name,
+                        value
+                            .map(|c| c.slice_along(IntExpr::from(start)..IntExpr::from(end), axis)),
+                    );
+                    start = end;
+                }
+            }
+
             // ---- magnitude / components ----
             "abs.default" => {
                 let value = self.get_complex_input(node, 0)?;
@@ -599,6 +618,41 @@ impl Translator<'_> {
             }
             "mean.dim" | "mean.default" => {
                 let value = self.translate_complex_reduction(node, ReductionOp::Mean)?;
+                self.store_complex(output_name, value);
+            }
+            "prod.default" | "prod.dim_int" => {
+                let mut value = self.get_complex_input(node, 0)?;
+                let rank = value.real.rank();
+                let dim = node.inputs.get(1).and_then(|i| i.arg.as_int());
+                let mut axes = if let Some(dim) = dim {
+                    vec![normalize_dim(dim, rank)]
+                } else {
+                    (0..rank).collect()
+                };
+                axes.sort_unstable_by(|a, b| b.cmp(a));
+                let keepdim = self.named_bool_arg(node, "keepdim").unwrap_or(false);
+                for axis in axes {
+                    let length = value.real.dims()[axis]
+                        .to_usize()
+                        .context("complex product requires a static reduction extent")?;
+                    let mut shape = value.real.dims();
+                    shape.remove(axis);
+                    let mut result = ComplexTensor::new(
+                        self.full_tensor(shape.clone(), value.real.dtype, 1.0),
+                        self.full_tensor(shape, value.real.dtype, 0.0),
+                        value.torch_dtype,
+                    );
+                    for index in 0..length {
+                        let item =
+                            value.map(|c| c.slice_along(index..index + 1, axis).squeeze(axis));
+                        result = self.complex_mul(result, item);
+                    }
+                    value = if keepdim {
+                        result.map(|c| c.expand_dim(axis, 1usize))
+                    } else {
+                        result
+                    };
+                }
                 self.store_complex(output_name, value);
             }
             "cumsum.default" => {
@@ -1589,12 +1643,7 @@ impl Translator<'_> {
                 let expr = self
                     .resolve_arg_as_expression(&input.arg)
                     .ok_or_else(|| anyhow!("slice end is not an expression"))?;
-                match expr.as_num() {
-                    Some(v) if v < 0 => {
-                        normalize_slice_bound(IntExpr::from(-1i32), value.dims()[dim]) + 1
-                    }
-                    _ => normalize_slice_bound(expr, value.dims()[dim]),
-                }
+                normalize_slice_bound(expr, value.dims()[dim])
             }
             None => value.dims()[dim],
         };

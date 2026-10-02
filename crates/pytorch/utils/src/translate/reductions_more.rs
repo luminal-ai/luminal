@@ -123,7 +123,7 @@ impl Translator<'_> {
         let correction = self.variance_correction(node);
         let dtype = self.compute_dtype(node).unwrap_or(input.dtype);
         let input = input.cast(dtype);
-        let variance = input.var_options(&axes, correction);
+        let variance = self.variance_with_correction(input, &axes, correction);
         let mean = input.mean(&axes);
         let keepdim = self.keepdim_flag(node, 3);
         let (variance, mean) = if keepdim {
@@ -237,12 +237,30 @@ impl Translator<'_> {
         })
     }
 
+    pub(super) fn variance_with_correction(
+        &mut self,
+        input: GraphTensor,
+        axes: &[usize],
+        correction: f64,
+    ) -> GraphTensor {
+        let mean = input.mean(axes).expand_to_shape_on_axes(input.dims(), axes);
+        let centered = input - mean;
+        let numerator = centered.square().sum(axes);
+        let count = super::dim_arith::product_of_dims(axes.iter().map(|&i| input.dims()[i]));
+        let count = self.cx.constant_i32(count).cast(input.dtype);
+        let offset = self.floating_scalar(correction, input.dtype);
+        let denominator = count - offset;
+        let zero = self.floating_scalar(0.0, input.dtype);
+        let denominator = denominator.maximum(zero).expand_rhs(numerator.dims());
+        numerator / denominator
+    }
+
     /// `correction` (degrees-of-freedom offset) or the `unbiased` bool.
-    fn variance_correction(&self, node: &Node) -> usize {
+    pub(super) fn variance_correction(&self, node: &Node) -> f64 {
         if let Some(correction) = self.named_float_arg(node, "correction") {
-            return correction.max(0.0) as usize;
+            return correction;
         }
-        self.named_bool_arg(node, "unbiased").map_or(1, usize::from)
+        self.named_bool_arg(node, "unbiased").map_or(1.0, f64::from)
     }
 
     fn keepdim_flag(&self, node: &Node, positional: usize) -> bool {

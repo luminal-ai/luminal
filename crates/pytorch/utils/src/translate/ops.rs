@@ -368,12 +368,9 @@ impl Translator<'_> {
         } else {
             dims.iter().map(|&d| normalize_dim(d, rank)).collect()
         };
-        let correction = self.named_int_arg(node, "correction").unwrap_or(1) as usize;
-        let result = if std {
-            x.std_options(axes.clone(), correction)
-        } else {
-            x.var_options(axes.clone(), correction)
-        };
+        let correction = self.variance_correction(node);
+        let variance = self.variance_with_correction(x, &axes, correction);
+        let result = if std { variance.sqrt() } else { variance };
         let keepdim = self
             .inputs_bool(node, "keepdim")
             .or_else(|| node.inputs.get(3).and_then(|i| i.arg.as_bool()))

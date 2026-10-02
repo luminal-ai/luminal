@@ -152,6 +152,8 @@ pub(crate) fn kernel(
 ) -> anyhow::Result<()> {
     let op = expect_op::<LeftSequentialScanSumDps>(op)?;
     match &ctx.operands[0] {
+        TypedBuffer::F16(_) => ctx.scan_opmath_f16(op.axis, 0.0, |a, b| a + b),
+        TypedBuffer::Bf16(_) => ctx.scan_opmath_bf16(op.axis, 0.0, |a, b| a + b),
         TypedBuffer::F32(_) => ctx.scan_axis(op.axis, 0.0, |acc, x| acc + x),
         TypedBuffer::F64(_) => ctx.scan_axis_f64(op.axis, 0.0, |acc, x| Ok(acc + x)),
         TypedBuffer::I64(_) => ctx.scan_axis_i64(op.axis, 0, |acc, x| {

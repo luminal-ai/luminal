@@ -163,6 +163,28 @@ pub(crate) fn kernel(
                 *out = u8::from(lhs[index] < rhs[index]);
             }
         }
+        (TypedBuffer::F16(lhs), TypedBuffer::F16(rhs)) => {
+            let (lhs, rhs) = (lhs.clone(), rhs.clone());
+            let dest = ctx.dests[0].as_bool8_mut()?;
+            anyhow::ensure!(
+                lhs.len() == rhs.len() && lhs.len() == dest.len(),
+                "less-than kernel length mismatch"
+            );
+            for (index, out) in dest.iter_mut().enumerate() {
+                *out = u8::from(lhs[index] < rhs[index]);
+            }
+        }
+        (TypedBuffer::Bf16(lhs), TypedBuffer::Bf16(rhs)) => {
+            let (lhs, rhs) = (lhs.clone(), rhs.clone());
+            let dest = ctx.dests[0].as_bool8_mut()?;
+            anyhow::ensure!(
+                lhs.len() == rhs.len() && lhs.len() == dest.len(),
+                "less-than kernel length mismatch"
+            );
+            for (index, out) in dest.iter_mut().enumerate() {
+                *out = u8::from(lhs[index] < rhs[index]);
+            }
+        }
         (TypedBuffer::F32(lhs), TypedBuffer::F32(rhs)) => {
             let (lhs, rhs) = (lhs.clone(), rhs.clone());
             let dest = ctx.dests[0].as_bool8_mut()?;

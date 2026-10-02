@@ -60,14 +60,18 @@ fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
     Ok(match dtype {
         DType::F16 => TypedBuffer::F16(
             bytes
-                .chunks_exact(2)
-                .map(|b| half::f16::from_bits(u16::from_ne_bytes(b.try_into().unwrap())))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_bits(u16::from_ne_bytes(*b)))
                 .collect(),
         ),
         DType::Bf16 => TypedBuffer::Bf16(
             bytes
-                .chunks_exact(2)
-                .map(|b| half::bf16::from_bits(u16::from_ne_bytes(b.try_into().unwrap())))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::bf16::from_bits(u16::from_ne_bytes(*b)))
                 .collect(),
         ),
         DType::F32 => prim!(f32, F32),

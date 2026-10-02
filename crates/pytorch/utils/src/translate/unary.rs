@@ -238,7 +238,7 @@ impl Translator<'_> {
         } else {
             let zero = self.constant_like(a, 0.0);
             let false_ = zero.gt(zero);
-            Ok(false_.expand_rhs(a.dims()))
+            Ok(false_)
         }
     }
 

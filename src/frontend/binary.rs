@@ -356,20 +356,27 @@ impl GraphTensor {
 
     // LessThan is false for unordered (NaN) operands. The two comparisons
     // together recognize every ordered value, including either infinity.
-    // Widening/narrowing to f32 preserves NaN classification even when a
-    // large f64 becomes infinity. Masks themselves contain only 0 or 1.
+    // NaN classification uses the operand's own dtype; exact operations
+    // such as half-precision clamp must not widen their input to f32.
     fn ordered(self) -> GraphTensor {
+        if !matches!(
+            self.dtype,
+            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::F8E4M3FN
+        ) {
+            return self.graph().constant_f32(1.0).expand_rhs(self.dims());
+        }
         let positive = self
             .graph()
             .constant_f32(f32::INFINITY)
+            .cast(self.dtype)
             .expand_rhs(self.dims());
         let negative = self
             .graph()
             .constant_f32(f32::NEG_INFINITY)
+            .cast(self.dtype)
             .expand_rhs(self.dims());
-        let value = self.cast(DType::F32);
-        let below = value.lt(positive).cast(DType::F32);
-        let above = negative.lt(value).cast(DType::F32);
+        let below = self.lt(positive).cast(DType::F32);
+        let above = negative.lt(self).cast(DType::F32);
         below + above - below * above
     }
 

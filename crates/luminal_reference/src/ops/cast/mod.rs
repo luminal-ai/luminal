@@ -192,6 +192,50 @@ pub(crate) fn kernel(
                 *o = half::bf16::from_f64(*i);
             }
         }
+        (TypedBuffer::I32(input), TypedBuffer::F16(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (o, i) in dest.iter_mut().zip(input) {
+                let value = half::f16::from_f64(*i as f64);
+                anyhow::ensure!(
+                    value.to_f64() == *i as f64,
+                    "integer to f16 cast is not exact"
+                );
+                *o = value;
+            }
+        }
+        (TypedBuffer::I64(input), TypedBuffer::F16(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (o, i) in dest.iter_mut().zip(input) {
+                let value = half::f16::from_f64(*i as f64);
+                anyhow::ensure!(
+                    value.to_f64() == *i as f64,
+                    "integer to f16 cast is not exact"
+                );
+                *o = value;
+            }
+        }
+        (TypedBuffer::I32(input), TypedBuffer::Bf16(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (o, i) in dest.iter_mut().zip(input) {
+                let value = half::bf16::from_f64(*i as f64);
+                anyhow::ensure!(
+                    value.to_f64() == *i as f64,
+                    "integer to bf16 cast is not exact"
+                );
+                *o = value;
+            }
+        }
+        (TypedBuffer::I64(input), TypedBuffer::Bf16(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (o, i) in dest.iter_mut().zip(input) {
+                let value = half::bf16::from_f64(*i as f64);
+                anyhow::ensure!(
+                    value.to_f64() == *i as f64,
+                    "integer to bf16 cast is not exact"
+                );
+                *o = value;
+            }
+        }
         // Same-type: value-preserving copies.
         (TypedBuffer::F32(input), TypedBuffer::F32(dest)) => {
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");

@@ -1536,8 +1536,6 @@ fn opmath_target(target: &str) -> bool {
             | "leaky_relu.default"
             | "angle.default"
             // reductions
-            | "cumsum.default"
-            | "cumprod.default"
             | "sum.default"
             | "sum.dim_IntList"
             | "mean.default"

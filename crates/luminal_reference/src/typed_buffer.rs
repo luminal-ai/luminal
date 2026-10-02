@@ -497,6 +497,72 @@ impl ReferenceKernelCtx {
         }
         Ok(())
     }
+    pub fn scan_opmath_f16(
+        &mut self,
+        axis_from_end: i64,
+        init: f32,
+        fold: impl Fn(f32, f32) -> f32,
+    ) -> Result<()> {
+        let dims = &self.operand_dims[0];
+        anyhow::ensure!(
+            axis_from_end >= 0 && (axis_from_end as usize) < dims.len(),
+            "scan axis out of range"
+        );
+        let axis = dims.len() - 1 - axis_from_end as usize;
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        let extent = dims[axis];
+        let input = self.operands[0].as_f16()?;
+        let dest = self.dests[0].as_f16_mut()?;
+        anyhow::ensure!(
+            input.len() == outer * extent * inner && input.len() == dest.len(),
+            "scan geometry mismatch"
+        );
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut acc = init;
+                for r in 0..extent {
+                    let index = o * extent * inner + r * inner + i;
+                    acc = fold(acc, input[index].to_f32());
+                    dest[index] = half::f16::from_f32(acc);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn scan_opmath_bf16(
+        &mut self,
+        axis_from_end: i64,
+        init: f32,
+        fold: impl Fn(f32, f32) -> f32,
+    ) -> Result<()> {
+        let dims = &self.operand_dims[0];
+        anyhow::ensure!(
+            axis_from_end >= 0 && (axis_from_end as usize) < dims.len(),
+            "scan axis out of range"
+        );
+        let axis = dims.len() - 1 - axis_from_end as usize;
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        let extent = dims[axis];
+        let input = self.operands[0].as_bf16()?;
+        let dest = self.dests[0].as_bf16_mut()?;
+        anyhow::ensure!(
+            input.len() == outer * extent * inner && input.len() == dest.len(),
+            "scan geometry mismatch"
+        );
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut acc = init;
+                for r in 0..extent {
+                    let index = o * extent * inner + r * inner + i;
+                    acc = fold(acc, input[index].to_f32());
+                    dest[index] = half::bf16::from_f32(acc);
+                }
+            }
+        }
+        Ok(())
+    }
     /// dest0[i] = f(operand0[i])
     pub fn unary_elementwise(&mut self, f: impl Fn(f32) -> f32) -> Result<()> {
         let input = self.operands[0].as_f32()?;
