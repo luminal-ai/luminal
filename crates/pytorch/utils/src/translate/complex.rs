@@ -347,10 +347,341 @@ impl Translator<'_> {
                 self.store_complex(output_name, ComplexTensor::new(real, imag, dtype));
             }
 
-            "index_select.default" => {
+            "copy.default" => {
+                let source_name = self.input_value_name(node, 1)?;
+                let shape = self.output_meta_shape(node)?;
+                if self.output_complex_dtype(output_name).is_ok() {
+                    let dtype = self.output_complex_dtype(output_name)?;
+                    let source = self.value_as_complex(source_name, dtype)?;
+                    self.store_complex(
+                        output_name,
+                        source.map(|mut component| {
+                            while component.rank() < shape.len() {
+                                component = component.unsqueeze(0);
+                            }
+                            component.expand(shape.clone())
+                        }),
+                    );
+                } else {
+                    let dtype = self.output_meta_dtype(node)?;
+                    let source = self.get_complex(source_name)?;
+                    let result = if dtype == DType::Bool {
+                        self.truth_of_value(source_name)?
+                    } else {
+                        source.real.cast(dtype)
+                    };
+                    self.values.insert(output_name.to_owned(), {
+                        let mut result = result;
+                        while result.rank() < shape.len() {
+                            result = result.unsqueeze(0);
+                        }
+                        result.expand(shape)
+                    });
+                }
+            }
+            "ldexp.Tensor" => {
+                let value = self.get_complex_input(node, 0)?;
+                let exponent = self.operand(&node.inputs[1])?.cast(value.real.dtype).exp2();
+                let (real, real_exponent) = broadcast_binary(value.real, exponent);
+                let (imag, imag_exponent) = broadcast_binary(value.imag, exponent);
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(
+                        real * real_exponent,
+                        imag * imag_exponent,
+                        value.torch_dtype,
+                    ),
+                );
+            }
+            "unbind_copy.int" | "unbind.int" => {
+                let value = self.get_complex_input(node, 0)?;
+                let axis = normalize_dim(self.get_int_arg(node, 1).unwrap_or(0), value.real.rank());
+                let length = value.real.dims()[axis]
+                    .to_usize()
+                    .context("complex unbind requires static extent")?;
+                let names = Self::tensor_output_names(node);
+                anyhow::ensure!(
+                    names.len() == length,
+                    "complex unbind output count mismatch"
+                );
+                for (index, name) in names.iter().enumerate() {
+                    self.store_complex(
+                        name,
+                        value.map(|component| {
+                            component.slice_along(index..index + 1, axis).squeeze(axis)
+                        }),
+                    );
+                }
+            }
+            "gather.default" => {
                 let value = self.get_complex_input(node, 0)?;
                 let axis = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank());
                 let indices = self.operand(&node.inputs[2])?.cast(DType::Int);
+                anyhow::ensure!(
+                    indices.rank() == value.real.rank(),
+                    "complex gather rank mismatch"
+                );
+                let shape = indices.dims();
+                let coords: Vec<_> = (0..shape.len())
+                    .map(|dim| {
+                        if dim == axis {
+                            indices
+                        } else {
+                            self.cx.iota(shape.clone(), |coords| coords[dim])
+                        }
+                    })
+                    .collect();
+                self.store_complex(
+                    output_name,
+                    value.map(|component| component.gather(&coords)),
+                );
+            }
+            "linalg_vector_norm.default" => {
+                let mut value = self.get_complex_input(node, 0)?;
+                let dtype = self.output_meta_dtype(node)?;
+                value = value.map(|component| component.cast(dtype));
+                let magnitude = self.complex_abs(value);
+                let result = self.vector_norm_from_magnitude(node, magnitude)?;
+                self.values.insert(output_name.to_owned(), result);
+            }
+            "var.correction"
+            | "var.dim"
+            | "var.default"
+            | "std.correction"
+            | "std.dim"
+            | "std.default"
+            | "var_mean.correction"
+            | "var_mean.dim"
+            | "var_mean.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let dims = self.get_ints_arg(node, 1).unwrap_or_default();
+                let axes: Vec<_> = if dims.is_empty() {
+                    (0..value.real.rank()).collect()
+                } else {
+                    dims.iter()
+                        .map(|&dim| normalize_dim(dim, value.real.rank()))
+                        .collect()
+                };
+                let correction = self.variance_correction(node);
+                let real_variance = self.variance_with_correction(value.real, &axes, correction);
+                let imag_variance = self.variance_with_correction(value.imag, &axes, correction);
+                let mut real_mean = value.real.mean(&axes);
+                let mut imag_mean = value.imag.mean(&axes);
+                let mut variance = real_variance + imag_variance;
+                if self.named_bool_arg(node, "keepdim").unwrap_or(false) {
+                    let mut axes = axes.clone();
+                    axes.sort_unstable();
+                    for axis in axes {
+                        variance = variance.expand_dim(axis, 1usize);
+                        real_mean = real_mean.expand_dim(axis, 1usize);
+                        imag_mean = imag_mean.expand_dim(axis, 1usize);
+                    }
+                }
+                let variance = if target.starts_with("std.") {
+                    variance.sqrt()
+                } else {
+                    variance
+                };
+                let names = Self::tensor_output_names(node);
+                self.values.insert(names[0].clone(), variance);
+                if target.starts_with("var_mean.") {
+                    anyhow::ensure!(names.len() == 2, "complex var_mean output count mismatch");
+                    self.store_complex(
+                        &names[1],
+                        ComplexTensor::new(real_mean, imag_mean, value.torch_dtype),
+                    );
+                }
+            }
+
+            "diagonal_scatter.default" => {
+                let destination = self.get_complex_input(node, 0)?;
+                let source = self.get_complex_input(node, 1)?;
+                let real = self.diagonal_scatter_components(node, destination.real, source.real)?;
+                let imag = self.diagonal_scatter_components(node, destination.imag, source.imag)?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, destination.torch_dtype),
+                );
+            }
+            "unfold.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let value = value.try_map(|component| self.unfold_component(node, component))?;
+                self.store_complex(output_name, value);
+            }
+            "scatter.src"
+            | "scatter.value"
+            | "scatter.reduce"
+            | "scatter.value_reduce"
+            | "scatter_add.default" => {
+                let data = self.get_complex_input(node, 0)?;
+                let axis = normalize_dim(self.get_int_arg(node, 1)?, data.real.rank());
+                let indices = self.operand(&node.inputs[2])?.cast(DType::Int);
+                let indices = self.idx_normalize(indices, data.real.dims()[axis]);
+                let updates = if matches!(target, "scatter.value" | "scatter.value_reduce") {
+                    let (real, imag) = self.complex_scalar_arg(node, 3)?;
+                    ComplexTensor::new(
+                        self.full_tensor(indices.dims(), data.real.dtype, real),
+                        self.full_tensor(indices.dims(), data.real.dtype, imag),
+                        data.torch_dtype,
+                    )
+                } else {
+                    self.value_as_complex(self.input_value_name(node, 3)?, data.torch_dtype)?
+                };
+                let updates = updates.map(|t| self.idx_crop_to(t, &indices.dims()));
+                let reduction = match target {
+                    "scatter.reduce" | "scatter.value_reduce" => self.idx_legacy_reduction(node)?,
+                    "scatter_add.default" => super::index::IdxReduce::Sum,
+                    _ => super::index::IdxReduce::Replace,
+                };
+                let coords = self.idx_scatter_coords(&indices.dims(), axis, indices);
+                let result = self.complex_scatter(data, coords, updates, reduction)?;
+                self.store_complex(output_name, result);
+            }
+            "index_put.default" | "index_put_.default" => {
+                let data = self.get_complex_input(node, 0)?;
+                let updates =
+                    self.value_as_complex(self.input_value_name(node, 2)?, data.torch_dtype)?;
+                let entries = Self::idx_entries(node)?;
+                let mut indices = vec![None; data.real.rank()];
+                let mut indexed = Vec::new();
+                for (axis, name) in entries.iter().enumerate() {
+                    if let Some(name) = name {
+                        anyhow::ensure!(axis < indices.len(), "index_put axis out of range");
+                        let index = *self.values.get(name).context("index_put missing index")?;
+                        anyhow::ensure!(
+                            index.dtype != DType::Bool,
+                            "complex index_put boolean mask is unsupported"
+                        );
+                        indices[axis] = Some(
+                            self.idx_normalize(index.cast(DType::Int), data.real.dims()[axis]),
+                        );
+                        indexed.push(axis);
+                    }
+                }
+                anyhow::ensure!(!indexed.is_empty(), "index_put requires indices");
+                let bshape = self.idx_broadcast_indices(&mut indices);
+                let (shape, block, basic) =
+                    super::index::idx_advanced_layout(&data.real.dims(), &indexed, &bshape);
+                let coords = self.idx_advanced_coords(&shape, block, &basic, &indices);
+                let updates = updates.map(|t| self.idx_broadcast_to(t, &shape));
+                let accumulate = node
+                    .inputs
+                    .get(3)
+                    .and_then(|v| v.arg.as_bool())
+                    .unwrap_or(false);
+                let reduction = if accumulate {
+                    super::index::IdxReduce::Sum
+                } else {
+                    super::index::IdxReduce::Replace
+                };
+                let result = self.complex_scatter(data, coords, updates, reduction)?;
+                self.store_complex(output_name, result);
+            }
+            "index.Tensor" => {
+                let value = self.get_complex_input(node, 0)?;
+                let result = value.try_map(|t| self.index_tensor_component(node, t))?;
+                self.store_complex(output_name, result);
+            }
+            "slice_scatter.default" => {
+                let destination = self.get_complex_input(node, 0)?;
+                let source = self.get_complex_input(node, 1)?;
+                let real = self.slice_scatter_component(node, destination.real, source.real)?;
+                let imag = self.slice_scatter_component(node, destination.imag, source.imag)?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, destination.torch_dtype),
+                );
+            }
+            "masked_scatter.default" => {
+                let destination = self.get_complex_input(node, 0)?;
+                let mask = self.operand(&node.inputs[1])?;
+                let source = self.get_complex_input(node, 2)?;
+                let real = self.idx_masked_scatter(destination.real, mask, source.real)?;
+                let imag = self.idx_masked_scatter(destination.imag, mask, source.imag)?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(real, imag, destination.torch_dtype),
+                );
+            }
+            "put.default" => {
+                let data = self.get_complex_input(node, 0)?;
+                let indices = self.operand(&node.inputs[1])?.cast(DType::Int);
+                let source = self.get_complex_input(node, 2)?;
+                let indices = self.idx_normalize(indices, data.real.flatten().dims()[0]);
+                let accumulate = self.named_bool_arg(node, "accumulate").unwrap_or(false);
+                let reduction = if accumulate {
+                    super::index::IdxReduce::Sum
+                } else {
+                    super::index::IdxReduce::Replace
+                };
+                let flat =
+                    ComplexTensor::new(data.real.flatten(), data.imag.flatten(), data.torch_dtype);
+                let source = source.map(|t| t.flatten());
+                let value = self.complex_scatter(flat, vec![indices], source, reduction)?;
+                self.store_complex(
+                    output_name,
+                    value.map(|t| reshape_tensor(t, &data.real.dims())),
+                );
+            }
+            "logcumsumexp.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let axis = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank());
+                let maximum = value
+                    .real
+                    .max(axis)
+                    .expand_to_shape_on_axes(value.real.dims(), axis);
+                let shifted =
+                    ComplexTensor::new(value.real - maximum, value.imag, value.torch_dtype);
+                let exponent = self.complex_exp(shifted);
+                let cumulative = exponent.map(|t| t.cumsum(axis));
+                let result = self.complex_log(cumulative);
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(result.real + maximum, result.imag, value.torch_dtype),
+                );
+            }
+            "dist.default" => {
+                let left = self.get_complex_input(node, 0)?;
+                let right = self.get_complex_input(node, 1)?;
+                let (ar, br) = broadcast_binary(left.real, right.real);
+                let (ai, bi) = broadcast_binary(left.imag, right.imag);
+                let difference = ComplexTensor::new(ar - br, ai - bi, left.torch_dtype);
+                let magnitude = self.complex_abs(difference);
+                let p = self.get_float_arg(node, 2).unwrap_or(2.0);
+                let reduced = if p == 2.0 {
+                    magnitude
+                        .square()
+                        .sum((0..magnitude.rank()).collect::<Vec<_>>())
+                        .sqrt()
+                } else {
+                    magnitude
+                        .pow(p as f32)
+                        .sum((0..magnitude.rank()).collect::<Vec<_>>())
+                        .pow((1.0 / p) as f32)
+                };
+                self.values.insert(output_name.to_string(), reduced);
+            }
+            "index_select.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                if value.real.rank() == 0 {
+                    let indices = self.operand(&node.inputs[2])?.cast(DType::Int);
+                    anyhow::ensure!(
+                        indices.rank() == 1 && indices.dims()[0].to_usize() == Some(1),
+                        "index_select of a scalar requires one index"
+                    );
+                    self.store_complex(
+                        output_name,
+                        value.map(|component| component.unsqueeze(0).gather(&[indices]).squeeze(0)),
+                    );
+                    return Ok(());
+                }
+                let axis = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank());
+                let indices = self.operand(&node.inputs[2])?.cast(DType::Int);
+                let indices = if indices.rank() == 0 {
+                    indices.unsqueeze(0)
+                } else {
+                    indices
+                };
                 let mut shape = value.real.dims();
                 shape[axis] = indices.dims()[0];
                 let coords: Vec<_> = (0..shape.len())
@@ -984,6 +1315,45 @@ impl Translator<'_> {
             .with_context(|| format!("Missing tensor metadata for {output_name}"))?
             .dtype;
         TorchDType::from_code(dtype).map_err(|code| anyhow!("Unknown PT2 dtype code {code}"))
+    }
+
+    fn complex_scatter(
+        &mut self,
+        data: ComplexTensor,
+        coords: Vec<GraphTensor>,
+        updates: ComplexTensor,
+        reduction: super::index::IdxReduce,
+    ) -> Result<ComplexTensor> {
+        use super::index::IdxReduce;
+        let count = self.idx_update_bound(&updates.real.dims())?;
+        let dests = self.idx_flat_dest(&data.real.dims(), &coords)?;
+        let mut real = data.real.flatten();
+        let mut imag = data.imag.flatten();
+        let ur = updates.real.flatten();
+        let ui = updates.imag.flatten();
+        for step in 0..count {
+            let extent = ur.dims()[0];
+            let start = IntExpr::from(step).min(extent);
+            let end = IntExpr::from(step + 1).min(extent);
+            let dest = dests.slice_along(start..end, 0);
+            let a = real.gather(&[dest]);
+            let b = imag.gather(&[dest]);
+            let c = ur.slice_along(start..end, 0);
+            let d = ui.slice_along(start..end, 0);
+            let (r, i) = match reduction {
+                IdxReduce::Replace => (c, d),
+                IdxReduce::Sum => (a + c, b + d),
+                IdxReduce::Prod => (a * c - b * d, a * d + b * c),
+                _ => bail!("unsupported complex scatter reduction"),
+            };
+            real = real.scatter(&[dest], r);
+            imag = imag.scatter(&[dest], i);
+        }
+        Ok(ComplexTensor::new(
+            reshape_tensor(real, &data.real.dims()),
+            reshape_tensor(imag, &data.real.dims()),
+            data.torch_dtype,
+        ))
     }
 
     fn complex_scalar_arg(&self, node: &Node, index: usize) -> Result<(f64, f64)> {

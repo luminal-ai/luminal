@@ -316,13 +316,15 @@ impl GraphTensor {
                     .cast(self.dtype)
                     .expand_rhs(self.dims()))
                 .select(-self, self),
-            _ => self
-                .lt(self
+            _ => {
+                let zero = self
                     .graph()
                     .constant_f32(0.0)
                     .cast(self.dtype)
-                    .expand_rhs(self.dims()))
-                .select(-self, self),
+                    .expand_rhs(self.dims());
+                let absolute = self.lt(zero).select(-self, self);
+                self.eq(zero).select(zero, absolute)
+            }
         }
     }
 

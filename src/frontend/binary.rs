@@ -534,10 +534,15 @@ impl GraphTensor {
             "select branches must share a dtype, got {:?} and {:?}",
             if_true.dtype, if_false.dtype
         );
-        assert_eq!(
-            if_true.dims(),
-            if_false.dims(),
-            "select branches must share a shape"
+        let true_dims = if_true.dims();
+        let false_dims = if_false.dims();
+        assert!(
+            true_dims.len() == false_dims.len()
+                && true_dims
+                    .iter()
+                    .zip(&false_dims)
+                    .all(|(left, right)| left == right || left.egglog_equal(*right)),
+            "select branches must share a shape: {true_dims:?} versus {false_dims:?}"
         );
         let new_id = self.graph().logical.op(
             LogicalOp::Select,

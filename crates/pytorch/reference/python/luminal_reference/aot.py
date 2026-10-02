@@ -46,6 +46,15 @@ def _collective(node):
     return "c10d" in target
 
 
+def _execution_boundary(node):
+    # Side-effectful tensor assertions must execute between native regions.
+    # Retain PyTorch's runtime checks rather than dropping them during export.
+    return _collective(node) or str(node.target) in {
+        "aten._assert_async.default",
+        "aten._assert_async.msg",
+    }
+
+
 def _compile_group(gm, communication):
     """Use the collective's participants for compilation as well as execution."""
     groups = []
@@ -204,6 +213,7 @@ def _compile_region(
                 for v in local_inputs
             ]
             compiler = compile_local or _compile_local_graph
+            defer_options = {"defer_search": True} if compile_local is None else {}
             compiled = compiler(
                 graph,
                 examples,
@@ -212,6 +222,7 @@ def _compile_region(
                 max_intermediate_bytes=max_intermediate_bytes,
                 memory_budget_bytes=memory_budget_bytes,
                 symbol_buckets=resolve_policies(shape_env, dim_buckets or {}),
+                **defer_options,
             )
             if isinstance(compiled, DeferredRegion):
                 compiled.record = record
@@ -227,6 +238,8 @@ def _compile_region(
             for position, index in enumerate(indices)
         ]
         values = compiled(*bound_inputs) if compiled is not None else ()
+        if record is not None and not isinstance(compiled, DeferredRegion):
+            record.buckets = compiled._graph.dim_buckets
         if len(values) != len(positions):
             raise RuntimeError("local compiler changed the AOT output arity")
         result = list(leaves)
@@ -323,7 +336,31 @@ class ReferenceAOTBackend:
                         expr = size.node.shape_env.replace(size.node.expr)
                         if expr in policies:
                             axes.setdefault(expr, []).append((index, axis))
-        compiled = self._backend(gm, example_inputs)
+        from torch._dynamo.exc import TensorifyScalarRestartAnalysis
+
+        try:
+            compiled = self._backend(gm, example_inputs)
+        except TensorifyScalarRestartAnalysis:
+            # AOT requests a Dynamo restart solely to remove specialized float
+            # inputs. This backend accepts unused inputs, so retry locally,
+            # installing the same constant guards on every specialized source.
+            from torch._dynamo.guards import GuardBuilder
+            from torch._dynamo.symbolic_convert import TensorifyState
+            from torch._guards import TracingContext
+
+            context = TracingContext.try_get()
+            if context is None or mode is None or mode.shape_env is None:
+                raise
+            for symbol in mode.shape_env.backed_var_to_val:
+                if TensorifyState.should_specialize(str(symbol)):
+                    sources = mode.shape_env.var_to_sources.get(symbol, ())
+                    if not sources:
+                        raise
+                    for source in sources:
+                        context.guards_context.dynamo_guards.add(
+                            source.make_guard(GuardBuilder.CONSTANT_MATCH)
+                        )
+            compiled = self._backend(gm, example_inputs)
         if not axes:
             return compiled
 
@@ -357,7 +394,12 @@ class ReferenceAOTBackend:
         self.graphs.append(
             GraphRecord(phase, gm.code, tuple(str(n.target) for n in communication))
         )
-        if not communication:
+        boundaries = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and _execution_boundary(n)
+        ]
+        if not boundaries:
             compiled = compile_region(
                 gm, example_inputs, phase, self.regions, **self.compile_options
             )
@@ -366,7 +408,7 @@ class ReferenceAOTBackend:
                 self.leader_compilations += batch.compilations
             return make_boxed_func(compiled)
 
-        # Contiguous topological regions keep collective ordering explicit.
+        # Contiguous regions keep collective and assertion ordering explicit.
         # This is a frontend boundary, not an extracted-Luminal graph rewrite.
         partition = -1
         previous = None
@@ -374,7 +416,7 @@ class ReferenceAOTBackend:
 
         def assign(node):
             nonlocal partition, previous
-            is_comm = _collective(node)
+            is_comm = _execution_boundary(node)
             if previous is None or is_comm != previous:
                 partition += 1
                 previous = is_comm

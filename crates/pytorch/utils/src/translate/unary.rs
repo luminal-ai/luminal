@@ -205,7 +205,8 @@ impl Translator<'_> {
             + self.constant_like(t, A1))
             * t;
         let one = self.constant_like(u, 1.0);
-        u.sign() * (one - poly * (u.square() * -1.0).exp())
+        let magnitude = one - poly * (u.square() * -1.0).exp();
+        self.copy_sign(magnitude, u)
     }
 
     pub(super) fn translate_sign(&mut self, node: &Node) -> Result<GraphTensor> {

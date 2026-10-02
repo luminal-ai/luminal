@@ -1335,6 +1335,17 @@ mod tests {
     }
 
     #[test]
+    fn nested_symbolic_extent_product_division_is_exact() {
+        let s = expr('s');
+        assert_eq!(((expr(4) * s * s) / (s * s)).simplify(), expr(4));
+        assert!(
+            ((expr(4) * s * s) / (s * s) * (s * s))
+                .simplify()
+                .egglog_equal((expr(4) * s * s).simplify())
+        );
+    }
+
+    #[test]
     fn test_interval_simplifications() {
         let s = expr('s');
         let intervals = [(crate::shape::Symbol::from('s'), DimInterval::new(0, 127))]

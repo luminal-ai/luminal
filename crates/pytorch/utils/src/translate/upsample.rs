@@ -170,6 +170,9 @@ impl Translator<'_> {
         out_dim: usize,
         scale: Option<f64>,
     ) -> Result<GraphTensor> {
+        if out_dim == in_dim {
+            return Ok(t);
+        }
         if out_dim.is_multiple_of(in_dim) {
             let k = out_dim / in_dim;
             let scale_matches = scale.is_none_or(|s| (s - k as f64).abs() < 1e-9);
@@ -361,14 +364,20 @@ impl Translator<'_> {
             }
             let multiplier = self.constant_like(weights, (1_u64 << precision) as f64);
             let half = self.constant_like(weights, 0.5);
-            weights = (weights * multiplier + half).floor().trunc_cast(DType::I64);
+            // Quantized weights and U8 products are exact in F64 while
+            // their sum fits its 53-bit integer significand.
+            assert!(
+                precision + 8 + input_size.next_power_of_two().ilog2() <= 53,
+                "quantized bilinear sum exceeds exact F64 integer range"
+            );
+            weights = (weights * multiplier + half).floor().cast(DType::F64);
             Some(precision)
         } else {
             None
         };
 
         let mut candidates = if quantized_u8 {
-            input.cast(DType::I64).expand_dim(axis, output_size)
+            input.cast(DType::F64).expand_dim(axis, output_size)
         } else {
             input.expand_dim(axis, output_size)
         };

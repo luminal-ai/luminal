@@ -184,12 +184,22 @@ impl Translator<'_> {
             _ => x.dims()[dim],
         };
         let step = node.inputs.get(4).and_then(|i| i.arg.as_int()).unwrap_or(1);
-        if step != 1 {
-            bail!("slice step {step} != 1 is not ported");
-        }
-        let mut ranges: Vec<(IntExpr, IntExpr)> = x.dims().iter().map(|d| (0.into(), *d)).collect();
-        ranges[dim] = (start, end);
-        Ok(x.slice(ranges))
+        anyhow::ensure!(step > 0, "slice step must be positive");
+        let start = start.max(0).min(x.dims()[dim]);
+        let shape = self.output_meta_shape(node)?;
+        let coords = (0..rank)
+            .map(|axis| {
+                self.cx.iota(shape.clone(), |c| {
+                    if axis == dim {
+                        c[axis] * step + start
+                    } else {
+                        c[axis]
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let _ = end;
+        Ok(x.gather(&coords))
     }
 
     pub(super) fn translate_select(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -299,6 +309,25 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|i| i.arg.as_bool()))
             .unwrap_or(false);
         let result = match op {
+            ReductionOp::Sum if matches!(x.dtype, DType::Int | DType::I64) => {
+                // The sequential scan backend checks overflow at runtime;
+                // use it when caller data has no static value-range proof.
+                let mut result = x;
+                let mut order = axes.clone();
+                order.sort_unstable();
+                for &axis in order.iter().rev() {
+                    let extent = result.dims()[axis];
+                    let mut zero_shape = result.dims();
+                    zero_shape[axis] = 1.into();
+                    let zero = self.full_tensor(zero_shape, result.dtype, 0.0);
+                    result = zero
+                        .concat_along(result, axis)
+                        .cumsum(axis)
+                        .slice_along(extent..extent + 1, axis)
+                        .squeeze(axis);
+                }
+                result
+            }
             ReductionOp::Sum => x.sum(axes.clone()),
             ReductionOp::Mean => x.mean(axes.clone()),
             ReductionOp::Max => x.max(axes.clone()),
@@ -606,24 +635,18 @@ impl Translator<'_> {
 
     pub(super) fn translate_clamp(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let min = node.inputs.get(1).and_then(|i| i.arg.as_float());
-        let max = node.inputs.get(2).and_then(|i| i.arg.as_float());
         let mut out = x;
-        if let Some(min) = min {
-            let bound = self
-                .cx
-                .constant_f32(min as f32)
-                .cast(x.dtype)
-                .expand_rhs(x.dims());
-            out = out.maximum(bound);
-        }
-        if let Some(max) = max {
-            let bound = self
-                .cx
-                .constant_f32(max as f32)
-                .cast(x.dtype)
-                .expand_rhs(x.dims());
-            out = out.minimum(bound);
+        for (position, lower) in [(1, true), (2, false)] {
+            if let Some(input) = node.inputs.get(position)
+                && (input.arg.as_float().is_some() || input.arg.as_int().is_some())
+            {
+                let bound = self.scalar(input, x.dtype)?.expand_rhs(x.dims());
+                out = if lower {
+                    out.maximum(bound)
+                } else {
+                    out.minimum(bound)
+                };
+            }
         }
         Ok(out)
     }

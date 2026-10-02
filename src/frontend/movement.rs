@@ -1110,9 +1110,25 @@ impl GraphTensor {
 
     /// Concat along an existing dimension
     pub fn concat_along(self, rhs: GraphTensor, axis: usize) -> GraphTensor {
-        // Pad and add
-        self.pad_along(0, rhs.dims()[axis], axis, 0.)
-            + rhs.pad_along(self.dims()[axis], 0, axis, 0.)
+        let left_extent = self.dims()[axis];
+        let left = self.pad_along(0, rhs.dims()[axis], axis, 0.);
+        let right = rhs.pad_along(left_extent, 0, axis, 0.);
+        if matches!(
+            self.dtype,
+            DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16
+        ) {
+            // The padded regions are disjoint. Selecting the occupied region
+            // preserves arbitrary integer payloads without claiming that a
+            // general addition is statically non-wrapping.
+            let positions = self.graph().iota(left.dims(), |coords| coords[axis]);
+            let extent = self
+                .graph()
+                .constant_i32(left_extent)
+                .expand_rhs(left.dims());
+            positions.lt(extent).select(left, right)
+        } else {
+            left + right
+        }
     }
 }
 
@@ -1124,6 +1140,15 @@ mod tests {
     use candle_core::{IndexOp, Tensor};
     use luminal::prelude::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn integer_concat_accepts_equivalent_symbolic_padding_extents() {
+        let mut cx = Graph::new();
+        let left = cx.named_tensor("left", (1, 'n'), DType::I64);
+        let right = cx.named_tensor("right", (1, 1), DType::I64);
+        let result = left.concat_along(right, 1);
+        assert!(result.dims()[1].egglog_equal(IntExpr::from('n') + 1));
+    }
 
     /// A merged symbolic extent splits back (`div-mul-var-self` proves
     /// `(H*W)/W * W = H*W`), and the split recovers the outer extent.

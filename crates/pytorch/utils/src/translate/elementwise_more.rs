@@ -108,7 +108,8 @@ impl Translator<'_> {
         let x_zero = self.exact_is_zero(x);
         let y_zero = self.exact_is_zero(y);
         let both_zero = self.bool_and(x_zero, y_zero);
-        let safe_x = x + both_zero.cast(x.dtype);
+        let one = self.constant_like(x, 1.0);
+        let safe_x = self.real_select(both_zero, one, x);
         let ratio = y / safe_x;
         let mut angle = self.exact_atan(ratio);
         let x_negative = self.signbit(x);
@@ -173,11 +174,20 @@ impl Translator<'_> {
 
     pub(super) fn translate_fmax_fmin(&mut self, node: &Node, max: bool) -> Result<GraphTensor> {
         let (a, b) = self.promoted_binary_inputs(node)?;
-        // Finite-input semantics. torch.fmax/fmin skip a NaN operand, which
-        // requires selecting a non-finite branch away; that is blocked on
-        // the core's NaN-safe select (LUM-804: arithmetic/e-graph selection
-        // leaks `NaN * 0`). A NaN operand therefore propagates here.
-        Ok(if max { a.maximum(b) } else { a.minimum(b) })
+        let ordered = if max {
+            self.real_select(a.gt(b), a, b)
+        } else {
+            self.real_select(a.lt(b), a, b)
+        };
+        let a_zero = self.exact_is_zero(a);
+        let b_zero = self.exact_is_zero(b);
+        let both_zero = self.bool_and(a_zero, b_zero);
+        let zero_result = if max { a.abs() } else { -a.abs() };
+        let ordered = self.real_select(both_zero, zero_result, ordered);
+        let a_nan = self.is_nan(a);
+        let b_nan = self.is_nan(b);
+        let selected = self.real_select(a_nan, b, ordered);
+        Ok(self.real_select(b_nan, a, selected))
     }
 
     /// Stable hypot: scale by the larger magnitude to avoid overflow.
@@ -202,16 +212,8 @@ impl Translator<'_> {
     }
 
     pub(super) fn translate_gcd(&mut self, node: &Node) -> Result<GraphTensor> {
-        // The old translator unrolled a 128-round Euclidean loop. Two things
-        // had to change before it could plan on this branch:
-        //   1. the arithmetic masks (`f*lhs + active*rhs`) became native
-        //      selects — a sum of products fed the integer AC + distributivity
-        //      e-graph closure and diverged saturation; and
-        //   2. the divisor became `rhs.maximum(1)` rather than
-        //      `finished.select(1, rhs)`, so its lower bound (`1`) is derivable
-        //      from the structural max rule in `logical_op/select`, which is
-        //      what discharges the proof gate on I64 `trunc_rem`.
-        // Both are compile-time (egglog) facts; no runtime logic is added.
+        // Native selects keep the Euclidean state exact without expanding
+        // arithmetic masks through integer algebraic rewrites.
         self.translate_gcd_unrolled(node)
     }
 
@@ -222,21 +224,42 @@ impl Translator<'_> {
         let mut rhs = rhs.cast(DType::I64);
         let one = self.constant_like(lhs, 1.0);
         let zero = self.constant_like(lhs, 0.0);
-        for _ in 0..32 {
+        let bits = match output_dtype {
+            DType::I8 | DType::U8 => 8,
+            DType::I16 => 16,
+            DType::Int => 32,
+            _ => 64,
+        };
+        // Lamé's bound: 1.5 rounds per storage bit covers the worst-case
+        // consecutive Fibonacci inputs, including signed minimum magnitudes.
+        for _ in 0..(3 * bits / 2 + 1) {
             let finished = self.exact_is_zero(rhs);
-            // Zero-free divisor: `maximum(|rhs|, 1)` is `|rhs|` whenever
-            // `rhs != 0` and `1` when `rhs == 0`. Euclid is invariant under
-            // the divisor's sign, so `|rhs|` is correct for signed inputs,
-            // and the structural max bound rule derives its lower bound `1`
-            // statically — the proof the I64 `trunc_rem` needs. (The previous
-            // `finished.select(1, rhs)` was correct but had only the generic
-            // union bounds, which included 0.)
-            let safe_rhs = rhs.abs().maximum(one);
-            let remainder = lhs.trunc_rem(safe_rhs);
+            // Checked remainder still sees a nonzero divisor after completion.
+            let safe_rhs = finished.select(one, rhs);
+            let remainder = lhs % safe_rhs;
             lhs = finished.select(lhs, rhs);
             rhs = finished.select(zero, remainder);
         }
-        Ok(lhs.abs().cast(output_dtype))
+        let negative = lhs.lt(zero);
+        let minus_one = self.cx.constant_i64(-1).expand_rhs(lhs.dims());
+        let minimum_value = match output_dtype {
+            DType::I8 => i64::from(i8::MIN),
+            DType::I16 => i64::from(i16::MIN),
+            DType::Int => i64::from(i32::MIN),
+            DType::U8 => 0,
+            _ => i64::MIN,
+        };
+        let minimum = self.cx.constant_i64(minimum_value).expand_rhs(lhs.dims());
+        let is_minimum = lhs.eq(minimum);
+        let safe_lhs = is_minimum.select(zero, lhs);
+        let negated = safe_lhs
+            .unsqueeze(0)
+            .concat_along(minus_one.unsqueeze(0), 0)
+            .cumprod(0)
+            .slice_along(1..2, 0)
+            .squeeze(0);
+        let absolute = negative.select(negated, lhs);
+        Ok(is_minimum.select(lhs, absolute).cast(output_dtype))
     }
 
     pub(super) fn translate_exp2(&mut self, node: &Node) -> Result<GraphTensor> {

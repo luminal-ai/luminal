@@ -885,7 +885,24 @@ impl Translator<'_> {
             "abs.default" => self.operand(&n[0])?.abs(),
             "neg.default" => -self.operand(&n[0])?,
             "silu.default" => self.operand(&n[0])?.silu(),
-            "gelu.default" => self.operand(&n[0])?.gelu(),
+            "gelu.default" => {
+                let x = self.operand(&n[0])?;
+                if n.get(1).and_then(|i| match &i.arg {
+                    crate::pt2_schema::Argument::Other(v) => {
+                        v.get("as_string").and_then(|v| v.as_str())
+                    }
+                    _ => None,
+                }) == Some("tanh")
+                {
+                    let k = self.constant_like(x, 0.044715);
+                    let scale = self.constant_like(x, (2.0 / std::f64::consts::PI).sqrt());
+                    let half = self.constant_like(x, 0.5);
+                    let one = self.constant_like(x, 1.0);
+                    x * half * (one + ((x + k * x * x * x) * scale).tanh())
+                } else {
+                    x.gelu()
+                }
+            }
             "reciprocal.default" => self.operand(&n[0])?.reciprocal(),
             "sin.default" => self.operand(&n[0])?.sin(),
             "square.default" => self.operand(&n[0])?.square(),
@@ -896,10 +913,9 @@ impl Translator<'_> {
             "round.default" => self.operand(&n[0])?.round(),
             "round.decimals" => {
                 let decimals = n.get(1).and_then(|i| i.arg.as_int()).unwrap_or(0);
-                if decimals != 0 {
-                    bail!("round(decimals={decimals}) is not ported (only decimals=0)");
-                }
-                self.operand(&n[0])?.round()
+                let x = self.operand(&n[0])?;
+                let scale = self.constant_like(x, 10_f64.powi(decimals as i32));
+                (x * scale).round() / scale
             }
             // ---- elementwise binary ----
             "add.Tensor" | "add.Scalar" => {
@@ -926,10 +942,34 @@ impl Translator<'_> {
                     }
                 };
                 let (a, b) = broadcast_pair(a, scaled);
-                a + b
+                if matches!(a.dtype, DType::Int | DType::I64) {
+                    // Checked accumulation retains the non-wrapping contract
+                    // for runtime integers without claiming static bounds.
+                    self.checked_int_pair(a, b, false)
+                } else {
+                    a + b
+                }
             }
-            "sub.Tensor" | "sub.Scalar" => self.binary(n, |a, b| a - b)?,
-            "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
+            "sub.Tensor" | "sub.Scalar" | "mul.Tensor" | "mul.Scalar" => {
+                let a = self.operand(&n[0])?;
+                let b = if let Some(t) = self.optional_tensor_operand(&n[1])? {
+                    t
+                } else {
+                    self.scalar(&n[1], a.dtype)?
+                };
+                let (a, b) = broadcast_pair(a, b);
+                if matches!(a.dtype, DType::Int | DType::I64) {
+                    if target.starts_with("sub.") {
+                        self.checked_int_sub(a, b)
+                    } else {
+                        self.checked_int_pair(a, b, true)
+                    }
+                } else if target.starts_with("sub.") {
+                    a - b
+                } else {
+                    a * b
+                }
+            }
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
             "minimum.default" => self.binary(n, |a, b| a.minimum(b))?,
