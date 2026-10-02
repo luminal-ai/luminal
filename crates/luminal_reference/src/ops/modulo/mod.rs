@@ -136,14 +136,22 @@ impl OpMatcher for ModFunctionalMatcher {
 
 use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
-/// Same story as the Div kernel: f32 `%` only; integer remainder is
-/// TruncRem.
+/// ATen fmod uses truncation toward zero for both real and integer operands.
 pub(crate) fn kernel(
     _op: &dyn BufferTensorIrOp,
     ctx: &mut ReferenceKernelCtx,
 ) -> anyhow::Result<()> {
     match &ctx.operands[0] {
         TypedBuffer::F32(_) => ctx.binary_elementwise(|a, b| a % b),
+        TypedBuffer::F64(_) => ctx.binary_elementwise_f64(|a, b| Ok(a % b)),
+        TypedBuffer::I32(_) => ctx.binary_elementwise_i32(|a, b| {
+            anyhow::ensure!(b != 0, "integer fmod by zero");
+            Ok(a.checked_rem(b).unwrap_or(0))
+        }),
+        TypedBuffer::I64(_) => ctx.binary_elementwise_i64(|a, b| {
+            anyhow::ensure!(b != 0, "integer fmod by zero");
+            Ok(a.checked_rem(b).unwrap_or(0))
+        }),
         other => anyhow::bail!(
             "Mod has no {} arm: integer remainder is TruncRem, not Mod",
             other.type_name()

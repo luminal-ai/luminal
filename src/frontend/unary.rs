@@ -333,7 +333,12 @@ impl GraphTensor {
 
     /// The Rectified Linear Unit activation function
     pub fn relu(self) -> GraphTensor {
-        self.maximum_f32(0.)
+        let zero = self
+            .graph()
+            .constant_f32(0.0)
+            .cast(self.dtype)
+            .expand_rhs(self.dims());
+        self.lt(zero).select(zero, self)
     }
 
     /// The sigmoid activation function

@@ -200,6 +200,9 @@ impl Translator<'_> {
             .unwrap_or(&node.target);
 
         match target {
+            "_fft_c2c.default" | "_fft_r2c.default" | "_fft_c2r.default" => {
+                self.translate_fourier(node, output_name, target)?
+            }
             // ---- arithmetic ----
             "add.Tensor" | "sub.Tensor" | "mul.Tensor" | "div.Tensor" => {
                 let op = match target {
@@ -344,16 +347,76 @@ impl Translator<'_> {
                 self.store_complex(output_name, ComplexTensor::new(real, imag, dtype));
             }
 
+            "index_select.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let axis = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank());
+                let indices = self.operand(&node.inputs[2])?.cast(DType::Int);
+                let mut shape = value.real.dims();
+                shape[axis] = indices.dims()[0];
+                let coords: Vec<_> = (0..shape.len())
+                    .map(|dim| {
+                        if dim == axis {
+                            let mut expanded = indices;
+                            for (before, &extent) in shape.iter().enumerate().take(axis) {
+                                expanded = expanded.expand_dim(before, extent);
+                            }
+                            for (after, &extent) in shape.iter().enumerate().skip(axis + 1) {
+                                expanded = expanded.expand_dim(after, extent);
+                            }
+                            expanded
+                        } else {
+                            self.cx.iota(shape.clone(), |coords| coords[dim])
+                        }
+                    })
+                    .collect();
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(
+                        value.real.gather(&coords),
+                        value.imag.gather(&coords),
+                        value.torch_dtype,
+                    ),
+                );
+            }
+
+            "constant_pad_nd.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let raw = self.get_ints_arg(node, 1)?;
+                anyhow::ensure!(
+                    raw.len() % 2 == 0 && raw.len() / 2 <= value.real.rank(),
+                    "invalid complex padding"
+                );
+                let mut padding =
+                    vec![(IntExpr::from(0), IntExpr::from(0)); value.real.rank() - raw.len() / 2];
+                padding.extend(
+                    raw.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .rev()
+                        .map(|pair| (IntExpr::from(pair[0]), IntExpr::from(pair[1]))),
+                );
+                let (real, imag) = if node.inputs.len() > 2 {
+                    self.complex_scalar_arg(node, 2)?
+                } else {
+                    (0.0, 0.0)
+                };
+                let real_fill = self.floating_scalar(real, value.real.dtype);
+                let imag_fill = self.floating_scalar(imag, value.imag.dtype);
+                let result = ComplexTensor::new(
+                    value.real.pad_with(padding.clone(), real_fill),
+                    value.imag.pad_with(padding, imag_fill),
+                    value.torch_dtype,
+                );
+                self.store_complex(output_name, result);
+            }
+
             // ---- constructors / casts ----
             "full.default" | "full_like.default" => {
                 let dtype = self.output_complex_dtype(output_name)?;
                 let shape = if target == "full_like.default" {
                     self.get_complex_input(node, 0)?.real.dims()
                 } else {
-                    self.get_ints_arg(node, 0)?
-                        .into_iter()
-                        .map(|v| IntExpr::from(v as usize))
-                        .collect()
+                    self.get_int_exprs_arg(node, 0)?
                 };
                 let value = self.complex_constructor_scalar_arg(node, 1, dtype)?;
                 let value = if shape.is_empty() {
@@ -1764,6 +1827,146 @@ impl Translator<'_> {
         } else {
             result
         })
+    }
+
+    fn complex_dft_axis(
+        &mut self,
+        value: ComplexTensor,
+        axis: usize,
+        forward: bool,
+    ) -> ComplexTensor {
+        let original = value.real.dims();
+        let length = original[axis];
+        let mut order: Vec<_> = (0..original.len()).filter(|&i| i != axis).collect();
+        order.push(axis);
+        let transposed = value.map(|c| c.permute(&order));
+        let shape = transposed.real.dims();
+        let rows = super::dim_arith::product_of_dims(shape[..shape.len() - 1].iter().copied());
+        let matrix = transposed.map(|c| reshape_tensor(c, &[rows, length]));
+        let phases = self
+            .cx
+            .iota([length, length], |c| c[0] * c[1])
+            .cast(value.real.dtype);
+        let tau = self
+            .floating_scalar(
+                if forward {
+                    -std::f64::consts::TAU
+                } else {
+                    std::f64::consts::TAU
+                },
+                value.real.dtype,
+            )
+            .expand_rhs(phases.dims());
+        let phase = phases * tau / length;
+        let quarter = self.constant_like(phase, std::f64::consts::FRAC_PI_2);
+        let cosine = (quarter - phase).sin();
+        let sine = phase.sin();
+        let real = matrix.real.matmul(cosine) - matrix.imag.matmul(sine);
+        let imag = matrix.real.matmul(sine) + matrix.imag.matmul(cosine);
+        let mut inverse = vec![0; order.len()];
+        for (position, &original_axis) in order.iter().enumerate() {
+            inverse[original_axis] = position;
+        }
+        ComplexTensor::new(
+            reshape_tensor(real, &shape).permute(&inverse),
+            reshape_tensor(imag, &shape).permute(&inverse),
+            value.torch_dtype,
+        )
+    }
+
+    fn translate_fourier(&mut self, node: &Node, output_name: &str, target: &str) -> Result<()> {
+        let axes_raw = self.get_ints_arg(node, 1)?;
+        let input_name = self.input_value_name(node, 0)?.to_string();
+        let mut value = if target == "_fft_r2c.default" {
+            let dtype = self.output_complex_dtype(output_name)?;
+            self.value_as_complex(&input_name, dtype)?
+        } else {
+            self.get_complex(&input_name)?
+        };
+        let axes: Vec<_> = axes_raw
+            .iter()
+            .map(|&d| normalize_dim(d, value.real.rank()))
+            .collect();
+        let last = *axes
+            .last()
+            .context("FFT needs at least one transform axis")?;
+        let normalization = self.get_int_arg(node, 2)?;
+        let c2r = target == "_fft_c2r.default";
+        let forward = target == "_fft_r2c.default"
+            || (target == "_fft_c2c.default" && self.get_bool_arg(node, 3)?);
+        let mut full_shape = value.real.dims();
+        if c2r {
+            full_shape[last] = self.output_meta_shape(node)?[last];
+        }
+        let count = super::dim_arith::product_of_dims(axes.iter().map(|&i| full_shape[i]));
+        if c2r {
+            // Undo every outer transform before restoring Hermitian pairs
+            // on the final axis; conjugation then applies independently per row.
+            for &axis in &axes[..axes.len() - 1] {
+                value = self.complex_dft_axis(value, axis, false);
+            }
+            let length = full_shape[last];
+            let coords: Vec<_> = (0..full_shape.len())
+                .map(|axis| {
+                    self.cx.iota(full_shape.clone(), |c| {
+                        if axis == last {
+                            c[axis].min(length - c[axis])
+                        } else {
+                            c[axis]
+                        }
+                    })
+                })
+                .collect();
+            let positions = self.cx.iota(full_shape.clone(), |c| c[last]);
+            let real = value.real.gather(&coords);
+            let imag = value.imag.gather(&coords);
+            let half = self
+                .cx
+                .constant_i32(length / 2)
+                .expand_rhs(full_shape.clone());
+            let reflected = positions.gt(half);
+            let imag = self.select(reflected, -imag, imag);
+            let zero_index = self.cx.constant_i32(0).expand_rhs(full_shape.clone());
+            let dc = positions.eq(zero_index);
+            let n = self.cx.constant_i32(length).expand_rhs(full_shape.clone());
+            let twice = positions * 2;
+            let nyquist = twice.eq(n);
+            let endpoint = self.bool_or(dc, nyquist);
+            let zero = self.full_tensor(full_shape, imag.dtype, 0.0);
+            let imag = self.select(endpoint, zero, imag);
+            value = self.complex_dft_axis(
+                ComplexTensor::new(real, imag, value.torch_dtype),
+                last,
+                false,
+            );
+        } else {
+            for &axis in &axes {
+                value = self.complex_dft_axis(value, axis, forward);
+            }
+            if target == "_fft_r2c.default" && self.get_bool_arg(node, 3)? {
+                let end = value.real.dims()[last] / 2 + 1;
+                value = value.map(|c| c.slice_along(IntExpr::from(0)..end, last));
+            }
+        }
+        if normalization != 0 {
+            anyhow::ensure!(
+                normalization == 1 || normalization == 2,
+                "invalid FFT normalization"
+            );
+            let divisor = self.cx.constant_i32(count).cast(value.real.dtype);
+            let divisor = if normalization == 1 {
+                divisor.sqrt()
+            } else {
+                divisor
+            };
+            value = value.map(|c| c / divisor.expand_rhs(c.dims()));
+        }
+        if c2r {
+            self.values.insert(output_name.to_string(), value.real);
+        } else {
+            self.store_complex(output_name, value);
+        }
+        Ok(())
     }
 
     fn translate_complex_reduction(

@@ -672,7 +672,7 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|input| input.arg.as_float()))
             .or_else(|| node.inputs.get(3).and_then(|input| input.arg.as_float()))
             .unwrap_or(0.0);
-        let fill = self.cast_scalar(value, x.dtype);
+        let fill = self.full_tensor(vec![], x.dtype, value);
         Ok(x.pad_with(padding, fill))
     }
 

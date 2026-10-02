@@ -1355,11 +1355,19 @@ impl Translator<'_> {
         n: &[NodeInput],
         op: impl FnOnce(GraphTensor, GraphTensor) -> GraphTensor,
     ) -> Result<GraphTensor> {
-        let a = self.operand(&n[0])?;
-        let b = if let Some(t) = self.optional_tensor_operand(&n[1])? {
-            t
-        } else {
-            self.scalar(&n[1], a.dtype)?
+        let a_tensor = self.optional_tensor_operand(&n[0])?;
+        let b_tensor = self.optional_tensor_operand(&n[1])?;
+        let dtype = a_tensor
+            .or(b_tensor)
+            .context("binary operation has no tensor operand")?
+            .dtype;
+        let a = match a_tensor {
+            Some(a) => a,
+            None => self.scalar(&n[0], dtype)?,
+        };
+        let b = match b_tensor {
+            Some(b) => b,
+            None => self.scalar(&n[1], dtype)?,
         };
         let (a, b) = broadcast_pair(a, b);
         Ok(op(a, b))

@@ -1064,28 +1064,11 @@ impl GraphTensor {
             .graph()
             .logical
             .record_mask_iota(&befores, &afters, &dims);
-        // ARITHMETIC MASKING, restored 2026-09-03. Main #406's select_by_index
-        // (packed 2N iota + two scatter1d + gather1d, PR #471) was NaN-safe
-        // but made egglog saturation stop converging for rank >= 2 pads
-        // (core lib tests 15 s -> >76 min; LUM-805). KNOWN LEAK, tracked as
-        // LUM-804: the clamped view repeats edge values into the pad region
-        // and `0 * NaN` / `0 * Inf` is NaN, so padding a tensor that holds
-        // non-finite values poisons its padding. The fix owed is a native
-        // Bool8 select op, not a gather construction.
+        // Native selection preserves IEEE values in both the data and fill.
         let mask = GraphTensor::from_id(mask_id, out_dims.clone(), self.graph_ref, DType::Int)
-            .cast(self.dtype);
-        let masked = clamped * mask;
-        match elem {
-            None => masked,
-            Some(elem) => {
-                let one = self
-                    .graph()
-                    .constant_i32(1)
-                    .cast(self.dtype)
-                    .expand_rhs(out_dims.clone());
-                masked + (one - mask) * elem.expand_rhs(out_dims)
-            }
-        }
+            .cast(DType::Bool);
+        let fill = elem.unwrap_or_else(|| self.graph().constant_i32(0).cast(self.dtype));
+        mask.select(clamped, fill.expand_rhs(out_dims))
     }
 
     /// Pad out dimensions of a tensor with an `f32` convenience value.
