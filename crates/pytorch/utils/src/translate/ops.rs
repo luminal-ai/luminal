@@ -441,18 +441,21 @@ impl Translator<'_> {
     }
 
     pub(super) fn translate_full(&mut self, node: &Node, like: bool) -> Result<GraphTensor> {
-        let (shape, dtype, value) = if like {
+        let (shape, dtype) = if like {
             let x = self.operand(&node.inputs[0])?;
-            let meta = self.output_meta_dtype(node).unwrap_or(x.dtype);
-            (x.dims(), meta, self.get_number_arg(node, 1)?)
+            (x.dims(), self.output_meta_dtype(node).unwrap_or(x.dtype))
         } else {
-            let shape = self.get_int_exprs_arg(node, 0)?;
             (
-                shape,
+                self.get_int_exprs_arg(node, 0)?,
                 self.output_meta_dtype(node)?,
-                self.get_number_arg(node, 1)?,
             )
         };
+        if let Some(name) = node.inputs[1].arg.as_value_name()
+            && let Some(value) = self.values.get(name).copied()
+        {
+            return Ok(value.cast(dtype).expand_rhs(shape));
+        }
+        let value = self.get_number_arg(node, 1)?;
         Ok(self.full_tensor(shape, dtype, value))
     }
 
@@ -460,6 +463,48 @@ impl Translator<'_> {
         let dtype = self.output_meta_dtype(node)?;
         // PT2 omits default arguments. Read by schema name, and preserve
         // symbolic scalar operands rather than interpreting them as literals.
+        let literal =
+            |name: &str, default: f64| match node.inputs.iter().find(|input| input.name == name) {
+                None => Some(default),
+                Some(input) => input
+                    .arg
+                    .as_float()
+                    .or_else(|| input.arg.as_int().map(|v| v as f64))
+                    .or_else(|| input.arg.as_bool().map(f64::from)),
+            };
+        if let (Some(start), Some(step)) = (literal("start", 0.0), literal("step", 1.0)) {
+            anyhow::ensure!(step != 0.0, "arange step must be nonzero");
+            let name = Self::tensor_output_names(node)
+                .into_iter()
+                .next()
+                .context("arange has no output")?;
+            let meta = self.tensor_meta(&name)?.clone();
+            let shape = self.boundary_shape(&meta, &name)?;
+            let integer = matches!(
+                dtype,
+                DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 | DType::U16
+            );
+            if integer {
+                let start = IntExpr::from(start as i64);
+                let step = IntExpr::from(step as i64);
+                return Ok(self
+                    .cx
+                    .iota(shape, |coordinates| coordinates[0] * step + start)
+                    .cast(dtype));
+            }
+            let arithmetic_dtype = if dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            };
+            let positions = self
+                .cx
+                .iota(shape.clone(), |coordinates| coordinates[0])
+                .cast(arithmetic_dtype);
+            let start = self.full_tensor(shape.clone(), arithmetic_dtype, start);
+            let step = self.full_tensor(shape, arithmetic_dtype, step);
+            return Ok((positions * step + start).cast(dtype));
+        }
         let argument = |name: &str, default: i64| -> Result<IntExpr> {
             let Some(input) = node.inputs.iter().find(|input| input.name == name) else {
                 return Ok(IntExpr::from(default));
@@ -511,6 +556,11 @@ impl Translator<'_> {
 
     pub(super) fn translate_scalar_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
         let dtype = self.output_meta_dtype(node)?;
+        if let Some(name) = node.inputs[0].arg.as_value_name()
+            && let Some(value) = self.values.get(name).copied()
+        {
+            return Ok(value.cast(dtype));
+        }
         let value = self.get_float_arg(node, 0)?;
         let scalar = match dtype {
             DType::F64 => self.cx.constant_f64(value),
@@ -632,11 +682,12 @@ impl Translator<'_> {
     pub(super) fn translate_item(&mut self, node: &Node) -> Result<()> {
         let x = self.operand(&node.inputs[0])?;
         let scalar = util::reshape_tensor(x, &[]);
-        let names = Self::tensor_output_names(node);
-        let name = names
-            .first()
+        let name = node
+            .outputs
+            .iter()
+            .find_map(|output| output.value_name())
             .context("item is missing its scalar output name")?
-            .clone();
+            .to_owned();
         self.values.insert(name, scalar);
         Ok(())
     }

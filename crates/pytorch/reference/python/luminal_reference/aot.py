@@ -94,6 +94,8 @@ def _compile_region(
         for i, leaf in enumerate(leaves)
         if isinstance(leaf, torch.fx.Node) and leaf in input_positions
     }
+    from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
+
     symbolic_outputs = {
         i: leaf.meta.get("val", leaf.meta.get("example_value"))
         for i, leaf in enumerate(leaves)
@@ -102,6 +104,9 @@ def _compile_region(
             leaf.meta.get("val", leaf.meta.get("example_value")), torch.SymInt
         )
         and i not in passthrough
+        and not has_free_unbacked_symbols(
+            leaf.meta.get("val", leaf.meta.get("example_value"))
+        )
     }
     from torch._guards import detect_fake_mode
 

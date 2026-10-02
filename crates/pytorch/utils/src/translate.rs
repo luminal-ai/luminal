@@ -531,6 +531,11 @@ impl Translator<'_> {
     /// A scalar literal as a rank-0 tensor of `dtype`. A Python float is
     /// read at the dtype the op computes in (F64 keeps the double).
     fn scalar(&mut self, input: &NodeInput, dtype: DType) -> Result<GraphTensor> {
+        if let Some(name) = input.arg.as_value_name()
+            && let Some(value) = self.values.get(name).copied()
+        {
+            return Ok(value.cast(dtype));
+        }
         if let Some(v) = input.arg.as_float() {
             return Ok(match dtype {
                 DType::F64 => self.cx.constant_f64(v),
@@ -738,7 +743,15 @@ impl Translator<'_> {
 
         // Shape comparisons feed export's scalar assertions. They contain no
         // tensor data; Dynamo/export owns their guards at the call boundary.
-        if !node.outputs.is_empty() && node.outputs.iter().all(|out| out.as_sym_bool.is_some()) {
+        if !node.outputs.is_empty()
+            && node.outputs.iter().all(|out| out.as_sym_bool.is_some())
+            && !node.inputs.iter().any(|input| {
+                input
+                    .arg
+                    .as_value_name()
+                    .is_some_and(|name| self.values.contains_key(name))
+            })
+        {
             return Ok(());
         }
 
@@ -765,6 +778,76 @@ impl Translator<'_> {
 
     fn dispatch_target(&mut self, node: &Node, target: &str) -> Result<()> {
         let n = &node.inputs;
+        if matches!(
+            target,
+            "_operator.ge"
+                | "_operator.le"
+                | "_operator.gt"
+                | "_operator.lt"
+                | "_operator.eq"
+                | "_operator.ne"
+        ) {
+            let name = node
+                .outputs
+                .iter()
+                .find_map(|output| output.value_name())
+                .context("scalar comparison has no output")?
+                .to_owned();
+            let left = n[0]
+                .arg
+                .as_value_name()
+                .and_then(|name| self.values.get(name))
+                .copied();
+            let right = n[1]
+                .arg
+                .as_value_name()
+                .and_then(|name| self.values.get(name))
+                .copied();
+            let dtype = left
+                .or(right)
+                .context("scalar comparison has no dataflow operand")?
+                .dtype;
+            let left = match left {
+                Some(value) => value,
+                None => self.scalar(&n[0], dtype)?,
+            };
+            let right = match right {
+                Some(value) => value,
+                None => self.scalar(&n[1], dtype)?,
+            };
+            let value = match target {
+                "_operator.ge" => left.ge(right),
+                "_operator.le" => left.le(right),
+                "_operator.gt" => left.gt(right),
+                "_operator.lt" => left.lt(right),
+                "_operator.eq" => left.eq(right),
+                _ => left.ne(right),
+            };
+            self.values.insert(name, value);
+            return Ok(());
+        }
+        if target == "torch.sym_ite" {
+            let condition = self
+                .values
+                .get(
+                    n[0].arg
+                        .as_value_name()
+                        .context("sym_ite condition is unnamed")?,
+                )
+                .copied()
+                .context("sym_ite condition has no scalar value")?;
+            let yes = self.scalar(&n[1], DType::I64)?;
+            let no = self.scalar(&n[2], DType::I64)?;
+            let name = node
+                .outputs
+                .iter()
+                .find_map(|output| output.value_name())
+                .context("sym_ite has no output")?
+                .to_owned();
+            self.values
+                .insert(name, condition.cast(DType::Bool).select(yes, no));
+            return Ok(());
+        }
 
         let value = match target {
             // ---- linear ----
