@@ -1309,7 +1309,11 @@ mod tests {
         assert_eq!(((h * w) / w).simplify(), h);
         assert_eq!(((w * h) / w).simplify(), h);
         assert_eq!(((h * w * c) / c).simplify(), (h * w).simplify());
-        assert!((((h * w) / w) * w).simplify().egglog_equal((h * w).simplify()));
+        assert!(
+            (((h * w) / w) * w)
+                .simplify()
+                .egglog_equal((h * w).simplify())
+        );
         // `div-mul-common-factor`: literal cofactors of a shared factor
         assert_eq!(((w * 4) / (w * 2)).simplify(), expr(2));
         // `div-mul-num-divisor`: a literal dividing the literal cofactor
