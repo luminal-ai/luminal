@@ -1054,6 +1054,14 @@ impl ReferenceRuntime {
     /// is not a bound output, and loud on a boolean buffer — use
     /// [`Self::get_bool8`] for those. Returns a borrow: reads never
     /// mutate or consume runtime state.
+    pub fn get_bf16(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<half::bf16>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_bf16()
+    }
+
+    pub fn get_f16(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<half::f16>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_f16()
+    }
+
     pub fn get_f32(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<f32>> {
         self.get_typed(self.output_buffer(tensor)?)?.as_f32()
     }

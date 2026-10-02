@@ -29,7 +29,13 @@ impl Scheduler for AlgebraBudget {
     fn filter_matches(&mut self, rule: &str, _: &str, matches: &mut Matches) -> bool {
         if !matches!(
             rule,
-            "int-add-associate"
+            "add/rewrite_2: associativity of LogicalAdd, Int only"
+                | "add/rewrite_2: associativity of LogicalAdd, Int64 only"
+                | "mul/rewrite_2: associativity of LogicalMul, Int only"
+                | "mul/rewrite_2: associativity of LogicalMul, Int64 only"
+                | "mul/rewrite_3: LogicalMul distributes over LogicalAdd, Int"
+                | "mul/rewrite_3: LogicalMul distributes over LogicalAdd, Int64"
+                | "int-add-associate"
                 | "int-mul-associate"
                 | "int-distribute-expand"
                 | "int-distribute-factor"

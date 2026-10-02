@@ -2,6 +2,7 @@
 
 import warnings
 
+import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
 
@@ -9,6 +10,34 @@ from backend_test_utils import compile_for_test as luminal_compile
 def _compile_and_run(module: torch.nn.Module, *inputs: torch.Tensor):
     compiled = luminal_compile(module, inputs, search_iterations=1, dynamic_shapes={})
     return compiled(*inputs)
+
+
+@pytest.mark.parametrize("op", [torch.cumsum, torch.cumprod])
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int8, torch.int16])
+@pytest.mark.parametrize("scalar", [False, True])
+def test_scan_promotes_before_accumulation(op, dtype, scalar):
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return op(value, 0)
+
+    value = torch.tensor(1 if scalar else [1, 1, 0, 1], dtype=dtype)
+    if not scalar and dtype != torch.bool:
+        value = torch.tensor([100, 100, 100, 100], dtype=dtype)
+    expected = Model()(value)
+    (actual,) = _compile_and_run(Model(), value)
+    assert actual.dtype == torch.int64
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("op", [torch.cumsum, torch.cumprod])
+def test_scan_explicit_accumulation_dtype(op):
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return op(value, 0, dtype=torch.float64)
+
+    value = torch.tensor([100, 100, 100, 100], dtype=torch.int8)
+    (actual,) = _compile_and_run(Model(), value)
+    torch.testing.assert_close(actual, Model()(value), rtol=0, atol=0)
 
 
 class CumulativeExtrema(torch.nn.Module):

@@ -150,6 +150,48 @@ pub(crate) fn kernel(
         return narrow_cast(ctx);
     }
     match (&ctx.operands[0], &mut ctx.dests[0]) {
+        (TypedBuffer::F16(input), TypedBuffer::F16(dest)) => dest.copy_from_slice(input),
+        (TypedBuffer::F16(input), TypedBuffer::F32(dest)) => {
+            for (o, i) in dest.iter_mut().zip(input) {
+                *o = i.to_f32();
+            }
+        }
+        (TypedBuffer::F32(input), TypedBuffer::F16(dest)) => {
+            for (o, i) in dest.iter_mut().zip(input) {
+                *o = half::f16::from_f32(*i);
+            }
+        }
+        (TypedBuffer::F16(input), TypedBuffer::F64(dest)) => {
+            for (o, i) in dest.iter_mut().zip(input) {
+                *o = i.to_f64();
+            }
+        }
+        (TypedBuffer::F64(input), TypedBuffer::F16(dest)) => {
+            for (o, i) in dest.iter_mut().zip(input) {
+                *o = half::f16::from_f64(*i);
+            }
+        }
+        (TypedBuffer::Bf16(input), TypedBuffer::Bf16(dest)) => dest.copy_from_slice(input),
+        (TypedBuffer::Bf16(input), TypedBuffer::F32(dest)) => {
+            for (o, i) in dest.iter_mut().zip(input) {
+                *o = i.to_f32();
+            }
+        }
+        (TypedBuffer::F32(input), TypedBuffer::Bf16(dest)) => {
+            for (o, i) in dest.iter_mut().zip(input) {
+                *o = half::bf16::from_f32(*i);
+            }
+        }
+        (TypedBuffer::Bf16(input), TypedBuffer::F64(dest)) => {
+            for (o, i) in dest.iter_mut().zip(input) {
+                *o = i.to_f64();
+            }
+        }
+        (TypedBuffer::F64(input), TypedBuffer::Bf16(dest)) => {
+            for (o, i) in dest.iter_mut().zip(input) {
+                *o = half::bf16::from_f64(*i);
+            }
+        }
         // Same-type: value-preserving copies.
         (TypedBuffer::F32(input), TypedBuffer::F32(dest)) => {
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");

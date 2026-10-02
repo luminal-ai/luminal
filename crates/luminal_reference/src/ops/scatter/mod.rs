@@ -259,6 +259,12 @@ pub(crate) fn kernel(
     }
     // Payload move: dest = copy(init); dest[target[i]] = src[i].
     match (&ctx.operands[0], &ctx.operands[1], &mut ctx.dests[0]) {
+        (TypedBuffer::F64(init), TypedBuffer::F64(src), TypedBuffer::F64(dest)) => {
+            dest.copy_from_slice(init);
+            for (i, target) in target_of.iter().enumerate() {
+                dest[*target] = src[i];
+            }
+        }
         (TypedBuffer::F32(init), TypedBuffer::F32(src), TypedBuffer::F32(dest)) => {
             dest.copy_from_slice(init);
             for (i, target) in target_of.iter().enumerate() {
@@ -296,6 +302,18 @@ pub(crate) fn kernel(
             }
         }
         (TypedBuffer::Bool8(init), TypedBuffer::Bool8(src), TypedBuffer::Bool8(dest)) => {
+            dest.copy_from_slice(init);
+            for (i, target) in target_of.iter().enumerate() {
+                dest[*target] = src[i];
+            }
+        }
+        (TypedBuffer::F16(init), TypedBuffer::F16(src), TypedBuffer::F16(dest)) => {
+            dest.copy_from_slice(init);
+            for (i, target) in target_of.iter().enumerate() {
+                dest[*target] = src[i];
+            }
+        }
+        (TypedBuffer::Bf16(init), TypedBuffer::Bf16(src), TypedBuffer::Bf16(dest)) => {
             dest.copy_from_slice(init);
             for (i, target) in target_of.iter().enumerate() {
                 dest[*target] = src[i];

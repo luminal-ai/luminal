@@ -35,6 +35,9 @@ _PT2_TO_TORCH = {
     6: torch.float16,
     7: torch.float32,
     8: torch.float64,
+    9: torch.complex32,
+    10: torch.complex64,
+    11: torch.complex128,
     12: torch.bool,
     13: torch.bfloat16,
 }
@@ -52,7 +55,7 @@ def _output_tensor(raw: bytes, dtype_code: int, shape: Sequence[int]) -> torch.T
         raise RuntimeError(
             f"luminal_reference cannot materialize PT2 dtype code {dtype_code}"
         )
-    if 0 in shape and not raw:
+    if 0 in shape:
         return torch.empty(tuple(shape), dtype=dtype, device="cpu")
     tensor = torch.frombuffer(bytearray(raw), dtype=dtype)
     return tensor.reshape(tuple(shape)).clone()

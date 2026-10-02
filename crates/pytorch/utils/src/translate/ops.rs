@@ -248,6 +248,7 @@ impl Translator<'_> {
         let x = self.operand(&node.inputs[0])?;
         let repeats = self.get_ints_arg(node, 1)?;
         let repeats: Vec<usize> = repeats.iter().map(|r| (*r).max(0) as usize).collect();
+        let x = (0..repeats.len().saturating_sub(x.rank())).fold(x, |v, _| v.expand_dim(0, 1usize));
         Ok(x.repeat(repeats.as_slice()))
     }
 
@@ -318,13 +319,32 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|i| i.arg.as_bool()))
             .unwrap_or(false);
         let dim = node.inputs.get(1).and_then(|i| i.arg.as_int());
+        if x.rank() == 0 {
+            if let Some(d) = dim
+                && d != 0
+                && d != -1
+            {
+                bail!("dim {d} is out of range for a rank-0 value");
+            }
+            return Ok(self.cx.constant_i64(0));
+        }
         let (result, axis) = match dim {
             Some(d) => {
                 let axis = normalize_dim(d, x.rank());
                 let r = if max { x.argmax(axis) } else { x.argmin(axis) };
                 (r, Some(axis))
             }
-            None => (if max { x.argmax(0) } else { x.argmin(0) }, None),
+            None => {
+                let flattened = x.flatten();
+                (
+                    if max {
+                        flattened.argmax(0)
+                    } else {
+                        flattened.argmin(0)
+                    },
+                    None,
+                )
+            }
         };
         let dtype = self.output_meta_dtype(node).unwrap_or(DType::I64);
         let result = if result.dtype != dtype {
@@ -334,6 +354,7 @@ impl Translator<'_> {
         };
         Ok(match (keepdim, axis) {
             (true, Some(axis)) => result.expand_dim(axis, 1usize),
+            (true, None) => (0..x.rank()).fold(result, |r, axis| r.expand_dim(axis, 1usize)),
             _ => result,
         })
     }
@@ -366,6 +387,10 @@ impl Translator<'_> {
 
     pub(super) fn translate_cumulative(&mut self, node: &Node, prod: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        // ATen accumulates in the declared output dtype: bool and narrow
+        // integers promote to i64 by default, and dtype= overrides that.
+        // Casting only the scan result would lose carries or overflow first.
+        let x = super::convert(x, self.compute_dtype(node)?);
         let dim = self.get_int_arg(node, 1)?;
         // A rank-0 scan is the identity, and only dims torch accepts there
         // reach it.
@@ -411,6 +436,12 @@ impl Translator<'_> {
     // ---------------------------------------------------------------
     // Creation and selection
     // ---------------------------------------------------------------
+
+    pub(super) fn translate_fill(&mut self, node: &Node, value: f64) -> Result<GraphTensor> {
+        let shape = self.output_meta_shape(node)?;
+        let dtype = self.output_meta_dtype(node)?;
+        Ok(self.full_tensor(shape, dtype, value))
+    }
 
     pub(super) fn translate_full(&mut self, node: &Node, like: bool) -> Result<GraphTensor> {
         let (shape, dtype, value) = if like {
@@ -557,7 +588,13 @@ impl Translator<'_> {
             let (out_b, min) = util::broadcast_binary(out, min);
             out = out_b.maximum(min);
         }
-        if let Some(max) = self.optional_tensor_operand(&node.inputs[2])? {
+        if let Some(max) = node
+            .inputs
+            .get(2)
+            .map(|input| self.optional_tensor_operand(input))
+            .transpose()?
+            .flatten()
+        {
             let (out_b, max) = util::broadcast_binary(out, max);
             out = out_b.minimum(max);
         }
@@ -566,6 +603,12 @@ impl Translator<'_> {
 
     pub(super) fn translate_softmax(&mut self, node: &Node, log: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        if x.rank() == 0 {
+            // Preserve NaN for infinite inputs, as ATen scalar softmax does.
+            #[allow(clippy::eq_op)]
+            let zero = x - x;
+            return Ok(if log { zero } else { zero.exp() });
+        }
         let dim = normalize_dim(self.get_int_arg(node, 1)?, x.rank());
         Ok(if log {
             x.log_softmax(dim)

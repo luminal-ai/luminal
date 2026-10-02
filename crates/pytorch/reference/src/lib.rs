@@ -34,13 +34,13 @@ fn kind_name(kind: &InputKind) -> &'static str {
     }
 }
 
-fn torch_code(dtype: DType) -> Result<u32> {
-    Ok(TorchDType::try_from(dtype)
-        .map_err(|d| anyhow!("no torch dtype for {d:?}"))?
-        .code())
-}
-
 fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
+    if matches!(dtype, DType::F16 | DType::Bf16) {
+        ensure!(
+            bytes.len().is_multiple_of(2),
+            "half input has an incomplete element"
+        );
+    }
     macro_rules! prim {
         ($t:ty, $variant:ident) => {{
             ensure!(
@@ -58,6 +58,18 @@ fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
         }};
     }
     Ok(match dtype {
+        DType::F16 => TypedBuffer::F16(
+            bytes
+                .chunks_exact(2)
+                .map(|b| half::f16::from_bits(u16::from_ne_bytes(b.try_into().unwrap())))
+                .collect(),
+        ),
+        DType::Bf16 => TypedBuffer::Bf16(
+            bytes
+                .chunks_exact(2)
+                .map(|b| half::bf16::from_bits(u16::from_ne_bytes(b.try_into().unwrap())))
+                .collect(),
+        ),
         DType::F32 => prim!(f32, F32),
         DType::F64 => prim!(f64, F64),
         DType::Int => prim!(i32, I32),
@@ -74,6 +86,7 @@ fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
     translation: Translation,
+    torch_dtypes: HashMap<String, u32>,
     runtime: ReferenceRuntime,
     /// The buffer each output was bound on, parallel to
     /// `translation.outputs`.
@@ -163,6 +176,8 @@ fn resolve_shape(shape: &[IntExpr], dims: &DynMap) -> Vec<usize> {
 /// to the search.
 fn zero_buffer(dtype: DType, elements: usize) -> TypedBuffer {
     match dtype {
+        DType::F16 => TypedBuffer::F16(vec![half::f16::ZERO; elements]),
+        DType::Bf16 => TypedBuffer::Bf16(vec![half::bf16::ZERO; elements]),
         DType::F32 => TypedBuffer::F32(vec![0.0; elements]),
         DType::F64 => TypedBuffer::F64(vec![0.0; elements]),
         DType::Int => TypedBuffer::I32(vec![0; elements]),
@@ -209,7 +224,7 @@ impl CompiledGraph {
         self.translation
             .inputs
             .iter()
-            .map(|input| torch_code(input.dtype).map_err(to_py))
+            .map(|input| Ok(self.torch_dtypes[&input.graph_name]))
             .collect()
     }
 
@@ -236,7 +251,7 @@ impl CompiledGraph {
         self.translation
             .outputs
             .iter()
-            .map(|output| torch_code(output.dtype).map_err(to_py))
+            .map(|output| Ok(self.torch_dtypes[&output.graph_name]))
             .collect()
     }
 
@@ -272,7 +287,7 @@ impl CompiledGraph {
     /// `shape` is the concrete tensor shape at the call site. Its axes bind
     /// the graph's symbolic dims, so a symbolic input can be driven at a new
     /// extent without re-exporting.
-    fn set_input(&mut self, name: &str, bytes: &[u8], shape: Vec<usize>) -> PyResult<()> {
+    fn set_input(&mut self, name: &str, bytes: &[u8], mut shape: Vec<usize>) -> PyResult<()> {
         let (dtype, bindings): (DType, Vec<(usize, Symbol)>) = {
             let input = self
                 .translation
@@ -280,6 +295,13 @@ impl CompiledGraph {
                 .iter()
                 .find(|input| input.graph_name == name)
                 .ok_or_else(|| PyRuntimeError::new_err(format!("unknown input {name:?}")))?;
+            if TorchDType::from_code(self.torch_dtypes[name])
+                .ok()
+                .and_then(|d| d.complex_component_dtype())
+                .is_some()
+            {
+                shape.push(2);
+            }
             if input.shape.len() != shape.len() {
                 return Err(PyRuntimeError::new_err(
                     "input rank differs from exported rank",
@@ -636,6 +658,8 @@ impl CompiledGraph {
             };
         }
         let bytes = match output.dtype {
+            DType::F16 => as_bytes(read!(get_f16, as_f16).map_err(to_py)?),
+            DType::Bf16 => as_bytes(read!(get_bf16, as_bf16).map_err(to_py)?),
             DType::F32 => as_bytes(read!(get_f32, as_f32).map_err(to_py)?),
             DType::F64 => as_bytes(read!(get_f64, as_f64).map_err(to_py)?),
             DType::Int => as_bytes(read!(get_i32, as_i32).map_err(to_py)?),
@@ -734,7 +758,20 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
     let runtime = ReferenceRuntime::load_with(&translation.graph, bindings)
         .context("loading the translated graph on the reference runtime")
         .map_err(to_py)?;
+    let torch_dtypes = translation
+        .inputs
+        .iter()
+        .map(|i| &i.graph_name)
+        .chain(translation.outputs.iter().map(|o| &o.graph_name))
+        .map(|name| {
+            (
+                name.clone(),
+                parsed.tensor_meta(name).expect("boundary metadata").dtype,
+            )
+        })
+        .collect();
     Ok(CompiledGraph {
+        torch_dtypes,
         translation,
         runtime,
         output_buffers,

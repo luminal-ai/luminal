@@ -538,7 +538,10 @@ impl Translator<'_> {
             });
         }
         if let Some(v) = input.arg.as_int() {
-            return Ok(self.cx.constant_i32(v).cast(dtype));
+            return Ok(self.cx.constant_i64(v).cast(dtype));
+        }
+        if let Some(v) = input.arg.as_bool() {
+            return Ok(self.full_tensor(vec![], dtype, f64::from(v)));
         }
         bail!(
             "operand {:?} is not a scalar (arg: {:?})",
@@ -816,7 +819,32 @@ impl Translator<'_> {
                 self.operand(&n[0])?.round()
             }
             // ---- elementwise binary ----
-            "add.Tensor" | "add.Scalar" => self.binary(n, |a, b| a + b)?,
+            "add.Tensor" | "add.Scalar" => {
+                let a = self.operand(&n[0])?;
+                let b = if let Some(t) = self.optional_tensor_operand(&n[1])? {
+                    t
+                } else {
+                    self.scalar(&n[1], a.dtype)?
+                };
+                let alpha_input = n.iter().find(|i| i.name == "alpha");
+                let scaled = match alpha_input {
+                    None => b,
+                    Some(input)
+                        if input.arg.as_float() == Some(1.0)
+                            || input.arg.as_int() == Some(1)
+                            || input.arg.as_bool() == Some(true) =>
+                    {
+                        b
+                    }
+                    Some(input) => {
+                        let alpha = self.scalar(input, b.dtype)?;
+                        let (b, alpha) = broadcast_pair(b, alpha);
+                        b * alpha
+                    }
+                };
+                let (a, b) = broadcast_pair(a, scaled);
+                a + b
+            }
             "sub.Tensor" | "sub.Scalar" => self.binary(n, |a, b| a - b)?,
             "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
@@ -1002,6 +1030,8 @@ impl Translator<'_> {
             // ---- creation / selection ----
             "full.default" => self.translate_full(node, false)?,
             "full_like.default" => self.translate_full(node, true)?,
+            "zeros.default" | "new_zeros.default" => self.translate_fill(node, 0.0)?,
+            "ones.default" | "new_ones.default" => self.translate_fill(node, 1.0)?,
             "zeros_like.default" => self.translate_like_fill(node, 0.0)?,
             "ones_like.default" => self.translate_like_fill(node, 1.0)?,
             "arange.start_step" => self.translate_arange(node, 2)?,
@@ -1506,6 +1536,8 @@ fn opmath_target(target: &str) -> bool {
             | "leaky_relu.default"
             | "angle.default"
             // reductions
+            | "cumsum.default"
+            | "cumprod.default"
             | "sum.default"
             | "sum.dim_IntList"
             | "mean.default"

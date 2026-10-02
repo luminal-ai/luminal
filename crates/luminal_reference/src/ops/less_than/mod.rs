@@ -141,6 +141,28 @@ pub(crate) fn kernel(
     // Bool8 invariant; never a partial-bit write). Int comparisons are
     // native and exact — no f32 detour (typed buffers 2026-08-11).
     match (&ctx.operands[0], &ctx.operands[1]) {
+        (TypedBuffer::F64(lhs), TypedBuffer::F64(rhs)) => {
+            let (lhs, rhs) = (lhs.clone(), rhs.clone());
+            let dest = ctx.dests[0].as_bool8_mut()?;
+            anyhow::ensure!(
+                lhs.len() == rhs.len() && lhs.len() == dest.len(),
+                "less-than kernel length mismatch"
+            );
+            for (index, out) in dest.iter_mut().enumerate() {
+                *out = u8::from(lhs[index] < rhs[index]);
+            }
+        }
+        (TypedBuffer::Bool8(lhs), TypedBuffer::Bool8(rhs)) => {
+            let (lhs, rhs) = (lhs.clone(), rhs.clone());
+            let dest = ctx.dests[0].as_bool8_mut()?;
+            anyhow::ensure!(
+                lhs.len() == rhs.len() && lhs.len() == dest.len(),
+                "less-than kernel length mismatch"
+            );
+            for (index, out) in dest.iter_mut().enumerate() {
+                *out = u8::from(lhs[index] < rhs[index]);
+            }
+        }
         (TypedBuffer::F32(lhs), TypedBuffer::F32(rhs)) => {
             let (lhs, rhs) = (lhs.clone(), rhs.clone());
             let dest = ctx.dests[0].as_bool8_mut()?;

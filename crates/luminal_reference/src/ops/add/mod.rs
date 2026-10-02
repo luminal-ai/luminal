@@ -147,6 +147,8 @@ pub(crate) fn kernel(
 ) -> anyhow::Result<()> {
     match &ctx.operands[0] {
         TypedBuffer::F32(_) => ctx.binary_elementwise(|a, b| a + b),
+        TypedBuffer::F64(_) => ctx.binary_elementwise_f64(|a, b| Ok(a + b)),
+        TypedBuffer::Bool8(_) => ctx.binary_elementwise_bool(|a, b| a | b),
         TypedBuffer::I32(_) => ctx.binary_elementwise_i32(|a, b| {
             a.checked_add(b).ok_or_else(|| {
                 anyhow::anyhow!("i32 add overflow: {a} + {b} (ints are non-wrapping)")

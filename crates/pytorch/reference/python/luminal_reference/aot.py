@@ -264,7 +264,13 @@ class ReferenceAOTBackend:
         max_intermediate_bytes=None,
         memory_budget_bytes=None,
         dim_buckets=None,
+        export_mode="pt2",
     ):
+        # PT2 is the native serialization boundary for every AOT region.
+        # Preserve callers that explicitly selected it before AOT became the
+        # default frontend, while rejecting any unsupported alternate route.
+        if export_mode != "pt2":
+            raise ValueError("export_mode must be 'pt2'")
         self.dim_buckets = normalize_buckets(dim_buckets)
         self.regions: list[RegionRecord] = []
         self.graphs: list[GraphRecord] = []

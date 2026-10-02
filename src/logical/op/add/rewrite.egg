@@ -4,3 +4,29 @@
   (LogicalAdd ?rhs ?lhs)
   :ruleset main_ruleset :name "add/rewrite: commutativity of LogicalAdd"
 )
+
+; Exact integer zero addition cannot overflow, including unbounded inputs.
+(rule
+  ((= ?out (LogicalAdd ?x ?zero))
+   (= (Int) (dtype-of ?out))
+   (= ?shape (shape-of ?x))
+   (= ?shape (shape-of ?zero))
+   (= (bigint 0) (value-lower-bound-of ?zero))
+   (= (bigint 0) (value-upper-bound-of ?zero)))
+  ((union ?out ?x)
+   (subsume (LogicalAdd ?x ?zero))
+   (subsume (LogicalAdd ?zero ?x)))
+  :ruleset main_ruleset :name "add/rewrite: integer zero identity Int")
+
+; Exact integer zero addition cannot overflow, including unbounded inputs.
+(rule
+  ((= ?out (LogicalAdd ?x ?zero))
+   (= (Int64) (dtype-of ?out))
+   (= ?shape (shape-of ?x))
+   (= ?shape (shape-of ?zero))
+   (= (bigint 0) (value-lower-bound-of ?zero))
+   (= (bigint 0) (value-upper-bound-of ?zero)))
+  ((union ?out ?x)
+   (subsume (LogicalAdd ?x ?zero))
+   (subsume (LogicalAdd ?zero ?x)))
+  :ruleset main_ruleset :name "add/rewrite: integer zero identity Int64")

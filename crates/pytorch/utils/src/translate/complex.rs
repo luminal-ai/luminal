@@ -610,6 +610,34 @@ impl Translator<'_> {
                     self.store_complex(output_name, value.map(|c| c.cumsum(dim)));
                 }
             }
+            "cumprod.default" => {
+                let mut value = self.get_complex_input(node, 0)?;
+                if value.real.rank() > 0 {
+                    let axis = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank());
+                    let length = value.real.dims()[axis].to_usize().ok_or_else(|| {
+                        anyhow::anyhow!("complex cumprod requires a concrete scan dimension")
+                    })?;
+                    let mut offset = 1;
+                    while offset < length {
+                        // Inclusive prefix product in real components. The
+                        // missing prefix is the complex multiplicative identity.
+                        let mut padding =
+                            vec![(IntExpr::from(0), IntExpr::from(0)); value.real.rank()];
+                        padding[axis].0 = IntExpr::from(offset);
+                        let left = ComplexTensor {
+                            torch_dtype: value.torch_dtype,
+                            real: value
+                                .real
+                                .pad(padding.clone(), 1.0)
+                                .slice_along(0..length, axis),
+                            imag: value.imag.pad(padding, 0.0).slice_along(0..length, axis),
+                        };
+                        value = self.complex_mul(left, value);
+                        offset *= 2;
+                    }
+                }
+                self.store_complex(output_name, value);
+            }
 
             // ---- matmul family ----
             "mm.default" | "bmm.default" => {

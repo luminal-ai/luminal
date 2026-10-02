@@ -252,12 +252,16 @@ impl Translator<'_> {
         // reciprocal flips the sign bit for every finite value and keeps
         // -0.0 negative.
         let zero = self.constant_like(value, 0.0);
-        value.reciprocal().lt(zero)
+        let negative = value.lt(zero);
+        let negative_zero = value.reciprocal().lt(zero);
+        self.bool_or(negative, negative_zero)
     }
 
     pub(super) fn copy_sign(&mut self, magnitude: GraphTensor, sign: GraphTensor) -> GraphTensor {
         let (magnitude, sign) = broadcast_binary(magnitude, sign);
-        magnitude.abs() * sign.sign().cast(magnitude.dtype)
+        let negative = self.signbit(sign);
+        let absolute = magnitude.abs();
+        self.select(negative, -absolute, absolute)
     }
 
     /// A floating scalar of the tensor's own dtype (F64 keeps doubles).
@@ -484,8 +488,15 @@ impl Translator<'_> {
     ) -> GraphTensor {
         let scalar = match dtype {
             DType::F64 => self.cx.constant_f64(value),
-            DType::I64 => self.cx.constant_i64(value as i64),
-            DType::Int => self.cx.constant_i64(value as i64).cast(DType::Int),
+            DType::Bool => self.cx.constant_i32(i64::from(value != 0.0)).cast(dtype),
+            DType::I64
+            | DType::Int
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16
+            | DType::I4
+            | DType::U4 => self.cx.constant_i64(value as i64).cast(dtype),
             _ => self.cx.constant_f32(value as f32).cast(dtype),
         };
         scalar.expand_rhs(shape)
