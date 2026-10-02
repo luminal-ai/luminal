@@ -382,15 +382,22 @@ impl CompiledGraph {
                 "search() must run before execute()",
             ));
         }
-        // SAFETY: the Python wrapper holds this PyTorch allocation through completion.
-        let arena = unsafe { luminal_cuda_lite::CudaArena::from_raw(arena_ptr, arena_bytes) };
-        self.runtime
-            .execute(
-                arena,
-                #[cfg(feature = "device")]
-                &mut staging.inner,
-            )
-            .map_err(to_py)
+        #[cfg(feature = "device")]
+        {
+            // SAFETY: the Python wrapper holds this PyTorch allocation through completion.
+            let arena = unsafe { luminal_cuda_lite::CudaArena::from_raw(arena_ptr, arena_bytes) };
+            self.runtime
+                .execute(arena, &mut staging.inner)
+                .map_err(to_py)
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            // Another workspace crate may enable the runtime's device feature
+            // without enabling this wrapper's feature or staging storage.
+            Err(PyRuntimeError::new_err(
+                "CUDA execution requires the Python wrapper's `device` feature",
+            ))
+        }
     }
 
     #[cfg_attr(not(feature = "device"), allow(unused_variables, unused_mut))]
@@ -405,15 +412,23 @@ impl CompiledGraph {
                 "search() must run before execute_async()",
             ));
         }
-        // SAFETY: the capture wrapper owns the arena until its GPU work completes.
-        unsafe {
-            self.runtime.execute_async(
-                luminal_cuda_lite::CudaArena::from_raw(arena_ptr, arena_bytes),
-                #[cfg(feature = "device")]
-                &mut staging.inner,
-            )
+        #[cfg(feature = "device")]
+        {
+            // SAFETY: the capture wrapper owns the arena until its GPU work completes.
+            unsafe {
+                self.runtime.execute_async(
+                    luminal_cuda_lite::CudaArena::from_raw(arena_ptr, arena_bytes),
+                    &mut staging.inner,
+                )
+            }
+            .map_err(to_py)
         }
-        .map_err(to_py)
+        #[cfg(not(feature = "device"))]
+        {
+            Err(PyRuntimeError::new_err(
+                "CUDA execution requires the Python wrapper's `device` feature",
+            ))
+        }
     }
 
     /// The runtime's cumulative counters, or None before it touched a device.
