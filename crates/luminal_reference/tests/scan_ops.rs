@@ -18,7 +18,12 @@ fn run_f32(build: impl Fn(&mut Graph) -> (GraphTensor, GraphTensor), input: Vec<
     let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
     data.insert(operand.id, TypedBuffer::F32(input.clone()));
     runtime
-        .search(&data, &harness_search_options())
+        .search(
+            &SymbolBounds::default(),
+            &FxHashMap::default(),
+            &data,
+            &harness_search_options(),
+        )
         .expect("search");
 
     runtime.set_data(operand.id, TypedBuffer::F32(input));
