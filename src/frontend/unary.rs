@@ -657,7 +657,16 @@ pub(super) mod tests {
         let b = func(a);
 
         let v = random_vec(shape.iter().copied().product());
-        let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, v.clone().into())]);
+        // `func` may fold to the identity, for example an all-zero `pad`, and
+        // then the result is the input itself, which is no leaf. Bind it
+        // explicitly whatever it turned out to be, as `run_pow` does.
+        let bindings = luminal_reference::ReferenceBindings::dense(&cx.logical, &[b.id]);
+        let rt = luminal_reference::harness::run_reference_bound(
+            &cx,
+            bindings,
+            &[(a.id, v.clone().into())],
+            &[],
+        );
 
         // Reference
         let device = Device::Cpu;
