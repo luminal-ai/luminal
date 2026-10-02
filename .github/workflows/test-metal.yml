@@ -13,7 +13,7 @@ env:
 jobs:
     metal_unit_test:
         name: Metal Unit Tests
-        runs-on: macos-14
+        runs-on: macos-15
         timeout-minutes: 30
 
         steps:
@@ -23,7 +23,7 @@ jobs:
 
     llama_1b_metal_example:
         name: Llama 1B Metal Example
-        runs-on: macos-14-xlarge
+        runs-on: macos-15-xlarge
         timeout-minutes: 120
 
         steps:
