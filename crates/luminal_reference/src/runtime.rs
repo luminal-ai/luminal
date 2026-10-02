@@ -574,7 +574,9 @@ impl ReferenceRuntime {
         let full = format!("{}\n\n{}", crate::assembled_program(), program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
         let saturation_start = std::time::Instant::now();
-        if let Err(err) = egraph.parse_and_run_program(None, &full) {
+        if let Err(err) =
+            crate::saturation::run_program(&mut egraph, &full, options.algebra_match_budget)
+        {
             // NAME THE DOOR (ruling 2026-08-13): a failed authoring
             // contract must never surface as a bare saturation error.
             // Re-saturate WITHOUT the checks, then run each labeled
@@ -587,7 +589,9 @@ impl ReferenceRuntime {
                 spec.bound.text_unchecked_with_seeds(&spec.binding_seeds)
             );
             let mut probe = luminal::egglog_snippet::new_egraph();
-            if probe.parse_and_run_program(None, &unchecked).is_ok() {
+            if crate::saturation::run_program(&mut probe, &unchecked, options.algebra_match_budget)
+                .is_ok()
+            {
                 let mut failed: Vec<&str> = Vec::new();
                 for (label, text) in &spec.bound.labeled_checks {
                     if probe.parse_and_run_program(None, text).is_err() {

@@ -105,6 +105,8 @@ pub use luminal::search_support::{
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
+    /// Cumulative optional ring-expansion matches; None requests exhaustive saturation.
+    pub algebra_match_budget: Option<usize>,
     /// Maximum size of one non-boundary buffer, checked before profiling or execution.
     pub max_intermediate_bytes: usize,
     /// Aggregate live tensor payload and kernel scratch ceiling.
@@ -127,6 +129,7 @@ pub struct CompileOptions {
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
+            algebra_match_budget: Some(crate::saturation::DEFAULT_ALGEBRA_MATCH_BUDGET),
             max_intermediate_bytes: crate::runtime::DEFAULT_MAX_INTERMEDIATE_BYTES,
             memory_budget_bytes: crate::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
             generations: 8,
@@ -639,12 +642,13 @@ pub fn bucketed_search_implementations(
 ) -> Result<Vec<BucketPlan>> {
     ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
     let mut plans = Vec::new();
-    for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
+    for (ranges, representative, program) in
+        bucket_renders(assembly, dim_buckets, options.algebra_match_budget)?
+    {
         check_interrupt()?;
         let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
-        egraph
-            .parse_and_run_program(None, &text)
+        crate::saturation::run_program(&mut egraph, &text, options.algebra_match_budget)
             .map_err(|err| anyhow!("bucket {ranges:?} representative render fails: {err}"))?;
         check_interrupt()?;
         crate::decoder_registry().check(&egraph)?;
@@ -702,6 +706,7 @@ type BucketRender = (
 fn bucket_renders(
     assembly: &BucketAssembly<'_>,
     dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
+    algebra_match_budget: Option<usize>,
 ) -> Result<Vec<BucketRender>> {
     let seeds_text = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| {
         let mut text = String::new();
@@ -765,9 +770,12 @@ fn bucket_renders(
         }
         let validation = assemble(&validation_seeds);
         let text = format!("{}\n\n{}", assembly.assembled_program, validation.text);
-        luminal::egglog_snippet::new_egraph()
-            .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
+        crate::saturation::run_program(
+            &mut luminal::egglog_snippet::new_egraph(),
+            &text,
+            algebra_match_budget,
+        )
+        .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
 
         // Extract from the range-valid fixpoint (matching CUDA Lite): the
         // bucket's dimensional seeds stay INTERVALS, so the winning plan's
@@ -804,6 +812,7 @@ pub fn select_bucket<'a>(
 /// PRODUCTION-PATH helper (the CL examples call it), not a test fixture.
 pub fn harness_search_options() -> CompileOptions {
     CompileOptions {
+        algebra_match_budget: Some(crate::saturation::DEFAULT_ALGEBRA_MATCH_BUDGET),
         max_intermediate_bytes: crate::runtime::DEFAULT_MAX_INTERMEDIATE_BYTES,
         memory_budget_bytes: crate::runtime::DEFAULT_MEMORY_BUDGET_BYTES,
         generations: 2,

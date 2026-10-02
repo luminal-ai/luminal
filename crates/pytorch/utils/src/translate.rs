@@ -1140,6 +1140,20 @@ impl Translator<'_> {
                             .ok_or_else(|| anyhow!("cat: unknown tensor {}", t.name))?,
                     );
                 }
+                // ATen accepts a rank-one empty tensor alongside tensors of
+                // any rank (including the initial Hugging Face KV cache).
+                // Discard these placeholders before resolving the axis from
+                // the real operands; retain one when every operand is empty.
+                let empty = values
+                    .iter()
+                    .copied()
+                    .find(|value| value.rank() == 1 && value.dims()[0].to_usize() == Some(0));
+                values.retain(|value| value.rank() != 1 || value.dims()[0].to_usize() != Some(0));
+                if values.is_empty()
+                    && let Some(empty) = empty
+                {
+                    values.push(empty);
+                }
                 let mut iter = values.into_iter();
                 let mut acc = iter.next().ok_or_else(|| anyhow!("cat: empty list"))?;
                 let rank = acc.rank();

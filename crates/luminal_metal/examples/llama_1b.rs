@@ -478,22 +478,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let outputs: Vec<_> = std::iter::once(logits.id)
         .chain(cache_outputs.iter().flat_map(|(k, v)| [k.id, v.id]))
         .collect();
-    let bindings = luminal_metal::bindings::MetalBindings::dense(&cx.logical, &outputs);
-    let mut runtime = MetalRuntime::load_with(&cx, bindings, luminal_metal::metal_registry())?;
-    runtime.bind_dim_buckets(
-        's',
-        vec![
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(search_s),
-        ],
-    )?;
-    runtime.bind_dim_buckets(
-        'c',
-        vec![
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_context).representative(search_c),
-        ],
-    )?;
     println!("Loading weights...");
     let load_start = Instant::now();
     let checkpoint = std::fs::read(model_dir.join("model.safetensors"))?;
@@ -531,6 +515,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     drop(tensors);
     drop(checkpoint);
     println!("  Weight load: {:.2} s", load_start.elapsed().as_secs_f64());
+    let mut bindings = luminal_metal::bindings::MetalBindings::dense(&cx.logical, &outputs);
+    // Checkpoint tensors are immutable. Keep their arena homes across
+    // profiling trials and serving calls instead of copying the checkpoint
+    // on every execution. Cache inputs remain writable and caller-staged.
+    for &id in data.keys() {
+        bindings.resident(id)?;
+    }
+    let mut runtime = MetalRuntime::load_with(&cx, bindings, luminal_metal::metal_registry())?;
+    runtime.bind_dim_buckets(
+        's',
+        vec![
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(search_s),
+        ],
+    )?;
+    runtime.bind_dim_buckets(
+        'c',
+        vec![
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_context).representative(search_c),
+        ],
+    )?;
     let cache_elements = MAX_SEQ_LEN * KV_DIM;
     for i in 0..LAYERS {
         data.insert(kv_cache.k_caches[i].id, vec![0.0f32; cache_elements].into());
