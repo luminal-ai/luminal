@@ -1971,13 +1971,43 @@ type RenderKey = (ClassId, usize, Option<&'static str>);
 struct RenderCtx {
     egraph: EGraph,
     class_nodes: HashMap<ClassId, Vec<NodeId>>,
+    logical_nodes: HashMap<ClassId, NodeId>,
     memo: RefCell<HashMap<RenderKey, Rc<str>>>,
 }
 
 impl RenderCtx {
     fn new(egraph: &EGraph) -> Self {
+        let class_nodes = render_class_nodes(egraph);
+        // Preserve the registered constructor order and first-member tie
+        // break used by choose_logical_node, but index it once per session.
+        // Repeated metadata ancestry walks otherwise rescan every spelling
+        // for each port, output, and candidate on convergent model graphs.
+        let mut priorities = HashMap::new();
+        for (priority, op) in crate::logical_op::built_in_logical_ops()
+            .iter()
+            .chain(crate::logical_helper::built_in_logical_helpers())
+            .enumerate()
+        {
+            priorities
+                .entry(op.egglog_constructor())
+                .or_insert(priority);
+        }
+        let logical_nodes = class_nodes
+            .iter()
+            .filter_map(|(class, nodes)| {
+                nodes
+                    .iter()
+                    .filter_map(|id| {
+                        let node = egraph.nodes.get(id)?;
+                        Some((*priorities.get(node.op.as_str())?, id))
+                    })
+                    .min_by_key(|(priority, _)| *priority)
+                    .map(|(_, id)| (class.clone(), id.clone()))
+            })
+            .collect();
         Self {
-            class_nodes: render_class_nodes(egraph),
+            class_nodes,
+            logical_nodes,
             egraph: egraph.clone(),
             memo: RefCell::new(HashMap::new()),
         }
@@ -1987,6 +2017,7 @@ impl RenderCtx {
         ClassRenderer {
             egraph: &self.egraph,
             class_nodes: &self.class_nodes,
+            logical_nodes: &self.logical_nodes,
             memo: &self.memo,
         }
     }
@@ -1995,6 +2026,7 @@ impl RenderCtx {
 struct ClassRenderer<'a> {
     egraph: &'a EGraph,
     class_nodes: &'a HashMap<ClassId, Vec<NodeId>>,
+    logical_nodes: &'a HashMap<ClassId, NodeId>,
     memo: &'a RefCell<HashMap<RenderKey, Rc<str>>>,
 }
 
@@ -2296,21 +2328,10 @@ impl<'a> ClassRenderer<'a> {
     }
 
     fn choose_logical_node(&self, class: &ClassId) -> Option<&NodeId> {
-        let node_ids = self.class_nodes.get(class)?;
-        for op in crate::logical_op::built_in_logical_ops()
-            .iter()
-            .chain(crate::logical_helper::built_in_logical_helpers())
-        {
-            if let Some(node_id) = node_ids.iter().find(|node_id| {
-                self.egraph
-                    .nodes
-                    .get(*node_id)
-                    .is_some_and(|node| node.op == op.egglog_constructor())
-            }) {
-                return Some(node_id);
-            }
-        }
-        choose_render_node(self.egraph, node_ids, None)
+        self.logical_nodes.get(class).or_else(|| {
+            let node_ids = self.class_nodes.get(class)?;
+            choose_render_node(self.egraph, node_ids, None)
+        })
     }
 
     /// ONE LEVEL OF INDIRECTION (Austin's ruling 2026-08-07): a logical
@@ -4346,6 +4367,50 @@ mod render_memo_tests {
         add("a3", "A3", vec!["a2", "leaf"]);
         add("a4", "A4", vec!["a3", "leaf"]);
         egraph
+    }
+
+    #[test]
+    fn logical_node_index_preserves_registry_priority_and_member_order() {
+        let mut graph = shared_child_chain();
+        for (id, op) in [
+            ("logical-mul", "LogicalMul"),
+            ("logical-add-1", "LogicalAdd"),
+            ("logical-add-2", "LogicalAdd"),
+        ] {
+            graph.add_node(
+                NodeId::from(id),
+                Node {
+                    op: op.to_owned(),
+                    children: vec![NodeId::from("leaf"), NodeId::from("leaf")],
+                    eclass: ClassId::from("logical-class"),
+                    cost: ordered_float::NotNan::new(1.0).unwrap(),
+                    subsumed: false,
+                },
+            );
+        }
+        let context = RenderCtx::new(&graph);
+        let renderer = context.renderer();
+        for (class, nodes) in &context.class_nodes {
+            let legacy = crate::logical_op::built_in_logical_ops()
+                .iter()
+                .chain(crate::logical_helper::built_in_logical_helpers())
+                .find_map(|op| {
+                    nodes.iter().find(|id| {
+                        graph
+                            .nodes
+                            .get(*id)
+                            .is_some_and(|node| node.op == op.egglog_constructor())
+                    })
+                })
+                .or_else(|| super::choose_render_node(&graph, nodes, None));
+            assert_eq!(renderer.choose_logical_node(class), legacy);
+            assert_eq!(renderer.choose_logical_node(class), legacy);
+        }
+        assert!(
+            context
+                .logical_nodes
+                .contains_key(&ClassId::from("logical-class"))
+        );
     }
 
     /// The memo returns the SAME text on the second call, and adds no
