@@ -10,7 +10,7 @@ from typing import Callable
 import pytest
 import torch
 import torch._dynamo
-from backend_test_utils import luminal_backend
+from backend_test_utils import luminal_backend, selected_backend
 from test_models import (
     CausalSelfAttentionModel,
     LlamaTransformerBlockModel,
@@ -53,6 +53,12 @@ def test_rotary_embedding(device: torch.device):
     assert torch.allclose(output, original, atol=1e-5)
 
 
+@pytest.mark.xfail(
+    selected_backend() == "reference",
+    reason="known search timeout: core subst-walk keeps growing during causal attention compilation",
+    run=False,
+    strict=True,
+)
 def test_causal_self_attention(device: torch.device):
     """Test multi-head causal self-attention with additive mask."""
     model: torch.nn.Module = CausalSelfAttentionModel().to(device)

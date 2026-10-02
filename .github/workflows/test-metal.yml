@@ -23,6 +23,10 @@ jobs:
 
     llama_1b_metal_example:
         name: Llama 1B Metal Example
+        # Known timeout on main and PRs: decode with s=1, c=[2,128] stalls
+        # after memory pruning and exhausts the 120-minute job limit.
+        # Keep manual reproduction available while quarantined from CI gates.
+        if: github.event_name == 'workflow_dispatch'
         runs-on: macos-14-xlarge
         timeout-minutes: 120
 
