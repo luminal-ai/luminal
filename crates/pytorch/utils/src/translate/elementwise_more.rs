@@ -182,7 +182,13 @@ impl Translator<'_> {
         let a_zero = self.exact_is_zero(a);
         let b_zero = self.exact_is_zero(b);
         let both_zero = self.bool_and(a_zero, b_zero);
-        let zero_result = if max { a.abs() } else { -a.abs() };
+        // ATen calls the host C library's fmax/fmin. GNU's equal-zero
+        // case returns the first operand; Darwin chooses +0/-0 respectively.
+        let zero_result = if cfg!(target_vendor = "apple") {
+            if max { a.abs() } else { -a.abs() }
+        } else {
+            a
+        };
         let ordered = self.real_select(both_zero, zero_result, ordered);
         let a_nan = self.is_nan(a);
         let b_nan = self.is_nan(b);

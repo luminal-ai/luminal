@@ -300,14 +300,23 @@ pub fn search_implementations(
     }
 
     let allow = allow_override;
+    if options.search_log_enabled() {
+        eprintln!("Metal: building producer index");
+    }
     let mut session =
         extractor::ExtractionSession::new_with_matcher_set(egraph, allow.as_deref(), matchers);
     let index = session.producer_index();
+    if options.search_log_enabled() {
+        eprintln!("Metal: producer index ready ({} classes)", index.len());
+    }
     timings.analysis_nanos = analysis_start.elapsed().as_nanos();
     let classes: Vec<_> = index.keys().cloned().collect();
     let mut rng = StdRng::seed_from_u64(options.seed);
 
     let space = session.sampling_space(&index);
+    if options.search_log_enabled() {
+        eprintln!("Metal: sampling space ready");
+    }
 
     let families: Vec<_> = index
         .values()
@@ -427,6 +436,12 @@ pub fn search_implementations(
                         }
                     };
                     let profile_start = Instant::now();
+                    if options.search_log_enabled() && best.is_none() {
+                        eprintln!(
+                            "Metal: profiling candidate ({} buffers)",
+                            plan.buffers.len()
+                        );
+                    }
                     let priced = evaluator.measure(
                         &plan,
                         options,

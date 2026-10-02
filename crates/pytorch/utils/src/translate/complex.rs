@@ -1624,8 +1624,18 @@ impl Translator<'_> {
         let b_real_zero = self.is_zero(b.real);
         let b_imag_zero = self.is_zero(b.imag);
         let denominator_zero = cx_bool_and(b_real_zero, b_imag_zero);
-        let real_inf = self.signed_constant_like(b.real, f64::INFINITY);
-        let imag_inf = self.signed_constant_like(b.imag, f64::INFINITY);
+        // c10::complex divides by abs(c)/abs(d) at the zero denominator.
+        // Its GCC implementation uses std::abs (clearing -0), while the
+        // Apple Clang implementation's comparison preserves zero's sign.
+        let (real_inf, imag_inf) = if cfg!(target_vendor = "apple") {
+            (
+                self.signed_constant_like(b.real, f64::INFINITY),
+                self.signed_constant_like(b.imag, f64::INFINITY),
+            )
+        } else {
+            let infinity = self.constant_like(b.real, f64::INFINITY);
+            (infinity, infinity)
+        };
         result.real = self.cx_select(denominator_zero, real_inf * a.real, result.real);
         result.imag = self.cx_select(denominator_zero, imag_inf * a.imag, result.imag);
         Ok(result)
@@ -1848,7 +1858,7 @@ impl Translator<'_> {
             stable_signed_acosh,
             signed_acosh,
         );
-        let signed_acos = self.copy_sign(acos_beta, value.imag);
+        let mut signed_acos = self.copy_sign(acos_beta, value.imag);
 
         let mut acos_real = acos_beta;
         let mut acos_imag = signed_acosh * -1.0;
@@ -1857,13 +1867,34 @@ impl Translator<'_> {
         let zero_with_nan_imag = cx_bool_and(real_zero, imag_nan);
         let half_pi = self.constant_like(acos_real, std::f64::consts::FRAC_PI_2);
         acos_real = self.cx_select(zero_with_nan_imag, half_pi, acos_real);
+        if !cfg!(target_vendor = "apple") {
+            // GNU cacosh preserves the imaginary half-pi at 0 + NaN*i.
+            let signed_half_pi = self.copy_sign(half_pi, value.imag);
+            signed_acos = self.cx_select(zero_with_nan_imag, signed_half_pi, signed_acos);
+        }
         let real_inf_with_nan_imag = cx_bool_and(real_inf, imag_nan);
-        let signed_infinity = self.signed_constant_like(value.real, f64::INFINITY);
+        let signed_infinity = if cfg!(target_vendor = "apple") {
+            self.signed_constant_like(value.real, f64::INFINITY)
+        } else {
+            self.constant_like(value.real, f64::NEG_INFINITY)
+        };
         acos_imag = self.cx_select(real_inf_with_nan_imag, signed_infinity, acos_imag);
 
         let mut asin_real = self.cx_asin(beta);
         asin_real = self.cx_select(zero_with_nan_imag, value.real, asin_real);
         let asin_imag = acos_imag * -1.0;
+
+        // ATen's x86 complex-double vector acos uses pi/2 - asin: the
+        // imaginary subtraction produces +0 for either signed zero.
+        // Keep that convention confined to acos; asin retains zero's sign.
+        if cfg!(target_arch = "x86_64")
+            && !cfg!(target_vendor = "apple")
+            && value.real.dtype == DType::F64
+        {
+            let imag_zero = self.is_zero(acos_imag);
+            let positive_zero = self.constant_like(acos_imag, 0.0);
+            acos_imag = self.cx_select(imag_zero, positive_zero, acos_imag);
+        }
 
         (
             ComplexTensor::new(acos_real, acos_imag, value.torch_dtype),

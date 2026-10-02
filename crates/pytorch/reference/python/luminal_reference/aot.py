@@ -32,6 +32,7 @@ class RegionRecord:
     targets: tuple[str, ...]
     executions: int = 0
     buckets: dict = field(default_factory=dict)
+    writeback_inputs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -39,6 +40,7 @@ class GraphRecord:
     phase: str
     code: str
     collectives: tuple[str, ...]
+    writeback_inputs: dict = field(default_factory=dict)
 
 
 def _collective(node):
@@ -228,6 +230,7 @@ def _compile_region(
                 compiled.record = record
             else:
                 record.buckets = compiled._graph.dim_buckets
+                record.writeback_inputs = compiled.writeback_inputs
         records.append(record)
 
     def run(*args):
@@ -265,6 +268,21 @@ def _compile_region(
         return tree_unflatten(result, spec)
 
     return run
+
+
+def _nearest2d_preserve_kernel(input, output_size, scale_factors):
+    # PyTorch's vec decomposition gathers floor(j / scale), even when the
+    # native nearest kernel returns its input for equal spatial sizes.
+    from torch._decomp.decompositions import upsample_compute_output_size
+
+    size = upsample_compute_output_size(input.size(), output_size, scale_factors)
+    scales = list(scale_factors) if scale_factors is not None else [None, None]
+    for axis in range(2):
+        if size[axis] == input.shape[axis + 2]:
+            scales[axis] = 1.0
+        elif size[axis] == 2 * input.shape[axis + 2]:
+            scales[axis] = 2.0
+    return torch.ops.aten.upsample_nearest2d.default(input, size, *scales)
 
 
 class ReferenceAOTBackend:
@@ -317,6 +335,34 @@ class ReferenceAOTBackend:
         )
 
     def __call__(self, gm, example_inputs):
+        # Normalize the vec frontend before CompositeImplicitAutograd expands
+        # it into a gather that misses ATen's equal-size kernel fast path.
+        for node in gm.graph.nodes:
+            if (
+                node.op != "call_function"
+                or node.target is not torch.nn.functional.interpolate
+                or len(node.args) != 1
+            ):
+                continue
+            kw = node.kwargs
+            value = node.args[0].meta.get("example_value")
+            if (
+                kw.get("mode", "nearest") == "nearest"
+                and isinstance(value, torch.Tensor)
+                and value.ndim == 4
+                and kw.get("align_corners") is None
+                and not kw.get("antialias", False)
+                and not kw.get("recompute_scale_factor", False)
+            ):
+                scale = kw.get("scale_factor")
+                scales = (scale, scale) if isinstance(scale, (int, float)) else scale
+                node.target = _nearest2d_preserve_kernel
+                size = kw.get("size")
+                size = (size, size) if isinstance(size, int) else size
+                node.args = (node.args[0], size, scales)
+                node.kwargs = {}
+        gm.graph.lint()
+        gm.recompile()
         from torch._guards import detect_fake_mode
 
         mode = detect_fake_mode(example_inputs)
@@ -338,6 +384,8 @@ class ReferenceAOTBackend:
                             axes.setdefault(expr, []).append((index, axis))
         from torch._dynamo.exc import TensorifyScalarRestartAnalysis
 
+        first_region = len(self.regions)
+        first_graph = len(self.graphs)
         try:
             compiled = self._backend(gm, example_inputs)
         except TensorifyScalarRestartAnalysis:
@@ -361,6 +409,14 @@ class ReferenceAOTBackend:
                             source.make_guard(GuardBuilder.CONSTANT_MATCH)
                         )
             compiled = self._backend(gm, example_inputs)
+        writebacks = {
+            name: target
+            for record in self.regions[first_region:]
+            for name, target in record.writeback_inputs.items()
+        }
+        for graph in self.graphs[first_graph:]:
+            writebacks.update(graph.writeback_inputs)
+        compiled.writeback_inputs = writebacks
         if not axes:
             return compiled
 
@@ -379,6 +435,7 @@ class ReferenceAOTBackend:
                     )
             return compiled(*args)
 
+        run.writeback_inputs = writebacks
         return run
 
     def _compile(self, gm, example_inputs, *, phase):
@@ -391,8 +448,22 @@ class ReferenceAOTBackend:
             _compile_region,
             compile_local=batch.enqueue if batch is not None else None,
         )
+        from torch._guards import TracingContext
+
+        context = TracingContext.try_get()
+        metadata = context.fw_metadata if context is not None else None
+        writebacks = {}
+        if metadata is not None and phase != "backward":
+            placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+            output = next(n for n in gm.graph.nodes if n.op == "output")
+            flat, _ = tree_flatten(output.args[0])
+            offset = len(metadata.tokens)
+            for position, index in enumerate(metadata.mutated_inp_runtime_indices):
+                writebacks[flat[offset + position].name] = placeholders[index].name
         self.graphs.append(
-            GraphRecord(phase, gm.code, tuple(str(n.target) for n in communication))
+            GraphRecord(
+                phase, gm.code, tuple(str(n.target) for n in communication), writebacks
+            )
         )
         boundaries = [
             n

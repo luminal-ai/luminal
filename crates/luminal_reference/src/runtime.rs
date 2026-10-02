@@ -66,6 +66,46 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
                 .and_then(|v| v.checked_add(out))
         }
         "CastGeneric" => n.checked_mul(8),
+        "MatrixMultiplyGeneric" => {
+            // GEMM packs bounded tiles. Round both inputs' dimensions upward
+            // conservatively for the microkernel, and account for their full
+            // packed sizes even though only tiles are live at once.
+            fn padded_elements(dims: &[usize]) -> Option<usize> {
+                dims.iter()
+                    .try_fold(1usize, |n, extent| n.checked_mul(extent.checked_add(8)?))
+            }
+            ctx.operand_dims
+                .first()
+                .zip(ctx.operand_dims.get(1))
+                .map_or(Some(0), |(a, b)| {
+                    let width = if matches!(ctx.operands.first(), Some(TypedBuffer::F64(_))) {
+                        8
+                    } else {
+                        4
+                    };
+                    padded_elements(a)
+                        .and_then(|a| padded_elements(b).and_then(|b| a.checked_add(b)))
+                        .and_then(|elements| elements.checked_mul(width))
+                        .and_then(|packed| {
+                            if matches!(
+                                ctx.operands.first(),
+                                Some(TypedBuffer::F16(_) | TypedBuffer::Bf16(_))
+                            ) {
+                                ctx.operands
+                                    .iter()
+                                    .take(2)
+                                    .try_fold(packed, |bytes, input| {
+                                        input
+                                            .len()
+                                            .checked_mul(4)
+                                            .and_then(|cast| bytes.checked_add(cast))
+                                    })
+                            } else {
+                                Some(packed)
+                            }
+                        })
+                })
+        }
 
         "AddFunctionalGeneric"
         | "CeilFunctionalGeneric"
@@ -754,6 +794,35 @@ impl ReferenceRuntime {
     }
 
     pub fn execute(&mut self) -> Result<()> {
+        self.execute_with_borrowed_inputs(&FxHashMap::default())
+    }
+
+    /// Execute with caller-owned typed inputs borrowed for this call. This
+    /// avoids retaining another copy of immutable checkpoint tensors.
+    pub fn execute_with_inputs(
+        &mut self,
+        inputs: &FxHashMap<petgraph::graph::NodeIndex, &TypedBuffer>,
+    ) -> Result<()> {
+        let buffers = inputs
+            .iter()
+            .map(|(tensor, data)| {
+                let buffer = self
+                    .input_buffers
+                    .get(tensor)
+                    .ok_or_else(|| anyhow!("tensor {tensor:?} is not a bound input"))?;
+                Ok((*buffer, *data))
+            })
+            .collect::<Result<FxHashMap<_, _>>>()?;
+        self.execute_with_borrowed_inputs(&buffers)
+    }
+
+    /// Search borrows immutable checkpoint inputs instead of duplicating the
+    /// entire model for each candidate. Kernels still receive their owned
+    /// operands, and outputs never borrow these inputs beyond this call.
+    pub(crate) fn execute_with_borrowed_inputs(
+        &mut self,
+        inputs: &FxHashMap<i64, &TypedBuffer>,
+    ) -> Result<()> {
         // With buckets bound, the plan is chosen HERE, from the current
         // dims (see [`Self::select_bucket_plan`] for the static-plan
         // refusal). Without them nothing changes.
@@ -825,7 +894,9 @@ impl ReferenceRuntime {
                         let buffer = &plan.buffers[&slot.buffer];
                         let data = buffer
                             .lit
-                            .and_then(|lit| self.staged.get(&lit))
+                            .and_then(|lit| {
+                                inputs.get(&lit).copied().or_else(|| self.staged.get(&lit))
+                            })
                             .ok_or_else(|| {
                                 anyhow!("input buffer {} was never set_data", buffer.label)
                             })?;
@@ -887,12 +958,17 @@ impl ReferenceRuntime {
             n.checked_add(data.byte_len())
                 .ok_or_else(|| anyhow!("staged byte count overflow"))
         })?;
+        let staged_bytes = inputs.values().try_fold(staged_bytes, |n, data| {
+            n.checked_add(data.byte_len())
+                .ok_or_else(|| anyhow!("borrowed input byte count overflow"))
+        })?;
         ensure!(
             staged_bytes <= budget,
             "reference live memory budget exceeded: staged inputs require {staged_bytes} bytes, budget={budget}"
         );
         // Old outputs are invalidated on execution; keeping them would double
-        // storage across calls. Inputs remain borrowed from self.staged.
+        // storage across calls. Inputs remain borrowed from their caller or
+        // self.staged for the duration of this execution.
         self.storage.clear();
         let mut live = staged_bytes;
         self.peak_live_bytes = live;
@@ -1268,6 +1344,7 @@ mod tests {
             "LayoutTensorOpLeftSequentialScanSum",
             "LayoutTensorOpLessThanGeneric",
             "LayoutTensorOpLog2FunctionalGeneric",
+            "LayoutTensorOpMatrixMultiplyGeneric",
             "LayoutTensorOpModFunctionalGeneric",
             "LayoutTensorOpMulFunctionalGeneric",
             "LayoutTensorOpRecipFunctionalGeneric",
@@ -1401,6 +1478,38 @@ mod tests {
         runtime.set_data(x.id, vec![0.0f32; 4]);
         runtime.execute().unwrap();
         assert_eq!(runtime.get_f32(out.id).unwrap(), &vec![0.0; 4]);
+    }
+
+    #[test]
+    fn borrowed_search_inputs_preserve_ownership_and_memory_budget() {
+        let mut graph = Graph::new();
+        let x = graph.tensor(4, DType::F32);
+        let out = x + x;
+        let mut data = FxHashMap::from_iter([(x.id, vec![3.0f32, -7.0, 0.0, 4.0].into())]);
+        let mut runtime = ReferenceRuntime::load(&graph).unwrap();
+        runtime
+            .search(&data, &crate::search::harness_search_options())
+            .unwrap();
+        runtime
+            .execute_with_inputs(&FxHashMap::from_iter([(x.id, &data[&x.id])]))
+            .unwrap();
+        assert_eq!(runtime.get_f32(out.id).unwrap(), &[6.0, -14.0, 0.0, 8.0]);
+        assert_eq!(data[&x.id].as_f32().unwrap(), &[3.0, -7.0, 0.0, 4.0]);
+
+        let TypedBuffer::F32(input) = data.get_mut(&x.id).unwrap() else {
+            unreachable!()
+        };
+        input[0] = 99.0;
+        assert_eq!(runtime.get_f32(out.id).unwrap(), &[6.0, -14.0, 0.0, 8.0]);
+        let inputs = FxHashMap::from_iter([(x.id, &data[&x.id])]);
+        runtime.execute_with_inputs(&inputs).unwrap();
+        assert_eq!(runtime.get_f32(out.id).unwrap(), &[198.0, -14.0, 0.0, 8.0]);
+        runtime.set_memory_budget_bytes(15);
+        let error = runtime
+            .execute_with_inputs(&inputs)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("staged inputs require 16 bytes"), "{error}");
     }
 
     #[test]

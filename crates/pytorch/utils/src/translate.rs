@@ -854,7 +854,9 @@ impl Translator<'_> {
             "linear.default" => {
                 let x = self.operand(&n[0])?;
                 let w = self.operand(&n[1])?;
-                let mut out = x.matmul(w.t());
+                let mut out = x
+                    .cast(opmath_compute(x.dtype))
+                    .matmul(w.cast(opmath_compute(w.dtype)).t());
                 if let Some(bias) = n
                     .get(2)
                     .map(|b| self.optional_tensor_operand(b))
@@ -864,13 +866,15 @@ impl Translator<'_> {
                     let dims = out.dims();
                     out += broadcast_to(bias, &dims);
                 }
-                out
+                out.cast(x.dtype)
             }
             // ---- matmul family ----
             "mm.default" | "bmm.default" | "matmul.default" => {
                 let a = self.operand(&n[0])?;
                 let b = self.operand(&n[1])?;
-                a.matmul(b)
+                a.cast(opmath_compute(a.dtype))
+                    .matmul(b.cast(opmath_compute(b.dtype)))
+                    .cast(a.dtype)
             }
             // ---- grouped GEMM (batch 6) ----
             "_grouped_mm.default" | "transformers.grouped_mm_fallback.default" => {
@@ -882,7 +886,36 @@ impl Translator<'_> {
             "tanh.default" => self.operand(&n[0])?.tanh(),
             "log.default" => self.operand(&n[0])?.log(),
             "sqrt.default" => self.operand(&n[0])?.sqrt(),
-            "abs.default" => self.operand(&n[0])?.abs(),
+            "abs.default" => {
+                let input = self.operand(&n[0])?;
+                if matches!(input.dtype, DType::Int | DType::I64) {
+                    let zero = if input.dtype == DType::I64 {
+                        self.cx.constant_i64(0)
+                    } else {
+                        self.cx.constant_i32(0)
+                    }
+                    .expand_rhs(input.dims());
+                    let minimum = if input.dtype == DType::I64 {
+                        self.cx.constant_i64(i64::MIN)
+                    } else {
+                        self.cx.constant_i32(i32::MIN)
+                    }
+                    .expand_rhs(input.dims());
+                    let minus_one = if input.dtype == DType::I64 {
+                        self.cx.constant_i64(-1)
+                    } else {
+                        self.cx.constant_i32(-1)
+                    }
+                    .expand_rhs(input.dims());
+                    let is_minimum = input.eq(minimum);
+                    let safe = is_minimum.select(zero, input);
+                    let negated = self.checked_int_pair(safe, minus_one, true);
+                    let absolute = input.lt(zero).select(negated, input);
+                    is_minimum.select(input, absolute)
+                } else {
+                    input.abs()
+                }
+            }
             "neg.default" => -self.operand(&n[0])?,
             "silu.default" => self.operand(&n[0])?.silu(),
             "gelu.default" => {
@@ -951,11 +984,19 @@ impl Translator<'_> {
                 }
             }
             "sub.Tensor" | "sub.Scalar" | "mul.Tensor" | "mul.Scalar" => {
-                let a = self.operand(&n[0])?;
-                let b = if let Some(t) = self.optional_tensor_operand(&n[1])? {
-                    t
-                } else {
-                    self.scalar(&n[1], a.dtype)?
+                let at = self.optional_tensor_operand(&n[0])?;
+                let bt = self.optional_tensor_operand(&n[1])?;
+                let dtype = at
+                    .or(bt)
+                    .context("binary operation has no tensor operand")?
+                    .dtype;
+                let a = match at {
+                    Some(a) => a,
+                    None => self.scalar(&n[0], dtype)?,
+                };
+                let b = match bt {
+                    Some(b) => b,
+                    None => self.scalar(&n[1], dtype)?,
                 };
                 let (a, b) = broadcast_pair(a, b);
                 if matches!(a.dtype, DType::Int | DType::I64) {
@@ -1237,7 +1278,9 @@ impl Translator<'_> {
             "convolution.default" => self.translate_conv(node)?,
             "conv2d.default" => self.translate_conv(node)?,
             // ---- upsample / resize (batch 6) ----
-            "upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
+            "upsample_nearest2d.vec" | "upsample_nearest2d.default" => {
+                self.translate_upsample_nearest2d(node)?
+            }
             "upsample_bilinear2d.vec" => self.translate_upsample_bilinear2d(node)?,
             "_upsample_bilinear2d_aa.default" | "_upsample_bilinear2d_aa.vec" => {
                 self.translate_upsample_bilinear2d_aa(node)?

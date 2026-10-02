@@ -185,14 +185,12 @@ pub struct SearchOutcome {
 /// argument rather than a guess. Every reader of `best_nanos` is
 /// reading a mean.
 ///
-/// THE INPUT CLONE is deliberate and unavoidable today: each candidate
-/// gets its OWN runtime (no state carried between candidates), and
-/// `set_data_buffer` takes ownership of the payload. A borrowing stage
-/// API would remove it; that is a runtime-surface change, not a Phase 1
-/// one.
+/// Each candidate gets its own runtime, while immutable checkpoint inputs
+/// remain borrowed. Kernel operands and returned outputs keep their owned
+/// storage contracts, so profiling never modifies the caller's checkpoint.
 fn profile_on_reference_runtime(
     plan: &BufferIrGraph<DecodedLayout>,
-    input_data: &FxHashMap<i64, TypedBuffer>,
+    input_data: &FxHashMap<i64, &TypedBuffer>,
     dims: &luminal::shape::DynMap,
     trials: usize,
     best_so_far: Option<u128>,
@@ -218,15 +216,12 @@ fn profile_on_reference_runtime(
     for (symbol, value) in dims {
         runtime.set_dim(*symbol, *value);
     }
-    for (id, data) in input_data {
-        runtime.set_data_buffer(*id, data.clone());
-    }
-    runtime.execute()?; // warmup + validity
+    runtime.execute_with_borrowed_inputs(input_data)?; // warmup + validity
     let total = trials.max(1);
     let mut sum = 0u128;
     for trial in 0..total {
         let start = Instant::now();
-        runtime.execute()?;
+        runtime.execute_with_borrowed_inputs(input_data)?;
         sum += start.elapsed().as_nanos();
         let completed = trial + 1;
         // EARLY STOP (#386). The cutoff is applied to a LOWER BOUND on
@@ -279,7 +274,7 @@ pub fn search_implementations_with_ops(
     let allow_override = allow_override.or_else(|| Some(reference_allow_list()));
     // Tensor-keyed at the boundary (the retired-HLIR-keyspace design);
     // buffer-keyed internally via the program's slots.
-    let buffer_data: FxHashMap<i64, crate::typed_buffer::TypedBuffer> = input_data
+    let buffer_data: FxHashMap<i64, &crate::typed_buffer::TypedBuffer> = input_data
         .iter()
         .map(|(tensor, data)| {
             let bound = program
@@ -287,7 +282,7 @@ pub fn search_implementations_with_ops(
                 .iter()
                 .find(|bound| bound.value == *tensor)
                 .unwrap_or_else(|| panic!("tensor {tensor:?} is not a bound input"));
-            (bound.buffer, data.clone())
+            (bound.buffer, data)
         })
         .collect();
     let input_data = &buffer_data;

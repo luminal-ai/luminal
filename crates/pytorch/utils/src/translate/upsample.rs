@@ -140,14 +140,20 @@ impl Translator<'_> {
         // Optional explicit scale_factors (arg 2): ATen's general branch
         // indexes by floor(j / s) when scales are provided, which differs
         // from floor(j * in / out) when in * s is non-integral.
-        let scales: Option<(f64, f64)> =
-            node.inputs
-                .get(2)
-                .and_then(float_list_arg)
-                .and_then(|values| match values.as_slice() {
-                    [height, width] => Some((*height, *width)),
-                    _ => None,
-                });
+        let scales: Option<(f64, f64)> = node
+            .inputs
+            .get(2)
+            .and_then(float_list_arg)
+            .and_then(|values| match values.as_slice() {
+                [height, width] => Some((*height, *width)),
+                _ => None,
+            })
+            .or_else(|| {
+                Some((
+                    node.inputs.get(2)?.arg.as_float()?,
+                    node.inputs.get(3)?.arg.as_float()?,
+                ))
+            });
 
         let result =
             self.upsample_nearest_axis(input, 2, input_height, output_height, scales.map(|s| s.0))?;

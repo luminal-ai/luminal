@@ -99,7 +99,6 @@ pub struct CompiledGraph {
     /// tensor is ambiguous, so they are read by buffer instead.
     shared_outputs: HashSet<NodeIndex>,
     staged: HashMap<String, TypedBuffer>,
-    dirty: HashSet<String>,
     searched: bool,
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
@@ -337,7 +336,6 @@ impl CompiledGraph {
         }
         let buffer = typed_buffer(dtype, bytes).map_err(to_py)?;
         self.staged.insert(name.to_string(), buffer);
-        self.dirty.insert(name.to_string());
         Ok(())
     }
 
@@ -493,19 +491,14 @@ impl CompiledGraph {
             }
             resolved.insert(name.clone(), entries);
         }
-        let data: FxHashMap<_, _> = self
-            .translation
-            .inputs
-            .iter()
-            .map(|input| {
-                let buffer = self
-                    .staged
-                    .get(&input.graph_name)
-                    .ok_or_else(|| anyhow!("input {:?} was never set", input.graph_name))?;
-                Ok((input.tensor, buffer.clone()))
-            })
-            .collect::<Result<_>>()
-            .map_err(to_py)?;
+        for input in &self.translation.inputs {
+            if !self.staged.contains_key(&input.graph_name) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "input {:?} was never set",
+                    input.graph_name
+                )));
+            }
+        }
         let mut options: CompileOptions = luminal_reference::harness_search_options();
         if let Some(generations) = generations {
             options.generations = generations;
@@ -520,6 +513,20 @@ impl CompiledGraph {
         let search = || {
             if self.dims.is_empty() {
                 // Static program: one concrete plan at the exported shapes.
+                // Bucketed search supplies its own representative inputs and
+                // must not also duplicate the unused checkpoint here.
+                let data: FxHashMap<_, _> =
+                    self.translation
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            let buffer = self.staged.get(&input.graph_name).ok_or_else(|| {
+                                anyhow!("input {:?} was never set", input.graph_name)
+                            })?;
+                            Ok((input.tensor, buffer.clone()))
+                        })
+                        .collect::<Result<_>>()
+                        .map_err(to_py)?;
                 self.runtime.search(&data, &options).map_err(to_py)?;
             } else {
                 // Search each Cartesian combination of buckets. Winning plans
@@ -619,25 +626,15 @@ impl CompiledGraph {
                 "search() must run before execute()",
             ));
         }
-        let updates: Vec<_> = self
+        let inputs: FxHashMap<_, _> = self
             .translation
             .inputs
             .iter()
-            .filter(|input| self.dirty.contains(&input.graph_name))
-            .map(|input| {
-                (
-                    input.tensor,
-                    self.staged.get(&input.graph_name).unwrap().clone(),
-                )
-            })
+            .map(|input| (input.tensor, self.staged.get(&input.graph_name).unwrap()))
             .collect();
-        for (tensor, buffer) in updates {
-            self.runtime.set_data(tensor, buffer);
-        }
-        self.dirty.clear();
         luminal_reference::search::with_interrupt_check(
             || Python::attach(|py| py.check_signals().map_err(anyhow::Error::from)),
-            || self.runtime.execute().map_err(to_py),
+            || self.runtime.execute_with_inputs(&inputs).map_err(to_py),
         )
     }
 
@@ -781,7 +778,6 @@ fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
         output_buffers,
         shared_outputs,
         staged: HashMap::new(),
-        dirty: HashSet::new(),
         searched: false,
         dims,
         dim_bounds,

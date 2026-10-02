@@ -37,6 +37,7 @@ pub(crate) mod index_map_apply_materialize;
 pub(crate) mod iota;
 pub(crate) mod less_than;
 pub(crate) mod log2;
+pub(crate) mod matrix_multiply;
 pub(crate) mod modulo;
 pub(crate) mod mul;
 pub(crate) mod trunc_div;
@@ -321,6 +322,13 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
                 kernel: entry::<LeftSequentialScanMaxDps>(
                     "LeftSequentialScanMax",
                     left_sequential_scan_max::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || Box::new(matrix_multiply::MatrixMultiplyMatcher),
+                kernel: entry::<matrix_multiply::MatrixMultiplyDps>(
+                    "MatrixMultiplyGeneric",
+                    matrix_multiply::kernel,
                 ),
             },
             // ── data movement ──

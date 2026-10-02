@@ -45,6 +45,10 @@ _PT2_TO_TORCH = {
 
 def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     tensor = tensor.detach().cpu().contiguous()
+    # PyTorch bool storage may use any nonzero byte for True. Native Bool8
+    # requires canonical 0/1 codes; convert values rather than copying bits.
+    if tensor.dtype == torch.bool:
+        return tensor.numpy().astype("uint8").tobytes()
     # Flatten first: a 0-dim tensor cannot be viewed as a wider dtype.
     return tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
 

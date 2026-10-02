@@ -54,6 +54,9 @@ pub fn profile_candidate_at(
     let staged = prepare_candidate(device, plan, staged, residents, shapes, arena_budget)
         .map_err(ProfileFailure::Prepare)?;
     let staged: FxHashMap<_, _> = staged.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+    if crate::search::log_channel_enabled(false, "SEARCH_LOG") {
+        eprintln!("Metal: candidate warmup");
+    }
     device
         .execute(0, &staged, &shapes.values)
         .map_err(ProfileFailure::Prepare)?;
