@@ -8,6 +8,18 @@ from test_dtype_boundary import BoundaryNoopModel, EmptyWeightModel
 luminal_backend = Compiler()
 
 
+def test_cpu_bool_input_normalizes_noncanonical_true_bytes():
+    class LogicalNot(torch.nn.Module):
+        def forward(self, value):
+            return value.logical_not()
+
+    value = torch.tensor([0, 1, 2, 64, 128, 255], dtype=torch.uint8).view(torch.bool)
+    compiled = torch.compile(LogicalNot(), backend=luminal_backend, fullgraph=True)
+    actual = compiled(value)
+    torch.testing.assert_close(actual, value.logical_not())
+    assert set(actual.view(torch.uint8).tolist()) <= {0, 1}
+
+
 @pytest.mark.parametrize(
     "dtype",
     [

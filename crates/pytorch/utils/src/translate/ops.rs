@@ -184,12 +184,22 @@ impl Translator<'_> {
             _ => x.dims()[dim],
         };
         let step = node.inputs.get(4).and_then(|i| i.arg.as_int()).unwrap_or(1);
-        if step != 1 {
-            bail!("slice step {step} != 1 is not ported");
-        }
-        let mut ranges: Vec<(IntExpr, IntExpr)> = x.dims().iter().map(|d| (0.into(), *d)).collect();
-        ranges[dim] = (start, end);
-        Ok(x.slice(ranges))
+        anyhow::ensure!(step > 0, "slice step must be positive");
+        let start = start.max(0).min(x.dims()[dim]);
+        let shape = self.output_meta_shape(node)?;
+        let coords = (0..rank)
+            .map(|axis| {
+                self.cx.iota(shape.clone(), |c| {
+                    if axis == dim {
+                        c[axis] * step + start
+                    } else {
+                        c[axis]
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let _ = end;
+        Ok(x.gather(&coords))
     }
 
     pub(super) fn translate_select(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -248,6 +258,7 @@ impl Translator<'_> {
         let x = self.operand(&node.inputs[0])?;
         let repeats = self.get_ints_arg(node, 1)?;
         let repeats: Vec<usize> = repeats.iter().map(|r| (*r).max(0) as usize).collect();
+        let x = (0..repeats.len().saturating_sub(x.rank())).fold(x, |v, _| v.expand_dim(0, 1usize));
         Ok(x.repeat(repeats.as_slice()))
     }
 
@@ -298,6 +309,25 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|i| i.arg.as_bool()))
             .unwrap_or(false);
         let result = match op {
+            ReductionOp::Sum if matches!(x.dtype, DType::Int | DType::I64) => {
+                // The sequential scan backend checks overflow at runtime;
+                // use it when caller data has no static value-range proof.
+                let mut result = x;
+                let mut order = axes.clone();
+                order.sort_unstable();
+                for &axis in order.iter().rev() {
+                    let extent = result.dims()[axis];
+                    let mut zero_shape = result.dims();
+                    zero_shape[axis] = 1.into();
+                    let zero = self.full_tensor(zero_shape, result.dtype, 0.0);
+                    result = zero
+                        .concat_along(result, axis)
+                        .cumsum(axis)
+                        .slice_along(extent..extent + 1, axis)
+                        .squeeze(axis);
+                }
+                result
+            }
             ReductionOp::Sum => x.sum(axes.clone()),
             ReductionOp::Mean => x.mean(axes.clone()),
             ReductionOp::Max => x.max(axes.clone()),
@@ -318,13 +348,32 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|i| i.arg.as_bool()))
             .unwrap_or(false);
         let dim = node.inputs.get(1).and_then(|i| i.arg.as_int());
+        if x.rank() == 0 {
+            if let Some(d) = dim
+                && d != 0
+                && d != -1
+            {
+                bail!("dim {d} is out of range for a rank-0 value");
+            }
+            return Ok(self.cx.constant_i64(0));
+        }
         let (result, axis) = match dim {
             Some(d) => {
                 let axis = normalize_dim(d, x.rank());
                 let r = if max { x.argmax(axis) } else { x.argmin(axis) };
                 (r, Some(axis))
             }
-            None => (if max { x.argmax(0) } else { x.argmin(0) }, None),
+            None => {
+                let flattened = x.flatten();
+                (
+                    if max {
+                        flattened.argmax(0)
+                    } else {
+                        flattened.argmin(0)
+                    },
+                    None,
+                )
+            }
         };
         let dtype = self.output_meta_dtype(node).unwrap_or(DType::I64);
         let result = if result.dtype != dtype {
@@ -334,6 +383,7 @@ impl Translator<'_> {
         };
         Ok(match (keepdim, axis) {
             (true, Some(axis)) => result.expand_dim(axis, 1usize),
+            (true, None) => (0..x.rank()).fold(result, |r, axis| r.expand_dim(axis, 1usize)),
             _ => result,
         })
     }
@@ -347,12 +397,9 @@ impl Translator<'_> {
         } else {
             dims.iter().map(|&d| normalize_dim(d, rank)).collect()
         };
-        let correction = self.named_int_arg(node, "correction").unwrap_or(1) as usize;
-        let result = if std {
-            x.std_options(axes.clone(), correction)
-        } else {
-            x.var_options(axes.clone(), correction)
-        };
+        let correction = self.variance_correction(node);
+        let variance = self.variance_with_correction(x, &axes, correction);
+        let result = if std { variance.sqrt() } else { variance };
         let keepdim = self
             .inputs_bool(node, "keepdim")
             .or_else(|| node.inputs.get(3).and_then(|i| i.arg.as_bool()))
@@ -366,6 +413,10 @@ impl Translator<'_> {
 
     pub(super) fn translate_cumulative(&mut self, node: &Node, prod: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        // ATen accumulates in the declared output dtype: bool and narrow
+        // integers promote to i64 by default, and dtype= overrides that.
+        // Casting only the scan result would lose carries or overflow first.
+        let x = super::convert(x, self.compute_dtype(node)?);
         let dim = self.get_int_arg(node, 1)?;
         // A rank-0 scan is the identity, and only dims torch accepts there
         // reach it.
@@ -412,19 +463,28 @@ impl Translator<'_> {
     // Creation and selection
     // ---------------------------------------------------------------
 
+    pub(super) fn translate_fill(&mut self, node: &Node, value: f64) -> Result<GraphTensor> {
+        let shape = self.output_meta_shape(node)?;
+        let dtype = self.output_meta_dtype(node)?;
+        Ok(self.full_tensor(shape, dtype, value))
+    }
+
     pub(super) fn translate_full(&mut self, node: &Node, like: bool) -> Result<GraphTensor> {
-        let (shape, dtype, value) = if like {
+        let (shape, dtype) = if like {
             let x = self.operand(&node.inputs[0])?;
-            let meta = self.output_meta_dtype(node).unwrap_or(x.dtype);
-            (x.dims(), meta, self.get_number_arg(node, 1)?)
+            (x.dims(), self.output_meta_dtype(node).unwrap_or(x.dtype))
         } else {
-            let shape = self.get_int_exprs_arg(node, 0)?;
             (
-                shape,
+                self.get_int_exprs_arg(node, 0)?,
                 self.output_meta_dtype(node)?,
-                self.get_number_arg(node, 1)?,
             )
         };
+        if let Some(name) = node.inputs[1].arg.as_value_name()
+            && let Some(value) = self.values.get(name).copied()
+        {
+            return Ok(value.cast(dtype).expand_rhs(shape));
+        }
+        let value = self.get_number_arg(node, 1)?;
         Ok(self.full_tensor(shape, dtype, value))
     }
 
@@ -432,6 +492,48 @@ impl Translator<'_> {
         let dtype = self.output_meta_dtype(node)?;
         // PT2 omits default arguments. Read by schema name, and preserve
         // symbolic scalar operands rather than interpreting them as literals.
+        let literal =
+            |name: &str, default: f64| match node.inputs.iter().find(|input| input.name == name) {
+                None => Some(default),
+                Some(input) => input
+                    .arg
+                    .as_float()
+                    .or_else(|| input.arg.as_int().map(|v| v as f64))
+                    .or_else(|| input.arg.as_bool().map(f64::from)),
+            };
+        if let (Some(start), Some(step)) = (literal("start", 0.0), literal("step", 1.0)) {
+            anyhow::ensure!(step != 0.0, "arange step must be nonzero");
+            let name = Self::tensor_output_names(node)
+                .into_iter()
+                .next()
+                .context("arange has no output")?;
+            let meta = self.tensor_meta(&name)?.clone();
+            let shape = self.boundary_shape(&meta, &name)?;
+            let integer = matches!(
+                dtype,
+                DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 | DType::U16
+            );
+            if integer {
+                let start = IntExpr::from(start as i64);
+                let step = IntExpr::from(step as i64);
+                return Ok(self
+                    .cx
+                    .iota(shape, |coordinates| coordinates[0] * step + start)
+                    .cast(dtype));
+            }
+            let arithmetic_dtype = if dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            };
+            let positions = self
+                .cx
+                .iota(shape.clone(), |coordinates| coordinates[0])
+                .cast(arithmetic_dtype);
+            let start = self.full_tensor(shape.clone(), arithmetic_dtype, start);
+            let step = self.full_tensor(shape, arithmetic_dtype, step);
+            return Ok((positions * step + start).cast(dtype));
+        }
         let argument = |name: &str, default: i64| -> Result<IntExpr> {
             let Some(input) = node.inputs.iter().find(|input| input.name == name) else {
                 return Ok(IntExpr::from(default));
@@ -483,6 +585,11 @@ impl Translator<'_> {
 
     pub(super) fn translate_scalar_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
         let dtype = self.output_meta_dtype(node)?;
+        if let Some(name) = node.inputs[0].arg.as_value_name()
+            && let Some(value) = self.values.get(name).copied()
+        {
+            return Ok(value.cast(dtype));
+        }
         let value = self.get_float_arg(node, 0)?;
         let scalar = match dtype {
             DType::F64 => self.cx.constant_f64(value),
@@ -528,24 +635,18 @@ impl Translator<'_> {
 
     pub(super) fn translate_clamp(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let min = node.inputs.get(1).and_then(|i| i.arg.as_float());
-        let max = node.inputs.get(2).and_then(|i| i.arg.as_float());
         let mut out = x;
-        if let Some(min) = min {
-            let bound = self
-                .cx
-                .constant_f32(min as f32)
-                .cast(x.dtype)
-                .expand_rhs(x.dims());
-            out = out.maximum(bound);
-        }
-        if let Some(max) = max {
-            let bound = self
-                .cx
-                .constant_f32(max as f32)
-                .cast(x.dtype)
-                .expand_rhs(x.dims());
-            out = out.minimum(bound);
+        for (position, lower) in [(1, true), (2, false)] {
+            if let Some(input) = node.inputs.get(position)
+                && (input.arg.as_float().is_some() || input.arg.as_int().is_some())
+            {
+                let bound = self.scalar(input, x.dtype)?.expand_rhs(x.dims());
+                out = if lower {
+                    out.maximum(bound)
+                } else {
+                    out.minimum(bound)
+                };
+            }
         }
         Ok(out)
     }
@@ -557,7 +658,13 @@ impl Translator<'_> {
             let (out_b, min) = util::broadcast_binary(out, min);
             out = out_b.maximum(min);
         }
-        if let Some(max) = self.optional_tensor_operand(&node.inputs[2])? {
+        if let Some(max) = node
+            .inputs
+            .get(2)
+            .map(|input| self.optional_tensor_operand(input))
+            .transpose()?
+            .flatten()
+        {
             let (out_b, max) = util::broadcast_binary(out, max);
             out = out_b.minimum(max);
         }
@@ -566,6 +673,12 @@ impl Translator<'_> {
 
     pub(super) fn translate_softmax(&mut self, node: &Node, log: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        if x.rank() == 0 {
+            // Preserve NaN for infinite inputs, as ATen scalar softmax does.
+            #[allow(clippy::eq_op)]
+            let zero = x - x;
+            return Ok(if log { zero } else { zero.exp() });
+        }
         let dim = normalize_dim(self.get_int_arg(node, 1)?, x.rank());
         Ok(if log {
             x.log_softmax(dim)
@@ -592,11 +705,12 @@ impl Translator<'_> {
     pub(super) fn translate_item(&mut self, node: &Node) -> Result<()> {
         let x = self.operand(&node.inputs[0])?;
         let scalar = util::reshape_tensor(x, &[]);
-        let names = Self::tensor_output_names(node);
-        let name = names
-            .first()
+        let name = node
+            .outputs
+            .iter()
+            .find_map(|output| output.value_name())
             .context("item is missing its scalar output name")?
-            .clone();
+            .to_owned();
         self.values.insert(name, scalar);
         Ok(())
     }

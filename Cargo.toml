@@ -90,3 +90,16 @@ members = [
 # debug-assertions stay ON everywhere (this changes opt-level only).
 [profile.dev.package."*"]
 opt-level = 3
+
+# Reference search profiles real tensor kernels, including billion-element
+# model weights. Optimize their loops and shared index-expression evaluation
+# in dev builds too; debug assertions and overflow checks remain enabled.
+[profile.dev.package.luminal]
+opt-level = 3
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.package.luminal_reference]
+opt-level = 3
+debug-assertions = true
+overflow-checks = true

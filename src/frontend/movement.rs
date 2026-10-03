@@ -1064,28 +1064,11 @@ impl GraphTensor {
             .graph()
             .logical
             .record_mask_iota(&befores, &afters, &dims);
-        // ARITHMETIC MASKING, restored 2026-09-03. Main #406's select_by_index
-        // (packed 2N iota + two scatter1d + gather1d, PR #471) was NaN-safe
-        // but made egglog saturation stop converging for rank >= 2 pads
-        // (core lib tests 15 s -> >76 min; LUM-805). KNOWN LEAK, tracked as
-        // LUM-804: the clamped view repeats edge values into the pad region
-        // and `0 * NaN` / `0 * Inf` is NaN, so padding a tensor that holds
-        // non-finite values poisons its padding. The fix owed is a native
-        // Bool8 select op, not a gather construction.
+        // Native selection preserves IEEE values in both the data and fill.
         let mask = GraphTensor::from_id(mask_id, out_dims.clone(), self.graph_ref, DType::Int)
-            .cast(self.dtype);
-        let masked = clamped * mask;
-        match elem {
-            None => masked,
-            Some(elem) => {
-                let one = self
-                    .graph()
-                    .constant_i32(1)
-                    .cast(self.dtype)
-                    .expand_rhs(out_dims.clone());
-                masked + (one - mask) * elem.expand_rhs(out_dims)
-            }
-        }
+            .cast(DType::Bool);
+        let fill = elem.unwrap_or_else(|| self.graph().constant_i32(0).cast(self.dtype));
+        mask.select(clamped, fill.expand_rhs(out_dims))
     }
 
     /// Pad out dimensions of a tensor with an `f32` convenience value.
@@ -1127,9 +1110,25 @@ impl GraphTensor {
 
     /// Concat along an existing dimension
     pub fn concat_along(self, rhs: GraphTensor, axis: usize) -> GraphTensor {
-        // Pad and add
-        self.pad_along(0, rhs.dims()[axis], axis, 0.)
-            + rhs.pad_along(self.dims()[axis], 0, axis, 0.)
+        let left_extent = self.dims()[axis];
+        let left = self.pad_along(0, rhs.dims()[axis], axis, 0.);
+        let right = rhs.pad_along(left_extent, 0, axis, 0.);
+        if matches!(
+            self.dtype,
+            DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16
+        ) {
+            // The padded regions are disjoint. Selecting the occupied region
+            // preserves arbitrary integer payloads without claiming that a
+            // general addition is statically non-wrapping.
+            let positions = self.graph().iota(left.dims(), |coords| coords[axis]);
+            let extent = self
+                .graph()
+                .constant_i32(left_extent)
+                .expand_rhs(left.dims());
+            positions.lt(extent).select(left, right)
+        } else {
+            left + right
+        }
     }
 }
 
@@ -1141,6 +1140,15 @@ mod tests {
     use candle_core::{IndexOp, Tensor};
     use luminal::prelude::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn integer_concat_accepts_equivalent_symbolic_padding_extents() {
+        let mut cx = Graph::new();
+        let left = cx.named_tensor("left", (1, 'n'), DType::I64);
+        let right = cx.named_tensor("right", (1, 1), DType::I64);
+        let result = left.concat_along(right, 1);
+        assert!(result.dims()[1].egglog_equal(IntExpr::from('n') + 1));
+    }
 
     /// A merged symbolic extent splits back (`div-mul-var-self` proves
     /// `(H*W)/W * W = H*W`), and the split recovers the outer extent.

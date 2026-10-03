@@ -115,7 +115,10 @@ impl Translator<'_> {
         // `enable_gqa` — only the unified op carries the flag, and the
         // pipeline emits only the unified op (sdpa decomps are stripped).
         // Flagless graphs with mismatched heads fail the ensure below.
-        let enable_gqa = self.named_bool_arg(node, "enable_gqa").unwrap_or(false);
+        let enable_gqa = self.named_bool_arg(node, "enable_gqa").unwrap_or(false)
+            || node
+                .target
+                .ends_with("_scaled_dot_product_flash_attention_for_cpu.default");
         if enable_gqa && q_ndim >= 3 && !same_dim(query.dims()[q_ndim - 3], key.dims()[q_ndim - 3])
         {
             let h_axis = q_ndim - 3;
@@ -185,10 +188,18 @@ impl Translator<'_> {
         }
 
         let mut attn = scores.softmax(q_ndim - 1);
+        let row_max = scores
+            .max(q_ndim - 1)
+            .expand_to_shape_on_axes(scores.dims(), q_ndim - 1);
+        let negative_infinity = self.constant_like(row_max, f64::NEG_INFINITY);
+        let masked_row = row_max.eq(negative_infinity);
+        let zero = self.constant_like(attn, 0.0);
+        attn = masked_row.select(zero, attn);
         if let Some(indicator) = row_any_keep {
             let (a, i) = util::ensure_same_dtype(attn, indicator);
             let (a, i) = util::broadcast_binary(a, i);
-            attn = a * i;
+            let zero = self.constant_like(a, 0.0);
+            attn = i.cast(DType::Bool).select(a, zero);
         }
         // torch parity, part two: the fused kernels round the probabilities
         // to the operands' dtype before the P@V GEMM. No-op on fp32.

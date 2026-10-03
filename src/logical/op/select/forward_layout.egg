@@ -1,16 +1,30 @@
-; Forward LayoutTensor Propagation : LogicalSelect — the output may be laid
-; out like any of its three inputs.
+; Select produces the value branches' dtype. A Bool condition's bit layout
+; cannot be reused for its wider result, and broadcast input layouts cannot
+; store distinct selected values. Forward only injective value layouts.
 (rule
-  (
-    (= ?out_logical (LogicalSelect ?cond ?if_true ?if_false))
-    (= ?cond_layout_tensor (LayoutTensorLit ?cond ?cond_layout))
-    (= ?true_layout_tensor (LayoutTensorLit ?if_true ?true_layout))
-    (= ?false_layout_tensor (LayoutTensorLit ?if_false ?false_layout))
-  )
-  (
-    (let ?out_layout_tensor1 (LayoutTensorLit ?out_logical ?cond_layout))
-    (let ?out_layout_tensor2 (LayoutTensorLit ?out_logical ?true_layout))
-    (let ?out_layout_tensor3 (LayoutTensorLit ?out_logical ?false_layout))
-  )
-  :ruleset main_ruleset :name "select/forward_layout: select result in any of its three inputs' layouts"
+  ((= ?out (LogicalSelect ?cond ?yes ?no))
+   (= ?input (LayoutTensorLit ?yes ?layout))
+   (= (injectivity-of ?input) (Injective)))
+  ((let ?output (LayoutTensorLit ?out ?layout)))
+  :ruleset main_ruleset :name "select/forward_layout: injective true branch layout"
+)
+(rule
+  ((= ?out (LogicalSelect ?cond ?yes ?no))
+   (= ?input (LayoutTensorLit ?no ?layout))
+   (= (injectivity-of ?input) (Injective)))
+  ((let ?output (LayoutTensorLit ?out ?layout)))
+  :ruleset main_ruleset :name "select/forward_layout: injective false branch layout"
+)
+
+; Sliced and broadcast value branches need not disclose an injective layout.
+; Materialize the selected result in its own shape and dtype, rather than
+; forwarding a condition layout whose Bool width may differ.
+(rule
+  ((= ?out (LogicalSelect ?cond ?yes ?no))
+   (= ?condition (LayoutTensorLit ?cond ?condition_layout))
+   (= ?shape (shape-of ?out))
+   (= ?bits (bits-of (dtype-of ?out))))
+  ((let ?output
+     (LayoutTensorLit ?out (RightMajorContiguousElementLayoutLit ?shape ?bits))))
+  :ruleset main_ruleset :name "select/forward_layout: canonical result layout"
 )

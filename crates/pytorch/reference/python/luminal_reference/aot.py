@@ -32,6 +32,7 @@ class RegionRecord:
     targets: tuple[str, ...]
     executions: int = 0
     bounds: dict = field(default_factory=dict)
+    writeback_inputs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -39,11 +40,21 @@ class GraphRecord:
     phase: str
     code: str
     collectives: tuple[str, ...]
+    writeback_inputs: dict = field(default_factory=dict)
 
 
 def _collective(node):
     target = str(node.target)
     return "c10d" in target
+
+
+def _execution_boundary(node):
+    # Side-effectful tensor assertions must execute between native regions.
+    # Retain PyTorch's runtime checks rather than dropping them during export.
+    return _collective(node) or str(node.target) in {
+        "aten._assert_async.default",
+        "aten._assert_async.msg",
+    }
 
 
 def _compile_group(gm, communication):
@@ -93,6 +104,8 @@ def _compile_region(
         for i, leaf in enumerate(leaves)
         if isinstance(leaf, torch.fx.Node) and leaf in input_positions
     }
+    from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
+
     symbolic_outputs = {
         i: leaf.meta.get("val", leaf.meta.get("example_value"))
         for i, leaf in enumerate(leaves)
@@ -101,6 +114,9 @@ def _compile_region(
             leaf.meta.get("val", leaf.meta.get("example_value")), torch.SymInt
         )
         and i not in passthrough
+        and not has_free_unbacked_symbols(
+            leaf.meta.get("val", leaf.meta.get("example_value"))
+        )
     }
     from torch._guards import detect_fake_mode
 
@@ -198,6 +214,7 @@ def _compile_region(
                 for v in local_inputs
             ]
             compiler = compile_local or _compile_local_graph
+            defer_options = {"defer_search": True} if compile_local is None else {}
             compiled = compiler(
                 graph,
                 examples,
@@ -205,11 +222,13 @@ def _compile_region(
                 search_log=search_log,
                 max_intermediate_bytes=max_intermediate_bytes,
                 memory_budget_bytes=memory_budget_bytes,
+                **defer_options,
             )
             if isinstance(compiled, DeferredRegion):
                 compiled.record = record
             else:
                 record.bounds = compiled._graph.dim_bounds
+                record.writeback_inputs = compiled.writeback_inputs
         records.append(record)
 
     def run(*args):
@@ -220,6 +239,8 @@ def _compile_region(
             for position, index in enumerate(indices)
         ]
         values = compiled(*bound_inputs) if compiled is not None else ()
+        if record is not None and not isinstance(compiled, DeferredRegion):
+            record.bounds = compiled._graph.dim_bounds
         if len(values) != len(positions):
             raise RuntimeError("local compiler changed the AOT output arity")
         result = list(leaves)
@@ -247,6 +268,21 @@ def _compile_region(
     return run
 
 
+def _nearest2d_preserve_kernel(input, output_size, scale_factors):
+    # PyTorch's vec decomposition gathers floor(j / scale), even when the
+    # native nearest kernel returns its input for equal spatial sizes.
+    from torch._decomp.decompositions import upsample_compute_output_size
+
+    size = upsample_compute_output_size(input.size(), output_size, scale_factors)
+    scales = list(scale_factors) if scale_factors is not None else [None, None]
+    for axis in range(2):
+        if size[axis] == input.shape[axis + 2]:
+            scales[axis] = 1.0
+        elif size[axis] == 2 * input.shape[axis + 2]:
+            scales[axis] = 2.0
+    return torch.ops.aten.upsample_nearest2d.default(input, size, *scales)
+
+
 class ReferenceAOTBackend:
     """Callable torch.compile backend; inspect ``graphs`` and ``regions``.
 
@@ -261,7 +297,13 @@ class ReferenceAOTBackend:
         log=False,
         max_intermediate_bytes=None,
         memory_budget_bytes=None,
+        export_mode="pt2",
     ):
+        # PT2 is the native serialization boundary for every AOT region.
+        # Preserve callers that explicitly selected it before AOT became the
+        # default frontend, while rejecting any unsupported alternate route.
+        if export_mode != "pt2":
+            raise ValueError("export_mode must be 'pt2'")
         self.regions: list[RegionRecord] = []
         self.graphs: list[GraphRecord] = []
         self.leader_compilations = 0
@@ -288,7 +330,73 @@ class ReferenceAOTBackend:
         )
 
     def __call__(self, gm, example_inputs):
-        return self._backend(gm, example_inputs)
+        # Normalize the vec frontend before CompositeImplicitAutograd expands
+        # it into a gather that misses ATen's equal-size kernel fast path.
+        for node in gm.graph.nodes:
+            if (
+                node.op != "call_function"
+                or node.target is not torch.nn.functional.interpolate
+                or len(node.args) != 1
+            ):
+                continue
+            kw = node.kwargs
+            value = node.args[0].meta.get("example_value")
+            if (
+                kw.get("mode", "nearest") == "nearest"
+                and isinstance(value, torch.Tensor)
+                and value.ndim == 4
+                and kw.get("align_corners") is None
+                and not kw.get("antialias", False)
+                and not kw.get("recompute_scale_factor", False)
+            ):
+                scale = kw.get("scale_factor")
+                scales = (scale, scale) if isinstance(scale, (int, float)) else scale
+                node.target = _nearest2d_preserve_kernel
+                size = kw.get("size")
+                size = (size, size) if isinstance(size, int) else size
+                node.args = (node.args[0], size, scales)
+                node.kwargs = {}
+        gm.graph.lint()
+        gm.recompile()
+        from torch._guards import detect_fake_mode
+
+        mode = detect_fake_mode(example_inputs)
+        from torch._dynamo.exc import TensorifyScalarRestartAnalysis
+
+        first_region = len(self.regions)
+        first_graph = len(self.graphs)
+        try:
+            compiled = self._backend(gm, example_inputs)
+        except TensorifyScalarRestartAnalysis:
+            # AOT requests a Dynamo restart solely to remove specialized float
+            # inputs. This backend accepts unused inputs, so retry locally,
+            # installing the same constant guards on every specialized source.
+            from torch._dynamo.guards import GuardBuilder
+            from torch._dynamo.symbolic_convert import TensorifyState
+            from torch._guards import TracingContext
+
+            context = TracingContext.try_get()
+            if context is None or mode is None or mode.shape_env is None:
+                raise
+            for symbol in mode.shape_env.backed_var_to_val:
+                if TensorifyState.should_specialize(str(symbol)):
+                    sources = mode.shape_env.var_to_sources.get(symbol, ())
+                    if not sources:
+                        raise
+                    for source in sources:
+                        context.guards_context.dynamo_guards.add(
+                            source.make_guard(GuardBuilder.CONSTANT_MATCH)
+                        )
+            compiled = self._backend(gm, example_inputs)
+        writebacks = {
+            name: target
+            for record in self.regions[first_region:]
+            for name, target in record.writeback_inputs.items()
+        }
+        for graph in self.graphs[first_graph:]:
+            writebacks.update(graph.writeback_inputs)
+        compiled.writeback_inputs = writebacks
+        return compiled
 
     def _compile(self, gm, example_inputs, *, phase):
         communication = [
@@ -300,10 +408,29 @@ class ReferenceAOTBackend:
             _compile_region,
             compile_local=batch.enqueue if batch is not None else None,
         )
+        from torch._guards import TracingContext
+
+        context = TracingContext.try_get()
+        metadata = context.fw_metadata if context is not None else None
+        writebacks = {}
+        if metadata is not None and phase != "backward":
+            placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+            output = next(n for n in gm.graph.nodes if n.op == "output")
+            flat, _ = tree_flatten(output.args[0])
+            offset = len(metadata.tokens)
+            for position, index in enumerate(metadata.mutated_inp_runtime_indices):
+                writebacks[flat[offset + position].name] = placeholders[index].name
         self.graphs.append(
-            GraphRecord(phase, gm.code, tuple(str(n.target) for n in communication))
+            GraphRecord(
+                phase, gm.code, tuple(str(n.target) for n in communication), writebacks
+            )
         )
-        if not communication:
+        boundaries = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and _execution_boundary(n)
+        ]
+        if not boundaries:
             compiled = compile_region(
                 gm, example_inputs, phase, self.regions, **self.compile_options
             )
@@ -312,7 +439,7 @@ class ReferenceAOTBackend:
                 self.leader_compilations += batch.compilations
             return make_boxed_func(compiled)
 
-        # Contiguous topological regions keep collective ordering explicit.
+        # Contiguous regions keep collective and assertion ordering explicit.
         # This is a frontend boundary, not an extracted-Luminal graph rewrite.
         partition = -1
         previous = None
@@ -320,7 +447,7 @@ class ReferenceAOTBackend:
 
         def assign(node):
             nonlocal partition, previous
-            is_comm = _collective(node)
+            is_comm = _execution_boundary(node)
             if previous is None or is_comm != previous:
                 partition += 1
                 previous = is_comm

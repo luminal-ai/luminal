@@ -59,8 +59,15 @@ def device():
 def execution_device(device):
     # Bare tensor constructors in the shared cases must use the selected device,
     # rather than quietly exercising the reference runtime in a CUDA run.
-    with torch.device(device):
+    # PyTorch 2.14 Dynamo loses floating .item() dataflow inside a CPU
+    # DeviceContext (even the eager FX backend receives return (None,)).
+    # The existing CPU default already places bare constructors correctly;
+    # avoid that redundant TorchFunctionMode while retaining the CUDA guard.
+    if device.type == "cpu" and torch.get_default_device().type == "cpu":
         yield
+    else:
+        with torch.device(device):
+            yield
 
 
 @pytest.fixture(autouse=True)

@@ -146,7 +146,15 @@ pub(crate) fn kernel(
     ctx: &mut ReferenceKernelCtx,
 ) -> anyhow::Result<()> {
     match &ctx.operands[0] {
+        TypedBuffer::F16(_) => {
+            ctx.binary_elementwise_f16(|a, b| Ok(half::f16::from_f32(a.to_f32() + b.to_f32())))
+        }
+        TypedBuffer::Bf16(_) => {
+            ctx.binary_elementwise_bf16(|a, b| Ok(half::bf16::from_f32(a.to_f32() + b.to_f32())))
+        }
         TypedBuffer::F32(_) => ctx.binary_elementwise(|a, b| a + b),
+        TypedBuffer::F64(_) => ctx.binary_elementwise_f64(|a, b| Ok(a + b)),
+        TypedBuffer::Bool8(_) => ctx.binary_elementwise_bool(|a, b| a | b),
         TypedBuffer::I32(_) => ctx.binary_elementwise_i32(|a, b| {
             a.checked_add(b).ok_or_else(|| {
                 anyhow::anyhow!("i32 add overflow: {a} + {b} (ints are non-wrapping)")

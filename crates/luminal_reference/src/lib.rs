@@ -26,6 +26,7 @@ pub mod kernels;
 pub mod layouts;
 pub mod ops;
 pub mod runtime;
+mod saturation;
 pub mod search;
 pub mod typed_buffer;
 

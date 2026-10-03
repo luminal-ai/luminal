@@ -17,7 +17,8 @@ use crate::pt2_schema::{Argument, Node, OptionalTensorEntry};
 
 /// Reduction flavours shared by the scatter-reduce / index-reduce family.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum IdxReduce {
+pub(super) enum IdxReduce {
+    Replace,
     Sum,
     Prod,
     Mean,
@@ -58,7 +59,7 @@ fn idx_can_broadcast_to(from: &[IntExpr], to: &[IntExpr]) -> bool {
 /// indexed axis; indices separated by basic axes put the block first.
 /// Returns the output shape, the block's start axis, and
 /// `(source_axis, output_axis)` for every non-indexed source axis.
-fn idx_advanced_layout(
+pub(super) fn idx_advanced_layout(
     source_dims: &[IntExpr],
     indexed: &[usize],
     bshape: &[IntExpr],
@@ -103,31 +104,21 @@ impl Translator<'_> {
     /// and truncates back (Int arithmetic is proof-gated, and the plan has
     /// no F64 binary arms), Bool uses the boolean primitives, floats use
     /// `cond`.
-    fn idx_cond(&mut self, cond: GraphTensor, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+    pub(super) fn idx_cond(
+        &mut self,
+        cond: GraphTensor,
+        a: GraphTensor,
+        b: GraphTensor,
+    ) -> GraphTensor {
         let (a, b) = util::broadcast_binary(a, b);
         let (a, cond) = util::broadcast_binary(a, cond);
-        match a.dtype {
-            DType::Bool => {
-                let yes = self.bool_and(cond, a);
-                let not_cond = self.bool_not(cond);
-                let no = self.bool_and(not_cond, b);
-                self.bool_or(yes, no)
-            }
-            DType::Int | DType::I64 => {
-                let dtype = a.dtype;
-                let a32 = a.cast(DType::F32);
-                let b32 = b.cast(DType::F32);
-                let mask = cond.cast(DType::F32);
-                let one = self.cx.constant_f32(1.0).expand_rhs(mask.dims());
-                (a32 * mask + b32 * (one - mask)).trunc_cast(dtype)
-            }
-            _ => a.cond(cond, b),
-        }
+        let b = self.idx_broadcast_to(b, &a.dims());
+        cond.cast(DType::Bool).select(a, b)
     }
 
     /// Wrap negative index values into `[0, dim)` without proof-gated Int
     /// arithmetic (the adjustment runs in F32).
-    fn idx_normalize(&mut self, indices: GraphTensor, dim: IntExpr) -> GraphTensor {
+    pub(super) fn idx_normalize(&mut self, indices: GraphTensor, dim: IntExpr) -> GraphTensor {
         let zero = self.cx.constant_i32(0).expand_rhs(indices.dims());
         let negative = indices.lt(zero);
         let dim_f = self
@@ -141,7 +132,7 @@ impl Translator<'_> {
 
     /// Cast to a storage dtype, using the explicit truncating read for
     /// float -> int.
-    fn idx_cast_like(&mut self, t: GraphTensor, dtype: DType) -> GraphTensor {
+    pub(super) fn idx_cast_like(&mut self, t: GraphTensor, dtype: DType) -> GraphTensor {
         if t.dtype == dtype {
             return t;
         }
@@ -152,7 +143,11 @@ impl Translator<'_> {
     }
 
     /// Right-aligned broadcast to `target` (prepends size-1 dims, expands).
-    fn idx_broadcast_to(&mut self, mut t: GraphTensor, target: &[IntExpr]) -> GraphTensor {
+    pub(super) fn idx_broadcast_to(
+        &mut self,
+        mut t: GraphTensor,
+        target: &[IntExpr],
+    ) -> GraphTensor {
         while t.rank() < target.len() {
             t = t.expand_dim(0, 1usize);
         }
@@ -160,7 +155,11 @@ impl Translator<'_> {
     }
 
     /// Slice `updates` down to `shape` along every axis whose extent differs.
-    fn idx_crop_to(&mut self, mut updates: GraphTensor, shape: &[IntExpr]) -> GraphTensor {
+    pub(super) fn idx_crop_to(
+        &mut self,
+        mut updates: GraphTensor,
+        shape: &[IntExpr],
+    ) -> GraphTensor {
         for (axis, want) in shape.iter().enumerate() {
             if axis >= updates.rank() {
                 break;
@@ -175,7 +174,10 @@ impl Translator<'_> {
 
     /// Broadcast every present index tensor to their common shape and
     /// return that shape.
-    fn idx_broadcast_indices(&mut self, tensors: &mut [Option<GraphTensor>]) -> Vec<IntExpr> {
+    pub(super) fn idx_broadcast_indices(
+        &mut self,
+        tensors: &mut [Option<GraphTensor>],
+    ) -> Vec<IntExpr> {
         let present: Vec<usize> = (0..tensors.len())
             .filter(|d| tensors[*d].is_some())
             .collect();
@@ -205,7 +207,7 @@ impl Translator<'_> {
     }
 
     /// Coordinate tensor per source axis for an advanced-index layout.
-    fn idx_advanced_coords(
+    pub(super) fn idx_advanced_coords(
         &mut self,
         out_dims: &[IntExpr],
         block_start: usize,
@@ -234,7 +236,7 @@ impl Translator<'_> {
 
     /// Parse the `indices` input of `index.Tensor`/`index_put` into one
     /// optional entry per indexed axis (None = a basic slice axis).
-    fn idx_entries(node: &Node) -> Result<Vec<Option<String>>> {
+    pub(super) fn idx_entries(node: &Node) -> Result<Vec<Option<String>>> {
         let input = node
             .inputs
             .get(1)
@@ -336,51 +338,38 @@ impl Translator<'_> {
         }
     }
 
-    /// Sequential read/modify/write scatter-reduce: duplicate destinations
-    /// must accumulate in update order and the recorder's scatter is
-    /// overwrite-only, so one static graph step per update element.
-    fn idx_scatter_reduce(
+    /// Unroll only over a proven exported upper bound. Out-of-extent slices
+    /// are empty, so their checked scatter writes are no-ops at runtime.
+    pub(super) fn idx_update_bound(&self, dims: &[IntExpr]) -> Result<usize> {
+        let ranges = crate::dim_range::dim_ranges(&self.ranges, &self.symbols);
+        dims.iter().try_fold(1usize, |count, dim| {
+            let bound = if let Some(n) = dim.to_usize() {
+                n
+            } else {
+                let terms = dim.terms.read();
+                let [luminal::shape::Term::Var(symbol)] = terms.as_slice() else {
+                    bail!("scatter reduction requires a bounded update extent");
+                };
+                ranges
+                    .get(symbol)
+                    .and_then(|range| range.max)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .context("scatter reduction requires a finite exported update bound")?
+            };
+            count
+                .checked_mul(bound)
+                .context("scatter update bound overflows")
+        })
+    }
+
+    pub(super) fn idx_flat_dest(
         &mut self,
-        data: GraphTensor,
-        coords: Vec<GraphTensor>,
-        updates: GraphTensor,
-        reduction: IdxReduce,
-        include_self: bool,
+        dims: &[IntExpr],
+        coords: &[GraphTensor],
     ) -> Result<GraphTensor> {
-        if coords.len() != data.rank() {
-            bail!(
-                "scatter reduction: {} coordinate tensors for rank {}",
-                coords.len(),
-                data.rank()
-            );
-        }
-        let count = idx_numel(&updates.dims())
-            .context("scatter reduction requires a concrete update element count")?;
-        let bool_data = data.dtype == DType::Bool;
-        if bool_data && matches!(reduction, IdxReduce::Mean) {
-            bail!("scatter reduction `mean` on Bool data is not ported");
-        }
-        let int_data = idx_is_int(data.dtype);
-        let work_dtype = if int_data { DType::F32 } else { data.dtype };
-        let original = data.flatten();
-        let original_work = if int_data {
-            original.cast(DType::F32)
-        } else {
-            original
-        };
-        let mut output = original_work;
-        let flat_updates = if int_data {
-            updates.flatten().cast(DType::F32)
-        } else {
-            updates.flatten()
-        };
-        // Collapse the per-axis coordinates into one flat destination index
-        // (F32 multiply/add then a single truncation): the gather/scatter
-        // coordinate forms take exactly one Int coordinate per axis, so a
-        // multi-axis destination cannot address flat storage directly.
-        let strides: Vec<IntExpr> = (0..data.rank())
+        let strides: Vec<IntExpr> = (0..dims.len())
             .map(|i| {
-                data.dims()[i + 1..]
+                dims[i + 1..]
                     .iter()
                     .fold(IntExpr::from(1), |acc, d| acc * *d)
             })
@@ -398,10 +387,55 @@ impl Translator<'_> {
                 None => contribution,
             });
         }
-        let flat_dest = flat_dest
+        Ok(flat_dest
             .context("scatter reduction requires at least one coordinate axis")?
             .flatten()
-            .trunc_cast(DType::Int);
+            .trunc_cast(DType::Int))
+    }
+
+    /// Sequential read/modify/write scatter-reduce: duplicate destinations
+    /// must accumulate in update order and the recorder's scatter is
+    /// overwrite-only, so one static graph step per update element.
+    pub(super) fn idx_scatter_reduce(
+        &mut self,
+        data: GraphTensor,
+        coords: Vec<GraphTensor>,
+        updates: GraphTensor,
+        reduction: IdxReduce,
+        include_self: bool,
+    ) -> Result<GraphTensor> {
+        if coords.len() != data.rank() {
+            bail!(
+                "scatter reduction: {} coordinate tensors for rank {}",
+                coords.len(),
+                data.rank()
+            );
+        }
+        let count = self.idx_update_bound(&updates.dims())?;
+        let bool_data = data.dtype == DType::Bool;
+        if bool_data && matches!(reduction, IdxReduce::Mean) {
+            bail!("scatter reduction `mean` on Bool data is not ported");
+        }
+        let int_data = idx_is_int(data.dtype);
+        let float_work = int_data && reduction != IdxReduce::Replace;
+        let work_dtype = if float_work { DType::F32 } else { data.dtype };
+        let original = data.flatten();
+        let original_work = if float_work {
+            original.cast(DType::F32)
+        } else {
+            original
+        };
+        let mut output = original_work;
+        let flat_updates = if float_work {
+            updates.flatten().cast(DType::F32)
+        } else {
+            updates.flatten()
+        };
+        // Collapse the per-axis coordinates into one flat destination index
+        // (F32 multiply/add then a single truncation): the gather/scatter
+        // coordinate forms take exactly one Int coordinate per axis, so a
+        // multi-axis destination cannot address flat storage directly.
+        let flat_dest = self.idx_flat_dest(&data.dims(), &coords)?;
         let track_counts = !include_self || matches!(reduction, IdxReduce::Mean);
         let mut counts = self
             .full_tensor(
@@ -411,10 +445,14 @@ impl Translator<'_> {
             )
             .flatten();
         for step in 0..count {
-            let dest = flat_dest.slice_along(step..step + 1, 0);
-            let update = flat_updates.slice_along(step..step + 1, 0);
+            let extent = flat_updates.dims()[0];
+            let start = IntExpr::from(step).min(extent);
+            let end = IntExpr::from(step + 1).min(extent);
+            let dest = flat_dest.slice_along(start..end, 0);
+            let update = flat_updates.slice_along(start..end, 0);
             let current = output.gather(&[dest]);
             let mut combined = match reduction {
+                IdxReduce::Replace => update,
                 IdxReduce::Sum | IdxReduce::Mean => {
                     if bool_data {
                         self.bool_or(current, update)
@@ -461,9 +499,10 @@ impl Translator<'_> {
             let has_values = counts.gt(zero);
             let divisor = counts.cast(work_dtype);
             let means = output / divisor;
+            let means = if int_data { means.floor() } else { means };
             output = self.idx_cond(has_values, means, original_work);
         }
-        let output = if int_data {
+        let output = if float_work {
             output.trunc_cast(data.dtype)
         } else {
             output
@@ -474,7 +513,7 @@ impl Translator<'_> {
     /// Scatter coordinates for an update at `[.., index[c], ..]` (ONNX
     /// ScatterElements): one coordinate tensor per data axis over the
     /// update shape.
-    fn idx_scatter_coords(
+    pub(super) fn idx_scatter_coords(
         &mut self,
         update_dims: &[IntExpr],
         axis: usize,
@@ -539,7 +578,7 @@ impl Translator<'_> {
     }
 
     /// Legacy `scatter.reduce`/`scatter.value_reduce` names.
-    fn idx_legacy_reduction(&self, node: &Node) -> Result<IdxReduce> {
+    pub(super) fn idx_legacy_reduction(&self, node: &Node) -> Result<IdxReduce> {
         match self.idx_reduce_arg(node)?.as_str() {
             "add" | "sum" => Ok(IdxReduce::Sum),
             "multiply" | "prod" => Ok(IdxReduce::Prod),
@@ -564,7 +603,7 @@ impl Translator<'_> {
     }
 
     /// `data[mask] = source` with `source` a flat list of the true slots.
-    fn idx_masked_scatter(
+    pub(super) fn idx_masked_scatter(
         &mut self,
         destination: GraphTensor,
         mask: GraphTensor,
@@ -598,6 +637,14 @@ impl Translator<'_> {
     /// so no flat-index arithmetic is needed.
     pub(super) fn translate_index_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
         let source = self.operand(&node.inputs[0])?;
+        self.index_tensor_component(node, source)
+    }
+
+    pub(super) fn index_tensor_component(
+        &mut self,
+        node: &Node,
+        source: GraphTensor,
+    ) -> Result<GraphTensor> {
         if source.rank() == 0 {
             bail!("index.Tensor on a scalar is not ported");
         }
@@ -774,7 +821,7 @@ impl Translator<'_> {
         let updates = self.idx_cast_like(updates, data.dtype);
         let coords = self.idx_scatter_coords(&update_dims, dim, index);
         let result = match reduction {
-            None => data.scatter(&coords, updates),
+            None => self.idx_scatter_reduce(data, coords, updates, IdxReduce::Replace, true)?,
             Some(reduction) => {
                 self.idx_scatter_reduce(data, coords, updates, reduction, include_self)?
             }
@@ -846,7 +893,7 @@ impl Translator<'_> {
         Ok(if accumulate {
             self.idx_scatter_reduce(data, coords, updates, IdxReduce::Sum, true)?
         } else {
-            data.scatter(&coords, updates)
+            self.idx_scatter_reduce(data, coords, updates, IdxReduce::Replace, true)?
         })
     }
 
@@ -1110,10 +1157,8 @@ impl Translator<'_> {
             .cx
             .constant_i32(index_count)
             .expand_rhs(vec![offset_count]);
-        let ends_full = shifted.scatter(
-            &[self.cx.arange(offset_count - IntExpr::from(1))],
-            ends_full,
-        );
+        let ends_full =
+            ends_full.scatter(&[self.cx.arange(offset_count - IntExpr::from(1))], shifted);
         let positions = self.cx.arange(index_count).expand_dim(0, bag_count);
         let starts = starts_full.expand_dim(1, index_count);
         let ends = ends_full

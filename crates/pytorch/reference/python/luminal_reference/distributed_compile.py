@@ -7,6 +7,7 @@ compiles each distinct program and scatters selected plans to their owners.
 import hashlib
 import io
 import json
+import pickle
 from weakref import WeakKeyDictionary
 from zipfile import ZipFile
 
@@ -16,6 +17,7 @@ import torch.distributed as dist
 from .backend import _prepare_local_graph, compile_exported
 
 _coordination_groups = WeakKeyDictionary()
+_coordination_rounds = WeakKeyDictionary()
 
 
 def _without_graph_ids(value):
@@ -126,6 +128,35 @@ class RegionBatch:
             )
         self.group = _coordination_groups[model_group]
         self.leader = dist.get_global_rank(self.group, 0)
+        from torch.distributed.distributed_c10d import _get_process_group_store
+
+        round_id = _coordination_rounds.get(model_group, 0)
+        _coordination_rounds[model_group] = round_id + 1
+        self.store = dist.PrefixStore(
+            f"luminal-reference/{round_id}", _get_process_group_store(self.group)
+        )
+
+    def _gather_messages(self, phase, value):
+        # Compiler artifacts are byte messages, not tensor collectives. Gloo's
+        # asynchronous object-collective cleanup can acquire the GIL under its
+        # queue lock, deadlocking the next enqueue from AOT compilation.
+        rank = dist.get_rank(self.group)
+        self.store.set(f"{phase}/{rank}", pickle.dumps(value))
+        keys = [f"{phase}/{peer}" for peer in range(dist.get_world_size(self.group))]
+        self.store.wait(keys)
+        return [pickle.loads(self.store.get(key)) for key in keys]
+
+    def _finish_exchange(self):
+        rank = dist.get_rank(self.group)
+        peers = range(dist.get_world_size(self.group))
+        self.store.set(f"done/{rank}", b"1")
+        if rank == 0:
+            # Peers acknowledge after reading their messages. Remove the byte
+            # payloads from long-lived stores without racing a slow reader.
+            self.store.wait([f"done/{peer}" for peer in peers])
+            for phase in ("requests", "responses", "installation", "done"):
+                for peer in peers:
+                    self.store.delete_key(f"{phase}/{peer}")
 
     def enqueue(self, gm, examples, **options):
         try:
@@ -166,8 +197,8 @@ class RegionBatch:
 
     def resolve(self):
         # AOT invokes backend compilation under FakeTensor/ShapeEnv tracing.
-        # Gloo's object collectives inspect real size tensors and must not be
-        # intercepted as symbolic computations.
+        # Export and selected-plan installation need real CPU tensor shapes;
+        # artifact messages travel through the process-group store as bytes.
         from torch._guards import tracing
         from torch._subclasses.fake_tensor import unset_fake_temporarily
 
@@ -181,8 +212,7 @@ class RegionBatch:
                 local.append(self._request(job))
             except Exception as exc:  # noqa: BLE001
                 local.append((False, str(exc)))
-        all_requests = [None] * dist.get_world_size(self.group)
-        dist.all_gather_object(all_requests, local, group=self.group)
+        all_requests = self._gather_messages("requests", local)
         rank = dist.get_rank(self.group)
         responses = None
         if rank == 0:
@@ -210,15 +240,16 @@ class RegionBatch:
                         owner_responses.append((True, cache[key]))
                     responses.append(owner_responses)
             except Exception as exc:  # noqa: BLE001
-                # Every peer must receive a failure; never leave one blocked
-                # in scatter while rank zero unwinds from a compiler error.
+                # Every peer must receive a failure before the leader unwinds.
                 responses = [
                     [(False, f"leader compilation failed: {exc}")] for _ in all_requests
                 ]
-        received = [None]
-        dist.scatter_object_list(received, responses, src=self.leader, group=self.group)
-        result = received[0]
+        if rank == 0:
+            for owner, response in enumerate(responses):
+                self.store.set(f"responses/{owner}", pickle.dumps(response))
+        result = pickle.loads(self.store.get(f"responses/{rank}"))
         if result and not result[0][0]:
+            self._finish_exchange()
             raise RuntimeError(result[0][1])
         installation_error = None
         try:
@@ -242,10 +273,8 @@ class RegionBatch:
                     job.record.bounds = job.model._graph.dim_bounds
         except Exception as exc:  # noqa: BLE001
             installation_error = f"rank {rank} failed to install leader plan: {exc}"
-        installation_errors = [None] * dist.get_world_size(self.group)
-        dist.all_gather_object(
-            installation_errors, installation_error, group=self.group
-        )
+        installation_errors = self._gather_messages("installation", installation_error)
+        self._finish_exchange()
         errors = [error for error in installation_errors if error is not None]
         if errors:
             raise RuntimeError("; ".join(errors))

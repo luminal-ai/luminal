@@ -240,11 +240,46 @@ impl Translator<'_> {
         self.bool_or(positive, negative)
     }
 
+    pub(super) fn checked_int_pair(
+        &mut self,
+        lhs: GraphTensor,
+        rhs: GraphTensor,
+        product: bool,
+    ) -> GraphTensor {
+        let pair = lhs.unsqueeze(0).concat_along(rhs.unsqueeze(0), 0);
+        let scan = if product {
+            pair.cumprod(0)
+        } else {
+            pair.cumsum(0)
+        };
+        scan.slice_along(1..2, 0).squeeze(0)
+    }
+
+    pub(super) fn checked_int_sub(&mut self, lhs: GraphTensor, rhs: GraphTensor) -> GraphTensor {
+        let dtype = lhs.dtype;
+        let lhs = lhs.cast(DType::I64);
+        let rhs = rhs.cast(DType::I64);
+        let zero = self.cx.constant_i64(0).expand_rhs(lhs.dims());
+        let minus_one = self.cx.constant_i64(-1).expand_rhs(lhs.dims());
+        let minimum = self.cx.constant_i64(i64::MIN).expand_rhs(lhs.dims());
+        let maximum = self.cx.constant_i64(i64::MAX).expand_rhs(lhs.dims());
+        let one = self.cx.constant_i64(1).expand_rhs(lhs.dims());
+        let rhs_min = rhs.eq(minimum);
+        // Never negate MIN, or evaluate an unused branch with overflowing
+        // operands. Each selected subtraction still checks its true result.
+        let safe_rhs = rhs_min.select(zero, rhs);
+        let safe_lhs = rhs_min.select(zero, lhs);
+        let negative = self.checked_int_pair(safe_rhs, minus_one, true);
+        let ordinary = self.checked_int_pair(safe_lhs, negative, false);
+        let min_lhs = rhs_min.select(lhs, minimum);
+        let shifted = self.checked_int_pair(min_lhs, maximum, false);
+        let min_result = self.checked_int_pair(shifted, one, false);
+        rhs_min.select(min_result, ordinary).cast(dtype)
+    }
+
     pub(super) fn is_zero(&mut self, value: GraphTensor) -> GraphTensor {
-        let x = value.cast(DType::F32);
-        let zero = self.cx.constant_f32(0.0).expand_rhs(x.dims());
-        let nonzero = self.bool_or(x.lt(zero), x.gt(zero));
-        self.bool_not(nonzero)
+        let zero = self.full_tensor(value.dims(), value.dtype, 0.0);
+        value.eq(zero)
     }
 
     pub(super) fn signbit(&mut self, value: GraphTensor) -> GraphTensor {
@@ -252,12 +287,16 @@ impl Translator<'_> {
         // reciprocal flips the sign bit for every finite value and keeps
         // -0.0 negative.
         let zero = self.constant_like(value, 0.0);
-        value.reciprocal().lt(zero)
+        let negative = value.lt(zero);
+        let negative_zero = value.reciprocal().lt(zero);
+        self.bool_or(negative, negative_zero)
     }
 
     pub(super) fn copy_sign(&mut self, magnitude: GraphTensor, sign: GraphTensor) -> GraphTensor {
         let (magnitude, sign) = broadcast_binary(magnitude, sign);
-        magnitude.abs() * sign.sign().cast(magnitude.dtype)
+        let negative = self.signbit(sign);
+        let absolute = magnitude.abs();
+        self.select(negative, -absolute, absolute)
     }
 
     /// A floating scalar of the tensor's own dtype (F64 keeps doubles).
@@ -484,8 +523,15 @@ impl Translator<'_> {
     ) -> GraphTensor {
         let scalar = match dtype {
             DType::F64 => self.cx.constant_f64(value),
-            DType::I64 => self.cx.constant_i64(value as i64),
-            DType::Int => self.cx.constant_i64(value as i64).cast(DType::Int),
+            DType::Bool => self.cx.constant_i32(i64::from(value != 0.0)).cast(dtype),
+            DType::I64
+            | DType::Int
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16
+            | DType::I4
+            | DType::U4 => self.cx.constant_i64(value as i64).cast(dtype),
             _ => self.cx.constant_f32(value as f32).cast(dtype),
         };
         scalar.expand_rhs(shape)

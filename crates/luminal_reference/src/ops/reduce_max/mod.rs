@@ -149,6 +149,32 @@ pub(crate) fn kernel(
 ) -> anyhow::Result<()> {
     let op = expect_op::<ReduceMaxDps>(op)?;
     match &ctx.operands[0] {
+        TypedBuffer::F64(_) => ctx.reduce_axis_f64(op.axis, f64::NEG_INFINITY, |a, b| {
+            Ok(if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.max(b)
+            })
+        }),
+        TypedBuffer::I64(_) => ctx.reduce_axis_i64(op.axis, i64::MIN, |a, b| Ok(a.max(b))),
+        TypedBuffer::F16(_) => ctx.reduce_axis_f16(op.axis, half::f16::NEG_INFINITY, |a, b| {
+            Ok(if a.is_nan() || b.is_nan() {
+                half::f16::NAN
+            } else if a > b {
+                a
+            } else {
+                b
+            })
+        }),
+        TypedBuffer::Bf16(_) => ctx.reduce_axis_bf16(op.axis, half::bf16::NEG_INFINITY, |a, b| {
+            Ok(if a.is_nan() || b.is_nan() {
+                half::bf16::NAN
+            } else if a > b {
+                a
+            } else {
+                b
+            })
+        }),
         TypedBuffer::F32(_) => ctx.reduce_axis(op.axis, f32::NEG_INFINITY, crate::kernels::maximum),
         TypedBuffer::I32(_) => ctx.reduce_axis_i32(op.axis, i32::MIN, |acc, x| Ok(acc.max(x))),
         // Max never leaves the operand range, so there is nothing to

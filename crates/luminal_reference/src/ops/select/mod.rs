@@ -171,6 +171,8 @@ pub(crate) fn kernel(
     }
 
     match &ctx.operands[1] {
+        TypedBuffer::F16(_) => arm!(as_f16, as_f16_mut),
+        TypedBuffer::Bf16(_) => arm!(as_bf16, as_bf16_mut),
         TypedBuffer::F32(_) => arm!(as_f32, as_f32_mut),
         TypedBuffer::F64(_) => arm!(as_f64, as_f64_mut),
         TypedBuffer::I32(_) => arm!(as_i32, as_i32_mut),
