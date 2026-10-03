@@ -5,6 +5,7 @@ use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal::shape::SliceRange;
 use luminal_metal::CompileOptions;
 use luminal_metal::HostBuffer;
 use luminal_metal::MetalRuntime;
@@ -121,9 +122,9 @@ fn assert_bytes_equal(want: &[f32], got: &[f32], what: &str) {
 #[test]
 fn transpose_consumer_byte_matches_materialize_route() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize), DType::F32);
-    let c = cx.tensor((3usize, 2usize), DType::F32);
-    let out = x.permute((1, 0)) * c;
+    let x = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let c = cx.tensor(vec![3usize, 2usize], DType::F32);
+    let out = x.permute(vec![1, 0]) * c;
     let (want, got) = run_differential(
         &cx,
         &[
@@ -139,9 +140,9 @@ fn transpose_consumer_byte_matches_materialize_route() {
 #[test]
 fn slice_consumer_byte_matches_materialize_route() {
     let mut cx = Graph::new();
-    let x = cx.tensor((4usize, 6usize), DType::F32);
-    let c = cx.tensor((2usize, 6usize), DType::F32);
-    let out = x.slice((1..3, ..)) * c;
+    let x = cx.tensor(vec![4usize, 6usize], DType::F32);
+    let c = cx.tensor(vec![2usize, 6usize], DType::F32);
+    let out = x.slice(vec![(1..3).bounds(), (..).bounds()]) * c;
     let (want, got) = run_differential(
         &cx,
         &[
@@ -158,7 +159,7 @@ fn slice_consumer_byte_matches_materialize_route() {
 fn broadcast_consumer_byte_matches_materialize_route() {
     let mut cx = Graph::new();
     let x = cx.tensor(3usize, DType::F32);
-    let c = cx.tensor((2usize, 3usize), DType::F32);
+    let c = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = x.expand_dim(0, 2) * c;
     let (want, got) = run_differential(
         &cx,
@@ -175,9 +176,9 @@ fn broadcast_consumer_byte_matches_materialize_route() {
 #[test]
 fn chained_matmul_byte_matches_materialize_route() {
     let mut cx = Graph::new();
-    let a = cx.tensor((2usize, 3usize), DType::F32);
-    let b = cx.tensor((3usize, 4usize), DType::F32);
-    let c = cx.tensor((4usize, 2usize), DType::F32);
+    let a = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let b = cx.tensor(vec![3usize, 4usize], DType::F32);
+    let c = cx.tensor(vec![4usize, 2usize], DType::F32);
     let out = a.matmul(b).matmul(c);
     let (want, got) = run_differential(
         &cx,

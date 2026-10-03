@@ -24,8 +24,8 @@ const PIN: &[&str] = &[
 fn record_blocks(geometries: &[(usize, usize, usize)]) -> String {
     let mut cx = Graph::new();
     for &(m, k, n) in geometries {
-        let x = cx.tensor((m, k), DType::F32);
-        let w = cx.tensor((k, n), DType::F32);
+        let x = cx.tensor(vec![m, k], DType::F32);
+        let w = cx.tensor(vec![k, n], DType::F32);
         let _out = x.matmul(w).relu();
     }
     test_runtime::bind_leaves(&cx)

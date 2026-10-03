@@ -590,8 +590,8 @@ mod differential {
     /// without being unioned away.
     fn saturate_model() -> EGraph {
         let mut graph = luminal::prelude::Graph::new();
-        let x = graph.tensor((2, 3), luminal::prelude::DType::F32);
-        let y = graph.tensor((2, 3), luminal::prelude::DType::F32);
+        let x = graph.tensor(vec![2, 3], luminal::prelude::DType::F32);
+        let y = graph.tensor(vec![2, 3], luminal::prelude::DType::F32);
         let _ = (x * y + x).sum(1);
         let bound = luminal_reference::ReferenceBindings::leaves(&graph.logical)
             .bind(&graph.logical)

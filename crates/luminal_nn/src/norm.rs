@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn normalization_uses_caller_supplied_parameters() {
         let mut cx = Graph::new();
-        let input = cx.tensor((2, 4), DType::Bf16);
+        let input = cx.tensor(vec![2, 4], DType::Bf16);
         let weight = cx.tensor(4, DType::Bf16);
         let bias = cx.tensor(4, DType::Bf16);
         assert_eq!(

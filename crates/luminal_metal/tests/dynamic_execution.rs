@@ -8,8 +8,8 @@ use support::TestTransfers;
 #[test]
 fn shape_changes_reuse_one_arena() {
     let mut g = Graph::new();
-    let x = g.tensor(('a', 2), DType::F32);
-    let y = g.tensor(('a', 2), DType::F32);
+    let x = g.tensor(vec![IntExpr::from('a'), 2.into()], DType::F32);
+    let y = g.tensor(vec![IntExpr::from('a'), 2.into()], DType::F32);
     let out = x * y + x;
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
@@ -71,8 +71,8 @@ fn metadata_only_dimension_changes_reuse_compiled_kernel() {
 #[test]
 fn dynamic_transpose_and_reduction_use_live_strides() {
     let mut g = Graph::new();
-    let x = g.tensor((3, 'a'), DType::F32);
-    let out = (x.permute((1, 0)) + 1.).sum(0);
+    let x = g.tensor(vec![IntExpr::from(3), 'a'.into()], DType::F32);
+    let out = (x.permute(vec![1, 0]) + 1.).sum(0);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
         &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),

@@ -23,6 +23,7 @@ use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal::shape::SliceRange;
 use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::HostBuffer;
 use luminal_cuda_lite::{CudaRuntime, kernels};
@@ -223,9 +224,9 @@ fn reference_values(cx: &Graph, inputs: &[(NodeIndex, HostBuffer)], out: NodeInd
 )]
 fn gather_lowers_a_folded_coordinate_operand() {
     let mut cx = Graph::new();
-    let data = cx.tensor((4usize, 3usize), DType::F32);
+    let data = cx.tensor(vec![4usize, 3usize], DType::F32);
     let rows = cx.tensor(2usize, DType::Int);
-    let cols = cx.iota((2usize, 3usize), |c| c[1]);
+    let cols = cx.iota(vec![2usize, 3usize], |c| c[1]);
     let row_coord = rows.expand_dim(1, 3usize);
     let out = data.gather(&[row_coord, cols]);
 
@@ -296,11 +297,11 @@ fn gather_lowers_a_folded_coordinate_operand() {
 )]
 fn gather_lowers_a_folded_data_operand() {
     let mut cx = Graph::new();
-    let base = cx.tensor((3usize, 4usize), DType::F32);
+    let base = cx.tensor(vec![3usize, 4usize], DType::F32);
     let rows = cx.tensor(2usize, DType::Int);
-    let cols = cx.iota((2usize, 3usize), |c| c[1]);
+    let cols = cx.iota(vec![2usize, 3usize], |c| c[1]);
     // data = base^T, shape (4,3): data[i][j] = base[j][i].
-    let data = base.permute((1, 0));
+    let data = base.permute(vec![1, 0]);
     let out = data.gather(&[rows.expand_dim(1, 3usize), cols]);
 
     let base_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
@@ -355,10 +356,10 @@ fn gather_lowers_a_folded_data_operand() {
 )]
 fn scatter_lowers_a_folded_coordinate_operand() {
     let mut cx = Graph::new();
-    let init = cx.tensor((4usize, 3usize), DType::F32);
-    let src = cx.tensor((2usize, 3usize), DType::F32);
+    let init = cx.tensor(vec![4usize, 3usize], DType::F32);
+    let src = cx.tensor(vec![2usize, 3usize], DType::F32);
     let rows = cx.tensor(2usize, DType::Int);
-    let cols = cx.iota((2usize, 3usize), |c| c[1]);
+    let cols = cx.iota(vec![2usize, 3usize], |c| c[1]);
     let row_coord = rows.expand_dim(1, 3usize);
     let out = init.scatter(&[row_coord, cols], src);
 
@@ -438,12 +439,12 @@ fn scatter_lowers_a_folded_coordinate_operand() {
 )]
 fn scatter_lowers_all_read_side_folds() {
     let mut cx = Graph::new();
-    let init_base = cx.tensor((3usize, 4usize), DType::F32);
-    let src_base = cx.tensor((4usize, 3usize), DType::F32);
+    let init_base = cx.tensor(vec![3usize, 4usize], DType::F32);
+    let src_base = cx.tensor(vec![4usize, 3usize], DType::F32);
     let rows = cx.tensor(2usize, DType::Int);
-    let cols = cx.iota((2usize, 3usize), |c| c[1]);
-    let init = init_base.permute((1, 0)); // (4,3), init[i][j] = init_base[j][i]
-    let src = src_base.slice((1..3, ..)); // (2,3), src[i][j] = src_base[i+1][j]
+    let cols = cx.iota(vec![2usize, 3usize], |c| c[1]);
+    let init = init_base.permute(vec![1, 0]); // (4,3), init[i][j] = init_base[j][i]
+    let src = src_base.slice(vec![(1..3).bounds(), (..).bounds()]); // (2,3), src[i][j] = src_base[i+1][j]
     let out = init.scatter(&[rows.expand_dim(1, 3usize), cols], src);
 
     let init_vals: Vec<f32> = (0..12).map(|v| 100.0 + v as f32).collect();
@@ -519,11 +520,13 @@ fn scatter_lowers_all_read_side_folds() {
 #[test]
 fn materialize_lowers_a_folded_input_operand() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize), DType::F32);
+    let x = cx.tensor(vec![2usize, 3usize], DType::F32);
     // A pure movement chain into a pinned output: the planner must
     // land the result in the caller's dense buffer, so one movement
     // materializes — and the other folds onto its input operand.
-    let out = x.permute((1, 0)).slice((0..2, ..));
+    let out = x
+        .permute(vec![1, 0])
+        .slice(vec![(0..2).bounds(), (..).bounds()]);
 
     let inputs: Vec<(NodeIndex, HostBuffer)> =
         vec![(x.id, (0..6).map(|v| v as f32).collect::<Vec<f32>>().into())];

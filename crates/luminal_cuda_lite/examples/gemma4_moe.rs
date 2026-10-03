@@ -30,12 +30,15 @@ fn run() -> anyhow::Result<()> {
     let model = Gemma4Moe::init(&mut cx, &dims);
     let token = cx.tensor(1, DType::Int);
     let q_pos = cx.tensor(1, DType::Int);
-    let sliding_cos = cx.tensor((1, dims.sliding_head_dim), DType::F32);
-    let sliding_sin = cx.tensor((1, dims.sliding_head_dim), DType::F32);
-    let sliding_rot = cx.tensor((dims.sliding_head_dim, dims.sliding_head_dim), DType::F32);
-    let full_cos = cx.tensor((1, dims.full_head_dim), DType::F32);
-    let full_sin = cx.tensor((1, dims.full_head_dim), DType::F32);
-    let full_rot = cx.tensor((dims.full_head_dim, dims.full_head_dim), DType::F32);
+    let sliding_cos = cx.tensor(vec![1, dims.sliding_head_dim], DType::F32);
+    let sliding_sin = cx.tensor(vec![1, dims.sliding_head_dim], DType::F32);
+    let sliding_rot = cx.tensor(
+        vec![dims.sliding_head_dim, dims.sliding_head_dim],
+        DType::F32,
+    );
+    let full_cos = cx.tensor(vec![1, dims.full_head_dim], DType::F32);
+    let full_sin = cx.tensor(vec![1, dims.full_head_dim], DType::F32);
+    let full_rot = cx.tensor(vec![dims.full_head_dim, dims.full_head_dim], DType::F32);
     let gather_idx = cx.tensor(SLOTS, DType::Int);
     let scatter_idx = cx.tensor(1, DType::Int);
     let pool = named_heterogeneous_kv_cache_pool(

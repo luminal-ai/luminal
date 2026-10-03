@@ -740,7 +740,7 @@ pub(super) mod tests {
         #[test]
         fn test_softmax(size in 1usize..128, rows in 1usize..16, cols in 1usize..16) {
             test_unary(size, |a| a.softmax(0), |a| softmax(&a, 0).unwrap());
-            test_unary((rows, cols), |a| a.softmax(1), |a| softmax(&a, 1).unwrap());
+            test_unary(vec![rows, cols], |a| a.softmax(1), |a| softmax(&a, 1).unwrap());
         }
 
         #[test]
@@ -772,43 +772,43 @@ pub(super) mod tests {
         #[test]
         fn test_cumulative(rows in 1usize..16, cols in 1usize..16) {
             test_unary(rows, |a| a.cumsum(0), |a| a.cumsum(0).unwrap());
-            test_unary((rows, cols), |a| a.cumsum(1), |a| a.cumsum(1).unwrap());
-            test_unary((rows, cols), |a| a.cumsum(0), |a| a.cumsum(0).unwrap());
+            test_unary(vec![rows, cols], |a| a.cumsum(1), |a| a.cumsum(1).unwrap());
+            test_unary(vec![rows, cols], |a| a.cumsum(0), |a| a.cumsum(0).unwrap());
             test_unary(
-                (rows, cols),
-                |a| a.cumsum((0, 1)),
+                vec![rows, cols],
+                |a| a.cumsum(vec![0, 1]),
                 |a| a.cumsum(0).unwrap().cumsum(1).unwrap(),
             );
             test_unary(
-                (rows, cols),
-                |a| a.cumsum((1, 0)),
+                vec![rows, cols],
+                |a| a.cumsum(vec![1, 0]),
                 |a| a.cumsum(1).unwrap().cumsum(0).unwrap(),
             );
-            test_unary((rows, cols), |a| a.cummax(1), cummax_ref_2d);
-            test_unary((rows, cols), |a| a.cumprod(1), cumprod_ref_2d);
+            test_unary(vec![rows, cols], |a| a.cummax(1), cummax_ref_2d);
+            test_unary(vec![rows, cols], |a| a.cumprod(1), cumprod_ref_2d);
         }
 
         #[test]
         fn test_argmax(rows in 1usize..16, cols in 1usize..16) {
-            test_unary((rows, cols), |a| a.argmax(0).cast(DType::F32), |a| a.argmax(0).unwrap().to_dtype(candle_core::DType::F32).unwrap());
-            test_unary((rows, cols), |a| a.argmax(1).cast(DType::F32), |a| a.argmax(1).unwrap().to_dtype(candle_core::DType::F32).unwrap());
+            test_unary(vec![rows, cols], |a| a.argmax(0).cast(DType::F32), |a| a.argmax(0).unwrap().to_dtype(candle_core::DType::F32).unwrap());
+            test_unary(vec![rows, cols], |a| a.argmax(1).cast(DType::F32), |a| a.argmax(1).unwrap().to_dtype(candle_core::DType::F32).unwrap());
         }
 
         #[test]
         fn test_argmin(rows in 1usize..16, cols in 1usize..16) {
-            test_unary((rows, cols), |a| a.argmin(0).cast(DType::F32), |a| a.argmin(0).unwrap().to_dtype(candle_core::DType::F32).unwrap());
-            test_unary((rows, cols), |a| a.argmin(1).cast(DType::F32), |a| a.argmin(1).unwrap().to_dtype(candle_core::DType::F32).unwrap());
+            test_unary(vec![rows, cols], |a| a.argmin(0).cast(DType::F32), |a| a.argmin(0).unwrap().to_dtype(candle_core::DType::F32).unwrap());
+            test_unary(vec![rows, cols], |a| a.argmin(1).cast(DType::F32), |a| a.argmin(1).unwrap().to_dtype(candle_core::DType::F32).unwrap());
         }
 
         #[test]
         fn test_var(rows in 1usize..16, cols in 1usize..16) {
-            test_unary((rows, cols), |a| a.var(1), |a| a.var(1).unwrap());
-            test_unary((rows, cols), |a| a.var(0), |a| a.var(0).unwrap());
+            test_unary(vec![rows, cols], |a| a.var(1), |a| a.var(1).unwrap());
+            test_unary(vec![rows, cols], |a| a.var(0), |a| a.var(0).unwrap());
         }
 
         #[test]
         fn test_std(rows in 1usize..16, cols in 1usize..16) {
-            test_unary((rows, cols), |a| a.std(1), |a| a.var(1).unwrap().sqrt().unwrap());
+            test_unary(vec![rows, cols], |a| a.std(1), |a| a.var(1).unwrap().sqrt().unwrap());
         }
 
     }
@@ -819,7 +819,7 @@ pub(super) mod tests {
     #[test]
     fn test_topk_indexes() {
         let mut cx = Graph::new();
-        let x = cx.tensor((2, 4), DType::F32);
+        let x = cx.tensor(vec![2, 4], DType::F32);
         let out = x.topk_indexes(2, 1).cast(DType::F32);
 
         // row 0: [0.1, 3.0, 2.0, -1.0] → top-2 desc = idx 1, 2

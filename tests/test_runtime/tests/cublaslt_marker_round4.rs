@@ -88,8 +88,8 @@ fn t6a_bufferize_all_four_forms() {
             "base",
             CublasLtForm::Base,
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize), DType::F32);
-                let w = cx.tensor((8usize, 3usize), DType::F32);
+                let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+                let w = cx.tensor(vec![8usize, 3usize], DType::F32);
                 let _ = x.matmul(w);
             }),
         ),
@@ -97,8 +97,8 @@ fn t6a_bufferize_all_four_forms() {
             "bias",
             CublasLtForm::Bias,
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize), DType::F32);
-                let w = cx.tensor((8usize, 3usize), DType::F32);
+                let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+                let w = cx.tensor(vec![8usize, 3usize], DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
                 let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
@@ -107,9 +107,9 @@ fn t6a_bufferize_all_four_forms() {
             "accumulate",
             CublasLtForm::Accumulate,
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize), DType::F32);
-                let w = cx.tensor((8usize, 3usize), DType::F32);
-                let c = cx.tensor((4usize, 3usize), DType::F32);
+                let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+                let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+                let c = cx.tensor(vec![4usize, 3usize], DType::F32);
                 let _ = x.matmul(w) + c;
             }),
         ),
@@ -117,9 +117,9 @@ fn t6a_bufferize_all_four_forms() {
             "accumulate-bias",
             CublasLtForm::AccumulateBias,
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize), DType::F32);
-                let w = cx.tensor((8usize, 3usize), DType::F32);
-                let c = cx.tensor((4usize, 3usize), DType::F32);
+                let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+                let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+                let c = cx.tensor(vec![4usize, 3usize], DType::F32);
                 let b = cx.tensor(3usize, DType::F32);
                 let _ = (x.matmul(w) + c) + b.expand_dim(0, 4usize);
             }),
@@ -260,10 +260,10 @@ fn t6a_bufferize_all_four_forms() {
 fn t6a_accumulate_intermediate_c_donation_observed() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
-        let y = cx.tensor((4usize, 3usize), DType::F32);
-        let z = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+        let y = cx.tensor(vec![4usize, 3usize], DType::F32);
+        let z = cx.tensor(vec![4usize, 3usize], DType::F32);
         let c = y + z; // intermediate C (program-freed once consumed)
         // Original boundary-flowing spelling (restored under
         // escape-and-disclose: the view-produced bound output escapes);

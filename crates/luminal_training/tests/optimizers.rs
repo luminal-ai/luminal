@@ -219,11 +219,11 @@ fn adamw_trains_linear_regression() {
     }
 
     let mut cx = Graph::new();
-    let x = cx.tensor((n, d_in), DType::F32);
-    let y = cx.tensor((n, d_out), DType::F32);
-    let w = cx.tensor((d_in, d_out), DType::F32);
+    let x = cx.tensor(vec![n, d_in], DType::F32);
+    let y = cx.tensor(vec![n, d_out], DType::F32);
+    let w = cx.tensor(vec![d_in, d_out], DType::F32);
     let d = x.matmul(w) - y;
-    let loss = (d * d).mean((0, 1));
+    let loss = (d * d).mean(vec![0, 1]);
 
     let opt = AdamW::new(0.05);
     let mut t = OptTrainer::new(&mut cx, loss, &[w], vec![vec![0.0; d_in * d_out]], &opt)
@@ -255,17 +255,17 @@ fn sgd_momentum_trains_xor() {
     let hidden = 8;
 
     let mut cx = Graph::new();
-    let x = cx.tensor((4, 2), DType::F32);
-    let y = cx.tensor((4, 1), DType::F32);
-    let w1 = cx.tensor((2, hidden), DType::F32);
+    let x = cx.tensor(vec![4, 2], DType::F32);
+    let y = cx.tensor(vec![4, 1], DType::F32);
+    let w1 = cx.tensor(vec![2, hidden], DType::F32);
     let b1 = cx.tensor(hidden, DType::F32);
-    let w2 = cx.tensor((hidden, 1), DType::F32);
+    let w2 = cx.tensor(vec![hidden, 1], DType::F32);
     let pred = (x.matmul(w1) + b1.expand_dim(0, 4))
         .tanh()
         .matmul(w2)
         .sigmoid();
     let d = pred - y;
-    let loss = (d * d).mean((0, 1));
+    let loss = (d * d).mean(vec![0, 1]);
 
     let opt = SGD::new(0.5).momentum(0.9);
     let mut t = OptTrainer::new(

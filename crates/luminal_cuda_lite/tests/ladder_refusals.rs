@@ -59,12 +59,12 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
             )
         })
         .collect();
-    let x = cx.tensor((1, d), DType::F32);
+    let x = cx.tensor(vec![1, d], DType::F32);
     let caches: Vec<_> = (0..layers)
         .map(|_| {
             (
-                cx.tensor((SLOTS, kv_dim), DType::F32),
-                cx.tensor((SLOTS, kv_dim), DType::F32),
+                cx.tensor(vec![SLOTS, kv_dim], DType::F32),
+                cx.tensor(vec![SLOTS, kv_dim], DType::F32),
             )
         })
         .collect();

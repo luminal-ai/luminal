@@ -91,8 +91,8 @@ fn read_layouts<'a>(
 #[test]
 fn a_column_major_input_carries_the_left_major_spelling() {
     let mut cx = Graph::new();
-    let x = cx.named_tensor("x", (2usize, 3usize), DType::F32);
-    let c = cx.tensor((2usize, 3usize), DType::F32);
+    let x = cx.named_tensor("x", vec![2usize, 3usize], DType::F32);
+    let c = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = x * c;
 
     let mut bindings = CudaBindings::new();
@@ -125,8 +125,8 @@ fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
     // so out (i, j) lives at flat i + 2j.
     let strides = vec![1i64, 2];
     let mut cx = Graph::new();
-    let x = cx.named_tensor("x", (2usize, 3usize), DType::F32);
-    let c = cx.tensor((2usize, 3usize), DType::F32);
+    let x = cx.named_tensor("x", vec![2usize, 3usize], DType::F32);
+    let c = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = x * c;
 
     let mut bindings = CudaBindings::new();
@@ -189,8 +189,8 @@ fn a_strided_input_is_spelled_and_planned_at_its_own_strides() {
 )]
 fn a_right_major_strides_chain_is_discovered_contiguous() {
     let mut cx = Graph::new();
-    let x = cx.named_tensor("x", (2usize, 4usize), DType::F32);
-    let c = cx.tensor((2usize, 4usize), DType::F32);
+    let x = cx.named_tensor("x", vec![2usize, 4usize], DType::F32);
+    let c = cx.tensor(vec![2usize, 4usize], DType::F32);
     let out = x * c;
 
     let mut bindings = CudaBindings::new();
@@ -229,8 +229,8 @@ fn a_right_major_strides_chain_is_discovered_contiguous() {
 )]
 fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
     let mut cx = Graph::new();
-    let x = cx.named_tensor("x", ('n', 4usize), DType::F32);
-    let c = cx.named_tensor("c", ('n', 4usize), DType::F32);
+    let x = cx.named_tensor("x", vec![IntExpr::from('n'), 4usize.into()], DType::F32);
+    let c = cx.named_tensor("c", vec![IntExpr::from('n'), 4usize.into()], DType::F32);
     let out = x * c;
 
     let mut bindings = CudaBindings::new();
@@ -282,8 +282,8 @@ fn a_symbolic_shape_at_right_major_strides_is_discovered_contiguous() {
 )]
 fn an_arbitrary_stride_on_a_degenerate_axis_is_discovered_contiguous() {
     let mut cx = Graph::new();
-    let x = cx.named_tensor("x", (1usize, 4usize), DType::F32);
-    let c = cx.tensor((1usize, 4usize), DType::F32);
+    let x = cx.named_tensor("x", vec![1usize, 4usize], DType::F32);
+    let c = cx.tensor(vec![1usize, 4usize], DType::F32);
     let out = x * c;
 
     let mut bindings = CudaBindings::new();
@@ -336,7 +336,7 @@ fn an_arbitrary_stride_on_a_degenerate_axis_is_discovered_contiguous() {
 #[test]
 fn a_strided_binding_states_one_non_negative_stride_per_axis() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize), DType::F32);
+    let x = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = x + 1.;
 
     let refusal = |layout: BoundaryLayout| {
@@ -368,8 +368,8 @@ fn a_strided_binding_states_one_non_negative_stride_per_axis() {
 )]
 fn a_zero_stride_input_plans_as_a_broadcast_read() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize), DType::F32);
-    let delta = cx.tensor((2usize, 3usize), DType::F32);
+    let x = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let delta = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = x + delta;
 
     let mut bindings = CudaBindings::new();
@@ -423,8 +423,8 @@ fn a_zero_stride_input_plans_as_a_broadcast_read() {
 )]
 fn a_zero_stride_sink_binds_and_the_search_names_it() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize), DType::F32);
-    let delta = cx.tensor((2usize, 3usize), DType::F32);
+    let x = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let delta = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = x + delta;
 
     let mut bindings = CudaBindings::new();
@@ -461,8 +461,8 @@ fn a_zero_stride_sink_binds_and_the_search_names_it() {
 )]
 fn a_column_major_sink_binds_and_the_search_names_it() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize), DType::F32);
-    let delta = cx.tensor((2usize, 3usize), DType::F32);
+    let x = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let delta = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = x + delta;
 
     let mut bindings = CudaBindings::new();
@@ -500,8 +500,8 @@ fn a_column_major_sink_binds_and_the_search_names_it() {
 )]
 fn a_column_major_output_binds_and_the_search_names_it() {
     let mut cx = Graph::new();
-    let a = cx.tensor((2usize, 3usize), DType::F32);
-    let b = cx.tensor((2usize, 3usize), DType::F32);
+    let a = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let b = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = a + b;
 
     let mut bindings = CudaBindings::new();
@@ -537,8 +537,8 @@ fn a_column_major_output_binds_and_the_search_names_it() {
 )]
 fn a_row_major_output_bound_external_plans() {
     let mut cx = Graph::new();
-    let a = cx.tensor((2usize, 3usize), DType::F32);
-    let b = cx.tensor((2usize, 3usize), DType::F32);
+    let a = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let b = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = a + b;
 
     let mut bindings = CudaBindings::new();
@@ -578,8 +578,8 @@ fn a_row_major_output_bound_external_plans() {
 fn a_zero_extent_output_at_torchs_contiguous_chain_is_named_by_the_search() {
     let plan_at = |strides: [i64; 2]| {
         let mut cx = Graph::new();
-        let a = cx.tensor((4usize, 0usize), DType::F32);
-        let b = cx.tensor((4usize, 0usize), DType::F32);
+        let a = cx.tensor(vec![4usize, 0usize], DType::F32);
+        let b = cx.tensor(vec![4usize, 0usize], DType::F32);
         let out = a + b;
 
         let mut bindings = CudaBindings::new();
@@ -620,7 +620,7 @@ fn a_zero_extent_output_at_torchs_contiguous_chain_is_named_by_the_search() {
 #[test]
 fn a_symbolic_strided_output_binds_at_its_own_dim() {
     let mut cx = Graph::new();
-    let x = cx.tensor(('n', 4usize), DType::F32);
+    let x = cx.tensor(vec![IntExpr::from('n'), 4usize.into()], DType::F32);
     let out = x + 1.;
 
     let mut bindings = CudaBindings::new();
@@ -775,9 +775,9 @@ fn reaches_int_var(egraph: &EGraph, root: &ClassId, name: &str) -> bool {
 )]
 fn symbolic_strided_inputs_are_spelled_planned_and_lowered_through_their_dim() {
     let mut cx = Graph::new();
-    let x = cx.named_tensor("x", ('n', 4usize), DType::F32);
-    let w = cx.named_tensor("w", ('n', 4usize), DType::F32);
-    let v = cx.named_tensor("v", ('n', 4usize), DType::F32);
+    let x = cx.named_tensor("x", vec![IntExpr::from('n'), 4usize.into()], DType::F32);
+    let w = cx.named_tensor("w", vec![IntExpr::from('n'), 4usize.into()], DType::F32);
+    let v = cx.named_tensor("v", vec![IntExpr::from('n'), 4usize.into()], DType::F32);
     let out = x * w * v;
 
     let dim = IntExpr::from('n');

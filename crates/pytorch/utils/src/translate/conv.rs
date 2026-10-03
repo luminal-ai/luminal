@@ -347,7 +347,7 @@ fn conv_unfold(
     }
     // patches: [N, spatial_product, ch_in * kernel_product]
 
-    let mut out = patches.matmul(w_flat.permute((1, 0)));
+    let mut out = patches.matmul(w_flat.permute(vec![1, 0]));
     // out: [N, spatial_product, ch_out]
 
     // Restore the spatial dimensions.

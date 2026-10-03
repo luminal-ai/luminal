@@ -143,8 +143,8 @@ mod tests {
         let mut cx = Graph::new();
         let layers = (0..2).map(|_| {
             KvCache::new(
-                cx.tensor((8, 4), DType::Bf16),
-                cx.tensor((8, 4), DType::Bf16),
+                cx.tensor(vec![8, 4], DType::Bf16),
+                cx.tensor(vec![8, 4], DType::Bf16),
             )
         });
         let pool = KvCachePool::from_layers(layers);

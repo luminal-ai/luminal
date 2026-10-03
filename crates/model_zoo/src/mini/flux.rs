@@ -373,8 +373,8 @@ impl MiniDit {
             let dims = x.dims();
             x * g.expand(dims)
         };
-        let heads = |x: GraphTensor| x.split_dims(1, self.head_dim).permute((1, 0, 2)); // (H,S,hd)
-        let unheads = |x: GraphTensor| x.permute((1, 0, 2)).merge_dims(1, 2); // (S,d)
+        let heads = |x: GraphTensor| x.split_dims(1, self.head_dim).permute(vec![1, 0, 2]); // (H,S,hd)
+        let unheads = |x: GraphTensor| x.permute(vec![1, 0, 2]).merge_dims(1, 2); // (S,d)
         let head_rms = |x: GraphTensor, weight: GraphTensor| {
             let dims = x.dims();
             let inv = ((x * x).mean(2) + 1e-6).sqrt().reciprocal(); // (H,S)
@@ -392,7 +392,7 @@ impl MiniDit {
         };
         let sdpa = |q: GraphTensor, k: GraphTensor, v: GraphTensor| {
             let scale = 1.0 / (self.head_dim as f32).sqrt();
-            let scores = q.matmul(k.permute((0, 2, 1))) * scale; // (H,S,S)
+            let scores = q.matmul(k.permute(vec![0, 2, 1])) * scale; // (H,S,S)
             scores.softmax(2).matmul(v) // (H,S,hd)
         };
         let swiglu =

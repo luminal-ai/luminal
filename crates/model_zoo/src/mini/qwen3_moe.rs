@@ -95,10 +95,14 @@ fn moe_lm_new(
                     moe: Box::new(MiniLinearMoe {
                         expert_weights: cx.named_tensor(
                             mlp_ns.leaf("experts"),
-                            (experts, d, d),
+                            vec![experts, d, d],
                             DType::F32,
                         ),
-                        router: cx.named_tensor(mlp_ns.leaf("router"), (d, experts), DType::F32),
+                        router: cx.named_tensor(
+                            mlp_ns.leaf("router"),
+                            vec![d, experts],
+                            DType::F32,
+                        ),
                         top_k,
                     }),
                     n_heads,

@@ -29,10 +29,10 @@ fn flux2_dev_full_forward_contract_builds() {
     const TOKENS: usize = TEXT_TOKENS + IMAGE_TOKENS;
     let mut cx = Graph::new();
     let model = Flux2Transformer::init(&mut cx);
-    let latent = cx.tensor((IMAGE_TOKENS, IN_CHANNELS), DType::F32);
-    let text = cx.tensor((TEXT_TOKENS, JOINT_ATTENTION_DIM), DType::F32);
-    let rope_cos = cx.tensor((TOKENS, HEAD_DIM), DType::F32);
-    let rope_sin = cx.tensor((TOKENS, HEAD_DIM), DType::F32);
+    let latent = cx.tensor(vec![IMAGE_TOKENS, IN_CHANNELS], DType::F32);
+    let text = cx.tensor(vec![TEXT_TOKENS, JOINT_ATTENTION_DIM], DType::F32);
+    let rope_cos = cx.tensor(vec![TOKENS, HEAD_DIM], DType::F32);
+    let rope_sin = cx.tensor(vec![TOKENS, HEAD_DIM], DType::F32);
     let timestep = cx.tensor(1, DType::F32);
     let guidance = cx.tensor(1, DType::F32);
 

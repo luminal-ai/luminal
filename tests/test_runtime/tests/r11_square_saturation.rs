@@ -8,8 +8,8 @@ use luminal::graph::Graph;
 fn r11_squares_saturate_bounded() {
     let a3 = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize), DType::F32);
-        let w = cx.tensor((4usize, 4usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 4usize], DType::F32);
+        let w = cx.tensor(vec![4usize, 4usize], DType::F32);
         let _ = x.matmul(w);
         test_runtime::bind_leaves(&cx)
     };
@@ -18,8 +18,8 @@ fn r11_squares_saturate_bounded() {
 
     let a6b = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize), DType::F32);
-        let _ = x.matmul(x.permute((1usize, 0usize)));
+        let x = cx.tensor(vec![4usize, 4usize], DType::F32);
+        let _ = x.matmul(x.permute(vec![1usize, 0usize]));
         test_runtime::bind_leaves(&cx)
     };
     let s6 = test_runtime::serialize_fixture(&a6b);

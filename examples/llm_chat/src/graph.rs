@@ -287,9 +287,9 @@ impl RopeInputs {
         dtype: DType,
     ) -> Self {
         Self {
-            cos: cx.tensor(('q', width), dtype),
-            sin: cx.tensor(('q', width), dtype),
-            rot: rotation.unwrap_or_else(|| cx.tensor((width, width), dtype)),
+            cos: cx.tensor(vec![IntExpr::from('q'), width.into()], dtype),
+            sin: cx.tensor(vec![IntExpr::from('q'), width.into()], dtype),
+            rot: rotation.unwrap_or_else(|| cx.tensor(vec![width, width], dtype)),
             width,
             theta,
             scale,

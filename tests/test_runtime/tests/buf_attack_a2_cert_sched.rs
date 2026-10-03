@@ -109,8 +109,8 @@ fn report(name: &str, text: &str) {
 fn a2_single_view_to_bound() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let _ = x.matmul(w).transpose(0, 1);
         test_runtime::bind_leaves(&cx)
     };
@@ -123,8 +123,8 @@ fn a2_single_view_to_bound() {
 fn a2_double_view_roundtrip() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let _ = x.matmul(w).transpose(0, 1).transpose(0, 1);
         test_runtime::bind_leaves(&cx)
     };
@@ -137,9 +137,9 @@ fn a2_double_view_roundtrip() {
 fn a2_view_fanout() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
-        let c = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+        let c = cx.tensor(vec![4usize, 3usize], DType::F32);
         let y = x.matmul(w);
         let _ = y.transpose(0, 1);
         let _ = y * c;
@@ -163,8 +163,8 @@ fn a2_view_fanout() {
 fn a2_two_slots_same_value() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let y = x.matmul(w);
         let t = y.transpose(0, 1);
         // Two slots on ONE value: the matmul is bound directly as well as

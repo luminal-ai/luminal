@@ -35,23 +35,23 @@ fn nodes(text: &str, name: &str) -> usize {
 fn transpose_view_marginal_cost() {
     // P0: the scaling test's own block, A[m,k],B[k,n]-spelled.
     let mut cx = Graph::new();
-    let x = cx.tensor((32usize, 48usize), DType::F32);
-    let w = cx.tensor((48usize, 64usize), DType::F32);
+    let x = cx.tensor(vec![32usize, 48usize], DType::F32);
+    let w = cx.tensor(vec![48usize, 64usize], DType::F32);
     let _ = x.matmul(w).relu();
     let p0 = test_runtime::bind_leaves(&cx);
 
     // P1: same block, plus ONE transposing view on the output.
     let mut cx = Graph::new();
-    let x = cx.tensor((32usize, 48usize), DType::F32);
-    let w = cx.tensor((48usize, 64usize), DType::F32);
-    let _ = x.matmul(w).relu().permute((1usize, 0usize));
+    let x = cx.tensor(vec![32usize, 48usize], DType::F32);
+    let w = cx.tensor(vec![48usize, 64usize], DType::F32);
+    let _ = x.matmul(w).relu().permute(vec![1usize, 0usize]);
     let p1 = test_runtime::bind_leaves(&cx);
 
     // P2: A[m,k],B[n,k]-spelled -- the permute folds into the operand's index map.
     let mut cx = Graph::new();
-    let x = cx.tensor((32usize, 48usize), DType::F32);
-    let w = cx.tensor((64usize, 48usize), DType::F32);
-    let _ = x.matmul(w.permute((1usize, 0usize))).relu();
+    let x = cx.tensor(vec![32usize, 48usize], DType::F32);
+    let w = cx.tensor(vec![64usize, 48usize], DType::F32);
+    let _ = x.matmul(w.permute(vec![1usize, 0usize])).relu();
     let p2 = test_runtime::bind_leaves(&cx);
 
     let n0 = nodes(&p0, "P0 amk_bkn-block");

@@ -333,7 +333,7 @@ impl Translator<'_> {
         // and only the 0/1 predicate is materialized (no floating-point indices).
         let mut mask = self
             .cx
-            .iota((rows, cols), |c| {
+            .iota(vec![rows, cols], |c| {
                 let offset = c[1] - c[0];
                 if upper {
                     offset.gte(diagonal)

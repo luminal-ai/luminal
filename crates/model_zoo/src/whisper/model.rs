@@ -92,8 +92,8 @@ fn conv1d_bias(
     let unfolded = padded
         .unfold([1usize, kernel], [1usize, stride], [1usize, 1usize])
         .squeeze(2);
-    let flat = unfolded.permute((1, 0, 2)).merge_dims(1, 2);
-    let out = flat.matmul(weight.permute((1, 0)));
+    let flat = unfolded.permute(vec![1, 0, 2]).merge_dims(1, 2);
+    let out = flat.matmul(weight.permute(vec![1, 0]));
     let n_windows = out.dims()[0];
     (out + bias.expand_dim(0, n_windows)).transpose(0, 1)
 }
@@ -240,7 +240,7 @@ impl Whisper {
             conv1_w: cx
                 .named_tensor(
                     enc.child("conv1").leaf("weight"),
-                    (d.state, d.n_mels, 3usize),
+                    vec![d.state, d.n_mels, 3usize],
                     DType::F32,
                 )
                 .view()
@@ -250,7 +250,7 @@ impl Whisper {
             conv2_w: cx
                 .named_tensor(
                     enc.child("conv2").leaf("weight"),
-                    (d.state, d.state, 3usize),
+                    vec![d.state, d.state, 3usize],
                     DType::F32,
                 )
                 .view()
@@ -259,7 +259,7 @@ impl Whisper {
             conv2_b: cx.named_tensor(enc.child("conv2").leaf("bias"), d.state, DType::F32),
             enc_pos: cx.named_tensor(
                 enc.child("embed_positions").leaf("weight"),
-                (d.audio_ctx, d.state),
+                vec![d.audio_ctx, d.state],
                 DType::F32,
             ),
             enc_layers,
@@ -267,7 +267,7 @@ impl Whisper {
             embed: Embedding::new(d.vocab, d.state, DType::F32, &dec.child("embed_tokens"), cx),
             dec_pos: cx.named_tensor(
                 dec.child("embed_positions").leaf("weight"),
-                (d.text_ctx, d.state),
+                vec![d.text_ctx, d.state],
                 DType::F32,
             ),
             dec_layers,

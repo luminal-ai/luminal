@@ -61,7 +61,7 @@ fn pool_windows(input: GraphTensor, kernel: impl ToShape, stride: impl ToShape) 
         .unfold(kernel, stride, [1, 1, 1, 1])
         .squeeze(4)
         .squeeze(4)
-        .mean((4, 5))
+        .mean(vec![4, 5])
 }
 
 #[cfg(test)]
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn avg_pool_2d_batched() {
         let mut cx = Graph::new();
-        let input = cx.tensor((1, 1, 4, 4), DType::F32);
+        let input = cx.tensor(vec![1, 1, 4, 4], DType::F32);
         let output = avg_pool_2d(input, (2, 2), (2, 2));
 
         assert_eq!(
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn avg_pool_2d_unbatched() {
         let mut cx = Graph::new();
-        let input = cx.tensor((1, 4, 4), DType::F32);
+        let input = cx.tensor(vec![1, 4, 4], DType::F32);
         let output = avg_pool_2d(input, (2, 2), (2, 2));
 
         assert_eq!(
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn adaptive_avg_pool_2d_uses_overlapping_windows() {
         let mut cx = Graph::new();
-        let input = cx.tensor((1, 1, 5, 5), DType::F32);
+        let input = cx.tensor(vec![1, 1, 5, 5], DType::F32);
         let output = adaptive_avg_pool_2d(input, (2, 2));
 
         assert_eq!(

@@ -4,6 +4,7 @@ use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::FxHashMap;
+use luminal::shape::IntExpr;
 use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, harness_search_options};
 
 fn signature(plan: &BufferIrGraph<DecodedLayout>) -> (usize, usize, usize, Vec<String>) {
@@ -26,8 +27,8 @@ fn signature(plan: &BufferIrGraph<DecodedLayout>) -> (usize, usize, usize, Vec<S
 
 fn elementwise_fixture() -> (Graph, FxHashMap<luminal::prelude::NodeIndex, HostBuffer>) {
     let mut cx = Graph::new();
-    let a = cx.tensor((2usize, 3usize), DType::F32);
-    let b = cx.tensor((2usize, 3usize), DType::F32);
+    let a = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let b = cx.tensor(vec![2usize, 3usize], DType::F32);
     let _out = (a + b) * a;
     let data: FxHashMap<_, _> = [
         (a.id, vec![1.0f32, 2., 3., 4., 5., 6.].into()),
@@ -93,11 +94,11 @@ fn bounded_fixture() -> Graph {
     let mut cx = Graph::new();
     cx.set_dim('a', 3);
     let d = 8usize;
-    let x = cx.tensor((1usize, d), DType::F32);
-    let wq = cx.tensor((d, d), DType::F32);
-    let k = cx.tensor(('a', d), DType::F32);
+    let x = cx.tensor(vec![1usize, d], DType::F32);
+    let wq = cx.tensor(vec![d, d], DType::F32);
+    let k = cx.tensor(vec![IntExpr::from('a'), d.into()], DType::F32);
     let q = x.matmul(wq);
-    let scores = q.matmul(k.permute((1, 0)));
+    let scores = q.matmul(k.permute(vec![1, 0]));
     let e = scores.exp();
     let p = e * scores;
     let o = p.matmul(k);

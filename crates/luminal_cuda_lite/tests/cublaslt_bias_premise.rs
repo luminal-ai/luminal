@@ -58,9 +58,9 @@ const N: usize = 3; // features (the recorder's n = the sibling call's m)
 /// `y = x.matmul(w) + b.expand_lhs(&[m])`.
 fn linear_with_bias() -> (Graph, NodeIndex, NodeIndex, NodeIndex, NodeIndex) {
     let mut cx = Graph::new();
-    let weight = cx.named_tensor("fc.weight", (K, N), DType::F32);
+    let weight = cx.named_tensor("fc.weight", vec![K, N], DType::F32);
     let bias = cx.named_tensor("fc.bias", N, DType::F32);
-    let x = cx.tensor((M, K), DType::F32);
+    let x = cx.tensor(vec![M, K], DType::F32);
     let out = luminal_nn::linear(x, weight, Some(bias));
     (cx, x.id, weight.id, bias.id, out.id)
 }
@@ -398,9 +398,9 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
 /// call frame's n collapses to 1.
 fn degenerate_linear_with_bias() -> (Graph, NodeIndex, NodeIndex, NodeIndex, NodeIndex) {
     let mut cx = Graph::new();
-    let weight = cx.named_tensor("fc.weight", (K, N), DType::F32);
+    let weight = cx.named_tensor("fc.weight", vec![K, N], DType::F32);
     let bias = cx.named_tensor("fc.bias", N, DType::F32);
-    let x = cx.tensor((1usize, K), DType::F32);
+    let x = cx.tensor(vec![1usize, K], DType::F32);
     let out = luminal_nn::linear(x, weight, Some(bias));
     (cx, x.id, weight.id, bias.id, out.id)
 }
@@ -584,8 +584,8 @@ fn a_degenerate_extent_bias_election_binds_col_and_is_not_refused() {
 #[test]
 fn per_row_bias_does_not_mint_the_bias_form() {
     let mut cx = Graph::new();
-    let x = cx.tensor((M, K), DType::F32);
-    let w = cx.tensor((K, N), DType::F32);
+    let x = cx.tensor(vec![M, K], DType::F32);
+    let w = cx.tensor(vec![K, N], DType::F32);
     let b_rows = cx.tensor(M, DType::F32);
     // [4] -> [4, 3] along the FEATURE axis: entry (CoordVar d_shape 1),
     // i.e. bias[i] added to every element of row i — cuBLASLt's epilogue

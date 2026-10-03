@@ -12,15 +12,15 @@ fn e2_fill_depth_from_live_recorder() {
     for (name, text) in [
         ("relu", {
             let mut cx = Graph::new();
-            let x = cx.tensor((4usize, 8usize), DType::F32);
-            let w = cx.tensor((8usize, 3usize), DType::F32);
+            let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+            let w = cx.tensor(vec![8usize, 3usize], DType::F32);
             let _ = x.matmul(w).relu();
             test_runtime::bind_leaves(&cx)
         }),
         ("bias+relu", {
             let mut cx = Graph::new();
-            let x = cx.tensor((4usize, 8usize), DType::F32);
-            let w = cx.tensor((8usize, 3usize), DType::F32);
+            let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+            let w = cx.tensor(vec![8usize, 3usize], DType::F32);
             let b = cx.tensor(3usize, DType::F32);
             let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
             test_runtime::bind_leaves(&cx)

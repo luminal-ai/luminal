@@ -1,5 +1,6 @@
 #![cfg(target_os = "macos")]
 mod support;
+use luminal::shape::IntExpr;
 use luminal::{bufferize::BufferNode, dtype::DType, graph::Graph};
 use luminal_metal::{MetalRuntime, harness_search_options, metal_registry_filtered};
 #[cfg(target_os = "macos")]
@@ -8,8 +9,8 @@ use support::TestTransfers;
 #[test]
 fn fused_dot_handles_broadcast_views_and_dynamic_contraction() {
     let mut g = Graph::new();
-    let a = g.tensor((3, 'k'), DType::F32);
-    let b = g.tensor((2, 'k'), DType::F32);
+    let a = g.tensor(vec![IntExpr::from(3), 'k'.into()], DType::F32);
+    let b = g.tensor(vec![IntExpr::from(2), 'k'.into()], DType::F32);
     let out = a.matmul(b.t());
     // Require the fused operation to prove that its own generated shader runs.
     let mut rt = MetalRuntime::load_with_registry(
@@ -80,8 +81,8 @@ fn fused_dot_does_not_contract_multiply_and_add() {
 fn default_search_measures_a_matmul_chain() {
     use luminal_metal::CompileOptions;
     let mut graph = Graph::new();
-    let input = graph.tensor((4, 32), DType::F32);
-    let weight = graph.tensor((32, 32), DType::F32);
+    let input = graph.tensor(vec![4, 32], DType::F32);
+    let weight = graph.tensor(vec![32, 32], DType::F32);
     let mut value = input;
     for _ in 0..6 {
         value = value.matmul(weight);
@@ -127,8 +128,8 @@ fn default_search_measures_a_matmul_chain() {
 fn deep_fork_join_search_executes_without_cost_overflow() {
     use luminal_metal::CompileOptions;
     let mut graph = Graph::new();
-    let input = graph.tensor((4, 32), DType::F32);
-    let weight = graph.tensor((32, 32), DType::F32);
+    let input = graph.tensor(vec![4, 32], DType::F32);
+    let weight = graph.tensor(vec![32, 32], DType::F32);
     let mut value = input;
     // Repeated joins have exponentially many paths but linear graph depth.
     // Extraction must remain finite without a recursive byte estimate.

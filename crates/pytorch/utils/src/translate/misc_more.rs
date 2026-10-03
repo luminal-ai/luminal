@@ -497,7 +497,7 @@ mod tests {
             vec![1, 2, 12],
         ] {
             let mut cx = Graph::new();
-            let x = cx.tensor((2, 3, 4), DType::F32);
+            let x = cx.tensor(vec![2, 3, 4], DType::F32);
             let reshaped = reshape_view(x, &dims(&target));
             assert_eq!(reshaped.dims(), dims(&target), "target {target:?}");
         }

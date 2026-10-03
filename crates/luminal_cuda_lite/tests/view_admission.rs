@@ -14,6 +14,7 @@
 //!    the view's own layout as the e-graph minted it (the hop chain is
 //!    retired: corrected contract, 2026-08-31).
 
+use luminal::shape::SliceRange;
 use std::collections::{BTreeMap, BTreeSet};
 
 use luminal::dtype::DType;
@@ -220,9 +221,9 @@ fn flat_index(layout: &DecodedLayout, out_coord: &[usize]) -> i64 {
 #[test]
 fn transpose_consumer_folds_and_carries_the_swap_map() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize), DType::F32);
-    let c = cx.tensor((3usize, 2usize), DType::F32);
-    let _out = x.permute((1, 0)) * c;
+    let x = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let c = cx.tensor(vec![3usize, 2usize], DType::F32);
+    let _out = x.permute(vec![1, 0]) * c;
 
     let (rt, egraph) = saturated(&cx);
     let view = EGraphView::new(&egraph, rt.decoders());
@@ -249,9 +250,9 @@ fn transpose_consumer_folds_and_carries_the_swap_map() {
 #[test]
 fn slice_consumer_folds_and_carries_the_offset_map() {
     let mut cx = Graph::new();
-    let x = cx.tensor((4usize, 6usize), DType::F32);
-    let c = cx.tensor((2usize, 6usize), DType::F32);
-    let _out = x.slice((1..3, ..)) * c;
+    let x = cx.tensor(vec![4usize, 6usize], DType::F32);
+    let c = cx.tensor(vec![2usize, 6usize], DType::F32);
+    let _out = x.slice(vec![(1..3).bounds(), (..).bounds()]) * c;
 
     let (rt, egraph) = saturated(&cx);
     let view = EGraphView::new(&egraph, rt.decoders());
@@ -278,7 +279,7 @@ fn slice_consumer_folds_and_carries_the_offset_map() {
 fn broadcast_consumer_folds_and_carries_the_stride0_map() {
     let mut cx = Graph::new();
     let x = cx.tensor(3usize, DType::F32);
-    let c = cx.tensor((2usize, 3usize), DType::F32);
+    let c = cx.tensor(vec![2usize, 3usize], DType::F32);
     let _out = x.expand_dim(0, 2) * c;
 
     let (rt, egraph) = saturated(&cx);
@@ -306,9 +307,9 @@ fn broadcast_consumer_folds_and_carries_the_stride0_map() {
 #[test]
 fn chained_matmul_folds_all_movement() {
     let mut cx = Graph::new();
-    let a = cx.tensor((2usize, 3usize), DType::F32);
-    let b = cx.tensor((3usize, 4usize), DType::F32);
-    let c = cx.tensor((4usize, 2usize), DType::F32);
+    let a = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let b = cx.tensor(vec![3usize, 4usize], DType::F32);
+    let c = cx.tensor(vec![4usize, 2usize], DType::F32);
     let _out = a.matmul(b).matmul(c);
 
     let (rt, egraph) = saturated(&cx);

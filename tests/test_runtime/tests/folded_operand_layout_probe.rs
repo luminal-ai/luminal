@@ -30,6 +30,7 @@
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
+use luminal::shape::SliceRange;
 use std::collections::HashMap;
 use test_runtime::test_support::MockLayout;
 
@@ -102,9 +103,9 @@ fn folded_slots(
 fn transpose_view_consumer_carries_the_views_own_layout() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((2usize, 3usize), DType::F32);
-        let c = cx.tensor((3usize, 2usize), DType::F32);
-        let _ = x.permute((1, 0)) * c;
+        let x = cx.tensor(vec![2usize, 3usize], DType::F32);
+        let c = cx.tensor(vec![3usize, 2usize], DType::F32);
+        let _ = x.permute(vec![1, 0]) * c;
         test_runtime::bind_leaves(&cx)
     };
     let (plan, table, found) = folded_slots(&text, &["LayoutTensorOpIndexMapApplyViewGeneric"]);
@@ -150,9 +151,12 @@ fn transpose_view_consumer_carries_the_views_own_layout() {
 fn sliced_transpose_chain_arrives_as_one_layout() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 6usize), DType::F32);
-        let c = cx.tensor((6usize, 2usize), DType::F32);
-        let _ = x.slice((1..3, ..)).permute((1, 0)) * c;
+        let x = cx.tensor(vec![4usize, 6usize], DType::F32);
+        let c = cx.tensor(vec![6usize, 2usize], DType::F32);
+        let _ = x
+            .slice(vec![(1..3).bounds(), (..).bounds()])
+            .permute(vec![1, 0])
+            * c;
         test_runtime::bind_leaves(&cx)
     };
     let (plan, table, found) = folded_slots(&text, &["LayoutTensorOpIndexMapApplyViewGeneric"]);
@@ -176,9 +180,9 @@ fn sliced_transpose_chain_arrives_as_one_layout() {
 fn r10_chained_matmuls_read_through_folded_layouts() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w1 = cx.tensor((8usize, 3usize), DType::F32);
-        let w2 = cx.tensor((3usize, 5usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w1 = cx.tensor(vec![8usize, 3usize], DType::F32);
+        let w2 = cx.tensor(vec![3usize, 5usize], DType::F32);
         let _ = x.matmul(w1).matmul(w2);
         test_runtime::bind_leaves(&cx)
     };

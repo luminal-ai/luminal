@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn a_symbolic_stride_renders_as_the_dim() {
         let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor(('n', 4usize), DType::F32);
+        let x = cx.tensor(vec![IntExpr::from('n'), 4usize.into()], DType::F32);
         let out = x + 1.;
         let mut bindings = CudaBindings::new();
         bindings.input_with(

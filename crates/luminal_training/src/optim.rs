@@ -16,9 +16,9 @@
 //! use luminal_training::{Backward, Optimizer, SGD};
 //!
 //! let mut cx = Graph::new();
-//! let w = cx.tensor((3, 4), DType::F32);
-//! let x = cx.tensor((2, 3), DType::F32);
-//! let loss = x.matmul(w).sum((0, 1));
+//! let w = cx.tensor(vec![3, 4], DType::F32);
+//! let x = cx.tensor(vec![2, 3], DType::F32);
+//! let loss = x.matmul(w).sum(vec![0, 1]);
 //! let grads = cx.backward(loss, &[w]);
 //! let opt = SGD::new(1e-2).momentum(0.9);
 //! let step = opt.build(&mut cx, &[w], &grads);

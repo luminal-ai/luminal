@@ -57,8 +57,8 @@ fn weights(n: usize, seed: usize) -> Vec<f32> {
 /// transpose-sandwich + double-transpose collapse produced the welds.
 fn marker_matmul() -> (Graph, NodeIndex, NodeIndex) {
     let mut cx = Graph::new();
-    let a = cx.tensor((4usize, 8usize), DType::F32);
-    let b = cx.tensor((8usize, 3usize), DType::F32);
+    let a = cx.tensor(vec![4usize, 8usize], DType::F32);
+    let b = cx.tensor(vec![8usize, 3usize], DType::F32);
     let _out = a.matmul(b);
     (cx, a.id, b.id)
 }
@@ -422,8 +422,8 @@ const NAMED_OUTPUT: &str = "logits";
 /// transpose collapse, so the same input producers are minted.
 fn named_marker_matmul() -> Graph {
     let mut cx = Graph::new();
-    let a = cx.named_tensor(NAMED_INPUTS[0], (4usize, 8usize), DType::F32);
-    let b = cx.named_tensor(NAMED_INPUTS[1], (8usize, 3usize), DType::F32);
+    let a = cx.named_tensor(NAMED_INPUTS[0], vec![4usize, 8usize], DType::F32);
+    let b = cx.named_tensor(NAMED_INPUTS[1], vec![8usize, 3usize], DType::F32);
     let _out = a.matmul(b).named(NAMED_OUTPUT);
     cx
 }

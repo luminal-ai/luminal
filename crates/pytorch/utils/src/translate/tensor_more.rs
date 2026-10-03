@@ -923,7 +923,7 @@ impl Translator<'_> {
         //   flat[m, k_, n_] = expert_id[m] * (K*N) + k_ * N + n_
         let io = k * n;
         let base = expert_id * io;
-        let within = self.cx.iota((k, n), |c| c[0] * n + c[1]);
+        let within = self.cx.iota(vec![k, n], |c| c[0] * n + c[1]);
         let exp_base = base.expand_dim(1, k).expand_dim(2, n);
         let exp_within = within.expand_dim(0, s);
         let flat_idx = exp_base + exp_within;
