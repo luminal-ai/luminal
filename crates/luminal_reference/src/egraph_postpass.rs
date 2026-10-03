@@ -23,6 +23,14 @@ pub fn run(
 ) -> Result<MemoryPruning> {
     let intervals = bounds.signed_intervals();
     let capacity = |layout: &DecodedLayout| {
+        // An empty domain reaches no storage, even when its strided spelling
+        // computes a negative formal span from (extent - 1).
+        if layout
+            .literal_extents()
+            .is_some_and(|dims| dims.contains(&0))
+        {
+            return Ok(Some(0));
+        }
         let Some(span) = layout
             .spellings
             .iter()

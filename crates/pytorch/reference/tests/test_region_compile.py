@@ -185,6 +185,78 @@ def test_compiled_artifact_round_trip_cpu() -> None:
     torch.testing.assert_close(actual, inputs[0] + inputs[1])
 
 
+def test_cold_bindings_share_plan_and_keep_execution_storage_independent():
+    import copy
+
+    from luminal_reference.backend import compile_exported
+
+    inputs = [torch.randn(2, 4), torch.randn(2, 4)]
+    program = torch.export.export(_add_graph(), tuple(inputs))
+    fake_inputs = [
+        node.meta["val"] for node in program.graph.nodes if node.op == "placeholder"
+    ]
+    native = compile_exported(program, fake_inputs, search_iterations=1)
+    searches = []
+
+    class CountedGraph:
+        def __init__(self, graph):
+            self.graph = graph
+
+        def __getattr__(self, name):
+            return getattr(self.graph, name)
+
+        def fork(self):
+            return CountedGraph(self.graph.fork())
+
+        def search(self, **options):
+            searches.append(self.graph)
+            return self.graph.search(**options)
+
+    native._graph = CountedGraph(native._graph)
+    first, second = copy.copy(native), copy.copy(native)
+    assert first._pending_search is not second._pending_search
+    (actual,) = first(*inputs)
+    saved_bytes = first._graph.output_bytes(0)
+    torch.testing.assert_close(actual, sum(inputs))
+    zeros = [torch.zeros_like(value) for value in inputs]
+    (other,) = second(*zeros)
+    torch.testing.assert_close(other, zeros[0])
+    assert first._graph.output_bytes(0) == saved_bytes
+    third = copy.copy(native)
+    torch.testing.assert_close(third(*inputs)[0], sum(inputs))
+    warm = copy.copy(first)
+    torch.testing.assert_close(warm(*zeros)[0], zeros[0])
+    assert first._graph.output_bytes(0) == saved_bytes
+    assert len(searches) == 1
+
+
+def test_cold_bindings_isolate_mutable_exported_buffers():
+    import copy
+
+    from luminal_reference.backend import compile_exported
+
+    class Accumulator(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.zeros(4))
+
+        def forward(self, value):
+            self.total.add_(value)
+            return self.total.clone()
+
+    value = torch.ones(4)
+    program = torch.export.export(Accumulator(), (value,)).run_decompositions()
+    native = compile_exported(program, (value,), search_iterations=1, defer_search=True)
+    first, second = copy.copy(native), copy.copy(native)
+    torch.testing.assert_close(first(value)[0], value)
+    torch.testing.assert_close(first(value)[0], value * 2)
+    torch.testing.assert_close(second(value)[0], value)
+    warm = copy.copy(first)
+    torch.testing.assert_close(warm(value)[0], value * 3)
+    torch.testing.assert_close(first(value)[0], value * 3)
+    assert all(torch.count_nonzero(buffer) == 0 for buffer in native._held.values())
+
+
 def test_compiled_artifact_rejects_bound_weights() -> None:
     from luminal_reference.frontend import compile_exported
 

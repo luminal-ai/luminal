@@ -259,21 +259,20 @@ pub struct ReferenceRuntime {
 }
 
 impl ReferenceRuntime {
-    /// A fresh execution binding for the selected program. No search or data
-    /// storage is copied; callers stage their own inputs and dimension values.
+    /// A fresh execution binding. A selected plan is reused; a cold binding
+    /// retains its search specification. Callers stage their own input storage.
     pub fn fork(&self) -> Result<Self> {
-        let plan = self
-            .plan
-            .as_ref()
-            .ok_or_else(|| anyhow!("search before fork"))?;
         let mut runtime = Self {
             memory_budget_bytes: self.memory_budget_bytes,
             input_buffers: self.input_buffers.clone(),
             output_buffers: self.output_buffers.clone(),
             dims: self.dims.clone(),
+            native: self.plan.is_none().then(|| self.native.clone()).flatten(),
             ..Default::default()
         };
-        runtime.load_plan(plan.clone(), self.bounds.clone());
+        if let Some(plan) = &self.plan {
+            runtime.load_plan(plan.clone(), self.bounds.clone());
+        }
         Ok(runtime)
     }
 

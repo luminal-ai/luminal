@@ -78,6 +78,9 @@ class CompiledModel:
     ):
         self._graph = graph
         self._pending_search = [pending_search]
+        # Bindings share the selected program, never execution storage or the
+        # per-binding deferred-search state. Populate only after search succeeds.
+        self._selected_plan = [None]
         self._ep = ep
         self._scalar_output_positions = frozenset(scalar_output_positions)
         # Graph input name -> the exported parameter/buffer tensor staged for
@@ -94,10 +97,20 @@ class CompiledModel:
         self._output_returns = graph.output_returns
 
     def __copy__(self):
+        mutations = set(self._output_mutations)
+        held = {
+            name: value.clone() if name in mutations else value
+            for name, value in self._held.items()
+        }
         model = type(self)(
-            self._graph.fork(), self._ep, self._scalar_output_positions, self._held
+            self._graph.fork(),
+            self._ep,
+            self._scalar_output_positions,
+            held,
+            self._pending_search[0],
         )
-        for name, value in self._held.items():
+        model._selected_plan = self._selected_plan
+        for name, value in held.items():
             model._graph.set_input(name, _tensor_bytes(value), list(value.shape))
         return model
 
@@ -124,12 +137,29 @@ class CompiledModel:
             )
         for name, value in zip(self._user_input_names, inputs):
             self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+        # Buffer writes update the held tensor after execution. Rebind that
+        # state on the next invocation, including after candidate profiling.
+        for name, value in self._held.items():
+            if name in self._output_mutations:
+                self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
         if self._pending_search[0] is not None:
-            self._graph.search(**self._pending_search[0])
+            if self._selected_plan[0] is None:
+                self._graph.search(**self._pending_search[0])
+                self._selected_plan[0] = self._graph.serialize_compiled()
+            else:
+                self._graph.load_compiled(
+                    self._selected_plan[0],
+                    memory_budget_bytes=self._pending_search[0].get(
+                        "memory_budget_bytes"
+                    ),
+                )
             self._pending_search[0] = None
             # Restore the real invocation after search profiles candidates.
             for name, value in zip(self._user_input_names, inputs):
                 self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+            for name, value in self._held.items():
+                if name in self._output_mutations:
+                    self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
         # Output shapes depend on the bound dims, so read them after the
         # inputs are staged rather than caching them at compile time.
         output_shapes = self._graph.output_shapes

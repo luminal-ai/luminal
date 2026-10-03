@@ -175,11 +175,8 @@ fn resolve_shape(shape: &[IntExpr], dims: &DynMap) -> Vec<usize> {
 
 #[pymethods]
 impl CompiledGraph {
-    /// A new binding of the selected program, with no native compilation.
+    /// A new independent binding, preserving whether search is still deferred.
     fn fork(&self) -> PyResult<Self> {
-        if !self.searched {
-            return Err(PyRuntimeError::new_err("search before fork"));
-        }
         Ok(Self {
             translation: self.translation.clone(),
             torch_dtypes: self.torch_dtypes.clone(),
@@ -189,7 +186,7 @@ impl CompiledGraph {
             staged: HashMap::new(),
             dims: self.dims.clone(),
             bounds: self.bounds.clone(),
-            searched: true,
+            searched: self.searched,
         })
     }
 
