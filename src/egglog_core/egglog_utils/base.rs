@@ -686,6 +686,28 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
         )
         .ruleset("expr"),
     );
+    // Associate a literal cofactor across two symbolic extent factors.
+    p.add_rule(
+        rewrite(
+            "associate-literal-extent-product",
+            mul(mul(num(v("?n")), v("?x")), v("?y")),
+            mul(num(v("?n")), mul(v("?x"), v("?y"))),
+        )
+        .ruleset("expr"),
+    );
+    // Cancel a two-factor denominator of a left-associated extent product.
+    // A literal result bounds this rule: it cannot grow a new division tree.
+    p.add_rule(
+        rewrite(
+            "div-left-associated-symbolic-product",
+            div(
+                mul(mul(num(v("?n")), v("?x")), v("?y")),
+                mul(v("?x"), v("?y")),
+            ),
+            num(v("?n")),
+        )
+        .ruleset("expr"),
+    );
     // `div-mul-num-self` for a literal that divides the cofactor:
     // (x*a)/b → x*(a/b) when b divides a (a merged 2-wide pair over a
     // pinned extent, (H*4)/2). It rewrites to a product with a smaller

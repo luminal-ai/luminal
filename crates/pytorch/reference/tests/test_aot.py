@@ -136,3 +136,78 @@ def test_dynamic_scalar_shape_output():
         tensor, count = compiled(x)
         torch.testing.assert_close(tensor, x + 1)
         assert count == rows // 2
+
+
+def test_one_hot_runtime_assertions_are_preserved():
+    backend = Compiler()
+    compiled = torch.compile(
+        lambda x: torch.nn.functional.one_hot(x, num_classes=5).float(),
+        backend=backend,
+        fullgraph=True,
+        dynamic=False,
+    )
+    valid = torch.tensor([0, 2, 4])
+    torch.testing.assert_close(
+        compiled(valid), torch.nn.functional.one_hot(valid, 5).float()
+    )
+    for invalid in (torch.tensor([-1, 2, 4]), torch.tensor([0, 2, 5])):
+        try:
+            compiled(invalid)
+        except RuntimeError as error:
+            assert "one_hot" in str(error)
+        else:
+            raise AssertionError("one_hot accepted an out-of-range class")
+
+
+def test_tensorified_scalar_specialization_keeps_constant_guards():
+    class Norm(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.order = 2.0
+
+        def forward(self, value):
+            return torch.linalg.vector_norm(value, ord=self.order, dim=-1)
+
+    calls = []
+
+    def backend(graph, inputs):
+        calls.append(1)
+        return Compiler()(graph, inputs)
+
+    model = Norm()
+    value = torch.tensor([[3.0, 4.0], [-5.0, 12.0]])
+    guards = []
+    compiled = torch._dynamo.optimize(
+        backend,
+        nopython=True,
+        dynamic=True,
+        guard_export_fn=lambda exported: guards.extend(exported),
+    )(model)
+    torch.testing.assert_close(compiled(value), model(value))
+    assert len(calls) == 1
+    assert any(
+        guard.code_list
+        and any("order" in code and "== 2.0" in code for code in guard.code_list)
+        for guard in guards
+    ), "the scalar specialization must retain its exact constant guard"
+
+
+def test_masked_scatter_profiles_real_inputs_and_checks_bounds():
+    class Scatter(torch.nn.Module):
+        def forward(self, value, mask, source):
+            return torch.masked_scatter(value, mask, source)
+
+    model = Scatter()
+    value = torch.arange(8.0).reshape(2, 4)
+    mask = torch.tensor([[False, True, False, True], [False, True, False, True]])
+    source = torch.tensor([10.0, 11.0, 12.0, 13.0])
+    compiled = torch.compile(model, backend=Compiler(), fullgraph=True)
+    torch.testing.assert_close(
+        compiled(value, mask, source), model(value, mask, source)
+    )
+    try:
+        compiled(value, torch.ones_like(mask), source)
+    except RuntimeError as error:
+        assert "out of bounds" in str(error)
+    else:
+        raise AssertionError("masked_scatter accepted an insufficient source")

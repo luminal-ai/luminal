@@ -42,47 +42,7 @@ impl Translator<'_> {
         a: GraphTensor,
         b: GraphTensor,
     ) -> GraphTensor {
-        let (a, condition) = util::broadcast_binary(a, condition);
-        let (a, b) = util::broadcast_binary(a, b);
-        // If the `b` broadcast drove the shape, bring `condition` up to it.
-        let (a, condition) = util::broadcast_binary(a, condition);
-        let dims = a.dims();
-        if dims.is_empty() {
-            let selected =
-                self.special_select(condition.unsqueeze(0), a.unsqueeze(0), b.unsqueeze(0));
-            return selected.squeeze(0);
-        }
-        let rank = dims.len();
-        // One coordinate tensor per data axis, shared by both writes and the
-        // final read.
-        let axis_coordinates: Vec<GraphTensor> = (0..rank)
-            .map(|axis| self.cx.iota(dims.clone(), |c| c[axis]))
-            .collect();
-        // Branch 0 gets `b`, branch 1 gets `a` (the condition's 0/1 code).
-        let mut false_coordinates = Vec::with_capacity(rank + 1);
-        false_coordinates.push(self.cx.iota(dims.clone(), |_| IntExpr::from(0)));
-        false_coordinates.extend(axis_coordinates.iter().copied());
-        let mut true_coordinates = Vec::with_capacity(rank + 1);
-        true_coordinates.push(self.cx.iota(dims.clone(), |_| IntExpr::from(1)));
-        true_coordinates.extend(axis_coordinates.iter().copied());
-
-        let mut stacked_dims = Vec::with_capacity(rank + 1);
-        stacked_dims.push(IntExpr::from(2));
-        stacked_dims.extend(dims.iter().copied());
-        // A real materialized zero buffer: an expanded scalar would alias one
-        // element and scatter copies its destination before writing.
-        let scratch = self
-            .cx
-            .iota(stacked_dims, |_| IntExpr::from(0))
-            .cast(a.dtype);
-        let stacked = scratch
-            .scatter(&false_coordinates, b)
-            .scatter(&true_coordinates, a);
-
-        let mut gather_coordinates = Vec::with_capacity(rank + 1);
-        gather_coordinates.push(condition.cast(DType::Int));
-        gather_coordinates.extend(axis_coordinates);
-        stacked.gather(&gather_coordinates)
+        self.select(condition, a, b)
     }
 
     /// Keep log2(e) in the tensor's actual dtype (F64-safe `exp`).
@@ -412,7 +372,8 @@ impl Translator<'_> {
         let large = self.special_cylindrical_bessel_asymptotic(absolute, 1, false);
         let threshold = self.constant_like(value, 5.0);
         let magnitude = self.special_select(absolute.le(threshold), small, large);
-        self.copy_sign(magnitude, value)
+        let negative = self.signbit(value);
+        self.special_select(negative, -magnitude, magnitude)
     }
 
     #[allow(clippy::excessive_precision)]

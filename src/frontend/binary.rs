@@ -346,19 +346,46 @@ impl GraphTensor {
 
     /// Less than or equal
     pub fn le(self, rhs: GraphTensor) -> GraphTensor {
-        (-self.gt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
+        ((-self.gt(rhs).cast(DType::F32) + 1.0) * self.ordered() * rhs.ordered()).cast(DType::Bool)
     }
 
     /// Greater than or equal
     pub fn ge(self, rhs: GraphTensor) -> GraphTensor {
-        (-self.lt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
+        ((-self.lt(rhs).cast(DType::F32) + 1.0) * self.ordered() * rhs.ordered()).cast(DType::Bool)
+    }
+
+    // LessThan is false for unordered (NaN) operands. The two comparisons
+    // together recognize every ordered value, including either infinity.
+    // NaN classification uses the operand's own dtype; exact operations
+    // such as half-precision clamp must not widen their input to f32.
+    fn ordered(self) -> GraphTensor {
+        if !matches!(
+            self.dtype,
+            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::F8E4M3FN
+        ) {
+            return self.graph().constant_f32(1.0).expand_rhs(self.dims());
+        }
+        let positive = self
+            .graph()
+            .constant_f32(f32::INFINITY)
+            .cast(self.dtype)
+            .expand_rhs(self.dims());
+        let negative = self
+            .graph()
+            .constant_f32(f32::NEG_INFINITY)
+            .cast(self.dtype)
+            .expand_rhs(self.dims());
+        let below = self.lt(positive).cast(DType::F32);
+        let above = negative.lt(self).cast(DType::F32);
+        below + above - below * above
     }
 
     /// Not equal. Returns `Bool`, like every other comparison here
     /// (`lt`/`gt`/`le`/`ge`); the `lt + gt` sum is an internal numeric
     /// indicator, not the result type.
     pub fn ne(self, rhs: GraphTensor) -> GraphTensor {
-        (self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32)).cast(DType::Bool)
+        let unequal = self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32);
+        (-(1.0 - unequal) * self.ordered() * rhs.ordered() + 1.0).cast(DType::Bool)
     }
 
     /// Equal
@@ -368,7 +395,7 @@ impl GraphTensor {
         // without Bool storage to materialize an otherwise internal boolean
         // buffer.
         let not_equal = self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32);
-        (-not_equal + 1.0).cast(DType::Bool)
+        ((-not_equal + 1.0) * self.ordered() * rhs.ordered()).cast(DType::Bool)
     }
 
     /// Raise the tensor to a power.
@@ -507,10 +534,15 @@ impl GraphTensor {
             "select branches must share a dtype, got {:?} and {:?}",
             if_true.dtype, if_false.dtype
         );
-        assert_eq!(
-            if_true.dims(),
-            if_false.dims(),
-            "select branches must share a shape"
+        let true_dims = if_true.dims();
+        let false_dims = if_false.dims();
+        assert!(
+            true_dims.len() == false_dims.len()
+                && true_dims
+                    .iter()
+                    .zip(&false_dims)
+                    .all(|(left, right)| left == right || left.egglog_equal(*right)),
+            "select branches must share a shape: {true_dims:?} versus {false_dims:?}"
         );
         let new_id = self.graph().logical.op(
             LogicalOp::Select,
@@ -912,6 +944,57 @@ pub(super) mod tests {
             |a, b| a.eq(b).cast(luminal::dtype::DType::F32),
             |a, b| a.eq(&b).unwrap().to_dtype(DType::F32).unwrap(),
         );
+    }
+
+    #[test]
+    fn comparisons_preserve_ieee_nan_and_infinity_semantics() {
+        let lhs = vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+        ];
+        let rhs = vec![
+            0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.0,
+            0.0,
+            f32::NAN,
+            f32::INFINITY,
+        ];
+        for comparison in 0..4 {
+            let mut cx = Graph::new();
+            let a = cx.tensor(lhs.len(), luminal::dtype::DType::F32);
+            let b = cx.tensor(rhs.len(), luminal::dtype::DType::F32);
+            let out = match comparison {
+                0 => a.eq(b),
+                1 => a.ne(b),
+                2 => a.le(b),
+                _ => a.ge(b),
+            }
+            .cast(luminal::dtype::DType::F32);
+            let rt = luminal_reference::harness::run_reference(
+                &cx,
+                &[(a.id, lhs.clone().into()), (b.id, rhs.clone().into())],
+            );
+            let expected: Vec<f32> = lhs
+                .iter()
+                .zip(&rhs)
+                .map(|(a, b)| {
+                    f32::from(match comparison {
+                        0 => a == b,
+                        1 => a != b,
+                        2 => a <= b,
+                        _ => a >= b,
+                    })
+                })
+                .collect();
+            assert_eq!(rt.get_f32(out.id).unwrap().as_slice(), expected.as_slice());
+        }
     }
 
     #[test]

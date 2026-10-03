@@ -1163,6 +1163,9 @@ impl DecodedLayout {
     /// reach (the offset-expression forms) or the terms are symbolic —
     /// allocation-sizing callers bail loudly on `None`, never guess.
     pub fn literal_span_elements(&self) -> Option<usize> {
+        if self.literal_extents().is_some_and(|dims| dims.contains(&0)) {
+            return Some(0);
+        }
         self.spellings
             .iter()
             .find_map(|f| f.span_elements())
@@ -1177,6 +1180,9 @@ impl DecodedLayout {
     /// Loud: a layout with no disclosed reach and an expression with an
     /// unbound variable both refuse, naming what is missing.
     pub fn span_with(&self, dims: &DynMap) -> Result<usize> {
+        if self.extents_with(dims)?.contains(&0) {
+            return Ok(0);
+        }
         let span = self
             .spellings
             .iter()
@@ -1497,6 +1503,20 @@ mod tests {
             layout.span(),
             add(add(lit(1), lit(0)), mul(add(lit(2), lit(-1)), lit(3)))
         );
+    }
+
+    #[test]
+    fn empty_strided_domain_has_no_storage_reach() {
+        let layout = DecodedLayout::of(
+            StridedElementLayout {
+                shape: ShapeTerm(vec![lit(0), lit(3)]),
+                chain: vec![coord(0), mul(coord(1), lit(4))],
+                width: w32(),
+            },
+            Some(crate::dtype::PlanDtype::F32),
+        );
+        assert_eq!(layout.literal_span_elements(), Some(0));
+        assert_eq!(layout.span_with(&DynMap::default()).unwrap(), 0);
     }
 
     /// Symbolic dims stay symbolic: no evaluation, no folding.

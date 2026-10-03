@@ -452,6 +452,34 @@ pub fn sample_genome_correlated(
     sample_genome_with_family_order(index, space, rng, Some(&order)).0
 }
 
+/// Explore a coherent implementation with one family ranked first. Runtimes
+/// can cycle through families before finding a feasible incumbent, ensuring
+/// repeated sites receive coordinated choices instead of relying on chance.
+pub fn sample_genome_with_preferred_family(
+    index: &ProducerIndex,
+    space: &SamplingSpace,
+    rng: &mut StdRng,
+    preferred: &str,
+) -> Genome {
+    let families: std::collections::BTreeSet<_> = index
+        .values()
+        .flatten()
+        .map(|(family, _)| family.clone())
+        .collect();
+    let order = families
+        .into_iter()
+        .map(|family| {
+            let rank = if family == preferred {
+                0
+            } else {
+                rng.random::<u64>().saturating_add(1)
+            };
+            (family, rank)
+        })
+        .collect();
+    sample_genome_with_family_order(index, space, rng, Some(&order)).0
+}
+
 fn sample_genome_with_family_order(
     index: &ProducerIndex,
     space: &SamplingSpace,
@@ -830,6 +858,26 @@ mod sampler_tests {
 
     fn cyclic(index: &ProducerIndex, space: &SamplingSpace, genome: &Genome) -> bool {
         edges_have_cycle(&space.chosen_edges(index, genome))
+    }
+
+    #[test]
+    fn preferred_family_coordinates_repeated_sites_without_cycles() {
+        let candidates: &[CandidateRow<'_>] = &[("family_a", &[]), ("family_b", &[])];
+        let (index, space) = build(&[("left", candidates), ("right", candidates)]);
+        for preferred in ["family_a", "family_b"] {
+            let genome = super::sample_genome_with_preferred_family(
+                &index,
+                &space,
+                &mut StdRng::seed_from_u64(0),
+                preferred,
+            );
+            assert!(!cyclic(&index, &space, &genome));
+            assert!(
+                spelling(&index, &genome)
+                    .iter()
+                    .all(|s| s.ends_with(preferred))
+            );
+        }
     }
 
     #[test]

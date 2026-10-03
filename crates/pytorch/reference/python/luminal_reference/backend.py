@@ -35,6 +35,9 @@ _PT2_TO_TORCH = {
     6: torch.float16,
     7: torch.float32,
     8: torch.float64,
+    9: torch.complex32,
+    10: torch.complex64,
+    11: torch.complex128,
     12: torch.bool,
     13: torch.bfloat16,
 }
@@ -42,6 +45,10 @@ _PT2_TO_TORCH = {
 
 def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     tensor = tensor.detach().cpu().contiguous()
+    # PyTorch bool storage may use any nonzero byte for True. Native Bool8
+    # requires canonical 0/1 codes; convert values rather than copying bits.
+    if tensor.dtype == torch.bool:
+        return tensor.numpy().astype("uint8").tobytes()
     # Flatten first: a 0-dim tensor cannot be viewed as a wider dtype.
     return tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
 
@@ -52,7 +59,7 @@ def _output_tensor(raw: bytes, dtype_code: int, shape: Sequence[int]) -> torch.T
         raise RuntimeError(
             f"luminal_reference cannot materialize PT2 dtype code {dtype_code}"
         )
-    if 0 in shape and not raw:
+    if 0 in shape:
         return torch.empty(tuple(shape), dtype=dtype, device="cpu")
     tensor = torch.frombuffer(bytearray(raw), dtype=dtype)
     return tensor.reshape(tuple(shape)).clone()
@@ -67,8 +74,10 @@ class CompiledModel:
         ep: Any,
         scalar_output_positions: Sequence[int] = (),
         held: dict | None = None,
+        pending_search: dict | None = None,
     ):
         self._graph = graph
+        self._pending_search = [pending_search]
         self._ep = ep
         self._scalar_output_positions = frozenset(scalar_output_positions)
         # Graph input name -> the exported parameter/buffer tensor staged for
@@ -115,6 +124,12 @@ class CompiledModel:
             )
         for name, value in zip(self._user_input_names, inputs):
             self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
+        if self._pending_search[0] is not None:
+            self._graph.search(**self._pending_search[0])
+            self._pending_search[0] = None
+            # Restore the real invocation after search profiles candidates.
+            for name, value in zip(self._user_input_names, inputs):
+                self._graph.set_input(name, _tensor_bytes(value), list(value.shape))
         # Output shapes depend on the bound dims, so read them after the
         # inputs are staged rather than caching them at compile time.
         output_shapes = self._graph.output_shapes
@@ -322,6 +337,7 @@ def _compile_local_graph(
     search_log: bool = False,
     max_intermediate_bytes: int | None = None,
     memory_budget_bytes: int | None = None,
+    defer_search=False,
 ) -> CompiledModel:
     """Compile one local ATen graph after AOT partitioning."""
     if options:
@@ -342,6 +358,7 @@ def _compile_local_graph(
         search_log=search_log,
         max_intermediate_bytes=max_intermediate_bytes,
         memory_budget_bytes=memory_budget_bytes,
+        defer_search=defer_search,
     )
 
 
@@ -355,6 +372,7 @@ def compile_exported(
     max_intermediate_bytes=None,
     memory_budget_bytes=None,
     artifact=None,
+    defer_search=False,
 ):
     """Compile a functional ExportedProgram with the native runtime."""
 
@@ -395,18 +413,20 @@ def compile_exported(
             value = export_inputs[user_index]
             user_index += 1
         else:
-            if parameter_name not in ep.state_dict:
+            state = ep.state_dict if parameter_name in ep.state_dict else ep.constants
+            if parameter_name not in state:
                 raise RuntimeError(
                     f"parameter {parameter_name!r} (graph input {name!r}) is not in "
                     "the exported state_dict"
                 )
-            value = ep.state_dict[parameter_name]
+            value = state[parameter_name]
             # The export's own tensor, not the caller's module buffer: mutated
             # state persists across calls on the input's runtime buffer.
             held[name] = value
         from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 
         if isinstance(value, FakeTensor):
+            defer_search = True
             with unset_fake_temporarily():
                 value = torch.ones(
                     tuple(profile_value(d) for d in value.shape), dtype=value.dtype
@@ -418,13 +438,20 @@ def compile_exported(
             f"export consumed {user_index} of {len(export_inputs)} example_inputs"
         )
 
+    search_options = dict(
+        generations=search_iterations,
+        search_log=search_log,
+        max_intermediate_bytes=max_intermediate_bytes,
+        memory_budget_bytes=memory_budget_bytes,
+    )
+    # Fake example values do not preserve masks, indices, or other data
+    # preconditions. Profile candidates against the first real invocation.
+    pending_search = None
     if artifact is None:
-        graph.search(
-            search_iterations,
-            search_log=search_log,
-            max_intermediate_bytes=max_intermediate_bytes,
-            memory_budget_bytes=memory_budget_bytes,
-        )
+        if defer_search:
+            pending_search = search_options
+        else:
+            graph.search(**search_options)
     else:
         graph.load_compiled(artifact, memory_budget_bytes=memory_budget_bytes)
-    return CompiledModel(graph, ep, scalar_output_positions, held)
+    return CompiledModel(graph, ep, scalar_output_positions, held, pending_search)

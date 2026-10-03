@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use luminal::prelude::*;
 
 use super::Translator;
-use super::util::{broadcast_binary, normalize_dim, normalize_slice_bound};
+use super::util::{normalize_dim, normalize_slice_bound};
 use crate::pt2_schema::Node;
 
 /// Flip dimensions must be in range and unique.
@@ -84,32 +84,7 @@ impl Translator<'_> {
     /// used as the low gather coordinate and is never an arithmetic operand.
     /// (Same construction as the parked translator's complex select.)
     fn order_select(&mut self, mask: GraphTensor, a: GraphTensor, b: GraphTensor) -> GraphTensor {
-        let (a, b) = broadcast_binary(a, b);
-        let (a, mask) = broadcast_binary(a, mask);
-        let shape = a.dims();
-        let rank = shape.len();
-        let strides: Vec<IntExpr> = (0..rank)
-            .map(|d| {
-                shape[d + 1..]
-                    .iter()
-                    .fold(IntExpr::from(1), |acc, size| acc * *size)
-            })
-            .collect();
-        let flat = |c: &[IntExpr]| -> IntExpr {
-            (0..rank).fold(IntExpr::from(0), |acc, d| acc + c[d] * strides[d])
-        };
-        let even = self.cx.iota(shape.clone(), |c| flat(c) * IntExpr::from(2));
-        let odd = self.cx.iota(shape.clone(), |c| {
-            flat(c) * IntExpr::from(2) + IntExpr::from(1)
-        });
-        let numel = shape.iter().fold(IntExpr::from(1), |acc, size| acc * *size);
-        let zeros = self
-            .cast_scalar(0.0, a.dtype)
-            .expand_rhs(vec![numel, IntExpr::from(2)]);
-        let packed = b.scatter1d(even, zeros);
-        let packed = a.scatter1d(odd, packed);
-        let flat_coord = self.cx.iota(shape, |c| flat(c));
-        packed.gather(&[flat_coord, mask.cast(DType::Int)])
+        self.select(mask, a, b)
     }
 
     /// Coordinate-form gather along `axis`. `indices` may be full-rank (one
@@ -287,6 +262,15 @@ impl Translator<'_> {
     pub(super) fn translate_diagonal_scatter(&mut self, node: &Node) -> Result<GraphTensor> {
         let destination = self.operand(&node.inputs[0])?;
         let source = self.operand(&node.inputs[1])?;
+        self.diagonal_scatter_components(node, destination, source)
+    }
+
+    pub(super) fn diagonal_scatter_components(
+        &mut self,
+        node: &Node,
+        destination: GraphTensor,
+        source: GraphTensor,
+    ) -> Result<GraphTensor> {
         let offset = self.get_int_arg(node, 2).unwrap_or(0);
         let (dim1, dim2) = normalize_diagonal_dims(
             self.get_int_arg(node, 3).unwrap_or(0),
@@ -335,8 +319,23 @@ impl Translator<'_> {
             return self.translate_im2col(node);
         }
         let x = self.operand(&node.inputs[0])?;
+        self.unfold_component(node, x)
+    }
+
+    pub(super) fn unfold_component(&mut self, node: &Node, x: GraphTensor) -> Result<GraphTensor> {
         let rank = x.rank();
-        anyhow::ensure!(rank > 0, "unfold on a rank-0 tensor is not ported");
+        if rank == 0 {
+            let dim = self.get_int_arg(node, 1)?;
+            let size = self.get_int_arg(node, 2)?;
+            let step = self.get_int_arg(node, 3)?;
+            anyhow::ensure!(
+                (dim == 0 || dim == -1) && (0..=1).contains(&size) && step > 0,
+                "invalid scalar unfold arguments"
+            );
+            return Ok(x
+                .expand_dim(0, 1usize)
+                .slice_along(0usize..size as usize, 0));
+        }
         let raw_dim = self.get_int_arg(node, 1)?;
         anyhow::ensure!(
             raw_dim >= -(rank as i64) && raw_dim < rank as i64,
@@ -661,7 +660,7 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|input| input.arg.as_float()))
             .or_else(|| node.inputs.get(3).and_then(|input| input.arg.as_float()))
             .unwrap_or(0.0);
-        let fill = self.cast_scalar(value, x.dtype);
+        let fill = self.full_tensor(vec![], x.dtype, value);
         Ok(x.pad_with(padding, fill))
     }
 
@@ -867,7 +866,8 @@ impl Translator<'_> {
             let inf = self.constant_like(base, f64::INFINITY);
             let key = self.order_select(nan_mask, inf, base);
             let value_order = key.stable_argsort(axis, false);
-            let nan_order = nan_mask.cast(DType::F32).stable_argsort(axis, false);
+            let sorted_nan = self.order_gather(nan_mask.cast(DType::F32), value_order, axis);
+            let nan_order = sorted_nan.stable_argsort(axis, false);
             let sort_order = self.order_gather(value_order, nan_order, axis);
             let nan_count = nan_mask.cast(DType::Int).sum(axis);
             let length = self

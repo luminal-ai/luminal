@@ -152,7 +152,14 @@ pub(crate) fn kernel(
 ) -> anyhow::Result<()> {
     let op = expect_op::<LeftSequentialScanSumDps>(op)?;
     match &ctx.operands[0] {
+        TypedBuffer::F16(_) => ctx.scan_opmath_f16(op.axis, 0.0, |a, b| a + b),
+        TypedBuffer::Bf16(_) => ctx.scan_opmath_bf16(op.axis, 0.0, |a, b| a + b),
         TypedBuffer::F32(_) => ctx.scan_axis(op.axis, 0.0, |acc, x| acc + x),
+        TypedBuffer::F64(_) => ctx.scan_axis_f64(op.axis, 0.0, |acc, x| Ok(acc + x)),
+        TypedBuffer::I64(_) => ctx.scan_axis_i64(op.axis, 0, |acc, x| {
+            acc.checked_add(x)
+                .ok_or_else(|| anyhow::anyhow!("i64 scan-sum overflow (ints are non-wrapping)"))
+        }),
         TypedBuffer::I32(_) => ctx.scan_axis_i32(op.axis, 0, |acc, x| {
             acc.checked_add(x)
                 .ok_or_else(|| anyhow::anyhow!("i32 scan-sum overflow (ints are non-wrapping)"))

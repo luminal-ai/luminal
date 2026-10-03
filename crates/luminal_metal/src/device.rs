@@ -188,6 +188,13 @@ impl MetalExecutable {
                             pipeline.clone()
                         } else {
                             let options = metal::CompileOptions::new();
+                            if crate::search::log_channel_enabled(false, "SEARCH_LOG") {
+                                eprintln!(
+                                    "Metal: compiling {} shader ({} source bytes)",
+                                    op.label(),
+                                    text.len()
+                                );
+                            }
                             options.set_fast_math_enabled(false);
                             let library = self
                                 .device

@@ -37,6 +37,8 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedBuffer {
     F32(Vec<f32>),
+    F16(Vec<half::f16>),
+    Bf16(Vec<half::bf16>),
     /// Double-precision floats. A model that declares F64 executes in
     /// F64: silently bridging through F32 would hide a precision
     /// downgrade behind a dtype tag, which is the one thing the
@@ -112,6 +114,8 @@ impl TypedBuffer {
 
     pub fn len(&self) -> usize {
         match self {
+            TypedBuffer::F16(values) => values.len(),
+            TypedBuffer::Bf16(values) => values.len(),
             TypedBuffer::F32(values) => values.len(),
             TypedBuffer::F64(values) => values.len(),
             TypedBuffer::I32(values) => values.len(),
@@ -130,6 +134,8 @@ impl TypedBuffer {
 
     pub fn type_name(&self) -> &'static str {
         match self {
+            TypedBuffer::F16(_) => "f16",
+            TypedBuffer::Bf16(_) => "bf16",
             TypedBuffer::F32(_) => "f32",
             TypedBuffer::F64(_) => "f64",
             TypedBuffer::I32(_) => "i32",
@@ -230,13 +236,36 @@ impl TypedBuffer {
         }
     }
 
-    /// A fresh zero-filled buffer of the same variant and length —
-    /// the executor's dest-allocation shape.
+    /// Native half-precision payload access.
+    pub fn as_f16(&self) -> Result<&Vec<half::f16>> {
+        match self {
+            Self::F16(v) => Ok(v),
+            other => anyhow::bail!("expected f16, found {}", other.type_name()),
+        }
+    }
+    pub fn as_bf16(&self) -> Result<&Vec<half::bf16>> {
+        match self {
+            Self::Bf16(v) => Ok(v),
+            other => anyhow::bail!("expected bf16, found {}", other.type_name()),
+        }
+    }
+    pub fn as_bf16_mut(&mut self) -> Result<&mut Vec<half::bf16>> {
+        match self {
+            Self::Bf16(v) => Ok(v),
+            other => anyhow::bail!("expected bf16, found {}", other.type_name()),
+        }
+    }
+    pub fn as_f16_mut(&mut self) -> Result<&mut Vec<half::f16>> {
+        match self {
+            Self::F16(v) => Ok(v),
+            other => anyhow::bail!("expected f16, found {}", other.type_name()),
+        }
+    }
     pub fn byte_len(&self) -> usize {
         let width = match self {
             Self::F64(_) | Self::I64(_) => 8,
             Self::F32(_) | Self::I32(_) => 4,
-            Self::I16(_) => 2,
+            Self::I16(_) | Self::F16(_) | Self::Bf16(_) => 2,
             _ => 1,
         };
         self.len() * width
@@ -245,6 +274,8 @@ impl TypedBuffer {
     pub(crate) fn zeroed(dtype: luminal::dtype::PlanDtype, n: usize) -> Result<Self> {
         use luminal::dtype::PlanDtype as D;
         Ok(match dtype {
+            D::F16 => Self::F16(vec![half::f16::ZERO; n]),
+            D::Bf16 => Self::Bf16(vec![half::bf16::ZERO; n]),
             D::F32 => Self::F32(vec![0.; n]),
             D::F64 => Self::F64(vec![0.; n]),
             D::Int => Self::I32(vec![0; n]),
@@ -260,6 +291,8 @@ impl TypedBuffer {
 
     pub fn zeroed_like(&self) -> TypedBuffer {
         match self {
+            TypedBuffer::F16(values) => TypedBuffer::F16(vec![half::f16::ZERO; values.len()]),
+            TypedBuffer::Bf16(values) => TypedBuffer::Bf16(vec![half::bf16::ZERO; values.len()]),
             TypedBuffer::F32(values) => TypedBuffer::F32(vec![0.0; values.len()]),
             TypedBuffer::F64(values) => TypedBuffer::F64(vec![0.0; values.len()]),
             TypedBuffer::I32(values) => TypedBuffer::I32(vec![0; values.len()]),
@@ -351,6 +384,47 @@ pub struct ReferenceKernelCtx {
 /// [`ReferenceKernelCtx::reduce_axis_i32`] and
 /// [`ReferenceKernelCtx::scan_axis_i32`], whose bodies are identical once the
 /// primitive type is fixed.
+macro_rules! typed_scan_helper {
+    ($prim:ty, $get:ident, $get_mut:ident, $scan:ident) => {
+        /// Contiguous inclusive scan over one axis at this storage width
+        /// (axis zero-based FROM THE END, the house convention).
+        pub fn $scan(
+            &mut self,
+            axis_from_end: i64,
+            init: $prim,
+            fold: impl Fn($prim, $prim) -> Result<$prim>,
+        ) -> Result<()> {
+            let dims = &self.operand_dims[0];
+            let rank = dims.len();
+            anyhow::ensure!(
+                (axis_from_end as usize) < rank,
+                "scan axis {axis_from_end} out of rank {rank}"
+            );
+            let axis = rank - 1 - axis_from_end as usize;
+            let reduced = dims[axis];
+            let inner: usize = dims[axis + 1..].iter().product();
+            let outer: usize = dims[..axis].iter().product();
+            let input = self.operands[0].$get()?.clone();
+            let dest = self.dests[0].$get_mut()?;
+            anyhow::ensure!(
+                dest.len() == input.len() && input.len() == outer * reduced * inner,
+                "scan kernel geometry mismatch"
+            );
+            for o in 0..outer {
+                for i in 0..inner {
+                    let mut acc = init;
+                    for r in 0..reduced {
+                        let k = o * reduced * inner + r * inner + i;
+                        acc = fold(acc, input[k])?;
+                        dest[k] = acc;
+                    }
+                }
+            }
+            Ok(())
+        }
+    };
+}
+
 macro_rules! narrow_int_kernel_helpers {
     ($prim:ty, $get:ident, $get_mut:ident, $binary:ident, $reduce:ident, $scan:ident) => {
         /// dest0[i] = f(operand0[i], operand1[i]) at this narrow width.
@@ -405,46 +479,90 @@ macro_rules! narrow_int_kernel_helpers {
             Ok(())
         }
 
-        /// Contiguous inclusive scan over one axis at this narrow width
-        /// (axis zero-based FROM THE END, the house convention).
-        pub fn $scan(
-            &mut self,
-            axis_from_end: i64,
-            init: $prim,
-            fold: impl Fn($prim, $prim) -> Result<$prim>,
-        ) -> Result<()> {
-            let dims = &self.operand_dims[0];
-            let rank = dims.len();
-            anyhow::ensure!(
-                (axis_from_end as usize) < rank,
-                "scan axis {axis_from_end} out of rank {rank}"
-            );
-            let axis = rank - 1 - axis_from_end as usize;
-            let reduced = dims[axis];
-            let inner: usize = dims[axis + 1..].iter().product();
-            let outer: usize = dims[..axis].iter().product();
-            let input = self.operands[0].$get()?.clone();
-            let dest = self.dests[0].$get_mut()?;
-            anyhow::ensure!(
-                dest.len() == input.len() && input.len() == outer * reduced * inner,
-                "scan kernel geometry mismatch"
-            );
-            for o in 0..outer {
-                for i in 0..inner {
-                    let mut acc = init;
-                    for r in 0..reduced {
-                        let k = o * reduced * inner + r * inner + i;
-                        acc = fold(acc, input[k])?;
-                        dest[k] = acc;
-                    }
-                }
-            }
-            Ok(())
-        }
+        typed_scan_helper!($prim, $get, $get_mut, $scan);
     };
 }
 
 impl ReferenceKernelCtx {
+    pub fn binary_elementwise_bool(&mut self, f: impl Fn(u8, u8) -> u8) -> Result<()> {
+        let lhs = self.operands[0].as_bool8()?;
+        let rhs = self.operands[1].as_bool8()?;
+        let dest = self.dests[0].as_bool8_mut()?;
+        anyhow::ensure!(
+            lhs.len() == rhs.len() && lhs.len() == dest.len(),
+            "binary length mismatch"
+        );
+        for ((out, a), b) in dest.iter_mut().zip(lhs).zip(rhs) {
+            *out = f(*a, *b);
+        }
+        Ok(())
+    }
+    pub fn scan_opmath_f16(
+        &mut self,
+        axis_from_end: i64,
+        init: f32,
+        fold: impl Fn(f32, f32) -> f32,
+    ) -> Result<()> {
+        let dims = &self.operand_dims[0];
+        anyhow::ensure!(
+            axis_from_end >= 0 && (axis_from_end as usize) < dims.len(),
+            "scan axis out of range"
+        );
+        let axis = dims.len() - 1 - axis_from_end as usize;
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        let extent = dims[axis];
+        let input = self.operands[0].as_f16()?;
+        let dest = self.dests[0].as_f16_mut()?;
+        anyhow::ensure!(
+            input.len() == outer * extent * inner && input.len() == dest.len(),
+            "scan geometry mismatch"
+        );
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut acc = init;
+                for r in 0..extent {
+                    let index = o * extent * inner + r * inner + i;
+                    acc = fold(acc, input[index].to_f32());
+                    dest[index] = half::f16::from_f32(acc);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn scan_opmath_bf16(
+        &mut self,
+        axis_from_end: i64,
+        init: f32,
+        fold: impl Fn(f32, f32) -> f32,
+    ) -> Result<()> {
+        let dims = &self.operand_dims[0];
+        anyhow::ensure!(
+            axis_from_end >= 0 && (axis_from_end as usize) < dims.len(),
+            "scan axis out of range"
+        );
+        let axis = dims.len() - 1 - axis_from_end as usize;
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        let extent = dims[axis];
+        let input = self.operands[0].as_bf16()?;
+        let dest = self.dests[0].as_bf16_mut()?;
+        anyhow::ensure!(
+            input.len() == outer * extent * inner && input.len() == dest.len(),
+            "scan geometry mismatch"
+        );
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut acc = init;
+                for r in 0..extent {
+                    let index = o * extent * inner + r * inner + i;
+                    acc = fold(acc, input[index].to_f32());
+                    dest[index] = half::bf16::from_f32(acc);
+                }
+            }
+        }
+        Ok(())
+    }
     /// dest0[i] = f(operand0[i])
     pub fn unary_elementwise(&mut self, f: impl Fn(f32) -> f32) -> Result<()> {
         let input = self.operands[0].as_f32()?;
@@ -458,9 +576,8 @@ impl ReferenceKernelCtx {
 
     /// dest0[i] = f64_fn(operand0[i]) over an F64 operand, or
     /// f32_fn(operand0[i]) over an F32 one — main's `UnaryKernels`
-    /// struct (#398) re-expressed for this branch's storage. Main
-    /// carried four widths (f32/f16/bf16/f64); there is no f16 or
-    /// bf16 TypedBuffer here, so this carries two, and every other
+    /// struct (#398) re-expressed for this branch's storage. Half operands
+    /// widen through an explicit opmath cast before these kernels. Every other
     /// variant refuses BY NAME rather than bridging through f32: a
     /// caller who asked for double precision must not be handed
     /// single-precision arithmetic behind an F64 tag.
@@ -559,6 +676,22 @@ impl ReferenceKernelCtx {
     // its call site (`Ok(a.wrapping_add(b))`), in its own folder, which
     // is where this branch keeps op semantics.
     narrow_int_kernel_helpers!(
+        half::f16,
+        as_f16,
+        as_f16_mut,
+        binary_elementwise_f16,
+        reduce_axis_f16,
+        scan_axis_f16
+    );
+    narrow_int_kernel_helpers!(
+        half::bf16,
+        as_bf16,
+        as_bf16_mut,
+        binary_elementwise_bf16,
+        reduce_axis_bf16,
+        scan_axis_bf16
+    );
+    narrow_int_kernel_helpers!(
         i8,
         as_i8,
         as_i8_mut,
@@ -581,6 +714,23 @@ impl ReferenceKernelCtx {
         binary_elementwise_i16,
         reduce_axis_i16,
         scan_axis_i16
+    );
+
+    narrow_int_kernel_helpers!(
+        i64,
+        as_i64,
+        as_i64_mut,
+        binary_elementwise_i64_extra,
+        reduce_axis_i64,
+        scan_axis_i64
+    );
+    narrow_int_kernel_helpers!(
+        f64,
+        as_f64,
+        as_f64_mut,
+        binary_elementwise_f64,
+        reduce_axis_f64,
+        scan_axis_f64
     );
 
     /// Contiguous fold over one axis (zero-based FROM THE END — the house

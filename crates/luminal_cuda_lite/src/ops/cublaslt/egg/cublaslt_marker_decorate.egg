@@ -519,3 +519,164 @@
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLtAccumulateBias"
 )
+
+; --- relu: epilogue field rewrite in place, one rule per constructor ------
+; ReLU is the IEEE-safe native select(y < 0, 0, y); a NaN input
+; selects itself, so it needs no arithmetic NaN guards. Match this recorder
+; contract and retain the existing layout/injectivity requirements.
+(rule
+  (
+    (= ?op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b ?desc_d
+        (CublasLtEpilogueDefault)))
+    (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
+    (= ?op (LayoutTensorOpLit ?ins (LayoutTensorCons ?y_lt (LayoutTensorNil))))
+    (= ?y_lt (LayoutTensorLit ?y ?inner_L))
+    (= ?y (LogicalIndexMapApply ?y_outer ?tmap ?ishape))
+    (= ?tmap (IndexMapLit
+        (IntExprCons (CoordVar ?ishape 0)
+          (IntExprCons (CoordVar ?ishape 1) (IntExprNil)))
+        ?d_shape))
+    (= ?y_outer_lt (LayoutTensorLit ?y_outer ?d_layout))
+    (= ?d_layout (BitOffsetExpressionLayoutLit ?d_expr ?d_shape ?d_bits))
+    (= ?composed_d (int-subst-of ?d_expr ?tmap))
+    (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
+    (= ?z (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
+    (= ?relu (LogicalSelect (LogicalLessThan ?y_outer ?z) ?z ?y_outer))
+    (= ?relu_outer_lt (LayoutTensorLit ?relu ?d_layout))
+    (= (injectivity-of ?relu_outer_lt) (Injective))
+  )
+  (
+    (let ?inner_relu (LogicalIndexMapApply ?relu ?tmap ?ishape))
+    (let ?relu_lt (LayoutTensorLit ?inner_relu ?inner_L))
+    (set (injectivity-of ?relu_lt) (Injective))
+    (union ?relu (LogicalIndexMapApply ?inner_relu
+      (IndexMapLit
+        (IntExprCons (CoordVar ?d_shape 0)
+          (IntExprCons (CoordVar ?d_shape 1) (IntExprNil)))
+        ?ishape)
+      ?d_shape))
+    (let ?op2 (LayoutTensorOpLit ?ins (LayoutTensorCons ?relu_lt (LayoutTensorNil))))
+    (union ?op2 (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b
+      (CublasLtOutputDDescriptor ?site ?relu_lt)
+      (CublasLtEpilogueRelu)))
+  )
+  :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: native relu epilogue on CublasLt"
+)
+(rule
+  (
+    (= ?op (LayoutTensorOpCublasLtBias ?site ?desc_a ?desc_b ?desc_d
+        ?bias_lt (CublasLtEpilogueDefault)))
+    (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
+    (= ?op (LayoutTensorOpLit ?ins (LayoutTensorCons ?y_lt (LayoutTensorNil))))
+    (= ?y_lt (LayoutTensorLit ?y ?inner_L))
+    (= ?y (LogicalIndexMapApply ?y_outer ?tmap ?ishape))
+    (= ?tmap (IndexMapLit
+        (IntExprCons (CoordVar ?ishape 0)
+          (IntExprCons (CoordVar ?ishape 1) (IntExprNil)))
+        ?d_shape))
+    (= ?y_outer_lt (LayoutTensorLit ?y_outer ?d_layout))
+    (= ?d_layout (BitOffsetExpressionLayoutLit ?d_expr ?d_shape ?d_bits))
+    (= ?composed_d (int-subst-of ?d_expr ?tmap))
+    (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
+    (= ?z (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
+    (= ?relu (LogicalSelect (LogicalLessThan ?y_outer ?z) ?z ?y_outer))
+    (= ?relu_outer_lt (LayoutTensorLit ?relu ?d_layout))
+    (= (injectivity-of ?relu_outer_lt) (Injective))
+  )
+  (
+    (let ?inner_relu (LogicalIndexMapApply ?relu ?tmap ?ishape))
+    (let ?relu_lt (LayoutTensorLit ?inner_relu ?inner_L))
+    (set (injectivity-of ?relu_lt) (Injective))
+    (union ?relu (LogicalIndexMapApply ?inner_relu
+      (IndexMapLit
+        (IntExprCons (CoordVar ?d_shape 0)
+          (IntExprCons (CoordVar ?d_shape 1) (IntExprNil)))
+        ?ishape)
+      ?d_shape))
+    (let ?op2 (LayoutTensorOpLit ?ins (LayoutTensorCons ?relu_lt (LayoutTensorNil))))
+    (union ?op2 (LayoutTensorOpCublasLtBias ?site ?desc_a ?desc_b
+      (CublasLtOutputDDescriptor ?site ?relu_lt)
+      ?bias_lt (CublasLtEpilogueRelu)))
+  )
+  :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: native relu epilogue on CublasLtBias"
+)
+(rule
+  (
+    (= ?op (LayoutTensorOpCublasLtAccumulate ?site ?desc_a ?desc_b ?desc_d
+        ?c_lt (CublasLtEpilogueDefault)))
+    (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
+    (= ?op (LayoutTensorOpLit ?ins (LayoutTensorCons ?y_lt (LayoutTensorNil))))
+    (= ?y_lt (LayoutTensorLit ?y ?inner_L))
+    (= ?y (LogicalIndexMapApply ?y_outer ?tmap ?ishape))
+    (= ?tmap (IndexMapLit
+        (IntExprCons (CoordVar ?ishape 0)
+          (IntExprCons (CoordVar ?ishape 1) (IntExprNil)))
+        ?d_shape))
+    (= ?y_outer_lt (LayoutTensorLit ?y_outer ?d_layout))
+    (= ?d_layout (BitOffsetExpressionLayoutLit ?d_expr ?d_shape ?d_bits))
+    (= ?composed_d (int-subst-of ?d_expr ?tmap))
+    (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
+    (= ?z (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
+    (= ?relu (LogicalSelect (LogicalLessThan ?y_outer ?z) ?z ?y_outer))
+    (= ?relu_outer_lt (LayoutTensorLit ?relu ?d_layout))
+    (= (injectivity-of ?relu_outer_lt) (Injective))
+  )
+  (
+    (let ?inner_relu (LogicalIndexMapApply ?relu ?tmap ?ishape))
+    (let ?relu_lt (LayoutTensorLit ?inner_relu ?inner_L))
+    (set (injectivity-of ?relu_lt) (Injective))
+    (union ?relu (LogicalIndexMapApply ?inner_relu
+      (IndexMapLit
+        (IntExprCons (CoordVar ?d_shape 0)
+          (IntExprCons (CoordVar ?d_shape 1) (IntExprNil)))
+        ?ishape)
+      ?d_shape))
+    (let ?op2 (LayoutTensorOpLit ?ins (LayoutTensorCons ?relu_lt (LayoutTensorNil))))
+    (union ?op2 (LayoutTensorOpCublasLtAccumulate ?site ?desc_a ?desc_b
+      (CublasLtOutputDDescriptor ?site ?relu_lt)
+      ?c_lt (CublasLtEpilogueRelu)))
+  )
+  :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: native relu epilogue on CublasLtAccumulate"
+)
+(rule
+  (
+    (= ?op (LayoutTensorOpCublasLtAccumulateBias ?site ?desc_a ?desc_b ?desc_d
+        ?c_lt ?bias_lt (CublasLtEpilogueDefault)))
+    (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
+    (= ?op (LayoutTensorOpLit ?ins (LayoutTensorCons ?y_lt (LayoutTensorNil))))
+    (= ?y_lt (LayoutTensorLit ?y ?inner_L))
+    (= ?y (LogicalIndexMapApply ?y_outer ?tmap ?ishape))
+    (= ?tmap (IndexMapLit
+        (IntExprCons (CoordVar ?ishape 0)
+          (IntExprCons (CoordVar ?ishape 1) (IntExprNil)))
+        ?d_shape))
+    (= ?y_outer_lt (LayoutTensorLit ?y_outer ?d_layout))
+    (= ?d_layout (BitOffsetExpressionLayoutLit ?d_expr ?d_shape ?d_bits))
+    (= ?composed_d (int-subst-of ?d_expr ?tmap))
+    (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
+    (= ?z (LogicalIndexMapApply (LogicalConstant 0.0) ?zm1 ?zt1))
+    (= ?relu (LogicalSelect (LogicalLessThan ?y_outer ?z) ?z ?y_outer))
+    (= ?relu_outer_lt (LayoutTensorLit ?relu ?d_layout))
+    (= (injectivity-of ?relu_outer_lt) (Injective))
+  )
+  (
+    (let ?inner_relu (LogicalIndexMapApply ?relu ?tmap ?ishape))
+    (let ?relu_lt (LayoutTensorLit ?inner_relu ?inner_L))
+    (set (injectivity-of ?relu_lt) (Injective))
+    (union ?relu (LogicalIndexMapApply ?inner_relu
+      (IndexMapLit
+        (IntExprCons (CoordVar ?d_shape 0)
+          (IntExprCons (CoordVar ?d_shape 1) (IntExprNil)))
+        ?ishape)
+      ?d_shape))
+    (let ?op2 (LayoutTensorOpLit ?ins (LayoutTensorCons ?relu_lt (LayoutTensorNil))))
+    (union ?op2 (LayoutTensorOpCublasLtAccumulateBias ?site ?desc_a ?desc_b
+      (CublasLtOutputDDescriptor ?site ?relu_lt)
+      ?c_lt ?bias_lt (CublasLtEpilogueRelu)))
+  )
+  :ruleset backend
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: native relu epilogue on CublasLtAccumulateBias"
+)

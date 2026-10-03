@@ -120,25 +120,7 @@ impl Translator<'_> {
     /// code selected a non-finite branch away this port keeps the same
     /// selection and documents the limitation at the call site.
     fn blend_select(&mut self, cond: GraphTensor, a: GraphTensor, b: GraphTensor) -> GraphTensor {
-        let (a, b) = util::broadcast_binary(a, b);
-        let (a, cond) = util::broadcast_binary(a, cond);
-        match a.dtype {
-            DType::Bool => {
-                let yes = self.bool_and(cond, a);
-                let not_cond = self.bool_not(cond);
-                let no = self.bool_and(not_cond, b);
-                self.bool_or(yes, no)
-            }
-            DType::Int | DType::I64 => {
-                let dtype = a.dtype;
-                let a32 = a.cast(DType::F32);
-                let b32 = b.cast(DType::F32);
-                let mask = cond.cast(DType::F32);
-                let one = self.cx.constant_f32(1.0).expand_rhs(mask.dims());
-                (a32 * mask + b32 * (one - mask)).trunc_cast(dtype)
-            }
-            _ => a.cond(cond, b),
-        }
+        self.select(cond, a, b)
     }
 
     /// A dtype-preserving rank-0 constant scalar.
@@ -211,7 +193,9 @@ impl Translator<'_> {
     fn p_norm(&mut self, magnitude: GraphTensor, p: f64, axes: Vec<usize>) -> GraphTensor {
         if p == 0.0 {
             let zero = self.constant_like(magnitude, 0.0);
-            let nonzero = self.bool_or(magnitude.lt(zero), magnitude.gt(zero));
+            let ordered = self.bool_or(magnitude.lt(zero), magnitude.gt(zero));
+            let nan = self.is_nan(magnitude);
+            let nonzero = self.bool_or(ordered, nan);
             nonzero.cast(magnitude.dtype).sum(axes)
         } else if p == 1.0 {
             magnitude.sum(axes)
@@ -227,7 +211,7 @@ impl Translator<'_> {
     }
 
     /// `linalg_vector_norm` after the caller constructed real magnitudes.
-    fn vector_norm_from_magnitude(
+    pub(super) fn vector_norm_from_magnitude(
         &mut self,
         node: &Node,
         magnitude: GraphTensor,
@@ -727,9 +711,7 @@ impl Translator<'_> {
         if density {
             let axes = (0..bin_shape.len()).collect::<Vec<_>>();
             let total = histogram.sum(axes).expand_rhs(bin_shape.clone());
-            let mut volume = self
-                .scalar_like(histogram, 1.0)
-                .expand_rhs(bin_shape.clone());
+            let mut volume = self.scalar_like(histogram, 1.0);
             for (dimension, edge) in edges.iter().enumerate() {
                 let bins = bin_shape[dimension];
                 let widths = edge

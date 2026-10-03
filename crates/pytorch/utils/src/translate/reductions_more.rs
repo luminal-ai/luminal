@@ -123,7 +123,7 @@ impl Translator<'_> {
         let correction = self.variance_correction(node);
         let dtype = self.compute_dtype(node).unwrap_or(input.dtype);
         let input = input.cast(dtype);
-        let variance = input.var_options(&axes, correction);
+        let variance = self.variance_with_correction(input, &axes, correction);
         let mean = input.mean(&axes);
         let keepdim = self.keepdim_flag(node, 3);
         let (variance, mean) = if keepdim {
@@ -141,9 +141,30 @@ impl Translator<'_> {
         node: &Node,
         variant: AddMmVariant,
     ) -> Result<GraphTensor> {
-        let input = self.operand(&node.inputs[0])?;
-        let lhs = self.operand(&node.inputs[1])?;
-        let rhs = self.operand(&node.inputs[2])?;
+        let output_dtype = self.output_meta_dtype(node)?;
+        let compute_dtype = if matches!(output_dtype, DType::F16 | DType::Bf16) {
+            DType::F32
+        } else {
+            output_dtype
+        };
+        let input = super::convert(self.operand(&node.inputs[0])?, compute_dtype);
+        let lhs = super::convert(self.operand(&node.inputs[1])?, compute_dtype);
+        let rhs = super::convert(self.operand(&node.inputs[2])?, compute_dtype);
+        if matches!(variant, AddMmVariant::AddBmm)
+            && matches!(output_dtype, DType::F32 | DType::Bf16)
+            && let Some(count) = lhs.dims()[0].to_usize()
+        {
+            let mut result = self.scale_by_named_scalar(node, "beta", input)?;
+            for batch in 0..count {
+                let a = lhs.slice_along(batch..batch + 1, 0).squeeze(0);
+                let b = rhs.slice_along(batch..batch + 1, 0).squeeze(0);
+                let product = self.scale_by_named_scalar(node, "alpha", a.matmul(b))?;
+                let (current, product) =
+                    util::broadcast_binary(result.cast(compute_dtype), product);
+                result = (current + product).cast(output_dtype);
+            }
+            return Ok(result.cast(output_dtype));
+        }
         let product = match variant {
             AddMmVariant::AddMm => lhs.matmul(rhs),
             AddMmVariant::AddBmm => {
@@ -160,7 +181,7 @@ impl Translator<'_> {
         let input = self.scale_by_named_scalar(node, "beta", input)?;
         let product = self.scale_by_named_scalar(node, "alpha", product)?;
         let (input, product) = util::broadcast_binary(input, product);
-        Ok(input + product)
+        Ok(super::convert(input + product, output_dtype))
     }
 
     /// `copy.default(destination, source)`: source broadcast into the
@@ -237,12 +258,30 @@ impl Translator<'_> {
         })
     }
 
+    pub(super) fn variance_with_correction(
+        &mut self,
+        input: GraphTensor,
+        axes: &[usize],
+        correction: f64,
+    ) -> GraphTensor {
+        let mean = input.mean(axes).expand_to_shape_on_axes(input.dims(), axes);
+        let centered = input - mean;
+        let numerator = centered.square().sum(axes);
+        let count = super::dim_arith::product_of_dims(axes.iter().map(|&i| input.dims()[i]));
+        let count = self.cx.constant_i32(count).cast(input.dtype);
+        let offset = self.floating_scalar(correction, input.dtype);
+        let denominator = count - offset;
+        let zero = self.floating_scalar(0.0, input.dtype);
+        let denominator = denominator.maximum(zero).expand_rhs(numerator.dims());
+        numerator / denominator
+    }
+
     /// `correction` (degrees-of-freedom offset) or the `unbiased` bool.
-    fn variance_correction(&self, node: &Node) -> usize {
+    pub(super) fn variance_correction(&self, node: &Node) -> f64 {
         if let Some(correction) = self.named_float_arg(node, "correction") {
-            return correction.max(0.0) as usize;
+            return correction;
         }
-        self.named_bool_arg(node, "unbiased").map_or(1, usize::from)
+        self.named_bool_arg(node, "unbiased").map_or(1.0, f64::from)
     }
 
     fn keepdim_flag(&self, node: &Node, positional: usize) -> bool {
@@ -267,7 +306,18 @@ impl Translator<'_> {
         if scalar == 0.0 {
             return Ok(self.constant_like(value, 0.0));
         }
-        Ok(value * self.constant_like(value, scalar))
+        let constant = if matches!(
+            value.dtype,
+            DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16
+        ) {
+            self.cx
+                .constant_i64(scalar as i64)
+                .cast(value.dtype)
+                .expand_rhs(value.dims())
+        } else {
+            self.constant_like(value, scalar)
+        };
+        Ok(value * constant)
     }
 }
 

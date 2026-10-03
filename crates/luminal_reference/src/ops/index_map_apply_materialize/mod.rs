@@ -249,10 +249,10 @@ pub(crate) fn kernel(
     // resolve them against THIS call's assignment (see `ReferenceKernelCtx`).
     let dims = ctx.dims.clone();
     let mut index_of = vec![0usize; numel];
+    let mut coords = vec![0usize; out_rank];
     for (flat, slot) in index_of.iter_mut().enumerate() {
         // Decompose the flat OUT index into row-major coordinates.
         let mut remainder = flat;
-        let mut coords = vec![0usize; out_rank];
         for axis in (0..out_rank).rev() {
             coords[axis] = remainder % out_dims[axis];
             remainder /= out_dims[axis];
@@ -269,6 +269,5 @@ pub(crate) fn kernel(
         }
         *slot = parent_flat;
     }
-    let parent = ctx.operands[0].clone();
-    move_gathered(&parent, &mut ctx.dests[0], &index_of)
+    move_gathered(&ctx.operands[0], &mut ctx.dests[0], &index_of)
 }

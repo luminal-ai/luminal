@@ -532,6 +532,11 @@ impl Translator<'_> {
     /// A scalar literal as a rank-0 tensor of `dtype`. A Python float is
     /// read at the dtype the op computes in (F64 keeps the double).
     fn scalar(&mut self, input: &NodeInput, dtype: DType) -> Result<GraphTensor> {
+        if let Some(name) = input.arg.as_value_name()
+            && let Some(value) = self.values.get(name).copied()
+        {
+            return Ok(value.cast(dtype));
+        }
         if let Some(v) = input.arg.as_float() {
             return Ok(match dtype {
                 DType::F64 => self.cx.constant_f64(v),
@@ -539,7 +544,10 @@ impl Translator<'_> {
             });
         }
         if let Some(v) = input.arg.as_int() {
-            return Ok(self.cx.constant_i32(v).cast(dtype));
+            return Ok(self.cx.constant_i64(v).cast(dtype));
+        }
+        if let Some(v) = input.arg.as_bool() {
+            return Ok(self.full_tensor(vec![], dtype, f64::from(v)));
         }
         bail!(
             "operand {:?} is not a scalar (arg: {:?})",
@@ -736,7 +744,15 @@ impl Translator<'_> {
 
         // Shape comparisons feed export's scalar assertions. They contain no
         // tensor data; Dynamo/export owns their guards at the call boundary.
-        if !node.outputs.is_empty() && node.outputs.iter().all(|out| out.as_sym_bool.is_some()) {
+        if !node.outputs.is_empty()
+            && node.outputs.iter().all(|out| out.as_sym_bool.is_some())
+            && !node.inputs.iter().any(|input| {
+                input
+                    .arg
+                    .as_value_name()
+                    .is_some_and(|name| self.values.contains_key(name))
+            })
+        {
             return Ok(());
         }
 
@@ -763,13 +779,85 @@ impl Translator<'_> {
 
     fn dispatch_target(&mut self, node: &Node, target: &str) -> Result<()> {
         let n = &node.inputs;
+        if matches!(
+            target,
+            "_operator.ge"
+                | "_operator.le"
+                | "_operator.gt"
+                | "_operator.lt"
+                | "_operator.eq"
+                | "_operator.ne"
+        ) {
+            let name = node
+                .outputs
+                .iter()
+                .find_map(|output| output.value_name())
+                .context("scalar comparison has no output")?
+                .to_owned();
+            let left = n[0]
+                .arg
+                .as_value_name()
+                .and_then(|name| self.values.get(name))
+                .copied();
+            let right = n[1]
+                .arg
+                .as_value_name()
+                .and_then(|name| self.values.get(name))
+                .copied();
+            let dtype = left
+                .or(right)
+                .context("scalar comparison has no dataflow operand")?
+                .dtype;
+            let left = match left {
+                Some(value) => value,
+                None => self.scalar(&n[0], dtype)?,
+            };
+            let right = match right {
+                Some(value) => value,
+                None => self.scalar(&n[1], dtype)?,
+            };
+            let value = match target {
+                "_operator.ge" => left.ge(right),
+                "_operator.le" => left.le(right),
+                "_operator.gt" => left.gt(right),
+                "_operator.lt" => left.lt(right),
+                "_operator.eq" => left.eq(right),
+                _ => left.ne(right),
+            };
+            self.values.insert(name, value);
+            return Ok(());
+        }
+        if target == "torch.sym_ite" {
+            let condition = self
+                .values
+                .get(
+                    n[0].arg
+                        .as_value_name()
+                        .context("sym_ite condition is unnamed")?,
+                )
+                .copied()
+                .context("sym_ite condition has no scalar value")?;
+            let yes = self.scalar(&n[1], DType::I64)?;
+            let no = self.scalar(&n[2], DType::I64)?;
+            let name = node
+                .outputs
+                .iter()
+                .find_map(|output| output.value_name())
+                .context("sym_ite has no output")?
+                .to_owned();
+            self.values
+                .insert(name, condition.cast(DType::Bool).select(yes, no));
+            return Ok(());
+        }
 
         let value = match target {
             // ---- linear ----
             "linear.default" => {
                 let x = self.operand(&n[0])?;
                 let w = self.operand(&n[1])?;
-                let mut out = x.matmul(w.t());
+                let mut out = x
+                    .cast(opmath_compute(x.dtype))
+                    .matmul(w.cast(opmath_compute(w.dtype)).t());
                 if let Some(bias) = n
                     .get(2)
                     .map(|b| self.optional_tensor_operand(b))
@@ -779,13 +867,15 @@ impl Translator<'_> {
                     let dims = out.dims();
                     out += broadcast_to(bias, &dims);
                 }
-                out
+                out.cast(x.dtype)
             }
             // ---- matmul family ----
             "mm.default" | "bmm.default" | "matmul.default" => {
                 let a = self.operand(&n[0])?;
                 let b = self.operand(&n[1])?;
-                a.matmul(b)
+                a.cast(opmath_compute(a.dtype))
+                    .matmul(b.cast(opmath_compute(b.dtype)))
+                    .cast(a.dtype)
             }
             // ---- grouped GEMM (batch 6) ----
             "_grouped_mm.default" | "transformers.grouped_mm_fallback.default" => {
@@ -797,10 +887,56 @@ impl Translator<'_> {
             "tanh.default" => self.operand(&n[0])?.tanh(),
             "log.default" => self.operand(&n[0])?.log(),
             "sqrt.default" => self.operand(&n[0])?.sqrt(),
-            "abs.default" => self.operand(&n[0])?.abs(),
+            "abs.default" => {
+                let input = self.operand(&n[0])?;
+                if matches!(input.dtype, DType::Int | DType::I64) {
+                    let zero = if input.dtype == DType::I64 {
+                        self.cx.constant_i64(0)
+                    } else {
+                        self.cx.constant_i32(0)
+                    }
+                    .expand_rhs(input.dims());
+                    let minimum = if input.dtype == DType::I64 {
+                        self.cx.constant_i64(i64::MIN)
+                    } else {
+                        self.cx.constant_i32(i32::MIN)
+                    }
+                    .expand_rhs(input.dims());
+                    let minus_one = if input.dtype == DType::I64 {
+                        self.cx.constant_i64(-1)
+                    } else {
+                        self.cx.constant_i32(-1)
+                    }
+                    .expand_rhs(input.dims());
+                    let is_minimum = input.eq(minimum);
+                    let safe = is_minimum.select(zero, input);
+                    let negated = self.checked_int_pair(safe, minus_one, true);
+                    let absolute = input.lt(zero).select(negated, input);
+                    is_minimum.select(input, absolute)
+                } else {
+                    input.abs()
+                }
+            }
             "neg.default" => -self.operand(&n[0])?,
             "silu.default" => self.operand(&n[0])?.silu(),
-            "gelu.default" => self.operand(&n[0])?.gelu(),
+            "gelu.default" => {
+                let x = self.operand(&n[0])?;
+                if n.get(1).and_then(|i| match &i.arg {
+                    crate::pt2_schema::Argument::Other(v) => {
+                        v.get("as_string").and_then(|v| v.as_str())
+                    }
+                    _ => None,
+                }) == Some("tanh")
+                {
+                    let k = self.constant_like(x, 0.044715);
+                    let scale = self.constant_like(x, (2.0 / std::f64::consts::PI).sqrt());
+                    let half = self.constant_like(x, 0.5);
+                    let one = self.constant_like(x, 1.0);
+                    x * half * (one + ((x + k * x * x * x) * scale).tanh())
+                } else {
+                    x.gelu()
+                }
+            }
             "reciprocal.default" => self.operand(&n[0])?.reciprocal(),
             "sin.default" => self.operand(&n[0])?.sin(),
             "square.default" => self.operand(&n[0])?.square(),
@@ -811,15 +947,71 @@ impl Translator<'_> {
             "round.default" => self.operand(&n[0])?.round(),
             "round.decimals" => {
                 let decimals = n.get(1).and_then(|i| i.arg.as_int()).unwrap_or(0);
-                if decimals != 0 {
-                    bail!("round(decimals={decimals}) is not ported (only decimals=0)");
-                }
-                self.operand(&n[0])?.round()
+                let x = self.operand(&n[0])?;
+                let scale = self.constant_like(x, 10_f64.powi(decimals as i32));
+                (x * scale).round() / scale
             }
             // ---- elementwise binary ----
-            "add.Tensor" | "add.Scalar" => self.binary(n, |a, b| a + b)?,
-            "sub.Tensor" | "sub.Scalar" => self.binary(n, |a, b| a - b)?,
-            "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
+            "add.Tensor" | "add.Scalar" => {
+                let a = self.operand(&n[0])?;
+                let b = if let Some(t) = self.optional_tensor_operand(&n[1])? {
+                    t
+                } else {
+                    self.scalar(&n[1], a.dtype)?
+                };
+                let alpha_input = n.iter().find(|i| i.name == "alpha");
+                let scaled = match alpha_input {
+                    None => b,
+                    Some(input)
+                        if input.arg.as_float() == Some(1.0)
+                            || input.arg.as_int() == Some(1)
+                            || input.arg.as_bool() == Some(true) =>
+                    {
+                        b
+                    }
+                    Some(input) => {
+                        let alpha = self.scalar(input, b.dtype)?;
+                        let (b, alpha) = broadcast_pair(b, alpha);
+                        b * alpha
+                    }
+                };
+                let (a, b) = broadcast_pair(a, scaled);
+                if matches!(a.dtype, DType::Int | DType::I64) {
+                    // Checked accumulation retains the non-wrapping contract
+                    // for runtime integers without claiming static bounds.
+                    self.checked_int_pair(a, b, false)
+                } else {
+                    a + b
+                }
+            }
+            "sub.Tensor" | "sub.Scalar" | "mul.Tensor" | "mul.Scalar" => {
+                let at = self.optional_tensor_operand(&n[0])?;
+                let bt = self.optional_tensor_operand(&n[1])?;
+                let dtype = at
+                    .or(bt)
+                    .context("binary operation has no tensor operand")?
+                    .dtype;
+                let a = match at {
+                    Some(a) => a,
+                    None => self.scalar(&n[0], dtype)?,
+                };
+                let b = match bt {
+                    Some(b) => b,
+                    None => self.scalar(&n[1], dtype)?,
+                };
+                let (a, b) = broadcast_pair(a, b);
+                if matches!(a.dtype, DType::Int | DType::I64) {
+                    if target.starts_with("sub.") {
+                        self.checked_int_sub(a, b)
+                    } else {
+                        self.checked_int_pair(a, b, true)
+                    }
+                } else if target.starts_with("sub.") {
+                    a - b
+                } else {
+                    a * b
+                }
+            }
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
             "minimum.default" => self.binary(n, |a, b| a.minimum(b))?,
@@ -1003,6 +1195,8 @@ impl Translator<'_> {
             // ---- creation / selection ----
             "full.default" => self.translate_full(node, false)?,
             "full_like.default" => self.translate_full(node, true)?,
+            "zeros.default" | "new_zeros.default" => self.translate_fill(node, 0.0)?,
+            "ones.default" | "new_ones.default" => self.translate_fill(node, 1.0)?,
             "zeros_like.default" => self.translate_like_fill(node, 0.0)?,
             "ones_like.default" => self.translate_like_fill(node, 1.0)?,
             "arange.start_step" => self.translate_arange(node, 2)?,
@@ -1085,7 +1279,9 @@ impl Translator<'_> {
             "convolution.default" => self.translate_conv(node)?,
             "conv2d.default" => self.translate_conv(node)?,
             // ---- upsample / resize (batch 6) ----
-            "upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
+            "upsample_nearest2d.vec" | "upsample_nearest2d.default" => {
+                self.translate_upsample_nearest2d(node)?
+            }
             "upsample_bilinear2d.vec" => self.translate_upsample_bilinear2d(node)?,
             "_upsample_bilinear2d_aa.default" | "_upsample_bilinear2d_aa.vec" => {
                 self.translate_upsample_bilinear2d_aa(node)?
@@ -1291,11 +1487,19 @@ impl Translator<'_> {
         n: &[NodeInput],
         op: impl FnOnce(GraphTensor, GraphTensor) -> GraphTensor,
     ) -> Result<GraphTensor> {
-        let a = self.operand(&n[0])?;
-        let b = if let Some(t) = self.optional_tensor_operand(&n[1])? {
-            t
-        } else {
-            self.scalar(&n[1], a.dtype)?
+        let a_tensor = self.optional_tensor_operand(&n[0])?;
+        let b_tensor = self.optional_tensor_operand(&n[1])?;
+        let dtype = a_tensor
+            .or(b_tensor)
+            .context("binary operation has no tensor operand")?
+            .dtype;
+        let a = match a_tensor {
+            Some(a) => a,
+            None => self.scalar(&n[0], dtype)?,
+        };
+        let b = match b_tensor {
+            Some(b) => b,
+            None => self.scalar(&n[1], dtype)?,
         };
         let (a, b) = broadcast_pair(a, b);
         Ok(op(a, b))

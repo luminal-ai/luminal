@@ -60,6 +60,9 @@ pub fn profile_candidate_at(
         .map_err(ProfileFailure::Prepare)?;
     initialize_inputs(device, plan, &mut arena, &staged, &shapes.values)
         .map_err(ProfileFailure::Prepare)?;
+    if crate::search::log_channel_enabled(false, "SEARCH_LOG") {
+        eprintln!("Metal: candidate warmup");
+    }
     device
         .execute(arena.buffer(), &shapes.values)
         .map_err(ProfileFailure::Prepare)?;

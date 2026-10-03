@@ -15,7 +15,7 @@ pub use luminal::search_support::{
     CaptureAwareStderr, ProducerIndex, RefusalBreakdown, SearchProgress, SearchTimings,
     bufferize_cycle_tripwire, early_stop_exceeded, log_channel_enabled, mutate_genome,
     mutate_genome_reporting, mutate_genome_with_seed, sample_genome, sample_genome_correlated,
-    sample_genome_reporting, sample_genome_with_seed,
+    sample_genome_reporting, sample_genome_with_preferred_family, sample_genome_with_seed,
 };
 
 #[derive(Debug, Clone)]
@@ -251,14 +251,32 @@ pub fn search_implementations(
     }
 
     let allow = allow_override;
+    if options.search_log_enabled() {
+        eprintln!("Metal: building producer index");
+    }
     let mut session =
         extractor::ExtractionSession::new_with_matcher_set(egraph, allow.as_deref(), matchers);
     let index = session.producer_index();
+    if options.search_log_enabled() {
+        eprintln!("Metal: producer index ready ({} classes)", index.len());
+    }
     timings.analysis_nanos = analysis_start.elapsed().as_nanos();
     let classes: Vec<_> = index.keys().cloned().collect();
     let mut rng = StdRng::seed_from_u64(options.seed);
 
     let space = session.sampling_space(&index);
+    if options.search_log_enabled() {
+        eprintln!("Metal: sampling space ready");
+    }
+
+    let families: Vec<_> = index
+        .values()
+        .flatten()
+        .map(|(family, _)| family.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut family_cursor = 0usize;
 
     let random_genome = |rng: &mut StdRng| sample_genome(&index, &space, rng);
     let mutate = |parent: &Genome, rng: &mut StdRng, count: usize| {
@@ -283,11 +301,15 @@ pub fn search_implementations(
         match &best {
             None => {
                 while candidates.len() < options.generation_size {
-                    candidates.push(if candidates.len().is_multiple_of(2) {
-                        sample_genome_correlated(&index, &space, &mut rng)
-                    } else {
-                        random_genome(&mut rng)
-                    });
+                    candidates.push(
+                        if candidates.len().is_multiple_of(2) && !families.is_empty() {
+                            let preferred = &families[family_cursor % families.len()];
+                            family_cursor += 1;
+                            sample_genome_with_preferred_family(&index, &space, &mut rng, preferred)
+                        } else {
+                            random_genome(&mut rng)
+                        },
+                    );
                 }
             }
             Some(incumbent) => {
@@ -365,6 +387,12 @@ pub fn search_implementations(
                         }
                     };
                     let profile_start = Instant::now();
+                    if options.search_log_enabled() && best.is_none() {
+                        eprintln!(
+                            "Metal: profiling candidate ({} buffers)",
+                            plan.buffers.len()
+                        );
+                    }
                     let priced = evaluator.measure(
                         &plan,
                         options,
