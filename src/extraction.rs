@@ -13,7 +13,10 @@
 use once_cell::unsync::Lazy;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+// FxHashMap/FxHashSet under the std names: these maps key on ClassId,
+// NodeId and BufferId, which are internal ids, so the default
+// SipHash buys nothing and showed up as ~29% of a sampled search.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
@@ -339,7 +342,7 @@ impl<'a> ExtractionSession<'a> {
         };
         // Tarjan over the blocked graph via petgraph.
         let mut graph = petgraph::graph::DiGraph::<ClassId, ()>::new();
-        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::default();
         for class in extractor.blocked.keys() {
             let index = graph.add_node(class.clone());
             nodes.insert(class.clone(), index);
@@ -458,7 +461,7 @@ impl<'a> ExtractionSession<'a> {
         };
         let mut out = String::new();
         let mut graph = petgraph::graph::DiGraph::<ClassId, ()>::new();
-        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::default();
         for class in ex.blocked.keys() {
             nodes.insert(class.clone(), graph.add_node(class.clone()));
         }
@@ -835,7 +838,7 @@ pub fn edges_have_cycle(edges: &std::collections::BTreeMap<ClassId, Vec<ClassId>
         Open,
         Done,
     }
-    let mut colour: HashMap<&ClassId, Colour> = HashMap::new();
+    let mut colour: HashMap<&ClassId, Colour> = HashMap::default();
     for root in edges.keys() {
         if colour.contains_key(root) {
             continue;
@@ -1003,8 +1006,8 @@ impl<'a> Extractor<'a> {
             producer_index,
             input_terminals,
             genome: genome.cloned(),
-            memo: HashMap::new(),
-            blocked: HashMap::new(),
+            memo: HashMap::default(),
+            blocked: HashMap::default(),
             no_candidates: Vec::new(),
             op_cache: Default::default(),
             dtype_index: Default::default(),
@@ -1228,7 +1231,7 @@ impl<'a> Extractor<'a> {
     /// Pure construction — no planning, no memo.
     fn discover(&self, roots: &[ClassId]) -> Universe {
         // Discover the class universe reachable through candidates.
-        let mut discovered: HashSet<ClassId> = HashSet::new();
+        let mut discovered: HashSet<ClassId> = HashSet::default();
         let mut universe: Vec<ClassId> = Vec::new();
         let mut candidate_lists: Vec<Vec<Candidate>> = Vec::new();
         let mut queue: std::collections::VecDeque<ClassId> = roots.iter().cloned().collect();
@@ -1860,7 +1863,7 @@ impl<'a> Extractor<'a> {
     ) -> R {
         let mut slot = self.dtype_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, crate::dtype::PlanDtype> = HashMap::new();
+            let mut index: HashMap<ClassId, crate::dtype::PlanDtype> = HashMap::default();
             for node in self.egraph.nodes.values() {
                 if node.op != "dtype-of" {
                     continue;
@@ -1979,7 +1982,7 @@ impl RenderCtx {
         Self {
             class_nodes: render_class_nodes(egraph),
             egraph: egraph.clone(),
-            memo: RefCell::new(HashMap::new()),
+            memo: RefCell::new(HashMap::default()),
         }
     }
 
@@ -2046,7 +2049,7 @@ impl LogicalRender for LogicalRenderCtx<'_, '_, '_> {
 
     fn child_int_expr(&mut self, node: &Node, index: usize) -> Option<String> {
         child_class(self.renderer.egraph, node, index)
-            .map(|class| self.renderer.readable_expr(&class, &mut HashSet::new()))
+            .map(|class| self.renderer.readable_expr(&class, &mut HashSet::default()))
     }
 }
 
@@ -2240,7 +2243,7 @@ impl<'a> ClassRenderer<'a> {
                     node,
                     &mut LogicalRenderCtx {
                         renderer: self,
-                        visiting: &mut HashSet::new(),
+                        visiting: &mut HashSet::default(),
                         depth: 8,
                     },
                 ),
@@ -2253,7 +2256,7 @@ impl<'a> ClassRenderer<'a> {
         let mut details = self.class_details(class);
         details.push((
             "expr".to_string(),
-            self.readable_logical_expr(class, &mut HashSet::new()),
+            self.readable_logical_expr(class, &mut HashSet::default()),
         ));
         if let Some(shape) = self.logical_shape(class) {
             details.push(("shape".to_string(), shape));
@@ -2546,7 +2549,7 @@ impl<'a> ClassRenderer<'a> {
     }
 
     fn readable_expr_list_display(&self, class: &ClassId) -> Option<String> {
-        let exprs = self.readable_expr_list(class, &mut HashSet::new())?;
+        let exprs = self.readable_expr_list(class, &mut HashSet::default())?;
         Some(format!("[{}]", exprs.join(", ")))
     }
 
@@ -2566,7 +2569,7 @@ impl<'a> ClassRenderer<'a> {
             let cons = self.egraph.nodes.get(cons_id)?;
             let head_class = child_class(self.egraph, cons, 0)?;
             let tail_class = child_class(self.egraph, cons, 1)?;
-            let mut dims = vec![self.readable_expr(&head_class, &mut HashSet::new())];
+            let mut dims = vec![self.readable_expr(&head_class, &mut HashSet::default())];
             dims.extend(self.readable_expr_list(&tail_class, visiting)?);
             Some(dims)
         };
@@ -3068,8 +3071,8 @@ impl<'a> Extractor<'a> {
         let mut builder = IrBuilder {
             extractor: self,
             dag: DiGraph::new(),
-            value_producer: HashMap::new(),
-            op_nodes: HashMap::new(),
+            value_producer: HashMap::default(),
+            op_nodes: HashMap::default(),
         };
         let mut outputs = Vec::with_capacity(roots.len());
         for root in roots {
@@ -3097,7 +3100,7 @@ impl<'a> Extractor<'a> {
 
         let (logical, layout) = match self.layout_tensor_parts(class) {
             Some((logical_class, layout_class)) => (
-                self.logical_info(&logical_class, &mut HashSet::new(), 4),
+                self.logical_info(&logical_class, &mut HashSet::default(), 4),
                 self.layout_info(&layout_class),
             ),
             None => (
@@ -3280,7 +3283,7 @@ impl<'a> Extractor<'a> {
     fn with_buffer_access_index<R>(&self, read: impl FnOnce(&HashMap<ClassId, Access>) -> R) -> R {
         let mut slot = self.buffer_access_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, Access> = HashMap::new();
+            let mut index: HashMap<ClassId, Access> = HashMap::default();
             for (node_id, node) in &self.egraph.nodes {
                 if node.subsumed || node.op != "buffer-access-of" {
                     continue;
@@ -3325,7 +3328,7 @@ impl<'a> Extractor<'a> {
     ) -> R {
         let mut slot = self.buffer_freed_by_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, FreedBy> = HashMap::new();
+            let mut index: HashMap<ClassId, FreedBy> = HashMap::default();
             for (node_id, node) in &self.egraph.nodes {
                 if node.subsumed || node.op != "buffer-freed-by" {
                     continue;
@@ -3786,7 +3789,7 @@ fn enqueue(index: u32, in_queue: &mut [bool], queue: &mut std::collections::VecD
 }
 
 fn class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
-    let mut classes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+    let mut classes: HashMap<ClassId, Vec<NodeId>> = HashMap::default();
     for (node_id, node) in &egraph.nodes {
         if node.subsumed || node.op == "[...]" {
             continue;
@@ -3800,7 +3803,7 @@ fn class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
 }
 
 fn render_class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
-    let mut classes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+    let mut classes: HashMap<ClassId, Vec<NodeId>> = HashMap::default();
     for (node_id, node) in &egraph.nodes {
         if node.op == "[...]" {
             continue;
@@ -3841,7 +3844,7 @@ fn render_class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
 /// its own constructor into that same class and a core rule cannot name
 /// them all.
 fn collect_input_producer_ops(egraph: &EGraph) -> HashSet<ClassId> {
-    let mut ops = HashSet::new();
+    let mut ops = HashSet::default();
     for node in egraph.nodes.values() {
         if node.subsumed || node.op != "input-producer" {
             continue;
@@ -3860,8 +3863,8 @@ fn collect_op_specs(
     HashMap<ClassId, Vec<OpSpec>>,
     HashMap<ClassId, Vec<ProducerRef>>,
 ) {
-    let mut op_specs: HashMap<ClassId, Vec<OpSpec>> = HashMap::new();
-    let mut producer_index: HashMap<ClassId, Vec<ProducerRef>> = HashMap::new();
+    let mut op_specs: HashMap<ClassId, Vec<OpSpec>> = HashMap::default();
+    let mut producer_index: HashMap<ClassId, Vec<ProducerRef>> = HashMap::default();
 
     for (op_class, node_ids) in class_nodes {
         for node_id in node_ids {
@@ -3882,7 +3885,7 @@ fn collect_op_specs(
                 egraph,
                 class_nodes,
                 &input_list_class,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             ) else {
                 continue;
             };
@@ -3890,7 +3893,7 @@ fn collect_op_specs(
                 egraph,
                 class_nodes,
                 &output_list_class,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             ) else {
                 continue;
             };
@@ -3975,8 +3978,8 @@ fn collect_output_buffer_classes(
     egraph: &EGraph,
     class_nodes: &HashMap<ClassId, Vec<NodeId>>,
 ) -> HashSet<ClassId> {
-    let mut output_buffers = HashSet::new();
-    let mut visited_lists = HashSet::new();
+    let mut output_buffers = HashSet::default();
+    let mut visited_lists = HashSet::default();
 
     for node in egraph
         .nodes
@@ -4002,8 +4005,8 @@ fn collect_input_buffer_classes(
     egraph: &EGraph,
     class_nodes: &HashMap<ClassId, Vec<NodeId>>,
 ) -> HashSet<ClassId> {
-    let mut input_buffers = HashSet::new();
-    let mut visited_lists = HashSet::new();
+    let mut input_buffers = HashSet::default();
+    let mut visited_lists = HashSet::default();
 
     for node in egraph
         .nodes
@@ -4061,7 +4064,7 @@ fn collect_input_terminals(
     output_buffer_classes: &HashSet<ClassId>,
     input_buffer_classes: &HashSet<ClassId>,
 ) -> HashMap<ClassId, InputInfo> {
-    let mut terminals = HashMap::new();
+    let mut terminals = HashMap::default();
     let egraph = &render.egraph;
     // Through the session's renderer, so these session-start renders
     // populate (and later hit) the same memo as everything else.
@@ -4203,7 +4206,7 @@ pub enum ChainStride {
 /// a slot is opaque (e.g. an accumulated diagonal summand) — fail
 /// closed, never guess.
 pub fn chain_strides(egraph: &EGraph, layout: &ClassId) -> Option<Vec<Option<ChainStride>>> {
-    let mut class_nodes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+    let mut class_nodes: HashMap<ClassId, Vec<NodeId>> = HashMap::default();
     for node_id in egraph.nodes.keys() {
         class_nodes
             .entry(egraph.nid_to_cid(node_id).clone())
