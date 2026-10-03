@@ -1353,8 +1353,8 @@ mod logical_petgraph_tests {
     #[test]
     fn tensor_ids_are_petgraph_values_with_ported_operand_edges() {
         let mut cx = Graph::new();
-        let lhs = cx.named_tensor("lhs", (2usize, 3usize), DType::F32);
-        let rhs = cx.named_tensor("rhs", (2usize, 3usize), DType::F32);
+        let lhs = cx.named_tensor("lhs", vec![2usize, 3usize], DType::F32);
+        let rhs = cx.named_tensor("rhs", vec![2usize, 3usize], DType::F32);
         let sum = lhs + rhs;
         let viewed = sum.expand_dim(0, 4usize);
 
@@ -1391,8 +1391,8 @@ mod logical_petgraph_tests {
     #[test]
     fn render_emits_the_cone_and_its_names() {
         let mut cx = Graph::new();
-        let x = cx.named_tensor("x", (2usize,), DType::F32);
-        let y = cx.named_tensor("y", (2usize,), DType::F32);
+        let x = cx.named_tensor("x", vec![2usize], DType::F32);
+        let y = cx.named_tensor("y", vec![2usize], DType::F32);
         let sum = (x + y).named("sum");
         let other = x * 2.0f32;
         assert_eq!(cx.logical.leaves(), vec![sum.id, other.id]);
@@ -1423,7 +1423,7 @@ mod logical_petgraph_tests {
     #[should_panic(expected = "duplicate name")]
     fn duplicate_names_refuse_at_construction() {
         let mut cx = Graph::new();
-        let x = cx.named_tensor("x", (2usize,), DType::F32);
+        let x = cx.named_tensor("x", vec![2usize], DType::F32);
         let _ = (x + x).named("y");
         let _ = (x * x).named("y");
     }

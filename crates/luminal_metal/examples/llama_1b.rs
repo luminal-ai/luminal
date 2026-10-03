@@ -2,6 +2,7 @@
 mod memory;
 use hf_hub::api::sync::Api;
 use luminal::prelude::FxHashMap;
+use luminal::shape::SliceRange;
 use luminal::{
     bucketing::{BucketSet, BucketSpec},
     memory::{PersistentBinding, ProgramMemory, ResourceId, SharedArenaPlan},
@@ -117,12 +118,12 @@ impl KVCache {
         for l in 0..LAYERS {
             k_caches.push(cx.named_tensor(
                 format!("kv_cache.{l}.k"),
-                (num_slots, KV_DIM),
+                vec![num_slots, KV_DIM],
                 DType::F32,
             ));
             v_caches.push(cx.named_tensor(
                 format!("kv_cache.{l}.v"),
-                (num_slots, KV_DIM),
+                vec![num_slots, KV_DIM],
                 DType::F32,
             ));
         }
@@ -144,37 +145,37 @@ impl Llama {
             layers.push(LlamaLayer {
                 up: cx.named_tensor(
                     format!("model.layers.{l}.mlp.up_proj.weight"),
-                    (INTERMEDIATE, HIDDEN),
+                    vec![INTERMEDIATE, HIDDEN],
                     DType::F32,
                 ),
                 gate: cx.named_tensor(
                     format!("model.layers.{l}.mlp.gate_proj.weight"),
-                    (INTERMEDIATE, HIDDEN),
+                    vec![INTERMEDIATE, HIDDEN],
                     DType::F32,
                 ),
                 down: cx.named_tensor(
                     format!("model.layers.{l}.mlp.down_proj.weight"),
-                    (HIDDEN, INTERMEDIATE),
+                    vec![HIDDEN, INTERMEDIATE],
                     DType::F32,
                 ),
                 q_proj: cx.named_tensor(
                     format!("model.layers.{l}.self_attn.q_proj.weight"),
-                    (HIDDEN, HIDDEN),
+                    vec![HIDDEN, HIDDEN],
                     DType::F32,
                 ),
                 k_proj: cx.named_tensor(
                     format!("model.layers.{l}.self_attn.k_proj.weight"),
-                    (KV_DIM, HIDDEN),
+                    vec![KV_DIM, HIDDEN],
                     DType::F32,
                 ),
                 v_proj: cx.named_tensor(
                     format!("model.layers.{l}.self_attn.v_proj.weight"),
-                    (KV_DIM, HIDDEN),
+                    vec![KV_DIM, HIDDEN],
                     DType::F32,
                 ),
                 o_proj: cx.named_tensor(
                     format!("model.layers.{l}.self_attn.o_proj.weight"),
-                    (HIDDEN, HIDDEN),
+                    vec![HIDDEN, HIDDEN],
                     DType::F32,
                 ),
                 attn_rms: LayerNorm::new(
@@ -203,7 +204,7 @@ impl Llama {
         Self {
             embedding: cx.named_tensor(
                 "model.embed_tokens.weight",
-                (VOCAB_SIZE, HIDDEN),
+                vec![VOCAB_SIZE, HIDDEN],
                 DType::F32,
             ),
             layers,
@@ -276,8 +277,16 @@ fn llama_rotary_embeddings(mut input: GraphTensor, pos_ids: GraphTensor) -> Grap
         .expand_dim(1, 1)
         .matmul(inv_freqs.expand_dim(0, 1));
 
-    let x0 = input.slice((.., .., ..HEAD_DIM / 2));
-    let x1 = input.slice((.., .., HEAD_DIM / 2..));
+    let x0 = input.slice(vec![
+        (..).bounds(),
+        (..).bounds(),
+        (..HEAD_DIM / 2).bounds(),
+    ]);
+    let x1 = input.slice(vec![
+        (..).bounds(),
+        (..).bounds(),
+        (HEAD_DIM / 2..).bounds(),
+    ]);
 
     let cos = emb.cos().expand_dim(0, x0.dims()[0]);
     let sin = emb.sin().expand_dim(0, x0.dims()[0]);
@@ -308,7 +317,7 @@ fn attention(
     let v_ctx = gather_rows(v_cache_out, gather_idx);
 
     let q = (q_rope * 1.0).split_dims(1, HEAD_DIM).transpose(0, 1);
-    let k = k.split_dims(1, HEAD_DIM).permute((1, 2, 0));
+    let k = k.split_dims(1, HEAD_DIM).permute(vec![1, 2, 0]);
     let v_ctx = v_ctx.split_dims(1, HEAD_DIM).transpose(0, 1);
 
     let k = k.expand_dim(1, KV_GROUPS).merge_dims(0, 1) * 1.0;
@@ -486,7 +495,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let q_pos_t = cx.named_tensor("q_pos", 's', DType::Int);
     let scatter_idx_t = cx.named_tensor("scatter_idx", 's', DType::Int);
     let gather_idx_t = cx.named_tensor("gather_idx", 'c', DType::Int);
-    let attn_mask_t = cx.named_tensor("attn_mask", ('s', 'c'), DType::F32);
+    let attn_mask_t = cx.named_tensor("attn_mask", vec!['s', 'c'], DType::F32);
     let kv_cache = KVCache::new(&mut cx, MAX_SEQ_LEN);
     let (logits, cache_outputs) = Llama::init(&mut cx).forward(
         input,

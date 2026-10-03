@@ -145,7 +145,7 @@ impl ConvNdConfig {
             patches = patches.merge_dims(1, 2);
         }
 
-        let mut out = patches.finish().matmul(weight.permute((1, 0)));
+        let mut out = patches.finish().matmul(weight.permute(vec![1, 0]));
 
         // Restore batch and spatial dimensions. The collapse loops merged
         // k dims into 1, so restore splits k-1 times: splitting by every dim
@@ -408,8 +408,8 @@ mod forward_tests {
             .collect();
 
         let mut cx = Graph::new();
-        let x = cx.tensor((b, ci, h, w), DType::F32);
-        let weight = cx.tensor((co, ci * k * k), DType::F32);
+        let x = cx.tensor(vec![b, ci, h, w], DType::F32);
+        let weight = cx.tensor(vec![co, ci * k * k], DType::F32);
         let config = ConvNdConfig::new([k, k], [1, 1], [1, 1], [0, 0]);
         let out = conv_nd(x, weight, None, &config);
         let rt = luminal_reference::harness::run_reference(
@@ -450,8 +450,8 @@ mod forward_tests {
     #[test]
     fn convnd_applies_caller_supplied_bias() {
         let mut cx = Graph::new();
-        let input = cx.tensor((1, 1, 2, 2), DType::F32);
-        let weight = cx.tensor((2, 1), DType::F32);
+        let input = cx.tensor(vec![1, 1, 2, 2], DType::F32);
+        let weight = cx.tensor(vec![2, 1], DType::F32);
         let bias = cx.tensor(2, DType::F32);
         let config = ConvNdConfig::new([1, 1], [1, 1], [1, 1], [0, 0]);
         let output = conv_nd(input, weight, Some(bias), &config);

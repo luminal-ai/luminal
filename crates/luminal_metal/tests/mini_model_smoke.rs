@@ -100,7 +100,7 @@ fn mini_conv_runs() {
 
     let mut cx = Graph::new();
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
-    let input = cx.tensor((1, 1, 5, 5), DType::F32);
+    let input = cx.tensor(vec![1, 1, 5, 5], DType::F32);
     let output = model.forward(input);
     run(cx, &[output], []);
 }
@@ -112,7 +112,10 @@ fn mini_llama3_runs() {
     let mut cx = Graph::new();
     let model = MiniLlama3::new(5, 8, 12, 4, 2, 1, &mut cx);
     let ids = cx.tensor(1, DType::Int);
-    let caches = vec![(cx.tensor((4, 4), DType::F32), cx.tensor((4, 4), DType::F32))];
+    let caches = vec![(
+        cx.tensor(vec![4, 4], DType::F32),
+        cx.tensor(vec![4, 4], DType::F32),
+    )];
     let gather = cx.tensor(2, DType::Int);
     let scatter = cx.tensor(1, DType::Int);
     let (output, cache_outputs) =
@@ -141,7 +144,10 @@ fn mini_qwen3_runs() {
     let mut cx = Graph::new();
     let model = MiniQwen3::new(5, 8, 12, 4, 2, 1, &mut cx);
     let ids = cx.tensor(1, DType::Int);
-    let caches = vec![(cx.tensor((4, 4), DType::F32), cx.tensor((4, 4), DType::F32))];
+    let caches = vec![(
+        cx.tensor(vec![4, 4], DType::F32),
+        cx.tensor(vec![4, 4], DType::F32),
+    )];
     let gather = cx.tensor(2, DType::Int);
     let scatter = cx.tensor(1, DType::Int);
     let (output, cache_outputs) =
@@ -175,8 +181,8 @@ fn mini_gemma3_runs() {
     let caches = (0..LAYERS)
         .map(|_| {
             (
-                cx.tensor((4, HEAD_DIM), DType::F32),
-                cx.tensor((4, HEAD_DIM), DType::F32),
+                cx.tensor(vec![4, HEAD_DIM], DType::F32),
+                cx.tensor(vec![4, HEAD_DIM], DType::F32),
             )
         })
         .collect::<Vec<_>>();
@@ -185,12 +191,12 @@ fn mini_gemma3_runs() {
     let rope = (0..LAYERS)
         .map(|_| {
             (
-                cx.tensor((1, HEAD_DIM), DType::F32),
-                cx.tensor((1, HEAD_DIM), DType::F32),
+                cx.tensor(vec![1, HEAD_DIM], DType::F32),
+                cx.tensor(vec![1, HEAD_DIM], DType::F32),
             )
         })
         .collect::<Vec<_>>();
-    let rotation = cx.tensor((HEAD_DIM, HEAD_DIM), DType::F32);
+    let rotation = cx.tensor(vec![HEAD_DIM, HEAD_DIM], DType::F32);
     let (output, cache_outputs) = model.forward(
         ids,
         &caches,
@@ -241,7 +247,10 @@ fn mini_qwen3_moe_runs() {
         |cx| MiniQwen3Moe::new(5, 4, 2, 1, 2, 1, cx),
         |model, cx| {
             let ids = cx.tensor(1, DType::Int);
-            let caches = vec![(cx.tensor((4, 4), DType::F32), cx.tensor((4, 4), DType::F32))];
+            let caches = vec![(
+                cx.tensor(vec![4, 4], DType::F32),
+                cx.tensor(vec![4, 4], DType::F32),
+            )];
             let gather = cx.tensor(2, DType::Int);
             let scatter = cx.tensor(1, DType::Int);
             model.forward(ids, &caches, gather, scatter, IntExpr::from(1usize))
@@ -257,7 +266,10 @@ fn mini_gemma4_moe_runs() {
         |cx| MiniGemma4Moe::new(5, 4, 2, 1, 2, 1, cx),
         |model, cx| {
             let ids = cx.tensor(1, DType::Int);
-            let caches = vec![(cx.tensor((4, 4), DType::F32), cx.tensor((4, 4), DType::F32))];
+            let caches = vec![(
+                cx.tensor(vec![4, 4], DType::F32),
+                cx.tensor(vec![4, 4], DType::F32),
+            )];
             let gather = cx.tensor(2, DType::Int);
             let scatter = cx.tensor(1, DType::Int);
             model.forward(ids, &caches, gather, scatter, IntExpr::from(1usize))
@@ -271,8 +283,8 @@ fn mini_whisper_runs() {
 
     let mut cx = Graph::new();
     let model = MiniWhisper::new(4, 6, 2, &mut cx);
-    let audio = cx.tensor((2, 4), DType::F32);
-    let tokens = cx.tensor((1, 4), DType::F32);
+    let audio = cx.tensor(vec![2, 4], DType::F32);
+    let tokens = cx.tensor(vec![1, 4], DType::F32);
     let output = model.forward(audio, tokens);
     run(cx, &[output], []);
 }
@@ -288,14 +300,14 @@ fn mini_flux_runs() {
     const HIDDEN: usize = 16;
     let mut cx = Graph::new();
     let model = MiniDit::new(4, 6, HIDDEN, 2, 6, 2, TEXT_TOKENS, &mut cx);
-    let latent = cx.tensor((IMAGE_TOKENS, 4), DType::F32);
-    let text = cx.tensor((TEXT_TOKENS, 6), DType::F32);
+    let latent = cx.tensor(vec![IMAGE_TOKENS, 4], DType::F32);
+    let text = cx.tensor(vec![TEXT_TOKENS, 6], DType::F32);
     let timestep = cx.tensor(1, DType::F32);
     let guidance = cx.tensor(1, DType::F32);
-    let rope_cos = cx.tensor((TEXT_TOKENS + IMAGE_TOKENS, HEAD_DIM), DType::F32);
-    let rope_sin = cx.tensor((TEXT_TOKENS + IMAGE_TOKENS, HEAD_DIM), DType::F32);
-    let rope_rotation = cx.tensor((HEAD_DIM, HEAD_DIM), DType::F32);
-    let joint_base = cx.tensor((TEXT_TOKENS + IMAGE_TOKENS, HIDDEN), DType::F32);
+    let rope_cos = cx.tensor(vec![TEXT_TOKENS + IMAGE_TOKENS, HEAD_DIM], DType::F32);
+    let rope_sin = cx.tensor(vec![TEXT_TOKENS + IMAGE_TOKENS, HEAD_DIM], DType::F32);
+    let rope_rotation = cx.tensor(vec![HEAD_DIM, HEAD_DIM], DType::F32);
+    let joint_base = cx.tensor(vec![TEXT_TOKENS + IMAGE_TOKENS, HIDDEN], DType::F32);
     let output = model.forward(
         latent,
         text,

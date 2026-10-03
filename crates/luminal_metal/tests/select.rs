@@ -9,13 +9,13 @@ use support::TestTransfers;
 #[test]
 fn select_preserves_branch_bits_through_strided_views() {
     let mut graph = Graph::new();
-    let condition = graph.tensor((3, 2), DType::F32);
-    let a = graph.tensor((3, 2), DType::F32);
-    let b = graph.tensor((2, 3), DType::F32);
+    let condition = graph.tensor(vec![3, 2], DType::F32);
+    let a = graph.tensor(vec![3, 2], DType::F32);
+    let b = graph.tensor(vec![2, 3], DType::F32);
     let output = condition
-        .permute((1, 0))
-        .lt(graph.constant_f32(0.).expand_rhs((2, 3)))
-        .select(a.permute((1, 0)), b);
+        .permute(vec![1, 0])
+        .lt(graph.constant_f32(0.).expand_rhs(vec![2, 3]))
+        .select(a.permute(vec![1, 0]), b);
     let condition_values = vec![-1f32, 1., 1., -1., -1., 1.];
     let a_values = vec![-0f32, 99., f32::NAN, f32::INFINITY, f32::NAN, 99.];
     let b_values = vec![f32::NAN, 2., 99., -3., f32::NAN, f32::NEG_INFINITY];

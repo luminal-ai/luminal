@@ -36,8 +36,8 @@ fn bf16_bytes(values: &[f32]) -> Vec<u8> {
 /// `a * b` on `dtype`, returned as raw output storage bytes.
 fn mul_device(dtype: DType, a: HostBuffer, b: HostBuffer) -> Vec<u8> {
     let mut cx = Graph::new();
-    let ta = cx.tensor((4,), dtype);
-    let tb = cx.tensor((4,), dtype);
+    let ta = cx.tensor(vec![4], dtype);
+    let tb = cx.tensor(vec![4], dtype);
     let out = ta * tb;
     let data: FxHashMap<_, _> = [(ta.id, a.clone()), (tb.id, b.clone())]
         .into_iter()
@@ -89,7 +89,7 @@ fn f64_reciprocal_round_trips() {
             .collect(),
     );
     let mut cx = Graph::new();
-    let t = cx.tensor((4,), DType::F64);
+    let t = cx.tensor(vec![4], DType::F64);
     let out = t.reciprocal();
     let data: FxHashMap<_, _> = [(t.id, a.clone())].into_iter().collect();
     let mut rt = CudaRuntime::load(&cx).expect("load");
@@ -125,7 +125,7 @@ fn f16_reciprocal_round_trips() {
     // The `1.0f / __half` ambiguity regression: half recip must compile.
     let a = host(PlanDtype::F16, f16_bytes(&[4.0, 2.0, 1.0, 8.0]));
     let mut cx = Graph::new();
-    let t = cx.tensor((4,), DType::F16);
+    let t = cx.tensor(vec![4], DType::F16);
     let out = t.reciprocal();
     let data: FxHashMap<_, _> = [(t.id, a.clone())].into_iter().collect();
     let mut rt = CudaRuntime::load(&cx).expect("load");

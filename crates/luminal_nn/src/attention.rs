@@ -39,7 +39,9 @@ pub fn gather_rows(data: GraphTensor, indices: GraphTensor) -> GraphTensor {
     let n = indices.dims1();
     let width = data.dims()[1];
     let rows = indices.expand_dim(1, width);
-    let cols = data.graph().iota((n, width), |coordinate| coordinate[1]);
+    let cols = data
+        .graph()
+        .iota(vec![n, width], |coordinate| coordinate[1]);
     restore_row_payload(data.gather(&[rows, cols]), &payload_dims)
 }
 
@@ -65,7 +67,7 @@ pub fn scatter_rows(src: GraphTensor, indices: GraphTensor, dest: GraphTensor) -
     let n = indices.dims1();
     let width = src.dims()[1];
     let rows = indices.expand_dim(1, width);
-    let cols = src.graph().iota((n, width), |coordinate| coordinate[1]);
+    let cols = src.graph().iota(vec![n, width], |coordinate| coordinate[1]);
     restore_row_payload(dest.scatter(&[rows, cols], src), &payload_dims)
 }
 
@@ -342,12 +344,12 @@ pub fn grouped_query_scores(
         .view()
         .split_dims(1, geometry.head_dim)
         .split_dims(1, groups)
-        .permute((1, 2, 0, 3))
+        .permute(vec![1, 2, 0, 3])
         .finish();
     let keys = keys
         .view()
         .split_dims(1, geometry.head_dim)
-        .permute((1, 2, 0))
+        .permute(vec![1, 2, 0])
         .expand_dim(1, groups)
         .finish();
     query.matmul(keys) * geometry.scale
@@ -386,13 +388,13 @@ pub fn grouped_query_apply(
     let values = values
         .view()
         .split_dims(1, geometry.head_dim)
-        .permute((1, 0, 2))
+        .permute(vec![1, 0, 2])
         .expand_dim(1, groups)
         .finish();
     weights
         .matmul(values)
         .view()
-        .permute((2, 0, 1, 3))
+        .permute(vec![2, 0, 1, 3])
         .merge_dims(1, 2)
         .merge_dims(1, 2)
         .finish()
@@ -609,14 +611,26 @@ pub fn attention(
     );
     let sq = q.dims()[0];
     let sk = k.dims()[0];
-    let q = q.view().split_dims(1, head_dim).permute((1, 0, 2)).finish(); // (nh, sq, hd)
-    let k = k.view().split_dims(1, head_dim).permute((1, 2, 0)).finish(); // (nh, hd, sk)
-    let v = v.view().split_dims(1, head_dim).permute((1, 0, 2)).finish(); // (nh, sk, hd)
+    let q = q
+        .view()
+        .split_dims(1, head_dim)
+        .permute(vec![1, 0, 2])
+        .finish(); // (nh, sq, hd)
+    let k = k
+        .view()
+        .split_dims(1, head_dim)
+        .permute(vec![1, 2, 0])
+        .finish(); // (nh, hd, sk)
+    let v = v
+        .view()
+        .split_dims(1, head_dim)
+        .permute(vec![1, 0, 2])
+        .finish(); // (nh, sk, hd)
     let scores = q.matmul(k) * scale; // (nh, sq, sk)
     let weights = scores.softmax(2);
     let out = weights.matmul(v); // (nh, sq, hd)
     let _ = (sq, sk);
-    out.view().permute((1, 0, 2)).merge_dims(1, 2).finish() // (sq, nh·hd)
+    out.view().permute(vec![1, 0, 2]).merge_dims(1, 2).finish() // (sq, nh·hd)
 }
 
 #[cfg(test)]
@@ -646,7 +660,7 @@ mod tests {
     #[test]
     fn gather_rows_selects_rows() {
         let mut cx = Graph::new();
-        let data = cx.tensor((4, 3), DType::F32);
+        let data = cx.tensor(vec![4, 3], DType::F32);
         let idx = cx.tensor(2, DType::Int);
         let out = gather_rows(data, idx);
 
@@ -674,7 +688,7 @@ mod tests {
     #[test]
     fn gather_rows_preserves_trailing_axes() {
         let mut cx = Graph::new();
-        let data = cx.tensor((3, 2, 2), DType::F32);
+        let data = cx.tensor(vec![3, 2, 2], DType::F32);
         let indices = cx.tensor(2, DType::Int);
         let output = gather_rows(data, indices);
         assert_eq!(
@@ -703,9 +717,9 @@ mod tests {
     #[test]
     fn scatter_rows_replaces_rows() {
         let mut cx = Graph::new();
-        let src = cx.tensor((2, 3), DType::F32);
+        let src = cx.tensor(vec![2, 3], DType::F32);
         let idx = cx.tensor(2, DType::Int);
-        let dest = cx.tensor((4, 3), DType::F32);
+        let dest = cx.tensor(vec![4, 3], DType::F32);
         let out = scatter_rows(src, idx, dest);
         assert_eq!(out.dims(), dest.dims());
 
@@ -751,11 +765,11 @@ mod tests {
         let prev_seq = 1usize;
 
         let mut cx = Graph::new();
-        let q = cx.tensor((1, HIDDEN), DType::F32);
-        let k_new = cx.tensor((1, HIDDEN), DType::F32);
-        let v_new = cx.tensor((1, HIDDEN), DType::F32);
-        let k_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
-        let v_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let q = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let k_new = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let v_new = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let k_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
+        let v_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
         let gather_idx = cx.tensor(CTX, DType::Int);
         let scatter_idx = cx.tensor(1, DType::Int);
         let query_positions = cx.iota(1, |c| c[0] + IntExpr::from(prev_seq));
@@ -843,10 +857,10 @@ mod tests {
         const CONTEXT: usize = 2;
 
         let mut cx = Graph::new();
-        let query = cx.tensor((1, QUERY_HEADS * HEAD_DIM), DType::F32);
-        let keys = cx.tensor((CONTEXT, KV_HEADS * HEAD_DIM), DType::F32);
-        let values = cx.tensor((CONTEXT, KV_HEADS * HEAD_DIM), DType::F32);
-        let bias = cx.tensor((1, CONTEXT), DType::F32);
+        let query = cx.tensor(vec![1, QUERY_HEADS * HEAD_DIM], DType::F32);
+        let keys = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let values = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let bias = cx.tensor(vec![1, CONTEXT], DType::F32);
         let output = grouped_query_attention(
             query,
             keys,
@@ -912,11 +926,11 @@ mod tests {
         let q_position = 1usize;
 
         let mut cx = Graph::new();
-        let q = cx.tensor((1, HIDDEN), DType::F32);
-        let k_new = cx.tensor((1, HIDDEN), DType::F32);
-        let v_new = cx.tensor((1, HIDDEN), DType::F32);
-        let k_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
-        let v_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let q = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let k_new = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let v_new = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let k_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
+        let v_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
         let gather_idx = cx.tensor(CTX, DType::Int);
         let scatter_idx = cx.tensor(1, DType::Int);
         let q_pos = cx.tensor(1, DType::Int);
@@ -1104,14 +1118,14 @@ mod score_bias_tests {
         const CTX: usize = 3;
 
         let mut cx = Graph::new();
-        let q = cx.tensor((1, HIDDEN), DType::F32);
-        let k_new = cx.tensor((1, HIDDEN), DType::F32);
-        let v_new = cx.tensor((1, HIDDEN), DType::F32);
-        let k_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
-        let v_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let q = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let k_new = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let v_new = cx.tensor(vec![1, HIDDEN], DType::F32);
+        let k_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
+        let v_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
         let gather_idx = cx.tensor(CTX, DType::Int);
         let scatter_idx = cx.tensor(1, DType::Int);
-        let mask = cx.tensor((1, CTX), DType::F32);
+        let mask = cx.tensor(vec![1, CTX], DType::F32);
         let result = paged_attention(
             q,
             k_new,

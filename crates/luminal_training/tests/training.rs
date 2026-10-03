@@ -115,7 +115,7 @@ impl Trainer {
 
 fn mse(pred: GraphTensor, target: GraphTensor) -> GraphTensor {
     let d = pred - target;
-    (d * d).mean((0, 1))
+    (d * d).mean(vec![0, 1])
 }
 
 /// Convex problem with a known solution: SGD must recover the generating
@@ -138,9 +138,9 @@ fn linear_regression_recovers_true_weights() {
     }
 
     let mut cx = Graph::new();
-    let x = cx.tensor((n, d_in), DType::F32);
-    let y = cx.tensor((n, d_out), DType::F32);
-    let w = cx.tensor((d_in, d_out), DType::F32);
+    let x = cx.tensor(vec![n, d_in], DType::F32);
+    let y = cx.tensor(vec![n, d_out], DType::F32);
+    let w = cx.tensor(vec![d_in, d_out], DType::F32);
     let b = cx.tensor(d_out, DType::F32);
     let pred = x.matmul(w) + b.expand_dim(0, n);
     let loss = mse(pred, y);
@@ -182,11 +182,11 @@ fn xor_mlp_learns_nonlinear_function() {
     let hidden = 8;
 
     let mut cx = Graph::new();
-    let x = cx.tensor((4, 2), DType::F32);
-    let y = cx.tensor((4, 1), DType::F32);
-    let w1 = cx.tensor((2, hidden), DType::F32);
+    let x = cx.tensor(vec![4, 2], DType::F32);
+    let y = cx.tensor(vec![4, 1], DType::F32);
+    let w1 = cx.tensor(vec![2, hidden], DType::F32);
     let b1 = cx.tensor(hidden, DType::F32);
-    let w2 = cx.tensor((hidden, 1), DType::F32);
+    let w2 = cx.tensor(vec![hidden, 1], DType::F32);
     let pred = (x.matmul(w1) + b1.expand_dim(0, 4))
         .tanh()
         .matmul(w2)
@@ -238,12 +238,12 @@ fn softmax_classifier_reaches_full_accuracy() {
     }
 
     let mut cx = Graph::new();
-    let x = cx.tensor((6, 2), DType::F32);
-    let onehot = cx.tensor((6, 3), DType::F32);
-    let w = cx.tensor((2, 3), DType::F32);
+    let x = cx.tensor(vec![6, 2], DType::F32);
+    let onehot = cx.tensor(vec![6, 3], DType::F32);
+    let w = cx.tensor(vec![2, 3], DType::F32);
     let b = cx.tensor(3, DType::F32);
     let logits = x.matmul(w) + b.expand_dim(0, 6);
-    let loss = -(onehot * logits.log_softmax(1)).mean((0, 1)) * 3.0; // mean CE per sample
+    let loss = -(onehot * logits.log_softmax(1)).mean(vec![0, 1]) * 3.0; // mean CE per sample
     let logits_out = logits.output();
 
     let mut t = Trainer::new(&mut cx, loss, &[w, b], vec![vec![0.0; 6], vec![0.0; 3]])
@@ -287,9 +287,9 @@ fn embedding_rows_train_through_gather() {
     let table_init = seq(n_rows * dim, -0.4, 0.4);
 
     let mut cx = Graph::new();
-    let table = cx.tensor((n_rows, dim), DType::F32);
+    let table = cx.tensor(vec![n_rows, dim], DType::F32);
     let rows = cx.tensor(4, DType::Int);
-    let targets = cx.tensor((4, dim), DType::F32);
+    let targets = cx.tensor(vec![4, dim], DType::F32);
     // Flat gather indices: row_id * dim + column
     let dim_const = cx.constant(dim).expand_dim(0, 4).expand_dim(1, dim);
     let col = cx.iota(expr('z') % dim, (4, dim));
@@ -342,10 +342,10 @@ fn deep_mlp_with_layernorm_trains() {
     let y_data = seq(n * d_out, -0.8, 0.8);
 
     let mut cx = Graph::new();
-    let x = cx.tensor((n, d_in), DType::F32);
-    let y = cx.tensor((n, d_out), DType::F32);
-    let w1 = cx.tensor((d_in, hidden), DType::F32);
-    let w2 = cx.tensor((hidden, d_out), DType::F32);
+    let x = cx.tensor(vec![n, d_in], DType::F32);
+    let y = cx.tensor(vec![n, d_out], DType::F32);
+    let w1 = cx.tensor(vec![d_in, hidden], DType::F32);
+    let w2 = cx.tensor(vec![hidden, d_out], DType::F32);
     let h = x.matmul(w1).sigmoid().layer_norm(1, 1e-5);
     let pred = h.matmul(w2);
     let loss = mse(pred, y);

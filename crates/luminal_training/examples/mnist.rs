@@ -39,7 +39,7 @@ fn build_model(x: GraphTensor, cx: &mut Graph) -> (Vec<GraphTensor>, GraphTensor
     let head = Linear::new(32 * 9, 10, true, DType::F32, &root.child("head"), cx);
     let img = x.split_dims(1, IMG).unsqueeze(1); // (B,1,12,12)
     let h1 = conv1.forward(img).relu(); // conv 1->16, relu -> (B,16,10,10)
-    let pool = h1.split_dims(2, 2).split_dims(4, 2).max((3, 5)); // 2x2 maxpool -> (B,16,5,5)
+    let pool = h1.split_dims(2, 2).split_dims(4, 2).max(vec![3, 5]); // 2x2 maxpool -> (B,16,5,5)
     let h2 = conv2.forward(pool).relu(); // conv 16->32, relu -> (B,32,3,3)
     let feats = h2.merge_dims(2, 3).merge_dims(1, 2); // (B,288)
     let logits = head.forward(feats); // linear to 10 classes
@@ -66,10 +66,10 @@ fn main() {
     let test_x: Vec<Vec<f32>> = data.tst_img.chunks(784).map(preprocess).collect();
 
     let mut cx = Graph::new();
-    let x = cx.tensor((BATCH, IMG * IMG), DType::F32);
-    let y = cx.tensor((BATCH, 10), DType::F32);
+    let x = cx.tensor(vec![BATCH, IMG * IMG], DType::F32);
+    let y = cx.tensor(vec![BATCH, 10], DType::F32);
     let (params, logits) = build_model(x, &mut cx);
-    let loss = -(y * logits.log_softmax(1)).mean((0, 1)) * 10.0; // mean cross-entropy
+    let loss = -(y * logits.log_softmax(1)).mean(vec![0, 1]) * 10.0; // mean cross-entropy
 
     // Trainer appends backward + the AdamW update to the graph and compiles it all.
     let mut tr = Trainer::new(&mut cx, loss, &params, AdamW::new(3e-3));

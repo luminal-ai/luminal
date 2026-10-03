@@ -93,12 +93,12 @@ impl Qwen3MoeFfn {
             ),
             gate_up: cx.named_tensor(
                 experts.leaf("gate_up_proj"),
-                (d.experts, 2 * d.moe_intermediate, d.hidden),
+                vec![d.experts, 2 * d.moe_intermediate, d.hidden],
                 dtype,
             ),
             down: cx.named_tensor(
                 experts.leaf("down_proj"),
-                (d.experts, d.hidden, d.moe_intermediate),
+                vec![d.experts, d.hidden, d.moe_intermediate],
                 dtype,
             ),
             top_k: d.top_k,
@@ -115,7 +115,7 @@ impl Qwen3MoeFfn {
         let projected = routes
             .dispatch(input)
             .expand_dim(2, 1)
-            .matmul(gate_up.permute((0, 1, 3, 2)))
+            .matmul(gate_up.permute(vec![0, 1, 3, 2]))
             .squeeze(2);
         let gate = projected.slice_along(..self.intermediate, 2);
         let up = projected.slice_along(self.intermediate.., 2);
@@ -124,7 +124,7 @@ impl Qwen3MoeFfn {
         let down = routes.select(self.down).cast(DType::F32);
         let routed_output = hidden_states
             .expand_dim(2, 1)
-            .matmul(down.permute((0, 1, 3, 2)))
+            .matmul(down.permute(vec![0, 1, 3, 2]))
             .squeeze(2);
         routes.combine(routed_output)
     }

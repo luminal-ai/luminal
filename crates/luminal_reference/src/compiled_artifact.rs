@@ -574,14 +574,15 @@ impl OpWire {
 mod tests {
     use luminal::graph::Graph;
     use luminal::prelude::DType;
+    use luminal::shape::IntExpr;
 
     use crate::{ReferenceRuntime, TypedBuffer};
 
     #[test]
     fn selected_plan_round_trips_without_search() {
         let mut graph = Graph::new();
-        let a = graph.tensor((2, 2), DType::F32);
-        let b = graph.tensor((2, 2), DType::F32);
+        let a = graph.tensor(vec![2, 2], DType::F32);
+        let b = graph.tensor(vec![2, 2], DType::F32);
         let result = a + b;
         let mut leader = ReferenceRuntime::load(&graph).unwrap();
         let data = [
@@ -623,7 +624,7 @@ mod tests {
     fn bounded_scan_program_round_trips_without_search() {
         use luminal::shape::SymbolBounds;
         let mut graph = Graph::new();
-        let x = graph.tensor(('n', 2), DType::F32);
+        let x = graph.tensor(vec![IntExpr::from('n'), 2.into()], DType::F32);
         // Axis 1 must survive serialization; folding axis 0 changes the result.
         let out = x.cumsum(1).cumprod(1).cummax(1);
         let output = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
@@ -662,8 +663,8 @@ mod tests {
     fn bounded_program_round_trip_without_search() {
         use luminal::shape::{DynMap, SymbolBounds};
         let mut graph = Graph::new();
-        let x = graph.tensor(('s', 2), DType::F32);
-        let y = graph.tensor(('s', 2), DType::F32);
+        let x = graph.tensor(vec![IntExpr::from('s'), 2.into()], DType::F32);
+        let y = graph.tensor(vec![IntExpr::from('s'), 2.into()], DType::F32);
         let out = x + y;
         let output = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
         let mut leader = ReferenceRuntime::load(&graph).unwrap();

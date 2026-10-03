@@ -30,8 +30,8 @@ use luminal::graph::Graph;
 fn bounded_program(iters: usize, with_collapse: bool) -> String {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((2usize, 4usize), DType::F32);
-        let w = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![2usize, 4usize], DType::F32);
+        let w = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _out = x.matmul(w);
         test_runtime::bind_leaves(&cx)
     };

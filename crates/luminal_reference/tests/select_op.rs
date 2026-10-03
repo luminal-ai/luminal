@@ -10,9 +10,9 @@ use rustc_hash::FxHashMap;
 #[test]
 fn select_picks_branches_elementwise() {
     let mut cx = Graph::new();
-    let condition = cx.tensor((4,), DType::Bool);
-    let if_true = cx.tensor((4,), DType::F32);
-    let if_false = cx.tensor((4,), DType::F32);
+    let condition = cx.tensor(vec![4], DType::Bool);
+    let if_true = cx.tensor(vec![4], DType::F32);
+    let if_false = cx.tensor(vec![4], DType::F32);
     let out = condition.select(if_true, if_false);
 
     let mut runtime = ReferenceRuntime::load(&cx).expect("load");
@@ -44,9 +44,9 @@ fn select_picks_branches_elementwise() {
 #[test]
 fn select_does_not_leak_unselected_nan() {
     let mut cx = Graph::new();
-    let condition = cx.tensor((2,), DType::Bool);
-    let if_true = cx.tensor((2,), DType::F32);
-    let if_false = cx.tensor((2,), DType::F32);
+    let condition = cx.tensor(vec![2], DType::Bool);
+    let if_true = cx.tensor(vec![2], DType::F32);
+    let if_false = cx.tensor(vec![2], DType::F32);
     let out = condition.select(if_true, if_false);
 
     let mut runtime = ReferenceRuntime::load(&cx).expect("load");
@@ -81,7 +81,7 @@ fn select_does_not_leak_unselected_nan() {
 #[test]
 fn abs_uses_select_and_runs() {
     let mut cx = Graph::new();
-    let x = cx.tensor((4,), DType::F32);
+    let x = cx.tensor(vec![4], DType::F32);
     let out = x.abs();
 
     let values = vec![-1.5f32, 2.0, -3.0, 0.0];
@@ -108,9 +108,9 @@ fn abs_uses_select_and_runs() {
 #[test]
 fn select_i64_branches() {
     let mut cx = Graph::new();
-    let condition = cx.tensor((3,), DType::Bool);
-    let if_true = cx.tensor((3,), DType::I64);
-    let if_false = cx.tensor((3,), DType::I64);
+    let condition = cx.tensor(vec![3], DType::Bool);
+    let if_true = cx.tensor(vec![3], DType::I64);
+    let if_false = cx.tensor(vec![3], DType::I64);
     let out = condition.select(if_true, if_false);
 
     let mut runtime = ReferenceRuntime::load(&cx).expect("load");

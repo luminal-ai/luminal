@@ -545,9 +545,9 @@ mod tests {
     #[test]
     fn grad_shapes_match_params() {
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3), DType::F32);
-        let b = cx.tensor((2, 3), DType::F32);
-        let loss = (a * b).sum((0, 1));
+        let a = cx.tensor(vec![2, 3], DType::F32);
+        let b = cx.tensor(vec![2, 3], DType::F32);
+        let loss = (a * b).sum(vec![0, 1]);
         let grads = cx.backward(loss, &[a, b]);
         assert_eq!(grads.len(), 2);
         assert_eq!(grads[0].dims(), a.dims());
@@ -558,7 +558,7 @@ mod tests {
     fn unused_param_gets_zero_grad() {
         let mut cx = Graph::new();
         let a = cx.tensor(3, DType::F32);
-        let unused = cx.tensor((4, 2), DType::F32);
+        let unused = cx.tensor(vec![4, 2], DType::F32);
         let loss = a.sum(0);
         let grads = cx.backward(loss, &[a, unused]);
         assert_eq!(grads[1].dims(), unused.dims());
@@ -568,7 +568,7 @@ mod tests {
     #[should_panic(expected = "loss must be a scalar")]
     fn non_scalar_loss_panics() {
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3), DType::F32);
+        let a = cx.tensor(vec![2, 3], DType::F32);
         let loss = a.sum(1); // shape (2,) — not scalar
         cx.backward(loss, &[a]);
     }
@@ -576,9 +576,9 @@ mod tests {
     #[test]
     fn matmul_grad_shapes() {
         let mut cx = Graph::new();
-        let x = cx.tensor((2, 3), DType::F32);
-        let w = cx.tensor((3, 4), DType::F32);
-        let loss = x.matmul(w).sum((0, 1));
+        let x = cx.tensor(vec![2, 3], DType::F32);
+        let w = cx.tensor(vec![3, 4], DType::F32);
+        let loss = x.matmul(w).sum(vec![0, 1]);
         let grads = cx.backward(loss, &[x, w]);
         assert_eq!(grads[0].dims(), x.dims());
         assert_eq!(grads[1].dims(), w.dims());

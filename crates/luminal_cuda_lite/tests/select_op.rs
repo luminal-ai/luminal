@@ -13,9 +13,9 @@ use support::TestTransfers;
 /// Build `select(condition, if_true, if_false)`, search, execute, read back.
 fn run(condition: HostBuffer, if_true: HostBuffer, if_false: HostBuffer) -> Vec<f32> {
     let mut cx = Graph::new();
-    let condition_t = cx.tensor((4,), DType::Bool);
-    let if_true_t = cx.tensor((4,), DType::F32);
-    let if_false_t = cx.tensor((4,), DType::F32);
+    let condition_t = cx.tensor(vec![4], DType::Bool);
+    let if_true_t = cx.tensor(vec![4], DType::F32);
+    let if_false_t = cx.tensor(vec![4], DType::F32);
     let out = condition_t.select(if_true_t, if_false_t);
 
     let data: FxHashMap<_, _> = [

@@ -8,6 +8,8 @@ use luminal::dtype::DType;
 use luminal::egglog_snippet::EgglogSnippet;
 use luminal::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, ToDps};
 use luminal::prelude::FxHashMap;
+#[cfg(feature = "device")]
+use luminal::shape::IntExpr;
 use luminal_cuda_lite::kernels::{CodegenCtx, KernelSource};
 use luminal_cuda_lite::ops::add::{AddFunctionalDps, AddFunctionalMatcher};
 use luminal_cuda_lite::{
@@ -136,8 +138,8 @@ impl OpMatcher for ExternalAddMatcher {
 )]
 fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     let mut graph = luminal::graph::Graph::new();
-    let a = graph.tensor((2, 3), DType::F32);
-    let b = graph.tensor((2, 3), DType::F32);
+    let a = graph.tensor(vec![2, 3], DType::F32);
+    let b = graph.tensor(vec![2, 3], DType::F32);
     let out = a + b;
     let mut registry = cuda_registry_without_cublaslt();
     registry.retain(|entry| entry.constructor() != AddFunctionalMatcher.egglog_constructor());
@@ -383,8 +385,8 @@ mod host_graphs {
     #[test]
     fn external_host_topology_changes_cache_graphs_and_recover_from_errors() {
         let mut g = luminal::graph::Graph::new();
-        let a = g.tensor(('a', 2), DType::F32);
-        let b = g.tensor(('a', 2), DType::F32);
+        let a = g.tensor(vec![IntExpr::from('a'), 2.into()], DType::F32);
+        let b = g.tensor(vec![IntExpr::from('a'), 2.into()], DType::F32);
         let out = a + b;
         let mut registry = cuda_registry_without_cublaslt();
         registry.retain(|e| e.constructor() != AddFunctionalMatcher.egglog_constructor());

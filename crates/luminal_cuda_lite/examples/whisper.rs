@@ -26,7 +26,7 @@ fn run() -> anyhow::Result<()> {
     let dims = WhisperDims::whisper_tiny_en();
     let mut cx = Graph::new();
     let model = Whisper::init(&mut cx, &dims);
-    let mel = cx.tensor((dims.n_mels, dims.mel_frames()), DType::F32);
+    let mel = cx.tensor(vec![dims.n_mels, dims.mel_frames()], DType::F32);
     let token = cx.tensor(1, DType::Int);
     let q_pos = cx.tensor(1, DType::Int);
     let gather_idx = cx.tensor(dims.text_ctx, DType::Int);

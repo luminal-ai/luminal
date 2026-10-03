@@ -43,8 +43,8 @@ fn ops_in(s: &EGraph, class: &ClassId) -> Vec<String> {
 fn r10_debug_fixture1() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((2usize, 4usize), DType::F32);
-        let w = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![2usize, 4usize], DType::F32);
+        let w = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _out = x.matmul(w);
         test_runtime::bind_leaves(&cx)
     };
@@ -147,9 +147,9 @@ fn r10_debug_fixture1() {
 fn r10_debug_c6() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
-        let c = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+        let c = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _ = (x.matmul(w) * 2.0) + c;
         test_runtime::bind_leaves(&cx)
     };
@@ -321,9 +321,9 @@ fn r10_debug_c6() {
 fn r10_debug_a4() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize), DType::F32);
-        let w1 = cx.tensor((4usize, 4usize), DType::F32);
-        let w2 = cx.tensor((4usize, 4usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 4usize], DType::F32);
+        let w1 = cx.tensor(vec![4usize, 4usize], DType::F32);
+        let w2 = cx.tensor(vec![4usize, 4usize], DType::F32);
         let y = x.matmul(w1);
         let _ = y.matmul(w2);
         test_runtime::bind_leaves(&cx)
@@ -365,8 +365,8 @@ fn r10_debug_a4() {
 fn r10_debug_g2_mincost() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let y = x.matmul(w);
         let scaled = y * 2.0;
         // The CSE'd matmul is bound itself and feeds the scale, so the
@@ -575,8 +575,8 @@ fn r10_debug_rc3() {
 fn r10_debug_bufferize() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let _ = x.matmul(w);
         test_runtime::bind_leaves(&cx)
     };

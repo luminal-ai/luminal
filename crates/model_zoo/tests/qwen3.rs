@@ -30,9 +30,9 @@ fn qwen3_4b_full_forward_contract_builds() {
     let model = Qwen::init(&mut cx, &d);
     let token = cx.tensor(1, DType::Int);
     let q_pos = cx.tensor(1, DType::Int);
-    let rope_cos = cx.tensor((1, d.head_dim), DType::F32);
-    let rope_sin = cx.tensor((1, d.head_dim), DType::F32);
-    let rope_rot = cx.tensor((d.head_dim, d.head_dim), DType::F32);
+    let rope_cos = cx.tensor(vec![1, d.head_dim], DType::F32);
+    let rope_sin = cx.tensor(vec![1, d.head_dim], DType::F32);
+    let rope_rot = cx.tensor(vec![d.head_dim, d.head_dim], DType::F32);
     let gather_idx = cx.tensor(SLOTS, DType::Int);
     let scatter_idx = cx.tensor(1, DType::Int);
     let pool = named_kv_cache_pool(

@@ -194,8 +194,8 @@ pub(crate) fn static_scatter_add(
             let gc = reinterpret(g_flat, &[(m / b).into(), b.into()]);
             let ic = reinterpret(idx_flat, &[(m / b).into(), b.into()]);
             (
-                gc.slice((0.., k..k + 1)).squeeze(1), // (m/b,)
-                ic.slice((0.., k..k + 1)).squeeze(1), // (m/b,) Int
+                gc.slice(vec![(0..).bounds(), (k..k + 1).bounds()]).squeeze(1), // (m/b,)
+                ic.slice(vec![(0..).bounds(), (k..k + 1).bounds()]).squeeze(1), // (m/b,) Int
             )
         };
         let dest = zeros_flat(cx, l.into(), g_flat.dtype);

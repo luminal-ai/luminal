@@ -63,7 +63,11 @@ impl Conv {
         cx: &mut Graph,
     ) -> Self {
         let weight = cx
-            .named_tensor(format!("{name}.weight"), (c_out, c_in, k, k), DType::F32)
+            .named_tensor(
+                format!("{name}.weight"),
+                vec![c_out, c_in, k, k],
+                DType::F32,
+            )
             .merge_dims(1, 2)
             .merge_dims(1, 2);
         let bias = cx.named_tensor(format!("{name}.bias"), c_out, DType::F32);
@@ -130,7 +134,7 @@ impl Conv {
         }
         // patches: [N=1, spatial_product, ch_in * kernel_product]
 
-        let mut out = patches.matmul(self.weight.permute((1, 0)));
+        let mut out = patches.matmul(self.weight.permute(vec![1, 0]));
         // out: [N=1, spatial_product, ch_out]
 
         // Restore spatial dimensions
@@ -194,7 +198,7 @@ pub struct DwConv {
 impl DwConv {
     pub fn new(name: &str, c: usize, k: usize, s: usize, p: usize, cx: &mut Graph) -> Self {
         let weight = cx
-            .named_tensor(format!("{name}.weight"), (c, 1usize, k, k), DType::F32)
+            .named_tensor(format!("{name}.weight"), vec![c, 1usize, k, k], DType::F32)
             .merge_dims(1, 2)
             .merge_dims(1, 2);
         let bias = cx.named_tensor(format!("{name}.bias"), c, DType::F32);
@@ -794,7 +798,7 @@ impl Detect {
         let dfl_weight = cx
             .named_tensor(
                 format!("{name}.dfl.conv.weight"),
-                (1usize, REG_MAX, 1usize, 1usize),
+                vec![1usize, REG_MAX, 1usize, 1usize],
                 DType::F32,
             )
             .flatten();
@@ -806,12 +810,16 @@ impl Detect {
         let anchors: Vec<GraphTensor> = feat_sizes
             .iter()
             .enumerate()
-            .map(|(i, s)| cx.named_tensor(format!("yolo.anchors.{i}"), (2usize, s * s), DType::F32))
+            .map(|(i, s)| {
+                cx.named_tensor(format!("yolo.anchors.{i}"), vec![2usize, s * s], DType::F32)
+            })
             .collect();
         let strides: Vec<GraphTensor> = feat_sizes
             .iter()
             .enumerate()
-            .map(|(i, s)| cx.named_tensor(format!("yolo.strides.{i}"), (1usize, s * s), DType::F32))
+            .map(|(i, s)| {
+                cx.named_tensor(format!("yolo.strides.{i}"), vec![1usize, s * s], DType::F32)
+            })
             .collect();
         Self {
             scales,
@@ -852,8 +860,10 @@ impl Detect {
             let dfl_out = (dfl_in * w).sum(&[1usize]); // (1, 4, A_i)
 
             // dist2bbox xywh over THIS scale's anchor grid.
-            let lt = make_contiguous(dfl_out.slice((.., 0..2, ..)));
-            let rb = make_contiguous(dfl_out.slice((.., 2..4, ..)));
+            let lt =
+                make_contiguous(dfl_out.slice(vec![(..).bounds(), (0..2).bounds(), (..).bounds()]));
+            let rb =
+                make_contiguous(dfl_out.slice(vec![(..).bounds(), (2..4).bounds(), (..).bounds()]));
             let anchors = self.anchors[i].expand_dim(0, 1); // (1, 2, A_i)
             let x1y1 = anchors - lt;
             let x2y2 = anchors + rb;

@@ -14,19 +14,19 @@ const PIN: &[&str] = &[
 fn diag_a5() {
     {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize), DType::F32);
-        let w1 = cx.tensor((4usize, 4usize), DType::F32);
-        let w2 = cx.tensor((4usize, 4usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 4usize], DType::F32);
+        let w1 = cx.tensor(vec![4usize, 4usize], DType::F32);
+        let w2 = cx.tensor(vec![4usize, 4usize], DType::F32);
         let y = x.matmul(w1);
-        let _ = y.matmul(w2.permute((1usize, 0usize)));
+        let _ = y.matmul(w2.permute(vec![1usize, 0usize]));
     };
     let program = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize), DType::F32);
-        let w1 = cx.tensor((4usize, 4usize), DType::F32);
-        let w2 = cx.tensor((4usize, 4usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 4usize], DType::F32);
+        let w1 = cx.tensor(vec![4usize, 4usize], DType::F32);
+        let w2 = cx.tensor(vec![4usize, 4usize], DType::F32);
         let y = x.matmul(w1);
-        let _ = y.matmul(w2.permute((1usize, 0usize)));
+        let _ = y.matmul(w2.permute(vec![1usize, 0usize]));
         test_runtime::bind_leaves(&cx)
     };
     let (graph, _) = test_runtime::extract_fixture_with_genome(&program, PIN);

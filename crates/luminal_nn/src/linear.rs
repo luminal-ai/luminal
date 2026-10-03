@@ -53,8 +53,8 @@ mod tests {
     #[test]
     fn linear_forward_matches_hand_reference() {
         let mut cx = Graph::new();
-        let x = cx.tensor((2, 3), DType::F32);
-        let weight = cx.tensor((3, 4), DType::F32);
+        let x = cx.tensor(vec![2, 3], DType::F32);
+        let weight = cx.tensor(vec![3, 4], DType::F32);
         let out = linear(x, weight, None);
 
         let x_data = vec![1., 2., 3., 4., 5., 6.];
@@ -87,8 +87,8 @@ mod tests {
     #[test]
     fn linear_bias_broadcasts_over_the_batch() {
         let mut cx = Graph::new();
-        let x = cx.tensor((2, 2), DType::F32);
-        let weight = cx.tensor((2, 3), DType::F32);
+        let x = cx.tensor(vec![2, 2], DType::F32);
+        let weight = cx.tensor(vec![2, 3], DType::F32);
         let bias = cx.tensor(3, DType::F32);
         let out = linear(x, weight, Some(bias));
 
@@ -156,7 +156,7 @@ pub fn fp8_linear(
     let in_scale = input_scale.expand_lhs(&dims[..]).reciprocal();
     let quantized = (input * in_scale).cast(DType::F8E4M3FN);
     let wide = quantized.cast(DType::F32);
-    let weight_wide = weight.cast(DType::F32).permute((1, 0));
+    let weight_wide = weight.cast(DType::F32).permute(vec![1, 0]);
     let raw = wide.matmul(weight_wide);
     let out_dims = raw.dims();
     let rescale = input_scale.expand_lhs(&out_dims[..]) * weight_scale.expand_lhs(&out_dims[..]);
@@ -179,8 +179,8 @@ mod fp8_tests {
         const IN: usize = 3;
         const OUT: usize = 2;
         let mut cx = Graph::new();
-        let x = cx.tensor((1, IN), DType::F32);
-        let weight = cx.tensor((OUT, IN), DType::F8E4M3FN);
+        let x = cx.tensor(vec![1, IN], DType::F32);
+        let weight = cx.tensor(vec![OUT, IN], DType::F8E4M3FN);
         let input_scale_tensor = cx.tensor((), DType::F32);
         let weight_scale_tensor = cx.tensor((), DType::F32);
         let out = fp8_linear(x, weight, input_scale_tensor, weight_scale_tensor);

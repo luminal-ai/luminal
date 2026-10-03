@@ -27,8 +27,8 @@ fn add_graph() -> (
     luminal::prelude::GraphTensor,
 ) {
     let mut cx = luminal::graph::Graph::new();
-    let a = cx.tensor((2usize, 3usize), DType::F32);
-    let b = cx.tensor((2usize, 3usize), DType::F32);
+    let a = cx.tensor(vec![2usize, 3usize], DType::F32);
+    let b = cx.tensor(vec![2usize, 3usize], DType::F32);
     let _out = a + b;
     (cx, a, b)
 }

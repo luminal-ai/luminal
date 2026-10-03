@@ -886,7 +886,7 @@ mod tests {
         let inputs = names
             .iter()
             .map(|name| {
-                let tensor = cx.named_tensor(*name, (2usize, 3usize), DType::F32);
+                let tensor = cx.named_tensor(*name, vec![2usize, 3usize], DType::F32);
                 TranslatedInput {
                     graph_name: (*name).to_string(),
                     parameter_name: None,
@@ -899,7 +899,7 @@ mod tests {
                 }
             })
             .collect();
-        let out = cx.named_tensor("out_source", (2usize, 3usize), DType::F32);
+        let out = cx.named_tensor("out_source", vec![2usize, 3usize], DType::F32);
         let outputs = vec![TranslatedOutput {
             graph_name: "out".to_string(),
             tensor: out.id,
@@ -961,7 +961,7 @@ mod tests {
         let mut cx = Graph::new();
         let tensors: Vec<_> = rows
             .iter()
-            .map(|(name, _)| cx.named_tensor(*name, (2usize, 3usize), DType::F32))
+            .map(|(name, _)| cx.named_tensor(*name, vec![2usize, 3usize], DType::F32))
             .collect();
         let out = tensors[1..]
             .iter()
@@ -1413,7 +1413,7 @@ mod tests {
     #[test]
     fn a_writeback_the_kernels_cannot_write_is_named_by_the_search() {
         let mut cx = Graph::new();
-        let x = cx.named_tensor("x", (2usize, 3usize), DType::F32);
+        let x = cx.named_tensor("x", vec![2usize, 3usize], DType::F32);
         let out = x + 1.;
         let out_value = out.id.index();
         let shape = vec![IntExpr::from(2i64), IntExpr::from(3i64)];

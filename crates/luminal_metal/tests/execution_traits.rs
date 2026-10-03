@@ -136,8 +136,8 @@ impl OpMatcher for ExternalAddMatcher {
 )]
 fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
     let mut graph = luminal::graph::Graph::new();
-    let a = graph.tensor((2, 3), DType::F32);
-    let b = graph.tensor((2, 3), DType::F32);
+    let a = graph.tensor(vec![2, 3], DType::F32);
+    let b = graph.tensor(vec![2, 3], DType::F32);
     let out = a + b;
     let mut registry = metal_registry();
     registry.retain(|entry| entry.constructor() != AddFunctionalMatcher.egglog_constructor());

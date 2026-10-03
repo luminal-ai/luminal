@@ -5,7 +5,7 @@ use luminal_cuda_lite::{CudaRuntime, harness_search_options};
 #[test]
 fn invalid_search_domains_are_rejected_before_device_work() {
     let mut graph = Graph::new();
-    let x = graph.tensor(('a', 2), DType::F32);
+    let x = graph.tensor(vec![IntExpr::from('a'), 2.into()], DType::F32);
     let _ = x + 1.;
     for (bounds, dims, message) in [
         (SymbolBounds::default(), DynMap::default(), "missing"),
@@ -40,7 +40,7 @@ fn invalid_search_domains_are_rejected_before_device_work() {
 )]
 fn bounded_plan_retains_symbolic_capacity_and_satisfies_authoring_checks() {
     let mut graph = Graph::new();
-    let x = graph.tensor(('a', 2), DType::F32);
+    let x = graph.tensor(vec![IntExpr::from('a'), 2.into()], DType::F32);
     let _ = x.max(0);
     let bounds = SymbolBounds::from_ranges([('a'.into(), (2, 9))]).unwrap();
     let dims = [('a'.into(), 3)].into_iter().collect();

@@ -1519,6 +1519,7 @@ mod intcoordvar_probe {
 #[cfg(test)]
 mod stage4b_probes {
     use luminal::dtype::DType;
+    use luminal::shape::SliceRange;
 
     /// (History: this module held the Step-4b degenerate-broadcast
     /// unsoundness pin — the stride recovery walks welding the zero
@@ -1574,7 +1575,7 @@ mod stage4b_probes {
         for lead in [1usize, 2usize] {
             eprintln!("[rejoin-probe] ===== lead extent {lead} =====");
             let mut cx = luminal::graph::Graph::new();
-            let x = cx.tensor((lead, 8usize), DType::F32);
+            let x = cx.tensor(vec![lead, 8usize], DType::F32);
             let heads = x.split_dims(1, 4);
             let x1 = heads.slice_along(0..2, 2);
             let x2 = heads.slice_along(2..4, 2);
@@ -1751,8 +1752,8 @@ mod stage4b_probes {
     #[ignore = "diagnostic — run explicitly by name"]
     fn specimen_1235_full_schedule() {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor((1usize, 2usize, 3usize), DType::F32);
-        let b = cx.tensor((3usize, 5usize), DType::F32);
+        let a = cx.tensor(vec![1usize, 2usize, 3usize], DType::F32);
+        let b = cx.tensor(vec![3usize, 5usize], DType::F32);
         let _out = a.matmul(b);
         let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
             .bind(&cx.logical)
@@ -1786,10 +1787,10 @@ mod stage4b_probes {
         let specimens: Vec<(&str, String)> = vec![
             ("slice_pad(27x10)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((27usize, 10usize), DType::F32);
+                let a = cx.tensor(vec![27usize, 10usize], DType::F32);
                 let _out = a
-                    .slice((2..6, 7..10))
-                    .pad(((1usize, 2usize), (1usize, 0usize)), 0.);
+                    .slice(vec![(2..6).bounds(), (7..10).bounds()])
+                    .pad(vec![(1usize, 2usize), (1usize, 0usize)], 0.);
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
                     .expect("recorder clean");
@@ -1797,8 +1798,8 @@ mod stage4b_probes {
             }),
             ("batch_matmul(2,3,4)x(4,5)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((2usize, 3usize, 4usize), DType::F32);
-                let b = cx.tensor((4usize, 5usize), DType::F32);
+                let a = cx.tensor(vec![2usize, 3usize, 4usize], DType::F32);
+                let b = cx.tensor(vec![4usize, 5usize], DType::F32);
                 let _out = a.matmul(b);
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
@@ -1807,8 +1808,8 @@ mod stage4b_probes {
             }),
             ("specimen(1,2,3)x(3,5)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((1usize, 2usize, 3usize), DType::F32);
-                let b = cx.tensor((3usize, 5usize), DType::F32);
+                let a = cx.tensor(vec![1usize, 2usize, 3usize], DType::F32);
+                let b = cx.tensor(vec![3usize, 5usize], DType::F32);
                 let _out = a.matmul(b);
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
@@ -1817,7 +1818,7 @@ mod stage4b_probes {
             }),
             ("rejoin_lead1(1,8)", {
                 let mut cx = luminal::graph::Graph::new();
-                let x = cx.tensor((1usize, 8usize), DType::F32);
+                let x = cx.tensor(vec![1usize, 8usize], DType::F32);
                 let heads = x.split_dims(1, 4);
                 let x1 = heads.slice_along(0..2, 2);
                 let x2 = heads.slice_along(2..4, 2);
@@ -1884,10 +1885,10 @@ mod stage4b_probes {
         let specimens: Vec<(&str, String)> = vec![
             ("slice_pad(27x10)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((27usize, 10usize), DType::F32);
+                let a = cx.tensor(vec![27usize, 10usize], DType::F32);
                 let _out = a
-                    .slice((2..6, 7..10))
-                    .pad(((1usize, 2usize), (1usize, 0usize)), 0.);
+                    .slice(vec![(2..6).bounds(), (7..10).bounds()])
+                    .pad(vec![(1usize, 2usize), (1usize, 0usize)], 0.);
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
                     .expect("recorder clean");
@@ -1901,8 +1902,8 @@ mod stage4b_probes {
             }),
             ("batch_matmul(2,3,4,5)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((2usize, 3usize, 4usize), DType::F32);
-                let b = cx.tensor((4usize, 5usize), DType::F32);
+                let a = cx.tensor(vec![2usize, 3usize, 4usize], DType::F32);
+                let b = cx.tensor(vec![4usize, 5usize], DType::F32);
                 let _out = a.matmul(b);
                 let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
                     .bind(&cx.logical)
@@ -2232,8 +2233,8 @@ mod subst_guard_study {
     fn interface_specs_report_pristine_labels_and_names() {
         use luminal::prelude::{DType, Graph};
         let mut cx = Graph::default();
-        let a = cx.named_tensor("blocks.0.wq.weight", (2usize, 3usize), DType::F32);
-        let b = cx.tensor((2usize, 3usize), DType::F32);
+        let a = cx.named_tensor("blocks.0.wq.weight", vec![2usize, 3usize], DType::F32);
+        let b = cx.tensor(vec![2usize, 3usize], DType::F32);
         let logits = (a + b).named("logits");
 
         let inputs = cx.logical.input_specs();
@@ -2268,8 +2269,8 @@ mod subst_guard_study {
     fn duplicate_input_labels_refuse_at_construction() {
         use luminal::prelude::{DType, Graph};
         let mut cx2 = Graph::default();
-        let _a = cx2.named_tensor("blocks.0.wq.weight", (2usize,), DType::F32);
-        let _b = cx2.named_tensor("blocks.0.wq.weight", (2usize,), DType::F32);
+        let _a = cx2.named_tensor("blocks.0.wq.weight", vec![2usize], DType::F32);
+        let _b = cx2.named_tensor("blocks.0.wq.weight", vec![2usize], DType::F32);
     }
 
     /// COMPOUND-DIM PROBE (2026-08-12, Austin's challenge: "do we
@@ -2288,8 +2289,8 @@ mod subst_guard_study {
         cx.set_dim('b', 3);
         let ab = IntExpr::from('a') + IntExpr::from('b');
         let ba = IntExpr::from('b') + IntExpr::from('a');
-        let x = cx.named_tensor("x", (ab,), DType::F32);
-        let y = cx.named_tensor("y", (ba,), DType::F32);
+        let x = cx.named_tensor("x", vec![ab], DType::F32);
+        let y = cx.named_tensor("y", vec![ba], DType::F32);
         let doubled = x + x;
         let summed = y * y;
         // MIXED-SPELLING elementwise: a+b meets b+a directly — the
@@ -2322,10 +2323,10 @@ mod subst_guard_study {
     /// [1,1] pin discharges it; a [2,2] pin refuses at saturation.
     #[test]
     fn squeeze_contract_discharges_at_one_and_refuses_otherwise() {
-        use luminal::prelude::{DType, Graph};
+        use luminal::prelude::{DType, Graph, IntExpr};
         let mut cx = Graph::default();
         cx.set_dim('s', 1);
-        let x = cx.named_tensor("x", ('s', 3usize), DType::F32);
+        let x = cx.named_tensor("x", vec![IntExpr::from('s'), 3usize.into()], DType::F32);
         let out = x.squeeze(0) * 2.0;
         let rt = luminal_reference::harness::run_reference(
             &cx,
@@ -2335,7 +2336,7 @@ mod subst_guard_study {
 
         let mut cx = Graph::default();
         cx.set_dim('s', 2);
-        let x = cx.named_tensor("x", ('s', 3usize), DType::F32);
+        let x = cx.named_tensor("x", vec![IntExpr::from('s'), 3usize.into()], DType::F32);
         let _ = x.squeeze(0) * 2.0;
         let mut rt = luminal_reference::ReferenceRuntime::load(&cx).expect("records + loads");
         let data: rustc_hash::FxHashMap<_, _> =
@@ -2365,8 +2366,8 @@ mod subst_guard_study {
         let mut cx = Graph::default();
         cx.set_dim('s', 3);
         cx.set_dim('t', 2);
-        let x = cx.named_tensor("x", ('s',), DType::F32);
-        let y = cx.named_tensor("y", ('t',), DType::F32);
+        let x = cx.named_tensor("x", vec!['s'], DType::F32);
+        let y = cx.named_tensor("y", vec!['t'], DType::F32);
         let padded = x.pad_along(1, 1, 0, 0.0);
         let joined = x.concat_along(y, 0);
         let rt = luminal_reference::harness::run_reference(
@@ -2388,8 +2389,8 @@ mod subst_guard_study {
         use luminal::prelude::{DType, Graph};
         let mut cx = Graph::default();
         cx.set_dim('s', 5);
-        let x = cx.named_tensor("x", ('s',), DType::F32);
-        let out = x.unfold((3usize,), (1usize,), (1usize,)).sum(1);
+        let x = cx.named_tensor("x", vec!['s'], DType::F32);
+        let out = x.unfold(vec![3usize], vec![1usize], vec![1usize]).sum(1);
         let rt = luminal_reference::harness::run_reference(
             &cx,
             &[(x.id, vec![1.0f32, 2.0, 3.0, 4.0, 5.0].into())],
@@ -2398,8 +2399,8 @@ mod subst_guard_study {
 
         let mut cx = Graph::default();
         cx.set_dim('s', 2);
-        let x = cx.named_tensor("x", ('s',), DType::F32);
-        let _ = x.unfold((3usize,), (1usize,), (1usize,)).sum(1);
+        let x = cx.named_tensor("x", vec!['s'], DType::F32);
+        let _ = x.unfold(vec![3usize], vec![1usize], vec![1usize]).sum(1);
         let mut rt = luminal_reference::ReferenceRuntime::load(&cx).expect("records + loads");
         let data: rustc_hash::FxHashMap<_, _> =
             [(x.id, luminal_reference::TypedBuffer::from(vec![0.0f32; 2]))]
@@ -3180,8 +3181,8 @@ mod ring_ignition_battery {
         use luminal::prelude::{DType, Graph};
         let mut cx = Graph::new();
         cx.set_dim('s', 5);
-        let x = cx.named_tensor("x", ('s',), DType::F32);
-        let _out = x.unfold((3usize,), (1usize,), (1usize,)).sum(1);
+        let x = cx.named_tensor("x", vec!['s'], DType::F32);
+        let _out = x.unfold(vec![3usize], vec![1usize], vec![1usize]).sum(1);
         let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
             .bind(&cx.logical)
             .expect("recorder clean");

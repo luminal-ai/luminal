@@ -10,9 +10,9 @@
 //! use luminal_training::Backward;
 //!
 //! let mut cx = Graph::new();
-//! let w = cx.tensor((3, 4), DType::F32);
-//! let x = cx.tensor((2, 3), DType::F32);
-//! let loss = x.matmul(w).sum((0, 1));
+//! let w = cx.tensor(vec![3, 4], DType::F32);
+//! let x = cx.tensor(vec![2, 3], DType::F32);
+//! let loss = x.matmul(w).sum(vec![0, 1]);
 //! let grads = cx.backward(loss, &[w]);
 //! let grad_out = grads[0].output();
 //! // ...compile and execute as usual; read grad_out like any output.

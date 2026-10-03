@@ -53,8 +53,8 @@ fn mini_llama3_fixture() -> MiniLlama3Fixture {
     let mut cx = Graph::new();
     let model = MiniLlama3::new(VOCAB, D, 12, 4, 2, 1, &mut cx);
     let ids = cx.tensor(1, DType::Int);
-    let k_cache = cx.tensor((4, 4), DType::F32);
-    let v_cache = cx.tensor((4, 4), DType::F32);
+    let k_cache = cx.tensor(vec![4, 4], DType::F32);
+    let v_cache = cx.tensor(vec![4, 4], DType::F32);
     let gather_idx = cx.tensor(2, DType::Int);
     let scatter_idx = cx.tensor(1, DType::Int);
     let caches = vec![(k_cache, v_cache)];

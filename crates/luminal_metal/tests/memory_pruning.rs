@@ -21,8 +21,8 @@ fn inspect_domain(
 #[test]
 fn oversized_products_are_pruned_before_search_and_fused_dot_matches_reference() {
     let mut graph = Graph::new();
-    let a = graph.tensor(('q', 256), DType::F32);
-    let b = graph.tensor((256, 512), DType::F32);
+    let a = graph.tensor(vec![IntExpr::from('q'), 256.into()], DType::F32);
+    let b = graph.tensor(vec![256, 512], DType::F32);
     let output = a.matmul(b);
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     let weights: Vec<_> = (0..256 * 512)

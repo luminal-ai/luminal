@@ -63,7 +63,7 @@ impl Linear {
         cx: &mut Graph,
     ) -> Self {
         Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (inp, out), dtype),
+            weight: cx.named_tensor(ns.leaf("weight"), vec![inp, out], dtype),
             bias: bias.then(|| cx.named_tensor(ns.leaf("bias"), out, dtype)),
         }
     }
@@ -106,7 +106,7 @@ impl Embedding {
         cx: &mut Graph,
     ) -> Self {
         Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (n_embeddings, embedding_dim), dtype),
+            weight: cx.named_tensor(ns.leaf("weight"), vec![n_embeddings, embedding_dim], dtype),
         }
     }
 
@@ -232,7 +232,11 @@ impl ConvND {
         let kernel = kernel.as_ref().to_vec();
         let kernel_product = kernel.iter().product::<usize>();
         Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (ch_out, ch_in * kernel_product), dtype),
+            weight: cx.named_tensor(
+                ns.leaf("weight"),
+                vec![ch_out, ch_in * kernel_product],
+                dtype,
+            ),
             bias: bias.then(|| cx.named_tensor(ns.leaf("bias"), ch_out, dtype)),
             config: luminal_nn::ConvNdConfig::new(kernel, stride, dilation, padding),
             ch_in,
@@ -261,7 +265,7 @@ pub struct Fp8Linear {
 impl Fp8Linear {
     pub fn new(inp: usize, out: usize, ns: &Namespace, cx: &mut Graph) -> Self {
         Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (out, inp), DType::F8E4M3FN),
+            weight: cx.named_tensor(ns.leaf("weight"), vec![out, inp], DType::F8E4M3FN),
             input_scale: cx.named_tensor(ns.leaf("input_scale"), (), DType::F32),
             weight_scale: cx.named_tensor(ns.leaf("weight_scale"), (), DType::F32),
             out,
@@ -298,8 +302,8 @@ pub fn named_heterogeneous_kv_cache_pool(
     let layers = kv_dims.iter().enumerate().map(|(layer, kv_dim)| {
         let layer_ns = ns.index(layer);
         luminal_nn::KvCache::new(
-            cx.named_tensor(layer_ns.leaf("k_cache"), (slots, *kv_dim), dtype),
-            cx.named_tensor(layer_ns.leaf("v_cache"), (slots, *kv_dim), dtype),
+            cx.named_tensor(layer_ns.leaf("k_cache"), vec![slots, *kv_dim], dtype),
+            cx.named_tensor(layer_ns.leaf("v_cache"), vec![slots, *kv_dim], dtype),
         )
     });
     luminal_nn::KvCachePool::from_layers(layers)

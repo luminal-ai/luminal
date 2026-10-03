@@ -149,8 +149,8 @@ fn logical_apply_classes(s: &EGraph) -> Vec<(ClassId, String)> {
 #[test]
 fn probe_a_bare_transpose_view() {
     let mut cx = Graph::new();
-    let w = cx.tensor((4usize, 3usize), DType::F32); // stored row-major [4,3]
-    let _t = w.permute((1usize, 0usize)); // [3,4] view
+    let w = cx.tensor(vec![4usize, 3usize], DType::F32); // stored row-major [4,3]
+    let _t = w.permute(vec![1usize, 0usize]); // [3,4] view
     let program = test_runtime::bind_leaves(&cx);
     println!("=== FIXTURE A native_program (w[4,3].permute((1,0))) ===");
     println!("{program}");
@@ -215,9 +215,9 @@ fn probe_a_bare_transpose_view() {
 #[test]
 fn probe_b_matmul_amk_bnk() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 4usize), DType::F32);
-    let w = cx.tensor((3usize, 4usize), DType::F32); // stored [n,k]
-    let _out = x.matmul(w.permute((1usize, 0usize)));
+    let x = cx.tensor(vec![2usize, 4usize], DType::F32);
+    let w = cx.tensor(vec![3usize, 4usize], DType::F32); // stored [n,k]
+    let _out = x.matmul(w.permute(vec![1usize, 0usize]));
     let program = test_runtime::bind_leaves(&cx);
     let s = test_runtime::serialize_fixture(&program);
     println!("=== FIXTURE B: {} nodes ===", s.nodes.len());

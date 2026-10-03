@@ -153,8 +153,8 @@ fn fixture7_m1_degenerate_no_panic() {
     use luminal::graph::Graph;
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((1usize, 4usize), DType::F32);
-        let w = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![1usize, 4usize], DType::F32);
+        let w = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _out = x.matmul(w);
         test_runtime::bind_leaves(&cx)
     };

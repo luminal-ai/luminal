@@ -167,8 +167,8 @@ fn an_external_output_slot_sits_on_the_bound_buffer() {
 )]
 fn an_external_output_may_be_a_view_of_an_escape_cell() {
     let mut cx = Graph::new();
-    let x = cx.tensor((4usize, 16usize), DType::F32);
-    let w = cx.tensor((16usize, 32usize), DType::F32);
+    let x = cx.tensor(vec![4usize, 16usize], DType::F32);
+    let w = cx.tensor(vec![16usize, 32usize], DType::F32);
     let out = x.matmul(w);
 
     let mut bindings = CudaBindings::new();

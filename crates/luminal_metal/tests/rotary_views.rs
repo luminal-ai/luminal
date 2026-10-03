@@ -12,10 +12,10 @@ use support::TestTransfers;
 #[test]
 fn rotary_split_rejoin_with_dynamic_sequence_matches_scalar() {
     let mut graph = Graph::default();
-    let input = graph.tensor(('s', 2048), DType::F32);
+    let input = graph.tensor(vec![IntExpr::from('s'), 2048.into()], DType::F32);
     let heads = input.split_dims(1, 64).transpose(0, 1);
-    let lo = heads.slice((.., .., ..32));
-    let hi = heads.slice((.., .., 32..));
+    let lo = heads.slice(vec![(..).bounds(), (..).bounds(), (..32).bounds()]);
+    let hi = heads.slice(vec![(..).bounds(), (..).bounds(), (32..).bounds()]);
     let output = (lo * 2. - hi * 3.)
         .concat_along(hi * 2. + lo * 3., 2)
         .transpose(0, 1)

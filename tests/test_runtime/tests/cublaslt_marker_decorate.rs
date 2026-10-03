@@ -164,8 +164,8 @@ fn timed(text: &str) -> f64 {
 fn fixture5_relu() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let _out = x.matmul(w).relu();
         test_runtime::bind_leaves(&cx)
     };
@@ -192,9 +192,9 @@ fn fixture5_relu() {
 fn fixture5_c_fold() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
-        let c = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+        let c = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _out = x.matmul(w) + c;
         test_runtime::bind_leaves(&cx)
     };
@@ -222,9 +222,9 @@ fn fixture5_c_fold() {
 fn fixture5_c_fold_reversed_orientation() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
-        let c = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+        let c = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _out = c + x.matmul(w);
         test_runtime::bind_leaves(&cx)
     };
@@ -241,8 +241,8 @@ fn fixture5_c_fold_reversed_orientation() {
 fn fixture5_bias() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let b = cx.tensor(3usize, DType::F32);
         let _out = x.matmul(w) + b.expand_dim(0, 4usize);
         test_runtime::bind_leaves(&cx)
@@ -301,8 +301,8 @@ fn fixture5_bias() {
 fn fixture5_bias_elected_by_name_alone() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let b = cx.tensor(3usize, DType::F32);
         let _out = x.matmul(w) + b.expand_dim(0, 4usize);
         test_runtime::bind_leaves(&cx)
@@ -337,8 +337,8 @@ fn fixture5_bias_elected_by_name_alone() {
 fn fixture5_bias_relu() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let b = cx.tensor(3usize, DType::F32);
         let _out = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
         test_runtime::bind_leaves(&cx)
@@ -362,9 +362,9 @@ fn fixture5_bias_relu() {
 fn fixture5_full_stack() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
-        let c = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+        let c = cx.tensor(vec![4usize, 3usize], DType::F32);
         let b = cx.tensor(3usize, DType::F32);
         let _out = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
         test_runtime::bind_leaves(&cx)
@@ -395,9 +395,9 @@ fn fixture5_full_stack() {
 fn fixture6_relu_then_add_c_not_folded() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
-        let c = cx.tensor((4usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
+        let c = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _out = x.matmul(w).relu() + c;
         test_runtime::bind_leaves(&cx)
     };
@@ -438,8 +438,8 @@ fn fixture6_relu_then_add_c_not_folded() {
 fn fixture6_relu_then_bias_not_folded() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let b = cx.tensor(3usize, DType::F32);
         let _out = x.matmul(w).relu() + b.expand_dim(0, 4usize);
         test_runtime::bind_leaves(&cx)
@@ -462,8 +462,8 @@ fn fixture6_relu_then_bias_not_folded() {
 fn fixture8_diamond_base_and_decorated_coexist() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize), DType::F32);
-        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let x = cx.tensor(vec![4usize, 8usize], DType::F32);
+        let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let b = cx.tensor(3usize, DType::F32);
         let mm = x.matmul(w);
         let biased = mm + b.expand_dim(0, 4usize);

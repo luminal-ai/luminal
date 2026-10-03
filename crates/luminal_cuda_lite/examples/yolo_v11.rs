@@ -28,7 +28,7 @@ fn run() -> anyhow::Result<()> {
     let mut cx = Graph::new();
     let image = cx.named_tensor(
         "input.image",
-        (1usize, 3usize, IMG_SIZE, IMG_SIZE),
+        vec![1usize, 3usize, IMG_SIZE, IMG_SIZE],
         DType::F32,
     );
     let model = YoloV11::init(&mut cx);

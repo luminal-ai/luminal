@@ -30,11 +30,11 @@ fn run() -> anyhow::Result<()> {
     let model = Gemma3::init(&mut cx, &dims);
     let token = cx.tensor(1, DType::Int);
     let q_pos = cx.tensor(1, DType::Int);
-    let local_cos = cx.tensor((1, dims.head_dim), DType::F32);
-    let local_sin = cx.tensor((1, dims.head_dim), DType::F32);
-    let global_cos = cx.tensor((1, dims.head_dim), DType::F32);
-    let global_sin = cx.tensor((1, dims.head_dim), DType::F32);
-    let rope_rot = cx.tensor((dims.head_dim, dims.head_dim), DType::F32);
+    let local_cos = cx.tensor(vec![1, dims.head_dim], DType::F32);
+    let local_sin = cx.tensor(vec![1, dims.head_dim], DType::F32);
+    let global_cos = cx.tensor(vec![1, dims.head_dim], DType::F32);
+    let global_sin = cx.tensor(vec![1, dims.head_dim], DType::F32);
+    let rope_rot = cx.tensor(vec![dims.head_dim, dims.head_dim], DType::F32);
     let gather_idx = cx.tensor(SLOTS, DType::Int);
     let scatter_idx = cx.tensor(1, DType::Int);
     let pool = named_kv_cache_pool(
