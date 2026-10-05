@@ -242,13 +242,13 @@ impl GraphTensor {
     pub fn argmax(self, axis: usize) -> GraphTensor {
         // Get one-hot along last dimension
         let x_equal = self
-            .eq(self.max(axis).expand_dim(axis, self.dims()[axis]))
+            .eq(self.max(vec![axis]).expand_dim(axis, self.dims()[axis]))
             .cast(DType::Int);
         // Create index arange for last dimension
         let r = self.graph().arange(self.dims()[axis]);
         let axes = (0..self.rank()).filter(|i| *i != axis).collect_vec();
         // Multiply one-hot by expanded index arange
-        (x_equal * r.expand_to_shape_on_axes(self.dims(), axes)).max(axis)
+        (x_equal * r.expand_to_shape_on_axes(self.dims(), axes)).max(vec![axis])
     }
 
     /// Get the indices of the min elements along an axis
@@ -414,7 +414,7 @@ impl GraphTensor {
         // Int-native (2026-08-11): the Bool comparison converts through
         // the exact 0/1 indicator and SUMS in i32 — the old spelling
         // summed in f32 and cast back, a refused lossy read.
-        let ranks = cmp.cast(DType::Int).sum(axis);
+        let ranks = cmp.cast(DType::Int).sum(vec![axis]);
         // Scatter original indices into rank positions to get sort indices
         scatter_ranks_to_sort_indices(ranks, self.dims(), axis, self.graph())
     }
@@ -462,7 +462,7 @@ impl GraphTensor {
         let cmp = primary_count + val_eq * idx_count;
 
         // Scatter original indices into rank positions to get sort indices
-        let ranks = cmp.sum(axis);
+        let ranks = cmp.sum(vec![axis]);
         scatter_ranks_to_sort_indices(ranks, dims, axis, self.graph())
     }
 
@@ -549,7 +549,7 @@ pub(super) mod tests {
     fn unsigned_abs_is_the_identity() {
         let mut cx = Graph::new();
         for dtype in [DType::U4, DType::U8, DType::U16] {
-            let x = cx.tensor(4, dtype);
+            let x = cx.tensor(vec![4], dtype);
             assert_eq!(
                 x.abs().id,
                 x.id,
@@ -564,8 +564,8 @@ pub(super) mod tests {
     fn cumprod_signs_are_exact() {
         let input = vec![-1.0f32, 2.0, -3.0, 4.0];
         let mut cx = Graph::new();
-        let a = cx.tensor(input.len(), DType::F32);
-        let b = a.cumprod(0);
+        let a = cx.tensor(vec![input.len()], DType::F32);
+        let b = a.cumprod(vec![0]);
         let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
         assert_exact(rt.get_f32(b.id).unwrap(), &[-1.0, -2.0, 6.0, 24.0]);
     }
@@ -575,8 +575,8 @@ pub(super) mod tests {
     #[test]
     fn cummax_propagates_nan() {
         let mut cx = Graph::new();
-        let a = cx.tensor(4, DType::F32);
-        let b = a.cummax(0);
+        let a = cx.tensor(vec![4], DType::F32);
+        let b = a.cummax(vec![0]);
         let rt = luminal_reference::harness::run_reference(
             &cx,
             &[(a.id, vec![1.0, f32::NAN, 2.0, 3.0].into())],
@@ -596,8 +596,8 @@ pub(super) mod tests {
             expected.push(acc);
         }
         let mut cx = Graph::new();
-        let a = cx.tensor(input.len(), DType::F32);
-        let b = a.cumsum(0);
+        let a = cx.tensor(vec![input.len()], DType::F32);
+        let b = a.cumsum(vec![0]);
         let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
         assert_exact(rt.get_f32(b.id).unwrap(), &expected);
     }
@@ -607,8 +607,8 @@ pub(super) mod tests {
     fn cummax_is_the_running_maximum() {
         let input = vec![-5.0f32, -3.0, -9.0, -1.0, -7.0, -2.0, -8.0, -4.0];
         let mut cx = Graph::new();
-        let a = cx.tensor(input.len(), DType::F32);
-        let b = a.cummax(0);
+        let a = cx.tensor(vec![input.len()], DType::F32);
+        let b = a.cummax(vec![0]);
         let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
         assert_exact(
             rt.get_f32(b.id).unwrap(),
@@ -673,40 +673,40 @@ pub(super) mod tests {
 
         #[test]
         fn test_exp(size in 1usize..128) {
-            test_unary(size, |a| a.exp(), |a| a.exp().unwrap());
+            test_unary(vec![size], |a| a.exp(), |a| a.exp().unwrap());
         }
 
         #[test]
         fn test_log(size in 1usize..128) {
-            test_unary(size, |a| a.log(), |a| a.log().unwrap());
+            test_unary(vec![size], |a| a.log(), |a| a.log().unwrap());
         }
 
         #[test]
         fn test_sin(size in 1usize..128) {
-            test_unary(size, |a| a.sin(), |a| a.sin().unwrap());
+            test_unary(vec![size], |a| a.sin(), |a| a.sin().unwrap());
         }
 
         #[test]
         fn test_cos(size in 1usize..128) {
-            test_unary(size, |a| a.cos(), |a| a.cos().unwrap());
+            test_unary(vec![size], |a| a.cos(), |a| a.cos().unwrap());
         }
 
         #[test]
         fn test_relu(size in 1usize..128) {
-            test_unary(size, |a| a.relu(), |a| a.relu().unwrap());
+            test_unary(vec![size], |a| a.relu(), |a| a.relu().unwrap());
         }
 
         #[test]
         #[ignore = "SCALE-GATED (Step 4b): the exact-gelu model (~100 values: A&S degree-5 Horner + sign/abs + the to-Bool desugar) sends the unbounded (saturate (run)) schedule into a >1h AC/distributivity closure — needs bounded saturation scheduling before it can run as a test"]
         fn test_gelu_exact(size in 1usize..128) {
             // Exact GELU vs candle's exact erf GELU.
-            test_unary(size, |a| a.gelu(), |a| a.gelu_erf().unwrap());
+            test_unary(vec![size], |a| a.gelu(), |a| a.gelu_erf().unwrap());
         }
 
         #[test]
         fn test_gelu_tanh_approximation(size in 1usize..128) {
             test_unary(
-                size,
+                vec![size],
                 |a| a.gelu_fast_tanh_approximation(),
                 |a| a.gelu().unwrap(),
             );
@@ -714,40 +714,40 @@ pub(super) mod tests {
 
         #[test]
         fn test_swish(size in 1usize..128) {
-            test_unary(size, |a| a.swish(), |a| a.silu().unwrap());
+            test_unary(vec![size], |a| a.swish(), |a| a.silu().unwrap());
         }
 
         #[test]
         fn test_tanh(size in 1usize..128) {
-            test_unary(size, |a| a.tanh(), |a| a.tanh().unwrap());
+            test_unary(vec![size], |a| a.tanh(), |a| a.tanh().unwrap());
         }
 
         #[test]
         fn test_recip(size in 1usize..128) {
-            test_unary(size, |a| a.reciprocal(), |a| a.recip().unwrap());
+            test_unary(vec![size], |a| a.reciprocal(), |a| a.recip().unwrap());
         }
 
         #[test]
         fn test_sqrt(size in 1usize..128) {
-            test_unary(size, |a| a.sqrt(), |a| a.sqrt().unwrap());
+            test_unary(vec![size], |a| a.sqrt(), |a| a.sqrt().unwrap());
         }
 
         #[test]
         fn test_square(size in 1usize..128) {
-            test_unary(size, |a| a.square(), |a| a.powf(2.0).unwrap());
+            test_unary(vec![size], |a| a.square(), |a| a.powf(2.0).unwrap());
         }
 
         #[test]
         fn test_softmax(size in 1usize..128, rows in 1usize..16, cols in 1usize..16) {
-            test_unary(size, |a| a.softmax(0), |a| softmax(&a, 0).unwrap());
-            test_unary(vec![rows, cols], |a| a.softmax(1), |a| softmax(&a, 1).unwrap());
+            test_unary(vec![size], |a| a.softmax(vec![0]), |a| softmax(&a, 0).unwrap());
+            test_unary(vec![rows, cols], |a| a.softmax(vec![1]), |a| softmax(&a, 1).unwrap());
         }
 
         #[test]
         fn test_layer_norm(size in 1usize..128) {
             test_unary(
-                size,
-                |a| a.layer_norm(0, 1e-5),
+                vec![size],
+                |a| a.layer_norm(vec![0], 1e-5),
                 |a| {
                     let meaned = (a.clone() - a.mean(0).unwrap().broadcast_as(size)).unwrap();
                     meaned
@@ -771,9 +771,9 @@ pub(super) mod tests {
 
         #[test]
         fn test_cumulative(rows in 1usize..16, cols in 1usize..16) {
-            test_unary(rows, |a| a.cumsum(0), |a| a.cumsum(0).unwrap());
-            test_unary(vec![rows, cols], |a| a.cumsum(1), |a| a.cumsum(1).unwrap());
-            test_unary(vec![rows, cols], |a| a.cumsum(0), |a| a.cumsum(0).unwrap());
+            test_unary(vec![rows], |a| a.cumsum(vec![0]), |a| a.cumsum(0).unwrap());
+            test_unary(vec![rows, cols], |a| a.cumsum(vec![1]), |a| a.cumsum(1).unwrap());
+            test_unary(vec![rows, cols], |a| a.cumsum(vec![0]), |a| a.cumsum(0).unwrap());
             test_unary(
                 vec![rows, cols],
                 |a| a.cumsum(vec![0, 1]),
@@ -784,8 +784,8 @@ pub(super) mod tests {
                 |a| a.cumsum(vec![1, 0]),
                 |a| a.cumsum(1).unwrap().cumsum(0).unwrap(),
             );
-            test_unary(vec![rows, cols], |a| a.cummax(1), cummax_ref_2d);
-            test_unary(vec![rows, cols], |a| a.cumprod(1), cumprod_ref_2d);
+            test_unary(vec![rows, cols], |a| a.cummax(vec![1]), cummax_ref_2d);
+            test_unary(vec![rows, cols], |a| a.cumprod(vec![1]), cumprod_ref_2d);
         }
 
         #[test]
@@ -802,13 +802,13 @@ pub(super) mod tests {
 
         #[test]
         fn test_var(rows in 1usize..16, cols in 1usize..16) {
-            test_unary(vec![rows, cols], |a| a.var(1), |a| a.var(1).unwrap());
-            test_unary(vec![rows, cols], |a| a.var(0), |a| a.var(0).unwrap());
+            test_unary(vec![rows, cols], |a| a.var(vec![1]), |a| a.var(1).unwrap());
+            test_unary(vec![rows, cols], |a| a.var(vec![0]), |a| a.var(0).unwrap());
         }
 
         #[test]
         fn test_std(rows in 1usize..16, cols in 1usize..16) {
-            test_unary(vec![rows, cols], |a| a.std(1), |a| a.var(1).unwrap().sqrt().unwrap());
+            test_unary(vec![rows, cols], |a| a.std(vec![1]), |a| a.var(1).unwrap().sqrt().unwrap());
         }
 
     }

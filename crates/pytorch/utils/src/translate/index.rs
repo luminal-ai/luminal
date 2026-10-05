@@ -580,7 +580,7 @@ impl Translator<'_> {
         }
         // Prefix count of trues; the source element for true slot i is at
         // rank i, so gather source at max(prefix - 1, 0) only where true.
-        let prefix = mask.cast(DType::F32).cumsum(0);
+        let prefix = mask.cast(DType::F32).cumsum(vec![0]);
         let one = self.cx.constant_f32(1.0).expand_rhs(prefix.dims());
         let zero = self.cx.constant_f32(0.0).expand_rhs(prefix.dims());
         let positions = (prefix - one).maximum(zero).trunc_cast(DType::Int);
@@ -1018,7 +1018,10 @@ impl Translator<'_> {
         let flat_truth = truth.flatten();
         // 1s first, stable: the true positions in row-major order.
         let sorted = flat_truth.cast(DType::F32).stable_argsort(0, true);
-        let count = flat_truth.cast(DType::F32).sum(0).trunc_cast(DType::Int);
+        let count = flat_truth
+            .cast(DType::F32)
+            .sum(vec![0])
+            .trunc_cast(DType::Int);
         let numel = input_shape.iter().fold(IntExpr::from(1), |acc, d| acc * *d);
         let positions = self.cx.arange(size);
         let last = self
@@ -1156,10 +1159,13 @@ impl Translator<'_> {
                 .expand_dim(2, embedding_size);
             selected *= scale;
         }
-        let counts = membership.cast(DType::F32).sum(1).trunc_cast(DType::I64);
+        let counts = membership
+            .cast(DType::F32)
+            .sum(vec![1])
+            .trunc_cast(DType::I64);
         let nonzero = self.cx.constant_i64(0).expand_rhs(counts.dims());
         let nonempty = counts.gt(nonzero);
-        let sum = selected.sum(1);
+        let sum = selected.sum(vec![1]);
         let (output, max_indices) = match mode {
             0 => (sum, self.cx.constant_i64(0).expand_rhs(vec![bag_count])),
             1 => {
@@ -1200,7 +1206,7 @@ impl Translator<'_> {
                 .cast(DType::F32)
                 .expand_dim(1, index_count);
             (bag_membership.cast(DType::F32) * bag_ids)
-                .sum(0)
+                .sum(vec![0])
                 .trunc_cast(DType::I64)
         };
         let bag_size = if mode == 0 {

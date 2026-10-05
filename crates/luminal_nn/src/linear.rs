@@ -89,7 +89,7 @@ mod tests {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![2, 2], DType::F32);
         let weight = cx.tensor(vec![2, 3], DType::F32);
-        let bias = cx.tensor(3, DType::F32);
+        let bias = cx.tensor(vec![3], DType::F32);
         let out = linear(x, weight, Some(bias));
 
         let x_data = vec![1., 2., 3., 4.];
@@ -181,8 +181,8 @@ mod fp8_tests {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![1, IN], DType::F32);
         let weight = cx.tensor(vec![OUT, IN], DType::F8E4M3FN);
-        let input_scale_tensor = cx.tensor((), DType::F32);
-        let weight_scale_tensor = cx.tensor((), DType::F32);
+        let input_scale_tensor = cx.tensor(vec![] as Vec<usize>, DType::F32);
+        let weight_scale_tensor = cx.tensor(vec![] as Vec<usize>, DType::F32);
         let out = fp8_linear(x, weight, input_scale_tensor, weight_scale_tensor);
 
         let x_vals = vec![0.37f32, -1.42, 2.6];

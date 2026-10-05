@@ -90,7 +90,7 @@ impl TopKRoutes {
     pub fn normalize(self) -> Self {
         let axis = self.route_axis();
         let slots = self.expert_ids.dims()[axis];
-        let denominator = self.weights.sum(axis).expand_dim(axis, slots);
+        let denominator = self.weights.sum(vec![axis]).expand_dim(axis, slots);
         self.with_weights(self.weights / denominator)
     }
 
@@ -142,7 +142,7 @@ impl TopKRoutes {
             .weights
             .cast(routed_output.dtype)
             .expand_rhs(&output_dims[route_dims.len()..]);
-        (routed_output * weights).sum(self.route_axis())
+        (routed_output * weights).sum(vec![self.route_axis()])
     }
 
     /// Convert structured top-k routes into the general flat route table.
@@ -339,7 +339,7 @@ impl Routes {
                     .iota(output_dims.clone(), |c| c[axis + 1]),
             );
         }
-        destination.scatter(&coords, weighted).sum(1)
+        destination.scatter(&coords, weighted).sum(vec![1])
     }
 }
 
@@ -483,10 +483,10 @@ mod tests {
         const WIDTH: usize = 2;
 
         let mut cx = Graph::new();
-        let token_ids = cx.tensor(ROUTES, DType::Int);
-        let expert_ids = cx.tensor(ROUTES, DType::Int);
-        let slot_ids = cx.tensor(ROUTES, DType::Int);
-        let weights = cx.tensor(ROUTES, DType::F32);
+        let token_ids = cx.tensor(vec![ROUTES], DType::Int);
+        let expert_ids = cx.tensor(vec![ROUTES], DType::Int);
+        let slot_ids = cx.tensor(vec![ROUTES], DType::Int);
+        let weights = cx.tensor(vec![ROUTES], DType::F32);
         let input = cx.tensor(vec![TOKENS, WIDTH], DType::F32);
         let expert_weights = cx.tensor(vec![EXPERTS, WIDTH, WIDTH], DType::F32);
 

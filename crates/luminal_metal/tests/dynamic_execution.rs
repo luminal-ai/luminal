@@ -46,7 +46,7 @@ fn shape_changes_reuse_one_arena() {
 fn metadata_only_dimension_changes_reuse_compiled_kernel() {
     let mut g = Graph::new();
     let a = IntExpr::from('a');
-    let out = g.iota(5, |c| c[0] + a);
+    let out = g.iota(vec![5], |c| c[0] + a);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
         &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (1, 19))]).unwrap(),
@@ -72,7 +72,7 @@ fn metadata_only_dimension_changes_reuse_compiled_kernel() {
 fn dynamic_transpose_and_reduction_use_live_strides() {
     let mut g = Graph::new();
     let x = g.tensor(vec![IntExpr::from(3), 'a'.into()], DType::F32);
-    let out = (x.permute(vec![1, 0]) + 1.).sum(0);
+    let out = (x.permute(vec![1, 0]) + 1.).sum(vec![0]);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
         &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
@@ -102,7 +102,7 @@ fn dynamic_transpose_and_reduction_use_live_strides() {
 #[test]
 fn profiling_and_serving_share_dynamic_graph_execution() {
     let mut g = Graph::new();
-    let x = g.tensor('a', DType::F32);
+    let x = g.tensor(vec!['a'], DType::F32);
     let out = x + 2.;
     let mut rt = MetalRuntime::load(&g).unwrap();
     let data = [(x.id, vec![1f32, 2., 3.].into())].into_iter().collect();

@@ -396,7 +396,7 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
     let build = || {
         let mut cx = luminal::graph::Graph::new();
         let weight = cx.named_tensor("q_proj.weight", vec![STATE, STATE], DType::F32);
-        let bias = cx.named_tensor("q_proj.bias", STATE, DType::F32);
+        let bias = cx.named_tensor("q_proj.bias", vec![STATE], DType::F32);
         let x = cx.tensor(vec![1usize, STATE], DType::F32);
         let out = luminal_nn::linear(x, weight, Some(bias));
         (cx, x.id, weight.id, bias.id, out.id)

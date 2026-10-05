@@ -89,7 +89,7 @@ impl MiniLlama3Layer {
             q = rms_norm_heads(q, self.head_dim, q_weight, 1e-6);
             k = rms_norm_heads(k, self.head_dim, k_weight, 1e-6);
         }
-        let query_positions = q.graph().iota(q.dims()[0], |c| c[0] + prev_seq);
+        let query_positions = q.graph().iota(vec![q.dims()[0]], |c| c[0] + prev_seq);
         let context_positions = q.graph().arange(gather_idx.dims1());
         let result = paged_attention(
             q,

@@ -928,7 +928,7 @@ fn attack_a2b_amk_bnk_with_relu_and_bias() {
     let text = record(|cx| {
         let x = cx.tensor(vec![2usize, 4usize], DType::F32);
         let w = cx.tensor(vec![4usize, 4usize], DType::F32);
-        let bias = cx.tensor(4usize, DType::F32);
+        let bias = cx.tensor(vec![4usize], DType::F32);
         let _ = (x.matmul(w.permute(vec![1usize, 0usize])) + bias.expand_dim(0, 2usize)).relu();
     });
     let (ops, labels) = flavored_cublaslt(&text, false, true, true);
@@ -1575,7 +1575,7 @@ fn attack_a11_all_ones_decorated_stress() {
         let x = cx.tensor(vec![1usize, 1usize], DType::F32);
         let w = cx.tensor(vec![1usize, 1usize], DType::F32);
         let c = cx.tensor(vec![1usize, 1usize], DType::F32);
-        let bias = cx.tensor(1usize, DType::F32);
+        let bias = cx.tensor(vec![1usize], DType::F32);
         let _ = ((x.matmul(w) + c) + bias.expand_dim(0, 1usize)).relu();
     });
     let s = test_runtime::serialize_fixture(&text);
@@ -1653,7 +1653,7 @@ fn attack_b1_wrong_axis_bias_square_out() {
     let text = record(|cx| {
         let x = cx.tensor(vec![4usize, 4usize], DType::F32);
         let w = cx.tensor(vec![4usize, 4usize], DType::F32);
-        let bias = cx.tensor(4usize, DType::F32);
+        let bias = cx.tensor(vec![4usize], DType::F32);
         // expand_dim(1, 4): [4] -> [4,4] varying along axis 0 (rows).
         let _ = x.matmul(w) + bias.expand_dim(1, 4usize);
     });
@@ -1711,7 +1711,7 @@ fn attack_b2_right_axis_bias_square_out() {
     let text = record(|cx| {
         let x = cx.tensor(vec![4usize, 4usize], DType::F32);
         let w = cx.tensor(vec![4usize, 4usize], DType::F32);
-        let bias = cx.tensor(4usize, DType::F32);
+        let bias = cx.tensor(vec![4usize], DType::F32);
         let _ = x.matmul(w) + bias.expand_dim(0, 4usize);
     });
     let s = test_runtime::serialize_fixture(&text);
@@ -1937,7 +1937,7 @@ fn attack_c4_bias_then_c_then_relu_order() {
     let text = record(|cx| {
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let bias = cx.tensor(3usize, DType::F32);
+        let bias = cx.tensor(vec![3usize], DType::F32);
         let c = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _ = ((x.matmul(w) + bias.expand_dim(0, 4usize)) + c).relu();
     });
@@ -1983,7 +1983,7 @@ fn attack_c5_bias_then_c_plain() {
     let bias_then_c = record(|cx| {
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let bias = cx.tensor(3usize, DType::F32);
+        let bias = cx.tensor(vec![3usize], DType::F32);
         let c = cx.tensor(vec![4usize, 3usize], DType::F32);
         let _ = (x.matmul(w) + bias.expand_dim(0, 4usize)) + c;
     });
@@ -1991,7 +1991,7 @@ fn attack_c5_bias_then_c_plain() {
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-        let bias = cx.tensor(3usize, DType::F32);
+        let bias = cx.tensor(vec![3usize], DType::F32);
         let _ = (x.matmul(w) + c) + bias.expand_dim(0, 4usize);
     });
 
@@ -2402,7 +2402,7 @@ fn attack_e3_four_inlined_relu_copies_agree() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
             }),
         ),
@@ -2425,7 +2425,7 @@ fn attack_e3_four_inlined_relu_copies_agree() {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
                 let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
             }),
         ),
@@ -3292,7 +3292,7 @@ fn attack_p3_no_legal_program_reaches_a_panic() {
             let x = cx.tensor(vec![4usize, 8usize], DType::F32);
             let w = cx.tensor(vec![8usize, 3usize], DType::F32);
             let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-            let b = cx.tensor(3usize, DType::F32);
+            let b = cx.tensor(vec![3usize], DType::F32);
             let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
         })),
         ("m1", record(|cx| {
@@ -3427,7 +3427,7 @@ fn attack_o1_the_oracles_discriminate() {
             let x = cx.tensor(vec![4usize, 8usize], DType::F32);
             let w = cx.tensor(vec![8usize, 3usize], DType::F32);
             let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-            let b = cx.tensor(3usize, DType::F32);
+            let b = cx.tensor(vec![3usize], DType::F32);
             let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
         }),
     ];
@@ -3724,7 +3724,7 @@ fn attack_h1_one_lit_per_op_class() {
             record(|cx| {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
@@ -3743,7 +3743,7 @@ fn attack_h1_one_lit_per_op_class() {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
                 let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
             }),
         ),
@@ -3761,7 +3761,7 @@ fn attack_h1_one_lit_per_op_class() {
             record_outputs(|cx| {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let mm = x.matmul(w);
                 let biased = mm + b.expand_dim(0, 4usize);
                 vec![mm.id, biased.id]
@@ -3811,7 +3811,7 @@ fn attack_u1_lit_slot_contents_pinned() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
@@ -3832,7 +3832,7 @@ fn attack_u1_lit_slot_contents_pinned() {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
                 let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = (x.matmul(w) + c) + b.expand_dim(0, 4usize);
             }),
         ),
@@ -4171,7 +4171,7 @@ fn attack_u5_no_spec_less_op_can_be_elected() {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
                 let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
             }),
             true,

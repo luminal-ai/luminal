@@ -325,7 +325,7 @@ fn attention(
 
     let scores = q.matmul(k) / (HEAD_DIM as f32).sqrt();
     let masked_scores = scores + attn_mask.expand_dim(0, N_HEADS);
-    let weights = masked_scores.softmax(2);
+    let weights = masked_scores.softmax(vec![2]);
     let out = weights.matmul(v_ctx);
     let attn_out = out.transpose(0, 1).merge_dims(1, 2);
 
@@ -491,10 +491,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .to_vec();
 
     let mut cx = Graph::default();
-    let input = cx.named_tensor("input", 's', DType::Int);
-    let q_pos_t = cx.named_tensor("q_pos", 's', DType::Int);
-    let scatter_idx_t = cx.named_tensor("scatter_idx", 's', DType::Int);
-    let gather_idx_t = cx.named_tensor("gather_idx", 'c', DType::Int);
+    let input = cx.named_tensor("input", vec!['s'], DType::Int);
+    let q_pos_t = cx.named_tensor("q_pos", vec!['s'], DType::Int);
+    let scatter_idx_t = cx.named_tensor("scatter_idx", vec!['s'], DType::Int);
+    let gather_idx_t = cx.named_tensor("gather_idx", vec!['c'], DType::Int);
     let attn_mask_t = cx.named_tensor("attn_mask", vec!['s', 'c'], DType::F32);
     let kv_cache = KVCache::new(&mut cx, MAX_SEQ_LEN);
     let (logits, cache_outputs) = Llama::init(&mut cx).forward(

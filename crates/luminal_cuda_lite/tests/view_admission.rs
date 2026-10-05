@@ -278,7 +278,7 @@ fn slice_consumer_folds_and_carries_the_offset_map() {
 #[test]
 fn broadcast_consumer_folds_and_carries_the_stride0_map() {
     let mut cx = Graph::new();
-    let x = cx.tensor(3usize, DType::F32);
+    let x = cx.tensor(vec![3usize], DType::F32);
     let c = cx.tensor(vec![2usize, 3usize], DType::F32);
     let _out = x.expand_dim(0, 2) * c;
 

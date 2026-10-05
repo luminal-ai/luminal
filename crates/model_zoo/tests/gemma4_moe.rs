@@ -59,16 +59,16 @@ fn gemma4_26b_a4b_full_forward_contract_builds() {
     let d = Gemma4Dims::gemma4_26b_a4b();
     let mut cx = Graph::new();
     let model = Gemma4Moe::init(&mut cx, &d);
-    let token = cx.tensor(1, DType::Int);
-    let q_pos = cx.tensor(1, DType::Int);
+    let token = cx.tensor(vec![1], DType::Int);
+    let q_pos = cx.tensor(vec![1], DType::Int);
     let sliding_cos = cx.tensor(vec![1, d.sliding_head_dim], DType::F32);
     let sliding_sin = cx.tensor(vec![1, d.sliding_head_dim], DType::F32);
     let sliding_rot = cx.tensor(vec![d.sliding_head_dim, d.sliding_head_dim], DType::F32);
     let full_cos = cx.tensor(vec![1, d.full_head_dim], DType::F32);
     let full_sin = cx.tensor(vec![1, d.full_head_dim], DType::F32);
     let full_rot = cx.tensor(vec![d.full_head_dim, d.full_head_dim], DType::F32);
-    let gather_idx = cx.tensor(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor(1, DType::Int);
+    let gather_idx = cx.tensor(vec![SLOTS], DType::Int);
+    let scatter_idx = cx.tensor(vec![1], DType::Int);
     let pool = named_heterogeneous_kv_cache_pool(
         &mut cx,
         SLOTS,

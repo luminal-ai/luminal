@@ -31,12 +31,12 @@ impl BatchStep {
     pub fn build(dims: &Llama3Dims, slots: usize) -> Self {
         let mut cx = Graph::new();
         let model = Llama3::init(&mut cx, dims);
-        let tokens = cx.tensor(ROWS, DType::Int);
+        let tokens = cx.tensor(vec![ROWS], DType::Int);
         let rope_cos = cx.tensor(vec![ROWS, dims.head_dim], DType::F32);
         let rope_sin = cx.tensor(vec![ROWS, dims.head_dim], DType::F32);
         let rope_rot = cx.tensor(vec![dims.head_dim, dims.head_dim], DType::F32);
-        let gather_idx = cx.tensor(slots, DType::Int);
-        let scatter_idx = cx.tensor(ROWS, DType::Int);
+        let gather_idx = cx.tensor(vec![slots], DType::Int);
+        let scatter_idx = cx.tensor(vec![ROWS], DType::Int);
         let mask = cx.tensor(vec![ROWS, slots], DType::F32);
         let pool = crate::model_support::named_kv_cache_pool(
             &mut cx,

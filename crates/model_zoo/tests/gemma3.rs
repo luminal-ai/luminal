@@ -57,15 +57,15 @@ fn gemma3_4b_full_forward_contract_builds() {
     let d = Gemma3Dims::gemma3_4b();
     let mut cx = Graph::new();
     let model = Gemma3::init(&mut cx, &d);
-    let token = cx.tensor(1, DType::Int);
-    let q_pos = cx.tensor(1, DType::Int);
+    let token = cx.tensor(vec![1], DType::Int);
+    let q_pos = cx.tensor(vec![1], DType::Int);
     let local_cos = cx.tensor(vec![1, d.head_dim], DType::F32);
     let local_sin = cx.tensor(vec![1, d.head_dim], DType::F32);
     let global_cos = cx.tensor(vec![1, d.head_dim], DType::F32);
     let global_sin = cx.tensor(vec![1, d.head_dim], DType::F32);
     let rope_rot = cx.tensor(vec![d.head_dim, d.head_dim], DType::F32);
-    let gather_idx = cx.tensor(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor(1, DType::Int);
+    let gather_idx = cx.tensor(vec![SLOTS], DType::Int);
+    let scatter_idx = cx.tensor(vec![1], DType::Int);
     let pool = named_kv_cache_pool(
         &mut cx,
         d.layers,

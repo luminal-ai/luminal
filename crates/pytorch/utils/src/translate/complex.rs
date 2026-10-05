@@ -607,7 +607,7 @@ impl Translator<'_> {
                     self.store_complex(output_name, value);
                 } else {
                     let dim = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank());
-                    self.store_complex(output_name, value.map(|c| c.cumsum(dim)));
+                    self.store_complex(output_name, value.map(|c| c.cumsum(vec![dim])));
                 }
             }
 

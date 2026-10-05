@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn embedding_looks_up_rows() {
         let mut cx = Graph::new();
-        let ids = cx.tensor(3, DType::Int);
+        let ids = cx.tensor(vec![3], DType::Int);
         let weight = cx.tensor(vec![3, 4], DType::F32);
         let out = embedding(ids, weight);
         assert_eq!(out.dims(), vec![IntExpr::from(3), IntExpr::from(4)]);

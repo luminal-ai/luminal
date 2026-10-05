@@ -10,7 +10,7 @@ use support::TestTransfers;
 #[test]
 fn bool_output_uses_byte_storage_with_odd_lengths() {
     let mut g = Graph::new();
-    let x = g.tensor(5, DType::F32);
+    let x = g.tensor(vec![5], DType::F32);
     let out = x.lt(g.constant_f32(0.).expand_dim(0, 5));
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
@@ -31,7 +31,7 @@ fn bool_output_uses_byte_storage_with_odd_lengths() {
 #[test]
 fn f16_inputs_cast_and_compute_on_device() {
     let mut g = Graph::new();
-    let x = g.tensor(5, DType::F16);
+    let x = g.tensor(vec![5], DType::F16);
     let out = (x * x).cast(DType::F32);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
@@ -68,8 +68,8 @@ fn f16_inputs_cast_and_compute_on_device() {
 fn integer_max_and_i64_copy_preserve_extremes() {
     let mut g = Graph::new();
     let x = g.tensor(vec![2, 3], DType::Int);
-    let y = g.tensor(3, DType::I64);
-    let out = x.max(1);
+    let y = g.tensor(vec![3], DType::I64);
+    let out = x.max(vec![1]);
     // `wide` hands an input straight back out: not a leaf, so bind it by hand.
     let wide = y;
     let mut rt = MetalRuntime::load_with(
@@ -103,7 +103,7 @@ fn integer_max_and_i64_copy_preserve_extremes() {
 fn empty_reduction_and_replay_initialize_recycled_storage() {
     let mut g = Graph::new();
     let x = g.tensor(vec![IntExpr::from(3), 'n'.into()], DType::F32);
-    let out = x.sum(1);
+    let out = x.sum(vec![1]);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(
         &luminal::shape::SymbolBounds::from_ranges([('n'.into(), (0, 4))]).unwrap(),
@@ -126,7 +126,7 @@ fn empty_reduction_and_replay_initialize_recycled_storage() {
 #[test]
 fn application_validates_payloads_and_executor_uses_device_contents() {
     let mut g = Graph::new();
-    let x = g.tensor(3, DType::F32);
+    let x = g.tensor(vec![3], DType::F32);
     let out = x + 1.;
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(

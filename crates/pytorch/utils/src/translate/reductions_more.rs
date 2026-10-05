@@ -149,7 +149,7 @@ impl Translator<'_> {
             AddMmVariant::AddBmm => {
                 anyhow::ensure!(lhs.rank() == 3, "addbmm batch1 must be rank 3");
                 anyhow::ensure!(rhs.rank() == 3, "addbmm batch2 must be rank 3");
-                lhs.matmul(rhs).sum(0)
+                lhs.matmul(rhs).sum(vec![0])
             }
             AddMmVariant::AddMv => {
                 anyhow::ensure!(lhs.rank() == 2, "addmv matrix must be rank 2");

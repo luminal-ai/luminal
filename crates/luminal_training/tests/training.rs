@@ -141,7 +141,7 @@ fn linear_regression_recovers_true_weights() {
     let x = cx.tensor(vec![n, d_in], DType::F32);
     let y = cx.tensor(vec![n, d_out], DType::F32);
     let w = cx.tensor(vec![d_in, d_out], DType::F32);
-    let b = cx.tensor(d_out, DType::F32);
+    let b = cx.tensor(vec![d_out], DType::F32);
     let pred = x.matmul(w) + b.expand_dim(0, n);
     let loss = mse(pred, y);
 
@@ -185,7 +185,7 @@ fn xor_mlp_learns_nonlinear_function() {
     let x = cx.tensor(vec![4, 2], DType::F32);
     let y = cx.tensor(vec![4, 1], DType::F32);
     let w1 = cx.tensor(vec![2, hidden], DType::F32);
-    let b1 = cx.tensor(hidden, DType::F32);
+    let b1 = cx.tensor(vec![hidden], DType::F32);
     let w2 = cx.tensor(vec![hidden, 1], DType::F32);
     let pred = (x.matmul(w1) + b1.expand_dim(0, 4))
         .tanh()
@@ -241,9 +241,9 @@ fn softmax_classifier_reaches_full_accuracy() {
     let x = cx.tensor(vec![6, 2], DType::F32);
     let onehot = cx.tensor(vec![6, 3], DType::F32);
     let w = cx.tensor(vec![2, 3], DType::F32);
-    let b = cx.tensor(3, DType::F32);
+    let b = cx.tensor(vec![3], DType::F32);
     let logits = x.matmul(w) + b.expand_dim(0, 6);
-    let loss = -(onehot * logits.log_softmax(1)).mean(vec![0, 1]) * 3.0; // mean CE per sample
+    let loss = -(onehot * logits.log_softmax(vec![1])).mean(vec![0, 1]) * 3.0; // mean CE per sample
     let logits_out = logits.output();
 
     let mut t = Trainer::new(&mut cx, loss, &[w, b], vec![vec![0.0; 6], vec![0.0; 3]])
@@ -288,7 +288,7 @@ fn embedding_rows_train_through_gather() {
 
     let mut cx = Graph::new();
     let table = cx.tensor(vec![n_rows, dim], DType::F32);
-    let rows = cx.tensor(4, DType::Int);
+    let rows = cx.tensor(vec![4], DType::Int);
     let targets = cx.tensor(vec![4, dim], DType::F32);
     // Flat gather indices: row_id * dim + column
     let dim_const = cx.constant(dim).expand_dim(0, 4).expand_dim(1, dim);
@@ -346,7 +346,7 @@ fn deep_mlp_with_layernorm_trains() {
     let y = cx.tensor(vec![n, d_out], DType::F32);
     let w1 = cx.tensor(vec![d_in, hidden], DType::F32);
     let w2 = cx.tensor(vec![hidden, d_out], DType::F32);
-    let h = x.matmul(w1).sigmoid().layer_norm(1, 1e-5);
+    let h = x.matmul(w1).sigmoid().layer_norm(vec![1], 1e-5);
     let pred = h.matmul(w2);
     let loss = mse(pred, y);
 

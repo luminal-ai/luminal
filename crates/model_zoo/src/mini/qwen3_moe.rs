@@ -17,7 +17,7 @@ pub struct MiniLinearMoe {
 impl MiniLinearMoe {
     fn forward(&self, input: GraphTensor) -> GraphTensor {
         let expert_axis = input.rank() - 1;
-        let scores = input.matmul(self.router).softmax(expert_axis);
+        let scores = input.matmul(self.router).softmax(vec![expert_axis]);
         let expert_ids = scores.topk_indexes(self.top_k, expert_axis);
         let routes = TopKRoutes::from_scores(scores, expert_ids);
         let routed_input = routes.dispatch(input);
@@ -52,7 +52,9 @@ impl MiniQwen3MoeLayer {
         prev_seq: IntExpr,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
         let query = self.wq.forward(x);
-        let query_positions = query.graph().iota(query.dims()[0], |c| c[0] + prev_seq);
+        let query_positions = query
+            .graph()
+            .iota(vec![query.dims()[0]], |c| c[0] + prev_seq);
         let context_positions = query.graph().arange(gather_idx.dims1());
         let result = paged_attention(
             query,

@@ -120,14 +120,14 @@ fn rmsnorm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
     };
     let x_rank = x.dims().len();
     let w_rank = w.dims().len();
-    x.std_norm(x_rank - 1, eps) * w.expand_lhs(&x.dims()[..x_rank - w_rank])
+    x.std_norm(vec![x_rank - 1], eps) * w.expand_lhs(&x.dims()[..x_rank - w_rank])
 }
 
 /// LayerNorm with no affine parameters (mean-norm + std-norm only).
 /// Matches `nn.LayerNorm(dim, elementwise_affine=False)` in PyTorch.
 fn layernorm_noaffine(x: GraphTensor, eps: f32) -> GraphTensor {
     let last = x.rank() - 1;
-    x.layer_norm(last, eps)
+    x.layer_norm(vec![last], eps)
 }
 
 /// Apply rotary embedding. `x` is `(S, H, D)` and `(cos, sin)` are `(S, D)`.
@@ -185,7 +185,7 @@ fn sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
     let k = k * 1.0_f32;
     let v = v * 1.0_f32;
     let scores = q.matmul(k.transpose(1, 2)) * scale; // (H, S, S)
-    let attn_w = scores.softmax(2);
+    let attn_w = scores.softmax(vec![2]);
     let attn = attn_w.matmul(v); // (H, S, D)
     attn.transpose(0, 1) // (S, H, D)
 }
@@ -343,16 +343,24 @@ impl DoubleStreamAttn {
             add_q_proj: lin("add_q_proj.weight", cx),
             add_k_proj: lin("add_k_proj.weight", cx),
             add_v_proj: lin("add_v_proj.weight", cx),
-            norm_q: cx.named_tensor(format!("{prefix}.norm_q.weight"), HEAD_DIM, WEIGHT_DTYPE),
-            norm_k: cx.named_tensor(format!("{prefix}.norm_k.weight"), HEAD_DIM, WEIGHT_DTYPE),
+            norm_q: cx.named_tensor(
+                format!("{prefix}.norm_q.weight"),
+                vec![HEAD_DIM],
+                WEIGHT_DTYPE,
+            ),
+            norm_k: cx.named_tensor(
+                format!("{prefix}.norm_k.weight"),
+                vec![HEAD_DIM],
+                WEIGHT_DTYPE,
+            ),
             norm_added_q: cx.named_tensor(
                 format!("{prefix}.norm_added_q.weight"),
-                HEAD_DIM,
+                vec![HEAD_DIM],
                 WEIGHT_DTYPE,
             ),
             norm_added_k: cx.named_tensor(
                 format!("{prefix}.norm_added_k.weight"),
-                HEAD_DIM,
+                vec![HEAD_DIM],
                 WEIGHT_DTYPE,
             ),
             to_out: lin("to_out.0.weight", cx),
@@ -447,8 +455,16 @@ impl SingleStreamAttn {
                 vec![qkv_mlp_out, HIDDEN],
                 WEIGHT_DTYPE,
             ),
-            norm_q: cx.named_tensor(format!("{prefix}.norm_q.weight"), HEAD_DIM, WEIGHT_DTYPE),
-            norm_k: cx.named_tensor(format!("{prefix}.norm_k.weight"), HEAD_DIM, WEIGHT_DTYPE),
+            norm_q: cx.named_tensor(
+                format!("{prefix}.norm_q.weight"),
+                vec![HEAD_DIM],
+                WEIGHT_DTYPE,
+            ),
+            norm_k: cx.named_tensor(
+                format!("{prefix}.norm_k.weight"),
+                vec![HEAD_DIM],
+                WEIGHT_DTYPE,
+            ),
             to_out: cx.named_tensor(
                 format!("{prefix}.to_out.weight"),
                 vec![HIDDEN, HIDDEN + MLP_HIDDEN],

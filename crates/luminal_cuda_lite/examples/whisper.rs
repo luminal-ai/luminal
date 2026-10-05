@@ -27,10 +27,10 @@ fn run() -> anyhow::Result<()> {
     let mut cx = Graph::new();
     let model = Whisper::init(&mut cx, &dims);
     let mel = cx.tensor(vec![dims.n_mels, dims.mel_frames()], DType::F32);
-    let token = cx.tensor(1, DType::Int);
-    let q_pos = cx.tensor(1, DType::Int);
-    let gather_idx = cx.tensor(dims.text_ctx, DType::Int);
-    let scatter_idx = cx.tensor(1, DType::Int);
+    let token = cx.tensor(vec![1], DType::Int);
+    let q_pos = cx.tensor(vec![1], DType::Int);
+    let gather_idx = cx.tensor(vec![dims.text_ctx], DType::Int);
+    let scatter_idx = cx.tensor(vec![1], DType::Int);
     let pool = named_kv_cache_pool(
         &mut cx,
         dims.text_layers,

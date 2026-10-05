@@ -107,7 +107,7 @@ impl Qwen3MoeFfn {
     }
 
     fn forward(&self, input: GraphTensor) -> GraphTensor {
-        let probabilities = self.router.forward(input).softmax(1);
+        let probabilities = self.router.forward(input).softmax(vec![1]);
         let expert_ids = probabilities.topk_indexes(self.top_k, 1);
         let routes = TopKRoutes::from_scores(probabilities, expert_ids).normalize();
 
@@ -194,10 +194,10 @@ impl Qwen3MoeBlock {
                 cx,
             ),
             q_norm: cx
-                .named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, dtype)
+                .named_tensor(attn.child("q_norm").leaf("weight"), vec![d.head_dim], dtype)
                 .cast(DType::F32),
             k_norm: cx
-                .named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, dtype)
+                .named_tensor(attn.child("k_norm").leaf("weight"), vec![d.head_dim], dtype)
                 .cast(DType::F32),
             ffn_norm: LayerNorm::new_with_storage_dtype(
                 d.hidden,

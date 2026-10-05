@@ -337,11 +337,11 @@ impl LlmGraph {
             "require 1 <= prefill-chunk <= max-context <= i32::MAX"
         );
         let mut cx = Graph::new();
-        let tokens = cx.tensor('q', DType::Int);
-        let positions = cx.tensor('q', DType::Int);
-        let gather = cx.tensor('c', DType::Int);
-        let scatter = cx.tensor('q', DType::Int);
-        let last = cx.tensor(1, DType::Int);
+        let tokens = cx.tensor(vec!['q'], DType::Int);
+        let positions = cx.tensor(vec!['q'], DType::Int);
+        let gather = cx.tensor(vec!['c'], DType::Int);
+        let scatter = cx.tensor(vec!['q'], DType::Int);
+        let last = cx.tensor(vec![1], DType::Int);
         let (kind, vocab, widths, roles) = match &config {
             ModelConfig::Llama3(d) => (
                 ModelType::Llama3,

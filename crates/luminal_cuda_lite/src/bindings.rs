@@ -612,8 +612,8 @@ mod tests {
     /// can be bound on an input's buffer.
     fn pair() -> (luminal::graph::Graph, ValueId, ValueId, ValueId) {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor(4, DType::F32);
-        let b = cx.tensor(4, DType::F32);
+        let a = cx.tensor(vec![4], DType::F32);
+        let b = cx.tensor(vec![4], DType::F32);
         let sum = a + b;
         (cx, a.id, b.id, sum.id)
     }

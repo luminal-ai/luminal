@@ -1162,8 +1162,8 @@ mod tests {
             // pinned_pure_identity_output; binding-level fix at 4d/M4).
             prop_assume!(left + right > 0);
             test_unary(
-                len,
-                |a| a.pad((left, right), 0.),
+                vec![len],
+                |a| a.pad(vec![(left, right)], 0.),
                 |a| a.pad_with_zeros(0, left, right).unwrap(),
             );
         }
@@ -1374,8 +1374,8 @@ mod tests {
         }
 
         test_unary(
-            5,
-            |a| a.unfold(3, 1, 1),
+            vec![5],
+            |a| a.unfold(vec![3], vec![1], vec![1]),
             |a| {
                 Tensor::new(
                     unfold_nd_f32(
@@ -1461,8 +1461,8 @@ mod tests {
     #[test]
     fn test_concat() {
         test_binary(
-            17,
-            32,
+            vec![17],
+            vec![32],
             |a, b| a.concat_along(b, 0),
             |a, b| Tensor::cat(&[a, b], 0).unwrap(),
         );
@@ -1523,9 +1523,9 @@ mod tests {
     #[test]
     fn pad_with_uses_a_typed_scalar_fill() {
         let mut cx = Graph::new();
-        let a = cx.tensor(3, DType::F32);
+        let a = cx.tensor(vec![3], DType::F32);
         let fill = cx.constant_f32(-7.0);
-        let b = a.pad_with((1, 2), fill);
+        let b = a.pad_with(vec![(1, 2)], fill);
 
         let rt = luminal_reference::harness::run_reference(
             &cx,

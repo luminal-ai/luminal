@@ -111,13 +111,13 @@ fn mini_llama3_runs() {
 
     let mut cx = Graph::new();
     let model = MiniLlama3::new(5, 8, 12, 4, 2, 1, &mut cx);
-    let ids = cx.tensor(1, DType::Int);
+    let ids = cx.tensor(vec![1], DType::Int);
     let caches = vec![(
         cx.tensor(vec![4, 4], DType::F32),
         cx.tensor(vec![4, 4], DType::F32),
     )];
-    let gather = cx.tensor(2, DType::Int);
-    let scatter = cx.tensor(1, DType::Int);
+    let gather = cx.tensor(vec![2], DType::Int);
+    let scatter = cx.tensor(vec![1], DType::Int);
     let (output, cache_outputs) =
         model.forward(ids, &caches, gather, scatter, IntExpr::from(1usize));
     let mut outputs = vec![output];
@@ -143,13 +143,13 @@ fn mini_qwen3_runs() {
 
     let mut cx = Graph::new();
     let model = MiniQwen3::new(5, 8, 12, 4, 2, 1, &mut cx);
-    let ids = cx.tensor(1, DType::Int);
+    let ids = cx.tensor(vec![1], DType::Int);
     let caches = vec![(
         cx.tensor(vec![4, 4], DType::F32),
         cx.tensor(vec![4, 4], DType::F32),
     )];
-    let gather = cx.tensor(2, DType::Int);
-    let scatter = cx.tensor(1, DType::Int);
+    let gather = cx.tensor(vec![2], DType::Int);
+    let scatter = cx.tensor(vec![1], DType::Int);
     let (output, cache_outputs) =
         model.forward(ids, &caches, gather, scatter, IntExpr::from(1usize));
     let mut outputs = vec![output];
@@ -177,7 +177,7 @@ fn mini_gemma3_runs() {
     const HEAD_DIM: usize = 4;
     let mut cx = Graph::new();
     let model = MiniGemma3::new(5, 6, 8, 2, 1, HEAD_DIM, LAYERS, 1, 2, &mut cx);
-    let ids = cx.tensor(1, DType::Int);
+    let ids = cx.tensor(vec![1], DType::Int);
     let caches = (0..LAYERS)
         .map(|_| {
             (
@@ -186,8 +186,8 @@ fn mini_gemma3_runs() {
             )
         })
         .collect::<Vec<_>>();
-    let gather = cx.tensor(2, DType::Int);
-    let scatter = cx.tensor(1, DType::Int);
+    let gather = cx.tensor(vec![2], DType::Int);
+    let scatter = cx.tensor(vec![1], DType::Int);
     let rope = (0..LAYERS)
         .map(|_| {
             (
@@ -246,13 +246,13 @@ fn mini_qwen3_moe_runs() {
     mini_moe(
         |cx| MiniQwen3Moe::new(5, 4, 2, 1, 2, 1, cx),
         |model, cx| {
-            let ids = cx.tensor(1, DType::Int);
+            let ids = cx.tensor(vec![1], DType::Int);
             let caches = vec![(
                 cx.tensor(vec![4, 4], DType::F32),
                 cx.tensor(vec![4, 4], DType::F32),
             )];
-            let gather = cx.tensor(2, DType::Int);
-            let scatter = cx.tensor(1, DType::Int);
+            let gather = cx.tensor(vec![2], DType::Int);
+            let scatter = cx.tensor(vec![1], DType::Int);
             model.forward(ids, &caches, gather, scatter, IntExpr::from(1usize))
         },
     );
@@ -265,13 +265,13 @@ fn mini_gemma4_moe_runs() {
     mini_moe(
         |cx| MiniGemma4Moe::new(5, 4, 2, 1, 2, 1, cx),
         |model, cx| {
-            let ids = cx.tensor(1, DType::Int);
+            let ids = cx.tensor(vec![1], DType::Int);
             let caches = vec![(
                 cx.tensor(vec![4, 4], DType::F32),
                 cx.tensor(vec![4, 4], DType::F32),
             )];
-            let gather = cx.tensor(2, DType::Int);
-            let scatter = cx.tensor(1, DType::Int);
+            let gather = cx.tensor(vec![2], DType::Int);
+            let scatter = cx.tensor(vec![1], DType::Int);
             model.forward(ids, &caches, gather, scatter, IntExpr::from(1usize))
         },
     );
@@ -302,8 +302,8 @@ fn mini_flux_runs() {
     let model = MiniDit::new(4, 6, HIDDEN, 2, 6, 2, TEXT_TOKENS, &mut cx);
     let latent = cx.tensor(vec![IMAGE_TOKENS, 4], DType::F32);
     let text = cx.tensor(vec![TEXT_TOKENS, 6], DType::F32);
-    let timestep = cx.tensor(1, DType::F32);
-    let guidance = cx.tensor(1, DType::F32);
+    let timestep = cx.tensor(vec![1], DType::F32);
+    let guidance = cx.tensor(vec![1], DType::F32);
     let rope_cos = cx.tensor(vec![TEXT_TOKENS + IMAGE_TOKENS, HEAD_DIM], DType::F32);
     let rope_sin = cx.tensor(vec![TEXT_TOKENS + IMAGE_TOKENS, HEAD_DIM], DType::F32);
     let rope_rotation = cx.tensor(vec![HEAD_DIM, HEAD_DIM], DType::F32);

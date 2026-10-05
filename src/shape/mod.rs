@@ -103,14 +103,10 @@ impl SliceRange for RangeFull {
         (0.into(), IntExpr::from(i64::MAX))
     }
 }
+
+/// An explicit collection of per-axis slice bounds, such as `vec![(0, 4)]`.
 pub trait ToSlice {
     fn to_range_vec(self) -> Vec<(IntExpr, IntExpr)>;
-}
-
-impl<R: SliceRange> ToSlice for R {
-    fn to_range_vec(self) -> Vec<(IntExpr, IntExpr)> {
-        vec![self.bounds()]
-    }
 }
 
 impl<A: Into<IntExpr>, B: Into<IntExpr>> ToSlice for Vec<(A, B)> {
@@ -137,20 +133,9 @@ impl<const N: usize, A: Into<IntExpr> + Copy, B: Into<IntExpr> + Copy> ToSlice f
     }
 }
 
+/// An explicit collection of `(before, after)` padding pairs.
 pub trait ToPad {
     fn to_pad_vec(self) -> Vec<(IntExpr, IntExpr)>;
-}
-
-impl ToPad for () {
-    fn to_pad_vec(self) -> Vec<(IntExpr, IntExpr)> {
-        vec![]
-    }
-}
-
-impl<S: Into<IntExpr>, E: Into<IntExpr>> ToPad for (S, E) {
-    fn to_pad_vec(self) -> Vec<(IntExpr, IntExpr)> {
-        vec![(self.0.into(), self.1.into())]
-    }
 }
 
 impl<S: Into<IntExpr> + Copy, E: Into<IntExpr> + Copy> ToPad for &[(S, E)] {
@@ -185,20 +170,9 @@ impl<S: Into<IntExpr>, E: Into<IntExpr>> ToPad for Vec<(S, E)> {
     }
 }
 
+/// An explicit axis collection: `vec![0]` selects one axis; `vec![]` selects none.
 pub trait ToAxes {
     fn to_axes(&self) -> Vec<usize>;
-}
-
-impl ToAxes for () {
-    fn to_axes(&self) -> Vec<usize> {
-        vec![]
-    }
-}
-
-impl ToAxes for usize {
-    fn to_axes(&self) -> Vec<usize> {
-        vec![*self]
-    }
 }
 
 impl ToAxes for Vec<usize> {
@@ -225,14 +199,10 @@ impl ToAxes for &Vec<usize> {
     }
 }
 
+/// An explicit dimension collection, including for rank-one and rank-zero shapes.
+/// Use `vec![n]` for one dimension and `vec![] as Vec<usize>` for a scalar shape.
 pub trait ToShape {
     fn to_shape(self) -> Vec<IntExpr>;
-}
-
-impl ToShape for () {
-    fn to_shape(self) -> Vec<IntExpr> {
-        vec![]
-    }
 }
 
 impl<A: Into<IntExpr> + Copy> ToShape for &[A] {
@@ -256,11 +226,5 @@ impl<const E: usize, A: Into<IntExpr>> ToShape for [A; E] {
 impl<A: Into<IntExpr>> ToShape for Vec<A> {
     fn to_shape(self) -> Vec<IntExpr> {
         self.into_iter().map(|i| i.into()).collect()
-    }
-}
-
-impl<A: Into<IntExpr>> ToShape for A {
-    fn to_shape(self) -> Vec<IntExpr> {
-        vec![self.into()]
     }
 }

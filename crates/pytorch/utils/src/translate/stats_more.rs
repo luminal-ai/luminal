@@ -446,13 +446,13 @@ impl Translator<'_> {
         // arange(bins), optionally shifted by an integer `min`, compared for
         // equality against the broadcast input.
         let min_i = min as i64;
-        let bins_arange = self.cx.iota(bins, move |c| c[0] + min_i);
+        let bins_arange = self.cx.iota(vec![bins], move |c| c[0] + min_i);
         let bins_expanded = bins_arange.cast(input.dtype).expand_dim(1, n);
         let input_expanded = input.expand_dim(0, IntExpr::from(bins));
         let matches = input_expanded.eq(bins_expanded);
 
         let out_dtype = self.output_meta_dtype(node)?;
-        Ok(matches.cast(out_dtype).sum(1))
+        Ok(matches.cast(out_dtype).sum(vec![1]))
     }
 
     pub(super) fn translate_histogram(
@@ -591,7 +591,7 @@ impl Translator<'_> {
                 self.scalar_value(upper, values.dtype),
             )
         } else {
-            (values.min(0), values.max(0))
+            (values.min(vec![0]), values.max(vec![0]))
         };
         // A degenerate range is widened by half a unit, matching torch.
         let equal = self.is_zero(upper - lower);
@@ -723,7 +723,7 @@ impl Translator<'_> {
         let mut weight_shape = vec![IntExpr::from(1); columns.len() + 1];
         weight_shape[0] = sample_count;
         let weight = util::reshape_tensor(weight, &weight_shape).expand(full_shape);
-        let mut histogram = (membership.cast(weight.dtype) * weight).sum(0);
+        let mut histogram = (membership.cast(weight.dtype) * weight).sum(vec![0]);
         if density {
             let axes = (0..bin_shape.len()).collect::<Vec<_>>();
             let total = histogram.sum(axes).expand_rhs(bin_shape.clone());
@@ -764,7 +764,7 @@ impl Translator<'_> {
             // All the segment bookkeeping runs in F32: the candidate axis is
             // short and this avoids proof-gated Int cumsum/subtract.
             let lengths = lengths.cast(DType::F32);
-            let ends = lengths.cumsum(axis);
+            let ends = lengths.cumsum(vec![axis]);
             (ends - lengths, ends)
         } else if let Some(offsets) = offsets {
             let offsets = offsets.cast(DType::F32);
@@ -794,7 +794,7 @@ impl Translator<'_> {
             .cast(DType::F32);
         let membership = self.bool_and(positions.ge(starts), positions.lt(ends));
         let expanded = data.expand_dim(axis, segment_count);
-        let count = membership.cast(DType::F32).sum(candidate_axis);
+        let count = membership.cast(DType::F32).sum(vec![candidate_axis]);
 
         let initial = named_index(node, "initial")
             .and_then(|index| self.get_number_arg(node, index).ok())
@@ -810,7 +810,7 @@ impl Translator<'_> {
                 // form; segment_reduce inputs are finite in the common path.
                 let mut sum = self
                     .blend_select(membership, expanded, zero)
-                    .sum(candidate_axis);
+                    .sum(vec![candidate_axis]);
                 if let Some(initial) = initial {
                     sum += initial;
                 }
@@ -832,8 +832,11 @@ impl Translator<'_> {
             }
             "prod" => {
                 let selected = self.blend_select(membership, expanded, one);
-                let magnitude = self.real_abs(selected).prod(candidate_axis);
-                let negative_count = self.signbit(selected).cast(DType::F32).sum(candidate_axis);
+                let magnitude = self.real_abs(selected).prod(vec![candidate_axis]);
+                let negative_count = self
+                    .signbit(selected)
+                    .cast(DType::F32)
+                    .sum(vec![candidate_axis]);
                 // odd in {0, 1}; sign multiplication avoids a select (and
                 // preserves infinities instead of leaking inf * 0).
                 let odd = negative_count - (negative_count * 0.5f32).floor() * 2.0f32;
@@ -858,9 +861,9 @@ impl Translator<'_> {
                 );
                 let values = self.blend_select(membership, expanded, fill);
                 let mut result = if reduction == "max" {
-                    values.max(candidate_axis)
+                    values.max(vec![candidate_axis])
                 } else {
-                    values.min(candidate_axis)
+                    values.min(vec![candidate_axis])
                 };
                 if let Some(initial) = initial {
                     // The fill is the identity, so an empty segment lands on

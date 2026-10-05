@@ -82,36 +82,44 @@ fn gradcheck(
 
 #[test]
 fn grad_sin() {
-    gradcheck(&[&[6]], &[seq(6, -1.5, 1.5)], |_, p| p[0].sin().sum(0));
+    gradcheck(&[&[6]], &[seq(6, -1.5, 1.5)], |_, p| {
+        p[0].sin().sum(vec![0])
+    });
 }
 
 #[test]
 fn grad_exp2() {
-    gradcheck(&[&[6]], &[seq(6, -1.0, 1.0)], |_, p| p[0].exp2().sum(0));
+    gradcheck(&[&[6]], &[seq(6, -1.0, 1.0)], |_, p| {
+        p[0].exp2().sum(vec![0])
+    });
 }
 
 #[test]
 fn grad_log2() {
-    gradcheck(&[&[6]], &[seq(6, 0.5, 2.5)], |_, p| p[0].log2().sum(0));
+    gradcheck(&[&[6]], &[seq(6, 0.5, 2.5)], |_, p| {
+        p[0].log2().sum(vec![0])
+    });
 }
 
 #[test]
 fn grad_recip() {
     gradcheck(&[&[6]], &[seq(6, 0.7, 2.0)], |_, p| {
-        p[0].reciprocal().sum(0)
+        p[0].reciprocal().sum(vec![0])
     });
 }
 
 #[test]
 fn grad_sqrt() {
-    gradcheck(&[&[6]], &[seq(6, 0.5, 3.0)], |_, p| p[0].sqrt().sum(0));
+    gradcheck(&[&[6]], &[seq(6, 0.5, 3.0)], |_, p| {
+        p[0].sqrt().sum(vec![0])
+    });
 }
 
 #[test]
 fn grad_unary_chain() {
     // exp(log(x)) composites through scale-by-constant Muls too
     gradcheck(&[&[5]], &[seq(5, 0.6, 2.0)], |_, p| {
-        (p[0].log() * p[0].exp()).sum(0)
+        (p[0].log() * p[0].exp()).sum(vec![0])
     });
 }
 
@@ -129,7 +137,7 @@ fn grad_mul() {
 #[test]
 fn grad_add_scalar_and_mul_scalar() {
     gradcheck(&[&[4]], &[seq(4, -1.0, 1.0)], |_, p| {
-        ((p[0] * 3.0 + 1.0) * p[0]).sum(0)
+        ((p[0] * 3.0 + 1.0) * p[0]).sum(vec![0])
     });
 }
 
@@ -148,7 +156,7 @@ fn grad_div() {
     gradcheck(
         &[&[4], &[4]],
         &[seq(4, -1.0, 1.0), seq(4, 0.8, 2.0)],
-        |_, p| (p[0] / p[1]).sum(0),
+        |_, p| (p[0] / p[1]).sum(vec![0]),
     );
 }
 
@@ -169,7 +177,7 @@ fn grad_reshape() {
     // merge_dims: tests the Reshape unview path
     gradcheck(&[&[2, 3]], &[seq(6, -1.0, 1.0)], |_, p| {
         let flat = p[0].merge_dims(0, 1); // (6,)
-        (flat * flat).sum(0)
+        (flat * flat).sum(vec![0])
     });
 }
 
@@ -218,7 +226,7 @@ fn grad_gather_with_duplicate_indices() {
     gradcheck(&[&[6]], &[seq(6, -1.0, 1.0)], |cx, p| {
         let idx = cx.iota((expr('z') * 2 + 1) % 6, 4);
         let g = p[0].gather(idx); // (4,)
-        (g * g).sum(0)
+        (g * g).sum(vec![0])
     });
 }
 
@@ -229,7 +237,7 @@ fn grad_mod() {
     gradcheck(
         &[&[4], &[4]],
         &[vec![2.5, 3.7, 4.9, 3.1], vec![1.1, 1.4, 1.6, 0.9]],
-        |_, p| (p[0] % p[1]).sum(0),
+        |_, p| (p[0] % p[1]).sum(vec![0]),
     );
 }
 
@@ -243,7 +251,7 @@ fn grad_scatter_unique_indices() {
         |cx, p| {
             let idx = cx.iota(expr('z') * 2, 3); // [0, 2, 4]
             let out = p[1].scatter(idx, p[0]);
-            (out * out).sum(0)
+            (out * out).sum(vec![0])
         },
     );
 }
@@ -260,7 +268,7 @@ fn grad_scatter_duplicate_indices() {
         |cx, p| {
             let idx = cx.iota((expr('z') * 2) % 4, 3); // [0, 2, 0]
             let out = p[1].scatter(idx, p[0]);
-            (out * out).sum(0)
+            (out * out).sum(vec![0])
         },
     );
 }
@@ -298,7 +306,7 @@ fn grad_conv1d_style_windows() {
                     None => term,
                 });
             }
-            (acc.unwrap() * acc.unwrap()).sum(0)
+            (acc.unwrap() * acc.unwrap()).sum(vec![0])
         },
     );
 }
@@ -308,7 +316,7 @@ fn grad_conv1d_style_windows() {
 #[test]
 fn grad_sum_reduce() {
     gradcheck(&[&[2, 3]], &[seq(6, -1.0, 1.0)], |_, p| {
-        p[0].sum(1).sin().sum(0)
+        p[0].sum(vec![1]).sin().sum(vec![0])
     });
 }
 
@@ -317,13 +325,13 @@ fn grad_max_reduce() {
     // Distinct values with gaps well above EPS so the argmax is stable under
     // perturbation.
     let vals: Vec<f32> = (0..6).map(|i| ((i * 5) % 6) as f32 * 0.5 + 0.1).collect();
-    gradcheck(&[&[2, 3]], &[vals], |_, p| p[0].max(1).sum(0));
+    gradcheck(&[&[2, 3]], &[vals], |_, p| p[0].max(vec![1]).sum(vec![0]));
 }
 
 #[test]
 fn grad_mean() {
     gradcheck(&[&[2, 3]], &[seq(6, -1.0, 1.0)], |_, p| {
-        (p[0].mean(1) * p[0].mean(1)).sum(0)
+        (p[0].mean(vec![1]) * p[0].mean(vec![1])).sum(vec![0])
     });
 }
 
@@ -343,7 +351,7 @@ fn grad_softmax() {
     gradcheck(
         &[&[2, 3], &[2, 3]],
         &[seq(6, -1.0, 1.0), seq(6, 0.5, 1.5)],
-        |_, p| (p[0].softmax(1) * p[1]).sum(vec![0, 1]),
+        |_, p| (p[0].softmax(vec![1]) * p[1]).sum(vec![0, 1]),
     );
 }
 

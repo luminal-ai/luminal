@@ -28,8 +28,8 @@ fn run() -> anyhow::Result<()> {
     let dims = Gemma4Dims::gemma4_26b_a4b();
     let mut cx = Graph::new();
     let model = Gemma4Moe::init(&mut cx, &dims);
-    let token = cx.tensor(1, DType::Int);
-    let q_pos = cx.tensor(1, DType::Int);
+    let token = cx.tensor(vec![1], DType::Int);
+    let q_pos = cx.tensor(vec![1], DType::Int);
     let sliding_cos = cx.tensor(vec![1, dims.sliding_head_dim], DType::F32);
     let sliding_sin = cx.tensor(vec![1, dims.sliding_head_dim], DType::F32);
     let sliding_rot = cx.tensor(
@@ -39,8 +39,8 @@ fn run() -> anyhow::Result<()> {
     let full_cos = cx.tensor(vec![1, dims.full_head_dim], DType::F32);
     let full_sin = cx.tensor(vec![1, dims.full_head_dim], DType::F32);
     let full_rot = cx.tensor(vec![dims.full_head_dim, dims.full_head_dim], DType::F32);
-    let gather_idx = cx.tensor(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor(1, DType::Int);
+    let gather_idx = cx.tensor(vec![SLOTS], DType::Int);
+    let scatter_idx = cx.tensor(vec![1], DType::Int);
     let pool = named_heterogeneous_kv_cache_pool(
         &mut cx,
         SLOTS,

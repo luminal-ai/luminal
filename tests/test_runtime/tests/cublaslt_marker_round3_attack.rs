@@ -1363,7 +1363,7 @@ fn rc4_bias_relu_chain_no_stale_d() {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let b = cx.tensor(3usize, DType::F32);
+        let b = cx.tensor(vec![3usize], DType::F32);
         let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
         test_runtime::bind_leaves(&cx)
     };
@@ -1746,7 +1746,7 @@ fn rp2_decoration_depth_enode_count() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
@@ -1755,7 +1755,7 @@ fn rp2_decoration_depth_enode_count() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
             }),
         ),

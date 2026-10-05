@@ -50,7 +50,7 @@ fn shape_changes_reuse_one_arena_and_replay_cached_graphs() {
 fn metadata_only_dimension_change_patches_no_nodes() {
     let mut g = Graph::new();
     let a = IntExpr::from('a');
-    let out = g.iota(5, |c| c[0] + a);
+    let out = g.iota(vec![5], |c| c[0] + a);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
         &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (1, 19))]).unwrap(),
@@ -80,7 +80,7 @@ fn metadata_only_dimension_change_patches_no_nodes() {
 fn dynamic_transpose_and_reduction_use_live_strides() {
     let mut g = Graph::new();
     let x = g.tensor(vec![IntExpr::from(3), 'a'.into()], DType::F32);
-    let out = (x.permute(vec![1, 0]) + 1.).sum(0);
+    let out = (x.permute(vec![1, 0]) + 1.).sum(vec![0]);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
         &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (2, 11))]).unwrap(),
@@ -181,7 +181,7 @@ fn cublas_geometry_changes_rerecord_the_child_every_execution() {
 #[test]
 fn profiling_and_serving_share_dynamic_graph_execution() {
     let mut g = Graph::new();
-    let x = g.tensor('a', DType::F32);
+    let x = g.tensor(vec!['a'], DType::F32);
     let out = x + 2.;
     let mut rt = CudaRuntime::load(&g).unwrap();
     let data = [(x.id, vec![1f32, 2., 3.].into())].into_iter().collect();
@@ -210,7 +210,7 @@ fn profiling_and_serving_share_dynamic_graph_execution() {
 #[test]
 fn zero_extents_disable_copies_and_restore_them() {
     let mut g = Graph::new();
-    let x = g.tensor('a', DType::F32);
+    let x = g.tensor(vec!['a'], DType::F32);
     let out = x + 3.;
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
@@ -239,7 +239,7 @@ fn zero_extents_disable_copies_and_restore_them() {
 fn gather_scatter_update_symbolic_coordinates() {
     let mut g = Graph::new();
     let data = g.tensor(vec![IntExpr::from('a'), 3.into()], DType::F32);
-    let rows = g.tensor('a', DType::Int);
+    let rows = g.tensor(vec!['a'], DType::Int);
     let cols = g.iota(vec![IntExpr::from('a'), 3.into()], |c| c[1]);
     let coords = [rows.expand_dim(1, 3), cols];
     let gathered = data.gather(&coords);
@@ -293,7 +293,7 @@ fn installing_larger_plan_invalidates_graphs_before_arena_growth() {
     use luminal_cuda_lite::device::CudaDevice;
     fn plan(n: usize) -> luminal_cuda_lite::CudaPlan {
         let mut g = Graph::new();
-        let _ = g.iota(n, |c| c[0]);
+        let _ = g.iota(vec![n], |c| c[0]);
         let mut rt = CudaRuntime::load(&g).unwrap();
         rt.search(
             &Default::default(),
@@ -362,7 +362,7 @@ fn ceil_division_in_dynamic_iota_is_evaluated_on_device() {
     use luminal_cuda_lite::ops::iota::IotaDps;
     let mut g = Graph::new();
     let a = IntExpr::from('a');
-    let _ = g.iota(7, |c| c[0] + a);
+    let _ = g.iota(vec![7], |c| c[0] + a);
     let mut rt = CudaRuntime::load(&g).unwrap();
     rt.search(
         &luminal::shape::SymbolBounds::from_ranges([('a'.into(), (1, 12))]).unwrap(),
@@ -456,7 +456,7 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
     let mut g = Graph::new();
     let a = g.tensor(vec![IntExpr::from('m'), 4.into()], DType::F32);
     let b = g.tensor(vec![IntExpr::from(4), 'n'.into()], DType::F32);
-    let bias = g.tensor('n', DType::F32);
+    let bias = g.tensor(vec!['n'], DType::F32);
     let out = (a.matmul(b) + bias.expand_dim(0, 'm')).relu();
     let mut rt = CudaRuntime::load_with_registry(
         &g,

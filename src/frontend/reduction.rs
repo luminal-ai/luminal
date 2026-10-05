@@ -139,7 +139,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
         fn test_sum(rows in 1usize..8, cols in 1usize..8, depth in 1usize..6) {
-            test_unary(vec![rows, cols], |a| a.sum(1), |a| a.sum(1).unwrap());
+            test_unary(vec![rows, cols], |a| a.sum(vec![1]), |a| a.sum(1).unwrap());
             test_unary(
                 vec![rows, cols, depth],
                 |a| a.sum(vec![0, 2]),
@@ -152,7 +152,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
         fn test_max(rows in 1usize..8, cols in 1usize..8) {
-            test_unary(vec![rows, cols], |a| a.max(1), |a| a.max(1).unwrap());
+            test_unary(vec![rows, cols], |a| a.max(vec![1]), |a| a.max(1).unwrap());
         }
     }
 
@@ -160,7 +160,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
         fn test_min(rows in 1usize..8, cols in 1usize..8) {
-            test_unary(vec![rows, cols], |a| a.min(1), |a| a.min(1).unwrap());
+            test_unary(vec![rows, cols], |a| a.min(vec![1]), |a| a.min(1).unwrap());
         }
     }
 
@@ -168,7 +168,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
         fn test_mean(rows in 1usize..8, cols in 1usize..8, depth in 1usize..6) {
-            test_unary(vec![rows, cols], |a| a.mean(1), |a| a.mean(1).unwrap());
+            test_unary(vec![rows, cols], |a| a.mean(vec![1]), |a| a.mean(1).unwrap());
             let denom = (rows * depth) as f32;
             test_unary(
                 vec![rows, cols, depth],
@@ -187,7 +187,7 @@ mod tests {
         fn test_prod(rows in 1usize..8, cols in 1usize..8) {
             test_unary(
                 vec![rows, cols],
-                |a| a.prod(1),
+                |a| a.prod(vec![1]),
                 |a| {
                     let v = a.to_vec2::<f32>().unwrap();
                     let out: Vec<f32> = v.iter().map(|row| row.iter().product()).collect();
@@ -212,7 +212,7 @@ mod tests {
         for (input, expected) in cases {
             let mut cx = Graph::new();
             let a = cx.tensor(vec![1, input.len()], DType::F32);
-            let b = a.prod(1);
+            let b = a.prod(vec![1]);
             let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, input.into())]);
             assert_exact(rt.get_f32(b.id).unwrap(), &[expected]);
         }
@@ -224,7 +224,7 @@ mod tests {
     fn prod_over_an_empty_axis_is_one() {
         let mut cx = Graph::new();
         let a = cx.tensor(vec![2, 0], DType::F32);
-        let b = a.prod(1);
+        let b = a.prod(vec![1]);
         let rt =
             luminal_reference::harness::run_reference(&cx, &[(a.id, Vec::<f32>::new().into())]);
         assert_exact(rt.get_f32(b.id).unwrap(), &[1.0, 1.0]);
@@ -236,7 +236,7 @@ mod tests {
     fn max_propagates_nan() {
         let mut cx = Graph::new();
         let a = cx.tensor(vec![2, 2], DType::F32);
-        let b = a.max(1);
+        let b = a.max(vec![1]);
         let rt = luminal_reference::harness::run_reference(
             &cx,
             &[(a.id, vec![1.0, f32::NAN, 3.0, 2.0].into())],

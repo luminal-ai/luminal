@@ -11,7 +11,7 @@ use support::TestTransfers;
 #[test]
 fn rounding_ops_execute_on_device() {
     let mut g = Graph::new();
-    let x = g.tensor(9, DType::F32);
+    let x = g.tensor(vec![9], DType::F32);
     let floor = x.floor();
     let ceil = x.ceil();
     let trunc = x.trunc();
@@ -56,7 +56,7 @@ fn rounding_ops_execute_on_device() {
 #[test]
 fn trunc_cast_executes_on_device() {
     let mut g = Graph::new();
-    let x = g.tensor(6, DType::F32);
+    let x = g.tensor(vec![6], DType::F32);
     let out = x.trunc_cast(DType::Int);
     let mut rt = MetalRuntime::load(&g).unwrap();
     rt.search(

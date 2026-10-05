@@ -194,8 +194,10 @@ pub(crate) fn static_scatter_add(
             let gc = reinterpret(g_flat, &[(m / b).into(), b.into()]);
             let ic = reinterpret(idx_flat, &[(m / b).into(), b.into()]);
             (
-                gc.slice(vec![(0..).bounds(), (k..k + 1).bounds()]).squeeze(1), // (m/b,)
-                ic.slice(vec![(0..).bounds(), (k..k + 1).bounds()]).squeeze(1), // (m/b,) Int
+                gc.slice(vec![(0..).bounds(), (k..k + 1).bounds()])
+                    .squeeze(1), // (m/b,)
+                ic.slice(vec![(0..).bounds(), (k..k + 1).bounds()])
+                    .squeeze(1), // (m/b,) Int
             )
         };
         let dest = zeros_flat(cx, l.into(), g_flat.dtype);
@@ -268,7 +270,7 @@ fn scatter_add_through_view(
         .expand_dim(1, m)
         .eq(phys_idx.expand_dim(0, n))
         .cast(g_flat.dtype); // (N, M)
-    let flat = (onehot * g_flat.expand_dim(0, n)).sum(1); // (N,)
+    let flat = (onehot * g_flat.expand_dim(0, n)).sum(vec![1]); // (N,)
     reinterpret(flat, producer_dims)
 }
 

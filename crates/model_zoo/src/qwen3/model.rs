@@ -241,10 +241,10 @@ impl Qwen {
                 cx,
             ),
             q_norm: cx
-                .named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, dtype)
+                .named_tensor(attn.child("q_norm").leaf("weight"), vec![d.head_dim], dtype)
                 .cast(DType::F32),
             k_norm: cx
-                .named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, dtype)
+                .named_tensor(attn.child("k_norm").leaf("weight"), vec![d.head_dim], dtype)
                 .cast(DType::F32),
             ffn_norm: LayerNorm::new_with_storage_dtype(
                 d.hidden,

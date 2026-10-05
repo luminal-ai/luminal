@@ -62,7 +62,7 @@ impl GraphTensor {
                 * rhs.record_view_map(vec![c(0, k), c(1, n)], p);
 
             // Sum Reduce
-            let mut ret = mul.sum(2);
+            let mut ret = mul.sum(vec![2]);
             if vec {
                 ret = ret.squeeze(0);
             }
@@ -79,7 +79,7 @@ impl GraphTensor {
                     * rhs.record_view_map(vec![c(0, k), c(1, d)], p);
 
                 // Sum Reduce
-                mul.sum(3)
+                mul.sum(vec![3])
             } else if rhs.rank() == 3 {
                 // ABKxAKD -> ABD
                 let (ra, rk, d) = rhs.dims3();
@@ -91,7 +91,7 @@ impl GraphTensor {
                     * rhs.record_view_map(vec![c(3, a), c(0, k), c(1, d)], p);
 
                 // Sum Reduce
-                mul.sum(3)
+                mul.sum(vec![3])
             } else {
                 panic!(
                     "Can't matmul lhs {:?} and rhs {:?}",
@@ -112,7 +112,7 @@ impl GraphTensor {
                     * rhs.record_view_map(vec![c(0, k), c(1, e)], p);
 
                 // Sum Reduce
-                mul.sum(4)
+                mul.sum(vec![4])
             } else if rhs.rank() == 4 {
                 // ABCKxABKE -> ABCE
                 let (ra, rb, rk, e) = rhs.dims4();
@@ -126,7 +126,7 @@ impl GraphTensor {
                     * rhs.record_view_map(vec![c(4, a), c(3, b), c(0, k), c(1, e)], p);
 
                 // Sum Reduce
-                mul.sum(4)
+                mul.sum(vec![4])
             } else {
                 panic!(
                     "Can't matmul lhs {:?} and rhs {:?}",
@@ -153,7 +153,7 @@ impl GraphTensor {
                 .record_view_map(vec![c(5, a), c(4, b), c(3, cc), c(0, k), c(1, f)], p);
 
             // Sum Reduce
-            mul.sum(5)
+            mul.sum(vec![5])
         } else {
             panic!(
                 "Can't matmul lhs {:?} and rhs {:?}",
@@ -165,7 +165,7 @@ impl GraphTensor {
 
     /// Simple dot product of two vectors
     pub fn dot(self, rhs: GraphTensor) -> GraphTensor {
-        (self * rhs).sum(0)
+        (self * rhs).sum(vec![0])
     }
 }
 

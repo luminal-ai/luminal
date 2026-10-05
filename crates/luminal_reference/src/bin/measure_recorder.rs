@@ -100,7 +100,7 @@ fn main() {
             let k = cx.tensor(vec![1, 2, 6, 8], DType::F32);
             let v = cx.tensor(vec![1, 2, 6, 8], DType::F32);
             let scores = q.matmul(k.permute(vec![0, 1, 3, 2])) * (1.0 / (8f32).sqrt());
-            let probs = scores.softmax(3);
+            let probs = scores.softmax(vec![3]);
             let out = probs.matmul(v);
             (
                 vec![
@@ -116,7 +116,7 @@ fn main() {
     if which.is_empty() || which == "cumsum" {
         measure("cumsum_rank4", |cx| {
             let x = cx.tensor(vec![2, 3, 4, 5], DType::F32);
-            let out = x.cumsum(3);
+            let out = x.cumsum(vec![3]);
             (vec![(x.id, random_vec(120))], out)
         });
     }

@@ -246,7 +246,7 @@ impl Whisper {
                 .view()
                 .merge_dims(1, 2)
                 .finish(),
-            conv1_b: cx.named_tensor(enc.child("conv1").leaf("bias"), d.state, DType::F32),
+            conv1_b: cx.named_tensor(enc.child("conv1").leaf("bias"), vec![d.state], DType::F32),
             conv2_w: cx
                 .named_tensor(
                     enc.child("conv2").leaf("weight"),
@@ -256,7 +256,7 @@ impl Whisper {
                 .view()
                 .merge_dims(1, 2)
                 .finish(),
-            conv2_b: cx.named_tensor(enc.child("conv2").leaf("bias"), d.state, DType::F32),
+            conv2_b: cx.named_tensor(enc.child("conv2").leaf("bias"), vec![d.state], DType::F32),
             enc_pos: cx.named_tensor(
                 enc.child("embed_positions").leaf("weight"),
                 vec![d.audio_ctx, d.state],

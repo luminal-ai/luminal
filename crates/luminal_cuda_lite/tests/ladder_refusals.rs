@@ -68,8 +68,8 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
             )
         })
         .collect();
-    let gather_idx = cx.tensor(CTX, luminal::dtype::DType::Int);
-    let scatter_idx = cx.tensor(1, luminal::dtype::DType::Int);
+    let gather_idx = cx.tensor(vec![CTX], luminal::dtype::DType::Int);
+    let scatter_idx = cx.tensor(vec![1], luminal::dtype::DType::Int);
     let mut h = x;
     for (layer, block) in blocks.iter().enumerate() {
         let (next, kc, vc) = block.forward(

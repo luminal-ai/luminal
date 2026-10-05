@@ -10,7 +10,7 @@ use luminal::prelude::*;
 use luminal_metal::{MetalRuntime, harness_search_options};
 
 let mut graph = Graph::new();
-let x = graph.tensor(3, DType::F32);
+let x = graph.tensor(vec![3], DType::F32);
 let out = x + 2.;
 let mut runtime = MetalRuntime::load(&graph)?;
 let data = [(x.id, vec![1f32, 2., 3.].into())].into_iter().collect();

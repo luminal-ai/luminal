@@ -64,7 +64,7 @@ impl Linear {
     ) -> Self {
         Self {
             weight: cx.named_tensor(ns.leaf("weight"), vec![inp, out], dtype),
-            bias: bias.then(|| cx.named_tensor(ns.leaf("bias"), out, dtype)),
+            bias: bias.then(|| cx.named_tensor(ns.leaf("bias"), vec![out], dtype)),
         }
     }
 
@@ -156,8 +156,8 @@ impl LayerNorm {
         cx: &mut Graph,
     ) -> Self {
         Self {
-            weight: weight.then(|| cx.named_tensor(ns.leaf("weight"), dim, dtype)),
-            bias: bias.then(|| cx.named_tensor(ns.leaf("bias"), dim, dtype)),
+            weight: weight.then(|| cx.named_tensor(ns.leaf("weight"), vec![dim], dtype)),
+            bias: bias.then(|| cx.named_tensor(ns.leaf("bias"), vec![dim], dtype)),
             mean_norm,
             epsilon,
             unit_offset: false,
@@ -237,7 +237,7 @@ impl ConvND {
                 vec![ch_out, ch_in * kernel_product],
                 dtype,
             ),
-            bias: bias.then(|| cx.named_tensor(ns.leaf("bias"), ch_out, dtype)),
+            bias: bias.then(|| cx.named_tensor(ns.leaf("bias"), vec![ch_out], dtype)),
             config: luminal_nn::ConvNdConfig::new(kernel, stride, dilation, padding),
             ch_in,
             ch_out,
@@ -266,8 +266,12 @@ impl Fp8Linear {
     pub fn new(inp: usize, out: usize, ns: &Namespace, cx: &mut Graph) -> Self {
         Self {
             weight: cx.named_tensor(ns.leaf("weight"), vec![out, inp], DType::F8E4M3FN),
-            input_scale: cx.named_tensor(ns.leaf("input_scale"), (), DType::F32),
-            weight_scale: cx.named_tensor(ns.leaf("weight_scale"), (), DType::F32),
+            input_scale: cx.named_tensor(ns.leaf("input_scale"), vec![] as Vec<usize>, DType::F32),
+            weight_scale: cx.named_tensor(
+                ns.leaf("weight_scale"),
+                vec![] as Vec<usize>,
+                DType::F32,
+            ),
             out,
         }
     }

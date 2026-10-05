@@ -5,7 +5,7 @@ impl Graph {
     pub fn constant_i32(&mut self, i: impl Into<IntExpr>) -> GraphTensor {
         let expr = i.into();
         let id = self.logical.record_iota(&expr, &[]);
-        GraphTensor::from_id(id, (), self, DType::Int)
+        GraphTensor::from_id(id, vec![] as Vec<usize>, self, DType::Int)
     }
 
     /// An EXACT scalar `I64` constant, assembled from 16-bit limbs.
@@ -40,7 +40,7 @@ impl Graph {
         let id = self
             .logical
             .op(LogicalOp::Constant(i as f64), &[], Vec::new(), DType::F32);
-        GraphTensor::from_id(id, (), self, DType::F32)
+        GraphTensor::from_id(id, vec![] as Vec<usize>, self, DType::F32)
     }
 
     /// An exact scalar `F64` constant. `LogicalConstantF64` owns the F64
@@ -51,7 +51,7 @@ impl Graph {
         let id = self
             .logical
             .op(LogicalOp::ConstantF64(value), &[], Vec::new(), DType::F64);
-        GraphTensor::from_id(id, (), self, DType::F64)
+        GraphTensor::from_id(id, vec![] as Vec<usize>, self, DType::F64)
     }
 
     /// Iota as a TRUE COORDINATE FUNCTION (P1 ruling 2026-08-07): the
@@ -83,7 +83,7 @@ impl Graph {
 
     /// ARange from 0 to N
     pub fn arange(&mut self, to: impl Into<IntExpr>) -> GraphTensor {
-        self.iota(to, |c| c[0])
+        self.iota(vec![to], |c| c[0])
     }
 
     /// ARange from beginning to end
@@ -94,7 +94,7 @@ impl Graph {
         step: impl Into<IntExpr>,
     ) -> GraphTensor {
         let (start, end, step) = (start.into(), end.into(), step.into());
-        self.iota((end - start) / step, move |c| c[0] * step + start)
+        self.iota(vec![(end - start) / step], move |c| c[0] * step + start)
     }
 
     /// Lower left-hand triangle of 1s. Currently required to be square

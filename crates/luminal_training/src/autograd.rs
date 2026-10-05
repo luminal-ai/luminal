@@ -473,7 +473,7 @@ fn vjp(
                     .expand_dim(1, m)
                     .eq(idx_flat.expand_dim(0, l))
                     .cast(g_flat.dtype); // (L, M)
-                (onehot * g_flat.expand_dim(0, l)).sum(1) // (L,)
+                (onehot * g_flat.expand_dim(0, l)).sum(vec![1]) // (L,)
             });
             let local = reinterpret(local_flat, &data_view.dims);
             out.push((1, local, data_view));
@@ -505,7 +505,7 @@ fn vjp(
                 .expand_dim(1, m_flat)
                 .eq(idx_flat.expand_dim(0, n_flat))
                 .cast(g.dtype))
-            .sum(1); // (N,)
+            .sum(vec![1]); // (N,)
             let not_covered = counts.lt(half.expand_dim(0, n_flat)).cast(g.dtype);
             let local = reinterpret(g_flat * not_covered, &dest_dims);
             out.push((0, local, dest_view));
@@ -522,7 +522,7 @@ fn vjp(
                 .expand_dim(1, m_flat)
                 .eq(idx_flat.expand_dim(0, m_flat))
                 .cast(g.dtype); // (M, M)
-            let later_dups = (same_slot * later).sum(1); // (M,)
+            let later_dups = (same_slot * later).sum(vec![1]); // (M,)
             let winner = later_dups.lt(half.expand_dim(0, m_flat)).cast(g.dtype);
             let local = reinterpret(gathered * winner, &index_dims);
             out.push((2, local, src_view));
@@ -557,9 +557,9 @@ mod tests {
     #[test]
     fn unused_param_gets_zero_grad() {
         let mut cx = Graph::new();
-        let a = cx.tensor(3, DType::F32);
+        let a = cx.tensor(vec![3], DType::F32);
         let unused = cx.tensor(vec![4, 2], DType::F32);
-        let loss = a.sum(0);
+        let loss = a.sum(vec![0]);
         let grads = cx.backward(loss, &[a, unused]);
         assert_eq!(grads[1].dims(), unused.dims());
     }
@@ -569,7 +569,7 @@ mod tests {
     fn non_scalar_loss_panics() {
         let mut cx = Graph::new();
         let a = cx.tensor(vec![2, 3], DType::F32);
-        let loss = a.sum(1); // shape (2,) — not scalar
+        let loss = a.sum(vec![1]); // shape (2,) — not scalar
         cx.backward(loss, &[a]);
     }
 

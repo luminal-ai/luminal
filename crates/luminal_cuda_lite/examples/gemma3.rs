@@ -28,15 +28,15 @@ fn run() -> anyhow::Result<()> {
     let dims = Gemma3Dims::gemma3_4b();
     let mut cx = Graph::new();
     let model = Gemma3::init(&mut cx, &dims);
-    let token = cx.tensor(1, DType::Int);
-    let q_pos = cx.tensor(1, DType::Int);
+    let token = cx.tensor(vec![1], DType::Int);
+    let q_pos = cx.tensor(vec![1], DType::Int);
     let local_cos = cx.tensor(vec![1, dims.head_dim], DType::F32);
     let local_sin = cx.tensor(vec![1, dims.head_dim], DType::F32);
     let global_cos = cx.tensor(vec![1, dims.head_dim], DType::F32);
     let global_sin = cx.tensor(vec![1, dims.head_dim], DType::F32);
     let rope_rot = cx.tensor(vec![dims.head_dim, dims.head_dim], DType::F32);
-    let gather_idx = cx.tensor(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor(1, DType::Int);
+    let gather_idx = cx.tensor(vec![SLOTS], DType::Int);
+    let scatter_idx = cx.tensor(vec![1], DType::Int);
     let pool = named_kv_cache_pool(
         &mut cx,
         dims.layers,

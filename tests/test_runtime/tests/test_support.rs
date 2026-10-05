@@ -1535,7 +1535,7 @@ mod stage4b_probes {
     #[test]
     fn pinned_pure_identity_output() {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor(2, DType::F32);
+        let a = cx.tensor(vec![2], DType::F32);
         let b = a;
         // An input passed straight through is no leaf: the binding names it
         // as an output explicitly.
@@ -2028,7 +2028,7 @@ mod stage4b_probes {
     #[test]
     fn degenerate_broadcast_runs_clean() {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor(1, DType::F32);
+        let a = cx.tensor(vec![1], DType::F32);
         let b = a * 2.0;
         let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, vec![0.5f32].into())]);
         let got = rt.get_f32(b.id).unwrap();
@@ -2390,7 +2390,9 @@ mod subst_guard_study {
         let mut cx = Graph::default();
         cx.set_dim('s', 5);
         let x = cx.named_tensor("x", vec!['s'], DType::F32);
-        let out = x.unfold(vec![3usize], vec![1usize], vec![1usize]).sum(1);
+        let out = x
+            .unfold(vec![3usize], vec![1usize], vec![1usize])
+            .sum(vec![1]);
         let rt = luminal_reference::harness::run_reference(
             &cx,
             &[(x.id, vec![1.0f32, 2.0, 3.0, 4.0, 5.0].into())],
@@ -2400,7 +2402,9 @@ mod subst_guard_study {
         let mut cx = Graph::default();
         cx.set_dim('s', 2);
         let x = cx.named_tensor("x", vec!['s'], DType::F32);
-        let _ = x.unfold(vec![3usize], vec![1usize], vec![1usize]).sum(1);
+        let _ = x
+            .unfold(vec![3usize], vec![1usize], vec![1usize])
+            .sum(vec![1]);
         let mut rt = luminal_reference::ReferenceRuntime::load(&cx).expect("records + loads");
         let data: rustc_hash::FxHashMap<_, _> =
             [(x.id, luminal_reference::TypedBuffer::from(vec![0.0f32; 2]))]
@@ -3182,7 +3186,9 @@ mod ring_ignition_battery {
         let mut cx = Graph::new();
         cx.set_dim('s', 5);
         let x = cx.named_tensor("x", vec!['s'], DType::F32);
-        let _out = x.unfold(vec![3usize], vec![1usize], vec![1usize]).sum(1);
+        let _out = x
+            .unfold(vec![3usize], vec![1usize], vec![1usize])
+            .sum(vec![1]);
         let bound = luminal_reference::ReferenceBindings::leaves(&cx.logical)
             .bind(&cx.logical)
             .expect("recorder clean");

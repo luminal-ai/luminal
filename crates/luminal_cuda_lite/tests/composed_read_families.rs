@@ -225,7 +225,7 @@ fn reference_values(cx: &Graph, inputs: &[(NodeIndex, HostBuffer)], out: NodeInd
 fn gather_lowers_a_folded_coordinate_operand() {
     let mut cx = Graph::new();
     let data = cx.tensor(vec![4usize, 3usize], DType::F32);
-    let rows = cx.tensor(2usize, DType::Int);
+    let rows = cx.tensor(vec![2usize], DType::Int);
     let cols = cx.iota(vec![2usize, 3usize], |c| c[1]);
     let row_coord = rows.expand_dim(1, 3usize);
     let out = data.gather(&[row_coord, cols]);
@@ -298,7 +298,7 @@ fn gather_lowers_a_folded_coordinate_operand() {
 fn gather_lowers_a_folded_data_operand() {
     let mut cx = Graph::new();
     let base = cx.tensor(vec![3usize, 4usize], DType::F32);
-    let rows = cx.tensor(2usize, DType::Int);
+    let rows = cx.tensor(vec![2usize], DType::Int);
     let cols = cx.iota(vec![2usize, 3usize], |c| c[1]);
     // data = base^T, shape (4,3): data[i][j] = base[j][i].
     let data = base.permute(vec![1, 0]);
@@ -358,7 +358,7 @@ fn scatter_lowers_a_folded_coordinate_operand() {
     let mut cx = Graph::new();
     let init = cx.tensor(vec![4usize, 3usize], DType::F32);
     let src = cx.tensor(vec![2usize, 3usize], DType::F32);
-    let rows = cx.tensor(2usize, DType::Int);
+    let rows = cx.tensor(vec![2usize], DType::Int);
     let cols = cx.iota(vec![2usize, 3usize], |c| c[1]);
     let row_coord = rows.expand_dim(1, 3usize);
     let out = init.scatter(&[row_coord, cols], src);
@@ -441,7 +441,7 @@ fn scatter_lowers_all_read_side_folds() {
     let mut cx = Graph::new();
     let init_base = cx.tensor(vec![3usize, 4usize], DType::F32);
     let src_base = cx.tensor(vec![4usize, 3usize], DType::F32);
-    let rows = cx.tensor(2usize, DType::Int);
+    let rows = cx.tensor(vec![2usize], DType::Int);
     let cols = cx.iota(vec![2usize, 3usize], |c| c[1]);
     let init = init_base.permute(vec![1, 0]); // (4,3), init[i][j] = init_base[j][i]
     let src = src_base.slice(vec![(1..3).bounds(), (..).bounds()]); // (2,3), src[i][j] = src_base[i+1][j]

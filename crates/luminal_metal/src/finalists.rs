@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn advances_to_next_rank_when_final_validation_refuses() {
         let mut graph = Graph::new();
-        let x = graph.tensor(4, DType::F32);
+        let x = graph.tensor(vec![4], DType::F32);
         let _ = x + 1.;
         let runtime = crate::MetalRuntime::load(&graph).unwrap();
         let egraph = runtime.saturated_egraph(&Default::default()).unwrap();

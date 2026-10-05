@@ -111,10 +111,10 @@ fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
 /// Quadratic bowl loss = mean((w − target)²): gradient is analytically
 /// 2(w − target)/n, so host reference updates are exact.
 fn quadratic_setup(cx: &mut Graph, n: usize) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let w = cx.tensor(n, DType::F32);
-    let target = cx.tensor(n, DType::F32);
+    let w = cx.tensor(vec![n], DType::F32);
+    let target = cx.tensor(vec![n], DType::F32);
     let d = w - target;
-    let loss = (d * d).mean(0);
+    let loss = (d * d).mean(vec![0]);
     (w, target, loss)
 }
 
@@ -182,7 +182,7 @@ fn sgd_weight_decay_shrinks_unused_param() {
     let opt = SGD::new(0.1).weight_decay(0.5);
     let mut cx = Graph::new();
     let (w, tgt, loss) = quadratic_setup(&mut cx, 2);
-    let unused = cx.tensor(3, DType::F32);
+    let unused = cx.tensor(vec![3], DType::F32);
     let unused0 = vec![1.0, -2.0, 0.5];
     let mut t = OptTrainer::new(
         &mut cx,
@@ -258,7 +258,7 @@ fn sgd_momentum_trains_xor() {
     let x = cx.tensor(vec![4, 2], DType::F32);
     let y = cx.tensor(vec![4, 1], DType::F32);
     let w1 = cx.tensor(vec![2, hidden], DType::F32);
-    let b1 = cx.tensor(hidden, DType::F32);
+    let b1 = cx.tensor(vec![hidden], DType::F32);
     let w2 = cx.tensor(vec![hidden, 1], DType::F32);
     let pred = (x.matmul(w1) + b1.expand_dim(0, 4))
         .tanh()

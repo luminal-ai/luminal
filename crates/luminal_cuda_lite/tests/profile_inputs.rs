@@ -9,7 +9,7 @@ use support::TestTransfers;
 #[test]
 fn explicit_profile_payload_and_assignment() {
     let mut graph = Graph::new();
-    let input = graph.tensor('q', DType::F32);
+    let input = graph.tensor(vec!['q'], DType::F32);
     let output = input + 1.;
     let bounds = SymbolBounds::from_ranges([('q'.into(), (1, 128))]).unwrap();
     let dims = [('q'.into(), 128)].into_iter().collect();

@@ -71,8 +71,16 @@ impl MiniGemma3Layer {
             wk: Linear::new(d, kv_dim, false, DType::F32, &attn.child("k_proj"), cx),
             wv: Linear::new(d, kv_dim, false, DType::F32, &attn.child("v_proj"), cx),
             wo: Linear::new(q_dim, d, false, DType::F32, &attn.child("o_proj"), cx),
-            q_norm: cx.named_tensor(attn.child("q_norm").leaf("weight"), head_dim, DType::F32),
-            k_norm: cx.named_tensor(attn.child("k_norm").leaf("weight"), head_dim, DType::F32),
+            q_norm: cx.named_tensor(
+                attn.child("q_norm").leaf("weight"),
+                vec![head_dim],
+                DType::F32,
+            ),
+            k_norm: cx.named_tensor(
+                attn.child("k_norm").leaf("weight"),
+                vec![head_dim],
+                DType::F32,
+            ),
             gate: Linear::new(d, ff, false, DType::F32, &mlp.child("gate_proj"), cx),
             up: Linear::new(d, ff, false, DType::F32, &mlp.child("up_proj"), cx),
             down: Linear::new(ff, d, false, DType::F32, &mlp.child("down_proj"), cx),
@@ -125,7 +133,7 @@ impl MiniGemma3Layer {
             rope_sin,
             rope_rot,
         );
-        let query_positions = q.graph().iota(q.dims()[0], |c| c[0] + prev_seq);
+        let query_positions = q.graph().iota(vec![q.dims()[0]], |c| c[0] + prev_seq);
         let context_positions = q.graph().arange(gather_idx.dims1());
         let score_bias = if self.local {
             sliding_window_bias(query_positions, context_positions, self.window)

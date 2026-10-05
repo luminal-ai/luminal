@@ -173,8 +173,8 @@ impl Translator<'_> {
                 let keep = mask.cast(DType::F32);
                 let key_axis = keep.rank() - 1;
                 row_any_keep = Some(
-                    keep.max(key_axis)
-                        .expand_to_shape_on_axes(keep.dims(), key_axis),
+                    keep.max(vec![key_axis])
+                        .expand_to_shape_on_axes(keep.dims(), vec![key_axis]),
                 );
                 let one = self.cx.constant_f32(1.0).expand_rhs(keep.dims());
                 (one - keep) * self.constant_like(keep, -1e9)
@@ -184,7 +184,7 @@ impl Translator<'_> {
             scores = add_offset(scores, offset);
         }
 
-        let mut attn = scores.softmax(q_ndim - 1);
+        let mut attn = scores.softmax(vec![q_ndim - 1]);
         if let Some(indicator) = row_any_keep {
             let (a, i) = util::ensure_same_dtype(attn, indicator);
             let (a, i) = util::broadcast_binary(a, i);

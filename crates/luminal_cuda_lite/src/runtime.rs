@@ -1202,7 +1202,7 @@ mod caller_memory_tests {
     #[test]
     fn host_staging_can_be_shared_between_programs() {
         let mut graph = Graph::new();
-        let output = graph.iota('n', |coords| coords[0]);
+        let output = graph.iota(vec!['n'], |coords| coords[0]);
         let mut first = CudaRuntime::load(&graph).unwrap();
         first
             .search(
@@ -1243,9 +1243,9 @@ mod caller_memory_tests {
     #[test]
     fn application_state_survives_replaced_execution_storage() {
         let mut graph = Graph::new();
-        let state = graph.tensor(4, DType::F32);
-        let increment = graph.tensor(4, DType::F32);
-        let previous = state.sum(0);
+        let state = graph.tensor(vec![4], DType::F32);
+        let increment = graph.tensor(vec![4], DType::F32);
+        let previous = state.sum(vec![0]);
         let next = state + increment;
         let mut bindings = crate::bindings::CudaBindings::new();
         let state_id = bindings.input_external(state.id);

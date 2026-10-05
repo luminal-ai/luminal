@@ -133,7 +133,7 @@ fn main() {
         let t0 = Instant::now();
         let mut cx = Graph::new();
         let x = cx.tensor(vec![4, 4, 64, 64], DType::F32);
-        let _ = x.cumsum(3);
+        let _ = x.cumsum(vec![3]);
         let pairs = vec![(x.id, TypedBuffer::from(random_vec(4 * 4 * 64 * 64)))];
         measure_plan("cumsum_big", &cx, &pairs, t0);
     }

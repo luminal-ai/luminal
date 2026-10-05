@@ -204,7 +204,7 @@ pub fn packed_sequence_ids(indptr: GraphTensor, item_count: IntExpr) -> GraphTen
     boundaries
         .le(items)
         .cast(DType::Int)
-        .sum(1)
+        .sum(vec![1])
         .cast(DType::Int)
         - 1
 }
@@ -419,7 +419,7 @@ pub fn grouped_query_attention(
         scores.dims(),
         "attention bias dimensions do not match scores"
     );
-    grouped_query_apply((scores + bias).softmax(3), values, geometry)
+    grouped_query_apply((scores + bias).softmax(vec![3]), values, geometry)
 }
 
 /// Write new keys and values, read the requested context, and evaluate GQA.
@@ -570,7 +570,9 @@ pub fn rope_tables_partial(
 pub fn rms_norm_heads_unweighted(x: GraphTensor, head_dim: usize, epsilon: f32) -> GraphTensor {
     let heads = x.split_dims(1, head_dim);
     let dims = heads.dims();
-    let inv = ((heads * heads).mean(2) + epsilon).sqrt().reciprocal();
+    let inv = ((heads * heads).mean(vec![2]) + epsilon)
+        .sqrt()
+        .reciprocal();
     (heads * inv.view().unsqueeze(2).expand(dims).finish()).merge_dims(1, 2)
 }
 
@@ -582,7 +584,9 @@ pub fn rms_norm_heads(
 ) -> GraphTensor {
     let heads = x.split_dims(1, head_dim); // (s, n_heads, head_dim)
     let dims = heads.dims();
-    let inv = ((heads * heads).mean(2) + epsilon).sqrt().reciprocal(); // (s, n_heads)
+    let inv = ((heads * heads).mean(vec![2]) + epsilon)
+        .sqrt()
+        .reciprocal(); // (s, n_heads)
     let scaled = heads
         * inv.view().unsqueeze(2).expand(dims.clone()).finish()
         * weight
@@ -627,7 +631,7 @@ pub fn attention(
         .permute(vec![1, 0, 2])
         .finish(); // (nh, sk, hd)
     let scores = q.matmul(k) * scale; // (nh, sq, sk)
-    let weights = scores.softmax(2);
+    let weights = scores.softmax(vec![2]);
     let out = weights.matmul(v); // (nh, sq, hd)
     let _ = (sq, sk);
     out.view().permute(vec![1, 0, 2]).merge_dims(1, 2).finish() // (sq, nh·hd)
@@ -661,7 +665,7 @@ mod tests {
     fn gather_rows_selects_rows() {
         let mut cx = Graph::new();
         let data = cx.tensor(vec![4, 3], DType::F32);
-        let idx = cx.tensor(2, DType::Int);
+        let idx = cx.tensor(vec![2], DType::Int);
         let out = gather_rows(data, idx);
 
         let data_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
@@ -689,7 +693,7 @@ mod tests {
     fn gather_rows_preserves_trailing_axes() {
         let mut cx = Graph::new();
         let data = cx.tensor(vec![3, 2, 2], DType::F32);
-        let indices = cx.tensor(2, DType::Int);
+        let indices = cx.tensor(vec![2], DType::Int);
         let output = gather_rows(data, indices);
         assert_eq!(
             output.dims(),
@@ -718,7 +722,7 @@ mod tests {
     fn scatter_rows_replaces_rows() {
         let mut cx = Graph::new();
         let src = cx.tensor(vec![2, 3], DType::F32);
-        let idx = cx.tensor(2, DType::Int);
+        let idx = cx.tensor(vec![2], DType::Int);
         let dest = cx.tensor(vec![4, 3], DType::F32);
         let out = scatter_rows(src, idx, dest);
         assert_eq!(out.dims(), dest.dims());
@@ -770,9 +774,9 @@ mod tests {
         let v_new = cx.tensor(vec![1, HIDDEN], DType::F32);
         let k_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
         let v_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
-        let gather_idx = cx.tensor(CTX, DType::Int);
-        let scatter_idx = cx.tensor(1, DType::Int);
-        let query_positions = cx.iota(1, |c| c[0] + IntExpr::from(prev_seq));
+        let gather_idx = cx.tensor(vec![CTX], DType::Int);
+        let scatter_idx = cx.tensor(vec![1], DType::Int);
+        let query_positions = cx.iota(vec![1], |c| c[0] + IntExpr::from(prev_seq));
         let key_positions = cx.arange(CTX);
         let result = paged_attention(
             q,
@@ -931,9 +935,9 @@ mod tests {
         let v_new = cx.tensor(vec![1, HIDDEN], DType::F32);
         let k_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
         let v_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
-        let gather_idx = cx.tensor(CTX, DType::Int);
-        let scatter_idx = cx.tensor(1, DType::Int);
-        let q_pos = cx.tensor(1, DType::Int);
+        let gather_idx = cx.tensor(vec![CTX], DType::Int);
+        let scatter_idx = cx.tensor(vec![1], DType::Int);
+        let q_pos = cx.tensor(vec![1], DType::Int);
         let key_positions = cx.arange(CTX);
         let result_pos = paged_attention(
             q,
@@ -944,7 +948,7 @@ mod tests {
             causal_bias(q_pos, key_positions),
             AttentionGeometry::new(N_HEADS, N_KV_HEADS, HEAD_DIM),
         );
-        let expr_positions = cx.iota(1, |c| c[0] + IntExpr::from(q_position));
+        let expr_positions = cx.iota(vec![1], |c| c[0] + IntExpr::from(q_position));
         let result_expr = paged_attention(
             q,
             k_new,
@@ -1028,9 +1032,9 @@ mod tests {
     #[test]
     fn packed_causal_bias_isolates_variable_length_sequences() {
         let mut cx = Graph::new();
-        let query_positions = cx.tensor(3, DType::Int);
-        let query_indptr = cx.tensor(3, DType::Int);
-        let context_indptr = cx.tensor(3, DType::Int);
+        let query_positions = cx.tensor(vec![3], DType::Int);
+        let query_indptr = cx.tensor(vec![3], DType::Int);
+        let context_indptr = cx.tensor(vec![3], DType::Int);
         let bias = packed_causal_bias(
             query_positions,
             query_indptr,
@@ -1063,8 +1067,8 @@ mod tests {
     #[test]
     fn sliding_window_bias_masks_future_and_old_context() {
         let mut cx = Graph::new();
-        let query_positions = cx.tensor(1, DType::Int);
-        let key_positions = cx.tensor(5, DType::Int);
+        let query_positions = cx.tensor(vec![1], DType::Int);
+        let key_positions = cx.tensor(vec![5], DType::Int);
         let bias = sliding_window_bias(query_positions, key_positions, 2);
 
         let rt = luminal_reference::harness::run_reference(
@@ -1083,8 +1087,8 @@ mod tests {
     #[test]
     fn sequence_isolation_bias_supports_interleaved_context() {
         let mut cx = Graph::new();
-        let query_sequences = cx.tensor(2, DType::Int);
-        let key_sequences = cx.tensor(4, DType::Int);
+        let query_sequences = cx.tensor(vec![2], DType::Int);
+        let key_sequences = cx.tensor(vec![4], DType::Int);
         let bias = sequence_isolation_bias(query_sequences, key_sequences);
 
         let rt = luminal_reference::harness::run_reference(
@@ -1123,8 +1127,8 @@ mod score_bias_tests {
         let v_new = cx.tensor(vec![1, HIDDEN], DType::F32);
         let k_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
         let v_cache = cx.tensor(vec![SLOTS, HIDDEN], DType::F32);
-        let gather_idx = cx.tensor(CTX, DType::Int);
-        let scatter_idx = cx.tensor(1, DType::Int);
+        let gather_idx = cx.tensor(vec![CTX], DType::Int);
+        let scatter_idx = cx.tensor(vec![1], DType::Int);
         let mask = cx.tensor(vec![1, CTX], DType::F32);
         let result = paged_attention(
             q,

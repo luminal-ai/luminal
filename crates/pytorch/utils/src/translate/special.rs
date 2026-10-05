@@ -1266,9 +1266,9 @@ impl Translator<'_> {
             }
         }
         let reduction_axis = rank;
-        let maximum = windows.max(reduction_axis);
+        let maximum = windows.max(vec![reduction_axis]);
         let expanded = maximum.expand_dim(reduction_axis, windows.dims()[reduction_axis]);
-        let ordinary = maximum + (windows - expanded).exp().sum(reduction_axis).log();
+        let ordinary = maximum + (windows - expanded).exp().sum(vec![reduction_axis]).log();
 
         // Positive infinity is detected directly: `util::signbit` reads the
         // sign through `reciprocal().lt(0)`, and `reciprocal(-inf)` is `-0.0`
@@ -1279,13 +1279,16 @@ impl Translator<'_> {
             _ => f32::MAX as f64,
         };
         let positive_infinite = windows.gt(self.constant_like(windows, largest));
-        let positive_count = positive_infinite.cast(DType::F32).sum(reduction_axis);
+        let positive_count = positive_infinite.cast(DType::F32).sum(vec![reduction_axis]);
         let zero = self.constant_like(positive_count, 0.0);
         let has_positive_infinity = positive_count.gt(zero);
         let infinity = self.constant_like(ordinary, f64::INFINITY);
         let result = self.special_select(has_positive_infinity, infinity, ordinary);
 
-        let nan_count = self.is_nan(windows).cast(DType::F32).sum(reduction_axis);
+        let nan_count = self
+            .is_nan(windows)
+            .cast(DType::F32)
+            .sum(vec![reduction_axis]);
         let zero = self.constant_like(nan_count, 0.0);
         let has_nan = nan_count.gt(zero);
         let nan = self.constant_like(result, f64::NAN);

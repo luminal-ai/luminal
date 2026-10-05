@@ -208,7 +208,7 @@ fn a_familiar_label_without_metal_traits_is_not_claimed() {
     let mut graph = luminal::graph::Graph::new();
     // A binding names at least one output, so the graph carries a leaf;
     // the allow list is the registry's, whatever the graph holds.
-    let a = graph.tensor(3, DType::F32);
+    let a = graph.tensor(vec![3], DType::F32);
     let _out = a + 1.;
     let registry = vec![RegisteredOp::new(
         Box::new(luminal_reference::ops::AddFunctionalMatcher),
@@ -222,8 +222,8 @@ fn a_familiar_label_without_metal_traits_is_not_claimed() {
 #[test]
 fn external_kernel_launch_geometry_updates_reuse_compiled_pipeline() {
     let mut graph = luminal::graph::Graph::new();
-    let a = graph.tensor('a', DType::F32);
-    let b = graph.tensor('a', DType::F32);
+    let a = graph.tensor(vec!['a'], DType::F32);
+    let b = graph.tensor(vec!['a'], DType::F32);
     let out = a + b;
     let mut registry = metal_registry();
     registry.retain(|e| e.constructor() != AddFunctionalMatcher.egglog_constructor());

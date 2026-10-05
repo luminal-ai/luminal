@@ -669,8 +669,8 @@ mod tests {
     fn search_returns_a_correct_plan_and_dedups_duplicate_plans() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor(4, DType::F32);
-            let y = cx.tensor(4, DType::F32);
+            let x = cx.tensor(vec![4], DType::F32);
+            let y = cx.tensor(vec![4], DType::F32);
             let a = x + y;
             let m = x * y;
             (cx, x, y, a, m)

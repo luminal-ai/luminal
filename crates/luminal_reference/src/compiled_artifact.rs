@@ -626,7 +626,7 @@ mod tests {
         let mut graph = Graph::new();
         let x = graph.tensor(vec![IntExpr::from('n'), 2.into()], DType::F32);
         // Axis 1 must survive serialization; folding axis 0 changes the result.
-        let out = x.cumsum(1).cumprod(1).cummax(1);
+        let out = x.cumsum(vec![1]).cumprod(vec![1]).cummax(vec![1]);
         let output = crate::ReferenceBindings::leaves(&graph.logical).outputs()[0].buffer;
         let bounds = SymbolBounds::from_ranges([('n'.into(), (1, 4))]).unwrap();
         let dims = [('n'.into(), 2)].into_iter().collect();

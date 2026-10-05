@@ -332,7 +332,7 @@ impl Translator<'_> {
         // `cond` keeps the weight dtype exact (util::select projects the
         // condition through F32, which would mix dtypes for F64/F16).
         let mut weights = unbounded.cond(positive, zero);
-        let normalization = weights.sum(1).expand_dim(1, input_size);
+        let normalization = weights.sum(vec![1]).expand_dim(1, input_size);
         weights /= normalization;
 
         let weights_precision = if quantized_u8 {
@@ -379,7 +379,7 @@ impl Translator<'_> {
             weights = weights.expand_dim(dim + 1, input.dims()[dim]);
         }
         candidates *= weights;
-        let result = candidates.sum(axis + 1);
+        let result = candidates.sum(vec![axis + 1]);
         if let Some(precision) = weights_precision {
             let result = result.cast(DType::F64);
             let bias = self.constant_like(result, (1_u64 << (precision - 1)) as f64);

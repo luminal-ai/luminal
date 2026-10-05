@@ -523,9 +523,9 @@ mod caller_memory_tests {
     #[test]
     fn application_state_survives_replaced_execution_storage() {
         let mut graph = Graph::new();
-        let state = graph.tensor(4, DType::F32);
-        let increment = graph.tensor(4, DType::F32);
-        let previous = state.sum(0);
+        let state = graph.tensor(vec![4], DType::F32);
+        let increment = graph.tensor(vec![4], DType::F32);
+        let previous = state.sum(vec![0]);
         let next = state + increment;
         let mut bindings = crate::bindings::MetalBindings::new();
         let state_id = bindings.input_external(state.id);

@@ -438,7 +438,7 @@ impl Translator<'_> {
         // The insertion count is carried in F32 (exact below 2^24) so the
         // NaN redirect can use the native F32 `cond`; an Int `cond` is refused
         // because it would have to cast the F32 complement back to Int.
-        let mut result = before.cast(DType::F32).sum(query_rank);
+        let mut result = before.cast(DType::F32).sum(vec![query_rank]);
         if matches!(
             query.dtype,
             DType::F16 | DType::Bf16 | DType::F32 | DType::F64
@@ -469,7 +469,10 @@ impl Translator<'_> {
         let flat_truth = truth.flatten();
         // 1s first and stable: true positions in row-major order.
         let sorted = flat_truth.cast(DType::F32).stable_argsort(0, true);
-        let count = flat_truth.cast(DType::F32).sum(0).trunc_cast(DType::Int);
+        let count = flat_truth
+            .cast(DType::F32)
+            .sum(vec![0])
+            .trunc_cast(DType::Int);
         let numel = input_shape
             .iter()
             .fold(IntExpr::from(1), |acc, dim| acc * *dim);
@@ -671,17 +674,17 @@ impl Translator<'_> {
             .cast(DType::Int)
             .expand_dim(1, indices.dims()[0]);
         let indices = indices.expand_dim(0, rows);
-        let selected_count = row_ids.eq(indices).cast(DType::Int).sum(1);
+        let selected_count = row_ids.eq(indices).cast(DType::Int).sum(vec![1]);
         let zero_count = self.cx.constant_i32(0).expand_rhs(selected_count.dims());
         let selected = selected_count.gt(zero_count);
 
         let magnitude = self.real_abs(weight);
         let norm = if norm_type == f64::INFINITY {
-            magnitude.max(1)
+            magnitude.max(vec![1])
         } else {
             magnitude
                 .pow(norm_type as f32)
-                .sum(1)
+                .sum(vec![1])
                 .pow((1.0 / norm_type) as f32)
         };
         let maximum = self.constant_like(norm, max_norm);

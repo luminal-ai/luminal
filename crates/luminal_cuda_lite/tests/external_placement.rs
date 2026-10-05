@@ -12,8 +12,8 @@ use luminal_cuda_lite::{CudaBindings, CudaRuntime, harness_search_options};
 /// `a + b` with `a` on caller device memory and `b` host-staged.
 fn runtime() -> (CudaRuntime, i64, i64) {
     let mut cx = Graph::new();
-    let a = cx.tensor(4, DType::F32);
-    let b = cx.tensor(4, DType::F32);
+    let a = cx.tensor(vec![4], DType::F32);
+    let b = cx.tensor(vec![4], DType::F32);
     let sum = a + b;
     let mut bindings = CudaBindings::new();
     let external = bindings.input_external(a.id);
@@ -86,8 +86,8 @@ fn execute_refuses_an_external_buffer_with_no_pointer() {
 #[test]
 fn a_sink_and_its_target_share_one_external_buffer() {
     let mut cx = Graph::new();
-    let state = cx.tensor(4, DType::F32);
-    let delta = cx.tensor(4, DType::F32);
+    let state = cx.tensor(vec![4], DType::F32);
+    let delta = cx.tensor(vec![4], DType::F32);
     let next = state + delta;
     let mut bindings = CudaBindings::new();
     let home = bindings.input_external(state.id);
@@ -114,8 +114,8 @@ fn a_sink_and_its_target_share_one_external_buffer() {
 )]
 fn an_external_output_slot_sits_on_the_bound_buffer() {
     let mut cx = Graph::new();
-    let a = cx.tensor(4, DType::F32);
-    let b = cx.tensor(4, DType::F32);
+    let a = cx.tensor(vec![4], DType::F32);
+    let b = cx.tensor(vec![4], DType::F32);
     let sum = a + b;
     let mut bindings = CudaBindings::new();
     bindings.input(a.id);

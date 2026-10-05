@@ -452,7 +452,7 @@ mod forward_tests {
         let mut cx = Graph::new();
         let input = cx.tensor(vec![1, 1, 2, 2], DType::F32);
         let weight = cx.tensor(vec![2, 1], DType::F32);
-        let bias = cx.tensor(2, DType::F32);
+        let bias = cx.tensor(vec![2], DType::F32);
         let config = ConvNdConfig::new([1, 1], [1, 1], [1, 1], [0, 0]);
         let output = conv_nd(input, weight, Some(bias), &config);
         let runtime = luminal_reference::harness::run_reference(

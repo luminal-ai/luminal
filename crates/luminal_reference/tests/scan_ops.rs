@@ -36,7 +36,7 @@ fn cumsum_is_an_inclusive_scan() {
     let got = run_f32(
         |cx| {
             let a = cx.tensor(vec![4], DType::F32);
-            (a, a.cumsum(0))
+            (a, a.cumsum(vec![0]))
         },
         vec![1.0, 2.0, 3.0, 4.0],
     );
@@ -48,7 +48,7 @@ fn cummax_is_an_inclusive_scan() {
     let got = run_f32(
         |cx| {
             let a = cx.tensor(vec![5], DType::F32);
-            (a, a.cummax(0))
+            (a, a.cummax(vec![0]))
         },
         vec![1.0, 3.0, 2.0, 5.0, 4.0],
     );
@@ -60,7 +60,7 @@ fn cumprod_is_an_inclusive_scan() {
     let got = run_f32(
         |cx| {
             let a = cx.tensor(vec![4], DType::F32);
-            (a, a.cumprod(0))
+            (a, a.cumprod(vec![0]))
         },
         vec![1.0, 2.0, 3.0, 4.0],
     );
@@ -75,7 +75,7 @@ fn cumprod_carries_signs_through_negatives() {
     let got = run_f32(
         |cx| {
             let a = cx.tensor(vec![4], DType::F32);
-            (a, a.cumprod(0))
+            (a, a.cumprod(vec![0]))
         },
         vec![-1.0, 2.0, -3.0, 4.0],
     );
@@ -94,7 +94,7 @@ fn prod_reduces_negatives_without_nan() {
         let got = run_f32(
             move |cx| {
                 let a = cx.tensor(vec![1, cols], DType::F32);
-                (a, a.prod(1))
+                (a, a.prod(vec![1]))
             },
             input.clone(),
         );
@@ -109,7 +109,7 @@ fn prod_over_a_statically_empty_axis_is_one() {
     let got = run_f32(
         |cx| {
             let a = cx.tensor(vec![1, 0], DType::F32);
-            (a, a.prod(1))
+            (a, a.prod(vec![1]))
         },
         vec![],
     );
@@ -121,8 +121,8 @@ fn prod_over_a_statically_empty_axis_is_one() {
 fn prod_of_a_rank0_operand_is_the_value() {
     let got = run_f32(
         |cx| {
-            let a = cx.tensor((), DType::F32);
-            (a, a.prod(()))
+            let a = cx.tensor(vec![] as Vec<usize>, DType::F32);
+            (a, a.prod(vec![]))
         },
         vec![7.0],
     );
@@ -136,7 +136,7 @@ fn cumsum_scans_each_row_independently() {
     let got = run_f32(
         |cx| {
             let a = cx.tensor(vec![2, 3], DType::F32);
-            (a, a.cumsum(1))
+            (a, a.cumsum(vec![1]))
         },
         vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0],
     );

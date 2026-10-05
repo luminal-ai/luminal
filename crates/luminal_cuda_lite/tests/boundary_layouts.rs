@@ -661,8 +661,8 @@ fn a_symbolic_strided_output_binds_at_its_own_dim() {
 )]
 fn an_output_bound_on_a_read_write_input_shares_its_buffer() {
     let mut cx = Graph::new();
-    let state = cx.tensor(4usize, DType::F32);
-    let delta = cx.tensor(4usize, DType::F32);
+    let state = cx.tensor(vec![4usize], DType::F32);
+    let delta = cx.tensor(vec![4usize], DType::F32);
     let next = state + delta;
 
     let mut bindings = CudaBindings::new();
@@ -713,7 +713,7 @@ fn an_output_bound_on_a_read_write_input_shares_its_buffer() {
 #[test]
 fn a_value_bound_on_two_buffers_has_no_tensor_keyed_slot() {
     let mut cx = Graph::new();
-    let x = cx.tensor(4usize, DType::F32);
+    let x = cx.tensor(vec![4usize], DType::F32);
     let out = x + 1.;
 
     let mut bindings = CudaBindings::new();

@@ -189,7 +189,7 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal::layouts::
             searched_plan(|cx| {
                 let a = cx.tensor(vec![3usize, 4usize], DType::F32);
                 let b = cx.tensor(vec![3usize, 4usize], DType::F32);
-                let _ = (a * b).sum(1);
+                let _ = (a * b).sum(vec![1]);
                 [
                     (a.id, vec![1.0f32; 12].into()),
                     (b.id, vec![2.0f32; 12].into()),

@@ -376,7 +376,11 @@ impl Translator<'_> {
             return Ok(x);
         }
         let dim = normalize_dim(dim, x.rank());
-        Ok(if prod { x.cumprod(dim) } else { x.cumsum(dim) })
+        Ok(if prod {
+            x.cumprod(vec![dim])
+        } else {
+            x.cumsum(vec![dim])
+        })
     }
 
     /// `max.dim` / `min.dim`: values and indices into one graph.
@@ -388,9 +392,9 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|i| i.arg.as_bool()))
             .unwrap_or(false);
         let (values, indices) = if max {
-            (x.max(dim), x.argmax(dim))
+            (x.max(vec![dim]), x.argmax(dim))
         } else {
-            (x.min(dim), x.argmin(dim))
+            (x.min(vec![dim]), x.argmin(dim))
         };
         let indices = if indices.dtype != DType::I64 {
             indices.cast(DType::I64)
@@ -568,9 +572,9 @@ impl Translator<'_> {
         let x = self.operand(&node.inputs[0])?;
         let dim = normalize_dim(self.get_int_arg(node, 1)?, x.rank());
         Ok(if log {
-            x.log_softmax(dim)
+            x.log_softmax(vec![dim])
         } else {
-            x.softmax(dim)
+            x.softmax(vec![dim])
         })
     }
 

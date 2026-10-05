@@ -85,7 +85,7 @@ fn recorded_bias_program() -> (String, String, usize) {
     let mut cx = Graph::new();
     let x = cx.tensor(vec![4usize, 8usize], DType::F32);
     let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-    let b = cx.tensor(3usize, DType::F32);
+    let b = cx.tensor(vec![3usize], DType::F32);
     let out = x.matmul(w) + b.expand_dim(0, 4usize);
     let text = test_runtime::bind_leaves(&cx);
     (text, format!("v{}", out.id.index()), out.id.index())

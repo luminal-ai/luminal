@@ -429,9 +429,9 @@ fn marker_matmul_program() -> String {
 /// BEFORE the schedule so saturation sees it.
 fn re_description_program() -> String {
     let mut cx = Graph::new();
-    let x = cx.tensor(4usize, DType::F32);
-    let y = cx.tensor(4usize, DType::F32);
-    let z = cx.tensor(4usize, DType::F32);
+    let x = cx.tensor(vec![4usize], DType::F32);
+    let y = cx.tensor(vec![4usize], DType::F32);
+    let z = cx.tensor(vec![4usize], DType::F32);
     let a = x + y;
     let b = a - x;
     let c = z + b;

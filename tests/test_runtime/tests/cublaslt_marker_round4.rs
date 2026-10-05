@@ -99,7 +99,7 @@ fn t6a_bufferize_all_four_forms() {
             Box::new(|cx: &mut Graph| {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = x.matmul(w) + b.expand_dim(0, 4usize);
             }),
         ),
@@ -120,7 +120,7 @@ fn t6a_bufferize_all_four_forms() {
                 let x = cx.tensor(vec![4usize, 8usize], DType::F32);
                 let w = cx.tensor(vec![8usize, 3usize], DType::F32);
                 let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-                let b = cx.tensor(3usize, DType::F32);
+                let b = cx.tensor(vec![3usize], DType::F32);
                 let _ = (x.matmul(w) + c) + b.expand_dim(0, 4usize);
             }),
         ),

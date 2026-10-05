@@ -564,14 +564,14 @@ impl Translator<'_> {
             return Ok(self.cast_scalar(0.0, DType::I64).expand_rhs(vec![out_len]));
         }
         // F32 carries the inclusive prefix sums exactly (counts < 2^24).
-        let ends = repeats.cast(DType::F32).cumsum(0);
+        let ends = repeats.cast(DType::F32).cumsum(vec![0]);
         let ends = ends.expand_dim(0, out_len);
         let positions = self
             .cx
             .arange(out_len)
             .cast(DType::F32)
             .expand_dim(1, count);
-        let counts = ends.le(positions).cast(DType::Int).sum(1);
+        let counts = ends.le(positions).cast(DType::Int).sum(vec![1]);
         Ok(counts.cast(DType::I64))
     }
 
@@ -803,7 +803,7 @@ impl Translator<'_> {
         let nan = self.is_nan(value);
         let order = nan.cast(DType::F32).stable_argsort(axis, true);
         let first = order.slice_along(0..1, axis).squeeze(axis);
-        let count = nan.cast(DType::Int).sum(axis);
+        let count = nan.cast(DType::Int).sum(vec![axis]);
         let zero = self.cx.constant_i32(0).expand_rhs(count.dims());
         let has_nan = count.gt(zero);
         (first, has_nan)
@@ -869,7 +869,7 @@ impl Translator<'_> {
             let value_order = key.stable_argsort(axis, false);
             let nan_order = nan_mask.cast(DType::F32).stable_argsort(axis, false);
             let sort_order = self.order_gather(value_order, nan_order, axis);
-            let nan_count = nan_mask.cast(DType::Int).sum(axis);
+            let nan_count = nan_mask.cast(DType::Int).sum(vec![axis]);
             let length = self
                 .cx
                 .constant_i32(axis_len)
@@ -894,7 +894,7 @@ impl Translator<'_> {
             let median_index = self.order_gather(sort_order, median_pos, axis);
             let has_nan = float.then(|| {
                 let nan_mask = self.is_nan(base);
-                let count = nan_mask.cast(DType::Int).sum(axis);
+                let count = nan_mask.cast(DType::Int).sum(vec![axis]);
                 let zero = self.cx.constant_i32(0).expand_rhs(count.dims());
                 count.gt(zero)
             });

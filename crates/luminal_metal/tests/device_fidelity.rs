@@ -85,7 +85,7 @@ fn reduce_and_broadcast() {
     let mut cx = Graph::new();
     let a = cx.tensor(vec![3usize, 4usize], DType::F32);
     let e = a.exp();
-    let out = e / e.sum(1).expand_dim(1, 4);
+    let out = e / e.sum(vec![1]).expand_dim(1, 4);
     let (want, got) = run_both(
         &cx,
         &[(a.id, (0..12).map(|i| i as f32 * 0.25).collect())],
@@ -109,7 +109,7 @@ fn movement_materialize() {
 fn iota_arange() {
     let mut cx = Graph::new();
     let idx = cx.arange(6usize);
-    let a = cx.tensor(6usize, DType::F32);
+    let a = cx.tensor(vec![6usize], DType::F32);
     let out = a * idx.cast(luminal::dtype::DType::F32);
     let (want, got) = run_both(&cx, &[(a.id, vec![2.0; 6])], out.id);
     assert_close(&want, &got, "arange*x");
@@ -132,8 +132,8 @@ fn gather_rows() {
 #[test]
 fn scatter_write() {
     let mut cx = Graph::new();
-    let init = cx.tensor(6usize, DType::F32);
-    let src = cx.tensor(2usize, DType::F32);
+    let init = cx.tensor(vec![6usize], DType::F32);
+    let src = cx.tensor(vec![2usize], DType::F32);
     let coords = cx.arange(2usize); // write positions 0 and 1
     let out = init.scatter(&[coords], src);
     let (want, got) = run_both(
@@ -154,8 +154,8 @@ fn assert_exact_both(want: &[f32], got: &[f32], expected: &[f32], what: &str) {
 #[test]
 fn cumsum_rank1() {
     let mut cx = Graph::new();
-    let a = cx.tensor(4usize, DType::F32);
-    let out = a.cumsum(0);
+    let a = cx.tensor(vec![4usize], DType::F32);
+    let out = a.cumsum(vec![0]);
     let (want, got) = run_both(&cx, &[(a.id, vec![1.0, 2., 3., 4.])], out.id);
     assert_exact_both(&want, &got, &[1.0, 3., 6., 10.], "cumsum [1,2,3,4]");
 }
@@ -163,8 +163,8 @@ fn cumsum_rank1() {
 #[test]
 fn cumprod_carries_signs() {
     let mut cx = Graph::new();
-    let a = cx.tensor(4usize, DType::F32);
-    let out = a.cumprod(0);
+    let a = cx.tensor(vec![4usize], DType::F32);
+    let out = a.cumprod(vec![0]);
     let (want, got) = run_both(&cx, &[(a.id, vec![-1.0, 2., -3., 4.])], out.id);
     assert_exact_both(&want, &got, &[-1.0, -2., 6., 24.], "cumprod [-1,2,-3,4]");
 }
@@ -172,8 +172,8 @@ fn cumprod_carries_signs() {
 #[test]
 fn cummax_is_the_running_maximum() {
     let mut cx = Graph::new();
-    let a = cx.tensor(8usize, DType::F32);
-    let out = a.cummax(0);
+    let a = cx.tensor(vec![8usize], DType::F32);
+    let out = a.cummax(vec![0]);
     let (want, got) = run_both(
         &cx,
         &[(a.id, vec![-5.0, -3., -9., -1., -7., -2., -8., -4.])],
@@ -191,7 +191,7 @@ fn cummax_is_the_running_maximum() {
 fn prod_along_rows() {
     let mut cx = Graph::new();
     let a = cx.tensor(vec![2usize, 2usize], DType::F32);
-    let out = a.prod(1);
+    let out = a.prod(vec![1]);
     let (want, got) = run_both(&cx, &[(a.id, vec![-2.0, 3., -2., -3.])], out.id);
     assert_exact_both(&want, &got, &[-6.0, 6.], "prod over rows");
 }
@@ -202,7 +202,7 @@ fn prod_along_rows() {
 fn cumsum_along_the_outer_axis() {
     let mut cx = Graph::new();
     let a = cx.tensor(vec![3usize, 2usize], DType::F32);
-    let out = a.cumsum(0);
+    let out = a.cumsum(vec![0]);
     let (want, got) = run_both(&cx, &[(a.id, vec![1.0, 2., 3., 4., 5., 6.])], out.id);
     assert_exact_both(
         &want,
@@ -217,7 +217,7 @@ fn cumsum_along_the_outer_axis() {
 fn cummax_along_the_outer_axis() {
     let mut cx = Graph::new();
     let a = cx.tensor(vec![3usize, 2usize], DType::F32);
-    let out = a.cummax(0);
+    let out = a.cummax(vec![0]);
     let (want, got) = run_both(&cx, &[(a.id, vec![-1.0, 6., 3., -2., 2., 5.])], out.id);
     assert_exact_both(
         &want,
@@ -233,8 +233,8 @@ fn cummax_along_the_outer_axis() {
 fn int_cummax_over_negatives() {
     let input = vec![-7i32, -9, -3, -5];
     let mut cx = Graph::new();
-    let a = cx.tensor(4usize, DType::Int);
-    let out = a.cummax(0);
+    let a = cx.tensor(vec![4usize], DType::Int);
+    let out = a.cummax(vec![0]);
     let mut rt = MetalRuntime::load(&cx).expect("device load");
     let data: FxHashMap<NodeIndex, HostBuffer> =
         [(a.id, input.clone().into())].into_iter().collect();
@@ -280,7 +280,7 @@ fn assert_exact_both_with_nan(want: &[f32], got: &[f32], expected: &[f32], what:
 fn max_propagates_nan() {
     let mut cx = Graph::new();
     let a = cx.tensor(vec![2usize, 2usize], DType::F32);
-    let out = a.max(1);
+    let out = a.max(vec![1]);
     let (want, got) = run_both(&cx, &[(a.id, vec![1.0, f32::NAN, 3., 2.])], out.id);
     assert_exact_both_with_nan(&want, &got, &[f32::NAN, 3.0], "max over rows with a NaN");
 }
@@ -289,8 +289,8 @@ fn max_propagates_nan() {
 #[test]
 fn cummax_propagates_nan() {
     let mut cx = Graph::new();
-    let a = cx.tensor(4usize, DType::F32);
-    let out = a.cummax(0);
+    let a = cx.tensor(vec![4usize], DType::F32);
+    let out = a.cummax(vec![0]);
     let (want, got) = run_both(&cx, &[(a.id, vec![1.0, f32::NAN, 2., 3.])], out.id);
     assert_exact_both_with_nan(
         &want,
@@ -306,7 +306,7 @@ fn cummax_propagates_nan() {
 fn scan_chain_runs_across_one_declared_domain() {
     let mut graph = Graph::new();
     let x = graph.tensor(vec![IntExpr::from('n'), 2.into()], DType::F32);
-    let out = x.cumsum(0).cumprod(0).cummax(0);
+    let out = x.cumsum(vec![0]).cumprod(vec![0]).cummax(vec![0]);
     let bounds = luminal::shape::SymbolBounds::from_ranges([('n'.into(), (1, 6))]).unwrap();
     let dims = [('n'.into(), 3)].into_iter().collect();
     let data = [(x.id, HostBuffer::from([-1f32, 2.].repeat(3)))]

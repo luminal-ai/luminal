@@ -92,7 +92,7 @@ fn oversized_products_are_pruned_before_search_and_fused_dot_matches_reference()
 #[test]
 fn impossible_boundary_is_rejected_before_any_device_launch() {
     let mut graph = Graph::new();
-    let input = graph.tensor(1024, DType::F32);
+    let input = graph.tensor(vec![1024], DType::F32);
     let _output = input + 1.;
     let mut runtime = MetalRuntime::load(&graph).unwrap();
     let error = runtime

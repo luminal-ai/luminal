@@ -219,7 +219,7 @@ fn a_familiar_label_without_cuda_traits_is_not_claimed() {
     // to have a leaf to bind. The subject is the REGISTRY's claim
     // derivation, which reads the rows and never the graph.
     let mut graph = luminal::graph::Graph::new();
-    let x = graph.tensor(2usize, DType::F32);
+    let x = graph.tensor(vec![2usize], DType::F32);
     let _leaf = x + x;
     let registry = vec![RegisteredOp::new(
         Box::new(luminal_reference::ops::AddFunctionalMatcher),
@@ -503,8 +503,8 @@ mod host_graphs {
 #[test]
 fn external_kernel_launch_geometry_updates_without_reinstantiation() {
     let mut graph = luminal::graph::Graph::new();
-    let a = graph.tensor('a', DType::F32);
-    let b = graph.tensor('a', DType::F32);
+    let a = graph.tensor(vec!['a'], DType::F32);
+    let b = graph.tensor(vec!['a'], DType::F32);
     let out = a + b;
     let mut registry = cuda_registry_without_cublaslt();
     registry.retain(|e| e.constructor() != AddFunctionalMatcher.egglog_constructor());

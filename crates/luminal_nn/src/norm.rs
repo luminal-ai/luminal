@@ -8,7 +8,12 @@ pub fn layer_norm(
     bias: Option<GraphTensor>,
     epsilon: f32,
 ) -> GraphTensor {
-    normalize(input.mean_norm(input.rank() - 1), weight, bias, epsilon)
+    normalize(
+        input.mean_norm(vec![input.rank() - 1]),
+        weight,
+        bias,
+        epsilon,
+    )
 }
 
 /// Normalize the final axis by its root mean square, then apply optional affine
@@ -28,7 +33,7 @@ fn normalize(
     bias: Option<GraphTensor>,
     epsilon: f32,
 ) -> GraphTensor {
-    input = input.std_norm(input.rank() - 1, epsilon);
+    input = input.std_norm(vec![input.rank() - 1], epsilon);
     if let Some(weight) = weight {
         assert_eq!(weight.rank(), 1, "normalization weight must be rank one");
         assert_eq!(
@@ -56,8 +61,8 @@ mod tests {
     fn normalization_uses_caller_supplied_parameters() {
         let mut cx = Graph::new();
         let input = cx.tensor(vec![2, 4], DType::Bf16);
-        let weight = cx.tensor(4, DType::Bf16);
-        let bias = cx.tensor(4, DType::Bf16);
+        let weight = cx.tensor(vec![4], DType::Bf16);
+        let bias = cx.tensor(vec![4], DType::Bf16);
         assert_eq!(
             layer_norm(input, Some(weight), Some(bias), 1e-5).dtype,
             DType::Bf16

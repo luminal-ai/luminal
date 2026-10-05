@@ -59,7 +59,7 @@ impl MiniConvNet {
         let x = self.conv1.forward(x).relu(); // (1, c1, 3, 3)
         let x = self.conv2.forward(x).relu(); // (1, c2, 1, 1)
         let flat = x.flatten(); // (c2,)
-        let logits = self.head.forward(flat.expand_lhs(1)); // (1, classes)
+        let logits = self.head.forward(flat.expand_lhs(vec![1])); // (1, classes)
         let _ = self.classes;
         logits.squeeze(0)
     }

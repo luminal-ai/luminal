@@ -243,7 +243,7 @@ fn fixture5_bias() {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let b = cx.tensor(3usize, DType::F32);
+        let b = cx.tensor(vec![3usize], DType::F32);
         let _out = x.matmul(w) + b.expand_dim(0, 4usize);
         test_runtime::bind_leaves(&cx)
     };
@@ -303,7 +303,7 @@ fn fixture5_bias_elected_by_name_alone() {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let b = cx.tensor(3usize, DType::F32);
+        let b = cx.tensor(vec![3usize], DType::F32);
         let _out = x.matmul(w) + b.expand_dim(0, 4usize);
         test_runtime::bind_leaves(&cx)
     };
@@ -339,7 +339,7 @@ fn fixture5_bias_relu() {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let b = cx.tensor(3usize, DType::F32);
+        let b = cx.tensor(vec![3usize], DType::F32);
         let _out = (x.matmul(w) + b.expand_dim(0, 4usize)).relu();
         test_runtime::bind_leaves(&cx)
     };
@@ -365,7 +365,7 @@ fn fixture5_full_stack() {
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
         let c = cx.tensor(vec![4usize, 3usize], DType::F32);
-        let b = cx.tensor(3usize, DType::F32);
+        let b = cx.tensor(vec![3usize], DType::F32);
         let _out = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).relu();
         test_runtime::bind_leaves(&cx)
     };
@@ -440,7 +440,7 @@ fn fixture6_relu_then_bias_not_folded() {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let b = cx.tensor(3usize, DType::F32);
+        let b = cx.tensor(vec![3usize], DType::F32);
         let _out = x.matmul(w).relu() + b.expand_dim(0, 4usize);
         test_runtime::bind_leaves(&cx)
     };
@@ -464,7 +464,7 @@ fn fixture8_diamond_base_and_decorated_coexist() {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let b = cx.tensor(3usize, DType::F32);
+        let b = cx.tensor(vec![3usize], DType::F32);
         let mm = x.matmul(w);
         let biased = mm + b.expand_dim(0, 4usize);
         // The diamond: mm is bound as an output AND feeds the bias add, so

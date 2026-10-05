@@ -51,9 +51,9 @@ fn fused_dot_handles_broadcast_views_and_dynamic_contraction() {
 #[test]
 fn fused_dot_does_not_contract_multiply_and_add() {
     let mut g = Graph::new();
-    let a = g.tensor(2, DType::F32);
-    let b = g.tensor(2, DType::F32);
-    let out = (a * b).sum(0);
+    let a = g.tensor(vec![2], DType::F32);
+    let b = g.tensor(vec![2], DType::F32);
+    let out = (a * b).sum(vec![0]);
     let mut rt = MetalRuntime::load_with_registry(
         &g,
         metal_registry_filtered(|row| row.label() != "ReduceSumGeneric"),

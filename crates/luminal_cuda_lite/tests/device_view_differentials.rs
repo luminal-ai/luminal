@@ -217,7 +217,7 @@ fn slice_consumer_byte_matches_materialize_route() {
 #[test]
 fn broadcast_consumer_byte_matches_materialize_route() {
     let mut cx = Graph::new();
-    let x = cx.tensor(3usize, DType::F32);
+    let x = cx.tensor(vec![3usize], DType::F32);
     let c = cx.tensor(vec![2usize, 3usize], DType::F32);
     let out = x.expand_dim(0, 2) * c;
     let (want, got) = run_differential(

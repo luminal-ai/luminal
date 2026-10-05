@@ -230,10 +230,10 @@ impl MiniDit {
                 &Namespace::root().child("txt_out"),
                 cx,
             ),
-            img_qnorm: cx.named_tensor("ImgQNorm", head_dim, DType::F32),
-            img_knorm: cx.named_tensor("ImgKNorm", head_dim, DType::F32),
-            txt_qnorm: cx.named_tensor("TxtQNorm", head_dim, DType::F32),
-            txt_knorm: cx.named_tensor("TxtKNorm", head_dim, DType::F32),
+            img_qnorm: cx.named_tensor("ImgQNorm", vec![head_dim], DType::F32),
+            img_knorm: cx.named_tensor("ImgKNorm", vec![head_dim], DType::F32),
+            txt_qnorm: cx.named_tensor("TxtQNorm", vec![head_dim], DType::F32),
+            txt_knorm: cx.named_tensor("TxtKNorm", vec![head_dim], DType::F32),
             ff_in: Linear::new(
                 d,
                 2 * mlp,
@@ -290,8 +290,8 @@ impl MiniDit {
                 &Namespace::root().child("single_out_mlp"),
                 cx,
             ),
-            single_qnorm: cx.named_tensor("SglQNorm", head_dim, DType::F32),
-            single_knorm: cx.named_tensor("SglKNorm", head_dim, DType::F32),
+            single_qnorm: cx.named_tensor("SglQNorm", vec![head_dim], DType::F32),
+            single_knorm: cx.named_tensor("SglKNorm", vec![head_dim], DType::F32),
             ln: LayerNorm::new(
                 d,
                 false,
@@ -377,7 +377,7 @@ impl MiniDit {
         let unheads = |x: GraphTensor| x.permute(vec![1, 0, 2]).merge_dims(1, 2); // (S,d)
         let head_rms = |x: GraphTensor, weight: GraphTensor| {
             let dims = x.dims();
-            let inv = ((x * x).mean(2) + 1e-6).sqrt().reciprocal(); // (H,S)
+            let inv = ((x * x).mean(vec![2]) + 1e-6).sqrt().reciprocal(); // (H,S)
             x * inv.unsqueeze(2).expand(dims.clone())
                 * weight.unsqueeze(0).unsqueeze(0).expand(dims)
         };
@@ -393,7 +393,7 @@ impl MiniDit {
         let sdpa = |q: GraphTensor, k: GraphTensor, v: GraphTensor| {
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let scores = q.matmul(k.permute(vec![0, 2, 1])) * scale; // (H,S,S)
-            scores.softmax(2).matmul(v) // (H,S,hd)
+            scores.softmax(vec![2]).matmul(v) // (H,S,hd)
         };
         let swiglu =
             |u: GraphTensor| u.slice_along(0..mlp, 1).silu() * u.slice_along(mlp..2 * mlp, 1);
@@ -450,7 +450,7 @@ impl MiniDit {
         // is a compute write — the slice stops there.
         let graph = latent.graph();
         let txt_positions = graph.arange(s_txt);
-        let img_positions = graph.iota(latent.dims()[0], move |c| c[0] + s_txt);
+        let img_positions = graph.iota(vec![latent.dims()[0]], move |c| c[0] + s_txt);
         let mut hidden = scatter_rows(
             img,
             img_positions,

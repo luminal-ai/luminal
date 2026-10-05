@@ -69,7 +69,7 @@ fn main() {
     let x = cx.tensor(vec![BATCH, IMG * IMG], DType::F32);
     let y = cx.tensor(vec![BATCH, 10], DType::F32);
     let (params, logits) = build_model(x, &mut cx);
-    let loss = -(y * logits.log_softmax(1)).mean(vec![0, 1]) * 10.0; // mean cross-entropy
+    let loss = -(y * logits.log_softmax(vec![1])).mean(vec![0, 1]) * 10.0; // mean cross-entropy
 
     // Trainer appends backward + the AdamW update to the graph and compiles it all.
     let mut tr = Trainer::new(&mut cx, loss, &params, AdamW::new(3e-3));

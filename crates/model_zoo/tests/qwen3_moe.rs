@@ -31,13 +31,13 @@ fn qwen3_30b_a3b_full_forward_contract_builds() {
     let d = Qwen3MoeDims::qwen3_30b_a3b();
     let mut cx = Graph::new();
     let model = Qwen3Moe::init(&mut cx, &d);
-    let token = cx.tensor(1, DType::Int);
-    let q_pos = cx.tensor(1, DType::Int);
+    let token = cx.tensor(vec![1], DType::Int);
+    let q_pos = cx.tensor(vec![1], DType::Int);
     let rope_cos = cx.tensor(vec![1, d.head_dim], DType::F32);
     let rope_sin = cx.tensor(vec![1, d.head_dim], DType::F32);
     let rope_rot = cx.tensor(vec![d.head_dim, d.head_dim], DType::F32);
-    let gather_idx = cx.tensor(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor(1, DType::Int);
+    let gather_idx = cx.tensor(vec![SLOTS], DType::Int);
+    let scatter_idx = cx.tensor(vec![1], DType::Int);
     let pool = named_kv_cache_pool(
         &mut cx,
         d.layers,

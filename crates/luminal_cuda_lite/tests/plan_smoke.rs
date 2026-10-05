@@ -130,7 +130,7 @@ fn codegen_emits_wellformed_sources() {
 #[test]
 fn search_refuses_without_a_device() {
     let mut graph = luminal::graph::Graph::new();
-    let input = graph.tensor(3, DType::F32);
+    let input = graph.tensor(vec![3], DType::F32);
     let _out = input + 1.;
     let mut runtime = CudaRuntime::load(&graph).unwrap();
     runtime
