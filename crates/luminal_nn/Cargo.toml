@@ -15,5 +15,4 @@ rand = "0.9.2"
 luminal_reference = { path = "../luminal_reference" }
 scalar_refs = { path = "../../tests/scalar_refs" }
 dfdx = { version = "0.13", features = ["f16"] }
-paste = "1.0.14"
 candle-core = "0.9.2-alpha.1"

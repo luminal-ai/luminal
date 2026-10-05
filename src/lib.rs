@@ -108,5 +108,3 @@ pub mod prelude {
     pub use tinyvec;
     pub use tracing;
 }
-
-pub use paste::paste;
