@@ -113,9 +113,14 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(desc: &LtDesc) -> Result<Self> {
+    fn new(desc: &LtDesc, dtype: luminal::dtype::PlanDtype) -> Result<Self> {
+        let dtype = match dtype {
+            luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+            luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
+            dtype => return Err(anyhow!("cuBLASLt unsupported matrix dtype {dtype:?}")),
+        };
         let raw = lt::create_matrix_layout(
-            sys::cudaDataType_t::CUDA_R_32F,
+            dtype,
             u64::try_from(desc.rows).map_err(|_| anyhow!("negative rows"))?,
             u64::try_from(desc.cols).map_err(|_| anyhow!("negative cols"))?,
             desc.ld,
@@ -183,9 +188,20 @@ pub fn prepare(
     super::exec::assert_bias_destination_order(call, "dispatch")?;
     // Pre-dispatch bounds gate (contract 4) — LOUD, before any library
     // call, byte counts converted to f32 element counts.
-    let elems: Vec<usize> = operands.iter().map(|r| r.bytes / 4).collect();
-    call.validate_against(&elems, dest.bytes / 4)
-        .context("cuBLASLt pre-dispatch bounds validation")?;
+    let mut elems = Vec::with_capacity(operands.len());
+    for (index, range) in operands.iter().enumerate() {
+        let dtype = match index {
+            0 => call.a_dtype,
+            1 => call.b_dtype,
+            _ => call.d_dtype,
+        };
+        elems.push(range.bytes / crate::host_buffer::dtype_bytes(dtype)?);
+    }
+    call.validate_against(
+        &elems,
+        dest.bytes / crate::host_buffer::dtype_bytes(call.d_dtype)?,
+    )
+    .context("cuBLASLt pre-dispatch bounds validation")?;
 
     let handle = handle()?;
     let guard = handle
@@ -254,10 +270,10 @@ pub fn prepare(
 
     // Layouts: A, B, and a VALID Cdesc on EVERY call (contract 3 — a
     // NULL Cdesc segfaults), plus D.
-    let a_layout = Layout::new(&call.a)?;
-    let b_layout = Layout::new(&call.b)?;
-    let c_layout = Layout::new(&call.c)?;
-    let d_layout = Layout::new(&call.d)?;
+    let a_layout = Layout::new(&call.a, call.a_dtype)?;
+    let b_layout = Layout::new(&call.b, call.b_dtype)?;
+    let c_layout = Layout::new(&call.c, call.d_dtype)?;
+    let d_layout = Layout::new(&call.d, call.d_dtype)?;
 
     let pref =
         lt::create_matmul_pref().map_err(|e| anyhow!("cublasLtMatmulPreferenceCreate: {e:?}"))?;

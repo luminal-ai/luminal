@@ -13,6 +13,12 @@ cargo run --release -p llm_chat_cuda -- \
 
 # Apple GPU on macOS:
 cargo run --release -p llm_chat_metal -- \
+
+# No local checkpoint: download the validated repo for --model.
+cargo run --release -p llm_chat_cuda -- --model qwen3
+
+# Apple GPU on macOS with a local checkpoint:
+cargo run --release -p llm_chat_metal -- \
   --model qwen3 --checkpoint /path/to/Qwen3-0.6B
 ```
 
@@ -22,28 +28,45 @@ The shared library and its tests build on any host.
 Otherwise, enter messages interactively; `/reset` clears the conversation
 and KV state, and `/quit` exits.
 
-The checkpoint directory must contain:
+`--checkpoint` is optional. When it is omitted, the example downloads the
+safetensors weights and the metadata below from the Hugging Face Hub into the
+standard cache (`HF_HOME`; `HF_TOKEN` authenticates gated repos) and uses that
+snapshot. `--repo <id>` selects a different repository and `--revision
+<branch|tag|commit>` pins a revision; otherwise the repo validated for
+`--model` is used:
+
+```sh
+cargo run --release -p llm_chat_cuda -- \
+  --model qwen3 --repo Qwen/Qwen3-4B --revision main
+```
+
+The checkpoint directory (local or downloaded) must contain:
 
 - `config.json`, `tokenizer.json`, and `tokenizer_config.json`.
 - `model.safetensors`, or `model.safetensors.index.json` and its shards.
 - A chat template in `chat_template.jinja` or `tokenizer_config.json`.
 - Optionally, `generation_config.json` for additional EOS token IDs.
 
-Use a local, immutable checkpoint snapshot while loading. The example does not
-download weights, execute remote model code, or supply replacement weights.
-It reads F32, F16, and BF16 checkpoints and keeps parameter inputs in the
-native `torch_dtype` declared by `config.json`. The chat adapter inserts
-explicit FP32 compute casts, keeps KV state and RoPE inputs in FP32, and reads
-FP32 logits for sampling. Quantized/FP8 checkpoints are unsupported.
+The downloader fetches only checkpoint metadata and safetensors weights; it does
+not execute remote model code or supply replacement weights. Prefer a local,
+immutable snapshot for validation. F32, F16, and BF16 checkpoints are supported.
+By default parameter storage follows `config.json`'s `torch_dtype`; use
+`--weight-dtype bf16` to store every supported model's weights in BF16 (or
+`f16`/`f32` to select those modes). In BF16 mode, linear layers use BF16
+activations and weights with FP32 outputs; residual, normalization, KV state,
+RoPE, and sampling paths remain FP32. Quantized/FP8 checkpoints are unsupported.
 
 ## Model selection
 
-| `--model` | Zoo definition and configuration |
-| --- | --- |
-| `llama3` | `model_zoo::llama3::Llama3`; bias-free SwiGLU, untied head, unscaled full RoPE |
-| `qwen3` | `model_zoo::qwen3::Qwen`; tied embeddings, Q/K normalization, unscaled RoPE; includes compatible sizes such as 0.6B and 4B |
-| `gemma3` | `model_zoo::gemma3::Gemma3`; the existing Gemma-3-4B text tower configuration |
-| `qwen3-moe` | `model_zoo::qwen3_moe::Qwen3Moe`; the existing Qwen3-30B-A3B configuration |
+| `--model` | Zoo definition and configuration | Default `--repo` |
+| --- | --- | --- |
+| `llama3` | `model_zoo::llama3::Llama3`; bias-free SwiGLU, untied head, unscaled full RoPE | `NousResearch/Meta-Llama-3-8B-Instruct` |
+| `qwen3` | `model_zoo::qwen3::Qwen`; tied embeddings, Q/K normalization, unscaled RoPE; includes compatible sizes such as 0.6B and 4B | `Qwen/Qwen3-0.6B` |
+| `gemma3` | `model_zoo::gemma3::Gemma3`; the existing Gemma-3-4B text tower configuration | `unsloth/gemma-3-4b-it` |
+| `qwen3-moe` | `model_zoo::qwen3_moe::Qwen3Moe`; the existing Qwen3-30B-A3B configuration | `Qwen/Qwen3-30B-A3B` |
+
+Defaults are the repositories validated for each adapter; `--repo` selects a
+different compatible size or naming.
 
 The adapter validates configuration before loading weights. Model families with
 different architecture or positional conventions need an explicit adapter.
@@ -138,9 +161,19 @@ The runner renders the checkpoint chat template for every turn and compares
 prefix changes. Context limits are enforced without silently truncating history.
 A full context requires `/reset` or a larger `--max-context` at startup.
 
+Each turn prints one stderr line:
+`Latency: TTFT ... | TPOT ... | prefill ... | decode ...`. TTFT covers prompt
+prefill plus the first sampled token; TPOT is the mean interval between later
+tokens. Startup also prints tensor-load time, the compiler search budget, and
+compile time.
+
 Useful options:
 
 ```text
+--checkpoint DIR        local checkpoint directory; omit to download
+--repo ID               Hugging Face repo to download (default per --model)
+--revision REV          branch, tag, or commit to download
+--weight-dtype MODE     checkpoint (default), bf16, f16, or f32
 --max-context 2048       maximum total tokens in the cache
 --prefill-chunk 128      prompt tokens per execution
 --max-new-tokens 256     generation limit per turn

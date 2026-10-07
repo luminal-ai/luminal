@@ -339,6 +339,38 @@ pub struct ExtractionSite<'a> {
 }
 
 impl ExtractionSite<'_> {
+    /// Read the unique serialized `dtype-of` fact for a logical tensor class.
+    pub fn logical_dtype(
+        &self,
+        logical: &egraph_serialize::ClassId,
+    ) -> Option<crate::dtype::PlanDtype> {
+        for node in self
+            .egraph
+            .nodes
+            .values()
+            .filter(|node| node.op == "dtype-of")
+        {
+            let Some(value) = node
+                .children
+                .first()
+                .and_then(|id| self.egraph.nodes.get(id))
+            else {
+                continue;
+            };
+            if &value.eclass != logical {
+                continue;
+            }
+            for dtype_node in self.members(&node.eclass) {
+                if dtype_node.children.is_empty()
+                    && let Some(dtype) = crate::dtype::PlanDtype::from_egglog_name(&dtype_node.op)
+                {
+                    return Some(dtype);
+                }
+            }
+        }
+        None
+    }
+
     /// THE ONE CLASS READ every class helper below is built from: the
     /// members of `class`, in e-graph order. The index gives the class's
     /// node ids in O(1); resolving each id back to its node is a lookup

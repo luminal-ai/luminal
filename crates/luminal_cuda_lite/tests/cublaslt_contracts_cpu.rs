@@ -32,6 +32,9 @@ fn base_spec(m: i64, n: i64, k: i64) -> LtMatmulSpec {
         k: CuDim::Literal(k),
         trans_a: false,
         trans_b: false,
+        a_dtype: PlanDtype::F32,
+        b_dtype: PlanDtype::F32,
+        d_dtype: PlanDtype::F32,
         lda: CuDim::Literal(m),
         ldb: CuDim::Literal(k),
         ldc: CuDim::Literal(m),
@@ -49,6 +52,18 @@ fn base_spec(m: i64, n: i64, k: i64) -> LtMatmulSpec {
         c_tensor: None,
         bias_tensor: None,
     }
+}
+
+#[test]
+fn mixed_bf16_spec_preserves_operand_and_f32_destination_types() {
+    let mut spec = base_spec(4, 3, 8);
+    spec.a_dtype = PlanDtype::Bf16;
+    spec.b_dtype = PlanDtype::Bf16;
+    spec.d_dtype = PlanDtype::F32;
+    let call = plan_call_from_spec(&spec).unwrap();
+    assert_eq!(call.a_dtype, PlanDtype::Bf16);
+    assert_eq!(call.b_dtype, PlanDtype::Bf16);
+    assert_eq!(call.d_dtype, PlanDtype::F32);
 }
 
 // ---------------------------------------------------------------------------

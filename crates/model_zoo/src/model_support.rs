@@ -76,11 +76,22 @@ impl Linear {
         ns: &Namespace,
         cx: &mut Graph,
     ) -> Self {
-        Self::new(inp, out, bias, storage_dtype, ns, cx).cast_parameters(DType::F32)
+        Self::new(inp, out, bias, storage_dtype, ns, cx)
     }
 
     pub fn forward(&self, input: GraphTensor) -> GraphTensor {
-        luminal_nn::linear(input, self.weight, self.bias)
+        let output_dtype = input.dtype;
+        let input = if input.dtype == self.weight.dtype {
+            input
+        } else {
+            input.cast(self.weight.dtype)
+        };
+        let output = luminal_nn::linear(input, self.weight, self.bias);
+        if output.dtype == output_dtype {
+            output
+        } else {
+            output.cast(output_dtype)
+        }
     }
 
     /// Keep the named parameter inputs in their checkpoint storage dtype while
@@ -117,15 +128,26 @@ impl Embedding {
         ns: &Namespace,
         cx: &mut Graph,
     ) -> Self {
-        Self::new(n_embeddings, embedding_dim, storage_dtype, ns, cx).cast_parameters(DType::F32)
+        Self::new(n_embeddings, embedding_dim, storage_dtype, ns, cx)
     }
 
     pub fn forward(&self, input: GraphTensor) -> GraphTensor {
-        luminal_nn::embedding(input, self.weight)
+        luminal_nn::embedding(input, self.weight).cast(DType::F32)
     }
 
     pub fn reverse(&self, input: GraphTensor) -> GraphTensor {
-        luminal_nn::embedding_projection(input, self.weight)
+        let output_dtype = input.dtype;
+        let input = if input.dtype == self.weight.dtype {
+            input
+        } else {
+            input.cast(self.weight.dtype)
+        };
+        let output = luminal_nn::embedding_projection(input, self.weight);
+        if output.dtype == output_dtype {
+            output
+        } else {
+            output.cast(output_dtype)
+        }
     }
 
     pub fn cast_parameters(mut self, dtype: DType) -> Self {

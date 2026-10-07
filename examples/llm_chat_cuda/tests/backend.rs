@@ -5,7 +5,8 @@ use llm_chat::{
     graph::{LlmGraph, ModelConfig},
 };
 use llm_chat_cuda::backend::CudaBackend;
-use model_zoo::llama3::Llama3Dims;
+use luminal::dtype::DType;
+use model_zoo::{gemma3::Gemma3Dims, llama3::Llama3Dims, qwen3::QwenDims, qwen3_moe::Qwen3MoeDims};
 
 fn fixture() -> (LlmGraph, Inputs) {
     fixture_with_shape(4, 2)
@@ -43,6 +44,119 @@ fn fixture_with_shape(capacity: usize, chunk: usize) -> (LlmGraph, Inputs) {
         })
         .collect();
     (graph, weights)
+}
+
+fn bf16_fixture(model: ModelConfig) -> (LlmGraph, Inputs) {
+    let graph = LlmGraph::build_with_parameter_dtype(model, DType::Bf16, 6, 2).unwrap();
+    let weights = graph
+        .parameters
+        .iter()
+        .enumerate()
+        .map(|(seed, parameter)| {
+            let elements = parameter.shape.iter().product();
+            let values = (0..elements)
+                .map(|i| {
+                    if parameter.namespace.contains("norm") {
+                        1.
+                    } else {
+                        (((i * 17 + seed * 13) % 31) as f32 - 15.) / 100.
+                    }
+                })
+                .collect();
+            (
+                parameter.input,
+                TensorData::from_f32(DType::Bf16, values).unwrap(),
+            )
+        })
+        .collect();
+    (graph, weights)
+}
+
+fn tiny_models() -> [(&'static str, ModelConfig); 4] {
+    [
+        (
+            "llama3",
+            ModelConfig::Llama3(Llama3Dims {
+                vocab: 31,
+                hidden: 16,
+                intermediate: 24,
+                head_dim: 4,
+                n_heads: 4,
+                n_kv_heads: 2,
+                layers: 2,
+                rope_theta: 10_000.,
+                rms_eps: 1e-5,
+            }),
+        ),
+        ("qwen3", ModelConfig::Qwen3(QwenDims::tiny())),
+        ("gemma3", ModelConfig::Gemma3(Gemma3Dims::tiny())),
+        (
+            "qwen3-moe",
+            ModelConfig::Qwen3Moe(Qwen3MoeDims {
+                vocab: 31,
+                hidden: 16,
+                moe_intermediate: 24,
+                head_dim: 4,
+                n_heads: 4,
+                n_kv_heads: 2,
+                layers: 2,
+                experts: 4,
+                top_k: 2,
+                rope_theta: 10_000.,
+                rms_eps: 1e-6,
+            }),
+        ),
+    ]
+}
+
+#[test]
+fn bf16_weights_execute_for_every_supported_model() {
+    for (name, model) in tiny_models() {
+        let (graph, weights) = bf16_fixture(model);
+        assert!(graph.parameters.iter().all(|p| p.dtype == DType::Bf16));
+        assert!(
+            weights
+                .values()
+                .all(|data| matches!(data, TensorData::BF16(_)))
+        );
+
+        let mut backend = CudaBackend::compile(
+            &graph,
+            weights,
+            &luminal_cuda_lite::harness_search_options(),
+        )
+        .unwrap_or_else(|error| panic!("{name}: compile failed: {error:#}"));
+        let prefill = graph.step_inputs(&[1, 2], 0).unwrap();
+        let first = backend
+            .step(prefill.clone(), 2, 2)
+            .unwrap_or_else(|error| panic!("{name}: prefill failed: {error:#}"));
+        assert_eq!(first.len(), graph.vocab, "{name}: wrong logits length");
+        assert!(
+            first.iter().all(|value| value.is_finite()),
+            "{name}: non-finite prefill logits"
+        );
+
+        let decode = backend
+            .step(graph.step_inputs(&[3], 2).unwrap(), 1, 3)
+            .unwrap_or_else(|error| panic!("{name}: decode failed: {error:#}"));
+        assert_eq!(
+            decode.len(),
+            graph.vocab,
+            "{name}: wrong decode logits length"
+        );
+        assert!(
+            decode.iter().all(|value| value.is_finite()),
+            "{name}: non-finite decode logits"
+        );
+
+        backend
+            .reset()
+            .unwrap_or_else(|error| panic!("{name}: reset failed: {error:#}"));
+        let replay = backend
+            .step(prefill, 2, 2)
+            .unwrap_or_else(|error| panic!("{name}: replay failed: {error:#}"));
+        assert_eq!(replay, first, "{name}: reset/replay changed logits");
+    }
 }
 
 #[test]

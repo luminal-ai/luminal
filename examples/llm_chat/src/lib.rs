@@ -3,6 +3,7 @@ pub mod app;
 pub mod backend;
 pub mod checkpoint;
 pub mod graph;
+pub mod hf;
 pub mod sampling;
 pub mod search;
 pub mod session;

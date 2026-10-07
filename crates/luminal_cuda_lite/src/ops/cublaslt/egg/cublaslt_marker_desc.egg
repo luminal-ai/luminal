@@ -70,7 +70,7 @@
     (= ?a_layout (StridedElementLayoutLit ?a_shape
         (IntAffineExprCons ?s_m (IntAffineExprCons ?s_k (IntAffineExprNil)))
         ?a_bits))
-    (= ?a_bits (bits-of (F32)))
+    (= ?a_bits (bits-of (dtype-of ?a)))
     (= (injectivity-of ?a_lt) (Injective))
     ; THE READING: unit stride on m.
     (= ?s_m (CoordVar ?a_shape 1))
@@ -97,7 +97,7 @@
     (= ?a_layout (StridedElementLayoutLit ?a_shape
         (IntAffineExprCons ?s_m (IntAffineExprCons ?s_k (IntAffineExprNil)))
         ?a_bits))
-    (= ?a_bits (bits-of (F32)))
+    (= ?a_bits (bits-of (dtype-of ?a)))
     (= (injectivity-of ?a_lt) (Injective))
     ; THE READING: unit stride on k.
     (= ?s_k (CoordVar ?a_shape 0))
@@ -123,7 +123,7 @@
     (= ?b_layout (StridedElementLayoutLit ?b_shape
         (IntAffineExprCons ?s_k (IntAffineExprCons ?s_n (IntAffineExprNil)))
         ?b_bits))
-    (= ?b_bits (bits-of (F32)))
+    (= ?b_bits (bits-of (dtype-of ?b)))
     (= (injectivity-of ?b_lt) (Injective))
     ; THE READING: unit stride on k.
     (= ?s_k (CoordVar ?b_shape 1))
@@ -149,7 +149,7 @@
     (= ?b_layout (StridedElementLayoutLit ?b_shape
         (IntAffineExprCons ?s_k (IntAffineExprCons ?s_n (IntAffineExprNil)))
         ?b_bits))
-    (= ?b_bits (bits-of (F32)))
+    (= ?b_bits (bits-of (dtype-of ?b)))
     (= (injectivity-of ?b_lt) (Injective))
     ; THE READING: unit stride on n.
     (= ?s_n (CoordVar ?b_shape 0))

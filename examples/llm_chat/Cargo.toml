@@ -11,6 +11,7 @@ model_zoo = { path = "../../crates/model_zoo" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 half = "2"
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
 memmap2 = "0.9"
 minijinja = { version = "2", features = ["json", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }

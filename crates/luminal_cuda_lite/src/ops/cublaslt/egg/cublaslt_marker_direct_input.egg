@@ -1,0 +1,211 @@
+; Prefer a cuBLASLt call which reads caller storage directly over an
+; equivalent call which first materializes another layout of that storage.
+; Equivalence is witnessed by the calls producing the same LayoutTensorList
+; e-class, not guessed from shapes or descriptor spellings.
+
+; (layout, bound leaf whose bytes it views). Only zero-movement views propagate
+; this relation; copies deliberately do not.
+(relation cublaslt-direct-input-layout (LayoutTensor LayoutTensor))
+; (materialized layout, bound leaf whose data it copied).
+(relation cublaslt-copied-input-layout (LayoutTensor LayoutTensor))
+
+(rule
+  ((input-leaf-layout-tensor ?leaf))
+  ((cublaslt-direct-input-layout ?leaf ?leaf))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: a bound input is direct storage"
+)
+
+(rule
+  (
+    (cublaslt-direct-input-layout ?in_lt ?leaf)
+    (= ?in_lt (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_logical (LogicalIndexMapApply ?in_logical ?index_map ?out_shape))
+    (= ?out_lt (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?view (LayoutTensorOpIndexMapApplyViewGeneric
+      ?in_lt ?index_map ?out_shape ?out_layout))
+  )
+  ((cublaslt-direct-input-layout ?out_lt ?leaf))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: a view preserves direct input storage"
+)
+
+(rule
+  (
+    (cublaslt-direct-input-layout ?source_lt ?leaf)
+    (= ?source_lt (LayoutTensorLit ?logical ?source_layout))
+    (= ?copied_lt (LayoutTensorLit ?logical ?copied_layout))
+    (= ?copy (LayoutTensorOpCopyGeneric ?source_lt ?copied_layout))
+  )
+  ((cublaslt-copied-input-layout ?copied_lt ?leaf))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: identify a materialized layout of direct input storage"
+)
+
+; A view after a copy still belongs to the copied route. Full matmuls commonly
+; transpose a materialized operand again for the transpose-sandwich call, so
+; stopping at the immediate copy output would miss the actual descriptor.
+(rule
+  (
+    (cublaslt-copied-input-layout ?in_lt ?leaf)
+    (= ?in_lt (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_logical (LogicalIndexMapApply ?in_logical ?index_map ?out_shape))
+    (= ?out_lt (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?view (LayoutTensorOpIndexMapApplyViewGeneric
+      ?in_lt ?index_map ?out_shape ?out_layout))
+  )
+  ((cublaslt-copied-input-layout ?out_lt ?leaf))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: a view preserves copied input provenance"
+)
+
+; The four call forms, for operand A and operand B. The direct and copied calls
+; may use different transpose-sandwich sites and descriptor operations. Their
+; output-list equality is the e-graph proof that they are interchangeable.
+(rule
+  (
+    (= ?direct_desc (CublasLtOperandADescriptor ?direct_site ?direct_lt ?direct_operation))
+    (= ?copied_desc (CublasLtOperandADescriptor ?copied_site ?copied_lt ?copied_operation))
+    (cublaslt-direct-input-layout ?direct_lt ?leaf)
+    (cublaslt-copied-input-layout ?copied_lt ?leaf)
+    (= ?direct_op (LayoutTensorOpCublasLt
+      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_epilogue))
+    (= ?copied_op (LayoutTensorOpCublasLt
+      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_epilogue))
+    (= (output-layout-tensor-list-of ?direct_op)
+       (output-layout-tensor-list-of ?copied_op))
+  )
+  ((subsume (LayoutTensorOpCublasLt
+    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_epilogue)))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: direct A dominates copied A for an equivalent base call"
+)
+(rule
+  (
+    (= ?direct_desc (CublasLtOperandBDescriptor ?direct_site ?direct_lt ?direct_operation))
+    (= ?copied_desc (CublasLtOperandBDescriptor ?copied_site ?copied_lt ?copied_operation))
+    (cublaslt-direct-input-layout ?direct_lt ?leaf)
+    (cublaslt-copied-input-layout ?copied_lt ?leaf)
+    (= ?direct_op (LayoutTensorOpCublasLt
+      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_epilogue))
+    (= ?copied_op (LayoutTensorOpCublasLt
+      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_epilogue))
+    (= (output-layout-tensor-list-of ?direct_op)
+       (output-layout-tensor-list-of ?copied_op))
+  )
+  ((subsume (LayoutTensorOpCublasLt
+    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_epilogue)))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: direct B dominates copied B for an equivalent base call"
+)
+
+(rule
+  (
+    (= ?direct_desc (CublasLtOperandADescriptor ?direct_site ?direct_lt ?direct_operation))
+    (= ?copied_desc (CublasLtOperandADescriptor ?copied_site ?copied_lt ?copied_operation))
+    (cublaslt-direct-input-layout ?direct_lt ?leaf)
+    (cublaslt-copied-input-layout ?copied_lt ?leaf)
+    (= ?direct_op (LayoutTensorOpCublasLtBias
+      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_bias ?direct_epilogue))
+    (= ?copied_op (LayoutTensorOpCublasLtBias
+      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_bias ?copied_epilogue))
+    (= (output-layout-tensor-list-of ?direct_op)
+       (output-layout-tensor-list-of ?copied_op))
+  )
+  ((subsume (LayoutTensorOpCublasLtBias
+    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_bias ?copied_epilogue)))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: direct A dominates copied A for an equivalent bias call"
+)
+(rule
+  (
+    (= ?direct_desc (CublasLtOperandBDescriptor ?direct_site ?direct_lt ?direct_operation))
+    (= ?copied_desc (CublasLtOperandBDescriptor ?copied_site ?copied_lt ?copied_operation))
+    (cublaslt-direct-input-layout ?direct_lt ?leaf)
+    (cublaslt-copied-input-layout ?copied_lt ?leaf)
+    (= ?direct_op (LayoutTensorOpCublasLtBias
+      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_bias ?direct_epilogue))
+    (= ?copied_op (LayoutTensorOpCublasLtBias
+      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_bias ?copied_epilogue))
+    (= (output-layout-tensor-list-of ?direct_op)
+       (output-layout-tensor-list-of ?copied_op))
+  )
+  ((subsume (LayoutTensorOpCublasLtBias
+    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_bias ?copied_epilogue)))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: direct B dominates copied B for an equivalent bias call"
+)
+
+(rule
+  (
+    (= ?direct_desc (CublasLtOperandADescriptor ?direct_site ?direct_lt ?direct_operation))
+    (= ?copied_desc (CublasLtOperandADescriptor ?copied_site ?copied_lt ?copied_operation))
+    (cublaslt-direct-input-layout ?direct_lt ?leaf)
+    (cublaslt-copied-input-layout ?copied_lt ?leaf)
+    (= ?direct_op (LayoutTensorOpCublasLtAccumulate
+      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_c ?direct_epilogue))
+    (= ?copied_op (LayoutTensorOpCublasLtAccumulate
+      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_epilogue))
+    (= (output-layout-tensor-list-of ?direct_op)
+       (output-layout-tensor-list-of ?copied_op))
+  )
+  ((subsume (LayoutTensorOpCublasLtAccumulate
+    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_epilogue)))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: direct A dominates copied A for an equivalent accumulate call"
+)
+(rule
+  (
+    (= ?direct_desc (CublasLtOperandBDescriptor ?direct_site ?direct_lt ?direct_operation))
+    (= ?copied_desc (CublasLtOperandBDescriptor ?copied_site ?copied_lt ?copied_operation))
+    (cublaslt-direct-input-layout ?direct_lt ?leaf)
+    (cublaslt-copied-input-layout ?copied_lt ?leaf)
+    (= ?direct_op (LayoutTensorOpCublasLtAccumulate
+      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_c ?direct_epilogue))
+    (= ?copied_op (LayoutTensorOpCublasLtAccumulate
+      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_epilogue))
+    (= (output-layout-tensor-list-of ?direct_op)
+       (output-layout-tensor-list-of ?copied_op))
+  )
+  ((subsume (LayoutTensorOpCublasLtAccumulate
+    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_epilogue)))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: direct B dominates copied B for an equivalent accumulate call"
+)
+
+(rule
+  (
+    (= ?direct_desc (CublasLtOperandADescriptor ?direct_site ?direct_lt ?direct_operation))
+    (= ?copied_desc (CublasLtOperandADescriptor ?copied_site ?copied_lt ?copied_operation))
+    (cublaslt-direct-input-layout ?direct_lt ?leaf)
+    (cublaslt-copied-input-layout ?copied_lt ?leaf)
+    (= ?direct_op (LayoutTensorOpCublasLtAccumulateBias
+      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_c ?direct_bias ?direct_epilogue))
+    (= ?copied_op (LayoutTensorOpCublasLtAccumulateBias
+      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_bias ?copied_epilogue))
+    (= (output-layout-tensor-list-of ?direct_op)
+       (output-layout-tensor-list-of ?copied_op))
+  )
+  ((subsume (LayoutTensorOpCublasLtAccumulateBias
+    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_bias ?copied_epilogue)))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: direct A dominates copied A for an equivalent accumulate-bias call"
+)
+(rule
+  (
+    (= ?direct_desc (CublasLtOperandBDescriptor ?direct_site ?direct_lt ?direct_operation))
+    (= ?copied_desc (CublasLtOperandBDescriptor ?copied_site ?copied_lt ?copied_operation))
+    (cublaslt-direct-input-layout ?direct_lt ?leaf)
+    (cublaslt-copied-input-layout ?copied_lt ?leaf)
+    (= ?direct_op (LayoutTensorOpCublasLtAccumulateBias
+      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_c ?direct_bias ?direct_epilogue))
+    (= ?copied_op (LayoutTensorOpCublasLtAccumulateBias
+      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_bias ?copied_epilogue))
+    (= (output-layout-tensor-list-of ?direct_op)
+       (output-layout-tensor-list-of ?copied_op))
+  )
+  ((subsume (LayoutTensorOpCublasLtAccumulateBias
+    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_bias ?copied_epilogue)))
+  :ruleset cleanup
+  :name "cuda_lite/cublaslt: direct B dominates copied B for an equivalent accumulate-bias call"
+)

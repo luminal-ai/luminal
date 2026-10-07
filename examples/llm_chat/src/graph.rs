@@ -21,6 +21,42 @@ pub enum ModelType {
     Qwen3Moe,
 }
 
+/// Storage precision for checkpoint-backed model parameters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum WeightDtype {
+    /// Use the checkpoint's `torch_dtype` declaration.
+    #[default]
+    Checkpoint,
+    F32,
+    F16,
+    Bf16,
+}
+
+impl WeightDtype {
+    pub fn resolve(self, checkpoint: DType) -> DType {
+        match self {
+            Self::Checkpoint => checkpoint,
+            Self::F32 => DType::F32,
+            Self::F16 => DType::F16,
+            Self::Bf16 => DType::Bf16,
+        }
+    }
+}
+
+impl ModelType {
+    /// Hugging Face repository used when `--checkpoint` is omitted. These are
+    /// the configurations validated for each adapter; a different size of the
+    /// same family can be downloaded by passing `--repo`.
+    pub fn default_hf_repo(self) -> &'static str {
+        match self {
+            Self::Llama3 => "NousResearch/Meta-Llama-3-8B-Instruct",
+            Self::Qwen3 => "Qwen/Qwen3-0.6B",
+            Self::Gemma3 => "unsloth/gemma-3-4b-it",
+            Self::Qwen3Moe => "Qwen/Qwen3-30B-A3B",
+        }
+    }
+}
+
 pub enum ModelConfig {
     Llama3(Llama3Dims),
     Qwen3(QwenDims),
@@ -551,6 +587,34 @@ impl LlmGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tiny_qwen3_moe() -> Qwen3MoeDims {
+        Qwen3MoeDims {
+            vocab: 31,
+            hidden: 16,
+            moe_intermediate: 24,
+            head_dim: 4,
+            n_heads: 4,
+            n_kv_heads: 2,
+            layers: 2,
+            experts: 4,
+            top_k: 2,
+            rope_theta: 10_000.,
+            rms_eps: 1e-6,
+        }
+    }
+
+    #[test]
+    fn every_model_has_a_default_hugging_face_repo() {
+        for model in [
+            ModelType::Llama3,
+            ModelType::Qwen3,
+            ModelType::Gemma3,
+            ModelType::Qwen3Moe,
+        ] {
+            assert!(model.default_hf_repo().contains('/'));
+        }
+    }
     #[test]
     fn adapters_keep_parameter_mapping_and_runtime_inputs_separate() {
         for config in [
@@ -584,21 +648,30 @@ mod tests {
 
     #[test]
     fn native_weight_storage_keeps_explicit_f32_compute_inputs() {
-        let graph = LlmGraph::build_with_parameter_dtype(
+        for config in [
+            ModelConfig::Llama3(Llama3Dims::tiny()),
             ModelConfig::Qwen3(QwenDims::tiny()),
-            DType::Bf16,
-            8,
-            2,
-        )
-        .unwrap();
-        assert!(graph.parameters.iter().all(|p| p.dtype == DType::Bf16));
-        assert!(graph.state.iter().all(|s| s.dtype == DType::F32));
-        assert!(
-            graph
-                .initial_inputs()
-                .values()
-                .all(|value| matches!(value, TensorData::F32(_)))
-        );
+            ModelConfig::Gemma3(Gemma3Dims::tiny()),
+            ModelConfig::Qwen3Moe(tiny_qwen3_moe()),
+        ] {
+            let graph = LlmGraph::build_with_parameter_dtype(config, DType::Bf16, 8, 2).unwrap();
+            assert!(graph.parameters.iter().all(|p| p.dtype == DType::Bf16));
+            assert!(graph.state.iter().all(|s| s.dtype == DType::F32));
+            assert!(
+                graph
+                    .initial_inputs()
+                    .values()
+                    .all(|value| matches!(value, TensorData::F32(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn weight_dtype_mode_resolves_checkpoint_and_explicit_precisions() {
+        assert_eq!(WeightDtype::Checkpoint.resolve(DType::F16), DType::F16);
+        assert_eq!(WeightDtype::Bf16.resolve(DType::F32), DType::Bf16);
+        assert_eq!(WeightDtype::F16.resolve(DType::F32), DType::F16);
+        assert_eq!(WeightDtype::F32.resolve(DType::Bf16), DType::F32);
     }
     #[test]
     fn incompatible_checkpoint_architecture_is_rejected_before_loading() {

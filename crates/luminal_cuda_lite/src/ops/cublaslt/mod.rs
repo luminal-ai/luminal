@@ -215,6 +215,9 @@ pub struct LtMatmulSpec {
     pub k: CuDim,
     pub trans_a: bool,
     pub trans_b: bool,
+    pub a_dtype: luminal::dtype::PlanDtype,
+    pub b_dtype: luminal::dtype::PlanDtype,
+    pub d_dtype: luminal::dtype::PlanDtype,
     /// lds are CuDim like m/n/k (RULING 1): contiguous forms may carry a
     /// symbolic storage extent — the executor binds it at call time.
     pub lda: CuDim,
@@ -770,6 +773,9 @@ pub fn parse_spec(site: &ExtractionSite<'_>, form: CublasLtForm) -> Option<LtMat
         k,
         trans_a,
         trans_b,
+        a_dtype: site.logical_dtype(&logical_a)?,
+        b_dtype: site.logical_dtype(&logical_b)?,
+        d_dtype: site.logical_dtype(&logical_out)?,
         lda,
         ldb,
         ldc: ldd.clone(), // C is guarded onto the D layout; ldc = ldd
@@ -1006,6 +1012,10 @@ impl OpMatcher for CublasLtMarkerMatcher {
             EgglogSnippet {
                 category: SpliceCategory::Match,
                 text: include_str!("egg/cublaslt_marker_decorate.egg"),
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Match,
+                text: include_str!("egg/cublaslt_marker_direct_input.egg"),
             },
         ]
     }
