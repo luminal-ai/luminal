@@ -8,8 +8,8 @@ use rand::rngs::StdRng;
 
 use crate::extractor::{self, Genome};
 use luminal::bufferize::BufferIrGraph;
-use luminal::prelude::FxHashMap;
 use luminal::prelude::egraph_serialize;
+use luminal::prelude::{FxHashMap, FxHashSet};
 
 // The pieces that decide nothing, in core since Phase 8. Re-exported
 // under this module's own name: every public path this crate used to
@@ -105,7 +105,9 @@ pub struct SearchOutcome {
     pub best_nanos: u128,
     /// Plans actually profiled (distinct fingerprints).
     pub plans_profiled: usize,
-    /// Candidates answered from the fingerprint cache without re-profiling.
+    /// Proposed genomes rejected because their extracted plan fingerprint was
+    /// already admitted earlier in the search. Duplicate phenotypes never
+    /// consume a generation slot.
     pub fingerprint_hits: usize,
     /// Wall-clock attribution across the pipeline stages — the
     /// programmatic answer to "what is the search time actually spent
@@ -460,28 +462,29 @@ pub fn search_implementations(
         .then(|| SearchProgress::new(CaptureAwareStderr));
 
     for generation in 0..options.generations {
-        let mut candidates: Vec<Genome> = Vec::with_capacity(options.generation_size);
-        match &best {
-            None => {
-                for attempt in 0..options.generation_size {
-                    candidates.push(if attempt % 2 == 0 {
-                        sample_genome_correlated(&index, &space, &mut rng)
-                    } else {
-                        random_genome(&mut rng)
-                    });
+        // A generation contains feasible PHENOTYPES, not merely proposed
+        // genomes. Mutation is transactional: retain the parent, propose a
+        // child, extract and arena-plan it, and admit it only after the exact
+        // physical-lifetime plan is within budget. Rejection does not repair
+        // the child into some other graph; it simply draws another mutation.
+        // This keeps genotype diversity meaningful because duplicate plans do
+        // not consume population slots either.
+        let parent = best.as_ref().map(|incumbent| incumbent.genome.clone());
+        let max_attempts = options.generation_size.saturating_mul(32).max(1);
+        let mut attempts = 0usize;
+        let mut admitted = 0usize;
+        let mut generation_fingerprints: FxHashSet<u64> = FxHashSet::default();
+        while admitted < options.generation_size && attempts < max_attempts {
+            let genome = match &parent {
+                None if attempts.is_multiple_of(2) => {
+                    sample_genome_correlated(&index, &space, &mut rng)
                 }
-            }
-            Some(incumbent) => {
-                let parent = incumbent.genome.clone();
-                for _ in 0..options.generation_size {
-                    candidates.push(mutate(&parent, &mut rng, options.mutations));
-                }
-            }
-        }
-
-        for genome in candidates {
+                None => random_genome(&mut rng),
+                Some(parent) => mutate(parent, &mut rng, options.mutations),
+            };
+            attempts += 1;
             // Extraction failure = invalid genome (cycle, contract breach):
-            // discard; the next generation's fresh mutations are the repair.
+            // discard; a fresh proposal is the repair.
             let extract_start = Instant::now();
             let extracted = session.extract_with_genome(&genome);
             timings.extract_nanos += extract_start.elapsed().as_nanos();
@@ -535,144 +538,110 @@ pub fn search_implementations(
                 }
             };
             let fingerprint = extractor::plan_fingerprint(&graph);
-            let nanos = match cache.get(&fingerprint) {
-                Some(nanos) => {
-                    fingerprint_hits += 1;
-                    *nanos
-                }
-                None => {
-                    let build_start = Instant::now();
-                    // Decode the elected layouts (the runtime's hook; a
-                    // refusal rejects THIS genome, loudly accounted, and
-                    // the search tries others), then bufferize under the
-                    // decoded table.
-                    // The table is VALUE-keyed (corrected contract), so it
-                    // must be built over the graph bufferize sees — the
-                    // POST-DPS one, whose poison destinations are fresh
-                    // values. They clone their tied result's layout class
-                    // AND dtype fact, so every poison is a decoder-cache
-                    // HIT: value-keying costs no extra decoder calls.
-                    let dps = luminal::dps::dps_rewrite(&graph);
-                    let built = luminal::layouts::decode_layout_table(
-                        &view,
-                        &dps,
-                        "implementation search",
-                        &mut layout_cache,
-                    )
-                    .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
-                    timings.plan_build_nanos += build_start.elapsed().as_nanos();
-                    let plan = match built {
-                        Ok(plan) => plan,
-                        Err(err) => {
-                            // THE BUFFERIZE TRIPWIRE (2026-09-02): a
-                            // cyclic extracted graph from a SAMPLED
-                            // genome is a sampler bug, not a refusal.
-                            bufferize_cycle_tripwire(&err, &index, &space, &genome)?;
-                            breakdown.plan_build_refusals += 1;
-                            if refusals.len() < 8 {
-                                refusals.push(format!("bufferize: {err:#}"));
-                            }
-                            continue;
-                        }
-                    };
-                    if let Err(why) = external_placement_feasible(&plan, &program.outputs) {
-                        breakdown.plan_build_refusals += 1;
-                        if refusals.len() < 8 {
-                            refusals.push(format!("placement: {why}"));
-                        }
-                        continue;
-                    }
-                    let profile_start = Instant::now();
-                    let priced = evaluator.measure(
-                        &plan,
-                        options,
-                        shapes,
-                        best.as_ref().map(|incumbent| incumbent.nanos),
-                    );
-                    timings.profile_nanos += profile_start.elapsed().as_nanos();
-                    let nanos = match priced {
-                        Priced::Cost(nanos) => nanos,
-                        Priced::TimedOut(note) => {
-                            // NOT a refusal: nothing failed, the plan is
-                            // just too slow to finish measuring. Counted
-                            // apart so the zero-refusal ladder
-                            // acceptance stays about failures.
-                            breakdown.timed_out += 1;
-                            if refusals.len() < 8 {
-                                refusals.push(format!("timed out: {note}"));
-                            }
-                            continue;
-                        }
-                        Priced::PrepareFailed(note) => {
-                            // D10: a plan the device cannot compile,
-                            // stage or warm up is an ordinary unfit
-                            // candidate — accounted with the other
-                            // plan-build refusals, never fatal.
-                            breakdown.plan_build_refusals += 1;
-                            if refusals.len() < 8 {
-                                refusals.push(format!("device prepare: {note}"));
-                            }
-                            continue;
-                        }
-                        Priced::ExecuteFailed(note) => {
-                            breakdown.execute_refusals += 1;
-                            if refusals.len() < 8 {
-                                refusals.push(format!("execute: {note}"));
-                            }
-                            continue;
-                        }
-                    };
-                    cache.insert(fingerprint, nanos);
-                    plans_profiled += 1;
-                    rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
-                    let improved = best
-                        .as_ref()
-                        .is_none_or(|incumbent| nanos < incumbent.nanos);
-                    if let Some(progress) = progress.as_mut() {
-                        // The FIRST profiled plan IS the baseline, so it
-                        // reports as `Start`, never as an improvement on
-                        // itself; everything after it is Faster/Slower.
-                        if plans_profiled == 1 {
-                            progress.start(nanos);
-                        } else {
-                            progress.report(improved, nanos);
-                        }
-                    }
-                    if improved {
-                        best = Some(Best {
-                            nanos,
-                            genome: genome.clone(),
-                            plan,
-                        });
+            if cache.contains_key(&fingerprint) || !generation_fingerprints.insert(fingerprint) {
+                fingerprint_hits += 1;
+                continue;
+            }
+            let build_start = Instant::now();
+            // Decode the elected layouts and bufferize before admission: the
+            // arena planner consumes this exact plan, so its certificate is
+            // the same one device installation will enforce.
+            let dps = luminal::dps::dps_rewrite(&graph);
+            let built = luminal::layouts::decode_layout_table(
+                &view,
+                &dps,
+                "implementation search",
+                &mut layout_cache,
+            )
+            .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
+            timings.plan_build_nanos += build_start.elapsed().as_nanos();
+            let plan = match built {
+                Ok(plan) => plan,
+                Err(err) => {
+                    bufferize_cycle_tripwire(&err, &index, &space, &genome)?;
+                    breakdown.plan_build_refusals += 1;
+                    if refusals.len() < 8 {
+                        refusals.push(format!("bufferize: {err:#}"));
                     }
                     continue;
                 }
             };
-            if best
-                .as_ref()
-                .is_none_or(|incumbent| nanos < incumbent.nanos)
-            {
-                let build_start = Instant::now();
-                let dps = luminal::dps::dps_rewrite(&graph);
-                let built = luminal::layouts::decode_layout_table(
-                    &view,
-                    &dps,
-                    "implementation search",
-                    &mut layout_cache,
-                )
-                .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
-                timings.plan_build_nanos += build_start.elapsed().as_nanos();
-                let plan = match built {
-                    Ok(plan) => plan,
+            if let Err(why) = external_placement_feasible(&plan, &program.outputs) {
+                breakdown.plan_build_refusals += 1;
+                if refusals.len() < 8 {
+                    refusals.push(format!("placement: {why}"));
+                }
+                continue;
+            }
+            let arena =
+                match crate::storage::plan_storage(&plan, &shapes.bounds, &Default::default()) {
+                    Ok(arena) => arena,
                     Err(err) => {
-                        bufferize_cycle_tripwire(&err, &index, &space, &genome)?;
+                        breakdown.plan_build_refusals += 1;
+                        if refusals.len() < 8 {
+                            refusals.push(format!("arena planning: {err:#}"));
+                        }
                         continue;
                     }
                 };
-                if external_placement_feasible(&plan, &program.outputs).is_err() {
+            if arena.slab_bytes > arena_budget_bytes {
+                breakdown.arena_refusals += 1;
+                if refusals.len() < 8 {
+                    refusals.push(format!(
+                        "arena: {} bytes exceeds budget {arena_budget_bytes}",
+                        arena.slab_bytes
+                    ));
+                }
+                continue;
+            }
+
+            admitted += 1;
+            let profile_start = Instant::now();
+            let priced = evaluator.measure(
+                &plan,
+                options,
+                shapes,
+                best.as_ref().map(|incumbent| incumbent.nanos),
+            );
+            timings.profile_nanos += profile_start.elapsed().as_nanos();
+            let nanos = match priced {
+                Priced::Cost(nanos) => nanos,
+                Priced::TimedOut(note) => {
+                    breakdown.timed_out += 1;
+                    if refusals.len() < 8 {
+                        refusals.push(format!("timed out: {note}"));
+                    }
                     continue;
                 }
-                rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
+                Priced::PrepareFailed(note) => {
+                    breakdown.plan_build_refusals += 1;
+                    if refusals.len() < 8 {
+                        refusals.push(format!("device prepare: {note}"));
+                    }
+                    continue;
+                }
+                Priced::ExecuteFailed(note) => {
+                    breakdown.execute_refusals += 1;
+                    if refusals.len() < 8 {
+                        refusals.push(format!("execute: {note}"));
+                    }
+                    continue;
+                }
+            };
+            cache.insert(fingerprint, nanos);
+            plans_profiled += 1;
+            rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
+            let improved = best
+                .as_ref()
+                .is_none_or(|incumbent| nanos < incumbent.nanos);
+            if let Some(progress) = progress.as_mut() {
+                if plans_profiled == 1 {
+                    progress.start(nanos);
+                } else {
+                    progress.report(improved, nanos);
+                }
+            }
+            if improved {
                 best = Some(Best {
                     nanos,
                     genome: genome.clone(),

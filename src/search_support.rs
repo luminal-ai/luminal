@@ -258,6 +258,10 @@ pub struct RefusalBreakdown {
     /// compile is an ordinary unfit candidate, indistinguishable in kind
     /// from one bufferize refused, and it must NOT fail the ladder.
     pub plan_build_refusals: usize,
+    /// Extracted plans whose exact physical-lifetime arena exceeds the
+    /// configured device budget. CUDA's genetic search rejects these before
+    /// they enter a generation or reach device preparation.
+    pub arena_refusals: usize,
     /// Failures in a TIMED trial, after the warmup already succeeded.
     pub execute_refusals: usize,
     /// Candidates whose TIMED RUN exceeded the runtime's candidate
@@ -273,12 +277,13 @@ pub struct RefusalBreakdown {
 impl RefusalBreakdown {
     pub fn summary(&self) -> String {
         format!(
-            "extract refusals {} (choice-cycles {}, dead-ends {}), bufferize {}, execute {}, \
-             timed out {}",
+            "extract refusals {} (choice-cycles {}, dead-ends {}), bufferize {}, arena {}, \
+             execute {}, timed out {}",
             self.extract_refusals,
             self.with_choice_cycles,
             self.with_dead_ends,
             self.plan_build_refusals,
+            self.arena_refusals,
             self.execute_refusals,
             self.timed_out
         )
