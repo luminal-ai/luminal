@@ -2969,7 +2969,7 @@ fn ru3_m1_corner_multiplicity() {
          surface {surface:?} — the reader is walking the welded class"
     );
 
-    // (3) EVERY reachable kernel is numerically sound.
+    // (3) EVERY reachable kernel retains a sound call frame.
     let frames = elect_all(&s);
     println!("  reachable frames: {frames:?}");
     // ROUND-10 RE-PIN: at m=1 the ORIGINAL site's out is COL-presenting
@@ -2977,10 +2977,22 @@ fn ru3_m1_corner_multiplicity() {
     // the DIRECT frame's — call (1, 3, 4), A = x (its welded layout read
     // N or T: lda in {1, 4}), B = w (T: ldb = n = 3), ldd = m = 1. The
     // sibling's candidates exist but the boundary elects the direct claim.
-    // ROUND-11 RE-PIN (was 2): the frame doubling adds the column-form
-    // readings; all reachable kernels stay in the one call frame
-    // (asserted below).
-    assert_eq!(frames.len(), 4, "the sound readings of the welded x layout");
+    // Cleanup prefers direct bound-input storage over an equivalent copied
+    // input. The column-form w readings (N, ldb = 4) remain among the eight
+    // raw candidates above, but are subsumed and cannot be elected. Both
+    // readings of the welded x layout survive with direct w (T, ldb = 3).
+    assert_eq!(frames.len(), 2, "the sound readings of the welded x layout");
+    assert_eq!(
+        frames
+            .iter()
+            .map(|f| (f.trans_a, f.trans_b, f.lda, f.ldb, f.ldd))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            (false, true, Some(1), Some(3), Some(1)),
+            (true, true, Some(4), Some(3), Some(1)),
+        ]),
+        "both welded x readings must survive with direct weight storage"
+    );
     for f in &frames {
         assert_eq!(
             (f.m, f.n, f.k),
@@ -2993,14 +3005,8 @@ fn ru3_m1_corner_multiplicity() {
             "COL clamp: ldb={:?} < rows(B)={rows_b:?} for {f:?}",
             f.ldb
         );
-        // ROUND-11 RE-PIN (was exactly 3): w reads T in its storage frame
-        // (ldb = n = 3) and N in its column-form frame (ldb = k = 4);
-        // both are w's own numbers, cross-checked by the clamp above.
-        assert!(
-            f.ldb == Some(3) || f.ldb == Some(4),
-            "ldb is one of w's own frame readings, got {:?}",
-            f.ldb
-        );
+        // The surviving w reading uses its original storage frame.
+        assert_eq!(f.ldb, Some(3), "direct weight storage has ldb = n = 3");
         assert_eq!(f.ldd, Some(1), "ldd is the direct frame's m = 1");
         assert!(
             f.lda == Some(4) || f.lda == Some(1),
