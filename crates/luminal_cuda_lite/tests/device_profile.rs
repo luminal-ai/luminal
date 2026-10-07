@@ -202,6 +202,40 @@ fn device_profiled_search_ranks_by_measurement_and_keeps_the_numbers() {
     assert_close(&want, &got, "device-profiled mini-llama3 logits");
 }
 
+/// Arena feasibility is part of offspring admission, not a late device
+/// preparation failure. This budget is larger than every individual tensor in
+/// the fixture (so the serialized-graph pruning pass cannot decide the result)
+/// but smaller than the live physical arena of every complete plan.
+#[test]
+fn over_budget_offspring_never_reach_device_profiling() {
+    let (cx, floats, ints, _out) = mini_llama3_fixture();
+    let data: FxHashMap<NodeIndex, HostBuffer> = floats
+        .iter()
+        .map(|(id, v)| (*id, HostBuffer::from(v.clone())))
+        .chain(
+            ints.iter()
+                .map(|(id, v)| (*id, HostBuffer::from(v.clone()))),
+        )
+        .collect();
+    let options = CompileOptions {
+        generations: 1,
+        generation_size: 2,
+        trials: 1,
+        search_log: false,
+        device_budget_bytes: Some(1024),
+        ..CompileOptions::default()
+    };
+    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    let err = rt
+        .search(&Default::default(), &Default::default(), &data, &options)
+        .expect_err("every complete mini-llama plan exceeds a 1 KiB arena");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("arena:") && message.contains("exceeds budget 1024"),
+        "the rejection must come from pre-profile arena admission: {message}"
+    );
+}
+
 /// THE TIMEOUT COVERS THE TIMED RUN (ruling: *"timeout should just cover
 /// run"*). A zero budget cannot be met by any candidate, so every one of
 /// them times out, none is ranked, and the search refuses — naming the
