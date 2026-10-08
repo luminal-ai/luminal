@@ -1,6 +1,6 @@
 //! Profile the chat graph on CUDA and inventory its selected execution plan.
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use llm_chat::{
     TensorData, checkpoint,
     graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
@@ -15,12 +15,6 @@ use std::{
     path::PathBuf,
     time::Instant,
 };
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Phase {
-    Decode,
-    Prefill,
-}
 
 #[derive(Parser)]
 struct Args {
@@ -42,9 +36,6 @@ struct Args {
     /// Maximum CUDA arena size in GiB. By default search uses available device memory.
     #[arg(long)]
     memory_limit_gib: Option<usize>,
-    /// Inspect one of the two chat search buckets.
-    #[arg(long, value_enum, default_value_t = Phase::Decode)]
-    phase: Phase,
     /// Inspect viable alternatives to each selected reduction.
     #[arg(long)]
     audit_candidates: bool,
@@ -148,24 +139,9 @@ pub fn main() -> Result<()> {
         llm_chat::search::DEFAULT_PREFILL_CHUNK,
     )?;
     let buckets = llm_chat::search::buckets(&graph)?;
-    let bucket = &buckets[match args.phase {
-        Phase::Decode => 0,
-        Phase::Prefill => 1,
-    }];
-    let query = bucket.profile_dims()[&'q'.into()];
     let context = llm_chat::search::context_representative(&graph);
     let registry = cuda_registry();
     let registered: Vec<_> = registry.iter().map(|op| op.label().to_owned()).collect();
-    let mut runtime = CudaRuntime::load_with(&graph.graph, bindings(&graph), registry)?;
-    eprintln!(
-        "Searching {:?} {:?}: q={}..{}, representative q={query}, c={context}, generations={}, population={}",
-        args.model,
-        args.phase,
-        bucket.bounds().get(&'q'.into()).unwrap().min(),
-        bucket.bounds().get(&'q'.into()).unwrap().max(),
-        args.search_generations,
-        args.search_population
-    );
     let options = CompileOptions {
         generations: args.search_generations,
         generation_size: args.search_population,
@@ -175,92 +151,94 @@ pub fn main() -> Result<()> {
 
         ..Default::default()
     };
-    // Keep selection and audit on ONE e-graph: e-class identities are local
-    // to a saturation run and must not be joined across fresh assemblies.
-    let mut egraph = args
-        .audit_candidates
-        .then(|| runtime.saturated_egraph(bucket.bounds()))
-        .transpose()?;
     let mut weights = checkpoint::load(&checkpoint, &graph.parameters)?;
     weights.extend(graph.initial_inputs());
-    weights.extend(graph.step_inputs(&vec![0; query], context - query)?);
-    let data: FxHashMap<_, luminal_cuda_lite::HostBuffer> = weights
+    let mut data: FxHashMap<_, luminal_cuda_lite::HostBuffer> = weights
         .into_iter()
-        .map(|(id, v)| {
-            (
-                id,
-                match v {
-                    TensorData::F32(v) => v.into(),
-                    TensorData::BF16(v) => HostBuffer::new(
-                        PlanDtype::Bf16,
-                        v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
-                    )
-                    .unwrap(),
-                    TensorData::F16(v) => HostBuffer::new(
-                        PlanDtype::F16,
-                        v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
-                    )
-                    .unwrap(),
-                    TensorData::I32(v) => v.into(),
-                },
-            )
-        })
+        .map(|(id, value)| (id, host_buffer(value)))
         .collect();
-    let start = Instant::now();
-    let outcome = if let Some(egraph) = &mut egraph {
-        use luminal_cuda_lite::search::{Evaluator, SearchProgram, search_implementations};
-        let bound = bindings(&graph)
-            .bind(&graph.graph.logical)
-            .map_err(anyhow::Error::msg)?;
-        let program = SearchProgram {
-            text: String::new(),
-            inputs: bound.inputs.clone(),
-            outputs: bound.outputs,
+    let mut phase_reports = Vec::new();
+    for (index, bucket) in buckets.iter().enumerate() {
+        let phase = if index == 0 { "decode" } else { "prefill" };
+        let query = bucket.profile_dims()[&'q'.into()];
+        for (id, value) in graph.step_inputs(&vec![0; query], context - query)? {
+            data.insert(id, host_buffer(value));
+        }
+        let mut runtime = CudaRuntime::load_with(&graph.graph, bindings(&graph), cuda_registry())?;
+        eprintln!(
+            "Searching {:?} {phase}: q={}..{}, representative q={query}, c={context}, generations={}, population={}",
+            args.model,
+            bucket.bounds().get(&'q'.into()).unwrap().min(),
+            bucket.bounds().get(&'q'.into()).unwrap().max(),
+            args.search_generations,
+            args.search_population
+        );
+        // Keep selection and audit on ONE e-graph: e-class identities are local
+        // to a saturation run and must not be joined across fresh assemblies.
+        let mut egraph = args
+            .audit_candidates
+            .then(|| runtime.saturated_egraph(bucket.bounds()))
+            .transpose()?;
+        let start = Instant::now();
+        let outcome = if let Some(egraph) = &mut egraph {
+            use luminal_cuda_lite::search::{Evaluator, SearchProgram, search_implementations};
+            let bound = bindings(&graph)
+                .bind(&graph.graph.logical)
+                .map_err(anyhow::Error::msg)?;
+            let program = SearchProgram {
+                text: String::new(),
+                inputs: bound.inputs.clone(),
+                outputs: bound.outputs,
+            };
+            let shapes = luminal_cuda_lite::symbolic::ShapeEnv {
+                bounds: bucket.bounds().ranges(),
+                values: bucket.profile_dims().clone(),
+            };
+            let staged = bound
+                .inputs
+                .iter()
+                .filter_map(|b| data.get(&b.value).map(|v| (b.buffer, v)))
+                .collect();
+            let mut device = luminal_cuda_lite::device::CudaDevice::new(0)?.executable();
+            search_implementations(
+                egraph,
+                &program,
+                &shapes,
+                &options,
+                Some(CudaRuntime::allow_list()),
+                &luminal_cuda_lite::ops::cuda_matchers(),
+                Evaluator::Device {
+                    device: &mut device,
+                    staged: &staged,
+                },
+            )?
+        } else {
+            runtime.search(bucket.bounds(), bucket.profile_dims(), &data, &options)?
         };
-        let shapes = luminal_cuda_lite::symbolic::ShapeEnv {
-            bounds: bucket.bounds().ranges(),
-            values: bucket.profile_dims().clone(),
+        let plan = if args.audit_candidates {
+            outcome.best_plan.clone()
+        } else {
+            runtime.plan().context("missing selected plan")?.clone()
         };
-        let staged = bound
-            .inputs
-            .iter()
-            .filter_map(|b| data.get(&b.value).map(|v| (b.buffer, v)))
-            .collect();
-        let mut device = luminal_cuda_lite::device::CudaDevice::new(0)?.executable();
-        search_implementations(
-            egraph,
-            &program,
-            &shapes,
-            &options,
-            Some(CudaRuntime::allow_list()),
-            &luminal_cuda_lite::ops::cuda_matchers(),
-            Evaluator::Device {
-                device: &mut device,
-                staged: &staged,
-            },
-        )?
-    } else {
-        runtime.search(bucket.bounds(), bucket.profile_dims(), &data, &options)?
-    };
-    let plan = if args.audit_candidates {
-        &outcome.best_plan
-    } else {
-        runtime.plan().context("missing selected plan")?
-    };
-    let mut counts = BTreeMap::<String, usize>::new();
-    let mut nodes = Vec::new();
-    for id in plan.dag.node_indices() {
-        let node = &plan.dag[id];
-        let label = match node {
-            BufferNode::Compute {
-                op,
-                reads,
-                writes,
-                operand_info,
-                result_info,
-                ..
-            } => {
-                nodes.push(json!({
+        let arena_bytes = if args.audit_candidates {
+            None
+        } else {
+            Some(runtime.arena_bytes()?)
+        };
+        let mut counts = BTreeMap::<String, usize>::new();
+        let mut nodes = Vec::new();
+        for id in plan.dag.node_indices() {
+            let node = &plan.dag[id];
+            let label = match node {
+                BufferNode::Compute {
+                    op,
+                    reads,
+                    writes,
+                    operand_info,
+                    result_info,
+                    ..
+                } => {
+                    nodes.push(json!({
                     "id": id.index(), "op": op.label(), "details": format!("{op:?}"),
                     "reads": reads.iter().map(|b| format!("{b:?}")).collect::<Vec<_>>(),
                     "writes": writes.iter().map(|b| format!("{b:?}")).collect::<Vec<_>>(),
@@ -269,42 +247,65 @@ pub fn main() -> Result<()> {
                     "operand_shapes": operand_info.iter().map(|s| format!("{:?}", s.layout.shape())).collect::<Vec<_>>(),
                     "result_shapes": result_info.iter().map(|s| format!("{:?}", s.layout.shape())).collect::<Vec<_>>()
                 }));
-                op.label()
-            }
-            BufferNode::BufferInput { .. } => "BufferInput",
-            BufferNode::BufferOutput { .. } => "BufferOutput",
-            BufferNode::BufferCopy { .. } => "BufferCopy",
+                    op.label()
+                }
+                BufferNode::BufferInput { .. } => "BufferInput",
+                BufferNode::BufferOutput { .. } => "BufferOutput",
+                BufferNode::BufferCopy { .. } => "BufferCopy",
+            };
+            *counts.entry(label.to_owned()).or_default() += 1;
+        }
+        let search_seconds = start.elapsed().as_secs_f64();
+        let audit = if args.audit_candidates {
+            eprintln!("Auditing {phase} alternatives to selected reductions...");
+            Some(candidate_audit(egraph.as_ref().unwrap(), &plan)?)
+        } else {
+            None
         };
-        *counts.entry(label.to_owned()).or_default() += 1;
+        println!("{phase}: {}", serde_json::to_string_pretty(&counts)?);
+        phase_reports.push(json!({
+            "phase": phase, "selected_counts": counts, "nodes": nodes,
+            "search_seconds": search_seconds, "candidate_audit": audit,
+            "q_range": [bucket.bounds().get(&'q'.into()).unwrap().min(), bucket.bounds().get(&'q'.into()).unwrap().max()],
+            "initial_q": query, "initial_c": context, "arena_bytes": arena_bytes,
+            "best_nanos": outcome.best_nanos.to_string(),
+            "memory_pruning": {
+                "oversized_tensors": outcome.memory_pruning.oversized_tensors,
+                "producer_classes": outcome.memory_pruning.producer_classes,
+                "removed_nodes": outcome.memory_pruning.removed_nodes,
+                "largest_tensor_bytes": outcome.memory_pruning.largest_tensor_bytes
+            }
+        }));
     }
     let text_config = config.get("text_config").unwrap_or(&config);
-    let search_seconds = start.elapsed().as_secs_f64();
-    let audit = if args.audit_candidates {
-        eprintln!("Auditing matched alternatives to selected reductions...");
-        Some(candidate_audit(egraph.as_ref().unwrap(), plan)?)
-    } else {
-        None
-    };
     let report = json!({
         "model": format!("{:?}", args.model), "checkpoint": checkpoint,
         "layers": text_config["num_hidden_layers"], "hidden_size": text_config["hidden_size"],
-        "registered_ops": registered, "selected_counts": counts, "nodes": nodes,
-        "search_seconds": search_seconds, "candidate_audit":audit,
-        "search_settings": {"phase":format!("{:?}", args.phase), "q_range": [bucket.bounds().get(&'q'.into()).unwrap().min(),bucket.bounds().get(&'q'.into()).unwrap().max()], "c_range": [1,256], "initial_q":query, "initial_c":context,
-            "generations":args.search_generations, "population":args.search_population, "seed":0, "ranking":"device_time",
+        "registered_ops": registered, "phases": phase_reports,
+        "search_settings": {"c_range": [1,256],
+            "generations_per_bucket":args.search_generations, "population_per_bucket":args.search_population, "seed":0, "ranking":"device_time",
             "memory_limit_gib": args.memory_limit_gib, "device_budget_bytes": device_budget_bytes},
-        "best_nanos": outcome.best_nanos.to_string(),
-        "memory_pruning": {
-            "oversized_tensors": outcome.memory_pruning.oversized_tensors,
-            "producer_classes": outcome.memory_pruning.producer_classes,
-            "removed_nodes": outcome.memory_pruning.removed_nodes,
-            "largest_tensor_bytes": outcome.memory_pruning.largest_tensor_bytes
-        },
-        "method": "Measured CUDA search using checkpoint weights and the chat graph, bindings, dynamic bounds and initial dimensions. This diagnostic searches only the requested decode or prefill bucket; the chat runner searches both."
+        "method": "Measured CUDA searches for both decode and prefill using checkpoint weights and the chat graph, bindings, dynamic bounds and initial dimensions."
     });
     if let Some(path) = &args.report {
         std::fs::write(path, serde_json::to_string_pretty(&report)? + "\n")?;
     }
-    println!("{}", serde_json::to_string_pretty(&counts)?);
     Ok(())
+}
+
+fn host_buffer(value: TensorData) -> HostBuffer {
+    match value {
+        TensorData::F32(v) => v.into(),
+        TensorData::BF16(v) => HostBuffer::new(
+            PlanDtype::Bf16,
+            v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+        )
+        .unwrap(),
+        TensorData::F16(v) => HostBuffer::new(
+            PlanDtype::F16,
+            v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+        )
+        .unwrap(),
+        TensorData::I32(v) => v.into(),
+    }
 }
