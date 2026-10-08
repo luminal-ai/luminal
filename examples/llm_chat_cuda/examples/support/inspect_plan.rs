@@ -4,6 +4,7 @@ use clap::{Parser, ValueEnum};
 use llm_chat::{
     TensorData, checkpoint,
     graph::{LlmGraph, ModelConfig, ModelType, checkpoint_dtype},
+    hf,
 };
 use llm_chat_cuda::backend::bindings;
 use luminal::{bufferize::BufferNode, dtype::PlanDtype, prelude::FxHashMap};
@@ -25,10 +26,13 @@ enum Phase {
 struct Args {
     #[arg(long, value_enum)]
     model: ModelType,
+    /// Local Hugging Face checkpoint directory. When omitted, use the model's
+    /// default repository through the standard Hugging Face cache.
     #[arg(long)]
-    checkpoint: PathBuf,
+    checkpoint: Option<PathBuf>,
+    /// Write the detailed JSON plan report. Omit to print only the summary.
     #[arg(long)]
-    report: PathBuf,
+    report: Option<PathBuf>,
     /// Search generations per bucket.
     #[arg(long, default_value_t = llm_chat::search::DEFAULT_SEARCH_GENERATIONS)]
     search_generations: usize,
@@ -127,7 +131,16 @@ pub fn main() -> Result<()> {
                 .context("--memory-limit-gib overflows usize bytes")
         })
         .transpose()?;
-    let config = checkpoint::read_json(&args.checkpoint.join("config.json"))?;
+    let checkpoint = match &args.checkpoint {
+        Some(path) => path.clone(),
+        None => {
+            let repo = args.model.default_hf_repo();
+            eprintln!("Using Hugging Face checkpoint {repo}...");
+            hf::download_checkpoint(repo, None)
+                .with_context(|| format!("download Hugging Face checkpoint {repo}"))?
+        }
+    };
+    let config = checkpoint::read_json(&checkpoint.join("config.json"))?;
     let graph = LlmGraph::build_with_parameter_dtype(
         ModelConfig::from_checkpoint(args.model, &config)?,
         checkpoint_dtype(&config)?,
@@ -168,7 +181,7 @@ pub fn main() -> Result<()> {
         .audit_candidates
         .then(|| runtime.saturated_egraph(bucket.bounds()))
         .transpose()?;
-    let mut weights = checkpoint::load(&args.checkpoint, &graph.parameters)?;
+    let mut weights = checkpoint::load(&checkpoint, &graph.parameters)?;
     weights.extend(graph.initial_inputs());
     weights.extend(graph.step_inputs(&vec![0; query], context - query)?);
     let data: FxHashMap<_, luminal_cuda_lite::HostBuffer> = weights
@@ -273,7 +286,7 @@ pub fn main() -> Result<()> {
         None
     };
     let report = json!({
-        "model": format!("{:?}", args.model), "checkpoint": args.checkpoint,
+        "model": format!("{:?}", args.model), "checkpoint": checkpoint,
         "layers": text_config["num_hidden_layers"], "hidden_size": text_config["hidden_size"],
         "registered_ops": registered, "selected_counts": counts, "nodes": nodes,
         "search_seconds": search_seconds, "candidate_audit":audit,
@@ -289,7 +302,9 @@ pub fn main() -> Result<()> {
         },
         "method": "Measured CUDA search using checkpoint weights and the chat graph, bindings, dynamic bounds and initial dimensions. This diagnostic searches only the requested decode or prefill bucket; the chat runner searches both."
     });
-    std::fs::write(&args.report, serde_json::to_string_pretty(&report)? + "\n")?;
+    if let Some(path) = &args.report {
+        std::fs::write(path, serde_json::to_string_pretty(&report)? + "\n")?;
+    }
     println!("{}", serde_json::to_string_pretty(&counts)?);
     Ok(())
 }
