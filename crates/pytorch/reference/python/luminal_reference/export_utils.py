@@ -19,10 +19,9 @@ new home of those passes:
 # Without this, torch.export.export raises when handed an HF model that
 # returns CausalLMOutputWithPast(past_key_values=DynamicCache(...)), which
 # is every model with use_cache=True. The registration mirrors the one in
-# transformers.integrations.executorch.register_dynamic_cache_export_support
-# — same dict-based flatten (key_cache / value_cache lists), same replay via
-# cache.update(k, v, idx), and the matching torch.fx._pytree spec for FX
-# graphs. Done lazily by luminal_reference() so both entry points get it.
+# transformers.integrations.executorch.register_dynamic_cache_export_support:
+# dict-based key/value lists and a matching torch.fx._pytree spec. Unlike that
+# helper, retain empty slots so a populated later layer keeps its index.
 # ---------------------------------------------------------------------------
 
 
@@ -50,12 +49,10 @@ def private_graph_copy(gm):
 
 
 def _get_cache_dict(cache):
-    """Flatten a DynamicCache to a dict of parallel key/value lists."""
+    """Flatten a DynamicCache without shifting its empty layer slots."""
     return {
-        "key_cache": [layer.keys for layer in cache.layers if layer.keys is not None],
-        "value_cache": [
-            layer.values for layer in cache.layers if layer.values is not None
-        ],
+        "key_cache": [layer.keys for layer in cache.layers],
+        "value_cache": [layer.values for layer in cache.layers],
     }
 
 
@@ -69,7 +66,7 @@ def flatten_dynamic_cache(cache):
 def unflatten_dynamic_cache(values, context):
     """Pytree unflatten function for DynamicCache."""
     import torch
-    from transformers.cache_utils import DynamicCache
+    from transformers.cache_utils import DynamicCache, DynamicLayer
 
     dictionary = torch.utils._pytree._dict_unflatten(values, context)
     cache = DynamicCache()
@@ -78,7 +75,10 @@ def unflatten_dynamic_cache(values, context):
     for idx in range(max(len(key_list), len(value_list))):
         key = key_list[idx] if idx < len(key_list) else None
         value = value_list[idx] if idx < len(value_list) else None
-        cache.update(key, value, idx)
+        if key is None and value is None:
+            cache.layers.append(DynamicLayer())
+        else:
+            cache.update(key, value, idx)
     return cache
 
 
