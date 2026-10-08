@@ -35,6 +35,9 @@ struct Args {
     /// Candidate attempts per generation, per bucket.
     #[arg(long, default_value_t = llm_chat::search::DEFAULT_SEARCH_POPULATION)]
     search_population: usize,
+    /// Maximum CUDA arena size in GiB. By default search uses available device memory.
+    #[arg(long)]
+    memory_limit_gib: Option<usize>,
     /// Inspect one of the two chat search buckets.
     #[arg(long, value_enum, default_value_t = Phase::Decode)]
     phase: Phase,
@@ -117,6 +120,13 @@ fn candidate_audit(
 
 pub fn main() -> Result<()> {
     let args = Args::parse();
+    let device_budget_bytes = args
+        .memory_limit_gib
+        .map(|gib| {
+            gib.checked_mul(1024 * 1024 * 1024)
+                .context("--memory-limit-gib overflows usize bytes")
+        })
+        .transpose()?;
     let config = checkpoint::read_json(&args.checkpoint.join("config.json"))?;
     let graph = LlmGraph::build_with_parameter_dtype(
         ModelConfig::from_checkpoint(args.model, &config)?,
@@ -148,6 +158,7 @@ pub fn main() -> Result<()> {
         generation_size: args.search_population,
         seed: 0,
         search_log: false,
+        device_budget_bytes,
 
         ..Default::default()
     };
@@ -267,7 +278,8 @@ pub fn main() -> Result<()> {
         "registered_ops": registered, "selected_counts": counts, "nodes": nodes,
         "search_seconds": search_seconds, "candidate_audit":audit,
         "search_settings": {"phase":format!("{:?}", args.phase), "q_range": [bucket.bounds().get(&'q'.into()).unwrap().min(),bucket.bounds().get(&'q'.into()).unwrap().max()], "c_range": [1,256], "initial_q":query, "initial_c":context,
-            "generations":args.search_generations, "population":args.search_population, "seed":0, "ranking":"device_time"},
+            "generations":args.search_generations, "population":args.search_population, "seed":0, "ranking":"device_time",
+            "memory_limit_gib": args.memory_limit_gib, "device_budget_bytes": device_budget_bytes},
         "best_nanos": outcome.best_nanos.to_string(),
         "memory_pruning": {
             "oversized_tensors": outcome.memory_pruning.oversized_tensors,
