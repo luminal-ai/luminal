@@ -65,12 +65,17 @@ struct Args {
     /// Candidate attempts per generation, per bucket.
     #[arg(long, default_value_t = crate::search::DEFAULT_SEARCH_POPULATION)]
     search_population: usize,
+    /// Maximum shared device arena size in GiB. CUDA defaults to currently
+    /// available device memory when omitted.
+    #[arg(long)]
+    memory_limit_gib: Option<usize>,
 }
 
 pub struct SearchOptions {
     pub generations: usize,
     pub population: usize,
     pub seed: u64,
+    pub device_budget_bytes: Option<usize>,
 }
 
 pub fn main<B: Backend>(
@@ -140,6 +145,13 @@ fn run<B: Backend>(
         generations: args.search_generations,
         population: args.search_population,
         seed: args.seed,
+        device_budget_bytes: args
+            .memory_limit_gib
+            .map(|gib| {
+                gib.checked_mul(1024 * 1024 * 1024)
+                    .context("--memory-limit-gib overflows usize bytes")
+            })
+            .transpose()?,
     };
     let compile_started = Instant::now();
     let backend = compile(&graph, weights, options).context("compile chat graph")?;
