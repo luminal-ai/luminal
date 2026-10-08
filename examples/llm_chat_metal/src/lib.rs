@@ -13,6 +13,7 @@ pub fn run() -> anyhow::Result<()> {
                 generations: search.generations,
                 generation_size: search.population,
                 seed: search.seed,
+                device_budget_bytes: search.device_budget_bytes,
                 ..Default::default()
             },
         )

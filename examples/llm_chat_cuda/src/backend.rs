@@ -69,6 +69,12 @@ impl CudaBackend {
         options: &CompileOptions,
     ) -> Result<Self> {
         let device = luminal_cuda_lite::device::CudaDevice::new(0)?;
+        let available = device.executable().available_arena_bytes()?;
+        let arena_budget = options
+            .device_budget_bytes
+            .map_or(available, |requested| requested.min(available));
+        let mut resolved_options = options.clone();
+        resolved_options.device_budget_bytes = Some(arena_budget);
         weights.extend(graph.initial_inputs());
         let mut data: FxHashMap<_, HostBuffer> =
             weights.into_iter().map(|(id, v)| (id, host(v))).collect();
@@ -85,7 +91,8 @@ impl CudaBackend {
             let mut runtime =
                 CudaRuntime::load_with(&graph.graph, bindings(graph), cuda_registry())?
                     .with_device(&device)?;
-            let outcome = runtime.search(spec.bounds(), spec.profile_dims(), &data, options)?;
+            let outcome =
+                runtime.search(spec.bounds(), spec.profile_dims(), &data, &resolved_options)?;
             let scratch_bytes = runtime.arena_bytes()?;
             let resource_bindings = resources
                 .iter()
@@ -112,7 +119,7 @@ impl CudaBackend {
             let staging = runtime.allocate_staging()?;
             programs.push((spec, (runtime, staging)));
         }
-        let memory = SharedArenaPlan::build(&requirements, usize::MAX)?;
+        let memory = SharedArenaPlan::build(&requirements, arena_budget)?;
         let mut arena = crate::memory::Allocation::new(device.stream().clone(), memory.bytes)?;
         for id in resources {
             let home = memory.homes[&ResourceId(id.index() as u64)];

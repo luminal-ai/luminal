@@ -178,16 +178,10 @@ fn prefill_and_decode_share_application_state_and_match_reference() {
         assert_eq!(plan.representative[&'q'.into()], query);
         assert_eq!(plan.representative[&'c'.into()], 128);
         let outcome = &plan.outcome;
-        let refusals = &outcome.refusal_breakdown;
-        let attempts = outcome.plans_profiled
-            + outcome.fingerprint_hits
-            + refusals.extract_refusals
-            + refusals.plan_build_refusals
-            + refusals.execute_refusals
-            + refusals.timed_out;
         assert_eq!(
-            attempts, 100,
-            "each bucket must receive the full default budget"
+            outcome.plans_profiled, 100,
+            "each bucket must admit and profile the full default population; rejected and \
+             duplicate proposals do not consume population slots"
         );
     }
     let prefill: Vec<u32> = (0..128).map(|i| i % 9 + 1).collect();
