@@ -172,9 +172,9 @@ fn var_correction_without_dim_reduces_everything() {
     );
 }
 
-/// A rank-0 value has no axis: torch's `prod.dim_int` and `cumsum.default`
-/// both return it unchanged rather than folding. The translation records no
-/// op at all, so the output value IS the input value.
+/// A rank-0 F32 value has no axis: without a dtype override, torch's
+/// `prod.dim_int` and `cumsum.default` both return it unchanged. The
+/// translation records no op, so the output value IS the input value.
 #[test]
 fn rank_zero_prod_and_cumsum_are_the_identity() {
     for (target, args) in [

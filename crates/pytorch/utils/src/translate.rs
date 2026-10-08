@@ -36,6 +36,8 @@ mod movement_more;
 mod opmath_tests;
 mod ops;
 mod pooling;
+#[cfg(test)]
+mod reduction_dtype_tests;
 mod reductions_more;
 #[cfg(test)]
 mod scan_tests;
@@ -562,7 +564,18 @@ impl Translator<'_> {
         if let Some(widened) = self.widened.get(&key) {
             return *widened;
         }
-        let widened = convert(convert(value, opmath.common), opmath.compute);
+        let mut common = convert(value, opmath.common);
+        if opmath.common == DType::Bool && opmath.compute == DType::F32 && is_float(value.dtype) {
+            // Boolean sum/prod also treat NaN as true. Core's to-Bool
+            // projection uses ordered nonzero comparisons, so supply the
+            // ATen unordered case here. Every non-NaN is below +inf or
+            // above -inf (including either infinity itself).
+            let infinity = self.constant_like(value, f64::INFINITY);
+            let ordered = self.bool_or(value.lt(infinity), (-infinity).lt(value));
+            let nan = self.bool_not(ordered);
+            common = self.bool_or(common, nan);
+        }
+        let widened = convert(common, opmath.compute);
         self.widened.insert(key, widened);
         widened
     }
@@ -570,8 +583,26 @@ impl Translator<'_> {
     /// The dtype pattern this node's op performs: torch's common dtype is
     /// the declared result dtype, except for a comparison, whose Bool
     /// result says nothing about where the operands met.
-    fn opmath_for(&self, node: &Node) -> Result<OpMath> {
+    fn opmath_for(&self, node: &Node, target: &str) -> Result<OpMath> {
         let declared = self.first_output_dtype(node)?;
+        // Sum/prod cast to the resolved result dtype BEFORE reducing,
+        // including bool/integer -> int64 when dtype is omitted. An
+        // explicit Bool result is not a comparison: project each operand
+        // to Bool first, then fold its 0/1 indicator and project the result.
+        // F32 can fold those indicators without changing their truth value.
+        if matches!(
+            target,
+            "sum.default" | "sum.dim_IntList" | "prod.default" | "prod.dim_int"
+        ) {
+            return Ok(OpMath {
+                common: declared,
+                compute: if declared == DType::Bool {
+                    DType::F32
+                } else {
+                    opmath_compute(declared)
+                },
+            });
+        }
         let common = match declared {
             DType::Bool => {
                 let promoted = self.promoted_operand_dtype(node).unwrap_or(declared);
@@ -754,7 +785,7 @@ impl Translator<'_> {
         // The op's dtype pattern is set for the whole arm and cleared on
         // every exit, so its operands widen and its outputs round once.
         if opmath_target(target) {
-            self.opmath = Some(self.opmath_for(node)?);
+            self.opmath = Some(self.opmath_for(node, target)?);
         }
         let result = self.dispatch_target(node, target);
         self.opmath = None;
@@ -1395,10 +1426,10 @@ fn convert(value: GraphTensor, dtype: DType) -> GraphTensor {
 }
 
 /// Whether torch performs this op in opmath — half-precision math in F32,
-/// rounded once at the store. Everything the dispatch table names and this
-/// does not is exact: it rounds nothing, so it keeps its operands' dtype
+/// rounded once at the store. Targets outside this set do not receive this
+/// generic widening; their lowerings own any ATen-specific conversions
 /// (movement, indexing, selection, casts, max/min-family reductions,
-/// nearest-neighbour resampling, the operand-dtype scans, and
+/// nearest-neighbour resampling, scans at their resolved result dtype, and
 /// `_grouped_mm`, whose `offs` operand is an int index).
 fn opmath_target(target: &str) -> bool {
     // Every `special_*` lowering is a float math function.
@@ -1489,8 +1520,8 @@ fn opmath_target(target: &str) -> bool {
             | "var_mean.correction"
             | "linalg_vector_norm.default"
             | "logcumsumexp.default"
-            // (cumsum/cumprod are exact-class: torch's scans accumulate
-            // in the operand dtype.)
+            // cumsum/cumprod stay outside generic opmath. Their translator
+            // casts to the resolved result dtype before the core scan.
             | "dist.default"
             | "_cdist_forward.default"
             | "_pdist_forward.default"

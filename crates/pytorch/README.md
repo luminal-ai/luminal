@@ -77,6 +77,31 @@ uv run --project cuda_lite --group dev modal run cuda_lite/modal_pytest_runner.p
 Python environments and caches are generated, ignored files. Only backend
 `.venv` directories are used; none is needed at the PyTorch root.
 
+## Reduction and scan dtypes
+
+The PT2 translator owns PyTorch's implicit dtype conversions. For `sum`,
+`prod`, `cumsum`, and `cumprod`, an omitted or `None` `dtype` promotes Boolean
+and integer inputs to `torch.int64`; floating inputs keep their dtype. An
+explicit `dtype` overrides that rule and converts each input element **before**
+accumulation, including rank-zero inputs. PT2 output metadata records the
+resolved dtype even when the exported ATen node contains no cast or dtype
+argument; the translator uses that metadata to insert the conversion.
+
+`sum`/`prod` retain the existing F32 opmath path for FP16/BF16, followed by one
+conversion to the declared output dtype. With explicit Boolean output they
+convert each element to Boolean (including NaN to true), reduce its 0/1
+indicator, and project the result. `cumsum`/`cumprod` retain the existing scan at the resolved
+dtype, without adding generic opmath widening. These rules do not apply to
+index results such as `argmax`: its Int64 output does not change its input
+dtype. Luminal's core operators and strict declared-dtype checks are unchanged.
+
+Translation coverage does not imply every runtime has the corresponding
+kernel. In particular, the reference runtime currently lacks Int64 reductions
+and scans and FP16/BF16 storage; Int32 sums require value-bound proofs that the
+PT2 test harness does not currently supply. Their dtype contracts can still be
+checked during translation and saturation. PyTorch CPU also rejects non-scalar
+Boolean scans with explicit `dtype=torch.bool`.
+
 ## Internal region artifacts
 
 Region export, compilation, serialization, and artifact caching are internal

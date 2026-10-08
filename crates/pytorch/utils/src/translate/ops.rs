@@ -366,9 +366,14 @@ impl Translator<'_> {
 
     pub(super) fn translate_cumulative(&mut self, node: &Node, prod: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        // ATen casts BEFORE scanning: absent dtype promotes bool/integer
+        // inputs to int64; an explicit dtype overrides that default. PT2's
+        // output metadata has already resolved both cases, even when the
+        // exported node has no dtype argument or explicit cast. Luminal's
+        // scans themselves preserve their operand dtype.
+        let x = super::convert(x, self.output_meta_dtype(node)?);
         let dim = self.get_int_arg(node, 1)?;
-        // A rank-0 scan is the identity, and only dims torch accepts there
-        // reach it.
+        // A rank-0 scan is the identity AFTER the dtype conversion.
         if x.rank() == 0 {
             if dim != 0 && dim != -1 {
                 bail!("dim {dim} is out of range for a rank-0 value");
