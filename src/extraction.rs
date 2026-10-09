@@ -12,8 +12,8 @@
 
 use once_cell::unsync::Lazy;
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
@@ -30,7 +30,8 @@ use crate::logical_op::{LogicalRender, logical_op_for};
 /// The genome-independent candidate memo: (produced class, chosen enode,
 /// chosen output slot) → that choice's candidates. See the field on
 /// [`Extractor`].
-type ChoiceCandidateCache = std::cell::RefCell<HashMap<(ClassId, NodeId, usize), Rc<[Candidate]>>>;
+type ChoiceCandidateCache =
+    std::cell::RefCell<FxHashMap<(ClassId, NodeId, usize), Rc<[Candidate]>>>;
 
 #[derive(Debug)]
 struct Extractor<'a> {
@@ -41,8 +42,8 @@ struct Extractor<'a> {
     /// structural plumbing — inputs, outputs, buffer lists — is never
     /// filtered). This registry is the ONLY dispatch: an enode whose label
     /// has no entry here simply offers no implementation candidate.
-    matchers: HashMap<&'static str, &'a dyn OpMatcher>,
-    class_nodes: HashMap<ClassId, Vec<NodeId>>,
+    matchers: FxHashMap<&'static str, &'a dyn OpMatcher>,
+    class_nodes: FxHashMap<ClassId, Vec<NodeId>>,
     /// The serialized index every [`ExtractionSite`] this extractor
     /// builds reads through: class → its e-nodes, constructor → its
     /// e-nodes, and (constructor, child 0's class) → its fact rows, ALL
@@ -58,18 +59,18 @@ struct Extractor<'a> {
     /// lazy text closures the extraction hands out can keep it alive
     /// after this borrow of the caller's e-graph ends.
     render: Rc<RenderCtx>,
-    op_specs: HashMap<ClassId, Vec<OpSpec>>,
-    producer_index: HashMap<ClassId, Vec<ProducerRef>>,
-    input_terminals: HashMap<ClassId, InputInfo>,
+    op_specs: FxHashMap<ClassId, Vec<OpSpec>>,
+    producer_index: FxHashMap<ClassId, Vec<ProducerRef>>,
+    input_terminals: FxHashMap<ClassId, InputInfo>,
     /// The search genome, when this walk is genome-driven (see [`Genome`]).
     /// `None` = the deterministic fixture extractor (minimum-height derivation).
     genome: Option<Genome>,
-    memo: HashMap<ClassId, Option<Plan>>,
+    memo: FxHashMap<ClassId, Option<Plan>>,
     /// Post-relaxation blockage record (diagnosis, ruling 2026-08-07:
     /// UNDERSTAND refusals, no auto-repair): unplanned class → its
     /// candidates' unplanned children, plus the unplanned classes with
     /// no candidates at all. Cleared per extraction.
-    blocked: HashMap<ClassId, Vec<ClassId>>,
+    blocked: FxHashMap<ClassId, Vec<ClassId>>,
     no_candidates: Vec<ClassId>,
     /// GENOME-INDEPENDENT op-instance cache: matcher `extract()` parses
     /// only enode METADATA (index maps, iota expressions, coordinate
@@ -77,27 +78,27 @@ struct Extractor<'a> {
     /// never depends on the genome. Filled once per session, NEVER
     /// cleared by `extract_with_genome` — measured 2026-08-06: re-parsing
     /// per genome was 98% of a 378s MLP search (5.8s × 64 genomes).
-    op_cache: std::cell::RefCell<HashMap<NodeId, Box<dyn LayoutIrOp>>>,
+    op_cache: std::cell::RefCell<FxHashMap<NodeId, Box<dyn LayoutIrOp>>>,
     /// GENOME-INDEPENDENT dtype index (typed-buffers landing A,
     /// 2026-08-11): serialized `dtype-of` rows, scanned once —
     /// LogicalTensor class → the plan dtype. Same row encoding as the
     /// bounds index (op = function name, children[0] = the argument
     /// node, the row's own eclass holds the value member); pinned by
     /// `dtype_index_reads_serialized_rows` in test_support.
-    dtype_index: std::cell::RefCell<Option<HashMap<ClassId, crate::dtype::PlanDtype>>>,
+    dtype_index: std::cell::RefCell<Option<FxHashMap<ClassId, crate::dtype::PlanDtype>>>,
     /// GENOME-INDEPENDENT boundary-declaration indexes: the serialized
     /// `buffer-access-of` / `buffer-freed-by` rows, scanned once —
     /// BufferId class → the declared permission / free responsibility.
     /// Same row encoding as the bounds and dtype indexes above. These
     /// are read once per buffer per assembled graph, so un-indexed they
     /// cost (buffers x nodes) per genome.
-    buffer_access_index: std::cell::RefCell<Option<HashMap<ClassId, Access>>>,
-    buffer_freed_by_index: std::cell::RefCell<Option<HashMap<ClassId, FreedBy>>>,
+    buffer_access_index: std::cell::RefCell<Option<FxHashMap<ClassId, Access>>>,
+    buffer_freed_by_index: std::cell::RefCell<Option<FxHashMap<ClassId, FreedBy>>>,
     /// GENOME-INDEPENDENT stable-key memo (measured 2026-08-10: eager
     /// per-comparison rendering was 99% of deep extraction — 7395/7471
     /// sampled stacks inside `is_better`). The rendered form of an enode
     /// never changes within a session, so one cache serves every genome.
-    stable_key_cache: std::cell::RefCell<HashMap<NodeId, std::rc::Rc<str>>>,
+    stable_key_cache: std::cell::RefCell<FxHashMap<NodeId, std::rc::Rc<str>>>,
     /// GENOME-INDEPENDENT candidate memo: (produced class, chosen enode,
     /// chosen output slot) → the candidates
     /// [`Extractor::producer_candidates_for_choice`] builds for it.
@@ -128,7 +129,7 @@ struct Universe {
     /// The inverse of `classes`: class → its universe index. Every child
     /// class of every candidate is a key (the BFS closure), which is what
     /// lets the worklist index its counters densely.
-    position: HashMap<ClassId, u32>,
+    position: FxHashMap<ClassId, u32>,
     candidates: Vec<Vec<Candidate>>,
 }
 
@@ -339,7 +340,7 @@ impl<'a> ExtractionSession<'a> {
         };
         // Tarjan over the blocked graph via petgraph.
         let mut graph = petgraph::graph::DiGraph::<ClassId, ()>::new();
-        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut nodes: FxHashMap<ClassId, petgraph::graph::NodeIndex> = FxHashMap::default();
         for class in extractor.blocked.keys() {
             let index = graph.add_node(class.clone());
             nodes.insert(class.clone(), index);
@@ -367,7 +368,7 @@ impl<'a> ExtractionSession<'a> {
         // Landing D refusal visibility: a dead-end whose logical member
         // is a proof-gated Int op did not fail for lack of a kernel —
         // it failed for lack of a PROOF. Name that, and name the door.
-        let bounded: std::collections::HashSet<ClassId> = extractor
+        let bounded: FxHashSet<ClassId> = extractor
             .egraph
             .nodes
             .values()
@@ -458,7 +459,7 @@ impl<'a> ExtractionSession<'a> {
         };
         let mut out = String::new();
         let mut graph = petgraph::graph::DiGraph::<ClassId, ()>::new();
-        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut nodes: FxHashMap<ClassId, petgraph::graph::NodeIndex> = FxHashMap::default();
         for class in ex.blocked.keys() {
             nodes.insert(class.clone(), graph.add_node(class.clone()));
         }
@@ -560,7 +561,7 @@ pub struct ProducerChoice {
 /// free (the reachability-kill semantics).
 #[derive(Debug, Clone, Default)]
 pub struct Genome {
-    pub choices: HashMap<ClassId, ProducerChoice>,
+    pub choices: FxHashMap<ClassId, ProducerChoice>,
 }
 
 /// Genome-driven extraction with an EXPLICIT runtime matcher set — the
@@ -835,7 +836,7 @@ pub fn edges_have_cycle(edges: &std::collections::BTreeMap<ClassId, Vec<ClassId>
         Open,
         Done,
     }
-    let mut colour: HashMap<&ClassId, Colour> = HashMap::new();
+    let mut colour: FxHashMap<&ClassId, Colour> = FxHashMap::default();
     for root in edges.keys() {
         if colour.contains_key(root) {
             continue;
@@ -922,7 +923,7 @@ impl<'a> Extractor<'a> {
     /// the reference registry is just the default caller.
     fn new_with_matchers(
         egraph: &'a EGraph,
-        allowed_ops: Option<HashSet<String>>,
+        allowed_ops: Option<FxHashSet<String>>,
         genome: Option<&Genome>,
         matcher_set: &'a [Box<dyn OpMatcher>],
     ) -> Self {
@@ -933,7 +934,7 @@ impl<'a> Extractor<'a> {
         // list once instead of rebuilding it per call — `dyn OpMatcher`
         // is not `Clone` and the registry is chosen at `load`, so there
         // is nothing to rebuild it FROM down here.
-        let matchers: HashMap<&'static str, &'a dyn OpMatcher> = matcher_set
+        let matchers: FxHashMap<&'static str, &'a dyn OpMatcher> = matcher_set
             .iter()
             .map(|matcher| matcher.as_ref())
             .filter(|matcher| {
@@ -1003,8 +1004,8 @@ impl<'a> Extractor<'a> {
             producer_index,
             input_terminals,
             genome: genome.cloned(),
-            memo: HashMap::new(),
-            blocked: HashMap::new(),
+            memo: FxHashMap::default(),
+            blocked: FxHashMap::default(),
             no_candidates: Vec::new(),
             op_cache: Default::default(),
             dtype_index: Default::default(),
@@ -1028,7 +1029,7 @@ impl<'a> Extractor<'a> {
         // The candidate memo is keyed on the choice and reads the
         // producer index; this is the one place that edits it.
         self.choice_candidate_cache.borrow_mut().clear();
-        let op_matched: HashMap<&ClassId, bool> = self
+        let op_matched: FxHashMap<&ClassId, bool> = self
             .op_specs
             .keys()
             .map(|op_class| {
@@ -1045,7 +1046,7 @@ impl<'a> Extractor<'a> {
                 (op_class, matched)
             })
             .collect();
-        let mut viable: HashSet<ClassId> = self.input_terminals.keys().cloned().collect();
+        let mut viable: FxHashSet<ClassId> = self.input_terminals.keys().cloned().collect();
         loop {
             let mut changed = false;
             for (op_class, specs) in &self.op_specs {
@@ -1066,7 +1067,7 @@ impl<'a> Extractor<'a> {
                 break;
             }
         }
-        let op_matched: HashMap<ClassId, bool> = op_matched
+        let op_matched: FxHashMap<ClassId, bool> = op_matched
             .into_iter()
             .map(|(k, v)| (k.clone(), v))
             .collect();
@@ -1228,7 +1229,7 @@ impl<'a> Extractor<'a> {
     /// Pure construction — no planning, no memo.
     fn discover(&self, roots: &[ClassId]) -> Universe {
         // Discover the class universe reachable through candidates.
-        let mut discovered: HashSet<ClassId> = HashSet::new();
+        let mut discovered: FxHashSet<ClassId> = FxHashSet::default();
         let mut universe: Vec<ClassId> = Vec::new();
         let mut candidate_lists: Vec<Vec<Candidate>> = Vec::new();
         let mut queue: std::collections::VecDeque<ClassId> = roots.iter().cloned().collect();
@@ -1856,11 +1857,11 @@ impl<'a> Extractor<'a> {
     /// and we refuse loudly rather than pick one.
     fn with_dtype_index<R>(
         &self,
-        read: impl FnOnce(&HashMap<ClassId, crate::dtype::PlanDtype>) -> R,
+        read: impl FnOnce(&FxHashMap<ClassId, crate::dtype::PlanDtype>) -> R,
     ) -> R {
         let mut slot = self.dtype_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, crate::dtype::PlanDtype> = HashMap::new();
+            let mut index: FxHashMap<ClassId, crate::dtype::PlanDtype> = FxHashMap::default();
             for node in self.egraph.nodes.values() {
                 if node.op != "dtype-of" {
                     continue;
@@ -1970,8 +1971,8 @@ type RenderKey = (ClassId, usize, Option<&'static str>);
 #[derive(Debug)]
 struct RenderCtx {
     egraph: EGraph,
-    class_nodes: HashMap<ClassId, Vec<NodeId>>,
-    memo: RefCell<HashMap<RenderKey, Rc<str>>>,
+    class_nodes: FxHashMap<ClassId, Vec<NodeId>>,
+    memo: RefCell<FxHashMap<RenderKey, Rc<str>>>,
 }
 
 impl RenderCtx {
@@ -1979,7 +1980,7 @@ impl RenderCtx {
         Self {
             class_nodes: render_class_nodes(egraph),
             egraph: egraph.clone(),
-            memo: RefCell::new(HashMap::new()),
+            memo: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -1994,8 +1995,8 @@ impl RenderCtx {
 
 struct ClassRenderer<'a> {
     egraph: &'a EGraph,
-    class_nodes: &'a HashMap<ClassId, Vec<NodeId>>,
-    memo: &'a RefCell<HashMap<RenderKey, Rc<str>>>,
+    class_nodes: &'a FxHashMap<ClassId, Vec<NodeId>>,
+    memo: &'a RefCell<FxHashMap<RenderKey, Rc<str>>>,
 }
 
 /// The renderer's implementation of the [`LogicalRender`] callbacks: the
@@ -2004,7 +2005,7 @@ struct ClassRenderer<'a> {
 /// to labels exactly as direct recursion did.
 struct LogicalRenderCtx<'r, 'a, 'v> {
     renderer: &'r ClassRenderer<'a>,
-    visiting: &'v mut HashSet<ClassId>,
+    visiting: &'v mut FxHashSet<ClassId>,
     /// Remaining expansion depth — the logical value graph is a
     /// CONVERGENT DAG (residual connections reuse values), so unbounded
     /// readable-expression expansion is exponential (2026-08-07: the
@@ -2045,8 +2046,10 @@ impl LogicalRender for LogicalRenderCtx<'_, '_, '_> {
     }
 
     fn child_int_expr(&mut self, node: &Node, index: usize) -> Option<String> {
-        child_class(self.renderer.egraph, node, index)
-            .map(|class| self.renderer.readable_expr(&class, &mut HashSet::new()))
+        child_class(self.renderer.egraph, node, index).map(|class| {
+            self.renderer
+                .readable_expr(&class, &mut FxHashSet::default())
+        })
     }
 }
 
@@ -2240,7 +2243,7 @@ impl<'a> ClassRenderer<'a> {
                     node,
                     &mut LogicalRenderCtx {
                         renderer: self,
-                        visiting: &mut HashSet::new(),
+                        visiting: &mut FxHashSet::default(),
                         depth: 8,
                     },
                 ),
@@ -2253,7 +2256,7 @@ impl<'a> ClassRenderer<'a> {
         let mut details = self.class_details(class);
         details.push((
             "expr".to_string(),
-            self.readable_logical_expr(class, &mut HashSet::new()),
+            self.readable_logical_expr(class, &mut FxHashSet::default()),
         ));
         if let Some(shape) = self.logical_shape(class) {
             details.push(("shape".to_string(), shape));
@@ -2318,14 +2321,14 @@ impl<'a> ClassRenderer<'a> {
     /// stable e-class ids) — "id-123 = sqrt(id-122)" — never the nested
     /// tree. The logical value graph is a convergent DAG; full-tree
     /// expansion was exponential (the 2-layer decoder build hang).
-    fn readable_logical_expr(&self, class: &ClassId, visiting: &mut HashSet<ClassId>) -> String {
+    fn readable_logical_expr(&self, class: &ClassId, visiting: &mut FxHashSet<ClassId>) -> String {
         self.readable_logical_expr_depth(class, visiting, 1)
     }
 
     fn readable_logical_expr_depth(
         &self,
         class: &ClassId,
-        visiting: &mut HashSet<ClassId>,
+        visiting: &mut FxHashSet<ClassId>,
         depth: usize,
     ) -> String {
         if depth == 0 || !visiting.insert(class.clone()) {
@@ -2546,14 +2549,14 @@ impl<'a> ClassRenderer<'a> {
     }
 
     fn readable_expr_list_display(&self, class: &ClassId) -> Option<String> {
-        let exprs = self.readable_expr_list(class, &mut HashSet::new())?;
+        let exprs = self.readable_expr_list(class, &mut FxHashSet::default())?;
         Some(format!("[{}]", exprs.join(", ")))
     }
 
     fn readable_expr_list(
         &self,
         class: &ClassId,
-        visiting: &mut HashSet<ClassId>,
+        visiting: &mut FxHashSet<ClassId>,
     ) -> Option<Vec<String>> {
         if !visiting.insert(class.clone()) {
             return None;
@@ -2566,7 +2569,7 @@ impl<'a> ClassRenderer<'a> {
             let cons = self.egraph.nodes.get(cons_id)?;
             let head_class = child_class(self.egraph, cons, 0)?;
             let tail_class = child_class(self.egraph, cons, 1)?;
-            let mut dims = vec![self.readable_expr(&head_class, &mut HashSet::new())];
+            let mut dims = vec![self.readable_expr(&head_class, &mut FxHashSet::default())];
             dims.extend(self.readable_expr_list(&tail_class, visiting)?);
             Some(dims)
         };
@@ -2575,7 +2578,7 @@ impl<'a> ClassRenderer<'a> {
         result
     }
 
-    fn readable_expr(&self, class: &ClassId, visiting: &mut HashSet<ClassId>) -> String {
+    fn readable_expr(&self, class: &ClassId, visiting: &mut FxHashSet<ClassId>) -> String {
         if !visiting.insert(class.clone()) {
             return class.to_string();
         }
@@ -3068,8 +3071,8 @@ impl<'a> Extractor<'a> {
         let mut builder = IrBuilder {
             extractor: self,
             dag: DiGraph::new(),
-            value_producer: HashMap::new(),
-            op_nodes: HashMap::new(),
+            value_producer: FxHashMap::default(),
+            op_nodes: FxHashMap::default(),
         };
         let mut outputs = Vec::with_capacity(roots.len());
         for root in roots {
@@ -3097,7 +3100,7 @@ impl<'a> Extractor<'a> {
 
         let (logical, layout) = match self.layout_tensor_parts(class) {
             Some((logical_class, layout_class)) => (
-                self.logical_info(&logical_class, &mut HashSet::new(), 4),
+                self.logical_info(&logical_class, &mut FxHashSet::default(), 4),
                 self.layout_info(&layout_class),
             ),
             None => (
@@ -3159,7 +3162,7 @@ impl<'a> Extractor<'a> {
     fn logical_info(
         &self,
         class: &ClassId,
-        visiting: &mut HashSet<ClassId>,
+        visiting: &mut FxHashSet<ClassId>,
         depth: usize,
     ) -> LogicalInfo {
         let label = {
@@ -3277,10 +3280,13 @@ impl<'a> Extractor<'a> {
     /// class -> the declared [`Access`]. Rows are walked in e-graph order
     /// and the FIRST row naming a buffer wins, which is exactly what the
     /// scan this replaces did by returning on its first match.
-    fn with_buffer_access_index<R>(&self, read: impl FnOnce(&HashMap<ClassId, Access>) -> R) -> R {
+    fn with_buffer_access_index<R>(
+        &self,
+        read: impl FnOnce(&FxHashMap<ClassId, Access>) -> R,
+    ) -> R {
         let mut slot = self.buffer_access_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, Access> = HashMap::new();
+            let mut index: FxHashMap<ClassId, Access> = FxHashMap::default();
             for (node_id, node) in &self.egraph.nodes {
                 if node.subsumed || node.op != "buffer-access-of" {
                     continue;
@@ -3321,11 +3327,11 @@ impl<'a> Extractor<'a> {
     /// -> the declared [`FreedBy`]. First row wins, as above.
     fn with_buffer_freed_by_index<R>(
         &self,
-        read: impl FnOnce(&HashMap<ClassId, FreedBy>) -> R,
+        read: impl FnOnce(&FxHashMap<ClassId, FreedBy>) -> R,
     ) -> R {
         let mut slot = self.buffer_freed_by_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, FreedBy> = HashMap::new();
+            let mut index: FxHashMap<ClassId, FreedBy> = FxHashMap::default();
             for (node_id, node) in &self.egraph.nodes {
                 if node.subsumed || node.op != "buffer-freed-by" {
                     continue;
@@ -3367,9 +3373,9 @@ struct IrBuilder<'e, 'a> {
     extractor: &'e Extractor<'a>,
     dag: ExtractedDag,
     /// Value e-class -> the node that produces it (an op or an input boundary).
-    value_producer: HashMap<ClassId, NodeIndex>,
+    value_producer: FxHashMap<ClassId, NodeIndex>,
     /// Op identity -> its node, so multi-output ops are emitted exactly once.
-    op_nodes: HashMap<(ClassId, NodeId), NodeIndex>,
+    op_nodes: FxHashMap<(ClassId, NodeId), NodeIndex>,
 }
 
 impl<'e, 'a> IrBuilder<'e, 'a> {
@@ -3785,8 +3791,8 @@ fn enqueue(index: u32, in_queue: &mut [bool], queue: &mut std::collections::VecD
     }
 }
 
-fn class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
-    let mut classes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+fn class_nodes(egraph: &EGraph) -> FxHashMap<ClassId, Vec<NodeId>> {
+    let mut classes: FxHashMap<ClassId, Vec<NodeId>> = FxHashMap::default();
     for (node_id, node) in &egraph.nodes {
         if node.subsumed || node.op == "[...]" {
             continue;
@@ -3799,8 +3805,8 @@ fn class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
     classes
 }
 
-fn render_class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
-    let mut classes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+fn render_class_nodes(egraph: &EGraph) -> FxHashMap<ClassId, Vec<NodeId>> {
+    let mut classes: FxHashMap<ClassId, Vec<NodeId>> = FxHashMap::default();
     for (node_id, node) in &egraph.nodes {
         if node.op == "[...]" {
             continue;
@@ -3840,8 +3846,8 @@ fn render_class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
 /// generic term, while each runtime op's `match_functional.egg` unions
 /// its own constructor into that same class and a core rule cannot name
 /// them all.
-fn collect_input_producer_ops(egraph: &EGraph) -> HashSet<ClassId> {
-    let mut ops = HashSet::new();
+fn collect_input_producer_ops(egraph: &EGraph) -> FxHashSet<ClassId> {
+    let mut ops = FxHashSet::default();
     for node in egraph.nodes.values() {
         if node.subsumed || node.op != "input-producer" {
             continue;
@@ -3855,13 +3861,13 @@ fn collect_input_producer_ops(egraph: &EGraph) -> HashSet<ClassId> {
 
 fn collect_op_specs(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: &FxHashMap<ClassId, Vec<NodeId>>,
 ) -> (
-    HashMap<ClassId, Vec<OpSpec>>,
-    HashMap<ClassId, Vec<ProducerRef>>,
+    FxHashMap<ClassId, Vec<OpSpec>>,
+    FxHashMap<ClassId, Vec<ProducerRef>>,
 ) {
-    let mut op_specs: HashMap<ClassId, Vec<OpSpec>> = HashMap::new();
-    let mut producer_index: HashMap<ClassId, Vec<ProducerRef>> = HashMap::new();
+    let mut op_specs: FxHashMap<ClassId, Vec<OpSpec>> = FxHashMap::default();
+    let mut producer_index: FxHashMap<ClassId, Vec<ProducerRef>> = FxHashMap::default();
 
     for (op_class, node_ids) in class_nodes {
         for node_id in node_ids {
@@ -3882,7 +3888,7 @@ fn collect_op_specs(
                 egraph,
                 class_nodes,
                 &input_list_class,
-                &mut HashSet::new(),
+                &mut FxHashSet::default(),
             ) else {
                 continue;
             };
@@ -3890,7 +3896,7 @@ fn collect_op_specs(
                 egraph,
                 class_nodes,
                 &output_list_class,
-                &mut HashSet::new(),
+                &mut FxHashSet::default(),
             ) else {
                 continue;
             };
@@ -3927,9 +3933,9 @@ fn collect_op_specs(
 
 fn layout_tensor_list_items(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: &FxHashMap<ClassId, Vec<NodeId>>,
     list_class: &ClassId,
-    visiting: &mut HashSet<ClassId>,
+    visiting: &mut FxHashSet<ClassId>,
 ) -> Option<Vec<ClassId>> {
     if !visiting.insert(list_class.clone()) {
         return None;
@@ -3973,10 +3979,10 @@ fn output_root_classes(egraph: &EGraph) -> Vec<ClassId> {
 
 fn collect_output_buffer_classes(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
-) -> HashSet<ClassId> {
-    let mut output_buffers = HashSet::new();
-    let mut visited_lists = HashSet::new();
+    class_nodes: &FxHashMap<ClassId, Vec<NodeId>>,
+) -> FxHashSet<ClassId> {
+    let mut output_buffers = FxHashSet::default();
+    let mut visited_lists = FxHashSet::default();
 
     for node in egraph
         .nodes
@@ -4000,10 +4006,10 @@ fn collect_output_buffer_classes(
 
 fn collect_input_buffer_classes(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
-) -> HashSet<ClassId> {
-    let mut input_buffers = HashSet::new();
-    let mut visited_lists = HashSet::new();
+    class_nodes: &FxHashMap<ClassId, Vec<NodeId>>,
+) -> FxHashSet<ClassId> {
+    let mut input_buffers = FxHashSet::default();
+    let mut visited_lists = FxHashSet::default();
 
     for node in egraph
         .nodes
@@ -4027,10 +4033,10 @@ fn collect_input_buffer_classes(
 
 fn collect_buffer_list(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: &FxHashMap<ClassId, Vec<NodeId>>,
     list_class: &ClassId,
-    visited_lists: &mut HashSet<ClassId>,
-    buffers: &mut HashSet<ClassId>,
+    visited_lists: &mut FxHashSet<ClassId>,
+    buffers: &mut FxHashSet<ClassId>,
 ) {
     if !visited_lists.insert(list_class.clone()) {
         return;
@@ -4058,10 +4064,10 @@ fn collect_buffer_list(
 
 fn collect_input_terminals(
     render: &RenderCtx,
-    output_buffer_classes: &HashSet<ClassId>,
-    input_buffer_classes: &HashSet<ClassId>,
-) -> HashMap<ClassId, InputInfo> {
-    let mut terminals = HashMap::new();
+    output_buffer_classes: &FxHashSet<ClassId>,
+    input_buffer_classes: &FxHashSet<ClassId>,
+) -> FxHashMap<ClassId, InputInfo> {
+    let mut terminals = FxHashMap::default();
     let egraph = &render.egraph;
     // Through the session's renderer, so these session-start renders
     // populate (and later hit) the same memo as everything else.
@@ -4203,7 +4209,7 @@ pub enum ChainStride {
 /// a slot is opaque (e.g. an accumulated diagonal summand) — fail
 /// closed, never guess.
 pub fn chain_strides(egraph: &EGraph, layout: &ClassId) -> Option<Vec<Option<ChainStride>>> {
-    let mut class_nodes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
+    let mut class_nodes: FxHashMap<ClassId, Vec<NodeId>> = FxHashMap::default();
     for node_id in egraph.nodes.keys() {
         class_nodes
             .entry(egraph.nid_to_cid(node_id).clone())
