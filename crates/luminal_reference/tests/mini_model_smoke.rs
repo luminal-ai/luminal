@@ -310,3 +310,48 @@ fn mini_flux_runs() {
     );
     run(cx, &[output], []);
 }
+
+/// `paged_llama3` reuses the `Llama3` block over a page-table cache pool
+/// instead of per-layer cache tensors. Nothing referenced it, so the
+/// page-table spelling of the cache had no execution coverage: its dims are
+/// fully parameterised, so a mini instance drives the real graph rather than
+/// a copy of it.
+#[test]
+fn paged_llama3_batch_step_runs() {
+    use model_zoo::llama3::Llama3Dims;
+    use model_zoo::paged_llama3::BatchStep;
+
+    const SLOTS: usize = 4;
+    let dims = Llama3Dims {
+        vocab: 5,
+        hidden: 6,
+        intermediate: 8,
+        head_dim: 4,
+        n_heads: 2,
+        n_kv_heads: 1,
+        layers: 2,
+        rope_theta: 10_000.0,
+        rms_eps: 1e-5,
+    };
+    let step = BatchStep::build(&dims, SLOTS);
+    let BatchStep {
+        cx,
+        tokens,
+        logits,
+        cache_outs,
+        ..
+    } = step;
+
+    let mut outputs = vec![logits];
+    outputs.extend(cache_outs.into_iter().flat_map(|(key, value)| [key, value]));
+
+    run(
+        cx,
+        &outputs,
+        // `run`'s defaults cover the rest: the index tensors fill with `0..n`,
+        // in range for SLOTS, and the rope and mask tensors fill with varied
+        // floats. Pinning the mask to zeros would make the bias add an
+        // identity.
+        [(tokens.id, vec![1i32, 3].into())],
+    );
+}
