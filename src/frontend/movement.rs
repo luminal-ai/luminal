@@ -1186,6 +1186,24 @@ mod tests {
         }
     }
 
+    /// An all-zero pad folds to the operand, so the result is a pass-through of
+    /// an input and names no leaf. `test_pad_2d` draws each padding from
+    /// `0..6`, so it reaches all four zeros on roughly one run in a hundred
+    /// and a saved proptest seed is the only reason it reproduces at all.
+    #[test]
+    fn zero_pad_is_the_operand() {
+        test_unary(
+            (1, 1),
+            |a| a.pad(((0, 0), (0, 0)), 0.),
+            |a| {
+                a.pad_with_zeros(0, 0, 0)
+                    .unwrap()
+                    .pad_with_zeros(1, 0, 0)
+                    .unwrap()
+            },
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
