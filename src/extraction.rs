@@ -98,6 +98,15 @@ struct Extractor<'a> {
     /// sampled stacks inside `is_better`). The rendered form of an enode
     /// never changes within a session, so one cache serves every genome.
     stable_key_cache: std::cell::RefCell<HashMap<NodeId, std::rc::Rc<str>>>,
+    /// GENOME-INDEPENDENT `LayoutTensorInfo` memo. Everything the builder
+    /// reads off a LayoutTensor class, its label, shape, dtype, dims,
+    /// element bits and the depth-capped logical/layout context, is a
+    /// function of the class and the session's e-graph. The one
+    /// genome-dependent part is the waste-slot relabel, which `build_node`
+    /// applies to its own copy after the call, so the cached value stays
+    /// the unrelabelled form. Un-memoized this ran once per value per
+    /// genome, which is what #517 named as the next wall after relaxation.
+    layout_tensor_info_cache: std::cell::RefCell<HashMap<ClassId, LayoutTensorInfo>>,
     /// GENOME-INDEPENDENT candidate memo: (produced class, chosen enode,
     /// chosen output slot) → the candidates
     /// [`Extractor::producer_candidates_for_choice`] builds for it.
@@ -1011,6 +1020,7 @@ impl<'a> Extractor<'a> {
             buffer_access_index: Default::default(),
             buffer_freed_by_index: Default::default(),
             stable_key_cache: Default::default(),
+            layout_tensor_info_cache: Default::default(),
             choice_candidate_cache: Default::default(),
         }
     }
@@ -3084,6 +3094,17 @@ impl<'a> Extractor<'a> {
     // ---- structured info builders for the Layout IR DAG ----
 
     fn layout_tensor_info(&self, class: &ClassId) -> LayoutTensorInfo {
+        if let Some(hit) = self.layout_tensor_info_cache.borrow().get(class) {
+            return hit.clone();
+        }
+        let info = self.layout_tensor_info_uncached(class);
+        self.layout_tensor_info_cache
+            .borrow_mut()
+            .insert(class.clone(), info.clone());
+        info
+    }
+
+    fn layout_tensor_info_uncached(&self, class: &ClassId) -> LayoutTensorInfo {
         let renderer = self.renderer();
         let label = renderer.layout_tensor_label(class);
         // `shape`/`dtype` stay eager but no longer force the details
