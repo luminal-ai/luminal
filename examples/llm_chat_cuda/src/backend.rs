@@ -1,6 +1,6 @@
 //! The CUDA-lite runtime's boundary statement for this example's chat graph,
 //! and the execution loop over it.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use llm_chat::{
     Inputs, TensorData,
     graph::{LlmGraph, StateBinding},
@@ -73,12 +73,24 @@ impl CudaBackend {
         let arena_budget = options
             .device_budget_bytes
             .map_or(available, |requested| requested.min(available));
-        let mut resolved_options = options.clone();
-        resolved_options.device_budget_bytes = Some(arena_budget);
         weights.extend(graph.initial_inputs());
         let mut data: FxHashMap<_, HostBuffer> =
             weights.into_iter().map(|(id, v)| (id, host(v))).collect();
         let resources: Vec<_> = data.keys().copied().collect();
+        // The arena seats scratch AND every persistent resource, so the
+        // search may only spend what the weights leave. Admitting candidates
+        // against the whole budget accepts plans `SharedArenaPlan::build`
+        // then refuses, and only after both bucket searches have paid for
+        // them.
+        let scratch_budget = SharedArenaPlan::scratch_budget(
+            resources
+                .iter()
+                .map(|id| (ResourceId(id.index() as u64), data[id].bytes.len())),
+            arena_budget,
+        )
+        .context("device memory budget cannot seat the model weights")?;
+        let mut resolved_options = options.clone();
+        resolved_options.device_budget_bytes = Some(scratch_budget);
         let mut programs = Vec::new();
         let mut reports = Vec::new();
         let mut requirements = Vec::new();
