@@ -8,11 +8,9 @@ use crate::{CacheAccess, KvCache};
 /// receive `0.0` (transparent). Uses `LogicalSelect` so no arithmetic
 /// touches the infinity — the old `bool.cast(F32) * sentinel` pattern
 /// risks `0 * -inf = NaN` (IEEE 754) and required a finite sentinel.
-///
-/// **Caller obligation**: the resulting bias is added to attention scores
-/// before softmax. If an entire softmax row is `-inf`, the stable softmax
-/// computes `-inf - (-inf) = NaN`, producing NaN outputs. Callers must
-/// ensure at least one key per query row is unmasked.
+/// **Caller note**: the resulting bias is added to attention scores before
+/// softmax. [`grouped_query_attention`] safely handles rows where all keys
+/// are `-inf` by returning exact zero attention output without producing NaNs.
 fn masked_bias(mask: GraphTensor) -> GraphTensor {
     assert_eq!(
         mask.dtype,
@@ -160,13 +158,9 @@ fn assert_vector(tensor: GraphTensor, name: &str) {
 /// Build an additive causal bias from explicit logical token positions.
 ///
 /// Query and key positions need not match their physical cache slots or their
-/// order in the gathered context. Masked (future) positions receive exact
-/// `f32::NEG_INFINITY`; allowed positions receive `0.0`.
-///
-/// **Precondition**: every query must have at least one causally visible key
-/// (i.e., at least one key position ≤ the query position). If an entire row
-/// is masked, the subsequent softmax produces NaN. In standard autoregressive
-/// decoding this holds because each token always sees itself.
+/// Masked (future) positions receive exact `f32::NEG_INFINITY`; allowed
+/// positions receive `0.0`. If all keys for a query are masked,
+/// [`grouped_query_attention`] treats the row as idle and outputs zero.
 pub fn causal_bias(query_positions: GraphTensor, key_positions: GraphTensor) -> GraphTensor {
     assert_vector(query_positions, "query_positions");
     assert_vector(key_positions, "key_positions");
@@ -454,15 +448,59 @@ pub fn grouped_query_apply(
         .finish()
 }
 
+/// Compute softmax along axis 3 (the context axis) for GQA scores of shape
+/// `[kv_heads, groups, queries, context]`.
+///
+/// If an entire query row is fully masked (`-inf` additive bias on all keys),
+/// this produces exact `0.0` attention weights for that row instead of
+/// evaluating `-inf - (-inf) = NaN`, ensuring that idle or padded queries
+/// contribute zero attention output.
+///
+/// **Boundary contract**: this guard specifically handles rows where all keys
+/// are suppressed by `-inf` masking. It assumes pre-masking attention scores are
+/// finite floats (as produced by standard linear projections and QK matmul);
+/// it does not protect against upstream NaNs or positive infinities in raw scores.
+fn safe_gqa_softmax(scores: GraphTensor) -> GraphTensor {
+    let full_shape = scores.dims();
+    let max_scores = scores.max(vec![3]);
+    let neg_inf = max_scores
+        .graph()
+        .constant_f32(f32::NEG_INFINITY)
+        .cast(max_scores.dtype)
+        .expand_rhs(max_scores.dims());
+    let has_valid = max_scores.gt(neg_inf);
+
+    let zero = max_scores
+        .graph()
+        .constant_f32(0.0)
+        .cast(max_scores.dtype)
+        .expand_rhs(max_scores.dims());
+    let safe_max = has_valid
+        .select(max_scores, zero)
+        .expand_to_shape_on_axes(full_shape.clone(), vec![3]);
+
+    let exp = (scores - safe_max).exp();
+    let sum = exp.sum(vec![3]);
+    let one = sum
+        .graph()
+        .constant_f32(1.0)
+        .cast(sum.dtype)
+        .expand_rhs(sum.dims());
+    let safe_sum = has_valid
+        .select(sum, one)
+        .expand_to_shape_on_axes(full_shape, vec![3]);
+
+    exp / safe_sum
+}
+
 /// Grouped-query attention over already materialized keys and values.
 ///
 /// `score_bias` may have shape `[queries, context]`,
 /// `[query_heads, queries, context]`, or the canonical grouped-query score
 /// shape `[kv_heads, groups, queries, context]`.
 ///
-/// **Precondition**: the combined `scores + bias` must have at least one
-/// finite value per softmax row (the last axis). If an entire row is
-/// `-inf`, the stable softmax computes `-inf - (-inf) = NaN`.
+/// For any query row where all context positions are masked (`-inf`),
+/// this produces exact `0.0` attention output for that row without producing NaNs.
 pub fn grouped_query_attention(
     query: GraphTensor,
     keys: GraphTensor,
@@ -477,7 +515,8 @@ pub fn grouped_query_attention(
         scores.dims(),
         "attention bias dimensions do not match scores"
     );
-    grouped_query_apply((scores + bias).softmax(vec![3]), values, geometry)
+    let weights = safe_gqa_softmax(scores + bias);
+    grouped_query_apply(weights, values, geometry)
 }
 
 /// Write new keys and values, read the requested context, and evaluate GQA.
@@ -1317,6 +1356,186 @@ mod tests {
             );
         }
         assert!(out.iter().all(|v| !v.is_nan()), "bias must be NaN-free");
+    }
+
+    /// Verify that a rolling cache at query position 1000 with window 4
+    /// and gathered key positions [997, 998, 999, 1000] produces all-zeros [0, 0, 0, 0].
+    /// Also verify that raw physical slot indices [0, 1, 2, 3] would be mistaken
+    /// as pre-window positions and erroneously masked out as -inf.
+    #[test]
+    fn rolling_cache_sliding_window_uses_logical_positions() {
+        let mut cx = Graph::new();
+        let q_pos = cx.tensor(vec![1], DType::Int);
+        let logical_k_pos = cx.tensor(vec![4], DType::Int);
+        let physical_slots = cx.tensor(vec![4], DType::Int);
+
+        let bias_logical = sliding_window_bias(q_pos, logical_k_pos, 4);
+        let bias_physical = sliding_window_bias(q_pos, physical_slots, 4);
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (q_pos.id, vec![1000i32].into()),
+                (logical_k_pos.id, vec![997i32, 998, 999, 1000].into()),
+                (physical_slots.id, vec![0i32, 1, 2, 3].into()),
+            ],
+        );
+
+        let logical_out = rt.get_f32(bias_logical.id).expect("logical bias");
+        assert_eq!(
+            logical_out,
+            &[0.0, 0.0, 0.0, 0.0],
+            "logical positions [997..=1000] within window 4 of query 1000 must all be unmasked"
+        );
+
+        let physical_out = rt.get_f32(bias_physical.id).expect("physical bias");
+        assert_eq!(
+            physical_out,
+            &[
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ],
+            "mistaking raw physical slots [0..3] for logical positions fully masks the window"
+        );
+    }
+
+    /// Verify that an entirely masked query row produces exact zero output
+    /// at the GQA output with no NaNs.
+    #[test]
+    fn grouped_query_attention_all_masked_row_produces_zero_output() {
+        const QUERY_HEADS: usize = 2;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 2;
+        const CONTEXT: usize = 3;
+
+        let mut cx = Graph::new();
+        let query = cx.tensor(vec![1, QUERY_HEADS * HEAD_DIM], DType::F32);
+        let keys = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let values = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let bias = cx.tensor(vec![1, CONTEXT], DType::F32);
+        let output = grouped_query_attention(
+            query,
+            keys,
+            values,
+            bias,
+            AttentionGeometry::new(QUERY_HEADS, KV_HEADS, HEAD_DIM),
+        );
+
+        let query_vals = vec![1.0, 2.0, 3.0, 4.0];
+        let key_vals = vec![0.5, -0.5, 1.0, -1.0, 0.2, 0.8];
+        let val_vals = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        // All context positions masked out with -inf:
+        let bias_vals = vec![f32::NEG_INFINITY; CONTEXT];
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (query.id, query_vals.into()),
+                (keys.id, key_vals.into()),
+                (values.id, val_vals.into()),
+                (bias.id, bias_vals.into()),
+            ],
+        );
+
+        let out = rt.get_f32(output.id).expect("GQA output");
+        assert_eq!(out.len(), QUERY_HEADS * HEAD_DIM);
+        for (i, &v) in out.iter().enumerate() {
+            assert!(!v.is_nan(), "output[{i}] must not be NaN");
+            assert_eq!(v, 0.0, "output[{i}] for all-masked row must be exactly 0.0");
+        }
+    }
+
+    /// Verify that in a mixed batch containing both valid and fully masked rows,
+    /// the valid row computes standard softmax attention while the fully masked
+    /// row produces exact 0.0 output with no NaNs.
+    #[test]
+    fn grouped_query_attention_mixed_batch_preserves_active_and_zeroes_idle() {
+        const QUERY_HEADS: usize = 2;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 2;
+        const CONTEXT: usize = 2;
+
+        let mut cx = Graph::new();
+        // 2 queries in batch
+        let query = cx.tensor(vec![2, QUERY_HEADS * HEAD_DIM], DType::F32);
+        let keys = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let values = cx.tensor(vec![CONTEXT, KV_HEADS * HEAD_DIM], DType::F32);
+        let bias = cx.tensor(vec![2, CONTEXT], DType::F32);
+        let output = grouped_query_attention(
+            query,
+            keys,
+            values,
+            bias,
+            AttentionGeometry::new(QUERY_HEADS, KV_HEADS, HEAD_DIM),
+        );
+
+        let query_vals = vec![
+            // Query 0: active
+            0.5, -0.3, 0.8, 0.1, // Query 1: idle / padded
+            1.0, 2.0, 3.0, 4.0,
+        ];
+        let key_vals = vec![0.2, 0.4, -0.1, 0.3, 0.6, -0.5, 0.9, 0.2];
+        let value_vals = vec![1.0, -1.0, 0.5, 2.0, -0.5, 0.25, 1.5, -0.75];
+        let bias_vals = vec![
+            // Query 0 bias: unmasked
+            0.0,
+            0.0,
+            // Query 1 bias: all masked
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (query.id, query_vals.clone().into()),
+                (keys.id, key_vals.clone().into()),
+                (values.id, value_vals.clone().into()),
+                (bias.id, bias_vals.into()),
+            ],
+        );
+
+        let out = rt.get_f32(output.id).expect("mixed GQA output");
+        assert_eq!(out.len(), 2 * QUERY_HEADS * HEAD_DIM);
+
+        // Compute expected output for Query 0 manually using standard softmax:
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mut expected_q0 = vec![0.0f32; QUERY_HEADS * HEAD_DIM];
+        for h in 0..QUERY_HEADS {
+            let q_h = &query_vals[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+            let mut scores = [0.0f32; CONTEXT];
+            for c in 0..CONTEXT {
+                let k_c = &key_vals[c * KV_HEADS * HEAD_DIM + h * HEAD_DIM..][..HEAD_DIM];
+                scores[c] = q_h.iter().zip(k_c).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps = scores.map(|s| (s - max).exp());
+            let sum: f32 = exps.iter().sum();
+            for (c, exp) in exps.iter().enumerate() {
+                let v_c = &value_vals[c * KV_HEADS * HEAD_DIM + h * HEAD_DIM..][..HEAD_DIM];
+                for d in 0..HEAD_DIM {
+                    expected_q0[h * HEAD_DIM + d] += exp / sum * v_c[d];
+                }
+            }
+        }
+
+        // Query 0 must match expected standard softmax attention:
+        let q0_out = &out[..QUERY_HEADS * HEAD_DIM];
+        for (i, (&got, &exp)) in q0_out.iter().zip(&expected_q0).enumerate() {
+            assert!(
+                (got - exp).abs() <= 1e-4 * exp.abs().max(1.0),
+                "q0 element {i}: got {got}, expected {exp}"
+            );
+        }
+
+        // Query 1 (all-masked) must be exactly 0.0 with no NaNs:
+        let q1_out = &out[QUERY_HEADS * HEAD_DIM..];
+        for (i, &v) in q1_out.iter().enumerate() {
+            assert!(!v.is_nan(), "q1 element {i} must not be NaN");
+            assert_eq!(v, 0.0, "q1 element {i} must be exactly 0.0");
+        }
     }
 }
 
