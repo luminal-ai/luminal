@@ -663,7 +663,22 @@ pub fn mutate_genome_reporting(
         if allowed.is_empty() {
             fallbacks.push(class.clone());
         }
-        let position = choose_position(rng, &allowed, candidates.len());
+        // A point mutation must CHANGE the genome. Re-electing the
+        // incumbent candidate spends a whole extraction on a clone of the
+        // parent, so the draw drops the incumbent whenever any alternative
+        // survives the cycle filter.
+        let current = child.choices.get(class);
+        let changing: Vec<usize> = allowed
+            .iter()
+            .copied()
+            .filter(|&position| current != Some(&candidates[position].1))
+            .collect();
+        let draw = if changing.is_empty() {
+            &allowed
+        } else {
+            &changing
+        };
+        let position = choose_position(rng, draw, candidates.len());
         child
             .choices
             .insert(class.clone(), candidates[position].1.clone());
