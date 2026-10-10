@@ -13,7 +13,7 @@
 use once_cell::unsync::Lazy;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
@@ -206,6 +206,53 @@ enum PlanKind {
 struct OpSpec {
     inputs: Vec<ClassId>,
     outputs: Vec<ClassId>,
+}
+
+/// Reachability of already-matched implementations, independent of candidate
+/// order. Each operand occurrence is registered once and each newly realizable
+/// class is propagated once. Duplicate operands deliberately have duplicate
+/// edges: both occurrences are discharged by the same class notification.
+fn realizable_classes<'a>(
+    terminals: impl IntoIterator<Item = ClassId>,
+    specs: impl IntoIterator<Item = &'a OpSpec>,
+) -> HashSet<ClassId> {
+    let specs: Vec<_> = specs.into_iter().collect();
+    let mut viable: HashSet<_> = terminals.into_iter().collect();
+    let mut waiting: HashMap<&ClassId, Vec<usize>> = HashMap::new();
+    let mut remaining = vec![0usize; specs.len()];
+    for (index, spec) in specs.iter().enumerate() {
+        for input in &spec.inputs {
+            if !viable.contains(input) {
+                waiting.entry(input).or_default().push(index);
+                remaining[index] += 1;
+            }
+        }
+    }
+    let mut ready = VecDeque::new();
+    for (index, spec) in specs.iter().enumerate() {
+        if remaining[index] == 0 {
+            for output in &spec.outputs {
+                if viable.insert(output.clone()) {
+                    ready.push_back(output);
+                }
+            }
+        }
+    }
+    while let Some(class) = ready.pop_front() {
+        if let Some(dependents) = waiting.remove(class) {
+            for index in dependents {
+                remaining[index] -= 1;
+                if remaining[index] == 0 {
+                    for output in &specs[index].outputs {
+                        if viable.insert(output.clone()) {
+                            ready.push_back(output);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    viable
 }
 
 #[derive(Debug, Clone)]
@@ -1045,27 +1092,13 @@ impl<'a> Extractor<'a> {
                 (op_class, matched)
             })
             .collect();
-        let mut viable: HashSet<ClassId> = self.input_terminals.keys().cloned().collect();
-        loop {
-            let mut changed = false;
-            for (op_class, specs) in &self.op_specs {
-                if !op_matched.get(op_class).copied().unwrap_or(false) {
-                    continue;
-                }
-                for spec in specs {
-                    if spec.inputs.iter().all(|class| viable.contains(class)) {
-                        for output in &spec.outputs {
-                            if viable.insert(output.clone()) {
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+        let viable = realizable_classes(
+            self.input_terminals.keys().cloned(),
+            self.op_specs
+                .iter()
+                .filter(|(op_class, _)| op_matched.get(op_class).copied().unwrap_or(false))
+                .flat_map(|(_, specs)| specs),
+        );
         let op_matched: HashMap<ClassId, bool> = op_matched
             .into_iter()
             .map(|(k, v)| (k.clone(), v))
@@ -4513,5 +4546,88 @@ mod chain_stride_tests {
             "broadcast axis is determined: {v:?}"
         );
         assert_eq!(v[2], Some(ChainStride::Unit), "{v:?}");
+    }
+}
+
+#[cfg(test)]
+mod viability_queue_tests {
+    use super::{OpSpec, realizable_classes};
+    use egraph_serialize::ClassId;
+    use std::collections::HashSet;
+
+    fn spec(inputs: &[usize], outputs: &[usize]) -> OpSpec {
+        let classes = |ids: &[usize]| ids.iter().map(|id| ClassId::from(id.to_string())).collect();
+        OpSpec {
+            inputs: classes(inputs),
+            outputs: classes(outputs),
+        }
+    }
+
+    // Independent reference: the previous order-insensitive least fixpoint.
+    fn reference(terminals: &[ClassId], specs: &[OpSpec]) -> HashSet<ClassId> {
+        let mut result: HashSet<_> = terminals.iter().cloned().collect();
+        loop {
+            let before = result.len();
+            for spec in specs {
+                if spec.inputs.iter().all(|input| result.contains(input)) {
+                    result.extend(spec.outputs.iter().cloned());
+                }
+            }
+            if result.len() == before {
+                return result;
+            }
+        }
+    }
+
+    #[test]
+    fn viability_queue_matches_fixpoint_for_constants_duplicates_choices_and_cycles() {
+        let terminals = vec![ClassId::from("0")];
+        let specs = vec![
+            spec(&[4], &[5]),
+            spec(&[3], &[4]),
+            spec(&[2, 2], &[3]),
+            spec(&[], &[1]),
+            spec(&[0, 1], &[2, 6]),
+            spec(&[6], &[7]),
+            spec(&[7], &[6]), // anchored cycle
+            spec(&[8], &[9]),
+            spec(&[9], &[8]),      // disconnected cycle
+            spec(&[99], &[2]),     // dead alternative of viable class
+            spec(&[5, 99], &[10]), // incomplete input inventory
+        ];
+        let actual = realizable_classes(terminals.clone(), &specs);
+        assert_eq!(actual, reference(&terminals, &specs));
+        assert_eq!(
+            actual,
+            (0..8).map(|i| ClassId::from(i.to_string())).collect()
+        );
+    }
+
+    #[test]
+    fn viability_queue_matches_fixpoint_on_reverse_chain_and_seeded_graphs() {
+        let terminals = vec![ClassId::from("0")];
+        let specs: Vec<_> = (0..1024).rev().map(|i| spec(&[i], &[i + 1])).collect();
+        assert_eq!(
+            realizable_classes(terminals.clone(), &specs),
+            reference(&terminals, &specs)
+        );
+        let mut seed = 0x849ab9f13u64;
+        for _ in 0..32 {
+            let mut next = || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 32) as usize
+            };
+            let specs: Vec<_> = (0..256)
+                .map(|_| {
+                    let inputs: Vec<_> = (0..next() % 4).map(|_| next() % 128).collect();
+                    let outputs: Vec<_> = (0..1 + next() % 3).map(|_| next() % 128).collect();
+                    spec(&inputs, &outputs)
+                })
+                .collect();
+            assert_eq!(
+                realizable_classes(terminals.clone(), &specs),
+                reference(&terminals, &specs)
+            );
+        }
     }
 }
