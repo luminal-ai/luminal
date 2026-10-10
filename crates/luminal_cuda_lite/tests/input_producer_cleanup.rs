@@ -651,11 +651,30 @@ fn named_input_keeps_its_name_bearing_spellings() {
         .keys()
         .filter(|op| !without_cleanup.contains_key(*op))
         .collect();
-    assert_eq!(
-        newly_subsumed,
-        ["LayoutTensorOpLit".to_string()].iter().collect(),
-        "the cleanup stratum may retire the generic LayoutTensorOpLit spelling \
-         and NOTHING else; with={with_cleanup:?} without={without_cleanup:?}"
+    // THE STRATUM'S REMIT, not one fixture's output. `cleanup` retires the
+    // generic input-producer spelling, and since #575 it also carries the
+    // cuBLASLt direct-input dominance rules, whose entire purpose is to
+    // subsume a copied call once an equivalent direct one exists. Those four
+    // call spellings are therefore in remit. Anything else is a stratum
+    // reaching past what it is allowed to retire, which is what this pin is
+    // here to catch.
+    const CLEANUP_MAY_RETIRE: [&str; 5] = [
+        "LayoutTensorOpLit",
+        "LayoutTensorOpCublasLt",
+        "LayoutTensorOpCublasLtBias",
+        "LayoutTensorOpCublasLtAccumulate",
+        "LayoutTensorOpCublasLtAccumulateBias",
+    ];
+    let out_of_remit: BTreeSet<&String> = newly_subsumed
+        .iter()
+        .copied()
+        .filter(|op| !CLEANUP_MAY_RETIRE.contains(&op.as_str()))
+        .collect();
+    assert!(
+        out_of_remit.is_empty(),
+        "the cleanup stratum retired {out_of_remit:?}, which is outside its \
+         remit of {CLEANUP_MAY_RETIRE:?}. with={with_cleanup:?} \
+         without={without_cleanup:?}"
     );
     for (op, before) in &without_cleanup {
         let after = with_cleanup.get(op).copied().unwrap_or(0);
