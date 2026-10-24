@@ -1758,6 +1758,11 @@ impl Translator<'_> {
         if real == 1.0 && imag == 0.0 {
             return Ok(value);
         }
+        // ATen ignores the input entirely when beta is zero: multiplying
+        // its components by zero would still propagate NaN and infinity.
+        if name == "beta" && real == 0.0 && imag == 0.0 {
+            return Ok(self.complex_constant_like(value.real, 0.0, 0.0, value.torch_dtype));
+        }
         let scalar = self.complex_constant_like(value.real, real, imag, value.torch_dtype);
         Ok(self.complex_mul(value, scalar))
     }
@@ -1814,22 +1819,10 @@ impl Translator<'_> {
         let input = self.value_as_complex(self.input_value_name(node, 0)?, dtype)?;
         let a = self.value_as_complex(self.input_value_name(node, 1)?, dtype)?;
         let b = self.value_as_complex(self.input_value_name(node, 2)?, dtype)?;
-        let beta = self.named_float_arg(node, "beta").unwrap_or(1.0);
-        let alpha = self.named_float_arg(node, "alpha").unwrap_or(1.0);
         let mm = self.complex_matmul(a, b);
-        let beta = self.constant_like(input.real, beta);
-        let alpha = self.constant_like(mm.real, alpha);
-        let input_real = input.real * beta;
-        let input_imag = input.imag * beta;
-        let mm_real = mm.real * alpha;
-        let mm_imag = mm.imag * alpha;
-        let (input_real, mm_real) = broadcast_binary(input_real, mm_real);
-        let (input_imag, mm_imag) = broadcast_binary(input_imag, mm_imag);
-        Ok(ComplexTensor::new(
-            input_real + mm_real,
-            input_imag + mm_imag,
-            dtype,
-        ))
+        let input = self.scale_complex_by_named_scalar(node, "beta", input)?;
+        let mm = self.scale_complex_by_named_scalar(node, "alpha", mm)?;
+        Ok(self.add_complex(input, mm))
     }
 
     fn translate_complex_comparison(&mut self, node: &Node, is_eq: bool) -> Result<GraphTensor> {
@@ -1870,6 +1863,150 @@ enum BinaryOp {
 mod tests {
     use crate::pt2_parser::ParsedPT2;
     use crate::translate::translate;
+
+    // ---- Numeric fixture helpers ------------------------------------------------
+
+    fn assert_addmm_family(
+        target: &str,
+        scalars: Vec<crate::pt2_schema::NodeInput>,
+        bias: &[f32],
+        expected: &[f32],
+    ) {
+        use crate::translate::test_support::*;
+
+        let (left, right, output): (&[i64], &[i64], &[i64]) = match target {
+            "addmm" => (&[2, 2], &[2, 1], &[2, 1]),
+            "addmv" => (&[2, 2], &[2], &[2]),
+            "addbmm" => (&[1, 2, 2], &[1, 2, 1], &[2, 1]),
+            _ => unreachable!(),
+        };
+        let (lhs, rhs) = match target {
+            "addmv" => ("mat", "vec"),
+            "addbmm" => ("batch1", "batch2"),
+            _ => ("mat1", "mat2"),
+        };
+        let mut args = vec![
+            tensor_input("self", "bias"),
+            tensor_input(lhs, "a"),
+            tensor_input(rhs, "b"),
+        ];
+        args.extend(scalars);
+        let dtype = crate::dtype::TorchDType::ComplexFloat.code();
+        let t = translate_one(
+            node(&format!("torch.ops.aten.{target}.default"), args, &["out"]),
+            &[
+                ("bias", dtype, &[]),
+                ("a", dtype, left),
+                ("b", dtype, right),
+                ("out", dtype, output),
+            ],
+            &["bias", "a", "b"],
+            &["out"],
+        );
+        // (a @ b) = [-10 + i, 7 - 2i]; the scalar bias broadcasts to both rows.
+        let data = [
+            bias,
+            &[1., 2., -3., 1., 2., -1., 1., 0.],
+            &[2., -1., 4., 2.],
+        ];
+        let inputs = t
+            .inputs
+            .iter()
+            .zip(data)
+            .map(|(input, values)| (input.tensor, values.to_vec().into()))
+            .collect::<Vec<_>>();
+        let rt = luminal_reference::harness::run_reference(&t.graph, &inputs);
+        let actual = rt.get_f32(t.outputs[0].tensor).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, e)| a == e || (a.is_nan() && e.is_nan())),
+            "{target}: {actual:?} != {expected:?}"
+        );
+    }
+
+    fn complex_scalar(name: &str, real: f64, imag: f64) -> crate::pt2_schema::NodeInput {
+        crate::translate::test_support::input(
+            name,
+            serde_json::from_value(serde_json::json!({
+                "as_complex": {"real": real, "imag": imag}
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn assert_zero_beta(target: &str) {
+        use crate::translate::test_support::{scalar_float, scalar_int};
+        for beta in [
+            scalar_int("beta", 0),
+            scalar_float("beta", -0.0),
+            complex_scalar("beta", 0., 0.),
+        ] {
+            assert_addmm_family(
+                target,
+                vec![beta],
+                &[f32::NAN, f32::INFINITY],
+                &[-10., 1., 7., -2.],
+            );
+        }
+    }
+
+    // ---- End numeric fixture helpers --------------------------------------------
+
+    #[test]
+    fn complex_addmm_preserves_imaginary_scaling_and_broadcast_bias() {
+        assert_addmm_family(
+            "addmm",
+            vec![
+                complex_scalar("alpha", 2., -1.),
+                complex_scalar("beta", -1., 2.),
+            ],
+            &[3., -2.],
+            &[-18., 20., 13., -3.],
+        );
+    }
+
+    #[test]
+    fn complex_addmm_beta_zero_ignores_nonfinite_bias() {
+        assert_zero_beta("addmm");
+    }
+
+    #[test]
+    fn complex_addmv_beta_zero_ignores_nonfinite_bias() {
+        assert_zero_beta("addmv");
+    }
+
+    #[test]
+    fn complex_addbmm_beta_zero_ignores_nonfinite_bias() {
+        assert_zero_beta("addbmm");
+    }
+
+    #[test]
+    fn complex_addmm_preserves_default_and_real_scalars() {
+        use crate::translate::test_support::{scalar_float, scalar_int};
+        assert_addmm_family("addmm", vec![], &[3., -2.], &[-7., -1., 10., -4.]);
+        assert_addmm_family(
+            "addmm",
+            vec![scalar_float("beta", 2.), scalar_int("alpha", -1)],
+            &[3., -2.],
+            &[16., -5., -1., -2.],
+        );
+    }
+
+    #[test]
+    fn complex_addmm_family_real_scaling_preserves_nonfinite_semantics() {
+        use crate::translate::test_support::scalar_int;
+        for target in ["addmm", "addmv", "addbmm"] {
+            assert_addmm_family(
+                target,
+                vec![scalar_int("beta", 2)],
+                &[f32::INFINITY, -2.],
+                &[f32::INFINITY, f32::NAN, f32::INFINITY, f32::NAN],
+            );
+        }
+    }
 
     /// Two complex inputs and a node chain exercising add, mul,
     /// view_as_real, view_as_complex, real and imag.
