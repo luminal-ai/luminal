@@ -3042,6 +3042,123 @@
 ; distributivity normalization — so the guard cannot regress the suite;
 ; the positive merge pins in the fence fixture keep it honest instead.
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; AFFINE NORMAL FORM, BEFORE EXPANSION (2026-10-26).
+;
+; The affine fragment -- literals, coordinates, dimensions, IntAdd, and
+; IntMul by a literal -- has a canonical spelling: a sum of monomials, each
+; a non-literal scaled by ONE literal, plus one literal. Composed view
+; offsets arrive far from it (a coordinate scaled twice by the strides of
+; two reshapes, a literal slice start buried under a scaling, a literal
+; factor outside a sum), and the equivalence-discovery rules below
+; (associativity, both distributivity directions) then enumerate every
+; regrouping of every such term. On a joined stream with a tail slice and
+; a reshape around a reduction (the FLUX single-block form) that
+; enumeration does not converge: the e-graph grows from 0.06 GB to over
+; 24 GB in one round (the Trainium backend's `wm_no_residual` reproducer,
+; docs 2026-10-25).
+;
+; These rules rewrite each non-canonical affine spelling into the
+; canonical one and SUBSUME the spelling they matched, both operand
+; orientations as the like-term combiner does (commutativity presents the
+; swapped twin). Every rule is a ring identity; the union is sound, and
+; subsuming the matched node only removes a representative from matching
+; and extraction, never an equality. Once a term is canonical the
+; expansion rules have nothing non-canonical to regroup: associativity
+; finds no nested literal scaling, expansion finds no literal factor over
+; a sum, and the like-term combiner below finishes the sum.
+;
+; Subsumption has a price every structural matcher pays: a rule that
+; matched the recorded spelling of such a term now has to match the
+; canonical one. In core that is the bit-to-element layout discovery,
+; which reads the canonical form through `bits-quotient` (DOWNWARD LAYOUT
+; DISCOVERY, 3c); a backend's recorded chain patterns spell their literal
+; arithmetic canonically for the same reason. Unions without subsumption
+; were tried: they converge, and cost sixty times the saturation on a
+; two-block FLUX stack (the substitution walk visits every live spelling).
+;
+; Only LITERAL factors and summands are moved. A product of two unknowns,
+; a symbolic dimension as a factor, and every Min/Max/div/rem term are
+; left where they are: nothing here is a polynomial normal form for them,
+; and expanding them is what produced the combinatorics. The backend reads
+; what remains through its address function.
+
+; GUARDS, each one load-bearing:
+;   - The literal arithmetic is checked i64: a literal beyond 2^31 (a slice
+;     end spelled as i64::MAX by an exporter) is left unfolded, never
+;     overflowed.
+;   - No identity literal (1 under IntMul, 0 under IntAdd) and no constant
+;     inner term (point bounds, the G2 test). A class holds its identity
+;     spelling for an iteration before the identity rule subsumes it --
+;     `c` is also `c * 1` -- so without this a fold binds `?inner` to the
+;     operand's own class through that spelling and the node it subsumes
+;     is the one it matched (`c * 8` matched as `(c * 1) * 8`): a live
+;     term with no live spelling left, and a chain rule's recorded pattern
+;     matching nothing (the Trainium group-norm election, 2026-10-26). A
+;     constant inner is a preserved factorization (`8 = 2 * 4`) that the
+;     constant-folding discipline keeps live on purpose.
+;   - Distribution asks the nonzero certificate of both summands, as the
+;     expansion rules do: the zero class is never certified, so `x + 0`
+;     cannot bind the sum to `x`'s own class.
+; (x * a) * b  ->  x * (a*b): a term scaled by two literals is scaled once.
+(rule
+  (
+    (= ?expr (IntMul ?inner (IntLit ?b)))
+    (= ?inner (IntMul ?x (IntLit ?a)))
+    (!= ?a 0) (!= ?a 1) (!= ?b 0) (!= ?b 1)
+    (< ?a 2147483648) (> ?a -2147483648) (< ?b 2147483648) (> ?b -2147483648)
+    (= ?x_lower (lower-bound-of ?x))
+    (= ?x_upper (upper-bound-of ?x))
+    (< ?x_lower ?x_upper)
+  )
+  (
+    (union ?expr (IntMul ?x (IntLit (* ?a ?b))))
+    (subsume (IntMul ?inner (IntLit ?b)))
+    (subsume (IntMul (IntLit ?b) ?inner))
+  )
+  :ruleset main_ruleset :name "core: affine normal form: nested literal scaling folds to one literal"
+)
+; (x + y) * k  ->  x*k + y*k: a literal factor distributes over a sum.
+(rule
+  (
+    (= ?expr (IntMul ?sum (IntLit ?k)))
+    (= ?sum (IntAdd ?x ?y))
+    (!= ?k 0) (!= ?k 1)
+    (< ?k 2147483648) (> ?k -2147483648)
+    (provably-cannot-union-with-zero ?x)
+    (provably-cannot-union-with-zero ?y)
+    (= ?x_lower (lower-bound-of ?x))
+    (= ?x_upper (upper-bound-of ?x))
+    (< ?x_lower ?x_upper)
+    (= ?y_lower (lower-bound-of ?y))
+    (= ?y_upper (upper-bound-of ?y))
+    (< ?y_lower ?y_upper)
+  )
+  (
+    (union ?expr (IntAdd (IntMul ?x (IntLit ?k)) (IntMul ?y (IntLit ?k))))
+    (subsume (IntMul ?sum (IntLit ?k)))
+    (subsume (IntMul (IntLit ?k) ?sum))
+  )
+  :ruleset main_ruleset :name "core: affine normal form: a literal factor distributes over a sum"
+)
+; (x + a) + b  ->  x + (a+b): two literal summands fold to one.
+(rule
+  (
+    (= ?expr (IntAdd ?inner (IntLit ?b)))
+    (= ?inner (IntAdd ?x (IntLit ?a)))
+    (!= ?a 0) (!= ?b 0)
+    (< ?a 4611686018427387904) (> ?a -4611686018427387904) (< ?b 4611686018427387904) (> ?b -4611686018427387904)
+    (= ?x_lower (lower-bound-of ?x))
+    (= ?x_upper (upper-bound-of ?x))
+    (< ?x_lower ?x_upper)
+  )
+  (
+    (union ?expr (IntAdd ?x (IntLit (+ ?a ?b))))
+    (subsume (IntAdd ?inner (IntLit ?b)))
+    (subsume (IntAdd (IntLit ?b) ?inner))
+  )
+  :ruleset main_ruleset :name "core: affine normal form: nested literal summands fold to one literal"
+)
 ; Associativity : IntAdd
 ; [G2 FENCE, ruled 2026-08-27]: refuse CONSTANT inner classes (point
 ; bounds, lower == upper). A point-bound class is a known constant owned
@@ -3828,6 +3945,59 @@
     (union ?layout (ElementOffsetExpressionLayoutLit ?expr ?shape ?bit_width))
   )
   :ruleset main_ruleset :name "core: bit offset layout divides its width out"
+)
+; The same discovery through the AFFINE NORMAL FORM (2026-10-26): the
+; `(IntMul elements (IntLit bits))` spelling a bit offset is minted with is
+; subsumed once the folds scale `elements`' monomials by the width, so the
+; width is divided out of the canonical form instead -- a quotient demanded
+; per bit layout and built bottom-up: a literal divisible by the width, a
+; monomial whose literal factor is, a sum of two quotients. Anything else
+; stalls, and the layout keeps its bit form (fail-closed).
+(relation bits-quotient-demand (IntExpr i64))
+(constructor bits-quotient (IntExpr i64) IntExpr :unextractable)
+(rule
+  (
+    (bit-to-element-demand ?layout)
+    (= ?layout (BitOffsetExpressionLayoutLit ?bit_expr ?shape ?bit_width))
+    (= ?bit_width (BitWidthLit ?bits))
+  )
+  ((bits-quotient-demand ?bit_expr ?bits))
+  :ruleset main_ruleset :name "core: bit offset layout demands its quotient by the width"
+)
+(rule
+  ((bits-quotient-demand ?e ?bits) (= ?e (IntAdd ?a ?b)))
+  ((bits-quotient-demand ?a ?bits) (bits-quotient-demand ?b ?bits))
+  :ruleset main_ruleset :name "core: bits quotient demand descends into a sum"
+)
+(rule
+  ((bits-quotient-demand ?e ?bits) (= ?e (IntLit ?k)) (!= ?bits 0) (= 0 (% ?k ?bits)))
+  ((union (bits-quotient ?e ?bits) (IntLit (/ ?k ?bits))))
+  :ruleset main_ruleset :name "core: bits quotient of a divisible literal"
+)
+(rule
+  ((bits-quotient-demand ?e ?bits) (= ?e (IntMul ?x (IntLit ?k))) (!= ?bits 0) (= 0 (% ?k ?bits)))
+  ((union (bits-quotient ?e ?bits) (IntMul ?x (IntLit (/ ?k ?bits)))))
+  :ruleset main_ruleset :name "core: bits quotient of a monomial with a divisible literal factor"
+)
+(rule
+  (
+    (bits-quotient-demand ?e ?bits)
+    (= ?e (IntAdd ?a ?b))
+    (= ?qa (bits-quotient ?a ?bits))
+    (= ?qb (bits-quotient ?b ?bits))
+  )
+  ((union (bits-quotient ?e ?bits) (IntAdd ?qa ?qb)))
+  :ruleset main_ruleset :name "core: bits quotient of a sum is the sum of the quotients"
+)
+(rule
+  (
+    (bit-to-element-demand ?layout)
+    (= ?layout (BitOffsetExpressionLayoutLit ?bit_expr ?shape ?bit_width))
+    (= ?bit_width (BitWidthLit ?bits))
+    (= ?quotient (bits-quotient ?bit_expr ?bits))
+  )
+  ((union ?layout (ElementOffsetExpressionLayoutLit ?quotient ?shape ?bit_width)))
+  :ruleset main_ruleset :name "core: bit offset layout divides its width out of the canonical form"
 )
 
 ; --- (3b) STRIDED PRESENTATIONS: existential testimony, never recovery ---

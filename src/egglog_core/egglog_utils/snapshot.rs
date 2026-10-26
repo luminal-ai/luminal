@@ -608,6 +608,52 @@ mod differential {
         egraph
     }
 
+    /// A recorded graph saturated under the reference program, with the
+    /// wall-clock the saturation took.
+    fn saturate_graph(graph: &luminal::prelude::Graph, outputs: &[luminal::graph::ValueId]) -> std::time::Duration {
+        let bound = luminal_reference::ReferenceBindings::dense(&graph.logical, outputs)
+            .bind(&graph.logical)
+            .expect("the recorded graph binds");
+        let program = format!(
+            "{}\n\n{}",
+            luminal_reference::assembled_program(),
+            bound.text()
+        );
+        let mut egraph = luminal::egglog_snippet::new_egraph();
+        let started = std::time::Instant::now();
+        egraph
+            .parse_and_run_program(None, &program)
+            .expect("the graph saturates");
+        started.elapsed()
+    }
+
+    /// A joined stream with a reshape around a reduction and a tail slice:
+    /// the shape of a FLUX single-stream block (join, q/k RMSNorm over
+    /// heads, split), whose torch-exported form made the Trainium backend's
+    /// saturation grow from 0.06 GB to over 24 GB in one round before the
+    /// affine normal form (preamble, "AFFINE NORMAL FORM, BEFORE EXPANSION";
+    /// docs/design/affine-normal-form.md). This frontend spelling under the
+    /// reference program saturates either way; it pins convergence of the
+    /// same structure here, and the bound is generous on purpose because the
+    /// failure mode being guarded against is "never", not "slow".
+    #[test]
+    fn joined_stream_with_reshaped_reduction_and_tail_slice_saturates() {
+        use luminal::prelude::*;
+        let mut graph = Graph::new();
+        let text = graph.tensor((1, 64, 128), DType::F32);
+        let image = graph.tensor((1, 192, 128), DType::F32);
+        let weight = graph.tensor((128, 128), DType::F32);
+        let joined = text.concat_along(image, 1); // [1, 256, 128]
+        let heads = joined.matmul(weight).split_dims(2, 32); // [1, 256, 4, 32]
+        let scale = (heads * heads).mean(3).expand_dim(3, 32); // the keepdim broadcast
+        let out = (heads * scale).merge_dims(2, 3).slice_along(64.., 1); // [1, 192, 128]
+        let elapsed = saturate_graph(&graph, &[out.id]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(120),
+            "saturation took {elapsed:?}; the affine normal form is not keeping the expansion rules in check"
+        );
+    }
+
     /// How egglog prints a base value: the base type's own `Debug`.
     fn spelling(literal: &Literal) -> String {
         match literal {
