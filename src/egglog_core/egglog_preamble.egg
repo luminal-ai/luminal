@@ -1356,8 +1356,11 @@
 ; division, so the trunc folds are the primitives verbatim; the ceil
 ; folds are trunc PLUS ONE exactly when the division is inexact and the
 ; operand signs agree (positive true quotient) — the sign-gated rule
-; family, verified over the full mixed-sign grid. Custom rounding
-; primitives can replace this split later without changing any meaning.
+; family, verified over the full mixed-sign grid. The exact ceil arm
+; binds `(exact-div a b)`, the harness primitive that is PARTIAL unless
+; b is nonzero and divides a: one premise carries both guards and the
+; quotient. Custom rounding primitives can replace the inexact split
+; later without changing any meaning.
 (rule
   ((= ?expr (IntTruncDiv (IntLit ?dividend) (IntLit ?divisor))) (!= ?divisor 0))
   ((union ?expr (IntLit (/ ?dividend ?divisor))))
@@ -1372,10 +1375,9 @@
 (rule
   (
     (= ?expr (IntCeilDiv (IntLit ?dividend) (IntLit ?divisor)))
-    (!= ?divisor 0)
-    (= 0 (% ?dividend ?divisor))
+    (= ?quotient (exact-div ?dividend ?divisor))
   )
-  ((union ?expr (IntLit (/ ?dividend ?divisor))))
+  ((union ?expr (IntLit ?quotient)))
   :ruleset main_ruleset :name "core: IntCeilDiv folding, exact division"
 )
 ; ...inexact with agreeing signs (positive true quotient): trunc + 1...
@@ -2371,13 +2373,13 @@
 ; fact pays).
 (relation provably-exact-division-expression (IntExpr IntExpr))
 
-; The literal route (subsumes luminal's (= 0 (% a b)) guards).
+; The literal route: exact-div is PARTIAL, so binding its result IS the
+; nonzero-divisor and zero-remainder check in one premise.
 (rule
   (
     (= ?dividend (IntLit ?dividend_value))
     (= ?divisor (IntLit ?divisor_value))
-    (!= ?divisor_value 0)
-    (= 0 (% ?dividend_value ?divisor_value))
+    (= ?quotient (exact-div ?dividend_value ?divisor_value))
   )
   ((provably-exact-division-expression ?dividend ?divisor))
   :ruleset main_ruleset :name "core: exact division: both operands literal, remainder 0"
