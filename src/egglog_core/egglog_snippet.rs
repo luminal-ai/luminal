@@ -144,16 +144,6 @@ pub fn new_egraph() -> egglog::EGraph {
         },
         None,
     );
-    egraph.add_full_primitive(
-        crate::subst_primitive::MemoizedSubst {
-            name: "memoized-int-subst".to_owned(),
-            cache_table: "int-subst-cache".to_owned(),
-            inner: crate::subst_primitive::Subst {
-                skip: ["int-subst-of".to_owned()].into_iter().collect(),
-            },
-        },
-        None,
-    );
     egraph
 }
 
