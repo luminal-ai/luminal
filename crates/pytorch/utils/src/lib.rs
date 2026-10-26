@@ -22,4 +22,4 @@ pub use dtype::TorchDType;
 pub use pt2_parser::{InputKind, ParsedPT2, parse_pt2};
 pub use torch_device::TorchDevice;
 pub use torch_layout::TorchLayout;
-pub use translate::{TranslatedInput, TranslatedOutput, Translation, translate};
+pub use translate::{TranslateOptions, TranslatedInput, TranslatedOutput, Translation, translate, translate_with};

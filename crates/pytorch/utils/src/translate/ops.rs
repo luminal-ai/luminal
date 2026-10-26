@@ -625,7 +625,8 @@ impl Translator<'_> {
         }
         let mean = x.mean(axes.clone());
         let var = x.var_options(axes.clone(), 0);
-        let eps_const = self.cx.constant_f32(eps).expand_rhs(var.dims());
+        // in the variance's dtype: F32 under opmath, the operands' own otherwise
+        let eps_const = self.constant_like(var, f64::from(eps));
         let rstd = (var + eps_const).sqrt().reciprocal();
         // `native_layer_norm` returns (out, mean, rstd) with the normalized
         // axes kept as size-1 extents; `layer_norm` returns just `out`.

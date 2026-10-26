@@ -34,7 +34,7 @@ impl Translator<'_> {
         let out_dtype = self.output_meta_dtype(node)?;
         // Exact-class op (`offs` is an int index tensor), so the arm states
         // torch's opmath itself: the GEMM runs wide and rounds once.
-        let compute_dtype = super::opmath_compute(out_dtype);
+        let compute_dtype = self.opmath_compute(out_dtype);
 
         anyhow::ensure!(
             input.rank() == 2,

@@ -117,10 +117,28 @@ struct OpMath {
 }
 
 /// Torch's opmath: half-precision math is performed in F32.
-fn opmath_compute(common: DType) -> DType {
+fn opmath_compute_widened(common: DType) -> DType {
     match common {
         DType::F16 | DType::Bf16 => DType::F32,
         dtype => dtype,
+    }
+}
+
+/// How the translation spells torch's half-precision arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranslateOptions {
+    /// Torch's opmath: an op over F16/BF16 operands computes in F32 and rounds
+    /// its result back, spelled as casts around the op (the default; CPU
+    /// parity). `false` computes in the operands' own dtype -- for a backend
+    /// whose kernels accumulate in F32 themselves and read half-precision
+    /// operands directly, where the casts are only copies in the way of
+    /// the kernels that match the uncast chain.
+    pub widen_half_precision: bool,
+}
+
+impl Default for TranslateOptions {
+    fn default() -> Self {
+        Self { widen_half_precision: true }
     }
 }
 
@@ -142,6 +160,8 @@ struct Translator<'a> {
     /// The dtype pattern of the op being translated, when torch performs
     /// that op in opmath; `None` for the ops that round nothing.
     opmath: Option<OpMath>,
+    /// Whether half-precision ops compute in F32 (`TranslateOptions`).
+    widen_half_precision: bool,
     /// One widening per (value, common dtype), so several nodes widening
     /// the same value share one cast.
     widened: HashMap<(NodeIndex, Discriminant<DType>), GraphTensor>,
@@ -167,6 +187,11 @@ pub fn parse_dim_expr(translation: &Translation, expr: &str) -> Result<IntExpr> 
 
 /// Translate a parsed PT2 program into the recorder frontend.
 pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
+    translate_with(parsed, &TranslateOptions::default())
+}
+
+/// [`translate`] with the arithmetic spelled per `options`.
+pub fn translate_with(parsed: &ParsedPT2, options: &TranslateOptions) -> Result<Translation> {
     let mut tensors: Vec<(&String, &TensorMeta)> = parsed
         .program
         .graph_module
@@ -190,6 +215,7 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         parsed,
         dims: HashMap::new(),
         opmath: None,
+        widen_half_precision: options.widen_half_precision,
         widened: HashMap::new(),
     };
 
@@ -590,8 +616,13 @@ impl Translator<'_> {
         };
         Ok(OpMath {
             common,
-            compute: opmath_compute(common),
+            compute: self.opmath_compute(common),
         })
+    }
+
+    /// The dtype an op over `common` operands computes in.
+    fn opmath_compute(&self, common: DType) -> DType {
+        if self.widen_half_precision { opmath_compute_widened(common) } else { common }
     }
 
     /// The dtype the export declares for the node's first tensor output

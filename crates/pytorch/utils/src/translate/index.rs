@@ -1136,7 +1136,7 @@ impl Translator<'_> {
             .cx
             .iota(vec![bag_count, index_count, embedding_size], |c| c[2]);
         // Bags accumulate at torch's opmath dtype and round once at the store.
-        let accumulate = super::opmath_compute(weight.dtype);
+        let accumulate = self.opmath_compute(weight.dtype);
         let gathered = weight.gather(&[rows, cols]).cast(accumulate);
         let membership_values = membership.expand_dim(2, embedding_size);
         let zero_values = self.full_tensor(gathered.dims(), accumulate, 0.0);
