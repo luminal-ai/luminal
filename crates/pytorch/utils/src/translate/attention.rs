@@ -13,6 +13,7 @@
 //! repeat-interleaved (GQA).
 
 use anyhow::{Context, Result};
+use luminal::prelude::IntExpr;
 use luminal::prelude::*;
 
 use super::Translator;
@@ -145,6 +146,46 @@ impl Translator<'_> {
             );
         }
 
+        // The two products are rank-3 batched products: every leading axis
+        // (batch, heads) is folded into one batch axis -- what torch's own
+        // decomposition does with `expand` and `view` around `bmm` -- and the
+        // attention output is split back at the end. A backend matches the
+        // batched multiply-and-sum chain for one batch axis; written over
+        // [b, h, s, d] the same product is a rank-5 chain no matmul kernel
+        // claims, and it runs as the elementwise spelling with every operand
+        // broadcast and copied (the tiny FLUX transformer spent its whole
+        // forward there, 2026-10-26).
+        let leading: Vec<IntExpr> = query.dims()[..q_ndim - 2].to_vec();
+        let folded = q_ndim > 3;
+        let fold = |mut tensor: GraphTensor| {
+            while tensor.rank() > 3 {
+                tensor = tensor.merge_dims(0, 1);
+            }
+            tensor
+        };
+        let (query, key, value) = if folded {
+            (fold(query), fold(key), fold(value))
+        } else {
+            (query, key, value)
+        };
+        let additive = match additive {
+            // a mask over [.., s_q, s_k] broadcasts over the leading axes from
+            // the right, torch-style: make it full over them, then fold it
+            // the same way (a rank-2 mask broadcasts over the folded axis as is)
+            Some(mask) if folded && mask.rank() > 2 => {
+                let mut mask = mask;
+                while mask.rank() < leading.len() + 2 {
+                    mask = mask.expand_dim(0, 1);
+                }
+                let mut target = leading.clone();
+                target.push(mask.dims()[mask.rank() - 2]);
+                target.push(mask.dims()[mask.rank() - 1]);
+                Some(fold(mask.expand(target)))
+            }
+            other => other,
+        };
+        let q_ndim = query.rank();
+
         // scores = (Q @ K^T) * scale.
         // Q/K arrive at the compute dtype, so the scores, the scale, the
         // masks and the softmax are all F32 for half-precision inputs.
@@ -195,6 +236,15 @@ impl Translator<'_> {
         let operand_dtype = self.opmath.map_or(value.dtype, |opmath| opmath.common);
         let probabilities = super::convert(super::convert(attn, operand_dtype), value.dtype);
         let out = probabilities.matmul(value);
+        // the leading axes back, innermost first
+        let out = if folded {
+            leading[1..]
+                .iter()
+                .rev()
+                .fold(out, |out, inner| out.split_dims(0, *inner))
+        } else {
+            out
+        };
 
         // Tuple outputs serialize as one `as_tensors` list or one entry per
         // element — flatten to slot order; slot 0 is the attention output.

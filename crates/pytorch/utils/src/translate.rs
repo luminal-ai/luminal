@@ -784,7 +784,7 @@ impl Translator<'_> {
             "mm.default" | "bmm.default" | "matmul.default" => {
                 let a = self.operand(&n[0])?;
                 let b = self.operand(&n[1])?;
-                a.matmul(b)
+                matmul_at_most_rank_3(a, b)
             }
             // ---- grouped GEMM (batch 6) ----
             "_grouped_mm.default" | "transformers.grouped_mm_fallback.default" => {
@@ -1572,6 +1572,41 @@ fn opmath_target(target: &str) -> bool {
             | "gt.Scalar"
             | "ge.Scalar"
     )
+}
+
+/// A matrix product with the operands' batch axes folded so the recorded
+/// chain is a rank-2 or a rank-3 product: a rank-N operand against a
+/// matrix folds every leading axis into the row axis (`[a, b, m, k] x
+/// [k, n]` is `[a*b*m, k] x [k, n]`), two rank-N operands with N > 3 fold
+/// their equal leading axes into one batch axis; the result is split back
+/// to torch's shape. torch's own decompositions do the same (`view` to 2-D
+/// around `mm`, `expand`+`view` around `bmm`); a backend matches the rank-2
+/// helper and the one-batch-axis chain, and a product recorded over more
+/// axes runs as the elementwise multiply-and-sum with every operand
+/// broadcast and copied.
+pub(crate) fn matmul_at_most_rank_3(a: GraphTensor, b: GraphTensor) -> GraphTensor {
+    let fold_to = |mut tensor: GraphTensor, rank: usize| {
+        while tensor.rank() > rank {
+            tensor = tensor.merge_dims(0, 1);
+        }
+        tensor
+    };
+    let unfold = |out: GraphTensor, leading: &[IntExpr]| {
+        // the folded axis back into the leading axes, innermost first
+        leading[1..]
+            .iter()
+            .rev()
+            .fold(out, |out, inner| out.split_dims(0, *inner))
+    };
+    if b.rank() == 2 && a.rank() > 2 {
+        let leading: Vec<IntExpr> = a.dims()[..a.rank() - 1].to_vec();
+        return unfold(fold_to(a, 2).matmul(b), &leading);
+    }
+    if a.rank() == b.rank() && a.rank() > 3 && a.dims()[..a.rank() - 2] == b.dims()[..b.rank() - 2] {
+        let leading: Vec<IntExpr> = a.dims()[..a.rank() - 2].to_vec();
+        return unfold(fold_to(a, 3).matmul(fold_to(b, 3)), &leading);
+    }
+    a.matmul(b)
 }
 
 /// torch's promotion categories: bool < integer < floating.
