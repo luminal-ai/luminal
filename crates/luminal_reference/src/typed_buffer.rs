@@ -94,6 +94,32 @@ macro_rules! narrow_int_accessors {
 }
 
 impl TypedBuffer {
+    /// Copy a value's declared storage span while preserving spare capacity.
+    pub fn copy_prefix_from(&mut self, source: &Self, count: usize) -> Result<()> {
+        macro_rules! copy {
+            ($a:expr, $b:expr) => {{
+                anyhow::ensure!(
+                    count <= $a.len() && count <= $b.len(),
+                    "value copy exceeds buffer capacity"
+                );
+                $a[..count].copy_from_slice(&$b[..count]);
+            }};
+        }
+        match (self, source) {
+            (Self::F32(a), Self::F32(b)) => copy!(a, b),
+            (Self::F64(a), Self::F64(b)) => copy!(a, b),
+            (Self::I32(a), Self::I32(b)) => copy!(a, b),
+            (Self::I64(a), Self::I64(b)) => copy!(a, b),
+            (Self::I8(a), Self::I8(b)) => copy!(a, b),
+            (Self::U8(a), Self::U8(b)) => copy!(a, b),
+            (Self::I16(a), Self::I16(b)) => copy!(a, b),
+            (Self::Bool8(a), Self::Bool8(b)) => copy!(a, b),
+            (Self::F8E4M3FN(a), Self::F8E4M3FN(b)) => copy!(a, b),
+            _ => anyhow::bail!("value copy dtype mismatch"),
+        }
+        Ok(())
+    }
+
     /// The validated Bool8 entry point — the ONLY way caller bytes
     /// become boolean storage. The two-legal-codes invariant is
     /// established here, at the door, so an ill-formed code never

@@ -55,7 +55,8 @@ fn copies(
     plan.dag
         .node_indices()
         .filter_map(|i| match &plan.dag[i] {
-            BufferNode::BufferCopy { src, dst, .. } => Some((i, src.clone(), dst.clone())),
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. } => Some((i, src.clone(), dst.clone())),
             _ => None,
         })
         .collect()
@@ -109,7 +110,7 @@ fn diamond_bound_buffer_is_alias_parent_and_survives_writer_attack() {
                 not_conflicting: false,
             }),
             &[&v],
-            &[("a", "rm")],
+            &[("a", "view")],
         )
         .remove(0);
     g.output(&r, "D"); // seed proposal: e -> D
@@ -145,29 +146,31 @@ fn diamond_bound_buffer_is_alias_parent_and_survives_writer_attack() {
         writers_of_d[0].1.is_empty() || writers_of_d[0].1[0] != d || writers_of_d[0].2[0] == d,
         "the sole writer is the chain root"
     );
-    // RULING 2026-08-27 (repair destinations are fresh single-writer
-    // buffers): the accumulator's operand is a FOLDED view, so its repair
-    // copy lands the parent bytes in a FRESHLY minted buffer the
-    // accumulator READS (re-rooted fold) while WRITING its own result
-    // buffer — the two are distinct Allocated buffers now, where the
-    // pre-ruling plan copied into the result buffer itself.
+    // Rejected reuse protects D, but the physical accumulator still reads
+    // and writes one fresh allocation, initialized with the view's value span.
     let acc = mocks
         .iter()
         .find(|(_, reads, writes)| {
             !reads.is_empty()
                 && reads[0] != d
-                && reads[0] != writes[0]
+                && reads[0] == writes[0]
                 && matches!(reads[0], BufferId::Allocated(_))
                 && matches!(writes[0], BufferId::Allocated(_))
         })
-        .expect("the repaired accumulator reads the fresh repair buffer, writes its own");
+        .expect("the repaired accumulator reads and writes one fresh buffer");
     // its bytes were carried out of D by a repair copy into the buffer it READS
     assert!(
         copies(&plan)
             .iter()
             .any(|(_, src, dst)| *src == d && *dst == acc.1[0]),
-        "repair copy D -> the fresh single-writer repair buffer:\n{}",
+        "repair copy D -> the accumulator's tied result storage:\n{}",
         plan.summary()
+    );
+    assert!(
+        plan.dag.node_weights().any(|node| matches!(node,
+            BufferNode::BufferCopyValue {src,dst,..} if *src==d && *dst==acc.2[0]
+        )),
+        "the accumulator is initialized through the unchanged view layout"
     );
     // no BufferCopy writes D either (no delivery needed: src == dest elided)
     assert!(
@@ -702,7 +705,7 @@ fn every_compute_node_carries_filled_slot_descriptors() {
             // The copy carries ONLY {src, dst} (the BufferCopy contract):
             // a dumb exact-size whole-buffer copy, with ordering left to
             // the runtime. What landed in `dst` is the ASSIGNMENT's word.
-            BufferNode::BufferCopy { src, dst } => {
+            BufferNode::BufferCopy { src, dst } | BufferNode::BufferCopyValue { src, dst, .. } => {
                 assert_ne!(src, dst, "never a self-copy");
                 assert_eq!(
                     plan.backed_tensor(dst),

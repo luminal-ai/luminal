@@ -10,7 +10,7 @@
 //!    compared tolerance-based against the host walk; a bias form with
 //!    a ROW D pins the tripwire (the measured library restriction — no
 //!    BIAS/RELU_BIAS on a ROW-order D — now unreachable from the estate,
-//!    whose bias decorators require a LeftMajor D);
+//!    whose bias requires a column-order D);
 //!  * the TF32 strictness detector assertion (contract 5);
 //!  * a deliberate ld-bounds violation refused loudly BEFORE dispatch
 //!    (contract 4 — including the rows==1 case the library's own check
@@ -21,6 +21,8 @@
 #![cfg(feature = "device")]
 
 mod support;
+#[path = "support/whitelist.rs"]
+mod whitelist;
 use cudarc::driver::{CudaContext, CudaSlice};
 use luminal::bufferize::BufferNode;
 use luminal::prelude::{DType, FxHashMap, NodeIndex};
@@ -174,7 +176,7 @@ fn from_device(stream: &Arc<cudarc::driver::CudaStream>, slice: &CudaSlice<u8>) 
 /// dense row-major operands (ld = the row pitch = cols); C and D in the
 /// order the plan would elect for the form: ROW (ld = n) for the default
 /// forms, COL (ld = m) for the bias forms — the estate's bias decorators
-/// require a LeftMajor D, which `bind_destination` resolves to COL.
+/// require an explicitly elected column-order D.
 fn call_for(form: CublasLtForm) -> LtCall {
     let (m, n, k) = (3i64, 4i64, 5i64);
     let cd = if form.has_bias() {
@@ -355,7 +357,7 @@ fn bias_form_with_a_row_d_is_refused_before_dispatch() {
         let msg = format!("{err:#}");
         assert!(msg.contains("unreachable"), "{form:?}: {msg}");
         assert!(
-            msg.contains("bias decorators require a LeftMajor D"),
+            msg.contains("bias requires a column-order D"),
             "{form:?}: {msg}"
         );
         assert!(msg.contains("refused BEFORE dispatch"), "{form:?}: {msg}");
@@ -367,33 +369,11 @@ fn bias_form_with_a_row_d_is_refused_before_dispatch() {
     }
 }
 
-/// THE DEGENERATE-EXTENT COINCIDENCE ON DEVICE (whisper, A100
-/// 2026-09-04 — NEEDS A100 RUN). whisper tiny.en decodes ONE token, so
-/// its q/v projections are `x[1, 384] @ w[384, 384] + b[384]` and the
-/// sandwich sibling's call frame is `m = 384, n = 1`. At that degenerate
-/// extent the right-major and left-major contiguous index maps over
-/// `[m, n]` are the SAME FUNCTION, so both spellings live in ONE e-class:
-/// the estate's bias decorator matched the LeftMajor spelling while the
-/// decoder (RightMajor first by preference order) handed the executor the
-/// right-major one, `bind_destination` built a ROW D, and the tripwire
-/// refused EVERY candidate genome at prepare —
-///
-///   cuBLASLt CublasLtAccumulateBias: unreachable: the bias decorators
-///   require a LeftMajor D; a bias form
-///   (LayoutTensorOpCublasLtAccumulateBias) reached the executor with a
-///   Row-order D descriptor (384x1 ld 1). [...] refused BEFORE dispatch
-///
-/// — so the search died with "no candidate genome produced an executable
-/// plan". `bind_destination` now spells the coincidence COL on a
-/// bias-bearing call, and this is the DEVICE half: the whisper dims,
-/// searched, executed through the host-call arm with the BIAS epilogue
-/// under a COL `384x1 ld 384` D, against the decomposed route,
-/// tolerance-based.
-///
-/// The CPU halves (the class really holds both spellings; the elected
-/// call binds COL instead of bailing) are in
-/// `tests/cublaslt_bias_premise.rs`, and the descriptor arithmetic is in
-/// `tests/cublaslt_contracts_cpu.rs`.
+/// Whisper's one-token projection has a 384x1 vendor destination. Row and
+/// column layouts have identical addresses at that singleton extent, but
+/// vendor bias still requires the column-order descriptor. Execute the exact
+/// elected descriptor and compare with the decomposed reduction under the
+/// retained F32 reassociation policy.
 #[test]
 fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
     // whisper tiny.en's `state` (crates/model_zoo/src/whisper/model.rs), and its
@@ -417,51 +397,26 @@ fn degenerate_extent_bias_plan_matches_decomposed_route_tolerance_based() {
         .collect()
     };
 
-    // Sweep the seeds the CPU pin sweeps: the assertion below needs a
-    // plan that actually carries a bias form, and which seed delivers one
-    // is an election fact, not a contract (see
-    // `tests/cublaslt_bias_premise.rs`, which sweeps 0..6 the same way).
-    let mut fused = None;
-    for seed in 0..6u64 {
-        let options = luminal_cuda_lite::CompileOptions {
-            generations: 12,
-            generation_size: 16,
-            mutations: 4,
-            trials: 1,
-            seed,
-            search_log: false,
-            ..luminal_cuda_lite::harness_search_options()
-        };
-        let (cx, x, w, b, out) = build();
-        let mut rt = CudaRuntime::load(&cx).expect("load fused");
-        // BEFORE THE FIX this call is where whisper died: every genome
-        // carrying the bias form was refused at prepare, so the search
-        // reported "no candidate genome produced an executable plan".
-        rt.search(
+    // Restrict the production whitelist to bias contracts so this fixture
+    // exercises the epilogue rather than a materialized C-addend alternative.
+    let options = luminal_cuda_lite::CompileOptions {
+        generations: 4,
+        generation_size: 8,
+        ..luminal_cuda_lite::harness_search_options()
+    };
+    let (cx, x, w, b, out) = build();
+    let mut fused =
+        CudaRuntime::load_with_registry(&cx, whitelist::bias_registry()).expect("load fused");
+    fused
+        .search(
             &Default::default(),
             &Default::default(),
             &data_for(x, w, b),
             &options,
         )
-        .unwrap_or_else(|e| panic!("DEGENERATE-D seed {seed}: fused search: {e:#}"));
-        let elected_bias = rt.plan().expect("plan").dag.node_weights().any(|n| {
-            matches!(n, BufferNode::Compute { op, .. }
-                if op.label().starts_with("CublasLt") && op.label().contains("Bias"))
-        });
-        println!("DEGENERATE-D seed {seed}: bias form elected = {elected_bias}");
-        if elected_bias {
-            fused = Some((seed, rt, x, w, b, out));
-            break;
-        }
-    }
-    let (seed, mut fused, x, w, b, out) = fused.expect(
-        "some seed in 0..6 at the 12x16/mut-4 pin budget must elect a cuBLASLt \
-         bias form on the whisper decode shape (the CPU pin \
-         tests/cublaslt_bias_premise.rs sweeps the same seeds; re-sweep it if \
-         this moves) — without one this test is not exercising the degenerate-D \
-         binding at all",
-    );
-    println!("DEGENERATE-D: executing the plan searched at seed {seed}");
+        .expect("bias search");
+    assert!(fused.plan().unwrap().dag.node_weights().any(|node| matches!(node,
+        BufferNode::Compute{op,..} if op.as_any().downcast_ref::<luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt>().is_some_and(|call|call.bias.is_some()))));
     let mut arena = support::allocate_arena(&fused).unwrap();
     fused.upload(&mut arena, x, weights(STATE, 1)).unwrap();
     fused

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ops;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct Artifact {
@@ -94,6 +94,7 @@ enum SpellingWire {
     Strided(StridedElementLayout),
     ElementOffset(ElementOffsetExpressionLayout),
     BitOffset(BitOffsetExpressionLayout),
+    ElementStrided(luminal::element_stride::ElementStridedLayout),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,6 +120,10 @@ impl LayoutWire {
                 SpellingWire::ElementOffset(v.clone())
             } else if let Some(v) = any.downcast_ref::<BitOffsetExpressionLayout>() {
                 SpellingWire::BitOffset(v.clone())
+            } else if let Some(v) =
+                any.downcast_ref::<luminal::element_stride::ElementStridedLayout>()
+            {
+                SpellingWire::ElementStrided(v.clone())
             } else {
                 bail!("unknown reference layout spelling in {}", layout.class);
             };
@@ -146,6 +151,7 @@ impl LayoutWire {
                 SpellingWire::Strided(v) => Arc::new(v) as Arc<dyn LayoutFacts>,
                 SpellingWire::ElementOffset(v) => Arc::new(v) as Arc<dyn LayoutFacts>,
                 SpellingWire::BitOffset(v) => Arc::new(v) as Arc<dyn LayoutFacts>,
+                SpellingWire::ElementStrided(v) => Arc::new(v) as Arc<dyn LayoutFacts>,
             })
             .collect();
         ensure!(
@@ -208,6 +214,11 @@ enum NodeWire {
     Copy {
         src: BufferId,
         dst: BufferId,
+    },
+    CopyValue {
+        src: BufferId,
+        dst: BufferId,
+        layout: LayoutWire,
     },
     Output(Vec<OutputWire>),
 }
@@ -272,9 +283,14 @@ impl PlanWire {
                         operand_info: operand_info.iter().map(&slot).collect::<Result<_>>()?,
                         result_info: result_info.iter().map(&slot).collect::<Result<_>>()?,
                     },
-                    BufferNode::BufferCopy { src, dst } => NodeWire::Copy {
+                    BufferNode::BufferCopy { src, dst, .. } => NodeWire::Copy {
                         src: src.clone(),
                         dst: dst.clone(),
+                    },
+                    BufferNode::BufferCopyValue { src, dst, layout } => NodeWire::CopyValue {
+                        src: src.clone(),
+                        dst: dst.clone(),
+                        layout: LayoutWire::from_layout(layout)?,
                     },
                     BufferNode::BufferOutput { slots } => NodeWire::Output(
                         slots
@@ -367,6 +383,11 @@ impl PlanWire {
                     result_info: result_info.into_iter().map(&slot).collect::<Result<_>>()?,
                 },
                 NodeWire::Copy { src, dst } => BufferNode::BufferCopy { src, dst },
+                NodeWire::CopyValue { src, dst, layout } => BufferNode::BufferCopyValue {
+                    src,
+                    dst,
+                    layout: layout.into_layout()?,
+                },
                 NodeWire::Output(slots) => BufferNode::BufferOutput {
                     slots: slots
                         .into_iter()

@@ -43,6 +43,10 @@ impl LogicalOp for LogicalCast {
                 text: include_str!("value_bounds.egg"),
             },
             EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("rewrite_view.egg"),
+            },
+            EgglogSnippet {
                 category: SpliceCategory::Shape,
                 text: include_str!("shape.egg"),
             },
@@ -51,5 +55,37 @@ impl LogicalOp for LogicalCast {
                 text: include_str!("forward_layout.egg"),
             },
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::egglog_snippet::{assembled_program_for, new_egraph};
+
+    #[test]
+    fn views_preserve_cast_chains_without_crossing_arithmetic() {
+        let script = r#"
+(let shape (ShapeLit (IntExprCons (IntLit 3) (IntExprCons (IntLit 5) (IntExprNil)))))
+(let x (LogicalTensorInputLit (LogicalIdLit "x") shape (F32)))
+(let y (LogicalTensorInputLit (LogicalIdLit "y") shape (F32)))
+(let narrow (LogicalCast x (Bf16)))
+(let wide (LogicalCast narrow (F32)))
+(let transposed (LogicalHelperMatrixTranspose wide))
+(let tx (LogicalHelperMatrixTranspose x))
+(let rounded_product (LogicalCast (LogicalMul x y) (Bf16)))
+(let narrow_product (LogicalMul narrow (LogicalCast y (Bf16))))
+(let narrow_sum (LogicalCast (LogicalReduceSum narrow 0) (F32)))
+(let wide_sum (LogicalReduceSum wide 0))
+(run-schedule (saturate (run prop))
+  (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)))
+(check (= transposed (LogicalCast (LogicalCast tx (Bf16)) (F32))))
+(check (= (dtype-of transposed) (F32)))
+(fail (check (= transposed tx)))
+(fail (check (= rounded_product narrow_product)))
+(fail (check (= narrow_sum wide_sum)))
+"#;
+        new_egraph()
+            .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
+            .unwrap();
     }
 }

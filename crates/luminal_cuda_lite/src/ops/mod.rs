@@ -115,40 +115,18 @@ impl RegisteredOp {
     }
 }
 
-/// THE DEFAULT REGISTRY (cuBLASLt ON BY DEFAULT, ruling 2026-09-04):
-/// every matcher this crate ships, paired with a prototype of the
-/// (functional-form) op its `extract` produces — the kernel-bearing and
-/// plan-transparent rows of [`cuda_registry_without_cublaslt`] PLUS the
-/// four fixed-arity cuBLASLt marker contracts, whose execution row is a
-/// HOST LIBRARY CALL (`cublasLtMatmul`) through `HostOp`, never an NVRTC kernel (the
-/// third claim class — see [`crate::CudaRuntime::allow_list`]).
-///
-/// WHY THE MARKERS USED TO SIT BEHIND AN EXPLICIT SEAM, and why they no
-/// longer do. Splicing the marker vocabulary into every assembly once
-/// detonated the `view-arity-lock` (`Illegal merge attempted`) on all
-/// seven minis, because that lock keyed a ROUTE fact (an apply's parent
-/// rank) on a VALUE (its output class) and the collapse rule's sound
-/// union `x ≡ Tᵀ(x)` put two different-parent-rank spellings in one
-/// class; the check now lives on the `IndexMapLit` (entry count == rank
-/// of the source-shape tag) and saturation succeeds. What kept the
-/// default at the Train-2 set after that was the SEARCH BUDGET: the same
-/// union is a re-description 2-cycle, and at the 2×4 harness budget the
-/// sampler exhausts on unfit genomes on real graphs (they elect at
-/// 12×16). Both are settled, so the markers are simply part of what a
-/// default CL runtime searches with.
-///
-/// A caller who wants the DECOMPOSED route on purpose asks for
-/// [`cuda_registry_without_cublaslt`]; see [`cuda_registry_filtered`]
-/// for row-by-row narrowing (and for why the four marker rows are ONE
-/// estate that must be kept or dropped together).
+/// The default executable vocabulary, including whitelist-gated cuBLASLt
+/// separate-destination and in-place calls. The decomposed preset omits both.
 pub fn cuda_registry() -> Vec<RegisteredOp> {
     let mut registry = cuda_registry_without_cublaslt();
-    for form in cublaslt::CublasLtForm::ALL {
-        registry.push(RegisteredOp {
-            matcher: Box::new(cublaslt::CublasLtMarkerMatcher { form }),
-            prototype: Box::new(cublaslt::CublasLt { form, spec: None }),
-        });
-    }
+    registry.push(RegisteredOp {
+        matcher: Box::new(cublaslt::approved::ApprovedCublasLtMatcher),
+        prototype: Box::new(cublaslt::approved::ApprovedCublasLt::prototype()),
+    });
+    registry.push(RegisteredOp {
+        matcher: Box::new(cublaslt::accumulate_in_place::CublasLtAccumulateInPlaceMatcher),
+        prototype: Box::new(cublaslt::accumulate_in_place::CublasLtAccumulateInPlace::prototype()),
+    });
     registry
 }
 
@@ -262,13 +240,8 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
 /// The two presets remain available whole ([`cuda_registry`],
 /// [`cuda_registry_without_cublaslt`]).
 ///
-/// THE FOUR cuBLASLt MARKER ROWS ARE ONE ESTATE, not four independent
-/// ones: the Base row's snippets declare all four constructors and mint
-/// all four forms, so a predicate that drops Base must drop all four.
-/// [`crate::CudaRuntime::load_with_registry`] refuses the other
-/// combination; `active_allow_list` alone cannot tell you, because a
-/// claim is derived from the prototype and says nothing about whether
-/// the assembled program declares the constructor.
+/// cuBLASLt is one independent registry row. Its snippets own the complete
+/// configuration table and the only executable call emitter.
 ///
 /// A PREDICATE THAT MATCHES NOTHING IS SILENT — it returns the full
 /// registry, and the search then simply has the op available. Assert on

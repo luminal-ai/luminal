@@ -32,7 +32,8 @@ fn copies(
     plan.dag
         .node_weights()
         .filter_map(|n| match n {
-            BufferNode::BufferCopy { src, dst, .. } => Some((src.clone(), dst.clone())),
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. } => Some((src.clone(), dst.clone())),
             _ => None,
         })
         .collect()
@@ -403,11 +404,9 @@ fn a1_unordered_reader_of_cohabited_buffer_hazard_gone_under_escape() {
 /// and is vetoed; the repair copies the bytes out and the consumer reads the
 /// copy. The shared buffer keeps exactly one writing compute.
 ///
-/// RULING 2026-08-27 (repair destinations are fresh single-writer buffers):
-/// the repair copy of a FOLDED operand targets a FRESHLY minted
-/// parent-shaped buffer — never the tied result's buffer, whose writer
-/// votes result-shaped geometry the base-storage copy would contradict —
-/// and the consumer's operand re-roots onto it through its unchanged fold.
+/// The writing tie requires identical input/result layouts. Its repair
+/// initializes the result's storage with the view's unchanged value span;
+/// the parent stays protected and the accumulator still reads/writes one buffer.
 #[test]
 fn a1_mutating_consumer_through_view_of_bound_value_vetoed_and_repaired() {
     let mut g = TestGraph::new();
@@ -433,7 +432,7 @@ fn a1_mutating_consumer_through_view_of_bound_value_vetoed_and_repaired() {
                 not_conflicting: false,
             }),
             &[&v],
-            &[("r", "rm")],
+            &[("r", "view")],
         )
         .remove(0);
     g.output(&y, "D");
@@ -465,18 +464,25 @@ fn a1_mutating_consumer_through_view_of_bound_value_vetoed_and_repaired() {
         "exactly one writer of the bound buffer:\n{}",
         plan.summary()
     );
-    // The repair copied D's bytes into a FRESH single-writer buffer the
-    // consumer re-roots onto — never the accumulator's own result buffer.
+    // Copy the view's old address span into the accumulator's fresh result
+    // storage. The physical read-modify-write tie must survive the repair.
     let repair = copies(&plan)
         .into_iter()
         .find(|(src, _)| *src == d)
         .expect("repair copy reads the bound buffer");
     assert!(matches!(repair.1, BufferId::Allocated(_)));
-    assert_ne!(
+    assert_eq!(
         repair.1,
         plan.value_buffer[&r],
-        "fresh repair destination, not the tied result's buffer:\n{}",
+        "repair must initialize the same storage the accumulator overwrites:\n{}",
         plan.summary()
+    );
+    assert!(
+        plan.dag.node_weights().any(|node| matches!(node,
+            BufferNode::BufferCopyValue {src,dst,layout}
+                if *src==d && *dst==repair.1 && *layout==table[&v]
+        )),
+        "the repair preserves the view's address map"
     );
     let consumer_operand = plan
         .dag

@@ -13,13 +13,14 @@
 //! unfused spelling keeps original HF tensor names and no slice
 //! triple. Rope is the concat-free pairing-matrix spelling.
 
-use crate::model_support::{
-    AttentionGeometry, CacheAccess, Embedding, KvCache, KvCachePool, LayerNorm, Linear, Namespace,
-    causal_bias, paged_attention, rotary_apply,
-};
+use crate::namespace::Namespace;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::GraphTensor;
+use luminal_nn::{
+    AttentionGeometry, CacheAccess, KvCache, KvCachePool, causal_bias, paged_attention,
+    rotary_apply,
+};
 
 #[derive(Clone)]
 pub struct Llama3Dims {
@@ -76,15 +77,26 @@ impl Llama3Dims {
 }
 
 pub struct Llama3Layer {
-    pub attn_norm: LayerNorm,
-    pub wq: Linear,
-    pub wk: Linear,
-    pub wv: Linear,
-    pub wo: Linear,
-    pub ffn_norm: LayerNorm,
-    pub gate: Linear,
-    pub up: Linear,
-    pub down: Linear,
+    pub attn_norm_weight: Option<GraphTensor>,
+    pub attn_norm_bias: Option<GraphTensor>,
+    pub attn_norm_epsilon: f32,
+    pub wq_weight: GraphTensor,
+    pub wq_bias: Option<GraphTensor>,
+    pub wk_weight: GraphTensor,
+    pub wk_bias: Option<GraphTensor>,
+    pub wv_weight: GraphTensor,
+    pub wv_bias: Option<GraphTensor>,
+    pub wo_weight: GraphTensor,
+    pub wo_bias: Option<GraphTensor>,
+    pub ffn_norm_weight: Option<GraphTensor>,
+    pub ffn_norm_bias: Option<GraphTensor>,
+    pub ffn_norm_epsilon: f32,
+    pub gate_weight: GraphTensor,
+    pub gate_bias: Option<GraphTensor>,
+    pub up_weight: GraphTensor,
+    pub up_bias: Option<GraphTensor>,
+    pub down_weight: GraphTensor,
+    pub down_bias: Option<GraphTensor>,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -104,16 +116,21 @@ impl Llama3Layer {
         rope_sin: GraphTensor,
         rope_rot: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let normed = self.attn_norm.forward(x);
+        let normed = luminal_nn::rms_norm(
+            x,
+            self.attn_norm_weight,
+            self.attn_norm_bias,
+            self.attn_norm_epsilon,
+        );
         let q = rotary_apply(
-            self.wq.forward(normed),
+            luminal_nn::linear(normed, self.wq_weight, self.wq_bias),
             self.head_dim,
             rope_cos,
             rope_sin,
             rope_rot,
         );
         let k = rotary_apply(
-            self.wk.forward(normed),
+            luminal_nn::linear(normed, self.wk_weight, self.wk_bias),
             self.head_dim,
             rope_cos,
             rope_sin,
@@ -123,18 +140,26 @@ impl Llama3Layer {
         let result = paged_attention(
             q,
             k,
-            self.wv.forward(normed),
+            luminal_nn::linear(normed, self.wv_weight, self.wv_bias),
             KvCache::new(k_cache, v_cache),
             CacheAccess::new(scatter_idx, gather_idx),
             causal_bias(q_pos, context_positions),
             AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
-        let x = x + self.wo.forward(attn);
-        let ff_in = self.ffn_norm.forward(x);
-        let ff = self
-            .down
-            .forward(self.gate.forward(ff_in).silu() * self.up.forward(ff_in));
+        let x = x + luminal_nn::linear(attn, self.wo_weight, self.wo_bias);
+        let ff_in = luminal_nn::rms_norm(
+            x,
+            self.ffn_norm_weight,
+            self.ffn_norm_bias,
+            self.ffn_norm_epsilon,
+        );
+        let ff = luminal_nn::linear(
+            luminal_nn::linear(ff_in, self.gate_weight, self.gate_bias).silu()
+                * luminal_nn::linear(ff_in, self.up_weight, self.up_bias),
+            self.down_weight,
+            self.down_bias,
+        );
         (x + ff, k_cache, v_cache)
     }
 
@@ -151,16 +176,21 @@ impl Llama3Layer {
         rope_sin: GraphTensor,
         rope_rot: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let normed = self.attn_norm.forward(x);
+        let normed = luminal_nn::rms_norm(
+            x,
+            self.attn_norm_weight,
+            self.attn_norm_bias,
+            self.attn_norm_epsilon,
+        );
         let q = rotary_apply(
-            self.wq.forward(normed),
+            luminal_nn::linear(normed, self.wq_weight, self.wq_bias),
             self.head_dim,
             rope_cos,
             rope_sin,
             rope_rot,
         );
         let k = rotary_apply(
-            self.wk.forward(normed),
+            luminal_nn::linear(normed, self.wk_weight, self.wk_bias),
             self.head_dim,
             rope_cos,
             rope_sin,
@@ -169,37 +199,45 @@ impl Llama3Layer {
         let result = paged_attention(
             q,
             k,
-            self.wv.forward(normed),
+            luminal_nn::linear(normed, self.wv_weight, self.wv_bias),
             KvCache::new(k_cache, v_cache),
             CacheAccess::new(scatter_idx, gather_idx),
             mask,
             AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
-        let x = x + self.wo.forward(attn);
-        let ff_in = self.ffn_norm.forward(x);
-        let ff = self
-            .down
-            .forward(self.gate.forward(ff_in).silu() * self.up.forward(ff_in));
+        let x = x + luminal_nn::linear(attn, self.wo_weight, self.wo_bias);
+        let ff_in = luminal_nn::rms_norm(
+            x,
+            self.ffn_norm_weight,
+            self.ffn_norm_bias,
+            self.ffn_norm_epsilon,
+        );
+        let ff = luminal_nn::linear(
+            luminal_nn::linear(ff_in, self.gate_weight, self.gate_bias).silu()
+                * luminal_nn::linear(ff_in, self.up_weight, self.up_bias),
+            self.down_weight,
+            self.down_bias,
+        );
         (x + ff, k_cache, v_cache)
     }
 }
 
 pub struct Llama3 {
     pub dims: Llama3Dims,
-    pub embed: Embedding,
+    pub embed: GraphTensor,
     pub blocks: Vec<Llama3Layer>,
-    pub final_norm: LayerNorm,
+    pub final_norm_weight: Option<GraphTensor>,
+    pub final_norm_bias: Option<GraphTensor>,
+    pub final_norm_epsilon: f32,
     /// UNTIED head — a real (vocab, hidden) checkpoint tensor.
-    pub lm_head: Linear,
+    pub lm_head_weight: GraphTensor,
+    pub lm_head_bias: Option<GraphTensor>,
 }
 
 impl Llama3 {
     pub fn init(cx: &mut Graph, dims: &Llama3Dims) -> Self {
-        Self::init_with_parameter_dtype(cx, dims, DType::F32)
-    }
-
-    pub fn init_with_parameter_dtype(cx: &mut Graph, dims: &Llama3Dims, dtype: DType) -> Self {
+        let dtype = DType::F32;
         let blocks = (0..dims.layers)
             .map(|l| Self::block(l, dims, dtype, cx))
             .collect();
@@ -207,32 +245,33 @@ impl Llama3 {
             dims: dims.clone(),
             // HF stores embed_tokens as (vocab, hidden) — the natural
             // Embedding orientation.
-            embed: Embedding::new_with_storage_dtype(
-                dims.vocab,
-                dims.hidden,
+            embed: cx.named_tensor(
+                Namespace::root()
+                    .child("model")
+                    .child("embed_tokens")
+                    .leaf("weight"),
+                vec![dims.vocab, dims.hidden],
                 dtype,
-                &Namespace::root().child("model").child("embed_tokens"),
-                cx,
             ),
             blocks,
-            final_norm: LayerNorm::new_with_storage_dtype(
-                dims.hidden,
-                true,
-                false,
-                false,
-                dims.rms_eps,
-                dtype,
-                &Namespace::root().child("model").child("norm"),
-                cx,
+            final_norm_weight: Some(
+                cx.named_tensor(
+                    Namespace::root()
+                        .child("model")
+                        .child("norm")
+                        .leaf("weight"),
+                    vec![dims.hidden],
+                    dtype,
+                ),
             ),
-            lm_head: Linear::new_with_storage_dtype(
-                dims.hidden,
-                dims.vocab,
-                false,
+            final_norm_bias: None,
+            final_norm_epsilon: dims.rms_eps,
+            lm_head_weight: cx.named_tensor(
+                Namespace::root().child("lm_head").leaf("weight"),
+                vec![dims.hidden, dims.vocab],
                 dtype,
-                &Namespace::root().child("lm_head"),
-                cx,
             ),
+            lm_head_bias: None,
         }
     }
 
@@ -244,82 +283,62 @@ impl Llama3 {
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         Llama3Layer {
-            attn_norm: LayerNorm::new_with_storage_dtype(
-                d.hidden,
-                true,
-                false,
-                false,
-                d.rms_eps,
+            attn_norm_weight: Some(cx.named_tensor(
+                ns.child("input_layernorm").leaf("weight"),
+                vec![d.hidden],
                 dtype,
-                &ns.child("input_layernorm"),
-                cx,
-            ),
-            wq: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.q_dim(),
-                false,
+            )),
+            attn_norm_bias: None,
+            attn_norm_epsilon: d.rms_eps,
+            wq_weight: cx.named_tensor(
+                attn.child("q_proj").leaf("weight"),
+                vec![d.hidden, d.q_dim()],
                 dtype,
-                &attn.child("q_proj"),
-                cx,
             ),
-            wk: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.kv_dim(),
-                false,
+            wq_bias: None,
+            wk_weight: cx.named_tensor(
+                attn.child("k_proj").leaf("weight"),
+                vec![d.hidden, d.kv_dim()],
                 dtype,
-                &attn.child("k_proj"),
-                cx,
             ),
-            wv: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.kv_dim(),
-                false,
+            wk_bias: None,
+            wv_weight: cx.named_tensor(
+                attn.child("v_proj").leaf("weight"),
+                vec![d.hidden, d.kv_dim()],
                 dtype,
-                &attn.child("v_proj"),
-                cx,
             ),
-            wo: Linear::new_with_storage_dtype(
-                d.q_dim(),
-                d.hidden,
-                false,
+            wv_bias: None,
+            wo_weight: cx.named_tensor(
+                attn.child("o_proj").leaf("weight"),
+                vec![d.q_dim(), d.hidden],
                 dtype,
-                &attn.child("o_proj"),
-                cx,
             ),
-            ffn_norm: LayerNorm::new_with_storage_dtype(
-                d.hidden,
-                true,
-                false,
-                false,
-                d.rms_eps,
+            wo_bias: None,
+            ffn_norm_weight: Some(cx.named_tensor(
+                ns.child("post_attention_layernorm").leaf("weight"),
+                vec![d.hidden],
                 dtype,
-                &ns.child("post_attention_layernorm"),
-                cx,
-            ),
-            gate: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.intermediate,
-                false,
+            )),
+            ffn_norm_bias: None,
+            ffn_norm_epsilon: d.rms_eps,
+            gate_weight: cx.named_tensor(
+                mlp.child("gate_proj").leaf("weight"),
+                vec![d.hidden, d.intermediate],
                 dtype,
-                &mlp.child("gate_proj"),
-                cx,
             ),
-            up: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.intermediate,
-                false,
+            gate_bias: None,
+            up_weight: cx.named_tensor(
+                mlp.child("up_proj").leaf("weight"),
+                vec![d.hidden, d.intermediate],
                 dtype,
-                &mlp.child("up_proj"),
-                cx,
             ),
-            down: Linear::new_with_storage_dtype(
-                d.intermediate,
-                d.hidden,
-                false,
+            up_bias: None,
+            down_weight: cx.named_tensor(
+                mlp.child("down_proj").leaf("weight"),
+                vec![d.intermediate, d.hidden],
                 dtype,
-                &mlp.child("down_proj"),
-                cx,
             ),
+            down_bias: None,
             n_heads: d.n_heads,
             n_kv_heads: d.n_kv_heads,
             head_dim: d.head_dim,
@@ -342,7 +361,7 @@ impl Llama3 {
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         assert_eq!(tokens.dtype, DType::Int);
         assert_eq!(pool.layers.len(), self.blocks.len());
-        let mut x = self.embed.forward(tokens);
+        let mut x = luminal_nn::embedding(tokens, self.embed);
         let mut caches_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
             let (next, k_cache, v_cache) = block.forward_rope(
@@ -359,7 +378,16 @@ impl Llama3 {
             x = next;
             caches_out.push((k_cache, v_cache));
         }
-        let logits = self.lm_head.forward(self.final_norm.forward(x));
+        let logits = luminal_nn::linear(
+            luminal_nn::rms_norm(
+                x,
+                self.final_norm_weight,
+                self.final_norm_bias,
+                self.final_norm_epsilon,
+            ),
+            self.lm_head_weight,
+            self.lm_head_bias,
+        );
         (logits, caches_out)
     }
 }

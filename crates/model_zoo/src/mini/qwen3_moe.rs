@@ -1,12 +1,12 @@
 //! MiniQwen3Moe — the qwen3_moe family mini (mini relocation, 2026-08-13):
 //! the model definition and decoder layer live here in the example crate.
 
-use crate::model_support::{
-    AttentionGeometry, CacheAccess, Embedding, KvCache, LayerNorm, Linear, Namespace, TopKRoutes,
-    causal_bias, paged_attention,
-};
+use crate::namespace::Namespace;
 use luminal::prelude::*;
 use luminal::shape::IntExpr;
+use luminal_nn::{
+    AttentionGeometry, CacheAccess, KvCache, TopKRoutes, causal_bias, paged_attention,
+};
 
 pub struct MiniLinearMoe {
     pub expert_weights: GraphTensor,
@@ -32,10 +32,14 @@ impl MiniLinearMoe {
 }
 
 pub struct MiniQwen3MoeLayer {
-    pub wq: Linear,
-    pub wk: Linear,
-    pub wv: Linear,
-    pub wo: Linear,
+    pub wq_weight: GraphTensor,
+    pub wq_bias: Option<GraphTensor>,
+    pub wk_weight: GraphTensor,
+    pub wk_bias: Option<GraphTensor>,
+    pub wv_weight: GraphTensor,
+    pub wv_bias: Option<GraphTensor>,
+    pub wo_weight: GraphTensor,
+    pub wo_bias: Option<GraphTensor>,
     pub moe: Box<MiniLinearMoe>,
     pub n_heads: usize,
     pub head_dim: usize,
@@ -51,22 +55,22 @@ impl MiniQwen3MoeLayer {
         scatter_idx: GraphTensor,
         prev_seq: IntExpr,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let query = self.wq.forward(x);
+        let query = luminal_nn::linear(x, self.wq_weight, self.wq_bias);
         let query_positions = query
             .graph()
             .iota(vec![query.dims()[0]], |c| c[0] + prev_seq);
         let context_positions = query.graph().arange(gather_idx.dims1());
         let result = paged_attention(
             query,
-            self.wk.forward(x),
-            self.wv.forward(x),
+            luminal_nn::linear(x, self.wk_weight, self.wk_bias),
+            luminal_nn::linear(x, self.wv_weight, self.wv_bias),
             KvCache::new(k_cache, v_cache),
             CacheAccess::new(scatter_idx, gather_idx),
             causal_bias(query_positions, context_positions),
             AttentionGeometry::new(self.n_heads, self.n_heads, self.head_dim),
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
-        let x = x + self.wo.forward(attn);
+        let x = x + luminal_nn::linear(attn, self.wo_weight, self.wo_bias);
         (x + self.moe.forward(x), k_cache, v_cache)
     }
 }
@@ -81,19 +85,43 @@ fn moe_lm_new(
     n_heads: usize,
     layers: usize,
     cx: &mut Graph,
-) -> (Embedding, Vec<MiniQwen3MoeLayer>, LayerNorm) {
+) -> (GraphTensor, Vec<MiniQwen3MoeLayer>, f32) {
     let model = Namespace::root().child("model");
     (
-        Embedding::new(vocab, d, DType::F32, &model.child("embed_tokens"), cx),
+        cx.named_tensor(
+            model.child("embed_tokens").leaf("weight"),
+            vec![vocab, d],
+            DType::F32,
+        ),
         (0..layers)
             .map(|l| {
                 let a = model.child("layers").index(l).child("self_attn");
                 let mlp_ns = model.child("layers").index(l).child("mlp");
                 MiniQwen3MoeLayer {
-                    wq: Linear::new(d, d, false, DType::F32, &a.child("q_proj"), cx),
-                    wk: Linear::new(d, d, false, DType::F32, &a.child("k_proj"), cx),
-                    wv: Linear::new(d, d, false, DType::F32, &a.child("v_proj"), cx),
-                    wo: Linear::new(d, d, false, DType::F32, &a.child("o_proj"), cx),
+                    wq_weight: cx.named_tensor(
+                        a.child("q_proj").leaf("weight"),
+                        vec![d, d],
+                        DType::F32,
+                    ),
+                    wq_bias: None,
+                    wk_weight: cx.named_tensor(
+                        a.child("k_proj").leaf("weight"),
+                        vec![d, d],
+                        DType::F32,
+                    ),
+                    wk_bias: None,
+                    wv_weight: cx.named_tensor(
+                        a.child("v_proj").leaf("weight"),
+                        vec![d, d],
+                        DType::F32,
+                    ),
+                    wv_bias: None,
+                    wo_weight: cx.named_tensor(
+                        a.child("o_proj").leaf("weight"),
+                        vec![d, d],
+                        DType::F32,
+                    ),
+                    wo_bias: None,
                     moe: Box::new(MiniLinearMoe {
                         expert_weights: cx.named_tensor(
                             mlp_ns.leaf("experts"),
@@ -112,31 +140,22 @@ fn moe_lm_new(
                 }
             })
             .collect(),
-        LayerNorm::new(
-            d,
-            false,
-            false,
-            true,
-            1e-5,
-            DType::F32,
-            &model.child("norm"),
-            cx,
-        ),
+        1e-5,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn moe_lm_forward(
-    embed: &Embedding,
+    embed: &GraphTensor,
     blocks: &[MiniQwen3MoeLayer],
-    final_norm: &LayerNorm,
+    final_norm: &(Option<GraphTensor>, Option<GraphTensor>, f32),
     ids: GraphTensor,
     caches: &[(GraphTensor, GraphTensor)],
     gather_idx: GraphTensor,
     scatter_idx: GraphTensor,
     prev_seq: IntExpr,
 ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-    let mut x = embed.forward(ids);
+    let mut x = luminal_nn::embedding(ids, *embed);
     let mut caches_out = Vec::with_capacity(blocks.len());
     for (layer, block) in blocks.iter().enumerate() {
         let (next, kc, vc) = block.forward(
@@ -150,7 +169,10 @@ fn moe_lm_forward(
         x = next;
         caches_out.push((kc, vc));
     }
-    let logits = embed.reverse(final_norm.forward(x));
+    let logits = luminal_nn::embedding_projection(
+        luminal_nn::layer_norm(x, final_norm.0, final_norm.1, final_norm.2),
+        *embed,
+    );
     (logits, caches_out)
 }
 
@@ -159,9 +181,11 @@ fn moe_lm_forward(
 /// top-k=8 routing with renormalized weights (mini routes k=1); those
 /// ride the pending fidelity ruling.
 pub struct MiniQwen3Moe {
-    pub embed: Embedding,
+    pub embed: GraphTensor,
     pub blocks: Vec<MiniQwen3MoeLayer>,
-    pub final_norm: LayerNorm,
+    pub final_norm_weight: Option<GraphTensor>,
+    pub final_norm_bias: Option<GraphTensor>,
+    pub final_norm_epsilon: f32,
 }
 
 impl MiniQwen3Moe {
@@ -175,11 +199,18 @@ impl MiniQwen3Moe {
         layers: usize,
         cx: &mut Graph,
     ) -> Self {
-        let (embed, blocks, final_norm) = moe_lm_new(vocab, d, experts, top_k, n_heads, layers, cx);
-        Self {
-            embed,
-            blocks,
-            final_norm,
+        let (embed, blocks, final_norm_epsilon) =
+            moe_lm_new(vocab, d, experts, top_k, n_heads, layers, cx);
+        {
+            let final_norm_weight = None;
+            let final_norm_bias = None;
+            Self {
+                embed,
+                blocks,
+                final_norm_weight,
+                final_norm_bias,
+                final_norm_epsilon,
+            }
         }
     }
 
@@ -194,7 +225,11 @@ impl MiniQwen3Moe {
         moe_lm_forward(
             &self.embed,
             &self.blocks,
-            &self.final_norm,
+            &(
+                self.final_norm_weight,
+                self.final_norm_bias,
+                self.final_norm_epsilon,
+            ),
             ids,
             caches,
             gather_idx,

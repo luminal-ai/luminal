@@ -657,7 +657,12 @@
 (function expr-list-length-of (IntExprList) i64 :no-merge) ; I think these can be no merge
 (function expr-list-nth-from-end (IntExprList i64) IntExpr :no-merge) ; I think these can be no merge
 (relation expr-list-scale-demand (IntExpr IntExprList))
-(function expr-list-scale-of (IntExpr IntExprList) IntExprList :no-merge)
+; These are proof relations rather than unique-value memo functions. When
+; dynamic extents are pinned after saturation, input keys can become equal
+; before scalar rewriting proves their folded results equal. Every row still
+; denotes the same elementwise scaling or fold for its inputs; retaining all
+; proved presentations avoids requiring premature e-class identity.
+(relation expr-list-scaled (IntExpr IntExprList IntExprList))
 
 ; Zero length list -> length = 0
 (rule
@@ -739,7 +744,8 @@
     (expr-list-scale-demand ?factor (IntExprNil))
   )
   (
-    (set (expr-list-scale-of ?factor (IntExprNil)) (IntExprNil))
+    (expr-list-scaled ?factor (IntExprNil)
+      (IntExprNil))
   )
   :ruleset main_ruleset :name "core: scaling IntExprNil yields IntExprNil"
 )
@@ -749,11 +755,11 @@
   (
     (expr-list-scale-demand ?factor ?list)
     (= ?list (IntExprCons ?item ?tail))
-    (= ?scaled_tail (expr-list-scale-of ?factor ?tail))
+    (expr-list-scaled ?factor ?tail
+      ?scaled_tail)
   )
   (
-    (set
-      (expr-list-scale-of ?factor ?list)
+    (expr-list-scaled ?factor ?list
       (IntExprCons (IntMul ?factor ?item) ?scaled_tail))
   )
   :ruleset main_ruleset :name "core: scale each IntExpr in a list by one factor"
@@ -3336,7 +3342,7 @@
 ; Right-Major Contiguous Strides
 
 (relation right-major-strides-demand (IntExprList))
-(function right-major-strides-state-of (IntExprList) RightMajorStridesFoldState :no-merge)
+(relation right-major-strides-state (IntExprList RightMajorStridesFoldState))
 
 ; Demand folded strides state for right-major contiguous element layouts.
 ;   shape   = [d2, d1, d0]
@@ -3371,8 +3377,7 @@
     (right-major-strides-demand (IntExprNil))
   )
   (
-    (set
-      (right-major-strides-state-of (IntExprNil))
+    (right-major-strides-state (IntExprNil)
       (RightMajorStridesFoldStateLit 0 (IntLit 1) (IntExprNil)))
   )
   :ruleset main_ruleset :name "core: right-major strides fold state of the empty suffix"
@@ -3385,12 +3390,11 @@
   (
     (right-major-strides-demand ?list)
     (= ?list (IntExprCons ?size ?tail))
-    (= (right-major-strides-state-of ?tail)
+    (right-major-strides-state ?tail
       (RightMajorStridesFoldStateLit ?rank ?total-elements ?strides))
   )
   (
-    (set
-      (right-major-strides-state-of ?list)
+    (right-major-strides-state ?list
       (RightMajorStridesFoldStateLit
         (+ ?rank 1)
         (IntMul ?size ?total-elements)
@@ -3452,7 +3456,7 @@
 (rule
   (
     (= ?right_major_layout (RightMajorContiguousElementLayoutLit (ShapeLit ?dims) ?bits))
-    (= (right-major-strides-state-of ?dims)
+    (right-major-strides-state ?dims
       (RightMajorStridesFoldStateLit ?rank ?total-elements ?strides))
   )
   (
@@ -3465,7 +3469,7 @@
 ; Left-Major Contiguous Strides
 
 (relation left-major-strides-demand (IntExprList))
-(function left-major-strides-state-of (IntExprList) LeftMajorStridesFoldState :no-merge)
+(relation left-major-strides-state (IntExprList LeftMajorStridesFoldState))
 
 ; Demand folded strides state for left-major contiguous element layouts.
 ;   shape   = [d2, d1, d0]
@@ -3500,8 +3504,7 @@
     (left-major-strides-demand (IntExprNil))
   )
   (
-    (set
-      (left-major-strides-state-of (IntExprNil))
+    (left-major-strides-state (IntExprNil)
       (LeftMajorStridesFoldStateLit 0 (IntLit 1) (IntExprNil)))
   )
   :ruleset main_ruleset :name "core: left-major strides fold state of the empty suffix"
@@ -3514,7 +3517,7 @@
   (
     (left-major-strides-demand ?list)
     (= ?list (IntExprCons ?size ?tail))
-    (= (left-major-strides-state-of ?tail)
+    (left-major-strides-state ?tail
       (LeftMajorStridesFoldStateLit ?rank ?total-elements ?tail_strides))
   )
   (
@@ -3527,13 +3530,13 @@
   (
     (left-major-strides-demand ?list)
     (= ?list (IntExprCons ?size ?tail))
-    (= (left-major-strides-state-of ?tail)
+    (left-major-strides-state ?tail
       (LeftMajorStridesFoldStateLit ?rank ?total-elements ?tail_strides))
-    (= ?scaled_tail_strides (expr-list-scale-of ?size ?tail_strides))
+    (expr-list-scaled ?size ?tail_strides
+      ?scaled_tail_strides)
   )
   (
-    (set
-      (left-major-strides-state-of ?list)
+    (left-major-strides-state ?list
       (LeftMajorStridesFoldStateLit
         (+ ?rank 1)
         (IntMul ?size ?total-elements)
@@ -3547,7 +3550,7 @@
 (rule
   (
     (= ?left_major_layout (LeftMajorContiguousElementLayoutLit (ShapeLit ?dims) ?bits))
-    (= (left-major-strides-state-of ?dims)
+    (left-major-strides-state ?dims
       (LeftMajorStridesFoldStateLit ?rank ?total-elements ?strides))
   )
   (
@@ -3564,7 +3567,7 @@
 ; (CoordVar root axis). Costs tail-suffix sharing across different
 ; shapes; buys owner-scoped mints.
 (relation strided-indexing-foldr-demand (Shape IntExprList IntExprList))
-(function strided-indexing-foldr-state-of (Shape IntExprList IntExprList) StridedIndexingFoldRState :no-merge)
+(relation strided-indexing-foldr-state (Shape IntExprList IntExprList StridedIndexingFoldRState))
 
 ; Demand a folded element offset expression for explicit strided layouts.
 ; Shape and stride lists are in the same order, so:
@@ -3596,8 +3599,7 @@
     (strided-indexing-foldr-demand ?root_shape (IntExprNil) (IntExprNil))
   )
   (
-    (set
-      (strided-indexing-foldr-state-of ?root_shape (IntExprNil) (IntExprNil))
+    (strided-indexing-foldr-state ?root_shape (IntExprNil) (IntExprNil)
       (StridedIndexingFoldRStateLit 0 (IntLit 0)))
   )
   :ruleset main_ruleset :name "core: offset fold state of the empty suffixes is zero"
@@ -3661,12 +3663,11 @@
     (= ?dims (IntExprCons ?size ?dim_tail))
     (= ?strides (IntExprCons ?stride ?stride_tail))
     (provably-cannot-union-with-zero ?stride)
-    (= (strided-indexing-foldr-state-of ?root_shape ?dim_tail ?stride_tail)
+    (strided-indexing-foldr-state ?root_shape ?dim_tail ?stride_tail
       (StridedIndexingFoldRStateLit ?axis ?linear))
   )
   (
-    (set
-      (strided-indexing-foldr-state-of ?root_shape ?dims ?strides)
+    (strided-indexing-foldr-state ?root_shape ?dims ?strides
       (StridedIndexingFoldRStateLit
         (+ ?axis 1)
         (IntAdd
@@ -3690,12 +3691,11 @@
     (= ?dims (IntExprCons ?size ?dim_tail))
     (= ?strides (IntExprCons ?stride ?stride_tail))
     (= ?stride (IntLit 0))
-    (= (strided-indexing-foldr-state-of ?root_shape ?dim_tail ?stride_tail)
+    (strided-indexing-foldr-state ?root_shape ?dim_tail ?stride_tail
       (StridedIndexingFoldRStateLit ?axis ?linear))
   )
   (
-    (set
-      (strided-indexing-foldr-state-of ?root_shape ?dims ?strides)
+    (strided-indexing-foldr-state ?root_shape ?dims ?strides
       (StridedIndexingFoldRStateLit
         (+ ?axis 1)
         ?linear))
@@ -3708,7 +3708,7 @@
 (rule
   (
     (strided-lists ?layout ?shape ?dims ?strides ?bits)
-    (= (strided-indexing-foldr-state-of ?shape ?dims ?strides)
+    (strided-indexing-foldr-state ?shape ?dims ?strides
       (StridedIndexingFoldRStateLit ?rank ?indexing_expr))
   )
   (
@@ -3772,7 +3772,7 @@
   (
     (= ?layout (StridedElementLayoutLit ?shape ?chain ?bits))
     (= ?shape (ShapeLit ?dims))
-    (= (right-major-strides-state-of ?dims)
+    (right-major-strides-state ?dims
       (RightMajorStridesFoldStateLit ?rank ?total ?strides))
   )
   ((affine-zip-demand ?shape ?dims ?strides))
@@ -3782,7 +3782,7 @@
   (
     (= ?layout (StridedElementLayoutLit ?shape ?chain ?bits))
     (= ?shape (ShapeLit ?dims))
-    (= (right-major-strides-state-of ?dims)
+    (right-major-strides-state ?dims
       (RightMajorStridesFoldStateLit ?rank ?total ?strides))
     (affine-zip-out ?shape ?dims ?strides ?chain)
   )
@@ -3795,7 +3795,7 @@
   (
     (= ?layout (StridedElementLayoutLit ?shape ?chain ?bits))
     (= ?shape (ShapeLit ?dims))
-    (= (left-major-strides-state-of ?dims)
+    (left-major-strides-state ?dims
       (LeftMajorStridesFoldStateLit ?rank ?total ?strides))
   )
   ((affine-zip-demand ?shape ?dims ?strides))
@@ -3805,7 +3805,7 @@
   (
     (= ?layout (StridedElementLayoutLit ?shape ?chain ?bits))
     (= ?shape (ShapeLit ?dims))
-    (= (left-major-strides-state-of ?dims)
+    (left-major-strides-state ?dims
       (LeftMajorStridesFoldStateLit ?rank ?total ?strides))
     (affine-zip-out ?shape ?dims ?strides ?chain)
   )

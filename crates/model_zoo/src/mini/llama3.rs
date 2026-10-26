@@ -2,24 +2,35 @@
 //! llama/paged_llama example-model family (mini relocation ruling
 //! 2026-08-13: model definitions live in their example crates).
 
-use crate::model_support::{
-    AttentionGeometry, CacheAccess, Embedding, KvCache, LayerNorm, Linear, Namespace, causal_bias,
-    paged_attention, rms_norm_heads,
-};
+use crate::namespace::Namespace;
 use luminal::prelude::*;
 use luminal::shape::IntExpr;
+use luminal_nn::{
+    AttentionGeometry, CacheAccess, KvCache, causal_bias, paged_attention, rms_norm_heads,
+};
 
 pub struct MiniLlama3Layer {
-    pub attn_norm: LayerNorm,
-    pub wq: Linear,
-    pub wk: Linear,
-    pub wv: Linear,
-    pub wo: Linear,
+    pub attn_norm_weight: Option<GraphTensor>,
+    pub attn_norm_bias: Option<GraphTensor>,
+    pub attn_norm_epsilon: f32,
+    pub wq_weight: GraphTensor,
+    pub wq_bias: Option<GraphTensor>,
+    pub wk_weight: GraphTensor,
+    pub wk_bias: Option<GraphTensor>,
+    pub wv_weight: GraphTensor,
+    pub wv_bias: Option<GraphTensor>,
+    pub wo_weight: GraphTensor,
+    pub wo_bias: Option<GraphTensor>,
     pub qk_norm: Option<(GraphTensor, GraphTensor)>,
-    pub ffn_norm: LayerNorm,
-    pub gate: Linear,
-    pub up: Linear,
-    pub down: Linear,
+    pub ffn_norm_weight: Option<GraphTensor>,
+    pub ffn_norm_bias: Option<GraphTensor>,
+    pub ffn_norm_epsilon: f32,
+    pub gate_weight: GraphTensor,
+    pub gate_bias: Option<GraphTensor>,
+    pub up_weight: GraphTensor,
+    pub up_bias: Option<GraphTensor>,
+    pub down_weight: GraphTensor,
+    pub down_bias: Option<GraphTensor>,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -39,34 +50,47 @@ impl MiniLlama3Layer {
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         Self {
-            attn_norm: LayerNorm::new(
-                d,
-                false,
-                false,
-                false,
-                1e-5,
+            attn_norm_weight: None,
+            attn_norm_bias: None,
+            attn_norm_epsilon: 1e-5,
+            wq_weight: cx.named_tensor(attn.child("q_proj").leaf("weight"), vec![d, d], DType::F32),
+            wq_bias: None,
+            wk_weight: cx.named_tensor(
+                attn.child("k_proj").leaf("weight"),
+                vec![d, kv_dim],
                 DType::F32,
-                &ns.child("input_layernorm"),
-                cx,
             ),
-            wq: Linear::new(d, d, false, DType::F32, &attn.child("q_proj"), cx),
-            wk: Linear::new(d, kv_dim, false, DType::F32, &attn.child("k_proj"), cx),
-            wv: Linear::new(d, kv_dim, false, DType::F32, &attn.child("v_proj"), cx),
-            wo: Linear::new(d, d, false, DType::F32, &attn.child("o_proj"), cx),
+            wk_bias: None,
+            wv_weight: cx.named_tensor(
+                attn.child("v_proj").leaf("weight"),
+                vec![d, kv_dim],
+                DType::F32,
+            ),
+            wv_bias: None,
+            wo_weight: cx.named_tensor(attn.child("o_proj").leaf("weight"), vec![d, d], DType::F32),
+            wo_bias: None,
             qk_norm: None,
-            ffn_norm: LayerNorm::new(
-                d,
-                false,
-                false,
-                false,
-                1e-5,
+            ffn_norm_weight: None,
+            ffn_norm_bias: None,
+            ffn_norm_epsilon: 1e-5,
+            gate_weight: cx.named_tensor(
+                mlp.child("gate_proj").leaf("weight"),
+                vec![d, ff],
                 DType::F32,
-                &ns.child("post_attention_layernorm"),
-                cx,
             ),
-            gate: Linear::new(d, ff, false, DType::F32, &mlp.child("gate_proj"), cx),
-            up: Linear::new(d, ff, false, DType::F32, &mlp.child("up_proj"), cx),
-            down: Linear::new(ff, d, false, DType::F32, &mlp.child("down_proj"), cx),
+            gate_bias: None,
+            up_weight: cx.named_tensor(
+                mlp.child("up_proj").leaf("weight"),
+                vec![d, ff],
+                DType::F32,
+            ),
+            up_bias: None,
+            down_weight: cx.named_tensor(
+                mlp.child("down_proj").leaf("weight"),
+                vec![ff, d],
+                DType::F32,
+            ),
+            down_bias: None,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -82,9 +106,14 @@ impl MiniLlama3Layer {
         scatter_idx: GraphTensor,
         prev_seq: IntExpr,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let normed = self.attn_norm.forward(x);
-        let mut q = self.wq.forward(normed);
-        let mut k = self.wk.forward(normed);
+        let normed = luminal_nn::rms_norm(
+            x,
+            self.attn_norm_weight,
+            self.attn_norm_bias,
+            self.attn_norm_epsilon,
+        );
+        let mut q = luminal_nn::linear(normed, self.wq_weight, self.wq_bias);
+        let mut k = luminal_nn::linear(normed, self.wk_weight, self.wk_bias);
         if let Some((q_weight, k_weight)) = self.qk_norm {
             q = rms_norm_heads(q, self.head_dim, q_weight, 1e-6);
             k = rms_norm_heads(k, self.head_dim, k_weight, 1e-6);
@@ -94,18 +123,26 @@ impl MiniLlama3Layer {
         let result = paged_attention(
             q,
             k,
-            self.wv.forward(normed),
+            luminal_nn::linear(normed, self.wv_weight, self.wv_bias),
             KvCache::new(k_cache, v_cache),
             CacheAccess::new(scatter_idx, gather_idx),
             causal_bias(query_positions, context_positions),
             AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
-        let x = x + self.wo.forward(attn);
-        let ff_in = self.ffn_norm.forward(x);
-        let ff = self
-            .down
-            .forward(self.gate.forward(ff_in).silu() * self.up.forward(ff_in));
+        let x = x + luminal_nn::linear(attn, self.wo_weight, self.wo_bias);
+        let ff_in = luminal_nn::rms_norm(
+            x,
+            self.ffn_norm_weight,
+            self.ffn_norm_bias,
+            self.ffn_norm_epsilon,
+        );
+        let ff = luminal_nn::linear(
+            luminal_nn::linear(ff_in, self.gate_weight, self.gate_bias).silu()
+                * luminal_nn::linear(ff_in, self.up_weight, self.up_bias),
+            self.down_weight,
+            self.down_bias,
+        );
         (x + ff, k_cache, v_cache)
     }
 }
@@ -123,7 +160,7 @@ fn gqa_lm_new(
     n_kv_heads: usize,
     layers: usize,
     cx: &mut Graph,
-) -> (Embedding, Vec<MiniLlama3Layer>, LayerNorm) {
+) -> (GraphTensor, Vec<MiniLlama3Layer>, f32) {
     let model = Namespace::root().child("model");
     let blocks = (0..layers)
         .map(|l| {
@@ -132,33 +169,28 @@ fn gqa_lm_new(
         })
         .collect();
     (
-        Embedding::new(vocab, d, DType::F32, &model.child("embed_tokens"), cx),
-        blocks,
-        LayerNorm::new(
-            d,
-            false,
-            false,
-            false,
-            1e-5,
+        cx.named_tensor(
+            model.child("embed_tokens").leaf("weight"),
+            vec![vocab, d],
             DType::F32,
-            &model.child("norm"),
-            cx,
         ),
+        blocks,
+        1e-5,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn gqa_lm_forward(
-    embed: &Embedding,
+    embed: &GraphTensor,
     blocks: &[MiniLlama3Layer],
-    final_norm: &LayerNorm,
+    final_norm: &(Option<GraphTensor>, Option<GraphTensor>, f32),
     ids: GraphTensor,
     caches: &[(GraphTensor, GraphTensor)],
     gather_idx: GraphTensor,
     scatter_idx: GraphTensor,
     prev_seq: IntExpr,
 ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-    let mut x = embed.forward(ids);
+    let mut x = luminal_nn::embedding(ids, *embed);
     let mut caches_out = Vec::with_capacity(blocks.len());
     for (layer, block) in blocks.iter().enumerate() {
         let (next, kc, vc) = block.forward(
@@ -172,16 +204,21 @@ fn gqa_lm_forward(
         x = next;
         caches_out.push((kc, vc));
     }
-    let logits = embed.reverse(final_norm.forward(x));
+    let logits = luminal_nn::embedding_projection(
+        luminal_nn::rms_norm(x, final_norm.0, final_norm.1, final_norm.2),
+        *embed,
+    );
     (logits, caches_out)
 }
 
 /// MiniLlama3 — the llama/paged_llama family: RMS pre-norms, GQA over a
 /// paged KV cache, SwiGLU. (RoPE deferred by ruling, as everywhere.)
 pub struct MiniLlama3 {
-    pub embed: Embedding,
+    pub embed: GraphTensor,
     pub blocks: Vec<MiniLlama3Layer>,
-    pub final_norm: LayerNorm,
+    pub final_norm_weight: Option<GraphTensor>,
+    pub final_norm_bias: Option<GraphTensor>,
+    pub final_norm_epsilon: f32,
 }
 
 impl MiniLlama3 {
@@ -194,11 +231,18 @@ impl MiniLlama3 {
         layers: usize,
         cx: &mut Graph,
     ) -> Self {
-        let (embed, blocks, final_norm) = gqa_lm_new(vocab, d, ff, n_heads, n_kv_heads, layers, cx);
-        Self {
-            embed,
-            blocks,
-            final_norm,
+        let (embed, blocks, final_norm_epsilon) =
+            gqa_lm_new(vocab, d, ff, n_heads, n_kv_heads, layers, cx);
+        {
+            let final_norm_weight = None;
+            let final_norm_bias = None;
+            Self {
+                embed,
+                blocks,
+                final_norm_weight,
+                final_norm_bias,
+                final_norm_epsilon,
+            }
         }
     }
 
@@ -214,7 +258,11 @@ impl MiniLlama3 {
         gqa_lm_forward(
             &self.embed,
             &self.blocks,
-            &self.final_norm,
+            &(
+                self.final_norm_weight,
+                self.final_norm_bias,
+                self.final_norm_epsilon,
+            ),
             ids,
             caches,
             gather_idx,

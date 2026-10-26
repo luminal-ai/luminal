@@ -107,6 +107,12 @@ pub trait BufferTensorIrOp: OpSlotNames + CloneBufferTensorIrOp + AsAnyOp + Debu
         None
     }
 
+    /// A planner transport delivers one value's address span instead of
+    /// relocating its whole backing allocation. The layout is unchanged.
+    fn copies_value_span(&self) -> bool {
+        false
+    }
+
     /// Is this operand's buffer read? (Inputs are read.)
     fn operand_reads_memory(&self, _operand: usize) -> bool {
         true
@@ -214,6 +220,21 @@ impl OpSlotNames for BufferCopy {
 impl BufferTensorIrOp for BufferCopy {
     fn label(&self) -> &str {
         "BufferCopy"
+    }
+}
+
+/// Copy a value's unchanged address span. Used for boundary delivery and
+/// descriptor-exact read-modify-write repair of an operand read through a view.
+/// Either allocation may have spare capacity; the copy never changes layouts.
+#[derive(Debug, Clone, Copy)]
+pub struct BufferCopyValue;
+impl OpSlotNames for BufferCopyValue {}
+impl BufferTensorIrOp for BufferCopyValue {
+    fn label(&self) -> &str {
+        "BufferCopyValue"
+    }
+    fn copies_value_span(&self) -> bool {
+        true
     }
 }
 
@@ -786,72 +807,32 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                     if analysis.in_place.get(&(position, operand)) == Some(&true) {
                         continue;
                     }
-                    let mut target = results[result].buffer.clone();
+                    let target = results[result].buffer.clone();
                     let needs_bytes =
                         op.op.operand_reads_memory(operand) || !op.op.result_writes_memory(result);
                     if needs_bytes {
-                        // REPAIR DESTINATIONS ARE FRESH SINGLE-WRITER
-                        // BUFFERS (ruling 2026-08-27) when the operand is a
-                        // FOLDED view: its repair copy lowers to a
-                        // base-storage copy of the fold ROOT — PARENT-shaped
-                        // — while this op writes its RESULT-shaped bytes,
-                        // and the two extents cannot cohabit one buffer
-                        // (the writer-identity dims join is an equality
-                        // lattice and bails loudly, by design — it stays
-                        // the planner-bug tripwire). The copy targets a
-                        // freshly minted buffer whose sole writer it is;
-                        // the operand re-roots onto it and reads through
-                        // its unchanged hop chain. A non-folded operand
-                        // keeps the MLIR resolveConflicts shape (copy into
-                        // the tied result's buffer, overwritten in place),
-                        // as does a rejected VIEW tie (the op writes
-                        // nothing — the parent copy IS the view's
-                        // initializing write, and view and copy must share
-                        // storage).
-                        if let Some(root) = view_root.get(&operands[operand].value).cloned()
-                            && op.op.result_writes_memory(result)
-                        {
-                            let id = BufferId::Allocated(next_alloc);
-                            next_alloc += 1;
-                            buffers.insert(
-                                id.clone(),
-                                Buffer {
-                                    id: id.clone(),
-                                    access: Access::ReadWrite,
-                                    freed_by: crate::layout_ir::FreedBy::Program,
-                                    owner: crate::bufferize::Owner::System,
-                                    label: "view-repair".to_string(),
-                                    lit: None,
-                                    // The base-storage copy lands the
-                                    // fold ROOT's bytes here: the
-                                    // buffer backs the root, whose
-                                    // layout sizes it (parent-shaped).
-                                    backs: root.clone(),
-                                    layout: layout_of(&root)?,
-                                },
-                            );
-                            target = id;
-                        }
+                        // A writing tie is descriptor-exact by the op's match
+                        // contract. Even when the input is a folded view, its
+                        // old value can initialize the result's storage under
+                        // that SAME layout. Copy its address span rather than
+                        // the larger fold root, and keep input/result tied.
+                        let folded_mutation = view_root.contains_key(&operands[operand].value)
+                            && op.op.result_writes_memory(result);
                         let src = operands[operand].clone();
                         let dst = BufferTensor {
                             value: src.value.clone(),
                             buffer: target.clone(),
                         };
-                        // MINT SITE — CAUSE 1: RESIDENCE CONFLICT REPAIR.
-                        // The conflict engine rejected this operand's
-                        // in-place tie, so the result took fresh storage and
-                        // the operand's bytes must be there before the
-                        // kernel reads them. THE CONTRACT (stated on
-                        // [`crate::bufferize::BufferNode::BufferCopy`]): a
-                        // DUMB EXACT-SIZE WHOLE-BUFFER copy — `target` was
-                        // minted to back exactly this value (or, for a
-                        // folded operand, its fold ROOT), so src and dst are
-                        // the same size by construction. ORDERING IS THE
-                        // RUNTIME'S OBLIGATION: all we emit is the
-                        // dependency structure (the `link` below, and the
-                        // WAR anti-edges the rewrite adds later).
+                        // Folded read-modify-write repair preserves the
+                        // value's address span. Non-folded repairs and pure
+                        // view relocation retain whole-storage copy semantics.
+                        let copy_op: Box<dyn BufferTensorIrOp> = if folded_mutation {
+                            Box::new(BufferCopyValue)
+                        } else {
+                            Box::new(BufferCopy)
+                        };
                         let copy = dag.add_node(BtNode::Op {
-                            op: Box::new(BufferCopy),
+                            op: copy_op,
                             operands: vec![src.clone()],
                             results: vec![dst.clone()],
                             ties: Vec::new(),
@@ -1072,12 +1053,10 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                         // (`src_buffer`), so the bytes move into the
                         // caller's storage. (A producer pinned to write
                         // `dest` directly makes src == dest and skips this.)
-                        // THE CONTRACT (stated on
-                        // [`crate::bufferize::BufferNode::BufferCopy`]): a
-                        // DUMB EXACT-SIZE WHOLE-BUFFER copy — the caller's
-                        // buffer is declared for exactly this tensor, so the
-                        // sizes agree by the boundary declaration. ORDERING
-                        // IS THE RUNTIME'S OBLIGATION.
+                        // Deliver this value's unchanged address span. The
+                        // caller allocation may have spare capacity; both
+                        // backing capacities must cover the declared span.
+                        // Ordering remains the runtime's obligation.
                         if buffers
                             .get(&dest)
                             .is_some_and(|b| b.access == Access::ReadOnly)
@@ -1100,7 +1079,7 @@ pub(crate) fn build_buffer_tensor_ir<L: PlanLayout>(
                             buffer: dest.clone(),
                         };
                         let copy = dag.add_node(BtNode::Op {
-                            op: Box::new(BufferCopy),
+                            op: Box::new(BufferCopyValue),
                             operands: vec![src.clone()],
                             results: vec![dst.clone()],
                             ties: Vec::new(),
@@ -1716,7 +1695,19 @@ pub(crate) fn validate<L: PlanLayout>(bt: &BufferTensorIrGraph<L>) -> Result<()>
                     producer.insert((slot.value.clone(), slot.buffer.clone()), index);
                 }
             }
-            BtNode::Op { results, .. } => {
+            BtNode::Op {
+                op,
+                operands,
+                results,
+                ties,
+            } => {
+                for &(operand, result) in ties {
+                    anyhow::ensure!(
+                        operands[operand].buffer == results[result].buffer,
+                        "{}: required storage tie from operand {operand} to result {result} was broken",
+                        op.label()
+                    );
+                }
                 for tensor in results {
                     producer.insert((tensor.value.clone(), tensor.buffer.clone()), index);
                 }

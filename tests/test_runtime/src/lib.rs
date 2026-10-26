@@ -59,17 +59,6 @@ pub use ops::{
     AddMulFused, AddMulFusedDps, AddMulFusedMatcher, IndexMapApplyView, IndexMapApplyViewMatcher,
 };
 
-/// The cuBLASLt marker estate — REHOMED (Train 3 op-ownership move) to
-/// `luminal_cuda_lite::ops::cublaslt`, its executing runtime. The board
-/// keeps its `test_runtime::cublaslt_marker::…` spelling through this
-/// re-export; the rule text, extractor, and election core are the SAME
-/// items, never forked.
-///
-/// This is the ONE runtime crate the TestRuntime still reaches into, and
-/// it is deliberate: the marker estate asserts on a real backend's
-/// election, so forking it here would be asserting on a copy.
-pub use luminal_cuda_lite::ops::cublaslt as cublaslt_marker;
-
 use std::path::PathBuf;
 
 use luminal::layout_ir::ExtractedGraph;
@@ -77,17 +66,20 @@ use luminal::layout_ir::OpMatcher;
 
 /// THE TestRuntime vocabulary, every op entry owned by this crate: 23
 /// forked functional ops, the metadata view op, the fused add+mul pair,
-/// and the 12 mutating forms — plus the cuBLASLt markers, which stay
-/// borrowed from their executing runtime (see [`cublaslt_marker`]).
+/// and the 12 mutating forms — plus the approved cuBLASLt separate-destination
+/// and in-place matchers borrowed from CUDA-lite.
 /// Tests here extract and assemble against exactly this list.
 pub fn matchers() -> Vec<Box<dyn OpMatcher>> {
     let mut matchers = ops::functional::functional_matchers();
     matchers.push(Box::new(IndexMapApplyViewMatcher));
     matchers.push(Box::new(AddMulFusedMatcher));
     matchers.extend(ops::mutating::mutating_matchers());
-    for matcher in cublaslt_marker::all_matchers() {
-        matchers.push(Box::new(matcher));
-    }
+    matchers.push(Box::new(
+        luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLtMatcher,
+    ));
+    matchers.push(Box::new(
+        luminal_cuda_lite::ops::cublaslt::accumulate_in_place::CublasLtAccumulateInPlaceMatcher,
+    ));
     matchers
 }
 

@@ -653,7 +653,8 @@ impl ReferenceRuntime {
                         last_use.insert(id.clone(), step);
                     }
                 }
-                BufferNode::BufferCopy { src, dst } => {
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. } => {
                     last_use.insert(src.clone(), step);
                     last_use.insert(dst.clone(), step);
                 }
@@ -685,17 +686,29 @@ impl ReferenceRuntime {
             crate::search::check_interrupt()?;
             match &plan.dag[index] {
                 BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. } => {}
-                BufferNode::BufferCopy { src, dst } => {
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. } => {
+                    let value_layout = plan.dag[index].copy_value_layout();
                     let source = storage
                         .get(src)
                         .ok_or_else(|| anyhow!("copy reads missing buffer"))?;
-                    let (n, _, bytes, name) = geometry[dst];
-                    ensure!(
-                        source.len() == n && source.type_name() == name,
-                        "copy length/type mismatch"
-                    );
+                    let (n, dtype, bytes, name) = geometry[dst];
+                    ensure!(source.type_name() == name, "copy dtype mismatch");
+                    let copy = if let Some(layout) = value_layout {
+                        ensure!(layout.dtype == Some(dtype), "value copy dtype mismatch");
+                        let count = layout.span_with(&self.dims)?;
+                        let mut target = if let Some(target) = storage.get(dst) {
+                            target.as_ref().clone()
+                        } else {
+                            TypedBuffer::zeroed(dtype, n)?
+                        };
+                        target.copy_prefix_from(source, count)?;
+                        target
+                    } else {
+                        ensure!(source.len() == n, "copy length mismatch");
+                        source.as_ref().clone()
+                    };
                     reserve_live(&mut live, bytes, budget, &mut self.peak_live_bytes)?;
-                    let copy = source.as_ref().clone();
                     if let Some(Cow::Owned(old)) = storage.insert(dst.clone(), Cow::Owned(copy)) {
                         live -= old.byte_len();
                     }

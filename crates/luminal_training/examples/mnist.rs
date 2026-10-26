@@ -3,7 +3,8 @@
 use itertools::Itertools;
 use luminal::prelude::*;
 use luminal_training::{AdamW, Trainer};
-use model_zoo::model_support::{ConvND, Linear, Namespace};
+use model_zoo::namespace::Namespace;
+
 use rand::{Rng, SeedableRng, distr::Uniform, rngs::StdRng, seq::SliceRandom};
 
 const IMG: usize = 12; // 28x28 inputs center-cropped to 24x24, then 2x2 average-pooled
@@ -12,39 +13,27 @@ const STEPS: usize = 500;
 
 fn build_model(x: GraphTensor, cx: &mut Graph) -> (Vec<GraphTensor>, GraphTensor) {
     let root = Namespace::root();
-    let conv1 = ConvND::new(
-        1,
-        16,
-        [3, 3],
-        [1, 1],
-        [1, 1],
-        [0, 0],
-        false,
+    let conv1_weight = cx.named_tensor(root.child("conv1").leaf("weight"), vec![16, 9], DType::F32);
+    let conv2_weight = cx.named_tensor(
+        root.child("conv2").leaf("weight"),
+        vec![32, 16 * 9],
         DType::F32,
-        &root.child("conv1"),
-        cx,
     );
-    let conv2 = ConvND::new(
-        16,
-        32,
-        [3, 3],
-        [1, 1],
-        [1, 1],
-        [0, 0],
-        false,
+    let head_weight = cx.named_tensor(
+        root.child("head").leaf("weight"),
+        vec![32 * 9, 10],
         DType::F32,
-        &root.child("conv2"),
-        cx,
     );
-    let head = Linear::new(32 * 9, 10, true, DType::F32, &root.child("head"), cx);
+    let head_bias = cx.named_tensor(root.child("head").leaf("bias"), vec![10], DType::F32);
+    let conv_config = luminal_nn::ConvNdConfig::new([3, 3], [1, 1], [1, 1], [0, 0]);
     let img = x.split_dims(1, IMG).unsqueeze(1); // (B,1,12,12)
-    let h1 = conv1.forward(img).relu(); // conv 1->16, relu -> (B,16,10,10)
+    let h1 = luminal_nn::conv_nd(img, conv1_weight, None, &conv_config).relu(); // conv 1->16, relu -> (B,16,10,10)
     let pool = h1.split_dims(2, 2).split_dims(4, 2).max(vec![3, 5]); // 2x2 maxpool -> (B,16,5,5)
-    let h2 = conv2.forward(pool).relu(); // conv 16->32, relu -> (B,32,3,3)
+    let h2 = luminal_nn::conv_nd(pool, conv2_weight, None, &conv_config).relu(); // conv 16->32, relu -> (B,32,3,3)
     let feats = h2.merge_dims(2, 3).merge_dims(1, 2); // (B,288)
-    let logits = head.forward(feats); // linear to 10 classes
+    let logits = luminal_nn::linear(feats, head_weight, Some(head_bias)); // linear to 10 classes
     (
-        vec![conv1.weight, conv2.weight, head.weight, head.bias.unwrap()],
+        vec![conv1_weight, conv2_weight, head_weight, head_bias],
         logits.output(),
     )
 }

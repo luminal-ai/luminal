@@ -97,7 +97,13 @@ pub fn assemble(core: &str, snippets: &[EgglogSnippet]) -> String {
             "core preamble is missing the {marker} anchor"
         );
         let mut section = String::from(marker);
+        let mut included = std::collections::HashSet::new();
         for snippet in snippets.iter().filter(|s| s.category == category) {
+            // Several executable forms can depend on the same proof vocabulary.
+            // Keep its declarations/rules once, in first-contributor order.
+            if !included.insert(snippet.text.trim_end()) {
+                continue;
+            }
             section.push_str("\n\n");
             section.push_str(snippet.text.trim_end());
         }
@@ -126,6 +132,7 @@ pub fn new_egraph() -> egglog::EGraph {
     use egglog::sort::Z;
 
     let mut egraph = egglog::EGraph::default();
+    crate::element_stride::register(&mut egraph);
     // Tree decomposition is off for now: egglog's decomposition planner was
     // a large performance regression on our saturations (identical fixpoints
     // either way). Temporary until the planner is revisited.
@@ -156,6 +163,7 @@ pub fn new_egraph() -> egglog::EGraph {
 pub fn assembled_program_for(matchers: &[Box<dyn crate::layout_ir::OpMatcher>]) -> String {
     let core = include_str!("egglog_preamble.egg");
     let mut snippets: Vec<EgglogSnippet> = Vec::new();
+    snippets.extend(crate::element_stride::snippets());
     for op in crate::logical_op::built_in_logical_ops() {
         snippets.extend(op.snippets());
     }
@@ -173,7 +181,13 @@ pub fn assembled_program_for(matchers: &[Box<dyn crate::layout_ir::OpMatcher>]) 
 /// is the `core` half of that pairing, the matcher's
 /// [`crate::layout_ir::OpMatcher::decoders`] is the other.
 pub fn core_decoders() -> Vec<crate::egglog_utils::eclass::ConstructorDecoder> {
-    crate::layouts::layout_decoders()
+    let decoders = crate::layouts::layout_decoders();
+    decoders
+        .into_iter()
+        .chain([crate::egglog_utils::eclass::ConstructorDecoder::of::<
+            crate::element_stride::ElementStridedLayout,
+        >()])
+        .collect()
 }
 
 /// The decoder registry for a runtime's matcher set — the same shape as
@@ -194,6 +208,18 @@ pub fn decoder_registry_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_proof_snippets_are_included_once_per_category() {
+        let core = assembled_program_for(&[]);
+        let shared = EgglogSnippet {
+            category: SpliceCategory::LayoutOpConstructors,
+            text: "(datatype SharedProofVocabulary (SharedProofWitness))",
+        };
+        let program = assemble(&core, &[shared, shared]);
+        assert_eq!(program.matches(shared.text).count(), 1);
+        new_egraph().parse_and_run_program(None, &program).unwrap();
+    }
 
     /// Splicing inserts at the anchor, keeps the anchor as a header, and
     /// preserves contribution order within a category.
@@ -230,6 +256,39 @@ mod tests {
         new_egraph()
             .parse_and_run_program(None, &assembled_program_for(&[]))
             .expect("assembled program loads");
+    }
+
+    #[test]
+    fn offset_fold_preserves_equivalent_states_after_a_late_singleton_pin() {
+        let mut graph = new_egraph();
+        graph
+            .parse_and_run_program(None, &assembled_program_for(&[]))
+            .unwrap();
+        graph
+            .parse_and_run_program(
+                None,
+                r#"
+(let extent (IntVar "fold-late-singleton"))
+(set (lower-bound-of extent) (bigint 1))
+(set (upper-bound-of extent) (bigint 8))
+(let dimensions (IntExprCons extent (IntExprCons (IntLit 4) (IntExprNil))))
+(let shape (ShapeLit dimensions))
+(let pinned_dimensions (IntExprCons (IntLit 1) (IntExprCons (IntLit 4) (IntExprNil))))
+(let pinned_shape (ShapeLit pinned_dimensions))
+(let dynamic (RightMajorContiguousElementLayoutLit shape (BitWidthLit 32)))
+(let pinned (RightMajorContiguousElementLayoutLit pinned_shape (BitWidthLit 32)))
+(LeftMajorContiguousElementLayoutLit shape (BitWidthLit 32))
+(LeftMajorContiguousElementLayoutLit pinned_shape (BitWidthLit 32))
+(run-schedule (saturate (run main_ruleset) (run prop)))
+; Key equality can arrive before rewriting proves the folded expressions equal.
+(union extent (IntLit 1))
+(run-schedule (saturate (run main_ruleset) (run prop)))
+(check (= dynamic pinned))
+(check (= dynamic (ElementOffsetExpressionLayoutLit (CoordVar shape 0) shape (BitWidthLit 32))))
+(fail (check (= (IntLit 4) (IntLit 1))))
+"#,
+            )
+            .unwrap();
     }
 
     /// The `prop` ruleset holds exactly the shape-of / dtype-of / rank-of

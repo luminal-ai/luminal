@@ -10,13 +10,13 @@
 //! the (untied) lm_head are bf16 in the checkpoint — numeric tensors,
 //! not quantization — staged f32 like every zoo example.
 
-use crate::model_support::{
-    AttentionGeometry, CacheAccess, Embedding, Fp8Linear, KvCache, KvCachePool, LayerNorm, Linear,
-    Namespace, causal_bias, paged_attention,
-};
+use crate::namespace::Namespace;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::GraphTensor;
+use luminal_nn::{
+    AttentionGeometry, CacheAccess, KvCache, KvCachePool, causal_bias, paged_attention,
+};
 
 #[derive(Clone)]
 pub struct Fp8Dims {
@@ -65,18 +65,35 @@ impl Fp8Dims {
 }
 
 /// One fp8 layer: the Llama block anatomy with every projection an
-/// [`Fp8Linear`]. Example-level for now — promoted to luminal_nn when a
-/// second fp8 model lands.
+/// call to [`luminal_nn::fp8_linear`] with explicit weight and scale tensors.
 pub struct Fp8Block {
-    pub attn_norm: LayerNorm,
-    pub wq: Fp8Linear,
-    pub wk: Fp8Linear,
-    pub wv: Fp8Linear,
-    pub wo: Fp8Linear,
-    pub ffn_norm: LayerNorm,
-    pub gate: Fp8Linear,
-    pub up: Fp8Linear,
-    pub down: Fp8Linear,
+    pub attn_norm_weight: Option<GraphTensor>,
+    pub attn_norm_bias: Option<GraphTensor>,
+    pub attn_norm_epsilon: f32,
+    pub wq_weight: GraphTensor,
+    pub wq_input_scale: GraphTensor,
+    pub wq_weight_scale: GraphTensor,
+    pub wk_weight: GraphTensor,
+    pub wk_input_scale: GraphTensor,
+    pub wk_weight_scale: GraphTensor,
+    pub wv_weight: GraphTensor,
+    pub wv_input_scale: GraphTensor,
+    pub wv_weight_scale: GraphTensor,
+    pub wo_weight: GraphTensor,
+    pub wo_input_scale: GraphTensor,
+    pub wo_weight_scale: GraphTensor,
+    pub ffn_norm_weight: Option<GraphTensor>,
+    pub ffn_norm_bias: Option<GraphTensor>,
+    pub ffn_norm_epsilon: f32,
+    pub gate_weight: GraphTensor,
+    pub gate_input_scale: GraphTensor,
+    pub gate_weight_scale: GraphTensor,
+    pub up_weight: GraphTensor,
+    pub up_input_scale: GraphTensor,
+    pub up_weight_scale: GraphTensor,
+    pub down_weight: GraphTensor,
+    pub down_input_scale: GraphTensor,
+    pub down_weight_scale: GraphTensor,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -88,33 +105,125 @@ impl Fp8Block {
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         Self {
-            attn_norm: LayerNorm::new(
-                d.hidden,
-                true,
-                false,
-                false,
-                d.rms_eps,
+            attn_norm_weight: Some(cx.named_tensor(
+                ns.child("input_layernorm").leaf("weight"),
+                vec![d.hidden],
                 DType::F32,
-                &ns.child("input_layernorm"),
-                cx,
+            )),
+            attn_norm_bias: None,
+            attn_norm_epsilon: d.rms_eps,
+            wq_weight: cx.named_tensor(
+                attn.child("q_proj").leaf("weight"),
+                vec![d.q_dim(), d.hidden],
+                DType::F8E4M3FN,
             ),
-            wq: Fp8Linear::new(d.hidden, d.q_dim(), &attn.child("q_proj"), cx),
-            wk: Fp8Linear::new(d.hidden, d.kv_dim(), &attn.child("k_proj"), cx),
-            wv: Fp8Linear::new(d.hidden, d.kv_dim(), &attn.child("v_proj"), cx),
-            wo: Fp8Linear::new(d.q_dim(), d.hidden, &attn.child("o_proj"), cx),
-            ffn_norm: LayerNorm::new(
-                d.hidden,
-                true,
-                false,
-                false,
-                d.rms_eps,
+            wq_input_scale: cx.named_tensor(
+                attn.child("q_proj").leaf("input_scale"),
+                Vec::<usize>::new(),
                 DType::F32,
-                &ns.child("post_attention_layernorm"),
-                cx,
             ),
-            gate: Fp8Linear::new(d.hidden, d.intermediate, &mlp.child("gate_proj"), cx),
-            up: Fp8Linear::new(d.hidden, d.intermediate, &mlp.child("up_proj"), cx),
-            down: Fp8Linear::new(d.intermediate, d.hidden, &mlp.child("down_proj"), cx),
+            wq_weight_scale: cx.named_tensor(
+                attn.child("q_proj").leaf("weight_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            wk_weight: cx.named_tensor(
+                attn.child("k_proj").leaf("weight"),
+                vec![d.kv_dim(), d.hidden],
+                DType::F8E4M3FN,
+            ),
+            wk_input_scale: cx.named_tensor(
+                attn.child("k_proj").leaf("input_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            wk_weight_scale: cx.named_tensor(
+                attn.child("k_proj").leaf("weight_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            wv_weight: cx.named_tensor(
+                attn.child("v_proj").leaf("weight"),
+                vec![d.kv_dim(), d.hidden],
+                DType::F8E4M3FN,
+            ),
+            wv_input_scale: cx.named_tensor(
+                attn.child("v_proj").leaf("input_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            wv_weight_scale: cx.named_tensor(
+                attn.child("v_proj").leaf("weight_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            wo_weight: cx.named_tensor(
+                attn.child("o_proj").leaf("weight"),
+                vec![d.hidden, d.q_dim()],
+                DType::F8E4M3FN,
+            ),
+            wo_input_scale: cx.named_tensor(
+                attn.child("o_proj").leaf("input_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            wo_weight_scale: cx.named_tensor(
+                attn.child("o_proj").leaf("weight_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            ffn_norm_weight: Some(cx.named_tensor(
+                ns.child("post_attention_layernorm").leaf("weight"),
+                vec![d.hidden],
+                DType::F32,
+            )),
+            ffn_norm_bias: None,
+            ffn_norm_epsilon: d.rms_eps,
+            gate_weight: cx.named_tensor(
+                mlp.child("gate_proj").leaf("weight"),
+                vec![d.intermediate, d.hidden],
+                DType::F8E4M3FN,
+            ),
+            gate_input_scale: cx.named_tensor(
+                mlp.child("gate_proj").leaf("input_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            gate_weight_scale: cx.named_tensor(
+                mlp.child("gate_proj").leaf("weight_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            up_weight: cx.named_tensor(
+                mlp.child("up_proj").leaf("weight"),
+                vec![d.intermediate, d.hidden],
+                DType::F8E4M3FN,
+            ),
+            up_input_scale: cx.named_tensor(
+                mlp.child("up_proj").leaf("input_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            up_weight_scale: cx.named_tensor(
+                mlp.child("up_proj").leaf("weight_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            down_weight: cx.named_tensor(
+                mlp.child("down_proj").leaf("weight"),
+                vec![d.hidden, d.intermediate],
+                DType::F8E4M3FN,
+            ),
+            down_input_scale: cx.named_tensor(
+                mlp.child("down_proj").leaf("input_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
+            down_weight_scale: cx.named_tensor(
+                mlp.child("down_proj").leaf("weight_scale"),
+                Vec::<usize>::new(),
+                DType::F32,
+            ),
             n_heads: d.n_heads,
             n_kv_heads: d.n_kv_heads,
             head_dim: d.head_dim,
@@ -134,16 +243,31 @@ impl Fp8Block {
         rope_sin: GraphTensor,
         rope_rot: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let normed = self.attn_norm.forward(x);
+        let normed = luminal_nn::rms_norm(
+            x,
+            self.attn_norm_weight,
+            self.attn_norm_bias,
+            self.attn_norm_epsilon,
+        );
         let q = luminal_nn::rotary_apply(
-            self.wq.forward(normed),
+            luminal_nn::fp8_linear(
+                normed,
+                self.wq_weight,
+                self.wq_input_scale,
+                self.wq_weight_scale,
+            ),
             self.head_dim,
             rope_cos,
             rope_sin,
             rope_rot,
         );
         let k = luminal_nn::rotary_apply(
-            self.wk.forward(normed),
+            luminal_nn::fp8_linear(
+                normed,
+                self.wk_weight,
+                self.wk_input_scale,
+                self.wk_weight_scale,
+            ),
             self.head_dim,
             rope_cos,
             rope_sin,
@@ -153,28 +277,61 @@ impl Fp8Block {
         let result = paged_attention(
             q,
             k,
-            self.wv.forward(normed),
+            luminal_nn::fp8_linear(
+                normed,
+                self.wv_weight,
+                self.wv_input_scale,
+                self.wv_weight_scale,
+            ),
             KvCache::new(k_cache, v_cache),
             CacheAccess::new(scatter_idx, gather_idx),
             causal_bias(q_pos, context_positions),
             AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
-        let x = x + self.wo.forward(attn);
-        let ff_in = self.ffn_norm.forward(x);
-        let ff = self
-            .down
-            .forward(self.gate.forward(ff_in).silu() * self.up.forward(ff_in));
+        let x = x + luminal_nn::fp8_linear(
+            attn,
+            self.wo_weight,
+            self.wo_input_scale,
+            self.wo_weight_scale,
+        );
+        let ff_in = luminal_nn::rms_norm(
+            x,
+            self.ffn_norm_weight,
+            self.ffn_norm_bias,
+            self.ffn_norm_epsilon,
+        );
+        let ff = luminal_nn::fp8_linear(
+            luminal_nn::fp8_linear(
+                ff_in,
+                self.gate_weight,
+                self.gate_input_scale,
+                self.gate_weight_scale,
+            )
+            .silu()
+                * luminal_nn::fp8_linear(
+                    ff_in,
+                    self.up_weight,
+                    self.up_input_scale,
+                    self.up_weight_scale,
+                ),
+            self.down_weight,
+            self.down_input_scale,
+            self.down_weight_scale,
+        );
         (x + ff, k_cache, v_cache)
     }
 }
 
 pub struct Llama31Fp8 {
     pub dims: Fp8Dims,
-    pub embed: Embedding,
+    pub embed: GraphTensor,
     pub blocks: Vec<Fp8Block>,
-    pub final_norm: LayerNorm,
-    pub lm_head: Linear,
+    pub final_norm_weight: Option<GraphTensor>,
+    pub final_norm_bias: Option<GraphTensor>,
+    pub final_norm_epsilon: f32,
+    pub lm_head_weight: GraphTensor,
+    pub lm_head_bias: Option<GraphTensor>,
 }
 
 impl Llama31Fp8 {
@@ -184,32 +341,33 @@ impl Llama31Fp8 {
             .collect();
         Self {
             dims: dims.clone(),
-            embed: Embedding::new(
-                dims.vocab,
-                dims.hidden,
+            embed: cx.named_tensor(
+                Namespace::root()
+                    .child("model")
+                    .child("embed_tokens")
+                    .leaf("weight"),
+                vec![dims.vocab, dims.hidden],
                 DType::F32,
-                &Namespace::root().child("model").child("embed_tokens"),
-                cx,
             ),
             blocks,
-            final_norm: LayerNorm::new(
-                dims.hidden,
-                true,
-                false,
-                false,
-                dims.rms_eps,
-                DType::F32,
-                &Namespace::root().child("model").child("norm"),
-                cx,
+            final_norm_weight: Some(
+                cx.named_tensor(
+                    Namespace::root()
+                        .child("model")
+                        .child("norm")
+                        .leaf("weight"),
+                    vec![dims.hidden],
+                    DType::F32,
+                ),
             ),
-            lm_head: Linear::new(
-                dims.hidden,
-                dims.vocab,
-                false,
+            final_norm_bias: None,
+            final_norm_epsilon: dims.rms_eps,
+            lm_head_weight: cx.named_tensor(
+                Namespace::root().child("lm_head").leaf("weight"),
+                vec![dims.hidden, dims.vocab],
                 DType::F32,
-                &Namespace::root().child("lm_head"),
-                cx,
             ),
+            lm_head_bias: None,
         }
     }
 
@@ -226,7 +384,7 @@ impl Llama31Fp8 {
         scatter_idx: GraphTensor,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         assert_eq!(tokens.dtype, DType::Int);
-        let mut x = self.embed.forward(tokens);
+        let mut x = luminal_nn::embedding(tokens, self.embed);
         let mut caches_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
             let (next, k_cache, v_cache) = block.forward(
@@ -243,7 +401,16 @@ impl Llama31Fp8 {
             x = next;
             caches_out.push((k_cache, v_cache));
         }
-        let logits = self.lm_head.forward(self.final_norm.forward(x));
+        let logits = luminal_nn::linear(
+            luminal_nn::rms_norm(
+                x,
+                self.final_norm_weight,
+                self.final_norm_bias,
+                self.final_norm_epsilon,
+            ),
+            self.lm_head_weight,
+            self.lm_head_bias,
+        );
         (logits, caches_out)
     }
 }

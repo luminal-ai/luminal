@@ -8,7 +8,8 @@ use petgraph::{
     stable_graph::{NodeIndex, StableDiGraph},
     visit::EdgeRef,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeSet;
 
 use crate::dtype::DType;
 use crate::shape::{IntExpr, Term};
@@ -532,6 +533,27 @@ impl LogicalGraph {
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn input_source(&mut self, port: ValueId, source_dtype: DType) -> ValueId {
+        let Some(node) = self.graph.node_weight(port) else {
+            self.refuse(format!("input_source: unknown port {port:?}"));
+        };
+        let LogicalOp::Input { label } = &node.op else {
+            self.refuse("input_source requires an unbound model input port");
+        };
+        if source_dtype == node.dtype {
+            return port;
+        }
+        let is_float = |dtype| matches!(dtype, DType::F32 | DType::F64 | DType::F16 | DType::Bf16);
+        if !is_float(source_dtype) || !is_float(node.dtype) {
+            self.refuse("input_source dtype adaptation requires floating-point tensors");
+        }
+        let (label, dims, target_dtype) = (label.clone(), node.dims.clone(), node.dtype);
+        self.graph[port].op = LogicalOp::Cast(target_dtype);
+        let source = self.push(LogicalOp::Input { label }, &[], dims, source_dtype);
+        self.graph.add_edge(source, port, InputPort(0));
+        source
     }
 
     /// Record an op over operand values.
@@ -1185,16 +1207,46 @@ impl LogicalGraph {
     }
 
     /// The model as egglog text: one `let` per value in the cone of
-    /// `roots`, in SSA (node-index) order, then a `LogicalTensorNamed`
+    /// `roots`, in dependency order (recording order breaks ties), then a `LogicalTensorNamed`
     /// union for every named value in the cone. No buffers, layouts or
     /// schedule — those are the runtime's binding statements.
     pub fn render(&self, roots: &[ValueId]) -> Result<String, String> {
         let live = self.cone(roots);
         let mut text = String::new();
-        for id in self.graph.node_indices() {
+        // Preserve the original SSA emission order wherever dependencies allow.
+        // Attaching a checkpoint source can introduce a later-recorded parent.
+        let mut pending: FxHashMap<_, _> = self
+            .graph
+            .node_indices()
+            .map(|id| {
+                (
+                    id,
+                    self.graph
+                        .neighbors_directed(id, Direction::Incoming)
+                        .count(),
+                )
+            })
+            .collect();
+        let mut ready: BTreeSet<_> = pending
+            .iter()
+            .filter_map(|(&id, &count)| (count == 0).then_some(id))
+            .collect();
+        let mut emitted = 0;
+        while let Some(id) = ready.pop_first() {
+            emitted += 1;
             if live.contains(&id) {
                 text.push_str(&self.render_value(id)?);
             }
+            for consumer in self.graph.neighbors_directed(id, Direction::Outgoing) {
+                let count = pending.get_mut(&consumer).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(consumer);
+                }
+            }
+        }
+        if emitted != self.graph.node_count() {
+            return Err("logical graph contains a cycle".to_string());
         }
         for (id, name) in &self.names {
             if live.contains(id) {

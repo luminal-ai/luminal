@@ -164,56 +164,125 @@ fn cublaslt_contracts_are_registered_host_call_claims() {
         CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry_without_cublaslt())
             .expect("load decomposed");
 
-    for form in luminal_cuda_lite::ops::cublaslt::CublasLtForm::ALL {
-        let ctor = form.constructor_name();
-        assert!(
-            default.contains(&ctor),
-            "{ctor} missing from the DEFAULT claim set — the marker vocabulary \
-             is on by default (ruling 2026-09-04)"
-        );
-        assert!(
-            !decomposed.active_allow_list().contains(&ctor),
-            "{ctor} claimed by `cuda_registry_without_cublaslt` — that preset is \
-             exactly the one with no marker in it"
-        );
-    }
-    // The claim is host-call-derived: no kernel interface exists for the labels.
-    for form in luminal_cuda_lite::ops::cublaslt::CublasLtForm::ALL {
-        let proto = luminal_cuda_lite::ops::cublaslt::CublasLt { form, spec: None };
-        let dps = luminal::layout_ir::ToDps::to_dps(&proto).expect("host DPS");
-        assert!(luminal_cuda_lite::as_host_op(dps.as_ref()).is_some());
-        assert!(
-            luminal_cuda_lite::as_kernel_op(dps.as_ref()).is_none(),
-            "cuBLASLt must have NO kernel interface — it is a host library call"
-        );
-        assert!(!luminal_cuda_lite::plan_transparent(&proto));
+    let ctor = luminal_cuda_lite::ops::cublaslt::approved::CONSTRUCTOR;
+    assert!(default.contains(&ctor));
+    assert!(!decomposed.active_allow_list().contains(&ctor));
+    let proto = luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt::prototype();
+    let dps = luminal::layout_ir::ToDps::to_dps(&proto).unwrap();
+    assert!(luminal_cuda_lite::as_host_op(dps.as_ref()).is_some());
+    assert!(luminal_cuda_lite::as_kernel_op(dps.as_ref()).is_none());
+    assert!(!luminal_cuda_lite::plan_transparent(&proto));
+}
+
+#[test]
+fn narrow_and_wide_arithmetic_stay_in_distinct_eclasses() {
+    for dtype in [DType::Bf16, DType::F16] {
+        for with_bias in [false, true] {
+            let mut graph = Graph::new();
+            let a = graph.tensor(vec![4usize, 512], dtype);
+            let b = graph.tensor(vec![512usize, 3], dtype);
+            let mut narrow = a.matmul(b);
+            let mut wide = a.cast(DType::F32).matmul(b.cast(DType::F32));
+            if with_bias {
+                let bias = graph.tensor(vec![3usize], dtype);
+                narrow += bias.expand_dim(0, 4);
+                wide += bias.cast(DType::F32).expand_dim(0, 4);
+            }
+            let _narrow = narrow.cast(DType::F32).named("narrow_arithmetic");
+            let _wide = wide.named("wide_arithmetic");
+            let runtime = CudaRuntime::load(&graph).unwrap();
+            let egraph = runtime.saturated_egraph(&Default::default()).unwrap();
+            let named_class = |name: &str| {
+                egraph
+                    .nodes
+                    .values()
+                    .find_map(|node| {
+                        if node.op != "LogicalTensorNamed" {
+                            return None;
+                        }
+                        let id_class = &egraph.nodes.get(node.children.first()?)?.eclass;
+                        let id = egraph
+                            .nodes
+                            .values()
+                            .find(|id| &id.eclass == id_class && id.op == "LogicalIdLit")?;
+                        let text = &egraph.nodes.get(id.children.first()?)?.op;
+                        (text.trim_matches('"') == name).then(|| node.eclass.clone())
+                    })
+                    .expect("named logical output")
+            };
+            assert_ne!(
+                named_class("narrow_arithmetic"),
+                named_class("wide_arithmetic"),
+                "{dtype:?}, bias={with_bias}: equal output dtypes do not erase arithmetic rounding boundaries"
+            );
+        }
     }
 }
 
 #[test]
-fn bf16_matmul_widened_to_f32_mints_cublaslt_candidate() {
+fn narrow_matmul_followed_by_widening_never_mints_cublaslt() {
+    for dtype in [DType::Bf16, DType::F16] {
+        for with_bias in [false, true] {
+            let mut cx = Graph::new();
+            let a = cx.tensor(vec![4usize, 8usize], dtype);
+            let b = cx.tensor(vec![8usize, 3usize], dtype);
+            let product = a.matmul(b);
+            let product = if with_bias {
+                let bias = cx.tensor(vec![3usize], dtype);
+                product + bias.expand_dim(0, 4)
+            } else {
+                product
+            };
+            let _out = product.cast(DType::F32);
+            let runtime = CudaRuntime::load(&cx).unwrap();
+            let egraph = runtime.saturated_egraph(&Default::default()).unwrap();
+            assert!(
+                !egraph
+                    .nodes
+                    .values()
+                    .any(|node| node.op.starts_with("LayoutTensorOpCublasLt")),
+                "{dtype:?} arithmetic, bias={with_bias}, cannot become F32 accumulation"
+            );
+        }
+    }
+}
+
+#[test]
+fn bf16_operands_widened_before_matmul_mint_cublaslt_candidate() {
     let mut cx = Graph::new();
     let a = cx.tensor(vec![4usize, 8usize], DType::Bf16);
     let b = cx.tensor(vec![8usize, 3usize], DType::Bf16);
-    let _out = a.matmul(b).cast(DType::F32);
+    let _out = a.cast(DType::F32).matmul(b.cast(DType::F32));
     let runtime = CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry())
         .expect("load mixed BF16 graph");
     let egraph = runtime
         .saturated_egraph(&Default::default())
         .expect("saturate mixed BF16 graph");
+    let index = luminal::layout_ir::SerializedIndex::new(&egraph);
+    let matcher = luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLtMatcher;
     assert!(
-        egraph
-            .nodes
-            .values()
-            .any(|node| node.op == "LayoutTensorOpCublasLt"),
-        "BF16 x BF16 followed by an F32 cast must offer a cuBLASLt candidate"
-    );
-    assert!(
-        egraph
-            .nodes
-            .values()
-            .any(|node| node.op == "LayoutTensorOpCublasLt" && node.subsumed),
-        "a direct cuBLASLt input must dominate an equivalent copied input"
+        egraph.nodes.iter().any(|(node_id, node)| {
+            if node.op != luminal_cuda_lite::ops::cublaslt::approved::CONSTRUCTOR || node.subsumed {
+                return false;
+            }
+            let op = luminal::layout_ir::OpMatcher::extract(
+                &matcher,
+                &luminal::layout_ir::ExtractionSite {
+                    egraph: &egraph,
+                    node_id,
+                    node,
+                    index: &index,
+                },
+            );
+            let spec = op
+                .as_any()
+                .downcast_ref::<luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt>()
+                .unwrap();
+            spec.a.dtype == luminal::dtype::PlanDtype::Bf16
+                && spec.b.dtype == luminal::dtype::PlanDtype::Bf16
+                && spec.d.dtype == luminal::dtype::PlanDtype::F32
+        }),
+        "explicit widening must offer a live BF16-input/F32-compute library candidate"
     );
 }
 
@@ -281,9 +350,9 @@ fn election_row_conv() {
     let _out = model.forward(x);
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (x.id, weights(25, 1).into()),
-        (model.conv1.weight.id, weights(18, 2).into()),
-        (model.conv2.weight.id, weights(54, 3).into()),
-        (model.head.weight.id, weights(6, 4).into()),
+        (model.conv1_weight.id, weights(18, 2).into()),
+        (model.conv2_weight.id, weights(54, 3).into()),
+        (model.head_weight.id, weights(6, 4).into()),
     ];
     search_and_count("conv", &cx, &pairs);
 }
@@ -315,14 +384,14 @@ fn election_row_llama3() {
     let block = &model.blocks[0];
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![3i32].into()),
-        (model.embed.weight.id, weights(VOCAB * D, 1).into()),
-        (block.wq.weight.id, weights(D * D, 2).into()),
-        (block.wk.weight.id, weights(D * 4, 3).into()),
-        (block.wv.weight.id, weights(D * 4, 4).into()),
-        (block.wo.weight.id, weights(D * D, 5).into()),
-        (block.gate.weight.id, weights(D * 12, 6).into()),
-        (block.up.weight.id, weights(D * 12, 7).into()),
-        (block.down.weight.id, weights(12 * D, 8).into()),
+        (model.embed.id, weights(VOCAB * D, 1).into()),
+        (block.wq_weight.id, weights(D * D, 2).into()),
+        (block.wk_weight.id, weights(D * 4, 3).into()),
+        (block.wv_weight.id, weights(D * 4, 4).into()),
+        (block.wo_weight.id, weights(D * D, 5).into()),
+        (block.gate_weight.id, weights(D * 12, 6).into()),
+        (block.up_weight.id, weights(D * 12, 7).into()),
+        (block.down_weight.id, weights(12 * D, 8).into()),
         (k_cache.id, weights(16, 9).into()),
         (v_cache.id, weights(16, 10).into()),
         (gather_idx.id, vec![0i32, 1].into()),
@@ -360,14 +429,14 @@ fn election_row_qwen3() {
     let (q_norm, k_norm) = block.qk_norm.expect("qwen3 block carries QK-norm");
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![3i32].into()),
-        (model.embed.weight.id, weights(VOCAB * D, 1).into()),
-        (block.wq.weight.id, weights(D * D, 2).into()),
-        (block.wk.weight.id, weights(D * 4, 3).into()),
-        (block.wv.weight.id, weights(D * 4, 4).into()),
-        (block.wo.weight.id, weights(D * D, 5).into()),
-        (block.gate.weight.id, weights(D * 12, 6).into()),
-        (block.up.weight.id, weights(D * 12, 7).into()),
-        (block.down.weight.id, weights(12 * D, 8).into()),
+        (model.embed.id, weights(VOCAB * D, 1).into()),
+        (block.wq_weight.id, weights(D * D, 2).into()),
+        (block.wk_weight.id, weights(D * 4, 3).into()),
+        (block.wv_weight.id, weights(D * 4, 4).into()),
+        (block.wo_weight.id, weights(D * D, 5).into()),
+        (block.gate_weight.id, weights(D * 12, 6).into()),
+        (block.up_weight.id, weights(D * 12, 7).into()),
+        (block.down_weight.id, weights(12 * D, 8).into()),
         (q_norm.id, weights(HD, 11).into()),
         (k_norm.id, weights(HD, 12).into()),
         (k_cache.id, weights(16, 9).into()),
@@ -396,18 +465,18 @@ fn election_row_whisper() {
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (audio.id, weights(2 * D, 1).into()),
         (tokens.id, weights(D, 2).into()),
-        (model.enc_wq.weight.id, weights(D * D, 3).into()),
-        (model.enc_wk.weight.id, weights(D * D, 4).into()),
-        (model.enc_wv.weight.id, weights(D * D, 5).into()),
-        (model.enc_wo.weight.id, weights(D * D, 6).into()),
-        (model.enc_up.weight.id, weights(D * FF, 7).into()),
-        (model.enc_down.weight.id, weights(FF * D, 8).into()),
-        (model.dec_wq.weight.id, weights(D * D, 9).into()),
-        (model.dec_wk.weight.id, weights(D * D, 10).into()),
-        (model.dec_wv.weight.id, weights(D * D, 11).into()),
-        (model.dec_wo.weight.id, weights(D * D, 12).into()),
-        (model.dec_up.weight.id, weights(D * FF, 13).into()),
-        (model.dec_down.weight.id, weights(FF * D, 14).into()),
+        (model.enc_wq_weight.id, weights(D * D, 3).into()),
+        (model.enc_wk_weight.id, weights(D * D, 4).into()),
+        (model.enc_wv_weight.id, weights(D * D, 5).into()),
+        (model.enc_wo_weight.id, weights(D * D, 6).into()),
+        (model.enc_up_weight.id, weights(D * FF, 7).into()),
+        (model.enc_down_weight.id, weights(FF * D, 8).into()),
+        (model.dec_wq_weight.id, weights(D * D, 9).into()),
+        (model.dec_wk_weight.id, weights(D * D, 10).into()),
+        (model.dec_wv_weight.id, weights(D * D, 11).into()),
+        (model.dec_wo_weight.id, weights(D * D, 12).into()),
+        (model.dec_up_weight.id, weights(D * FF, 13).into()),
+        (model.dec_down_weight.id, weights(FF * D, 14).into()),
     ];
     search_and_count("whisper", &cx, &pairs);
 }
@@ -439,11 +508,11 @@ fn election_row_qwen3_moe() {
     let moe = &block.moe;
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![2i32].into()),
-        (model.embed.weight.id, weights(VOCAB * D, 1).into()),
-        (block.wq.weight.id, weights(D * D, 2).into()),
-        (block.wk.weight.id, weights(D * D, 3).into()),
-        (block.wv.weight.id, weights(D * D, 4).into()),
-        (block.wo.weight.id, weights(D * D, 5).into()),
+        (model.embed.id, weights(VOCAB * D, 1).into()),
+        (block.wq_weight.id, weights(D * D, 2).into()),
+        (block.wk_weight.id, weights(D * D, 3).into()),
+        (block.wv_weight.id, weights(D * D, 4).into()),
+        (block.wo_weight.id, weights(D * D, 5).into()),
         (moe.router.id, weights(D * 2, 6).into()),
         (moe.expert_weights.id, weights(2 * D * D, 7).into()),
         (k_cache.id, weights(4 * D, 8).into()),
@@ -481,11 +550,11 @@ fn election_row_gemma4_moe() {
     let moe = &block.moe;
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![2i32].into()),
-        (model.embed.weight.id, weights(VOCAB * D, 1).into()),
-        (block.wq.weight.id, weights(D * D, 2).into()),
-        (block.wk.weight.id, weights(D * D, 3).into()),
-        (block.wv.weight.id, weights(D * D, 4).into()),
-        (block.wo.weight.id, weights(D * D, 5).into()),
+        (model.embed.id, weights(VOCAB * D, 1).into()),
+        (block.wq_weight.id, weights(D * D, 2).into()),
+        (block.wk_weight.id, weights(D * D, 3).into()),
+        (block.wv_weight.id, weights(D * D, 4).into()),
+        (block.wo_weight.id, weights(D * D, 5).into()),
         (moe.router.id, weights(D * 2, 6).into()),
         (moe.expert_weights.id, weights(2 * D * D, 7).into()),
         (k_cache.id, weights(4 * D, 8).into()),
@@ -553,12 +622,12 @@ fn election_row_gemma3() {
 
     let mut pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (ids.id, vec![3i32].into()),
-        (model.embed.weight.id, weights(VOCAB * D, 199).into()),
+        (model.embed.id, weights(VOCAB * D, 199).into()),
         (gather_idx.id, vec![0i32, 1].into()),
         (scatter_idx.id, vec![1i32].into()),
         (rope_rot.id, rope_pairing_matrix(HD, false).into()),
         (
-            model.final_norm.weight.expect("weighted").id,
+            model.final_norm_weight.expect("weighted").id,
             weights(D, 660).into(),
         ),
     ];
@@ -570,27 +639,27 @@ fn election_row_gemma3() {
     }
     for (layer, block) in model.blocks.iter().enumerate() {
         let seed = |slot: usize| 600 + layer * 20 + slot;
-        pairs.push((block.wq.weight.id, weights(D * Q_DIM, seed(0)).into()));
-        pairs.push((block.wk.weight.id, weights(D * KV_DIM, seed(1)).into()));
-        pairs.push((block.wv.weight.id, weights(D * KV_DIM, seed(2)).into()));
-        pairs.push((block.wo.weight.id, weights(Q_DIM * D, seed(3)).into()));
-        pairs.push((block.gate.weight.id, weights(D * FF, seed(4)).into()));
-        pairs.push((block.up.weight.id, weights(D * FF, seed(5)).into()));
-        pairs.push((block.down.weight.id, weights(FF * D, seed(6)).into()));
+        pairs.push((block.wq_weight.id, weights(D * Q_DIM, seed(0)).into()));
+        pairs.push((block.wk_weight.id, weights(D * KV_DIM, seed(1)).into()));
+        pairs.push((block.wv_weight.id, weights(D * KV_DIM, seed(2)).into()));
+        pairs.push((block.wo_weight.id, weights(Q_DIM * D, seed(3)).into()));
+        pairs.push((block.gate_weight.id, weights(D * FF, seed(4)).into()));
+        pairs.push((block.up_weight.id, weights(D * FF, seed(5)).into()));
+        pairs.push((block.down_weight.id, weights(FF * D, seed(6)).into()));
         pairs.push((
-            block.input_norm.weight.expect("weighted").id,
+            block.input_norm_weight.expect("weighted").id,
             weights(D, seed(7)).into(),
         ));
         pairs.push((
-            block.post_attn_norm.weight.expect("weighted").id,
+            block.post_attn_norm_weight.expect("weighted").id,
             weights(D, seed(8)).into(),
         ));
         pairs.push((
-            block.pre_ff_norm.weight.expect("weighted").id,
+            block.pre_ff_norm_weight.expect("weighted").id,
             weights(D, seed(9)).into(),
         ));
         pairs.push((
-            block.post_ff_norm.weight.expect("weighted").id,
+            block.post_ff_norm_weight.expect("weighted").id,
             weights(D, seed(10)).into(),
         ));
         pairs.push((block.q_norm.id, weights(HD, seed(11)).into()));

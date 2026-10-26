@@ -8,6 +8,10 @@ pub mod bucketing;
 pub mod dtype;
 #[path = "egglog_core/egglog_utils/mod.rs"]
 pub mod egglog_utils;
+#[path = "layout/element_stride.rs"]
+pub mod element_stride;
+// Compatibility for callers of the former opt-in experiment.
+pub use element_stride as experimental_element_stride;
 pub mod frontend;
 pub mod graph;
 #[path = "logical/ir.rs"]

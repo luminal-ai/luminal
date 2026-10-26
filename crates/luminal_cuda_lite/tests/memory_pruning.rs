@@ -66,7 +66,7 @@ fn oversized_products_are_pruned_before_search_and_cublas_matches_reference() {
             .dag
             .node_weights()
             .any(|node| matches!(node,
-        luminal::bufferize::BufferNode::Compute { op, .. } if op.label() == "CublasLt"))
+        luminal::bufferize::BufferNode::Compute { op, .. } if op.label() == "CublasLtCall"))
     );
     for q in [128, 1, 7] {
         let values: Vec<_> = (0..q * 256).map(|i| ((i % 11) as f32 - 5.) / 8.).collect();

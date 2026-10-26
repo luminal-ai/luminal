@@ -23,7 +23,7 @@ fn nodes(text: &str, name: &str) -> usize {
     let sites = serialized
         .nodes
         .values()
-        .filter(|x| x.op == "CublasLtLogicalMatmulSite")
+        .filter(|x| x.op == "CublasLtExpressionFrameOf")
         .count();
     println!(
         "MEASURE probe {name}: {n} nodes, {applies} applies, {maps} maps, {sites} sites, {wall:.2?}"

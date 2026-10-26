@@ -25,11 +25,11 @@ use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 
 const GENOME: &[&str] = &[
-    "LayoutTensorOpCublasLt",
     "LayoutTensorOpIndexMapApplyViewGeneric",
+    "LayoutTensorOpCublasLtCall",
 ];
 
-fn report(name: &str, text: &str) {
+fn report(name: &str, text: &str, expect_view: bool) {
     let (graph, _) = test_runtime::extract_fixture_with_genome(text, GENOME);
     let dps = luminal::dps::dps_rewrite(&graph);
     let mut views = 0usize;
@@ -62,10 +62,10 @@ fn report(name: &str, text: &str) {
     println!("[{name}] plan:\n{summary}");
     use luminal::bufferize::{BufferId, BufferNode};
     assert!(
-        !plan
-            .dag
-            .node_indices()
-            .any(|i| matches!(&plan.dag[i], BufferNode::BufferCopy { .. })),
+        !plan.dag.node_indices().any(|i| matches!(
+            &plan.dag[i],
+            BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+        )),
         "[{name}] zero copies under escape:\n{summary}"
     );
     let slot = plan
@@ -76,10 +76,19 @@ fn report(name: &str, text: &str) {
             _ => None,
         })
         .expect("slot 0 (the view output)");
-    assert!(
-        matches!(slot.buffer, BufferId::Allocated(_)),
-        "[{name}] the view slot is backed by the kernel's escaping alloc:\n{summary}"
-    );
+    if expect_view {
+        assert!(views > 0, "fixture must elect a view");
+        assert!(
+            matches!(slot.buffer, BufferId::Allocated(_)),
+            "view storage escapes: {summary}"
+        );
+    } else {
+        assert_eq!(views, 0, "identity transposes normalize away");
+        assert!(
+            matches!(slot.buffer, BufferId::Boundary(_)),
+            "identity result writes the bound destination: {summary}"
+        );
+    }
     assert_eq!(
         plan.buffers[&slot.buffer].freed_by,
         luminal::layout_ir::FreedBy::Caller,
@@ -114,7 +123,7 @@ fn a2_single_view_to_bound() {
         let _ = x.matmul(w).transpose(0, 1);
         test_runtime::bind_leaves(&cx)
     };
-    report("mm.t", &text);
+    report("mm.t", &text, true);
 }
 
 /// Two stacked transposes composing to identity: does the planner ever SEE
@@ -128,7 +137,7 @@ fn a2_double_view_roundtrip() {
         let _ = x.matmul(w).transpose(0, 1).transpose(0, 1);
         test_runtime::bind_leaves(&cx)
     };
-    report("mm.t.t", &text);
+    report("mm.t.t", &text, false);
 }
 
 /// Fan-out: the matmul value goes to a bound output through a view AND to a
@@ -145,7 +154,7 @@ fn a2_view_fanout() {
         let _ = y * c;
         test_runtime::bind_leaves(&cx)
     };
-    report("mm.fanout", &text);
+    report("mm.fanout", &text, true);
 }
 
 /// Same matmul value bound to two slots: direct + through a transpose view.
@@ -174,5 +183,5 @@ fn a2_two_slots_same_value() {
             .expect("recorder clean")
             .text()
     };
-    report("mm.2slots", &text);
+    report("mm.2slots", &text, true);
 }

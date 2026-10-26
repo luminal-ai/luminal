@@ -123,7 +123,9 @@ pub mod device {
             match &plan.dag[idx] {
                 BufferNode::BufferInput { .. } => {}
                 BufferNode::Compute { .. } => stats.kernels += 1,
-                BufferNode::BufferCopy { .. } => stats.copies += 1,
+                BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. } => {
+                    stats.copies += 1
+                }
                 BufferNode::BufferOutput { slots } => stats.outputs += slots.len(),
             }
         }

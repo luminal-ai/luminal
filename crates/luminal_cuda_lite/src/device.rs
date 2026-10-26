@@ -549,6 +549,31 @@ fn resolve(
         Addr::Params => base + storage.parameters.offset as u64,
     })
 }
+enum CopyCheck {
+    Equal(Expr),
+    Capacity(Expr, Expr),
+}
+impl CopyCheck {
+    fn check(&self, bytes: usize, dims: &DynMap) -> Result<()> {
+        match self {
+            Self::Equal(other) => ensure!(bytes == other.eval(dims)?, "copy length mismatch"),
+            Self::Capacity(source, dest) => ensure!(
+                bytes <= source.eval(dims)? && bytes <= dest.eval(dims)?,
+                "value copy exceeds buffer capacity"
+            ),
+        }
+        Ok(())
+    }
+    fn variables(&self, vars: &mut BTreeSet<Symbol>) {
+        match self {
+            Self::Equal(other) => symbolic::vars(&other.0, vars),
+            Self::Capacity(a, b) => {
+                symbolic::vars(&a.0, vars);
+                symbolic::vars(&b.0, vars);
+            }
+        }
+    }
+}
 enum Action {
     Copy {
         src: u64,
@@ -557,7 +582,7 @@ enum Action {
         dst_ref: Addr,
         kind: CopyKind,
         size: Expr,
-        other_size: Option<Expr>,
+        other_size: Option<CopyCheck>,
         bytes: usize,
     },
     Kernel {
@@ -781,9 +806,11 @@ impl HostNode {
             unreachable!()
         };
         let host = crate::as_host_op(op.as_ref()).unwrap();
-        let inputs = reads[..reads.len() - writes.len()]
+        let inputs = reads
             .iter()
-            .map(|id| range(plan, storage, id, base, external, dims))
+            .enumerate()
+            .filter(|(operand, _)| op.operand_reads_memory(*operand))
+            .map(|(_, id)| range(plan, storage, id, base, external, dims))
             .collect::<Result<Vec<_>>>()?;
         let workspace = storage
             .workspaces
@@ -993,19 +1020,31 @@ impl CompiledPlan {
                             bail!("no CUDA execution interface for {label}");
                         }
                     }
-                    BufferNode::BufferCopy { src, dst } => {
+                    BufferNode::BufferCopy { src, dst, .. }
+                    | BufferNode::BufferCopyValue { src, dst, .. } => {
+                        let value_layout = plan.dag[*node].copy_value_layout();
                         let from = range(plan, storage, src, base, external, dims)?;
                         let to = range(plan, storage, dst, base, external, dims)?;
-                        ensure!(from.bytes == to.bytes, "copy length mismatch");
+                        let copy_size = value_layout.unwrap_or(&plan.buffers[src].layout);
+                        let bytes = size(copy_size)?.eval(dims)?;
+                        let check = if value_layout.is_some() {
+                            CopyCheck::Capacity(
+                                size(&plan.buffers[src].layout)?,
+                                size(&plan.buffers[dst].layout)?,
+                            )
+                        } else {
+                            CopyCheck::Equal(size(&plan.buffers[dst].layout)?)
+                        };
+                        check.check(bytes, dims)?;
                         out.actions.push(Action::Copy {
                             src: from.ptr,
                             dst: to.ptr,
                             src_ref: Addr::Buffer(src.clone()),
                             dst_ref: Addr::Buffer(dst.clone()),
                             kind: CopyKind::DtoD,
-                            size: size(&plan.buffers[src].layout)?,
-                            other_size: Some(size(&plan.buffers[dst].layout)?),
-                            bytes: from.bytes,
+                            size: size(copy_size)?,
+                            other_size: Some(check),
+                            bytes,
                         });
                     }
                     _ => {}
@@ -1020,7 +1059,7 @@ impl CompiledPlan {
                 } => {
                     symbolic::vars(&size.0, &mut vars);
                     if let Some(s) = other_size {
-                        symbolic::vars(&s.0, &mut vars);
+                        s.variables(&mut vars);
                     }
                 }
                 Action::Host(_) => {}
@@ -1181,7 +1220,7 @@ impl CompiledPlan {
                 } => {
                     let next = size.eval(dims)?;
                     if let Some(other) = other_size {
-                        ensure!(next == other.eval(dims)?, "dynamic copy length mismatch");
+                        other.check(next, dims)?;
                     }
                     if *bytes != next {
                         self.executable

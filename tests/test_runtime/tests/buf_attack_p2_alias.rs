@@ -39,7 +39,8 @@ fn copies(
     plan.dag
         .node_weights()
         .filter_map(|n| match n {
-            BufferNode::BufferCopy { src, dst, .. } => Some((src.clone(), dst.clone())),
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. } => Some((src.clone(), dst.clone())),
             _ => None,
         })
         .collect()
@@ -233,7 +234,7 @@ fn c_view_of_readonly_input_vetoes_inplace_writer() {
                     op.label()
                 );
             }
-            BufferNode::BufferCopy { dst, .. } => {
+            BufferNode::BufferCopy { dst, .. } | BufferNode::BufferCopyValue { dst, .. } => {
                 assert_ne!(dst, &x_buf, "copy into read-only buffer")
             }
             _ => {}

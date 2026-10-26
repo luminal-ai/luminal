@@ -157,7 +157,7 @@ impl CudaRuntime {
 
     /// Record the graph's native program under the DEFAULT op registry
     /// ([`crate::ops::cuda_registry`]) — which since the 2026-09-04
-    /// ruling INCLUDES the four cuBLASLt marker contracts, so a default
+    /// vocabulary INCLUDES the complete-call cuBLASLt matcher, so a default
     /// search assembles the marker's egg snippets and may elect the
     /// host-call route. Saturation happens in [`CudaRuntime::search`].
     ///
@@ -189,11 +189,8 @@ impl CudaRuntime {
     /// alone does not grant a claim. External ops supply the same interfaces
     /// as built-in ops without changing this runtime's dispatch code.
     ///
-    /// ONE EXCEPTION TO ROW-BY-ROW SELECTION: the four cuBLASLt marker
-    /// rows are ONE vocabulary, declared and minted by the Base row's
-    /// snippets. A registry holding a non-Base marker row without Base is
-    /// REFUSED here — such a row would be claimed but never declared, an
-    /// op that cannot be elected under a claim set that says it can.
+    /// Retired marker constructor registrations are rejected: production
+    /// library calls must use the complete configuration whitelist gate.
     pub fn load_with_registry(
         graph: &graph::Graph,
         registry: Vec<crate::ops::RegisteredOp>,
@@ -218,35 +215,19 @@ impl CudaRuntime {
         let bound = bindings
             .bind(&graph.logical)
             .map_err(|reason| anyhow!("load refused: {reason}"))?;
-        // THE FOUR cuBLASLt MARKER ROWS ARE ONE VOCABULARY. Only the
-        // Base row emits snippets, and that one snippet set declares all
-        // four constructors and every minting rule. A registry holding a
-        // non-Base marker WITHOUT Base would derive a claim for an op the
-        // assembled program never declares and never mints: claimed,
-        // un-electable, and `active_allow_list()` — the check this
-        // module's doc recommends — would say it is available. Refuse the
-        // configuration at load instead, keyed on constructor names.
-        {
-            use crate::ops::cublaslt::CublasLtForm;
-            let has = |ctor: &str| {
-                registry
-                    .iter()
-                    .any(|entry| entry.matcher.egglog_constructor() == ctor)
-            };
-            if let Some(orphan) = CublasLtForm::ALL
-                .into_iter()
-                .filter(|form| *form != CublasLtForm::Base)
-                .find(|form| has(form.constructor_name()))
-            {
-                anyhow::ensure!(
-                    has(CublasLtForm::Base.constructor_name()),
-                    "registry holds the cuBLASLt `{}` row without the Base row `{}`: \
-                     the Base row declares and mints the whole marker vocabulary, so \
-                     the four marker rows must be kept or dropped together",
-                    orphan.constructor_name(),
-                    CublasLtForm::Base.constructor_name()
-                );
-            }
+        // Retired marker constructors cannot bypass the complete-call whitelist.
+        for entry in &registry {
+            anyhow::ensure!(
+                !matches!(
+                    entry.constructor(),
+                    "LayoutTensorOpCublasLt"
+                        | "LayoutTensorOpCublasLtBias"
+                        | "LayoutTensorOpCublasLtAccumulate"
+                        | "LayoutTensorOpCublasLtAccumulateBias"
+                ),
+                "retired cuBLASLt marker {}; register the complete-call matcher instead",
+                entry.constructor(),
+            );
         }
         // Derive the claim set BEFORE the rows are consumed: the allow
         // list reads the prototypes, the search reads the matchers.

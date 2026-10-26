@@ -45,7 +45,8 @@ fn copies(
     plan.dag
         .node_indices()
         .filter_map(|i| match &plan.dag[i] {
-            BufferNode::BufferCopy { src, dst, .. } => Some((i, src.clone(), dst.clone())),
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. } => Some((i, src.clone(), dst.clone())),
             _ => None,
         })
         .collect()
@@ -299,7 +300,7 @@ fn attack3a_view_of_view_of_readonly_vetoes_writer() {
                 "read-only caller storage written by {} through a two-view chain",
                 op.label()
             ),
-            BufferNode::BufferCopy { dst, .. } => {
+            BufferNode::BufferCopy { dst, .. } | BufferNode::BufferCopyValue { dst, .. } => {
                 assert_ne!(dst, &xb, "copy into read-only caller storage")
             }
             _ => {}
@@ -349,7 +350,7 @@ fn attack3b_passthrough_obligation_blocks_inplace_writer_via_view() {
                 "pass-through buffer written by {}",
                 op.label()
             ),
-            BufferNode::BufferCopy { dst, .. } => {
+            BufferNode::BufferCopy { dst, .. } | BufferNode::BufferCopyValue { dst, .. } => {
                 assert_ne!(dst, &xb, "copy into pass-through buffer")
             }
             _ => {}

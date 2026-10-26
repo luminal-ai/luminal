@@ -1,0 +1,19 @@
+; One read-modify-write C operand. Descriptor and layout equality are proved
+; before this op exists; its storage tie is unconditional after extraction.
+(rule
+  ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
+     (CublasLtCMatrixInput ?C_matrix_descriptor) ?bias_argument ?D_matrix_descriptor
+     ?input_tensors ?expression_frame)
+   (= ?C_matrix_descriptor
+     (CublasLtMatrixDescriptorOf ?C_layout_tensor ?C_and_D_storage_data_type ?C_and_D_matrix_order
+       ?m ?n ?C_and_D_LeadingDimension))
+   (= ?D_matrix_descriptor
+     (CublasLtMatrixDescriptorOf ?D_layout_tensor ?C_and_D_storage_data_type ?C_and_D_matrix_order
+       ?m ?n ?C_and_D_LeadingDimension))
+   (= ?C_layout_tensor (LayoutTensorLit ?C_matrix ?C_and_D_layout))
+   (= ?D_layout_tensor (LayoutTensorLit ?D_matrix ?C_and_D_layout)))
+  ((union (LayoutTensorOpLit ?input_tensors (LayoutTensorCons ?D_layout_tensor (LayoutTensorNil)))
+     (LayoutTensorOpCublasLtAccumulateInPlace ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
+       ?C_matrix_descriptor ?bias_argument ?input_tensors ?expression_frame)))
+  :ruleset backend
+  :name "cublaslt: emit approved in place accumulation with one shared C D descriptor")

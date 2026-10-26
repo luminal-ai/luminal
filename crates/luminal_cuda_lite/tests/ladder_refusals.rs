@@ -22,7 +22,7 @@ use luminal::shape::IntExpr;
 use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::HostBuffer;
-use model_zoo::{mini::llama3::MiniLlama3Layer, model_support::Namespace};
+use model_zoo::{mini::llama3::MiniLlama3Layer, namespace::Namespace};
 
 /// Deterministic pseudo-random weights (the nn harness's `weights`
 /// discipline: value content is irrelevant, only geometry matters).
@@ -91,26 +91,26 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
         (scatter_idx.id, vec![1i32].into()),
     ];
     for (layer, block) in blocks.iter().enumerate() {
-        pairs.push((block.wq.weight.id, weights(d * d, 91 + layer as u64).into()));
+        pairs.push((block.wq_weight.id, weights(d * d, 91 + layer as u64).into()));
         pairs.push((
-            block.wk.weight.id,
+            block.wk_weight.id,
             weights(d * kv_dim, 92 + layer as u64).into(),
         ));
         pairs.push((
-            block.wv.weight.id,
+            block.wv_weight.id,
             weights(d * kv_dim, 93 + layer as u64).into(),
         ));
-        pairs.push((block.wo.weight.id, weights(d * d, 94 + layer as u64).into()));
+        pairs.push((block.wo_weight.id, weights(d * d, 94 + layer as u64).into()));
         pairs.push((
-            block.gate.weight.id,
+            block.gate_weight.id,
             weights(d * ff, 95 + layer as u64).into(),
         ));
         pairs.push((
-            block.up.weight.id,
+            block.up_weight.id,
             weights(d * ff, 96 + layer as u64).into(),
         ));
         pairs.push((
-            block.down.weight.id,
+            block.down_weight.id,
             weights(ff * d, 97 + layer as u64).into(),
         ));
         pairs.push((

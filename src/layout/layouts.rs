@@ -198,9 +198,42 @@ fn numel(shape: &ShapeTerm) -> IntExprTerm {
     let Some(first) = extents.next() else {
         return IntExprTerm::Lit(1);
     };
-    extents.fold(first.clone(), |acc, e| {
+    let count = extents.fold(first.clone(), |acc, e| {
         IntExprTerm::Mul(Box::new(acc), Box::new(e.clone()))
-    })
+    });
+    zero_for_empty_domain(shape, count)
+}
+
+/// A shape has no elements if any extent is zero. Guard the computation
+/// before evaluating it: even an unused count or last-address expression
+/// can overflow. Nonnegative extents make min(1, extent) a 0/1 indicator.
+/// Rank-zero shapes keep their one scalar element.
+pub(crate) fn zero_for_empty_domain(shape: &ShapeTerm, value: IntExprTerm) -> IntExprTerm {
+    let mut nonempty = None;
+    for extent in &shape.0 {
+        match extent.eval_literal() {
+            Some(0) => return IntExprTerm::Lit(0),
+            Some(_) => continue,
+            None => {}
+        }
+        let indicator = IntExprTerm::Min(Box::new(IntExprTerm::Lit(1)), Box::new(extent.clone()));
+        nonempty = Some(match nonempty {
+            None => indicator,
+            Some(previous) => IntExprTerm::Mul(Box::new(previous), Box::new(indicator)),
+        });
+    }
+    match nonempty {
+        None => value,
+        Some(indicator) => IntExprTerm::Mul(
+            Box::new(indicator),
+            // Interval analysis loses the correlation between the indicator
+            // and last coordinates; an empty domain has no negative span.
+            Box::new(IntExprTerm::Max(
+                Box::new(IntExprTerm::Lit(0)),
+                Box::new(value),
+            )),
+        ),
+    }
 }
 
 impl SpanExpr for RightMajorContiguousElementLayout {
@@ -240,7 +273,7 @@ impl SpanExpr for StridedElementLayout {
                 Box::new(summand.substitute_coords(&last_coord)),
             );
         }
-        total
+        zero_for_empty_domain(shape, total)
     }
 }
 
@@ -250,8 +283,8 @@ impl SpanExpr for StridedElementLayout {
 
 impl IntExprTerm {
     /// Evaluate a closed literal expression (no vars, no coordinates) to
-    /// its value. `None` for symbolic/coordinate-bearing terms — callers
-    /// bail loudly, never guess. Runtime-side convenience: the planner
+    /// its value. `None` if the value depends on unresolved symbols or
+    /// coordinates. A zero product does not depend on its other factor. Runtime-side convenience: the planner
     /// never evaluates layout terms.
     pub fn eval_literal(&self) -> Option<i64> {
         let go = |e: &IntExprTerm| e.eval_literal();
@@ -259,7 +292,17 @@ impl IntExprTerm {
             IntExprTerm::Lit(v) => *v,
             IntExprTerm::Var(_) | IntExprTerm::Coord { .. } => return None,
             IntExprTerm::Add(a, b) => go(a)?.checked_add(go(b)?)?,
-            IntExprTerm::Mul(a, b) => go(a)?.checked_mul(go(b)?)?,
+            IntExprTerm::Mul(a, b) => {
+                let left = go(a);
+                if left == Some(0) {
+                    return Some(0);
+                }
+                let right = go(b);
+                if right == Some(0) {
+                    return Some(0);
+                }
+                left?.checked_mul(right?)?
+            }
             IntExprTerm::TruncDiv(a, b) => go(a)?.checked_div(go(b)?)?,
             IntExprTerm::TruncRem(a, b) => go(a)?.checked_rem(go(b)?)?,
             IntExprTerm::CeilDiv(a, b) => {
@@ -380,8 +423,16 @@ impl IntExprTerm {
                 )
             }
             IntExprTerm::Mul(a, b) => {
-                let (a, z) = a.interval(bounds)?;
-                let (b, y) = b.interval(bounds)?;
+                let left = a.interval(bounds);
+                if matches!(left, Ok((0, 0))) {
+                    return Ok((0, 0));
+                }
+                let right = b.interval(bounds);
+                if matches!(right, Ok((0, 0))) {
+                    return Ok((0, 0));
+                }
+                let (a, z) = left?;
+                let (b, y) = right?;
                 let v = [
                     a as i128 * b as i128,
                     a as i128 * y as i128,
@@ -1160,34 +1211,44 @@ impl DecodedLayout {
 
     /// The storage reach in ELEMENTS, taken from the FIRST spelling that
     /// discloses one and evaluated. `None` when no spelling discloses a
-    /// reach (the offset-expression forms) or the terms are symbolic —
-    /// allocation-sizing callers bail loudly on `None`, never guess.
+    /// reach (the offset-expression forms) or the terms are symbolic.
+    /// A statically empty domain proves zero reach without an offset analysis.
     pub fn literal_span_elements(&self) -> Option<usize> {
         self.spellings
             .iter()
             .find_map(|f| f.span_elements())
             .and_then(|span| span.eval_literal())
             .and_then(|v| usize::try_from(v).ok())
+            .or_else(|| {
+                self.shape()
+                    .0
+                    .iter()
+                    .any(|extent| extent.eval_literal() == Some(0))
+                    .then_some(0)
+            })
     }
 
     /// The storage reach in ELEMENTS under a CONCRETE dimension
     /// assignment `dims` — the symbolic-plan twin of
     /// [`Self::literal_span_elements`]. Literal-only layouts evaluate with
     /// `dims` empty, so this is the one reader a symbolic plan needs.
-    /// Loud: a layout with no disclosed reach and an expression with an
-    /// unbound variable both refuse, naming what is missing.
+    /// An empty domain proves zero reach for every layout presentation.
+    /// Otherwise a missing reach or unbound span variable refuses.
     pub fn span_with(&self, dims: &DynMap) -> Result<usize> {
-        let span = self
-            .spellings
-            .iter()
-            .find_map(|f| f.span_elements())
-            .ok_or_else(|| {
-                anyhow!(
-                    "layout {:?} discloses no storage span; an offset function \
-                     alone does not size storage",
-                    self.present()
-                )
-            })?;
+        let Some(span) = self.spellings.iter().find_map(|f| f.span_elements()) else {
+            if self
+                .shape()
+                .0
+                .iter()
+                .any(|extent| matches!(extent.eval_dims(dims), Ok(0)))
+            {
+                return Ok(0);
+            }
+            bail!(
+                "layout {:?} discloses no storage span; an offset function alone does not size storage",
+                self.present()
+            );
+        };
         let value = span.eval_dims(dims)?;
         usize::try_from(value).map_err(|_| anyhow!("negative storage span {value}"))
     }
@@ -1507,7 +1568,13 @@ mod tests {
             shape: ShapeTerm(vec![n(), lit(128)]),
             width: w32(),
         };
-        assert_eq!(contiguous.span(), mul(n(), lit(128)));
+        for extent in [0usize, 1, 3] {
+            let dims: DynMap = [('n'.into(), extent)].into_iter().collect();
+            assert_eq!(
+                contiguous.span().eval_dims(&dims).unwrap(),
+                (extent * 128) as i64
+            );
+        }
 
         // shape (n, 128), row-major strides spelled as a chain:
         // from-end [coord0, coord1 * 128].
@@ -1516,13 +1583,133 @@ mod tests {
             chain: vec![coord(0), mul(coord(1), lit(128))],
             width: w32(),
         };
+        for extent in [0usize, 1, 3] {
+            let dims: DynMap = [('n'.into(), extent)].into_iter().collect();
+            assert_eq!(
+                strided.span().eval_dims(&dims).unwrap(),
+                (extent * 128) as i64
+            );
+        }
+    }
+
+    #[test]
+    fn empty_shapes_have_zero_span_and_element_count_at_every_axis_position() {
+        for extents in [
+            vec![0],
+            vec![0, 4],
+            vec![3, 0],
+            vec![2, 0, 3],
+            vec![2, 3, 0],
+            vec![i64::MAX, i64::MAX, 0],
+        ] {
+            let shape = ShapeTerm(extents.iter().copied().map(lit).collect());
+            let chain = (0..extents.len())
+                .map(|axis| mul(coord(axis as i64), lit(8)))
+                .collect();
+            let strided = StridedElementLayout {
+                shape: shape.clone(),
+                chain,
+                width: w32(),
+            };
+            let right = RightMajorContiguousElementLayout {
+                shape: shape.clone(),
+                width: w32(),
+            };
+            let left = LeftMajorContiguousElementLayout {
+                shape,
+                width: w32(),
+            };
+            for span in [strided.span(), right.span(), left.span()] {
+                assert_eq!(span.eval_literal(), Some(0), "shape {extents:?}");
+                assert_eq!(span.eval_dims(&DynMap::default()).unwrap(), 0);
+            }
+        }
         assert_eq!(
-            strided.span(),
-            add(
-                add(lit(1), add(lit(128), lit(-1))),
-                mul(add(n(), lit(-1)), lit(128))
-            )
+            StridedElementLayout {
+                shape: ShapeTerm(vec![]),
+                chain: vec![],
+                width: w32()
+            }
+            .span()
+            .eval_literal(),
+            Some(1)
         );
+    }
+
+    #[test]
+    fn symbolic_empty_spans_skip_unused_overflow_and_preserve_nonempty_pitch() {
+        let m = IntExprTerm::Var("m".into());
+        let n = IntExprTerm::Var("n".into());
+        let shape = ShapeTerm(vec![m.clone(), n.clone()]);
+        let strided = StridedElementLayout {
+            shape,
+            chain: vec![mul(coord(1), lit(8)), coord(0)],
+            width: w32(),
+        };
+        for rows in 0..=3 {
+            for cols in 0..=4 {
+                let dims: DynMap = [('m'.into(), rows), ('n'.into(), cols)]
+                    .into_iter()
+                    .collect();
+                let expected = if rows == 0 || cols == 0 {
+                    0
+                } else {
+                    1 + (rows - 1) * 8 + cols - 1
+                };
+                assert_eq!(strided.span().eval_dims(&dims).unwrap(), expected as i64);
+            }
+        }
+        let bounds: DimBounds = [('m'.into(), (0, 3)), ('n'.into(), (0, 4))]
+            .into_iter()
+            .collect();
+        assert_eq!(strided.span().interval(&bounds).unwrap(), (0, 20));
+        let huge = RightMajorContiguousElementLayout {
+            shape: ShapeTerm(vec![lit(i64::MAX), lit(i64::MAX), m]),
+            width: w32(),
+        };
+        let zero: DynMap = [('m'.into(), 0)].into_iter().collect();
+        assert_eq!(huge.span().eval_dims(&zero).unwrap(), 0);
+        let nonzero: DynMap = [('m'.into(), 1)].into_iter().collect();
+        assert!(
+            huge.span().eval_dims(&nonzero).is_err(),
+            "a nonempty overflowing count must still refuse"
+        );
+    }
+
+    #[test]
+    fn empty_offset_presentations_need_no_address_or_span_analysis() {
+        for extent in [lit(0), IntExprTerm::Var("m".into())] {
+            let shape = ShapeTerm(vec![extent, lit(4)]);
+            let offset = IntExprTerm::Var("unobserved-offset".into());
+            let spellings: Vec<Arc<dyn LayoutFacts>> = vec![
+                Arc::new(ElementOffsetExpressionLayout {
+                    shape: shape.clone(),
+                    offset: offset.clone(),
+                    width: w32(),
+                }),
+                Arc::new(BitOffsetExpressionLayout {
+                    shape,
+                    offset,
+                    width: w32(),
+                }),
+            ];
+            for spelling in spellings {
+                let layout =
+                    DecodedLayout::of_spellings(vec![spelling], Some(crate::dtype::PlanDtype::F32));
+                let zero: DynMap = [('m'.into(), 0)].into_iter().collect();
+                assert_eq!(layout.span_with(&zero).unwrap(), 0);
+                if layout.shape().0[0] == lit(0) {
+                    assert_eq!(layout.literal_span_elements(), Some(0));
+                } else {
+                    assert_eq!(layout.literal_span_elements(), None);
+                    let nonempty: DynMap = [('m'.into(), 1)].into_iter().collect();
+                    assert!(
+                        layout.span_with(&nonempty).is_err(),
+                        "a nonempty offset expression still needs a reach proof"
+                    );
+                }
+            }
+        }
     }
 
     /// A hand-built layout compares structurally on its SPELLING SET —

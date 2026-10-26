@@ -1,6 +1,6 @@
 use luminal::prelude::*;
 use model_zoo::gemma4_moe::{Gemma4Dims, Gemma4Moe};
-use model_zoo::model_support::{Namespace, named_heterogeneous_kv_cache_pool};
+use model_zoo::namespace::{Namespace, named_heterogeneous_kv_cache_pool};
 
 fn static_dims(tensor: GraphTensor) -> Vec<usize> {
     tensor

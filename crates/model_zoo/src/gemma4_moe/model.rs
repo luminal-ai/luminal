@@ -16,13 +16,14 @@
 //! form everywhere. Logits softcap at 30. Embeddings tie with the
 //! √hidden normalizer in-graph over the unscaled table.
 
-use crate::model_support::{
-    AttentionGeometry, CacheAccess, Embedding, KvCache, KvCachePool, LayerNorm, Linear, Namespace,
-    TopKRoutes, causal_bias, paged_attention, sliding_window_bias,
-};
+use crate::namespace::Namespace;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::GraphTensor;
+use luminal_nn::{
+    AttentionGeometry, CacheAccess, KvCache, KvCachePool, TopKRoutes, causal_bias, paged_attention,
+    sliding_window_bias,
+};
 
 pub const SLIDING_WINDOW: usize = 1024;
 
@@ -126,7 +127,8 @@ impl Gemma4Dims {
 /// The parallel-branch MoE (router on the RAW stream, experts on the
 /// normed one, gemma-gelu gating, per-expert output scales).
 pub struct Gemma4MoeFfn {
-    pub router_proj: Linear,
+    pub router_proj_weight: GraphTensor,
+    pub router_proj_bias: Option<GraphTensor>,
     pub router_scale: GraphTensor,
     pub per_expert_scale: GraphTensor,
     pub gate_up: GraphTensor,
@@ -142,14 +144,12 @@ impl Gemma4MoeFfn {
         let router = ns.child("router");
         let experts = ns.child("experts");
         Self {
-            router_proj: Linear::new(
-                d.hidden,
-                d.experts,
-                false,
+            router_proj_weight: cx.named_tensor(
+                router.child("proj").leaf("weight"),
+                vec![d.hidden, d.experts],
                 DType::F32,
-                &router.child("proj"),
-                cx,
             ),
+            router_proj_bias: None,
             router_scale: cx.named_tensor(router.leaf("scale"), vec![d.hidden], DType::F32),
             per_expert_scale: cx.named_tensor(
                 router.leaf("per_expert_scale"),
@@ -180,7 +180,12 @@ impl Gemma4MoeFfn {
         // Router: std-normed raw stream × router.scale × 1/sqrt(hidden).
         let scale = self.router_scale.expand_lhs(&raw.dims()[..1]);
         let router_hidden = raw.std_norm(vec![1], self.rms_eps) * scale * (h as f32).sqrt().recip();
-        let probs = self.router_proj.forward(router_hidden).softmax(vec![1]);
+        let probs = luminal_nn::linear(
+            router_hidden,
+            self.router_proj_weight,
+            self.router_proj_bias,
+        )
+        .softmax(vec![1]);
         let expert_ids = probs.topk_indexes(self.top_k, 1);
         let routes = TopKRoutes::from_scores(probs, expert_ids).normalize();
         let scaled_weights = routes.weights() * routes.select(self.per_expert_scale);
@@ -213,24 +218,44 @@ fn gemma_gelu(x: GraphTensor) -> GraphTensor {
 }
 
 pub struct Gemma4Block {
-    pub input_norm: LayerNorm,
-    pub post_attn_norm: LayerNorm,
-    pub pre_ff_norm: LayerNorm,
-    pub post_ff_norm: LayerNorm,
-    pub post_ff_norm_1: LayerNorm,
-    pub pre_ff_norm_2: LayerNorm,
-    pub post_ff_norm_2: LayerNorm,
+    pub input_norm_weight: Option<GraphTensor>,
+    pub input_norm_bias: Option<GraphTensor>,
+    pub input_norm_epsilon: f32,
+    pub post_attn_norm_weight: Option<GraphTensor>,
+    pub post_attn_norm_bias: Option<GraphTensor>,
+    pub post_attn_norm_epsilon: f32,
+    pub pre_ff_norm_weight: Option<GraphTensor>,
+    pub pre_ff_norm_bias: Option<GraphTensor>,
+    pub pre_ff_norm_epsilon: f32,
+    pub post_ff_norm_weight: Option<GraphTensor>,
+    pub post_ff_norm_bias: Option<GraphTensor>,
+    pub post_ff_norm_epsilon: f32,
+    pub post_ff_norm_1_weight: Option<GraphTensor>,
+    pub post_ff_norm_1_bias: Option<GraphTensor>,
+    pub post_ff_norm_1_epsilon: f32,
+    pub pre_ff_norm_2_weight: Option<GraphTensor>,
+    pub pre_ff_norm_2_bias: Option<GraphTensor>,
+    pub pre_ff_norm_2_epsilon: f32,
+    pub post_ff_norm_2_weight: Option<GraphTensor>,
+    pub post_ff_norm_2_bias: Option<GraphTensor>,
+    pub post_ff_norm_2_epsilon: f32,
     pub layer_scalar: GraphTensor,
-    pub wq: Linear,
-    pub wk: Linear,
+    pub wq_weight: GraphTensor,
+    pub wq_bias: Option<GraphTensor>,
+    pub wk_weight: GraphTensor,
+    pub wk_bias: Option<GraphTensor>,
     /// Sliding layers only — full layers take V from the K projection.
-    pub wv: Option<Linear>,
-    pub wo: Linear,
+    pub wv: Option<(GraphTensor, Option<GraphTensor>)>,
+    pub wo_weight: GraphTensor,
+    pub wo_bias: Option<GraphTensor>,
     pub q_norm: GraphTensor,
     pub k_norm: GraphTensor,
-    pub gate: Linear,
-    pub up: Linear,
-    pub down: Linear,
+    pub gate_weight: GraphTensor,
+    pub gate_bias: Option<GraphTensor>,
+    pub up_weight: GraphTensor,
+    pub up_bias: Option<GraphTensor>,
+    pub down_weight: GraphTensor,
+    pub down_bias: Option<GraphTensor>,
     pub moe: Gemma4MoeFfn,
     pub sliding: bool,
     pub head_dim: usize,
@@ -252,98 +277,111 @@ impl Gemma4Block {
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         let rms = |segment: &str, cx: &mut Graph| {
-            LayerNorm::new(
-                d.hidden,
-                true,
-                false,
-                false,
+            (
+                Some(cx.named_tensor(ns.child(segment).leaf("weight"), vec![d.hidden], DType::F32)),
+                None,
                 d.rms_eps,
-                DType::F32,
-                &ns.child(segment),
-                cx,
             )
         };
-        Self {
-            input_norm: rms("input_layernorm", cx),
-            post_attn_norm: rms("post_attention_layernorm", cx),
-            pre_ff_norm: rms("pre_feedforward_layernorm", cx),
-            post_ff_norm: rms("post_feedforward_layernorm", cx),
-            post_ff_norm_1: rms("post_feedforward_layernorm_1", cx),
-            pre_ff_norm_2: rms("pre_feedforward_layernorm_2", cx),
-            post_ff_norm_2: rms("post_feedforward_layernorm_2", cx),
-            layer_scalar: cx.named_tensor(ns.leaf("layer_scalar"), vec![1], DType::F32),
-            wq: Linear::new(
-                d.hidden,
-                q_dim,
-                false,
-                DType::F32,
-                &attn.child("q_proj"),
-                cx,
-            ),
-            wk: Linear::new(
-                d.hidden,
-                kv_dim,
-                false,
-                DType::F32,
-                &attn.child("k_proj"),
-                cx,
-            ),
-            wv: sliding.then(|| {
-                Linear::new(
-                    d.hidden,
-                    kv_dim,
-                    false,
+        {
+            let (input_norm_weight, input_norm_bias, input_norm_epsilon) =
+                rms("input_layernorm", cx);
+            let (post_attn_norm_weight, post_attn_norm_bias, post_attn_norm_epsilon) =
+                rms("post_attention_layernorm", cx);
+            let (pre_ff_norm_weight, pre_ff_norm_bias, pre_ff_norm_epsilon) =
+                rms("pre_feedforward_layernorm", cx);
+            let (post_ff_norm_weight, post_ff_norm_bias, post_ff_norm_epsilon) =
+                rms("post_feedforward_layernorm", cx);
+            let (post_ff_norm_1_weight, post_ff_norm_1_bias, post_ff_norm_1_epsilon) =
+                rms("post_feedforward_layernorm_1", cx);
+            let (pre_ff_norm_2_weight, pre_ff_norm_2_bias, pre_ff_norm_2_epsilon) =
+                rms("pre_feedforward_layernorm_2", cx);
+            let (post_ff_norm_2_weight, post_ff_norm_2_bias, post_ff_norm_2_epsilon) =
+                rms("post_feedforward_layernorm_2", cx);
+            Self {
+                input_norm_weight,
+                input_norm_bias,
+                input_norm_epsilon,
+                post_attn_norm_weight,
+                post_attn_norm_bias,
+                post_attn_norm_epsilon,
+                pre_ff_norm_weight,
+                pre_ff_norm_bias,
+                pre_ff_norm_epsilon,
+                post_ff_norm_weight,
+                post_ff_norm_bias,
+                post_ff_norm_epsilon,
+                post_ff_norm_1_weight,
+                post_ff_norm_1_bias,
+                post_ff_norm_1_epsilon,
+                pre_ff_norm_2_weight,
+                pre_ff_norm_2_bias,
+                pre_ff_norm_2_epsilon,
+                post_ff_norm_2_weight,
+                post_ff_norm_2_bias,
+                post_ff_norm_2_epsilon,
+                layer_scalar: cx.named_tensor(ns.leaf("layer_scalar"), vec![1], DType::F32),
+                wq_weight: cx.named_tensor(
+                    attn.child("q_proj").leaf("weight"),
+                    vec![d.hidden, q_dim],
                     DType::F32,
-                    &attn.child("v_proj"),
-                    cx,
-                )
-            }),
-            wo: Linear::new(
-                q_dim,
-                d.hidden,
-                false,
-                DType::F32,
-                &attn.child("o_proj"),
-                cx,
-            ),
-            q_norm: cx.named_tensor(
-                attn.child("q_norm").leaf("weight"),
-                vec![head_dim],
-                DType::F32,
-            ),
-            k_norm: cx.named_tensor(
-                attn.child("k_norm").leaf("weight"),
-                vec![head_dim],
-                DType::F32,
-            ),
-            gate: Linear::new(
-                d.hidden,
-                d.dense_intermediate,
-                false,
-                DType::F32,
-                &mlp.child("gate_proj"),
-                cx,
-            ),
-            up: Linear::new(
-                d.hidden,
-                d.dense_intermediate,
-                false,
-                DType::F32,
-                &mlp.child("up_proj"),
-                cx,
-            ),
-            down: Linear::new(
-                d.dense_intermediate,
-                d.hidden,
-                false,
-                DType::F32,
-                &mlp.child("down_proj"),
-                cx,
-            ),
-            moe: Gemma4MoeFfn::new(&ns, d, cx),
-            sliding,
-            head_dim,
-            kv_heads,
+                ),
+                wq_bias: None,
+                wk_weight: cx.named_tensor(
+                    attn.child("k_proj").leaf("weight"),
+                    vec![d.hidden, kv_dim],
+                    DType::F32,
+                ),
+                wk_bias: None,
+                wv: sliding.then(|| {
+                    (
+                        cx.named_tensor(
+                            attn.child("v_proj").leaf("weight"),
+                            vec![d.hidden, kv_dim],
+                            DType::F32,
+                        ),
+                        None,
+                    )
+                }),
+                wo_weight: cx.named_tensor(
+                    attn.child("o_proj").leaf("weight"),
+                    vec![q_dim, d.hidden],
+                    DType::F32,
+                ),
+                wo_bias: None,
+                q_norm: cx.named_tensor(
+                    attn.child("q_norm").leaf("weight"),
+                    vec![head_dim],
+                    DType::F32,
+                ),
+                k_norm: cx.named_tensor(
+                    attn.child("k_norm").leaf("weight"),
+                    vec![head_dim],
+                    DType::F32,
+                ),
+                gate_weight: cx.named_tensor(
+                    mlp.child("gate_proj").leaf("weight"),
+                    vec![d.hidden, d.dense_intermediate],
+                    DType::F32,
+                ),
+                gate_bias: None,
+                up_weight: cx.named_tensor(
+                    mlp.child("up_proj").leaf("weight"),
+                    vec![d.hidden, d.dense_intermediate],
+                    DType::F32,
+                ),
+                up_bias: None,
+                down_weight: cx.named_tensor(
+                    mlp.child("down_proj").leaf("weight"),
+                    vec![d.dense_intermediate, d.hidden],
+                    DType::F32,
+                ),
+                down_bias: None,
+                moe: Gemma4MoeFfn::new(&ns, d, cx),
+                sliding,
+                head_dim,
+                kv_heads,
+            }
         }
     }
 
@@ -361,11 +399,16 @@ impl Gemma4Block {
         rope_sin: GraphTensor,
         rope_rot: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let normed = self.input_norm.forward(x);
-        let q_raw = self.wq.forward(normed);
-        let k_raw = self.wk.forward(normed);
+        let normed = luminal_nn::rms_norm(
+            x,
+            self.input_norm_weight,
+            self.input_norm_bias,
+            self.input_norm_epsilon,
+        );
+        let q_raw = luminal_nn::linear(normed, self.wq_weight, self.wq_bias);
+        let k_raw = luminal_nn::linear(normed, self.wk_weight, self.wk_bias);
         let v_raw = match &self.wv {
-            Some(wv) => wv.forward(normed),
+            Some(wv) => luminal_nn::linear(normed, wv.0, wv.1),
             None => k_raw, // full layers: V IS the K projection output
         };
         let q = luminal_nn::rotary_apply(
@@ -399,16 +442,63 @@ impl Gemma4Block {
             AttentionGeometry::with_scale(d.n_heads, self.kv_heads, self.head_dim, 1.0),
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
-        let x = x + self.post_attn_norm.forward(self.wo.forward(attn));
-
-        let dense = self.down.forward(
-            gemma_gelu(self.gate.forward(self.pre_ff_norm.forward(x)))
-                * self.up.forward(self.pre_ff_norm.forward(x)),
+        let x = x + luminal_nn::rms_norm(
+            luminal_nn::linear(attn, self.wo_weight, self.wo_bias),
+            self.post_attn_norm_weight,
+            self.post_attn_norm_bias,
+            self.post_attn_norm_epsilon,
         );
-        let dense = self.post_ff_norm_1.forward(dense);
-        let moe = self.moe.forward(x, self.pre_ff_norm_2.forward(x));
-        let moe = self.post_ff_norm_2.forward(moe);
-        let ff_out = self.post_ff_norm.forward(dense + moe);
+
+        let dense = luminal_nn::linear(
+            gemma_gelu(luminal_nn::linear(
+                luminal_nn::rms_norm(
+                    x,
+                    self.pre_ff_norm_weight,
+                    self.pre_ff_norm_bias,
+                    self.pre_ff_norm_epsilon,
+                ),
+                self.gate_weight,
+                self.gate_bias,
+            )) * luminal_nn::linear(
+                luminal_nn::rms_norm(
+                    x,
+                    self.pre_ff_norm_weight,
+                    self.pre_ff_norm_bias,
+                    self.pre_ff_norm_epsilon,
+                ),
+                self.up_weight,
+                self.up_bias,
+            ),
+            self.down_weight,
+            self.down_bias,
+        );
+        let dense = luminal_nn::rms_norm(
+            dense,
+            self.post_ff_norm_1_weight,
+            self.post_ff_norm_1_bias,
+            self.post_ff_norm_1_epsilon,
+        );
+        let moe = self.moe.forward(
+            x,
+            luminal_nn::rms_norm(
+                x,
+                self.pre_ff_norm_2_weight,
+                self.pre_ff_norm_2_bias,
+                self.pre_ff_norm_2_epsilon,
+            ),
+        );
+        let moe = luminal_nn::rms_norm(
+            moe,
+            self.post_ff_norm_2_weight,
+            self.post_ff_norm_2_bias,
+            self.post_ff_norm_2_epsilon,
+        );
+        let ff_out = luminal_nn::rms_norm(
+            dense + moe,
+            self.post_ff_norm_weight,
+            self.post_ff_norm_bias,
+            self.post_ff_norm_epsilon,
+        );
         let x = x + ff_out;
         let scalar = self
             .layer_scalar
@@ -420,9 +510,11 @@ impl Gemma4Block {
 
 pub struct Gemma4Moe {
     pub dims: Gemma4Dims,
-    pub embed: Embedding,
+    pub embed: GraphTensor,
     pub blocks: Vec<Gemma4Block>,
-    pub final_norm: LayerNorm,
+    pub final_norm_weight: Option<GraphTensor>,
+    pub final_norm_bias: Option<GraphTensor>,
+    pub final_norm_epsilon: f32,
 }
 
 impl Gemma4Moe {
@@ -433,24 +525,19 @@ impl Gemma4Moe {
             .collect();
         Self {
             dims: dims.clone(),
-            embed: Embedding::new(
-                dims.vocab,
-                dims.hidden,
+            embed: cx.named_tensor(
+                text.child("embed_tokens").leaf("weight"),
+                vec![dims.vocab, dims.hidden],
                 DType::F32,
-                &text.child("embed_tokens"),
-                cx,
             ),
             blocks,
-            final_norm: LayerNorm::new(
-                dims.hidden,
-                true,
-                false,
-                false,
-                dims.rms_eps,
+            final_norm_weight: Some(cx.named_tensor(
+                text.child("norm").leaf("weight"),
+                vec![dims.hidden],
                 DType::F32,
-                &text.child("norm"),
-                cx,
-            ),
+            )),
+            final_norm_bias: None,
+            final_norm_epsilon: dims.rms_eps,
         }
     }
 
@@ -469,7 +556,7 @@ impl Gemma4Moe {
         scatter_idx: GraphTensor,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         assert_eq!(tokens.dtype, DType::Int);
-        let mut x = self.embed.forward(tokens) * (self.dims.hidden as f32).sqrt();
+        let mut x = luminal_nn::embedding(tokens, self.embed) * (self.dims.hidden as f32).sqrt();
         let mut caches_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
             let (cos, sin, rot) = if block.sliding {
@@ -492,7 +579,15 @@ impl Gemma4Moe {
             x = next;
             caches_out.push((k_cache, v_cache));
         }
-        let logits = self.embed.reverse(self.final_norm.forward(x));
+        let logits = luminal_nn::embedding_projection(
+            luminal_nn::rms_norm(
+                x,
+                self.final_norm_weight,
+                self.final_norm_bias,
+                self.final_norm_epsilon,
+            ),
+            self.embed,
+        );
         let softcap = self.dims.logit_softcap;
         let logits = (logits * (1.0 / softcap)).tanh() * softcap;
         (logits, caches_out)

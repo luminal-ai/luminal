@@ -1,0 +1,421 @@
+; Production proof relations. None of these helper facts is an executable call.
+(relation cublaslt-approved-configuration (CublasLtConfiguration))
+(relation cublaslt-layout-axis (LayoutTensor Shape i64 IntExpr IntExpr))
+(relation cublaslt-layout-axis-walk (LayoutTensor Shape IntExprList IntAffineExprList))
+(relation cublaslt-element-stride-reading (LayoutTensor i64 ElementStride))
+(relation cublaslt-positive-extent (IntExpr))
+(relation cublaslt-greater-than-or-equal (IntExpr IntExpr))
+(relation cublaslt-greater-than-or-equal-demand (IntExpr IntExpr))
+(relation cublaslt-unit-element-stride (ElementStride))
+(relation cublaslt-leading-dimension-demand (ElementStride IntExpr))
+(relation cublaslt-legal-leading-dimension (ElementStride IntExpr IntExpr))
+; Reading: tensor, logical rows/cols, storage type, API order/op, API descriptor.
+(relation cublaslt-matrix-reading
+  (LayoutTensor IntExpr IntExpr Dtype CublasLtMatrixOrder CublasLtMatrixOperation CublasLtMatrixDescriptor))
+(relation cublaslt-destination-reading
+  (LayoutTensor IntExpr IntExpr Dtype CublasLtMatrixOrder CublasLtMatrixDescriptor))
+(relation cublaslt-logical-matrix-product (LogicalTensor LogicalTensor LogicalTensor))
+(relation cublaslt-product-with-C-matrix (LogicalTensor LogicalTensor LogicalTensor CublasLtLogicalCMatrix))
+(relation cublaslt-logical-expression
+  (LogicalTensor LogicalTensor LogicalTensor CublasLtLogicalCMatrix CublasLtLogicalBias CublasLtEpilogue))
+(relation cublaslt-rectified-linear-activation (LogicalTensor LogicalTensor))
+(relation cublaslt-expression-frame (CublasLtExpressionFrame))
+(relation cublaslt-C-matrix-argument
+  (CublasLtExpressionFrame CublasLtMatrixDescriptor CublasLtCMatrixArgument Dtype CublasLtHostScalars
+    LayoutTensorList))
+(relation cublaslt-bias-argument
+  (CublasLtExpressionFrame IntExpr CublasLtBiasArgument CublasLtBiasDataType LayoutTensorList))
+(relation cublaslt-remaining-inputs (LayoutTensorList LayoutTensorList LayoutTensorList))
+; Complete, whitelist-approved call descriptions are proof facts, not ops.
+; Executable forms consume this same admission result without reinterpreting it.
+(relation cublaslt-approved-call
+  (CublasLtConfiguration CublasLtMatrixDescriptor CublasLtMatrixDescriptor
+    CublasLtCMatrixArgument CublasLtBiasArgument CublasLtMatrixDescriptor
+    LayoutTensorList CublasLtExpressionFrame))
+
+; Read complete, shape-owned stride certificates. A singleton Any stays local
+; to its axis; compatibility never unions coefficient expressions.
+(rule
+  ((element-stride-reading ?layout_tensor ?axis ?element_stride))
+  ((cublaslt-element-stride-reading ?layout_tensor ?axis ?element_stride))
+  :ruleset backend)
+(rule
+  ((element-stride-axis-walk ?layout (IntExprCons ?extent ?remaining_extents) ?stride_expressions)
+   (>= (lower-bound-of ?extent) (bigint 1)))
+  ((cublaslt-positive-extent ?extent))
+  :ruleset backend)
+(cublaslt-unit-element-stride (ElementStrideAny))
+(cublaslt-unit-element-stride (ElementStrideExact (IntLit 1)))
+(rule
+  ((cublaslt-greater-than-or-equal-demand ?left_expression ?left_expression))
+  ((cublaslt-greater-than-or-equal ?left_expression ?left_expression))
+  :ruleset backend
+  :name "cublaslt: correlated symbolic bound")
+(rule
+  ((cublaslt-greater-than-or-equal-demand ?left_expression ?right_expression)
+   (>= (lower-bound-of ?left_expression) (upper-bound-of ?right_expression)))
+  ((cublaslt-greater-than-or-equal ?left_expression ?right_expression))
+  :ruleset backend
+  :name "cublaslt: interval bound")
+(rule
+  ((cublaslt-leading-dimension-demand (ElementStrideExact ?LeadingDimension) ?minor_extent))
+  ((cublaslt-greater-than-or-equal-demand ?LeadingDimension ?minor_extent))
+  :ruleset backend
+  :name "cublaslt: exact pitch requires legal leading dimension")
+(rule
+  ((cublaslt-leading-dimension-demand (ElementStrideExact ?LeadingDimension) ?minor_extent)
+   (cublaslt-greater-than-or-equal ?LeadingDimension ?minor_extent))
+  ((cublaslt-legal-leading-dimension (ElementStrideExact ?LeadingDimension) ?minor_extent ?LeadingDimension))
+  :ruleset backend
+  :name "cublaslt: legal exact pitch")
+(rule
+  ((cublaslt-leading-dimension-demand (ElementStrideAny) ?minor_extent)
+   (cublaslt-positive-extent ?minor_extent))
+  ((cublaslt-legal-leading-dimension (ElementStrideAny) ?minor_extent ?minor_extent))
+  :ruleset backend
+  :name "cublaslt: choose canonical singleton pitch")
+
+; Two stride orientations, each with two equivalent API readings.
+(rule
+  ((cublaslt-element-stride-reading ?layout_tensor 1 ?outer_stride)
+   (cublaslt-element-stride-reading ?layout_tensor 0 ?inner_stride)
+   (cublaslt-unit-element-stride ?inner_stride)
+   (= ?layout_tensor (LayoutTensorLit ?logical_tensor ?layout))
+   (= (shape-of ?logical_tensor) (ShapeLit (IntExprCons ?row_count (IntExprCons ?column_count (IntExprNil)))))
+   (cublaslt-positive-extent ?row_count)
+   (cublaslt-positive-extent ?column_count))
+  ((cublaslt-leading-dimension-demand ?outer_stride ?column_count))
+  :ruleset backend
+  :name "cublaslt: demand row pitch")
+(rule
+  ((cublaslt-element-stride-reading ?layout_tensor 1 ?outer_stride)
+   (cublaslt-element-stride-reading ?layout_tensor 0 ?inner_stride)
+   (cublaslt-unit-element-stride ?outer_stride)
+   (= ?layout_tensor (LayoutTensorLit ?logical_tensor ?layout))
+   (= (shape-of ?logical_tensor) (ShapeLit (IntExprCons ?row_count (IntExprCons ?column_count (IntExprNil)))))
+   (cublaslt-positive-extent ?row_count)
+   (cublaslt-positive-extent ?column_count))
+  ((cublaslt-leading-dimension-demand ?inner_stride ?row_count))
+  :ruleset backend
+  :name "cublaslt: demand column pitch")
+(rule
+  ((cublaslt-element-stride-reading ?layout_tensor 1 ?outer_stride)
+   (cublaslt-element-stride-reading ?layout_tensor 0 ?inner_stride)
+   (cublaslt-unit-element-stride ?inner_stride)
+   (= ?layout_tensor (LayoutTensorLit ?logical_tensor ?layout))
+   (= ?element_data_type (dtype-of ?logical_tensor))
+   (= (shape-of ?logical_tensor) (ShapeLit (IntExprCons ?row_count (IntExprCons ?column_count (IntExprNil)))))
+   (cublaslt-positive-extent ?row_count)
+   (cublaslt-positive-extent ?column_count)
+   (cublaslt-legal-leading-dimension ?outer_stride ?column_count ?LeadingDimension))
+  ((cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type (CublasLtRowMajor)
+     (CublasLtNoTranspose)
+     (CublasLtMatrixDescriptorOf ?layout_tensor ?element_data_type (CublasLtRowMajor) ?row_count
+       ?column_count ?LeadingDimension))
+   (cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type (CublasLtColumnMajor)
+     (CublasLtTranspose)
+     (CublasLtMatrixDescriptorOf ?layout_tensor ?element_data_type (CublasLtColumnMajor) ?column_count
+       ?row_count ?LeadingDimension)))
+  :ruleset backend
+  :name "cublaslt: row layout readings")
+(rule
+  ((cublaslt-element-stride-reading ?layout_tensor 1 ?outer_stride)
+   (cublaslt-element-stride-reading ?layout_tensor 0 ?inner_stride)
+   (cublaslt-unit-element-stride ?outer_stride)
+   (= ?layout_tensor (LayoutTensorLit ?logical_tensor ?layout))
+   (= ?element_data_type (dtype-of ?logical_tensor))
+   (= (shape-of ?logical_tensor) (ShapeLit (IntExprCons ?row_count (IntExprCons ?column_count (IntExprNil)))))
+   (cublaslt-positive-extent ?row_count)
+   (cublaslt-positive-extent ?column_count)
+   (cublaslt-legal-leading-dimension ?inner_stride ?row_count ?LeadingDimension))
+  ((cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type (CublasLtColumnMajor)
+     (CublasLtNoTranspose)
+     (CublasLtMatrixDescriptorOf ?layout_tensor ?element_data_type (CublasLtColumnMajor) ?row_count
+       ?column_count ?LeadingDimension))
+   (cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type (CublasLtRowMajor)
+     (CublasLtTranspose)
+     (CublasLtMatrixDescriptorOf ?layout_tensor ?element_data_type (CublasLtRowMajor) ?column_count
+       ?row_count ?LeadingDimension)))
+  :ruleset backend
+  :name "cublaslt: column layout readings")
+; A non-transposed reading proves positive rank-two extents, a unit minor
+; stride, and LeadingDimension >= the minor extent. Together these prove non-overlapping
+; writes, including a padded leading dimension. Keep the SAME LayoutTensor
+; and descriptor: D is never transposed or rebound during extraction.
+(rule
+  ((cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type ?matrix_order
+     (CublasLtNoTranspose) ?matrix_descriptor))
+  ((cublaslt-destination-reading ?layout_tensor ?row_count ?column_count ?element_data_type ?matrix_order
+     ?matrix_descriptor))
+  :ruleset backend
+  :name "cublaslt: proven strided destination")
+
+; Recognize complete logical expressions; never match an existing library call.
+(rule
+  ((= ?matrix_product (LogicalHelperMatrixMultiply ?A_operand ?B_operand))
+   (= (dtype-of ?A_operand) (F32))
+   (= (dtype-of ?B_operand) (F32))
+   (= (dtype-of ?matrix_product) (F32)))
+  ((cublaslt-logical-matrix-product ?matrix_product ?A_operand ?B_operand)
+   (cublaslt-product-with-C-matrix ?matrix_product ?A_operand ?B_operand (CublasLtNoCMatrix)))
+  :ruleset backend
+  :name "cublaslt: logical product")
+(rule
+  ((cublaslt-logical-matrix-product ?matrix_product ?A_operand ?B_operand)
+   (= ?expression (LogicalAdd ?matrix_product ?C_matrix))
+   (= (shape-of ?matrix_product) (shape-of ?C_matrix)))
+  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix)))
+  :ruleset backend
+  :name "cublaslt: product then C in one order")
+(rule
+  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand ?C_matrix))
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix (CublasLtNoBias)
+     (CublasLtDefaultEpilogue)))
+  :ruleset backend
+  :name "cublaslt: expression without bias")
+(rule
+  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand ?C_matrix)
+   (= ?output_expression (LogicalAdd ?expression ?broadcast_bias))
+   (= (shape-of ?expression) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil)))))
+   (= ?broadcast_bias (LogicalHelperBroadcastAxis ?bias 1 ?m))
+   (= (shape-of ?bias) (ShapeLit (IntExprCons ?n (IntExprNil)))))
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix (CublasLtBiasOf ?bias)
+     (CublasLtBiasEpilogue)))
+  :ruleset backend
+  :name "cublaslt: add feature bias after C")
+; Minimal explicit select spelling, useful for adversarial fixtures.
+(rule
+  ((= ?output_expression
+     (LogicalSelect (LogicalLessThan ?activation_input ?zero_tensor) ?zero_tensor ?activation_input))
+   (= ?zero_tensor (LogicalIndexMapApply (LogicalConstant 0.0) ?zero_broadcast_index_map ?activation_shape))
+   (= ?zero_broadcast_index_map (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))))
+   (= ?activation_shape (shape-of ?activation_input)))
+  ((cublaslt-rectified-linear-activation ?output_expression ?activation_input))
+  :ruleset backend
+  :name "cublaslt: select ReLU")
+; The frontend's full maximum_f32 spelling, recognized ONCE. Numerical approval
+; is deferred; GPU acceptance includes NaN, infinities, subnormals, signed zero.
+(rule
+  ((= ?comparison_zero
+     (LogicalIndexMapApply (LogicalConstant 0.0) ?comparison_zero_broadcast_index_map
+       ?comparison_zero_broadcast_shape))
+   (= ?nonnegative_or_original_value
+     (LogicalSelect (LogicalLessThan ?activation_input ?comparison_zero) ?comparison_zero ?activation_input))
+   (= ?input_not_a_number_comparison_float
+     (LogicalCast (LogicalLessThan ?activation_input ?activation_input) (F32)))
+   (= ?input_not_a_number_comparison_sum
+     (LogicalAdd ?input_not_a_number_comparison_float ?input_not_a_number_comparison_float))
+   (= ?input_indicator_zero
+     (LogicalIndexMapApply (LogicalConstant 0.0) ?input_indicator_zero_broadcast_index_map
+       ?input_indicator_zero_broadcast_shape))
+   (= ?input_not_a_number_indicator
+     (LogicalAdd
+       (LogicalCast (LogicalLessThan ?input_indicator_zero ?input_not_a_number_comparison_sum) (F32))
+       (LogicalCast (LogicalLessThan ?input_not_a_number_comparison_sum ?input_indicator_zero) (F32))))
+   (= ?input_not_a_number_predicate_zero
+     (LogicalIndexMapApply (LogicalConstant 0.0) ?input_not_a_number_predicate_zero_broadcast_index_map
+       ?input_not_a_number_predicate_zero_broadcast_shape))
+   (= ?input_is_not_a_number
+     (LogicalLessThan ?input_not_a_number_predicate_zero ?input_not_a_number_indicator))
+   (= ?input_not_a_number_value
+     (LogicalIndexMapApply (LogicalConstant NaN) ?input_not_a_number_broadcast_index_map
+       ?input_not_a_number_broadcast_shape))
+   (= ?input_not_a_number_preserving_result
+     (LogicalSelect ?input_is_not_a_number ?input_not_a_number_value ?nonnegative_or_original_value))
+   (= ?comparison_zero_not_a_number_comparison_float
+     (LogicalCast (LogicalLessThan ?comparison_zero ?comparison_zero) (F32)))
+   (= ?comparison_zero_not_a_number_comparison_sum
+     (LogicalAdd ?comparison_zero_not_a_number_comparison_float
+       ?comparison_zero_not_a_number_comparison_float))
+   (= ?comparison_zero_indicator_zero
+     (LogicalIndexMapApply (LogicalConstant 0.0) ?comparison_zero_indicator_zero_broadcast_index_map
+       ?comparison_zero_indicator_zero_broadcast_shape))
+   (= ?comparison_zero_not_a_number_indicator
+     (LogicalAdd
+       (LogicalCast
+         (LogicalLessThan ?comparison_zero_indicator_zero ?comparison_zero_not_a_number_comparison_sum) (F32))
+       (LogicalCast
+         (LogicalLessThan ?comparison_zero_not_a_number_comparison_sum ?comparison_zero_indicator_zero) (F32))))
+   (= ?comparison_zero_not_a_number_predicate_zero
+     (LogicalIndexMapApply (LogicalConstant 0.0)
+       ?comparison_zero_not_a_number_predicate_zero_broadcast_index_map
+       ?comparison_zero_not_a_number_predicate_zero_broadcast_shape))
+   (= ?comparison_zero_is_not_a_number
+     (LogicalLessThan ?comparison_zero_not_a_number_predicate_zero ?comparison_zero_not_a_number_indicator))
+   (= ?comparison_zero_not_a_number_value
+     (LogicalIndexMapApply (LogicalConstant NaN) ?comparison_zero_not_a_number_broadcast_index_map
+       ?comparison_zero_not_a_number_broadcast_shape))
+   (= ?output_expression
+     (LogicalSelect ?comparison_zero_is_not_a_number ?comparison_zero_not_a_number_value
+       ?input_not_a_number_preserving_result)))
+  ((cublaslt-rectified-linear-activation ?output_expression ?activation_input))
+  :ruleset backend
+  :name "cublaslt: frontend ReLU")
+(rule
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias (CublasLtDefaultEpilogue))
+   (cublaslt-rectified-linear-activation ?output_expression ?expression))
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
+     (CublasLtRectifiedLinearEpilogue)))
+  :ruleset backend
+  :name "cublaslt: ReLU of expression without bias")
+(rule
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias (CublasLtBiasEpilogue))
+   (cublaslt-rectified-linear-activation ?output_expression ?expression))
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
+     (CublasLtRectifiedLinearBiasEpilogue)))
+  :ruleset backend
+  :name "cublaslt: ReLU of biased expression")
+(rule
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix (CublasLtNoBias) ?epilogue))
+  ((cublaslt-expression-frame
+     (CublasLtExpressionFrameOf ?output_expression ?output_expression ?A_operand ?B_operand ?C_matrix
+       (CublasLtNoBias) ?epilogue)))
+  :ruleset backend
+  :name "cublaslt: direct expression frame")
+; Transpose the COMPLETE expression once, so normal per-feature bias becomes
+; the vendor's per-row bias. This is proof construction, not call decoration.
+(rule
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand (CublasLtNoCMatrix) ?bias ?epilogue))
+  ((let ?transposed_expression (LogicalHelperMatrixTranspose ?output_expression))
+   (union ?output_expression (LogicalHelperMatrixTranspose ?transposed_expression))
+   (cublaslt-expression-frame
+     (CublasLtExpressionFrameOf ?output_expression ?transposed_expression
+       (LogicalHelperMatrixTranspose ?B_operand) (LogicalHelperMatrixTranspose ?A_operand)
+       (CublasLtNoCMatrix) ?bias ?epilogue)))
+  :ruleset backend
+  :name "cublaslt: transpose complete expression without C")
+(rule
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix) ?bias
+     ?epilogue))
+  ((let ?transposed_expression (LogicalHelperMatrixTranspose ?output_expression))
+   (union ?output_expression (LogicalHelperMatrixTranspose ?transposed_expression))
+   (cublaslt-expression-frame
+     (CublasLtExpressionFrameOf ?output_expression ?transposed_expression
+       (LogicalHelperMatrixTranspose ?B_operand) (LogicalHelperMatrixTranspose ?A_operand)
+       (CublasLtCMatrixOf (LogicalHelperMatrixTranspose ?C_matrix)) ?bias ?epilogue)))
+  :ruleset backend
+  :name "cublaslt: transpose complete expression with C")
+
+(rule
+  ((cublaslt-expression-frame ?expression_frame)
+   (= ?expression_frame
+     (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
+       (CublasLtNoCMatrix) ?bias ?epilogue))
+   (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?element_data_type ?matrix_order ?D_matrix_descriptor)
+   (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?layout)))
+  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor
+     (CublasLtZeroCMatrix ?D_matrix_descriptor) ?element_data_type (CublasLtHostScalarsAlphaOneBetaZero)
+     (LayoutTensorNil)))
+  :ruleset backend
+  :name "cublaslt: no C uses D descriptor and beta zero")
+(rule
+  ((cublaslt-expression-frame ?expression_frame)
+   (= ?expression_frame
+     (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
+       (CublasLtCMatrixOf ?C_matrix) ?bias ?epilogue))
+   (= ?D_matrix_descriptor
+     (CublasLtMatrixDescriptorOf ?D_layout_tensor ?element_data_type ?matrix_order ?m ?n
+       ?D_LeadingDimension))
+   (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?layout))
+   (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?element_data_type ?matrix_order ?D_matrix_descriptor)
+   (= ?C_layout_tensor (LayoutTensorLit ?C_matrix ?C_layout))
+   (cublaslt-matrix-reading ?C_layout_tensor ?m ?n ?element_data_type ?matrix_order (CublasLtNoTranspose)
+     ?C_matrix_descriptor))
+  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor
+     (CublasLtCMatrixInput ?C_matrix_descriptor) ?element_data_type (CublasLtHostScalarsAlphaOneBetaOne)
+     (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil))))
+  :ruleset backend
+  :name "cublaslt: out of place C permits a different leading dimension")
+(rule
+  ((cublaslt-expression-frame ?expression_frame)
+   (= ?expression_frame
+     (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand ?C_matrix
+       (CublasLtNoBias) ?epilogue))
+   (= (shape-of ?output_expression) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil))))))
+  ((cublaslt-bias-argument ?expression_frame ?m (CublasLtBiasAbsent) (CublasLtNoBiasDataType)
+     (LayoutTensorNil)))
+  :ruleset backend
+  :name "cublaslt: explicit absent bias")
+(rule
+  ((cublaslt-expression-frame ?expression_frame)
+   (= ?expression_frame
+     (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand ?C_matrix
+       (CublasLtBiasOf ?bias) ?epilogue))
+   (= (shape-of ?output_expression) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil)))))
+   (= (shape-of ?bias) (ShapeLit (IntExprCons ?m (IntExprNil))))
+   (= ?element_data_type (dtype-of ?bias))
+   (= ?bias_layout_tensor
+     (LayoutTensorLit ?bias
+       (RightMajorContiguousElementLayoutLit (shape-of ?bias) (bits-of ?element_data_type)))))
+  ((cublaslt-bias-argument ?expression_frame ?m (CublasLtBiasInput ?bias_layout_tensor ?element_data_type)
+     (CublasLtBiasDataTypeOf ?element_data_type) (LayoutTensorCons ?bias_layout_tensor (LayoutTensorNil))))
+  :ruleset backend
+  :name "cublaslt: packed bias with exact row length")
+(rule
+  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_storage_data_type
+     ?host_scalars (LayoutTensorNil))
+   (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors))
+  ((cublaslt-remaining-inputs (LayoutTensorNil) ?bias_input_tensors ?bias_input_tensors))
+  :ruleset backend
+  :name "cublaslt: argument tail without C")
+(rule
+  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_storage_data_type
+     ?host_scalars (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil)))
+   (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors))
+  ((cublaslt-remaining-inputs (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil)) ?bias_input_tensors
+     (LayoutTensorCons ?C_layout_tensor ?bias_input_tensors)))
+  :ruleset backend
+  :name "cublaslt: argument tail with C")
+
+; Shared admission gate. Every API field and every precision boundary is proved here.
+(rule
+  ((cublaslt-expression-frame ?expression_frame)
+   (= ?expression_frame
+     (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
+       ?logical_C_matrix ?logical_bias ?epilogue))
+   (cublaslt-operand-storage-reading ?A_operand ?A_storage_tensor)
+   (cublaslt-operand-storage-reading ?B_operand ?B_storage_tensor)
+   (= (shape-of ?A_operand) (shape-of ?A_storage_tensor))
+   (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
+   (= ?A_layout_tensor (LayoutTensorLit ?A_storage_tensor ?A_operand_layout))
+   (= ?B_layout_tensor (LayoutTensorLit ?B_storage_tensor ?B_operand_layout))
+   (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?D_layout))
+   (cublaslt-matrix-reading ?A_layout_tensor ?m ?k ?A_storage_data_type ?A_matrix_order
+     ?A_transpose_operation ?A_matrix_descriptor)
+   (cublaslt-matrix-reading ?B_layout_tensor ?k ?n ?B_storage_data_type ?B_matrix_order
+     ?B_transpose_operation ?B_matrix_descriptor)
+   (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?D_storage_data_type ?D_matrix_order
+     ?D_matrix_descriptor)
+   (= (dtype-of ?output_expression) ?D_storage_data_type)
+   (= (dtype-of ?A_operand) ?D_storage_data_type)
+   (= (dtype-of ?B_operand) ?D_storage_data_type)
+   (cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_storage_data_type
+     ?scalar_arguments ?C_input_tensors)
+   (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors)
+   (cublaslt-remaining-inputs ?C_input_tensors ?bias_input_tensors ?remaining_input_tensors)
+   (= ?configuration
+     (CublasLtConfigurationOf ?computation_type ?scalar_data_type ?A_storage_data_type ?B_storage_data_type
+       ?C_storage_data_type ?D_storage_data_type ?bias_data_type ?scalar_arguments ?epilogue ?A_matrix_order
+       ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
+   (cublaslt-approved-configuration ?configuration))
+  ((let ?input_tensors
+     (LayoutTensorCons ?A_layout_tensor (LayoutTensorCons ?B_layout_tensor ?remaining_input_tensors)))
+   (cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor ?C_matrix_argument
+     ?bias_argument ?D_matrix_descriptor ?input_tensors ?expression_frame))
+  :ruleset backend
+  :name "cublaslt: approve one complete configuration with exact logical semantics")
+
+
+; Storage never chooses arithmetic precision. Only an authored widening cast
+; permits reading BF16 directly, preserving any earlier source narrowing.
+(rule
+  ((= (dtype-of ?logical_operand) (F32)))
+  ((cublaslt-operand-storage-reading ?logical_operand ?logical_operand))
+  :ruleset backend)
+(rule
+  ((= ?logical_operand (LogicalCast ?storage_source (F32)))
+   (= (dtype-of ?storage_source) (Bf16))
+   (= (dtype-of ?logical_operand) (F32))
+   (= (shape-of ?logical_operand) (shape-of ?storage_source)))
+  ((cublaslt-operand-storage-reading ?logical_operand ?storage_source))
+  :ruleset backend)

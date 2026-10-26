@@ -349,9 +349,21 @@ impl MetalExecutable {
         for step in &p.storage.steps {
             match step {
                 ArenaStep::Node(node) => match &p.plan.dag[*node] {
-                    BufferNode::BufferCopy { src, dst } => {
-                        let bytes = sizes[src];
-                        ensure!(bytes <= sizes[dst], "buffer copy exceeds destination");
+                    BufferNode::BufferCopy { src, dst, .. }
+                    | BufferNode::BufferCopyValue { src, dst, .. } => {
+                        let value_layout = p.plan.dag[*node].copy_value_layout();
+                        let bytes = if let Some(layout) = value_layout {
+                            crate::symbolic::bytes(layout, dims)?
+                        } else {
+                            sizes[src]
+                        };
+                        if value_layout.is_none() {
+                            ensure!(bytes == sizes[dst], "whole buffer copy length mismatch");
+                        }
+                        ensure!(
+                            bytes <= sizes[src] && bytes <= sizes[dst],
+                            "value copy exceeds buffer capacity"
+                        );
                         if bytes == 0 || src == dst {
                             continue;
                         }

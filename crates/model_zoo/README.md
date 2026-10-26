@@ -9,11 +9,30 @@ Import full models by family and small fixtures through `mini`:
 ```rust
 use model_zoo::llama3::{Llama3, Llama3Dims};
 use model_zoo::mini::llama3::MiniLlama3;
-use model_zoo::model_support::Namespace;
+use model_zoo::namespace::Namespace;
 ```
 
-`model_support` contains the shared parameter bundles and checkpoint namespaces.
+Models store parameter tensors and call `luminal_nn` functions directly.
+`namespace` spells checkpoint paths and cache input names; it contains no layer
+implementations or precision policy.
 `checkpoint_layout` provides the checkpoint weight-layout conversion helper.
+
+Model weight ports declare the dtype used in arithmetic. Applications attach
+checkpoint sources in a separate step, before compilation. For example, an
+F32 model can consume an F16 checkpoint source through an explicit cast:
+
+```rust
+use luminal::prelude::*;
+let mut graph = Graph::new();
+let input = graph.tensor(vec![2, 3], DType::F32);
+let weight_port = graph.named_tensor("weight", vec![3, 4], DType::F32);
+let output = luminal_nn::linear(input, weight_port, None);
+let checkpoint_source = graph.input_source(weight_port.id, DType::F16);
+// Bind F16 bytes to checkpoint_source.id; weight_port and output remain F32.
+```
+
+Neither `linear` nor `matmul` casts operands implicitly. Inputs, weights, and
+biases must agree in dtype before invoking `linear`.
 
 The full model definitions correspond to these mini families:
 

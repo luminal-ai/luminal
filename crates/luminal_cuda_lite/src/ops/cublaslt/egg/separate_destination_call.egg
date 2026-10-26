@@ -1,0 +1,12 @@
+; Independent C and D storage. No permission to alias an input with D.
+(rule
+  ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor ?C_matrix_argument
+     ?bias_argument ?D_matrix_descriptor ?input_tensors ?expression_frame)
+   (= ?D_matrix_descriptor
+     (CublasLtMatrixDescriptorOf ?D_layout_tensor ?D_storage_data_type ?D_matrix_order ?m ?n
+       ?D_LeadingDimension)))
+  ((union (LayoutTensorOpLit ?input_tensors (LayoutTensorCons ?D_layout_tensor (LayoutTensorNil)))
+     (LayoutTensorOpCublasLtCall ?configuration ?A_matrix_descriptor ?B_matrix_descriptor ?C_matrix_argument
+       ?bias_argument ?D_matrix_descriptor ?input_tensors ?expression_frame)))
+  :ruleset backend
+  :name "cublaslt: emit approved separate destination call")

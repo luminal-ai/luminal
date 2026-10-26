@@ -1,5 +1,6 @@
 use luminal::prelude::*;
-use model_zoo::model_support::{Namespace, named_kv_cache_pool};
+use model_zoo::namespace::{Namespace, named_kv_cache_pool};
+
 use model_zoo::qwen3_moe::{Qwen3Moe, Qwen3MoeDims};
 
 fn static_dims(tensor: GraphTensor) -> Vec<usize> {

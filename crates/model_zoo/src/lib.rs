@@ -5,7 +5,7 @@
 
 pub mod checkpoint_layout;
 pub mod mini;
-pub mod model_support;
+pub mod namespace;
 
 pub mod flux2;
 pub mod gemma3;

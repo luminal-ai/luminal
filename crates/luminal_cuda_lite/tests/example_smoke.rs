@@ -34,9 +34,9 @@ fn conv_example_graph_searches_with_zero_refusals() {
     let out = model.forward(x);
     let pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (x.id, weights(25, 1).into()),
-        (model.conv1.weight.id, weights(18, 2).into()),
-        (model.conv2.weight.id, weights(54, 3).into()),
-        (model.head.weight.id, weights(6, 4).into()),
+        (model.conv1_weight.id, weights(18, 2).into()),
+        (model.conv2_weight.id, weights(54, 3).into()),
+        (model.head_weight.id, weights(6, 4).into()),
     ];
     let data: FxHashMap<NodeIndex, HostBuffer> = pairs.iter().cloned().collect();
 

@@ -132,7 +132,8 @@ pub fn buffer_lifetimes<L: PlanLayout>(
         let ids: Vec<_> = match &plan.dag[node] {
             BufferNode::BufferInput { slots } => slots.iter().map(|s| &s.buffer).collect(),
             BufferNode::Compute { reads, writes, .. } => reads.iter().chain(writes).collect(),
-            BufferNode::BufferCopy { src, dst } => vec![src, dst],
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. } => vec![src, dst],
             BufferNode::BufferOutput { slots } => slots.iter().map(|s| &s.buffer).collect(),
         };
         for id in ids {
@@ -631,7 +632,8 @@ pub fn plan_external_over<L: PlanLayout>(
         }
         let touched: Vec<&BufferId> = match op {
             BufferNode::Compute { reads, writes, .. } => reads.iter().chain(writes).collect(),
-            BufferNode::BufferCopy { src, dst } => vec![src, dst],
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. } => vec![src, dst],
             BufferNode::BufferOutput { slots } => {
                 for slot in slots {
                     ensure!(
@@ -692,7 +694,8 @@ pub fn plan_external_over<L: PlanLayout>(
                             touch(id, at, &mut intervals)?;
                         }
                     }
-                    BufferNode::BufferCopy { src, dst } => {
+                    BufferNode::BufferCopy { src, dst, .. }
+                    | BufferNode::BufferCopyValue { src, dst, .. } => {
                         touch(src, at, &mut intervals)?;
                         touch(dst, at, &mut intervals)?;
                     }
@@ -940,7 +943,8 @@ mod tests {
                     !matches!(op.label(), "BufferAlloc" | "BufferFree")
                         && (reads.contains(buffer) || writes.contains(buffer))
                 }
-                BufferNode::BufferCopy { src, dst } => src == buffer || dst == buffer,
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. } => src == buffer || dst == buffer,
                 BufferNode::BufferInput { slots } => slots.iter().any(|s| &s.buffer == buffer),
                 BufferNode::BufferOutput { slots } => slots.iter().any(|s| &s.buffer == buffer),
             })
@@ -1110,7 +1114,10 @@ mod tests {
                             BufferNode::Compute { reads, writes, .. } => {
                                 reads.contains(id) || writes.contains(id)
                             }
-                            BufferNode::BufferCopy { src, dst } => src == id || dst == id,
+                            BufferNode::BufferCopy { src, dst, .. }
+                            | BufferNode::BufferCopyValue { src, dst, .. } => {
+                                src == id || dst == id
+                            }
                             _ => false,
                         },
                     };

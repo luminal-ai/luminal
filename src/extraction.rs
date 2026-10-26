@@ -78,13 +78,6 @@ struct Extractor<'a> {
     /// cleared by `extract_with_genome` — measured 2026-08-06: re-parsing
     /// per genome was 98% of a 378s MLP search (5.8s × 64 genomes).
     op_cache: std::cell::RefCell<HashMap<NodeId, Box<dyn LayoutIrOp>>>,
-    /// GENOME-INDEPENDENT dtype index (typed-buffers landing A,
-    /// 2026-08-11): serialized `dtype-of` rows, scanned once —
-    /// LogicalTensor class → the plan dtype. Same row encoding as the
-    /// bounds index (op = function name, children[0] = the argument
-    /// node, the row's own eclass holds the value member); pinned by
-    /// `dtype_index_reads_serialized_rows` in test_support.
-    dtype_index: std::cell::RefCell<Option<HashMap<ClassId, crate::dtype::PlanDtype>>>,
     /// GENOME-INDEPENDENT boundary-declaration indexes: the serialized
     /// `buffer-access-of` / `buffer-freed-by` rows, scanned once —
     /// BufferId class → the declared permission / free responsibility.
@@ -1007,7 +1000,6 @@ impl<'a> Extractor<'a> {
             blocked: HashMap::new(),
             no_candidates: Vec::new(),
             op_cache: Default::default(),
-            dtype_index: Default::default(),
             buffer_access_index: Default::default(),
             buffer_freed_by_index: Default::default(),
             stable_key_cache: Default::default(),
@@ -1858,57 +1850,7 @@ impl<'a> Extractor<'a> {
         &self,
         read: impl FnOnce(&HashMap<ClassId, crate::dtype::PlanDtype>) -> R,
     ) -> R {
-        let mut slot = self.dtype_index.borrow_mut();
-        if slot.is_none() {
-            let mut index: HashMap<ClassId, crate::dtype::PlanDtype> = HashMap::new();
-            for node in self.egraph.nodes.values() {
-                if node.op != "dtype-of" {
-                    continue;
-                }
-                let Some(arg) = node
-                    .children
-                    .first()
-                    .and_then(|id| self.egraph.nodes.get(id))
-                else {
-                    continue;
-                };
-                let Some(dtype) = self.plan_dtype_value(&node.eclass) else {
-                    continue;
-                };
-                match index.entry(arg.eclass.clone()) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(dtype);
-                    }
-                    std::collections::hash_map::Entry::Occupied(entry) => {
-                        assert!(
-                            *entry.get() == dtype,
-                            "dtype-of divergence for class {}: {:?} vs {:?} \
-                             (the :no-merge tripwire should have caught this \
-                             at saturation)",
-                            arg.eclass,
-                            entry.get(),
-                            dtype
-                        );
-                    }
-                }
-            }
-            *slot = Some(index);
-        }
-        read(slot.as_ref().expect("dtype index just built"))
-    }
-
-    /// A `Dtype` class: the childless member whose op is one of the
-    /// egglog dtype spellings.
-    fn plan_dtype_value(&self, class: &ClassId) -> Option<crate::dtype::PlanDtype> {
-        for node_id in self.class_nodes.get(class)? {
-            let node = self.egraph.nodes.get(node_id)?;
-            if node.children.is_empty()
-                && let Some(dtype) = crate::dtype::PlanDtype::from_egglog_name(&node.op)
-            {
-                return Some(dtype);
-            }
-        }
-        None
+        self.site_index.with_dtype_index(self.egraph, read)
     }
 
     fn logical_name_from_layout_tensor(&self, class: &ClassId) -> Option<String> {

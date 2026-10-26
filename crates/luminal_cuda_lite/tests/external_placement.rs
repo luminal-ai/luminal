@@ -214,7 +214,7 @@ fn an_external_output_may_be_a_view_of_an_escape_cell() {
             .expect("the search installed a plan")
             .dag
             .node_weights()
-            .any(|node| matches!(node, BufferNode::Compute { op, .. } if op.label() == "CublasLt")),
+            .any(|node| matches!(node, BufferNode::Compute { op, .. } if op.label() == "CublasLtCall")),
         "the cuBLASLt estate is what makes this output a view"
     );
 }

@@ -252,6 +252,7 @@ pub fn main() -> Result<()> {
                 BufferNode::BufferInput { .. } => "BufferInput",
                 BufferNode::BufferOutput { .. } => "BufferOutput",
                 BufferNode::BufferCopy { .. } => "BufferCopy",
+                BufferNode::BufferCopyValue { .. } => "BufferCopyValue",
             };
             *counts.entry(label.to_owned()).or_default() += 1;
         }

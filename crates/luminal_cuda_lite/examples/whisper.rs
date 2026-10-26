@@ -20,7 +20,8 @@ fn main() {
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
     use luminal::prelude::*;
-    use model_zoo::model_support::{Namespace, named_kv_cache_pool};
+    use model_zoo::namespace::{Namespace, named_kv_cache_pool};
+
     use model_zoo::whisper::{Whisper, WhisperDims};
 
     let dims = WhisperDims::whisper_tiny_en();

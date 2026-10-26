@@ -1,0 +1,10 @@
+(datatype ElementStride
+  (ElementStrideAny)
+  (ElementStrideExact IntExpr))
+(datatype ElementStrideList
+  (ElementStrideNil)
+  (ElementStrideCons ElementStride ElementStrideList))
+(constructor ElementStridedLayoutLit (Shape ElementStrideList BitWidth) Layout)
+; Constructor constants in premises are lookups, so seed both explicitly.
+(ElementStrideAny)
+(ElementStrideExact (IntLit 1))

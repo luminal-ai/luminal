@@ -6,6 +6,12 @@ rust-version = "1.91"
 description = "Deep learning at the speed of light."
 license = "MIT OR Apache-2.0"
 
+[features]
+# Compatibility no-op; ElementStride primitives are registered by default.
+experimental-stride-primitive = []
+# Compatibility feature: ElementStride layouts and proofs are now always available.
+experimental-element-stride = []
+
 [dependencies]
 once_cell = "1.21"
 itertools = "0.11.0"

@@ -52,9 +52,11 @@ not execute remote model code or supply replacement weights. Prefer a local,
 immutable snapshot for validation. F32, F16, and BF16 checkpoints are supported.
 By default parameter storage follows `config.json`'s `torch_dtype`; use
 `--weight-dtype bf16` to store every supported model's weights in BF16 (or
-`f16`/`f32` to select those modes). In BF16 mode, linear layers use BF16
-activations and weights with FP32 outputs; residual, normalization, KV state,
-RoPE, and sampling paths remain FP32. Quantized/FP8 checkpoints are unsupported.
+`f16`/`f32` to select those modes). Model arithmetic, activations, residuals,
+normalization, KV state, RoPE, and sampling remain F32. After building the model,
+the application attaches weight sources in the selected storage dtype through
+explicit casts to the model's F32 weight ports. `--weight-dtype` does not change
+compute precision. Quantized/FP8 checkpoints are unsupported.
 
 ## Model selection
 

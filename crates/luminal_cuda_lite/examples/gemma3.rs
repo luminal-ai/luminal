@@ -22,7 +22,7 @@ fn run() -> anyhow::Result<()> {
     use luminal::prelude::*;
     use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};
     use model_zoo::gemma3::{Gemma3, Gemma3Dims};
-    use model_zoo::model_support::{Namespace, named_kv_cache_pool};
+    use model_zoo::namespace::{Namespace, named_kv_cache_pool};
 
     const SLOTS: usize = 4;
     let dims = Gemma3Dims::gemma3_4b();

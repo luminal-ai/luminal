@@ -1,0 +1,19 @@
+; A pure index view only chooses which element to read. Casting that element
+; before or after the view has the same value and rounding behavior. Keep the
+; cast itself, including its target dtype, and never move it through arithmetic.
+(rule
+  (
+    (= ?view (LogicalIndexMapApply ?cast ?map ?output_shape))
+    (= ?cast (LogicalCast ?input ?target_dtype))
+    (= ?input_shape (shape-of ?input))
+    (= ?input_shape (shape-of ?cast))
+  )
+  (
+    (union ?view
+      (LogicalCast
+        (LogicalIndexMapApply ?input ?map ?output_shape)
+        ?target_dtype))
+  )
+  :ruleset main_ruleset
+  :name "cast/rewrite_view: pure index views commute with an explicit cast"
+)

@@ -105,9 +105,7 @@ pub fn assert_compute_strictness() -> Result<()> {
 /// COL-major under a row-major disclosure), and hardcoding ROW here
 /// while the plan elected a left-major destination was the Option-B
 /// destination-frame regression. The order is DATA on the descriptor
-/// (see `exec.rs`'s ROW CONVENTION for A/B and
-/// `exec::bind_destination` for C/D) precisely so this site cannot
-/// hold an opinion of its own.
+/// selected by the complete egglog proof for every matrix.
 struct Layout {
     raw: sys::cublasLtMatrixLayout_t,
 }
@@ -178,16 +176,11 @@ pub fn prepare(
     dest: DeviceRange,
     workspace: DeviceRange,
 ) -> Result<PreparedCall> {
-    // BIAS/ORDER TRIPWIRE, DEFENSE IN DEPTH (ruling 2026-09-01): a
-    // planned bias form arrives with a COL D — the estate's bias
-    // decorators require a LeftMajor D and `exec::bind_destination`
-    // already ran this check. A hand-built bias call with a ROW D is
-    // the one way to reach this line with the wrong order; refuse it
-    // BEFORE any library call with the measured finding (the library
-    // rejects BIAS/RELU_BIAS on a ROW-order D).
+    // Vendor behavior is checked for direct descriptor calls too. The
+    // production whitelist already requires column order for bias.
     super::exec::assert_bias_destination_order(call, "dispatch")?;
     // Pre-dispatch bounds gate (contract 4) — LOUD, before any library
-    // call, byte counts converted to f32 element counts.
+    // call, byte counts converted using each operand's declared dtype.
     let mut elems = Vec::with_capacity(operands.len());
     for (index, range) in operands.iter().enumerate() {
         let dtype = match index {

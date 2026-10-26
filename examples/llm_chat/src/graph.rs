@@ -7,7 +7,7 @@ use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};
 use model_zoo::{
     gemma3::{Gemma3, Gemma3Dims},
     llama3::{Llama3, Llama3Dims},
-    model_support::{Namespace, named_heterogeneous_kv_cache_pool},
+    namespace::{Namespace, named_heterogeneous_kv_cache_pool},
     qwen3::{Qwen, QwenDims},
     qwen3_moe::{Qwen3Moe, Qwen3MoeDims},
 };
@@ -363,7 +363,7 @@ impl LlmGraph {
     ) -> Result<Self> {
         ensure!(
             matches!(weight_dtype, DType::F32 | DType::F16 | DType::Bf16),
-            "chat supports F32, F16, and BF16 model precision"
+            "chat supports F32, F16, and BF16 weight-source storage"
         );
         ensure!(
             capacity > 0
@@ -425,37 +425,32 @@ impl LlmGraph {
         );
         let r = &ropes[0];
         let (logits, caches) = match config {
-            ModelConfig::Llama3(d) => Llama3::init_with_parameter_dtype(&mut cx, &d, weight_dtype)
-                .forward(
-                    tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
-                ),
-            ModelConfig::Qwen3(d) => Qwen::init_with_parameter_dtype(&mut cx, &d, weight_dtype)
-                .forward(
-                    tokens,
-                    positions,
-                    r.cos,
-                    r.sin,
-                    r.rot,
-                    &pool.layers,
-                    gather,
-                    scatter,
-                ),
-            ModelConfig::Gemma3(d) => Gemma3::init_with_parameter_dtype(&mut cx, &d, weight_dtype)
-                .forward(
-                    tokens,
-                    positions,
-                    (r.cos, r.sin),
-                    (ropes[1].cos, ropes[1].sin),
-                    r.rot,
-                    &pool,
-                    gather,
-                    scatter,
-                ),
-            ModelConfig::Qwen3Moe(d) => {
-                Qwen3Moe::init_with_parameter_dtype(&mut cx, &d, weight_dtype).forward(
-                    tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
-                )
-            }
+            ModelConfig::Llama3(d) => Llama3::init(&mut cx, &d).forward(
+                tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
+            ),
+            ModelConfig::Qwen3(d) => Qwen::init(&mut cx, &d).forward(
+                tokens,
+                positions,
+                r.cos,
+                r.sin,
+                r.rot,
+                &pool.layers,
+                gather,
+                scatter,
+            ),
+            ModelConfig::Gemma3(d) => Gemma3::init(&mut cx, &d).forward(
+                tokens,
+                positions,
+                (r.cos, r.sin),
+                (ropes[1].cos, ropes[1].sin),
+                r.rot,
+                &pool,
+                gather,
+                scatter,
+            ),
+            ModelConfig::Qwen3Moe(d) => Qwen3Moe::init(&mut cx, &d).forward(
+                tokens, positions, r.cos, r.sin, r.rot, &pool, gather, scatter,
+            ),
         };
         let logits = luminal_nn::gather_rows(logits, last).cast(DType::F32).id;
         let state: Vec<_> = pool
@@ -483,6 +478,17 @@ impl LlmGraph {
         let mut app_inputs = vec![tokens.id, positions.id, gather.id, scatter.id, last.id];
         app_inputs.extend(state.iter().map(|s| s.input));
         app_inputs.extend(ropes.iter().flat_map(|r| [r.cos.id, r.sin.id, r.rot.id]));
+        // Model arithmetic is authored independently of checkpoint storage.
+        // Adapt only weight ports, before compilation, using visible cast nodes.
+        let weight_ports: Vec<_> = cx
+            .logical
+            .input_specs()
+            .into_iter()
+            .filter(|port| !app_inputs.contains(&port.id))
+            .collect();
+        for port in weight_ports {
+            cx.input_source(port.id, weight_dtype);
+        }
         let parameters = cx
             .logical
             .input_specs()
@@ -648,21 +654,34 @@ mod tests {
 
     #[test]
     fn native_weight_storage_keeps_explicit_f32_compute_inputs() {
-        for config in [
-            ModelConfig::Llama3(Llama3Dims::tiny()),
-            ModelConfig::Qwen3(QwenDims::tiny()),
-            ModelConfig::Gemma3(Gemma3Dims::tiny()),
-            ModelConfig::Qwen3Moe(tiny_qwen3_moe()),
-        ] {
-            let graph = LlmGraph::build_with_parameter_dtype(config, DType::Bf16, 8, 2).unwrap();
-            assert!(graph.parameters.iter().all(|p| p.dtype == DType::Bf16));
-            assert!(graph.state.iter().all(|s| s.dtype == DType::F32));
-            assert!(
-                graph
-                    .initial_inputs()
-                    .values()
-                    .all(|value| matches!(value, TensorData::F32(_)))
-            );
+        for source_dtype in [DType::F16, DType::Bf16] {
+            for config in [
+                ModelConfig::Llama3(Llama3Dims::tiny()),
+                ModelConfig::Qwen3(QwenDims::tiny()),
+                ModelConfig::Gemma3(Gemma3Dims::tiny()),
+                ModelConfig::Qwen3Moe(tiny_qwen3_moe()),
+            ] {
+                let graph =
+                    LlmGraph::build_with_parameter_dtype(config, source_dtype, 8, 2).unwrap();
+                assert!(graph.parameters.iter().all(|p| p.dtype == source_dtype));
+                // Narrow sources must never dictate a layer's arithmetic precision.
+                for node in graph.graph.logical.petgraph().node_weights() {
+                    if matches!(node.dtype, DType::F16 | DType::Bf16) {
+                        assert!(
+                            matches!(node.op, luminal::graph::LogicalOp::Input { .. }),
+                            "narrow storage leaked into model arithmetic: {:?}",
+                            node.op
+                        );
+                    }
+                }
+                assert!(graph.state.iter().all(|s| s.dtype == DType::F32));
+                assert!(
+                    graph
+                        .initial_inputs()
+                        .values()
+                        .all(|value| matches!(value, TensorData::F32(_)))
+                );
+            }
         }
     }
 

@@ -231,9 +231,11 @@ fn a_familiar_label_without_cuda_traits_is_not_claimed() {
 
 #[test]
 fn all_cublaslt_dps_forms_keep_the_host_interface_when_cloned() {
-    use luminal_cuda_lite::ops::cublaslt::{CublasLt, CublasLtForm};
+    use luminal_cuda_lite::ops::cublaslt::{CublasLtForm, approved::ApprovedCublasLt};
     for form in CublasLtForm::ALL {
-        let functional = CublasLt { form, spec: None };
+        let mut functional = ApprovedCublasLt::prototype();
+        functional.c = form.has_c().then(|| functional.d.clone());
+        functional.bias = form.has_bias().then(|| "bias".into());
         let dps = functional.to_dps().unwrap();
         let cloned = dps.clone_bt_box();
         let host = as_host_op(cloned.as_ref()).expect("cuBLASLt DPS implements HostOp");

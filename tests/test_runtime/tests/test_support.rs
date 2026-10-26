@@ -84,7 +84,7 @@ mod harness_tests {
         }
         assert!(matches!(
             &plan.dag[edge.target()],
-            BufferNode::BufferCopy { .. }
+            BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
         ));
     }
 
@@ -142,11 +142,15 @@ mod harness_tests {
         // Direction: the copy READING B (the B->C pass-onward) must run before
         // the copy WRITING B (the alloc->B overwrite).
         match &plan.dag[edge.source()] {
-            BufferNode::BufferCopy { src, .. } => assert_eq!(src, &plan.value_buffer[&x]),
+            BufferNode::BufferCopy { src, .. } | BufferNode::BufferCopyValue { src, .. } => {
+                assert_eq!(src, &plan.value_buffer[&x])
+            }
             other => panic!("anti source should be the B-reading copy, got {other:?}"),
         }
         match &plan.dag[edge.target()] {
-            BufferNode::BufferCopy { dst, .. } => assert_eq!(dst, &plan.value_buffer[&x]),
+            BufferNode::BufferCopy { dst, .. } | BufferNode::BufferCopyValue { dst, .. } => {
+                assert_eq!(dst, &plan.value_buffer[&x])
+            }
             other => panic!("anti target should be the B-writing copy, got {other:?}"),
         }
     }
@@ -235,10 +239,16 @@ mod harness_tests {
         let copy_edge = plan
             .dag
             .edges_directed(acc_idx, petgraph::Direction::Incoming)
-            .find(|e| matches!(&plan.dag[e.source()], BufferNode::BufferCopy { .. }))
+            .find(|e| {
+                matches!(
+                    &plan.dag[e.source()],
+                    BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+                )
+            })
             .expect("copy feeds the accumulator");
         match &plan.dag[copy_edge.source()] {
-            BufferNode::BufferCopy { src, dst, .. } => {
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. } => {
                 assert_eq!(src, &plan.value_buffer[&x]);
                 assert_eq!(dst, &acc_writes[0]);
             }
@@ -311,7 +321,7 @@ mod harness_tests {
             .dag
             .node_indices()
             .filter(|&idx| {
-                matches!(&plan.dag[idx], BufferNode::BufferCopy { dst, .. } if dst == &writes[0])
+                matches!(&plan.dag[idx], BufferNode::BufferCopy { dst, .. } | BufferNode::BufferCopyValue { dst, .. } if dst == &writes[0])
             })
             .count();
         assert_eq!(copies_into_target, 0, "{}", plan.summary());
@@ -370,7 +380,12 @@ mod harness_tests {
         let copies = plan
             .dag
             .node_indices()
-            .filter(|&idx| matches!(&plan.dag[idx], BufferNode::BufferCopy { .. }))
+            .filter(|&idx| {
+                matches!(
+                    &plan.dag[idx],
+                    BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+                )
+            })
             .count();
         assert_eq!(copies, 0, "zero copies:\n{}", plan.summary());
     }
@@ -407,7 +422,8 @@ mod harness_tests {
             .dag
             .node_indices()
             .filter_map(|idx| match &plan.dag[idx] {
-                BufferNode::BufferCopy { src, dst, .. } => Some((src, dst)),
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. } => Some((src, dst)),
                 _ => None,
             })
             .collect();
@@ -471,7 +487,7 @@ mod harness_tests {
             .dag
             .node_indices()
             .filter(|&idx| {
-                matches!(&plan.dag[idx], BufferNode::BufferCopy { dst, .. }
+                matches!(&plan.dag[idx], BufferNode::BufferCopy { dst, .. } | BufferNode::BufferCopyValue { dst, .. }
                     if dst == &plan.value_buffer[&x])
             })
             .count();
@@ -1139,9 +1155,10 @@ mod harness_tests {
                 .all(|id| matches!(id, BufferId::Boundary(_)))
         );
         assert!(
-            plan.dag
-                .node_indices()
-                .all(|idx| !matches!(&plan.dag[idx], BufferNode::BufferCopy { .. })),
+            plan.dag.node_indices().all(|idx| !matches!(
+                &plan.dag[idx],
+                BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+            )),
             "pass-through needs no copy:\n{}",
             plan.summary()
         );
@@ -1204,7 +1221,9 @@ mod harness_tests {
         let mut frees = 0;
         for idx in plan.dag.node_indices() {
             match &plan.dag[idx] {
-                BufferNode::BufferCopy { .. } => panic!("no copies:\n{}", plan.summary()),
+                BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. } => {
+                    panic!("no copies:\n{}", plan.summary())
+                }
                 BufferNode::Compute { op, reads, .. } if op.label() == "BufferFree" => {
                     frees += 1;
                     assert_eq!(

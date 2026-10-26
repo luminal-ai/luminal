@@ -1,6 +1,8 @@
 //! Numerical and resource-lifetime regressions for graph-only dynamic execution.
 #![cfg(feature = "device")]
 mod support;
+#[path = "support/whitelist.rs"]
+mod whitelist;
 use luminal::{dtype::DType, graph::Graph, shape::IntExpr};
 use luminal_cuda_lite::{CudaRuntime, harness_search_options};
 #[cfg(feature = "device")]
@@ -452,25 +454,13 @@ fn all_bounded_dimensions_stay_symbolic() {
 }
 
 #[test]
-fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
+fn dynamic_cublas_bias_uses_elected_symbolic_descriptors() {
     let mut g = Graph::new();
     let a = g.tensor(vec![IntExpr::from('m'), 4.into()], DType::F32);
     let b = g.tensor(vec![IntExpr::from(4), 'n'.into()], DType::F32);
     let bias = g.tensor(vec!['n'], DType::F32);
     let out = (a.matmul(b) + bias.expand_dim(0, 'm')).relu();
-    let mut rt = CudaRuntime::load_with_registry(
-        &g,
-        luminal_cuda_lite::cuda_registry_filtered(|row| {
-            // Exercise the bias epilogue regardless of profiling noise. The
-            // Accumulate form can also add a materialized broadcast bias, but
-            // that valid alternative does not exercise the bias binding.
-            !matches!(
-                row.label(),
-                "ReduceSumGeneric" | "AddFunctionalGeneric" | "CublasLtAccumulate"
-            )
-        }),
-    )
-    .unwrap();
+    let mut rt = CudaRuntime::load_with_registry(&g, whitelist::bias_registry()).unwrap();
 
     let mut options = harness_search_options();
     options.generations = 12;
@@ -487,7 +477,7 @@ fn dynamic_cublas_bias_epilogue_rebinds_geometry() {
     let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
     let mut staging_arena_rt = rt.allocate_staging().expect("allocate execution arena");
     let before = rt.graph_stats().unwrap();
-    assert!(rt.plan().unwrap().dag.node_weights().any(|node|matches!(node,luminal::bufferize::BufferNode::Compute{op,..} if luminal_cuda_lite::as_host_op(op.as_ref()).is_some()&&op.label().contains("Bias"))));
+    assert!(rt.plan().unwrap().dag.node_weights().any(|node|matches!(node,luminal::bufferize::BufferNode::Compute{op,..} if luminal_cuda_lite::as_host_op(op.as_ref()).is_some()&&op.as_any().downcast_ref::<luminal_cuda_lite::ops::cublaslt::approved::ApprovedCublasLt>().is_some_and(|call| call.bias.is_some()))));
     for (m, n) in [(2, 3), (9, 7), (4, 9), (2, 3)] {
         let av: Vec<_> = (0..m * 4).map(|i| (i % 5) as f32 - 2.).collect();
         let bv: Vec<_> = (0..4 * n).map(|i| (i % 7) as f32 * 0.25 - 0.5).collect();

@@ -74,6 +74,22 @@ impl BoundaryLayout {
             }
         })
     }
+    /// The declaration supplies the whole coefficient list before index
+    /// simplification can erase singleton factors. This is a shape-owned
+    /// equality certificate, not recovery from an arbitrary e-class spelling.
+    fn stride_certificate(&self, layout: &str, shape: &str, width: &str) -> Result<String, String> {
+        let Self::Strided { strides } = self else {
+            return Ok(String::new());
+        };
+        let mut list = "(ElementStrideNil)".to_string();
+        for stride in strides.iter().rev() {
+            let value = LogicalGraph::dim_term(stride)?;
+            list = format!("(ElementStrideCons (ElementStrideExact {value}) {list})");
+        }
+        Ok(format!(
+            "(union {layout} (ElementStridedLayoutLit {shape} {list} {width}))\n"
+        ))
+    }
 }
 
 /// A stride's value where the caller stated a literal one; `None` for a
@@ -518,6 +534,11 @@ impl CudaBindings {
                 bound.layout.term(&shape, &width)?,
                 bound.buffer
             ));
+            prefix.push_str(&bound.layout.stride_certificate(
+                &format!("{stem}_layout"),
+                &shape,
+                &width,
+            )?);
             input_tensors.push(format!("{stem}_buffer_tensor"));
             let_names.insert(bound.value, logical);
         }
@@ -556,6 +577,11 @@ impl CudaBindings {
                 bound.layout.term(&shape, &width)?,
                 bound.buffer
             ));
+            prefix.push_str(&bound.layout.stride_certificate(
+                &format!("{stem}_layout"),
+                &shape,
+                &width,
+            )?);
             output_tensors.push(format!("{stem}_buffer_tensor"));
             let_names.entry(bound.value).or_insert(value_name);
         }

@@ -38,6 +38,15 @@ mod tests {
     use luminal_reference::ReferenceRuntime;
     use rustc_hash::FxHashMap;
 
+    #[test]
+    #[should_panic(expected = "linear input/weight dtype mismatch")]
+    fn linear_requires_explicit_weight_conversion() {
+        let mut graph = Graph::new();
+        let input = graph.tensor(vec![2, 3], DType::F32);
+        let weight = graph.tensor(vec![3, 4], DType::F16);
+        linear(input, weight, None);
+    }
+
     fn assert_close(ours: &[f32], expected: &[f32]) {
         assert_eq!(ours.len(), expected.len(), "length mismatch");
         for (index, (a, b)) in ours.iter().zip(expected).enumerate() {

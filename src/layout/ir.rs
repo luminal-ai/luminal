@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use egraph_serialize::{ClassId, NodeId};
-use once_cell::unsync::Lazy;
+use once_cell::{sync::OnceCell, unsync::Lazy};
 use petgraph::graph::{DiGraph, NodeIndex};
 
 // =============================================================================
@@ -239,18 +239,19 @@ impl Clone for Box<dyn LayoutIrOp> {
 // extractor resolves candidates by looking the enode's constructor name up in
 // a registry built from that list.
 
-/// The two lookups the SERIALIZED e-graph does not carry, built once per
+/// The lookups the SERIALIZED e-graph does not carry, built once per
 /// extraction session and handed to every [`ExtractionSite`]:
 ///
 ///  * BY CLASS — every e-node of an e-class, the inverse of
 ///    [`egraph_serialize::Node::eclass`].
 ///  * BY OP — every e-node spelling a given constructor.
+///  * DTYPE — authoritative `dtype-of` facts, shared by extraction and matchers.
 ///
 /// Each was a scan of the whole e-graph filtered by `eclass ==` or by
 /// `op ==`, so a reader's cost grew with the model rather than with the
 /// class it read.
 ///
-/// BOTH LOOKUPS GO DOWNWARD — from a class to its spellings, or from a
+/// Constructor lookups GO DOWNWARD — from a class to its spellings, or from a
 /// constructor name to its enodes. There is no index from a child to its
 /// parents, because a matcher reads its own enode and the classes below
 /// it and never finds a constructor by one of its arguments.
@@ -259,13 +260,14 @@ impl Clone for Box<dyn LayoutIrOp> {
 /// spellings and the `"[...]"` elision marker included — so a helper's
 /// "first spelling wins" picks the spelling the e-graph orders first.
 ///
-/// ONE STRUCT, not one per lookup: both maps must describe the SAME
+/// ONE STRUCT, not one per lookup: all maps must describe the SAME
 /// e-graph, since a site resolves in its own `egraph` the ids either
 /// returns.
 #[derive(Debug, Clone, Default)]
 pub struct SerializedIndex {
     by_class: HashMap<ClassId, Vec<NodeId>>,
     by_op: HashMap<String, Vec<NodeId>>,
+    dtype: OnceCell<HashMap<ClassId, crate::dtype::PlanDtype>>,
 }
 
 /// The bucket for `op`, minting it on first sight. Keyed by the op's
@@ -290,7 +292,11 @@ impl SerializedIndex {
                 .push(node_id.clone());
             op_bucket(&mut by_op, &node.op).push(node_id.clone());
         }
-        Self { by_class, by_op }
+        Self {
+            by_class,
+            by_op,
+            dtype: OnceCell::new(),
+        }
     }
 
     /// The class's e-nodes, in e-graph order.
@@ -316,6 +322,55 @@ impl SerializedIndex {
     /// no explicit inputs.
     pub fn nodes_of_op(&self, op: &str) -> &[NodeId] {
         self.by_op.get(op).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// The core's dtype fact index, shared with matchers. Build it once from
+    /// indexed `dtype-of` rows; never search the graph for each candidate.
+    pub(crate) fn with_dtype_index<R>(
+        &self,
+        egraph: &egraph_serialize::EGraph,
+        read: impl FnOnce(&HashMap<ClassId, crate::dtype::PlanDtype>) -> R,
+    ) -> R {
+        let index = self.dtype.get_or_init(|| {
+            let mut index = HashMap::new();
+            // Every `dtype-of` row of a type shares its value class. Decode
+            // that class once, including its divergence check, rather than
+            // revisiting all of its rows for every tensor.
+            let mut dtype_values = HashMap::new();
+            for node_id in self.nodes_of_op("dtype-of") {
+                let row = &egraph.nodes[node_id];
+                let Some(arg) = row.children.first().and_then(|id| egraph.nodes.get(id)) else {
+                    continue;
+                };
+                let dtype = *dtype_values.entry(row.eclass.clone()).or_insert_with(|| {
+                    let mut dtype = None;
+                    for value_id in self.nodes_of(&row.eclass) {
+                        let value = &egraph.nodes[value_id];
+                        if !value.children.is_empty() {
+                            continue;
+                        }
+                        let Some(value) = crate::dtype::PlanDtype::from_egglog_name(&value.op) else {
+                            continue;
+                        };
+                        if let Some(previous) = dtype {
+                            assert_eq!(previous, value, "conflicting dtype values in {}", row.eclass);
+                        }
+                        dtype = Some(value);
+                    }
+                    dtype
+                });
+                let Some(dtype) = dtype else { continue };
+                if let Some(previous) = index.insert(arg.eclass.clone(), dtype) {
+                    assert_eq!(
+                        previous, dtype,
+                        "dtype-of divergence for class {} (the :no-merge tripwire should have caught this at saturation)",
+                        arg.eclass
+                    );
+                }
+            }
+            index
+        });
+        read(index)
     }
 }
 
@@ -344,31 +399,8 @@ impl ExtractionSite<'_> {
         &self,
         logical: &egraph_serialize::ClassId,
     ) -> Option<crate::dtype::PlanDtype> {
-        for node in self
-            .egraph
-            .nodes
-            .values()
-            .filter(|node| node.op == "dtype-of")
-        {
-            let Some(value) = node
-                .children
-                .first()
-                .and_then(|id| self.egraph.nodes.get(id))
-            else {
-                continue;
-            };
-            if &value.eclass != logical {
-                continue;
-            }
-            for dtype_node in self.members(&node.eclass) {
-                if dtype_node.children.is_empty()
-                    && let Some(dtype) = crate::dtype::PlanDtype::from_egglog_name(&dtype_node.op)
-                {
-                    return Some(dtype);
-                }
-            }
-        }
-        None
+        self.index
+            .with_dtype_index(self.egraph, |index| index.get(logical).copied())
     }
 
     /// THE ONE CLASS READ every class helper below is built from: the
@@ -1369,4 +1401,89 @@ pub(crate) fn slot_port(slot: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     format!("p_{sanitized}")
+}
+
+#[cfg(test)]
+mod dtype_tests {
+    use super::*;
+    use crate::dtype::PlanDtype;
+    use egraph_serialize::{EGraph, Node};
+
+    fn node(graph: &mut EGraph, id: &str, op: &str, class: &str, children: &[&str]) {
+        graph.add_node(
+            id,
+            Node {
+                op: op.into(),
+                children: children.iter().map(|id| NodeId::from(*id)).collect(),
+                eclass: ClassId::from(class),
+                cost: egraph_serialize::Cost::new(1.0).unwrap(),
+                subsumed: false,
+            },
+        );
+    }
+
+    #[test]
+    fn dtype_facts_distinguish_equal_width_storage_types() {
+        let mut graph = EGraph::default();
+        for (label, dtype) in [("half", PlanDtype::F16), ("brain", PlanDtype::Bf16)] {
+            node(&mut graph, label, "tensor", label, &[]);
+            let value = format!("{label}_type");
+            let row = format!("{label}_row");
+            node(
+                &mut graph,
+                &value,
+                if dtype == PlanDtype::F16 {
+                    "F16"
+                } else {
+                    "Bf16"
+                },
+                &value,
+                &[],
+            );
+            node(&mut graph, &row, "dtype-of", &value, &[label]);
+        }
+        let index = SerializedIndex::new(&graph);
+        index.with_dtype_index(&graph, |facts| {
+            assert_eq!(facts.get(&ClassId::from("half")), Some(&PlanDtype::F16));
+            assert_eq!(facts.get(&ClassId::from("brain")), Some(&PlanDtype::Bf16));
+        });
+        let site = ExtractionSite {
+            egraph: &graph,
+            node_id: graph.nodes.get_index(0).unwrap().0,
+            node: graph.nodes.get_index(0).unwrap().1,
+            index: &index,
+        };
+        assert_eq!(
+            site.logical_dtype(&ClassId::from("half")),
+            Some(PlanDtype::F16)
+        );
+        assert_eq!(
+            site.logical_dtype(&ClassId::from("brain")),
+            Some(PlanDtype::Bf16)
+        );
+        assert_eq!(site.logical_dtype(&ClassId::from("missing")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "dtype-of divergence")]
+    fn conflicting_dtype_rows_refuse_instead_of_picking_one() {
+        let mut graph = EGraph::default();
+        node(&mut graph, "tensor", "tensor", "logical", &[]);
+        node(&mut graph, "f32", "F32", "f32", &[]);
+        node(&mut graph, "bf16", "Bf16", "bf16", &[]);
+        node(&mut graph, "row1", "dtype-of", "f32", &["tensor"]);
+        node(&mut graph, "row2", "dtype-of", "bf16", &["tensor"]);
+        SerializedIndex::new(&graph).with_dtype_index(&graph, |_| ());
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting dtype values")]
+    fn conflicting_dtype_spellings_refuse_instead_of_picking_one() {
+        let mut graph = EGraph::default();
+        node(&mut graph, "tensor", "tensor", "logical", &[]);
+        node(&mut graph, "f32", "F32", "welded", &[]);
+        node(&mut graph, "bf16", "Bf16", "welded", &[]);
+        node(&mut graph, "row", "dtype-of", "welded", &["tensor"]);
+        SerializedIndex::new(&graph).with_dtype_index(&graph, |_| ());
+    }
 }

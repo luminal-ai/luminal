@@ -4,7 +4,7 @@
 
 use luminal::prelude::*;
 use luminal_training::Backward;
-use model_zoo::model_support;
+use model_zoo::namespace;
 
 const EPS: f32 = 1e-2;
 const TOL: f32 = 2e-2;
@@ -437,27 +437,20 @@ fn grad_unfold_windows() {
 }
 
 /// Finite-difference check of the weight gradient through luminal_nn's
-/// unfold-based ConvND (standalone: ConvND owns its weight tensor, so the
-/// shared harness can't inject it as a parameter).
+/// unfold-based conv_nd, with an explicitly supplied weight tensor.
 #[test]
 fn grad_convnd_weight() {
     let mut cx = Graph::new();
     let x = cx.tensor(vec![1, 1, 3, 3], DType::F32);
-    let conv = model_support::ConvND::new(
-        1,
-        2,
-        vec![2, 2],
-        vec![1, 1],
-        vec![1, 1],
-        vec![0, 0],
-        false,
+    let weight = cx.named_tensor(
+        namespace::Namespace::root().child("conv").leaf("weight"),
+        vec![2, 4],
         DType::F32,
-        &model_support::Namespace::root().child("conv"),
-        &mut cx,
     );
-    let out = conv.forward(x); // (1,2,2,2)
+    let config = luminal_nn::ConvNdConfig::new([2, 2], [1, 1], [1, 1], [0, 0]);
+    let out = luminal_nn::conv_nd(x, weight, None, &config); // (1,2,2,2)
     let loss = (out * out).sum(vec![0, 1, 2, 3]);
-    let grads = cx.backward(loss, &[conv.weight]);
+    let grads = cx.backward(loss, &[weight]);
     let (loss_out, grad_out) = (loss.output(), grads[0].output());
     cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
     let mut rt = cx.search(
@@ -468,7 +461,7 @@ fn grad_convnd_weight() {
     let w_data = seq(8, -0.5, 0.5);
     let run = |rt: &mut ReferenceRuntime, w: &[f32]| -> f32 {
         rt.set_data(x.id, x_data.clone());
-        rt.set_data(conv.weight.id, w.to_vec());
+        rt.set_data(weight.id, w.to_vec());
         rt.execute(&cx.dyn_map);
         rt.get_f32(loss_out.id)[0]
     };

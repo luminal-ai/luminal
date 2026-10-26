@@ -12,7 +12,10 @@
 
 use luminal::dtype::DType;
 use luminal::prelude::FxHashMap;
-use luminal_cuda_lite::ops::cublaslt::{CublasLt, CublasLtForm, CublasLtMarkerMatcher};
+use luminal_cuda_lite::ops::cublaslt::approved::{
+    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
+};
+
 use luminal_cuda_lite::{
     CudaRuntime, RegisteredOp, cuda_registry, cuda_registry_filtered,
     cuda_registry_without_cublaslt, harness_search_options,
@@ -78,23 +81,15 @@ fn the_presets_are_just_registries() {
             "the default preset dropped {claimed}"
         );
     }
-    for form in CublasLtForm::ALL {
-        assert!(
-            default
-                .active_allow_list()
-                .contains(&form.constructor_name()),
-            "the DEFAULT preset does not claim {} — the marker vocabulary is \
-             on by default (ruling 2026-09-04)",
-            form.constructor_name()
-        );
-        assert!(
-            !decomposed
-                .active_allow_list()
-                .contains(&form.constructor_name()),
-            "`cuda_registry_without_cublaslt` claims {} — that preset is exactly \
-             the one with no marker in it",
-            form.constructor_name()
-        );
+    assert!(default.active_allow_list().contains(&CONSTRUCTOR));
+    assert!(!decomposed.active_allow_list().contains(&CONSTRUCTOR));
+    for name in [
+        "LayoutTensorOpCublasLt",
+        "LayoutTensorOpCublasLtBias",
+        "LayoutTensorOpCublasLtAccumulate",
+        "LayoutTensorOpCublasLtAccumulateBias",
+    ] {
+        assert!(!default.active_allow_list().contains(&name));
     }
 }
 
@@ -164,45 +159,22 @@ fn a_filtered_registry_withholds_the_op_and_the_search_refuses() {
 /// through the prototype's DPS HostOp interface.
 #[test]
 fn a_row_registered_from_outside_joins_the_claim_set() {
-    let (cx, _a, _b) = add_graph();
-
-    // The BASE this row is added to is the decomposed preset: the
-    // default already ships all four marker rows, so adding one there
-    // would be a duplicate, not an outside registration.
+    let (cx, _, _) = add_graph();
     let mut registry = cuda_registry_without_cublaslt();
     registry.push(RegisteredOp::new(
-        Box::new(CublasLtMarkerMatcher {
-            form: CublasLtForm::Base,
-        }),
-        Box::new(CublasLt {
-            form: CublasLtForm::Base,
-            spec: None,
-        }),
+        Box::new(ApprovedCublasLtMatcher),
+        Box::new(ApprovedCublasLt::prototype()),
     ));
-
-    let rt = CudaRuntime::load_with_registry(&cx, registry).expect("load");
-    let default = CudaRuntime::load_with_registry(&cx, cuda_registry_without_cublaslt())
-        .expect("load decomposed");
-
-    assert!(
-        rt.active_allow_list()
-            .contains(&CublasLtForm::Base.constructor_name()),
-        "the hand-registered row is not claimed: {:?}",
-        rt.active_allow_list()
-    );
-    // Exactly one row more than the base, and the other three marker
-    // forms stayed out — the caller chose the vocabulary row by row.
+    let rt = CudaRuntime::load_with_registry(&cx, registry).unwrap();
+    assert!(rt.active_allow_list().contains(&CONSTRUCTOR));
     assert_eq!(
         rt.active_allow_list().len(),
-        default.active_allow_list().len() + 1
+        CudaRuntime::load_with_registry(&cx, cuda_registry_without_cublaslt())
+            .unwrap()
+            .active_allow_list()
+            .len()
+            + 1
     );
-    for form in [
-        CublasLtForm::Bias,
-        CublasLtForm::Accumulate,
-        CublasLtForm::AccumulateBias,
-    ] {
-        assert!(!rt.active_allow_list().contains(&form.constructor_name()));
-    }
 }
 
 /// `RegisteredOp::label` is the house label — the constructor minus the
@@ -234,55 +206,45 @@ fn registry_labels_agree_with_the_prototypes() {
 /// `active_allow_list()` says it is available. `load_with_registry`
 /// refuses that configuration by name.
 #[test]
-fn a_non_base_cublaslt_row_without_base_is_refused_at_load() {
-    let (cx, _a, _b) = add_graph();
-
-    let mut registry = cuda_registry_without_cublaslt();
-    registry.push(RegisteredOp::new(
-        Box::new(CublasLtMarkerMatcher {
-            form: CublasLtForm::Bias,
-        }),
-        Box::new(CublasLt {
-            form: CublasLtForm::Bias,
-            spec: None,
-        }),
-    ));
-    let err = match CudaRuntime::load_with_registry(&cx, registry) {
-        Ok(_) => panic!("a Bias row without Base must be refused"),
-        Err(err) => err,
-    };
-    let msg = format!("{err:#}");
-    assert!(msg.contains("LayoutTensorOpCublasLtBias"), "{msg}");
-    assert!(msg.contains("without the Base row"), "{msg}");
-
-    // Dropping Base out of the WHOLE preset is the same configuration,
-    // however the caller arrives at it.
-    let err = match CudaRuntime::load_with_registry(
+fn retired_cublaslt_rows_cannot_bypass_the_complete_call_whitelist() {
+    let (cx, _, _) = add_graph();
+    #[derive(Debug)]
+    struct Retired(&'static str);
+    impl luminal::layout_ir::OpMatcher for Retired {
+        fn egglog_constructor(&self) -> &'static str {
+            self.0
+        }
+        fn snippets(&self) -> Vec<luminal::egglog_snippet::EgglogSnippet> {
+            vec![]
+        }
+        fn extract(
+            &self,
+            _: &luminal::layout_ir::ExtractionSite<'_>,
+        ) -> Box<dyn luminal::layout_ir::LayoutIrOp> {
+            unreachable!()
+        }
+    }
+    for name in [
+        "LayoutTensorOpCublasLt",
+        "LayoutTensorOpCublasLtBias",
+        "LayoutTensorOpCublasLtAccumulate",
+        "LayoutTensorOpCublasLtAccumulateBias",
+    ] {
+        let mut registry = cuda_registry_without_cublaslt();
+        registry.push(RegisteredOp::new(
+            Box::new(Retired(name)),
+            Box::new(ApprovedCublasLt::prototype()),
+        ));
+        let err = CudaRuntime::load_with_registry(&cx, registry)
+            .err()
+            .expect("retired marker must be rejected");
+        assert!(format!("{err:#}").contains("retired cuBLASLt marker"));
+    }
+    CudaRuntime::load_with_registry(
         &cx,
-        cuda_registry_filtered(|op| op.constructor() != CublasLtForm::Base.constructor_name()),
-    ) {
-        Ok(_) => panic!("the preset minus Base must be refused"),
-        Err(err) => err,
-    };
-    assert!(
-        format!("{err:#}").contains("without the Base row"),
-        "{err:#}"
-    );
-
-    // Base alone, and all four together, both load.
-    let (cx, _a, _b) = add_graph();
-    CudaRuntime::load_with_registry(&cx, cuda_registry()).expect("the whole marker estate loads");
-    let mut base_only = cuda_registry_without_cublaslt();
-    base_only.push(RegisteredOp::new(
-        Box::new(CublasLtMarkerMatcher {
-            form: CublasLtForm::Base,
-        }),
-        Box::new(CublasLt {
-            form: CublasLtForm::Base,
-            spec: None,
-        }),
-    ));
-    CudaRuntime::load_with_registry(&cx, base_only).expect("Base alone loads");
+        cuda_registry_filtered(|row| row.constructor() != CONSTRUCTOR),
+    )
+    .unwrap();
 }
 
 /// THE ASSEMBLY TRIPWIRE, over the CUDA-lite registry's own assembled

@@ -16,8 +16,9 @@ use luminal::{
     prelude::{F32Pow, GraphTensor},
 };
 use luminal_metal::{CompileOptions, HostBuffer, MetalRuntime};
+use luminal_nn::{gather_rows, scatter_rows};
 use luminal_tracing::luminal_filter;
-use model_zoo::model_support::{LayerNorm, Namespace, gather_rows, scatter_rows};
+use model_zoo::namespace::Namespace;
 use rustc_hash::FxHashSet;
 use std::{
     error::Error,
@@ -134,7 +135,9 @@ impl KVCache {
 struct Llama {
     embedding: GraphTensor,
     layers: Vec<LlamaLayer>,
-    lm_norm: LayerNorm,
+    lm_norm_weight: Option<GraphTensor>,
+    lm_norm_bias: Option<GraphTensor>,
+    lm_norm_epsilon: f32,
 }
 
 impl Llama {
@@ -178,26 +181,20 @@ impl Llama {
                     vec![HIDDEN, HIDDEN],
                     DType::F32,
                 ),
-                attn_rms: LayerNorm::new(
-                    HIDDEN,
-                    true,
-                    false,
-                    false,
-                    RMS_NORM_EPS,
+                attn_rms_weight: Some(cx.named_tensor(
+                    layer_ns.child("input_layernorm").leaf("weight"),
+                    vec![HIDDEN],
                     DType::F32,
-                    &layer_ns.child("input_layernorm"),
-                    cx,
-                ),
-                mlp_rms: LayerNorm::new(
-                    HIDDEN,
-                    true,
-                    false,
-                    false,
-                    RMS_NORM_EPS,
+                )),
+                attn_rms_bias: None,
+                attn_rms_epsilon: RMS_NORM_EPS,
+                mlp_rms_weight: Some(cx.named_tensor(
+                    layer_ns.child("post_attention_layernorm").leaf("weight"),
+                    vec![HIDDEN],
                     DType::F32,
-                    &layer_ns.child("post_attention_layernorm"),
-                    cx,
-                ),
+                )),
+                mlp_rms_bias: None,
+                mlp_rms_epsilon: RMS_NORM_EPS,
             });
         }
 
@@ -208,16 +205,18 @@ impl Llama {
                 DType::F32,
             ),
             layers,
-            lm_norm: LayerNorm::new(
-                HIDDEN,
-                true,
-                false,
-                false,
-                RMS_NORM_EPS,
-                DType::F32,
-                &Namespace::root().child("model").child("norm"),
-                cx,
+            lm_norm_weight: Some(
+                cx.named_tensor(
+                    Namespace::root()
+                        .child("model")
+                        .child("norm")
+                        .leaf("weight"),
+                    vec![HIDDEN],
+                    DType::F32,
+                ),
             ),
+            lm_norm_bias: None,
+            lm_norm_epsilon: RMS_NORM_EPS,
         }
     }
 
@@ -246,7 +245,13 @@ impl Llama {
             cache_outputs.push((k_out, v_out));
         }
 
-        let logits = self.lm_norm.forward(x).matmul(self.embedding.t());
+        let logits = luminal_nn::rms_norm(
+            x,
+            self.lm_norm_weight,
+            self.lm_norm_bias,
+            self.lm_norm_epsilon,
+        )
+        .matmul(self.embedding.t());
         (logits, cache_outputs)
     }
 }
@@ -259,8 +264,12 @@ struct LlamaLayer {
     k_proj: GraphTensor,
     v_proj: GraphTensor,
     o_proj: GraphTensor,
-    attn_rms: LayerNorm,
-    mlp_rms: LayerNorm,
+    attn_rms_weight: Option<GraphTensor>,
+    attn_rms_bias: Option<GraphTensor>,
+    attn_rms_epsilon: f32,
+    mlp_rms_weight: Option<GraphTensor>,
+    mlp_rms_bias: Option<GraphTensor>,
+    mlp_rms_epsilon: f32,
 }
 
 fn llama_rotary_embeddings(mut input: GraphTensor, pos_ids: GraphTensor) -> GraphTensor {
@@ -344,7 +353,12 @@ impl LlamaLayer {
         k_cache: GraphTensor,
         v_cache: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let x_attn = self.attn_rms.forward(x);
+        let x_attn = luminal_nn::rms_norm(
+            x,
+            self.attn_rms_weight,
+            self.attn_rms_bias,
+            self.attn_rms_epsilon,
+        );
         let q = x_attn.matmul(self.q_proj.t());
         let k = x_attn.matmul(self.k_proj.t());
         let v = x_attn.matmul(self.v_proj.t());
@@ -363,7 +377,12 @@ impl LlamaLayer {
         );
         x += attn_out.matmul(self.o_proj.t());
 
-        let x_mlp = self.mlp_rms.forward(x);
+        let x_mlp = luminal_nn::rms_norm(
+            x,
+            self.mlp_rms_weight,
+            self.mlp_rms_bias,
+            self.mlp_rms_epsilon,
+        );
         let mlp_out =
             (x_mlp.matmul(self.gate.t()).swish() * x_mlp.matmul(self.up.t())).matmul(self.down.t());
         (x + mlp_out, k_cache_out, v_cache_out)

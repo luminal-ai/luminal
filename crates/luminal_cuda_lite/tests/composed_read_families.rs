@@ -497,10 +497,22 @@ fn scatter_lowers_all_read_side_folds() {
         &[
             "long long coord0_idx = c0 + 0LL;",
             "coord = (long long)coord0[coord0_idx];",
-            "long long src_idx = (((c0 * 3LL) + 3LL) + c1);",
             "out[flat] = src[src_idx];",
         ],
         "scatter all-folds write launch",
+    );
+    // Integer addition is commutative in the e-graph. Both emitted forms
+    // address the same row-offset slice; the representative may change when
+    // additional layout proofs are registered.
+    assert!(
+        [
+            "long long src_idx = (((c0 * 3LL) + 3LL) + c1);",
+            "long long src_idx = ((3LL + (c0 * 3LL)) + c1);",
+        ]
+        .iter()
+        .any(|index| sources[1].contains(index)),
+        "scatter source must address (row + 1) * 3 + column: {}",
+        sources[1]
     );
     // Three composed reads, three raw index computations, zero checks.
     for source in &sources {

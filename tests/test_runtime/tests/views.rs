@@ -109,7 +109,9 @@ fn real_view_op_to_output_slot_escapes_zero_copy() {
     assert!(
         plan.dag.node_indices().all(|idx| !matches!(
             &plan.dag[idx],
-            BufferNode::BufferCopy { .. } | BufferNode::Compute { .. }
+            BufferNode::BufferCopy { .. }
+                | BufferNode::BufferCopyValue { .. }
+                | BufferNode::Compute { .. }
         )),
         "zero copies, zero kernels — the storage is already the caller's:\n{}",
         plan.summary()
@@ -172,7 +174,9 @@ fn view_feeds_compute_fixture_runs_one_kernel_on_the_input_buffer() {
     let mut computes = 0;
     for idx in plan.dag.node_indices() {
         match &plan.dag[idx] {
-            BufferNode::BufferCopy { .. } => panic!("zero copies:\n{}", plan.summary()),
+            BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. } => {
+                panic!("zero copies:\n{}", plan.summary())
+            }
             BufferNode::Compute {
                 op, reads, writes, ..
             } => {
@@ -234,7 +238,10 @@ fn write_into_viewed_buffer_fixture_degrades_to_copy() {
     let mut exp_reads = None;
     for idx in plan.dag.node_indices() {
         match &plan.dag[idx] {
-            BufferNode::BufferCopy { src, dst, .. } => copies.push((src.clone(), dst.clone())),
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. } => {
+                copies.push((src.clone(), dst.clone()))
+            }
             BufferNode::Compute {
                 op, reads, writes, ..
             } => match op.label() {

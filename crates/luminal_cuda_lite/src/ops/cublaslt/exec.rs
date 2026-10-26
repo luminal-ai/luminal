@@ -1,135 +1,10 @@
-//! The cuBLASLt HOST-CALL contract layer — CPU-side, device-free.
-//!
-//! Train 3 (registry + host-call dispatch): the four marker contracts
-//! execute as ONE host library call (`cublasLtMatmul`), not an NVRTC
-//! kernel. This module turns an elected [`CublasLt`] op (its parsed
-//! [`LtMatmulSpec`]) into a fully-resolved [`LtCall`] — plain numerics
-//! and finite classifications only — and carries the executor-side
-//! validation the library itself does NOT provide. Everything here is
-//! unit-testable without a device; the cudarc dispatch lives in
-//! `device_call` (feature-gated) and consumes an `LtCall` verbatim.
-//!
-//! THE A100 EXECUTOR CONTRACTS (verified findings; load-bearing):
-//! 1. F32-only end to end (inputs, outputs, CUBLAS_COMPUTE_32F).
-//! 2. POINTER_MODE_HOST with LITERAL scalars: alpha = 1.0f always
-//!    (the marker has no alpha channel); beta is STRUCTURAL — 1.0f on
-//!    the C-fold (Accumulate) forms, 0.0f otherwise. There is no
-//!    runtime scalar channel: [`LtCall`] has NO alpha/beta float
-//!    fields, only [`LtCall::beta_is_one`], and the literals live in
-//!    the dispatch site as compile-time constants.
-//! 3. C = D aliasing with a VALID Cdesc on the no-C forms
-//!    (Cdesc = NULL segfaults): [`LtCall::c`] is NON-OPTIONAL — every
-//!    call carries a C descriptor; [`CSource::AliasD`] says "pass the
-//!    D pointer" and beta = 0.0f guarantees C is never read.
-//! 4. ld semantics: the library's own ld check is self-consistency
-//!    only and VACUOUS at rows == 1 (in ROW order a single row never
-//!    dereferences ld) — [`validate_ld_bounds`] is the REAL bounds
-//!    validation (`ld*(rows-1) + cols <= element count` in ROW order),
-//!    asserted loudly at dispatch for A, B, C, and D. Emitted lds are
-//!    clamped to `>= 1` at plan time.
-//! 5. TF32 is graph-modeled, never a flag: the dispatch sets
-//!    CUBLAS_COMPUTE_32F explicitly and `device_call` carries a
-//!    startup detector assertion at handle creation.
-//!
-//! THE ROW CONVENTION (Train-3 orientation fix; measured on the A100
-//! with the 4x8x3 dump — see `tests/cublaslt_contracts.rs`):
-//! every emitted layout descriptor DECLARES its order explicitly —
-//! never the library's COL default, and (since the destination-frame
-//! fix below) never a constant at the dispatch site either. The order
-//! is a field of [`LtDesc`]. A and B are ROW; C and D are whatever the
-//! plan's elected destination layout resolves to. This DECLARES
-//! REALITY, in two halves:
-//!
-//!  * A and B: the marker spec's readings are COL views over the
-//!    operand buffers' bytes (frozen estate convention R9/R10). A COL
-//!    `r x c / ld` view of a byte range IS the ROW `c x r / ld` view
-//!    of the transposed matrix — same bytes, same pitch — so the
-//!    bridge re-expresses each operand reading as ROW by swapping the
-//!    descriptor dims and FLIPPING the transpose op. The spec's lds
-//!    carry over verbatim (a COL view's ld and the underlying
-//!    row-major storage's row pitch are the same number, padded
-//!    layouts included).
-//!  * D (and C, which rides D's layout by rule guard): the PLAN'S
-//!    disclosed destination layout is authoritative. What is NOT
-//!    authoritative is the spec's ldd/ldc — those describe the CLAIMED
-//!    e-graph layout over the RECORDER's out buffer, a buffer the
-//!    executor never writes, and consuming them was the orientation
-//!    bug: bytes landed COL-major at the spec's pitch while the
-//!    disclosure read row-major (element 0 agreed, element 1 did not).
-//!    The bridge therefore builds the D FRAME from the call
-//!    (`m x n`) and takes its ORDER from the destination value's
-//!    elected layout via [`bind_destination`] — ROW `ld = n` for a
-//!    right-major election, COL `ld = m` for a left-major one.
-//!    Hardcoding ROW here instead was the second orientation failure;
-//!    see the note below.
-//!
-//! The CM-swap alternative (compute D^T with swapped roles under COL
-//! defaults) is REJECTED: cuBLASLt's bias epilogue adds bias[i] to
-//! row i of the API's D, and the marker's bias contract is per-row of
-//! the call's D (length m) — a role swap would silently turn it into
-//! a per-column bias.
-//!
-//! THE BIAS FORMS DISPATCH ONLY UNDER A COL-ORDER D (ruling 2026-09-01,
-//! Austin: "adding the layout requirement to the rule is the correct
-//! solution"). MEASURED on the A100 (2026-08-28): the library returns
-//! CUBLAS_STATUS_NOT_SUPPORTED for CUBLASLT_EPILOGUE_BIAS / RELU_BIAS
-//! whenever D is CUBLASLT_ORDER_ROW (any A/B order). The fix is in the
-//! ESTATE, not here: the two bias decorators
-//! (`egg/cublaslt_marker_decorate.egg`) now carry the premise
-//! `(= ?inner_L (LeftMajorContiguousElementLayoutLit ?ishape ?d_bits2))`
-//! — the bias form is minted only when the claimed D is provably
-//! left-major contiguous over the sibling frame `[n, m]`, which is
-//! byte-identical to the recorder's row-major `[m, n]`, puts the
-//! per-feature vector on D's rows (the API's only bias axis), and is
-//! exactly what [`bind_destination`] resolves to `LtDesc::col`.
-//!
-//! THE FENCE IS THE SAME QUESTION, ASKED OF THE CLASS.
-//! [`bind_destination`] binds a bias form's D by
-//! `dest.require::<LeftMajorContiguousElementLayout>(who)` — the
-//! decorator's premise, spelled at the call site. A destination class
-//! that holds the LeftMajor spelling binds COL; one that does not is
-//! unreachable from the estate and is refused before any descriptor
-//! exists. The degenerate-extent coincidence — at `m == 1` or `n == 1`
-//! the right-major and left-major contiguous index maps over `[m, n]`
-//! are the SAME function, so the e-graph puts BOTH literals in one
-//! class — is NOT a case here: the class carries both spellings and
-//! `require` reads the class, not one chosen spelling. (It was a case
-//! only while a preference-ordered decoder handed this bridge one
-//! spelling of that class and hid the other; that decoder is gone.)
-//!
-//! THE DESTINATION FRAME IS THE PLAN'S, NOT A CONSTANT (regression fix,
-//! 2026-08-31 — see [`bind_destination`]). The paragraph above says
-//! "the executor materializes every result DENSE ROW-MAJOR in the
-//! value's own dims (the disclosure downstream walks exactly that)".
-//! Under Option B that second clause STOPPED BEING TRUE: the plan
-//! carries each value's ELECTED layout and every consumer — the
-//! codegen read path, the output-slot disclosure, `dense_f32` — reads
-//! through it, so "dense row-major" is no longer a law the executor
-//! may assume. On the marker's own transpose-sandwich the elected
-//! destination layout is LEFT-major: the site that dispatches is the
-//! SIBLING (D' = B^T A^T = out^T, an `m' x n'` frame), and the e-graph
-//! elects for that sibling value exactly the layout that makes the
-//! ORIGINAL out right-major over the same bytes — `LeftMajor[m', n']`.
-//! Writing ROW there produced an exact product in transposed byte
-//! order: the SAME failure shape as the original orientation bug, one
-//! convention further along.
-//!
-//! So the destination ORDER is resolved against the plan, not assumed:
-//! [`LtOrder`] is a field of every [`LtDesc`], `plan_call` emits the
-//! spec-only DEFAULT (ROW), and the executor calls [`bind_destination`]
-//! with the result slot's elected layout before dispatch.
+//! Resolved vendor descriptors and buffer bounds checks.
+//! Egglog chooses every descriptor, order, transpose and optional argument.
+//! Rust evaluates those expressions and checks the actual backing capacities;
+//! it never recovers a layout or rebinds the selected destination.
+use super::CublasLtForm;
+use anyhow::{Result, bail};
 
-use anyhow::{Context, Result, bail};
-use luminal::layouts::{LeftMajorContiguousElementLayout, RightMajorContiguousElementLayout};
-
-use super::{CuDim, CuEpilogue, CublasLt, CublasLtForm, LtMatmulSpec};
-
-/// A descriptor's storage ORDER — the cuBLASLt
-/// `CUBLASLT_MATRIX_LAYOUT_ORDER` attribute, carried EXPLICITLY on
-/// every descriptor rather than hardcoded at the dispatch site. Two
-/// bugs (Train-3's orientation bug and the Option-B destination-frame
-/// regression) both had the same shape: an order convention that lived
-/// only in prose while the bytes said otherwise. It is data now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LtOrder {
     /// `CUBLASLT_ORDER_ROW`: element `(r, c)` at `r*ld + c`; `ld` is the
@@ -141,11 +16,8 @@ pub enum LtOrder {
 }
 
 /// One descriptor's geometry: `rows x cols` with leading dimension `ld`
-/// and its storage [`LtOrder`], all resolved literals (elements, not
-/// bytes). A and B are always [`LtOrder::Row`] — the frozen estate's
-/// COL readings re-expressed, see the module doc's ROW CONVENTION; C
-/// and D carry whatever the plan's elected destination layout says
-/// (see [`bind_destination`]).
+/// and its storage [`LtOrder`], all resolved literals in elements.
+/// The elected egglog descriptor supplies every field unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LtDesc {
     pub rows: i64,
@@ -226,27 +98,6 @@ pub struct LtCall {
     pub bias_operand: Option<usize>,
 }
 
-fn literal(dim: &CuDim, what: &str) -> Result<i64> {
-    match dim.literal() {
-        Some(v) => Ok(v),
-        None => bail!(
-            "cuBLASLt dispatch: {what} is SYMBOLIC — binding symbolic geometry \
-             from the dyn map at dispatch is not wired in this landing (loud \
-             bail, never a guess)"
-        ),
-    }
-}
-
-/// The REAL ld bounds validation (contract 4) — A VENDOR CHECK, not a
-/// type re-check: it stays under every cleanup (see the CHECK TAXONOMY
-/// on [`bind_destination`]). The library's own check is
-/// self-consistency only — `ld >= minor extent` when there is more than
-/// one major line — and VACUOUS at a single major line (one row in ROW
-/// order, one column in COL order, never dereferences ld), so a
-/// too-small buffer would be read/written out of bounds without a word.
-/// This check is the one that counts: [`LtDesc::reach`] `<= elems`,
-/// plus positivity. ORDER-AWARE, because the reach is (the ROW formula
-/// applied to a COL descriptor understates it whenever `rows > cols`).
 pub fn validate_ld_bounds(who: &str, desc: &LtDesc, elems: usize) -> Result<()> {
     if desc.rows < 1 || desc.cols < 1 {
         bail!(
@@ -281,152 +132,15 @@ pub fn validate_ld_bounds(who: &str, desc: &LtDesc, elems: usize) -> Result<()> 
     Ok(())
 }
 
-/// THE PLAN/CALL-FRAME COHERENCE FENCE — resolve the C/D descriptors
-/// against the destination value's ELECTED layout, the one the plan
-/// disclosed and every downstream reader walks.
-///
-/// CHECK TAXONOMY (standing ruling, written here so the next cleanup
-/// does not delete this again). Three kinds of executor-side check, and
-/// only ONE of them is disposable:
-///
-///  1. E-GRAPH RE-CHECKS — re-verifying a fact a rule PREMISE already
-///     guarantees (the marker's F32 end-to-end scope, C's dims and fold
-///     status matching D's by rule guard). These are OUT: they restate
-///     the e-graph's own postconditions in the executor's voice and
-///     rot. Correction 4 of 2026-08-31 removed them; they stay removed.
-///  2. VENDOR CHECKS — verifying the LIBRARY's behavior where its own
-///     guarantees are absent or vacuous: the TF32 strictness detector
-///     (contract 5) and [`validate_ld_bounds`] (contract 4, whose
-///     library counterpart is vacuous at rows == 1). These STAY.
-///  3. COHERENCE FENCES — agreement between the PLAN's vocabulary
-///     (elected layouts, extents, orders) and a CALL FRAME THE EXECUTOR
-///     ITSELF BUILDS from a different vocabulary (m/n/k, descriptors,
-///     lds). These STAY, and this is the category correction 4 got
-///     wrong: it classified the `[m, n]` frame check as (1) and deleted
-///     it. It is not (1). No e-graph rule has ever seen `LtCall` — the
-///     bridge in this module invents it — so nothing upstream can
-///     guarantee the two agree. Deleting the fence is how an exact
-///     product landed in transposed byte order twice.
-///
-/// This function is the fence, and it does more than the deleted check:
-/// the old one compared EXTENTS only (`dest_dims == [m, n]`), which the
-/// Option-B regression walked straight through — the extents were
-/// `[m, n]` and the ORDER was the thing that had diverged. Resolving
-/// the order here means the frame cannot silently disagree at all: the
-/// only two orders cuBLASLt has are the only two layouts admitted, and
-/// the descriptor carries the answer to the dispatch site.
-///
-/// Admitted destination layouts, both exactly expressible as a cuBLASLt
-/// matrix layout over the `m x n` frame:
-///  * `RightMajor[m, n]` — `(r, c)` at `r*n + c` → ROW, `ld = n`;
-///  * `LeftMajor[m, n]`  — `(r, c)` at `c*m + r` → COL, `ld = m`.
-///
-/// Everything else is a CAPABILITY REFUSAL, the exact mirror of the
-/// kernel path's identity-index write fence in
-/// `kernels::CodegenCtx::from_descriptors`: this backend writes no
-/// strided and no offset-expression destination, by kernel or by
-/// library call. Loud, never wrong bytes.
-///
-/// C rides D's frame (`c == d` throughout this bridge): the marker's
-/// rule guard cross-checks the C and D layout CLASSES, so a C-fold
-/// form's C operand is stored the same way its D is.
-pub fn bind_destination(
-    call: &mut LtCall,
-    dest: &luminal::layouts::DecodedLayout,
-    who: &str,
-) -> Result<()> {
-    let extents = dest.literal_extents().ok_or_else(|| {
-        anyhow::anyhow!(
-            "cuBLASLt {who}: the destination's elected layout has SYMBOLIC extents \
-             — the call frame cannot be checked against it; refused before dispatch"
-        )
-    })?;
-    if extents.len() != 2
-        || extents[0] as i128 != call.m as i128
-        || extents[1] as i128 != call.n as i128
-    {
-        bail!(
-            "cuBLASLt {who}: the plan's elected destination layout spans {extents:?} \
-             but the call frame is [m, n] = [{}, {}] — the plan's vocabulary and the \
-             executor's call frame have DIVERGED; refused before dispatch (never \
-             land bytes under a disclosure that does not describe them)",
-            call.m,
-            call.n
-        );
-    }
-    let desc = if call.bias_operand.is_some() {
-        // THE FENCE. The estate's two bias decorators mint a bias form
-        // ONLY when the claimed D class HOLDS the LeftMajor spelling
-        // (`egg/cublaslt_marker_decorate.egg`, premise
-        // `(= ?inner_L (LeftMajorContiguousElementLayoutLit ?ishape ?d_bits2))`).
-        // Ask the class the same question — not "which spelling does a
-        // decoder prefer", which is how a degenerate extent (`m == 1` or
-        // `n == 1`, where the two contiguous index maps are ONE function
-        // and both literals share the class) once looked like a drift
-        // and refused every whisper genome. A bias form whose class
-        // lacks the spelling is unreachable from the estate: a real
-        // drift, refused BEFORE any descriptor exists.
-        dest.require::<LeftMajorContiguousElementLayout>(who)
-            .with_context(|| {
-                format!(
-                    "cuBLASLt {who}: unreachable: the bias decorators require a LeftMajor \
-                     D; a bias form ({}) reached the executor whose destination class \
-                     holds {:?} and no LeftMajorContiguousElementLayoutLit — the library \
-                     refuses BIAS/RELU_BIAS on a ROW-order D \
-                     (CUBLAS_STATUS_NOT_SUPPORTED, measured on the A100 2026-08-28); \
-                     refused BEFORE dispatch, no bytes move",
-                    call.form.constructor_name(),
-                    dest.present()
-                )
-            })?;
-        LtDesc::col(call.m, call.n, call.m.max(1))
-    } else if dest.has::<LeftMajorContiguousElementLayout>() {
-        LtDesc::col(call.m, call.n, call.m.max(1))
-    } else if dest.has::<RightMajorContiguousElementLayout>() {
-        LtDesc::row(call.m, call.n, call.n.max(1))
-    } else {
-        bail!(
-            "cuBLASLt {who}: the plan elected a destination layout whose class holds \
-             {:?}; this backend writes only the two dense orders cuBLASLt can express \
-             (RightMajor -> CUBLASLT_ORDER_ROW, LeftMajor -> CUBLASLT_ORDER_COL). \
-             Strided and offset-expression destinations are NOT lowered — a CAPABILITY \
-             refusal (the host-call mirror of the codegen path's identity-index write \
-             fence), never a guess.",
-            dest.present()
-        )
-    };
-    call.d = desc;
-    call.c = desc;
-    Ok(())
-}
-
-/// THE VENDOR PRECONDITION, checked at dispatch: cuBLASLt refuses
-/// BIAS/RELU_BIAS on a ROW-order D (`CUBLAS_STATUS_NOT_SUPPORTED`,
-/// measured on the A100 2026-08-28), and the library documents no such
-/// guarantee anywhere a caller can read it. This names the finding
-/// BEFORE the call goes out.
-///
-/// Classification (see the CHECK TAXONOMY on [`bind_destination`]): a
-/// VENDOR CHECK — category (2), and it STAYS. Its one caller is
-/// `device_call::dispatch`, which sees every `LtCall` however built,
-/// INCLUDING the hand-built ones the direct-dispatch contract tests
-/// construct without ever passing through [`bind_destination`]. That is
-/// a release path, so a `debug_assert!` would be wrong here.
-///
-/// It is NOT called from [`bind_destination`] any more. There it merely
-/// restated that function's own postcondition — the bias branch binds
-/// COL or refuses — which is category (1), "OUT". The estate-premise
-/// fence lives in `bind_destination` itself, as
-/// `require::<LeftMajorContiguousElementLayout>`.
 pub fn assert_bias_destination_order(call: &LtCall, who: &str) -> Result<()> {
     if call.bias_operand.is_some() && call.d.order != LtOrder::Col {
         bail!(
-            "cuBLASLt {who}: unreachable: the bias decorators require a LeftMajor D; \
+            "cuBLASLt {who}: unreachable: bias requires a column-order D; \
              a bias form ({}) reached the executor with a {:?}-order D descriptor \
              ({}x{} ld {}). The library refuses BIAS/RELU_BIAS on a ROW-order D \
              (CUBLAS_STATUS_NOT_SUPPORTED, measured on the A100 2026-08-28) — \
              refused BEFORE dispatch, no bytes move",
-            call.form.constructor_name(),
+            format_args!("{:?}", call.form),
             call.d.order,
             call.d.rows,
             call.d.cols,
@@ -434,138 +148,6 @@ pub fn assert_bias_destination_order(call: &LtCall, who: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Resolve an elected [`CublasLt`] op into the host call. Loud on a
-/// missing spec (an op elected without its parsed marker spec is
-/// malformed) and on symbolic geometry.
-pub fn plan_call(op: &CublasLt) -> Result<LtCall> {
-    let Some(spec) = op.spec.as_ref() else {
-        bail!(
-            "cuBLASLt dispatch: elected {} carries no parsed LtMatmulSpec — \
-             the marker's extract() did not resolve this site",
-            op.form.constructor_name()
-        );
-    };
-    plan_call_from_spec(spec)
-}
-
-/// Bind symbolic dimensions before constructing the library descriptors.
-pub fn plan_call_at(op: &CublasLt, dims: &luminal::shape::DynMap) -> Result<LtCall> {
-    let mut bound = op.clone();
-    let spec = bound
-        .spec
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("cuBLASLt has no spec"))?;
-    for dim in [
-        &mut spec.m,
-        &mut spec.n,
-        &mut spec.k,
-        &mut spec.lda,
-        &mut spec.ldb,
-        &mut spec.ldc,
-        &mut spec.ldd,
-    ] {
-        if let CuDim::Symbolic(class) = dim {
-            let expr = spec
-                .dim_exprs
-                .get(class)
-                .ok_or_else(|| anyhow::anyhow!("unresolved cuBLASLt dimension {class:?}"))?;
-            *dim = CuDim::Literal(crate::symbolic::eval(expr, dims)?);
-        }
-    }
-    plan_call(&bound)
-}
-
-/// [`plan_call`] over the spec alone (test seam).
-pub fn plan_call_from_spec(spec: &LtMatmulSpec) -> Result<LtCall> {
-    // NO BIAS REFUSAL HERE (ruling 2026-09-01). The unconditional
-    // bias-form refusal that stood at the top of this function is gone:
-    // the estate's bias decorators now require a LeftMajor D, so a bias
-    // form arrives with a COL destination election and dispatches. The
-    // D order is NOT known at this point (the spec-only default below is
-    // ROW), so the bias/order coherence check cannot live here — it runs
-    // in [`bind_destination`] once the plan's election has been read
-    // (see [`assert_bias_destination_order`]).
-    let m = literal(&spec.m, "m")?;
-    let n = literal(&spec.n, "n")?;
-    let k = literal(&spec.k, "k")?;
-
-    // THE ROW CONVENTION (module doc): the spec's readings are COL
-    // views (frozen estate convention); a COL `r x c / ld` view of the
-    // operand bytes IS the ROW `c x r / ld` view of the transposed
-    // matrix, so the bridge flips each operand's transpose op and
-    // swaps the descriptor dims. The op algebra is then the same shape
-    // as before, with the FLIPPED trans:
-    //   A: op(A') is m x k  =>  A' is (m,k) at N, (k,m) at T
-    //   B: op(B') is k x n  =>  B' is (k,n) at N, (n,k) at T
-    //   D:                      m x n (no transD)
-    let trans_a = !spec.trans_a;
-    let trans_b = !spec.trans_b;
-    let (a_rows, a_cols) = if trans_a { (k, m) } else { (m, k) };
-    let (b_rows, b_cols) = if trans_b { (n, k) } else { (k, n) };
-    let (d_rows, d_cols) = (m, n);
-
-    // Operand lds carry over VERBATIM from the spec (a COL view's ld
-    // and the row-major storage's row pitch are the same number,
-    // padded layouts included), clamped to >= 1 (contract 4's
-    // emission rule).
-    let ld = |dim: &CuDim, what: &str| -> Result<i64> { Ok(literal(dim, what)?.max(1)) };
-    let a = LtDesc::row(a_rows, a_cols, ld(&spec.lda, "lda")?);
-    let b = LtDesc::row(b_rows, b_cols, ld(&spec.ldb, "ldb")?);
-    // D is the EXECUTOR's destination, not the spec's claim. The spec's
-    // ldd describes the claimed e-graph layout over the RECORDER's out
-    // buffer — a buffer the executor never writes — so consuming it
-    // here was the orientation bug.
-    //
-    // What stands here is the SPEC-ONLY DEFAULT: dense ROW `m x n`,
-    // ld = n. It is the right answer for a caller with no plan (the
-    // hand-built direct-dispatch contract tests) and it is NOT the
-    // final word for a planned dispatch: the executor calls
-    // [`bind_destination`] with the result slot's ELECTED layout, which
-    // may resolve this frame to COL (the transpose-sandwich sibling
-    // does). Assuming ROW here and never re-resolving it was the
-    // Option-B destination-frame regression.
-    let d = LtDesc::row(d_rows, d_cols, n.max(1));
-    // C rides the D layout by rule guard (the marker cross-checks the
-    // layout classes), so Cdesc == Ddesc geometry on EVERY form — the
-    // valid-Cdesc contract for the no-C forms comes for free. On the
-    // C-fold forms the executor owes a C operand buffer holding the
-    // call-frame C dense row-major (the dispatch site enforces it).
-    let c = d;
-
-    let c_source = if spec.form.has_c() {
-        // Contract order [a, b, c, bias?]: c is Lit operand 2.
-        CSource::Operand(2)
-    } else {
-        CSource::AliasD
-    };
-    let bias_operand = spec.form.has_bias().then(|| match spec.form {
-        CublasLtForm::Bias => 2,
-        CublasLtForm::AccumulateBias => 3,
-        _ => unreachable!("has_bias() is true only on the bias forms"),
-    });
-    let relu = matches!(spec.epilogue, CuEpilogue::Relu | CuEpilogue::ReluBias);
-
-    Ok(LtCall {
-        form: spec.form,
-        m,
-        n,
-        k,
-        trans_a,
-        trans_b,
-        a_dtype: spec.a_dtype,
-        b_dtype: spec.b_dtype,
-        d_dtype: spec.d_dtype,
-        a,
-        b,
-        c,
-        d,
-        c_source,
-        beta_is_one: spec.form.has_c(),
-        relu,
-        bias_operand,
-    })
 }
 
 impl LtCall {
@@ -576,7 +158,7 @@ impl LtCall {
         if operand_elems.len() != self.form.lit_arity() {
             bail!(
                 "cuBLASLt {}: {} operand buffers for Lit arity {}",
-                self.form.constructor_name(),
+                format_args!("{:?}", self.form),
                 operand_elems.len(),
                 self.form.lit_arity()
             );

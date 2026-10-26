@@ -63,14 +63,14 @@ fn mini_llama3_fixture() -> MiniLlama3Fixture {
 
     let block = &model.blocks[0];
     let floats: Vec<(NodeIndex, Vec<f32>)> = vec![
-        (model.embed.weight.id, weights(VOCAB * D, 1)),
-        (block.wq.weight.id, weights(D * D, 2)),
-        (block.wk.weight.id, weights(D * 4, 3)),
-        (block.wv.weight.id, weights(D * 4, 4)),
-        (block.wo.weight.id, weights(D * D, 5)),
-        (block.gate.weight.id, weights(D * 12, 6)),
-        (block.up.weight.id, weights(D * 12, 7)),
-        (block.down.weight.id, weights(12 * D, 8)),
+        (model.embed.id, weights(VOCAB * D, 1)),
+        (block.wq_weight.id, weights(D * D, 2)),
+        (block.wk_weight.id, weights(D * 4, 3)),
+        (block.wv_weight.id, weights(D * 4, 4)),
+        (block.wo_weight.id, weights(D * D, 5)),
+        (block.gate_weight.id, weights(D * 12, 6)),
+        (block.up_weight.id, weights(D * 12, 7)),
+        (block.down_weight.id, weights(12 * D, 8)),
         (k_cache.id, weights(16, 9)),
         (v_cache.id, weights(16, 10)),
     ];

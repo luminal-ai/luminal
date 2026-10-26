@@ -52,7 +52,7 @@ fn matmul_then_elementwise_bufferize() {
         "mm+add",
         &text,
         &[
-            "LayoutTensorOpCublasLt",
+            "LayoutTensorOpCublasLtCall",
             "LayoutTensorOpIndexMapApplyViewGeneric",
         ],
     );
@@ -76,7 +76,7 @@ fn chained_matmuls_bufferize() {
         "mm.mm",
         &text,
         &[
-            "LayoutTensorOpCublasLt",
+            "LayoutTensorOpCublasLtCall",
             "LayoutTensorOpIndexMapApplyViewGeneric",
         ],
     );

@@ -10,6 +10,8 @@ pub struct DeviceRange {
 #[cfg(feature = "device")]
 pub struct HostOpContext<'a> {
     pub stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+    /// Memory-reading operands in signature order, including a read-modify-write
+    /// destination. Write-only destination operands are excluded.
     pub inputs: &'a [DeviceRange],
     pub dest: DeviceRange,
     pub workspace: DeviceRange,

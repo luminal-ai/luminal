@@ -314,9 +314,8 @@ pub enum BufferNode<L: PlanLayout> {
     /// 1. **Residence conflict repair** — an in-place candidate was
     ///    rejected by the conflict engine, so the result gets fresh storage
     ///    and the operand's bytes are copied in first.
-    /// 2. **Boundary placement** — a tensor is bound to a SPECIFIC caller
-    ///    buffer whose producing residence is elsewhere, so its bytes are
-    ///    moved into the caller's storage.
+    /// 2. **Boundary placement** uses [`Self::BufferCopyValue`] to deliver
+    ///    a value's declared address span into the caller's storage.
     /// 3. **Lifetime repair** — a value must outlive the storage it
     ///    currently occupies (an escape, or a buffer about to be reused),
     ///    so it is relocated into storage with the right lifetime.
@@ -332,8 +331,28 @@ pub enum BufferNode<L: PlanLayout> {
     /// over buffer tensors in the egraph... We're just going to insert
     /// buffer copies as needed to repair").
     BufferCopy { src: BufferId, dst: BufferId },
+    /// Copy one value's unchanged address span, for boundary delivery or a
+    /// descriptor-exact writing tie's repair through a folded view. Either
+    /// allocation may have spare capacity; the copy does not change layouts.
+    /// Core carries the layout opaquely; runtimes check both capacities.
+    BufferCopyValue {
+        src: BufferId,
+        dst: BufferId,
+        layout: L,
+    },
     /// A program output: each slot's value pinned into its destination buffer.
     BufferOutput { slots: Vec<OutputBinding<L>> },
+}
+
+impl<L: PlanLayout> BufferNode<L> {
+    /// The explicit value span of a boundary delivery; whole-storage copies
+    /// intentionally have no value-dependent extent.
+    pub fn copy_value_layout(&self) -> Option<&L> {
+        match self {
+            Self::BufferCopyValue { layout, .. } => Some(layout),
+            _ => None,
+        }
+    }
 }
 
 // PROTOTYPE (Option B): `walk_layout_index` — the hop-chain host walker —
@@ -448,8 +467,13 @@ impl<L: PlanLayout> BufferIrGraph<L> {
                     self.names(reads),
                     self.names(writes),
                 )),
-                BufferNode::BufferCopy { src, dst, .. } => op_lines.push(format!(
+                BufferNode::BufferCopy { src, dst } => op_lines.push(format!(
                     "  BufferCopy: [{}] -> [{}]",
+                    self.buffer_name(src),
+                    self.buffer_name(dst),
+                )),
+                BufferNode::BufferCopyValue { src, dst, .. } => op_lines.push(format!(
+                    "  BufferCopyValue: [{}] -> [{}]",
                     self.buffer_name(src),
                     self.buffer_name(dst),
                 )),
@@ -483,6 +507,7 @@ impl<L: PlanLayout> BufferIrGraph<L> {
             let name = |idx: NodeIndex| match &self.dag[idx] {
                 BufferNode::Compute { op, .. } => op.label().to_string(),
                 BufferNode::BufferCopy { .. } => "BufferCopy".to_string(),
+                BufferNode::BufferCopyValue { .. } => "BufferCopyValue".to_string(),
                 BufferNode::BufferInput { .. } => "input".to_string(),
                 BufferNode::BufferOutput { .. } => "output".to_string(),
             };
@@ -574,7 +599,8 @@ impl<L: PlanLayout> BufferIrGraph<L> {
                     ));
                     continue;
                 }
-                BufferNode::BufferCopy { src, dst, .. } => (
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. } => (
                     // An op: a square, like every other op.
                     format!(
                         "BufferCopy\n{} → {}",
@@ -2196,7 +2222,10 @@ impl<L: PlanLayout> Bufferizer<L> {
 fn validate_plan<L: PlanLayout>(dag: &DiGraph<BufferNode<L>, BufferEdge>) -> Result<()> {
     for index in dag.node_indices() {
         match &dag[index] {
-            BufferNode::BufferCopy { src, dst, .. } if src == dst => {
+            BufferNode::BufferCopy { src, dst, .. }
+            | BufferNode::BufferCopyValue { src, dst, .. }
+                if src == dst =>
+            {
                 anyhow::bail!(
                     "plan validation failed: self-copy of {src:?} — a no-op \
                      writer must be folded before the WAR scan"
@@ -2419,34 +2448,18 @@ pub(crate) fn lower<L: PlanLayout>(
                 {
                     let src = &operands[0];
                     let dst = &results[0];
-                    // MINT SITE — cause 1 (residence conflict repair) and
-                    // cause 3 (lifetime repair): the BT graph already
-                    // decided a transport was needed; this is where it
-                    // becomes a plan node. THE CONTRACT (see
-                    // [`BufferNode::BufferCopy`]): a DUMB EXACT-SIZE
-                    // WHOLE-BUFFER copy, and ORDERING IS THE RUNTIME'S
-                    // OBLIGATION — all this site owes is the dependency
-                    // structure (the data edge below, plus the WAR
-                    // anti-edges added later).
-                    //
-                    // A FOLDED resident (the value addresses `src` through
-                    // folded views): the copy is dumb and whole-buffer, so
-                    // the one legal lowering is the BASE-STORAGE copy —
-                    // memcpy the PARENT buffer whole (copying the base
-                    // buffer counts as delivery; src and dst are the same
-                    // parent-sized storage, exact-size by construction) and
-                    // re-root the fold onto the copy: consumers keep their
-                    // own composed layouts, now anchored on the copied
-                    // buffer. Possibly expensive, and that is fine — search
-                    // finds cheaper routes via cost. The bufferizer never
-                    // switches to the materialize route (election committed
-                    // the genome); a materializing copy is a LayoutTensor
-                    // candidate in the e-graph, never a copy mode.
-                    if let Some(root) = fold_root.get(&src.value).cloned() {
-                        let copy = dag.add_node(BufferNode::BufferCopy {
+                    // Whole-storage relocation of a folded value moves its
+                    // fold root. A value-span transport instead copies the
+                    // declared value's unchanged address span: a writing tie
+                    // already guarantees identical input/result geometry.
+                    if let Some(root) = fold_root.get(&src.value).cloned()
+                        && !op.copies_value_span()
+                    {
+                        let transfer = BufferNode::BufferCopy {
                             src: src.buffer.clone(),
                             dst: dst.buffer.clone(),
-                        });
+                        };
+                        let copy = dag.add_node(transfer);
                         if let Some(&from) = producer.get(&residence(src)) {
                             dag.add_edge(
                                 from,
@@ -2472,10 +2485,19 @@ pub(crate) fn lower<L: PlanLayout>(
                     // The unfolded transport: same value, different buffer.
                     // Exact-size by construction (both buffers back the same
                     // tensor's layout); ordering is the runtime's.
-                    let copy = dag.add_node(BufferNode::BufferCopy {
-                        src: src.buffer.clone(),
-                        dst: dst.buffer.clone(),
-                    });
+                    let transport = if op.copies_value_span() {
+                        BufferNode::BufferCopyValue {
+                            src: src.buffer.clone(),
+                            dst: dst.buffer.clone(),
+                            layout: value_layouts[&src.value].clone(),
+                        }
+                    } else {
+                        BufferNode::BufferCopy {
+                            src: src.buffer.clone(),
+                            dst: dst.buffer.clone(),
+                        }
+                    };
+                    let copy = dag.add_node(transport);
                     if let Some(&from) = producer.get(&residence(src)) {
                         dag.add_edge(
                             from,
@@ -2596,12 +2618,13 @@ pub(crate) fn lower<L: PlanLayout>(
                         // MINT SITE — cause 2 (BOUNDARY PLACEMENT): this
                         // tensor is bound to a SPECIFIC caller buffer, and
                         // its producing residence is elsewhere, so its bytes
-                        // move into the caller's storage. Same contract as
-                        // every other copy (see [`BufferNode::BufferCopy`]):
-                        // dumb, exact-size, whole-buffer; the plan supplies
+                        // move into the caller's storage. The transfer is
+                        // scoped to this value's unchanged address span.
+                        // The plan supplies
                         // only the dependency structure (the data edge below
                         // + WAR anti-edges), and the runtime owns ordering.
-                        let copy = dag.add_node(BufferNode::BufferCopy {
+                        let copy = dag.add_node(BufferNode::BufferCopyValue {
+                            layout: value_layouts[&slot.value].clone(),
                             src: src_buffer.clone(),
                             dst: slot.buffer.clone(),
                         });
@@ -3374,7 +3397,12 @@ mod tests {
         let copies = plan
             .dag
             .node_indices()
-            .filter(|&i| matches!(&plan.dag[i], BufferNode::BufferCopy { .. }))
+            .filter(|&i| {
+                matches!(
+                    &plan.dag[i],
+                    BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+                )
+            })
             .count();
         assert_eq!(copies, 2, "repair + boundary:\n{}", plan.summary());
         assert!(
@@ -3828,10 +3856,10 @@ mod tests {
             .expect("a view of an input escapes zero-copy");
 
         assert!(
-            !plan
-                .dag
-                .node_indices()
-                .any(|i| matches!(&plan.dag[i], BufferNode::BufferCopy { .. })),
+            !plan.dag.node_indices().any(|i| matches!(
+                &plan.dag[i],
+                BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+            )),
             "zero copies — the storage is already the caller's:\n{}",
             plan.summary()
         );
@@ -3875,24 +3903,10 @@ mod tests {
         let _ = &entries;
     }
 
-    /// INTERIOR copy of a folded resident — the default legal lowering is
-    /// the BASE-STORAGE copy: the parent buffer is memcpy'd whole (a DUMB
-    /// EXACT-SIZE WHOLE-BUFFER copy — the copy contract admits no other
-    /// mode) and the fold re-roots onto the copy — the consumer's data edge
-    /// hangs off the copy and its operand descriptor keeps the view's own
-    /// composed layout, now anchored on the copied buffer. Forced by
-    /// hand-rejecting the CONSUMER's dest tie (its operand is the view),
-    /// the same discipline as `rejected_view_repairs_by_copying_the_parent`.
-    ///
-    /// The destination is a FRESHLY MINTED single-writer buffer, never the
-    /// tied result's (ruling 2026-08-27, the repair-destination fix): the
-    /// base-storage copy is PARENT-shaped while the consumer writes its
-    /// result-shaped bytes, so the two must not cohabit. Under the
-    /// corrected contract that is an ASSIGNMENT fact — the fresh buffer
-    /// `backs` the parent, the result's buffer `backs` the result — not a
-    /// geometry join the planner re-derives.
+    /// A folded operand's mutation repair initializes the result under the
+    /// same address map and retains the copy-to-consumer dependency.
     #[test]
-    fn interior_copy_of_folded_resident_copies_the_parent_and_reroots() {
+    fn interior_folded_mutation_copies_its_value_span_and_preserves_the_tie() {
         use crate::index_expr::IotaExpr;
         use crate::test_support::{MockOp, MockViewWithMap, TestGraph};
         let entries = vec![IotaExpr::Coord(0), IotaExpr::Coord(1)];
@@ -3913,7 +3927,7 @@ mod tests {
                 not_conflicting: false,
             }),
             &[&v],
-            &[("r", "rm")],
+            &[("r", "row0")],
         )[0]
         .clone();
         g.output(&r, "E");
@@ -3936,25 +3950,26 @@ mod tests {
             &graph, &order, assignment, &analysis, &geometry,
         )
         .expect("construction never errors on a rejected consumer tie");
-        let plan =
-            lower(bt, &geometry).expect("an interior folded copy lowers via the base-storage copy");
+        let plan = lower(bt, &geometry)
+            .expect("an interior folded mutation lowers via its unchanged value span");
 
-        // The repair copy moves the fold's BASE STORAGE — the parent's
-        // buffer, whole. The node carries only {src, dst}; the copy is
-        // identified by its SOURCE being the parent residence, and its
-        // destination's ASSIGNMENT row says which tensor landed there.
+        // The copy reads the parent allocation through the view's unchanged
+        // address map, initializing exactly the tied result's storage.
         let (copy_idx, copy_src, copy_dst) = plan
             .dag
             .node_indices()
             .find_map(|i| match &plan.dag[i] {
-                BufferNode::BufferCopy { src, dst } if *src == plan.value_buffer[&x] => {
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. }
+                    if *src == plan.value_buffer[&x] =>
+                {
                     Some((i, src.clone(), dst.clone()))
                 }
                 _ => None,
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "the base-storage copy reads the parent's buffer:\n{}",
+                    "the value-span copy reads the parent's buffer:\n{}",
                     plan.summary()
                 )
             });
@@ -3962,50 +3977,39 @@ mod tests {
             copy_src, plan.value_buffer[&x],
             "copied FROM the parent's buffer"
         );
+        assert_eq!(plan.backed_tensor(&copy_dst), Some(&r));
         assert_eq!(
-            plan.backed_tensor(&copy_dst),
-            Some(&x),
-            "the destination's ASSIGNMENT says the PARENT landed there — \
-             parent-shaped storage, sized by the parent's layout:\n{}",
-            plan.summary()
+            copy_dst, plan.value_buffer[&r],
+            "the initialization and mutation use one buffer"
         );
         assert!(
-            matches!(copy_dst, BufferId::Allocated(_)),
-            "interior destination is program storage:\n{}",
-            plan.summary()
+            matches!(&plan.dag[copy_idx],BufferNode::BufferCopyValue {layout,..} if *layout == geometry[&v])
         );
-        assert_ne!(
-            copy_dst,
-            plan.value_buffer[&r],
-            "the repair destination is FRESH, never the tied result's \
-             (result-shaped) buffer:\n{}",
-            plan.summary()
-        );
-        let writers_of_dst = plan
-            .dag
-            .node_indices()
-            .filter(|&i| match &plan.dag[i] {
-                BufferNode::BufferCopy { dst, .. } => *dst == copy_dst,
-                BufferNode::Compute { op, writes, .. } => writes
-                    .iter()
-                    .enumerate()
-                    .any(|(result, id)| *id == copy_dst && op.result_writes_memory(result)),
-                _ => false,
-            })
-            .count();
+        let writers_of_dst =
+            plan.dag
+                .node_indices()
+                .filter(|&i| match &plan.dag[i] {
+                    BufferNode::BufferCopy { dst, .. }
+                    | BufferNode::BufferCopyValue { dst, .. } => *dst == copy_dst,
+                    BufferNode::Compute { op, writes, .. } => writes
+                        .iter()
+                        .enumerate()
+                        .any(|(result, id)| *id == copy_dst && op.result_writes_memory(result)),
+                    _ => false,
+                })
+                .count();
         assert_eq!(
             writers_of_dst,
-            1,
-            "the repair copy is the fresh buffer's SOLE writer:\n{}",
+            2,
+            "the copy initializes the same storage the tied consumer overwrites:\n{}",
             plan.summary()
         );
         assert!(
             !plan.dag.node_indices().any(|i| matches!(
                 &plan.dag[i],
-                BufferNode::BufferCopy { dst, .. } if plan.backed_tensor(dst) == Some(&v)
+                BufferNode::BufferCopy { dst, .. } | BufferNode::BufferCopyValue { dst, .. } if plan.backed_tensor(dst) == Some(&v)
             )),
-            "no buffer is minted to hold the VIEW value itself — a view is \
-             no-work-same-buffer, so only its base storage is ever copied:\n{}",
+            "the initialization buffer backs the result, with the view's unchanged layout:\n{}",
             plan.summary()
         );
 
@@ -4081,10 +4085,10 @@ mod tests {
             .expect("a minted residence escapes in place");
 
         assert!(
-            !plan
-                .dag
-                .node_indices()
-                .any(|i| matches!(&plan.dag[i], BufferNode::BufferCopy { .. })),
+            !plan.dag.node_indices().any(|i| matches!(
+                &plan.dag[i],
+                BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+            )),
             "zero copies — the buffer itself is handed over:\n{}",
             plan.summary()
         );
@@ -4177,7 +4181,8 @@ mod tests {
             .dag
             .node_weights()
             .filter_map(|node| match node {
-                BufferNode::BufferCopy { src, dst } => Some((src.clone(), dst.clone())),
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. } => Some((src.clone(), dst.clone())),
                 _ => None,
             })
             .collect();
@@ -4313,10 +4318,10 @@ mod tests {
         assert_eq!(slots[0].buffer, plan.value_buffer[&p]);
         assert_eq!(plan.buffers[&slots[0].buffer].freed_by, FreedBy::Caller);
         assert!(
-            !plan
-                .dag
-                .node_indices()
-                .any(|i| matches!(&plan.dag[i], BufferNode::BufferCopy { .. })),
+            !plan.dag.node_indices().any(|i| matches!(
+                &plan.dag[i],
+                BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+            )),
             "zero copies:\n{}",
             plan.summary()
         );
@@ -4371,14 +4376,15 @@ mod tests {
         let plan =
             crate::test_support::bufferize_mock(&g.build()).expect("one repair serves both views");
 
-        let copies: Vec<BufferId> = plan
-            .dag
-            .node_weights()
-            .filter_map(|node| match node {
-                BufferNode::BufferCopy { dst, .. } => Some(dst.clone()),
-                _ => None,
-            })
-            .collect();
+        let copies: Vec<BufferId> =
+            plan.dag
+                .node_weights()
+                .filter_map(|node| match node {
+                    BufferNode::BufferCopy { dst, .. }
+                    | BufferNode::BufferCopyValue { dst, .. } => Some(dst.clone()),
+                    _ => None,
+                })
+                .collect();
         assert_eq!(
             copies.len(),
             1,
@@ -4398,23 +4404,10 @@ mod tests {
         assert_eq!(plan.buffers[&copies[0]].freed_by, FreedBy::Caller);
     }
 
-    /// THE ITEM-3 PROBE, RESPELLED AS ASSIGNMENT (corrected contract,
-    /// 2026-08-31). Parent x in buffer A; view v = row0 of x; a consumer
-    /// whose in-place dst-tie on v is REJECTED. The historical form of this
-    /// test carried per-value dims and ran the writer-identity DIMS JOIN,
-    /// asserting the repair buffer "votes" `[5,3]` while the result buffer
-    /// "votes" `[1,3]`. That whole apparatus is DELETED: there is no sizing
-    /// walk, no voting, and no contradiction detection ("all the necessary
-    /// preconditions have been checked in the egraph").
-    ///
-    /// What survives is the fact the join was reconstructing, now stated
-    /// directly: THE ASSIGNMENT. The repair destination is a FRESH buffer
-    /// that `backs` the PARENT (so a runtime sizes it by the parent's
-    /// layout), never the tied result's buffer, which `backs` the result
-    /// (sized by the result's layout). One lookup each; nothing to
-    /// contradict.
+    /// A rejected writing tie must retain one input/result storage even when
+    /// its operand reads through a view of a larger backing allocation.
     #[test]
-    fn folded_repair_targets_a_fresh_parent_backed_buffer() {
+    fn folded_mutating_repair_initializes_the_tied_result_storage() {
         use crate::index_expr::IotaExpr;
         use crate::test_support::{MockOp, MockViewWithMap, TestGraph};
         let entries = vec![IotaExpr::Lit(0), IotaExpr::Coord(0)];
@@ -4435,7 +4428,7 @@ mod tests {
                 not_conflicting: false,
             }),
             &[&v],
-            &[("r", "rm")],
+            &[("r", "row0")],
         )[0]
         .clone();
         g.output(&r, "E");
@@ -4472,37 +4465,44 @@ mod tests {
             .dag
             .node_weights()
             .find_map(|node| match node {
-                BufferNode::BufferCopy { src, dst } if *src == plan.value_buffer[&x] => {
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. }
+                    if *src == plan.value_buffer[&x] =>
+                {
                     Some(dst.clone())
                 }
                 _ => None,
             })
             .expect("the base-storage repair copy");
-        assert_ne!(
+        assert_eq!(
             copy_dst, plan.value_buffer[&r],
-            "fresh, not the result's buffer"
+            "repair must preserve the required storage tie"
         );
-        assert_eq!(
-            plan.backed_tensor(&copy_dst),
-            Some(&x),
-            "the repair buffer BACKS THE PARENT — a runtime sizes it by the \
-             parent's layout, with no walk and no vote:\n{}",
-            plan.summary()
-        );
-        assert_eq!(
-            plan.backed_tensor(&plan.value_buffer[&r]),
-            Some(&r),
-            "the consumer's result buffer backs the RESULT:\n{}",
-            plan.summary()
-        );
-        // Option B: each buffer additionally carries the backed tensor's
-        // layout, so a load_plan caller gets the same two answers with no
-        // table of its own.
-        assert_eq!(&plan.buffers[&copy_dst].layout, &mock_geometry[&x]);
-        assert_eq!(
-            &plan.buffers[&plan.value_buffer[&r]].layout,
-            &mock_geometry[&r]
-        );
+        assert_eq!(plan.backed_tensor(&copy_dst), Some(&r));
+        assert_eq!(&plan.buffers[&copy_dst].layout, &mock_geometry[&r]);
+        let copy_layout = plan
+            .dag
+            .node_weights()
+            .find_map(|node| match node {
+                BufferNode::BufferCopyValue { layout, .. } => Some(layout),
+                _ => None,
+            })
+            .expect("folded mutation copies only its unchanged value span");
+        assert_eq!(copy_layout, &mock_geometry[&v]);
+        let compute = plan
+            .dag
+            .node_weights()
+            .find_map(|node| match node {
+                BufferNode::Compute {
+                    reads,
+                    writes,
+                    ties,
+                    ..
+                } if !ties.is_empty() => Some((reads, writes)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(compute.0[0], compute.1[0]);
         let _ = &entries;
     }
 }

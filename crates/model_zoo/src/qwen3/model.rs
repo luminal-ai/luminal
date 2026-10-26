@@ -3,21 +3,22 @@
 //! luminal_nn constructs on the native recorder — no residency markers,
 //! no HLIR and no backend types. Weight-ness is not authored (a weight is
 //! an ordinary named input; storage residency is runtime-binding business).
-//! `init_with_parameter_dtype` can keep those inputs in checkpoint-native storage while
-//! explicit casts preserve this model's FP32 arithmetic semantics.
+//! Weight ports declare FP32 arithmetic. Applications can attach narrower
+//! checkpoint sources with `Graph::input_source`, which records explicit casts.
 //!
 //! RoPE is the concat-free pairing-matrix spelling ([`luminal_nn::rotary_apply`])
 //! with host-precomputed tables — the rejoin-divergence workaround — and
 //! the KV cache is the scatter/gather paged form, so no concat-of-slices
 //! road ever forms in the recorded graph.
 
-use crate::model_support::{
-    AttentionGeometry, CacheAccess, Embedding, KvCache, LayerNorm, Linear, Namespace, causal_bias,
-    paged_attention, rms_norm_heads, rotary_apply,
-};
+use crate::namespace::Namespace;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::GraphTensor;
+use luminal_nn::{
+    AttentionGeometry, CacheAccess, KvCache, causal_bias, paged_attention, rms_norm_heads,
+    rotary_apply,
+};
 
 /// Architecture hyperparameters. `qwen3_4b` is the real model;
 /// `tiny` keeps the identical anatomy at smoke-test scale.
@@ -77,17 +78,28 @@ impl QwenDims {
 }
 
 pub struct QwenLayer {
-    pub attn_norm: LayerNorm,
-    pub wq: Linear,
-    pub wk: Linear,
-    pub wv: Linear,
-    pub wo: Linear,
+    pub attn_norm_weight: Option<GraphTensor>,
+    pub attn_norm_bias: Option<GraphTensor>,
+    pub attn_norm_epsilon: f32,
+    pub wq_weight: GraphTensor,
+    pub wq_bias: Option<GraphTensor>,
+    pub wk_weight: GraphTensor,
+    pub wk_bias: Option<GraphTensor>,
+    pub wv_weight: GraphTensor,
+    pub wv_bias: Option<GraphTensor>,
+    pub wo_weight: GraphTensor,
+    pub wo_bias: Option<GraphTensor>,
     pub q_norm: GraphTensor,
     pub k_norm: GraphTensor,
-    pub ffn_norm: LayerNorm,
-    pub gate: Linear,
-    pub up: Linear,
-    pub down: Linear,
+    pub ffn_norm_weight: Option<GraphTensor>,
+    pub ffn_norm_bias: Option<GraphTensor>,
+    pub ffn_norm_epsilon: f32,
+    pub gate_weight: GraphTensor,
+    pub gate_bias: Option<GraphTensor>,
+    pub up_weight: GraphTensor,
+    pub up_bias: Option<GraphTensor>,
+    pub down_weight: GraphTensor,
+    pub down_bias: Option<GraphTensor>,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -107,16 +119,31 @@ impl QwenLayer {
         rope_sin: GraphTensor,
         rope_rot: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let normed = self.attn_norm.forward(x);
+        let normed = luminal_nn::rms_norm(
+            x,
+            self.attn_norm_weight,
+            self.attn_norm_bias,
+            self.attn_norm_epsilon,
+        );
         let q = rotary_apply(
-            rms_norm_heads(self.wq.forward(normed), self.head_dim, self.q_norm, 1e-6),
+            rms_norm_heads(
+                luminal_nn::linear(normed, self.wq_weight, self.wq_bias),
+                self.head_dim,
+                self.q_norm,
+                1e-6,
+            ),
             self.head_dim,
             rope_cos,
             rope_sin,
             rope_rot,
         );
         let k = rotary_apply(
-            rms_norm_heads(self.wk.forward(normed), self.head_dim, self.k_norm, 1e-6),
+            rms_norm_heads(
+                luminal_nn::linear(normed, self.wk_weight, self.wk_bias),
+                self.head_dim,
+                self.k_norm,
+                1e-6,
+            ),
             self.head_dim,
             rope_cos,
             rope_sin,
@@ -126,18 +153,26 @@ impl QwenLayer {
         let result = paged_attention(
             q,
             k,
-            self.wv.forward(normed),
+            luminal_nn::linear(normed, self.wv_weight, self.wv_bias),
             KvCache::new(k_cache, v_cache),
             CacheAccess::new(scatter_idx, gather_idx),
             causal_bias(q_pos, context_positions),
             AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
-        let x = x + self.wo.forward(attn);
-        let ff_in = self.ffn_norm.forward(x);
-        let ff = self
-            .down
-            .forward(self.gate.forward(ff_in).silu() * self.up.forward(ff_in));
+        let x = x + luminal_nn::linear(attn, self.wo_weight, self.wo_bias);
+        let ff_in = luminal_nn::rms_norm(
+            x,
+            self.ffn_norm_weight,
+            self.ffn_norm_bias,
+            self.ffn_norm_epsilon,
+        );
+        let ff = luminal_nn::linear(
+            luminal_nn::linear(ff_in, self.gate_weight, self.gate_bias).silu()
+                * luminal_nn::linear(ff_in, self.up_weight, self.up_bias),
+            self.down_weight,
+            self.down_bias,
+        );
         (x + ff, k_cache, v_cache)
     }
 }
@@ -151,135 +186,117 @@ impl QwenLayer {
 /// exists.
 pub struct Qwen {
     pub dims: QwenDims,
-    pub embed: Embedding,
+    pub embed: GraphTensor,
     pub blocks: Vec<QwenLayer>,
-    pub final_norm: LayerNorm,
+    pub final_norm_weight: Option<GraphTensor>,
+    pub final_norm_bias: Option<GraphTensor>,
+    pub final_norm_epsilon: f32,
 }
 
 impl Qwen {
     pub fn init(cx: &mut Graph, dims: &QwenDims) -> Self {
-        Self::init_with_parameter_dtype(cx, dims, DType::F32)
-    }
-
-    pub fn init_with_parameter_dtype(cx: &mut Graph, dims: &QwenDims, dtype: DType) -> Self {
+        let dtype = DType::F32;
         let blocks = (0..dims.layers)
             .map(|l| Self::block(l, dims, dtype, cx))
             .collect();
         Self {
             dims: dims.clone(),
             // HF stores embed_tokens as (vocab, hidden) — the natural
-            // Embedding orientation; `reverse` is the tied lm head.
-            embed: Embedding::new_with_storage_dtype(
-                dims.vocab,
-                dims.hidden,
+            // Embedding orientation; embedding_projection is the tied lm head.
+            embed: cx.named_tensor(
+                Namespace::root()
+                    .child("model")
+                    .child("embed_tokens")
+                    .leaf("weight"),
+                vec![dims.vocab, dims.hidden],
                 dtype,
-                &Namespace::root().child("model").child("embed_tokens"),
-                cx,
             ),
             blocks,
-            final_norm: LayerNorm::new_with_storage_dtype(
-                dims.hidden,
-                true,
-                false,
-                false,
-                dims.rms_eps,
-                dtype,
-                &Namespace::root().child("model").child("norm"),
-                cx,
+            final_norm_weight: Some(
+                cx.named_tensor(
+                    Namespace::root()
+                        .child("model")
+                        .child("norm")
+                        .leaf("weight"),
+                    vec![dims.hidden],
+                    dtype,
+                ),
             ),
+            final_norm_bias: None,
+            final_norm_epsilon: dims.rms_eps,
         }
     }
 
     /// Qwen3 uses decoupled head dimensions and learned norm weights.
-    /// `Linear::new` records Luminal's canonical
-    /// (in, out) orientation; checkpoint staging transposes HF weights.
+    /// Weight ports use Luminal's canonical (in, out) orientation;
+    /// checkpoint staging transposes HF weights.
     fn block(l: usize, d: &QwenDims, dtype: DType, cx: &mut Graph) -> QwenLayer {
         let ns = Namespace::root().child("model").child("layers").index(l);
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         QwenLayer {
-            attn_norm: LayerNorm::new_with_storage_dtype(
-                d.hidden,
-                true,
-                false,
-                false,
-                d.rms_eps,
+            attn_norm_weight: Some(cx.named_tensor(
+                ns.child("input_layernorm").leaf("weight"),
+                vec![d.hidden],
                 dtype,
-                &ns.child("input_layernorm"),
-                cx,
-            ),
-            wq: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.q_dim(),
-                false,
+            )),
+            attn_norm_bias: None,
+            attn_norm_epsilon: d.rms_eps,
+            wq_weight: cx.named_tensor(
+                attn.child("q_proj").leaf("weight"),
+                vec![d.hidden, d.q_dim()],
                 dtype,
-                &attn.child("q_proj"),
-                cx,
             ),
-            wk: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.kv_dim(),
-                false,
+            wq_bias: None,
+            wk_weight: cx.named_tensor(
+                attn.child("k_proj").leaf("weight"),
+                vec![d.hidden, d.kv_dim()],
                 dtype,
-                &attn.child("k_proj"),
-                cx,
             ),
-            wv: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.kv_dim(),
-                false,
+            wk_bias: None,
+            wv_weight: cx.named_tensor(
+                attn.child("v_proj").leaf("weight"),
+                vec![d.hidden, d.kv_dim()],
                 dtype,
-                &attn.child("v_proj"),
-                cx,
             ),
-            wo: Linear::new_with_storage_dtype(
-                d.q_dim(),
-                d.hidden,
-                false,
+            wv_bias: None,
+            wo_weight: cx.named_tensor(
+                attn.child("o_proj").leaf("weight"),
+                vec![d.q_dim(), d.hidden],
                 dtype,
-                &attn.child("o_proj"),
-                cx,
             ),
+            wo_bias: None,
             q_norm: cx
                 .named_tensor(attn.child("q_norm").leaf("weight"), vec![d.head_dim], dtype)
                 .cast(DType::F32),
             k_norm: cx
                 .named_tensor(attn.child("k_norm").leaf("weight"), vec![d.head_dim], dtype)
                 .cast(DType::F32),
-            ffn_norm: LayerNorm::new_with_storage_dtype(
-                d.hidden,
-                true,
-                false,
-                false,
-                d.rms_eps,
+            ffn_norm_weight: Some(cx.named_tensor(
+                ns.child("post_attention_layernorm").leaf("weight"),
+                vec![d.hidden],
                 dtype,
-                &ns.child("post_attention_layernorm"),
-                cx,
-            ),
-            gate: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.intermediate,
-                false,
+            )),
+            ffn_norm_bias: None,
+            ffn_norm_epsilon: d.rms_eps,
+            gate_weight: cx.named_tensor(
+                mlp.child("gate_proj").leaf("weight"),
+                vec![d.hidden, d.intermediate],
                 dtype,
-                &mlp.child("gate_proj"),
-                cx,
             ),
-            up: Linear::new_with_storage_dtype(
-                d.hidden,
-                d.intermediate,
-                false,
+            gate_bias: None,
+            up_weight: cx.named_tensor(
+                mlp.child("up_proj").leaf("weight"),
+                vec![d.hidden, d.intermediate],
                 dtype,
-                &mlp.child("up_proj"),
-                cx,
             ),
-            down: Linear::new_with_storage_dtype(
-                d.intermediate,
-                d.hidden,
-                false,
+            up_bias: None,
+            down_weight: cx.named_tensor(
+                mlp.child("down_proj").leaf("weight"),
+                vec![d.intermediate, d.hidden],
                 dtype,
-                &mlp.child("down_proj"),
-                cx,
             ),
+            down_bias: None,
             n_heads: d.n_heads,
             n_kv_heads: d.n_kv_heads,
             head_dim: d.head_dim,
@@ -304,7 +321,7 @@ impl Qwen {
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         assert_eq!(tokens.dtype, DType::Int);
         assert_eq!(caches.len(), self.blocks.len());
-        let mut x = self.embed.forward(tokens);
+        let mut x = luminal_nn::embedding(tokens, self.embed);
         let mut caches_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
             let (next, k_cache, v_cache) = block.forward_rope(
@@ -321,7 +338,15 @@ impl Qwen {
             x = next;
             caches_out.push((k_cache, v_cache));
         }
-        let logits = self.embed.reverse(self.final_norm.forward(x));
+        let logits = luminal_nn::embedding_projection(
+            luminal_nn::rms_norm(
+                x,
+                self.final_norm_weight,
+                self.final_norm_bias,
+                self.final_norm_epsilon,
+            ),
+            self.embed,
+        );
         (logits, caches_out)
     }
 }

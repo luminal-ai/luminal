@@ -4,10 +4,11 @@
 //! crates. This module specifies only the fixed-width logical graph.
 
 pub use crate::llama3::{Llama3, Llama3Dims};
-use crate::model_support::{KvCachePool, Namespace};
+use crate::namespace::Namespace;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::GraphTensor;
+use luminal_nn::KvCachePool;
 
 /// Fixed batch width of the step-invariant tick graph.
 pub const ROWS: usize = 2;
@@ -38,7 +39,7 @@ impl BatchStep {
         let gather_idx = cx.tensor(vec![slots], DType::Int);
         let scatter_idx = cx.tensor(vec![ROWS], DType::Int);
         let mask = cx.tensor(vec![ROWS, slots], DType::F32);
-        let pool = crate::model_support::named_kv_cache_pool(
+        let pool = crate::namespace::named_kv_cache_pool(
             &mut cx,
             dims.layers,
             slots,
@@ -47,7 +48,7 @@ impl BatchStep {
             &Namespace::root().child("cache"),
         );
 
-        let mut x = model.embed.forward(tokens);
+        let mut x = luminal_nn::embedding(tokens, model.embed);
         let mut cache_outs = Vec::with_capacity(model.blocks.len());
         for (layer, block) in model.blocks.iter().enumerate() {
             let (next, k_cache, v_cache) = block.forward_rope_masked(
@@ -64,7 +65,16 @@ impl BatchStep {
             x = next;
             cache_outs.push((k_cache, v_cache));
         }
-        let logits = model.lm_head.forward(model.final_norm.forward(x));
+        let logits = luminal_nn::linear(
+            luminal_nn::rms_norm(
+                x,
+                model.final_norm_weight,
+                model.final_norm_bias,
+                model.final_norm_epsilon,
+            ),
+            model.lm_head_weight,
+            model.lm_head_bias,
+        );
 
         Self {
             cx,

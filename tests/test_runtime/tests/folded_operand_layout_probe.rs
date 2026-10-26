@@ -177,20 +177,20 @@ fn sliced_transpose_chain_arrives_as_one_layout() {
 /// feeding the second call reads through a fold, and its descriptor
 /// carries the view's own layout.
 #[test]
-fn r10_chained_matmuls_read_through_folded_layouts() {
+fn explicit_transpose_between_matmuls_reads_through_its_own_layout() {
     let text = {
         let mut cx = Graph::new();
         let x = cx.tensor(vec![4usize, 8usize], DType::F32);
         let w1 = cx.tensor(vec![8usize, 3usize], DType::F32);
-        let w2 = cx.tensor(vec![3usize, 5usize], DType::F32);
-        let _ = x.matmul(w1).matmul(w2);
+        let w2 = cx.tensor(vec![4usize, 5usize], DType::F32);
+        let _ = x.matmul(w1).transpose(0, 1).matmul(w2);
         test_runtime::bind_leaves(&cx)
     };
     let (plan, table, found) = folded_slots(
         &text,
         &[
-            "LayoutTensorOpCublasLt",
             "LayoutTensorOpIndexMapApplyViewGeneric",
+            "LayoutTensorOpCublasLtCall",
         ],
     );
     println!(

@@ -11,6 +11,8 @@ edition = "2024"
 
 [features]
 default = []
+experimental-stride-primitive = ["luminal/experimental-stride-primitive"]
+experimental-element-stride = ["luminal/experimental-element-stride"]
 # Train 3: the cuBLASLt host-call dispatch rides the same feature —
 # cudarc's `cublaslt` module (result layer) joins the driver/NVRTC set.
 device = ["dep:cudarc", "cudarc/cublaslt"]
@@ -46,3 +48,8 @@ half = "2.7.1"
 luminal_nn = { path = "../luminal_nn" }
 # Logical model definitions and mini execution-smoke fixtures.
 model_zoo = { path = "../model_zoo" }
+
+[[bench]]
+name = "cublaslt_accumulation"
+harness = false
+required-features = ["device"]

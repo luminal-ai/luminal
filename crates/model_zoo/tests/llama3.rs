@@ -1,6 +1,6 @@
 use luminal::prelude::*;
 use model_zoo::llama3::{Llama3, Llama3Dims};
-use model_zoo::model_support::{Namespace, named_kv_cache_pool};
+use model_zoo::namespace::{Namespace, named_kv_cache_pool};
 
 fn static_dims(tensor: GraphTensor) -> Vec<usize> {
     tensor

@@ -1,0 +1,493 @@
+; Complete approved configurations. Every field is part of the admission gate.
+; Fields are grouped in the same order for every entry:
+;   computation type, scalar data type
+;   A storage type, B storage type, C storage type, D storage type
+;   bias storage type or explicit absence
+;   host alpha and beta values
+;   epilogue
+;   A matrix order, B matrix order, D matrix order
+;   A transpose operation, B transpose operation
+;
+; Computation, scalars, C, bias and D use float32.
+; Rectified linear activation stays generic because the vendor epilogue changes
+; negative zero. Alpha is one; beta is zero without C and one with C.
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (F32) (F32) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat32Computation) (F32)
+    (Bf16) (Bf16) (F32) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))

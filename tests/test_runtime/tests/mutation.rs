@@ -46,7 +46,9 @@ fn mutating_sqrt_bufferizes_zero_copy_in_place() {
     let mut computes = 0;
     for idx in plan.dag.node_indices() {
         match &plan.dag[idx] {
-            BufferNode::BufferCopy { .. } => panic!("zero copies:\n{}", plan.summary()),
+            BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. } => {
+                panic!("zero copies:\n{}", plan.summary())
+            }
             BufferNode::Compute {
                 op, reads, writes, ..
             } => {
@@ -87,7 +89,9 @@ fn alias_safe_add_accumulates_x_plus_x_in_place() {
     let mut computes = 0;
     for idx in plan.dag.node_indices() {
         match &plan.dag[idx] {
-            BufferNode::BufferCopy { .. } => panic!("zero copies:\n{}", plan.summary()),
+            BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. } => {
+                panic!("zero copies:\n{}", plan.summary())
+            }
             BufferNode::Compute {
                 op, reads, writes, ..
             } => {
@@ -131,7 +135,12 @@ fn plain_mutating_add_on_x_plus_x_degrades_to_copies() {
     let copies = plan
         .dag
         .node_indices()
-        .filter(|&idx| matches!(&plan.dag[idx], BufferNode::BufferCopy { .. }))
+        .filter(|&idx| {
+            matches!(
+                &plan.dag[idx],
+                BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+            )
+        })
         .count();
     assert_eq!(copies, 2, "copy-in + boundary copy:\n{}", plan.summary());
 }
@@ -174,7 +183,12 @@ fn boundary_mutation_via_functional_degrades_to_copy() {
     let copies = plan
         .dag
         .node_indices()
-        .filter(|&idx| matches!(&plan.dag[idx], BufferNode::BufferCopy { .. }))
+        .filter(|&idx| {
+            matches!(
+                &plan.dag[idx],
+                BufferNode::BufferCopy { .. } | BufferNode::BufferCopyValue { .. }
+            )
+        })
         .count();
     assert_eq!(copies, 1, "one boundary copy:\n{}", plan.summary());
     // No WAR anti is needed (the copy is dataflow-ordered after the
