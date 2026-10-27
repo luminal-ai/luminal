@@ -120,17 +120,33 @@ fn explicit_reduction_and_scan_dtypes_override_default_promotion() {
     }
 }
 
+/// A floating scan accumulates in the result dtype's opmath: F32 scans
+/// add no cast at all; half-precision scans widen to F32 and round the
+/// partial sums back once (ATen's `acc_type` — eager `cumsum` on a half
+/// tensor equals the f32 cumsum rounded per element, and a scan that
+/// rounded every step would drift by whole ulps of the total).
 #[test]
-fn default_floating_scans_do_not_add_opmath_widening() {
+fn floating_scans_accumulate_in_opmath() {
     for target in ["cumsum.default", "cumprod.default"] {
-        for dtype in [TorchDType::Float, TorchDType::Half, TorchDType::BFloat16] {
-            let t = case(target, dtype, dtype, false, false);
-            assert!(
-                !t.graph
-                    .logical
-                    .petgraph()
-                    .node_weights()
-                    .any(|node| matches!(node.op, LogicalOp::Cast(_)))
+        let casts = |dtype: TorchDType| {
+            case(target, dtype, dtype, false, false)
+                .graph
+                .logical
+                .petgraph()
+                .node_weights()
+                .filter(|node| matches!(node.op, LogicalOp::Cast(_)))
+                .count()
+        };
+        assert_eq!(
+            casts(TorchDType::Float),
+            0,
+            "{target}: F32 scans need no opmath cast"
+        );
+        for dtype in [TorchDType::Half, TorchDType::BFloat16] {
+            assert_eq!(
+                casts(dtype),
+                2,
+                "{target}: {dtype:?} widens to F32 and rounds back"
             );
         }
     }

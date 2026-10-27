@@ -158,6 +158,12 @@ pub(crate) fn kernel(
         TypedBuffer::I8(_) => ctx.reduce_axis_i8(op.axis, i8::MIN, |acc, x| Ok(acc.max(x))),
         TypedBuffer::U8(_) => ctx.reduce_axis_u8(op.axis, u8::MIN, |acc, x| Ok(acc.max(x))),
         TypedBuffer::I16(_) => ctx.reduce_axis_i16(op.axis, i16::MIN, |acc, x| Ok(acc.max(x))),
+        // Max SELECTS, never rounds, so it is exact at every width: the
+        // narrow floats (F16/BF16/fp8) get an arm through the exact f64
+        // widening — the one kind of arithmetic a storage-only format sees.
+        other if other.is_narrow_float() => {
+            ctx.reduce_axis_narrow_float(op.axis, f64::NEG_INFINITY, crate::kernels::maximum_f64)
+        }
         other => anyhow::bail!("reduce-max has no {} arm", other.type_name()),
     }
 }

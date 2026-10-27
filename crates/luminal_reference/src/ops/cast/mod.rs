@@ -150,6 +150,12 @@ pub(crate) fn kernel(
         return uint64_cast(ctx);
     }
     const F32_EXACT_INT: i64 = 1 << 24;
+    // NARROW FLOATS (F16/BF16/fp8): storage formats the runtime never
+    // computes in, so a cast is the ONLY arithmetic they see. One
+    // policy, stated once in `narrow_float_cast` below.
+    if ctx.operands[0].is_narrow_float() || ctx.dests[0].is_narrow_float() {
+        return narrow_float_cast(ctx);
+    }
     if is_narrow(&ctx.operands[0]) || is_narrow(&ctx.dests[0]) {
         return narrow_cast(ctx);
     }
@@ -234,32 +240,6 @@ pub(crate) fn kernel(
                 })?;
             }
         }
-        // fp8: the QUANTIZE direction is the model's own explicit
-        // step (quantization is model definition, ruling 2026-08-12) —
-        // E4M3FN semantics: round-to-nearest-even, SATURATE to ±448
-        // (the clamp handles the crate's non-FN overflow behavior;
-        // agreement with the checkpoint codec is pinned exhaustively
-        // by test). Widening back is exact.
-        (TypedBuffer::F32(input), TypedBuffer::F8E4M3FN(dest)) => {
-            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
-            for (out, value) in dest.iter_mut().zip(input) {
-                *out = if value.is_nan() {
-                    float8::F8E4M3::from_bits(0x7F)
-                } else {
-                    float8::F8E4M3::from_f32(value.clamp(-448.0, 448.0))
-                };
-            }
-        }
-        (TypedBuffer::F8E4M3FN(input), TypedBuffer::F32(dest)) => {
-            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
-            for (out, code) in dest.iter_mut().zip(input) {
-                *out = code.to_f32();
-            }
-        }
-        (TypedBuffer::F8E4M3FN(input), TypedBuffer::F8E4M3FN(dest)) => {
-            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
-            dest.copy_from_slice(input);
-        }
         // F64 bridges (exact widths only). F64 -> int stays the explicit-op
         // refusal; F64 -> F32 narrows precision but is a float->float cast.
         (TypedBuffer::F64(input), TypedBuffer::F64(dest)) => {
@@ -333,6 +313,109 @@ pub(crate) fn kernel(
             "cast has no ({} -> {}) arm",
             input.type_name(),
             dest.type_name()
+        ),
+    }
+    Ok(())
+}
+
+/// Every cast with a narrow float (F16/BF16/fp8) on either side. The
+/// policy, stated once for the whole family (`crate::narrow_float`):
+///
+/// * narrow -> F32 / F64 is EXACT widening (every format is a subset of
+///   f32).
+/// * F32 -> narrow rounds from f32; F64 -> narrow rounds from f64 —
+///   each a SINGLE round-to-nearest-even with the destination format's
+///   overflow policy. Never through an intermediate width: f64 -> f32 ->
+///   f16 can round twice and pick the wrong neighbour.
+/// * narrow -> narrow widens exactly to f64 and rounds once at the
+///   destination (same-format is a copy).
+/// * int -> narrow is CHECKED-EXACT like every int -> float cast here:
+///   the value must survive the round trip, else loud. `Bool8` -> narrow
+///   is the exact 0/1 indicator bridge.
+/// * narrow -> int and narrow -> `Bool8` are REFUSED, as for every other
+///   float: a rounding is a lossy read and a `!= 0` is a projection —
+///   both are explicit ops in the model, never casts.
+fn narrow_float_cast(ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+    let source_name = ctx.operands[0].type_name();
+    let dest_name = ctx.dests[0].type_name();
+    anyhow::ensure!(
+        ctx.operands[0].len() == ctx.dests[0].len(),
+        "cast length mismatch"
+    );
+    if ctx.dests[0].is_narrow_float() {
+        // Same format: a copy. Otherwise gather the source as exact f64
+        // (or f32 for an F32 source) and round once at the destination.
+        if source_name == dest_name {
+            return crate::kernels::move_gathered(
+                &ctx.operands[0].clone(),
+                &mut ctx.dests[0],
+                &(0..ctx.operands[0].len()).collect::<Vec<_>>(),
+            );
+        }
+        let exact: Vec<f64> = match &ctx.operands[0] {
+            TypedBuffer::F32(values) => {
+                let values = values.clone();
+                ctx.dests[0].fill_narrow_float_from_f32(&values)?;
+                return Ok(());
+            }
+            TypedBuffer::F64(values) => values.clone(),
+            TypedBuffer::Bool8(codes) => {
+                let mut values = Vec::with_capacity(codes.len());
+                for code in codes {
+                    anyhow::ensure!(*code <= 1, "Bool8 buffer holds ill-formed code {code}");
+                    values.push(f64::from(*code));
+                }
+                values
+            }
+            TypedBuffer::U64(values) => values.iter().map(|v| *v as f64).collect(),
+            other => match other.narrow_float_to_f64() {
+                Some(values) => values,
+                None => read_integer(other)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("cast has no ({source_name} -> {dest_name}) arm")
+                    })?
+                    .iter()
+                    .map(|v| *v as f64)
+                    .collect(),
+            },
+        };
+        let integer_source = !ctx.operands[0].is_narrow_float()
+            && !matches!(ctx.operands[0], TypedBuffer::F64(_) | TypedBuffer::Bool8(_));
+        ctx.dests[0].fill_narrow_float_from_f64(&exact)?;
+        if integer_source {
+            // Checked-exact: the integer must come back unchanged.
+            let back = ctx.dests[0].narrow_float_to_f64().expect("narrow dest");
+            for (value, rounded) in exact.iter().zip(&back) {
+                anyhow::ensure!(
+                    value == rounded,
+                    "cast {source_name} -> {dest_name} loses exactness at value {value} \
+                     (int -> float casts are checked-exact)"
+                );
+            }
+        }
+        return Ok(());
+    }
+    // Narrow source, wide destination: exact widening or a refusal.
+    let exact = ctx.operands[0]
+        .narrow_float_to_f64()
+        .expect("narrow source");
+    match &mut ctx.dests[0] {
+        TypedBuffer::F64(dest) => dest.copy_from_slice(&exact),
+        TypedBuffer::F32(dest) => {
+            for (out, value) in dest.iter_mut().zip(&exact) {
+                // Exact: every narrow value is an f32 value.
+                *out = *value as f32;
+            }
+        }
+        TypedBuffer::Bool8(_) => anyhow::bail!(
+            "cast {source_name} -> Bool8 is not a reinterpretation: the != 0 \
+             reading is a PROJECTION and must appear as an explicit \
+             comparison in the model (LessThan), never as a cast"
+        ),
+        _ => anyhow::bail!(
+            "cast {source_name} -> {dest_name} is not a reinterpretation: a rounding \
+             or truncation is a lossy read and must appear as an explicit op in \
+             the model, never as a cast"
         ),
     }
     Ok(())

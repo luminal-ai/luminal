@@ -25,6 +25,7 @@ mod egraph_postpass;
 pub mod harness;
 pub mod kernels;
 pub mod layouts;
+pub mod narrow_float;
 pub mod ops;
 pub mod runtime;
 pub mod search;

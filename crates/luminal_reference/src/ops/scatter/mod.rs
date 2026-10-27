@@ -204,7 +204,7 @@ impl OpMatcher for ScatterFunctionalMatcher {
 // ---------------------------------------------------------------------------
 
 use crate::kernels::{coordinate_columns, expect_op};
-use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer, same_variant_match};
 
 /// The CHECKED scatter kernel (ruling 2026-08-06): dest starts as a copy
 /// of init, then dest[coords(i)] = src[i] over the src iteration space.
@@ -257,68 +257,29 @@ pub(crate) fn kernel(
         written[flat] = true;
         *target = flat;
     }
-    // Payload move: dest = copy(init); dest[target[i]] = src[i].
-    match (&ctx.operands[0], &ctx.operands[1], &mut ctx.dests[0]) {
-        (TypedBuffer::F32(init), TypedBuffer::F32(src), TypedBuffer::F32(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (TypedBuffer::I32(init), TypedBuffer::I32(src), TypedBuffer::I32(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (TypedBuffer::U64(init), TypedBuffer::U64(src), TypedBuffer::U64(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (TypedBuffer::I64(init), TypedBuffer::I64(src), TypedBuffer::I64(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (TypedBuffer::I8(init), TypedBuffer::I8(src), TypedBuffer::I8(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (TypedBuffer::U8(init), TypedBuffer::U8(src), TypedBuffer::U8(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (TypedBuffer::I16(init), TypedBuffer::I16(src), TypedBuffer::I16(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (TypedBuffer::Bool8(init), TypedBuffer::Bool8(src), TypedBuffer::Bool8(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (TypedBuffer::F8E4M3FN(init), TypedBuffer::F8E4M3FN(src), TypedBuffer::F8E4M3FN(dest)) => {
-            dest.copy_from_slice(init);
-            for (i, target) in target_of.iter().enumerate() {
-                dest[*target] = src[i];
-            }
-        }
-        (init, src, dest) => anyhow::bail!(
-            "scatter payload dtypes disagree: init {}, src {}, dest {}",
+    // Payload move: dest = copy(init); dest[target[i]] = src[i]. Two
+    // same-variant moves, one body each, for every storage variant.
+    same_variant_match!(
+        (&ctx.operands[0], &mut ctx.dests[0]),
+        (init, dest) => dest.copy_from_slice(init),
+        (init, dest) => anyhow::bail!(
+            "scatter payload dtypes disagree: init {}, dest {}",
             init.type_name(),
+            dest.type_name()
+        )
+    );
+    same_variant_match!(
+        (&ctx.operands[1], &mut ctx.dests[0]),
+        (src, dest) => {
+            for (i, target) in target_of.iter().enumerate() {
+                dest[*target] = src[i];
+            }
+        },
+        (src, dest) => anyhow::bail!(
+            "scatter payload dtypes disagree: src {}, dest {}",
             src.type_name(),
             dest.type_name()
-        ),
-    }
+        )
+    );
     Ok(())
 }

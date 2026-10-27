@@ -8,6 +8,8 @@ name = "luminal_reference_py"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
+float8 = { version = "0.7", features = ["bytemuck", "num-traits"] }
 luminal = { path = "../../.." }
 luminal_reference = { path = "../../luminal_reference" }
 luminal_pytorch_utils = { path = "../utils" }

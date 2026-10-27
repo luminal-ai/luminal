@@ -448,7 +448,8 @@ impl Translator<'_> {
         // output metadata has already resolved both cases, even when the
         // exported node has no dtype argument or explicit cast. Luminal's
         // scans themselves preserve their operand dtype.
-        let x = super::convert(x, self.output_meta_dtype(node)?);
+        let result = self.output_meta_dtype(node)?;
+        let x = super::convert(x, result);
         let dim = self.get_int_arg(node, 1)?;
         // A rank-0 scan is the identity AFTER the dtype conversion.
         if x.rank() == 0 {
@@ -458,11 +459,18 @@ impl Translator<'_> {
             return Ok(x);
         }
         let dim = normalize_dim(dim, x.rank());
-        Ok(if prod {
+        // The running total accumulates in the result dtype's opmath
+        // (ATen's `acc_type`: F32 for F16/BF16) and each partial sum is
+        // rounded to the result dtype once. A half-precision scan that
+        // rounded every step would drift by whole ulps of the total.
+        let compute = super::opmath_compute(result);
+        let x = super::convert(x, compute);
+        let scanned = if prod {
             x.cumprod(vec![dim])
         } else {
             x.cumsum(vec![dim])
-        })
+        };
+        Ok(super::convert(scanned, result))
     }
 
     /// `max.dim` / `min.dim`: values and indices into one graph.

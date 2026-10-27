@@ -1,5 +1,7 @@
 //! Exact encoding access for Boolean conversion kernels and read-only bit views.
 use crate::TypedBuffer;
+use crate::narrow_float::NarrowFloat;
+use crate::typed_buffer::narrow_float_match;
 use anyhow::{Result, anyhow, ensure};
 use luminal::{
     dtype::PlanDtype,
@@ -21,7 +23,14 @@ pub(crate) fn code(data: &TypedBuffer, i: usize) -> Result<u64> {
             ensure!(v[i] <= 1, "ill-formed Bool8 code");
             u64::from(v[i])
         }
-        TypedBuffer::F8E4M3FN(v) => u64::from(v[i].to_bits()),
+        narrow @ (TypedBuffer::F8E4M3FN(_)
+        | TypedBuffer::F16(_)
+        | TypedBuffer::Bf16(_)
+        | TypedBuffer::F8E5M2(_)
+        | TypedBuffer::F8E4M3FNUZ(_)
+        | TypedBuffer::F8E5M2FNUZ(_)) => {
+            narrow_float_match!(narrow, v => v[i].to_code(), _other => unreachable!())
+        }
     })
 }
 pub(crate) fn set_code(data: &mut TypedBuffer, i: usize, code: u64) -> Result<()> {
@@ -39,7 +48,14 @@ pub(crate) fn set_code(data: &mut TypedBuffer, i: usize, code: u64) -> Result<()
             ensure!(code <= 1, "ill-formed Bool8 encoding {code}");
             v[i] = code as u8;
         }
-        TypedBuffer::F8E4M3FN(v) => v[i] = float8::F8E4M3::from_bits(code as u8),
+        narrow @ (TypedBuffer::F8E4M3FN(_)
+        | TypedBuffer::F16(_)
+        | TypedBuffer::Bf16(_)
+        | TypedBuffer::F8E5M2(_)
+        | TypedBuffer::F8E4M3FNUZ(_)
+        | TypedBuffer::F8E5M2FNUZ(_)) => {
+            narrow_float_match!(narrow, v => v[i] = NarrowFloat::from_code(code), _other => unreachable!())
+        }
     }
     Ok(())
 }

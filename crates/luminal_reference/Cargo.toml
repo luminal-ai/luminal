@@ -23,6 +23,9 @@ colored = "2.0.4"
 serde = { version = "1.0.202", features = ["derive"] }
 serde_json = "1.0.140"
 float8 = { version = "0.7", features = ["bytemuck", "num-traits"] }
+# The narrow-float storage family (src/narrow_float.rs): F16/BF16 codes
+# and their round-to-nearest-even conversions.
+half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
 # Neither egglog nor egraph-serialize is pinned here: both reach this crate
 # through `luminal::prelude::{egglog, egraph_serialize}`, so the types UNIFY
 # with luminal's by construction (see the root Cargo.toml).

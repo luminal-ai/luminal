@@ -34,34 +34,6 @@ class KnownFailure:
 
 REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
     KnownFailure(
-        ticket="LUM-1099",
-        url="https://linear.app/luminalai/issue/LUM-1099/reference-backend-rejects-f16-and-bf16-inputs",
-        reason=("reference backend does not support F16/BF16 inputs"),
-        tests=(
-            "test_binary.py::test_copysign_scalar_typed_constants_and_zero_signs",
-            "test_cpu_staging.py::test_empty_cpu_input_preserves_shape_and_dtype[bfloat16]",
-            "test_cpu_staging.py::test_empty_cpu_input_preserves_shape_and_dtype[float16]",
-            "test_dtype_boundary.py::test_arange_uses_exported_shape_and_declared_dtype[keyword-end]",
-            "test_dtype_boundary.py::test_boundary_noop_preserves_dtype_and_values[bfloat16]",
-            "test_dtype_boundary.py::test_boundary_noop_preserves_dtype_and_values[float16]",
-            "test_dtype_boundary.py::test_matching_dtype_does_not_raise[bfloat16]",
-            "test_dtype_boundary.py::test_matching_dtype_does_not_raise[float16]",
-            "test_hlir_ops.py::test_dtype_float16",
-            "test_hlir_ops.py::test_layer_norm_fp16_outliers",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[amax]",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[cumsum]",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[mean]",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[softmax]",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[sum]",
-            "test_hlir_ops.py::test_sdpa_bf16_bool_mask_softmax_parity",
-            "test_hlir_ops.py::test_sdpa_bf16_causal_softmax_parity",
-            "test_hlir_ops.py::test_sdpa_bf16_float_bias_softmax_parity",
-            "test_hlir_ops.py::test_sdpa_bf16_softmax_parity",
-            "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row_bf16_4d",
-            "test_hlir_ops.py::test_sdpa_f16_softmax_parity",
-        ),
-    ),
-    KnownFailure(
         ticket="LUM-1100",
         url="https://linear.app/luminalai/issue/LUM-1100/complex-tensor-inputs-fail-with-input-rank-differs-from-exported-rank",
         reason=(
@@ -277,7 +249,9 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         tests=(
             "test_binary.py::test_atan2_quadrants_and_signed_zero",
             "test_binary.py::test_copysign_fmax_fmin_nan_and_zero_signs",
+            "test_binary.py::test_copysign_scalar_typed_constants_and_zero_signs",
             "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row",
+            "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row_bf16_4d",
         ),
     ),
     KnownFailure(
