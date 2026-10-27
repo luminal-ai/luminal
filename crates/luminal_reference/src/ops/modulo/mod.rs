@@ -143,7 +143,10 @@ pub(crate) fn kernel(
     ctx: &mut ReferenceKernelCtx,
 ) -> anyhow::Result<()> {
     match &ctx.operands[0] {
+        // Rust's `%` on floats is C `fmod`: truncated quotient, result
+        // takes the dividend's sign, exact (fmod never rounds).
         TypedBuffer::F32(_) => ctx.binary_elementwise(|a, b| a % b),
+        TypedBuffer::F64(_) => ctx.binary_elementwise_f64(|a, b| Ok(a % b)),
         other => anyhow::bail!(
             "Mod has no {} arm: integer remainder is TruncRem, not Mod",
             other.type_name()

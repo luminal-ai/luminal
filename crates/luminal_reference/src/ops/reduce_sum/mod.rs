@@ -151,9 +151,14 @@ pub(crate) fn kernel(
     let op = expect_op::<ReduceSumDps>(op)?;
     match &ctx.operands[0] {
         TypedBuffer::F32(_) => ctx.reduce_axis(op.axis, 0.0, |acc, x| acc + x),
+        TypedBuffer::F64(_) => ctx.reduce_axis_f64(op.axis, 0.0, |acc, x| Ok(acc + x)),
         TypedBuffer::I32(_) => ctx.reduce_axis_i32(op.axis, 0, |acc, x| {
             acc.checked_add(x)
                 .ok_or_else(|| anyhow::anyhow!("i32 reduce-sum overflow (ints are non-wrapping)"))
+        }),
+        TypedBuffer::I64(_) => ctx.reduce_axis_i64(op.axis, 0, |acc, x| {
+            acc.checked_add(x)
+                .ok_or_else(|| anyhow::anyhow!("i64 reduce-sum overflow (ints are non-wrapping)"))
         }),
         // NARROW INTS WRAP: main #399's `fold(0i8, i8::wrapping_add)`
         // accumulators, re-expressed (carve-out 2026-09-02).
