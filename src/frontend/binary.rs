@@ -164,6 +164,27 @@ impl Rem<GraphTensor> for GraphTensor {
             "Dtypes must match to mod tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
+        // Mod is the FLOAT remainder (C `fmod`); every runtime implements
+        // it that way. Integer remainder is `trunc_rem`, which carries the
+        // nonzero-divisor proof Mod has no way to state — recording an
+        // integer Mod would build a graph no backend can execute exactly.
+        assert!(
+            !matches!(
+                self.dtype,
+                DType::Int
+                    | DType::I64
+                    | DType::U64
+                    | DType::I4
+                    | DType::U4
+                    | DType::I8
+                    | DType::U8
+                    | DType::I16
+                    | DType::U16
+                    | DType::Bool
+            ),
+            "`%` is the float remainder; use trunc_rem for {:?}",
+            self.dtype
+        );
         let new_id = self.graph().logical.op(
             LogicalOp::Mod,
             &[(self.id, self.dims()), (rhs.id, rhs.dims())],
@@ -726,6 +747,15 @@ pub(super) mod tests {
         let mut cx = Graph::new();
         let a = cx.tensor(vec![2, 3], luminal::dtype::DType::F32);
         let b = cx.tensor(vec![1, 3], luminal::dtype::DType::F32);
+        let _ = a % b;
+    }
+
+    #[test]
+    #[should_panic(expected = "`%` is the float remainder; use trunc_rem for Int64")]
+    fn test_mod_rejects_integer_operands() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(vec![3], luminal::dtype::DType::I64);
+        let b = cx.tensor(vec![3], luminal::dtype::DType::I64);
         let _ = a % b;
     }
 

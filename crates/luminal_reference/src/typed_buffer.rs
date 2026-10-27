@@ -591,13 +591,15 @@ pub struct ReferenceKernelCtx {
     pub dims: luminal::shape::DynMap,
 }
 
-/// The elementwise-binary, axis-reduce and axis-scan helpers for one narrow
-/// integer width — the I8/U8/I16 twins of
-/// [`ReferenceKernelCtx::binary_elementwise_i32`],
-/// [`ReferenceKernelCtx::reduce_axis_i32`] and
-/// [`ReferenceKernelCtx::scan_axis_i32`], whose bodies are identical once the
-/// primitive type is fixed.
-macro_rules! narrow_int_kernel_helpers {
+/// The elementwise-binary, axis-reduce and axis-scan helpers for one
+/// primitive element type, written ONCE: the bodies are identical once the
+/// type is fixed, so every width with fallible (checked or wrapping)
+/// arithmetic is one instantiation below — F64, I32, I64, U64 and the
+/// narrow ints. The closures return `Result` so a checked overflow or a
+/// zero divisor refuses loudly; what each op MEANS (checked vs wrapping)
+/// is written at its call site, in the op's own folder. F32 keeps its
+/// infallible hand-written helpers because most float kernels use them.
+macro_rules! typed_kernel_helpers {
     ($prim:ty, $get:ident, $get_mut:ident, $binary:ident, $reduce:ident, $scan:ident) => {
         /// dest0[i] = f(operand0[i], operand1[i]) at this narrow width.
         pub fn $binary(&mut self, f: impl Fn($prim, $prim) -> Result<$prim>) -> Result<()> {
@@ -751,44 +753,10 @@ impl ReferenceKernelCtx {
         Ok(())
     }
 
-    /// dest0[i] = f(operand0[i], operand1[i]) over i32 values; `f`
-    /// returns Result so checked arithmetic refuses loudly (ints are
-    /// semantically NON-WRAPPING — ruling 2026-08-11; an overflow is a
-    /// loud kernel error, never a wrapped value).
-    pub fn binary_elementwise_i32(&mut self, f: impl Fn(i32, i32) -> Result<i32>) -> Result<()> {
-        let lhs = self.operands[0].as_i32()?;
-        let rhs = self.operands[1].as_i32()?;
-        anyhow::ensure!(
-            lhs.len() == rhs.len() && lhs.len() == self.dests[0].len(),
-            "binary kernel length mismatch"
-        );
-        let (lhs, rhs) = (lhs.clone(), rhs.clone());
-        let dest = self.dests[0].as_i32_mut()?;
-        for (index, out) in dest.iter_mut().enumerate() {
-            *out = f(lhs[index], rhs[index])?;
-        }
-        Ok(())
-    }
-
-    /// The i64 twin of [`Self::binary_elementwise_i32`].
-    pub fn binary_elementwise_i64(&mut self, f: impl Fn(i64, i64) -> Result<i64>) -> Result<()> {
-        let lhs = self.operands[0].as_i64()?;
-        let rhs = self.operands[1].as_i64()?;
-        anyhow::ensure!(
-            lhs.len() == rhs.len() && lhs.len() == self.dests[0].len(),
-            "binary kernel length mismatch"
-        );
-        let (lhs, rhs) = (lhs.clone(), rhs.clone());
-        let dest = self.dests[0].as_i64_mut()?;
-        for (index, out) in dest.iter_mut().enumerate() {
-            *out = f(lhs[index], rhs[index])?;
-        }
-        Ok(())
-    }
-
-    // ---- the narrow-integer family (ruling 2026-09-02, main #399) ----
+    // ---- the fallible-arithmetic widths ----
     //
-    // CARVE-OUT, to be confirmed at review. I8/U8/I16 follow TORCH's
+    // Integer overflow policy (narrow-int carve-out, ruling 2026-09-02,
+    // main #399). CARVE-OUT, to be confirmed at review. I8/U8/I16 follow TORCH's
     // semantics, which main #399 adopted: arithmetic WRAPS at the type's
     // own width. I32 and I64 keep the non-wrapping ruling of 2026-08-11
     // — a checked overflow is a loud kernel error there, and the
@@ -798,13 +766,29 @@ impl ReferenceKernelCtx {
     // narrow-int op mints through the UNGATED arm and needs no proof; a
     // wrap is a defined result at these widths, not an escaped error.
     //
-    // The closures still return `Result` — same shape as the i32/i64
-    // helpers — because wrapping is not the only failure mode: a
+    // The closures return `Result` at every width because wrapping is
+    // not the only failure mode: a
     // zero divisor is undefined at every width, and the trunc-div and
     // trunc-rem kernels refuse it loudly. What each op MEANS shows up at
     // its call site (`Ok(a.wrapping_add(b))`), in its own folder, which
     // is where this branch keeps op semantics.
-    narrow_int_kernel_helpers!(
+    typed_kernel_helpers!(
+        i32,
+        as_i32,
+        as_i32_mut,
+        binary_elementwise_i32,
+        reduce_axis_i32,
+        scan_axis_i32
+    );
+    typed_kernel_helpers!(
+        i64,
+        as_i64,
+        as_i64_mut,
+        binary_elementwise_i64,
+        reduce_axis_i64,
+        scan_axis_i64
+    );
+    typed_kernel_helpers!(
         f64,
         as_f64,
         as_f64_mut,
@@ -812,7 +796,7 @@ impl ReferenceKernelCtx {
         reduce_axis_f64,
         scan_axis_f64
     );
-    narrow_int_kernel_helpers!(
+    typed_kernel_helpers!(
         u64,
         as_u64,
         as_u64_mut,
@@ -820,7 +804,7 @@ impl ReferenceKernelCtx {
         reduce_axis_u64,
         scan_axis_u64
     );
-    narrow_int_kernel_helpers!(
+    typed_kernel_helpers!(
         i8,
         as_i8,
         as_i8_mut,
@@ -828,7 +812,7 @@ impl ReferenceKernelCtx {
         reduce_axis_i8,
         scan_axis_i8
     );
-    narrow_int_kernel_helpers!(
+    typed_kernel_helpers!(
         u8,
         as_u8,
         as_u8_mut,
@@ -836,7 +820,7 @@ impl ReferenceKernelCtx {
         reduce_axis_u8,
         scan_axis_u8
     );
-    narrow_int_kernel_helpers!(
+    typed_kernel_helpers!(
         i16,
         as_i16,
         as_i16_mut,
@@ -972,78 +956,6 @@ impl ReferenceKernelCtx {
         Ok(())
     }
 
-    /// The i32 twin of [`Self::reduce_axis`]; the fold returns Result so
-    /// checked accumulation (non-wrapping Int sums) refuses loudly.
-    pub fn reduce_axis_i32(
-        &mut self,
-        axis_from_end: i64,
-        init: i32,
-        fold: impl Fn(i32, i32) -> Result<i32>,
-    ) -> Result<()> {
-        let dims = &self.operand_dims[0];
-        let rank = dims.len();
-        anyhow::ensure!(
-            (axis_from_end as usize) < rank,
-            "reduce axis {axis_from_end} out of rank {rank}"
-        );
-        let axis = rank - 1 - axis_from_end as usize;
-        let reduced = dims[axis];
-        let inner: usize = dims[axis + 1..].iter().product();
-        let outer: usize = dims[..axis].iter().product();
-        let input = self.operands[0].as_i32()?.clone();
-        let dest = self.dests[0].as_i32_mut()?;
-        anyhow::ensure!(
-            dest.len() == outer * inner && input.len() == outer * reduced * inner,
-            "reduce kernel geometry mismatch"
-        );
-        for o in 0..outer {
-            for i in 0..inner {
-                let mut acc = init;
-                for r in 0..reduced {
-                    acc = fold(acc, input[o * reduced * inner + r * inner + i])?;
-                }
-                dest[o * inner + i] = acc;
-            }
-        }
-        Ok(())
-    }
-
-    /// The i64 twin of [`Self::reduce_axis`]; the fold returns Result so
-    /// checked accumulation (non-wrapping Int sums) refuses loudly.
-    pub fn reduce_axis_i64(
-        &mut self,
-        axis_from_end: i64,
-        init: i64,
-        fold: impl Fn(i64, i64) -> Result<i64>,
-    ) -> Result<()> {
-        let dims = &self.operand_dims[0];
-        let rank = dims.len();
-        anyhow::ensure!(
-            (axis_from_end as usize) < rank,
-            "reduce axis {axis_from_end} out of rank {rank}"
-        );
-        let axis = rank - 1 - axis_from_end as usize;
-        let reduced = dims[axis];
-        let inner: usize = dims[axis + 1..].iter().product();
-        let outer: usize = dims[..axis].iter().product();
-        let input = self.operands[0].as_i64()?.clone();
-        let dest = self.dests[0].as_i64_mut()?;
-        anyhow::ensure!(
-            dest.len() == outer * inner && input.len() == outer * reduced * inner,
-            "reduce kernel geometry mismatch"
-        );
-        for o in 0..outer {
-            for i in 0..inner {
-                let mut acc = init;
-                for r in 0..reduced {
-                    acc = fold(acc, input[o * reduced * inner + r * inner + i])?;
-                }
-                dest[o * inner + i] = acc;
-            }
-        }
-        Ok(())
-    }
-
     /// Contiguous inclusive scan over one axis (zero-based FROM THE END —
     /// the house nth-from-end convention). Every prefix is written, so the
     /// destination carries the operand's geometry, not a reduced one.
@@ -1075,43 +987,6 @@ impl ReferenceKernelCtx {
                 for r in 0..reduced {
                     let k = o * reduced * inner + r * inner + i;
                     acc = fold(acc, input[k]);
-                    dest[k] = acc;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The i32 twin of [`Self::scan_axis`]; the fold returns Result so
-    /// checked accumulation (non-wrapping Int scans) refuses loudly.
-    pub fn scan_axis_i32(
-        &mut self,
-        axis_from_end: i64,
-        init: i32,
-        fold: impl Fn(i32, i32) -> Result<i32>,
-    ) -> Result<()> {
-        let dims = &self.operand_dims[0];
-        let rank = dims.len();
-        anyhow::ensure!(
-            (axis_from_end as usize) < rank,
-            "scan axis {axis_from_end} out of rank {rank}"
-        );
-        let axis = rank - 1 - axis_from_end as usize;
-        let reduced = dims[axis];
-        let inner: usize = dims[axis + 1..].iter().product();
-        let outer: usize = dims[..axis].iter().product();
-        let input = self.operands[0].as_i32()?.clone();
-        let dest = self.dests[0].as_i32_mut()?;
-        anyhow::ensure!(
-            dest.len() == input.len() && input.len() == outer * reduced * inner,
-            "scan kernel geometry mismatch"
-        );
-        for o in 0..outer {
-            for i in 0..inner {
-                let mut acc = init;
-                for r in 0..reduced {
-                    let k = o * reduced * inner + r * inner + i;
-                    acc = fold(acc, input[k])?;
                     dest[k] = acc;
                 }
             }

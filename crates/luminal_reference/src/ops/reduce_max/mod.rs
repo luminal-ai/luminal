@@ -150,6 +150,9 @@ pub(crate) fn kernel(
     let op = expect_op::<ReduceMaxDps>(op)?;
     match &ctx.operands[0] {
         TypedBuffer::F32(_) => ctx.reduce_axis(op.axis, f32::NEG_INFINITY, crate::kernels::maximum),
+        TypedBuffer::F64(_) => ctx.reduce_axis_f64(op.axis, f64::NEG_INFINITY, |acc, x| {
+            Ok(crate::kernels::maximum_f64(acc, x))
+        }),
         TypedBuffer::I32(_) => ctx.reduce_axis_i32(op.axis, i32::MIN, |acc, x| Ok(acc.max(x))),
         TypedBuffer::U64(_) => ctx.reduce_axis_u64(op.axis, 0, |a, b| Ok(a.max(b))),
         TypedBuffer::I64(_) => ctx.reduce_axis_i64(op.axis, i64::MIN, |acc, x| Ok(acc.max(x))),
