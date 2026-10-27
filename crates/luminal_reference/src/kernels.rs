@@ -24,7 +24,7 @@
 //! layout-specialized kernel changes nothing here: the family still
 //! claims once; its kernel branches internally on instance data.
 
-use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer, same_variant_match};
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use std::any::TypeId;
 
@@ -97,6 +97,16 @@ pub(crate) fn maximum(acc: f32, x: f32) -> f32 {
     }
 }
 
+/// [`maximum`] over the exact f64 widening of a narrow float (the
+/// selection folds in `reduce_max` / `left_sequential_scan_max`).
+pub(crate) fn maximum_f64(acc: f64, x: f64) -> f64 {
+    if acc.is_nan() || x.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(x)
+    }
+}
+
 pub(crate) fn expect_op<T: 'static>(op: &dyn BufferTensorIrOp) -> anyhow::Result<&T> {
     op.as_any().downcast_ref::<T>().ok_or_else(|| {
         anyhow::anyhow!(
@@ -139,63 +149,21 @@ pub(crate) fn move_gathered(
     dest: &mut TypedBuffer,
     index_of: &[usize],
 ) -> anyhow::Result<()> {
-    match (source, dest) {
-        (TypedBuffer::F32(data), TypedBuffer::F32(dest)) => {
+    // A payload move is the same loop at every variant: one body,
+    // instantiated per element type by `same_variant_match!`.
+    same_variant_match!(
+        (source, dest),
+        (data, dest) => {
             for (flat, index) in index_of.iter().enumerate() {
                 dest[flat] = data[*index];
             }
-        }
-        (TypedBuffer::F64(data), TypedBuffer::F64(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
-        (TypedBuffer::I32(data), TypedBuffer::I32(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
-        (TypedBuffer::U64(data), TypedBuffer::U64(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
-        (TypedBuffer::I64(data), TypedBuffer::I64(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
-        (TypedBuffer::I8(data), TypedBuffer::I8(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
-        (TypedBuffer::U8(data), TypedBuffer::U8(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
-        (TypedBuffer::I16(data), TypedBuffer::I16(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
-        (TypedBuffer::Bool8(data), TypedBuffer::Bool8(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
-        (TypedBuffer::F8E4M3FN(data), TypedBuffer::F8E4M3FN(dest)) => {
-            for (flat, index) in index_of.iter().enumerate() {
-                dest[flat] = data[*index];
-            }
-        }
+        },
         (source, dest) => anyhow::bail!(
             "payload move between {} and {} buffers",
             source.type_name(),
             dest.type_name()
-        ),
-    }
+        )
+    );
     Ok(())
 }
 

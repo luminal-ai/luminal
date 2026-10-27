@@ -129,7 +129,7 @@ impl OpMatcher for SelectFunctionalMatcher {
 // everything about an op lives in the op's folder).
 // ---------------------------------------------------------------------------
 
-use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer, same_variant_match};
 
 /// `dest0[i] = if condition[i] != 0 { if_true[i] } else { if_false[i] }`.
 ///
@@ -151,36 +151,35 @@ pub(crate) fn kernel(
         ctx.dests[0].len()
     );
 
-    macro_rules! arm {
-        ($as:ident, $as_mut:ident) => {{
-            let if_true = ctx.operands[1].$as()?.clone();
-            let if_false = ctx.operands[2].$as()?.clone();
-            anyhow::ensure!(
-                if_true.len() == if_false.len() && if_true.len() == condition.len(),
-                "select branch length mismatch"
-            );
-            let dest = ctx.dests[0].$as_mut()?;
+    // dest = if_false, then the condition's true positions take if_true:
+    // two same-variant moves, one body each, for every storage variant.
+    same_variant_match!(
+        (&ctx.operands[2], &mut ctx.dests[0]),
+        (if_false, dest) => {
+            anyhow::ensure!(if_false.len() == dest.len(), "select branch length mismatch");
+            dest.copy_from_slice(if_false);
+        },
+        (branch, dest) => anyhow::bail!(
+            "select branch dtypes disagree: if_false {}, output {}",
+            branch.type_name(),
+            dest.type_name()
+        )
+    );
+    same_variant_match!(
+        (&ctx.operands[1], &mut ctx.dests[0]),
+        (if_true, dest) => {
+            anyhow::ensure!(if_true.len() == dest.len(), "select branch length mismatch");
             for (index, out) in dest.iter_mut().enumerate() {
-                *out = if condition[index] != 0 {
-                    if_true[index]
-                } else {
-                    if_false[index]
-                };
+                if condition[index] != 0 {
+                    *out = if_true[index];
+                }
             }
-        }};
-    }
-
-    match &ctx.operands[1] {
-        TypedBuffer::F32(_) => arm!(as_f32, as_f32_mut),
-        TypedBuffer::F64(_) => arm!(as_f64, as_f64_mut),
-        TypedBuffer::I32(_) => arm!(as_i32, as_i32_mut),
-        TypedBuffer::I64(_) => arm!(as_i64, as_i64_mut),
-        TypedBuffer::U64(_) => arm!(as_u64, as_u64_mut),
-        TypedBuffer::I8(_) => arm!(as_i8, as_i8_mut),
-        TypedBuffer::U8(_) => arm!(as_u8, as_u8_mut),
-        TypedBuffer::I16(_) => arm!(as_i16, as_i16_mut),
-        TypedBuffer::Bool8(_) => arm!(as_bool8, as_bool8_mut),
-        other => anyhow::bail!("select has no {} arm", other.type_name()),
-    }
+        },
+        (branch, dest) => anyhow::bail!(
+            "select branch dtypes disagree: if_true {}, output {}",
+            branch.type_name(),
+            dest.type_name()
+        )
+    );
     Ok(())
 }

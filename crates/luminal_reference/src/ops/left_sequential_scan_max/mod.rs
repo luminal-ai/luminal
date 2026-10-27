@@ -157,6 +157,10 @@ pub(crate) fn kernel(
         TypedBuffer::U8(_) => ctx.scan_axis_u8(op.axis, u8::MIN, |acc, x| Ok(acc.max(x))),
         TypedBuffer::U64(_) => ctx.scan_axis_u64(op.axis, 0, |a, b| Ok(a.max(b))),
         TypedBuffer::I16(_) => ctx.scan_axis_i16(op.axis, i16::MIN, |acc, x| Ok(acc.max(x))),
+        // Selection, not arithmetic: exact for the narrow floats (see reduce_max).
+        other if other.is_narrow_float() => {
+            ctx.scan_axis_narrow_float(op.axis, f64::NEG_INFINITY, crate::kernels::maximum_f64)
+        }
         other => anyhow::bail!("scan-max has no {} arm", other.type_name()),
     }
 }

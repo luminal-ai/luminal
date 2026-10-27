@@ -991,6 +991,44 @@ impl ReferenceRuntime {
         self.get_typed(self.output_buffer(tensor)?)?.as_i16()
     }
 
+    /// The narrow-float readers: CODES, never widened values. An F16
+    /// output reads back as `half::f16`; the caller widens if it wants
+    /// to (exactly, see `crate::narrow_float`).
+    pub fn get_f16(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<half::f16>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_f16()
+    }
+
+    /// The bf16 twin of [`Self::get_f16`].
+    pub fn get_bf16(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<half::bf16>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_bf16()
+    }
+
+    /// The e4m3fn twin of [`Self::get_f16`].
+    pub fn get_f8e4m3(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<float8::F8E4M3>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_f8e4m3()
+    }
+
+    /// The e5m2 twin of [`Self::get_f16`].
+    pub fn get_f8e5m2(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<float8::F8E5M2>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_f8e5m2()
+    }
+
+    /// The e4m3fnuz twin of [`Self::get_f16`].
+    pub fn get_f8e4m3fnuz(
+        &self,
+        tensor: petgraph::graph::NodeIndex,
+    ) -> Result<&Vec<crate::narrow_float::F8E4M3FNUZ>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_f8e4m3fnuz()
+    }
+
+    /// The e5m2fnuz twin of [`Self::get_f16`].
+    pub fn get_f8e5m2fnuz(
+        &self,
+        tensor: petgraph::graph::NodeIndex,
+    ) -> Result<&Vec<crate::narrow_float::F8E5M2FNUZ>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_f8e5m2fnuz()
+    }
+
     fn output_buffer(&self, tensor: petgraph::graph::NodeIndex) -> Result<i64> {
         match self.output_buffers.get(&tensor).map(Vec::as_slice) {
             Some([buffer]) => Ok(*buffer),
@@ -2543,6 +2581,86 @@ mod tests {
         );
     }
 
+    /// NARROW-FLOAT STORAGE (LUM-1099). An F16 input through the opmath
+    /// shape the translator emits — widen to F32, compute, round back —
+    /// reads back as f16 codes, BIT-EXACT against `half`'s own rounding
+    /// of the f32 result. Every value is chosen so the f32 result is not
+    /// an f16 value: the final cast must round (to nearest even), and the
+    /// readback must be the code, never a widened float.
+    #[test]
+    fn f16_round_trips_through_opmath_exactly() {
+        use half::f16;
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(vec![4], DType::F16);
+        let out = x.cast(DType::F32).sqrt().cast(DType::F16);
+
+        let inputs: Vec<f16> = [2.0f32, 3.0, 0.1, 60000.0]
+            .iter()
+            .map(|v| f16::from_f32(*v))
+            .collect();
+        let rt = crate::harness::run_reference(&cx, &[(x.id, TypedBuffer::F16(inputs.clone()))]);
+
+        let expected: Vec<f16> = inputs
+            .iter()
+            .map(|v| f16::from_f32(v.to_f32().sqrt()))
+            .collect();
+        assert_eq!(rt.get_f16(out.id).unwrap(), &expected);
+        // Typed readback refuses to widen.
+        let err = rt.get_f32(out.id).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected an f32 buffer, found f16"),
+            "{err}"
+        );
+    }
+
+    /// The bf16 twin, with values whose f32 square roots sit between two
+    /// bf16 codes (7 mantissa bits), so rounding is exercised.
+    #[test]
+    fn bf16_round_trips_through_opmath_exactly() {
+        use half::bf16;
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(vec![3], DType::Bf16);
+        let out = x.cast(DType::F32).sqrt().cast(DType::Bf16);
+
+        let inputs: Vec<bf16> = [2.0f32, 1e30, 7.0]
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect();
+        let rt = crate::harness::run_reference(&cx, &[(x.id, TypedBuffer::Bf16(inputs.clone()))]);
+
+        let expected: Vec<bf16> = inputs
+            .iter()
+            .map(|v| bf16::from_f32(v.to_f32().sqrt()))
+            .collect();
+        assert_eq!(rt.get_bf16(out.id).unwrap(), &expected);
+    }
+
+    /// Staging never converts: f32 data into an F16 input buffer is a
+    /// loud variant refusal at execute, exactly as for Bool8.
+    #[test]
+    fn f16_input_refuses_f32_staging() {
+        use half::f16;
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor(vec![2], DType::F16);
+        let _out = x.cast(DType::F32).sqrt();
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        let mut data = FxHashMap::default();
+        data.insert(
+            x.id,
+            TypedBuffer::F16(vec![f16::from_f32(1.0), f16::from_f32(2.0)]),
+        );
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("search finds a plan");
+        rt.set_data(x.id, vec![1.0f32, 2.0]);
+        let err = rt.execute().unwrap_err();
+        assert!(err.to_string().contains("staging never converts"), "{err}");
+    }
     /// TYPED-BUFFERS LANDING B PINS (2026-08-11).
     /// Bool8 INPUT staging end to end: a Bool input tensor takes caller
     /// codes through the validated constructor, the indicator cast

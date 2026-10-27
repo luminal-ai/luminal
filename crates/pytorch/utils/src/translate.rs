@@ -141,7 +141,7 @@ struct OpMath {
 }
 
 /// Torch's opmath: half-precision math is performed in F32.
-fn opmath_compute(common: DType) -> DType {
+pub(crate) fn opmath_compute(common: DType) -> DType {
     match common {
         DType::F16 | DType::Bf16 => DType::F32,
         dtype => dtype,
@@ -1676,7 +1676,8 @@ fn opmath_target(target: &str) -> bool {
             | "linalg_vector_norm.default"
             | "logcumsumexp.default"
             // cumsum/cumprod stay outside generic opmath. Their translator
-            // casts to the resolved result dtype before the core scan.
+            // casts to the resolved result dtype, scans in that dtype's
+            // opmath (F32 for half: ATen's acc_type) and rounds once.
             | "dist.default"
             | "_cdist_forward.default"
             | "_pdist_forward.default"
