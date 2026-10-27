@@ -138,95 +138,52 @@ pub(crate) fn kernel(
     // The comparison is the one op whose OUTPUT dtype differs from its
     // inputs by construction: same-typed operands, a boolean result
     // stored as Bool8 codes (exact 0x00/0x01 — the writer side of the
-    // Bool8 invariant; never a partial-bit write). Int comparisons are
-    // native and exact — no f32 detour (typed buffers 2026-08-11).
-    match (&ctx.operands[0], &ctx.operands[1]) {
-        (TypedBuffer::F32(lhs), TypedBuffer::F32(rhs)) => {
-            let (lhs, rhs) = (lhs.clone(), rhs.clone());
-            let dest = ctx.dests[0].as_bool8_mut()?;
-            anyhow::ensure!(
-                lhs.len() == rhs.len() && lhs.len() == dest.len(),
-                "less-than kernel length mismatch"
-            );
-            for (index, out) in dest.iter_mut().enumerate() {
-                *out = u8::from(lhs[index] < rhs[index]);
-            }
-        }
-        (TypedBuffer::I32(lhs), TypedBuffer::I32(rhs)) => {
-            let (lhs, rhs) = (lhs.clone(), rhs.clone());
-            let dest = ctx.dests[0].as_bool8_mut()?;
-            anyhow::ensure!(
-                lhs.len() == rhs.len() && lhs.len() == dest.len(),
-                "less-than kernel length mismatch"
-            );
-            for (index, out) in dest.iter_mut().enumerate() {
-                *out = u8::from(lhs[index] < rhs[index]);
-            }
-        }
-        (TypedBuffer::U64(lhs), TypedBuffer::U64(rhs)) => {
-            let (lhs, rhs) = (lhs.clone(), rhs.clone());
-            let dest = ctx.dests[0].as_bool8_mut()?;
-            anyhow::ensure!(
-                lhs.len() == rhs.len() && lhs.len() == dest.len(),
-                "less-than kernel length mismatch"
-            );
-            for (index, out) in dest.iter_mut().enumerate() {
-                *out = u8::from(lhs[index] < rhs[index]);
-            }
-        }
-        (TypedBuffer::I64(lhs), TypedBuffer::I64(rhs)) => {
-            let (lhs, rhs) = (lhs.clone(), rhs.clone());
-            let dest = ctx.dests[0].as_bool8_mut()?;
-            anyhow::ensure!(
-                lhs.len() == rhs.len() && lhs.len() == dest.len(),
-                "less-than kernel length mismatch"
-            );
-            for (index, out) in dest.iter_mut().enumerate() {
-                *out = u8::from(lhs[index] < rhs[index]);
-            }
-        }
-        // Narrow ints compare NATIVELY: an i8 compared as i32 would be
-        // correct here but would need a widening the typed-buffer
-        // ruling forbids, and a u8 compared as i8 would not be correct
-        // at all.
-        (TypedBuffer::I8(lhs), TypedBuffer::I8(rhs)) => {
-            let (lhs, rhs) = (lhs.clone(), rhs.clone());
-            let dest = ctx.dests[0].as_bool8_mut()?;
-            anyhow::ensure!(
-                lhs.len() == rhs.len() && lhs.len() == dest.len(),
-                "less-than kernel length mismatch"
-            );
-            for (index, out) in dest.iter_mut().enumerate() {
-                *out = u8::from(lhs[index] < rhs[index]);
-            }
-        }
-        (TypedBuffer::U8(lhs), TypedBuffer::U8(rhs)) => {
-            let (lhs, rhs) = (lhs.clone(), rhs.clone());
-            let dest = ctx.dests[0].as_bool8_mut()?;
-            anyhow::ensure!(
-                lhs.len() == rhs.len() && lhs.len() == dest.len(),
-                "less-than kernel length mismatch"
-            );
-            for (index, out) in dest.iter_mut().enumerate() {
-                *out = u8::from(lhs[index] < rhs[index]);
-            }
-        }
-        (TypedBuffer::I16(lhs), TypedBuffer::I16(rhs)) => {
-            let (lhs, rhs) = (lhs.clone(), rhs.clone());
-            let dest = ctx.dests[0].as_bool8_mut()?;
-            anyhow::ensure!(
-                lhs.len() == rhs.len() && lhs.len() == dest.len(),
-                "less-than kernel length mismatch"
-            );
-            for (index, out) in dest.iter_mut().enumerate() {
-                *out = u8::from(lhs[index] < rhs[index]);
-            }
+    // Bool8 invariant; never a partial-bit write). Every type compares
+    // NATIVELY in its own order — no widening detour (typed buffers
+    // 2026-08-11): an i8 compared as i32 would be correct but a u8
+    // compared as i8 would not, and an f64 compared as f32 would merge
+    // distinct values.
+    let operands = &ctx.operands;
+    let dest = ctx.dests[0].as_bool8_mut()?;
+    match (&operands[0], &operands[1]) {
+        (TypedBuffer::F32(lhs), TypedBuffer::F32(rhs)) => less_than(lhs, rhs, dest),
+        (TypedBuffer::F64(lhs), TypedBuffer::F64(rhs)) => less_than(lhs, rhs, dest),
+        (TypedBuffer::I32(lhs), TypedBuffer::I32(rhs)) => less_than(lhs, rhs, dest),
+        (TypedBuffer::I64(lhs), TypedBuffer::I64(rhs)) => less_than(lhs, rhs, dest),
+        (TypedBuffer::U64(lhs), TypedBuffer::U64(rhs)) => less_than(lhs, rhs, dest),
+        (TypedBuffer::I8(lhs), TypedBuffer::I8(rhs)) => less_than(lhs, rhs, dest),
+        (TypedBuffer::U8(lhs), TypedBuffer::U8(rhs)) => less_than(lhs, rhs, dest),
+        (TypedBuffer::I16(lhs), TypedBuffer::I16(rhs)) => less_than(lhs, rhs, dest),
+        // Bool8 codes are exactly 0 and 1, so their integer order is the
+        // Boolean order False < True (torch's `lt` on bool tensors).
+        (TypedBuffer::Bool8(lhs), TypedBuffer::Bool8(rhs)) => less_than(lhs, rhs, dest),
+        // A comparison never rounds, so the narrow floats compare exactly
+        // through their f64 widening — the same exception reduce-max and
+        // scan-max make. Comparing the raw CODES would be wrong: sign-
+        // magnitude codes do not order like the values they encode.
+        (lhs, rhs) if lhs.is_narrow_float() && lhs.type_name() == rhs.type_name() => {
+            let missing = || anyhow::anyhow!("expected a narrow-float operand");
+            let lhs = lhs.narrow_float_to_f64().ok_or_else(missing)?;
+            let rhs = rhs.narrow_float_to_f64().ok_or_else(missing)?;
+            less_than(&lhs, &rhs, dest)
         }
         (lhs, rhs) => anyhow::bail!(
             "less-than has no ({}, {}) arm (operands must share one dtype)",
             lhs.type_name(),
             rhs.type_name()
         ),
+    }
+}
+
+/// `dest[i] = lhs[i] < rhs[i]` as a Bool8 code, in `T`'s own order. For
+/// floats that is IEEE order: any comparison with NaN is false.
+fn less_than<T: PartialOrd>(lhs: &[T], rhs: &[T], dest: &mut [u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        lhs.len() == rhs.len() && lhs.len() == dest.len(),
+        "less-than kernel length mismatch"
+    );
+    for ((out, lhs), rhs) in dest.iter_mut().zip(lhs).zip(rhs) {
+        *out = u8::from(lhs < rhs);
     }
     Ok(())
 }

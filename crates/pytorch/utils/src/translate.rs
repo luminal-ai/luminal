@@ -21,6 +21,8 @@ use std::mem::{Discriminant, discriminant};
 use anyhow::{Context, Result, anyhow, bail};
 use luminal::prelude::*;
 
+#[cfg(test)]
+mod add_sub_tests;
 mod array_extra;
 mod attention;
 mod cat;
@@ -952,8 +954,8 @@ impl Translator<'_> {
                 self.operand(&n[0])?.round()
             }
             // ---- elementwise binary ----
-            "add.Tensor" | "add.Scalar" => self.binary(n, |a, b| a + b)?,
-            "sub.Tensor" | "sub.Scalar" => self.binary(n, |a, b| a - b)?,
+            "add.Tensor" | "add.Scalar" => self.add_sub(n, false)?,
+            "sub.Tensor" | "sub.Scalar" => self.add_sub(n, true)?,
             "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
@@ -1457,6 +1459,51 @@ impl Translator<'_> {
         };
 
         self.bind_outputs(node, vec![value])
+    }
+
+    /// `torch.add(self, other, alpha)` / `torch.sub(...)`: `self ± alpha *
+    /// other`, with `alpha` multiplied in the op's compute dtype (opmath
+    /// for F16/BF16, like torch). An omitted or unit alpha records a
+    /// plain add/sub — no multiply. Eager's CPU kernel fuses the multiply
+    /// and add for floats (`vec::fmadd`); this records two roundings, so a
+    /// non-unit, non-power-of-two alpha can differ from eager in the last
+    /// ulp.
+    ///
+    /// Bool: torch defines `bool + bool` as logical OR and scales `other`
+    /// by `alpha` in Boolean space, so a zero alpha drops it and any other
+    /// leaves its truth value; there is no Boolean add in the IR. Torch
+    /// refuses `bool - bool`, so a Bool subtraction never reaches here.
+    fn add_sub(&mut self, n: &[NodeInput], subtract: bool) -> Result<GraphTensor> {
+        let alpha = n.iter().find(|input| input.name == "alpha");
+        let a = self.operand(&n[0])?;
+        let b = if let Some(t) = self.optional_tensor_operand(&n[1])? {
+            t
+        } else {
+            self.scalar(&n[1], a.dtype)?
+        };
+        let (a, b) = broadcast_pair(a, b);
+        if a.dtype == DType::Bool {
+            anyhow::ensure!(!subtract, "torch refuses subtraction of Bool tensors");
+            let alpha_is_zero = alpha.is_some_and(|alpha| {
+                alpha.arg.as_bool() == Some(false)
+                    || alpha.arg.as_int() == Some(0)
+                    || alpha.arg.as_float() == Some(0.0)
+            });
+            return Ok(if alpha_is_zero { a } else { a.logical_or(b) });
+        }
+        let unit_alpha = alpha.is_none_or(|alpha| {
+            alpha.arg.as_bool() == Some(true)
+                || alpha.arg.as_int() == Some(1)
+                || alpha.arg.as_float() == Some(1.0)
+        });
+        let b = match alpha {
+            Some(alpha) if !unit_alpha => {
+                let alpha = self.scalar(alpha, b.dtype)?.expand_rhs(b.dims());
+                b * alpha
+            }
+            _ => b,
+        };
+        Ok(if subtract { a - b } else { a + b })
     }
 
     fn binary(

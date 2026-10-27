@@ -59,7 +59,10 @@ impl Translator<'_> {
         let remainder = distance % safe_span;
         let two = self.cx.constant_i64(2).expand_rhs(quotient.dims());
         let zero_i = self.cx.constant_i64(0).expand_rhs(quotient.dims());
-        let odd = (quotient.trunc_cast(DType::I64) % two).ne(zero_i);
+        // Parity of the reflection count. Integer remainder is
+        // `trunc_rem` (its divisor, the constant 2, discharges the
+        // nonzero proof); `%` is the float remainder.
+        let odd = quotient.trunc_cast(DType::I64).trunc_rem(two).ne(zero_i);
         let reflected = (safe_span - remainder).cond(odd, remainder) + minimum;
         let zero = self.constant_like(reflected, 0.0);
         zero.cond(span_is_zero, reflected)
