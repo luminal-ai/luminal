@@ -62,3 +62,6 @@ pub fn decoder_registry() -> &'static luminal::egglog_utils::eclass::Constructor
             .expect("the built-in reference registry has no duplicate decoders")
     })
 }
+
+// Public scalar types for the reference runtime's narrow floating payloads.
+pub use half::{bf16, f16};

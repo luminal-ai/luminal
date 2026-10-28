@@ -38,6 +38,10 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedBuffer {
     F32(Vec<f32>),
+    /// IEEE FP16 storage; arithmetic follows explicit widening casts.
+    F16(Vec<half::f16>),
+    /// BF16 storage; arithmetic follows explicit widening casts.
+    Bf16(Vec<half::bf16>),
     /// TF32 precision in a distinct typed payload with 32-bit backing words.
     /// Arithmetic requires an explicit widening cast to F32.
     TF32(Vec<crate::tf32::Tf32>),
@@ -67,13 +71,14 @@ pub enum TypedBuffer {
     F8E4M3FN(Vec<float8::F8E4M3>),
 }
 
-/// The narrow-integer family (I8/U8/I16) is ONE implementation at three
+/// Typed accessors share one implementation across narrow float and integer
+/// storage. The narrow-integer family (I8/U8/I16) uses this at three
 /// widths: typed accessors that refuse by name rather than coerce,
 /// exactly like the hand-written F32/I32/I64 pairs above. Written as a
 /// macro because three verbatim copies of a seven-line accessor is not
 /// three decisions — it is one, repeated. Anything that DIFFERS between
 /// the widths (there is nothing, today) belongs outside the macro.
-macro_rules! narrow_int_accessors {
+macro_rules! typed_accessors {
     ($variant:ident, $prim:ty, $get:ident, $get_mut:ident, $article:literal) => {
         pub fn $get(&self) -> Result<&Vec<$prim>> {
             match self {
@@ -110,6 +115,8 @@ impl TypedBuffer {
             }};
         }
         match (self, source) {
+            (Self::F16(a), Self::F16(b)) => copy!(a, b),
+            (Self::Bf16(a), Self::Bf16(b)) => copy!(a, b),
             (Self::F32(a), Self::F32(b)) => copy!(a, b),
             (Self::TF32(a), Self::TF32(b)) => copy!(a, b),
             (Self::F64(a), Self::F64(b)) => copy!(a, b),
@@ -143,6 +150,8 @@ impl TypedBuffer {
 
     pub fn len(&self) -> usize {
         match self {
+            TypedBuffer::F16(values) => values.len(),
+            TypedBuffer::Bf16(values) => values.len(),
             TypedBuffer::F32(values) => values.len(),
             TypedBuffer::TF32(values) => values.len(),
             TypedBuffer::F64(values) => values.len(),
@@ -162,6 +171,8 @@ impl TypedBuffer {
 
     pub fn type_name(&self) -> &'static str {
         match self {
+            TypedBuffer::F16(_) => "f16",
+            TypedBuffer::Bf16(_) => "bf16",
             TypedBuffer::F32(_) => "f32",
             TypedBuffer::TF32(_) => "tf32",
             TypedBuffer::F64(_) => "f64",
@@ -174,6 +185,10 @@ impl TypedBuffer {
             TypedBuffer::F8E4M3FN(_) => "f8e4m3fn",
         }
     }
+
+    typed_accessors!(F16, half::f16, as_f16, as_f16_mut, "an f16");
+
+    typed_accessors!(Bf16, half::bf16, as_bf16, as_bf16_mut, "a bf16");
 
     pub fn as_f32(&self) -> Result<&Vec<f32>> {
         match self {
@@ -245,9 +260,9 @@ impl TypedBuffer {
         }
     }
 
-    narrow_int_accessors!(I8, i8, as_i8, as_i8_mut, "an i8");
-    narrow_int_accessors!(U8, u8, as_u8, as_u8_mut, "a u8");
-    narrow_int_accessors!(I16, i16, as_i16, as_i16_mut, "an i16");
+    typed_accessors!(I8, i8, as_i8, as_i8_mut, "an i8");
+    typed_accessors!(U8, u8, as_u8, as_u8_mut, "a u8");
+    typed_accessors!(I16, i16, as_i16, as_i16_mut, "an i16");
 
     pub fn as_f8e4m3(&self) -> Result<&Vec<float8::F8E4M3>> {
         match self {
@@ -282,7 +297,7 @@ impl TypedBuffer {
         match self {
             Self::F64(_) | Self::I64(_) => 8,
             Self::F32(_) | Self::TF32(_) | Self::I32(_) => 4,
-            Self::I16(_) => 2,
+            Self::F16(_) | Self::Bf16(_) | Self::I16(_) => 2,
             _ => 1,
         }
     }
@@ -304,6 +319,8 @@ impl TypedBuffer {
     pub(crate) fn zeroed(dtype: luminal::dtype::PlanDtype, n: usize) -> Result<Self> {
         use luminal::dtype::PlanDtype as D;
         Ok(match dtype {
+            D::F16 => Self::F16(vec![half::f16::ZERO; n]),
+            D::Bf16 => Self::Bf16(vec![half::bf16::ZERO; n]),
             D::F32 => Self::F32(vec![0.; n]),
             D::TF32 => Self::TF32(vec![crate::tf32::Tf32::default(); n]),
             D::F64 => Self::F64(vec![0.; n]),
@@ -320,6 +337,8 @@ impl TypedBuffer {
 
     pub fn zeroed_like(&self) -> TypedBuffer {
         match self {
+            TypedBuffer::F16(values) => TypedBuffer::F16(vec![half::f16::ZERO; values.len()]),
+            TypedBuffer::Bf16(values) => TypedBuffer::Bf16(vec![half::bf16::ZERO; values.len()]),
             TypedBuffer::F32(values) => TypedBuffer::F32(vec![0.0; values.len()]),
             TypedBuffer::TF32(values) => {
                 TypedBuffer::TF32(vec![crate::tf32::Tf32::default(); values.len()])
@@ -796,5 +815,17 @@ impl ReferenceKernelCtx {
             }
         }
         Ok(())
+    }
+}
+
+impl From<Vec<half::f16>> for TypedBuffer {
+    fn from(values: Vec<half::f16>) -> Self {
+        Self::F16(values)
+    }
+}
+
+impl From<Vec<half::bf16>> for TypedBuffer {
+    fn from(values: Vec<half::bf16>) -> Self {
+        Self::Bf16(values)
     }
 }

@@ -265,6 +265,18 @@ pub(crate) fn kernel(
                 dest[*target] = src[i];
             }
         }
+        (TypedBuffer::F16(init), TypedBuffer::F16(src), TypedBuffer::F16(dest)) => {
+            dest.copy_from_slice(init);
+            for (i, target) in target_of.iter().enumerate() {
+                dest[*target] = src[i];
+            }
+        }
+        (TypedBuffer::Bf16(init), TypedBuffer::Bf16(src), TypedBuffer::Bf16(dest)) => {
+            dest.copy_from_slice(init);
+            for (i, target) in target_of.iter().enumerate() {
+                dest[*target] = src[i];
+            }
+        }
         (TypedBuffer::TF32(init), TypedBuffer::TF32(src), TypedBuffer::TF32(dest)) => {
             dest.copy_from_slice(init);
             for (i, target) in target_of.iter().enumerate() {

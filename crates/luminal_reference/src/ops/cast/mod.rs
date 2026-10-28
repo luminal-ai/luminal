@@ -149,7 +149,73 @@ pub(crate) fn kernel(
     if is_narrow(&ctx.operands[0]) || is_narrow(&ctx.dests[0]) {
         return narrow_cast(ctx);
     }
+    macro_rules! convert {
+        ($input:expr, $dest:expr, $conversion:expr) => {{
+            anyhow::ensure!($input.len() == $dest.len(), "cast length mismatch");
+            for (out, value) in $dest.iter_mut().zip($input) {
+                *out = ($conversion)(*value);
+            }
+        }};
+    }
     match (&ctx.operands[0], &mut ctx.dests[0]) {
+        (TypedBuffer::F32(input), TypedBuffer::F16(dest)) => {
+            convert!(input, dest, half::f16::from_f32)
+        }
+        (TypedBuffer::F64(input), TypedBuffer::F16(dest)) => {
+            convert!(input, dest, half::f16::from_f64)
+        }
+        (TypedBuffer::TF32(input), TypedBuffer::F16(dest)) => {
+            convert!(input, dest, |x: crate::Tf32| half::f16::from_f32(
+                x.to_f32()
+            ))
+        }
+        (TypedBuffer::F16(input), TypedBuffer::F32(dest)) => {
+            convert!(input, dest, half::f16::to_f32)
+        }
+        (TypedBuffer::F16(input), TypedBuffer::F64(dest)) => {
+            convert!(input, dest, half::f16::to_f64)
+        }
+        (TypedBuffer::F16(input), TypedBuffer::TF32(dest)) => {
+            convert!(input, dest, |x: half::f16| crate::Tf32::from_f32(
+                x.to_f32()
+            ))
+        }
+        (TypedBuffer::F16(input), TypedBuffer::F16(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            dest.copy_from_slice(input);
+        }
+        (TypedBuffer::F32(input), TypedBuffer::Bf16(dest)) => {
+            convert!(input, dest, half::bf16::from_f32)
+        }
+        (TypedBuffer::F64(input), TypedBuffer::Bf16(dest)) => {
+            convert!(input, dest, half::bf16::from_f64)
+        }
+        (TypedBuffer::TF32(input), TypedBuffer::Bf16(dest)) => {
+            convert!(input, dest, |x: crate::Tf32| half::bf16::from_f32(
+                x.to_f32()
+            ))
+        }
+        (TypedBuffer::Bf16(input), TypedBuffer::F32(dest)) => {
+            convert!(input, dest, half::bf16::to_f32)
+        }
+        (TypedBuffer::Bf16(input), TypedBuffer::F64(dest)) => {
+            convert!(input, dest, half::bf16::to_f64)
+        }
+        (TypedBuffer::Bf16(input), TypedBuffer::TF32(dest)) => {
+            convert!(input, dest, |x: half::bf16| crate::Tf32::from_f32(
+                x.to_f32()
+            ))
+        }
+        (TypedBuffer::Bf16(input), TypedBuffer::Bf16(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            dest.copy_from_slice(input);
+        }
+        (TypedBuffer::F16(input), TypedBuffer::Bf16(dest)) => {
+            convert!(input, dest, |x: half::f16| half::bf16::from_f32(x.to_f32()))
+        }
+        (TypedBuffer::Bf16(input), TypedBuffer::F16(dest)) => {
+            convert!(input, dest, |x: half::bf16| half::f16::from_f32(x.to_f32()))
+        }
         // Same-type: value-preserving copies.
         (TypedBuffer::F32(input), TypedBuffer::F32(dest)) => {
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");

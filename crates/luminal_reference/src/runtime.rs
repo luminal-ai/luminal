@@ -876,6 +876,15 @@ impl ReferenceRuntime {
         self.get_typed(self.output_buffer(tensor)?)?.as_i32()
     }
 
+    /// Read native 16-bit floating storage without implicit widening.
+    pub fn get_f16(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<half::f16>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_f16()
+    }
+
+    pub fn get_bf16(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<half::bf16>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_bf16()
+    }
+
     pub fn get_tf32(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<crate::tf32::Tf32>> {
         self.get_typed(self.output_buffer(tensor)?)?.as_tf32()
     }
