@@ -76,8 +76,10 @@ fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
             );
             TypedBuffer::F16(
                 bytes
-                    .chunks_exact(2)
-                    .map(|c| half::f16::from_bits(u16::from_ne_bytes(c.try_into().unwrap())))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| half::f16::from_bits(u16::from_ne_bytes(*c)))
                     .collect(),
             )
         }
@@ -89,8 +91,10 @@ fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
             );
             TypedBuffer::Bf16(
                 bytes
-                    .chunks_exact(2)
-                    .map(|c| half::bf16::from_bits(u16::from_ne_bytes(c.try_into().unwrap())))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| half::bf16::from_bits(u16::from_ne_bytes(*c)))
                     .collect(),
             )
         }
