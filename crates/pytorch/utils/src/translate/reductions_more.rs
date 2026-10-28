@@ -9,7 +9,7 @@ use luminal::prelude::*;
 
 use super::Translator;
 use super::util;
-use crate::pt2_schema::Node;
+use crate::pt2_schema::{Argument, Node};
 
 /// Which linear-algebra composite an `addmm`-family target is.
 #[derive(Clone, Copy)]
@@ -31,6 +31,11 @@ fn normalize_axes(axes: &[i64], rank: usize) -> Result<Vec<usize>> {
                 .ok_or_else(|| anyhow::anyhow!("axis {a} out of range for rank {rank}"))
         })
         .collect()
+}
+
+/// An explicit `None` argument (PT2 spells it `{"as_none": ...}`).
+fn is_none_arg(arg: &Argument) -> bool {
+    matches!(arg, Argument::Other(value) if value.is_null() || value.get("as_none").is_some())
 }
 
 /// Re-insert the reduced axes as size-1 extents (keepdim).
@@ -116,22 +121,45 @@ impl Translator<'_> {
         })
     }
 
+    /// `var.*` / `std.*`: the shared variance lowering, square-rooted for
+    /// `std` (torch takes the root in the accumulate type, before rounding).
+    pub(super) fn translate_var(&mut self, node: &Node, std: bool) -> Result<GraphTensor> {
+        let (_, axes, variance) = self.lower_variance(node)?;
+        let result = if std { variance.sqrt() } else { variance };
+        Ok(if self.keepdim_flag(node, 3) {
+            keep_reduced(result, &axes)
+        } else {
+            result
+        })
+    }
+
     /// `var_mean.default` / `var_mean.dim` / `var_mean.correction` -> (var, mean).
     pub(super) fn translate_var_mean(&mut self, node: &Node) -> Result<()> {
-        let input = self.operand(&node.inputs[0])?;
-        let axes = self.reduction_axes(node, 1, input.rank())?;
-        let correction = self.variance_correction(node);
-        let dtype = self.compute_dtype(node).unwrap_or(input.dtype);
-        let input = input.cast(dtype);
-        let variance = input.var_options(&axes, correction);
+        let (input, axes, variance) = self.lower_variance(node)?;
         let mean = input.mean(&axes);
-        let keepdim = self.keepdim_flag(node, 3);
-        let (variance, mean) = if keepdim {
+        let (variance, mean) = if self.keepdim_flag(node, 3) {
             (keep_reduced(variance, &axes), keep_reduced(mean, &axes))
         } else {
             (variance, mean)
         };
         self.bind_outputs(node, vec![variance, mean])
+    }
+
+    /// The ONE variance lowering behind `var.*`, `std.*` and `var_mean.*`
+    /// (`std_mean` has no arm and reaches `var_mean` through its
+    /// decomposition). Returns the operand at the compute dtype (opmath
+    /// widens half precision to F32, torch's accumulate type), the reduced
+    /// axes, and the variance over them. The correction stays real-valued
+    /// all the way into core `var_correction`, which owns the divisor rule
+    /// `max(0, N - correction)` and the NaN of an empty reduction.
+    fn lower_variance(&mut self, node: &Node) -> Result<(GraphTensor, Vec<usize>, GraphTensor)> {
+        let input = self.operand(&node.inputs[0])?;
+        let axes = self.reduction_axes(node, 1, input.rank())?;
+        let correction = self.variance_correction(node)?;
+        let dtype = self.compute_dtype(node).unwrap_or(input.dtype);
+        let input = input.cast(dtype);
+        let variance = input.var_correction(&axes, correction);
+        Ok((input, axes, variance))
     }
 
     /// `addmm` / `addbmm` / `addmv`:
@@ -222,7 +250,8 @@ impl Translator<'_> {
     }
 
     /// The reduced axes for a variance/reduction node. A missing or empty
-    /// dim list means "reduce every axis".
+    /// dim list means "reduce every axis". A rank-0 operand has no axis to
+    /// reduce; torch accepts dim 0 or -1 for it.
     fn reduction_axes(&self, node: &Node, index: usize, rank: usize) -> Result<Vec<usize>> {
         let dims = match node.inputs.get(index) {
             Some(input) if input.arg.as_ints().is_some() || input.arg.as_sym_ints().is_some() => {
@@ -230,19 +259,46 @@ impl Translator<'_> {
             }
             _ => Vec::new(),
         };
+        if rank == 0 {
+            anyhow::ensure!(
+                dims.iter().all(|&d| d == 0 || d == -1),
+                "{}: dims {dims:?} out of range for a rank-0 operand",
+                node.target
+            );
+            return Ok(Vec::new());
+        }
         Ok(if dims.is_empty() {
             (0..rank).collect()
         } else {
-            dims.iter().map(|&d| util::normalize_dim(d, rank)).collect()
+            normalize_axes(&dims, rank)?
         })
     }
 
-    /// `correction` (degrees-of-freedom offset) or the `unbiased` bool.
-    fn variance_correction(&self, node: &Node) -> usize {
-        if let Some(correction) = self.named_float_arg(node, "correction") {
-            return correction.max(0.0) as usize;
+    /// The degrees-of-freedom correction, kept real-valued: torch's
+    /// `Scalar? correction` may be any Python float or int (0.5 and -1 are
+    /// legal), so truncating it to an unsigned integer changes the answer.
+    /// A named `correction` wins; an absent or `None` one falls back to the
+    /// `unbiased` bool of the `.default`/`.dim` overloads (true is Bessel's
+    /// 1, false is 0), and then to torch's default of 1. A correction this
+    /// arm cannot read as a literal number is refused, never defaulted.
+    fn variance_correction(&self, node: &Node) -> Result<f64> {
+        if let Some(input) = node.inputs.iter().find(|input| input.name == "correction") {
+            if let Some(correction) = input.arg.as_float() {
+                return Ok(correction);
+            }
+            if let Some(correction) = input.arg.as_int() {
+                return Ok(correction as f64);
+            }
+            anyhow::ensure!(
+                is_none_arg(&input.arg),
+                "{}: correction {:?} is not a literal number",
+                node.target,
+                input.arg
+            );
         }
-        self.named_bool_arg(node, "unbiased").map_or(1, usize::from)
+        Ok(self
+            .named_bool_arg(node, "unbiased")
+            .map_or(1.0, |unbiased| if unbiased { 1.0 } else { 0.0 }))
     }
 
     fn keepdim_flag(&self, node: &Node, positional: usize) -> bool {
@@ -700,5 +756,174 @@ mod scalar_precision_tests {
         );
         assert_eq!(rt.get_i64(a.id).unwrap(), &[alpha]);
         assert_eq!(rt.get_i64(b.id).unwrap(), &[beta]);
+    }
+}
+
+#[cfg(test)]
+mod variance_tests {
+    use crate::pt2_schema::{Argument, NodeInput, ScalarName, SymFloatArg};
+    use crate::translate::test_support::*;
+
+    const ROWS: [[f32; 4]; 3] = [
+        [1.0, 2.0, 4.0, 8.0],
+        [0.5, -1.0, 3.0, 2.5],
+        [2.0, 2.0, 2.0, 5.0],
+    ];
+
+    /// Independent two-pass variance in f64 with torch's divisor rule.
+    fn torch_variance(values: &[f32], correction: f64) -> f64 {
+        let n = values.len() as f64;
+        let mean = values.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let squares: f64 = values.iter().map(|&v| (v as f64 - mean).powi(2)).sum();
+        let degrees = if n > correction && n > 0.0 {
+            n - correction
+        } else {
+            0.0
+        };
+        squares / degrees
+    }
+
+    fn per_row(correction: f64) -> Vec<f64> {
+        ROWS.iter()
+            .map(|row| torch_variance(row, correction))
+            .collect()
+    }
+
+    fn everything(correction: f64) -> Vec<f64> {
+        let flat: Vec<f32> = ROWS.iter().flatten().copied().collect();
+        vec![torch_variance(&flat, correction)]
+    }
+
+    /// Translate one variance node over the 3x4 `x` and run it on the
+    /// reference runtime, returning every output.
+    fn run(target: &str, args: Vec<NodeInput>, outputs: &[(&str, &[i64])]) -> Vec<Vec<f32>> {
+        let mut inputs = vec![tensor_input("self", "x")];
+        inputs.extend(args);
+        let names: Vec<&str> = outputs.iter().map(|(name, _)| *name).collect();
+        let mut tensors: Vec<(&str, u32, &[i64])> = vec![("x", FLOAT, &[3, 4])];
+        tensors.extend(outputs.iter().map(|(name, shape)| (*name, FLOAT, *shape)));
+        let t = translate_one(
+            node(&format!("torch.ops.aten.{target}"), inputs, &names),
+            &tensors,
+            &["x"],
+            &names,
+        );
+        let flat: Vec<f32> = ROWS.iter().flatten().copied().collect();
+        let rt = luminal_reference::harness::run_reference(
+            &t.graph,
+            &[(t.inputs[0].tensor, flat.into())],
+        );
+        t.outputs
+            .iter()
+            .map(|output| rt.get_f32(output.tensor).unwrap().to_vec())
+            .collect()
+    }
+
+    fn assert_matches(got: &[f32], expected: &[f64], what: &str) {
+        assert_eq!(got.len(), expected.len(), "{what}: length");
+        for (index, (&got, &expected)) in got.iter().zip(expected).enumerate() {
+            let expected = expected as f32;
+            let same = (got.is_nan() && expected.is_nan())
+                || got == expected
+                || (got - expected).abs() <= 1e-5 * expected.abs().max(1.0);
+            assert!(same, "{what}[{index}]: got {got}, expected {expected}");
+        }
+    }
+
+    /// Every variance arm reads torch's correction as a real number: the
+    /// `unbiased` bool of `.default`/`.dim`, a float or int `correction`
+    /// (fractional, negative, past N), and the default of 1 for `None`.
+    #[test]
+    fn variance_arms_read_the_real_valued_correction() {
+        let out = run(
+            "var.default",
+            vec![scalar_bool("unbiased", false)],
+            &[("y", &[])],
+        );
+        assert_matches(&out[0], &everything(0.0), "var.default unbiased=False");
+
+        let out = run(
+            "var.dim",
+            vec![
+                ints("dim", &[1]),
+                scalar_bool("unbiased", false),
+                scalar_bool("keepdim", true),
+            ],
+            &[("y", &[3, 1])],
+        );
+        assert_matches(&out[0], &per_row(0.0), "var.dim unbiased=False");
+
+        let out = run(
+            "var.correction",
+            vec![ints("dim", &[1]), scalar_float("correction", 0.5)],
+            &[("y", &[3])],
+        );
+        assert_matches(&out[0], &per_row(0.5), "var.correction 0.5");
+
+        let out = run(
+            "std.correction",
+            vec![ints("dim", &[-1]), scalar_int("correction", 5)],
+            &[("y", &[3])],
+        );
+        let std: Vec<f64> = per_row(5.0).iter().map(|v| v.sqrt()).collect();
+        assert!(std.iter().all(|v| *v == f64::INFINITY));
+        assert_matches(&out[0], &std, "std.correction 5 > N");
+
+        let out = run(
+            "var_mean.correction",
+            vec![
+                ints("dim", &[1]),
+                scalar_int("correction", -1),
+                scalar_bool("keepdim", true),
+            ],
+            &[("var", &[3, 1]), ("mean", &[3, 1])],
+        );
+        assert_matches(&out[0], &per_row(-1.0), "var_mean.correction -1 variance");
+        let means: Vec<f64> = ROWS
+            .iter()
+            .map(|row| row.iter().map(|&v| v as f64).sum::<f64>() / 4.0)
+            .collect();
+        assert_matches(&out[1], &means, "var_mean.correction -1 mean");
+
+        let out = run(
+            "var.correction",
+            vec![none("dim"), none("correction")],
+            &[("y", &[])],
+        );
+        assert_matches(&out[0], &everything(1.0), "var.correction None");
+    }
+
+    /// A correction that is not a literal number is refused by name rather
+    /// than silently replaced by the default.
+    #[test]
+    fn variance_refuses_a_non_literal_correction() {
+        let parsed = parsed_nodes(
+            vec![node(
+                "torch.ops.aten.var.correction",
+                vec![
+                    tensor_input("self", "x"),
+                    ints("dim", &[1]),
+                    input(
+                        "correction",
+                        Argument::SymFloat(SymFloatArg {
+                            as_sym_float: ScalarName {
+                                as_name: "c".to_string(),
+                            },
+                        }),
+                    ),
+                ],
+                &["y"],
+            )],
+            &[("x", FLOAT, &[3, 4]), ("y", FLOAT, &[3])],
+            &["x"],
+            &["y"],
+        );
+        let error = crate::translate::translate(&parsed)
+            .err()
+            .expect("a symbolic correction must be refused");
+        assert!(
+            format!("{error:#}").contains("is not a literal number"),
+            "{error:#}"
+        );
     }
 }

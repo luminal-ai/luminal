@@ -2,8 +2,10 @@
 
 import warnings
 
+import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
+from backend_test_utils import luminal_backend
 
 
 def _compile_and_run(module: torch.nn.Module, *inputs: torch.Tensor):
@@ -173,6 +175,172 @@ def test_variance_default_and_dim_overloads_match_eager():
         torch.testing.assert_close(
             result, reference, rtol=1e-7, atol=1e-8, equal_nan=True
         )
+
+
+# torch's variance divides by max(0, N - correction) with a REAL-valued
+# correction (fractional and negative are legal; N or more gives inf, or NaN
+# for a zero sum), and an empty reduction is NaN. These run the production
+# two-stage path: its stage 1 keeps var, std and var_mean whole, where
+# compile_for_test would decompose std into var + sqrt.
+VARIANCE_VALUES = (
+    (1.0, 2.0, 4.0, 8.0),
+    (0.5, -1.0, 3.0, 2.5),
+    (2.0, 2.0, 2.0, 5.0),
+)
+
+
+def _eager_and_real_path(module, value):
+    compiled = torch.compile(
+        module,
+        backend=luminal_backend,
+        fullgraph=True,
+        dynamic=False,
+        options={"search_iterations": 1},
+    )
+    # Corrections at or past N are the point of these cases; torch warns.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        return module(value), compiled(value)
+
+
+def _assert_variance_outputs_match(actual, expected, labels):
+    assert len(actual) == len(expected) == len(labels)
+    for label, result, reference in zip(labels, actual, expected):
+        assert result.shape == reference.shape, label
+        assert result.dtype == reference.dtype, label
+        # Half precision keeps assert_close's dtype defaults: torch rounds
+        # one opmath result, as the lowering does.
+        tolerance = {
+            torch.float64: {"rtol": 1e-12, "atol": 1e-12},
+            torch.float32: {"rtol": 1e-5, "atol": 1e-6},
+        }.get(reference.dtype, {})
+        torch.testing.assert_close(
+            result,
+            reference,
+            equal_nan=True,
+            msg=lambda message, label=label: f"{label}: {message}",
+            **tolerance,
+        )
+
+
+class VarianceCorrections(torch.nn.Module):
+    """var, std and var_mean, each at every listed correction."""
+
+    OPS = ("var", "std", "var_mean.var", "var_mean.mean")
+
+    def __init__(self, dim, keepdim, corrections):
+        super().__init__()
+        self.dim = dim
+        self.keepdim = keepdim
+        self.corrections = corrections
+
+    def forward(self, value):
+        outputs = []
+        for correction in self.corrections:
+            options = {"correction": correction, "keepdim": self.keepdim}
+            outputs.append(torch.var(value, self.dim, **options))
+            outputs.append(torch.std(value, self.dim, **options))
+            outputs.extend(torch.var_mean(value, self.dim, **options))
+        return tuple(outputs)
+
+    def labels(self):
+        return [f"{op} correction={c}" for c in self.corrections for op in self.OPS]
+
+
+@pytest.mark.parametrize(
+    ("shape", "dim", "keepdim", "dtype"),
+    [
+        ((3, 4), 1, False, torch.float32),
+        ((3, 4), None, False, torch.float32),
+        ((3, 4), [], True, torch.float32),
+        ((3, 4), [0], True, torch.float32),
+        ((3, 4), 1, True, torch.float64),
+        ((3, 4), [0, 1], False, torch.float64),
+        ((3, 4), 1, False, torch.bfloat16),
+        ((3, 4), -1, True, torch.float16),
+        ((3, 0), 1, False, torch.float32),
+        ((), None, False, torch.float32),
+    ],
+    ids=[
+        "dim1-f32",
+        "all-f32",
+        "empty-dim-list-keepdim-f32",
+        "dim0-keepdim-f32",
+        "dim1-keepdim-f64",
+        "dims01-f64",
+        "dim1-bf16",
+        "dim-1-keepdim-f16",
+        "empty-reduction",
+        "scalar",
+    ],
+)
+def test_variance_real_valued_corrections_match_eager(shape, dim, keepdim, dtype):
+    if shape == (3, 4):
+        value = torch.tensor(VARIANCE_VALUES, dtype=dtype)
+    else:
+        value = torch.full(shape, 2.5, dtype=dtype)
+    reduced = range(value.dim()) if dim is None or dim == [] else dim
+    reduced = [reduced] if isinstance(reduced, int) else reduced
+    count = 1
+    for axis in reduced:
+        count *= value.shape[axis]
+    # 0 and 1 are the integral corrections; 0.5, 1.5 and -1 used to be
+    # truncated, and count / count + 1 used to divide by zero or a negative.
+    corrections = tuple(dict.fromkeys((0, 0.5, 1, 1.5, -1, count, count + 1)))
+    module = VarianceCorrections(dim, keepdim, corrections)
+    expected, actual = _eager_and_real_path(module, value)
+    _assert_variance_outputs_match(actual, expected, module.labels())
+
+
+class VarianceUnbiasedFlags(torch.nn.Module):
+    """The `unbiased` bool spelling of the correction (False is 0, True is 1)."""
+
+    LABELS = (
+        "var dim=1 unbiased=False",
+        "var unbiased=True",
+        "std dim=[0] unbiased=False keepdim",
+        "var_mean.var dim=1 unbiased=False keepdim",
+        "var_mean.mean dim=1 unbiased=False keepdim",
+    )
+
+    def forward(self, value):
+        return (
+            torch.var(value, 1, unbiased=False),
+            torch.var(value, unbiased=True),
+            torch.std(value, [0], unbiased=False, keepdim=True),
+            *torch.var_mean(value, 1, unbiased=False, keepdim=True),
+        )
+
+
+def test_variance_unbiased_flags_match_eager():
+    value = torch.tensor(VARIANCE_VALUES)
+    module = VarianceUnbiasedFlags()
+    expected, actual = _eager_and_real_path(module, value)
+    _assert_variance_outputs_match(actual, expected, VarianceUnbiasedFlags.LABELS)
+
+
+class StdMeanCorrections(torch.nn.Module):
+    """std_mean has no stage-1 arm; stage 2 decomposes it to var_mean + sqrt."""
+
+    CORRECTIONS = (0.5, -1, 5)
+
+    def forward(self, value):
+        outputs = []
+        for correction in self.CORRECTIONS:
+            outputs.extend(torch.std_mean(value, 1, correction=correction))
+        outputs.extend(torch.std_mean(value, unbiased=False))
+        return tuple(outputs)
+
+    def labels(self):
+        spellings = [f"correction={c}" for c in self.CORRECTIONS] + ["unbiased=False"]
+        return [f"std_mean.{part} {s}" for s in spellings for part in ("std", "mean")]
+
+
+def test_std_mean_real_valued_corrections_match_eager():
+    value = torch.tensor(VARIANCE_VALUES)
+    module = StdMeanCorrections()
+    expected, actual = _eager_and_real_path(module, value)
+    _assert_variance_outputs_match(actual, expected, module.labels())
 
 
 class DynamicComposedReductions(torch.nn.Module):

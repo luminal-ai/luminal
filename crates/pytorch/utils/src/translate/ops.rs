@@ -415,32 +415,6 @@ impl Translator<'_> {
         })
     }
 
-    pub(super) fn translate_var(&mut self, node: &Node, std: bool) -> Result<GraphTensor> {
-        let x = self.operand(&node.inputs[0])?;
-        let dims = self.optional_int_list(node, 1)?;
-        let rank = x.rank();
-        let axes: Vec<usize> = if dims.is_empty() {
-            (0..rank).collect()
-        } else {
-            dims.iter().map(|&d| normalize_dim(d, rank)).collect()
-        };
-        let correction = self.named_int_arg(node, "correction").unwrap_or(1) as usize;
-        let result = if std {
-            x.std_options(axes.clone(), correction)
-        } else {
-            x.var_options(axes.clone(), correction)
-        };
-        let keepdim = self
-            .inputs_bool(node, "keepdim")
-            .or_else(|| node.inputs.get(3).and_then(|i| i.arg.as_bool()))
-            .unwrap_or(false);
-        Ok(if keepdim {
-            keep_axes(result, &axes)
-        } else {
-            result
-        })
-    }
-
     pub(super) fn translate_cumulative(&mut self, node: &Node, prod: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
         // ATen casts BEFORE scanning: absent dtype promotes bool/integer

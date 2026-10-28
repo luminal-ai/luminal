@@ -199,7 +199,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_hlir_ops.py::test_acos_promotes_integral_input[dtype1]",
             "test_hlir_ops.py::test_acos_promotes_integral_input[dtype2]",
             "test_hlir_ops.py::test_gelu_tanh",
-            "test_reduction.py::test_composed_real_reductions_match_eager",
             "test_reduction.py::test_scatter_reduce_integer_mean_floors_negative_results",
             "test_remaining_existing_hlir_lowerings.py::test_inverse_probability_functions_cover_tails_and_boundaries",
             "test_remaining_existing_hlir_lowerings.py::test_modified_bessel_family_across_approximation_intervals",

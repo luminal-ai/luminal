@@ -303,19 +303,86 @@ impl GraphTensor {
         self.var_options(axes, 1)
     }
 
-    /// Compute the sample variance along an axes with options
+    /// Compute the variance along axes with an integer degrees-of-freedom
+    /// `correction`. This is [`Self::var_correction`]: when `correction`
+    /// reaches the reduced element count the divisor clamps to zero (the
+    /// result is +inf or NaN), it never goes negative.
     pub fn var_options(self, axes: impl ToAxes, correction: usize) -> GraphTensor {
+        self.var_correction(axes, correction as f64)
+    }
+
+    /// Compute the variance along `axes` with torch's real-valued
+    /// degrees-of-freedom `correction`: 0 is the population variance, 1 is
+    /// Bessel's sample variance, and fractional or negative values are legal.
+    ///
+    /// INVARIANT (torch's `WelfordOps::project`, plus `std_var_out`'s NaN
+    /// fill for an empty reduction). With `N` the product of the reduced
+    /// extents (possibly symbolic),
+    ///
+    /// ```text
+    /// variance = sum((x - mean)^2) / d
+    /// d = N - correction   if N > correction and N > 0
+    /// d = 0                otherwise
+    /// ```
+    ///
+    /// A zero divisor is the defined answer, not an error: a positive sum
+    /// gives +inf and a zero sum (all elements equal, or no element at all)
+    /// gives NaN. The divisor is never negative, so the variance never
+    /// changes sign, and an empty reduction is NaN for every correction.
+    /// The divisor is formed in `self`'s dtype; callers that follow torch's
+    /// opmath widen half-precision operands first. An integer tensor needs
+    /// an integral `correction`.
+    pub fn var_correction(self, axes: impl ToAxes, correction: f64) -> GraphTensor {
         let axes = axes.to_axes();
-        let n = axes
-            .to_axes()
-            .into_iter()
-            .map(|i| self.dims()[i])
-            .product::<IntExpr>();
+        let n = axes.iter().map(|&i| self.dims()[i]).product::<IntExpr>();
         let mean = self
-            .mean(axes.to_axes())
-            .expand_to_shape_on_axes(self.dims(), axes.to_axes());
+            .mean(axes.clone())
+            .expand_to_shape_on_axes(self.dims(), axes.clone());
         let centered = self - mean;
-        (centered * centered).sum(axes) / (n - correction)
+        let squares = (centered * centered).sum(axes);
+        let divisor = self
+            .variance_divisor(n, correction)
+            .expand_rhs(squares.dims());
+        squares / divisor
+    }
+
+    /// The rank-0 divisor `d` of [`Self::var_correction`], in `self`'s dtype.
+    fn variance_divisor(self, n: IntExpr, correction: f64) -> GraphTensor {
+        let dtype = self.dtype;
+        let float = matches!(
+            dtype,
+            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
+        );
+        assert!(
+            float || correction.fract() == 0.0,
+            "variance of a {dtype:?} tensor needs an integral correction, got {correction}"
+        );
+        let scalar = |graph: &mut Graph, value: f64| match dtype {
+            DType::F64 => graph.constant_f64(value),
+            _ if float => graph.constant_f32(value as f32).cast(dtype),
+            _ => graph.constant_i32(value as i64).cast(dtype),
+        };
+        // A static count evaluates the rule at authoring time, in f64.
+        if let Some(count) = n.to_usize() {
+            let count = count as f64;
+            let degrees = if count > correction && count > 0.0 {
+                count - correction
+            } else {
+                0.0
+            };
+            return scalar(self.graph(), degrees);
+        }
+        // A symbolic count evaluates the same rule at run time. No count
+        // exceeds a NaN correction, so that divisor is zero outright; for
+        // any other correction both conditions are `N > max(correction, 0)`.
+        let zero = scalar(self.graph(), 0.0);
+        if correction.is_nan() {
+            return zero;
+        }
+        let count = self.graph().constant_i32(n).cast(dtype);
+        let threshold = scalar(self.graph(), correction.max(0.0));
+        let degrees = count - scalar(self.graph(), correction);
+        count.gt(threshold).select(degrees, zero)
     }
 
     /// Compute the sample standard deviation along axes
@@ -323,9 +390,16 @@ impl GraphTensor {
         self.std_options(axes, 1)
     }
 
-    /// Compute the standard deviation along axes with options
+    /// Compute the standard deviation along axes with an integer
+    /// degrees-of-freedom `correction` (see [`Self::var_options`]).
     pub fn std_options(self, axes: impl ToAxes, correction: usize) -> GraphTensor {
         self.var_options(axes, correction).sqrt()
+    }
+
+    /// Compute the standard deviation along axes with a real-valued
+    /// degrees-of-freedom `correction` (see [`Self::var_correction`]).
+    pub fn std_correction(self, axes: impl ToAxes, correction: f64) -> GraphTensor {
+        self.var_correction(axes, correction).sqrt()
     }
 
     /// Take the absolute value.
@@ -982,6 +1056,95 @@ pub(super) mod tests {
         assert_eq!(got.len(), expected.len());
         for (index, (a, b)) in got.iter().zip(expected).enumerate() {
             assert_eq!(*a, b, "element {index}: got {a} vs expected {b}");
+        }
+    }
+
+    /// Independent two-pass variance in f64 with torch's divisor rule.
+    fn torch_variance(values: &[f32], correction: f64) -> f64 {
+        let n = values.len() as f64;
+        let mean = values.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let squares: f64 = values.iter().map(|&v| (v as f64 - mean).powi(2)).sum();
+        let degrees = if n > correction && n > 0.0 {
+            n - correction
+        } else {
+            0.0
+        };
+        squares / degrees
+    }
+
+    fn assert_same_float(got: f32, expected: f64, what: &str) {
+        let expected = expected as f32;
+        let same = (got.is_nan() && expected.is_nan())
+            || got == expected
+            || (got - expected).abs() <= 1e-5 * expected.abs().max(1.0);
+        assert!(same, "{what}: got {got}, expected {expected}");
+    }
+
+    /// `var_correction` divides by torch's `max(0, N - correction)` for a
+    /// real-valued correction (fractional, negative, N, past N, NaN), on a
+    /// static extent and on a symbolic one, and the integer `var_options`
+    /// wrapper clamps the same way instead of dividing by a negative count.
+    #[test]
+    fn var_correction_divides_by_clamped_degrees_of_freedom() {
+        let rows = [
+            [1.0f32, 2.0, 4.0, 8.0],
+            [0.5, -1.0, 3.0, 2.5],
+            [2.0, 2.0, 2.0, 5.0],
+        ];
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        let corrections = [0.0, 0.5, 1.0, 1.5, -1.0, 4.0, 5.0, f64::NAN];
+        for symbolic in [false, true] {
+            let mut cx = Graph::new();
+            let cols = if symbolic {
+                cx.set_dim('a', 4);
+                IntExpr::from('a')
+            } else {
+                IntExpr::from(4)
+            };
+            let x = cx.tensor(vec![IntExpr::from(3), cols], DType::F32);
+            let outputs: Vec<_> = corrections
+                .iter()
+                .map(|&c| {
+                    (
+                        c,
+                        x.var_correction(vec![1], c),
+                        x.std_correction(vec![1], c),
+                    )
+                })
+                .collect();
+            let unsigned = x.var_options(vec![1], 6);
+            let rt = luminal_reference::harness::run_reference(&cx, &[(x.id, flat.clone().into())]);
+            for (c, var, std) in outputs {
+                let var = rt.get_f32(var.id).unwrap();
+                let std = rt.get_f32(std.id).unwrap();
+                for (r, row) in rows.iter().enumerate() {
+                    let expected = torch_variance(row, c);
+                    let what = format!("symbolic={symbolic} correction={c} row {r}");
+                    assert_same_float(var[r], expected, &format!("var {what}"));
+                    assert_same_float(std[r], expected.sqrt(), &format!("std {what}"));
+                }
+            }
+            let unsigned = rt.get_f32(unsigned.id).unwrap();
+            assert!(unsigned.iter().all(|v| *v == f32::INFINITY), "{unsigned:?}");
+        }
+    }
+
+    /// An empty reduction is NaN for every correction, including a negative
+    /// one whose `N - correction` would be positive (torch fills NaN).
+    #[test]
+    fn var_correction_of_an_empty_reduction_is_nan() {
+        let mut cx = Graph::new();
+        let x = cx.tensor(vec![3, 0], DType::F32);
+        let outputs: Vec<_> = [0.0, 1.0, 0.5, -1.0]
+            .iter()
+            .map(|&c| x.var_correction(vec![1], c))
+            .collect();
+        let rt =
+            luminal_reference::harness::run_reference(&cx, &[(x.id, Vec::<f32>::new().into())]);
+        for var in outputs {
+            let var = rt.get_f32(var.id).unwrap();
+            assert_eq!(var.len(), 3);
+            assert!(var.iter().all(|v| v.is_nan()), "{var:?}");
         }
     }
 }
