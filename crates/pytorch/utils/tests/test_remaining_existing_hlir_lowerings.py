@@ -883,6 +883,70 @@ def test_pooling_and_bilinear_resize_composites() -> None:
     _check(module, value)
 
 
+class MaxPoolBackward(torch.nn.Module):
+    def __init__(self, kernel, stride, padding, dilation, ceil_mode):
+        super().__init__()
+        self.window = (kernel, stride, padding, dilation, ceil_mode)
+
+    def forward(self, grad, value, indices):
+        return torch.ops.aten.max_pool2d_with_indices_backward.default(
+            grad, value, *self.window, indices
+        )
+
+
+# (input shape, dtype, (kernel, stride, padding, dilation, ceil_mode)).
+# Every case has overlapping windows, so some input positions receive several
+# updates; the `ties` case rounds the input so equal maxima tie as well.
+_MAX_POOL_BACKWARD_CASES = {
+    "overlap": ((1, 2, 5, 5), torch.float32, ([3, 3], [1, 1], [0, 0], [1, 1], False)),
+    "padding_stride": (
+        (2, 2, 6, 6),
+        torch.float32,
+        ([3, 3], [2, 2], [1, 1], [1, 1], False),
+    ),
+    "dilation": ((1, 2, 6, 6), torch.float32, ([2, 2], [1, 1], [0, 0], [2, 2], False)),
+    "ceil_mode": ((1, 2, 6, 6), torch.float32, ([3, 3], [2, 2], [0, 0], [1, 1], True)),
+    "unbatched": ((2, 5, 5), torch.float32, ([3, 3], [1, 1], [0, 0], [1, 1], False)),
+    "ties": ((1, 2, 5, 5), torch.float32, ([2, 2], [1, 1], [0, 0], [1, 1], False)),
+    "float64": ((1, 2, 5, 5), torch.float64, ([3, 3], [1, 1], [1, 1], [1, 1], False)),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_MAX_POOL_BACKWARD_CASES))
+def test_max_pool2d_with_indices_backward_accumulates_like_eager(case) -> None:
+    # Real torch.compile path, the op called directly with eager indices.
+    shape, dtype, window = _MAX_POOL_BACKWARD_CASES[case]
+    torch.manual_seed(0)
+    value = torch.randn(shape, dtype=torch.float64)
+    if case == "ties":
+        value = value.round()
+    value = value.to(dtype)
+    _, indices = torch.ops.aten.max_pool2d_with_indices.default(value, *window)
+    grad = torch.randn(indices.shape, dtype=dtype)
+    module = MaxPoolBackward(*window)
+    actual = torch.compile(module, backend=luminal_backend)(grad, value, indices)
+    torch.testing.assert_close(actual, module(grad, value, indices))
+
+
+@pytest.mark.slow
+def test_max_pool2d_with_indices_backward_is_exact_past_f32_integers() -> None:
+    # One window per 4097x4097 plane (16,785,409 > 2^24 elements). Each
+    # plane's max sits at the odd in-plane position 2^24 + 1 (no f32 holds
+    # it) and the second plane starts past 2^24 too, so a destination
+    # routed through f32 arithmetic would round or refuse.
+    side = 4097
+    window = ([side, side], [side, side], [0, 0], [1, 1], False)
+    value = torch.zeros(1, 2, side, side)
+    row, column = divmod(2**24 + 1, side)
+    value[0, :, row, column] = 1.0
+    _, indices = torch.ops.aten.max_pool2d_with_indices.default(value, *window)
+    assert indices.flatten().tolist() == [2**24 + 1, 2**24 + 1]
+    grad = torch.tensor([3.0, 5.0]).reshape(1, 2, 1, 1)
+    module = MaxPoolBackward(*window)
+    actual = torch.compile(module, backend=luminal_backend)(grad, value, indices)
+    assert torch.equal(actual, module(grad, value, indices))
+
+
 class AntialiasedBilinearResize(torch.nn.Module):
     def forward(self, value):
         return (

@@ -1083,42 +1083,67 @@ impl Translator<'_> {
     // Max pool backward
     // -----------------------------------------------------------------
 
+    /// `aten.max_pool2d_with_indices_backward.default`: add each
+    /// `grad_output` element into a zero gradient at the input position its
+    /// window's max came from.
+    ///
+    /// Destination invariant: the forward op's `indices` are flat positions
+    /// WITHIN one `H*W` plane, so the destination is addressed in COORDINATE
+    /// form on a `[planes, H*W]` view of the gradient. The plane coordinate
+    /// (batch and channel) is an iota over the grad shape; the in-plane
+    /// coordinate is `indices` itself. No flat `plane_offset + index` sum is
+    /// formed. That sum mixes a DATA operand into the arithmetic, so it needs
+    /// either Int arithmetic on a value with no proven range (proof-gated) or
+    /// float arithmetic (inexact past 2^24 elements). Each coordinate is
+    /// checked against its own axis by the gather/scatter contract
+    /// (out-of-bounds is UB, refused loudly by the reference), so an index
+    /// outside `[0, H*W)` cannot silently land in a neighbouring plane.
     pub(super) fn translate_max_pool_backward(&mut self, node: &Node) -> Result<GraphTensor> {
         let updates = self.get_input_tensor(node, 0)?;
         let input = self.get_input_tensor(node, 1)?;
         let indices = self.get_input_tensor(node, 7)?.cast(DType::Int);
         let input_shape = input.dims();
+        anyhow::ensure!(
+            matches!(input_shape.len(), 3 | 4),
+            "max_pool2d_with_indices_backward expects a 3-D or 4-D input, got rank {}",
+            input_shape.len()
+        );
         let prefix_rank = input_shape.len() - 2;
-        let strides = row_major_strides(&input_shape);
         let output_shape = updates.dims();
-        // Indices are flattened-within-plane; only the batch/channel prefix
-        // needs a stride contribution.
-        let base = self
-            .cx
-            .iota(output_shape.clone(), |c| {
-                (0..prefix_rank).fold(IntExpr::from(0), |acc, axis| acc + c[axis] * strides[axis])
+
+        let prefix = &input_shape[..prefix_rank];
+        let plane_shape = vec![
+            super::dim_arith::product_of_dims(prefix.iter().copied()),
+            super::dim_arith::product_of_dims(input_shape[prefix_rank..].iter().copied()),
+        ];
+        // The two Int coordinates of `plane_shape`, each over the grad shape:
+        // the plane number is a coordinate function of the grad position
+        // (bounded by construction), the in-plane position is `indices`.
+        let prefix_strides = row_major_strides(prefix);
+        let planes = self.cx.iota(output_shape.clone(), |c| {
+            (0..prefix_rank).fold(IntExpr::from(0), |acc, axis| {
+                acc + c[axis] * prefix_strides[axis]
             })
-            .cast(DType::F32);
-        let destinations = (base + indices.cast(DType::F32))
-            .trunc_cast(DType::Int)
-            .flatten();
+        });
+        let coordinates = [planes.flatten(), indices.flatten()];
 
         let count = super::dim_arith::product_of_dims(output_shape.iter().copied())
             .to_usize()
             .context("max_pool2d_with_indices_backward requires a concrete output element count")?;
         let flat_updates = updates.flatten();
-        let mut output = self
-            .full_tensor(input_shape.clone(), input.dtype, 0.0)
-            .flatten();
+        let mut output = self.full_tensor(plane_shape, input.dtype, 0.0);
         // Duplicate destinations (overlapping windows selecting the same max)
         // must accumulate; the recorder's `scatter` is overwrite-only, so one
-        // read/modify/write step per update element, as in the parked
-        // translator's scatter-reduce helper.
+        // read/modify/write step per update element, in grad row-major order
+        // (ATen's CPU kernel order).
         for step in 0..count {
-            let destination = destinations.slice_along(step..step + 1, 0);
+            let destination: Vec<GraphTensor> = coordinates
+                .iter()
+                .map(|coordinate| coordinate.slice_along(step..step + 1, 0))
+                .collect();
             let update = flat_updates.slice_along(step..step + 1, 0);
-            let current = output.gather(&[destination]);
-            output = output.scatter(&[destination], current + update);
+            let current = output.gather(&destination);
+            output = output.scatter(&destination, current + update);
         }
         Ok(util::reshape_tensor(output, &input_shape))
     }
@@ -1707,5 +1732,71 @@ mod tests {
             &["grad", "x", "indices"],
             &["grad_input"],
         ));
+    }
+
+    /// The destination of every accumulation step is addressed in
+    /// coordinate form on a `[planes, H*W]` view of the gradient: the
+    /// in-plane coordinate is the data `indices`, never folded into a flat
+    /// sum, so no float detour (inexact past 2^24) and no unproven Int add
+    /// is recorded even when one plane holds more than 2^24 elements.
+    #[test]
+    fn max_pool_backward_scatters_plane_coordinates_without_flat_offsets() {
+        use luminal::prelude::{DType, IntExpr, LogicalOp};
+
+        let translation = crate::translate::test_support::translate_one(
+            node(
+                "torch.ops.aten.max_pool2d_with_indices_backward.default",
+                vec![
+                    input("grad_output", tensor_arg("grad")),
+                    input("self", tensor_arg("x")),
+                    ints("kernel_size", &[2050, 2050]),
+                    ints("stride", &[2050, 2050]),
+                    ints("padding", &[0, 0]),
+                    ints("dilation", &[1, 1]),
+                    scalar_bool("ceil_mode", false),
+                    input("indices", tensor_arg("indices")),
+                ],
+                &["grad_input"],
+            ),
+            &[
+                ("grad", F32, &[1, 2, 2, 2]),
+                ("x", F32, &[1, 2, 4100, 4100]),
+                ("indices", I64, &[1, 2, 2, 2]),
+                ("grad_input", F32, &[1, 2, 4100, 4100]),
+            ],
+            &["grad", "x", "indices"],
+            &["grad_input"],
+        );
+        let graph = translation.graph.logical.petgraph();
+        for node in graph.node_weights() {
+            assert!(
+                !matches!(
+                    node.op,
+                    LogicalOp::Cast(DType::F32) | LogicalOp::TruncCast(_)
+                ),
+                "no float detour for destinations: found {:?} -> {:?}",
+                node.op,
+                node.dtype
+            );
+            assert!(
+                !(matches!(node.op, LogicalOp::Add) && node.dtype == DType::Int),
+                "no flat Int offset sum over the data indices"
+            );
+        }
+        let plane_view: Vec<IntExpr> = [2usize, 4100 * 4100]
+            .into_iter()
+            .map(IntExpr::from)
+            .collect();
+        let scatters: Vec<_> = graph
+            .node_weights()
+            .filter(|node| matches!(node.op, LogicalOp::Scatter))
+            .collect();
+        assert_eq!(scatters.len(), 8, "one accumulation step per grad element");
+        for scatter in scatters {
+            assert_eq!(
+                scatter.dims, plane_view,
+                "each step writes the [planes, H*W] view"
+            );
+        }
     }
 }
