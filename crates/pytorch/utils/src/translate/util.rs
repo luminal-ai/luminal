@@ -283,6 +283,22 @@ pub(super) fn resolve_neg1_dim_exprs(target: &[IntExpr], current_dims: &[IntExpr
     result
 }
 
+/// The value a NaN-aware predicate (`is_nan`, `truth`) classifies: the fp8
+/// storage formats widened to F32, everything else unchanged. Every fp8 code
+/// widens exactly (NaN to NaN, infinities and subnormals kept). In their own
+/// dtype neither form works: the fp8 encodings do not follow the IEEE NaN
+/// rule (E4M3FN has a finite all-ones exponent, the FNUZ formats spell NaN
+/// as the negative zero code), and their comparisons are the NaN-free
+/// spelling.
+fn widen_storage_float(value: GraphTensor) -> GraphTensor {
+    match value.dtype {
+        DType::F8E4M3FN | DType::F8E4M3FNUZ | DType::F8E5M2 | DType::F8E5M2FNUZ => {
+            value.cast(DType::F32)
+        }
+        _ => value,
+    }
+}
+
 impl Translator<'_> {
     /// A rank-0 constant of `dtype`; integer dtypes never route through a
     /// refused float -> int cast.
@@ -387,23 +403,26 @@ impl Translator<'_> {
         condition.select(a, b)
     }
 
-    /// PyTorch truth conversion observes encodings: both signed zeros are
-    /// false, all other floating codes (including NaNs/subnormals) are true.
+    /// PyTorch truthiness, `bool(x)`: `x != 0` under IEEE.
+    ///
+    /// Invariant: for floats this is true at every code except the two
+    /// signed zeros, NaNs and subnormals included, so it must be a
+    /// comparison that is neither ordered-only (an ordered `x != 0` reads
+    /// NaN as false) nor lossy (a cast to F32 rounds F64 subnormals and
+    /// tiny normals to zero). Core `ne` meets both: it counts the unordered
+    /// case explicitly and compares in the operand's own dtype through
+    /// `LessThan`, which never rounds. That is why this no longer reads the
+    /// encoding: the bit count was the only NaN-correct spelling while `ne`
+    /// was ordered-only. Integers compare natively (`x != 0`), exact at
+    /// every width. The fp8 storage formats compare on their exact F32
+    /// widening ([`widen_storage_float`]).
     pub(super) fn truth(&mut self, value: GraphTensor) -> GraphTensor {
         if value.dtype == DType::Bool {
             return value;
         }
-        let width = value.dtype.logical_bits();
-        let mut bits = value.bits_to_bools();
-        let axis = bits.rank() - 1;
-        if matches!(
-            value.dtype,
-            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
-        ) {
-            bits = bits.slice_along(0..width - 1, axis);
-        }
-        let count = bits.cast(DType::Int).sum(vec![axis]);
-        self.cx.constant_i32(0).expand_rhs(count.dims()).lt(count)
+        let value = widen_storage_float(value);
+        let zero = self.constant_like(value, 0.0);
+        value.ne(zero)
     }
 
     pub(super) fn bool_or(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
@@ -449,10 +468,24 @@ impl Translator<'_> {
         exponent.lt(width)
     }
 
+    /// `torch.isnan`: a `Bool` tensor, true exactly at the NaN elements.
+    ///
+    /// Invariant: a code is NaN iff its exponent field is all ones and its
+    /// significand is nonzero. Reading the encoding classifies every code
+    /// exactly (subnormals are never flushed, no arithmetic runs in the
+    /// operand dtype) and is total on zero-element tensors, whose sliced bit
+    /// view spans zero storage. Integer and Bool inputs are all false. The
+    /// fp8 storage formats do have NaN codes: they are classified on their
+    /// exact F32 widening, which keeps every NaN a NaN.
+    ///
+    /// Core [`GraphTensor::is_nan`] (`[x < +inf] + [-inf < x] < 1`) is the
+    /// same predicate, but routing this helper through it is held back: with
+    /// both NaN tests of `logaddexp` (the `is_nan(y)` guard and the closing
+    /// passthrough) in that form, the masked `logaddexp` graph extracts a
+    /// select whose condition is its F32 operand (`masked.logaddexp`
+    /// OpInfo sample 10), an equivalence violation to fix before switching.
     pub(super) fn is_nan(&mut self, value: GraphTensor) -> GraphTensor {
-        // GraphTensor's ordered lt/gt-based inequality is false for NaNs.
-        // Classify the IEEE encoding instead: exponent all ones and a
-        // nonzero significand. This also avoids flushing subnormals.
+        let value = widen_storage_float(value);
         let (mantissa, end) = match value.dtype {
             DType::F16 => (10, 15),
             DType::Bf16 => (7, 15),

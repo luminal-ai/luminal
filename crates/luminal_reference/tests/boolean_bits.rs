@@ -511,3 +511,63 @@ fn numeric_producer_storage_matches_its_layout_before_bit_observation() {
         vec![10., 80., 60., 200., 150., 360.]
     );
 }
+
+/// A zero-element tensor's bit view, sliced into its IEEE fields and
+/// reduced the way the encoding classifiers read it, executes to an empty
+/// result. The field slice's strided layout used to size its storage at a
+/// negative reach (`1 + Σ (extent−1)*stride` over a zero extent: −9 for the
+/// F32 significand of (1,0,3)), which failed the search's allocation
+/// pruning with "out of range integral type conversion attempted".
+#[test]
+fn sliced_bit_view_of_a_zero_element_tensor_is_empty() {
+    for (shape, dtype, mantissa, end) in [
+        (vec![1, 0, 3], DType::F32, 23, 31),
+        (vec![0], DType::F64, 52, 63),
+        (vec![0, 1, 3], DType::F16, 10, 15),
+    ] {
+        let mut g = Graph::new();
+        let x = g.tensor(shape.clone(), dtype);
+        let bits = x.bits_to_bools();
+        let axis = bits.rank() - 1;
+        let exponent = bits
+            .slice_along(mantissa..end, axis)
+            .cast(DType::Int)
+            .sum(vec![axis]);
+        let fraction = bits
+            .slice_along(0..mantissa, axis)
+            .cast(DType::Int)
+            .sum(vec![axis]);
+        let zero = g.constant_i32(0).expand_rhs(x.dims());
+        let out = exponent
+            .gt(zero)
+            .logical_and(fraction.gt(zero))
+            .cast(DType::Int);
+        assert_eq!(
+            out.dims(),
+            shape.iter().map(|&d| IntExpr::from(d)).collect::<Vec<_>>()
+        );
+        let empty = match dtype {
+            DType::F32 => TypedBuffer::F32(vec![]),
+            DType::F64 => TypedBuffer::F64(vec![]),
+            DType::F16 => TypedBuffer::F16(vec![]),
+            _ => unreachable!(),
+        };
+        let rt = run(&g, &[(x, empty)]);
+        assert!(
+            rt.get_i32(out.id).unwrap().is_empty(),
+            "{dtype:?} {shape:?}"
+        );
+    }
+}
+
+/// A value slice of a zero-element tensor (`x[:, :1]` for `x` of shape
+/// (0, 2)) is the same strided view over an empty domain and executes too.
+#[test]
+fn slice_of_a_zero_element_tensor_is_empty() {
+    let mut g = Graph::new();
+    let x = g.tensor(vec![0, 2], DType::F32);
+    let out = x.slice_along(0..1, 1) * 2.0;
+    assert_eq!(out.dims(), vec![IntExpr::from(0), IntExpr::from(1)]);
+    let rt = run(&g, &[(x, TypedBuffer::F32(vec![]))]);
+    assert!(rt.get_f32(out.id).unwrap().is_empty());
+}

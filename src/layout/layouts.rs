@@ -186,7 +186,8 @@ pub struct BitOffsetExpressionLayout {
 /// a strided chain spans to its largest addressed element + 1 (offsets
 /// are monotone in every coordinate — element strides are non-negative
 /// by construction, an element layout has no base offset to point
-/// backwards from). The offset-expression forms do NOT implement this
+/// backwards from). Every form spans 0 on an empty domain, which
+/// addresses no element. The offset-expression forms do NOT implement this
 /// trait: nothing here analyzes an arbitrary offset function's reach.
 pub trait SpanExpr {
     fn span(&self) -> IntExprTerm;
@@ -216,31 +217,53 @@ impl SpanExpr for LeftMajorContiguousElementLayout {
 }
 
 impl SpanExpr for StridedElementLayout {
-    /// `1 + Σ summand[coord_axis := extent_axis − 1]`: each summand
-    /// evaluated at the last coordinate of its axis. Handles the chain's
-    /// three canonical residues uniformly — `x*stride` becomes
-    /// `(extent−1)*stride`, a bare coordinate becomes `extent−1`, and the
-    /// zero residue stays zero — because substitution is a pure tree map,
-    /// never a pattern match on spellings. `extent − 1` is constructed as
-    /// `(IntAdd extent (IntLit -1))` uniformly (symbolic extents have no
-    /// other spelling, and folding literal ones would be normalization,
-    /// which this crate refuses to do).
+    /// `min(numel, 1) * (1 + Σ summand[coord_axis := max(extent_axis − 1, 0)])`.
+    ///
+    /// The reach is the largest addressed element + 1. Offsets are
+    /// monotone in every coordinate, so on a NON-EMPTY domain the largest
+    /// one is read at the last coordinate of every axis: each summand
+    /// evaluated there. That handles the chain's three canonical residues
+    /// uniformly — `x*stride` becomes `last*stride`, a bare coordinate
+    /// becomes `last`, and the zero residue stays zero — because
+    /// substitution is a pure tree map, never a pattern match on
+    /// spellings. `last` is constructed as `(IntMax (IntAdd extent (IntLit
+    /// -1)) (IntLit 0))` uniformly (symbolic extents have no other
+    /// spelling, and folding literal ones would be normalization, which
+    /// this crate refuses to do).
+    ///
+    /// INVARIANT: the span is the exact reach at every point of the
+    /// domain, and its interval over any extent bounds is non-negative. An
+    /// EMPTY domain (some extent 0) addresses no element, so its reach is 0,
+    /// but "the last coordinate" of a zero extent does not exist: the bare
+    /// `1 + Σ (extent − 1)*stride` is meaningless there, negative (a
+    /// zero-element slice of an F32 bit view spanned −9, which failed
+    /// allocation sizing) or a spurious positive. `min(numel, 1)` is the
+    /// non-empty indicator (extents are non-negative, so it is 0 exactly
+    /// on an empty domain and 1 otherwise), which makes every point exact.
+    /// The `max(·, 0)` on each last coordinate changes no point the
+    /// indicator keeps (a non-empty axis has `extent − 1 >= 0`); it keeps
+    /// every factor non-negative so an interval over a symbolic extent
+    /// that may be 0 at run time stays non-negative too.
     fn span(&self) -> IntExprTerm {
         let shape = &self.shape;
         let last_coord = |axis_from_end: i64| -> IntExprTerm {
-            IntExprTerm::Add(
-                Box::new(shape.extent_from_end(axis_from_end).clone()),
-                Box::new(IntExprTerm::Lit(-1)),
+            IntExprTerm::Max(
+                Box::new(IntExprTerm::Add(
+                    Box::new(shape.extent_from_end(axis_from_end).clone()),
+                    Box::new(IntExprTerm::Lit(-1)),
+                )),
+                Box::new(IntExprTerm::Lit(0)),
             )
         };
-        let mut total = IntExprTerm::Lit(1);
+        let mut reach = IntExprTerm::Lit(1);
         for summand in &self.chain {
-            total = IntExprTerm::Add(
-                Box::new(total),
+            reach = IntExprTerm::Add(
+                Box::new(reach),
                 Box::new(summand.substitute_coords(&last_coord)),
             );
         }
-        total
+        let nonempty = IntExprTerm::Min(Box::new(numel(shape)), Box::new(IntExprTerm::Lit(1)));
+        IntExprTerm::Mul(Box::new(nonempty), Box::new(reach))
     }
 }
 
@@ -1428,6 +1451,15 @@ mod tests {
     fn w32() -> BitWidthTerm {
         BitWidthTerm(32)
     }
+    /// The strided span's non-empty indicator applied to its reach:
+    /// `min(numel, 1) * reach`.
+    fn nonempty(numel: IntExprTerm, reach: IntExprTerm) -> IntExprTerm {
+        mul(IntExprTerm::Min(Box::new(numel), Box::new(lit(1))), reach)
+    }
+    /// The last coordinate of an axis: `max(extent - 1, 0)`.
+    fn last(extent: IntExprTerm) -> IntExprTerm {
+        IntExprTerm::Max(Box::new(add(extent, lit(-1))), Box::new(lit(0)))
+    }
 
     #[test]
     fn right_major_span_is_numel() {
@@ -1454,7 +1486,7 @@ mod tests {
 
     /// The chain's first canonical residue: `x*stride` — the summand
     /// `(IntMul (CoordVar _ axis) stride)` contributes
-    /// `(extent-1)*stride` via coordinate substitution.
+    /// `max(extent-1, 0)*stride` via coordinate substitution.
     #[test]
     fn strided_span_product_residue() {
         // shape (4,), chain [coord0 * 32]: span = 1 + (4-1)*32.
@@ -1465,13 +1497,13 @@ mod tests {
         };
         assert_eq!(
             layout.span(),
-            add(lit(1), mul(add(lit(4), lit(-1)), lit(32)))
+            nonempty(lit(4), add(lit(1), mul(last(lit(4)), lit(32))))
         );
     }
 
     /// The second canonical residue: the bare coordinate IS the
     /// stride-1 summand (x*1 subsumes its product node), contributing
-    /// `extent-1`.
+    /// `max(extent-1, 0)`.
     #[test]
     fn strided_span_bare_coord_residue() {
         let layout = StridedElementLayout {
@@ -1479,7 +1511,7 @@ mod tests {
             chain: vec![coord(0)],
             width: w32(),
         };
-        assert_eq!(layout.span(), add(lit(1), add(lit(6), lit(-1))));
+        assert_eq!(layout.span(), nonempty(lit(6), add(lit(1), last(lit(6)))));
     }
 
     /// The third canonical residue: `(IntLit 0)` for a dead axis —
@@ -1495,7 +1527,10 @@ mod tests {
         };
         assert_eq!(
             layout.span(),
-            add(add(lit(1), lit(0)), mul(add(lit(2), lit(-1)), lit(3)))
+            nonempty(
+                mul(lit(2), lit(3)),
+                add(add(lit(1), lit(0)), mul(last(lit(2)), lit(3)))
+            )
         );
     }
 
@@ -1518,11 +1553,55 @@ mod tests {
         };
         assert_eq!(
             strided.span(),
-            add(
-                add(lit(1), add(lit(128), lit(-1))),
-                mul(add(n(), lit(-1)), lit(128))
+            nonempty(
+                mul(n(), lit(128)),
+                add(add(lit(1), last(lit(128))), mul(last(n()), lit(128)))
             )
         );
+    }
+
+    /// An empty domain addresses no element, so its strided reach is 0.
+    /// "The last coordinate of every axis" does not exist there: the bare
+    /// bracket `1 + Σ (extent−1)*stride` is negative for this zero-element
+    /// slice of an F32 bit view (shape (1,0,3,23) over strides 96/32/1,
+    /// i.e. `1 + 0 − 96 + 64 + 22 = −9`), which failed allocation sizing
+    /// as an out-of-range integer conversion. The non-empty value is
+    /// unchanged, and a symbolic extent that may be 0 keeps a non-negative
+    /// capacity interval.
+    #[test]
+    fn strided_span_of_an_empty_domain_is_zero() {
+        let empty = StridedElementLayout {
+            shape: ShapeTerm(vec![lit(1), lit(0), lit(3), lit(23)]),
+            chain: vec![
+                lit(0),
+                mul(coord(2), lit(96)),
+                mul(coord(1), lit(32)),
+                coord(0),
+            ],
+            width: BitWidthTerm(1),
+        };
+        assert_eq!(empty.span().eval_literal(), Some(0));
+        let full = StridedElementLayout {
+            shape: ShapeTerm(vec![lit(1), lit(2), lit(3), lit(23)]),
+            ..empty
+        };
+        // Largest offset (1*96 + 2*32 + 22) + 1.
+        assert_eq!(full.span().eval_literal(), Some(183));
+
+        // A symbolic extent that is 0 at run time sizes to 0 as well, and
+        // the capacity over a domain that includes 0 stays non-negative.
+        let n = || IntExprTerm::Var("n".to_string());
+        let padded = StridedElementLayout {
+            shape: ShapeTerm(vec![n(), lit(128)]),
+            chain: vec![coord(0), mul(coord(1), lit(160))],
+            width: w32(),
+        };
+        for (rows, reach) in [(0usize, 0i64), (1, 128), (3, 2 * 160 + 128)] {
+            let dims: DynMap = [('n'.into(), rows)].into_iter().collect();
+            assert_eq!(padded.span().eval_dims(&dims).unwrap(), reach);
+        }
+        let bounds: DimBounds = [('n'.into(), (0i64, 3i64))].into_iter().collect();
+        assert_eq!(padded.span().capacity_elements(&bounds).unwrap(), 448);
     }
 
     /// A hand-built layout compares structurally on its SPELLING SET —

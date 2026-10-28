@@ -134,3 +134,74 @@ fn logical_operations_convert_each_operand_to_truth() {
         );
     }
 }
+
+/// `isnan` reads the F64 encoding and truthiness is the IEEE `x != 0` in
+/// F64 (core `ne`). The NaNs (either sign) are the only isnan codes and are
+/// truthy (`bool(nan)` is True); subnormals are truthy, F64 ones included,
+/// which a detour through F32 would round to zero; both signed zeros are
+/// false.
+#[test]
+fn isnan_and_truth_classify_special_f64_codes_in_f64() {
+    let values = [
+        0.0f64,
+        -0.0,
+        f64::NAN,
+        -f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(1),
+        -1e-310,
+        1e-300,
+        1.0,
+    ];
+    for target in ["isnan.default", "logical_not.default"] {
+        let t = translate_one(
+            node(
+                &format!("torch.ops.aten.{target}"),
+                vec![tensor_input("self", "a")],
+                &["y"],
+            ),
+            &[("a", 8, &[10]), ("y", BOOL, &[10])],
+            &["a"],
+            &["y"],
+        );
+        let rt = run(&t, &[TypedBuffer::F64(values.to_vec())]);
+        let want = values
+            .iter()
+            .map(|v| {
+                u8::from(match target {
+                    "isnan.default" => v.is_nan(),
+                    _ => !(v.is_nan() || *v != 0.0),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rt.get_bool8(t.outputs[0].tensor).unwrap(),
+            &want,
+            "{target}"
+        );
+    }
+}
+
+/// The NaN test and truthiness are total on zero-element tensors: the NaN
+/// test's sliced bit view of an empty tensor spans zero storage.
+#[test]
+fn isnan_and_truth_of_a_zero_element_tensor_are_empty() {
+    for target in ["isnan.default", "logical_not.default"] {
+        let t = translate_one(
+            node(
+                &format!("torch.ops.aten.{target}"),
+                vec![tensor_input("self", "a")],
+                &["y"],
+            ),
+            &[("a", FLOAT, &[1, 0, 3]), ("y", BOOL, &[1, 0, 3])],
+            &["a"],
+            &["y"],
+        );
+        let rt = run(&t, &[TypedBuffer::F32(vec![])]);
+        assert!(
+            rt.get_bool8(t.outputs[0].tensor).unwrap().is_empty(),
+            "{target}"
+        );
+    }
+}

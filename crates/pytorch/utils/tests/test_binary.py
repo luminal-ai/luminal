@@ -513,3 +513,125 @@ def test_fmax_fmin_integers_are_maximum_minimum(dtype):
     b = torch.tensor([[-8, 0, 5, 9]], dtype=dtype)
     expected = FmaxFmin()(a, b)
     _assert_same_with_zero_signs(_compile_real(FmaxFmin())(a, b), expected)
+
+
+# ---------------------------------------------------------------------------
+# Zero-element inputs, and the NaN test and truthiness the float lowerings
+# share (`isnan`, the NaN passthrough of celu/mish/clamp_min/clamp_max, the
+# operand truth of the logical ops).
+#
+# Real path pinned to stage 1, so each ATen overload reaches its own arm. Every
+# op below used to fail on a zero-element input with "out of range integral
+# type conversion attempted": a strided view of an empty domain was sized at a
+# negative reach, and the NaN and truth helpers sliced such a view of the IEEE
+# bits. The view now spans zero storage, and truthiness is the IEEE `x != 0`.
+# ---------------------------------------------------------------------------
+
+EMPTY_SHAPES = [(0,), (1, 0, 3), (0, 1, 3)]
+
+EMPTY_UNARY_OPS = {
+    "isnan": torch.isnan,
+    "isinf": torch.isinf,
+    "celu": lambda x: torch.nn.functional.celu(x, alpha=2.0),
+    "mish": torch.nn.functional.mish,
+    "logical_not": torch.logical_not,
+    "where": lambda x: torch.where(x > 0, x, x * 2),
+}
+
+EMPTY_BINARY_OPS = {
+    "clamp_min": torch.clamp_min,
+    "clamp_max": torch.clamp_max,
+    "atan2": torch.atan2,
+    "hypot": torch.hypot,
+    "logical_and": torch.logical_and,
+    "logical_or": torch.logical_or,
+    "logaddexp": torch.logaddexp,
+}
+
+
+@pytest.mark.parametrize("shape", EMPTY_SHAPES, ids=str)
+@pytest.mark.parametrize("name", list(EMPTY_UNARY_OPS))
+def test_zero_element_unary_float_ops(stage_one_only, name, shape):
+    model = Unary(EMPTY_UNARY_OPS[name])
+    x = torch.zeros(shape)
+    _assert_outputs_bitwise(_compile_real(model)(x), model(x))
+
+
+@pytest.mark.parametrize("shape", EMPTY_SHAPES, ids=str)
+@pytest.mark.parametrize("name", list(EMPTY_BINARY_OPS))
+def test_zero_element_binary_float_ops(stage_one_only, name, shape):
+    model = Lambda(EMPTY_BINARY_OPS[name])
+    a, b = torch.zeros(shape), torch.zeros(shape)
+    _assert_outputs_bitwise(_compile_real(model)(a, b), model(a, b))
+
+
+@pytest.mark.parametrize("name", ["clamp_min", "clamp_max"])
+def test_zero_element_tensor_bound_broadcasts(stage_one_only, name):
+    # OpInfo's sample: an empty (0, 1, 3) input against a (0, 10, 3) bound.
+    model = Lambda(EMPTY_BINARY_OPS[name])
+    x, bound = torch.zeros(0, 1, 3), torch.zeros(0, 10, 3)
+    _assert_outputs_bitwise(_compile_real(model)(x, bound), model(x, bound))
+
+
+def test_searchsorted_and_bucketize_of_an_empty_float_query(stage_one_only):
+    model = Lambda(
+        lambda sorted_, query: (
+            torch.searchsorted(sorted_, query),
+            torch.bucketize(query, sorted_),
+        )
+    )
+    sorted_, query = torch.tensor([1.0, 2.0, 3.0]), torch.zeros(0)
+    _assert_outputs_bitwise(_compile_real(model)(sorted_, query), model(sorted_, query))
+
+
+class NanAndTruth(torch.nn.Module):
+    def forward(self, x):
+        one, zero = torch.ones_like(x), torch.zeros_like(x)
+        return (
+            torch.isnan(x),
+            torch.logical_not(x),
+            torch.logical_and(x, one),
+            torch.logical_or(x, zero),
+            torch.logical_xor(x, one),
+        )
+
+
+# The smallest positive subnormal of each dtype: truthy, and not NaN.
+SMALLEST_SUBNORMAL = {
+    torch.float32: 1e-45,
+    torch.float64: 5e-324,
+    torch.float16: 6e-8,
+    torch.bfloat16: 1e-40,
+}
+
+
+@pytest.mark.parametrize("dtype", list(SMALLEST_SUBNORMAL), ids=str)
+def test_isnan_and_truthiness_are_ieee(stage_one_only, dtype):
+    # bool(nan) is True: logical_not(nan) is False and logical_and(nan, 1) is
+    # True. Both signed zeros are the only falsy codes; subnormals are truthy.
+    tiny = SMALLEST_SUBNORMAL[dtype]
+    x = torch.tensor(
+        [0.0, -0.0, NAN, -NAN, INF, -INF, 1.0, -2.5, tiny, -tiny], dtype=dtype
+    )
+    expected = NanAndTruth()(x)
+    assert expected[0][2] and not expected[1][2] and expected[2][2]
+    assert expected[2][8] and expected[2][9]
+    _assert_outputs_bitwise(_compile_real(NanAndTruth())(x), expected)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+    ],
+    ids=str,
+)
+def test_isnan_of_fp8_storage_formats(stage_one_only, dtype):
+    # The fp8 formats have NaN codes that do not follow the IEEE encoding rule;
+    # they are classified on their exact F32 widening.
+    model = Unary(torch.isnan)
+    x = torch.tensor([1.0, NAN, 0.0, -0.0, -1.5]).to(dtype)
+    _assert_outputs_bitwise(_compile_real(model)(x), model(x))
