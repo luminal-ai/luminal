@@ -558,14 +558,14 @@ impl Translator<'_> {
         if count.to_usize() == Some(0) {
             return Ok(self.cast_scalar(0.0, DType::I64).expand_rhs(vec![out_len]));
         }
-        // F32 carries the inclusive prefix sums exactly (counts < 2^24).
-        let ends = repeats.cast(DType::F32).cumsum(vec![0]);
-        let ends = ends.expand_dim(0, out_len);
-        let positions = self
-            .cx
-            .arange(out_len)
-            .cast(DType::F32)
-            .expand_dim(1, count);
+        // INVARIANT: the interval ends and output positions are exact
+        // integers compared in Int, never carried in a float (F32 rounds
+        // past 2^24, merging neighbouring intervals). The ends are an Int
+        // scan of the repeat counts, whose kernels check integer overflow;
+        // the positions are an Int iota; the result counts 0/1 indicators,
+        // an Int sum proved in width by the indicator bounds.
+        let ends = repeats.cumsum(vec![0]).expand_dim(0, out_len);
+        let positions = self.cx.arange(out_len).expand_dim(1, count);
         let counts = ends.le(positions).cast(DType::Int).sum(vec![1]);
         Ok(counts.cast(DType::I64))
     }
@@ -1025,19 +1025,18 @@ impl Translator<'_> {
             let value_order = key.stable_argsort(axis, false);
             let nan_order = nan_mask.cast(DType::F32).stable_argsort(axis, false);
             let sort_order = self.order_gather(value_order, nan_order, axis);
-            let nan_count = nan_mask.cast(DType::Int).sum(vec![axis]);
-            let length = self
-                .cx
-                .constant_i32(axis_len)
-                .cast(DType::F32)
-                .expand_rhs(reduced_shape.clone());
-            let valid = length - nan_count.cast(DType::F32);
-            let zero = self.cx.constant_f32(0.0).expand_rhs(reduced_shape.clone());
             // Torch's nanmedian takes the lower of the two middle valid
-            // values: slot (valid_count - 1) / 2.
-            let median_pos = ((valid - 1.0).maximum(zero) * 0.5)
-                .floor()
-                .trunc_cast(DType::Int);
+            // values: slot (valid_count - 1) / 2, or 0 when every value is
+            // NaN. INVARIANT: the slot is exact Int arithmetic on an exact
+            // count (an F32 detour rounds past 2^24): the non-NaN count is
+            // an Int sum of 0/1 indicators in [0, axis_len], so the
+            // decrement, the clamp at zero, and the halving each stay in
+            // width by the value bounds.
+            let not_nan = self.bool_not(nan_mask);
+            let valid = not_nan.cast(DType::Int).sum(vec![axis]);
+            let zero = self.cx.constant_i32(0).expand_rhs(reduced_shape.clone());
+            let two = self.cx.constant_i32(2).expand_rhs(reduced_shape.clone());
+            let median_pos = (valid - IntExpr::from(1)).maximum(zero).trunc_div(two);
             let median_index = self.order_gather(sort_order, median_pos, axis);
             (median_index, None)
         } else {

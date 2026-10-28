@@ -2,9 +2,13 @@
 //!
 //! Gather/scatter are built from the recorder's coordinate forms so no
 //! caller-data flat-index arithmetic (proof-gated Int add/mul) enters the
-//! graph. Index normalization and the reductions that
-//! would need Int arithmetic run in F32 and `trunc_cast` back (the plan
-//! has no F64 binary arms); anything that cannot be done faithfully bails
+//! graph. INVARIANT: an index, coordinate, offset, or count is an exact
+//! integer and is never carried in a float (F32 holds integers exactly
+//! only to 2^24, so a longer axis would saturate or round silently).
+//! Counts are Bool -> Int/I64 indicator sums or Int scans; structural
+//! positions are `IntExpr` iotas; caller indices are normalized with
+//! bounded Int remainders; per-axis destinations use the coordinate form
+//! instead of a flat index. Anything that cannot be done faithfully bails
 //! with its op name.
 #![allow(dead_code)]
 
@@ -23,6 +27,20 @@ enum IdxReduce {
     Mean,
     Max,
     Min,
+}
+
+/// One destination coordinate per data axis of an index write. A lowering
+/// builds one per data axis and consumes them at translation time, so the
+/// variant size difference is immaterial.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy)]
+enum IdxCoord {
+    /// Caller index data over the update shape: exact Int, already wrapped
+    /// into the axis.
+    Data(GraphTensor),
+    /// The update element's own position along this update axis
+    /// (structural: an iota).
+    Position(usize),
 }
 
 fn idx_is_float(dtype: DType) -> bool {
@@ -180,6 +198,36 @@ impl Translator<'_> {
         shape
     }
 
+    /// Coordinate per source axis for an advanced-index layout: indexed
+    /// axes read the broadcast index data, basic axes their output position.
+    fn idx_advanced_plan(
+        &mut self,
+        out_dims: &[IntExpr],
+        block_start: usize,
+        basic: &[(usize, usize)],
+        index_for_dim: &[Option<GraphTensor>],
+    ) -> Vec<IdxCoord> {
+        let block_len = out_dims.len() - basic.len();
+        let non_block: Vec<usize> = (0..out_dims.len())
+            .filter(|p| !(block_start..block_start + block_len).contains(p))
+            .collect();
+        let mut coords: Vec<Option<IdxCoord>> = vec![None; index_for_dim.len()];
+        for (axis, t) in index_for_dim.iter().enumerate() {
+            if let Some(t) = t {
+                coords[axis] = Some(IdxCoord::Data(
+                    t.expand_to_shape_on_axes(out_dims.to_vec(), non_block.clone()),
+                ));
+            }
+        }
+        for (axis, out_axis) in basic {
+            coords[*axis] = Some(IdxCoord::Position(*out_axis));
+        }
+        coords
+            .into_iter()
+            .map(|c| c.expect("advanced index: every source axis has a coordinate"))
+            .collect()
+    }
+
     /// Coordinate tensor per source axis for an advanced-index layout.
     fn idx_advanced_coords(
         &mut self,
@@ -188,23 +236,21 @@ impl Translator<'_> {
         basic: &[(usize, usize)],
         index_for_dim: &[Option<GraphTensor>],
     ) -> Vec<GraphTensor> {
-        let block_len = out_dims.len() - basic.len();
-        let non_block: Vec<usize> = (0..out_dims.len())
-            .filter(|p| !(block_start..block_start + block_len).contains(p))
-            .collect();
-        let mut coords: Vec<Option<GraphTensor>> = vec![None; index_for_dim.len()];
-        for (axis, t) in index_for_dim.iter().enumerate() {
-            if let Some(t) = t {
-                coords[axis] =
-                    Some(t.expand_to_shape_on_axes(out_dims.to_vec(), non_block.clone()));
-            }
-        }
-        for (axis, out_axis) in basic {
-            coords[*axis] = Some(self.axis_positions(out_dims, *out_axis));
-        }
-        coords
-            .into_iter()
-            .map(|c| c.expect("advanced index: every source axis has a coordinate"))
+        let plan = self.idx_advanced_plan(out_dims, block_start, basic, index_for_dim);
+        self.idx_coordinate_tensors(&plan, out_dims)
+    }
+
+    /// The coordinate tensors of a plan over the update shape.
+    fn idx_coordinate_tensors(
+        &mut self,
+        plan: &[IdxCoord],
+        update_dims: &[IntExpr],
+    ) -> Vec<GraphTensor> {
+        plan.iter()
+            .map(|coord| match *coord {
+                IdxCoord::Data(index) => index,
+                IdxCoord::Position(axis) => self.axis_positions(update_dims, axis),
+            })
             .collect()
     }
 
@@ -318,7 +364,7 @@ impl Translator<'_> {
     fn idx_scatter_reduce(
         &mut self,
         data: GraphTensor,
-        coords: Vec<GraphTensor>,
+        coords: Vec<IdxCoord>,
         updates: GraphTensor,
         reduction: IdxReduce,
         include_self: bool,
@@ -336,60 +382,112 @@ impl Translator<'_> {
         if bool_data && matches!(reduction, IdxReduce::Mean) {
             bail!("scatter reduction `mean` on Bool data is not ported");
         }
+        let data_dims = data.dims();
+        if count == 0 || idx_numel(&data_dims) == Some(0) {
+            return Ok(data);
+        }
+        let update_dims = updates.dims();
+        // INVARIANT: every destination is addressed in the coordinate form,
+        // so no flat index is ever formed: an F32 flat index rounds past
+        // 2^24 elements and silently retargets the update, and an Int flat
+        // sum of caller indices is unproven. The structural axes (the update
+        // element's own position) are permuted to the front of a view of the
+        // data and merged into one plane axis, addressed by one exact
+        // `IntExpr` iota over the update positions; each caller-data axis
+        // keeps its own coordinate. Fewer coordinates keep the unrolled
+        // graph small: one coordinate per data axis measured up to 1.7x the
+        // old flat lowering's search time at rank 4, the plane view about
+        // 1.2-1.45x. A symbolic structural extent keeps one coordinate per
+        // axis (the plane strides must be concrete to split the view back).
+        // Step `k` reads and writes the data at the k-th element of every
+        // flattened coordinate tensor.
+        let structural: Vec<(usize, usize)> = coords
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, coord)| match coord {
+                IdxCoord::Position(update_axis) => Some((axis, *update_axis)),
+                IdxCoord::Data(_) => None,
+            })
+            .collect();
+        let plane = !structural.is_empty()
+            && structural
+                .iter()
+                .all(|(axis, _)| data_dims[*axis].to_usize().is_some());
+        // `order[k]` is the data axis at position `k` of the working view.
+        let order: Vec<usize> = if plane {
+            structural
+                .iter()
+                .map(|(axis, _)| *axis)
+                .chain((0..coords.len()).filter(|axis| matches!(coords[*axis], IdxCoord::Data(_))))
+                .collect()
+        } else {
+            (0..coords.len()).collect()
+        };
+        let mut flat_coords = Vec::with_capacity(coords.len());
+        if plane {
+            let terms: Vec<(usize, IntExpr)> = structural
+                .iter()
+                .enumerate()
+                .map(|(k, (_, update_axis))| {
+                    let stride = structural[k + 1..]
+                        .iter()
+                        .fold(IntExpr::from(1), |acc, (axis, _)| acc * data_dims[*axis]);
+                    (*update_axis, stride)
+                })
+                .collect();
+            let plane_coordinate = self.cx.iota(update_dims.clone(), move |c| {
+                terms.iter().fold(IntExpr::from(0), |acc, (axis, stride)| {
+                    acc + c[*axis] * *stride
+                })
+            });
+            flat_coords.push(plane_coordinate.flatten());
+            for coord in &coords {
+                if let IdxCoord::Data(index) = coord {
+                    flat_coords.push(index.flatten());
+                }
+            }
+        } else {
+            for coord in self.idx_coordinate_tensors(&coords, &update_dims) {
+                flat_coords.push(coord.flatten());
+            }
+        }
+        let planes = structural.len();
+        let to_working = |tensor: GraphTensor| {
+            if !plane {
+                return tensor;
+            }
+            let mut view = tensor.view().permute(order.clone());
+            for _ in 1..planes {
+                view = view.merge_dims(0, 1);
+            }
+            view.finish()
+        };
         let int_data = idx_is_int(data.dtype);
         let work_dtype = if int_data { DType::F32 } else { data.dtype };
-        let original = data.flatten();
-        let original_work = if int_data {
-            original.cast(DType::F32)
+        let original_work = to_working(if int_data {
+            data.cast(DType::F32)
         } else {
-            original
-        };
+            data
+        });
         let mut output = original_work;
         let flat_updates = if int_data {
             updates.flatten().cast(DType::F32)
         } else {
             updates.flatten()
         };
-        // Collapse the per-axis coordinates into one flat destination index
-        // (F32 multiply/add then a single truncation): the gather/scatter
-        // coordinate forms take exactly one Int coordinate per axis, so a
-        // multi-axis destination cannot address flat storage directly.
-        let strides: Vec<IntExpr> = (0..data.rank())
-            .map(|i| {
-                data.dims()[i + 1..]
-                    .iter()
-                    .fold(IntExpr::from(1), |acc, d| acc * *d)
-            })
-            .collect();
-        let mut flat_dest: Option<GraphTensor> = None;
-        for (coord, stride) in coords.iter().zip(strides) {
-            let stride_f = self
-                .cx
-                .constant_i32(stride)
-                .cast(DType::F32)
-                .expand_rhs(coord.dims());
-            let contribution = coord.cast(DType::F32) * stride_f;
-            flat_dest = Some(match flat_dest {
-                Some(acc) => acc + contribution,
-                None => contribution,
-            });
-        }
-        let flat_dest = flat_dest
-            .context("scatter reduction requires at least one coordinate axis")?
-            .flatten()
-            .trunc_cast(DType::Int);
         let track_counts = !include_self || matches!(reduction, IdxReduce::Mean);
-        let mut counts = self
-            .full_tensor(
-                data.dims(),
-                DType::F32,
-                if include_self { 1.0 } else { 0.0 },
-            )
-            .flatten();
+        let mut counts = self.full_tensor(
+            original_work.dims(),
+            DType::F32,
+            if include_self { 1.0 } else { 0.0 },
+        );
         for step in 0..count {
-            let dest = flat_dest.slice_along(step..step + 1, 0);
+            let dest: Vec<GraphTensor> = flat_coords
+                .iter()
+                .map(|coord| coord.slice_along(step..step + 1, 0))
+                .collect();
             let update = flat_updates.slice_along(step..step + 1, 0);
-            let current = output.gather(&[dest]);
+            let current = output.gather(&dest);
             let mut combined = match reduction {
                 IdxReduce::Sum | IdxReduce::Mean => {
                     if bool_data {
@@ -421,16 +519,19 @@ impl Translator<'_> {
                 }
             };
             if track_counts {
-                let count_here = counts.gather(&[dest]);
+                // The per-destination update count is bounded by the
+                // number of unrolled steps, far below 2^24, so its F32
+                // carrier (also the mean's divisor dtype) is exact.
+                let count_here = counts.gather(&dest);
                 if !include_self {
                     let zero = self.cx.constant_f32(0.0).expand_rhs(count_here.dims());
                     let first_update = count_here.eq(zero);
                     combined = self.idx_cond(first_update, update, combined);
                 }
                 let one = self.cx.constant_f32(1.0).expand_rhs(count_here.dims());
-                counts = counts.scatter(&[dest], count_here + one);
+                counts = counts.scatter(&dest, count_here + one);
             }
-            output = output.scatter(&[dest], combined);
+            output = output.scatter(&dest, combined);
         }
         if matches!(reduction, IdxReduce::Mean) {
             let zero = self.cx.constant_f32(0.0).expand_rhs(counts.dims());
@@ -439,32 +540,44 @@ impl Translator<'_> {
             let means = output / divisor;
             output = self.idx_cond(has_values, means, original_work);
         }
-        let output = if int_data {
-            super::convert(output, data.dtype)
+        // Split the plane axis back into the structural axes and restore
+        // the data axis order.
+        let output = if plane {
+            let mut view = output.view();
+            for k in 0..planes - 1 {
+                let inner = structural[k + 1..]
+                    .iter()
+                    .fold(IntExpr::from(1), |acc, (axis, _)| acc * data_dims[*axis]);
+                view = view.split_dims(k, inner);
+            }
+            let mut inverse = vec![0; order.len()];
+            for (position, axis) in order.iter().enumerate() {
+                inverse[*axis] = position;
+            }
+            view.permute(inverse).finish()
         } else {
             output
         };
-        Ok(reshape_tensor(output, &data.dims()))
+        Ok(if int_data {
+            super::convert(output, data.dtype)
+        } else {
+            output
+        })
     }
 
     /// Scatter coordinates for an update at `[.., index[c], ..]` (ONNX
     /// ScatterElements): one coordinate tensor per data axis over the
     /// update shape.
-    fn idx_scatter_coords(
-        &mut self,
-        update_dims: &[IntExpr],
-        axis: usize,
-        index: GraphTensor,
-    ) -> Vec<GraphTensor> {
-        let mut coords = Vec::with_capacity(update_dims.len());
-        for d in 0..update_dims.len() {
-            if d == axis {
-                coords.push(index);
-            } else {
-                coords.push(self.axis_positions(update_dims, d));
-            }
-        }
-        coords
+    fn idx_scatter_plan(rank: usize, axis: usize, index: GraphTensor) -> Vec<IdxCoord> {
+        (0..rank)
+            .map(|d| {
+                if d == axis {
+                    IdxCoord::Data(index)
+                } else {
+                    IdxCoord::Position(d)
+                }
+            })
+            .collect()
     }
 
     /// A scalar `value` argument of the requested dtype.
@@ -535,15 +648,24 @@ impl Translator<'_> {
         let mask = mask.cast(DType::Bool).flatten();
         let destination_flat = destination.flatten();
         let source_flat = self.idx_cast_like(source, destination.dtype).flatten();
-        if source_flat.dims()[0].to_usize() == Some(0) {
+        let slots = mask.dims()[0];
+        if source_flat.dims()[0].to_usize() == Some(0) || slots.to_usize() == Some(0) {
             return Ok(reshape_tensor(destination_flat, &output_shape));
         }
-        // Prefix count of trues; the source element for true slot i is at
-        // rank i, so gather source at max(prefix - 1, 0) only where true.
-        let prefix = mask.cast(DType::F32).cumsum(vec![0]);
-        let one = self.cx.constant_f32(1.0).expand_rhs(prefix.dims());
-        let zero = self.cx.constant_f32(0.0).expand_rhs(prefix.dims());
-        let positions = (prefix - one).maximum(zero).trunc_cast(DType::Int);
+        // INVARIANT: the source element for a true slot is at that slot's
+        // rank among the true slots, an exact integer count. It is the
+        // EXCLUSIVE prefix count of the mask: an Int scan of the 0/1
+        // indicators (the scan kernels check integer overflow) shifted one
+        // slot right with a zero fill, so no float carries it (F32
+        // rounds past 2^24 slots) and no unproven Int subtraction forms
+        // it. False slots read source element 0, which exists because the
+        // source is non-empty, and are discarded by the select.
+        let inclusive = mask.cast(DType::Int).cumsum(vec![0]);
+        let exclusive = inclusive
+            .slice_along(IntExpr::from(0)..slots - IntExpr::from(1), 0)
+            .pad_along(1, 0, 0, 0.0);
+        let first = self.cx.constant_i32(0).expand_rhs(exclusive.dims());
+        let positions = mask.select(exclusive, first);
         let updates = source_flat.gather(&[positions]);
         let output = self.idx_cond(mask, updates, destination_flat);
         Ok(reshape_tensor(output, &output_shape))
@@ -732,11 +854,14 @@ impl Translator<'_> {
         let update_dims = index.dims();
         let updates = self.idx_crop_to(updates, &update_dims);
         let updates = self.idx_cast_like(updates, data.dtype);
-        let coords = self.idx_scatter_coords(&update_dims, dim, index);
+        let plan = Self::idx_scatter_plan(update_dims.len(), dim, index);
         let result = match reduction {
-            None => data.scatter(&coords, updates),
+            None => {
+                let coords = self.idx_coordinate_tensors(&plan, &update_dims);
+                data.scatter(&coords, updates)
+            }
             Some(reduction) => {
-                self.idx_scatter_reduce(data, coords, updates, reduction, include_self)?
+                self.idx_scatter_reduce(data, plan, updates, reduction, include_self)?
             }
         };
         Ok(if squeeze { result.squeeze(0) } else { result })
@@ -850,12 +975,13 @@ impl Translator<'_> {
         }
         let bshape = self.idx_broadcast_indices(&mut index_for_dim);
         let (out_dims, block_start, basic) = idx_advanced_layout(&data.dims(), &indexed, &bshape);
-        let coords = self.idx_advanced_coords(&out_dims, block_start, &basic, &index_for_dim);
+        let plan = self.idx_advanced_plan(&out_dims, block_start, &basic, &index_for_dim);
         let updates = self.idx_cast_like(values, data.dtype);
         let updates = self.idx_broadcast_to(updates, &out_dims);
         Ok(if accumulate {
-            self.idx_scatter_reduce(data, coords, updates, IdxReduce::Sum, true)?
+            self.idx_scatter_reduce(data, plan, updates, IdxReduce::Sum, true)?
         } else {
+            let coords = self.idx_coordinate_tensors(&plan, &out_dims);
             data.scatter(&coords, updates)
         })
     }
@@ -887,8 +1013,13 @@ impl Translator<'_> {
             let source = source.unsqueeze(0);
             let index = self.idx_normalize(index, data.dims()[0]);
             let updates = self.idx_cast_like(source, data.dtype);
-            let result =
-                self.idx_scatter_reduce(data, vec![index], updates, reduction, include_self)?;
+            let result = self.idx_scatter_reduce(
+                data,
+                vec![IdxCoord::Data(index)],
+                updates,
+                reduction,
+                include_self,
+            )?;
             return Ok(result.squeeze(0));
         }
         let dim = normalize_dim(raw_dim, data.rank());
@@ -909,16 +1040,9 @@ impl Translator<'_> {
         let inserted: Vec<usize> = (0..data.rank()).filter(|axis| *axis != dim).collect();
         let index = self.idx_normalize(index, data.dims()[dim]);
         let expanded = index.expand_to_shape_on_axes(source.dims(), inserted);
-        let mut coords = Vec::with_capacity(data.rank());
-        for axis in 0..data.rank() {
-            if axis == dim {
-                coords.push(expanded);
-            } else {
-                coords.push(self.axis_positions(&source.dims(), axis));
-            }
-        }
+        let plan = Self::idx_scatter_plan(data.rank(), dim, expanded);
         let updates = self.idx_cast_like(source, data.dtype);
-        self.idx_scatter_reduce(data, coords, updates, reduction, include_self)
+        self.idx_scatter_reduce(data, plan, updates, reduction, include_self)
     }
 
     /// `masked_scatter.default`: copy `source` into the true slots of
@@ -962,21 +1086,22 @@ impl Translator<'_> {
             .dims()
             .iter()
             .fold(IntExpr::from(1), |acc, dim| acc * *dim);
+        // The flat index is caller data: wrap it into [0, numel) in exact
+        // Int (an F32 detour rounds past 2^24 and silently retargets the
+        // write).
         let index = indices.cast(DType::Int).flatten();
-        let zero = self.cx.constant_i32(0).expand_rhs(index.dims());
-        let negative = index.lt(zero);
-        let size_f = self
-            .cx
-            .constant_i32(flat_size)
-            .cast(DType::F32)
-            .expand_rhs(index.dims());
-        let shifted = (index.cast(DType::F32) + size_f).trunc_cast(DType::Int);
-        let index = self.idx_cond(negative, shifted, index);
+        let index = self.idx_normalize(index, flat_size);
         let destination = data.flatten();
         let source = self.idx_cast_like(source, data.dtype).flatten();
         let source = self.idx_crop_to(source, &index.dims());
         let output = if accumulate {
-            self.idx_scatter_reduce(destination, vec![index], source, IdxReduce::Sum, true)?
+            self.idx_scatter_reduce(
+                destination,
+                vec![IdxCoord::Data(index)],
+                source,
+                IdxReduce::Sum,
+                true,
+            )?
         } else {
             destination.scatter(&[index], source)
         };
@@ -1003,7 +1128,6 @@ impl Translator<'_> {
             .named_int_arg(node, "fill_value")
             .or_else(|| node.inputs.get(2).and_then(|input| input.arg.as_int()))
             .unwrap_or(0);
-        let input_shape = value.dims();
         let rank = value.rank();
         let truth = if idx_is_float(value.dtype) {
             let zero = self.is_zero(value);
@@ -1019,78 +1143,65 @@ impl Translator<'_> {
                 })
                 .cast(DType::I64));
         }
-        if idx_numel(&input_shape) == Some(0) {
-            return Ok(self
-                .cx
-                .constant_i64(fill_value)
-                .expand_rhs(vec![IntExpr::from(size), IntExpr::from(rank)]));
+        Ok(self.true_coordinates(truth, size, fill_value))
+    }
+
+    /// Row-major coordinates of the first `size` true entries of `truth`,
+    /// as an I64 `[size, rank]` tensor; rows past the true count (or past
+    /// the element count) hold `fill`. Shared by `nonzero_static` and
+    /// `tril_indices`/`triu_indices`.
+    ///
+    /// INVARIANT: every index here is an exact integer that never passes
+    /// through a float. The stable descending argsort of the 0/1 truth
+    /// key (an exact F32 key; its ranks and output indices are Int)
+    /// lists the true flat positions first, in row-major order. Slot `k`
+    /// reads position `min(k, numel - 1)` (an `IntExpr` iota), and is
+    /// valid exactly when it is a real slot (`k < numel`) whose element
+    /// is true: the sort puts every true element ahead of every false
+    /// one, so no count is needed. Each coordinate column gathers that
+    /// axis's coordinate iota over the flattened shape, so no flat
+    /// div/mod is formed (F32 div/mod rounds past 2^24 elements).
+    pub(super) fn true_coordinates(
+        &mut self,
+        truth: GraphTensor,
+        size: usize,
+        fill: i64,
+    ) -> GraphTensor {
+        let shape = truth.dims();
+        let rank = truth.rank();
+        let fill = self.cx.constant_i64(fill);
+        if idx_numel(&shape) == Some(0) {
+            return fill.expand_rhs(vec![IntExpr::from(size), IntExpr::from(rank)]);
         }
         let flat_truth = truth.flatten();
-        // 1s first, stable: the true positions in row-major order.
         let sorted = flat_truth.cast(DType::F32).stable_argsort(0, true);
-        let count = flat_truth
-            .cast(DType::F32)
-            .sum(vec![0])
-            .trunc_cast(DType::Int);
-        let numel = input_shape.iter().fold(IntExpr::from(1), |acc, d| acc * *d);
-        let positions = self.cx.arange(size);
-        let last = self
-            .cx
-            .constant_i32(numel - IntExpr::from(1))
-            .cast(DType::F32)
-            .expand_rhs(positions.dims());
-        let clamped = positions
-            .cast(DType::F32)
-            .minimum(last)
-            .trunc_cast(DType::Int);
-        let flat_indices = sorted.gather(&[clamped]);
-        let count = count.expand_rhs(positions.dims());
-        let numel_const = self.cx.constant_i32(numel).expand_rhs(positions.dims());
-        let valid = self.bool_and(positions.lt(count), positions.lt(numel_const));
-        // Per-axis coordinates as flat div/mod in F32 (the plan has no F64
-        // binary arms), blended with the fill value and truncated once at
-        // the end.
-        let strides: Vec<IntExpr> = (0..rank)
-            .map(|i| {
-                input_shape[i + 1..]
-                    .iter()
-                    .fold(IntExpr::from(1), |acc, d| acc * *d)
-            })
-            .collect();
-        let flat_f = flat_indices.cast(DType::F32);
-        let valid_f = valid.cast(DType::F32);
-        let one = self.cx.constant_f32(1.0).expand_rhs(valid_f.dims());
-        let invalid_f = one - valid_f;
-        let fill_f = self
-            .cx
-            .constant_f32(fill_value as f32)
-            .expand_rhs(valid_f.dims());
-        let mut columns = Vec::with_capacity(rank);
-        for axis in 0..rank {
-            let stride_f = self
-                .cx
-                .constant_i32(strides[axis])
-                .cast(DType::F32)
-                .expand_rhs(flat_f.dims());
-            let quotient = flat_f / stride_f;
-            let dim_f = self
-                .cx
-                .constant_i32(input_shape[axis])
-                .cast(DType::F32)
-                .expand_rhs(quotient.dims());
-            let coordinate = quotient - (quotient / dim_f).floor() * dim_f;
-            columns.push((coordinate * valid_f + fill_f * invalid_f).trunc_cast(DType::I64));
-        }
+        let numel = shape.iter().fold(IntExpr::from(1), |acc, d| acc * *d);
+        let slots = self.cx.arange(size);
+        let read = self.cx.iota(vec![IntExpr::from(size)], move |c| {
+            c[0].min(numel - IntExpr::from(1))
+        });
+        let flat_indices = sorted.gather(&[read]);
+        let numel_const = self.cx.constant_i32(numel).expand_rhs(slots.dims());
+        let read_true = flat_truth.gather(&[flat_indices]);
+        let valid = self.bool_and(slots.lt(numel_const), read_true);
+        let fill = fill.expand_rhs(slots.dims());
         let rows = self.cx.arange(size);
         let mut result = self
             .cx
             .constant_i64(0)
             .expand_rhs(vec![IntExpr::from(size), IntExpr::from(rank)]);
-        for (axis, column) in columns.into_iter().enumerate() {
+        for axis in 0..rank {
+            let coordinate = self
+                .cx
+                .iota(shape.clone(), move |c| c[axis])
+                .flatten()
+                .gather(&[flat_indices])
+                .cast(DType::I64);
+            let column = valid.select(coordinate, fill);
             let axis_column = self.cx.constant_i32(axis as i64).expand_rhs(rows.dims());
             result = result.scatter(&[rows, axis_column], column);
         }
-        Ok(result)
+        result
     }
 
     /// `embedding_bag.default`: sum/mean/max over the bags of `indices`
@@ -1117,16 +1228,16 @@ impl Translator<'_> {
         let bag_count = offset_count - IntExpr::from(include_last_offset as usize);
         // ends[b] = offsets[b + 1], with the terminal bag end pinned to
         // index_count; built by scatter so no Int pad arithmetic is needed.
+        // The pinned row is the scatter's destination and the shifted
+        // offsets are its source (one coordinate per source element).
         let starts_full = offsets.slice_along(IntExpr::from(0)..bag_count, 0);
         let shifted = offsets.slice_along(1.., 0);
         let ends_full = self
             .cx
             .constant_i32(index_count)
             .expand_rhs(vec![offset_count]);
-        let ends_full = shifted.scatter(
-            &[self.cx.arange(offset_count - IntExpr::from(1))],
-            ends_full,
-        );
+        let ends_full =
+            ends_full.scatter(&[self.cx.arange(offset_count - IntExpr::from(1))], shifted);
         let positions = self.cx.arange(index_count).expand_dim(0, bag_count);
         let starts = starts_full.expand_dim(1, index_count);
         let ends = ends_full
@@ -1169,10 +1280,10 @@ impl Translator<'_> {
                 .expand_dim(2, embedding_size);
             selected *= scale;
         }
-        let counts = membership
-            .cast(DType::F32)
-            .sum(vec![1])
-            .trunc_cast(DType::I64);
+        // INVARIANT: a bag size is an exact count of 0/1 membership
+        // indicators, summed in I64 (proved in width from the indicator
+        // bounds scaled by the index count); an F32 sum saturates at 2^24.
+        let counts = membership.cast(DType::I64).sum(vec![1]);
         let nonzero = self.cx.constant_i64(0).expand_rhs(counts.dims());
         let nonempty = counts.gt(nonzero);
         let sum = selected.sum(vec![1]);
@@ -1210,14 +1321,17 @@ impl Translator<'_> {
                 .constant_i64(0)
                 .expand_rhs(vec![IntExpr::from(0usize)])
         } else {
+            // Each index belongs to at most one bag, so summing the bag id
+            // where it is a member names that bag (0 for none). The ids
+            // are an exact Int iota selected natively and summed in I64,
+            // proved in width from the iota bounds; F32 ids round past 2^24.
             let bag_ids = self
                 .cx
                 .arange(bag_count)
-                .cast(DType::F32)
+                .cast(DType::I64)
                 .expand_dim(1, index_count);
-            (bag_membership.cast(DType::F32) * bag_ids)
-                .sum(vec![0])
-                .trunc_cast(DType::I64)
+            let no_bag = self.cx.constant_i64(0).expand_rhs(bag_ids.dims());
+            bag_membership.select(bag_ids, no_bag).sum(vec![0])
         };
         let bag_size = if mode == 0 {
             self.cx.constant_i64(0).expand_rhs(vec![bag_count])

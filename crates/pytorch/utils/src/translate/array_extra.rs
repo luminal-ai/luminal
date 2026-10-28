@@ -477,78 +477,6 @@ impl Translator<'_> {
     // tril_indices / triu_indices
     // -----------------------------------------------------------------
 
-    /// Row-major coordinates of the `size` leading true entries of `truth`,
-    /// as an I64 `[size, rank]` tensor (the tail is zero-filled). Mirrors the
-    /// `nonzero_static` lowering, which needs a data-independent extent.
-    fn triangular_coords(&mut self, truth: GraphTensor, size: usize) -> GraphTensor {
-        let input_shape = truth.dims();
-        let rank = truth.rank();
-        let flat_truth = truth.flatten();
-        // 1s first and stable: true positions in row-major order.
-        let sorted = flat_truth.cast(DType::F32).stable_argsort(0, true);
-        let count = flat_truth
-            .cast(DType::F32)
-            .sum(vec![0])
-            .trunc_cast(DType::Int);
-        let numel = input_shape
-            .iter()
-            .fold(IntExpr::from(1), |acc, dim| acc * *dim);
-        let positions = self.cx.arange(size);
-        let last = self
-            .cx
-            .constant_i32(numel - IntExpr::from(1))
-            .cast(DType::F32)
-            .expand_rhs(positions.dims());
-        let clamped = positions
-            .cast(DType::F32)
-            .minimum(last)
-            .trunc_cast(DType::Int);
-        let flat_indices = sorted.gather(&[clamped]);
-        let count = count.expand_rhs(positions.dims());
-        let numel_const = self.cx.constant_i32(numel).expand_rhs(positions.dims());
-        let valid = self.bool_and(positions.lt(count), positions.lt(numel_const));
-        let strides: Vec<IntExpr> = (0..rank)
-            .map(|axis| {
-                input_shape[axis + 1..]
-                    .iter()
-                    .fold(IntExpr::from(1), |acc, dim| acc * *dim)
-            })
-            .collect();
-        // Per-axis coordinates as flat div/mod in F32 (the plan has no F64
-        // binary arms), then one truncation at the end.
-        let flat_f = flat_indices.cast(DType::F32);
-        let valid_f = valid.cast(DType::F32);
-        let one = self.cx.constant_f32(1.0).expand_rhs(valid_f.dims());
-        let invalid_f = one - valid_f;
-        let fill_f = self.cx.constant_f32(0.0).expand_rhs(valid_f.dims());
-        let mut columns = Vec::with_capacity(rank);
-        for axis in 0..rank {
-            let stride_f = self
-                .cx
-                .constant_i32(strides[axis])
-                .cast(DType::F32)
-                .expand_rhs(flat_f.dims());
-            let quotient = flat_f / stride_f;
-            let dim_f = self
-                .cx
-                .constant_i32(input_shape[axis])
-                .cast(DType::F32)
-                .expand_rhs(quotient.dims());
-            let coordinate = quotient - (quotient / dim_f).floor() * dim_f;
-            columns.push((coordinate * valid_f + fill_f * invalid_f).trunc_cast(DType::I64));
-        }
-        let rows = self.cx.arange(size);
-        let mut result = self
-            .cx
-            .constant_i64(0)
-            .expand_rhs(vec![IntExpr::from(size), IntExpr::from(rank)]);
-        for (axis, column) in columns.into_iter().enumerate() {
-            let axis_column = self.cx.constant_i32(axis as i64).expand_rhs(rows.dims());
-            result = result.scatter(&[rows, axis_column], column);
-        }
-        result
-    }
-
     pub(super) fn translate_triangular_indices(
         &mut self,
         node: &Node,
@@ -579,7 +507,9 @@ impl Translator<'_> {
         let size = output_shape[1]
             .to_usize()
             .ok_or_else(|| anyhow::anyhow!("triangular indices need a concrete output width"))?;
-        let coordinates = self.triangular_coords(truth, size);
+        // The kept positions in row-major order are exactly the indices;
+        // the shared lowering keeps every coordinate an exact integer.
+        let coordinates = self.true_coordinates(truth, size, 0);
         Ok(coordinates
             .permute(vec![1usize, 0])
             .cast(self.output_meta_dtype(node)?))

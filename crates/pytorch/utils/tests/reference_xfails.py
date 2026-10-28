@@ -212,7 +212,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_hlir_ops.py::test_repeat_leading_dims",
             "test_llama3.py::test_hf_llama3_1b_bf16_error_within_fp32_floor",
             "test_reduction.py::test_scalar_log_softmax_preserves_ieee_behavior",
-            "test_remaining_existing_hlir_lowerings.py::test_trilinear_and_embedding_bag_composites",
             "test_tiny_llm.py::test_tiny_llm_dynamic_context_reuses_one_compile",
         ),
     ),

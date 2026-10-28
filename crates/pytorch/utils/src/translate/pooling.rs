@@ -168,9 +168,13 @@ impl Translator<'_> {
     }
 
     /// The adaptive pooling start/end tables: `start = floor(i*in/out)`,
-    /// `end = ceil((i+1)*in/out)` from ATen's adaptive-pool kernel. Done
-    /// in F32 and truncated, so no Int arithmetic enters the model (the
-    /// reference executor has no F64 elementwise arms).
+    /// `end = ceil((i+1)*in/out)` from ATen's adaptive-pool kernel.
+    /// INVARIANT: the window bounds are structural, so they are exact
+    /// `IntExpr` iotas over the output coordinate (non-negative operands,
+    /// so the recorder's truncating division is the floor, and the ceiling
+    /// is `(a + out - 1) / out`) and are compared with the input position
+    /// in Int. No float carries them: an F32 `i*in/out` rounds once the
+    /// product passes 2^24 and shifts a window by one element.
     fn adaptive_pool_candidates(
         &mut self,
         input: GraphTensor,
@@ -191,23 +195,17 @@ impl Translator<'_> {
         }
         let mut membership: Option<GraphTensor> = None;
         for index in 0..spatial {
-            let output_position = self.axis_positions(&full_shape, prefix_rank + index);
+            let output_axis = prefix_rank + index;
             let input_position = self.axis_positions(&full_shape, prefix_rank + spatial + index);
-            let input_size = self
-                .cx
-                .constant_i32(input_spatial[index])
-                .cast(DType::F32)
-                .expand_rhs(output_position.dims());
-            let output_size = self
-                .cx
-                .constant_i32(output_spatial[index])
-                .cast(DType::F32)
-                .expand_rhs(output_position.dims());
-            let output_position_f = output_position.cast(DType::F32);
-            let start = (output_position_f * input_size / output_size).trunc_cast(DType::Int);
-            let end = ((output_position_f + 1.0f32) * input_size / output_size)
-                .ceil()
-                .trunc_cast(DType::Int);
+            let input_size = input_spatial[index];
+            let output_size = output_spatial[index];
+            let start = self.cx.iota(full_shape.clone(), move |c| {
+                (c[output_axis] * input_size) / output_size
+            });
+            let end = self.cx.iota(full_shape.clone(), move |c| {
+                ((c[output_axis] + IntExpr::from(1)) * input_size + output_size - IntExpr::from(1))
+                    / output_size
+            });
             let in_window = self.bool_and(input_position.ge(start), input_position.lt(end));
             membership = Some(match membership {
                 Some(previous) => self.bool_and(previous, in_window),
@@ -352,8 +350,14 @@ impl Translator<'_> {
         let selected = self.pool_select(membership, expanded, zero);
         let reduction_axes = (prefix_rank + spatial..prefix_rank + 2 * spatial).collect::<Vec<_>>();
         let sum = selected.sum(reduction_axes.clone());
-        let count = membership.cast(compute_dtype).sum(reduction_axes);
-        Ok((sum / count).cast(in_dtype))
+        // The window size is an exact Int count of 0/1 membership indicators
+        // (an F32 count saturates at 2^24 and silently skews the mean, e.g.
+        // a global pool of a 4097 x 4097 map). It converts to the compute
+        // dtype only as the divisor, through the checked-exact int -> float
+        // cast, which refuses loudly where the count is not representable,
+        // as `mean` does.
+        let count = membership.cast(DType::Int).sum(reduction_axes);
+        Ok((sum / count.cast(compute_dtype)).cast(in_dtype))
     }
 
     /// Binds (values, indices) for the max-pool family.

@@ -1117,6 +1117,342 @@ def test_searchsorted_count_is_exact_past_the_f32_integer_range(
     _assert_stage_one(attempts, "aten.searchsorted.Tensor")
 
 
+# Integer counts, indices, and offsets are exact integers that never pass
+# through a float (F32 holds integers exactly only to 2^24). Each case runs
+# the real two-stage backend path and checks that stage 1 handed the op to
+# the translator, so the lowering under test is the one exercised.
+
+_F24 = 1 << 24
+
+
+class TrueCoordinates(torch.nn.Module):
+    def forward(self, value, count, flags):
+        return (
+            torch.nonzero_static(value, size=7, fill_value=-2),
+            torch.nonzero_static(value, size=2),
+            torch.nonzero_static(count, size=5, fill_value=9),
+            torch.nonzero_static(flags, size=4, fill_value=-1),
+            torch.tril_indices(4, 5, 1),
+            torch.tril_indices(3, 3, -1),
+            torch.triu_indices(5, 3, -1),
+            torch.triu_indices(3, 4, 2),
+        )
+
+
+def test_true_coordinate_composites_match_eager_on_the_backend_path(
+    monkeypatch,
+) -> None:
+    # -0.0 is zero; rows past the true count hold the fill.
+    inputs = (
+        torch.tensor([[0.0, 1.5, 0.0], [-0.0, -4.0, 2.0]]),
+        torch.tensor([[0, 3], [5, 0], [0, 7]]),
+        torch.tensor([[[True, False], [False, True]], [[False, False], [True, True]]]),
+    )
+    module = TrueCoordinates()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(
+        attempts,
+        "aten.nonzero_static.default",
+        "aten.tril_indices.default",
+        "aten.triu_indices.default",
+    )
+
+
+class ScatterDestinations(torch.nn.Module):
+    def forward(self, value, flat, rows, cols, updates, ints, index, src):
+        return (
+            torch.put(value, flat, updates, accumulate=True),
+            torch.put(ints, flat, updates.to(torch.int64), accumulate=True),
+            torch.index_put(value, (rows, cols), updates, accumulate=True),
+            torch.scatter_add(value, 1, index, src),
+            torch.scatter_reduce(value, 0, index, src, "mean", include_self=False),
+            torch.scatter_reduce(value, 1, index, src, "amax"),
+            torch.scatter_reduce(value, 0, index, src, "prod", include_self=False),
+            torch.index_reduce(value, 0, index[:, 0], src[:, :1].expand(3, 4), "amin"),
+        )
+
+
+def test_scatter_destinations_match_eager_on_the_backend_path(monkeypatch) -> None:
+    # Negative flat and per-axis indices wrap; duplicates accumulate in order.
+    inputs = (
+        torch.tensor(
+            [[1.0, -2.0, 3.0, 0.5], [4.0, 5.0, -6.0, 7.0], [8.0, 9.0, 1.0, -1.0]]
+        ),
+        torch.tensor([-1, 11, 0, -12]),
+        torch.tensor([2, -1, 0, 2]),
+        torch.tensor([1, 3, -4, 1]),
+        torch.tensor([0.5, -1.5, 2.0, 4.0]),
+        torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]),
+        torch.tensor([[2, 0], [1, 1], [0, 2]]),
+        torch.tensor([[1.0, -2.0], [3.0, 0.25], [-4.0, 5.0]]),
+    )
+    module = ScatterDestinations()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(
+        attempts,
+        "aten.put.default",
+        "aten.index_put.default",
+        "aten.scatter_add.default",
+        "aten.scatter_reduce.two",
+        "aten.index_reduce.default",
+    )
+
+
+class MaskedPrefix(torch.nn.Module):
+    def forward(self, value, mask, source, ints, int_source, row_mask):
+        none = torch.zeros_like(mask)
+        return (
+            value.masked_scatter(mask, source),
+            ints.masked_scatter(mask, int_source),
+            value.masked_scatter(row_mask, source),
+            value.masked_scatter(none, source),
+        )
+
+
+def test_masked_scatter_prefix_counts_match_eager_on_the_backend_path(
+    monkeypatch,
+) -> None:
+    # The source element for a true slot is that slot's rank among the trues;
+    # the [1, 4] mask broadcasts across rows, and an all-false mask is a copy.
+    # Every source has one element per slot: search-time planning executes
+    # candidates on all-ones placeholder inputs, where every mask slot is
+    # true and a shorter source reads out of bounds (LUM-1098).
+    inputs = (
+        torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]]
+        ),
+        torch.tensor(
+            [
+                [True, False, False, True],
+                [False, False, False, False],
+                [True, True, False, False],
+            ]
+        ),
+        torch.arange(12, dtype=torch.float32) * -1.5,
+        torch.arange(12).reshape(3, 4),
+        torch.arange(12) * 10 - 7,
+        torch.tensor([[False, True, True, False]]),
+    )
+    module = MaskedPrefix()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(attempts, "aten.masked_scatter.default")
+
+
+class IntervalCounts(torch.nn.Module):
+    def forward(self, repeats, value, lengths, offsets):
+        return (
+            torch.repeat_interleave(repeats, output_size=7),
+            torch.segment_reduce(value, "sum", lengths=lengths, axis=1),
+            torch.segment_reduce(value, "mean", lengths=lengths, axis=1),
+            torch.segment_reduce(value, "mean", offsets=offsets, axis=1, initial=1.0),
+            torch.segment_reduce(value, "prod", lengths=lengths, axis=1),
+            torch.segment_reduce(value, "max", offsets=offsets, axis=1),
+            torch.segment_reduce(value, "min", lengths=lengths, axis=1, initial=0.5),
+        )
+
+
+def test_interval_counts_match_eager_on_the_backend_path(monkeypatch) -> None:
+    # Zero repeats and empty segments: an interval of length zero owns nothing.
+    value = torch.tensor(
+        [[1.0, -3.0, -2.0, 5.0, 4.0, -0.5], [-1.0, 2.0, 6.0, -3.0, -7.0, -2.0]]
+    )
+    lengths = torch.tensor([[0, 1, 3, 2], [2, 0, 3, 1]])
+    inputs = (
+        torch.tensor([2, 0, 3, 2]),
+        value,
+        lengths,
+        torch.nn.functional.pad(lengths, [1, 0]).cumsum(1),
+    )
+    module = IntervalCounts()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(
+        attempts, "aten.repeat_interleave.Tensor", "aten.segment_reduce.default"
+    )
+
+
+class AdaptiveWindows(torch.nn.Module):
+    def forward(self, value):
+        return (
+            torch.nn.functional.adaptive_avg_pool2d(value, (3, 4)),
+            torch.nn.functional.adaptive_max_pool2d(value, (4, 3), return_indices=True),
+            torch.nn.functional.adaptive_avg_pool2d(value, (5, 7)),
+        )
+
+
+def test_adaptive_pool_windows_match_eager_on_the_backend_path(monkeypatch) -> None:
+    # Non-dividing sizes give overlapping windows of unequal length.
+    torch.manual_seed(5)
+    inputs = (torch.randn(1, 2, 5, 7),)
+    module = AdaptiveWindows()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(
+        attempts,
+        "aten._adaptive_avg_pool2d.default",
+        "aten.adaptive_max_pool2d.default",
+    )
+
+
+class NanMedianSlots(torch.nn.Module):
+    def forward(self, value):
+        return torch.nanmedian(value, dim=1), torch.nanmedian(
+            value, dim=1, keepdim=True
+        )
+
+
+def test_nanmedian_slot_matches_eager_on_the_backend_path(monkeypatch) -> None:
+    # Odd and even non-NaN counts, a single value, and an all-NaN row: the
+    # slot is (count - 1) // 2, or 0 with no values. The NaNs trail each row:
+    # the lowering's NaN reorder is composed in the wrong frame when a NaN
+    # precedes a value (reported separately), and this test is about the slot.
+    nan = float("nan")
+    inputs = (
+        torch.tensor(
+            [
+                [3.0, 1.0, 2.0, nan, nan],
+                [4.0, 1.0, 3.0, 2.0, 5.0],
+                [7.0, nan, nan, nan, nan],
+                [nan, nan, nan, nan, nan],
+                [2.0, 2.0, 1.0, 1.0, nan],
+            ]
+        ),
+    )
+    module = NanMedianSlots()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(attempts, "aten.nanmedian.dim")
+
+
+class EmbeddingBagCounts(torch.nn.Module):
+    def forward(self, weight, indices, offsets):
+        bag = torch.ops.aten._embedding_bag_forward_only.default
+        return (
+            bag(weight, indices, offsets, False, 0),
+            bag(weight, indices, offsets, False, 0, padding_idx=2),
+            bag(weight, indices, offsets, False, 1),
+            bag(weight, indices, offsets, False, 1, padding_idx=2),
+            bag(weight, indices, offsets, False, 2),
+        )
+
+
+def test_embedding_bag_counts_match_eager_on_the_backend_path(monkeypatch) -> None:
+    # Bag sizes and offset-to-bag ids are exact counts; one bag is empty.
+    torch.manual_seed(6)
+    inputs = (
+        torch.randn(6, 3),
+        torch.tensor([1, 2, 0, 3, 2, 5, 4]),
+        torch.tensor([0, 2, 2, 5]),
+    )
+    module = EmbeddingBagCounts()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(attempts, "aten._embedding_bag_forward_only.default")
+
+
+class FlatPut(torch.nn.Module):
+    def forward(self, value, index, source):
+        return torch.put(value, index, source, accumulate=True)
+
+
+def test_put_flat_index_is_exact_past_the_f32_integer_range(monkeypatch) -> None:
+    # -1 wraps to 2^24 + 1, the first index an F32 cannot hold. (accumulate:
+    # search-time planning runs on all-ones placeholder indices, which
+    # collide in an overwriting put; LUM-1098.)
+    length = _F24 + 2
+    inputs = (torch.zeros(length), torch.tensor([-1, -2]), torch.tensor([7.0, 5.0]))
+    module = FlatPut()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    expected = module(*inputs)
+    assert expected[-2:].tolist() == [5.0, 7.0]
+    _assert_close(compiled(*inputs), expected)
+    _assert_stage_one(attempts, "aten.put.default")
+
+
+class AccumulatedIndexPut(torch.nn.Module):
+    def forward(self, value, rows, cols, updates):
+        return torch.index_put(value, (rows, cols), updates, accumulate=True)
+
+
+def test_accumulated_index_put_destination_is_exact_past_the_f32_integer_range(
+    monkeypatch,
+) -> None:
+    # (4096, 4095) of a 4097 x 4097 tensor is flat element 2^24 + 8191, an
+    # odd integer past 2^24 that an F32 flat index rounds to its neighbour.
+    inputs = (
+        torch.zeros(4097, 4097),
+        torch.tensor([4096]),
+        torch.tensor([4095]),
+        torch.tensor([3.0]),
+    )
+    module = AccumulatedIndexPut()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(attempts, "aten.index_put.default")
+
+
+class MaskedScatter(torch.nn.Module):
+    def forward(self, value, mask, source):
+        return value.masked_scatter(mask, source)
+
+
+@pytest.mark.slow
+def test_masked_scatter_prefix_is_exact_past_the_f32_integer_range(
+    monkeypatch,
+) -> None:
+    # Distinct int64 sources expose any slot whose rank is off by one.
+    length = _F24 + 3
+    inputs = (
+        torch.zeros(length, dtype=torch.int64),
+        torch.ones(length, dtype=torch.bool),
+        torch.arange(length),
+    )
+    module = MaskedScatter()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(attempts, "aten.masked_scatter.default")
+
+
+class LongRepeat(torch.nn.Module):
+    def forward(self, repeats):
+        return torch.repeat_interleave(repeats, output_size=_F24 + 2)
+
+
+@pytest.mark.slow
+def test_repeat_interleave_intervals_are_exact_past_the_f32_integer_range(
+    monkeypatch,
+) -> None:
+    inputs = (torch.tensor([1, _F24 + 1]),)
+    module = LongRepeat()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(attempts, "aten.repeat_interleave.Tensor")
+
+
+class LongSegmentMax(torch.nn.Module):
+    def forward(self, value, lengths):
+        return torch.segment_reduce(value, "max", lengths=lengths)
+
+
+@pytest.mark.slow
+def test_segment_reduce_bounds_are_exact_past_the_f32_integer_range(
+    monkeypatch,
+) -> None:
+    # Segment 0 ends at 2^24 + 1, so its last element sits at position 2^24.
+    value = torch.zeros(_F24 + 2)
+    value[-2], value[-1] = 5.0, -3.0
+    inputs = (value, torch.tensor([_F24 + 1, 1]))
+    module = LongSegmentMax()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    expected = module(*inputs)
+    assert expected.tolist() == [5.0, -3.0]
+    _assert_close(compiled(*inputs), expected)
+    _assert_stage_one(attempts, "aten.segment_reduce.default")
+
+
 class ComplexMovement(torch.nn.Module):
     def forward(self, value, source, mask, gather_index, fancy_index):
         return (

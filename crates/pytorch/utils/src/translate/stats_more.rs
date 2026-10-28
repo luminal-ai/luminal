@@ -963,14 +963,28 @@ impl Translator<'_> {
 
         let lengths = self.named_tensor_operand(node, "lengths")?;
         let offsets = self.named_tensor_operand(node, "offsets")?;
+        // INVARIANT: segment bounds, input positions, and segment sizes are
+        // exact integers compared and counted in Int; no float carries
+        // them (F32 rounds past 2^24 and moves a segment boundary). The
+        // ends are an Int scan of the lengths (the scan kernels check
+        // integer overflow) and the starts are the same scan shifted one
+        // segment right with a zero fill (an exclusive scan, so no
+        // unproven Int subtraction of caller data); the positions are an
+        // Int iota; a segment size counts 0/1 membership indicators.
         let (starts, ends) = if let Some(lengths) = lengths {
-            // All the segment bookkeeping runs in F32: the candidate axis is
-            // short and this avoids proof-gated Int cumsum/subtract.
-            let lengths = lengths.cast(DType::F32);
-            let ends = lengths.cumsum(vec![axis]);
-            (ends - lengths, ends)
+            let ends = lengths.cast(DType::Int).cumsum(vec![axis]);
+            let starts = if segment_count.to_usize() == Some(0) {
+                ends
+            } else {
+                ends.slice_along(
+                    IntExpr::from(0usize)..segment_count - IntExpr::from(1),
+                    axis,
+                )
+                .pad_along(1, 0, axis, 0.0)
+            };
+            (starts, ends)
         } else if let Some(offsets) = offsets {
-            let offsets = offsets.cast(DType::F32);
+            let offsets = offsets.cast(DType::Int);
             (
                 offsets.slice_along(IntExpr::from(0usize)..segment_count, axis),
                 offsets.slice_along(
@@ -991,13 +1005,18 @@ impl Translator<'_> {
             ends = ends.expand_dim(ends.rank(), suffix);
         }
         let candidate_axis = axis + 1;
-        let positions = self
-            .cx
-            .iota(pair_shape, |c| c[candidate_axis])
-            .cast(DType::F32);
+        let positions = self.cx.iota(pair_shape, |c| c[candidate_axis]);
         let membership = self.bool_and(positions.ge(starts), positions.lt(ends));
         let expanded = data.expand_dim(axis, segment_count);
-        let count = membership.cast(DType::F32).sum(vec![candidate_axis]);
+        let count = membership.cast(DType::Int).sum(vec![candidate_axis]);
+        // The mean's divisor in the data dtype. A narrow float goes through
+        // F32 (exact for any count to 2^24, then one rounding), as the old
+        // F32 count did: a direct Int -> F16/BF16 cast is checked-exact and
+        // would refuse counts past 2048/256.
+        let divisor = |count: GraphTensor| match data.dtype {
+            DType::F16 | DType::Bf16 => count.cast(DType::F32).cast(data.dtype),
+            dtype => count.cast(dtype),
+        };
 
         let initial = named_index(node, "initial")
             .and_then(|index| self.get_number_arg(node, index).ok())
@@ -1022,28 +1041,35 @@ impl Translator<'_> {
                 }
                 if has_initial {
                     // Empty segments keep the initial value: replace a zero
-                    // count by one arithmetically (no branch selection).
-                    let zero_count = self.cx.constant_f32(0.0).expand_rhs(count.dims());
+                    // count by one (an Int add of a [0, 1] indicator, in
+                    // width by the count's bounds).
+                    let zero_count = self.cx.constant_i32(0).expand_rhs(count.dims());
                     let nonempty = count.gt(zero_count);
-                    let empty = self.bool_not(nonempty).cast(DType::F32);
+                    let empty = self.bool_not(nonempty).cast(DType::Int);
                     let safe_count = count + empty;
-                    Ok(sum / safe_count.cast(data.dtype))
+                    Ok(sum / divisor(safe_count))
                 } else {
                     // An empty segment is 0/0 -> NaN, exactly torch's mean.
-                    Ok(sum / count.cast(data.dtype))
+                    Ok(sum / divisor(count))
                 }
             }
             "prod" => {
                 let selected = self.blend_select(membership, expanded, one);
                 let magnitude = self.real_abs(selected).prod(vec![candidate_axis]);
+                // The parity of an exact Int count of negative factors: an
+                // F32 count rounds past 2^24 and can flip the sign. The
+                // remainder by 2 lies in [0, 1] and the sign in [-1, 1],
+                // each in width by the value bounds. Sign multiplication
+                // avoids a select (and preserves infinities instead of
+                // leaking inf * 0).
                 let negative_count = self
                     .signbit(selected)
-                    .cast(DType::F32)
+                    .cast(DType::Int)
                     .sum(vec![candidate_axis]);
-                // odd in {0, 1}; sign multiplication avoids a select (and
-                // preserves infinities instead of leaking inf * 0).
-                let odd = negative_count - (negative_count * 0.5f32).floor() * 2.0f32;
-                let sign = 1.0f32 - 2.0f32 * odd;
+                let two = self.cx.constant_i32(2).expand_rhs(negative_count.dims());
+                let odd = negative_count.trunc_rem(two);
+                let one = self.cx.constant_i32(1).expand_rhs(odd.dims());
+                let sign = one - odd * two;
                 let mut product = magnitude * sign.cast(magnitude.dtype);
                 if let Some(initial) = initial {
                     product *= initial;

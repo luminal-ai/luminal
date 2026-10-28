@@ -40,6 +40,8 @@ mod grouped_mm;
 mod index;
 #[cfg(test)]
 mod index_tests;
+#[cfg(test)]
+mod integer_carrier_tests;
 mod linalg;
 #[cfg(test)]
 mod matmul_tests;
