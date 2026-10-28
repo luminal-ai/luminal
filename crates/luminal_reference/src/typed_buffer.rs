@@ -21,8 +21,9 @@ use anyhow::Result;
 /// another type — "no smuggling data in invalid types"). Floats live
 /// as f32, or as f64 where the model asked for double precision
 /// (ruling 2026-09-02: F64 is a real executable dtype here, never an
-/// F32 bridge wearing an F64 tag); 32-bit integers as i32 and 64-bit
-/// as i64, NATIVE values
+/// F32 bridge wearing an F64 tag). TF32 uses its own validated value
+/// type in 32-bit backing words; widening to F32 is explicit.
+/// The 32-bit integers live as i32 and 64-bit integers as i64, NATIVE values
 /// (every bit pattern legal — total-code dtypes), which is what makes
 /// index arithmetic exact past f32's 2^24 ceiling; the NARROW integers
 /// I8/U8/I16 likewise store native, at their own width, never widened
@@ -37,6 +38,9 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedBuffer {
     F32(Vec<f32>),
+    /// TF32 precision in a distinct typed payload with 32-bit backing words.
+    /// Arithmetic requires an explicit widening cast to F32.
+    TF32(Vec<crate::tf32::Tf32>),
     /// Double-precision floats. A model that declares F64 executes in
     /// F64: silently bridging through F32 would hide a precision
     /// downgrade behind a dtype tag, which is the one thing the
@@ -107,6 +111,7 @@ impl TypedBuffer {
         }
         match (self, source) {
             (Self::F32(a), Self::F32(b)) => copy!(a, b),
+            (Self::TF32(a), Self::TF32(b)) => copy!(a, b),
             (Self::F64(a), Self::F64(b)) => copy!(a, b),
             (Self::I32(a), Self::I32(b)) => copy!(a, b),
             (Self::I64(a), Self::I64(b)) => copy!(a, b),
@@ -139,6 +144,7 @@ impl TypedBuffer {
     pub fn len(&self) -> usize {
         match self {
             TypedBuffer::F32(values) => values.len(),
+            TypedBuffer::TF32(values) => values.len(),
             TypedBuffer::F64(values) => values.len(),
             TypedBuffer::I32(values) => values.len(),
             TypedBuffer::I64(values) => values.len(),
@@ -157,6 +163,7 @@ impl TypedBuffer {
     pub fn type_name(&self) -> &'static str {
         match self {
             TypedBuffer::F32(_) => "f32",
+            TypedBuffer::TF32(_) => "tf32",
             TypedBuffer::F64(_) => "f64",
             TypedBuffer::I32(_) => "i32",
             TypedBuffer::I64(_) => "i64",
@@ -179,6 +186,20 @@ impl TypedBuffer {
         match self {
             TypedBuffer::F32(values) => Ok(values),
             other => anyhow::bail!("expected an f32 buffer, found {}", other.type_name()),
+        }
+    }
+
+    pub fn as_tf32(&self) -> Result<&Vec<crate::tf32::Tf32>> {
+        match self {
+            Self::TF32(values) => Ok(values),
+            other => anyhow::bail!("expected a tf32 buffer, found {}", other.type_name()),
+        }
+    }
+
+    pub fn as_tf32_mut(&mut self) -> Result<&mut Vec<crate::tf32::Tf32>> {
+        match self {
+            Self::TF32(values) => Ok(values),
+            other => anyhow::bail!("expected a tf32 buffer, found {}", other.type_name()),
         }
     }
 
@@ -256,22 +277,35 @@ impl TypedBuffer {
         }
     }
 
-    /// A fresh zero-filled buffer of the same variant and length —
-    /// the executor's dest-allocation shape.
-    pub fn byte_len(&self) -> usize {
-        let width = match self {
+    /// Physical reference storage width, distinct from logical precision.
+    pub(crate) fn element_bytes(&self) -> usize {
+        match self {
             Self::F64(_) | Self::I64(_) => 8,
-            Self::F32(_) | Self::I32(_) => 4,
+            Self::F32(_) | Self::TF32(_) | Self::I32(_) => 4,
             Self::I16(_) => 2,
             _ => 1,
-        };
-        self.len() * width
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.len() * self.element_bytes()
+    }
+
+    /// Serialized layout widths describe logical precision. TF32's nineteen
+    /// bits occupy a full word in this runtime; Bool's one bit occupies a byte.
+    pub(crate) fn storage_bytes_for_width(bits: i64) -> Result<usize> {
+        Ok(if bits == 19 {
+            std::mem::size_of::<crate::tf32::Tf32>()
+        } else {
+            usize::try_from(bits)?.div_ceil(8)
+        })
     }
 
     pub(crate) fn zeroed(dtype: luminal::dtype::PlanDtype, n: usize) -> Result<Self> {
         use luminal::dtype::PlanDtype as D;
         Ok(match dtype {
             D::F32 => Self::F32(vec![0.; n]),
+            D::TF32 => Self::TF32(vec![crate::tf32::Tf32::default(); n]),
             D::F64 => Self::F64(vec![0.; n]),
             D::Int => Self::I32(vec![0; n]),
             D::Int64 => Self::I64(vec![0; n]),
@@ -287,6 +321,9 @@ impl TypedBuffer {
     pub fn zeroed_like(&self) -> TypedBuffer {
         match self {
             TypedBuffer::F32(values) => TypedBuffer::F32(vec![0.0; values.len()]),
+            TypedBuffer::TF32(values) => {
+                TypedBuffer::TF32(vec![crate::tf32::Tf32::default(); values.len()])
+            }
             TypedBuffer::F64(values) => TypedBuffer::F64(vec![0.0; values.len()]),
             TypedBuffer::I32(values) => TypedBuffer::I32(vec![0; values.len()]),
             TypedBuffer::I64(values) => TypedBuffer::I64(vec![0; values.len()]),
@@ -316,6 +353,11 @@ impl TypedBuffer {
 impl From<Vec<f32>> for TypedBuffer {
     fn from(values: Vec<f32>) -> Self {
         TypedBuffer::F32(values)
+    }
+}
+impl From<Vec<crate::tf32::Tf32>> for TypedBuffer {
+    fn from(values: Vec<crate::tf32::Tf32>) -> Self {
+        Self::TF32(values)
     }
 }
 impl From<Vec<i32>> for TypedBuffer {

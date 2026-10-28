@@ -84,8 +84,11 @@ mod tests {
 (fail (check (= rounded_product narrow_product)))
 (fail (check (= narrow_sum wide_sum)))
 "#;
-        new_egraph()
-            .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
-            .unwrap();
+        for dtype in ["Bf16", "TF32"] {
+            let script = script.replace("(Bf16)", &format!("({dtype})"));
+            new_egraph()
+                .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
+                .unwrap();
+        }
     }
 }

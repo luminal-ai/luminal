@@ -38,7 +38,7 @@ pub fn run(
             return Ok(None);
         }
         let (_, upper) = span.interval(&intervals)?;
-        let width = usize::try_from(layout.width_bits())?.div_ceil(8);
+        let width = crate::typed_buffer::TypedBuffer::storage_bytes_for_width(layout.width_bits())?;
         Ok(Some(
             usize::try_from(upper)?
                 .checked_mul(width)

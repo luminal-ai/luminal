@@ -596,7 +596,7 @@ impl ReferenceRuntime {
                 .ok_or_else(|| anyhow!("buffer {} has no dtype", buffer.label))?;
             let empty = TypedBuffer::zeroed(dtype, 0)?;
             let bytes = numel
-                .checked_mul(usize::try_from(dtype.egglog_bits())?.div_ceil(8))
+                .checked_mul(empty.element_bytes())
                 .ok_or_else(|| anyhow!("buffer {} size overflow", buffer.label))?;
             geometry.insert(id.clone(), (numel, dtype, bytes, empty.type_name()));
         }
@@ -874,6 +874,10 @@ impl ReferenceRuntime {
     /// observe-only cast to F32).
     pub fn get_i32(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<i32>> {
         self.get_typed(self.output_buffer(tensor)?)?.as_i32()
+    }
+
+    pub fn get_tf32(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<crate::tf32::Tf32>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_tf32()
     }
 
     /// The i64 twin of [`Self::get_f32`].

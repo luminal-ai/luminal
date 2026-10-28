@@ -155,6 +155,22 @@ pub(crate) fn kernel(
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
             dest.copy_from_slice(input);
         }
+        (TypedBuffer::F32(input), TypedBuffer::TF32(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (out, value) in dest.iter_mut().zip(input) {
+                *out = crate::tf32::Tf32::from_f32(*value);
+            }
+        }
+        (TypedBuffer::TF32(input), TypedBuffer::F32(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            for (out, value) in dest.iter_mut().zip(input) {
+                *out = value.to_f32();
+            }
+        }
+        (TypedBuffer::TF32(input), TypedBuffer::TF32(dest)) => {
+            anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+            dest.copy_from_slice(input);
+        }
         (TypedBuffer::I32(input), TypedBuffer::I32(dest)) => {
             anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
             dest.copy_from_slice(input);

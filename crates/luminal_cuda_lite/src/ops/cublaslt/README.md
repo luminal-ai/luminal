@@ -79,6 +79,24 @@ available; floating reassociation or crossing casts does not authorize another
 fused expression. TF32, FP8, mixed A/B storage, narrow
 outputs, and arbitrary alpha/beta values have no approved configurations.
 
+### TF32 precision contract (reference support; cuBLASLt admission pending)
+
+The reference runtime implements `F32 -> TF32 -> F32` as nearest-even input
+rounding followed by exact widening, using the
+[NVIDIA compute-mode contract](https://docs.nvidia.com/cuda/cublas/index.html#cublascomputetype-t).
+It gives TF32 its own typed payload backed by 32-bit words. Multiply, reduction,
+C/bias additions and final casts retain their authored types and rounding sites.
+
+A future `CUBLAS_COMPUTE_32F_FAST_TF32` configuration must explicitly whitelist
+FP32 storage and prove both input cast chains. Reading the pre-cast storage is
+valid only under that computation proof; a mode-independent storage-reading
+fact would also permit a strict FP32 call to skip the required rounding. Strict
+FP32 calls may instead consume materialized rounded FP32 values. The computation
+proof must compose with the existing batch, accumulation and final-cast proofs.
+The agreed dispatch assumption is that the configured compute mode executes and
+`NVIDIA_TF32_OVERRIDE` is unset. This does not add a runtime environment check.
+No TF32 cuBLASLt configurations or dispatch changes are enabled yet.
+
 ## Element strides and strided batches
 
 Core represents coefficients with `ElementStrideExact IntExpr` and

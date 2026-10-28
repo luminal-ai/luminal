@@ -145,6 +145,11 @@ pub(crate) fn move_gathered(
                 dest[flat] = data[*index];
             }
         }
+        (TypedBuffer::TF32(data), TypedBuffer::TF32(dest)) => {
+            for (flat, index) in index_of.iter().enumerate() {
+                dest[flat] = data[*index];
+            }
+        }
         (TypedBuffer::F64(data), TypedBuffer::F64(dest)) => {
             for (flat, index) in index_of.iter().enumerate() {
                 dest[flat] = data[*index];
