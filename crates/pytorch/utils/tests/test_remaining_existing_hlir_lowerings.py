@@ -742,3 +742,15 @@ def test_fixed_shape_segment_reduce_composites() -> None:
     module = SegmentReductions()
     inputs = (value, lengths, offsets)
     _check(module, *inputs)
+
+
+class SegmentProduct(torch.nn.Module):
+    def forward(self, value, lengths):
+        return torch.segment_reduce(value, "prod", lengths=lengths)
+
+
+def test_segment_reduce_product_sign_counts_negative_infinity() -> None:
+    inf = float("inf")
+    value = torch.tensor([-inf, 2.0, 3.0, inf, -2.0, -inf, 2.0, -1.0, -inf, -inf])
+    lengths = torch.tensor([2, 1, 2, 3, 2])
+    _check(SegmentProduct(), value, lengths)

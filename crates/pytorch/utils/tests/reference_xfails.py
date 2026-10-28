@@ -204,7 +204,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_remaining_existing_hlir_lowerings.py::test_inverse_probability_functions_cover_tails_and_boundaries",
             "test_remaining_existing_hlir_lowerings.py::test_modified_bessel_family_across_approximation_intervals",
             "test_remaining_existing_hlir_lowerings.py::test_ordering_and_distance_composites",
-            "test_remaining_existing_hlir_lowerings.py::test_polygamma_orders_reflection_poles_and_infinities",
             "test_straightforward_lowerings.py::test_addmv_and_addbmm_preserve_real_dtypes_and_coefficients",
             "test_upsample.py::test_upsample_nearest_noninteger_scale_same_size",
         ),
@@ -216,7 +215,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "IEEE signed-zero / NaN semantics are not reproduced by the reference lowering"
         ),
         tests=(
-            "test_binary.py::test_atan2_quadrants_and_signed_zero",
             "test_binary.py::test_copysign_fmax_fmin_nan_and_zero_signs",
             "test_binary.py::test_copysign_scalar_typed_constants_and_zero_signs",
             "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row",

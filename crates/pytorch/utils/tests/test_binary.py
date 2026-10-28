@@ -27,6 +27,36 @@ def test_atan2_quadrants_and_signed_zero():
     assert torch.equal(torch.signbit(actual)[zeros], torch.signbit(expected)[zeros])
 
 
+def test_atan2_negative_infinity_and_zero_x_quadrants():
+    """The quadrant correction reads the sign bit of `x`, and `atan(y/x)`
+    reads the sign of the ratio; `-inf` and both signed zeros must agree."""
+    inf = float("inf")
+    y = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 0.0, -0.0, inf, -inf, inf, -inf, 2.0]
+    x = [0.0, 0.0, -0.0, -0.0, -inf, -inf, -inf, -inf, -inf, -inf, inf, inf, -3.0]
+    for dtype in (torch.float32, torch.float64):
+        y_t = torch.tensor(y, dtype=dtype)
+        x_t = torch.tensor(x, dtype=dtype)
+        expected = Atan2()(y_t, x_t)
+        (actual,) = _compile_and_run(Atan2(), y_t, x_t)
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+class CopySign(torch.nn.Module):
+    def forward(self, magnitude, sign):
+        return torch.copysign(magnitude, sign)
+
+
+def test_copysign_infinite_sign_operand():
+    magnitude = [5.0, 5.0, -5.0, -5.0, 2.0, -3.0]
+    sign = [-float("inf"), float("inf"), -float("inf"), float("inf"), -1.0, 1.0]
+    for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        a = torch.tensor(magnitude, dtype=dtype)
+        b = torch.tensor(sign, dtype=dtype)
+        expected = CopySign()(a, b)
+        (actual,) = _compile_and_run(CopySign(), a, b)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 class BinaryIeeeValues(torch.nn.Module):
     def forward(self, a, b):
         return torch.copysign(a, b), torch.fmax(a, b), torch.fmin(a, b)

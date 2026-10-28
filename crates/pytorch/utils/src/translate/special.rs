@@ -1273,10 +1273,9 @@ impl Translator<'_> {
         let expanded = maximum.expand_dim(reduction_axis, windows.dims()[reduction_axis]);
         let ordinary = maximum + (windows - expanded).exp().sum(vec![reduction_axis]).log();
 
-        // Positive infinity is detected directly: `util::signbit` reads the
-        // sign through `reciprocal().lt(0)`, and `reciprocal(-inf)` is `-0.0`
-        // which is not `< 0`, so the `-inf` window fill would otherwise be
-        // counted as a positive infinity.
+        // Positive infinity is detected directly, as a value above the
+        // largest finite one, so the `-inf` window fill never counts as a
+        // positive infinity.
         let largest = match windows.dtype {
             DType::F64 => f64::MAX,
             _ => f32::MAX as f64,

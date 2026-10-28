@@ -102,13 +102,19 @@ impl Translator<'_> {
     }
 
     /// `atan2(y, x)` with the full branch-cut, infinity and signed-zero
-    /// cases. The origin is nudged so `y/x` is `0/1` there rather than
+    /// cases. The origin is steered so `y/x` is `0/1` there rather than
     /// `0/0`, keeping the intermediate angle finite before the final select.
     fn exact_atan2(&mut self, y: GraphTensor, x: GraphTensor) -> GraphTensor {
         let x_zero = self.exact_is_zero(x);
         let y_zero = self.exact_is_zero(y);
         let both_zero = self.bool_and(x_zero, y_zero);
-        let safe_x = x + both_zero.cast(x.dtype);
+        // Invariant: away from the origin the ratio divides by `x` itself,
+        // so `y/x` and the quadrant correction below (`signbit(x)`) read
+        // the same sign of `x`. Steer the origin by selection: adding the
+        // `both_zero` indicator would compute `-0.0 + 0.0 = +0.0` and turn
+        // `atan2(-1, -0.0)` into `-3pi/2`.
+        let one = self.constant_like(x, 1.0);
+        let safe_x = self.real_select(both_zero, one, x);
         let ratio = y / safe_x;
         let mut angle = self.exact_atan(ratio);
         let x_negative = self.signbit(x);

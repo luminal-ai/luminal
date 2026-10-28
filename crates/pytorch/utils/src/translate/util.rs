@@ -412,12 +412,27 @@ impl Translator<'_> {
         self.bool_not(nonzero)
     }
 
+    /// The IEEE sign bit of a floating `value`, as `torch.signbit` reads it.
+    ///
+    /// Invariant: for every non-NaN `x`, the sign bit is set iff `x < 0`
+    /// (each negative finite value and `-inf`) or `x` is `-0.0`. Ordered
+    /// `<` cannot see a zero's sign, so the second clause reads it through
+    /// the reciprocal: `1/-0.0 = -inf < 0` while `1/+0.0 = +inf`. Neither
+    /// clause suffices alone: `-0.0 < 0` is false, and `1/-inf = -0.0` is
+    /// not `< 0` either, so the reciprocal clause by itself reads `-inf`
+    /// as positive.
+    ///
+    /// NaN: both clauses are ordered comparisons, so every NaN reads as
+    /// positive. That matches torch for the default (positive) NaN, but not
+    /// for a NaN whose sign bit is set, where torch reports `true`. Only the
+    /// encoding view (`bits_to_bools`) can observe a NaN's sign, and that
+    /// view does not execute on zero-element tensors yet, which this
+    /// predicate (and `copysign`/`atan2` through it) must keep supporting.
     pub(super) fn signbit(&mut self, value: GraphTensor) -> GraphTensor {
-        // Negative iff x < 0, or x is a negative zero / NaN: the
-        // reciprocal flips the sign bit for every finite value and keeps
-        // -0.0 negative.
         let zero = self.constant_like(value, 0.0);
-        value.reciprocal().lt(zero)
+        let negative = value.lt(zero);
+        let negative_zero = value.reciprocal().lt(zero);
+        negative.logical_or(negative_zero)
     }
 
     pub(super) fn copy_sign(&mut self, magnitude: GraphTensor, sign: GraphTensor) -> GraphTensor {

@@ -219,3 +219,28 @@ def test_logit_promotes_integral_input_to_float(
     actual = compiled(values)
     assert translated == [{"aten.logit.default"}]
     torch.testing.assert_close(actual, torch.logit(values, eps), equal_nan=True)
+
+
+# ── Signbit ──────────────────────────────────────────────────────────────────
+
+
+class SignbitModel(torch.nn.Module):
+    def forward(self, x):
+        return torch.signbit(x)
+
+
+def test_signbit_reads_negative_infinity_and_zero_signs(device):
+    """`-inf` is negative even though `1/-inf` is `-0.0`, and only `-0.0`
+    of the zeros is. Zero-element inputs must keep compiling."""
+    inf, nan = float("inf"), float("nan")
+    values = [-inf, -2.5, -1.0, -0.0, 0.0, 1.0, 2.5, inf, nan]
+    for dtype in (torch.float32, torch.float64):
+        full = torch.tensor(values, dtype=dtype, device=device)
+        empty = torch.empty(0, dtype=dtype, device=device)
+        for x in (full, empty):
+            torch._dynamo.reset()
+            model = SignbitModel().to(device)
+            model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+            actual = model_compiled(x)
+            assert actual.dtype == torch.bool
+            assert torch.equal(actual.cpu(), model(x).cpu()), (dtype, x)
