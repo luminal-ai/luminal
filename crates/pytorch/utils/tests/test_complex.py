@@ -5,6 +5,7 @@ import warnings
 import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
+from backend_test_utils import luminal_backend
 
 
 def _compile_and_run(module: torch.nn.Module, *inputs: torch.Tensor):
@@ -523,3 +524,66 @@ def test_complex_scalar_casts_and_noncontiguous_negative_views():
         actual = _compile_and_run(ComplexStructuralEdges(), value)
     for result, reference in zip(actual, expected):
         _assert_close(result, reference, rtol=0, atol=0)
+
+
+# Complex user inputs are refused upstream (LUM-1100), so these graphs build
+# their complex value in-graph from real components.
+
+
+class NegativeRealAxis(torch.nn.Module):
+    def forward(self, real, imag):
+        value = torch.complex(real, imag)
+        root = torch.sqrt(value)
+        log = torch.log(value)
+        return root.real, root.imag, torch.angle(value), log.real, log.imag
+
+
+def _assert_parts_close(actual, expected, *, zero_signs):
+    for index, (result, reference) in enumerate(zip(actual, expected)):
+        torch.testing.assert_close(result, reference, rtol=1e-6, atol=1e-6)
+        if index in zero_signs:
+            zeros = reference == 0
+            assert torch.equal(
+                torch.signbit(result)[zeros], torch.signbit(reference)[zeros]
+            ), (index, result, reference)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64), ids=str)
+def test_sqrt_angle_and_log_take_the_side_of_the_cut_from_a_signed_zero(
+    stage_one_only, dtype
+):
+    """On the negative real axis the sign of a zero imaginary part picks the
+    side of the branch cut: sqrt(-4 +- 0j) = +-2j, and angle and log's
+    imaginary part are +-pi. These copy the sign of `imag` onto a magnitude;
+    multiplying by an approximate sign(+-0) = 0 put both sides on the cut
+    (0), and sign(+-inf) = NaN made angle(-0 +- 1j) NaN."""
+    inf = float("inf")
+    real = torch.tensor([-4.0, -4.0, -0.0, -0.0, -inf, 4.0], dtype=dtype)
+    imag = torch.tensor([0.0, -0.0, 1.0, -1.0, 0.0, 3.0], dtype=dtype)
+    expected = NegativeRealAxis()(real, imag)
+    actual = torch.compile(NegativeRealAxis(), backend=luminal_backend)(real, imag)
+    # The zero sign of sqrt's REAL part is not checked: it divides |imag|
+    # computed by `abs()`, which keeps -0.0 (LUM-1106).
+    _assert_parts_close(actual, expected, zero_signs={1, 2, 4})
+
+
+class InverseCosines(torch.nn.Module):
+    def forward(self, real, imag):
+        value = torch.complex(real, imag)
+        acos = torch.acos(value)
+        acosh = torch.acosh(value)
+        return acos.real, acos.imag, acosh.real, acosh.imag
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64), ids=str)
+def test_acos_and_acosh_take_the_side_of_the_cut_from_a_signed_zero(
+    stage_one_only, dtype
+):
+    """acos(+-2 +- 0j) has imaginary part -+acosh(2), and acosh's imaginary
+    part copies the sign of the zero onto acos(beta). Both are copysign onto
+    a nonzero magnitude, which the old `|m| * sign(+-0)` flattened to 0."""
+    real = torch.tensor([2.0, 2.0, -2.0, -2.0, 0.5, 0.5, 0.0, 0.0], dtype=dtype)
+    imag = torch.tensor([0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0], dtype=dtype)
+    expected = InverseCosines()(real, imag)
+    actual = torch.compile(InverseCosines(), backend=luminal_backend)(real, imag)
+    _assert_parts_close(actual, expected, zero_signs={0, 1, 2, 3})

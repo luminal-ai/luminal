@@ -442,9 +442,56 @@ impl GraphTensor {
         }
     }
 
-    /// Get the sign of each element, '1' for positive and '-1' for negative
+    /// The sign of each element: `1` where `x > 0`, `-1` where `x < 0`, and
+    /// `x` itself everywhere else.
+    ///
+    /// Invariant: EXACT for every input. Each nonzero value, subnormals and
+    /// `±inf` included, maps to exactly `±1`; a zero keeps its own sign
+    /// (`sign(-0.0) = -0.0`) and NaN propagates. It is the native `Select`
+    /// over the ordered `gt`/`lt`, which are false for NaN and for both
+    /// zeros, so exactly those inputs fall through to `x` unchanged. The
+    /// old `x / (|x| + 1e-10)` was an approximation: NaN at `±inf`
+    /// (`inf / inf`), `0.5` at `1e-10`, and not exactly `±1` anywhere
+    /// below `|x| ~ 1e-3` in f32.
+    ///
+    /// This is the signum that odd-symmetric compositions (`erf`, `gelu`)
+    /// multiply by, so `-0.0` and NaN come out of them correctly. It is NOT
+    /// `torch.sign`, which is `(x > 0) - (x < 0)`: `+0` for both zeros and
+    /// for NaN. The PT2 translator lowers `aten.sign` to that form itself.
+    ///
+    /// Integers take the same selects with integer constants. An unsigned
+    /// type skips the `x < 0` arm (it is constant-false there), and Bool is
+    /// its own sign (`torch.sign` on a bool tensor is the identity).
     pub fn sign(self) -> GraphTensor {
-        self / (self.abs() + 1e-10)
+        let constant = |value: i32| -> GraphTensor {
+            match self.dtype {
+                DType::I4
+                | DType::I8
+                | DType::I16
+                | DType::Int
+                | DType::I64
+                | DType::U4
+                | DType::U8
+                | DType::U16
+                | DType::U64 => self
+                    .graph()
+                    .constant_i32(value)
+                    .cast(self.dtype)
+                    .expand_rhs(self.dims()),
+                _ => self.elementary_constant(value as f32, value as f64),
+            }
+        };
+        match self.dtype {
+            DType::Bool => self,
+            DType::U4 | DType::U8 | DType::U16 | DType::U64 => {
+                self.gt(constant(0)).select(constant(1), self)
+            }
+            _ => {
+                let zero = constant(0);
+                let negative = self.lt(zero).select(constant(-1), self);
+                self.gt(zero).select(constant(1), negative)
+            }
+        }
     }
 
     /// The Rectified Linear Unit activation function
@@ -672,6 +719,96 @@ pub(super) mod tests {
                 "abs() on {dtype:?} must be the identity, not a recorded op"
             );
         }
+    }
+
+    /// `sign()` is EXACT: `±1` for every nonzero value, subnormals and
+    /// `±inf` included; a zero keeps its own sign bit and NaN propagates.
+    /// The old `x / (|x| + 1e-10)` gave NaN at `±inf`, `0.5` at `1e-10` and
+    /// a fraction for every tiny value.
+    #[test]
+    fn sign_is_exact_at_zeros_subnormals_infinities_and_nan() {
+        let (inf, nan) = (f64::INFINITY, f64::NAN);
+        let tiny = [1e-45, 1e-30, 1e-10, 1e-4];
+        let mut input = vec![-inf, -1.0, -0.0, 0.0, 1.0, inf, nan];
+        let mut expected = vec![-1.0, -1.0, -0.0, 0.0, 1.0, 1.0, nan];
+        for t in tiny {
+            input.extend([-t, t]);
+            expected.extend([-1.0, 1.0]);
+        }
+
+        let mut cx = Graph::new();
+        let x = cx.tensor(vec![input.len() + 1], DType::F32);
+        let y = x.sign();
+        let mut narrow: Vec<f32> = input.iter().map(|&v| v as f32).collect();
+        // The smallest f32 subnormal, which `1e-45 as f32` rounds to.
+        narrow.push(f32::from_bits(1));
+        let rt = luminal_reference::harness::run_reference(&cx, &[(x.id, narrow.clone().into())]);
+        let mut narrow_expected: Vec<f32> = expected.iter().map(|&v| v as f32).collect();
+        narrow_expected.push(1.0);
+        for ((&got, &want), &v) in rt
+            .get_f32(y.id)
+            .unwrap()
+            .iter()
+            .zip(&narrow_expected)
+            .zip(&narrow)
+        {
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "f32 sign({v:e}) = {got:e}, expected {want:e}"
+            );
+        }
+
+        let mut cx = Graph::new();
+        let x = cx.tensor(vec![input.len() + 1], DType::F64);
+        let y = x.sign();
+        let mut wide = input.clone();
+        // The smallest f64 subnormal.
+        wide.push(f64::from_bits(1));
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[(x.id, luminal_reference::TypedBuffer::F64(wide.clone()))],
+        );
+        let mut wide_expected = expected;
+        wide_expected.push(1.0);
+        for ((&got, &want), &v) in rt
+            .get_f64(y.id)
+            .unwrap()
+            .iter()
+            .zip(&wide_expected)
+            .zip(&wide)
+        {
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "f64 sign({v:e}) = {got:e}, expected {want:e}"
+            );
+        }
+    }
+
+    /// Integer `sign()` selects integer constants: the extremes map to `±1`
+    /// with no negation that could overflow, and Bool is its own sign.
+    #[test]
+    fn integer_sign_is_exact_and_bool_sign_is_the_identity() {
+        let mut cx = Graph::new();
+        let x = cx.tensor(vec![5], DType::Int);
+        let y = x.sign();
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[(x.id, vec![i32::MIN, -7, 0, 9, i32::MAX].into())],
+        );
+        assert_exact(rt.get_i32(y.id).unwrap(), &[-1, -1, 0, 1, 1]);
+
+        let mut cx = Graph::new();
+        let x = cx.tensor(vec![5], DType::I64);
+        let y = x.sign();
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[(x.id, vec![i64::MIN, -7, 0, 9, i64::MAX].into())],
+        );
+        assert_exact(rt.get_i64(y.id).unwrap(), &[-1, -1, 0, 1, 1]);
+
+        let mut cx = Graph::new();
+        let x = cx.tensor(vec![4], DType::Bool);
+        assert_eq!(x.sign().id, x.id, "sign() on Bool must be the identity");
     }
 
     /// A cumulative product is exact: the sign of each prefix is carried,

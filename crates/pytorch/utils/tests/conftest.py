@@ -1,9 +1,9 @@
 """Run PT2 translator parity with the explicitly selected native runtime."""
 
-from backend_test_utils import device, execution_device, reset_dynamo
+from backend_test_utils import device, execution_device, reset_dynamo, stage_one_only
 from reference_xfails import apply_reference_xfails
 
-__all__ = ["device", "execution_device", "reset_dynamo"]
+__all__ = ["device", "execution_device", "reset_dynamo", "stage_one_only"]
 
 
 def pytest_configure(config):

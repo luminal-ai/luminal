@@ -96,14 +96,6 @@ impl Translator<'_> {
         condition.select(if_true, if_false)
     }
 
-    /// `abs(magnitude)` with the sign of `sign`.
-    fn exact_copy_sign(&mut self, magnitude: GraphTensor, sign: GraphTensor) -> GraphTensor {
-        let (magnitude, sign) = util::broadcast_binary(magnitude, sign);
-        let negative = magnitude * -1.0;
-        let signbit = self.signbit(sign);
-        self.real_select(signbit, negative, magnitude)
-    }
-
     /// `value == 0` that, unlike `util::is_zero`, is false for NaN.
     fn exact_is_zero(&mut self, value: GraphTensor) -> GraphTensor {
         let zero = self.constant_like(value, 0.0);
@@ -158,7 +150,7 @@ impl Translator<'_> {
         let base = self.real_select(quarter_turn_branch, quarter_pi + base, base);
         let half_pi = self.constant_like(z, std::f64::consts::FRAC_PI_2);
         let angle = self.real_select(reciprocal_branch, half_pi - base, base);
-        self.exact_copy_sign(angle, input)
+        self.copy_sign(angle, input)
     }
 
     /// `atan2(y, x)` with the full branch-cut, infinity and signed-zero
@@ -179,7 +171,7 @@ impl Translator<'_> {
         let mut angle = self.exact_atan(ratio);
         let x_negative = self.signbit(x);
         let pi = self.constant_like(y, std::f64::consts::PI);
-        let signed_pi = self.exact_copy_sign(pi, y);
+        let signed_pi = self.copy_sign(pi, y);
         angle = self.real_select(x_negative, angle + signed_pi, angle);
 
         let x_inf = self.is_inf(x);
@@ -188,11 +180,11 @@ impl Translator<'_> {
         let quarter = self.constant_like(y, std::f64::consts::FRAC_PI_4);
         let three_quarters = self.constant_like(y, 3.0 * std::f64::consts::FRAC_PI_4);
         let infinite_angle = self.real_select(x_negative, three_quarters, quarter);
-        let infinite_angle = self.exact_copy_sign(infinite_angle, y);
+        let infinite_angle = self.copy_sign(infinite_angle, y);
         angle = self.real_select(both_inf, infinite_angle, angle);
 
         let zero = self.constant_like(y, 0.0);
-        let signed_zero = self.exact_copy_sign(zero, y);
+        let signed_zero = self.copy_sign(zero, y);
         let zero_angle = self.real_select(x_negative, signed_pi, signed_zero);
         self.real_select(both_zero, zero_angle, angle)
     }
@@ -217,7 +209,9 @@ impl Translator<'_> {
             } else {
                 raw.cast(dtype)
             };
-            let magnitude = self.real_abs(magnitude);
+            // `ieee_abs`, not `abs()`: `abs(-0.0)` keeps the sign bit, so
+            // `copysign(-0.0, 0.0)` would come out `-0.0`.
+            let magnitude = self.ieee_abs(magnitude);
             let sign = node.inputs[1]
                 .arg
                 .as_int()
@@ -233,8 +227,7 @@ impl Translator<'_> {
             });
         }
         let (magnitude, sign) = self.promoted_binary_inputs(node)?;
-        let magnitude = self.real_abs(magnitude);
-        Ok(self.exact_copy_sign(magnitude, sign))
+        Ok(self.copy_sign(magnitude, sign))
     }
 
     pub(super) fn translate_fmax_fmin(&mut self, node: &Node, max: bool) -> Result<GraphTensor> {

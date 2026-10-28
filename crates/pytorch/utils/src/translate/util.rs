@@ -525,9 +525,38 @@ impl Translator<'_> {
         negative.logical_or(negative_zero)
     }
 
+    /// The IEEE absolute value of a floating `value`: its sign bit cleared,
+    /// so `-0.0` becomes `+0.0`. `abs()` cannot see a zero's sign (it
+    /// selects on the ordered `x < 0`) and keeps `-0.0`; this selects on
+    /// [`Self::signbit`] instead. Every NaN reads as positive there, so a
+    /// NaN passes through unchanged.
+    pub(super) fn ieee_abs(&mut self, value: GraphTensor) -> GraphTensor {
+        let negative = self.signbit(value);
+        negative.select(-value, value)
+    }
+
+    /// `torch.copysign(magnitude, sign)`: `|magnitude|` carrying the sign
+    /// bit of `sign`. Every translator lowering that transfers a sign goes
+    /// through this one helper.
+    ///
+    /// Invariant: the result's magnitude is exactly `|magnitude|` and its
+    /// sign bit is exactly `signbit(sign)`, for zeros, subnormals and
+    /// infinities in either operand. It is built by selection, never by
+    /// multiplying by a sign indicator: `|m| * sign(s)` is `0` for a zero
+    /// `s` and NaN for an infinite one (`0 * inf`).
+    ///
+    /// The magnitude goes through [`Self::ieee_abs`] rather than `abs()`:
+    /// `abs(-0.0)` keeps its sign bit, and the two branches below would then
+    /// carry the inverted sign (`copysign(-0.0, 1.0)` would be `-0.0`).
+    ///
+    /// NaN `sign`: `signbit` reads every NaN as positive (see
+    /// [`Self::signbit`]), so the result is `+|magnitude|`. That is torch's
+    /// answer for the default NaN, but not for a NaN whose sign bit is set.
     pub(super) fn copy_sign(&mut self, magnitude: GraphTensor, sign: GraphTensor) -> GraphTensor {
         let (magnitude, sign) = broadcast_binary(magnitude, sign);
-        magnitude.abs() * sign.sign().cast(magnitude.dtype)
+        let positive = self.ieee_abs(magnitude);
+        let negative = self.signbit(sign);
+        negative.select(-positive, positive)
     }
 
     /// A floating scalar of the tensor's own dtype (F64 keeps doubles).

@@ -63,6 +63,20 @@ def execution_device(device):
         yield
 
 
+@pytest.fixture
+def stage_one_only(monkeypatch):
+    """The real backend path, pinned to its first stage: the undecomposed
+    graph must translate as it is. Re-decomposing the whole graph (the
+    fallback for an unsupported op) fails the test instead of hiding a
+    missing arm."""
+    native = importlib.import_module(f"luminal_{selected_backend()}.backend")
+
+    def refuse_decomposition():
+        raise AssertionError("stage 1 refused the graph; it was re-decomposed")
+
+    monkeypatch.setattr(native, "_decomp_table", refuse_decomposition)
+
+
 @pytest.fixture(autouse=True)
 def reset_dynamo():
     torch.set_float32_matmul_precision("highest")

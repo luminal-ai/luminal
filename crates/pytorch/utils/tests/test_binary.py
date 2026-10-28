@@ -1,12 +1,11 @@
 """Regression coverage for PT2 binary elementwise lowerings."""
 
-import importlib
 import os
 
 import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
-from backend_test_utils import luminal_backend, selected_backend
+from backend_test_utils import luminal_backend
 
 
 def _compile_and_run(module: torch.nn.Module, *inputs: torch.Tensor):
@@ -57,6 +56,34 @@ def test_copysign_infinite_sign_operand():
         expected = CopySign()(a, b)
         (actual,) = _compile_and_run(CopySign(), a, b)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    (torch.float16, torch.bfloat16, torch.float32, torch.float64),
+    ids=str,
+)
+def test_copysign_takes_only_the_sign_bit_of_zero_tiny_and_infinite_signs(
+    stage_one_only, dtype
+):
+    """copysign is |magnitude| with the sign BIT of `sign`. A zero magnitude
+    becomes a signed zero, an infinite or subnormal `sign` is only a sign,
+    and a `-0.0` magnitude loses its own sign. Multiplying by `sign(s)` gave
+    0 for a zero `s` and NaN for an infinite one; `abs(-0.0)` is `-0.0`."""
+    inf, nan = float("inf"), float("nan")
+    magnitude = [0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 3.0, -3.0, 0.0, -0.0, 2.0, -2.0]
+    sign = [inf, inf, -inf, -inf, 1e-45, -1e-45, -1e-30, 1e-30, nan, -0.0, 0.0, 0.0]
+    magnitude += [inf, -inf, -0.0, 0.0]
+    sign += [-1e-45, 1e-45, 1.0, -1.0]
+    a = torch.tensor(magnitude, dtype=dtype)
+    b = torch.tensor(sign, dtype=dtype)
+    expected = CopySign()(a, b)
+    actual = torch.compile(CopySign(), backend=luminal_backend)(a, b)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(torch.signbit(actual), torch.signbit(expected)), (
+        actual,
+        expected,
+    )
 
 
 class BinaryIeeeValues(torch.nn.Module):
@@ -127,20 +154,6 @@ def test_not_equal_and_diff_preserve_boolean_output_dtype():
 # `sub.Tensor(1, x)` (decomposed), and `x.shape[0]` under dynamic shapes as
 # a SymInt operand. All were refused once: the lowerings read operand 0 as
 # a tensor and operand 1 as a literal.
-
-
-@pytest.fixture
-def stage_one_only(monkeypatch):
-    """The real backend path, pinned to its first stage: the undecomposed
-    graph must translate as it is. Re-decomposing the whole graph (the
-    fallback for an unsupported op) fails the test instead of hiding a
-    missing arm."""
-    native = importlib.import_module(f"luminal_{selected_backend()}.backend")
-
-    def refuse_decomposition():
-        raise AssertionError("stage 1 refused the graph; it was re-decomposed")
-
-    monkeypatch.setattr(native, "_decomp_table", refuse_decomposition)
 
 
 class Lambda(torch.nn.Module):

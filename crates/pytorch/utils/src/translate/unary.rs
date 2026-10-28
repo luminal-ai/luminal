@@ -208,6 +208,11 @@ impl Translator<'_> {
         u.sign() * (one - poly * (u.square() * -1.0).exp())
     }
 
+    /// `torch.sign` is `(x > 0) - (x < 0)` (ATen's CPU and CUDA kernels):
+    /// `+0` for both zeros AND for NaN, so eager `torch.sign(nan)` is `0`.
+    /// The core `GraphTensor::sign` is the IEEE signum instead (it keeps a
+    /// zero's sign and propagates NaN), so this lowering spells torch's form
+    /// itself rather than calling it.
     pub(super) fn translate_sign(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.operand(&node.inputs[0])?;
         let zero = self.constant_like(a, 0.0);

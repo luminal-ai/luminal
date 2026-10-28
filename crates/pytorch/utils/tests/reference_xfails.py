@@ -194,10 +194,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         url="https://linear.app/luminalai/issue/LUM-1105/reference-backend-numeric-mismatches-vs-eager-float64-add-alpha-acos",
         reason=("reference backend output differs numerically from eager"),
         tests=(
-            "test_hlir_ops.py::test_acos",
-            "test_hlir_ops.py::test_acos_promotes_integral_input[dtype0]",
-            "test_hlir_ops.py::test_acos_promotes_integral_input[dtype1]",
-            "test_hlir_ops.py::test_acos_promotes_integral_input[dtype2]",
             "test_hlir_ops.py::test_gelu_tanh",
             "test_reduction.py::test_scatter_reduce_integer_mean_floors_negative_results",
             "test_remaining_existing_hlir_lowerings.py::test_inverse_probability_functions_cover_tails_and_boundaries",
@@ -215,7 +211,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
         tests=(
             "test_binary.py::test_copysign_fmax_fmin_nan_and_zero_signs",
-            "test_binary.py::test_copysign_scalar_typed_constants_and_zero_signs",
             "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row",
             "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row_bf16_4d",
         ),
