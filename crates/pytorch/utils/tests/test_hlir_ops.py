@@ -1146,6 +1146,130 @@ def test_squeeze_in_expression(device: torch.device):
     assert torch.allclose(output, original)
 
 
+# torch removes only the named axes whose extent is 1. Any other named axis
+# is a no-op, and so is every dim of a 0-d tensor. torch.compile translates
+# the undecomposed graph first, so `x.squeeze(d)` reaches the translator as
+# `aten.squeeze.dim` (decomposition would rewrite it to `squeeze.dims`).
+_SQUEEZE_CASES = {
+    "dim_non_unit": (lambda x: x.squeeze(1), (1, 3, 1, 4)),
+    "dim_non_unit_negative": (lambda x: x.squeeze(-1), (1, 3, 1, 4)),
+    "dim_non_unit_then_mul": (lambda x: x.squeeze(1) * 2.0, (1, 3, 1, 4)),
+    "dim_unit": (lambda x: x.squeeze(2), (1, 3, 1, 4)),
+    "dim_unit_negative": (lambda x: x.squeeze(-2), (1, 3, 1, 4)),
+    "dims_mixed": (lambda x: x.squeeze((0, 1)), (1, 3, 1, 4)),
+    "dims_mixed_negative": (lambda x: x.squeeze((-1, -4)), (1, 3, 1, 4)),
+    "default_mixed": (lambda x: x.squeeze(), (1, 3, 1, 4)),
+    "default_all_unit": (lambda x: x.squeeze(), (1, 1, 1)),
+    "scalar_dim": (lambda x: x.squeeze(0), ()),
+    "scalar_dim_negative": (lambda x: x.squeeze(-1), ()),
+    "scalar_dim_then_add": (lambda x: x.squeeze(0) + 1.0, ()),
+    "scalar_dims": (lambda x: x.squeeze((0,)), ()),
+    "scalar_dims_negative": (lambda x: x.squeeze((-1,)), ()),
+    "scalar_default": (lambda x: x.squeeze(), ()),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SQUEEZE_CASES))
+def test_squeeze_matches_torch_semantics(device: torch.device, case: str):
+    fn, shape = _SQUEEZE_CASES[case]
+
+    class Squeeze(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return fn(x)
+
+    model = Squeeze().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    numel = torch.Size(shape).numel()
+    x = (torch.arange(numel, dtype=torch.float32, device=device) + 1.5).reshape(shape)
+    expected = model(x)
+    actual = compiled(x)
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "dims, shape",
+    [
+        (1, (1, 3, 1, 4)),
+        (2, (1, 3, 1, 4)),
+        ((0, 1), (1, 3, 1, 4)),
+        (None, (1, 3, 1, 4)),
+        (0, ()),
+        ((-1,), ()),
+    ],
+    ids=[
+        "dim_non_unit",
+        "dim_unit",
+        "dims_mixed",
+        "default",
+        "scalar_dim",
+        "scalar_dims",
+    ],
+)
+def test_complex_squeeze_matches_torch_semantics(
+    device: torch.device, dims: int | tuple[int, ...] | None, shape: tuple[int, ...]
+):
+    """Complex values lower to real components; squeeze applies the same rule."""
+
+    class ComplexSqueeze(torch.nn.Module):
+        def forward(self, real: torch.Tensor, imag: torch.Tensor) -> torch.Tensor:
+            z = torch.complex(real, imag)
+            z = z.squeeze() if dims is None else z.squeeze(dims)
+            return torch.view_as_real(z * 2.0)
+
+    model = ComplexSqueeze().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    numel = torch.Size(shape).numel()
+    real = torch.arange(numel, dtype=torch.float32, device=device).reshape(shape)
+    imag = -real - 0.5
+    expected = model(real, imag)
+    actual = compiled(real, imag)
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+def test_squeeze_keeps_a_dynamic_axis(device: torch.device):
+    """A dynamic extent is not provably 1, so torch's export keeps that axis.
+
+    The translator must keep it too, without panicking, while the static
+    unit axis still goes. One compiled graph serves every batch size.
+    """
+
+    class Squeezes(torch.nn.Module):
+        def forward(self, x: torch.Tensor):
+            return (
+                x.squeeze(0) * 2.0,
+                x.squeeze(2) + 1.0,
+                x.squeeze() - 1.0,
+                x.squeeze((0, 2)),
+            )
+
+    model = Squeezes().to(device)
+    runs: list[None] = []
+
+    def counting_backend(gm, example_inputs):
+        compiled_graph = luminal_backend(gm, example_inputs)
+
+        def run(*args):
+            runs.append(None)
+            return compiled_graph(*args)
+
+        return run
+
+    compiled = torch.compile(model, backend=counting_backend)
+    torch.manual_seed(0)
+    first = torch.randn(2, 3, 1, 4, device=device)
+    torch._dynamo.mark_dynamic(first, 0)
+    for batch in (2, 3, 5):
+        x = first if batch == 2 else torch.randn(batch, 3, 1, 4, device=device)
+        expected = model(x)
+        actual = compiled(x)
+        for e, a in zip(expected, actual, strict=True):
+            assert a.shape == e.shape
+            assert torch.equal(a, e)
+    assert len(runs) == 3, runs
+
+
 # ========== PT2 ReduceSum Node Tests ==========
 
 

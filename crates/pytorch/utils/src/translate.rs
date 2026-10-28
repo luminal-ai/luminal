@@ -984,12 +984,6 @@ impl Translator<'_> {
                 } as usize;
                 x.unsqueeze(dim)
             }
-            "squeeze.dim" => {
-                let x = self.operand(&n[0])?;
-                let dim = self.int_arg(&n[1])?;
-                let dim = if dim < 0 { dim + x.rank() as i64 } else { dim } as usize;
-                x.squeeze(dim)
-            }
             // ---- reductions ----
             "sum.default" | "sum.dim_IntList" => {
                 self.translate_reduction(node, ReductionOp::Sum)?
@@ -1071,8 +1065,9 @@ impl Translator<'_> {
             | "bitwise_right_shift.Scalar_Tensor"
             | "__rshift__.Tensor"
             | "__rshift__.Scalar" => self.translate_shift(node, true)?,
-            "squeeze.default" => self.translate_squeeze(node, true)?,
-            "squeeze.dims" => self.translate_squeeze(node, false)?,
+            squeeze @ ("squeeze.default" | "squeeze.dim" | "squeeze.dims") => {
+                self.translate_squeeze(node, squeeze)?
+            }
             "tril.default" => self.translate_triangular(node, false)?,
             "triu.default" => self.translate_triangular(node, true)?,
             // ---- batch 8: reductions, linalg, copies, constructors ----

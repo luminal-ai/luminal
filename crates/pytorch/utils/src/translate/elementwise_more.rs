@@ -10,11 +10,71 @@
 //! The atan origin is additionally steered to a finite ratio (`0/1` rather
 //! than `0/0`) so the intermediate angle is finite before the final select.
 
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
 use luminal::prelude::*;
 
 use super::{Translator, util};
 use crate::pt2_schema::Node;
+
+/// The axes torch's `squeeze` removes from a tensor with extents `dims`,
+/// ascending and distinct. `requested` is `None` for `squeeze.default`
+/// (every axis is a candidate), else the dims `squeeze.dim` / `squeeze.dims`
+/// name.
+///
+/// INVARIANT (torch semantics): squeeze removes exactly the requested axes
+/// whose extent is PROVABLY 1, and every other requested axis is a no-op.
+/// "Provably 1" is `to_usize() == Some(1)`: the extent evaluates to 1 with
+/// no dimension bound. A static extent other than 1 stays, as torch's
+/// `squeeze(dim)` leaves it alone. A symbolic extent stays too. Export only
+/// drops an axis it knows is 1, and then it records the literal 1, so a
+/// symbol here names an axis torch kept (its size-oblivious reasoning
+/// treats a dynamic extent as not 1). `Translator::squeeze_axes` checks
+/// the result against the rank the export declares, so a squeeze that
+/// broke this assumption would be refused rather than mistranslated.
+///
+/// Requested dims wrap against `max(rank, 1)`, as torch's `maybe_wrap_dim`
+/// does for a scalar. A rank-0 tensor accepts dim 0 and -1 and comes back
+/// unchanged. A dim out of that range, or one named twice, is an error, as
+/// it is in torch.
+pub(super) fn squeezable_axes(dims: &[IntExpr], requested: Option<&[i64]>) -> Result<Vec<usize>> {
+    let rank = dims.len();
+    let candidates: Vec<usize> = match requested {
+        None => (0..rank).collect(),
+        Some(requested) => {
+            let wrap = rank.max(1) as i64;
+            let mut axes = Vec::with_capacity(requested.len());
+            for &dim in requested {
+                let axis = if dim < 0 { dim + wrap } else { dim };
+                ensure!(
+                    (0..wrap).contains(&axis),
+                    "squeeze dim {dim} out of range [{}, {}] for rank {rank}",
+                    -wrap,
+                    wrap - 1
+                );
+                let axis = axis as usize;
+                ensure!(
+                    !axes.contains(&axis),
+                    "squeeze dim {axis} appears multiple times in the list of dims"
+                );
+                axes.push(axis);
+            }
+            axes
+        }
+    };
+    let mut axes: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&axis| axis < rank && dims[axis].to_usize() == Some(1))
+        .collect();
+    axes.sort_unstable();
+    Ok(axes)
+}
+
+/// Remove `axes` (ascending and distinct, each of extent 1: see
+/// [`squeezable_axes`]) from `tensor`. The highest goes first, so every
+/// remaining index still names its original axis.
+pub(super) fn remove_axes(tensor: GraphTensor, axes: &[usize]) -> GraphTensor {
+    axes.iter().rev().fold(tensor, |t, &axis| t.squeeze(axis))
+}
 
 impl Translator<'_> {
     /// Non-arithmetic `select`: the native ternary `LogicalSelect`, preceded
@@ -325,32 +385,48 @@ impl Translator<'_> {
         })
     }
 
-    pub(super) fn translate_squeeze(&mut self, node: &Node, all: bool) -> Result<GraphTensor> {
-        let mut result = self.operand(&node.inputs[0])?;
-        let rank = result.rank();
-        let dims: Vec<i64> = if all {
-            result
-                .dims()
-                .iter()
-                .enumerate()
-                .filter_map(|(axis, dim)| (dim.to_usize() == Some(1)).then_some(axis as i64))
-                .collect()
-        } else {
-            self.get_ints_arg(node, 1)?
+    /// `squeeze.default`, `squeeze.dim` and `squeeze.dims`: remove the
+    /// axes [`Self::squeeze_axes`] selects.
+    pub(super) fn translate_squeeze(&mut self, node: &Node, target: &str) -> Result<GraphTensor> {
+        let x = self.operand(&node.inputs[0])?;
+        let axes = self.squeeze_axes(node, target, &x.dims())?;
+        Ok(remove_axes(x, &axes))
+    }
+
+    /// The axes a squeeze overload removes from an operand with extents
+    /// `dims`: the requested axes that [`squeezable_axes`] proves are 1.
+    /// The real and the complex lowerings both take their axes from here,
+    /// so all three overloads share one rule.
+    ///
+    /// The export's declared output rank is checked against the result. An
+    /// axis torch removed that the rule keeps (or the reverse) is a loud
+    /// error, not a silently different shape.
+    pub(super) fn squeeze_axes(
+        &self,
+        node: &Node,
+        target: &str,
+        dims: &[IntExpr],
+    ) -> Result<Vec<usize>> {
+        let requested = match target {
+            "squeeze.default" => None,
+            "squeeze.dim" => Some(vec![self.get_int_arg(node, 1)?]),
+            "squeeze.dims" => Some(self.get_ints_arg(node, 1)?),
+            other => bail!("{other} is not a squeeze overload"),
         };
-        let mut sorted: Vec<usize> = dims
-            .iter()
-            .map(|&dim| util::normalize_dim(dim, rank))
-            .collect();
-        sorted.sort_unstable();
-        let mut offset = 0;
-        for dim in sorted {
-            if result.dims()[dim - offset].to_usize() == Some(1) {
-                result = result.squeeze(dim - offset);
-                offset += 1;
-            }
+        let axes = squeezable_axes(dims, requested.as_deref())?;
+        if let Some(name) = Self::tensor_output_names(node).first()
+            && let Ok(meta) = self.tensor_meta(name)
+        {
+            let rank = dims.len() - axes.len();
+            ensure!(
+                rank == meta.sizes.len(),
+                "{}: removing axes {axes:?} of extents {dims:?} gives rank {rank}, \
+                 but the export declares rank {}",
+                node.target,
+                meta.sizes.len()
+            );
         }
-        Ok(result)
+        Ok(axes)
     }
 
     pub(super) fn translate_triangular(&mut self, node: &Node, upper: bool) -> Result<GraphTensor> {
@@ -391,8 +467,11 @@ mod tests {
         Argument, DimInt, DimSize, ExportedProgram, FloatArg, Graph, GraphModule, IntArg, IntsArg,
         Node, NodeInput, Signature, TensorArg, TensorMeta, TensorName, TensorRef,
     };
+    use luminal::prelude::IntExpr;
     use luminal_reference::{ReferenceRuntime, TypedBuffer, harness_search_options};
     use rustc_hash::FxHashMap;
+
+    use super::squeezable_axes;
 
     fn tensor_ref(name: &str) -> TensorRef {
         TensorRef {
@@ -808,5 +887,109 @@ mod tests {
             &x,
         );
         assert_close(&upper, &[0.0, 1.0, 2.0, 0.0, 0.0, 5.0], 1e-6);
+    }
+
+    fn extents(values: &[i64]) -> Vec<IntExpr> {
+        values.iter().map(|&value| IntExpr::from(value)).collect()
+    }
+
+    /// The squeeze rule: only requested axes whose extent is provably 1 go;
+    /// every other requested axis is a no-op, as in torch.
+    #[test]
+    fn squeeze_removes_only_provable_unit_axes() {
+        let dims = extents(&[1, 3, 1, 4]);
+        let axes = |requested: Option<&[i64]>| squeezable_axes(&dims, requested).unwrap();
+        // squeeze.dim on an extent != 1 (positive and negative) is a no-op.
+        assert_eq!(axes(Some(&[1])), Vec::<usize>::new());
+        assert_eq!(axes(Some(&[-1])), Vec::<usize>::new());
+        assert_eq!(axes(Some(&[2])), vec![2]);
+        assert_eq!(axes(Some(&[-2])), vec![2]);
+        // squeeze.dims mixing unit and non-unit axes keeps the non-unit ones.
+        assert_eq!(axes(Some(&[0, 1, 2])), vec![0, 2]);
+        assert_eq!(axes(Some(&[-1, -4])), vec![0]);
+        assert_eq!(axes(Some(&[2, 0])), vec![0, 2]);
+        // squeeze.default: every unit axis.
+        assert_eq!(axes(None), vec![0, 2]);
+        assert_eq!(
+            squeezable_axes(&extents(&[1, 1]), None).unwrap(),
+            vec![0, 1]
+        );
+    }
+
+    /// A symbolic extent is never squeezed: export only drops an axis it
+    /// knows is 1, and then the extent is the literal 1.
+    #[test]
+    fn squeeze_keeps_a_symbolic_extent() {
+        let dims = vec![IntExpr::from('a'), IntExpr::from(1i64), IntExpr::from(3i64)];
+        assert_eq!(
+            squeezable_axes(&dims, Some(&[0])).unwrap(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(squeezable_axes(&dims, Some(&[0, 1])).unwrap(), vec![1]);
+        assert_eq!(squeezable_axes(&dims, None).unwrap(), vec![1]);
+    }
+
+    /// A rank-0 tensor wraps dims against rank 1 (torch's `maybe_wrap_dim`
+    /// for a scalar): dim 0 and -1 are accepted and remove nothing.
+    #[test]
+    fn squeeze_of_a_scalar_is_a_no_op() {
+        let none = Vec::<usize>::new();
+        assert_eq!(squeezable_axes(&[], Some(&[0])).unwrap(), none);
+        assert_eq!(squeezable_axes(&[], Some(&[-1])).unwrap(), none);
+        assert_eq!(squeezable_axes(&[], None).unwrap(), none);
+        assert!(squeezable_axes(&[], Some(&[1])).is_err());
+        assert!(squeezable_axes(&[], Some(&[-2])).is_err());
+        assert!(squeezable_axes(&[], Some(&[0, -1])).is_err());
+    }
+
+    #[test]
+    fn squeeze_refuses_what_torch_refuses() {
+        let dims = extents(&[1, 3]);
+        assert!(squeezable_axes(&dims, Some(&[2])).is_err());
+        assert!(squeezable_axes(&dims, Some(&[-3])).is_err());
+        assert!(squeezable_axes(&dims, Some(&[0, -2])).is_err());
+    }
+
+    /// Every overload, on non-unit axes and on a scalar, translates to
+    /// the shape torch declares (`squeeze.dim` used to panic on both).
+    #[test]
+    fn squeeze_overloads_translate_to_the_declared_shape() {
+        let check = |target: &str, dim: Option<NodeInput>, from: &[i64], to: &[i64]| {
+            let target = format!("torch.ops.aten.{target}");
+            let mut args = vec![input("self", tensor_arg("x"))];
+            args.extend(dim);
+            assert!(
+                translates(&target, args, F32, from, to),
+                "{target} {from:?} -> {to:?}"
+            );
+        };
+        let shape = [1, 3, 1, 4];
+        check("squeeze.dim", Some(int("dim", 1)), &shape, &shape);
+        check("squeeze.dim", Some(int("dim", -1)), &shape, &shape);
+        check("squeeze.dim", Some(int("dim", 2)), &shape, &[1, 3, 4]);
+        check(
+            "squeeze.dims",
+            Some(ints("dim", &[0, 1])),
+            &shape,
+            &[3, 1, 4],
+        );
+        check("squeeze.default", None, &shape, &[3, 4]);
+        check("squeeze.dim", Some(int("dim", 0)), &[], &[]);
+        check("squeeze.dim", Some(int("dim", -1)), &[], &[]);
+        check("squeeze.dims", Some(ints("dim", &[0])), &[], &[]);
+        check("squeeze.default", None, &[], &[]);
+    }
+
+    /// The export's declared rank is checked: a squeeze that would give a
+    /// different rank than torch recorded is refused, not translated.
+    #[test]
+    fn squeeze_refuses_a_rank_torch_did_not_declare() {
+        assert!(!translates(
+            "torch.ops.aten.squeeze.dim",
+            vec![input("self", tensor_arg("x")), int("dim", 1)],
+            F32,
+            &[1, 3, 1, 4],
+            &[1, 1, 4],
+        ));
     }
 }

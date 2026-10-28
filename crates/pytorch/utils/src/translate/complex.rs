@@ -19,6 +19,7 @@ use crate::dtype::TorchDType;
 use crate::pt2_schema::Node;
 
 use super::Translator;
+use super::elementwise_more::remove_axes;
 use super::ops::ReductionOp;
 use super::util::{
     broadcast_binary, materialize_tensor, normalize_dim, normalize_slice_bound, reshape_tensor,
@@ -128,18 +129,6 @@ fn interleave(cx: &mut Graph, first: GraphTensor, second: GraphTensor) -> GraphT
     odd[shape.len()] = cx.iota(shape.clone(), |_| IntExpr::from(1));
     let with_real = zero.scatter(&even, first);
     with_real.scatter(&odd, second)
-}
-
-fn squeeze_dims(mut tensor: GraphTensor, dims: &[usize]) -> GraphTensor {
-    let mut removed = 0;
-    for &original_dim in dims {
-        let dim = original_dim - removed;
-        if tensor.dims()[dim].to_usize() == Some(1) {
-            tensor = tensor.squeeze(dim);
-            removed += 1;
-        }
-    }
-    tensor
 }
 
 fn float_max(dtype: DType) -> f64 {
@@ -680,30 +669,12 @@ impl Translator<'_> {
                 let dim = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank() + 1);
                 self.store_complex(output_name, value.map(|component| component.unsqueeze(dim)));
             }
-            "squeeze.dims" | "squeeze.default" => {
+            "squeeze.default" | "squeeze.dim" | "squeeze.dims" => {
                 let value = self.get_complex_input(node, 0)?;
-                let dims = if target == "squeeze.dims" {
-                    self.get_ints_arg(node, 1)?
-                } else {
-                    value
-                        .real
-                        .dims()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(axis, dim)| {
-                            (dim.to_usize() == Some(1)).then_some(axis as i64)
-                        })
-                        .collect()
-                };
-                let rank = value.real.rank();
-                let mut dims: Vec<usize> = dims
-                    .into_iter()
-                    .map(|dim| normalize_dim(dim, rank))
-                    .collect();
-                dims.sort_unstable();
+                let axes = self.squeeze_axes(node, target, &value.real.dims())?;
                 self.store_complex(
                     output_name,
-                    value.map(|component| squeeze_dims(component, &dims)),
+                    value.map(|component| remove_axes(component, &axes)),
                 );
             }
             "expand.default" => {
