@@ -395,12 +395,10 @@ impl Translator<'_> {
         } else if dim.is_none() {
             let flat = util::reshape_tensor(x, &[x.dims().into_iter().product()]);
             if max { flat.argmax(0) } else { flat.argmin(0) }
+        } else if max {
+            x.argmax(axes[0])
         } else {
-            if max {
-                x.argmax(axes[0])
-            } else {
-                x.argmin(axes[0])
-            }
+            x.argmin(axes[0])
         };
         let dtype = self.output_meta_dtype(node).unwrap_or(DType::I64);
         let result = if result.dtype != dtype {
