@@ -196,7 +196,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         tests=(
             "test_hlir_ops.py::test_gelu_tanh",
             "test_reduction.py::test_scatter_reduce_integer_mean_floors_negative_results",
-            "test_remaining_existing_hlir_lowerings.py::test_inverse_probability_functions_cover_tails_and_boundaries",
             "test_remaining_existing_hlir_lowerings.py::test_ordering_and_distance_composites",
             "test_straightforward_lowerings.py::test_addmv_and_addbmm_preserve_real_dtypes_and_coefficients",
             "test_upsample.py::test_upsample_nearest_noninteger_scale_same_size",
