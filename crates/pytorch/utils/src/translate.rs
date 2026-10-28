@@ -34,6 +34,8 @@ mod dim_arith;
 mod elementwise_more;
 mod expr;
 mod frexp;
+#[cfg(test)]
+mod gcd_tests;
 mod grouped_mm;
 mod index;
 #[cfg(test)]

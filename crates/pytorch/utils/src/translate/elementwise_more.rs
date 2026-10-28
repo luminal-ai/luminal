@@ -284,11 +284,16 @@ impl Translator<'_> {
     fn translate_gcd_unrolled(&mut self, node: &Node) -> Result<GraphTensor> {
         let output_dtype = self.output_meta_dtype(node)?;
         let (lhs, rhs) = self.promoted_binary_inputs(node)?;
+        // The unroll is exact only if it runs every division Euclid can
+        // need; an unfinished state is a wrong answer, not an approximation.
+        // The round count is a function of the operands' dtype, taken
+        // before the widening cast below (see `gcd_euclid_rounds`).
+        let rounds = gcd_euclid_rounds(gcd_magnitude_bound(lhs.dtype));
         let mut lhs = lhs.cast(DType::I64);
         let mut rhs = rhs.cast(DType::I64);
         let one = self.constant_like(lhs, 1.0);
         let zero = self.constant_like(lhs, 0.0);
-        for _ in 0..32 {
+        for _ in 0..rounds {
             let finished = self.exact_is_zero(rhs);
             // Zero-free divisor: `maximum(|rhs|, 1)` is `|rhs|` whenever
             // `rhs != 0` and `1` when `rhs == 0`. Euclid is invariant under
@@ -455,6 +460,53 @@ impl Translator<'_> {
         let zero = self.cx.constant_i32(0).cast(x.dtype).expand_rhs(dims);
         // Multiplication would leak masked NaNs/infinities and lose signed zero.
         Ok(mask.select(x, zero))
+    }
+}
+
+/// The largest magnitude an operand of `dtype` carries into gcd's I64
+/// Euclid loop. An integer dtype is bounded by its own range. Every other
+/// dtype (U64, and anything non-integer) reaches the loop through the cast
+/// to I64, whose range bounds every magnitude by `2^63` (that of
+/// `i64::MIN`); that bound is also the safe answer for any dtype added later.
+pub(super) fn gcd_magnitude_bound(dtype: DType) -> u64 {
+    match dtype {
+        DType::Bool => 1,
+        DType::I4 => 1 << 3,
+        DType::U4 => (1 << 4) - 1,
+        DType::I8 => 1 << 7,
+        DType::U8 => u8::MAX as u64,
+        DType::I16 => 1 << 15,
+        DType::U16 => u16::MAX as u64,
+        DType::Int => 1 << 31,
+        _ => 1 << 63,
+    }
+}
+
+/// The number of Euclid divisions after which every pair with
+/// `|a|, |b| <= max_magnitude` has reached `b == 0`.
+///
+/// Lamé's theorem: if `a >= b > 0` and Euclid takes `n` divisions, then
+/// `b >= F(n+1)` and `a >= F(n+2)`, with `F(1) = F(2) = 1`. When `|a| < |b|`
+/// the first division only swaps the pair (`a rem b == a`), which costs one
+/// more. So, with `K` the largest index such that `F(K) <= max_magnitude`,
+/// every pair finishes within `K - 1` divisions, and the swapped consecutive
+/// pair `(F(K-1), F(K))` needs exactly that many, so the bound is tight.
+/// The truncated remainder by `|b|` has magnitude `|a| mod |b|`, so signs
+/// never change the count.
+///
+/// I64 (`2^63`, `K = 92`) needs 91 rounds; Int (`2^31`, `K = 46`) 45;
+/// I16 22; U8 12; I8 10.
+pub(super) fn gcd_euclid_rounds(max_magnitude: u64) -> usize {
+    // `(previous, current) = (F(index - 1), F(index))`, from `index = 2`.
+    let (mut previous, mut current, mut index) = (1u64, 1u64, 2usize);
+    loop {
+        match previous.checked_add(current) {
+            Some(next) if next <= max_magnitude => {
+                (previous, current) = (current, next);
+                index += 1;
+            }
+            _ => return index - 1,
+        }
     }
 }
 

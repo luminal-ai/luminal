@@ -1,5 +1,6 @@
 """Regression tests for ATen composites built from the existing HLIR."""
 
+import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
 
@@ -601,6 +602,52 @@ def test_integer_gcd_static_euclidean_rounds() -> None:
         lhs = torch.tensor(lhs_values, dtype=dtype)
         rhs = torch.tensor(rhs_values, dtype=dtype)
         _check(module, lhs, rhs)
+
+
+class ClampedGcd(torch.nn.Module):
+    """gcd over operands clamped to ``[-bound, bound]``.
+
+    The clamp attests the value range the reference backend needs before it
+    plans integer arithmetic over caller data. ``bound`` is the dtype's max,
+    so only the minimum (whose magnitude the dtype cannot hold) is excluded.
+    """
+
+    def __init__(self, bound: int) -> None:
+        super().__init__()
+        self.bound = bound
+
+    def forward(self, lhs, rhs):
+        return torch.ops.aten.gcd.default(
+            lhs.clamp(-self.bound, self.bound), rhs.clamp(-self.bound, self.bound)
+        )
+
+
+def _fibonacci(k: int) -> int:
+    """F(k), with F(1) = F(2) = 1."""
+    previous, current = 0, 1
+    for _ in range(k - 1):
+        previous, current = current, previous + current
+    return current
+
+
+@pytest.mark.parametrize(
+    ("dtype", "k"), [(torch.int32, 46), (torch.int64, 92)], ids=["int32", "int64"]
+)
+def test_integer_gcd_finishes_the_dtypes_worst_case_euclid_chain(dtype, k) -> None:
+    # F(k) is the largest Fibonacci number the dtype holds, so (F(k-1), F(k))
+    # needs k-1 divisions: the most any in-range pair needs (Lame's theorem).
+    # A lowering that stops early returns a Fibonacci number instead of 1.
+    bound = torch.iinfo(dtype).max
+    small, large = _fibonacci(k - 1), _fibonacci(k)
+    assert large <= bound < _fibonacci(k + 1)
+    # F35, F34 needs 33 divisions, one past the old 32-round unroll.
+    lhs = [small, large, -small, small, large, 0, 0, large, -12, 9227465]
+    rhs = [large, small, large, -large, large, 0, -large, 0, 18, 5702887]
+    _check(
+        ClampedGcd(bound),
+        torch.tensor(lhs, dtype=dtype),
+        torch.tensor(rhs, dtype=dtype),
+    )
 
 
 def test_ordering_and_distance_composites() -> None:
