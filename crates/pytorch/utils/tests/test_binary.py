@@ -469,3 +469,47 @@ class ThresholdNan(torch.nn.Module):
 def test_threshold_keeps_nan_input_and_ignores_nan_threshold():
     x = torch.tensor([NAN, -INF, 0.0, 0.5, 1.0, INF])
     _assert_outputs_bitwise(_compile_real(ThresholdNan())(x), ThresholdNan()(x))
+
+
+class FmaxFmin(torch.nn.Module):
+    def forward(self, a, b):
+        return torch.fmax(a, b), torch.fmin(a, b)
+
+
+# Every ordered pair of these, in both operand orders, through broadcasting a
+# column against a row: NaN against NaN, an infinity, a signed zero and a
+# finite value, and each signed zero against both zeros.
+FMAX_VALUES = [NAN, -INF, -2.0, -0.0, 0.0, 1.0, INF]
+
+
+def _assert_same_with_zero_signs(actual, expected):
+    for index, (result, reference) in enumerate(zip(actual, expected)):
+        assert result.dtype == reference.dtype, index
+        assert result.shape == reference.shape, index
+        assert torch.equal(torch.isnan(result), torch.isnan(reference)), index
+        ordered = ~torch.isnan(reference)
+        assert torch.equal(result[ordered], reference[ordered]), index
+        assert torch.equal(
+            torch.signbit(result)[ordered], torch.signbit(reference)[ordered]
+        ), index
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.float16, torch.bfloat16]
+)
+def test_fmax_fmin_skip_nan_and_order_signed_zeros(dtype):
+    # torch.fmax/fmin return the other operand when exactly one is NaN, NaN
+    # when both are, and order -0.0 below +0.0. Through torch.compile, so
+    # fmax.default/fmin.default reach their stage-1 arm.
+    values = torch.tensor(FMAX_VALUES, dtype=dtype)
+    a, b = values.reshape(-1, 1), values.reshape(1, -1)
+    expected = FmaxFmin()(a, b)
+    _assert_same_with_zero_signs(_compile_real(FmaxFmin())(a, b), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_fmax_fmin_integers_are_maximum_minimum(dtype):
+    a = torch.tensor([[-7], [0], [5]], dtype=dtype)
+    b = torch.tensor([[-8, 0, 5, 9]], dtype=dtype)
+    expected = FmaxFmin()(a, b)
+    _assert_same_with_zero_signs(_compile_real(FmaxFmin())(a, b), expected)

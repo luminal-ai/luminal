@@ -230,13 +230,43 @@ impl Translator<'_> {
         Ok(self.copy_sign(magnitude, sign))
     }
 
+    /// `torch.fmax` / `torch.fmin`: the larger / smaller operand, where a
+    /// NaN operand is skipped rather than propagated.
+    ///
+    /// Invariant (what torch's CPU kernel returns for every dtype with IEEE
+    /// NaN):
+    /// - exactly one operand NaN: the other operand; both NaN: NaN;
+    /// - otherwise the larger / smaller operand in the order
+    ///   `-inf < ... < -0.0 < +0.0 < ... < +inf`, so a pair of zeros of
+    ///   opposite sign gives `+0.0` from fmax and `-0.0` from fmin.
+    ///
+    /// For non-NaN operands, `a` is picked as the smaller (`b` as the larger)
+    /// iff `a < b`, or `a` has its sign bit set and `b < a` does not hold.
+    /// The second clause adds exactly the ties `a == b` with a sign-bit-set
+    /// `a`: `(-0.0, +0.0)`, which it orders, and pairs with equal encodings
+    /// (`(-0.0, -0.0)`, `(-2.0, -2.0)`), where both picks are the same
+    /// value. Every choice is the native `LogicalSelect`, which never blends
+    /// the branch it drops, so a NaN or infinite operand cannot leak into
+    /// the result.
+    /// Integer and Bool operands have neither NaN nor signed zeros, so the
+    /// plain `maximum` / `minimum` already is the rule.
     pub(super) fn translate_fmax_fmin(&mut self, node: &Node, max: bool) -> Result<GraphTensor> {
         let (a, b) = self.promoted_binary_inputs(node)?;
-        // Finite-input semantics. torch.fmax/fmin skip a NaN operand, which
-        // requires selecting a non-finite branch away; that is blocked on
-        // the core's NaN-safe select (LUM-804: arithmetic/e-graph selection
-        // leaks `NaN * 0`). A NaN operand therefore propagates here.
-        Ok(if max { a.maximum(b) } else { a.minimum(b) })
+        if !matches!(
+            a.dtype,
+            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
+        ) {
+            return Ok(if max { a.maximum(b) } else { a.minimum(b) });
+        }
+        let a_negative_tie = self.signbit(a).logical_and(b.lt(a).logical_not());
+        let a_first = a.lt(b).logical_or(a_negative_tie);
+        let ordered = if max {
+            a_first.select(b, a)
+        } else {
+            a_first.select(a, b)
+        };
+        let b_skipped = b.is_nan().select(a, ordered);
+        Ok(a.is_nan().select(b, b_skipped))
     }
 
     /// Stable hypot: scale by the larger magnitude to avoid overflow.
@@ -675,6 +705,51 @@ mod tests {
             .expect("one output")
     }
 
+    /// Translate and execute a two-tensor binary node `target(x, w)` on the
+    /// reference runtime, returning the F32 output.
+    fn run_binary_f32(target: &str, shape: &[i64], x: &[f32], w: &[f32]) -> Vec<f32> {
+        let mut parsed = program(
+            target,
+            binary(input("other", tensor_arg("w"))),
+            F32,
+            shape,
+            shape,
+        );
+        let graph = &mut parsed.program.graph_module.graph;
+        graph.inputs.push(tensor_ref("w"));
+        let x_meta = graph.tensor_values["x"].clone();
+        graph.tensor_values.insert("w".to_string(), x_meta);
+        let translation = crate::translate::translate(&parsed).expect("translate");
+        let mut runtime = ReferenceRuntime::load(&translation.graph).expect("load");
+        let dims: luminal::shape::DynMap = translation.dims.iter().map(|(s, v)| (*s, *v)).collect();
+        let staged = |name: &str| match name {
+            "x" => x.to_vec(),
+            "w" => w.to_vec(),
+            other => panic!("unexpected input {other}"),
+        };
+        let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
+        for bound in &translation.inputs {
+            data.insert(bound.tensor, TypedBuffer::F32(staged(&bound.graph_name)));
+        }
+        runtime
+            .search(
+                &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
+                &dims,
+                &data,
+                &harness_search_options(),
+            )
+            .expect("search");
+        for bound in &translation.inputs {
+            runtime.set_data(bound.tensor, TypedBuffer::F32(staged(&bound.graph_name)));
+        }
+        runtime.execute().expect("execute");
+        translation
+            .outputs
+            .first()
+            .map(|output| runtime.get_f32(output.tensor).expect("f32 output").clone())
+            .expect("one output")
+    }
+
     fn assert_close(actual: &[f32], expected: &[f32], tol: f32) {
         assert_eq!(actual.len(), expected.len(), "length mismatch");
         for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
@@ -874,12 +949,8 @@ mod tests {
         assert_close(&min, &[1.0, 3.0, -2.0], 1e-6);
     }
 
-    /// torch.fmax/fmin skip a NaN operand, but selecting a NaN branch away
-    /// needs a true selection. The recorder's `select`/`cond` and its
-    /// `stack`-based gather all leak `NaN * 0` (core LUM-804), so a NaN
-    /// operand propagates instead. Un-ignore once LUM-804 lands.
+    /// torch.fmax/fmin skip a NaN operand.
     #[test]
-    #[ignore = "blocked on core NaN-safe select (LUM-804): selection leaks NaN*0"]
     fn fmax_fmin_ignore_nan() {
         let x = [f32::NAN, 5.0, -2.0];
         let max = run_f32(
@@ -898,6 +969,42 @@ mod tests {
             &x,
         );
         assert_close(&min, &[3.0, 3.0, -2.0], 1e-6);
+    }
+
+    /// torch.fmax/fmin with tensors on both sides: a NaN on either side is
+    /// skipped, two NaNs stay NaN, infinities order normally, and zeros
+    /// order `-0.0 < +0.0` (torch's CPU kernel: fmax(-0.0, +0.0) = +0.0 and
+    /// fmin(+0.0, -0.0) = -0.0, in both operand orders).
+    #[test]
+    fn fmax_fmin_skip_nan_and_order_signed_zeros() {
+        let nan = f32::NAN;
+        let inf = f32::INFINITY;
+        let x = [
+            nan, 1.0, nan, inf, nan, -inf, -0.0, 0.0, -0.0, 0.0, -2.0, 3.0,
+        ];
+        let w = [
+            1.0, nan, nan, nan, -inf, 2.0, 0.0, -0.0, -0.0, 0.0, -2.0, -4.0,
+        ];
+        let expected_max = [
+            1.0, 1.0, nan, inf, -inf, 2.0, 0.0, 0.0, -0.0, 0.0, -2.0, 3.0,
+        ];
+        let expected_min = [
+            1.0, 1.0, nan, inf, -inf, -inf, -0.0, -0.0, -0.0, 0.0, -2.0, -4.0,
+        ];
+        for (target, expected) in [
+            ("torch.ops.aten.fmax.default", expected_max),
+            ("torch.ops.aten.fmin.default", expected_min),
+        ] {
+            let out = run_binary_f32(target, &[12], &x, &w);
+            for (i, (got, want)) in out.iter().zip(expected).enumerate() {
+                let same = if want.is_nan() {
+                    got.is_nan()
+                } else {
+                    got.to_bits() == want.to_bits()
+                };
+                assert!(same, "{target} index {i}: got {got:?}, expected {want:?}");
+            }
+        }
     }
 
     #[test]
