@@ -219,6 +219,17 @@ extents, independent C/D pitches, cast boundaries, and C reuse/copy repair acros
 all batches. `cargo fmt --all -- --check` and device-enabled CUDA Lite and
 test-runtime Clippy with `-D warnings` pass.
 
+The TF32 extension expands execution coverage to all **896 separate-destination
+configurations**, **448 in-place configurations**, and **384 batched dispatch
+witnesses**. Its regressions cover mode-specific raw-storage permission,
+whitelist ablation, views, earlier narrowing, final rounding, native cast
+materialization, decomposed execution, epilogues and batched C reuse/repair.
+Comparisons use operands away from halfway cases when checking GEMM against
+the reference; cast tests accept either nearest tie rather than imposing the
+reference codec's tie choice on CUDA. The five-package landing sweep passes
+663 tests with 54 existing ignores; the targeted device-enabled cuBLASLt suites
+pass 23 tests. Formatting and device-enabled CUDA Lite/test-runtime Clippy pass.
+
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its
 numbers do not measure the restored code.
