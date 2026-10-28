@@ -657,7 +657,15 @@ pub(super) mod tests {
         let b = func(a);
 
         let v = random_vec(shape.iter().copied().product());
-        let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, v.clone().into())]);
+        // The returned value can be the input itself (zero padding, an
+        // identity view, etc.). Bind that value explicitly instead of inferring
+        // computed leaves, which need not exist for an identity operation.
+        let rt = luminal_reference::harness::run_reference_bound(
+            &cx,
+            luminal_reference::ReferenceBindings::dense(&cx.logical, &[b.id]),
+            &[(a.id, v.clone().into())],
+            &[],
+        );
 
         // Reference
         let device = Device::Cpu;
@@ -666,6 +674,11 @@ pub(super) mod tests {
 
         // need to assert close because some unaries (exp and log) are (good) approximations
         assert_close(rt.get_f32(b.id).unwrap(), &ref_b.to_vec1::<f32>().unwrap())
+    }
+
+    #[test]
+    fn unary_differential_harness_accepts_an_input_as_the_output() {
+        test_unary([1, 1], |a| a, |a| a);
     }
 
     proptest! {
