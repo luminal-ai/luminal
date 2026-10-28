@@ -10,7 +10,50 @@ use anyhow::{Context, Result, bail};
 use luminal::prelude::*;
 
 use super::Translator;
-use crate::pt2_schema::{DimSize, Node, SymIntEntry, TensorMeta};
+use crate::pt2_schema::{Argument, DimSize, Node, SymIntEntry, TensorMeta};
+
+/// A real scalar argument's literal value, in whichever spelling PT2
+/// recorded it. A Python bool is the integer 0 or 1 (`False == 0`,
+/// `True == 1`), so [`Self::is_zero`] and [`Self::is_one`] answer by value
+/// for every literal spelling, not by which accessor happens to match.
+/// A symbolic scalar (SymInt/SymFloat/SymBool) is not a literal: its value
+/// is a runtime fact, so [`Self::of`] returns `None` for it.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ScalarLiteral {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+}
+
+impl ScalarLiteral {
+    pub(super) fn of(arg: &Argument) -> Option<Self> {
+        if let Some(value) = arg.as_float() {
+            return Some(Self::Float(value));
+        }
+        if let Some(value) = arg.as_int() {
+            return Some(Self::Int(value));
+        }
+        arg.as_bool().map(Self::Bool)
+    }
+
+    /// The value equals 0. A negative zero is zero (`-0.0 == 0`); NaN is not.
+    pub(super) fn is_zero(self) -> bool {
+        match self {
+            Self::Bool(value) => !value,
+            Self::Int(value) => value == 0,
+            Self::Float(value) => value == 0.0,
+        }
+    }
+
+    /// The value equals 1.
+    pub(super) fn is_one(self) -> bool {
+        match self {
+            Self::Bool(value) => value,
+            Self::Int(value) => value == 1,
+            Self::Float(value) => value == 1.0,
+        }
+    }
+}
 
 pub(super) fn same_dim(lhs: IntExpr, rhs: IntExpr) -> bool {
     lhs == rhs || lhs.simplify() == rhs.simplify() || lhs.egglog_equal(rhs)

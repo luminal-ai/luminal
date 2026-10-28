@@ -2,6 +2,7 @@
 and the addmm family."""
 
 import luminal_reference
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -122,6 +123,24 @@ class Addmv(nn.Module):
         return torch.addmv(b, m, v)
 
 
+class BoolCoefficientAddmmFamily(nn.Module):
+    """addmm, addmv and addbmm under one pair of Python-bool coefficients."""
+
+    def __init__(self, beta: bool, alpha: bool) -> None:
+        super().__init__()
+        self.beta = beta
+        self.alpha = alpha
+
+    def forward(self, matrix_input, vector_input, mat1, mat2, vec, batch1, batch2):
+        return (
+            torch.addmm(matrix_input, mat1, mat2, beta=self.beta, alpha=self.alpha),
+            torch.addmv(vector_input, mat1, vec, beta=self.beta, alpha=self.alpha),
+            torch.addbmm(
+                matrix_input, batch1, batch2, beta=self.beta, alpha=self.alpha
+            ),
+        )
+
+
 def test_atan2() -> None:
     _check(Atan2(), torch.randn(4, 4), torch.randn(4, 4))
 
@@ -200,3 +219,46 @@ def test_addbmm() -> None:
 
 def test_addmv() -> None:
     _check(Addmv(), torch.randn(4), torch.randn(4, 5), torch.randn(5))
+
+
+def _poisoned(like: torch.Tensor) -> torch.Tensor:
+    """`like`'s shape and dtype, every element NaN, inf or -inf."""
+    pattern = torch.tensor(
+        [float("nan"), float("inf"), float("-inf")], dtype=like.dtype
+    )
+    return pattern.repeat(like.numel() // 3 + 1)[: like.numel()].reshape(like.shape)
+
+
+@pytest.mark.parametrize(
+    ("beta", "alpha"), [(False, True), (True, False), (False, False), (True, True)]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int16])
+def test_addmm_family_bool_coefficients_are_literal_zero_and_one(
+    dtype: torch.dtype, beta: bool, alpha: bool
+) -> None:
+    # A Python-bool beta/alpha is the literal 0 or 1 (False == 0, True == 1).
+    # A False coefficient drops its term, so the NaN/inf put in the dropped
+    # operands never reach the result; a True one keeps the term unscaled.
+    # Integer tensors take bool coefficients too (they cannot hold NaN).
+    generator = torch.Generator().manual_seed(0)
+
+    def small_integers(*shape: int) -> torch.Tensor:
+        # Exact in every dtype here, so the comparison can be exact.
+        return torch.randint(-3, 4, shape, generator=generator).to(dtype)
+
+    matrix_input, vector_input = small_integers(2, 2), small_integers(2)
+    mat1, mat2, vec = small_integers(2, 3), small_integers(3, 2), small_integers(3)
+    batch1, batch2 = small_integers(4, 2, 3), small_integers(4, 3, 2)
+    if dtype.is_floating_point:
+        if not beta:
+            matrix_input, vector_input = map(_poisoned, (matrix_input, vector_input))
+        if not alpha:
+            mat1, vec, batch1 = map(_poisoned, (mat1, vec, batch1))
+    inputs = (matrix_input, vector_input, mat1, mat2, vec, batch1, batch2)
+    model = BoolCoefficientAddmmFamily(beta=beta, alpha=alpha)
+    eager = model(*inputs)
+    compiled = torch.compile(model, backend=luminal_reference.Compiler())(*inputs)
+    assert len(compiled) == len(eager)
+    for got, want in zip(compiled, eager):
+        assert got.dtype == want.dtype
+        torch.testing.assert_close(got, want, rtol=0, atol=0)

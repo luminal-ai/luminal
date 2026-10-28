@@ -307,7 +307,17 @@ impl Translator<'_> {
             .unwrap_or(false)
     }
 
-    /// Scale `value` by the named scalar `name`, defaulting to 1.0.
+    /// Scale `value` by the addmm-family coefficient `name` (`beta` or
+    /// `alpha`); an absent coefficient is 1.
+    ///
+    /// Invariant: torch treats a coefficient equal to 0 as dropping its
+    /// term, not as a multiply. `beta == 0` ignores `input` and `alpha == 0`
+    /// ignores the product, so NaN/inf in the dropped term never reach the
+    /// result (`NaN * 0` would). A coefficient equal to 1 is no multiply.
+    /// Both tests are on the literal's value, so every spelling of 0 and 1
+    /// takes them: `False`/`True`, `0`/`1`, and `0.0`/`-0.0`/`1.0`. A
+    /// symbolic coefficient is refused, because whether it is 0 is only
+    /// known at run time.
     fn scale_by_named_scalar(
         &mut self,
         node: &Node,
@@ -317,10 +327,17 @@ impl Translator<'_> {
         let Some(scalar) = node.inputs.iter().find(|input| input.name == name) else {
             return Ok(value);
         };
-        if scalar.arg.as_int() == Some(1) || scalar.arg.as_float() == Some(1.0) {
+        let Some(literal) = util::ScalarLiteral::of(&scalar.arg) else {
+            anyhow::bail!(
+                "{} coefficient {name:?} is not a literal real scalar (arg: {:?})",
+                node.target,
+                scalar.arg
+            );
+        };
+        if literal.is_one() {
             return Ok(value);
         }
-        if scalar.arg.as_int() == Some(0) || scalar.arg.as_float() == Some(0.0) {
+        if literal.is_zero() {
             return Ok(self.constant_like(value, 0.0));
         }
         // Preserve integer literals before any conversion to the compute dtype.
@@ -925,5 +942,145 @@ mod variance_tests {
             format!("{error:#}").contains("is not a literal number"),
             "{error:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bool_coefficient_tests {
+    use crate::pt2_schema::NodeInput;
+    use crate::translate::test_support::*;
+    use luminal_reference::harness::run_reference;
+
+    const NAN: f32 = f32::NAN;
+    const INF: f32 = f32::INFINITY;
+
+    /// One addmm-family target over f32 operands, named as in its ATen
+    /// schema, with finite data and a poisoned (NaN/inf) replacement for
+    /// the `input` and for the left matrix operand.
+    struct Case {
+        target: &'static str,
+        names: [&'static str; 3],
+        shapes: [&'static [i64]; 3],
+        output: &'static [i64],
+        data: [Vec<f32>; 3],
+        poisoned_input: Vec<f32>,
+        poisoned_lhs: Vec<f32>,
+        /// The variant's product of `data[1]` and `data[2]`.
+        product: Vec<f32>,
+    }
+
+    impl Case {
+        /// Translate and execute the node with `operands` and `coefficients`.
+        fn run(&self, operands: [Vec<f32>; 3], coefficients: Vec<NodeInput>) -> Vec<f32> {
+            let mut args: Vec<NodeInput> = self
+                .names
+                .iter()
+                .map(|name| tensor_input(name, name))
+                .collect();
+            args.extend(coefficients);
+            let mut tensors: Vec<(&str, u32, &[i64])> = self
+                .names
+                .iter()
+                .zip(self.shapes)
+                .map(|(name, shape)| (*name, FLOAT, shape))
+                .collect();
+            tensors.push(("out", FLOAT, self.output));
+            let t = translate_one(
+                node(self.target, args, &["out"]),
+                &tensors,
+                &self.names,
+                &["out"],
+            );
+            let inputs = t
+                .inputs
+                .iter()
+                .zip(operands)
+                .map(|(input, data)| (input.tensor, data.into()))
+                .collect::<Vec<_>>();
+            let rt = run_reference(&t.graph, &inputs);
+            rt.get_f32(t.outputs[0].tensor).unwrap().clone()
+        }
+    }
+
+    fn cases() -> [Case; 3] {
+        [
+            Case {
+                target: "torch.ops.aten.addmm.default",
+                names: ["self", "mat1", "mat2"],
+                shapes: [&[2, 2], &[2, 2], &[2, 2]],
+                output: &[2, 2],
+                // An identity mat1: the product is mat2.
+                data: [
+                    vec![1., 2., 3., 4.],
+                    vec![1., 0., 0., 1.],
+                    vec![5., 6., 7., 8.],
+                ],
+                poisoned_input: vec![NAN, INF, -INF, NAN],
+                poisoned_lhs: vec![INF, NAN, -INF, INF],
+                product: vec![5., 6., 7., 8.],
+            },
+            Case {
+                target: "torch.ops.aten.addmv.default",
+                names: ["self", "mat", "vec"],
+                shapes: [&[2], &[2, 2], &[2]],
+                output: &[2],
+                data: [vec![1., 2.], vec![1., 0., 0., 1.], vec![5., 6.]],
+                poisoned_input: vec![NAN, INF],
+                poisoned_lhs: vec![INF, NAN, -INF, INF],
+                product: vec![5., 6.],
+            },
+            Case {
+                target: "torch.ops.aten.addbmm.default",
+                names: ["self", "batch1", "batch2"],
+                shapes: [&[2, 2], &[2, 2, 2], &[2, 2, 2]],
+                output: &[2, 2],
+                // Two identity batches: the product sums batch2's matrices.
+                data: [
+                    vec![1., 2., 3., 4.],
+                    vec![1., 0., 0., 1., 1., 0., 0., 1.],
+                    vec![5., 6., 7., 8., 1., 1., 1., 1.],
+                ],
+                poisoned_input: vec![NAN, INF, -INF, NAN],
+                poisoned_lhs: vec![INF, NAN, -INF, INF, 1., 0., 0., 1.],
+                product: vec![6., 7., 8., 9.],
+            },
+        ]
+    }
+
+    /// A Python-bool `beta`/`alpha` is the literal 0 or 1. `False` drops its
+    /// term, so NaN/inf there never reach the result (`NaN * 0` would), and
+    /// `True` keeps the term unscaled.
+    #[test]
+    fn bool_coefficients_drop_or_keep_their_term() {
+        for case in cases() {
+            let target = case.target;
+            let [input, lhs, rhs] = case.data.clone();
+            for coefficients in [
+                vec![scalar_bool("beta", false)],
+                vec![scalar_bool("beta", false), scalar_bool("alpha", true)],
+            ] {
+                let operands = [case.poisoned_input.clone(), lhs.clone(), rhs.clone()];
+                let got = case.run(operands, coefficients);
+                assert_eq!(got, case.product, "{target}: beta=False drops the input");
+            }
+            for coefficients in [
+                vec![scalar_bool("alpha", false)],
+                vec![scalar_bool("beta", true), scalar_bool("alpha", false)],
+            ] {
+                let operands = [input.clone(), case.poisoned_lhs.clone(), rhs.clone()];
+                let got = case.run(operands, coefficients);
+                assert_eq!(got, input, "{target}: alpha=False drops the product");
+            }
+            let sum: Vec<f32> = input
+                .iter()
+                .zip(&case.product)
+                .map(|(x, y)| x + y)
+                .collect();
+            let got = case.run(
+                [input, lhs, rhs],
+                vec![scalar_bool("beta", true), scalar_bool("alpha", true)],
+            );
+            assert_eq!(got, sum, "{target}: True coefficients are 1");
+        }
     }
 }
