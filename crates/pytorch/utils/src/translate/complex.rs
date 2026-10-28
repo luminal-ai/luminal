@@ -525,10 +525,18 @@ impl Translator<'_> {
                 let (magnitude, angle) = broadcast_binary(magnitude, angle);
                 let dtype = self.output_complex_dtype(output_name)?;
                 let component_dtype = dtype.complex_component_dtype().unwrap();
-                let magnitude = magnitude.cast(component_dtype);
-                let angle = angle.cast(component_dtype);
-                let real = magnitude * self.cx_cos(angle);
-                let imag = magnitude * angle.sin();
+                // complex32's half components are storage: compute in F32
+                // and round each component once.
+                let compute = if component_dtype.is_narrow_float() {
+                    DType::F32
+                } else {
+                    component_dtype
+                };
+                let magnitude = magnitude.cast(compute);
+                let angle = angle.cast(compute);
+                let real =
+                    super::util::round_to_storage(magnitude * self.cx_cos(angle), component_dtype);
+                let imag = super::util::round_to_storage(magnitude * angle.sin(), component_dtype);
                 self.store_complex(output_name, ComplexTensor::new(real, imag, dtype));
             }
 

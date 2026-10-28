@@ -7,7 +7,7 @@ use luminal::prelude::petgraph::visit::EdgeRef;
 use luminal::prelude::*;
 
 use super::test_support::*;
-use super::{Translation, opmath_target};
+use super::{Translation, exact_arithmetic_target, opmath_target};
 
 // ---------------------------------------------------------------------
 // Graph facts
@@ -381,25 +381,49 @@ fn integer_tensor_against_a_float_literal_compares_at_f32() {
     assert!(input_is_cast_to(&t, "i", DType::F32));
 }
 
+/// An exact op whose lowering computes (`neg` is a multiply by -1, `abs`
+/// a multiply by the sign, a rounding is a math function) reads narrow
+/// storage through an explicit widening cast and rounds back to the
+/// declared dtype: the graph computes nothing in F16 or BF16.
+#[test]
+fn exact_arithmetic_widens_narrow_storage() {
+    for target in [
+        "abs.default",
+        "neg.default",
+        "floor.default",
+        "ceil.default",
+        "trunc.default",
+        "round.default",
+    ] {
+        for (code, dtype) in [(HALF, DType::F16), (BFLOAT16, DType::Bf16)] {
+            let t = translate_one(
+                node(
+                    &format!("torch.ops.aten.{target}"),
+                    vec![tensor_input("self", "a")],
+                    &["y"],
+                ),
+                &[("a", code, &[4]), ("y", code, &[4])],
+                &["a"],
+                &["y"],
+            );
+            assert!(
+                input_is_cast_to(&t, "a", DType::F32),
+                "{target} {dtype:?} widens its operand"
+            );
+            assert_eq!(t.outputs[0].dtype, dtype, "{target} rounds back");
+            let logical = &t.graph.logical;
+            assert!(
+                logical
+                    .narrow_float_arithmetic(logical.petgraph().node_indices())
+                    .is_empty(),
+                "{target} {dtype:?} computes in its storage dtype"
+            );
+        }
+    }
+}
+
 #[test]
 fn exact_ops_never_cast_their_operand() {
-    let neg = translate_one(
-        node(
-            "torch.ops.aten.neg.default",
-            vec![tensor_input("self", "a")],
-            &["y"],
-        ),
-        &[("a", HALF, &[4]), ("y", HALF, &[4])],
-        &["a"],
-        &["y"],
-    );
-    assert!(
-        consumers_of_input(&neg, "a")
-            .into_iter()
-            .all(|id| !is_op(op_of(&neg, id), &LogicalOp::Cast(DType::F32)))
-    );
-    assert_eq!(neg.outputs[0].dtype, DType::F16);
-
     let clamp = translate_one(
         node(
             "torch.ops.aten.clamp.default",
@@ -521,6 +545,8 @@ fn opmath_class_membership() {
     ] {
         assert!(!opmath_target(target), "{target} is exact");
     }
+    assert!(exact_arithmetic_target("neg.default"));
+    assert!(!exact_arithmetic_target("clamp.default"));
 }
 
 #[test]

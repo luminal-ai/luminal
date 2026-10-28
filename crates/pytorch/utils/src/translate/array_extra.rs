@@ -619,6 +619,10 @@ impl Translator<'_> {
 
     pub(super) fn translate_embedding_renorm(&mut self, node: &Node) -> Result<GraphTensor> {
         let weight = self.operand(&node.inputs[0])?;
+        // Narrow storage computes the norms and the scaling in F32 and
+        // rounds the renormalised table once.
+        let storage = weight.dtype;
+        let weight = super::util::widen_storage(weight);
         anyhow::ensure!(weight.rank() == 2, "embedding_renorm requires a matrix");
         let indices = self.operand(&node.inputs[1])?.cast(DType::Int).flatten();
         let max_norm = self.get_float_arg(node, 2)?;
@@ -655,7 +659,10 @@ impl Translator<'_> {
         let scale = maximum / norm;
         let scale = scale.expand_dim(1, columns);
         let apply = apply.expand_dim(1, columns);
-        Ok((weight * scale).cond(apply, weight))
+        Ok(super::util::round_to_storage(
+            (weight * scale).cond(apply, weight),
+            storage,
+        ))
     }
 
     // -----------------------------------------------------------------

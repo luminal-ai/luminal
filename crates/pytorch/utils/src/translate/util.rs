@@ -130,6 +130,43 @@ pub(super) fn promote(a: DType, b: DType) -> DType {
 }
 
 /// Promote two tensors to their common dtype (see [`promote`]).
+/// Narrow-float storage widened to F32 for computing; any other dtype is
+/// returned as it is. The widening is exact: every narrow format is a
+/// subset of F32. Narrow floats are storage in the translated graph (torch
+/// computes them in F32), so a lowering widens them before any arithmetic.
+pub(super) fn widen_storage(value: GraphTensor) -> GraphTensor {
+    if value.dtype.is_narrow_float() {
+        value.cast(DType::F32)
+    } else {
+        value
+    }
+}
+
+/// `value` rounded once to `storage` when that is a narrow float (the
+/// counterpart of [`widen_storage`]); otherwise `value` as it is.
+pub(super) fn round_to_storage(value: GraphTensor, storage: DType) -> GraphTensor {
+    if storage.is_narrow_float() && value.dtype != storage {
+        value.cast(storage)
+    } else {
+        value
+    }
+}
+
+/// One arithmetic step on storage values: `f` over the F32 widenings of
+/// `a` and `b`, rounded once to `a`'s storage dtype. For a single add,
+/// subtract, multiply or divide this is bit-identical to narrow-precision
+/// arithmetic: F32 carries at least `2p + 2` bits for every narrow format
+/// of precision `p`, so rounding through F32 lands where rounding once
+/// would. Other dtypes apply `f` directly.
+pub(super) fn storage_step(
+    a: GraphTensor,
+    b: GraphTensor,
+    f: impl FnOnce(GraphTensor, GraphTensor) -> GraphTensor,
+) -> GraphTensor {
+    let storage = a.dtype;
+    round_to_storage(f(widen_storage(a), widen_storage(b)), storage)
+}
+
 pub(super) fn ensure_same_dtype(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
     if a.dtype == b.dtype {
         return (a, b);
@@ -571,6 +608,8 @@ impl Translator<'_> {
     /// view does not execute on zero-element tensors yet, which this
     /// predicate (and `copysign`/`atan2` through it) must keep supporting.
     pub(super) fn signbit(&mut self, value: GraphTensor) -> GraphTensor {
+        // A narrow float's sign reads off its exact F32 widening.
+        let value = widen_storage(value);
         let zero = self.constant_like(value, 0.0);
         let negative = value.lt(zero);
         let negative_zero = value.reciprocal().lt(zero);
@@ -583,8 +622,10 @@ impl Translator<'_> {
     /// [`Self::signbit`] instead. Every NaN reads as positive there, so a
     /// NaN passes through unchanged.
     pub(super) fn ieee_abs(&mut self, value: GraphTensor) -> GraphTensor {
+        let storage = value.dtype;
+        let value = widen_storage(value);
         let negative = self.signbit(value);
-        negative.select(-value, value)
+        round_to_storage(negative.select(-value, value), storage)
     }
 
     /// `torch.copysign(magnitude, sign)`: `|magnitude|` carrying the sign

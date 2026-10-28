@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use luminal::prelude::*;
 
 use super::Translator;
-use super::util::{self, normalize_dim, reshape_tensor};
+use super::util::{self, normalize_dim, reshape_tensor, storage_step};
 use crate::pt2_schema::{Argument, Node, OptionalTensorEntry};
 
 /// Reduction flavours shared by the scatter-reduce / index-reduce family.
@@ -488,19 +488,21 @@ impl Translator<'_> {
                 .collect();
             let update = flat_updates.slice_along(step..step + 1, 0);
             let current = output.gather(&dest);
+            // Each step rounds to the data dtype, as torch's sequential
+            // kernels do; narrow storage computes the step in F32.
             let mut combined = match reduction {
                 IdxReduce::Sum | IdxReduce::Mean => {
                     if bool_data {
                         self.bool_or(current, update)
                     } else {
-                        current + update
+                        storage_step(current, update, |a, b| a + b)
                     }
                 }
                 IdxReduce::Prod => {
                     if bool_data {
                         self.bool_and(current, update)
                     } else {
-                        current * update
+                        storage_step(current, update, |a, b| a * b)
                     }
                 }
                 IdxReduce::Max => {
@@ -537,7 +539,7 @@ impl Translator<'_> {
             let zero = self.cx.constant_f32(0.0).expand_rhs(counts.dims());
             let has_values = counts.gt(zero);
             let divisor = counts.cast(work_dtype);
-            let means = output / divisor;
+            let means = storage_step(output, divisor, |a, b| a / b);
             output = self.idx_cond(has_values, means, original_work);
         }
         // Split the plane axis back into the structural axes and restore

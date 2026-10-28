@@ -203,7 +203,8 @@ impl Translator<'_> {
             values.len()
         );
         for (name, value) in names.into_iter().zip(values) {
-            self.values.insert(name, value);
+            // `bind_value` rounds a widened result to its declared dtype.
+            self.bind_value(name, value);
         }
         Ok(())
     }
@@ -976,7 +977,7 @@ impl Translator<'_> {
         let dim_variant = node.target.ends_with(".dim");
 
         if x.rank() == 0 {
-            self.values.insert(names[0].clone(), x);
+            self.bind_value(names[0].clone(), x);
             if dim_variant {
                 anyhow::ensure!(
                     names.len() >= 2,
@@ -984,7 +985,7 @@ impl Translator<'_> {
                     node.target
                 );
                 let zero = self.cast_scalar(0.0, DType::I64);
-                self.values.insert(names[1].clone(), zero);
+                self.bind_value(names[1].clone(), zero);
             }
             return Ok(());
         }
@@ -1073,7 +1074,7 @@ impl Translator<'_> {
         } else {
             value
         };
-        self.values.insert(names[0].clone(), value);
+        self.bind_value(names[0].clone(), value);
         if dim_variant {
             anyhow::ensure!(
                 names.len() >= 2,
@@ -1085,7 +1086,7 @@ impl Translator<'_> {
             } else {
                 index
             };
-            self.values.insert(names[1].clone(), index.cast(DType::I64));
+            self.bind_value(names[1].clone(), index.cast(DType::I64));
         }
         Ok(())
     }

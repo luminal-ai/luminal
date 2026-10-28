@@ -304,8 +304,10 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
 
     // 2. Nodes, in topological order.
     for node in &parsed.program.graph_module.graph.nodes {
+        let recorded = t.cx.logical.petgraph().node_count();
         t.dispatch(node)
             .with_context(|| format!("translating `{}`", node.target))?;
+        t.refuse_narrow_float_arithmetic(node, recorded)?;
     }
 
     // 3. Outputs, in export order: one row per output spec, keyed by the
@@ -725,6 +727,18 @@ impl Translator<'_> {
         })
     }
 
+    /// The widening an exact op's operands take: narrow storage computes
+    /// in F32. The common dtype is the operands' own, not the result's (an
+    /// argsort's int64 indices say nothing about where its values meet);
+    /// an op over wider dtypes takes no pattern at all.
+    fn storage_widening_for(&self, node: &Node) -> Option<OpMath> {
+        let common = self.promoted_operand_dtype(node)?;
+        common.is_narrow_float().then_some(OpMath {
+            common,
+            compute: DType::F32,
+        })
+    }
+
     /// The dtype the export declares for the node's first tensor output
     /// (tuple outputs included).
     fn first_output_dtype(&self, node: &Node) -> Result<DType> {
@@ -820,6 +834,32 @@ impl Translator<'_> {
         Ok(())
     }
 
+    /// Torch performs half-precision math in F32 (opmath), and narrow
+    /// floats are storage in the graphs this translator emits: every
+    /// arithmetic op over F16, BF16 or an fp8 format is preceded by an
+    /// explicit widening cast and followed by an explicit rounding cast.
+    /// This checks that contract for the ops `node` recorded (every value
+    /// id at or above `recorded`), so a lowering that computes in a narrow
+    /// format is refused here, naming its ATen op, rather than by a
+    /// backend kernel or not at all.
+    fn refuse_narrow_float_arithmetic(&self, node: &Node, recorded: usize) -> Result<()> {
+        let logical = &self.cx.logical;
+        let fresh = logical
+            .petgraph()
+            .node_indices()
+            .filter(|id| id.index() >= recorded);
+        if let Some((id, dtype)) = logical.narrow_float_arithmetic(fresh).first() {
+            bail!(
+                "`{}` lowered to {} over {dtype:?}: narrow floats are storage only \
+                 (torch computes them in F32), so the lowering must widen its operands \
+                 and round its result with explicit casts",
+                node.target,
+                logical.value_op(*id).constructor()
+            );
+        }
+        Ok(())
+    }
+
     fn dispatch(&mut self, node: &Node) -> Result<()> {
         let target = node
             .target
@@ -882,13 +922,43 @@ impl Translator<'_> {
         }
 
         // The op's dtype pattern is set for the whole arm and cleared on
-        // every exit, so its operands widen and its outputs round once.
+        // every exit, so its operands widen and its outputs round once. An
+        // exact op that still computes (`neg` is a multiply) widens the
+        // same way: narrow floats are storage, and widening, computing and
+        // rounding back reproduces its exact result bit for bit.
         if opmath_target(target) {
             self.opmath = Some(self.opmath_for(node, target)?);
+        } else if exact_arithmetic_target(target) {
+            self.opmath = self.storage_widening_for(node);
         }
         let result = self.dispatch_target(node, target);
+        if result.is_ok() && self.opmath.is_some() {
+            self.round_widened_outputs(node);
+        }
         self.opmath = None;
         result
+    }
+
+    /// Every output of a widened node that the export declares as a narrow
+    /// float is rounded to that dtype, however its lowering bound it (most
+    /// bind through `bind_value`, which already rounds; this holds the
+    /// contract for the ones that store directly).
+    fn round_widened_outputs(&mut self, node: &Node) {
+        for name in Self::tensor_output_names(node) {
+            let Some(value) = self.values.get(&name).copied() else {
+                continue;
+            };
+            let Some(declared) = self
+                .tensor_meta(&name)
+                .ok()
+                .and_then(|meta| dtype_of(meta.dtype).ok())
+            else {
+                continue;
+            };
+            if declared.is_narrow_float() && value.dtype != declared {
+                self.values.insert(name, convert(value, declared));
+            }
+        }
     }
 
     fn dispatch_target(&mut self, node: &Node, target: &str) -> Result<()> {
@@ -1000,7 +1070,17 @@ impl Translator<'_> {
             "tanh.default" => self.operand(&n[0])?.tanh(),
             "log.default" => self.operand(&n[0])?.log(),
             "sqrt.default" => self.operand(&n[0])?.sqrt(),
-            "abs.default" => self.operand(&n[0])?.abs(),
+            "abs.default" => {
+                // A float's magnitude clears its sign bit (`abs(-0.0)` is
+                // `+0.0`); core `abs` selects on the ordered `x < 0`, which
+                // cannot see a zero's sign, and keeps integer wrapping.
+                let x = self.operand(&n[0])?;
+                if is_float(x.dtype) {
+                    self.ieee_abs(x)
+                } else {
+                    x.abs()
+                }
+            }
             "neg.default" => -self.operand(&n[0])?,
             "silu.default" => self.operand(&n[0])?.silu(),
             "gelu.default" => self.operand(&n[0])?.gelu(),
@@ -1679,12 +1759,19 @@ fn broadcast_pair(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) 
 /// Convert a value to `dtype`: `cast` is lossless-only, so a float -> int
 /// conversion is an explicit truncating read. Narrow integer storage uses
 /// an Int32 truncation followed by an integer-width conversion, preserving
-/// both the rounding operation and the requested result dtype.
+/// both the rounding operation and the requested result dtype. A narrow
+/// float is storage, so it widens to F32 (exactly: every narrow format is
+/// a subset of F32) before the truncation reads it.
 fn convert(value: GraphTensor, dtype: DType) -> GraphTensor {
     if value.dtype == dtype {
         return value;
     }
     if is_float(value.dtype) && is_narrowing_int(dtype) {
+        let value = if value.dtype.is_narrow_float() {
+            value.cast(DType::F32)
+        } else {
+            value
+        };
         return if is_int(dtype) {
             value.trunc_cast(dtype)
         } else {
@@ -1692,6 +1779,45 @@ fn convert(value: GraphTensor, dtype: DType) -> GraphTensor {
         };
     }
     value.cast(dtype)
+}
+
+/// The ops torch computes at their own dtype because their result is
+/// exact in it (a negation, a magnitude, a rounding to an integer, a
+/// selection or ordering of values), whose lowerings nevertheless record
+/// arithmetic: core spells `neg` as a multiply, `min` through negation and
+/// `stable_argsort` with a materialising multiply. Narrow floats are
+/// storage in the translated graph, so these widen to F32; the exact
+/// result is representable in the narrow format, so rounding it back
+/// changes no bit. Every operand of these ops is a value (no integer
+/// index operand rides the widening).
+fn exact_arithmetic_target(target: &str) -> bool {
+    matches!(
+        target,
+        "abs.default"
+            | "neg.default"
+            | "floor.default"
+            | "ceil.default"
+            | "trunc.default"
+            | "round.default"
+            // `min` is `-max(-x)`
+            | "min.default"
+            | "min.dim"
+            | "amin.default"
+            | "argmin.default"
+            // ordering by `stable_argsort`
+            | "sort.default"
+            | "sort.stable"
+            | "argsort.default"
+            | "topk.default"
+            | "median.default"
+            | "median.dim"
+            | "nanmedian.default"
+            | "nanmedian.dim"
+            | "max_pool2d_with_indices.default"
+            | "max_pool3d_with_indices.default"
+            | "adaptive_max_pool2d.default"
+            | "adaptive_max_pool3d.default"
+    )
 }
 
 /// Whether torch performs this op in opmath — half-precision math in F32,
@@ -1738,6 +1864,7 @@ fn opmath_target(target: &str) -> bool {
             | "ldexp.Tensor"
             | "square.default"
             | "reciprocal.default"
+            | "round.decimals"
             | "logit.default" | "logaddexp.default" | "logaddexp2.default"
             | "xlogy.Tensor" | "special_xlog1py.default" | "sinc.default"
             | "softplus.default" | "mish.default" | "celu.default" | "glu.default"

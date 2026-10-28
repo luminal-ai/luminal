@@ -473,7 +473,17 @@ impl Translator<'_> {
         let matches = input_expanded.eq(bins_expanded);
 
         let out_dtype = self.output_meta_dtype(node)?;
-        Ok(matches.cast(out_dtype).sum(vec![1]))
+        // A narrow-float count is summed in F32 (exact below 2^24) and
+        // rounded once to the declared storage dtype.
+        let count_dtype = if out_dtype.is_narrow_float() {
+            DType::F32
+        } else {
+            out_dtype
+        };
+        Ok(super::util::round_to_storage(
+            matches.cast(count_dtype).sum(vec![1]),
+            out_dtype,
+        ))
     }
 
     pub(super) fn translate_histogram(
@@ -954,6 +964,14 @@ impl Translator<'_> {
 
     pub(super) fn translate_segment_reduce(&mut self, node: &Node) -> Result<GraphTensor> {
         let data = self.get_input_tensor(node, 0)?;
+        // Narrow storage reduces in F32 and rounds each segment's result
+        // once to the storage dtype.
+        let storage = data.dtype;
+        let reduced = self.segment_reduce_values(node, util::widen_storage(data))?;
+        Ok(util::round_to_storage(reduced, storage))
+    }
+
+    fn segment_reduce_values(&mut self, node: &Node, data: GraphTensor) -> Result<GraphTensor> {
         let reduction = segment_reduction_name(node)?;
         let axis = self.named_int_arg(node, "axis").unwrap_or(0);
         let axis = util::normalize_dim(axis, data.rank());
@@ -1384,7 +1402,12 @@ impl Translator<'_> {
                 .collect();
             let update = flat_updates.slice_along(step..step + 1, 0);
             let current = output.gather(&destination);
-            output = output.scatter(&destination, current + update);
+            // Each step rounds to the gradient's dtype, as torch's
+            // sequential kernel does; narrow storage adds in F32.
+            output = output.scatter(
+                &destination,
+                util::storage_step(current, update, |a, b| a + b),
+            );
         }
         Ok(util::reshape_tensor(output, &input_shape))
     }
