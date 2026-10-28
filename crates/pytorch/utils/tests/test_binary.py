@@ -312,3 +312,141 @@ def test_symbolic_scalar_operand_follows_torch_promotion(fn):
         x = torch.arange(rows * 2, dtype=torch.int64).reshape(rows, 2) - 5
         (actual,) = compiled(x)
         _assert_same(actual, model(x), exact=x.dtype == actual.dtype)
+
+
+# ---------------------------------------------------------------------------
+# IEEE NaN semantics of the comparisons, maximum/minimum and clamp.
+#
+# These go through torch.compile with the real backend, so each ATen overload
+# reaches its own stage-1 translator arm (eq.Tensor, ne.Scalar, maximum.default,
+# clamp.default, clamp_min.Tensor, any.default, ...). `compile_for_test` always
+# decomposes and would only reach the decomposed forms.
+# ---------------------------------------------------------------------------
+
+NAN = float("nan")
+INF = float("inf")
+# Every pairing of NaN with NaN, an infinity, a signed zero and a finite value,
+# with NaN on the left, on the right and on both sides.
+NAN_LHS = [NAN, 1.0, NAN, NAN, INF, -INF, 0.0, -0.0, NAN, 2.0, -INF]
+NAN_RHS = [0.0, NAN, NAN, INF, NAN, NAN, -0.0, 0.0, -INF, 1.0, INF]
+
+
+def _compile_real(module: torch.nn.Module):
+    return torch.compile(
+        module,
+        backend=lambda gm, example_inputs: luminal_backend(
+            gm, example_inputs, {"search_iterations": 1}
+        ),
+    )
+
+
+def _assert_same(actual, expected):
+    actual = actual if isinstance(actual, (tuple, list)) else (actual,)
+    expected = expected if isinstance(expected, (tuple, list)) else (expected,)
+    assert len(actual) == len(expected)
+    for index, (result, reference) in enumerate(zip(actual, expected)):
+        assert result.dtype == reference.dtype, index
+        torch.testing.assert_close(
+            result, reference, rtol=0, atol=0, equal_nan=True, msg=f"output {index}"
+        )
+
+
+class TensorComparisons(torch.nn.Module):
+    def forward(self, a, b):
+        return (
+            torch.eq(a, b),
+            torch.ne(a, b),
+            torch.le(a, b),
+            torch.ge(a, b),
+            torch.lt(a, b),
+            torch.gt(a, b),
+        )
+
+
+class ScalarComparisons(torch.nn.Module):
+    def forward(self, a):
+        return (
+            a == 1.0,
+            a != 1.0,
+            a <= 1.0,
+            a >= 1.0,
+            torch.eq(a, NAN),
+            torch.ne(a, NAN),
+            torch.le(a, NAN),
+            torch.ge(a, NAN),
+            a != a,
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.float16, torch.bfloat16]
+)
+def test_comparisons_are_false_for_nan_except_not_equal(dtype):
+    a = torch.tensor(NAN_LHS, dtype=dtype)
+    b = torch.tensor(NAN_RHS, dtype=dtype)
+    _assert_same(_compile_real(TensorComparisons())(a, b), TensorComparisons()(a, b))
+    _assert_same(_compile_real(ScalarComparisons())(a), ScalarComparisons()(a))
+
+
+class MaximumMinimumBothOrders(torch.nn.Module):
+    def forward(self, a, b):
+        return (
+            torch.maximum(a, b),
+            torch.maximum(b, a),
+            torch.minimum(a, b),
+            torch.minimum(b, a),
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
+def test_maximum_minimum_propagate_nan_from_either_operand(dtype):
+    a = torch.tensor(NAN_LHS, dtype=dtype)
+    b = torch.tensor(NAN_RHS, dtype=dtype)
+    expected = MaximumMinimumBothOrders()(a, b)
+    _assert_same(_compile_real(MaximumMinimumBothOrders())(a, b), expected)
+
+
+class ClampWithNan(torch.nn.Module):
+    def forward(self, x, bound, nan_scalar):
+        return (
+            torch.clamp(x, -1.0, 1.0),
+            torch.clamp(x, min=NAN),
+            torch.clamp(x, max=NAN),
+            torch.clamp(x, min=bound),
+            torch.clamp(x, max=bound),
+            torch.clamp_min(x, bound),
+            torch.clamp_max(x, bound),
+            torch.clamp_min(x, nan_scalar),
+            torch.clamp_max(x, nan_scalar),
+        )
+
+
+def test_clamp_propagates_nan_bounds_and_nan_inputs():
+    x = torch.tensor([NAN, -INF, -1.5, -0.0, 0.5, 2.0, INF])
+    bound = torch.tensor([0.0, NAN, 0.0, NAN, 0.0, NAN, 0.0])
+    nan_scalar = torch.tensor(NAN)
+    expected = ClampWithNan()(x, bound, nan_scalar)
+    _assert_same(_compile_real(ClampWithNan())(x, bound, nan_scalar), expected)
+
+
+class AnyOfRows(torch.nn.Module):
+    def forward(self, x):
+        return torch.any(x), torch.any(x, dim=1)
+
+
+def test_any_counts_nan_as_true():
+    x = torch.tensor([[NAN, 0.0], [0.0, -0.0], [0.0, 1.0]])
+    _assert_same(_compile_real(AnyOfRows())(x), AnyOfRows()(x))
+
+
+class ThresholdNan(torch.nn.Module):
+    def forward(self, x):
+        return (
+            torch.nn.functional.threshold(x, 0.5, -7.0),
+            torch.nn.functional.threshold(x, NAN, -7.0),
+        )
+
+
+def test_threshold_keeps_nan_input_and_ignores_nan_threshold():
+    x = torch.tensor([NAN, -INF, 0.0, 0.5, 1.0, INF])
+    _assert_same(_compile_real(ThresholdNan())(x), ThresholdNan()(x))
