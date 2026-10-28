@@ -58,6 +58,7 @@ pub mod scatter;
 pub mod select;
 pub mod sin;
 pub mod sqrt;
+pub mod tf32_round_trip;
 pub mod trunc;
 pub mod trunc_cast;
 pub mod trunc_div;
@@ -206,6 +207,10 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(less_than::LessThanMatcher, less_than::LessThan),
         reg(select::SelectFunctionalMatcher, select::SelectFunctional),
         reg(cast::CastMatcher, cast::Cast),
+        reg(
+            tf32_round_trip::Tf32RoundTripMatcher,
+            tf32_round_trip::Tf32RoundTrip,
+        ),
         reg(
             index_map_apply_materialize::IndexMapApplyMaterializeMatcher,
             index_map_apply_materialize::IndexMapApplyMaterialize { entries: None },

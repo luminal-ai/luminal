@@ -32,7 +32,8 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
         }
     };
     format!(
-        "(CublasLtConfigurationOf (CublasLtFloat32Computation) ({:?}) ({:?}) ({:?}) {} ({:?}) {} ({}) ({}) ({}) ({}) ({}) ({}) ({}))",
+        "(CublasLtConfigurationOf ({}) ({:?}) ({:?}) ({:?}) {} ({:?}) {} ({}) ({}) ({}) ({}) ({}) ({}) ({}))",
+        call.computation.egglog_constructor(),
         scale,
         call.a_dtype,
         call.b_dtype,
@@ -91,7 +92,12 @@ pub fn approved_keys() -> std::collections::BTreeSet<String> {
 }
 fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     let mut graphs = Vec::new();
-    for dtype in [DType::F32, DType::Bf16, DType::F16] {
+    for (dtype, tf32) in [
+        (DType::F32, false),
+        (DType::Bf16, false),
+        (DType::F16, false),
+        (DType::F32, true),
+    ] {
         for ta in [false, true] {
             for tb in [false, true] {
                 let mut model = Graph::new();
@@ -101,6 +107,10 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
                 let mut b = model
                     .tensor(if tb { [4, 8] } else { [8, 4] }, dtype)
                     .cast(DType::F32);
+                if tf32 {
+                    a = a.cast(DType::TF32).cast(DType::F32);
+                    b = b.cast(DType::TF32).cast(DType::F32);
+                }
                 if ta {
                     a = a.permute(&[1, 0]);
                 }
@@ -175,8 +185,6 @@ pub fn in_place_witnesses() -> std::collections::BTreeMap<String, CublasLtAccumu
 /// Narrow the production table before saturation so an epilogue execution test
 /// must use bias. All recognition, admission and extraction remain production.
 pub fn bias_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
-    use luminal::egglog_snippet::EgglogSnippet;
-    use luminal::layout_ir::LayoutIrOp;
     static TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         approved_keys()
             .into_iter()
@@ -184,11 +192,31 @@ pub fn bias_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
             .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
             .collect()
     });
+    table_registry(TABLE.as_str())
+}
+
+/// Force a TF32 call without depending on the profiler preferring it over
+/// materialized rounding followed by an ordinary F32 call.
+pub fn tf32_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        approved_keys()
+            .into_iter()
+            .filter(|key| key.contains("CublasLtTensorFloat32Computation"))
+            .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+            .collect()
+    });
+    table_registry(TABLE.as_str())
+}
+
+fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    use luminal::egglog_snippet::EgglogSnippet;
+    use luminal::layout_ir::LayoutIrOp;
     #[derive(Debug)]
-    struct BiasMatcher {
+    struct TableMatcher {
         in_place: bool,
+        table: &'static str,
     }
-    impl OpMatcher for BiasMatcher {
+    impl OpMatcher for TableMatcher {
         fn egglog_constructor(&self) -> &'static str {
             if self.in_place {
                 IN_PLACE_CONSTRUCTOR
@@ -206,7 +234,7 @@ pub fn bias_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
                 .into_iter()
                 .map(|mut snippet| {
                     if snippet.text == WHITELIST {
-                        snippet.text = TABLE.as_str();
+                        snippet.text = self.table;
                     }
                     snippet
                 })
@@ -231,8 +259,9 @@ pub fn bias_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
         luminal_cuda_lite::cuda_registry_filtered(|row| row.label() != "ReduceSumGeneric");
     for row in &mut registry {
         if [CONSTRUCTOR, IN_PLACE_CONSTRUCTOR].contains(&row.constructor()) {
-            row.matcher = Box::new(BiasMatcher {
+            row.matcher = Box::new(TableMatcher {
                 in_place: row.constructor() == IN_PLACE_CONSTRUCTOR,
+                table,
             });
         }
     }

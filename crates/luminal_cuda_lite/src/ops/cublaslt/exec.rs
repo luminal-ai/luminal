@@ -87,12 +87,29 @@ pub enum LtActivation {
     GaussianErrorLinear,
 }
 
+/// The explicitly admitted input-rounding and computation contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtComputation {
+    Float32,
+    TensorFloat32,
+}
+
+impl LtComputation {
+    pub fn egglog_constructor(self) -> &'static str {
+        match self {
+            Self::Float32 => "CublasLtFloat32Computation",
+            Self::TensorFloat32 => "CublasLtTensorFloat32Computation",
+        }
+    }
+}
+
 /// The fully-resolved host call: every number the dispatch needs,
 /// nothing the dispatch may reinterpret. NO scalar fields beyond the
 /// structural `beta_is_one`; admission owns the permitted literal scalars.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LtCall {
     pub form: CublasLtForm,
+    pub computation: LtComputation,
     pub m: i64,
     pub n: i64,
     pub k: i64,

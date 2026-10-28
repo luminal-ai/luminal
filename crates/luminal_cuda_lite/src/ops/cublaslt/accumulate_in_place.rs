@@ -2,9 +2,10 @@
 //! independent D operand, D descriptor, or conditional alias permission.
 use super::CublasLtForm;
 use super::approved::{
-    DECLARATIONS, Matrix, RULES, WHITELIST, activation, capture_dimensions, dtype, matrix, member,
+    DECLARATIONS, Matrix, RULES, WHITELIST, activation, capture_dimensions, computation, dtype,
+    matrix, member,
 };
-use super::exec::{LtActivation, LtCMatrixInput, LtCall};
+use super::exec::{LtActivation, LtCMatrixInput, LtCall, LtComputation};
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
 use luminal::egglog_snippet::{EgglogSnippet, SpliceCategory};
@@ -59,7 +60,7 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
         let configuration = member(site, &site.child_class(0), "CublasLtConfigurationOf");
         let child = |n| site.class_of_child(&configuration, n).unwrap();
-        member(site, &child(0), "CublasLtFloat32Computation");
+        let computation = computation(site, &child(0));
         member(site, &child(7), "CublasLtHostScalarsAlphaOneBetaOne");
         let frame = member(site, &site.child_class(6), "CublasLtExpressionFrameOf");
         let semantic = |n| site.class_of_child(&frame, n).unwrap();
@@ -70,6 +71,7 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
         let enum_is = |n, name| site.nodes_in_class_value(&child(n), name).next().is_some();
         Box::new(CublasLtAccumulateInPlace {
             configuration: site.child_class(0),
+            computation,
             logical_a: semantic(2),
             logical_b: semantic(3),
             logical_out: semantic(1),
@@ -89,6 +91,7 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
 #[derive(Debug, Clone)]
 pub struct CublasLtAccumulateInPlace {
     pub configuration: ClassId,
+    pub computation: LtComputation,
     pub logical_a: ClassId,
     pub logical_b: ClassId,
     pub logical_out: ClassId,
@@ -108,6 +111,7 @@ impl CublasLtAccumulateInPlace {
         let base = super::approved::ApprovedCublasLt::prototype();
         Self {
             configuration: base.configuration,
+            computation: base.computation,
             logical_a: base.logical_a,
             logical_b: base.logical_b,
             logical_out: base.logical_out,
@@ -129,6 +133,7 @@ impl CublasLtAccumulateInPlace {
         let b = self.b.resolve(dims);
         let c_and_d = self.c_and_d.resolve(dims);
         LtCall {
+            computation: self.computation,
             form: if self.bias.is_some() {
                 CublasLtForm::AccumulateBias
             } else {

@@ -86,13 +86,13 @@
   :name "cublaslt: demand batched result layout proofs")
 (rule
   ((cublaslt-strided-batch-product ?output_expression ?A_operand ?B_operand ?BatchCount ?m ?n ?k)
-   (cublaslt-operand-storage-reading ?A_operand ?A_storage_tensor))
+   (cublaslt-operand-storage-reading ?computation_type ?A_operand ?A_storage_tensor))
   ((cublaslt-strided-batch-layout-demand ?A_storage_tensor))
   :ruleset backend
   :name "cublaslt: demand batched A storage layout proofs")
 (rule
   ((cublaslt-strided-batch-product ?output_expression ?A_operand ?B_operand ?BatchCount ?m ?n ?k)
-   (cublaslt-operand-storage-reading ?B_operand ?B_storage_tensor))
+   (cublaslt-operand-storage-reading ?computation_type ?B_operand ?B_storage_tensor))
   ((cublaslt-strided-batch-layout-demand ?B_storage_tensor))
   :ruleset backend
   :name "cublaslt: demand batched B storage layout proofs")
@@ -212,8 +212,8 @@
 ; This gate admits the basic product. C addition has its own complete gate below.
 (rule
   ((cublaslt-strided-batch-product ?output_expression ?A_operand ?B_operand ?BatchCount ?m ?n ?k)
-   (cublaslt-operand-storage-reading ?A_operand ?A_storage_tensor)
-   (cublaslt-operand-storage-reading ?B_operand ?B_storage_tensor)
+   (cublaslt-operand-storage-reading ?computation_type ?A_operand ?A_storage_tensor)
+   (cublaslt-operand-storage-reading ?computation_type ?B_operand ?B_storage_tensor)
    (= (shape-of ?A_operand) (shape-of ?A_storage_tensor))
    (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
    (= ?A_layout_tensor (LayoutTensorLit ?A_storage_tensor ?A_layout))
@@ -225,7 +225,7 @@
      ?B_matrix_order ?B_transpose_operation ?B_matrix_descriptor)
    (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n (F32)
      ?D_matrix_order ?D_matrix_descriptor)
-   (= ?configuration (CublasLtConfigurationOf (CublasLtFloat32Computation) (F32)
+   (= ?configuration (CublasLtConfigurationOf ?computation_type (F32)
      ?A_storage_data_type ?B_storage_data_type (CublasLtNoCMatrixDataType) (F32)
      (CublasLtNoBiasDataType) (CublasLtHostScalarsAlphaOneBetaZero) (CublasLtDefaultEpilogue)
      ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
@@ -244,8 +244,8 @@
 (rule
   ((cublaslt-strided-batch-product-with-C-matrix
      ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k)
-   (cublaslt-operand-storage-reading ?A_operand ?A_storage_tensor)
-   (cublaslt-operand-storage-reading ?B_operand ?B_storage_tensor)
+   (cublaslt-operand-storage-reading ?computation_type ?A_operand ?A_storage_tensor)
+   (cublaslt-operand-storage-reading ?computation_type ?B_operand ?B_storage_tensor)
    (= (shape-of ?A_operand) (shape-of ?A_storage_tensor))
    (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
    (= ?A_layout_tensor (LayoutTensorLit ?A_storage_tensor ?A_layout))
@@ -260,7 +260,7 @@
      ?D_matrix_order (CublasLtNoTranspose) ?C_matrix_descriptor)
    (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n (F32)
      ?D_matrix_order ?D_matrix_descriptor)
-   (= ?configuration (CublasLtConfigurationOf (CublasLtFloat32Computation) (F32)
+   (= ?configuration (CublasLtConfigurationOf ?computation_type (F32)
      ?A_storage_data_type ?B_storage_data_type (CublasLtCMatrixDataTypeOf (F32)) (F32)
      (CublasLtNoBiasDataType) (CublasLtHostScalarsAlphaOneBetaOne) (CublasLtDefaultEpilogue)
      ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))

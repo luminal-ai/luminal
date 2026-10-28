@@ -1,6 +1,8 @@
 //! TF32 reference values: eight exponent bits and ten explicit fraction bits,
-//! represented in 32-bit words. The FP32 -> TF32 cast rounds to nearest, ties
-//! to even, matching the cuBLAS FAST_TF32 input-conversion contract:
+//! represented in 32-bit words. This reference implementation rounds to nearest,
+//! ties to even. Logical TF32 casts adopt the executing device's conversion;
+//! exact tie handling and NaN encodings are not portable compiler guarantees.
+//! CUDA's native conversion and cuBLASLt may choose a different nearest tie:
 //! <https://docs.nvidia.com/cuda/cublas/index.html#cublascomputetype-t>.
 //!
 //! Widening to FP32 is exact. Signed zeros and infinities are preserved;

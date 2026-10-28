@@ -1,7 +1,7 @@
 //! A complete call is admitted in egglog before extraction. This module only
 //! decodes the elected configuration and evaluates its descriptor expressions.
 use super::CublasLtForm;
-use super::exec::{LtActivation, LtCMatrixInput, LtCall, LtDesc, LtOrder};
+use super::exec::{LtActivation, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder};
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
 use luminal::egglog_snippet::{EgglogSnippet, SpliceCategory};
@@ -65,7 +65,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
         let config = member(site, &site.child_class(0), "CublasLtConfigurationOf");
         let child = |n: usize| site.class_of_child(&config, n).unwrap();
         // This decodes a closed enum, not an applicability decision or fallback.
-        member(site, &child(0), "CublasLtFloat32Computation");
+        let computation = computation(site, &child(0));
         let a = matrix(site, &site.child_class(1));
         let b = matrix(site, &site.child_class(2));
         let d = matrix(site, &site.child_class(5));
@@ -90,6 +90,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
         let semantic = |n| site.class_of_child(&frame, n).unwrap();
         Box::new(ApprovedCublasLt {
             configuration: site.child_class(0),
+            computation,
             logical_a: semantic(2),
             logical_b: semantic(3),
             logical_out: semantic(1),
@@ -127,6 +128,19 @@ pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
         }
     }
     panic!("cuBLASLt approved contract: unsupported dtype constructor in {class}");
+}
+
+pub(super) fn computation(site: &ExtractionSite<'_>, class: &ClassId) -> LtComputation {
+    for mode in [LtComputation::Float32, LtComputation::TensorFloat32] {
+        if site
+            .nodes_in_class_value(class, mode.egglog_constructor())
+            .next()
+            .is_some()
+        {
+            return mode;
+        }
+    }
+    panic!("cuBLASLt approved contract: unsupported computation constructor in {class}");
 }
 
 pub(super) fn activation(site: &ExtractionSite<'_>, class: &ClassId) -> LtActivation {
@@ -215,6 +229,7 @@ impl Matrix {
 #[derive(Debug, Clone)]
 pub struct ApprovedCublasLt {
     pub configuration: ClassId,
+    pub computation: LtComputation,
     pub logical_a: ClassId,
     pub logical_b: ClassId,
     pub logical_out: ClassId,
@@ -246,6 +261,7 @@ impl ApprovedCublasLt {
         };
         Self {
             configuration: ClassId::from("prototype"),
+            computation: LtComputation::Float32,
             logical_a: matrix.tensor.clone(),
             logical_b: matrix.tensor.clone(),
             logical_out: matrix.tensor.clone(),
@@ -274,6 +290,7 @@ impl ApprovedCublasLt {
         let b = self.b.resolve(dims);
         let d = self.d.resolve(dims);
         LtCall {
+            computation: self.computation,
             form: match (self.c.is_some(), self.bias.is_some()) {
                 (false, false) => CublasLtForm::Base,
                 (false, true) => CublasLtForm::Bias,

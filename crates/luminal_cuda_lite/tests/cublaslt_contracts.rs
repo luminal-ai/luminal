@@ -188,6 +188,7 @@ fn call_for(form: CublasLtForm) -> LtCall {
         LtDesc::row(m, n, n)
     };
     LtCall {
+        computation: luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32,
         form,
         m,
         n,
@@ -291,6 +292,7 @@ fn ld_bounds_violation_refuses_before_dispatch() {
     // rows==1 (the shape whose ld the library never dereferences in
     // ROW order): D is 1x8 — needs 8 elements; give it 4.
     let call = LtCall {
+        computation: luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32,
         form: CublasLtForm::Base,
         m: 1,
         n: 8,

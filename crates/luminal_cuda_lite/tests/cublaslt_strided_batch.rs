@@ -57,6 +57,16 @@ fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlac
 }
 
 fn graph(dtype: DType, transpose_a: bool, transpose_b: bool, with_c: bool) -> Graph {
+    graph_with_mode(dtype, transpose_a, transpose_b, with_c, false)
+}
+
+fn graph_with_mode(
+    dtype: DType,
+    transpose_a: bool,
+    transpose_b: bool,
+    with_c: bool,
+    tf32: bool,
+) -> Graph {
     let mut graph = Graph::new();
     let mut a = graph
         .tensor(if transpose_a { [2, 4, 3] } else { [2, 3, 4] }, dtype)
@@ -64,6 +74,10 @@ fn graph(dtype: DType, transpose_a: bool, transpose_b: bool, with_c: bool) -> Gr
     let mut b = graph
         .tensor(if transpose_b { [2, 5, 4] } else { [2, 4, 5] }, dtype)
         .cast(DType::F32);
+    if tf32 {
+        a = a.cast(DType::TF32).cast(DType::F32);
+        b = b.cast(DType::TF32).cast(DType::F32);
+    }
     if transpose_a {
         a = a.permute(&[0, 2, 1]);
     }
@@ -410,12 +424,25 @@ fn bounds_checks_include_every_batch_and_detect_overflow() {
 fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration() {
     use cudarc::driver::{CudaContext, DevicePtr};
     use luminal_cuda_lite::ops::cublaslt::device_call::{DeviceRange, dispatch};
-    let stream = CudaContext::new(0).unwrap().new_stream().unwrap();
+    let context = CudaContext::new(0).unwrap();
+    let ampere_or_newer = context.compute_capability().unwrap().0 >= 8;
+    let stream = context.new_stream().unwrap();
     let mut witnesses = std::collections::BTreeMap::new();
-    for dtype in [DType::F32, DType::Bf16, DType::F16] {
+    for (dtype, tf32) in [
+        (DType::F32, false),
+        (DType::Bf16, false),
+        (DType::F16, false),
+        (DType::F32, true),
+    ] {
+        if !ampere_or_newer && (dtype == DType::Bf16 || tf32) {
+            continue;
+        }
         for ta in [false, true] {
             for tb in [false, true] {
-                let (separate, in_place) = calls(&saturate(&graph(dtype, ta, tb, true), WHITELIST));
+                let (separate, in_place) = calls(&saturate(
+                    &graph_with_mode(dtype, ta, tb, true, tf32),
+                    WHITELIST,
+                ));
                 for op in separate {
                     witnesses
                         .entry((whitelist::key(&op), false))
@@ -433,6 +460,10 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                 let b_source = model.tensor(if tb { [2, 5, 4] } else { [2, 4, 5] }, dtype);
                 let mut a = a_source.cast(DType::F32);
                 let mut b = b_source.cast(DType::F32);
+                if tf32 {
+                    a = a.cast(DType::TF32).cast(DType::F32);
+                    b = b.cast(DType::TF32).cast(DType::F32);
+                }
                 if ta {
                     a = a.permute(&[0, 2, 1]);
                 }
@@ -470,8 +501,8 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
     }
     assert_eq!(
         witnesses.len(),
-        288,
-        "96 base, 96 separate C, and 96 in-place C configurations"
+        if ampere_or_newer { 384 } else { 192 },
+        "each storage/computation mode covers base, separate C and in-place C configurations"
     );
     let at = |d: LtDesc, batch: usize, row: usize, col: usize| {
         batch * d.batch_stride_in_elements as usize
@@ -576,55 +607,84 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
 #[test]
 fn changing_the_batch_count_replays_the_production_call() {
     use support::TestTransfers;
-    let mut model = Graph::new();
-    let a = model.tensor(vec![IntExpr::from('b'), 3.into(), 4.into()], DType::F32);
-    let b = model.tensor(vec![IntExpr::from('b'), 4.into(), 5.into()], DType::F32);
-    let c = model.tensor(vec![IntExpr::from('b'), 3.into(), 5.into()], DType::F32);
-    let out = a.matmul(b) + c;
-    let registry = luminal_cuda_lite::cuda_registry_filtered(|row| {
-        !matches!(row.label(), "AddFunctionalGeneric" | "ReduceSumGeneric")
-    });
-    let mut runtime = CudaRuntime::load_with_registry(&model, registry).unwrap();
-    let inputs = FxHashMap::from_iter([
-        (a.id, luminal_cuda_lite::HostBuffer::from(vec![2.0; 24])),
-        (b.id, luminal_cuda_lite::HostBuffer::from(vec![0.25; 40])),
-        (c.id, luminal_cuda_lite::HostBuffer::from(vec![1.0; 30])),
-    ]);
-    runtime
-        .search(
-            &SymbolBounds::from_ranges([('b'.into(), (1, 3))]).unwrap(),
-            &[('b'.into(), 2)].into_iter().collect(),
-            &inputs,
-            &luminal_cuda_lite::harness_search_options(),
-        )
-        .unwrap();
-    assert!(
+    for tf32 in [false, true] {
+        if tf32
+            && cudarc::driver::CudaContext::new(0)
+                .unwrap()
+                .compute_capability()
+                .unwrap()
+                .0
+                < 8
+        {
+            continue;
+        }
+        let mut model = Graph::new();
+        let a = model.tensor(vec![IntExpr::from('b'), 3.into(), 4.into()], DType::F32);
+        let b = model.tensor(vec![IntExpr::from('b'), 4.into(), 5.into()], DType::F32);
+        let c = model.tensor(vec![IntExpr::from('b'), 3.into(), 5.into()], DType::F32);
+        let out = if tf32 {
+            a.cast(DType::TF32)
+                .cast(DType::F32)
+                .matmul(b.cast(DType::TF32).cast(DType::F32))
+                + c
+        } else {
+            a.matmul(b) + c
+        };
+        let registry = if tf32 {
+            whitelist::tf32_registry()
+        } else {
+            luminal_cuda_lite::cuda_registry()
+        }
+        .into_iter()
+        .filter(|row| !matches!(row.label(), "AddFunctionalGeneric" | "ReduceSumGeneric"))
+        .collect();
+        let mut runtime = CudaRuntime::load_with_registry(&model, registry).unwrap();
+        let inputs = FxHashMap::from_iter([
+            (a.id, luminal_cuda_lite::HostBuffer::from(vec![2.0; 24])),
+            (b.id, luminal_cuda_lite::HostBuffer::from(vec![0.25; 40])),
+            (c.id, luminal_cuda_lite::HostBuffer::from(vec![1.0; 30])),
+        ]);
         runtime
-            .plan()
-            .unwrap()
-            .dag
-            .node_weights()
-            .any(|node| matches!(node,
+            .search(
+                &SymbolBounds::from_ranges([('b'.into(), (1, 3))]).unwrap(),
+                &[('b'.into(), 2)].into_iter().collect(),
+                &inputs,
+                &luminal_cuda_lite::harness_search_options(),
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .plan()
+                .unwrap()
+                .dag
+                .node_weights()
+                .any(|node| matches!(node,
         luminal::bufferize::BufferNode::Compute {op,..} if op.label().starts_with("CublasLt")))
-    );
-    let mut arena = support::allocate_arena(&runtime).unwrap();
-    let mut staging = runtime.allocate_staging().unwrap();
-    for count in [1, 3, 2, 1] {
-        runtime.set_dim('b', count);
-        runtime
-            .upload(&mut arena, a.id, vec![count as f32; count * 12])
-            .unwrap();
-        runtime
-            .upload(&mut arena, b.id, vec![0.25; count * 20])
-            .unwrap();
-        runtime
-            .upload(&mut arena, c.id, vec![1.0; count * 15])
-            .unwrap();
-        runtime.execute(arena.arena(), &mut staging).unwrap();
-        let (data, slot) = runtime.download(&arena, out.id).unwrap();
-        assert_eq!(
-            luminal_cuda_lite::layouts::dense_f32(&data.as_f32().unwrap(), &slot.layout).unwrap(),
-            vec![count as f32 + 1.0; count * 15]
         );
+        let mut arena = support::allocate_arena(&runtime).unwrap();
+        let mut staging = runtime.allocate_staging().unwrap();
+        for count in [1, 3, 2, 1] {
+            runtime.set_dim('b', count);
+            runtime
+                .upload(
+                    &mut arena,
+                    a.id,
+                    vec![count as f32 + if tf32 { 3.0 / 8192.0 } else { 0.0 }; count * 12],
+                )
+                .unwrap();
+            runtime
+                .upload(&mut arena, b.id, vec![0.25; count * 20])
+                .unwrap();
+            runtime
+                .upload(&mut arena, c.id, vec![1.0; count * 15])
+                .unwrap();
+            runtime.execute(arena.arena(), &mut staging).unwrap();
+            let (data, slot) = runtime.download(&arena, out.id).unwrap();
+            assert_eq!(
+                luminal_cuda_lite::layouts::dense_f32(&data.as_f32().unwrap(), &slot.layout)
+                    .unwrap(),
+                vec![count as f32 + 1.0; count * 15]
+            );
+        }
     }
 }

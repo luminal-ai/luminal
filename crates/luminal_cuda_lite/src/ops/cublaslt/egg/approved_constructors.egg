@@ -4,7 +4,9 @@
 ; C is a full matrix. The optional epilogue bias is a separate vector.
 (datatype CublasLtMatrixOrder (CublasLtRowMajor) (CublasLtColumnMajor))
 (datatype CublasLtMatrixOperation (CublasLtNoTranspose) (CublasLtTranspose))
-(datatype CublasLtComputationType (CublasLtFloat32Computation))
+(datatype CublasLtComputationType
+  (CublasLtFloat32Computation)
+  (CublasLtTensorFloat32Computation))
 (datatype CublasLtHostScalars (CublasLtHostScalarsAlphaOneBetaZero) (CublasLtHostScalarsAlphaOneBetaOne))
 (datatype CublasLtEpilogue
   (CublasLtDefaultEpilogue)
@@ -87,5 +89,6 @@
     CublasLtExpressionFrame)
   LayoutTensorOp)
 
-; Semantic F32 operand, physical descriptor source.
-(relation cublaslt-operand-storage-reading (LogicalTensor LogicalTensor))
+; Computation contract, semantic F32 operand, physical descriptor source.
+; Bypassing a rounding cast is valid only for the computation that performs it.
+(relation cublaslt-operand-storage-reading (CublasLtComputationType LogicalTensor LogicalTensor))

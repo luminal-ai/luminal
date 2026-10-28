@@ -12,7 +12,7 @@ the elected call and dispatches its descriptors unchanged.
 | `approved_constructors.egg` | Flat vendor layout data, storage descriptors, optional arguments, configuration and expression-frame types |
 | `approved_rules.egg` | Rank-two expression recognition, layout readings, precision proofs, and complete admission |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 672 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 896 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -54,15 +54,19 @@ and D. There is no conditional alias flag or Rust destination rebinding.
 
 ## Approved configurations and precision
 
-The table contains **672 configurations**:
+The table contains **896 configurations**: 672 ordinary F32 computation rows
+and 224 explicit TF32 computation rows. Each computation/storage choice has
+the following layout and epilogue combinations:
 
-- Matching F32/F32, BF16/BF16, or F16/F16 A/B storage: 3 choices.
+- Ordinary F32 computation with matching F32/F32, BF16/BF16, or F16/F16
+  A/B storage, or TF32 computation with F32/F32 A/B storage: 4 choices.
 - Independent A/B matrix orders and transpose flags: 16 choices.
 - Absent C with beta 0 or F32 C with beta 1: 2 choices.
 - Default epilogue with either D order, or bias, ReLU, ReLU+bias, GELU,
   GELU+bias with column-major D: 7 choices.
 
-Compute, scalar, D, and any present C or bias types are F32. Alpha is 1.
+Accumulation, scalar, D, and any present C or bias types are F32. Alpha is 1.
+The computation variant controls input precision independently of storage.
 Only explicit F32 input casts permit direct BF16 or F16 storage readings.
 Storage does not choose arithmetic precision. Casts between multiply, reduction,
 C addition, or bias addition remain rounding boundaries. Earlier narrowing and
@@ -76,26 +80,48 @@ Bias has the vendor's row length and packed storage. The rank-two rules
 transpose a complete expression to implement normal feature bias. C is added
 before bias and activation. Existing core addition commutativity remains
 available; floating reassociation or crossing casts does not authorize another
-fused expression. TF32, FP8, mixed A/B storage, narrow
+fused expression. FP8, mixed A/B storage, narrow
 outputs, and arbitrary alpha/beta values have no approved configurations.
 
-### TF32 precision contract (reference support; cuBLASLt admission pending)
+### TF32 precision contract
 
-The reference runtime implements `F32 -> TF32 -> F32` as nearest-even input
-rounding followed by exact widening, using the
-[NVIDIA compute-mode contract](https://docs.nvidia.com/cuda/cublas/index.html#cublascomputetype-t).
-It gives TF32 its own typed payload backed by 32-bit words. Multiply, reduction,
-C/bias additions and final casts retain their authored types and rounding sites.
+A logical `F32 -> TF32 -> F32` round trip means the executing device's TF32
+input conversion followed by exact widening. Storage remains F32; multiply,
+reduction, C/bias addition and final casts keep their authored rounding sites.
+TF32 uses eight exponent bits and ten fraction bits. Exact tie handling,
+subnormal behavior and NaN encodings follow the device/library; they are not
+additional portable compiler guarantees. The reference uses nearest-even as
+one representative implementation. NVIDIA's
+[compute-mode documentation](https://docs.nvidia.com/cuda/cublas/index.html#cublascomputetype-t)
+describes nearest-even conversion, while the selected CUDA 12.8/A100 kernels
+were observed to choose ties away from zero. Both are accepted by this policy.
 
-A future `CUBLAS_COMPUTE_32F_FAST_TF32` configuration must explicitly whitelist
-FP32 storage and prove both input cast chains. Reading the pre-cast storage is
-valid only under that computation proof; a mode-independent storage-reading
-fact would also permit a strict FP32 call to skip the required rounding. Strict
-FP32 calls may instead consume materialized rounded FP32 values. The computation
-proof must compose with the existing batch, accumulation and final-cast proofs.
-The agreed dispatch assumption is that the configured compute mode executes and
-`NVIDIA_TF32_OVERRIDE` is unset. This does not add a runtime environment check.
-No TF32 cuBLASLt configurations or dispatch changes are enabled yet.
+`CublasLtTensorFloat32Computation` maps to `CUBLAS_COMPUTE_32F_FAST_TF32`.
+Both operands must prove the exact authored cast chain, including through pure
+views, and join the same computation variant and complete whitelist row. Its
+224 rows use F32 A/B storage, F32 accumulation and F32 output. The call reads
+pre-cast F32 storage and delegates input conversion to cuBLASLt. Earlier
+narrowing remains in that storage source. Casts after multiplication/reduction
+cannot authorize this mode. The proof composes with rank-two epilogues,
+strided batches, separate destinations, in-place accumulation and subsequent
+output casts. Batched bias/activation remain outside the existing batch grammar.
+
+Operand storage proofs are parameterized by computation mode. A global fact
+allowing rounded operands to read pre-cast storage would also let ordinary F32
+calls skip rounding. Ordinary F32 calls instead consume materialized rounded
+values. CUDA's `Tf32RoundTrip` materializes the complete cast chain into F32
+storage using native TF32 conversion on Ampere and later, or software
+nearest-even on earlier devices. Decomposed operations and final round trips
+therefore remain executable. This adds no packed 19-bit CUDA storage ABI.
+
+FAST_TF32 alone selected a full-F32 algorithm for a 1x1 product on the A100.
+Dispatch constrains the numerical implementation mask to actual TF32 dot-product
+inputs using the vendor's
+[numerical implementation flags](https://docs.nvidia.com/cuda/cublas/index.html#cublasltnumericalimplflags-t).
+If no algorithm supports a descriptor, preparation refuses that candidate;
+ordinary F32 calls over materialized rounded operands remain available to
+production search. The agreed environment assumption is that
+`NVIDIA_TF32_OVERRIDE` is unset. No runtime environment check is added.
 
 ## Element strides and strided batches
 
@@ -156,12 +182,14 @@ artifacts use schema version 3 for element-stride layouts and value-copy spans.
 
 ## Recovery provenance and validation
 
-These six `.egg` files were recovered byte for byte from two surviving libraries
+The six `.egg` files at recovery commit `0adfb8d` were recovered byte for byte
+from two surviving libraries
 built on 2026-10-27 before the container rebuild; their SHA-256 values agree.
 The recovery bundle is `.recovery/cublaslt-2026-10-27/`, locally excluded from Git
 because it also preserves the binaries. Its manifest records archive sections,
-source bytes, and hashes. The core element-stride rule files match the recovered
-core library exactly and did not require replacement.
+source bytes, and hashes. Subsequent TF32 changes extend that recovered rule vocabulary; the manifest
+continues to record the original recovery bytes. The core element-stride rule
+files did not require replacement during recovery.
 
 The small [recovery records](../../../../../docs/recovery/cublaslt-2026-10-27/)
 are also committed: the ELF extraction script, original artifact locations and

@@ -8,7 +8,8 @@
 ;   A matrix order, B matrix order, D matrix order
 ;   A transpose operation, B transpose operation
 ;
-; Computation, scalars, D and any present C or bias use float32.
+; Accumulation, scalars, D and any present C or bias use float32.
+; TF32 input precision has its own explicitly admitted computation variant.
 ; ReLU ignores the sign of zero; GELU accepts the vendor approximation.
 ; Activation and bias epilogues require column-major D.
 ; Alpha is one; beta is zero without C and one with C.
@@ -6730,6 +6731,2249 @@
   (CublasLtConfigurationOf
     (CublasLtFloat32Computation) (F32)
     (F16) (F16) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+; Explicit TF32 input rounding, F32 storage and arithmetic outputs.
+; These configurations require both authored TF32 -> F32 cast chains.
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtRowMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtDefaultEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtNoCMatrixDataType) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaZero)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
+    (CublasLtBiasDataTypeOf (F32))
+    (CublasLtHostScalarsAlphaOneBetaOne)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtTensorFloat32Computation) (F32)
+    (F32) (F32) (CublasLtCMatrixDataTypeOf (F32)) (F32)
     (CublasLtBiasDataTypeOf (F32))
     (CublasLtHostScalarsAlphaOneBetaOne)
     (CublasLtGaussianErrorLinearBiasEpilogue)

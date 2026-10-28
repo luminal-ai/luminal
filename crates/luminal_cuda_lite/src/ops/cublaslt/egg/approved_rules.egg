@@ -493,8 +493,8 @@
    (= ?expression_frame
      (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
        ?logical_C_matrix ?logical_bias ?epilogue))
-   (cublaslt-operand-storage-reading ?A_operand ?A_storage_tensor)
-   (cublaslt-operand-storage-reading ?B_operand ?B_storage_tensor)
+   (cublaslt-operand-storage-reading ?computation_type ?A_operand ?A_storage_tensor)
+   (cublaslt-operand-storage-reading ?computation_type ?B_operand ?B_storage_tensor)
    (= (shape-of ?A_operand) (shape-of ?A_storage_tensor))
    (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
    (= ?A_layout_tensor (LayoutTensorLit ?A_storage_tensor ?A_operand_layout))
@@ -530,19 +530,33 @@
 ; permits reading BF16 or FP16 directly, preserving any earlier source narrowing.
 (rule
   ((= (dtype-of ?logical_operand) (F32)))
-  ((cublaslt-operand-storage-reading ?logical_operand ?logical_operand))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation) ?logical_operand ?logical_operand))
   :ruleset backend)
 (rule
   ((= ?logical_operand (LogicalCast ?storage_source (F32)))
    (= (dtype-of ?storage_source) (Bf16))
    (= (dtype-of ?logical_operand) (F32))
    (= (shape-of ?logical_operand) (shape-of ?storage_source)))
-  ((cublaslt-operand-storage-reading ?logical_operand ?storage_source))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation) ?logical_operand ?storage_source))
   :ruleset backend)
 (rule
   ((= ?logical_operand (LogicalCast ?storage_source (F32)))
    (= (dtype-of ?storage_source) (F16))
    (= (dtype-of ?logical_operand) (F32))
    (= (shape-of ?logical_operand) (shape-of ?storage_source)))
-  ((cublaslt-operand-storage-reading ?logical_operand ?storage_source))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation) ?logical_operand ?storage_source))
   :ruleset backend)
+
+; Both operands must separately prove this same computation contract before
+; admission. TF32 casts adopt the device's conversion behavior, including tie
+; handling. Only this computation mode may read the pre-cast F32 storage;
+; ordinary F32 calls must consume materialized rounded values.
+(rule
+  ((= ?logical_operand (LogicalCast (LogicalCast ?storage_source (TF32)) (F32)))
+   (= (dtype-of ?storage_source) (F32))
+   (= (dtype-of ?logical_operand) (F32))
+   (= (shape-of ?logical_operand) (shape-of ?storage_source)))
+  ((cublaslt-operand-storage-reading (CublasLtTensorFloat32Computation)
+     ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: explicit device TF32 rounding then F32 arithmetic reads F32 storage")

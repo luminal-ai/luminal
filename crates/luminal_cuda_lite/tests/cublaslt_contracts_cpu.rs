@@ -15,6 +15,7 @@ fn call(form: CublasLtForm) -> LtCall {
         LtDesc::row(4, 3, 3)
     };
     LtCall {
+        computation: luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32,
         form,
         m: 4,
         n: 3,

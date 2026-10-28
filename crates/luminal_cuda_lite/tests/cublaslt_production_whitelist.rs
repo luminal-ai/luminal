@@ -178,7 +178,7 @@ mod whitelist;
 #[test]
 fn every_approved_configuration_has_a_real_graph_witness_and_no_others_exist() {
     let witnesses = whitelist::witnesses();
-    assert_eq!(whitelist::approved_keys().len(), 672);
+    assert_eq!(whitelist::approved_keys().len(), 896);
     assert_eq!(
         witnesses
             .keys()

@@ -6,7 +6,9 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr};
 use luminal::dtype::PlanDtype;
 use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::device_call::{self, DeviceRange};
-use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtCall, LtDesc, LtOrder};
+use luminal_cuda_lite::ops::cublaslt::exec::{
+    LtActivation, LtCall, LtComputation, LtDesc, LtOrder,
+};
 use luminal_cuda_lite::{CudaRuntime, HostBuffer};
 use std::sync::Arc;
 use support::TestTransfers;
@@ -137,7 +139,7 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
 fn every_approved_configuration_executes_and_certified_aliases_preserve_results() {
     let context = CudaContext::new(0).unwrap();
     let stream = context.default_stream();
-    let native_bf16 = context.compute_capability().unwrap().0 >= 8;
+    let ampere_or_newer = context.compute_capability().unwrap().0 >= 8;
     let witnesses = whitelist::witnesses();
     assert_eq!(
         witnesses
@@ -149,7 +151,9 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
     let mut ran = 0;
     let mut aliases = 0;
     for op in witnesses.values() {
-        if op.a.dtype == PlanDtype::Bf16 && !native_bf16 {
+        if !ampere_or_newer
+            && (op.a.dtype == PlanDtype::Bf16 || op.computation == LtComputation::TensorFloat32)
+        {
             continue;
         }
         let call = op.resolve(&Default::default());
@@ -157,7 +161,9 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         ran += 1;
     }
     for op in whitelist::in_place_witnesses().values() {
-        if op.a.dtype == PlanDtype::Bf16 && !native_bf16 {
+        if !ampere_or_newer
+            && (op.a.dtype == PlanDtype::Bf16 || op.computation == LtComputation::TensorFloat32)
+        {
             continue;
         }
         let call = op.resolve(&Default::default());
@@ -165,8 +171,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if native_bf16 { 672 } else { 448 });
-    assert_eq!(aliases, if native_bf16 { 336 } else { 224 });
+    assert_eq!(ran, if ampere_or_newer { 896 } else { 448 });
+    assert_eq!(aliases, if ampere_or_newer { 448 } else { 224 });
 }
 
 #[test]

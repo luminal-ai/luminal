@@ -6,7 +6,7 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::exec::{LtActivation, LtCall, LtDesc, LtOrder};
+use super::exec::{LtActivation, LtCall, LtComputation, LtDesc, LtOrder};
 
 /// Workspace owned by US (contract: no silent fallback algos). 32 MiB —
 /// cuBLASLt's own recommendation ceiling for pre-Hopper devices is
@@ -224,14 +224,16 @@ pub fn prepare(
         .lock()
         .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
 
-    // Matmul descriptor: strict F32 compute (contract 1/5), HOST
-    // pointer mode (contract 2), transposes, epilogue.
+    // Decode the elected computation contract. TF32 requires explicit input
+    // cast proofs and a complete whitelist row; there is no global math flag.
+    // As agreed, the configured mode executes and NVIDIA_TF32_OVERRIDE is unset.
+    let computation = match call.computation {
+        LtComputation::Float32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        LtComputation::TensorFloat32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+    };
     let desc = Desc {
-        raw: lt::create_matmul_desc(
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cudaDataType_t::CUDA_R_32F,
-        )
-        .map_err(|e| anyhow!("cublasLtMatmulDescCreate: {e:?}"))?,
+        raw: lt::create_matmul_desc(computation, sys::cudaDataType_t::CUDA_R_32F)
+            .map_err(|e| anyhow!("cublasLtMatmulDescCreate: {e:?}"))?,
     };
     let set_desc = |attr: sys::cublasLtMatmulDescAttributes_t,
                     buf: *const std::ffi::c_void,
@@ -323,6 +325,26 @@ pub fn prepare(
         )
     }
     .map_err(|e| anyhow!("workspace preference: {e:?}"))?;
+
+    if call.computation == LtComputation::TensorFloat32 {
+        // FAST_TF32 alone permits a full-F32 algorithm (observed for 1x1 on
+        // A100), which would skip authored input rounding. Request algorithms
+        // whose multiplication inputs actually use TF32 precision. Unsupported
+        // geometries retain ordinary materialized-rounding candidates.
+        // cublasLt.h macros are absent from cudarc's generated Rust bindings.
+        const INPUT_TYPE_MASK: u64 = 0xff << 16;
+        const INPUT_TF32: u64 = 0x04 << 16;
+        let implementation_mask = !INPUT_TYPE_MASK | INPUT_TF32;
+        unsafe {
+            lt::set_matmul_pref_attribute(
+                pref.raw,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_IMPL_MASK,
+                (&implementation_mask) as *const _ as *const _,
+                std::mem::size_of::<u64>(),
+            )
+        }
+        .map_err(|e| anyhow!("TF32 numerical implementation preference: {e:?}"))?;
+    }
 
     let heuristic = unsafe {
         lt::get_matmul_algo_heuristic(

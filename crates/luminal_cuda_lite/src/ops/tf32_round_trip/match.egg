@@ -1,0 +1,15 @@
+; This materializes input rounding in ordinary F32 storage. It preserves the
+; complete logical cast chain and never moves rounding across arithmetic.
+(rule
+  ((= ?output (LogicalCast (LogicalCast ?input (TF32)) (F32)))
+   (= (dtype-of ?input) (F32))
+   (= ?input_tensor (LayoutTensorLit ?input ?input_layout))
+   (= ?output_tensor (LayoutTensorLit ?output ?output_layout))
+   (= ?output_layout (RightMajorContiguousElementLayoutLit (shape-of ?output) (BitWidthLit 32)))
+   (= (injectivity-of ?output_tensor) (Injective)))
+  ((union
+     (LayoutTensorOpLit (LayoutTensorCons ?input_tensor (LayoutTensorNil))
+       (LayoutTensorCons ?output_tensor (LayoutTensorNil)))
+     (LayoutTensorOpTf32RoundTrip ?input_tensor ?output_layout)))
+  :ruleset backend
+  :name "cuda_lite: materialize authored TF32 rounding and exact F32 widening")
