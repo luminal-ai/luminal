@@ -589,6 +589,46 @@ pub(crate) fn unary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
     elementwise(ctx, expr, &["a"], &sig, to)
 }
 
+/// The CUDA math-library function a kernel calls for its operands' dtype:
+/// `f32_name` (`sqrtf`) for F32 and `f64_name`, its double-precision twin
+/// (`sqrt`), for F64. The library has no other float overloads, and passing
+/// any other dtype to one of these would convert it at the call — a double
+/// to float loses precision and range, a half widens to float. So every
+/// other dtype is refused BY NAME, like the reference runtime's arithmetic
+/// kernels: narrow floats are storage, and a frontend computes on them
+/// only after an explicit widening cast (torch's opmath).
+///
+/// `inputs` counts the value operands; the destination-passing slot that
+/// follows them carries the result dtype, which a truncating cast changes.
+pub(crate) fn math_function(
+    ctx: &CodegenCtx,
+    inputs: usize,
+    f32_name: &'static str,
+    f64_name: &'static str,
+) -> Result<&'static str> {
+    let Some((&dtype, rest)) = ctx
+        .operand_dtypes
+        .get(..inputs)
+        .and_then(|values| values.split_first())
+    else {
+        bail!(
+            "{f64_name} expects {inputs} value operands, got {}",
+            ctx.operand_dtypes.len()
+        );
+    };
+    if let Some(other) = rest.iter().find(|other| **other != dtype) {
+        bail!("{f64_name} operands disagree on dtype: {dtype:?} and {other:?}");
+    }
+    Ok(match dtype {
+        PlanDtype::F32 => f32_name,
+        PlanDtype::F64 => f64_name,
+        other => bail!(
+            "cuda-lite {f64_name} has no {other:?} arm (cast at the call site; \
+             a silent bridge through f32 would hide a precision change)"
+        ),
+    })
+}
+
 /// Generate a three-input elementwise kernel (`c ? a : b`), reading each input
 /// through its layout. The condition is Bool8; the branches and destination
 /// share one dtype. The expression copies a value verbatim, so no arithmetic

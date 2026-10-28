@@ -51,6 +51,8 @@ pub mod left_sequential_scan_sum;
 pub mod less_than;
 pub mod log2;
 pub mod materialize_layout_copy;
+#[cfg(test)]
+mod math_function_dtypes;
 pub mod modulo;
 pub mod mul;
 pub mod not;
