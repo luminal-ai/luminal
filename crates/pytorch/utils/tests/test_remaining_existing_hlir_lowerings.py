@@ -3,6 +3,7 @@
 import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
+from backend_test_utils import luminal_backend
 
 
 def _compile(module: torch.nn.Module, *inputs: torch.Tensor, dynamic_shapes=None):
@@ -375,6 +376,125 @@ def test_histogram_composites_have_fixed_bin_shapes() -> None:
             torch.tensor([-1.0, 0.0, 1.5, 3.0], dtype=dtype),
         )
         _check(module, *inputs, rtol=tolerance, atol=tolerance)
+
+
+def _histogram(values, *rest, **kwargs):
+    return torch.histogram(values, *rest, **kwargs)
+
+
+def _histogramdd(points, *rest, **kwargs):
+    hist, edges = torch.histogramdd(points, *rest, **kwargs)
+    return (hist, *edges)
+
+
+# (callable, operand names). Every case normalises with ``density=True``:
+# uniform (``bin_ct``) and tensor (non-uniform) edges, 1-D and N-D, with and
+# without weights, and an all-zero histogram, where eager divides 0/0 into NaN.
+_HISTOGRAM_DENSITY_CASES = {
+    "1d_uniform": (lambda x: _histogram(x, 4, density=True), ("values",)),
+    "1d_uniform_range_weight": (
+        lambda x, w: _histogram(x, 4, range=(-1.0, 1.5), weight=w, density=True),
+        ("values", "weight"),
+    ),
+    "1d_edges": (
+        lambda x, e: _histogram(x, e, density=True),
+        ("values", "edges"),
+    ),
+    "1d_edges_weight": (
+        lambda x, e, w: _histogram(x, e, weight=w, density=True),
+        ("values", "edges", "weight"),
+    ),
+    "1d_all_zero": (
+        lambda x: _histogram(x, 3, range=(10.0, 11.0), density=True),
+        ("values",),
+    ),
+    "nd_uniform": (
+        lambda p: _histogramdd(p, [3, 4], density=True),
+        ("points",),
+    ),
+    "nd_uniform_range_weight": (
+        lambda p, w: _histogramdd(
+            p, [3, 4], range=[-2.0, 2.0, -1.0, 3.0], weight=w, density=True
+        ),
+        ("points", "point_weight"),
+    ),
+    "nd_edges": (
+        lambda p, a, b: _histogramdd(p, [a, b], density=True),
+        ("points", "first_edges", "second_edges"),
+    ),
+    "nd_edges_weight": (
+        lambda p, a, b, w: _histogramdd(p, [a, b], weight=w, density=True),
+        ("points", "first_edges", "second_edges", "point_weight"),
+    ),
+    "nd_all_zero": (
+        lambda p, w: _histogramdd(p, [3, 4], weight=w * 0, density=True),
+        ("points", "point_weight"),
+    ),
+}
+
+
+def _histogram_density_operands(dtype):
+    # Built on CPU: the generator is a CPU generator and eager histogram is
+    # CPU-only, whatever device the test selects for the compiled run.
+    cpu = {"dtype": torch.float64, "device": "cpu"}
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    # Fixed samples sit on interior edges, on the inclusive last edge and
+    # outside the tensor edges. They are also each axis' extremes (values in
+    # [-4, 3], points in [-3, 3]), so the uniform edges derived from min/max
+    # are exact in binary and this density check does not depend on how
+    # uniform edges round.
+    values = torch.cat(
+        (
+            torch.randn(20, generator=generator, **cpu).clamp(-3.5, 2.5),
+            torch.tensor([-0.5, 0.0, 3.0, -4.0], **cpu),
+        )
+    )
+    points = torch.cat(
+        (
+            torch.randn(16, 2, generator=generator, **cpu).clamp(-2.5, 2.5),
+            torch.tensor([[-3.0, -3.0], [3.0, 3.0], [-1.0, 1.5], [0.0, 0.5]], **cpu),
+        )
+    )
+    operands = {
+        "values": values,
+        "weight": torch.rand(values.shape, generator=generator, **cpu),
+        "edges": torch.tensor([-3.0, -0.5, 0.0, 0.7, 3.0], **cpu),
+        "points": points,
+        "point_weight": torch.rand(points.shape[0], generator=generator, **cpu),
+        "first_edges": torch.tensor([-3.0, -1.0, 0.0, 3.0], **cpu),
+        "second_edges": torch.tensor([-3.0, 0.0, 0.5, 1.0, 3.0], **cpu),
+    }
+    return {name: value.to(dtype) for name, value in operands.items()}
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "dtype, tolerance", ((torch.float32, 1e-5), (torch.float64, 1e-12))
+)
+@pytest.mark.parametrize("case", sorted(_HISTOGRAM_DENSITY_CASES))
+def test_histogram_density_matches_eager(device, case, dtype, tolerance) -> None:
+    """``density=True`` through ``torch.compile``, the backend's real path.
+
+    The histogram overloads are lowered at stage 1 (the undecomposed graph);
+    the density normalisation used to panic on a doubly expanded bin volume.
+    """
+    function, names = _HISTOGRAM_DENSITY_CASES[case]
+    operands = _histogram_density_operands(dtype)
+    inputs = tuple(operands[name] for name in names)
+    expected = function(*inputs)
+
+    compiles = 0
+
+    def backend(gm, example_inputs, options=None):
+        nonlocal compiles
+        compiles += 1
+        return luminal_backend(gm, example_inputs, options={"search_iterations": 1})
+
+    compiled = torch.compile(function, backend=backend, fullgraph=True, dynamic=False)
+    actual = compiled(*(value.to(device) for value in inputs))
+    assert compiles == 1
+    actual = tuple(value.cpu() for value in actual)
+    _assert_close(actual, expected, rtol=tolerance, atol=tolerance)
 
 
 class FixedShapeIndexing(torch.nn.Module):

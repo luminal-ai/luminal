@@ -706,11 +706,20 @@ impl Translator<'_> {
         let weight = util::reshape_tensor(weight, &weight_shape).expand(full_shape);
         let mut histogram = (membership.cast(weight.dtype) * weight).sum(vec![0]);
         if density {
+            // torch's density divides by the total weight, then by each axis'
+            // bin widths in turn. Keeping that order (not one divide by a
+            // product volume) lets F64, whose `/` rounds once, round as eager
+            // does. An all-zero histogram gives 0/0 = NaN in every bin, as in
+            // eager.
+            //
+            // Shape invariant: `histogram` is `bin_shape`. Each divisor starts
+            // below that rank and is expanded to `bin_shape` once: the rank-0
+            // total, and each width vector reshaped to `[1, .., bins_d, .., 1]`.
+            // Never expand a tensor that is already `bin_shape`: `expand_rhs`
+            // appends axes, giving `bin_shape ++ bin_shape`.
             let axes = (0..bin_shape.len()).collect::<Vec<_>>();
             let total = histogram.sum(axes).expand_rhs(bin_shape.clone());
-            let mut volume = self
-                .scalar_like(histogram, 1.0)
-                .expand_rhs(bin_shape.clone());
+            histogram /= total;
             for (dimension, edge) in edges.iter().enumerate() {
                 let bins = bin_shape[dimension];
                 let widths = edge
@@ -719,9 +728,8 @@ impl Translator<'_> {
                 let mut width_shape = vec![IntExpr::from(1); edges.len()];
                 width_shape[dimension] = bins;
                 let widths = util::reshape_tensor(widths, &width_shape).expand(bin_shape.clone());
-                volume *= widths;
+                histogram /= widths;
             }
-            histogram = histogram / total / volume;
         }
         Ok(histogram)
     }
@@ -1415,6 +1423,87 @@ mod tests {
                 ("hist", I64, vec![4]),
             ],
             &["x", "edges"],
+            &["hist"],
+        ));
+    }
+
+    /// `density=True` normalises a `bin_shape` histogram by the total and by
+    /// each axis' bin widths; every divisor must reach `bin_shape` exactly
+    /// (a second `expand_rhs` of an already-`bin_shape` tensor used to panic
+    /// in the frontend with "Dims must match to multiply tensors").
+    #[test]
+    fn histogram_density_records() {
+        assert!(translates(
+            vec![node(
+                "torch.ops.aten.histogram.bin_ct",
+                vec![
+                    input("self", tensor_arg("x")),
+                    scalar_int("bins", 4),
+                    scalar_bool("density", true),
+                ],
+                &["hist", "bin_edges"],
+            )],
+            &[
+                ("x", F32, vec![7]),
+                ("hist", F32, vec![4]),
+                ("bin_edges", F32, vec![5]),
+            ],
+            &["x"],
+            &["hist", "bin_edges"],
+        ));
+        assert!(translates(
+            vec![node(
+                "torch.ops.aten.histogram.bins_tensor",
+                vec![
+                    input("self", tensor_arg("x")),
+                    input("bins", tensor_arg("edges")),
+                    input("weight", tensor_arg("w")),
+                    scalar_bool("density", true),
+                ],
+                &["hist"],
+            )],
+            &[
+                ("x", F32, vec![6]),
+                ("edges", F32, vec![5]),
+                ("w", F32, vec![6]),
+                ("hist", F32, vec![4]),
+            ],
+            &["x", "edges", "w"],
+            &["hist"],
+        ));
+        assert!(translates(
+            vec![node(
+                "torch.ops.aten._histogramdd_from_bin_cts.default",
+                vec![
+                    input("self", tensor_arg("x")),
+                    ints("bins", &[3, 4]),
+                    scalar_bool("density", true),
+                ],
+                &["hist"],
+            )],
+            &[("x", F32, vec![8, 2]), ("hist", F32, vec![3, 4])],
+            &["x"],
+            &["hist"],
+        ));
+        assert!(translates(
+            vec![node(
+                "torch.ops.aten._histogramdd_from_bin_tensors.default",
+                vec![
+                    input("self", tensor_arg("x")),
+                    input("bins", tensors_arg(&["e0", "e1"])),
+                    input("weight", tensor_arg("w")),
+                    scalar_bool("density", true),
+                ],
+                &["hist"],
+            )],
+            &[
+                ("x", F32, vec![8, 2]),
+                ("e0", F32, vec![4]),
+                ("e1", F32, vec![5]),
+                ("w", F32, vec![8]),
+                ("hist", F32, vec![3, 4]),
+            ],
+            &["x", "e0", "e1", "w"],
             &["hist"],
         ));
     }
