@@ -210,7 +210,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "IEEE signed-zero / NaN semantics are not reproduced by the reference lowering"
         ),
         tests=(
-            "test_binary.py::test_copysign_fmax_fmin_nan_and_zero_signs",
             "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row",
             "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row_bf16_4d",
         ),
