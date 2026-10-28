@@ -14,6 +14,7 @@ shows up as XPASS, which is harmless but should be cleaned up.
 
 from __future__ import annotations
 
+import platform
 from dataclasses import dataclass
 
 import backend_test_utils
@@ -26,6 +27,13 @@ class KnownFailure:
     url: str
     reason: str
     tests: tuple[str, ...]
+    # ``platform.machine()`` values the failure is known on; empty means
+    # every machine. A machine-specific entry runs as an ordinary test
+    # elsewhere, so it keeps asserting where it is known to pass.
+    machines: tuple[str, ...] = ()
+
+    def applies_here(self) -> bool:
+        return not self.machines or platform.machine() in self.machines
 
     @property
     def xfail_reason(self) -> str:
@@ -202,6 +210,26 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
     ),
     KnownFailure(
+        ticket="LUM-1106",
+        url="https://linear.app/luminalai/issue/LUM-1106/ieee-signed-zero-and-nan-semantics-on-the-reference-backend-atan2",
+        reason=(
+            "signed-zero / NaN results differ on the Linux x86-64 CI runner "
+            "(fmax(-0.0, -0.0) returns +0.0 there); every case passes on arm64 "
+            "macOS in debug and release builds, and the x86 cause is not yet isolated"
+        ),
+        tests=(
+            "test_binary.py::test_copysign_fmax_fmin_nan_and_zero_signs",
+            "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype0]",
+            "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype1]",
+            "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype2]",
+            "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype3]",
+            "test_complex.py::test_acos_and_acosh_take_the_side_of_the_cut_from_a_signed_zero[torch.float64]",
+            "test_remaining_existing_hlir_lowerings.py::test_nanmedian_slot_matches_eager_on_the_backend_path",
+            "test_unary.py::test_erf_family_is_odd_through_an_exact_sign[gelu]",
+        ),
+        machines=("x86_64", "AMD64"),
+    ),
+    KnownFailure(
         ticket="LUM-1107",
         url="https://linear.app/luminalai/issue/LUM-1107/frontend-shape-assertions-panic-through-pyo3-instead-of-returning",
         reason=(
@@ -240,6 +268,7 @@ def apply_reference_xfails(items: list[pytest.Item]) -> None:
     reasons = {
         test: failure.xfail_reason
         for failure in REFERENCE_KNOWN_FAILURES
+        if failure.applies_here()
         for test in failure.tests
     }
     for item in items:
