@@ -74,8 +74,9 @@ policies, not claims of bitwise equivalence.
 
 Bias has the vendor's row length and packed storage. The rank-two rules
 transpose a complete expression to implement normal feature bias. C is added
-before bias and activation; reversing floating operands or crossing casts does
-not authorize another fused expression. TF32, FP8, mixed A/B storage, narrow
+before bias and activation. Existing core addition commutativity remains
+available; floating reassociation or crossing casts does not authorize another
+fused expression. TF32, FP8, mixed A/B storage, narrow
 outputs, and arbitrary alpha/beta values have no approved configurations.
 
 ## Element strides and strided batches
@@ -101,7 +102,7 @@ last touched element is insufficient. A singleton batch may choose its
 canonical padded pitch from Any. Live zero/broadcast strides, overlapping
 batches, negative strides, and unproved geometry cannot become matrix readings.
 
-Batched admission currently covers a product and ordered product+C, without
+Batched admission currently covers a product and product+C, without
 bias or activation. C and D share shape, dtype, order and count but may have
 independent leading dimensions and batch strides. In-place emission additionally
 requires identical complete descriptions and layouts. Multiple batch axes and
@@ -162,15 +163,15 @@ is recorded separately in the recovery bundle.
 Restored-source validation on the A100 passes all 672 separate-destination and
 336 in-place configuration executions, 288 batched dispatch witnesses, dynamic
 batch-count replay, precision boundaries, bounds checks, and storage-tie repair.
-The CPU admission suites pass, as do core, neural-network and reference-runtime
-tests. `cargo fmt --all -- --check` and device-enabled CUDA Lite Clippy with
-`-D warnings` pass.
-
-The broader test-runtime run reports
-`buf_attack_a2_cert_sched::a2_double_view_roundtrip`: it expects zero elected
-view nodes, but the restored vocabulary elects three. The same test passes on
-the pre-recovery foundation `6ebdf881`. This remains an open extraction/test
-expectation issue; the recovery does not claim a green full landing suite.
+The CPU admission suites pass, as do core, neural-network, reference-runtime,
+CUDA Lite and test-runtime suites. The transpose-roundtrip regression evaluates
+the elected vendor descriptors over the original input storage and compares the
+folded output layout against an independent dense product. It retains zero-copy
+and caller-ownership checks; complete expression transposition may validly add
+folded views. Batch regressions also cover false batch coordinates at equal
+extents, independent C/D pitches, cast boundaries, and C reuse/copy repair across
+all batches. `cargo fmt --all -- --check` and device-enabled CUDA Lite and
+test-runtime Clippy with `-D warnings` pass.
 
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its

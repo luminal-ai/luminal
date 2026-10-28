@@ -263,6 +263,138 @@ fn matrix_readings_require_disjoint_full_padded_batches() {
 }
 
 #[test]
+fn matching_extents_do_not_allow_a_matrix_axis_to_replace_the_batch_coordinate() {
+    let matchers: Vec<_> = luminal_cuda_lite::cuda_registry()
+        .into_iter()
+        .map(|row| row.matcher)
+        .collect();
+    let program = luminal::egglog_snippet::assembled_program_for(&matchers);
+    for replace_a in [false, true] {
+        for coordinate in 0..4 {
+            let a_coordinate = if replace_a { coordinate } else { 3 };
+            let b_coordinate = if replace_a { 3 } else { coordinate };
+            let mut egraph = luminal::egglog_snippet::new_egraph();
+            let check = "(check (cublaslt-strided-batch-product result a b (IntLit 2) (IntLit 2) (IntLit 2) (IntLit 2)))";
+            let check = if coordinate == 3 {
+                check.to_owned()
+            } else {
+                format!("(fail {check})")
+            };
+            let source = format!(
+                r#"
+(let shape (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 2) (IntExprCons (IntLit 2) (IntExprNil))))))
+(let domain (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 2) (IntExprCons (IntLit 2) (IntExprCons (IntLit 2) (IntExprNil)))))))
+(let a (LogicalTensorInputLit (LogicalIdLit "a") shape (F32)))
+(let b (LogicalTensorInputLit (LogicalIdLit "b") shape (F32)))
+(let av (LogicalIndexMapApply a (IndexMapLit
+ (IntExprCons (CoordVar domain {a_coordinate}) (IntExprCons (CoordVar domain 2)
+  (IntExprCons (CoordVar domain 0) (IntExprNil)))) shape) domain))
+(let bv (LogicalIndexMapApply b (IndexMapLit
+ (IntExprCons (CoordVar domain {b_coordinate}) (IntExprCons (CoordVar domain 0)
+  (IntExprCons (CoordVar domain 1) (IntExprNil)))) shape) domain))
+(let result (LogicalReduceSum (LogicalMul av bv) 0))
+{}
+{check}
+"#,
+                luminal_cuda_lite::CudaBindings::SCHEDULE
+            );
+            egraph
+                .parse_and_run_program(None, &format!("{program}\n{source}"))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn batched_c_and_d_descriptor_pitches_are_proved_independently() {
+    use luminal_cuda_lite::bindings::BoundaryLayout;
+    let mut model = Graph::new();
+    let a = model.tensor([2, 3, 4], DType::F32);
+    let b = model.tensor([2, 4, 5], DType::F32);
+    let c = model.tensor([2, 3, 5], DType::F32);
+    let output = a.matmul(b) + c;
+    let mut bindings = luminal_cuda_lite::CudaBindings::new();
+    bindings.input(a.id);
+    bindings.input(b.id);
+    bindings.input_with(c.id, BoundaryLayout::strided_literal([32, 8, 1]));
+    bindings.output_with(output.id, BoundaryLayout::strided_literal([24, 5, 1]));
+    let runtime =
+        CudaRuntime::load_with(&model, bindings, luminal_cuda_lite::cuda_registry()).unwrap();
+    let (separate, in_place) = calls(&runtime.saturated_egraph(&Default::default()).unwrap());
+    let witnesses: Vec<_> = separate
+        .iter()
+        .filter_map(|op| {
+            let call = op.resolve(&Default::default());
+            let c = call.c?;
+            (c.descriptor.order == LtOrder::Row
+                && c.descriptor.ld == 8
+                && c.descriptor.batch_stride_in_elements == 32
+                && call.d.order == LtOrder::Row
+                && call.d.ld == 5
+                && call.d.batch_stride_in_elements == 24)
+                .then_some(call)
+        })
+        .collect();
+    assert!(
+        !witnesses.is_empty(),
+        "native padded C and D stay independently described"
+    );
+    for call in witnesses {
+        assert_eq!(call.c.unwrap().descriptor.batch_count, 2);
+        assert_eq!(call.d.batch_count, 2);
+        call.validate_against(&[24, 40, 53], 39).unwrap();
+        assert!(call.validate_against(&[24, 40, 52], 39).is_err());
+        assert!(call.validate_against(&[24, 40, 53], 38).is_err());
+    }
+    // Search may materialize C into another layout to enable accumulation;
+    // every such in-place candidate must still prove one identical descriptor.
+    assert!(!in_place.is_empty());
+    for op in in_place {
+        let call = op.resolve(&Default::default());
+        assert_eq!(call.c.unwrap().descriptor, call.d);
+    }
+}
+
+#[test]
+fn batched_c_keeps_cast_boundaries_and_floating_addition_order() {
+    for case in 0..4 {
+        let mut model = Graph::new();
+        let a = model.tensor([2, 3, 4], DType::F32);
+        let b = model.tensor([2, 4, 5], DType::F32);
+        let c = model.tensor([2, 3, 5], if case == 3 { DType::Bf16 } else { DType::F32 });
+        let product = a.matmul(b);
+        let _output = match case {
+            0 => product + c,
+            1 => c + product,
+            2 => product.cast(DType::Bf16).cast(DType::F32) + c,
+            3 => product + c.cast(DType::F32),
+            _ => unreachable!(),
+        };
+        let (separate, in_place) = calls(&saturate(&model, WHITELIST));
+        let accumulating: Vec<_> = separate.iter().filter(|op| op.c.is_some()).collect();
+        // Core already equates the two operands of an addition. The backend
+        // consumes that equality, but cannot cross a narrowing of the product.
+        assert_eq!(
+            !accumulating.is_empty(),
+            matches!(case, 0 | 1 | 3),
+            "case {case}"
+        );
+        assert_eq!(
+            !in_place.is_empty(),
+            matches!(case, 0 | 1 | 3),
+            "case {case}"
+        );
+        for op in accumulating {
+            assert_eq!(
+                op.c.as_ref().unwrap().dtype,
+                PlanDtype::F32,
+                "C widening remains materialized rather than reading narrow storage"
+            );
+        }
+    }
+}
+
+#[test]
 fn bounds_checks_include_every_batch_and_detect_overflow() {
     let mut descriptor = LtDesc::row(3, 4, 8);
     descriptor.batch_count = 3;

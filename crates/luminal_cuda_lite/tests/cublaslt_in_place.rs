@@ -156,36 +156,105 @@ fn repeated_a_fixture() -> Fixture {
         expected,
     }
 }
+
+fn batched_fixture(access: Access, keep_c: bool, shared_pitch: bool) -> Fixture {
+    let mut graph = Graph::new();
+    let a = graph.tensor([2, 3, 8], DType::F32);
+    let b = graph.tensor([2, 8, 4], DType::F32);
+    let c = graph.tensor([2, 3, 4], DType::F32);
+    let out = a.matmul(b) + c;
+    let mut bindings = CudaBindings::new();
+    bindings.input(a.id);
+    bindings.input(b.id);
+    let layout = BoundaryLayout::strided_literal([40, 8, 1]);
+    let c_buffer = bindings.input_with(c.id, layout.clone());
+    bindings.declare(c_buffer, access, FreedBy::Caller);
+    bindings.output_with(
+        out.id,
+        if shared_pitch {
+            layout
+        } else {
+            BoundaryLayout::strided_literal([24, 4, 1])
+        },
+    );
+    if keep_c {
+        bindings.output(c.id);
+    }
+    let av: Vec<_> = (0..48).map(|i| (i as f32 - 20.0) / 8.0).collect();
+    let bv: Vec<_> = (0..64)
+        .map(|i| ((i * 7 % 23) as f32 - 11.0) / 4.0)
+        .collect();
+    let mut cv = vec![777.0; 60];
+    let mut c_values = Vec::new();
+    let mut expected = Vec::new();
+    for batch in 0..2 {
+        for row in 0..3 {
+            for col in 0..4 {
+                let c_value = (batch * 12 + row * 4 + col) as f32 / 8.0;
+                cv[batch * 40 + row * 8 + col] = c_value;
+                c_values.push(c_value);
+                expected.push(
+                    (0..8)
+                        .map(|inner| {
+                            f64::from(av[batch * 24 + row * 8 + inner])
+                                * f64::from(bv[batch * 32 + inner * 4 + col])
+                        })
+                        .sum::<f64>() as f32
+                        + c_value,
+                );
+            }
+        }
+    }
+    Fixture {
+        graph,
+        bindings,
+        inputs: vec![(a.id, av), (b.id, bv), (c.id, cv)],
+        c_buffer,
+        c_values,
+        expected,
+    }
+}
+
 fn plan(fixture: &Fixture) -> CudaPlan {
-    // Exercise the new matcher on its own. Generic views/copies remain; an
-    // independent C/D call or decomposed add/reduce cannot hide a broken tie.
-    let registry = luminal_cuda_lite::cuda_registry_filtered(|row| {
-        !matches!(
-            row.label(),
-            "CublasLtCall" | "AddFunctionalGeneric" | "ReduceSumGeneric"
-        )
-    });
+    plan_with_form(fixture, true)
+}
+
+fn plan_with_form(fixture: &Fixture, in_place: bool) -> CudaPlan {
+    // Exercise one executable form at a time. Generic views/copies remain;
+    // decomposed add/reduce cannot hide a missing call or a broken storage tie.
+    let allowed = |label: &str| {
+        !matches!(label, "AddFunctionalGeneric" | "ReduceSumGeneric")
+            && label
+                != if in_place {
+                    "CublasLtCall"
+                } else {
+                    "CublasLtAccumulateInPlace"
+                }
+    };
+    let registry = luminal_cuda_lite::cuda_registry_filtered(|row| allowed(row.label()));
     let runtime =
         CudaRuntime::load_with(&fixture.graph, fixture.bindings.clone(), registry).unwrap();
     let graph = runtime.saturated_egraph(&Default::default()).unwrap();
-    let matchers: Vec<_> = luminal_cuda_lite::cuda_registry_filtered(|row| {
-        !matches!(
-            row.label(),
-            "CublasLtCall" | "AddFunctionalGeneric" | "ReduceSumGeneric"
-        )
-    })
-    .into_iter()
-    .map(|row| row.matcher)
-    .collect();
+    let matchers: Vec<_> = luminal_cuda_lite::cuda_registry_filtered(|row| allowed(row.label()))
+        .into_iter()
+        .map(|row| row.matcher)
+        .collect();
     let genome = luminal_cuda_lite::ops::cublaslt::election::genome_preferring(
         &graph,
         &matchers,
-        &[CONSTRUCTOR, "LayoutTensorOpIndexMapApplyViewGeneric"],
+        &[
+            if in_place {
+                CONSTRUCTOR
+            } else {
+                luminal_cuda_lite::ops::cublaslt::approved::CONSTRUCTOR
+            },
+            "LayoutTensorOpIndexMapApplyViewGeneric",
+        ],
     );
     let extracted =
         luminal::extraction::extract_layout_ir_with_genome_and_matchers(&graph, &genome, &matchers)
             .unwrap()
-            .expect("the accumulating form must extract");
+            .expect("the selected complete cuBLASLt form must extract");
     let dps = luminal::dps::dps_rewrite(&extracted);
     let decoders = luminal::egglog_snippet::decoder_registry_for(&matchers).unwrap();
     let view = luminal::egglog_utils::eclass::EGraphView::new(&graph, &decoders);
@@ -197,6 +266,76 @@ fn plan(fixture: &Fixture) -> CudaPlan {
     )
     .unwrap();
     luminal::bufferize::bufferize(&dps, &layouts).unwrap()
+}
+
+#[test]
+fn batched_c_reuse_and_repair_preserve_every_batch_and_the_storage_tie() {
+    for (access, keep_c, reuse) in [
+        (Access::ReadWrite, false, true),
+        (Access::ReadOnly, false, false),
+        (Access::ReadWrite, true, false),
+    ] {
+        let fixture = batched_fixture(access, keep_c, true);
+        let plan = plan(&fixture);
+        let c_buffer = &plan
+            .buffers
+            .values()
+            .find(|buffer| buffer.lit == Some(fixture.c_buffer))
+            .unwrap()
+            .id;
+        let mut count = 0;
+        for node in plan.dag.node_weights() {
+            let BufferNode::Compute {
+                op,
+                reads,
+                writes,
+                ties,
+                operand_info,
+                result_info,
+            } = node
+            else {
+                continue;
+            };
+            let Some(op) = op.as_any().downcast_ref::<CublasLtAccumulateInPlace>() else {
+                continue;
+            };
+            count += 1;
+            let call = op.resolve(&Default::default());
+            assert_eq!(call.d.batch_count, 2);
+            assert_eq!(call.c.unwrap().descriptor, call.d);
+            assert_eq!(ties, &[(2, 0)]);
+            assert_eq!(reads[2], writes[0]);
+            assert_eq!(&reads[2] == c_buffer, reuse);
+            for batch in 0..2 {
+                for row in 0..3 {
+                    for col in 0..4 {
+                        let expected = batch * call.d.batch_stride_in_elements as usize
+                            + row * call.d.ld as usize
+                            + col;
+                        assert_eq!(
+                            operand_info[2]
+                                .layout
+                                .element_index(&[batch, row, col])
+                                .unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            result_info[0]
+                                .layout
+                                .element_index(&[batch, row, col])
+                                .unwrap(),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 1);
+        if !reuse {
+            assert!(plan.dag.node_weights().any(|node| matches!(node,
+                BufferNode::BufferCopy {src,..} | BufferNode::BufferCopyValue {src,..} if src == c_buffer)));
+        }
+    }
 }
 
 #[test]
@@ -324,8 +463,12 @@ fn reading_a_through_the_c_operand_requires_copying_before_mutation() {
 }
 #[cfg(feature = "device")]
 fn execute_fixture(fixture: Fixture, keep_c: bool) {
+    execute_fixture_with_form(fixture, keep_c, true);
+}
+#[cfg(feature = "device")]
+fn execute_fixture_with_form(fixture: Fixture, keep_c: bool, in_place: bool) {
     use support::Allocation;
-    let plan = plan(&fixture);
+    let plan = plan_with_form(&fixture, in_place);
     let device = luminal_cuda_lite::device::CudaDevice::new(0).unwrap();
     let mut executable = device.executable();
     executable
@@ -365,7 +508,7 @@ fn execute_fixture(fixture: Fixture, keep_c: bool) {
     assert_eq!(
         luminal_cuda_lite::layouts::dense_f32(&data.as_f32().unwrap(), &binding.layout).unwrap(),
         fixture.expected,
-        "required in-place execution semantics"
+        "complete cuBLASLt execution semantics"
     );
     if keep_c {
         let (data, binding) = outputs.remove(&1).unwrap();
@@ -374,6 +517,20 @@ fn execute_fixture(fixture: Fixture, keep_c: bool) {
                 .unwrap(),
             fixture.c_values.clone()
         );
+    }
+}
+
+#[cfg(feature = "device")]
+#[test]
+fn batched_c_replays_through_separate_repaired_and_reused_destinations() {
+    for in_place in [false, true] {
+        for (access, keep_c) in [
+            (Access::ReadWrite, false),
+            (Access::ReadOnly, false),
+            (Access::ReadWrite, true),
+        ] {
+            execute_fixture_with_form(batched_fixture(access, keep_c, in_place), keep_c, in_place);
+        }
     }
 }
 #[cfg(feature = "device")]
