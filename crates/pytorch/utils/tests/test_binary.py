@@ -340,7 +340,7 @@ def _compile_real(module: torch.nn.Module):
     )
 
 
-def _assert_same(actual, expected):
+def _assert_outputs_bitwise(actual, expected):
     actual = actual if isinstance(actual, (tuple, list)) else (actual,)
     expected = expected if isinstance(expected, (tuple, list)) else (expected,)
     assert len(actual) == len(expected)
@@ -384,8 +384,12 @@ class ScalarComparisons(torch.nn.Module):
 def test_comparisons_are_false_for_nan_except_not_equal(dtype):
     a = torch.tensor(NAN_LHS, dtype=dtype)
     b = torch.tensor(NAN_RHS, dtype=dtype)
-    _assert_same(_compile_real(TensorComparisons())(a, b), TensorComparisons()(a, b))
-    _assert_same(_compile_real(ScalarComparisons())(a), ScalarComparisons()(a))
+    _assert_outputs_bitwise(
+        _compile_real(TensorComparisons())(a, b), TensorComparisons()(a, b)
+    )
+    _assert_outputs_bitwise(
+        _compile_real(ScalarComparisons())(a), ScalarComparisons()(a)
+    )
 
 
 class MaximumMinimumBothOrders(torch.nn.Module):
@@ -403,7 +407,7 @@ def test_maximum_minimum_propagate_nan_from_either_operand(dtype):
     a = torch.tensor(NAN_LHS, dtype=dtype)
     b = torch.tensor(NAN_RHS, dtype=dtype)
     expected = MaximumMinimumBothOrders()(a, b)
-    _assert_same(_compile_real(MaximumMinimumBothOrders())(a, b), expected)
+    _assert_outputs_bitwise(_compile_real(MaximumMinimumBothOrders())(a, b), expected)
 
 
 class ClampWithNan(torch.nn.Module):
@@ -426,7 +430,9 @@ def test_clamp_propagates_nan_bounds_and_nan_inputs():
     bound = torch.tensor([0.0, NAN, 0.0, NAN, 0.0, NAN, 0.0])
     nan_scalar = torch.tensor(NAN)
     expected = ClampWithNan()(x, bound, nan_scalar)
-    _assert_same(_compile_real(ClampWithNan())(x, bound, nan_scalar), expected)
+    _assert_outputs_bitwise(
+        _compile_real(ClampWithNan())(x, bound, nan_scalar), expected
+    )
 
 
 class AnyOfRows(torch.nn.Module):
@@ -436,7 +442,7 @@ class AnyOfRows(torch.nn.Module):
 
 def test_any_counts_nan_as_true():
     x = torch.tensor([[NAN, 0.0], [0.0, -0.0], [0.0, 1.0]])
-    _assert_same(_compile_real(AnyOfRows())(x), AnyOfRows()(x))
+    _assert_outputs_bitwise(_compile_real(AnyOfRows())(x), AnyOfRows()(x))
 
 
 class ThresholdNan(torch.nn.Module):
@@ -449,4 +455,4 @@ class ThresholdNan(torch.nn.Module):
 
 def test_threshold_keeps_nan_input_and_ignores_nan_threshold():
     x = torch.tensor([NAN, -INF, 0.0, 0.5, 1.0, INF])
-    _assert_same(_compile_real(ThresholdNan())(x), ThresholdNan()(x))
+    _assert_outputs_bitwise(_compile_real(ThresholdNan())(x), ThresholdNan()(x))
