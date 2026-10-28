@@ -2390,6 +2390,107 @@ def test_sdpa_f32_unaffected_by_upcast(device: torch.device):
     )
 
 
+# ---- SDPA tuple slots ------------------------------------------------------
+#
+# The fused SDPA variants return tuples (output, logsumexp, RNG state, ...).
+# In default grad mode AOTAutograd's forward graph returns the
+# saved-for-backward slots as graph outputs, so translate_sdpa binds every
+# slot the variant's schema declares.
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_sdpa_grad_mode_compile_binds_saved_slots(
+    is_causal: bool, device: torch.device
+):
+    """A parameterised model in default grad mode: the forward graph also
+    returns SDPA's logsumexp, which must be produced for the compile to
+    succeed. The forward output matches eager."""
+    from test_models import SdpaProjectedModel
+
+    torch.manual_seed(0)
+    model = SdpaProjectedModel(is_causal=is_causal).to(device)
+    x = torch.randn(1, 8, 16, device=device)
+    assert torch.is_grad_enabled()
+    expected = model(x)
+    actual = torch.compile(model, backend=luminal_backend)(x)
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    assert torch.allclose(actual.detach(), expected.detach(), atol=1e-5), (
+        f"max_diff={(actual - expected).abs().max().item():.2e}"
+    )
+
+
+@pytest.mark.parametrize(
+    "is_causal,mask,dtype",
+    [
+        (False, "none", torch.float32),
+        (True, "none", torch.float32),
+        (False, "float", torch.float32),
+        (False, "bool", torch.float32),
+        (True, "float", torch.float32),
+        (False, "float", torch.float64),
+        (False, "none", torch.bfloat16),
+    ],
+    ids=[
+        "plain",
+        "causal",
+        "float_mask",
+        "bool_mask",
+        "causal_float_mask",
+        "f64",
+        "bf16",
+    ],
+)
+def test_sdpa_fused_cpu_logsumexp_matches_eager(
+    is_causal: bool, mask: str, dtype: torch.dtype, device: torch.device
+):
+    """`_scaled_dot_product_flash_attention_for_cpu` returns (output,
+    logsumexp); the logsumexp is the real per-row value over the scaled,
+    masked scores, at torch's computation dtype (F32 for bf16)."""
+    if device.type != "cpu":
+        pytest.skip("_scaled_dot_product_flash_attention_for_cpu is the CPU kernel")
+    from test_models import SdpaFusedCpuLogsumexpModel
+
+    g = torch.Generator().manual_seed(0)
+    q = torch.randn(2, 4, 5, 8, generator=g).to(dtype)
+    k = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
+    v = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
+    if mask == "bool":
+        # Every query row keeps at least one key (a fully masked row is LUM-1106).
+        keep = torch.rand(5, 6, generator=g) > 0.4
+        keep[:, 0] = True
+        mask_input = keep
+    else:
+        mask_input = (torch.randn(5, 6, generator=g) * 2.0).to(dtype)
+        mask_input[1, 2] = float("-inf")
+    model = SdpaFusedCpuLogsumexpModel(is_causal=is_causal, mask=mask)
+    expected_out, expected_lse = model(q, k, v, mask_input)
+    actual_out, actual_lse = torch.compile(model, backend=luminal_backend)(
+        q, k, v, mask_input
+    )
+    assert actual_lse.dtype == expected_lse.dtype
+    assert actual_lse.shape == expected_lse.shape == (2, 4, 5)
+    assert actual_out.dtype == expected_out.dtype
+    if dtype == torch.bfloat16:
+        # torch's bf16 CPU kernel uses a fast vectorised exp (~5e-5 off the
+        # exact logsumexp); bound luminal by the fp64 reference instead, as
+        # _assert_sdpa_parity does for the output.
+        ref_lse = model(q.double(), k.double(), v.double(), mask_input)[1]
+        err_eager = (expected_lse.double() - ref_lse).abs().max().item()
+        err_luminal = (actual_lse.double() - ref_lse).abs().max().item()
+        assert err_luminal <= 3.0 * err_eager + 1e-6, (
+            f"logsumexp error {err_luminal:.2e} vs fp64 exceeds 3x torch's {err_eager:.2e}"
+        )
+        out_atol = 1e-2
+    else:
+        assert torch.allclose(actual_lse, expected_lse, atol=1e-5), (
+            f"logsumexp max_diff={(actual_lse - expected_lse).abs().max().item():.2e}"
+        )
+        out_atol = 1e-5
+    assert torch.allclose(actual_out.double(), expected_out.double(), atol=out_atol), (
+        f"output max_diff={(actual_out.double() - expected_out.double()).abs().max().item():.2e}"
+    )
+
+
 # ---- mixed-dtype operand unification ---------------------------------------
 
 
