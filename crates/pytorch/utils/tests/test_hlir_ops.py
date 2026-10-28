@@ -2393,6 +2393,160 @@ def test_sdpa_bool_mask_fully_masked_row_bf16_4d(device: torch.device):
     )
 
 
+# Tolerances against eager on the rows that admit a key, per dtype.
+_MASKED_ROW_ATOL = {
+    torch.float32: 1e-5,
+    torch.float64: 1e-10,
+    torch.bfloat16: 1e-2,
+    torch.float16: 1e-2,
+}
+
+
+@pytest.mark.parametrize(
+    "dtype,rank",
+    [
+        (torch.float32, 2),
+        (torch.float64, 2),
+        (torch.bfloat16, 4),
+        (torch.float16, 4),
+    ],
+    ids=["f32_2d", "f64_2d", "bf16_4d", "f16_4d"],
+)
+def test_sdpa_float_mask_fully_masked_row(
+    dtype: torch.dtype, rank: int, device: torch.device
+):
+    """A float `attn_mask` whose row is all -inf admits no key, and that row
+    is exactly zero (torch CPU-kernel semantics), never NaN: `exp(s - max)`
+    is `exp(-inf - -inf)` there. torch.compile also hands a bool mask to
+    the lowering in this form (`where(mask, 0, -inf)`)."""
+    from test_models import SdpaWithBiasModel
+
+    model: torch.nn.Module = SdpaWithBiasModel().to(device)
+    q, k, v = (t.to(dtype) for t in _sdpa_qkv(device))
+    s_q, s_k = q.shape[-2], k.shape[-2]
+    bias = torch.zeros(s_q, s_k, dtype=dtype, device=device)
+    bias[1, :] = float("-inf")  # query row 1 admits no key
+    bias[2, 0] = float("-inf")  # query row 2 admits three
+    if rank == 4:
+        bias = bias.reshape(1, 1, s_q, s_k)
+    with torch.no_grad():
+        expected: torch.Tensor = model(q, k, v, bias)
+        actual: torch.Tensor = torch.compile(model, backend=luminal_backend)(
+            q, k, v, bias
+        )
+    assert actual.dtype == expected.dtype
+    assert not actual.isnan().any(), "a fully-masked row leaked NaN"
+    assert torch.all(actual[..., 1, :] == 0.0), (
+        f"fully-masked row must be zeros, got absmax "
+        f"{actual[..., 1, :].abs().max().item():.4f}"
+    )
+    if device.type == "cpu":
+        assert torch.equal(actual[..., 1, :], expected[..., 1, :])
+    defined = [0, 2, 3]
+    assert torch.allclose(
+        actual[..., defined, :].double(),
+        expected[..., defined, :].double(),
+        atol=_MASKED_ROW_ATOL[dtype],
+    ), (
+        f"max_diff="
+        f"{(actual[..., defined, :].double() - expected[..., defined, :].double()).abs().max().item():.2e}"
+    )
+
+
+@pytest.mark.parametrize(
+    "is_causal,mask,dtype",
+    [
+        (False, "float", torch.float32),
+        (False, "bool", torch.float32),
+        (True, "float", torch.float32),
+        (False, "float", torch.float64),
+        (False, "float", torch.bfloat16),
+        (True, "bool", torch.float16),
+    ],
+    ids=[
+        "float_mask",
+        "bool_mask",
+        "causal_float_mask",
+        "f64",
+        "bf16",
+        "f16_causal_bool",
+    ],
+)
+def test_sdpa_fused_cpu_masked_rows_match_eager(
+    is_causal: bool, mask: str, dtype: torch.dtype, device: torch.device
+):
+    """`_scaled_dot_product_flash_attention_for_cpu` on query rows that admit
+    no key returns output 0 and logsumexp 0, as eager does; every other row
+    matches eager. With `is_causal`, a row whose mask admits only keys above
+    the diagonal admits none: the causal mask excludes keys exactly as the
+    mask does (a finite causal offset would average V instead)."""
+    if device.type != "cpu":
+        pytest.skip("_scaled_dot_product_flash_attention_for_cpu is the CPU kernel")
+    from test_models import SdpaFusedCpuLogsumexpModel
+
+    g = torch.Generator().manual_seed(0)
+    q = torch.randn(2, 4, 5, 8, generator=g).to(dtype)
+    k = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
+    v = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
+    empty = [3]
+    if mask == "bool":
+        keep = torch.rand(5, 6, generator=g) > 0.4
+        keep[:, 0] = True
+        keep[3, :] = False
+        if is_causal:
+            keep[0, 0] = False  # row 0 keeps only keys the causal mask drops
+            empty = [0, 3]
+        mask_input = keep
+    else:
+        mask_input = (torch.randn(5, 6, generator=g) * 2.0).to(dtype)
+        mask_input[3, :] = float("-inf")
+        mask_input[1, 2] = float("-inf")
+        if is_causal:
+            mask_input[0, 0] = float("-inf")
+            empty = [0, 3]
+    model = SdpaFusedCpuLogsumexpModel(is_causal=is_causal, mask=mask)
+    with torch.no_grad():
+        expected_out, expected_lse = model(q, k, v, mask_input)
+        actual_out, actual_lse = torch.compile(model, backend=luminal_backend)(
+            q, k, v, mask_input
+        )
+    assert actual_out.dtype == expected_out.dtype
+    assert actual_lse.dtype == expected_lse.dtype
+    assert actual_lse.shape == expected_lse.shape == (2, 4, 5)
+    # The contract, as eager states it: zeros and logsumexp 0, no NaN.
+    assert torch.all(expected_out[..., empty, :] == 0.0)
+    assert torch.all(expected_lse[..., empty] == 0.0)
+    assert not actual_out.isnan().any() and not actual_lse.isnan().any()
+    assert torch.equal(actual_out[..., empty, :], expected_out[..., empty, :]), (
+        f"empty-row output absmax {actual_out[..., empty, :].abs().max().item():.4f}"
+    )
+    assert torch.equal(actual_lse[..., empty], expected_lse[..., empty]), (
+        f"empty-row logsumexp {actual_lse[..., empty].flatten()[:4].tolist()}"
+    )
+    defined = [row for row in range(5) if row not in empty]
+    # torch's half CPU kernel uses a fast vectorised exp (~5e-5 off the exact
+    # logsumexp); 1e-3 holds that, the output carries the dtype's rounding.
+    lse_atol = (
+        1e-3 if dtype in (torch.bfloat16, torch.float16) else _MASKED_ROW_ATOL[dtype]
+    )
+    assert torch.allclose(
+        actual_lse[..., defined].double(),
+        expected_lse[..., defined].double(),
+        atol=lse_atol,
+    ), (
+        f"logsumexp max_diff="
+        f"{(actual_lse[..., defined].double() - expected_lse[..., defined].double()).abs().max().item():.2e}"
+    )
+    assert torch.allclose(
+        actual_out[..., defined, :].double(),
+        expected_out[..., defined, :].double(),
+        atol=_MASKED_ROW_ATOL[dtype],
+    ), (
+        f"output max_diff="
+        f"{(actual_out[..., defined, :].double() - expected_out[..., defined, :].double()).abs().max().item():.2e}"
+    )
+
+
 def _gqa_qkv(device: torch.device, dtype: torch.dtype = torch.float32):
     """Q with 4 heads, K/V with 2 — the grouped-query head layout."""
     torch.manual_seed(0)
@@ -2506,7 +2660,8 @@ def test_sdpa_fused_cpu_logsumexp_matches_eager(
     k = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
     v = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
     if mask == "bool":
-        # Every query row keeps at least one key (a fully masked row is LUM-1106).
+        # Every query row keeps a key; test_sdpa_fused_cpu_masked_rows_match_eager
+        # covers the rows that keep none.
         keep = torch.rand(5, 6, generator=g) > 0.4
         keep[:, 0] = True
         mask_input = keep

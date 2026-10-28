@@ -2482,7 +2482,8 @@ class SdpaCausalModel(torch.nn.Module):
     """`F.scaled_dot_product_attention(q, k, v, is_causal=True)`.
 
     Tests the `is_causal` branch of `translate_sdpa`, which materializes a
-    triangular mask and adds `-1e9 * mask` to the pre-softmax scores.
+    triangular mask and selects `-inf` for the pre-softmax scores above the
+    diagonal.
     """
 
     def forward(

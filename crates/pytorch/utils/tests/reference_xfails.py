@@ -202,17 +202,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
     ),
     KnownFailure(
-        ticket="LUM-1106",
-        url="https://linear.app/luminalai/issue/LUM-1106/ieee-signed-zero-and-nan-semantics-on-the-reference-backend-atan2",
-        reason=(
-            "IEEE signed-zero / NaN semantics are not reproduced by the reference lowering"
-        ),
-        tests=(
-            "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row",
-            "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row_bf16_4d",
-        ),
-    ),
-    KnownFailure(
         ticket="LUM-1107",
         url="https://linear.app/luminalai/issue/LUM-1107/frontend-shape-assertions-panic-through-pyo3-instead-of-returning",
         reason=(

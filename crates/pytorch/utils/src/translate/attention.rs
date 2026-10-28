@@ -12,9 +12,9 @@
 //! translator's opmath pattern). Keep exponential weights and both
 //! contractions at that dtype; round only the original operator output.
 //! Normalization follows the value contraction;
-//! `is_causal` is a top-left iota mask; bool masks are keep-masks and
-//! fully-masked query rows output zeros; grouped K/V heads are
-//! repeat-interleaved (GQA).
+//! `is_causal` is a top-left iota mask; bool masks are keep-masks; a query
+//! row with no admissible key outputs zeros and logsumexp 0 (see
+//! [`RowStats`]); grouped K/V heads are repeat-interleaved (GQA).
 
 use anyhow::{Context, Result};
 use luminal::prelude::*;
@@ -174,17 +174,26 @@ fn insert_unit_axes(mut t: GraphTensor, declared: &[IntExpr]) -> Option<GraphTen
 
 /// The per-query-row statistics of the attention softmax, shared by the
 /// output and the logsumexp slot.
+///
+/// INVARIANT (empty rows): a key a mask excludes scores exactly `-inf`,
+/// so a query row admits no key exactly when its score max is `-inf`.
+/// Such a row follows torch's fused CPU kernel (`cpu_flash_attention`,
+/// and the math path's `_safe_softmax`): its softmax weights are 0, its
+/// max reads 0 and its denominator 1, so the output row is `0 @ V / 1`
+/// (zeros for finite V) and its logsumexp is `0 + ln 1 = 0`. Both values
+/// are native selects on the empty-row predicate, so every row with an
+/// admissible key keeps its statistics bit for bit. A plain softmax
+/// (`aten._softmax`) of an all `-inf` row stays NaN, as in eager; the
+/// zeroing belongs to attention only.
 #[derive(Clone, Copy)]
 struct RowStats {
-    /// `max_j s_ij` over the scaled, masked scores.
+    /// `max_j s_ij` over the scaled, masked scores; 0 for an empty row.
     max: GraphTensor,
-    /// `sum_j exp(s_ij - max)`, before fully-masked rows are zeroed.
+    /// `sum_j exp(s_ij - max)`; 1 for an empty row.
     denominator: GraphTensor,
-    /// Bool keep-mask only: 1.0 where the row keeps at least one key.
-    any_keep: Option<GraphTensor>,
 }
 
-/// Broadcast-add an additive offset (causal mask, attention bias) onto the
+/// Broadcast-add an additive offset (a float attention bias) onto the
 /// scores. Handles dtype promotion and rank extension: a `(S_q, S_k)` offset
 /// broadcasts across any batch/head prefix dims of `scores`.
 fn add_offset(scores: GraphTensor, offset: GraphTensor) -> GraphTensor {
@@ -318,34 +327,31 @@ impl Translator<'_> {
         let scale_const = self.constant_like(scores, scale);
         let mut scores = scores * scale_const;
 
+        // Masking: an inadmissible key's score is set to exactly -inf by a
+        // native select, never by a finite stand-in such as -1e9, so that
+        // `row_max == -inf` identifies the rows that admit no key (see
+        // [`RowStats`]). A finite offset would turn such a row into an
+        // average of V over the masked keys. A float mask is additive, as
+        // in torch; its -inf entries exclude keys the same way.
         if is_causal {
             let s_q = scores.dims()[q_ndim - 2];
             let s_k = scores.dims()[q_ndim - 1];
             let row = self.cx.arange(s_q).cast(DType::F32).expand_dim(1, s_k);
             let col = self.cx.arange(s_k).cast(DType::F32).expand_dim(0, s_q);
-            // 1.0 strictly above the diagonal (j > i = masked); -1e9 ~= -inf.
-            let masked = col.gt(row).cast(DType::F32);
-            let neg_inf = self.constant_like(masked, -1e9);
-            scores = add_offset(scores, masked * neg_inf);
+            // Top-left causal: key j is inadmissible for query i iff j > i.
+            let masked = col.gt(row);
+            let neg_inf = self.constant_like(scores, f64::NEG_INFINITY);
+            scores = self.select(masked, neg_inf, scores);
         }
-
-        // Bool masks: track per-row any-keep to zero fully-masked rows
-        // after softmax.
-        let mut row_any_keep: Option<GraphTensor> = None;
-        let mut any_keep: Option<GraphTensor> = None;
         if let Some(mask) = additive {
-            let offset = if mask.dtype == DType::Bool {
-                let keep = mask.cast(DType::F32);
-                let key_axis = keep.rank() - 1;
-                let rows = keep.max(vec![key_axis]);
-                any_keep = Some(rows);
-                row_any_keep = Some(rows.expand_to_shape_on_axes(keep.dims(), vec![key_axis]));
-                let one = self.cx.constant_f32(1.0).expand_rhs(keep.dims());
-                (one - keep) * self.constant_like(keep, -1e9)
+            scores = if mask.dtype == DType::Bool {
+                // A keep-mask: true admits the key.
+                let neg_inf = self.constant_like(scores, f64::NEG_INFINITY);
+                self.select(mask, scores, neg_inf)
             } else {
-                self.widen(mask)
+                let offset = self.widen(mask);
+                add_offset(scores, offset)
             };
-            scores = add_offset(scores, offset);
         }
 
         // Keep the stable softmax weights, denominator and value contraction
@@ -355,14 +361,18 @@ impl Translator<'_> {
         // bind_value restores the declared dtype at the operator boundary.
         let axis = q_ndim - 1;
         let row_max = scores.max(vec![axis]);
+        // IEEE `==`: a NaN max is not an empty row, so NaN still propagates.
+        let neg_inf = self.constant_like(row_max, f64::NEG_INFINITY);
+        let empty = row_max.eq(neg_inf);
+        let zero = self.constant_like(row_max, 0.0);
+        // An empty row subtracts 0, not -inf: exp(-inf - 0) = 0, where
+        // exp(-inf - -inf) would be NaN.
+        let row_max = self.select(empty, zero, row_max);
         let maximum = row_max.expand_to_shape_on_axes(scores.dims(), vec![axis]);
-        let mut weights = (scores - maximum).exp();
+        let weights = (scores - maximum).exp();
         let row_sum = weights.sum(vec![axis]);
-        if let Some(indicator) = row_any_keep {
-            let (a, i) = util::ensure_same_dtype(weights, indicator);
-            let (a, i) = util::broadcast_binary(a, i);
-            weights = a * i;
-        }
+        let one = self.constant_like(row_sum, 1.0);
+        let row_sum = self.select(empty, one, row_sum);
         let numerator = weights.matmul(value);
         let denominator = row_sum.expand_to_shape_on_axes(numerator.dims(), vec![axis]);
         let (numerator, denominator) = util::ensure_same_dtype(numerator, denominator);
@@ -371,7 +381,6 @@ impl Translator<'_> {
         let stats = RowStats {
             max: row_max,
             denominator: row_sum,
-            any_keep,
         };
         self.bind_sdpa_outputs(node, out, stats)
     }
@@ -447,12 +456,11 @@ impl Translator<'_> {
     /// The logsumexp slot: `max + ln(sum exp(s - max))`, built from the
     /// output's own row max and denominator, so it honours scale,
     /// `is_causal` and `attn_mask` exactly as the output does, in the
-    /// compute dtype. A bool-masked row that keeps no key outputs zeros and
-    /// its logsumexp is 0, as torch's CPU flash kernel returns for a row
-    /// with no admissible key (output 0, logsumexp 0). The rows are then
-    /// laid out as declared: padded to a rounded-up row extent with `pad`,
-    /// and given the declared unit axes. `None` when the declared shape is
-    /// not that layout.
+    /// compute dtype. A row with no admissible key has max 0 and
+    /// denominator 1 ([`RowStats`]), so its logsumexp is 0, as torch's CPU
+    /// flash kernel returns. The rows are then laid out as declared: padded
+    /// to a rounded-up row extent with `pad`, and given the declared unit
+    /// axes. `None` when the declared shape is not that layout.
     fn sdpa_logsumexp(
         &mut self,
         stats: RowStats,
@@ -465,10 +473,6 @@ impl Translator<'_> {
             return Some(self.full_tensor(declared.to_vec(), dtype, 0.0));
         }
         let mut lse = stats.max + stats.denominator.log();
-        if let Some(any_keep) = stats.any_keep {
-            let zero = self.constant_like(lse, 0.0);
-            lse = self.select(any_keep, lse, zero);
-        }
         if let Some(fill) = pad {
             let axis = lse.rank() - 1;
             let rows = lse.dims()[axis];
@@ -750,5 +754,223 @@ mod output_slot_tests {
             format!("{err:#}").contains("`logsumexp`"),
             "the refusal names the slot: {err:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod empty_row_tests {
+    //! A query row that admits no key outputs zeros and logsumexp 0, as
+    //! torch's CPU kernel returns (never NaN); every other row is the masked
+    //! softmax. Executed on the reference runtime against an f64 reference
+    //! of the same masked scores.
+    use luminal_reference::{ReferenceRuntime, TypedBuffer, harness_search_options};
+    use rustc_hash::FxHashMap;
+
+    use super::super::test_support::*;
+    use crate::dtype::TorchDType;
+
+    const H: usize = 2;
+    const SQ: usize = 3;
+    const SK: usize = 4;
+    const D: usize = 4;
+
+    enum Mask {
+        Float(Vec<f64>),
+        Bool(Vec<bool>),
+    }
+
+    /// Fixed, sign-mixed values.
+    fn values(len: usize, phase: f64) -> Vec<f64> {
+        (0..len)
+            .map(|i| ((i as f64 + phase) * 0.731).sin() * 1.5)
+            .collect()
+    }
+
+    /// Per (head, query row): the output row and the logsumexp, in f64.
+    fn reference(
+        q: &[f64],
+        k: &[f64],
+        v: &[f64],
+        mask: &Mask,
+        causal: bool,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let scale = 1.0 / (D as f64).sqrt();
+        let (mut out, mut lse) = (vec![0.0; H * SQ * D], vec![0.0; H * SQ]);
+        for h in 0..H {
+            for i in 0..SQ {
+                let scores: Vec<f64> = (0..SK)
+                    .map(|j| {
+                        let dot: f64 = (0..D)
+                            .map(|d| q[(h * SQ + i) * D + d] * k[(h * SK + j) * D + d])
+                            .sum();
+                        let causal_ok = !causal || j <= i;
+                        match mask {
+                            _ if !causal_ok => f64::NEG_INFINITY,
+                            Mask::Bool(keep) if !keep[i * SK + j] => f64::NEG_INFINITY,
+                            Mask::Bool(_) => dot * scale,
+                            Mask::Float(bias) => dot * scale + bias[i * SK + j],
+                        }
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                if max == f64::NEG_INFINITY {
+                    continue; // zeros, logsumexp 0
+                }
+                let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                let sum: f64 = weights.iter().sum();
+                lse[h * SQ + i] = max + sum.ln();
+                for d in 0..D {
+                    out[(h * SQ + i) * D + d] = (0..SK)
+                        .map(|j| weights[j] * v[(h * SK + j) * D + d])
+                        .sum::<f64>()
+                        / sum;
+                }
+            }
+        }
+        (out, lse)
+    }
+
+    /// Translate and execute one SDPA variant over q [1,H,SQ,D] and k/v
+    /// [1,H,SK,D]; returns each declared output, widened to f64.
+    fn run(variant: &str, dtype: TorchDType, mask: &Mask, causal: bool) -> Vec<Vec<f64>> {
+        let code = dtype.code();
+        let (q, k, v) = (
+            values(H * SQ * D, 0.0),
+            values(H * SK * D, 1.0),
+            values(H * SK * D, 2.0),
+        );
+        let buffer = |data: &[f64]| match dtype {
+            TorchDType::Double => TypedBuffer::F64(data.to_vec()),
+            _ => TypedBuffer::F32(data.iter().map(|&x| x as f32).collect()),
+        };
+        let (mask_code, mask_data) = match mask {
+            Mask::Float(bias) => (code, buffer(bias)),
+            Mask::Bool(keep) => (
+                BOOL,
+                TypedBuffer::Bool8(keep.iter().map(|&b| b as u8).collect()),
+            ),
+        };
+        let with_lse = variant.contains("for_cpu");
+        let outputs: &[&str] = if with_lse { &["out", "lse"] } else { &["out"] };
+        let t = translate_one(
+            node(
+                &format!("torch.ops.aten.{variant}"),
+                vec![
+                    tensor_input("query", "q"),
+                    tensor_input("key", "k"),
+                    tensor_input("value", "v"),
+                    tensor_input("attn_mask", "m"),
+                    scalar_float("dropout_p", 0.0),
+                    scalar_bool("is_causal", causal),
+                ],
+                outputs,
+            ),
+            &[
+                ("q", code, &[1, H as i64, SQ as i64, D as i64]),
+                ("k", code, &[1, H as i64, SK as i64, D as i64]),
+                ("v", code, &[1, H as i64, SK as i64, D as i64]),
+                ("m", mask_code, &[SQ as i64, SK as i64]),
+                ("out", code, &[1, H as i64, SQ as i64, D as i64]),
+                ("lse", code, &[1, H as i64, SQ as i64]),
+            ],
+            &["q", "k", "v", "m"],
+            outputs,
+        );
+        let values = vec![buffer(&q), buffer(&k), buffer(&v), mask_data];
+        let data: FxHashMap<_, _> = t
+            .inputs
+            .iter()
+            .zip(&values)
+            .map(|(input, value)| (input.tensor, value.clone()))
+            .collect();
+        let mut runtime = ReferenceRuntime::load(&t.graph).unwrap();
+        runtime
+            .search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &harness_search_options(),
+            )
+            .unwrap();
+        for (input, value) in t.inputs.iter().zip(values) {
+            runtime.set_data(input.tensor, value);
+        }
+        runtime.execute().unwrap();
+        t.outputs
+            .iter()
+            .map(|output| match dtype {
+                TorchDType::Double => runtime.get_f64(output.tensor).unwrap().clone(),
+                _ => runtime
+                    .get_f32(output.tensor)
+                    .unwrap()
+                    .iter()
+                    .map(|&x| x as f64)
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// `empty_rows` admit no key: they must be exactly 0 (output and
+    /// logsumexp); every other value is within `tol` of the f64 reference.
+    fn check(variant: &str, mask: Mask, causal: bool, empty_rows: &[usize]) {
+        let q = values(H * SQ * D, 0.0);
+        let (k, v) = (values(H * SK * D, 1.0), values(H * SK * D, 2.0));
+        let (want_out, want_lse) = reference(&q, &k, &v, &mask, causal);
+        for (dtype, tol) in [(TorchDType::Float, 1e-5), (TorchDType::Double, 1e-12)] {
+            let got = run(variant, dtype, &mask, causal);
+            let slots: Vec<(&str, &Vec<f64>, usize)> =
+                [("output", &want_out, D), ("logsumexp", &want_lse, 1)]
+                    .into_iter()
+                    .take(got.len())
+                    .collect();
+            for ((slot, want, width), got) in slots.into_iter().zip(&got) {
+                assert_eq!(got.len(), want.len(), "{variant} {dtype:?} {slot}: length");
+                for (index, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+                    let row = (index / width) % SQ;
+                    if empty_rows.contains(&row) {
+                        assert!(
+                            g == 0.0,
+                            "{variant} {dtype:?} {slot}[{index}]: an empty row must be 0, got {g}"
+                        );
+                    } else {
+                        assert!(
+                            (g - w).abs() <= tol,
+                            "{variant} {dtype:?} {slot}[{index}]: {g} vs reference {w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    const UNIFIED: &str = "scaled_dot_product_attention.default";
+    const FUSED_CPU: &str = "_scaled_dot_product_flash_attention_for_cpu.default";
+
+    #[test]
+    fn a_float_mask_row_of_negative_infinity_outputs_zeros() {
+        let mut bias = values(SQ * SK, 3.0);
+        bias[SK..2 * SK].fill(f64::NEG_INFINITY); // row 1 admits no key
+        bias[2 * SK + 1] = f64::NEG_INFINITY; // row 2 keeps three keys
+        for variant in [UNIFIED, FUSED_CPU] {
+            check(variant, Mask::Float(bias.clone()), false, &[1]);
+        }
+    }
+
+    #[test]
+    fn a_bool_keep_mask_row_of_false_outputs_zeros() {
+        let mut keep = vec![true; SQ * SK];
+        keep[..SK].fill(false); // row 0 admits no key
+        keep[2 * SK + 3] = false;
+        check(UNIFIED, Mask::Bool(keep), false, &[0]);
+    }
+
+    #[test]
+    fn causal_masking_empties_a_row_exactly_like_the_mask() {
+        // Row 0 admits only keys j >= 1 through the mask; the causal mask
+        // excludes j > 0, so no key is left. A finite causal offset would
+        // instead average V over keys 1..SK.
+        let mut bias = vec![0.0; SQ * SK];
+        bias[0] = f64::NEG_INFINITY;
+        check(FUSED_CPU, Mask::Float(bias), true, &[0]);
     }
 }

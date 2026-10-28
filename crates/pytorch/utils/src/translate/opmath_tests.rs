@@ -482,10 +482,18 @@ fn attention_reads_a_bool_mask_as_a_predicate() {
     );
     assert_eq!(t.outputs[0].dtype, DType::F16);
     assert!(
-        input_is_cast_to(&t, "m", DType::F32),
-        "the keep-mask is read"
+        consumers_of_input(&t, "m").into_iter().any(|id| {
+            is_op(op_of(&t, id), &LogicalOp::Select)
+                && is_input_named(op_of(&t, through_views(&t, operands(&t, id)[0])), "m")
+        }),
+        "the keep-mask is read as a select condition"
     );
-    assert!(!input_is_cast_to(&t, "m", DType::F16));
+    for dtype in [DType::F16, DType::F32] {
+        assert!(
+            !input_is_cast_to(&t, "m", dtype),
+            "the keep-mask is never an operand of the score arithmetic ({dtype:?})"
+        );
+    }
 }
 
 #[test]
@@ -569,7 +577,11 @@ fn attention_keeps_compute_precision_until_the_operator_output() {
                 .map(|id| through_views(&t, id))
                 .find(|&id| is_op(op_of(&t, id), &LogicalOp::Recip))
                 .expect("normalization follows the value contraction");
-            let denominator = through_views(&t, operands(&t, divisor)[0]);
+            // A row with no admissible key divides by 1 (RowStats); every
+            // other row selects the reduced sum, the false branch.
+            let guarded = through_views(&t, operands(&t, divisor)[0]);
+            assert!(is_op(op_of(&t, guarded), &LogicalOp::Select));
+            let denominator = through_views(&t, operands(&t, guarded)[2]);
             assert!(is_op(
                 op_of(&t, denominator),
                 &LogicalOp::ReduceSum { axis_from_end: 0 }
@@ -579,6 +591,19 @@ fn attention_keeps_compute_precision_until_the_operator_output() {
             assert_eq!(dtype_of(&t, weights), DType::F32);
             for id in nodes(&t) {
                 if id == output || matches!(op_of(&t, id), LogicalOp::Input { .. }) {
+                    continue;
+                }
+                // The empty-row predicate (a comparison of the row max) is
+                // Bool by type; it selects values but is not one of them.
+                if dtype_of(&t, id) == DType::Bool {
+                    assert!(
+                        matches!(
+                            op_of(&t, id),
+                            LogicalOp::LessThan | LogicalOp::IndexMapApply { .. }
+                        ),
+                        "{variant}: a Bool SDPA node is not a predicate: {:?}",
+                        op_of(&t, id)
+                    );
                     continue;
                 }
                 assert_eq!(
