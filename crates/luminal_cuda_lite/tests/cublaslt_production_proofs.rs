@@ -474,6 +474,20 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                 })
                 .collect();
             assert_eq!(selected.len(), 1, "one complete fused expression");
+            // Without a residual C, feature bias can also occupy the vendor's
+            // read-only broadcast-C slot instead of its native bias epilogue.
+            let broadcast_bias = !has_c && has_bias && selected[0].bias.is_none();
+            if broadcast_bias {
+                assert_eq!(
+                    selected[0]
+                        .c
+                        .as_ref()
+                        .unwrap()
+                        .resolve(&Default::default())
+                        .ld,
+                    0
+                );
+            }
             assert_eq!(
                 (
                     selected[0].c.is_some(),
@@ -481,7 +495,7 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                     (selected[0].activation
                         == luminal_cuda_lite::ops::cublaslt::exec::LtActivation::RectifiedLinear)
                 ),
-                (has_c, has_bias, relu)
+                (has_c || broadcast_bias, has_bias && !broadcast_bias, relu)
             );
             let plan = plan(&graph, &extracted);
             for node in plan.dag.node_weights() {
@@ -561,6 +575,19 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                 }
                 if let Some(c) = &op.c {
                     assert_eq!(operand_info[2].value, c.tensor);
+                    let descriptor = c.resolve(&Default::default());
+                    for row in 0..call.m as usize {
+                        for col in 0..call.n as usize {
+                            assert_eq!(
+                                luminal_cuda_lite::layouts::element_index(
+                                    &operand_info[2].layout,
+                                    &[row, col]
+                                )
+                                .unwrap(),
+                                at(&descriptor, row, col)
+                            );
+                        }
+                    }
                 }
                 if let Some(bias) = &op.bias {
                     assert_eq!(

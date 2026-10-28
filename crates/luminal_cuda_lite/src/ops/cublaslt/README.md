@@ -270,6 +270,11 @@ rounding, retained earlier narrowing, packed broadcast-C bias without
 materialization, independent C/D pitches, changing batch counts, C reuse and
 read-only repair, FP32 split-K partial sums, and finite cancellation/GELU
 fallbacks for the deliberately excluded native narrow epilogues.
+The 14 narrow-storage regressions pass with device execution enabled. The
+five-package landing checks pass 673 tests with 54 existing ignores, including
+the updated frontend proof that checks native-bias and broadcast-C operand
+addresses. Formatting and device-enabled CUDA Lite/reference/test-runtime
+Clippy with `-D warnings` pass.
 
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its
