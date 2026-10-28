@@ -73,6 +73,48 @@ fn reshape_preserves_logical_order_with_shared_prefixes_and_singletons() {
         );
     }
 }
+/// A zero-element source reaches every target torch accepts, including a
+/// target that is a strict prefix of the source and a zero extent past the
+/// first axis, and the view has exactly the target shape: the operand it
+/// is added to has that shape, so a mis-shaped view refuses the add.
+#[test]
+fn view_of_an_empty_tensor_takes_the_target_shape() {
+    for (source, target) in [
+        (vec![0, 3], vec![0]),
+        (vec![0, 3], vec![3, 0]),
+        (vec![0, 6], vec![0, 3, 2]),
+        (vec![2, 0], vec![0]),
+        (vec![0], vec![0, 1, 5]),
+    ] {
+        let t = translate_nodes(
+            vec![
+                node(
+                    "torch.ops.aten.view.default",
+                    vec![tensor_input("self", "a"), ints("size", &target)],
+                    &["v"],
+                ),
+                node(
+                    "torch.ops.aten.add.Tensor",
+                    vec![tensor_input("self", "v"), tensor_input("other", "b")],
+                    &["y"],
+                ),
+            ],
+            &[
+                ("a", FLOAT, &source),
+                ("b", FLOAT, &target),
+                ("v", FLOAT, &target),
+                ("y", FLOAT, &target),
+            ],
+            &["a", "b"],
+            &["y"],
+        );
+        let rt = run(&t, &[TypedBuffer::F32(vec![]), TypedBuffer::F32(vec![])]);
+        assert!(
+            rt.get_f32(t.outputs[0].tensor).unwrap().is_empty(),
+            "{source:?} -> {target:?}"
+        );
+    }
+}
 #[test]
 fn strided_copy_uses_storage_order_and_allows_repeated_reads() {
     for (shape, stride, offset, want) in [

@@ -960,6 +960,57 @@ def test_shape_reshape_view_batch(device: torch.device):
     assert torch.allclose(output, original)
 
 
+# A view of a zero-element tensor reads no element, so torch accepts any
+# zero-element target: a strict prefix of the source shape, a zero extent past
+# the first axis, unit axes inside the rest. The non-empty cases pin the
+# unchanged-prefix lowering those share a helper with. Each view feeds an add,
+# so the output is a computed tensor rather than an alias of the input.
+_VIEW_CASES = [
+    ("flatten_0x3", lambda x: x.flatten(), [(0, 3)]),
+    ("reshape_neg1_0x3", lambda x: x.reshape(-1), [(0, 3)]),
+    ("view_0_0x3", lambda x: x.view(0), [(0, 3)]),
+    ("ravel_0x3", lambda x: x.ravel(), [(0, 3)]),
+    ("view_as_0x3_to_0", lambda x, o: x.view_as(o), [(0, 3), (0,)]),
+    ("reshape_as_0x3_to_0", lambda x, o: x.reshape_as(o), [(0, 3), (0,)]),
+    ("reshape_0x3_to_3x0", lambda x: x.reshape(3, 0), [(0, 3)]),
+    ("reshape_0x6_to_0x3x2", lambda x: x.reshape(0, 3, 2), [(0, 6)]),
+    ("flatten_2x0", lambda x: x.flatten(), [(2, 0)]),
+    ("reshape_0_to_0x1x5", lambda x: x.reshape(0, 1, 5), [(0,)]),
+    ("reshape_2x3x4_to_2x12", lambda x: x.reshape(2, 12), [(2, 3, 4)]),
+    ("reshape_2x3x1_to_2x3", lambda x: x.reshape(2, 3), [(2, 3, 1)]),
+    ("view_2x1x1_to_2", lambda x: x.view(2), [(2, 1, 1)]),
+    ("view_2x3x4_to_2x3x2x2", lambda x: x.view(2, 3, 2, 2), [(2, 3, 4)]),
+]
+
+
+class _ViewThenAdd(torch.nn.Module):
+    def __init__(self, view: Callable[..., torch.Tensor]) -> None:
+        super().__init__()
+        self.view = view
+
+    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+        return self.view(*inputs) + 1
+
+
+@pytest.mark.parametrize(
+    ("view", "shapes"),
+    [pytest.param(view, shapes, id=name) for name, view, shapes in _VIEW_CASES],
+)
+def test_view_then_add_matches_eager(
+    device: torch.device,
+    view: Callable[..., torch.Tensor],
+    shapes: list[tuple[int, ...]],
+) -> None:
+    generator = torch.Generator().manual_seed(0)
+    inputs = [torch.rand(shape, generator=generator).to(device) for shape in shapes]
+    model = _ViewThenAdd(view)
+    expected = model(*inputs)
+    actual = torch.compile(model, backend=luminal_backend)(*inputs)
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    assert torch.allclose(actual, expected)
+
+
 # ========== PT2 Less Node Tests ==========
 # These tests verify parse_less_node in ops_parse.rs
 

@@ -143,9 +143,23 @@ pub(super) fn ensure_same_dtype(a: GraphTensor, b: GraphTensor) -> (GraphTensor,
 
 /// Reshape by view: flatten then split each leading target extent off the
 /// remaining axis. The total element count must agree (torch view rules).
+///
+/// The construction below takes every extent it invents from that
+/// element-count equality: with an unchanged prefix `P`,
+/// `numel(P) * numel(rest of source) == numel(P) * numel(rest of target)`
+/// cancels to `numel(rest of source) == numel(rest of target)`, which is
+/// what makes each dropped axis extent 1 and each split exact. The
+/// cancellation needs `numel(P) != 0`, so it holds for every tensor that
+/// holds an element and fails for an empty one: `(0,3) -> (0,)` would
+/// squeeze a size-3 axis, `(0,3) -> (3,0)` split by 0, and
+/// `(0,) -> (0,1,5)` split 1 by 5. A tensor with a provably zero extent
+/// therefore never enters it; [`reshape_empty`] lowers that view.
 pub(super) fn reshape_tensor(t: GraphTensor, target: &[IntExpr]) -> GraphTensor {
     if t.dims() == target {
         return t;
+    }
+    if t.dims().iter().any(|d| d.to_usize() == Some(0)) {
+        return reshape_empty(t, target);
     }
     if target.is_empty() {
         return t.flatten().squeeze(0);
@@ -160,6 +174,14 @@ pub(super) fn reshape_tensor(t: GraphTensor, target: &[IntExpr]) -> GraphTensor 
         .take_while(|(a, b)| a == b)
         .count();
     let mut flat = t.view();
+    // The target IS the prefix: squeezing the remaining axes is valid iff
+    // each has extent 1. The element count forces that (see above) once
+    // the source is not provably empty. A static extent is checked here
+    // by `squeeze`, which panics on anything but 1 (an invalid view). A
+    // symbolic extent may be paired with a symbolic prefix that is 0 at
+    // runtime, where torch accepts any extent; `squeeze` records the
+    // `extent == 1` contract for it, so the binding's bounds must prove
+    // the axis is 1 at saturation rather than this lowering assuming it.
     if prefix == target.len() {
         while flat.rank() > prefix {
             flat = flat.squeeze(prefix);
@@ -180,6 +202,31 @@ pub(super) fn reshape_tensor(t: GraphTensor, target: &[IntExpr]) -> GraphTensor 
     for i in prefix..target.len().saturating_sub(1) {
         let inner = super::dim_arith::product_of_dims(target[i + 1..].iter().copied());
         flat = flat.split_dims(i, inner);
+    }
+    flat.finish()
+}
+
+/// View of a tensor with a provably zero extent (see [`reshape_tensor`]).
+/// It holds no element, so every index map from the target to the source
+/// is a correct one, and the target must hold none either (torch's
+/// element-count rule). Collapse the source to its single zero-extent
+/// axis, place that axis at the target's first zero extent, and broadcast
+/// every other target axis around it with `expand_dim`, which needs no
+/// divisibility and no unit extent. A target with no static zero extent
+/// cannot be stated with the source's zero axis, so it is refused.
+fn reshape_empty(t: GraphTensor, target: &[IntExpr]) -> GraphTensor {
+    let source = t.dims();
+    let Some(zero_axis) = target.iter().position(|d| d.to_usize() == Some(0)) else {
+        panic!("view of the empty {source:?} as {target:?}: the target has no zero extent");
+    };
+    let mut flat = t.view();
+    while flat.rank() > 1 {
+        flat = flat.merge_dims(0, 1);
+    }
+    for (axis, &extent) in target.iter().enumerate() {
+        if axis != zero_axis {
+            flat = flat.expand_dim(axis, extent);
+        }
     }
     flat.finish()
 }
@@ -748,6 +795,61 @@ mod reshape_order_tests {
             vec![IntExpr::from(4usize), IntExpr::from(64usize)],
             "reshape [1,4,64] -> [4,64] must not reverse its target"
         );
+    }
+
+    fn exprs(dims: &[usize]) -> Vec<IntExpr> {
+        dims.iter().map(|&d| IntExpr::from(d)).collect()
+    }
+
+    /// Every target torch accepts for a zero-element source, including the
+    /// ones the prefix/merge/split construction cannot state: a target that
+    /// is a strict prefix of the source (`(0,3) -> (0,)` would squeeze a
+    /// size-3 axis), a zero extent past the first target axis (`(0,3) ->
+    /// (3,0)` would split by 0), and a unit extent inside the rest
+    /// (`(0,) -> (0,1,5)` would split 1 by 5).
+    #[test]
+    fn reshape_of_an_empty_tensor_reaches_every_torch_target() {
+        for (source, target) in [
+            (&[0usize, 3][..], &[0usize][..]),
+            (&[0, 3], &[3, 0]),
+            (&[0, 6], &[0, 3, 2]),
+            (&[2, 0], &[0]),
+            (&[0], &[0, 1, 5]),
+            (&[2, 0, 3], &[2, 0]),
+            (&[3, 0], &[0, 3]),
+            (&[0, 3], &[0, 1, 3]),
+        ] {
+            let mut cx = Graph::new();
+            let x = cx.tensor(source.to_vec(), DType::F32);
+            let out = reshape_tensor(x, &exprs(target));
+            assert_eq!(out.dims(), exprs(target), "{source:?} -> {target:?}");
+        }
+    }
+
+    /// A tensor with an element keeps the unchanged-prefix lowering: the
+    /// prefix axes are never flattened, so squeezing unit axes off it
+    /// (`[2,3,1] -> [2,3]`) or splitting the axis after it (`[4,8,16] ->
+    /// [4,8,2,8]`, the per-head pattern) records no quotient or remainder.
+    #[test]
+    fn reshape_of_a_nonempty_tensor_keeps_its_prefix() {
+        for (source, target, prefix_only) in [
+            (&[2usize, 3, 1][..], &[2usize, 3][..], true),
+            (&[2, 1, 1], &[2], true),
+            (&[4, 8, 16], &[4, 8, 2, 8], true),
+            (&[2, 3, 4], &[2, 12], false),
+        ] {
+            let mut cx = Graph::new();
+            let x = cx.tensor(source.to_vec(), DType::F32);
+            let out = reshape_tensor(x, &exprs(target));
+            assert_eq!(out.dims(), exprs(target), "{source:?} -> {target:?}");
+            if prefix_only {
+                let text = cx.logical.render_all().unwrap();
+                assert!(
+                    !text.contains("IntTruncDiv") && !text.contains("IntTruncRem"),
+                    "{source:?} -> {target:?} flattened its unchanged prefix:\n{text}"
+                );
+            }
+        }
     }
 
     #[test]
