@@ -646,6 +646,44 @@ mod tests {
         }
     }
 
+    /// Half-precision chat stores weights narrow and computes in F32: the
+    /// only arithmetic over a narrow float is each matmul's multiply and
+    /// sum, which a runtime lowers to a GEMM. Norms, softmax, activations
+    /// and rope never compute in F16/BF16, so a runtime that refuses math
+    /// functions on narrow floats (cuda-lite's `sqrt`, `exp2`, ...) runs
+    /// every half-precision chat model.
+    #[test]
+    fn half_precision_graphs_compute_only_matmuls_in_storage_dtype() {
+        for dtype in [DType::Bf16, DType::F16] {
+            for (name, config) in [
+                ("llama3", ModelConfig::Llama3(Llama3Dims::tiny())),
+                ("qwen3", ModelConfig::Qwen3(QwenDims::tiny())),
+                ("gemma3", ModelConfig::Gemma3(Gemma3Dims::tiny())),
+                ("qwen3_moe", ModelConfig::Qwen3Moe(tiny_qwen3_moe())),
+            ] {
+                let graph = LlmGraph::build_with_parameter_dtype(config, dtype, 8, 2).unwrap();
+                let logical = &graph.graph.logical;
+                let narrow = logical.narrow_float_arithmetic(logical.petgraph().node_indices());
+                assert!(
+                    !narrow.is_empty(),
+                    "{name} {dtype:?}: matmuls run at storage dtype"
+                );
+                for (id, found) in narrow {
+                    let op = logical.value_op(id);
+                    assert!(
+                        matches!(
+                            op,
+                            luminal::logical_ir::LogicalOp::Mul
+                                | luminal::logical_ir::LogicalOp::ReduceSum { .. }
+                        ),
+                        "{name} {dtype:?}: {} computes in {found:?}",
+                        op.constructor()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn native_weight_storage_keeps_explicit_f32_compute_inputs() {
         for config in [
