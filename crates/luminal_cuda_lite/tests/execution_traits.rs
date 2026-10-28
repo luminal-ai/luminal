@@ -235,7 +235,12 @@ fn all_cublaslt_dps_forms_keep_the_host_interface_when_cloned() {
     for form in CublasLtForm::ALL {
         let mut functional = ApprovedCublasLt::prototype();
         functional.c = form.has_c().then(|| functional.d.clone());
-        functional.bias = form.has_bias().then(|| "bias".into());
+        functional.bias =
+            form.has_bias()
+                .then(|| luminal_cuda_lite::ops::cublaslt::approved::Bias {
+                    tensor: "bias".into(),
+                    dtype: luminal::dtype::PlanDtype::F32,
+                });
         let dps = functional.to_dps().unwrap();
         let cloned = dps.clone_bt_box();
         let host = as_host_op(cloned.as_ref()).expect("cuBLASLt DPS implements HostOp");

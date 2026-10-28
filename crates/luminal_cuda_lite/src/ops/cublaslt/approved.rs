@@ -1,7 +1,9 @@
 //! A complete call is admitted in egglog before extraction. This module only
 //! decodes the elected configuration and evaluates its descriptor expressions.
 use super::CublasLtForm;
-use super::exec::{LtActivation, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder};
+use super::exec::{
+    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder,
+};
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
 use luminal::egglog_snippet::{EgglogSnippet, SpliceCategory};
@@ -79,11 +81,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
             member(site, &c_arg, "CublasLtCMatrixAbsent");
             None
         };
-        let bias_arg = site.child_class(4);
-        let bias = site
-            .nodes_in_class_value(&bias_arg, "CublasLtBiasInput")
-            .next()
-            .map(|node| site.class_of_child(node, 0).unwrap());
+        let bias = bias(site, &site.child_class(4));
         let enum_is =
             |class: &ClassId, name: &str| site.nodes_in_class_value(class, name).next().is_some();
         let frame = member(site, &site.child_class(7), "CublasLtExpressionFrameOf");
@@ -128,6 +126,24 @@ pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
         }
     }
     panic!("cuBLASLt approved contract: unsupported dtype constructor in {class}");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bias {
+    pub tensor: ClassId,
+    pub dtype: PlanDtype,
+}
+
+pub(super) fn bias(site: &ExtractionSite<'_>, class: &ClassId) -> Option<Bias> {
+    if let Some(node) = site.nodes_in_class_value(class, "CublasLtBiasInput").next() {
+        Some(Bias {
+            tensor: site.class_of_child(node, 0).unwrap(),
+            dtype: dtype(site, &site.class_of_child(node, 1).unwrap()),
+        })
+    } else {
+        member(site, class, "CublasLtBiasAbsent");
+        None
+    }
 }
 
 pub(super) fn computation(site: &ExtractionSite<'_>, class: &ClassId) -> LtComputation {
@@ -238,7 +254,7 @@ pub struct ApprovedCublasLt {
     pub b: Matrix,
     pub c: Option<Matrix>,
     pub d: Matrix,
-    pub bias: Option<ClassId>,
+    pub bias: Option<Bias>,
     pub scale: PlanDtype,
     pub trans_a: bool,
     pub trans_b: bool,
@@ -315,10 +331,10 @@ impl ApprovedCublasLt {
             d,
             beta_is_one: self.beta_one,
             activation: self.activation,
-            bias_operand: self
-                .bias
-                .as_ref()
-                .map(|_| 2 + usize::from(self.c.is_some())),
+            bias: self.bias.as_ref().map(|bias| LtBiasInput {
+                operand: 2 + usize::from(self.c.is_some()),
+                data_type: bias.dtype,
+            }),
         }
     }
 }

@@ -73,15 +73,18 @@
   :name "cublaslt: batched F32 product then C in one order")
 (rule
   ((cublaslt-strided-batch-product-with-C-matrix
-     ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k))
-  ((cublaslt-strided-batch-layout-demand ?C_matrix)
-   (cublaslt-strided-batch-layout-demand ?output_expression))
+     ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k)
+   (cublaslt-f32-storage-reading ?C_matrix ?C_storage_tensor)
+   (cublaslt-output-storage-reading ?output_expression ?stored_expression))
+  ((cublaslt-strided-batch-layout-demand ?C_storage_tensor)
+   (cublaslt-strided-batch-layout-demand ?stored_expression))
   :ruleset backend
-  :name "cublaslt: demand batched C and accumulated result layout proofs")
+  :name "cublaslt: demand batched C storage and rounded result layout proofs")
 
 (rule
-  ((cublaslt-strided-batch-product ?output_expression ?A_operand ?B_operand ?BatchCount ?m ?n ?k))
-  ((cublaslt-strided-batch-layout-demand ?output_expression))
+  ((cublaslt-strided-batch-product ?output_expression ?A_operand ?B_operand ?BatchCount ?m ?n ?k)
+   (cublaslt-output-storage-reading ?output_expression ?stored_expression))
+  ((cublaslt-strided-batch-layout-demand ?stored_expression))
   :ruleset backend
   :name "cublaslt: demand batched result layout proofs")
 (rule
@@ -218,22 +221,24 @@
    (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
    (= ?A_layout_tensor (LayoutTensorLit ?A_storage_tensor ?A_layout))
    (= ?B_layout_tensor (LayoutTensorLit ?B_storage_tensor ?B_layout))
-   (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?D_layout))
+   (cublaslt-output-storage-reading ?output_expression ?stored_expression)
+   (= ?D_storage_data_type (dtype-of ?stored_expression))
+   (= ?D_layout_tensor (LayoutTensorLit ?stored_expression ?D_layout))
    (cublaslt-strided-batch-matrix-reading ?A_layout_tensor ?BatchCount ?m ?k ?A_storage_data_type
      ?A_matrix_order ?A_transpose_operation ?A_matrix_descriptor)
    (cublaslt-strided-batch-matrix-reading ?B_layout_tensor ?BatchCount ?k ?n ?B_storage_data_type
      ?B_matrix_order ?B_transpose_operation ?B_matrix_descriptor)
-   (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n (F32)
+   (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order ?D_matrix_descriptor)
    (= ?configuration (CublasLtConfigurationOf ?computation_type (F32)
-     ?A_storage_data_type ?B_storage_data_type (CublasLtNoCMatrixDataType) (F32)
+     ?A_storage_data_type ?B_storage_data_type (CublasLtNoCMatrixDataType) ?D_storage_data_type
      (CublasLtNoBiasDataType) (CublasLtHostScalarsAlphaOneBetaZero) (CublasLtDefaultEpilogue)
      ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
    (cublaslt-approved-configuration ?configuration))
   ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
      (CublasLtCMatrixAbsent) (CublasLtBiasAbsent) ?D_matrix_descriptor
      (LayoutTensorCons ?A_layout_tensor (LayoutTensorCons ?B_layout_tensor (LayoutTensorNil)))
-     (CublasLtExpressionFrameOf ?output_expression ?output_expression ?A_operand ?B_operand
+     (CublasLtExpressionFrameOf ?stored_expression ?stored_expression ?A_operand ?B_operand
        (CublasLtNoCMatrix) (CublasLtNoBias) (CublasLtDefaultEpilogue))))
   :ruleset backend
   :name "cublaslt: approve complete strided batch product configuration")
@@ -250,18 +255,22 @@
    (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
    (= ?A_layout_tensor (LayoutTensorLit ?A_storage_tensor ?A_layout))
    (= ?B_layout_tensor (LayoutTensorLit ?B_storage_tensor ?B_layout))
-   (= ?C_layout_tensor (LayoutTensorLit ?C_matrix ?C_layout))
-   (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?D_layout))
+   (cublaslt-f32-storage-reading ?C_matrix ?C_storage_tensor)
+   (= (shape-of ?C_matrix) (shape-of ?C_storage_tensor))
+   (= ?C_layout_tensor (LayoutTensorLit ?C_storage_tensor ?C_layout))
+   (cublaslt-output-storage-reading ?output_expression ?stored_expression)
+   (= ?D_storage_data_type (dtype-of ?stored_expression))
+   (= ?D_layout_tensor (LayoutTensorLit ?stored_expression ?D_layout))
    (cublaslt-strided-batch-matrix-reading ?A_layout_tensor ?BatchCount ?m ?k ?A_storage_data_type
      ?A_matrix_order ?A_transpose_operation ?A_matrix_descriptor)
    (cublaslt-strided-batch-matrix-reading ?B_layout_tensor ?BatchCount ?k ?n ?B_storage_data_type
      ?B_matrix_order ?B_transpose_operation ?B_matrix_descriptor)
-   (cublaslt-strided-batch-matrix-reading ?C_layout_tensor ?BatchCount ?m ?n (F32)
+   (cublaslt-strided-batch-matrix-reading ?C_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order (CublasLtNoTranspose) ?C_matrix_descriptor)
-   (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n (F32)
+   (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order ?D_matrix_descriptor)
    (= ?configuration (CublasLtConfigurationOf ?computation_type (F32)
-     ?A_storage_data_type ?B_storage_data_type (CublasLtCMatrixDataTypeOf (F32)) (F32)
+     ?A_storage_data_type ?B_storage_data_type (CublasLtCMatrixDataTypeOf ?D_storage_data_type) ?D_storage_data_type
      (CublasLtNoBiasDataType) (CublasLtHostScalarsAlphaOneBetaOne) (CublasLtDefaultEpilogue)
      ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
    (cublaslt-approved-configuration ?configuration))
@@ -269,7 +278,7 @@
      (CublasLtCMatrixInput ?C_matrix_descriptor) (CublasLtBiasAbsent) ?D_matrix_descriptor
      (LayoutTensorCons ?A_layout_tensor (LayoutTensorCons ?B_layout_tensor
        (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil))))
-     (CublasLtExpressionFrameOf ?output_expression ?output_expression ?A_operand ?B_operand
+     (CublasLtExpressionFrameOf ?stored_expression ?stored_expression ?A_operand ?B_operand
        (CublasLtCMatrixOf ?C_matrix) (CublasLtNoBias) (CublasLtDefaultEpilogue))))
   :ruleset backend
   :name "cublaslt: approve complete strided batch C addition configuration")

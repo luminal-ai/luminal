@@ -42,17 +42,16 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
             |c| format!("(CublasLtCMatrixDataTypeOf ({:?}))", c.data_type)
         ),
         call.d_dtype,
-        if call.bias_operand.is_some() {
-            "(CublasLtBiasDataTypeOf (F32))"
-        } else {
-            "(CublasLtNoBiasDataType)"
-        },
+        call.bias.map_or_else(
+            || "(CublasLtNoBiasDataType)".to_string(),
+            |bias| format!("(CublasLtBiasDataTypeOf ({:?}))", bias.data_type)
+        ),
         if call.beta_is_one {
             "CublasLtHostScalarsAlphaOneBetaOne"
         } else {
             "CublasLtHostScalarsAlphaOneBetaZero"
         },
-        match (call.activation, call.bias_operand.is_some()) {
+        match (call.activation, call.bias.is_some()) {
             (LtActivation::Identity, false) => "CublasLtDefaultEpilogue",
             (LtActivation::Identity, true) => "CublasLtBiasEpilogue",
             (LtActivation::RectifiedLinear, false) => "CublasLtRectifiedLinearEpilogue",
@@ -92,11 +91,13 @@ pub fn approved_keys() -> std::collections::BTreeSet<String> {
 }
 fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     let mut graphs = Vec::new();
-    for (dtype, tf32) in [
-        (DType::F32, false),
-        (DType::Bf16, false),
-        (DType::F16, false),
-        (DType::F32, true),
+    for (dtype, tf32, narrow) in [
+        (DType::F32, false, false),
+        (DType::Bf16, false, false),
+        (DType::F16, false, false),
+        (DType::F32, true, false),
+        (DType::Bf16, false, true),
+        (DType::F16, false, true),
     ] {
         for ta in [false, true] {
             for tb in [false, true] {
@@ -118,14 +119,23 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
                     b = b.permute(&[1, 0]);
                 }
                 let p = a.matmul(b);
-                let c = model.tensor([3, 4], DType::F32);
-                let bias = model.tensor([4], DType::F32).expand_dim(0, 3);
+                let addend_dtype = if narrow { dtype } else { DType::F32 };
+                let c = model.tensor([3, 4], addend_dtype).cast(DType::F32);
+                let bias = model
+                    .tensor([4], addend_dtype)
+                    .cast(DType::F32)
+                    .expand_dim(0, 3);
                 let _acc = p + c;
                 let _biased = p + bias;
                 let _both = p + c + bias;
                 for expression in [p, _acc, _biased, _both] {
                     let _relu = expression.relu();
                     let _gelu = expression.gelu_fast_tanh_approximation();
+                    if narrow {
+                        let _rounded = expression.cast(dtype);
+                        let _rounded_relu = _relu.cast(dtype);
+                        let _rounded_gelu = _gelu.cast(dtype);
+                    }
                 }
                 let runtime = luminal_cuda_lite::CudaRuntime::load(&model).unwrap();
                 let graph = runtime.saturated_egraph(&Default::default()).unwrap();
@@ -202,6 +212,24 @@ pub fn tf32_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
         approved_keys()
             .into_iter()
             .filter(|key| key.contains("CublasLtTensorFloat32Computation"))
+            .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+            .collect()
+    });
+    table_registry(TABLE.as_str())
+}
+
+/// Require a complete narrow-output row; generic FP32 calls cannot hide a
+/// missing final-rounding or narrow C/bias proof in these execution tests.
+pub fn narrow_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        approved_keys()
+            .into_iter()
+            .filter(|key| {
+                ["Bf16", "F16"].iter().any(|dtype| {
+                    key.contains(&format!(") ({dtype}) (CublasLtNoBiasDataType)"))
+                        || key.contains(&format!(") ({dtype}) (CublasLtBiasDataTypeOf"))
+                })
+            })
             .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
             .collect()
     });

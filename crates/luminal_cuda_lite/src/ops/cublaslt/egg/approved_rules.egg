@@ -33,6 +33,28 @@
     CublasLtCMatrixArgument CublasLtBiasArgument CublasLtMatrixDescriptor
     LayoutTensorList CublasLtExpressionFrame))
 
+; Exact F32 values may use their own storage or an authored narrow-to-F32
+; widening. This relation never bypasses TF32 input rounding.
+(relation cublaslt-f32-storage-reading (LogicalTensor LogicalTensor))
+(relation cublaslt-output-storage-reading (LogicalTensor LogicalTensor))
+(relation cublaslt-narrow-storage-data-type (Dtype))
+(cublaslt-narrow-storage-data-type (Bf16))
+(cublaslt-narrow-storage-data-type (F16))
+(rule
+  ((= (dtype-of ?arithmetic_expression) (F32)))
+  ((cublaslt-output-storage-reading ?arithmetic_expression ?arithmetic_expression))
+  :ruleset backend
+  :name "cublaslt: F32 output preserves the arithmetic expression")
+(rule
+  ((= ?stored_expression (LogicalCast ?arithmetic_expression ?storage_data_type))
+   (cublaslt-narrow-storage-data-type ?storage_data_type)
+   (= (dtype-of ?arithmetic_expression) (F32))
+   (= (dtype-of ?stored_expression) ?storage_data_type)
+   (= (shape-of ?arithmetic_expression) (shape-of ?stored_expression)))
+  ((cublaslt-output-storage-reading ?arithmetic_expression ?stored_expression))
+  :ruleset backend
+  :name "cublaslt: authored final cast rounds the complete F32 expression")
+
 ; Read complete, shape-owned stride certificates. A singleton Any stays local
 ; to its axis; compatibility never unions coefficient expressions.
 (rule
@@ -142,6 +164,48 @@
          ?row_count ?LeadingDimension (IntLit 1) (IntLit 0)))))
   :ruleset backend
   :name "cublaslt: column layout readings")
+; C is read-only: the vendor explicitly permits leading dimension zero to
+; broadcast a packed row/column vector. This permission is confined to C;
+; A/B and every destination still require the ordinary non-overlapping proof.
+(relation cublaslt-C-matrix-reading
+  (LayoutTensor IntExpr IntExpr Dtype CublasLtMatrixOrder CublasLtMatrixDescriptor))
+(rule
+  ((cublaslt-matrix-reading ?tensor ?rows ?columns ?data_type ?order
+     (CublasLtNoTranspose) ?descriptor))
+  ((cublaslt-C-matrix-reading ?tensor ?rows ?columns ?data_type ?order ?descriptor))
+  :ruleset backend
+  :name "cublaslt: ordinary matrix storage can be read as C")
+(rule
+  ((= ?tensor (LayoutTensorLit ?logical ?layout))
+   (= ?data_type (dtype-of ?logical))
+   (= (shape-of ?logical) (ShapeLit (IntExprCons ?rows (IntExprCons ?columns (IntExprNil)))))
+   (cublaslt-positive-extent ?rows)
+   (cublaslt-positive-extent ?columns)
+   (cublaslt-element-stride-reading ?tensor 1 (ElementStrideExact (IntLit 0)))
+   (cublaslt-element-stride-reading ?tensor 0 ?minor_stride)
+   (cublaslt-unit-element-stride ?minor_stride))
+  ((cublaslt-C-matrix-reading ?tensor ?rows ?columns ?data_type (CublasLtRowMajor)
+     (CublasLtMatrixDescriptorOf ?tensor
+       (CublasLtMatrixLayoutLit ?data_type (CublasLtRowMajor) ?rows ?columns
+         (IntLit 0) (IntLit 1) (IntLit 0)))))
+  :ruleset backend
+  :name "cublaslt: read a packed feature bias as row-broadcast C")
+(rule
+  ((= ?tensor (LayoutTensorLit ?logical ?layout))
+   (= ?data_type (dtype-of ?logical))
+   (= (shape-of ?logical) (ShapeLit (IntExprCons ?rows (IntExprCons ?columns (IntExprNil)))))
+   (cublaslt-positive-extent ?rows)
+   (cublaslt-positive-extent ?columns)
+   (cublaslt-element-stride-reading ?tensor 0 (ElementStrideExact (IntLit 0)))
+   (cublaslt-element-stride-reading ?tensor 1 ?minor_stride)
+   (cublaslt-unit-element-stride ?minor_stride))
+  ((cublaslt-C-matrix-reading ?tensor ?rows ?columns ?data_type (CublasLtColumnMajor)
+     (CublasLtMatrixDescriptorOf ?tensor
+       (CublasLtMatrixLayoutLit ?data_type (CublasLtColumnMajor) ?rows ?columns
+         (IntLit 0) (IntLit 1) (IntLit 0)))))
+  :ruleset backend
+  :name "cublaslt: read a packed row bias as column-broadcast C")
+
 ; A non-transposed reading proves positive rank-two extents, a unit minor
 ; stride, and LeadingDimension >= the minor extent. Together these prove non-overlapping
 ; writes, including a padded leading dimension. Keep the SAME LayoutTensor
@@ -414,6 +478,34 @@
   :ruleset backend
   :name "cublaslt: transpose complete expression with C")
 
+; Output rounding stays after the complete FP32 expression. Keep the direct
+; frame and the proven whole-expression transpose as separate proof steps.
+(rule
+  ((cublaslt-expression-frame
+     (CublasLtExpressionFrameOf ?expression ?expression ?A_operand ?B_operand
+       ?C_matrix ?bias ?epilogue))
+   (cublaslt-output-storage-reading ?expression ?rounded_expression)
+   (cublaslt-narrow-storage-data-type (dtype-of ?rounded_expression)))
+  ((cublaslt-expression-frame
+     (CublasLtExpressionFrameOf ?rounded_expression ?rounded_expression ?A_operand ?B_operand
+       ?C_matrix ?bias ?epilogue)))
+  :ruleset backend
+  :name "cublaslt: authored final rounding of the direct expression frame")
+(rule
+  ((cublaslt-expression-frame
+     (CublasLtExpressionFrameOf ?original_expression ?api_expression ?A_operand ?B_operand
+       ?C_matrix ?bias ?epilogue))
+   (= ?original_expression (LogicalHelperMatrixTranspose ?api_expression))
+   (cublaslt-output-storage-reading ?original_expression ?rounded_original)
+   (cublaslt-narrow-storage-data-type (dtype-of ?rounded_original)))
+  ((let ?rounded_api (LogicalHelperMatrixTranspose ?rounded_original))
+   (union ?rounded_original (LogicalHelperMatrixTranspose ?rounded_api))
+   (cublaslt-expression-frame
+     (CublasLtExpressionFrameOf ?rounded_original ?rounded_api ?A_operand ?B_operand
+       ?C_matrix ?bias ?epilogue)))
+  :ruleset backend
+  :name "cublaslt: transpose the complete authored rounded output")
+
 (rule
   ((cublaslt-expression-frame ?expression_frame)
    (= ?expression_frame
@@ -437,8 +529,10 @@
          ?D_LeadingDimension (IntLit 1) (IntLit 0))))
    (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?layout))
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?element_data_type ?matrix_order ?D_matrix_descriptor)
-   (= ?C_layout_tensor (LayoutTensorLit ?C_matrix ?C_layout))
-   (cublaslt-matrix-reading ?C_layout_tensor ?m ?n ?element_data_type ?matrix_order (CublasLtNoTranspose)
+   (cublaslt-f32-storage-reading ?C_matrix ?C_storage_tensor)
+   (= (shape-of ?C_matrix) (shape-of ?C_storage_tensor))
+   (= ?C_layout_tensor (LayoutTensorLit ?C_storage_tensor ?C_layout))
+   (cublaslt-C-matrix-reading ?C_layout_tensor ?m ?n ?element_data_type ?matrix_order
      ?C_matrix_descriptor))
   ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor
      (CublasLtCMatrixInput ?C_matrix_descriptor) (CublasLtCMatrixDataTypeOf ?element_data_type)
@@ -463,10 +557,12 @@
        (CublasLtBiasOf ?bias) ?epilogue))
    (= (shape-of ?output_expression) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil)))))
    (= (shape-of ?bias) (ShapeLit (IntExprCons ?m (IntExprNil))))
-   (= ?element_data_type (dtype-of ?bias))
+   (cublaslt-f32-storage-reading ?bias ?bias_storage_tensor)
+   (= (shape-of ?bias) (shape-of ?bias_storage_tensor))
+   (= ?element_data_type (dtype-of ?bias_storage_tensor))
    (= ?bias_layout_tensor
-     (LayoutTensorLit ?bias
-       (RightMajorContiguousElementLayoutLit (shape-of ?bias) (bits-of ?element_data_type)))))
+     (LayoutTensorLit ?bias_storage_tensor
+       (RightMajorContiguousElementLayoutLit (shape-of ?bias_storage_tensor) (bits-of ?element_data_type)))))
   ((cublaslt-bias-argument ?expression_frame ?m (CublasLtBiasInput ?bias_layout_tensor ?element_data_type)
      (CublasLtBiasDataTypeOf ?element_data_type) (LayoutTensorCons ?bias_layout_tensor (LayoutTensorNil))))
   :ruleset backend
@@ -507,8 +603,8 @@
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?D_storage_data_type ?D_matrix_order
      ?D_matrix_descriptor)
    (= (dtype-of ?output_expression) ?D_storage_data_type)
-   (= (dtype-of ?A_operand) ?D_storage_data_type)
-   (= (dtype-of ?B_operand) ?D_storage_data_type)
+   (= (dtype-of ?A_operand) (F32))
+   (= (dtype-of ?B_operand) (F32))
    (cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
      ?scalar_arguments ?C_input_tensors)
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors)
@@ -530,22 +626,28 @@
 ; permits reading BF16 or FP16 directly, preserving any earlier source narrowing.
 (rule
   ((= (dtype-of ?logical_operand) (F32)))
-  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation) ?logical_operand ?logical_operand))
+  ((cublaslt-f32-storage-reading ?logical_operand ?logical_operand))
   :ruleset backend)
 (rule
   ((= ?logical_operand (LogicalCast ?storage_source (F32)))
    (= (dtype-of ?storage_source) (Bf16))
    (= (dtype-of ?logical_operand) (F32))
    (= (shape-of ?logical_operand) (shape-of ?storage_source)))
-  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation) ?logical_operand ?storage_source))
+  ((cublaslt-f32-storage-reading ?logical_operand ?storage_source))
   :ruleset backend)
 (rule
   ((= ?logical_operand (LogicalCast ?storage_source (F32)))
    (= (dtype-of ?storage_source) (F16))
    (= (dtype-of ?logical_operand) (F32))
    (= (shape-of ?logical_operand) (shape-of ?storage_source)))
-  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation) ?logical_operand ?storage_source))
+  ((cublaslt-f32-storage-reading ?logical_operand ?storage_source))
   :ruleset backend)
+
+(rule
+  ((cublaslt-f32-storage-reading ?logical_operand ?storage_source))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation) ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: F32 computation reads exact widened storage")
 
 ; Both operands must separately prove this same computation contract before
 ; admission. TF32 casts adopt the device's conversion behavior, including tie

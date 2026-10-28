@@ -209,6 +209,7 @@ pub fn prepare(
             0 => call.a_dtype,
             1 => call.b_dtype,
             i if call.c.is_some_and(|c| c.operand == i) => call.c.unwrap().data_type,
+            i if call.bias.is_some_and(|bias| bias.operand == i) => call.bias.unwrap().data_type,
             _ => call.d_dtype,
         };
         elems.push(range.bytes / crate::host_buffer::dtype_bytes(dtype)?);
@@ -263,7 +264,7 @@ pub fn prepare(
 
     // Decode only the elected activation and optional bias. Their admission
     // and approximation policy are owned by the egglog configuration proof.
-    let epilogue = match (call.activation, call.bias_operand.is_some()) {
+    let epilogue = match (call.activation, call.bias.is_some()) {
         (LtActivation::Identity, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
         (LtActivation::RectifiedLinear, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,
         (LtActivation::Identity, true) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
@@ -282,11 +283,23 @@ pub fn prepare(
         (&epilogue) as *const _ as *const _,
         std::mem::size_of::<sys::cublasLtEpilogue_t>(),
     )?;
-    if let Some(bias_idx) = call.bias_operand {
+    if let Some(bias) = call.bias {
+        let bias_idx = bias.operand;
         let bias_ptr = operands
             .get(bias_idx)
             .ok_or_else(|| anyhow!("bias operand {bias_idx} missing"))?
             .ptr;
+        let bias_type = match bias.data_type {
+            luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+            luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
+            luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
+            other => anyhow::bail!("unsupported cuBLASLt bias storage {other:?}"),
+        };
+        set_desc(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+            (&bias_type) as *const _ as *const _,
+            std::mem::size_of::<sys::cudaDataType_t>(),
+        )?;
         set_desc(
             sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
             (&bias_ptr) as *const _ as *const _,
@@ -325,6 +338,19 @@ pub fn prepare(
         )
     }
     .map_err(|e| anyhow!("workspace preference: {e:?}"))?;
+
+    if call.d_dtype != luminal::dtype::PlanDtype::F32 {
+        // The graph rounds only the final output. Split-K reductions must
+        // keep their partial sums in FP32, never the narrow output type.
+        // NONE (zero) remains available alongside COMPUTE_TYPE.
+        let reduction_mask =
+            sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+        unsafe {
+            lt::set_matmul_pref_attribute(pref.raw,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                (&reduction_mask) as *const _ as *const _, std::mem::size_of::<u32>())
+        }.map_err(|e| anyhow!("FP32 intermediate reduction preference: {e:?}"))?;
+    }
 
     if call.computation == LtComputation::TensorFloat32 {
         // FAST_TF32 alone permits a full-F32 algorithm (observed for 1x1 on

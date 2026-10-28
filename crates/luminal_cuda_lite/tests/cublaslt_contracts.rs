@@ -208,7 +208,12 @@ fn call_for(form: CublasLtForm) -> LtCall {
         d: cd,
         beta_is_one: form.has_c(),
         activation: LtActivation::Identity,
-        bias_operand: form.has_bias().then(|| if form.has_c() { 3 } else { 2 }),
+        bias: form
+            .has_bias()
+            .then_some(luminal_cuda_lite::ops::cublaslt::exec::LtBiasInput {
+                operand: if form.has_c() { 3 } else { 2 },
+                data_type: luminal::dtype::PlanDtype::F32,
+            }),
     }
 }
 
@@ -308,7 +313,7 @@ fn ld_bounds_violation_refuses_before_dispatch() {
         d: LtDesc::row(1, 8, 8),
         beta_is_one: false,
         activation: LtActivation::Identity,
-        bias_operand: None,
+        bias: None,
     };
     let dev_a = to_device(&stream, &weights(2, 1));
     let dev_b = to_device(&stream, &weights(16, 2));

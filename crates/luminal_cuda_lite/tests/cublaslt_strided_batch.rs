@@ -67,6 +67,17 @@ fn graph_with_mode(
     with_c: bool,
     tf32: bool,
 ) -> Graph {
+    graph_with_output(dtype, transpose_a, transpose_b, with_c, tf32, false)
+}
+
+fn graph_with_output(
+    dtype: DType,
+    transpose_a: bool,
+    transpose_b: bool,
+    with_c: bool,
+    tf32: bool,
+    narrow: bool,
+) -> Graph {
     let mut graph = Graph::new();
     let mut a = graph
         .tensor(if transpose_a { [2, 4, 3] } else { [2, 3, 4] }, dtype)
@@ -84,9 +95,14 @@ fn graph_with_mode(
     if transpose_b {
         b = b.permute(&[0, 2, 1]);
     }
-    let product = a.matmul(b);
+    let mut output = a.matmul(b);
     if with_c {
-        let _out = product + graph.tensor([2, 3, 5], DType::F32);
+        output += graph
+            .tensor([2, 3, 5], if narrow { dtype } else { DType::F32 })
+            .cast(DType::F32);
+    }
+    if narrow {
+        let _out = output.cast(dtype);
     }
     graph
 }
@@ -428,11 +444,13 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
     let ampere_or_newer = context.compute_capability().unwrap().0 >= 8;
     let stream = context.new_stream().unwrap();
     let mut witnesses = std::collections::BTreeMap::new();
-    for (dtype, tf32) in [
-        (DType::F32, false),
-        (DType::Bf16, false),
-        (DType::F16, false),
-        (DType::F32, true),
+    for (dtype, tf32, narrow) in [
+        (DType::F32, false, false),
+        (DType::Bf16, false, false),
+        (DType::F16, false, false),
+        (DType::F32, true, false),
+        (DType::Bf16, false, true),
+        (DType::F16, false, true),
     ] {
         if !ampere_or_newer && (dtype == DType::Bf16 || tf32) {
             continue;
@@ -440,7 +458,7 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
         for ta in [false, true] {
             for tb in [false, true] {
                 let (separate, in_place) = calls(&saturate(
-                    &graph_with_mode(dtype, ta, tb, true, tf32),
+                    &graph_with_output(dtype, ta, tb, true, tf32, narrow),
                     WHITELIST,
                 ));
                 for op in separate {
@@ -471,8 +489,13 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                     b = b.permute(&[0, 2, 1]);
                 }
                 let product = a.matmul(b);
-                let c = model.tensor([2, 3, 5], DType::F32);
-                let accumulated = product + c;
+                let c = model.tensor([2, 3, 5], if narrow { dtype } else { DType::F32 });
+                let accumulated = product + c.cast(DType::F32);
+                let (product, accumulated) = if narrow {
+                    (product.cast(dtype), accumulated.cast(dtype))
+                } else {
+                    (product, accumulated)
+                };
                 let layout =
                     luminal_cuda_lite::bindings::BoundaryLayout::strided_literal([24, 1, 4]);
                 let mut bindings = luminal_cuda_lite::CudaBindings::new();
@@ -501,7 +524,7 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
     }
     assert_eq!(
         witnesses.len(),
-        if ampere_or_newer { 384 } else { 192 },
+        if ampere_or_newer { 576 } else { 288 },
         "each storage/computation mode covers base, separate C and in-place C configurations"
     );
     let at = |d: LtDesc, batch: usize, row: usize, col: usize| {
@@ -559,25 +582,41 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                 bytes: data.len(),
             })
             .collect();
-        let output = stream.alloc_zeros::<f32>(elements(call.d)).unwrap();
+        let width = if call.d_dtype == PlanDtype::F32 { 4 } else { 2 };
+        let output = stream.alloc_zeros::<u8>(elements(call.d) * width).unwrap();
         let dest = if alias {
             ranges[call.c.unwrap().operand]
         } else {
             DeviceRange {
                 ptr: output.device_ptr(&stream).0,
-                bytes: output.len() * 4,
+                bytes: output.len(),
             }
         };
         dispatch(&call, &ranges, dest, &stream).unwrap();
-        let actual: Vec<f32> = if alias {
+        let bytes = if alias {
             stream
                 .clone_dtoh(&payloads[call.c.unwrap().operand])
                 .unwrap()
+        } else {
+            stream.clone_dtoh(&output).unwrap()
+        };
+        let actual: Vec<f32> = if call.d_dtype == PlanDtype::F32 {
+            bytes
                 .chunks_exact(4)
                 .map(|x| f32::from_ne_bytes(x.try_into().unwrap()))
                 .collect()
         } else {
-            stream.clone_dtoh(&output).unwrap()
+            bytes
+                .chunks_exact(2)
+                .map(|x| {
+                    let bits = u16::from_ne_bytes(x.try_into().unwrap());
+                    if call.d_dtype == PlanDtype::Bf16 {
+                        half::bf16::from_bits(bits).to_f32()
+                    } else {
+                        half::f16::from_bits(bits).to_f32()
+                    }
+                })
+                .collect()
         };
         for batch in 0..count {
             for row in 0..m {
@@ -594,7 +633,12 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                     }
                     assert_eq!(
                         actual[at(call.d, batch, row, col)],
-                        expected as f32,
+                        match call.d_dtype {
+                            PlanDtype::F32 => expected as f32,
+                            PlanDtype::Bf16 => half::bf16::from_f32(expected as f32).to_f32(),
+                            PlanDtype::F16 => half::f16::from_f32(expected as f32).to_f32(),
+                            _ => unreachable!(),
+                        },
                         "{call:?}, alias={alias}"
                     );
                 }

@@ -80,6 +80,13 @@ pub struct LtCMatrixInput {
     pub operand: usize,
 }
 
+/// The optional bias's physical type and literal operand position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LtBiasInput {
+    pub data_type: luminal::dtype::PlanDtype,
+    pub operand: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LtActivation {
     Identity,
@@ -127,11 +134,20 @@ pub struct LtCall {
     /// beta is STRUCTURAL: `true` exactly on the C-fold forms.
     pub beta_is_one: bool,
     pub activation: LtActivation,
-    /// Lit operand index of the bias vector, on the bias forms.
-    pub bias_operand: Option<usize>,
+    /// Physical bias storage, structurally absent on non-bias forms.
+    pub bias: Option<LtBiasInput>,
 }
 
 pub fn validate_ld_bounds(who: &str, desc: &LtDesc, elems: usize) -> Result<()> {
+    validate_descriptor_bounds(who, desc, elems, false)
+}
+
+fn validate_descriptor_bounds(
+    who: &str,
+    desc: &LtDesc,
+    elems: usize,
+    broadcast_c: bool,
+) -> Result<()> {
     if desc.rows < 1 || desc.cols < 1 {
         bail!(
             "cuBLASLt {who}: empty descriptor geometry {}x{} — refused before dispatch",
@@ -139,7 +155,7 @@ pub fn validate_ld_bounds(who: &str, desc: &LtDesc, elems: usize) -> Result<()> 
             desc.cols
         );
     }
-    if desc.ld < 1 {
+    if desc.ld < 0 || (desc.ld == 0 && !broadcast_c) {
         bail!(
             "cuBLASLt {who}: ld {} < 1 — refused before dispatch",
             desc.ld
@@ -175,7 +191,7 @@ pub fn validate_ld_bounds(who: &str, desc: &LtDesc, elems: usize) -> Result<()> 
 }
 
 pub fn assert_bias_destination_order(call: &LtCall, who: &str) -> Result<()> {
-    if (call.bias_operand.is_some() || call.activation != LtActivation::Identity)
+    if (call.bias.is_some() || call.activation != LtActivation::Identity)
         && call.d.order != LtOrder::Col
     {
         bail!(
@@ -217,9 +233,12 @@ impl LtCall {
                     c.operand
                 );
             };
-            validate_ld_bounds("C", &c.descriptor, elems)?;
+            // C alone may broadcast a packed vector with leading dimension
+            // zero. D still goes through the nonzero-leading-dimension gate.
+            validate_descriptor_bounds("C", &c.descriptor, elems, true)?;
         }
-        if let Some(i) = self.bias_operand {
+        if let Some(bias) = self.bias {
+            let i = bias.operand;
             let Some(&elems) = operand_elems.get(i) else {
                 bail!("cuBLASLt: bias operand index {i} out of operand range");
             };

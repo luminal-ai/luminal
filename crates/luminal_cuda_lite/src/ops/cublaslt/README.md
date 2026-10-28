@@ -12,7 +12,7 @@ the elected call and dispatches its descriptors unchanged.
 | `approved_constructors.egg` | Flat vendor layout data, storage descriptors, optional arguments, configuration and expression-frame types |
 | `approved_rules.egg` | Rank-two expression recognition, layout readings, precision proofs, and complete admission |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 896 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 1,088 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -54,34 +54,66 @@ and D. There is no conditional alias flag or Rust destination rebinding.
 
 ## Approved configurations and precision
 
-The table contains **896 configurations**: 672 ordinary F32 computation rows
-and 224 explicit TF32 computation rows. Each computation/storage choice has
-the following layout and epilogue combinations:
+The table contains **1,088 complete configurations**:
 
-- Ordinary F32 computation with matching F32/F32, BF16/BF16, or F16/F16
-  A/B storage, or TF32 computation with F32/F32 A/B storage: 4 choices.
-- Independent A/B matrix orders and transpose flags: 16 choices.
-- Absent C with beta 0 or F32 C with beta 1: 2 choices.
-- Default epilogue with either D order, or bias, ReLU, ReLU+bias, GELU,
-  GELU+bias with column-major D: 7 choices.
+- 896 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
+  FP16 A/B storage, plus explicit TF32 computation over F32 storage. Each has
+  16 A/B order/transpose combinations, absent/present F32 C, and seven
+  destination/epilogue combinations (default in either D order; bias, ReLU,
+  ReLU+bias, GELU or GELU+bias with column-major D).
+- 192 narrow-output rows: matching BF16 or FP16 A/B storage, FP32 arithmetic,
+  and an authored final cast to the matching narrow dtype. Each has 16 A/B
+  order/transpose combinations, absent/present matching narrow C, and default
+  in either D order or ReLU with column-major D. Native narrow bias and GELU
+  epilogues have no approved rows.
 
-Accumulation, scalar, D, and any present C or bias types are F32. Alpha is 1.
-The computation variant controls input precision independently of storage.
-Only explicit F32 input casts permit direct BF16 or F16 storage readings.
-Storage does not choose arithmetic precision. Casts between multiply, reduction,
-C addition, or bias addition remain rounding boundaries. Earlier narrowing and
-final output casts are retained. C and bias widening is materialized as F32.
+Scalars and accumulation remain FP32. Alpha is 1; beta is 0 without C and 1
+with C. Storage never chooses arithmetic precision. Only an authored exact
+widening permits direct BF16/FP16 readings. Casts between multiplication,
+reduction, C addition, bias addition and activation remain boundaries; earlier
+narrowing is preserved. A separate output-storage proof recognizes an authored
+final cast of the complete FP32 expression. Pure-view transposition carries that
+whole rounded expression into the API frame and back to the caller's output.
+
 F32 reduction reassociation and FMA contraction follow the existing compiler
-policy. ReLU accepts a difference in the sign of zero; both frontend GELU
-spellings may use the vendor tanh approximation. These are explicit admission
-policies, not claims of bitwise equivalence.
+policy. ReLU accepts a difference in the sign of zero; the FP32-output GELU rows
+accept the vendor tanh approximation. These are explicit admission policies,
+not claims of bitwise equivalence. FP8, mixed A/B storage and arbitrary
+alpha/beta values have no approved configurations.
 
-Bias has the vendor's row length and packed storage. The rank-two rules
-transpose a complete expression to implement normal feature bias. C is added
-before bias and activation. Existing core addition commutativity remains
-available; floating reassociation or crossing casts does not authorize another
-fused expression. FP8, mixed A/B storage, narrow
-outputs, and arbitrary alpha/beta values have no approved configurations.
+### Narrow C, bias and output storage
+
+`cublaslt-f32-storage-reading` proves identity F32 storage or exact BF16/FP16
+widening. Ordinary A/B readings, C and bias can use that proof. TF32's permission
+to read pre-cast storage remains confined to its computation-specific relation.
+C still shares D's dtype, shape, order and count, with independent pitches.
+In-place emission requires identical complete C/D descriptions and layouts.
+
+A packed narrow feature-bias vector is consumed directly through **read-only
+broadcast C**, with leading dimension zero. Both row and column broadcasts are
+proved from complete shape-owned stride certificates. No matrix-sized broadcast
+or FP32 widening buffer is needed. This is the vendor's documented
+[C broadcast representation](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul).
+The zero-leading-dimension permission applies only to C: A, B and all
+destinations retain their ordinary non-overlapping proofs. A broadcast C cannot
+become an in-place destination. This consumes C's argument slot, so a separate
+residual C plus feature bias still uses the FP32-output path.
+
+Native narrow bias/GELU epilogues can round an intermediate result before the
+authored final cast. On CUDA 12.8/A100, cancellation tests exposed infinity where
+the FP32 graph remains finite: `65504 + 32 - 65504` should produce FP16 32, but
+rounding after the C addition overflows first. Other layouts also exposed this
+in bias-only epilogues. A BF16 GELU case distinguished activation of an unrounded
+product from activation after BF16 rounding. These tuples remain deliberately
+unwhitelisted. Their graphs retain FP32 calls and explicit final casts; adding
+cast tolerance does not authorize a new arithmetic boundary.
+
+For narrow outputs, dispatch restricts split-K reductions to FP32 workspace
+partials or no split-K reduction, excluding reduction through the narrow output
+type. The selected bias argument carries an explicit dtype and operand index;
+dispatch configures its vendor type and checks capacities using its real width.
+The reference runtime has native two-byte FP16/BF16 payloads, exact widening,
+explicit narrowing, and bit-preserving payload movement for these graphs.
 
 ### TF32 precision contract
 
@@ -136,7 +168,8 @@ The batched recognizer matches `A[B,m,k]` and `B[B,k,n]` broadcast into the exac
 `[B,m,n,k]` multiply domain followed by reduction over k. Both maps must use the
 batch coordinate, even when a matrix extent happens to equal B. A static B=1
 also permits its coordinate to be literal zero. Arithmetic remains F32, with
-explicit narrow-input widening handled by the shared storage-reading proofs.
+explicit narrow-input widening handled by the shared storage-reading proofs. An
+authored final BF16/FP16 cast can select the matching narrow D and C storage.
 
 Batch descriptors require positive rank-three extents and one shared batch
 count that fits positive int32. Every matrix has unit minor stride and a legal
@@ -219,7 +252,7 @@ extents, independent C/D pitches, cast boundaries, and C reuse/copy repair acros
 all batches. `cargo fmt --all -- --check` and device-enabled CUDA Lite and
 test-runtime Clippy with `-D warnings` pass.
 
-The TF32 extension expands execution coverage to all **896 separate-destination
+At the TF32 checkpoint, the extension expanded execution coverage to all **896 separate-destination
 configurations**, **448 in-place configurations**, and **384 batched dispatch
 witnesses**. Its regressions cover mode-specific raw-storage permission,
 whitelist ablation, views, earlier narrowing, final rounding, native cast
@@ -229,6 +262,14 @@ the reference; cast tests accept either nearest tie rather than imposing the
 reference codec's tie choice on CUDA. The five-package landing sweep passes
 663 tests with 54 existing ignores; the targeted device-enabled cuBLASLt suites
 pass 23 tests. Formatting and device-enabled CUDA Lite/test-runtime Clippy pass.
+
+Narrow-storage validation executes all **1,088 separate-destination
+configurations**, **544 in-place configurations**, and **576 batched dispatch
+witnesses** on the A100. Regressions cover exact widening and authored final
+rounding, retained earlier narrowing, packed broadcast-C bias without
+materialization, independent C/D pitches, changing batch counts, C reuse and
+read-only repair, FP32 split-K partial sums, and finite cancellation/GELU
+fallbacks for the deliberately excluded native narrow epilogues.
 
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its

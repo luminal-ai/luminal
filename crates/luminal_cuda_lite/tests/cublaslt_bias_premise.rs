@@ -61,7 +61,7 @@ fn linear_with_bias_mints_only_approved_column_order_destinations() {
         assert_eq!(call.d.order, LtOrder::Col);
         assert_eq!((call.m, call.n), (3, 4));
         assert!(call.d.ld >= call.m);
-        assert_eq!(call.bias_operand, Some(2));
+        assert_eq!(call.bias.map(|bias| bias.operand), Some(2));
     }
 }
 #[test]

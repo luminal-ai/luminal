@@ -165,7 +165,7 @@ fn assert_roundtrip_values(
         .collect();
     assert_eq!(calls.len(), 1, "the fixture has one complete product");
     let (call, reads, writes) = &calls[0];
-    assert!(call.c.is_none() && call.bias_operand.is_none());
+    assert!(call.c.is_none() && call.bias.is_none());
     let at = |d: &LtDesc, row, col| match d.order {
         LtOrder::Row => row * d.ld as usize + col,
         LtOrder::Col => col * d.ld as usize + row,

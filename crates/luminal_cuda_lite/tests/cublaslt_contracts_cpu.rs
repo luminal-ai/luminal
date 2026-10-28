@@ -35,7 +35,12 @@ fn call(form: CublasLtForm) -> LtCall {
         d,
         beta_is_one: form.has_c(),
         activation: LtActivation::Identity,
-        bias_operand: form.has_bias().then_some(if form.has_c() { 3 } else { 2 }),
+        bias: form
+            .has_bias()
+            .then_some(luminal_cuda_lite::ops::cublaslt::exec::LtBiasInput {
+                operand: if form.has_c() { 3 } else { 2 },
+                data_type: luminal::dtype::PlanDtype::F32,
+            }),
     }
 }
 #[test]
@@ -116,5 +121,23 @@ fn bias_order_is_checked_even_for_direct_vendor_test_calls() {
         let mut call = call(form);
         call.d = LtDesc::row(4, 3, 3);
         assert!(assert_bias_destination_order(&call, "test").is_err());
+    }
+}
+
+#[test]
+fn zero_leading_dimension_is_a_read_only_c_permission_with_vector_bounds() {
+    for (descriptor, span) in [(LtDesc::row(4, 3, 0), 3), (LtDesc::col(4, 3, 0), 4)] {
+        let mut c = call(CublasLtForm::Accumulate);
+        c.c.as_mut().unwrap().descriptor = descriptor;
+        c.validate_against(&[20, 15, span], 12).unwrap();
+        assert!(c.validate_against(&[20, 15, span - 1], 12).is_err());
+        c.a.ld = 0;
+        assert!(c.validate_against(&[20, 15, span], 12).is_err());
+        c.a.ld = 5;
+        c.b.ld = 0;
+        assert!(c.validate_against(&[20, 15, span], 12).is_err());
+        c.b.ld = 3;
+        c.d.ld = 0;
+        assert!(c.validate_against(&[20, 15, span], 12).is_err());
     }
 }

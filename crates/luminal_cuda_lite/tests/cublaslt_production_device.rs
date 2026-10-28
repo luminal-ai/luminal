@@ -60,10 +60,42 @@ fn range<T>(stream: &Arc<CudaStream>, buffer: &CudaSlice<T>) -> DeviceRange {
 }
 fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     let (m, n, k) = (call.m as usize, call.n as usize, call.k as usize);
-    let a = values(m * k, 1);
-    let b = values(k * n, 2);
-    let c = values(m * n, 3);
-    let bias = values(m, 4);
+    let mut a = values(m * k, 1);
+    let mut b = values(k * n, 2);
+    let mut c = values(m * n, 3);
+    if let Some(input) = call.c.filter(|c| c.descriptor.ld == 0) {
+        let original = c.clone();
+        for row in 0..m {
+            for col in 0..n {
+                c[row * n + col] = if input.descriptor.order == LtOrder::Row {
+                    original[col]
+                } else {
+                    original[row * n]
+                };
+            }
+        }
+    }
+    let mut bias = values(m, 4);
+    if call.d_dtype != PlanDtype::F32 && call.bias.is_some() {
+        assert!(call.c.is_none(), "narrow C+bias must stay unwhitelisted");
+        let large = if call.d_dtype == PlanDtype::F16 {
+            65504.0
+        } else {
+            half::bf16::from_bits(0x7f7e).to_f32()
+        };
+        let factor = if call.d_dtype == PlanDtype::F16 {
+            1.0 + 1.0 / 1024.0
+        } else {
+            1.0 + 1.0 / 128.0
+        };
+        a.fill(0.0);
+        b.fill(0.0);
+        bias.fill(-large);
+        for row in 0..m {
+            a[row * k] = large;
+        }
+        b[..n].fill(factor);
+    }
     let mut payloads = vec![
         raw(&pack(&call.a, call.trans_a, m, k, &a), call.a_dtype),
         raw(&pack(&call.b, call.trans_b, k, n, &b), call.b_dtype),
@@ -72,16 +104,17 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     if let Some(input) = call.c {
         payloads[input.operand] = raw(&pack(&input.descriptor, false, m, n, &c), input.data_type);
     }
-    if let Some(operand) = call.bias_operand {
-        payloads[operand] = raw(&bias, PlanDtype::F32);
+    if let Some(input) = call.bias {
+        payloads[input.operand] = raw(&bias, input.data_type);
     }
     let buffers: Vec<_> = payloads
         .iter()
         .map(|data| stream.clone_htod(data).unwrap())
         .collect();
     let inputs: Vec<_> = buffers.iter().map(|buffer| range(stream, buffer)).collect();
-    let mut d = stream.alloc_zeros::<f32>(elements(&call.d)).unwrap();
-    stream.memcpy_htod(&vec![777.0; d.len()], &mut d).unwrap();
+    let d = stream
+        .clone_htod(&raw(&vec![777.0; elements(&call.d)], call.d_dtype))
+        .unwrap();
     let dest = if alias {
         inputs[call.c.unwrap().operand]
     } else {
@@ -89,18 +122,36 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     };
     device_call::dispatch(call, &inputs, dest, stream)
         .unwrap_or_else(|error| panic!("approved call failed: {call:?}: {error:#}"));
-    let mut actual = vec![0f32; elements(&call.d)];
-    if alias {
-        let bytes = stream
+    let bytes = if alias {
+        stream
             .clone_dtoh(&buffers[call.c.unwrap().operand])
-            .unwrap();
-        actual = bytes
+            .unwrap()
+    } else {
+        stream.clone_dtoh(&d).unwrap()
+    };
+    let actual: Vec<f32> = match call.d_dtype {
+        PlanDtype::F32 => bytes
             .chunks_exact(4)
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
-    } else {
-        stream.memcpy_dtoh(&d, &mut actual).unwrap();
-    }
+            .collect(),
+        dtype => bytes
+            .chunks_exact(2)
+            .map(|b| {
+                let bits = u16::from_ne_bytes(b.try_into().unwrap());
+                match dtype {
+                    PlanDtype::F16 => half::f16::from_bits(bits).to_f32(),
+                    PlanDtype::Bf16 => half::bf16::from_bits(bits).to_f32(),
+                    _ => panic!("unsupported output"),
+                }
+            })
+            .collect(),
+    };
+    let rounded = |value: f64| match call.d_dtype {
+        PlanDtype::F32 => value as f32,
+        PlanDtype::F16 => half::f16::from_f32(value as f32).to_f32(),
+        PlanDtype::Bf16 => half::bf16::from_f32(value as f32).to_f32(),
+        _ => panic!("unsupported output"),
+    };
     for r in 0..m {
         for col in 0..n {
             let mut expected = (0..k)
@@ -109,7 +160,7 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
             if call.beta_is_one {
                 expected += f64::from(c[r * n + col]);
             }
-            if call.bias_operand.is_some() {
+            if call.bias.is_some() {
                 expected += f64::from(bias[r]);
             }
             expected = match call.activation {
@@ -125,12 +176,17 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
             };
             let got = actual[at(&call.d, r, col)];
             if call.activation == LtActivation::GaussianErrorLinear {
+                let eps = 5e-4 + 5e-4 * expected.abs();
                 assert!(
-                    (f64::from(got) - expected).abs() <= 5e-4 + 5e-4 * expected.abs(),
+                    got >= rounded(expected - eps) && got <= rounded(expected + eps),
                     "{call:?}: {got} vs {expected}"
                 );
             } else {
-                assert_eq!(got, expected as f32, "{call:?}, alias={alias}, ({r},{col})");
+                assert_eq!(
+                    got,
+                    rounded(expected),
+                    "{call:?}, alias={alias}, ({r},{col})"
+                );
             }
         }
     }
@@ -171,8 +227,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 896 } else { 448 });
-    assert_eq!(aliases, if ampere_or_newer { 448 } else { 224 });
+    assert_eq!(ran, if ampere_or_newer { 1088 } else { 544 });
+    assert_eq!(aliases, if ampere_or_newer { 544 } else { 272 });
 }
 
 #[test]

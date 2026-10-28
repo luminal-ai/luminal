@@ -569,7 +569,7 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                             + usize::from(op.bias.is_some()))
                             - 1]
                         .value,
-                        *bias
+                        bias.tensor
                     );
                 }
                 println!(

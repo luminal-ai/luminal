@@ -2,10 +2,10 @@
 //! independent D operand, D descriptor, or conditional alias permission.
 use super::CublasLtForm;
 use super::approved::{
-    DECLARATIONS, Matrix, RULES, WHITELIST, activation, capture_dimensions, computation, dtype,
-    matrix, member,
+    Bias, DECLARATIONS, Matrix, RULES, WHITELIST, activation, bias, capture_dimensions,
+    computation, dtype, matrix, member,
 };
-use super::exec::{LtActivation, LtCMatrixInput, LtCall, LtComputation};
+use super::exec::{LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation};
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
 use luminal::egglog_snippet::{EgglogSnippet, SpliceCategory};
@@ -64,10 +64,7 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
         member(site, &child(7), "CublasLtHostScalarsAlphaOneBetaOne");
         let frame = member(site, &site.child_class(6), "CublasLtExpressionFrameOf");
         let semantic = |n| site.class_of_child(&frame, n).unwrap();
-        let bias = site
-            .nodes_in_class_value(&site.child_class(4), "CublasLtBiasInput")
-            .next()
-            .map(|node| site.class_of_child(node, 0).unwrap());
+        let bias = bias(site, &site.child_class(4));
         let enum_is = |n, name| site.nodes_in_class_value(&child(n), name).next().is_some();
         Box::new(CublasLtAccumulateInPlace {
             configuration: site.child_class(0),
@@ -99,7 +96,7 @@ pub struct CublasLtAccumulateInPlace {
     pub a: Matrix,
     pub b: Matrix,
     pub c_and_d: Matrix,
-    pub bias: Option<ClassId>,
+    pub bias: Option<Bias>,
     pub scale: PlanDtype,
     pub trans_a: bool,
     pub trans_b: bool,
@@ -157,7 +154,10 @@ impl CublasLtAccumulateInPlace {
             d: c_and_d,
             beta_is_one: true,
             activation: self.activation,
-            bias_operand: self.bias.as_ref().map(|_| 2),
+            bias: self.bias.as_ref().map(|bias| LtBiasInput {
+                operand: 2,
+                data_type: bias.dtype,
+            }),
         }
     }
 }

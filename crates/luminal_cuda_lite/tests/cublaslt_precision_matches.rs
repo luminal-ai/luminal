@@ -48,7 +48,23 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
         let call = op.as_any().downcast_ref::<ApprovedCublasLt>().unwrap();
         assert_eq!(site.logical_dtype(&call.logical_a), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::F32));
-        assert_eq!(call.d.dtype, PlanDtype::F32);
+        assert_eq!(site.logical_dtype(&call.logical_out), Some(call.d.dtype));
+        match call.d.dtype {
+            PlanDtype::F32 => (),
+            PlanDtype::Bf16 | PlanDtype::F16 => {
+                assert_eq!(call.d.dtype, call.a.dtype);
+                assert!(
+                    egraph.nodes.values().any(|node| {
+                        node.eclass == call.logical_root
+                            && node.op == "LogicalCast"
+                            && site.logical_dtype(&egraph.nodes[&node.children[0]].eclass)
+                                == Some(PlanDtype::F32)
+                    }),
+                    "narrow output must retain the authored final FP32-to-narrow cast"
+                );
+            }
+            other => panic!("unsupported call output {other:?}"),
+        }
         assert_eq!(call.a.dtype, call.b.dtype);
         for (semantic, descriptor) in [(&call.logical_a, &call.a), (&call.logical_b, &call.b)] {
             let physical = logical_of(&egraph, &descriptor.tensor);
@@ -62,12 +78,18 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
                 other => panic!("unsupported call input {other:?}"),
             }
         }
-        for tensor in call.c.iter().map(|c| &c.tensor).chain(call.bias.iter()) {
+        for (tensor, dtype) in call
+            .c
+            .iter()
+            .map(|c| (&c.tensor, c.dtype))
+            .chain(call.bias.iter().map(|bias| (&bias.tensor, bias.dtype)))
+        {
             assert_eq!(
                 site.logical_dtype(&logical_of(&egraph, tensor)),
-                Some(PlanDtype::F32)
+                Some(dtype)
             );
         }
+        assert!(call.c.as_ref().is_none_or(|c| c.dtype == call.d.dtype));
         specifications.push(call.clone());
     }
     // Both executable forms consume the same complete precision proof. Every
