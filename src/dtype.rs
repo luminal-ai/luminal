@@ -112,6 +112,26 @@ impl Display for DType {
 }
 
 impl DType {
+    /// The narrow floating-point formats: F16, BF16 and the 8-, 6- and
+    /// 4-bit floats. Every one is exactly representable in F32, so a
+    /// frontend that follows torch's opmath stores values in these formats
+    /// and computes on them only after an explicit widening cast.
+    pub fn is_narrow_float(self) -> bool {
+        matches!(
+            self,
+            DType::F16
+                | DType::Bf16
+                | DType::F8UE8M0
+                | DType::F8E4M3FN
+                | DType::F8E4M3FNUZ
+                | DType::F8E5M2
+                | DType::F8E5M2FNUZ
+                | DType::F6E2M3
+                | DType::F6E3M2
+                | DType::F4E2M1
+        )
+    }
+
     /// Encoding width in logical IR. Bool is one bit; byte-backed boundary
     /// booleans are the separate PlanDtype::Bool8 representation.
     pub fn logical_bits(self) -> usize {
