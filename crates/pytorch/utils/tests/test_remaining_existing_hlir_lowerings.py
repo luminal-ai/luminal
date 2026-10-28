@@ -1,5 +1,7 @@
 """Regression tests for ATen composites built from the existing HLIR."""
 
+import math
+
 import pytest
 import torch
 from backend_test_utils import compile_for_test as luminal_compile
@@ -73,6 +75,139 @@ def test_elementwise_composites_cover_ieee_edges() -> None:
     other = torch.tensor([[4.0], [2.0]])
     module = ElementwiseComposites()
     _check(module, value, other)
+
+
+class Hypot(torch.nn.Module):
+    def forward(self, value, other):
+        return torch.hypot(value, other)
+
+
+def _hypot_operands(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """(value, other) pairs covering C hypot's special values and range ends."""
+    inf, nan = float("inf"), float("nan")
+    info = torch.finfo(dtype)
+    sub = info.smallest_normal * info.eps  # the smallest subnormal
+    pairs = [
+        # +-inf wins, even over NaN.
+        (inf, inf),
+        (-inf, -inf),
+        (nan, inf),
+        (inf, nan),
+        (-inf, nan),
+        (nan, -inf),
+        (inf, 1.0),
+        (-3.0, -inf),
+        (0.0, inf),
+        # Otherwise NaN wins over any finite value.
+        (nan, 1.0),
+        (1.0, nan),
+        (nan, 0.0),
+        (-0.0, nan),
+        (nan, nan),
+        # The origin is +0 for every zero sign.
+        (0.0, 0.0),
+        (-0.0, -0.0),
+        (0.0, -0.0),
+        (-0.0, 0.0),
+        (-0.0, 3.0),
+        (5.0, 0.0),
+        (3.0, 4.0),
+        (-5.0, 12.0),
+        (7.0, -24.0),
+        # Squaring would overflow; the scaled form must not.
+        (1e38, 1e38),
+        (0.6 * info.max, 0.6 * info.max),
+        (info.max, 1.0),
+        (info.max, info.max),
+        (-info.max, info.max / 2),
+        # Subnormal magnitudes, whose reciprocal overflows.
+        (sub, sub),
+        (sub, 0.0),
+        (-0.0, sub),
+        (3 * sub, 4 * sub),
+        (info.smallest_normal / 2, info.smallest_normal / 2),
+        (info.smallest_normal, sub),
+        (info.max, sub),
+    ]
+    value, other = zip(*pairs)
+    return torch.tensor(value, dtype=dtype), torch.tensor(other, dtype=dtype)
+
+
+def _wide_hypot_operands(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """Seeded magnitudes spread over the dtype's whole exponent range."""
+    info = torch.finfo(dtype)
+    low = math.floor(math.log2(info.smallest_normal * info.eps))
+    high = math.floor(math.log2(info.max))
+    generator = torch.Generator().manual_seed(0)
+
+    def draw() -> torch.Tensor:
+        mantissa = torch.rand(64, generator=generator, dtype=torch.float64) * 2 - 1
+        exponent = torch.randint(low, high, (64,), generator=generator)
+        return (mantissa * exponent.to(torch.float64).exp2()).to(dtype)
+
+    return draw(), draw()
+
+
+def _assert_hypot_matches(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape
+    info = torch.finfo(expected.dtype)
+    rtol = {torch.float64: 4 * info.eps}.get(expected.dtype, 2 * info.eps)
+    # One subnormal ulp of slack: the result is rounded once into that range.
+    atol = info.smallest_normal * info.eps
+    torch.testing.assert_close(
+        actual, expected, rtol=rtol, atol=atol, equal_nan=True, check_stride=False
+    )
+    # assert_close equates the zero signs; hypot's zero is +0.
+    zeros = expected == 0
+    assert not torch.signbit(actual[zeros]).any(), actual[zeros]
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "operands", [_hypot_operands, _wide_hypot_operands], ids=["special", "wide"]
+)
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.float16, torch.bfloat16]
+)
+def test_hypot_follows_c_special_values(dtype, operands, monkeypatch) -> None:
+    """``hypot.default`` lowers at stage 1 of the real (torch.compile) path.
+
+    It used to scale by the larger magnitude unconditionally, so two
+    infinities gave ``inf / inf = NaN``, a subnormal pair gave ``inf`` from an
+    overflowing reciprocal, and the origin kept ``-0.0``.
+    """
+    value, other = operands(dtype)
+    module = Hypot()
+    compiled, attempts = _backend_path(module, monkeypatch, dynamic=False)
+    _assert_hypot_matches(compiled(value, other), module(value, other))
+    _assert_stage_one(attempts, "aten.hypot.default")
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "value, other",
+    [
+        (
+            torch.tensor([[float("inf")], [float("nan")], [-0.0], [3.0], [1e-45]]),
+            torch.tensor([float("nan"), -0.0, 4.0, 1e-300], dtype=torch.float64),
+        ),
+        (
+            torch.tensor([float("inf"), float("nan"), -0.0], dtype=torch.float16),
+            torch.tensor([[float("nan")], [-0.0], [65504.0]]),
+        ),
+        (
+            torch.tensor([float("inf"), float("nan"), 3.0], dtype=torch.bfloat16),
+            torch.tensor(-0.0, dtype=torch.float16),
+        ),
+        (torch.empty(0, 3), torch.empty(3)),
+    ],
+    ids=["f32-f64", "f16-f32", "bf16-f16-scalar", "empty"],
+)
+def test_hypot_promotes_and_broadcasts(value, other, monkeypatch) -> None:
+    module = Hypot()
+    compiled, attempts = _backend_path(module, monkeypatch, dynamic=False)
+    _assert_hypot_matches(compiled(value, other), module(value, other))
+    _assert_stage_one(attempts, "aten.hypot.default")
 
 
 class PolygammaOrders(torch.nn.Module):

@@ -127,9 +127,11 @@ impl Translator<'_> {
     fn exact_atan(&mut self, input: GraphTensor) -> GraphTensor {
         let x = input.abs();
         let one = self.constant_like(x, 1.0);
-        // Nudge a zero magnitude off zero so the reciprocal branch is a
-        // finite value: `1/0 = inf` cannot be selected away on this branch
-        // yet (LUM-804), because the selection leaks `inf * 0`.
+        // `x_safe` keeps the unselected reciprocal branch finite at `x = 0`.
+        // Correctness does not depend on it: `real_select` is the native
+        // `LogicalSelect`, a true selection, so an unselected `1/0 = inf`
+        // never reaches the result, and the reciprocal is selected only
+        // where `x > 1`, where `x_safe == x`.
         let x_safe = x + self.exact_is_zero(x).cast(x.dtype);
         let reciprocal_branch = x.gt(one);
         let reduced = self.real_select(reciprocal_branch, x_safe.reciprocal(), x);
@@ -269,25 +271,63 @@ impl Translator<'_> {
         Ok(a.is_nan().select(b, b_skipped))
     }
 
-    /// Stable hypot: scale by the larger magnitude to avoid overflow.
+    /// `hypot(a, b) = sqrt(a^2 + b^2)` with the C99 Annex F special values
+    /// torch follows, in this order of precedence:
+    ///   1. if either operand is +-inf the result is +inf, even when the
+    ///      other is NaN;
+    ///   2. otherwise, if either operand is NaN the result is NaN;
+    ///   3. otherwise `hypot(+-0, +-0) = +0`, and every other pair is the
+    ///      overflow-safe `larger * sqrt(1 + (smaller / larger)^2)`.
+    ///
+    /// INVARIANT: each case is a native select (`real_select`, a true
+    /// selection) on a predicate of the operands themselves, nested so the
+    /// outer case wins. The scaled formula is therefore only observed on
+    /// finite operands off the origin, where the ratio is in `[0, 1]`: no
+    /// intermediate overflows (only the final product can, exactly when the
+    /// true result is out of the dtype's range), and an underflowing
+    /// `ratio^2` only drops a term below `1`'s precision. Its `inf / inf`
+    /// and `0 / 0` elsewhere are selected away, never multiplied by a mask.
+    /// The origin's `+0` is a constant rather than the formula's value:
+    /// core `abs` is `select(x < 0, -x, x)`, which keeps `-0.0`.
     pub(super) fn translate_hypot(&mut self, node: &Node) -> Result<GraphTensor> {
         let (lhs, rhs) = self.promoted_binary_inputs(node)?;
         let lhs = self.real_abs(lhs);
         let rhs = self.real_abs(rhs);
         let larger = lhs.maximum(rhs);
         let smaller = lhs.minimum(rhs);
-        // Nudge a zero larger off zero so `smaller/larger` is finite
-        // (0/0 would poison the result; the core cannot yet select an inf
-        // or NaN branch away — LUM-804).
-        let larger_safe = larger + self.exact_is_zero(larger).cast(larger.dtype);
-        let ratio = smaller / larger_safe;
-        let finite = larger * (self.constant_like(larger, 1.0) + ratio.square()).sqrt();
-        // Zero the origin multiplicatively rather than by select: at the
-        // origin `finite` is already 0, and an infinite `finite` only
-        // occurs away from it, so no `inf * 0` arises.
-        let both_zero = self.exact_is_zero(larger);
-        let keep = self.constant_like(finite, 1.0) - both_zero.cast(finite.dtype);
-        Ok(finite * keep)
+        let zero = self.constant_like(larger, 0.0);
+        let one = self.constant_like(larger, 1.0);
+
+        // The ratio's divisor must have a finite, normal reciprocal: core
+        // division below F64 is `smaller * (1 / larger)`, and in F32
+        // `1 / larger` overflows for a subnormal `larger` (and is itself
+        // subnormal, so inexact, above 2^126). The ratio is invariant under
+        // scaling both magnitudes by one power of two, which is exact while
+        // they stay normal, so scale before dividing: by 2^64 below 1, by
+        // 2^-64 from 1 up, which puts an F32 `larger` in [2^-85, 2^64). A
+        // `smaller` the down-scaling takes out of the normal range is below
+        // 2^-62 * `larger`, where `ratio^2` is below `1`'s precision anyway.
+        // F64 divides directly; the same exact scaling is harmless there.
+        // The result multiplies the unscaled `larger`, so the scaling adds
+        // no rounding.
+        let up = self.constant_like(larger, 2f64.powi(64));
+        let down = self.constant_like(larger, 2f64.powi(-64));
+        let scale = self.real_select(larger.lt(one), up, down);
+        let ratio = (smaller * scale) / (larger * scale);
+        let scaled = larger * (one + ratio.square()).sqrt();
+        // IEEE `==` (false for NaN): both magnitudes are zero.
+        let origin = larger.eq(zero);
+        let finite = self.real_select(origin, zero, scaled);
+
+        let any_nan = self.bool_or(lhs.is_nan(), rhs.is_nan());
+        let nan = self.constant_like(larger, f64::NAN);
+        let result = self.real_select(any_nan, nan, finite);
+
+        let lhs_inf = self.is_inf(lhs);
+        let rhs_inf = self.is_inf(rhs);
+        let any_inf = self.bool_or(lhs_inf, rhs_inf);
+        let infinity = self.constant_like(larger, f64::INFINITY);
+        Ok(self.real_select(any_inf, infinity, result))
     }
 
     pub(super) fn translate_gcd(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -1018,6 +1058,82 @@ mod tests {
             &x,
         );
         assert_close(&out, &[0.0, (18.0f32).sqrt()], 1e-6);
+    }
+
+    /// hypot against libm's `hypotf`: +inf wins over NaN, NaN wins over a
+    /// finite value, the origin is +0 for either zero sign, and the scaled
+    /// formula neither overflows below `f32::MAX` nor flushes subnormals.
+    #[test]
+    fn hypot_follows_c_special_values() {
+        fn check(actual: &[f32], lhs: &[f32], rhs: &[f32]) {
+            assert_eq!(actual.len(), lhs.len(), "length mismatch");
+            for (i, (&got, (&a, &b))) in actual.iter().zip(lhs.iter().zip(rhs)).enumerate() {
+                let want = a.hypot(b);
+                let agrees = if want.is_finite() && want != 0.0 {
+                    ((got - want) / want).abs() <= 2.0 * f32::EPSILON
+                } else {
+                    got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan())
+                };
+                assert!(
+                    agrees,
+                    "index {i}: hypot({a}, {b}) got {got:e}, expected {want:e}"
+                );
+            }
+        }
+        let tiny = f32::from_bits(1);
+        // hypot(x, x): the `inf / inf` and `0 / 0` ratios are selected away.
+        let x = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -0.0,
+            0.0,
+            3.0,
+            -1e38,
+            3e38,
+            tiny,
+            f32::MIN_POSITIVE,
+        ];
+        let out = run_f32(
+            "torch.ops.aten.hypot.default",
+            binary(input("other", tensor_arg("x"))),
+            F32,
+            &[x.len() as i64],
+            &x,
+        );
+        check(&out, &x, &x);
+        // An infinite operand gives +inf even beside a NaN.
+        let x = [f32::NAN, 1.0, -0.0, f32::NEG_INFINITY];
+        let out = run_f32(
+            "torch.ops.aten.hypot.default",
+            binary(flt("other", f64::INFINITY)),
+            F32,
+            &[x.len() as i64],
+            &x,
+        );
+        check(&out, &x, &[f32::INFINITY; 4]);
+        // A NaN operand gives NaN unless the other is infinite.
+        let x = [f32::INFINITY, f32::NEG_INFINITY, 1.0, -0.0, 1e38];
+        let out = run_f32(
+            "torch.ops.aten.hypot.default",
+            binary(flt("other", f64::NAN)),
+            F32,
+            &[x.len() as i64],
+            &x,
+        );
+        check(&out, &x, &[f32::NAN; 5]);
+        // A subnormal partner: the ratio's divisor may be subnormal, and a
+        // ratio far below 1 must leave the largest finite magnitude intact.
+        let partner = 1e-39f64;
+        let x = [3e-39, tiny, 0.0, -0.0, -f32::MAX, 1.0];
+        let out = run_f32(
+            "torch.ops.aten.hypot.default",
+            binary(flt("other", partner)),
+            F32,
+            &[x.len() as i64],
+            &x,
+        );
+        check(&out, &x, &[partner as f32; 6]);
     }
 
     #[test]
