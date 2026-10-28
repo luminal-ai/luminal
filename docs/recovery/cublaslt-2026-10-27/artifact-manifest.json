@@ -1,0 +1,37 @@
+[
+  {
+    "source": "target/debug/deps/libluminal_cuda_lite-6b716ae4b95cc6af.rlib",
+    "preserved": ".recovery/cublaslt-2026-10-27/artifacts/libluminal_cuda_lite-6b716ae4b95cc6af.rlib",
+    "bytes": 49910450,
+    "modified_utc": "2026-10-27T20:01:09.414784+00:00",
+    "sha256": "505962f82561522402864fdd0ab98136280ba45000bef7a1c9cdb4b5757daeb8"
+  },
+  {
+    "source": "target/debug/deps/libluminal_cuda_lite-fc9145c3168abb2c.rlib",
+    "preserved": ".recovery/cublaslt-2026-10-27/artifacts/libluminal_cuda_lite-fc9145c3168abb2c.rlib",
+    "bytes": 62219420,
+    "modified_utc": "2026-10-27T19:58:42.025529+00:00",
+    "sha256": "850f373a00b8518b390846145374f2acf46f1a4308a272426e468165efe2f5fb"
+  },
+  {
+    "source": "target/debug/deps/cublaslt_strided_batch-2dba83a344abf150",
+    "preserved": ".recovery/cublaslt-2026-10-27/artifacts/cublaslt_strided_batch-2dba83a344abf150",
+    "bytes": 239236416,
+    "modified_utc": "2026-10-27T20:02:00.568276+00:00",
+    "sha256": "b760480051336d9f1dfae4f5884a1c763723898ae1398c36ef1d239d9a54c9a8"
+  },
+  {
+    "source": "target/debug/deps/cublaslt_strided_batch-4d2699e2e7da5f35",
+    "preserved": ".recovery/cublaslt-2026-10-27/artifacts/cublaslt_strided_batch-4d2699e2e7da5f35",
+    "bytes": 299841088,
+    "modified_utc": "2026-10-27T19:58:53.811430+00:00",
+    "sha256": "7e116e1eefbdb7a704b76deb75b4032f939bfd258d29355502b94c61840c4f76"
+  },
+  {
+    "source": "target/debug/deps/libluminal-add0cc576a86e07e.rlib",
+    "preserved": ".recovery/cublaslt-2026-10-27/artifacts/libluminal-add0cc576a86e07e.rlib",
+    "bytes": 100626758,
+    "modified_utc": "2026-10-27T06:12:28.855741+00:00",
+    "sha256": "339fb809ac26bead97c2a3e12012f564a197388169d2e50b16914de1dbe1e360"
+  }
+]

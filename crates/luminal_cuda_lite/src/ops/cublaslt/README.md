@@ -144,11 +144,33 @@ because it also preserves the binaries. Its manifest records archive sections,
 source bytes, and hashes. The core element-stride rule files match the recovered
 core library exactly and did not require replacement.
 
+The small [recovery records](../../../../../docs/recovery/cublaslt-2026-10-27/)
+are also committed: the ELF extraction script, original artifact locations and
+timestamps, and the section/byte/hash manifest. The large original binaries
+remain in the local bundle. To repeat extraction from those preserved archives:
+
+```sh
+python3 docs/recovery/cublaslt-2026-10-27/extract_egg.py .recovery/cublaslt-2026-10-27
+```
+
 The accompanying Rust wiring and missing batch test source were reconstructed
 from the surviving baseline, the exact rule types, and binary debug information;
 they are not claimed to be verbatim recovered Rust source. The preserved original
 batch board passes 14 CPU tests and 4 device tests on the A100. Source validation
 is recorded separately in the recovery bundle.
+
+Restored-source validation on the A100 passes all 672 separate-destination and
+336 in-place configuration executions, 288 batched dispatch witnesses, dynamic
+batch-count replay, precision boundaries, bounds checks, and storage-tie repair.
+The CPU admission suites pass, as do core, neural-network and reference-runtime
+tests. `cargo fmt --all -- --check` and device-enabled CUDA Lite Clippy with
+`-D warnings` pass.
+
+The broader test-runtime run reports
+`buf_attack_a2_cert_sched::a2_double_view_roundtrip`: it expects zero elected
+view nodes, but the restored vocabulary elects three. The same test passes on
+the pre-recovery foundation `6ebdf881`. This remains an open extraction/test
+expectation issue; the recovery does not claim a green full landing suite.
 
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its

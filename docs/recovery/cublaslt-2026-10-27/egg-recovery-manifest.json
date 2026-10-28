@@ -1,0 +1,167 @@
+[
+  {
+    "archive": "artifacts/libluminal-add0cc576a86e07e.rlib",
+    "member": "/15142",
+    "section": ".rodata..Lanon.a518cce5df0e42c0046a420c86390532.18",
+    "file": "recovered-egg/libluminal-add0cc576a86e07e/element_stride_constructors.egg",
+    "bytes": 386,
+    "sha256": "e0283193846ebd8601b28cc46aaca759f720076390c4e5f2af7234c69212652c",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal-add0cc576a86e07e.rlib",
+    "member": "/15142",
+    "section": ".rodata..Lanon.a518cce5df0e42c0046a420c86390532.19",
+    "file": "recovered-egg/libluminal-add0cc576a86e07e/element_stride_rules.egg",
+    "bytes": 13505,
+    "sha256": "2fd1e9050eb15fd379b9f6357c7b007cc600988f25b60d809e63e659a73987c4",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal-add0cc576a86e07e.rlib",
+    "member": "/15142",
+    "section": ".rodata..Lanon.a518cce5df0e42c0046a420c86390532.20",
+    "file": "recovered-egg/libluminal-add0cc576a86e07e/element_stride_discovery.egg",
+    "bytes": 8437,
+    "sha256": "67ba9aee5e10a2c0b9a9a06c71a56bb146cc02ccd0ac9b659d0ed5160cd22fd6",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-6b716ae4b95cc6af.rlib",
+    "member": "/4004",
+    "section": ".rodata..Lanon.5ee26c2170275a88e2d28a65361c0ec5.27",
+    "file": "recovered-egg/libluminal_cuda_lite-6b716ae4b95cc6af/approved_constructors.egg",
+    "bytes": 4960,
+    "sha256": "c36e68c0bb34d2a66ff2dbbf69742e7b35618d7cb3714cd1252cd98041ee5b3b",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-6b716ae4b95cc6af.rlib",
+    "member": "/4004",
+    "section": ".rodata..Lanon.5ee26c2170275a88e2d28a65361c0ec5.28",
+    "file": "recovered-egg/libluminal_cuda_lite-6b716ae4b95cc6af/approved_rules.egg",
+    "bytes": 32120,
+    "sha256": "60a58487238d4d8c61e35ae721d7ed1d791c2896905b7546102fff9c8ddc3565",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-6b716ae4b95cc6af.rlib",
+    "member": "/4004",
+    "section": ".rodata..Lanon.5ee26c2170275a88e2d28a65361c0ec5.29",
+    "file": "recovered-egg/libluminal_cuda_lite-6b716ae4b95cc6af/strided_batch_rules.egg",
+    "bytes": 16319,
+    "sha256": "2646bcb98546e16d454563e6fa73925205522ed87aab0c9e0b99c486c35b9c6d",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-6b716ae4b95cc6af.rlib",
+    "member": "/4004",
+    "section": ".rodata..Lanon.5ee26c2170275a88e2d28a65361c0ec5.30",
+    "file": "recovered-egg/libluminal_cuda_lite-6b716ae4b95cc6af/approved_whitelist.egg",
+    "bytes": 254590,
+    "sha256": "ad09da778da2375222accacc1d5f6eea48c47b29e09a175c703e93949b9f1cbc",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-6b716ae4b95cc6af.rlib",
+    "member": "/4004",
+    "section": ".rodata..Lanon.5ee26c2170275a88e2d28a65361c0ec5.31",
+    "file": "recovered-egg/libluminal_cuda_lite-6b716ae4b95cc6af/accumulate_in_place_call.egg",
+    "bytes": 2737,
+    "sha256": "95f6d498efc1ed5f46d3aeff21d6cade2cfae68d800a264d7d851e88ea777bf5",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-6b716ae4b95cc6af.rlib",
+    "member": "/13475",
+    "section": ".rodata..Lanon.b4657814ac52245db428bfc2e19f50dc.51",
+    "file": "recovered-egg/libluminal_cuda_lite-6b716ae4b95cc6af/separate_destination_call.egg",
+    "bytes": 719,
+    "sha256": "3bce5563f5b357df8a512e632e026c69a98ee281bad7b5e74b780e447a526bd0",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-fc9145c3168abb2c.rlib",
+    "member": "/1463",
+    "section": ".rodata..Lanon.29c696a7984d2ff0d6d5ba982517df5a.27",
+    "file": "recovered-egg/libluminal_cuda_lite-fc9145c3168abb2c/approved_constructors.egg",
+    "bytes": 4960,
+    "sha256": "c36e68c0bb34d2a66ff2dbbf69742e7b35618d7cb3714cd1252cd98041ee5b3b",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-fc9145c3168abb2c.rlib",
+    "member": "/1463",
+    "section": ".rodata..Lanon.29c696a7984d2ff0d6d5ba982517df5a.28",
+    "file": "recovered-egg/libluminal_cuda_lite-fc9145c3168abb2c/approved_rules.egg",
+    "bytes": 32120,
+    "sha256": "60a58487238d4d8c61e35ae721d7ed1d791c2896905b7546102fff9c8ddc3565",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-fc9145c3168abb2c.rlib",
+    "member": "/1463",
+    "section": ".rodata..Lanon.29c696a7984d2ff0d6d5ba982517df5a.29",
+    "file": "recovered-egg/libluminal_cuda_lite-fc9145c3168abb2c/strided_batch_rules.egg",
+    "bytes": 16319,
+    "sha256": "2646bcb98546e16d454563e6fa73925205522ed87aab0c9e0b99c486c35b9c6d",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-fc9145c3168abb2c.rlib",
+    "member": "/1463",
+    "section": ".rodata..Lanon.29c696a7984d2ff0d6d5ba982517df5a.30",
+    "file": "recovered-egg/libluminal_cuda_lite-fc9145c3168abb2c/approved_whitelist.egg",
+    "bytes": 254590,
+    "sha256": "ad09da778da2375222accacc1d5f6eea48c47b29e09a175c703e93949b9f1cbc",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-fc9145c3168abb2c.rlib",
+    "member": "/1463",
+    "section": ".rodata..Lanon.29c696a7984d2ff0d6d5ba982517df5a.31",
+    "file": "recovered-egg/libluminal_cuda_lite-fc9145c3168abb2c/accumulate_in_place_call.egg",
+    "bytes": 2737,
+    "sha256": "95f6d498efc1ed5f46d3aeff21d6cade2cfae68d800a264d7d851e88ea777bf5",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  },
+  {
+    "archive": "artifacts/libluminal_cuda_lite-fc9145c3168abb2c.rlib",
+    "member": "/9317",
+    "section": ".rodata..Lanon.a27f8641f3bf45621ec7d0376349c45d.51",
+    "file": "recovered-egg/libluminal_cuda_lite-fc9145c3168abb2c/separate_destination_call.egg",
+    "bytes": 719,
+    "sha256": "3bce5563f5b357df8a512e632e026c69a98ee281bad7b5e74b780e447a526bd0",
+    "starts_with_anchor": true,
+    "ends_with_newline": true,
+    "contains_nul": false
+  }
+]
