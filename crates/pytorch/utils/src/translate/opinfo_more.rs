@@ -194,15 +194,23 @@ impl Translator<'_> {
         let result = match target {
             "logit.default" => {
                 let mut x = x;
-                if let Some(eps) = node
-                    .inputs
-                    .iter()
-                    .find(|i| i.name == "eps")
-                    .and_then(|i| i.arg.as_float())
-                {
+                if let Some(eps) = self.named_float_arg(node, "eps") {
+                    // ATen clamps as `x < lo ? lo : (x > hi ? hi : x)` with
+                    // `lo = eps` and `hi = 1 - eps`, both in the arithmetic
+                    // dtype. The order of the two tests is the semantics: when
+                    // `eps > 0.5` the bounds cross (`lo > hi`), and inputs
+                    // below `lo` take `lo` while every other input takes `hi`.
+                    // `min(max(x, lo), hi)` collapses that to `hi` everywhere,
+                    // so the clamp must be this nested select. Only the ordered
+                    // `lt`/`gt` predicates are used: both are false for NaN, so
+                    // a NaN input passes through, and a NaN `eps` clamps
+                    // nothing. A negative `eps` (the kernel's "no clamp") gives
+                    // the same values either way: `x < lo < 0` and
+                    // `x > hi > 1` are already NaN in `log(x / (1 - x))`.
                     let lo = self.constant_like(x, eps);
-                    let hi = self.constant_like(x, 1.0 - eps);
-                    x = x.maximum(lo).minimum(hi);
+                    let hi = one - lo;
+                    let upper = self.select(x.gt(hi), hi, x);
+                    x = self.select(x.lt(lo), lo, upper);
                 }
                 (x / (one - x)).log()
             }

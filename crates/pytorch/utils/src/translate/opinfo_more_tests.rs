@@ -207,6 +207,84 @@ fn logaddexp_handles_equal_infinities_and_finite_cancellation() {
     assert!((y[3] - std::f32::consts::LN_2).abs() < 1e-6);
 }
 
+/// ATen's `logit_kernel`, in f32: a negative or NaN `eps` clamps nothing,
+/// otherwise `x < lo ? lo : (x > hi ? hi : x)` with `lo = eps`,
+/// `hi = 1 - eps`, then `x == 1 ? inf : log(x / (1 - x))`.
+fn aten_logit(x: f32, eps: Option<f32>) -> f32 {
+    let x = match eps {
+        Some(lo) if lo >= 0. => {
+            let hi = 1. - lo;
+            if x < lo {
+                lo
+            } else if x > hi {
+                hi
+            } else {
+                x
+            }
+        }
+        _ => x,
+    };
+    if x == 1. {
+        f32::INFINITY
+    } else {
+        (x / (1. - x)).ln()
+    }
+}
+
+#[test]
+fn logit_clamps_low_bound_first_when_eps_crosses_the_bounds() {
+    let x = vec![
+        0.,
+        0.2,
+        0.5,
+        0.7,
+        0.9,
+        1.,
+        1.5,
+        -0.5,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    // eps > 0.5 makes lo > hi; eps < 0 is the kernel's no-clamp branch.
+    for eps in [
+        None,
+        Some(0.),
+        Some(0.1),
+        Some(0.5),
+        Some(0.6),
+        Some(0.9),
+        Some(-0.1),
+    ] {
+        let mut inputs = vec![tensor_input("self", "x")];
+        if let Some(eps) = eps {
+            inputs.push(scalar_float("eps", eps));
+        }
+        let t = translate_one(
+            node("torch.ops.aten.logit.default", inputs, &["y"]),
+            &[("x", FLOAT, &[11]), ("y", FLOAT, &[11])],
+            &["x"],
+            &["y"],
+        );
+        let rt = run(&t, vec![TypedBuffer::F32(x.clone())]);
+        let actual = rt.get_f32(t.outputs[0].tensor).unwrap();
+        for (i, (&actual, &input)) in actual.iter().zip(&x).enumerate() {
+            let expected = aten_logit(input, eps.map(|eps| eps as f32));
+            let same = if expected.is_nan() {
+                actual.is_nan()
+            } else if expected.is_infinite() {
+                actual == expected
+            } else {
+                (actual - expected).abs() <= 1e-6 * expected.abs().max(1.)
+            };
+            assert!(
+                same,
+                "logit(x[{i}] = {input}, eps = {eps:?}): expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
 #[test]
 fn scalar_predicates_broadcast_with_the_other_value_branch() {
     let t = translate_one(
