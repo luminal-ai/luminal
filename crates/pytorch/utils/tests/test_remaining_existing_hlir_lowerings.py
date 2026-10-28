@@ -524,6 +524,156 @@ def test_fixed_shape_indexing_and_search_composites() -> None:
     _check(module, *inputs)
 
 
+def _backend_path(module: torch.nn.Module, monkeypatch, **compile_options):
+    """`torch.compile` through the luminal backend, the real two-stage path.
+
+    Returns the compiled module and the ATen targets of every program handed
+    to the translator. Stage 1 is the undecomposed graph; a second attempt
+    appears only if stage 1 raised "unsupported ATen op". The list doubles as
+    a recompile guard: one entry per compilation.
+    """
+    attempts: list[set[str]] = []
+    save = torch.export.save
+
+    def recording_save(program, *args, **kwargs):
+        attempts.append(
+            {
+                str(node.target)
+                for node in program.graph.nodes
+                if node.op == "call_function"
+            }
+        )
+        return save(program, *args, **kwargs)
+
+    monkeypatch.setattr(torch.export, "save", recording_save)
+    compiled = torch.compile(
+        module, backend=luminal_backend, fullgraph=True, **compile_options
+    )
+    return compiled, attempts
+
+
+def _assert_stage_one(attempts, *targets: str) -> None:
+    assert len(attempts) == 1, f"expected one stage-1 translation, got {attempts}"
+    for target in targets:
+        assert target in attempts[0], f"{target} was decomposed: {attempts[0]}"
+
+
+class SearchVariants(torch.nn.Module):
+    def forward(self, boundaries, queries, rows, row_queries, point, unsorted, sorter):
+        empty = boundaries[:0]
+        return (
+            torch.searchsorted(boundaries, queries),
+            torch.searchsorted(boundaries, queries, right=True),
+            torch.searchsorted(boundaries, queries, side="right"),
+            torch.searchsorted(boundaries, queries, out_int32=True),
+            torch.searchsorted(boundaries, queries, out_int32=True, right=True),
+            torch.searchsorted(rows, row_queries),
+            torch.searchsorted(rows, row_queries, side="right"),
+            torch.searchsorted(boundaries, row_queries),
+            torch.searchsorted(boundaries, point),
+            torch.searchsorted(boundaries, 3.0),
+            torch.searchsorted(boundaries, float("nan"), right=True, out_int32=True),
+            torch.searchsorted(unsorted, queries, sorter=sorter),
+            torch.searchsorted(
+                unsorted, queries, sorter=sorter, side="right", out_int32=True
+            ),
+            torch.searchsorted(empty, queries),
+            torch.bucketize(queries, boundaries),
+            torch.bucketize(queries, boundaries, right=True, out_int32=True),
+            torch.bucketize(row_queries, boundaries),
+        )
+
+
+def test_search_composites_match_eager_on_the_backend_path(monkeypatch) -> None:
+    # The insertion index is an exact integer count in [0, row_length]; NaN
+    # queries sort past every boundary, and ±inf boundaries are ordinary.
+    nan, inf = float("nan"), float("inf")
+    unsorted = torch.tensor([5.0, 3.0, -inf, 1.0, 3.0, inf])
+    inputs = (
+        torch.tensor([-inf, 1.0, 3.0, 3.0, 5.0, inf]),
+        torch.tensor([nan, -inf, 0.0, 1.0, 3.0, 4.0, 5.0, 8.0, inf]),
+        torch.tensor([[1.0, 3.0, 3.0, 5.0, 7.0], [0.0, 2.0, 4.0, 6.0, 8.0]]),
+        torch.tensor([[0.0, 3.0, 7.0, nan], [-1.0, 2.0, 5.0, 9.0]]),
+        torch.tensor(3.0),
+        unsorted,
+        torch.argsort(unsorted),
+    )
+    module = SearchVariants()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(
+        attempts,
+        "aten.searchsorted.Tensor",
+        "aten.searchsorted.Scalar",
+        "aten.bucketize.Tensor",
+    )
+
+
+class SearchDtypes(torch.nn.Module):
+    def forward(self, boundaries, queries):
+        return (
+            torch.searchsorted(boundaries, queries),
+            torch.searchsorted(boundaries, queries, right=True, out_int32=True),
+            torch.bucketize(queries, boundaries),
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float64, torch.float16, torch.bfloat16, torch.uint8, torch.int64],
+)
+def test_search_composites_match_eager_across_dtypes(dtype, monkeypatch) -> None:
+    queries = [0.0, 1.0, 3.0, 4.0, 7.0, 8.0]
+    if dtype.is_floating_point:
+        queries += [float("nan"), float("inf"), -float("inf")]
+    inputs = (
+        torch.tensor([1.0, 3.0, 3.0, 5.0, 7.0]).to(dtype),
+        torch.tensor(queries).to(dtype),
+    )
+    module = SearchDtypes()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(attempts, "aten.searchsorted.Tensor", "aten.bucketize.Tensor")
+
+
+class SearchSorted(torch.nn.Module):
+    def forward(self, boundaries, queries):
+        return torch.searchsorted(boundaries, queries)
+
+
+def test_searchsorted_matches_eager_with_symbolic_lengths(monkeypatch) -> None:
+    # A symbolic row length is the reduced extent of the count, so it is
+    # what the integer sum's width proof has to bound.
+    module = SearchSorted()
+    compiled, attempts = _backend_path(module, monkeypatch, dynamic=True)
+    nan = float("nan")
+    for boundaries, queries in (
+        ([1.0, 3.0, 5.0, 7.0], [0.0, 2.0, 4.0, 6.0, 8.0, nan]),
+        ([1.0, 3.0, 5.0, 7.0, 9.0, 11.0], [nan, 10.0, 3.0]),
+    ):
+        inputs = (torch.tensor(boundaries), torch.tensor(queries))
+        _assert_close(compiled(*inputs), module(*inputs))
+    _assert_stage_one(attempts, "aten.searchsorted.Tensor")
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("dtype", [torch.int64, torch.float32])
+def test_searchsorted_count_is_exact_past_the_f32_integer_range(
+    dtype, monkeypatch
+) -> None:
+    # 2^24 + 1 is the first count an F32 accumulator cannot hold; the float
+    # row also needs the NaN redirect to produce that same row length.
+    length = (1 << 24) + 1
+    queries = [1.0, float("nan")] if dtype.is_floating_point else [1]
+    inputs = (torch.zeros(length, dtype=dtype), torch.tensor(queries, dtype=dtype))
+    module = SearchSorted()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    expected = module(*inputs)
+    assert expected.tolist() == [length] * len(queries)
+    _assert_close(compiled(*inputs), expected)
+    _assert_stage_one(attempts, "aten.searchsorted.Tensor")
+
+
 class ComplexMovement(torch.nn.Module):
     def forward(self, value, source, mask, gather_index, fancy_index):
         return (

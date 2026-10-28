@@ -438,25 +438,39 @@ impl Translator<'_> {
         } else {
             boundaries.lt(queries)
         };
-        // The insertion count is carried in F32 (exact below 2^24) so the
-        // NaN redirect can use the native F32 `cond`; an Int `cond` is refused
-        // because it would have to cast the F32 complement back to Int.
-        let mut result = before.cast(DType::F32).sum(vec![query_rank]);
-        if matches!(
+        // INVARIANT: the insertion index is an exact integer in
+        // [0, row_length]. It is a count of `row_length` 0/1 indicators,
+        // so it is accumulated in I64, where every value in that interval
+        // is representable, and never passes through a float (F32 is exact
+        // only to 2^24, so a longer row would saturate silently). The
+        // planner proves the I64 sum in width from the Bool -> I64
+        // indicator bounds [0, 1] scaled by the reduced extent's bounds
+        // (cast/value_bounds.egg, reduce_sum/value_bounds.egg).
+        let count = before.cast(DType::I64).sum(vec![query_rank]);
+        let result = if matches!(
             query.dtype,
             DType::F16 | DType::Bf16 | DType::F32 | DType::F64
         ) {
             // NaN sorts past every boundary in both searchsorted and
-            // bucketize, so redirect it to the row length.
+            // bucketize, so redirect it to the row length: an exact
+            // integer constant (an `IntExpr`, so a symbolic row length
+            // stays symbolic) chosen by the native select at I64, which
+            // moves the chosen branch's payload untouched. The constant is
+            // an Int iota widened to I64, so a row past i32::MAX refuses
+            // loudly at the iota rather than wrapping.
             let nan = self.is_nan(query);
             let end = self
                 .cx
                 .constant_i32(row_length)
-                .cast(DType::F32)
-                .expand_rhs(result.dims());
-            result = end.cond(nan, result);
-        }
-        Ok(result.trunc_cast(self.output_meta_dtype(node)?))
+                .cast(DType::I64)
+                .expand_rhs(count.dims());
+            nan.select(end, count)
+        } else {
+            count
+        };
+        // int64 by default, int32 under `out_int32`; the I64 -> Int
+        // narrowing is checked for exactness by the runtime.
+        Ok(result.cast(self.output_meta_dtype(node)?))
     }
 
     // -----------------------------------------------------------------
@@ -824,6 +838,10 @@ impl Translator<'_> {
 mod tests {
     use std::collections::HashMap;
 
+    use luminal::prelude::petgraph::Direction;
+    use luminal::prelude::petgraph::visit::EdgeRef;
+    use luminal::prelude::{DType, LogicalOp, NodeIndex};
+
     use crate::pt2_parser::ParsedPT2;
     use crate::pt2_schema::{
         Argument, BoolArg, DimInt, DimSize, ExportedProgram, FloatArg, Graph, GraphArg,
@@ -1018,6 +1036,208 @@ mod tests {
             &["s"],
             &["y"],
         ));
+    }
+
+    /// The logical node behind `id`, seen through movement ops (a
+    /// broadcast is geometry, not arithmetic).
+    fn through_views(graph: &luminal::prelude::Graph, mut id: NodeIndex) -> NodeIndex {
+        while matches!(
+            graph.logical.petgraph()[id].op,
+            LogicalOp::IndexMapApply { .. }
+        ) {
+            id = operands(graph, id)[0];
+        }
+        id
+    }
+
+    /// A node's operands in port order.
+    fn operands(graph: &luminal::prelude::Graph, id: NodeIndex) -> Vec<NodeIndex> {
+        let mut edges: Vec<_> = graph
+            .logical
+            .petgraph()
+            .edges_directed(id, Direction::Incoming)
+            .map(|edge| (edge.weight().0, edge.source()))
+            .collect();
+        edges.sort_by_key(|(port, _)| *port);
+        edges.into_iter().map(|(_, source)| source).collect()
+    }
+
+    /// A tensor's name, torch dtype code, and static shape.
+    type Meta = (&'static str, u32, &'static [i64]);
+
+    /// The insertion index is an exact integer in [0, row_length]: the
+    /// count of 0/1 indicators is summed in I64 (F32 saturates at 2^24),
+    /// the NaN redirect is a native I64 select of the row length, and no
+    /// float-to-int truncation appears anywhere on the result's path.
+    #[test]
+    fn search_count_is_an_exact_i64_sum() {
+        let cases: [(&str, Vec<NodeInput>, Vec<Meta>, bool); 4] = [
+            (
+                "torch.ops.aten.searchsorted.Tensor",
+                vec![
+                    input("sorted_sequence", tensor_arg("s")),
+                    input("values", tensor_arg("v")),
+                    boolean("right", false),
+                ],
+                vec![("s", 7, &[5]), ("v", 7, &[3]), ("y", 5, &[3])],
+                true,
+            ),
+            (
+                "torch.ops.aten.searchsorted.Tensor",
+                vec![
+                    input("sorted_sequence", tensor_arg("s")),
+                    input("values", tensor_arg("v")),
+                    boolean("out_int32", true),
+                    boolean("right", true),
+                ],
+                vec![("s", 7, &[2, 5]), ("v", 7, &[2, 3]), ("y", 4, &[2, 3])],
+                true,
+            ),
+            (
+                "torch.ops.aten.searchsorted.Scalar",
+                vec![
+                    input("sorted_sequence", tensor_arg("s")),
+                    float("values", 2.5),
+                ],
+                vec![("s", 7, &[5]), ("y", 5, &[])],
+                true,
+            ),
+            (
+                "torch.ops.aten.bucketize.Tensor",
+                vec![
+                    input("input", tensor_arg("v")),
+                    input("boundaries", tensor_arg("s")),
+                    boolean("out_int32", false),
+                    boolean("right", false),
+                ],
+                vec![("v", 5, &[3]), ("s", 5, &[5]), ("y", 5, &[3])],
+                false,
+            ),
+        ];
+        for (target, inputs, metas, float_query) in cases {
+            let names: Vec<&str> = metas
+                .iter()
+                .map(|(name, _, _)| *name)
+                .filter(|name| *name != "y")
+                .collect();
+            let out_int32 = metas
+                .iter()
+                .any(|(name, code, _)| *name == "y" && *code == 4);
+            let t =
+                crate::translate::translate(&parsed(node(target, inputs), &metas, &names, &["y"]))
+                    .unwrap();
+            let graph = &t.graph;
+            let logical = graph.logical.petgraph();
+            for id in logical.node_indices() {
+                assert!(
+                    !matches!(logical[id].op, LogicalOp::TruncCast(_)),
+                    "{target}: the insertion index passes through a float truncation"
+                );
+            }
+            let mut value = t.outputs[0].tensor;
+            if out_int32 {
+                assert_eq!(logical[value].op, LogicalOp::Cast(DType::Int), "{target}");
+                value = operands(graph, value)[0];
+            }
+            let mut count = through_views(graph, value);
+            if float_query {
+                assert_eq!(logical[count].op, LogicalOp::Select, "{target}");
+                let branches = operands(graph, count);
+                let end = through_views(graph, branches[1]);
+                assert_eq!(logical[end].op, LogicalOp::Cast(DType::I64), "{target}");
+                assert!(
+                    matches!(
+                        logical[through_views(graph, operands(graph, end)[0])].op,
+                        LogicalOp::Iota { .. }
+                    ),
+                    "{target}: the NaN redirect is the exact row-length constant"
+                );
+                count = through_views(graph, branches[2]);
+            }
+            assert!(
+                matches!(logical[count].op, LogicalOp::ReduceSum { .. }),
+                "{target}: expected the insertion count, got {:?}",
+                logical[count].op
+            );
+            assert_eq!(logical[count].dtype, DType::I64, "{target}");
+            let indicator = through_views(graph, operands(graph, count)[0]);
+            assert_eq!(
+                logical[indicator].op,
+                LogicalOp::Cast(DType::I64),
+                "{target}"
+            );
+            assert_eq!(
+                logical[through_views(graph, operands(graph, indicator)[0])].dtype,
+                DType::Bool,
+                "{target}: the count sums Bool indicators"
+            );
+        }
+    }
+
+    /// Executes on the reference runtime: the planner must prove the I64
+    /// count in width, and NaN/±inf queries, `right`, and `out_int32`
+    /// keep their eager answers.
+    #[test]
+    fn search_count_executes_exactly_on_the_reference_runtime() {
+        use luminal_reference::{ReferenceRuntime, TypedBuffer, harness_search_options};
+        use rustc_hash::FxHashMap;
+
+        let run = |right: bool, out_code: u32| {
+            let mut inputs = vec![
+                input("sorted_sequence", tensor_arg("s")),
+                input("values", tensor_arg("v")),
+                boolean("right", right),
+            ];
+            if out_code == 4 {
+                inputs.push(boolean("out_int32", true));
+            }
+            let t = crate::translate::translate(&parsed(
+                node("torch.ops.aten.searchsorted.Tensor", inputs),
+                &[("s", 7, &[4]), ("v", 7, &[6]), ("y", out_code, &[6])],
+                &["s", "v"],
+                &["y"],
+            ))
+            .unwrap();
+            let mut runtime = ReferenceRuntime::load(&t.graph).unwrap();
+            let dims = t.dims.iter().map(|(&s, &hint)| (s, hint)).collect();
+            let bounds = luminal::shape::SymbolBounds::exact(&dims).unwrap();
+            let data: FxHashMap<_, _> = t
+                .inputs
+                .iter()
+                .zip([
+                    TypedBuffer::F32(vec![f32::NEG_INFINITY, 1.0, 1.0, 3.0]),
+                    TypedBuffer::F32(vec![
+                        f32::NAN,
+                        f32::NEG_INFINITY,
+                        1.0,
+                        2.0,
+                        3.0,
+                        f32::INFINITY,
+                    ]),
+                ])
+                .map(|(input, values)| (input.tensor, values))
+                .collect();
+            runtime
+                .search(&bounds, &dims, &data, &harness_search_options())
+                .unwrap();
+            for (input, values) in data {
+                runtime.set_data(input, values);
+            }
+            runtime.execute().unwrap();
+            if out_code == 4 {
+                runtime
+                    .get_i32(t.outputs[0].tensor)
+                    .unwrap()
+                    .iter()
+                    .map(|&v| i64::from(v))
+                    .collect::<Vec<_>>()
+            } else {
+                runtime.get_i64(t.outputs[0].tensor).unwrap().clone()
+            }
+        };
+        assert_eq!(run(false, 5), [4, 0, 1, 3, 3, 4]);
+        assert_eq!(run(true, 5), [4, 1, 3, 3, 4, 4]);
+        assert_eq!(run(false, 4), [4, 0, 1, 3, 3, 4]);
     }
 
     #[test]
