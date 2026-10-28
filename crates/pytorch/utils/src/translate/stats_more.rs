@@ -321,23 +321,7 @@ impl Translator<'_> {
                 let columns = input.dims()[1];
                 let output_shape = self.output_meta_shape(node)?;
                 let pairs = output_shape[0];
-                let k = self.cx.arange(pairs).cast(DType::F32);
-                let rows_f = self
-                    .cx
-                    .constant_i32(rows)
-                    .cast(DType::F32)
-                    .expand_rhs(k.dims());
-                let discriminant = k * -8.0f32 + rows_f * (rows_f - 1.0f32) * 4.0f32 - 7.0f32;
-                let i = (rows_f
-                    - 2.0f32
-                    - (discriminant.sqrt() * 0.5f32 - 0.5f32)
-                        .trunc_cast(DType::Int)
-                        .cast(DType::F32))
-                .trunc_cast(DType::Int);
-                let i_f = i.cast(DType::F32);
-                let j = (k + i_f + 1.0f32 - rows_f * (rows_f - 1.0f32) * 0.5f32
-                    + (rows_f - i_f) * (rows_f - i_f - 1.0f32) * 0.5f32)
-                    .trunc_cast(DType::Int);
+                let (i, j) = self.pdist_pair_indices(rows, pairs);
                 let i = i.expand_dim(1, columns);
                 let j = j.expand_dim(1, columns);
                 let pair_shape = vec![pairs, columns];
@@ -350,6 +334,46 @@ impl Translator<'_> {
                 Ok(self.p_norm(magnitude, p, vec![1]))
             }
         }
+    }
+
+    /// The row-major upper-triangle pair `(i, j)`, `i < j`, of every flat
+    /// pdist index `k in 0..pairs` (`pairs = n(n-1)/2`, `n = rows`): two
+    /// `Int` tensors of shape `[pairs]`, in torch.pdist's output order.
+    ///
+    /// Invariant: every value below is an INTEGER held in F64 whose
+    /// magnitude stays under `8n^2`, which is below `2^53` for every
+    /// `n <= 2^25`, so each add, multiply, halving (of an even product) and
+    /// compare is exact. That bound covers every pdist this lowering can
+    /// express: `k` is an Int (i32) iota, which refuses loudly once
+    /// `pairs > i32::MAX` (`n > 65536`). Floating point only SEEDS the row:
+    /// the closed-form inverse `n - 2 - floor((sqrt(4n(n-1) - 8k - 7) - 1) / 2)`
+    /// can land one row off when the backend's F64 square root or floor is
+    /// not correctly rounded (CUDA-lite currently emits `sqrtf`/`floorf`,
+    /// i.e. F32 precision, for F64 operands). The seed is then fixed by
+    /// exact comparisons: the true row is the unique `r` with
+    /// `row_start(r) <= k < row_start(r + 1)`, where
+    /// `row_start(r) = r(2n - r - 1)/2` counts the pairs before row `r`, and
+    /// one step each way recovers it from any seed within one row of it
+    /// (`row_start` is nondecreasing on `-1..=n`, so the seeds `-1` and
+    /// `n - 1` correct too). The old lowering ran the whole inverse in F32,
+    /// which cannot hold `k` or `4n(n-1)` exactly past `2^24`: its pairs went
+    /// wrong (and out of bounds) from `n = 4609`.
+    fn pdist_pair_indices(&mut self, rows: IntExpr, pairs: IntExpr) -> (GraphTensor, GraphTensor) {
+        let k = self.cx.arange(pairs).cast(DType::F64);
+        let n = self
+            .cx
+            .constant_i32(rows)
+            .cast(DType::F64)
+            .expand_rhs(k.dims());
+        let row_start = |row: GraphTensor| row * (n * 2.0 - row - 1.0) * 0.5;
+        let discriminant = n * (n - 1.0) * 4.0 - k * 8.0 - 7.0;
+        let seed = n - 2.0 - ((discriminant.sqrt() - 1.0) * 0.5).floor();
+        let next = seed + 1.0;
+        let row = k
+            .lt(row_start(seed))
+            .select(seed - 1.0, k.lt(row_start(next)).select(seed, next));
+        let column = k - row_start(row) + row + 1.0;
+        (row.trunc_cast(DType::Int), column.trunc_cast(DType::Int))
     }
 
     /// torch forms a distance's pairwise difference in the operand dtype
