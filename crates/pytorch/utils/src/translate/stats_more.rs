@@ -30,6 +30,19 @@ pub(super) enum DistVariant {
     Pdist,
 }
 
+/// Which of ATen's CPU histogram kernels (`native/cpu/HistogramKernel.cpp`)
+/// assigns samples to bins; see [`Translator::histogram_bin_onehot`].
+#[derive(Clone, Copy)]
+enum HistogramBinSearch {
+    /// `BINARY_SEARCH`, used by `histogramdd_stub` for caller-supplied edge
+    /// tensors: `upper_bound` over every edge.
+    Binary,
+    /// `LINEAR_INTERPOLATION_WITH_LOCAL_SEARCH`, used by
+    /// `histogramdd_linear_stub` for bin counts: `upper_bound` over the
+    /// three edges around the interpolated bin.
+    LocalSearch,
+}
+
 /// Expand `[k]` / `[k, k, ..]` spatial lists to exactly `spatial` entries.
 fn expand_spatial(values: &[i64], spatial: usize, default: i64) -> Result<Vec<usize>> {
     let values = if values.is_empty() {
@@ -489,7 +502,12 @@ impl Translator<'_> {
                 .map(|range| (range[0], range[1]));
             self.uniform_histogram_edges(values, bins, range)
         };
-        let histogram = self.histogram_from_edges(&[values], &[edges], weight, density)?;
+        let search = if bins_tensor {
+            HistogramBinSearch::Binary
+        } else {
+            HistogramBinSearch::LocalSearch
+        };
+        let histogram = self.histogram_from_edges(&[values], &[edges], weight, density, search)?;
         self.bind_declared_prefix(node, &[histogram, edges])?;
         Ok(histogram)
     }
@@ -535,8 +553,13 @@ impl Translator<'_> {
         };
         let (columns, sample_count) = self.histogram_columns(input, dimensions)?;
         let weight = self.histogram_weight(node, sample_count, out_dtype)?;
-        let histogram =
-            self.histogram_from_edges(&columns, &edges, weight, Self::histogram_density(node))?;
+        let search = if tensor_edges {
+            HistogramBinSearch::Binary
+        } else {
+            HistogramBinSearch::LocalSearch
+        };
+        let density = Self::histogram_density(node);
+        let histogram = self.histogram_from_edges(&columns, &edges, weight, density, search)?;
         self.bind_single_declared(node, histogram)?;
         Ok(histogram)
     }
@@ -587,29 +610,120 @@ impl Translator<'_> {
             .unwrap_or(false)
     }
 
+    /// The `bins + 1` uniform edges of one histogram axis, built the way
+    /// ATen builds them.
+    ///
+    /// `select_outer_bin_edges` picks the range in double: the explicit
+    /// `range`, else (0, 1) for an empty input, else the column's min and
+    /// max. A range with equal ends is widened by 0.5 on each side. The
+    /// edges are then `linspace(lower, upper, bins + 1)` in the values dtype
+    /// ([`Self::aten_linspace`]). So `edges[0]` is the lower end and
+    /// `edges[bins]` the upper end exactly, and the maximum sample always
+    /// lands in the closed last bin.
     fn uniform_histogram_edges(
         &mut self,
         values: GraphTensor,
         bins: usize,
         explicit_range: Option<(f64, f64)>,
     ) -> GraphTensor {
-        let (mut lower, mut upper) = if let Some((lower, upper)) = explicit_range {
-            (
-                self.scalar_value(lower, values.dtype),
-                self.scalar_value(upper, values.dtype),
-            )
-        } else {
-            (values.min(vec![0]), values.max(vec![0]))
+        let dtype = values.dtype;
+        let empty = values.dims()[0].to_usize() == Some(0);
+        let (lower, upper) = match explicit_range.or(empty.then_some((0.0, 1.0))) {
+            // A static range is widened in double, as torch does, and only
+            // then rounded to the values dtype.
+            Some((lower, upper)) => {
+                let (lower, upper) = if lower == upper {
+                    (lower - 0.5, upper + 0.5)
+                } else {
+                    (lower, upper)
+                };
+                (
+                    self.scalar_value(lower, dtype),
+                    self.scalar_value(upper, dtype),
+                )
+            }
+            // min/max are values of the dtype, so torch's double `min - 0.5`
+            // rounds to the same value as the one rounding of `min - 0.5`
+            // in the dtype.
+            None => {
+                let lower = values.min(vec![0]);
+                let upper = values.max(vec![0]);
+                let ordered = lower.lt(upper);
+                let degenerate = self.bool_not(ordered);
+                let half = self.scalar_value(0.5, dtype);
+                let widened_lower = self.select(degenerate, lower - half, lower);
+                let widened_upper = self.select(degenerate, upper + half, upper);
+                (widened_lower, widened_upper)
+            }
         };
-        // A degenerate range is widened by half a unit, matching torch.
-        let equal = self.is_zero(upper - lower);
-        lower = self.blend_select(equal, lower - 0.5f32, lower);
-        upper = self.blend_select(equal, upper + 0.5f32, upper);
-        let position = self.cx.arange(bins + 1).cast(values.dtype);
-        let edge_shape = position.dims();
-        let lower_expanded = lower.expand_rhs(edge_shape.clone());
-        let width = (upper - lower).expand_rhs(edge_shape);
-        lower_expanded + position * width / bins as f32
+        self.aten_linspace(lower, upper, bins + 1)
+    }
+
+    /// `linspace(start, end, steps)` for `steps >= 2` and rank-0 `start`
+    /// and `end`, computed the way ATen's linspace kernel computes it
+    /// (`native/cpu/RangeFactoriesKernel.cpp`; the CUDA kernel uses the same
+    /// formula). Both ends are in the values dtype `T`.
+    /// `step = (end - start) / (steps - 1)` is rounded once in `T`. The
+    /// kernel is two-sided:
+    ///
+    /// ```text
+    /// out[i] = start + step * i                  for i < steps / 2
+    /// out[i] = end - step * (steps - 1 - i)      otherwise
+    /// ```
+    ///
+    /// So `out[0] == start` and `out[steps - 1] == end` exactly, whatever
+    /// `step` rounds to. Each half is non-decreasing because rounding is
+    /// monotone. The halves meet in order unless `steps` approaches the
+    /// reciprocal of `T`'s epsilon. So the edges are non-decreasing, as
+    /// [`Self::histogram_bin_onehot`] requires.
+    ///
+    /// Rounding invariant: ATen compiles this kernel with floating-point
+    /// contraction. Each `base ± step * n` is then a fused multiply-add
+    /// that rounds once. This matched eager bit-for-bit on aarch64 for
+    /// random F32 and F64 ranges, and nvcc contracts the CUDA kernel the
+    /// same way. The IR has no fused multiply-add, so the edge is evaluated
+    /// in F64 and rounded to `T` once:
+    /// - For an F32 `T`, `step * n` is exact in F64: a 24-bit step times an
+    ///   integer below 2^29. The F64 add is the only other rounding. It is
+    ///   exact unless `base` and `step` are more than about 28 binades apart.
+    ///   So the cast gives the fused result.
+    /// - For F64 there is no wider type. The product and the sum each
+    ///   round, so an interior edge can sit one ulp from eager's.
+    fn aten_linspace(&mut self, start: GraphTensor, end: GraphTensor, steps: usize) -> GraphTensor {
+        assert!(steps >= 2, "aten_linspace needs at least two points");
+        let dtype = start.dtype;
+        let wide = DType::F64;
+        let intervals = self.scalar_value((steps - 1) as f64, dtype);
+        let step = self.rounded_quotient(end - start, intervals).cast(wide);
+        let half = steps / 2;
+        // n = i on the rising half, n = steps - 1 - i on the falling half.
+        let rising = self.cx.arange(half).cast(wide);
+        let falling_len = steps - half;
+        let falling = self
+            .cx
+            .iota(vec![falling_len], move |c| (falling_len - 1) - c[0])
+            .cast(wide);
+        let rising_dims = rising.dims();
+        let falling_dims = falling.dims();
+        let below = start.cast(wide).expand_rhs(rising_dims.clone())
+            + step.expand_rhs(rising_dims) * rising;
+        let above = end.cast(wide).expand_rhs(falling_dims.clone())
+            - step.expand_rhs(falling_dims) * falling;
+        below.concat_along(above, 0).cast(dtype)
+    }
+
+    /// `a / b` rounded once in `a`'s dtype, as IEEE division and ATen do.
+    ///
+    /// The frontend's F32 `/` is a reciprocal multiply, which rounds twice.
+    /// A binary64 quotient holds more than 2p + 2 bits of a p-bit float's
+    /// quotient (p = 24 for F32). Rounding it to the narrow dtype therefore
+    /// gives the correctly rounded quotient: double rounding is harmless for
+    /// division at that width (Figueroa, 1995). F64 `/` already rounds once.
+    fn rounded_quotient(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if a.dtype == DType::F64 {
+            return a / b;
+        }
+        (a.cast(DType::F64) / b.cast(DType::F64)).cast(a.dtype)
     }
 
     fn histogramdd_uniform_edges(
@@ -669,6 +783,7 @@ impl Translator<'_> {
         edges: &[GraphTensor],
         weight: GraphTensor,
         density: bool,
+        search: HistogramBinSearch,
     ) -> Result<GraphTensor> {
         anyhow::ensure!(
             !columns.is_empty(),
@@ -688,47 +803,21 @@ impl Translator<'_> {
 
         let mut full_shape = vec![sample_count];
         full_shape.extend_from_slice(&bin_shape);
-        // NaN never lands in a bin (torch drops it), and the boolean lattice
-        // here is exact, so no non-finite value is selected away.
-        let mut membership = self
-            .cx
-            .constant_i32(1)
-            .cast(DType::Bool)
-            .expand_rhs(full_shape.clone());
+        // A sample lands in the bin it hits on every axis. The Boolean
+        // lattice is exact, so no non-finite value is selected away.
+        let mut membership = None;
         for (dimension, (column, edge)) in columns.iter().zip(edges).enumerate() {
-            let bins = bin_shape[dimension];
-            let left = edge.slice_along(IntExpr::from(0usize)..bins, 0);
-            let right = edge.slice_along(IntExpr::from(1usize)..(bins + IntExpr::from(1usize)), 0);
-
-            let mut column_shape = vec![IntExpr::from(1); columns.len() + 1];
-            column_shape[0] = sample_count;
-            let mut column = util::reshape_tensor(*column, &column_shape);
-            column = column.expand(full_shape.clone());
-            let mut edge_shape = vec![IntExpr::from(1); columns.len() + 1];
-            edge_shape[dimension + 1] = bins;
-            let left = util::reshape_tensor(left, &edge_shape).expand(full_shape.clone());
-            let right = util::reshape_tensor(right, &edge_shape).expand(full_shape.clone());
-
-            let below_right = column.lt(right);
-            // `column == right`, not `column - right == 0`: an infinite last
-            // edge holds an equal infinite sample, and `inf - inf` is NaN.
-            let equal_right = column.eq(right);
-            let mut last_position = self.cx.arange(bins);
-            let last_index = self
-                .cx
-                .constant_i32(bins - IntExpr::from(1usize))
-                .expand_rhs(last_position.dims());
-            last_position = last_position.eq(last_index);
-            let last_position =
-                util::reshape_tensor(last_position, &edge_shape).expand(full_shape.clone());
-            let inclusive_last = self.bool_and(equal_right, last_position);
-            let upper = self.bool_or(below_right, inclusive_last);
-            let in_bin = self.bool_and(column.ge(left), upper);
-            let column_nan = self.is_nan(column);
-            let not_nan = self.bool_not(column_nan);
-            let in_bin = self.bool_and(in_bin, not_nan);
-            membership = self.bool_and(membership, in_bin);
+            let hit = self.histogram_bin_onehot(*column, *edge, search);
+            let mut hit_shape = vec![IntExpr::from(1); columns.len() + 1];
+            hit_shape[0] = sample_count;
+            hit_shape[dimension + 1] = bin_shape[dimension];
+            let hit = util::reshape_tensor(hit, &hit_shape).expand(full_shape.clone());
+            membership = Some(match membership {
+                Some(membership) => self.bool_and(membership, hit),
+                None => hit,
+            });
         }
+        let membership = membership.expect("a histogram has at least one dimension");
 
         let mut weight_shape = vec![IntExpr::from(1); columns.len() + 1];
         weight_shape[0] = sample_count;
@@ -761,6 +850,102 @@ impl Translator<'_> {
             }
         }
         Ok(histogram)
+    }
+
+    /// The bin of each sample of `column`, one-hot over the bins of `edges`
+    /// (`[samples, bins]`, Bool). This follows ATen's histogram kernel
+    /// (`native/cpu/HistogramKernel.cpp`, `histogramdd_cpu_contiguous`).
+    ///
+    /// A sample is counted iff it is not NaN and
+    /// `edges[0] <= x <= edges[bins]`. Its bin is
+    /// `upper_bound(window, x) - 1`, and a bin of `bins` becomes `bins - 1`,
+    /// which closes the last bin on the right. The window is every edge for
+    /// [`HistogramBinSearch::Binary`]. For
+    /// [`HistogramBinSearch::LocalSearch`] it is the edges
+    /// `[max(0, est - 1), min(est + 2, bins + 1))` around the interpolated
+    /// `est = trunc((x - edges[0]) * bins / (edges[bins] - edges[0]))`.
+    ///
+    /// Invariant: the edges are non-decreasing. torch requires this of edge
+    /// tensors, and uniform edges satisfy it (see [`Self::aten_linspace`]).
+    /// On a non-decreasing window, `upper_bound(window, x)` equals the
+    /// window's start plus the number of its edges `<= x`, and that count is
+    /// what this computes. The local window must be reproduced exactly, not
+    /// approximated by a full search. When the range spans only a few ulps
+    /// per bin, the edges repeat, and eager's bin is the last repeat inside
+    /// the window, not the last repeat overall. `est` uses the same rounded
+    /// subtract, multiply and divide as eager. Every index is a small
+    /// integer, held exactly in the values dtype.
+    fn histogram_bin_onehot(
+        &mut self,
+        column: GraphTensor,
+        edges: GraphTensor,
+        search: HistogramBinSearch,
+    ) -> GraphTensor {
+        let dtype = column.dtype;
+        let samples = column.dims()[0];
+        let edge_count = edges.dims()[0];
+        let bins = edge_count - IntExpr::from(1usize);
+        let first = edges.slice_along(IntExpr::from(0usize)..IntExpr::from(1usize), 0);
+        let first = util::reshape_tensor(first, &[]).expand_rhs(vec![samples]);
+        let last = util::reshape_tensor(edges.slice_along(bins..edge_count, 0), &[])
+            .expand_rhs(vec![samples]);
+        let below = column.lt(first);
+        let above = last.lt(column);
+        let outside = self.bool_or(below, above);
+        let nan = self.is_nan(column);
+        let skipped = self.bool_or(outside, nan);
+        let counted = self.bool_not(skipped);
+
+        // `edges[k] <= x` for each (sample, edge). Ordered `<` is false at
+        // NaN, and `counted` drops NaN samples.
+        let sample_grid = column.expand_dim(1, edge_count);
+        let edge_grid = edges.expand_dim(0, samples);
+        let exceeds = sample_grid.lt(edge_grid);
+        let at_or_below = self.bool_not(exceeds);
+        let zero = self.constant_like(column, 0.0);
+        let one = self.constant_like(column, 1.0);
+        let (in_window, window_start) = match search {
+            HistogramBinSearch::Binary => (at_or_below, zero),
+            HistogramBinSearch::LocalSearch => {
+                let bin_count = self
+                    .cx
+                    .constant_i32(bins)
+                    .cast(dtype)
+                    .expand_rhs(vec![samples]);
+                let scaled = (column - first) * bin_count;
+                let estimate = self.rounded_quotient(scaled, last - first).trunc();
+                let start = estimate - one;
+                let end = estimate + self.constant_like(column, 2.0);
+                let position = self
+                    .cx
+                    .arange(edge_count)
+                    .cast(dtype)
+                    .expand_dim(0, samples);
+                let before_start = position.lt(start.expand_dim(1, edge_count));
+                let from_start = self.bool_not(before_start);
+                let before_end = position.lt(end.expand_dim(1, edge_count));
+                let window = self.bool_and(from_start, before_end);
+                (self.bool_and(at_or_below, window), start.maximum(zero))
+            }
+        };
+        let count = in_window.cast(dtype).sum(vec![1]);
+        let last_bin = self
+            .cx
+            .constant_i32(bins - IntExpr::from(1usize))
+            .cast(dtype)
+            .expand_rhs(vec![samples]);
+        let bin = (window_start + count - one).minimum(last_bin);
+        // `bin - 1 < index < bin + 1` is the integer `index == bin`, and is
+        // false at a NaN `bin`. A NaN only comes from a zero span, where
+        // eager's integer cast is undefined; such a sample is dropped
+        // rather than counted in every bin.
+        let index = self.cx.arange(bins).cast(dtype).expand_dim(0, samples);
+        let bin_grid = bin.expand_dim(1, bins);
+        let one_grid = one.expand_dim(1, bins);
+        let not_below = (bin_grid - one_grid).lt(index);
+        let not_above = index.lt(bin_grid + one_grid);
+        let hit = self.bool_and(not_below, not_above);
+        self.bool_and(hit, counted.expand_dim(1, bins))
     }
 
     // -----------------------------------------------------------------

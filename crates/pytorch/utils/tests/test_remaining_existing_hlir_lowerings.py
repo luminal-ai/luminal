@@ -632,6 +632,314 @@ def test_histogram_density_matches_eager(device, case, dtype, tolerance) -> None
     _assert_close(actual, expected, rtol=tolerance, atol=tolerance)
 
 
+class _RealPath:
+    """``torch.compile`` through the backend's real path, counting compiles.
+
+    ``dynamic=False`` keeps one graph per input shape, so a test can push many
+    value sets through a single compile.
+    """
+
+    def __init__(self, function):
+        self.compiles = 0
+
+        def backend(gm, example_inputs, options=None):
+            self.compiles += 1
+            return luminal_backend(gm, example_inputs, options={"search_iterations": 1})
+
+        self._compiled = torch.compile(
+            function, backend=backend, fullgraph=True, dynamic=False
+        )
+
+    def __call__(self, device, *inputs):
+        actual = self._compiled(*(value.to(device) for value in inputs))
+        return tuple(value.cpu() for value in actual)
+
+
+def _assert_same(actual, expected, label) -> None:
+    """Bit-for-bit equality, dtype included (NaN equal to NaN)."""
+    assert len(actual) == len(expected), label
+    for index, (result, reference) in enumerate(zip(actual, expected)):
+        torch.testing.assert_close(
+            result,
+            reference,
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+            check_stride=False,
+            msg=f"{label}: output {index}",
+        )
+
+
+def _uniform_edge_range(generator, dtype, *, tiny):
+    """A random ``(lower, upper)`` in ``dtype``, over many binades.
+
+    With ``tiny``, the range spans one to four ulps, so a few bins repeat each
+    edge value.
+    """
+
+    def uniform(low, high):
+        unit = torch.rand((), generator=generator, dtype=torch.float64).item()
+        return low + (high - low) * unit
+
+    scale = 10.0 ** torch.randint(-6, 7, (), generator=generator).item()
+    lower = torch.tensor(uniform(-10.0, 10.0) * scale, dtype=dtype)
+    if tiny:
+        upper = lower
+        for _ in range(torch.randint(1, 5, (), generator=generator).item()):
+            upper = torch.nextafter(upper, torch.tensor(float("inf"), dtype=dtype))
+    else:
+        width = 10.0 ** torch.randint(-3, 2, (), generator=generator).item()
+        upper = torch.tensor(
+            lower.item() + uniform(0.0, 20.0) * width * scale, dtype=dtype
+        )
+    return lower.item(), upper.item()
+
+
+def _uniform_edge_samples(generator, dtype, lower, upper, count, edges):
+    """``count`` samples whose min is ``lower`` and max is ``upper``.
+
+    The extremes are samples, so the uniform edges run exactly from one to the
+    other and the maximum must land in the closed last bin. Every value of
+    ``edges`` is a sample too. The rest are random in between, and the order
+    is shuffled.
+    """
+    fixed = torch.cat((torch.tensor([lower, upper], dtype=dtype), edges.to(dtype)))
+    unit = torch.rand(count - fixed.numel(), generator=generator, dtype=torch.float64)
+    # Rounding a value inside [lower, upper] to the dtype keeps it inside.
+    random = (lower + (upper - lower) * unit).to(dtype)
+    samples = torch.cat((fixed, random))
+    return samples[torch.randperm(count, generator=generator)]
+
+
+def _linspace_interior(lower, upper, bins, dtype):
+    # ``torch.linspace`` is the kernel eager histogram builds its edges with.
+    return torch.linspace(lower, upper, bins + 1, dtype=dtype)[1:-1]
+
+
+_UNIFORM_EDGE_CASES = 48
+_UNIFORM_EDGE_SAMPLES = 24
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("density", (False, True))
+@pytest.mark.parametrize("bins", (1, 4, 7))
+def test_histogram_uniform_edges_match_eager_f32(device, bins, density) -> None:
+    """``histogram.bin_ct`` edges and bins agree with eager bit-for-bit.
+
+    Every case puts samples on all of eager's edges, including ranges a few
+    ulps wide whose edges repeat. Repeated edges exercise the kernel's local
+    search, whose bin for a sample on a repeated edge depends on the
+    interpolated estimate. One graph serves every case. The F32 edges round
+    once, through F64, exactly as eager's fused multiply-add does.
+    """
+    dtype = torch.float32
+    generator = torch.Generator(device="cpu").manual_seed(1000 + bins)
+
+    def function(values):
+        return tuple(torch.histogram(values, bins, density=density))
+
+    compiled = _RealPath(function)
+    for case in range(_UNIFORM_EDGE_CASES):
+        lower, upper = _uniform_edge_range(generator, dtype, tiny=case % 4 == 3)
+        edges = _linspace_interior(lower, upper, bins, dtype)
+        values = _uniform_edge_samples(
+            generator, dtype, lower, upper, _UNIFORM_EDGE_SAMPLES, edges
+        )
+        expected = function(values)
+        actual = compiled(device, values)
+        label = f"case {case}: range ({lower!r}, {upper!r})"
+        if density:
+            # The normalising divide is the frontend's reciprocal multiply.
+            _assert_same(actual[1:], expected[1:], label)
+            _assert_close(actual[:1], expected[:1], rtol=1e-5, atol=0)
+        else:
+            _assert_same(actual, expected, label)
+    assert compiled.compiles == 1
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("density", (False, True))
+@pytest.mark.parametrize("bins", (1, 4, 7))
+def test_histogram_uniform_edges_match_eager_f64(device, bins, density) -> None:
+    """``histogram.bin_ct`` in F64: exact ends, counts as eager.
+
+    Samples sit on the first and last edges, and the maximum must land in the
+    closed last bin. That is the case that used to drop it: the old last edge
+    was ``lower + bins * width / bins``, which rounded below the maximum.
+    Interior F64 edges are within one ulp of eager's, because the IR has no
+    fused multiply-add, so no sample is placed on them here; see
+    ``test_histogram_f64_samples_on_interior_edges_match_eager``.
+    """
+    dtype = torch.float64
+    generator = torch.Generator(device="cpu").manual_seed(2000 + bins)
+
+    def function(values):
+        return tuple(torch.histogram(values, bins, density=density))
+
+    compiled = _RealPath(function)
+    for case in range(_UNIFORM_EDGE_CASES):
+        lower, upper = _uniform_edge_range(generator, dtype, tiny=False)
+        values = _uniform_edge_samples(
+            generator, dtype, lower, upper, _UNIFORM_EDGE_SAMPLES, torch.empty(0)
+        )
+        expected = function(values)
+        actual = compiled(device, values)
+        label = f"case {case}: range ({lower!r}, {upper!r})"
+        hist, edges = actual
+        expected_hist, expected_edges = expected
+        _assert_same(
+            (edges[[0, -1]],), (expected_edges[[0, -1]],), f"{label}: end edges"
+        )
+        ulp = torch.finfo(dtype).eps * max(abs(lower), abs(upper))
+        torch.testing.assert_close(
+            edges, expected_edges, rtol=0, atol=ulp, msg=f"{label}: edges"
+        )
+        if density:
+            _assert_close((hist,), (expected_hist,), rtol=1e-12, atol=0)
+        else:
+            _assert_same((hist,), (expected_hist,), f"{label}: counts")
+    assert compiled.compiles == 1
+
+
+@torch.no_grad()
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "ATen's linspace kernel rounds each `base + step * n` once (a fused "
+        "multiply-add). The IR has no fused multiply-add and F64 has no wider "
+        "type, so an F64 interior edge can sit one ulp from eager's and move "
+        "a sample that sits on it."
+    ),
+)
+def test_histogram_f64_samples_on_interior_edges_match_eager(device) -> None:
+    dtype, bins = torch.float64, 7
+    generator = torch.Generator(device="cpu").manual_seed(3000)
+
+    def function(values):
+        return tuple(torch.histogram(values, bins))
+
+    compiled = _RealPath(function)
+    for case in range(_UNIFORM_EDGE_CASES):
+        lower, upper = _uniform_edge_range(generator, dtype, tiny=case % 4 == 3)
+        edges = _linspace_interior(lower, upper, bins, dtype)
+        values = _uniform_edge_samples(
+            generator, dtype, lower, upper, _UNIFORM_EDGE_SAMPLES, edges
+        )
+        _assert_same(compiled(device, values), function(values), f"case {case}")
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("density", (False, True))
+def test_histogramdd_uniform_edges_match_eager(device, density) -> None:
+    """``_histogramdd_bin_edges`` and ``_histogramdd_from_bin_cts`` in F32.
+
+    Each axis has its own random range, both extremes are samples on that
+    axis, and every eager edge of that axis is a sample coordinate.
+    """
+    dtype, bins = torch.float32, [3, 5]
+    generator = torch.Generator(device="cpu").manual_seed(4000)
+
+    def function(points):
+        hist, edges = torch.histogramdd(points, bins, density=density)
+        return (hist, *edges)
+
+    compiled = _RealPath(function)
+    for case in range(_UNIFORM_EDGE_CASES // 2):
+        columns = []
+        for axis_bins in bins:
+            lower, upper = _uniform_edge_range(generator, dtype, tiny=case % 4 == 3)
+            edges = _linspace_interior(lower, upper, axis_bins, dtype)
+            columns.append(
+                _uniform_edge_samples(
+                    generator, dtype, lower, upper, _UNIFORM_EDGE_SAMPLES, edges
+                )
+            )
+        points = torch.stack(columns, dim=1)
+        expected = function(points)
+        actual = compiled(device, points)
+        label = f"case {case}"
+        if density:
+            _assert_same(actual[1:], expected[1:], label)
+            _assert_close(actual[:1], expected[:1], rtol=1e-5, atol=0)
+        else:
+            _assert_same(actual, expected, label)
+    assert compiled.compiles == 1
+
+
+# (values, bins, histogram kwargs): fixed regressions for uniform edges.
+_HISTOGRAM_UNIFORM_EDGE_REGRESSIONS = {
+    # The old last edge, `lower + 4 * width / 4`, rounded to
+    # 2.9999999999999996 and dropped the maximum: eager counts [1, 1, 0, 1].
+    "max_on_last_edge_f64": (
+        torch.tensor([-1.1195351830271254, 0.0, 3.0], dtype=torch.float64),
+        4,
+        {},
+    ),
+    # Ranges of one or two ulps repeat each edge. Eager's local search puts
+    # the minimum in bin 1 (the last repeat inside its window), not bin 5.
+    "repeated_edges_f32": (
+        torch.tensor([1.0, 1.0 + 2**-23], dtype=torch.float32),
+        10,
+        {},
+    ),
+    "repeated_edges_f64": (
+        torch.tensor([1.0, 1.0 + 2**-52], dtype=torch.float64),
+        10,
+        {},
+    ),
+    "repeated_edges_three_values": (
+        torch.tensor([1.0, 1.0 + 2**-23, 1.0 + 2**-22], dtype=torch.float32),
+        7,
+        {},
+    ),
+    # An interior edge of an explicit F32 range: (2 - 1) / 3 must round once.
+    "explicit_range_f32": (
+        torch.tensor([1.0, 1.5, 5 / 3, 2.0], dtype=torch.float32),
+        3,
+        {"range": (1.0, 2.0)},
+    ),
+    # An explicit range with equal ends is widened by 0.5 before rounding.
+    "explicit_degenerate_range": (
+        torch.tensor([0.5, 1.0, 1.5], dtype=torch.float32),
+        2,
+        {"range": (1.0, 1.0)},
+    ),
+    # No samples: eager's edges come from (0, 1), or from `range`.
+    "empty": (torch.empty(0, dtype=torch.float32), 3, {}),
+    "empty_with_range": (
+        torch.empty(0, dtype=torch.float64),
+        3,
+        {"range": (1.0, 2.0)},
+    ),
+}
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("case", sorted(_HISTOGRAM_UNIFORM_EDGE_REGRESSIONS))
+def test_histogram_uniform_edge_regressions(device, case) -> None:
+    values, bins, kwargs = _HISTOGRAM_UNIFORM_EDGE_REGRESSIONS[case]
+
+    def function(values):
+        return tuple(torch.histogram(values, bins, **kwargs))
+
+    compiled = _RealPath(function)
+    _assert_same(compiled(device, values), function(values), case)
+    assert compiled.compiles == 1
+
+
+@torch.no_grad()
+def test_histogramdd_without_samples_matches_eager(device) -> None:
+    points = torch.empty(0, 2, dtype=torch.float32)
+
+    def function(points):
+        hist, edges = torch.histogramdd(points, [2, 3])
+        return (hist, *edges)
+
+    compiled = _RealPath(function)
+    _assert_same(compiled(device, points), function(points), "empty")
+    assert compiled.compiles == 1
+
+
 class FixedShapeIndexing(torch.nn.Module):
     def forward(self, value, mask, source, index, repeats, boundaries, queries):
         return (
