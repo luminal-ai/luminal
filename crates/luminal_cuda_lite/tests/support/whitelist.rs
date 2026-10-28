@@ -8,7 +8,7 @@ use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
 use luminal_cuda_lite::ops::cublaslt::approved::{
     ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
 };
-use luminal_cuda_lite::ops::cublaslt::exec::{LtCall, LtOrder};
+use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtCall, LtOrder};
 
 pub fn key(call: &ApprovedCublasLt) -> String {
     resolved_key(&call.resolve(&Default::default()), call.scale)
@@ -32,11 +32,14 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
         }
     };
     format!(
-        "(CublasLtConfigurationOf (CublasLtFloat32Computation) ({:?}) ({:?}) ({:?}) ({:?}) ({:?}) {} ({}) ({}) ({}) ({}) ({}) ({}) ({}))",
+        "(CublasLtConfigurationOf (CublasLtFloat32Computation) ({:?}) ({:?}) ({:?}) {} ({:?}) {} ({}) ({}) ({}) ({}) ({}) ({}) ({}))",
         scale,
         call.a_dtype,
         call.b_dtype,
-        call.d_dtype,
+        call.c.map_or_else(
+            || "(CublasLtNoCMatrixDataType)".to_string(),
+            |c| format!("(CublasLtCMatrixDataTypeOf ({:?}))", c.data_type)
+        ),
         call.d_dtype,
         if call.bias_operand.is_some() {
             "(CublasLtBiasDataTypeOf (F32))"
@@ -48,16 +51,13 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
         } else {
             "CublasLtHostScalarsAlphaOneBetaZero"
         },
-        if call.relu {
-            if call.bias_operand.is_some() {
-                "CublasLtRectifiedLinearBiasEpilogue"
-            } else {
-                "CublasLtRectifiedLinearEpilogue"
-            }
-        } else if call.bias_operand.is_some() {
-            "CublasLtBiasEpilogue"
-        } else {
-            "CublasLtDefaultEpilogue"
+        match (call.activation, call.bias_operand.is_some()) {
+            (LtActivation::Identity, false) => "CublasLtDefaultEpilogue",
+            (LtActivation::Identity, true) => "CublasLtBiasEpilogue",
+            (LtActivation::RectifiedLinear, false) => "CublasLtRectifiedLinearEpilogue",
+            (LtActivation::RectifiedLinear, true) => "CublasLtRectifiedLinearBiasEpilogue",
+            (LtActivation::GaussianErrorLinear, false) => "CublasLtGaussianErrorLinearEpilogue",
+            (LtActivation::GaussianErrorLinear, true) => "CublasLtGaussianErrorLinearBiasEpilogue",
         },
         order(call.a.order),
         order(call.b.order),
@@ -91,7 +91,7 @@ pub fn approved_keys() -> std::collections::BTreeSet<String> {
 }
 fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     let mut graphs = Vec::new();
-    for dtype in [DType::F32, DType::Bf16] {
+    for dtype in [DType::F32, DType::Bf16, DType::F16] {
         for ta in [false, true] {
             for tb in [false, true] {
                 let mut model = Graph::new();
@@ -113,6 +113,10 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
                 let _acc = p + c;
                 let _biased = p + bias;
                 let _both = p + c + bias;
+                for expression in [p, _acc, _biased, _both] {
+                    let _relu = expression.relu();
+                    let _gelu = expression.gelu_fast_tanh_approximation();
+                }
                 let runtime = luminal_cuda_lite::CudaRuntime::load(&model).unwrap();
                 let graph = runtime.saturated_egraph(&Default::default()).unwrap();
                 graphs.push(graph);

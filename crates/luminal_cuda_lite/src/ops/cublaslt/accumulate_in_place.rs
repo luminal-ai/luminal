@@ -2,9 +2,9 @@
 //! independent D operand, D descriptor, or conditional alias permission.
 use super::CublasLtForm;
 use super::approved::{
-    DECLARATIONS, Matrix, RULES, WHITELIST, capture_dimensions, dtype, matrix, member,
+    DECLARATIONS, Matrix, RULES, WHITELIST, activation, capture_dimensions, dtype, matrix, member,
 };
-use super::exec::{CSource, LtCall};
+use super::exec::{LtActivation, LtCMatrixInput, LtCall};
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
 use luminal::egglog_snippet::{EgglogSnippet, SpliceCategory};
@@ -31,6 +31,10 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
             EgglogSnippet {
                 category: SpliceCategory::Match,
                 text: RULES,
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Match,
+                text: include_str!("egg/strided_batch_rules.egg"),
             },
             EgglogSnippet {
                 category: SpliceCategory::Match,
@@ -75,16 +79,9 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
             c_and_d: matrix(site, &site.child_class(3)),
             bias,
             scale: dtype(site, &child(1)),
-            storage: [
-                dtype(site, &child(2)),
-                dtype(site, &child(3)),
-                dtype(site, &child(4)),
-                dtype(site, &child(5)),
-            ],
             trans_a: enum_is(12, "CublasLtTranspose"),
             trans_b: enum_is(13, "CublasLtTranspose"),
-            relu: enum_is(8, "CublasLtRectifiedLinearEpilogue")
-                || enum_is(8, "CublasLtRectifiedLinearBiasEpilogue"),
+            activation: activation(site, &child(8)),
         })
     }
 }
@@ -101,10 +98,9 @@ pub struct CublasLtAccumulateInPlace {
     pub c_and_d: Matrix,
     pub bias: Option<ClassId>,
     pub scale: PlanDtype,
-    pub storage: [PlanDtype; 4],
     pub trans_a: bool,
     pub trans_b: bool,
-    pub relu: bool,
+    pub activation: LtActivation,
 }
 
 impl CublasLtAccumulateInPlace {
@@ -121,10 +117,9 @@ impl CublasLtAccumulateInPlace {
             c_and_d: base.d,
             bias: None,
             scale: base.scale,
-            storage: base.storage,
             trans_a: false,
             trans_b: false,
-            relu: false,
+            activation: LtActivation::Identity,
         }
     }
     /// Evaluate the shared descriptor once. The vendor receives identical C/D
@@ -149,13 +144,21 @@ impl CublasLtAccumulateInPlace {
             d_dtype: self.c_and_d.dtype,
             a,
             b,
-            c: c_and_d,
+            c: Some(LtCMatrixInput {
+                descriptor: c_and_d,
+                data_type: self.c_and_d.dtype,
+                operand: self.destination_operand(),
+            }),
             d: c_and_d,
-            c_source: CSource::Operand(2),
             beta_is_one: true,
-            relu: self.relu,
-            bias_operand: self.bias.as_ref().map(|_| 3),
+            activation: self.activation,
+            bias_operand: self.bias.as_ref().map(|_| 2),
         }
+    }
+}
+impl CublasLtAccumulateInPlace {
+    pub fn destination_operand(&self) -> usize {
+        2 + usize::from(self.bias.is_some())
     }
 }
 impl OpSlotNames for CublasLtAccumulateInPlace {
@@ -163,8 +166,8 @@ impl OpSlotNames for CublasLtAccumulateInPlace {
         match operand {
             0 => "A".into(),
             1 => "B".into(),
-            2 => "C_destination".into(),
-            3 => "bias".into(),
+            n if n == self.destination_operand() => "C_destination".into(),
+            2 => "bias".into(),
             _ => format!("slot{operand}"),
         }
     }
@@ -180,7 +183,7 @@ impl BufferTensorIrOp for CublasLtAccumulateInPlace {
 impl Bufferizable for CublasLtAccumulateInPlace {
     fn alias_info(&self) -> Vec<AliasInfo> {
         vec![AliasInfo {
-            operand: 2,
+            operand: self.destination_operand(),
             result: 0,
             sharing: Sharing::Must,
         }]
@@ -205,7 +208,9 @@ impl crate::HostOp for CublasLtAccumulateInPlace {
         ctx: &crate::host::HostOpContext<'_>,
     ) -> anyhow::Result<Box<dyn crate::host::PreparedHostOp>> {
         anyhow::ensure!(
-            ctx.inputs.get(2).is_some_and(|c| c.ptr == ctx.dest.ptr),
+            ctx.inputs
+                .get(self.destination_operand())
+                .is_some_and(|c| c.ptr == ctx.dest.ptr),
             "in-place cuBLASLt accumulation requires C and the result to share storage"
         );
         let call = self.resolve(ctx.dims);

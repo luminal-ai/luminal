@@ -21,7 +21,7 @@
 (relation cublaslt-rectified-linear-activation (LogicalTensor LogicalTensor))
 (relation cublaslt-expression-frame (CublasLtExpressionFrame))
 (relation cublaslt-C-matrix-argument
-  (CublasLtExpressionFrame CublasLtMatrixDescriptor CublasLtCMatrixArgument Dtype CublasLtHostScalars
+  (CublasLtExpressionFrame CublasLtMatrixDescriptor CublasLtCMatrixArgument CublasLtCMatrixDataType CublasLtHostScalars
     LayoutTensorList))
 (relation cublaslt-bias-argument
   (CublasLtExpressionFrame IntExpr CublasLtBiasArgument CublasLtBiasDataType LayoutTensorList))
@@ -110,12 +110,14 @@
    (cublaslt-legal-leading-dimension ?outer_stride ?column_count ?LeadingDimension))
   ((cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type (CublasLtRowMajor)
      (CublasLtNoTranspose)
-     (CublasLtMatrixDescriptorOf ?layout_tensor ?element_data_type (CublasLtRowMajor) ?row_count
-       ?column_count ?LeadingDimension))
+     (CublasLtMatrixDescriptorOf ?layout_tensor
+       (CublasLtMatrixLayoutLit ?element_data_type (CublasLtRowMajor) ?row_count
+         ?column_count ?LeadingDimension (IntLit 1) (IntLit 0))))
    (cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type (CublasLtColumnMajor)
      (CublasLtTranspose)
-     (CublasLtMatrixDescriptorOf ?layout_tensor ?element_data_type (CublasLtColumnMajor) ?column_count
-       ?row_count ?LeadingDimension)))
+     (CublasLtMatrixDescriptorOf ?layout_tensor
+       (CublasLtMatrixLayoutLit ?element_data_type (CublasLtColumnMajor) ?column_count
+         ?row_count ?LeadingDimension (IntLit 1) (IntLit 0)))))
   :ruleset backend
   :name "cublaslt: row layout readings")
 (rule
@@ -130,12 +132,14 @@
    (cublaslt-legal-leading-dimension ?inner_stride ?row_count ?LeadingDimension))
   ((cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type (CublasLtColumnMajor)
      (CublasLtNoTranspose)
-     (CublasLtMatrixDescriptorOf ?layout_tensor ?element_data_type (CublasLtColumnMajor) ?row_count
-       ?column_count ?LeadingDimension))
+     (CublasLtMatrixDescriptorOf ?layout_tensor
+       (CublasLtMatrixLayoutLit ?element_data_type (CublasLtColumnMajor) ?row_count
+         ?column_count ?LeadingDimension (IntLit 1) (IntLit 0))))
    (cublaslt-matrix-reading ?layout_tensor ?row_count ?column_count ?element_data_type (CublasLtRowMajor)
      (CublasLtTranspose)
-     (CublasLtMatrixDescriptorOf ?layout_tensor ?element_data_type (CublasLtRowMajor) ?column_count
-       ?row_count ?LeadingDimension)))
+     (CublasLtMatrixDescriptorOf ?layout_tensor
+       (CublasLtMatrixLayoutLit ?element_data_type (CublasLtRowMajor) ?column_count
+         ?row_count ?LeadingDimension (IntLit 1) (IntLit 0)))))
   :ruleset backend
   :name "cublaslt: column layout readings")
 ; A non-transposed reading proves positive rank-two extents, a unit minor
@@ -193,8 +197,8 @@
   ((cublaslt-rectified-linear-activation ?output_expression ?activation_input))
   :ruleset backend
   :name "cublaslt: select ReLU")
-; The frontend's full maximum_f32 spelling, recognized ONCE. Numerical approval
-; is deferred; GPU acceptance includes NaN, infinities, subnormals, signed zero.
+; The frontend's full maximum_f32 spelling, including NaN propagation.
+; Admission accepts the vendor ReLU sign-of-zero difference.
 (rule
   ((= ?comparison_zero
      (LogicalIndexMapApply (LogicalConstant 0.0) ?comparison_zero_broadcast_index_map
@@ -265,6 +269,120 @@
      (CublasLtRectifiedLinearBiasEpilogue)))
   :ruleset backend
   :name "cublaslt: ReLU of biased expression")
+; GELU recognition is local to F32 matrix expressions. These facts describe
+; existing frontend DAGs; they neither construct arithmetic nor union tensors.
+; Both frontend GELU approximations may use the vendor tanh approximation.
+; No cast is skipped, and every scalar is an exact F32 broadcast to this shape.
+(relation cublaslt-gaussian-error-linear-input (LogicalTensor))
+(relation cublaslt-gaussian-error-linear-activation (LogicalTensor LogicalTensor))
+(relation cublaslt-float32-scalar-broadcast (LogicalTensor f64 Shape))
+(rule
+  ((= ?broadcast (LogicalIndexMapApply (LogicalConstant ?value)
+       (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
+  ((cublaslt-float32-scalar-broadcast ?broadcast ?value ?shape))
+  :ruleset backend
+  :name "cublaslt: exact scalar broadcast")
+(rule
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
+     (CublasLtDefaultEpilogue))
+   (= (dtype-of ?expression) (F32)))
+  ((cublaslt-gaussian-error-linear-input ?expression))
+  :ruleset backend
+  :name "cublaslt: examine default expression for GELU")
+(rule
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
+     (CublasLtBiasEpilogue))
+   (= (dtype-of ?expression) (F32)))
+  ((cublaslt-gaussian-error-linear-input ?expression))
+  :ruleset backend
+  :name "cublaslt: examine bias expression for GELU")
+(rule
+  ((cublaslt-gaussian-error-linear-input ?activation_input)
+   (= ?activation_shape (shape-of ?activation_input))
+   (cublaslt-float32-scalar-broadcast ?one 1.0 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?negative_one -1.0 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?exponential_scale 1.4426950216293335 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?tanh_scale 1.5957691669464111 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?cubic_coefficient 0.044714998453855515 ?activation_shape)
+   (= ?scaled_input (LogicalMul ?activation_input ?cubic_coefficient))
+   (= ?quadratic_term (LogicalMul ?scaled_input ?activation_input))
+   (= ?linear_term (LogicalMul ?activation_input ?tanh_scale))
+   (= ?one_plus_quadratic (LogicalAdd ?quadratic_term ?one))
+   (= ?sigmoid_input (LogicalMul ?linear_term ?one_plus_quadratic))
+   (= ?negative_sigmoid_input (LogicalMul ?sigmoid_input ?negative_one))
+   (= ?negative_exponential_scaled (LogicalMul ?negative_sigmoid_input ?exponential_scale))
+   (= ?negative_exponential (LogicalExp2 ?negative_exponential_scaled))
+   (= ?sigmoid_denominator (LogicalAdd ?negative_exponential ?one))
+   (= ?sigmoid (LogicalRecip ?sigmoid_denominator))
+   (= ?output_expression (LogicalMul ?activation_input ?sigmoid)))
+  ((cublaslt-gaussian-error-linear-activation ?output_expression ?activation_input))
+  :ruleset backend
+  :name "cublaslt: frontend tanh GELU")
+(rule
+  ((cublaslt-gaussian-error-linear-input ?activation_input)
+   (= ?activation_shape (shape-of ?activation_input))
+   (cublaslt-float32-scalar-broadcast ?one 1.0 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?negative_one -1.0 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?exponential_scale 1.4426950216293335 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?inverse_square_root_two 0.7071067690849304 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?zero 0.0 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?polynomial_scale 0.32759109139442444 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?sign_epsilon 1.000000013351432e-10 ?activation_shape)
+   (cublaslt-float32-scalar-broadcast ?half 0.5 ?activation_shape)
+   (= ?scaled_activation_input (LogicalMul ?activation_input ?inverse_square_root_two))
+   (= ?negative_input_predicate (LogicalLessThan ?scaled_activation_input ?zero))
+   (= ?negative_input (LogicalMul ?scaled_activation_input ?negative_one))
+   (= ?absolute_input (LogicalSelect ?negative_input_predicate ?negative_input ?scaled_activation_input))
+   (= ?scaled_absolute_input (LogicalMul ?absolute_input ?polynomial_scale))
+   (= ?polynomial_denominator (LogicalAdd ?scaled_absolute_input ?one))
+   (= ?polynomial_argument (LogicalRecip ?polynomial_denominator))
+   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_five 1.0614054203033447 ?activation_shape)
+   (= ?polynomial_degree_five (LogicalMul ?polynomial_argument ?polynomial_coefficient_five))
+   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_4 -1.453152060508728 ?activation_shape)
+   (= ?polynomial_sum_4 (LogicalAdd ?polynomial_degree_five ?polynomial_coefficient_4))
+   (= ?polynomial_degree_4 (LogicalMul ?polynomial_sum_4 ?polynomial_argument))
+   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_3 1.421413779258728 ?activation_shape)
+   (= ?polynomial_sum_3 (LogicalAdd ?polynomial_degree_4 ?polynomial_coefficient_3))
+   (= ?polynomial_degree_3 (LogicalMul ?polynomial_sum_3 ?polynomial_argument))
+   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_2 -0.2844967246055603 ?activation_shape)
+   (= ?polynomial_sum_2 (LogicalAdd ?polynomial_degree_3 ?polynomial_coefficient_2))
+   (= ?polynomial_degree_2 (LogicalMul ?polynomial_sum_2 ?polynomial_argument))
+   (cublaslt-float32-scalar-broadcast ?polynomial_coefficient_1 0.2548295855522156 ?activation_shape)
+   (= ?polynomial_sum_1 (LogicalAdd ?polynomial_degree_2 ?polynomial_coefficient_1))
+   (= ?polynomial_degree_1 (LogicalMul ?polynomial_sum_1 ?polynomial_argument))
+   (= ?sign_denominator (LogicalAdd ?absolute_input ?sign_epsilon))
+   (= ?sign_denominator_reciprocal (LogicalRecip ?sign_denominator))
+   (= ?input_sign (LogicalMul ?scaled_activation_input ?sign_denominator_reciprocal))
+   (= ?input_square (LogicalMul ?scaled_activation_input ?scaled_activation_input))
+   (= ?negative_input_square (LogicalMul ?input_square ?negative_one))
+   (= ?gaussian_exponential_scaled (LogicalMul ?negative_input_square ?exponential_scale))
+   (= ?gaussian_exponential (LogicalExp2 ?gaussian_exponential_scaled))
+   (= ?gaussian_polynomial (LogicalMul ?polynomial_degree_1 ?gaussian_exponential))
+   (= ?negative_gaussian_polynomial (LogicalMul ?gaussian_polynomial ?negative_one))
+   (= ?one_minus_gaussian_polynomial (LogicalAdd ?negative_gaussian_polynomial ?one))
+   (= ?error_function (LogicalMul ?input_sign ?one_minus_gaussian_polynomial))
+   (= ?half_input (LogicalMul ?activation_input ?half))
+   (= ?one_plus_error_function (LogicalAdd ?error_function ?one))
+   (= ?output_expression (LogicalMul ?half_input ?one_plus_error_function)))
+  ((cublaslt-gaussian-error-linear-activation ?output_expression ?activation_input))
+  :ruleset backend
+  :name "cublaslt: frontend erf GELU")
+(rule
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
+     (CublasLtDefaultEpilogue))
+   (cublaslt-gaussian-error-linear-activation ?output_expression ?expression))
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
+     (CublasLtGaussianErrorLinearEpilogue)))
+  :ruleset backend
+  :name "cublaslt: GELU of default expression")
+(rule
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
+     (CublasLtBiasEpilogue))
+   (cublaslt-gaussian-error-linear-activation ?output_expression ?expression))
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
+     (CublasLtGaussianErrorLinearBiasEpilogue)))
+  :ruleset backend
+  :name "cublaslt: GELU of bias expression")
 (rule
   ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix (CublasLtNoBias) ?epilogue))
   ((cublaslt-expression-frame
@@ -304,25 +422,27 @@
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?element_data_type ?matrix_order ?D_matrix_descriptor)
    (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?layout)))
   ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor
-     (CublasLtZeroCMatrix ?D_matrix_descriptor) ?element_data_type (CublasLtHostScalarsAlphaOneBetaZero)
+     (CublasLtCMatrixAbsent) (CublasLtNoCMatrixDataType) (CublasLtHostScalarsAlphaOneBetaZero)
      (LayoutTensorNil)))
   :ruleset backend
-  :name "cublaslt: no C uses D descriptor and beta zero")
+  :name "cublaslt: prove absent C and beta zero")
 (rule
   ((cublaslt-expression-frame ?expression_frame)
    (= ?expression_frame
      (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
        (CublasLtCMatrixOf ?C_matrix) ?bias ?epilogue))
    (= ?D_matrix_descriptor
-     (CublasLtMatrixDescriptorOf ?D_layout_tensor ?element_data_type ?matrix_order ?m ?n
-       ?D_LeadingDimension))
+     (CublasLtMatrixDescriptorOf ?D_layout_tensor
+       (CublasLtMatrixLayoutLit ?element_data_type ?matrix_order ?m ?n
+         ?D_LeadingDimension (IntLit 1) (IntLit 0))))
    (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?layout))
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?element_data_type ?matrix_order ?D_matrix_descriptor)
    (= ?C_layout_tensor (LayoutTensorLit ?C_matrix ?C_layout))
    (cublaslt-matrix-reading ?C_layout_tensor ?m ?n ?element_data_type ?matrix_order (CublasLtNoTranspose)
      ?C_matrix_descriptor))
   ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor
-     (CublasLtCMatrixInput ?C_matrix_descriptor) ?element_data_type (CublasLtHostScalarsAlphaOneBetaOne)
+     (CublasLtCMatrixInput ?C_matrix_descriptor) (CublasLtCMatrixDataTypeOf ?element_data_type)
+     (CublasLtHostScalarsAlphaOneBetaOne)
      (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil))))
   :ruleset backend
   :name "cublaslt: out of place C permits a different leading dimension")
@@ -352,14 +472,14 @@
   :ruleset backend
   :name "cublaslt: packed bias with exact row length")
 (rule
-  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_storage_data_type
+  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
      ?host_scalars (LayoutTensorNil))
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors))
   ((cublaslt-remaining-inputs (LayoutTensorNil) ?bias_input_tensors ?bias_input_tensors))
   :ruleset backend
   :name "cublaslt: argument tail without C")
 (rule
-  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_storage_data_type
+  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
      ?host_scalars (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil)))
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors))
   ((cublaslt-remaining-inputs (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil)) ?bias_input_tensors
@@ -389,13 +509,13 @@
    (= (dtype-of ?output_expression) ?D_storage_data_type)
    (= (dtype-of ?A_operand) ?D_storage_data_type)
    (= (dtype-of ?B_operand) ?D_storage_data_type)
-   (cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_storage_data_type
+   (cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
      ?scalar_arguments ?C_input_tensors)
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors)
    (cublaslt-remaining-inputs ?C_input_tensors ?bias_input_tensors ?remaining_input_tensors)
    (= ?configuration
      (CublasLtConfigurationOf ?computation_type ?scalar_data_type ?A_storage_data_type ?B_storage_data_type
-       ?C_storage_data_type ?D_storage_data_type ?bias_data_type ?scalar_arguments ?epilogue ?A_matrix_order
+       ?C_matrix_data_type ?D_storage_data_type ?bias_data_type ?scalar_arguments ?epilogue ?A_matrix_order
        ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
    (cublaslt-approved-configuration ?configuration))
   ((let ?input_tensors
@@ -407,7 +527,7 @@
 
 
 ; Storage never chooses arithmetic precision. Only an authored widening cast
-; permits reading BF16 directly, preserving any earlier source narrowing.
+; permits reading BF16 or FP16 directly, preserving any earlier source narrowing.
 (rule
   ((= (dtype-of ?logical_operand) (F32)))
   ((cublaslt-operand-storage-reading ?logical_operand ?logical_operand))
@@ -415,6 +535,13 @@
 (rule
   ((= ?logical_operand (LogicalCast ?storage_source (F32)))
    (= (dtype-of ?storage_source) (Bf16))
+   (= (dtype-of ?logical_operand) (F32))
+   (= (shape-of ?logical_operand) (shape-of ?storage_source)))
+  ((cublaslt-operand-storage-reading ?logical_operand ?storage_source))
+  :ruleset backend)
+(rule
+  ((= ?logical_operand (LogicalCast ?storage_source (F32)))
+   (= (dtype-of ?storage_source) (F16))
    (= (dtype-of ?logical_operand) (F32))
    (= (shape-of ?logical_operand) (shape-of ?storage_source)))
   ((cublaslt-operand-storage-reading ?logical_operand ?storage_source))

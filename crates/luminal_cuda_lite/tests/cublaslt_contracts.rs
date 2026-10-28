@@ -46,10 +46,13 @@ fn walked_dense(rt: &CudaRuntime, arena_rt: &support::Allocation, out: NodeIndex
     luminal_cuda_lite::layouts::dense_f32(&bytes, &binding.layout)
         .expect("the returned layout reads dense over its backing buffer")
 }
+use luminal::dtype::PlanDtype;
 use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::ops::cublaslt::CublasLtForm;
 use luminal_cuda_lite::ops::cublaslt::device_call;
-use luminal_cuda_lite::ops::cublaslt::exec::{CSource, LtCall, LtDesc, LtOrder};
+use luminal_cuda_lite::ops::cublaslt::exec::{
+    LtActivation, LtCMatrixInput, LtCall, LtDesc, LtOrder,
+};
 use std::sync::Arc;
 
 /// REDUCTION-ORDER CONTRACT (Item 4, documented at the comparison
@@ -124,13 +127,13 @@ fn host_reference(
                 acc += (a_v as f64) * (b_v as f64);
             }
             if let Some(c) = c {
-                acc += c[at(&call.c, row, col)] as f64;
+                acc += c[at(&call.c.unwrap().descriptor, row, col)] as f64;
             }
             if let Some(bias) = bias {
                 acc += bias[row] as f64;
             }
             let mut v = acc as f32;
-            if call.relu {
+            if call.activation == LtActivation::RectifiedLinear {
                 v = v.max(0.0);
             }
             d[at(&call.d, row, col)] = v;
@@ -196,15 +199,14 @@ fn call_for(form: CublasLtForm) -> LtCall {
         d_dtype: luminal::dtype::PlanDtype::F32,
         a: LtDesc::row(m, k, k),
         b: LtDesc::row(k, n, n),
-        c: cd,
+        c: form.has_c().then_some(LtCMatrixInput {
+            descriptor: cd,
+            data_type: PlanDtype::F32,
+            operand: 2,
+        }),
         d: cd,
-        c_source: if form.has_c() {
-            CSource::Operand(2)
-        } else {
-            CSource::AliasD
-        },
         beta_is_one: form.has_c(),
-        relu: false,
+        activation: LtActivation::Identity,
         bias_operand: form.has_bias().then(|| if form.has_c() { 3 } else { 2 }),
     }
 }
@@ -300,11 +302,10 @@ fn ld_bounds_violation_refuses_before_dispatch() {
         d_dtype: luminal::dtype::PlanDtype::F32,
         a: LtDesc::row(1, 2, 2),
         b: LtDesc::row(2, 8, 8),
-        c: LtDesc::row(1, 8, 8),
+        c: None,
         d: LtDesc::row(1, 8, 8),
-        c_source: CSource::AliasD,
         beta_is_one: false,
-        relu: false,
+        activation: LtActivation::Identity,
         bias_operand: None,
     };
     let dev_a = to_device(&stream, &weights(2, 1));
@@ -338,8 +339,10 @@ fn bias_form_with_a_row_d_is_refused_before_dispatch() {
     for form in [CublasLtForm::Bias, CublasLtForm::AccumulateBias] {
         let mut call = call_for(form);
         let (m, n, k) = (call.m as usize, call.n as usize, call.k as usize);
-        call.c = LtDesc::row(call.m, call.n, call.n);
-        call.d = call.c;
+        call.d = LtDesc::row(call.m, call.n, call.n);
+        if let Some(c) = &mut call.c {
+            c.descriptor = call.d;
+        }
         let a = weights(m * k, 1);
         let b = weights(k * n, 2);
         let dev_a = to_device(&stream, &a);
@@ -356,10 +359,7 @@ fn bias_form_with_a_row_d_is_refused_before_dispatch() {
             .expect_err("a ROW-order D under a bias form must trip the fence");
         let msg = format!("{err:#}");
         assert!(msg.contains("unreachable"), "{form:?}: {msg}");
-        assert!(
-            msg.contains("bias requires a column-order D"),
-            "{form:?}: {msg}"
-        );
+        assert!(msg.contains("requires a column-order D"), "{form:?}: {msg}");
         assert!(msg.contains("refused BEFORE dispatch"), "{form:?}: {msg}");
         stream.synchronize().expect("sync");
         assert!(

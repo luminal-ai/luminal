@@ -1,0 +1,498 @@
+//! Reconstructed source coverage for the recovered 2026-10-27 batch rules.
+//! The original compiled 14-test board is preserved in .recovery; these tests
+//! exercise the restored source and compare descriptors to independent addresses.
+use luminal::dtype::PlanDtype;
+use luminal::layout_ir::{Bufferizable, ExtractionSite, OpMatcher, SerializedIndex};
+use luminal::prelude::egraph_serialize::EGraph;
+use luminal::prelude::*;
+use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
+    CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
+};
+use luminal_cuda_lite::ops::cublaslt::approved::{
+    ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
+};
+use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtDesc, LtOrder, validate_ld_bounds};
+
+#[cfg(feature = "device")]
+mod support;
+#[path = "support/whitelist.rs"]
+mod whitelist;
+
+fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
+    let index = SerializedIndex::new(graph);
+    let mut separate = Vec::new();
+    let mut in_place = Vec::new();
+    for (id, node) in &graph.nodes {
+        if node.subsumed {
+            continue;
+        }
+        let site = ExtractionSite {
+            egraph: graph,
+            node_id: id,
+            node,
+            index: &index,
+        };
+        match node.op.as_str() {
+            CONSTRUCTOR => separate.push(
+                ApprovedCublasLtMatcher
+                    .extract(&site)
+                    .as_any()
+                    .downcast_ref::<ApprovedCublasLt>()
+                    .unwrap()
+                    .clone(),
+            ),
+            IN_PLACE => in_place.push(
+                CublasLtAccumulateInPlaceMatcher
+                    .extract(&site)
+                    .as_any()
+                    .downcast_ref::<CublasLtAccumulateInPlace>()
+                    .unwrap()
+                    .clone(),
+            ),
+            _ => (),
+        }
+    }
+    (separate, in_place)
+}
+
+fn graph(dtype: DType, transpose_a: bool, transpose_b: bool, with_c: bool) -> Graph {
+    let mut graph = Graph::new();
+    let mut a = graph
+        .tensor(if transpose_a { [2, 4, 3] } else { [2, 3, 4] }, dtype)
+        .cast(DType::F32);
+    let mut b = graph
+        .tensor(if transpose_b { [2, 5, 4] } else { [2, 4, 5] }, dtype)
+        .cast(DType::F32);
+    if transpose_a {
+        a = a.permute(&[0, 2, 1]);
+    }
+    if transpose_b {
+        b = b.permute(&[0, 2, 1]);
+    }
+    let product = a.matmul(b);
+    if with_c {
+        let _out = product + graph.tensor([2, 3, 5], DType::F32);
+    }
+    graph
+}
+
+fn saturate(model: &Graph, table: &str) -> EGraph {
+    let matchers: Vec<_> = luminal_cuda_lite::cuda_registry()
+        .into_iter()
+        .map(|row| row.matcher)
+        .collect();
+    let program = luminal::egglog_snippet::assembled_program_for(&matchers)
+        .replace(WHITELIST.trim_end(), table);
+    let bindings = luminal_cuda_lite::CudaBindings::leaves(&model.logical)
+        .bind(&model.logical)
+        .unwrap();
+    let mut egraph = luminal::egglog_snippet::new_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            &format!(
+                "{program}\n{}\n{}",
+                bindings.prefix,
+                luminal_cuda_lite::CudaBindings::SCHEDULE
+            ),
+        )
+        .unwrap();
+    egraph.serialize(Default::default()).egraph
+}
+
+#[test]
+fn frontend_strided_batches_are_admitted_and_descriptors_match_every_address() {
+    use luminal::egglog_utils::eclass::{ConstructorRegistry, EGraphView};
+    for dtype in [DType::F32, DType::Bf16, DType::F16] {
+        for ta in [false, true] {
+            for tb in [false, true] {
+                let egraph = saturate(&graph(dtype, ta, tb, true), WHITELIST);
+                let (separate, in_place) = calls(&egraph);
+                assert!(!separate.is_empty());
+                assert!(!in_place.is_empty());
+                let registry =
+                    ConstructorRegistry::new(luminal::egglog_snippet::core_decoders()).unwrap();
+                let view = EGraphView::new(&egraph, &registry);
+                for op in separate {
+                    let call = op.resolve(&Default::default());
+                    assert_eq!((call.m, call.n, call.k), (3, 5, 4));
+                    assert_eq!(call.activation, LtActivation::Identity);
+                    assert!(op.bias.is_none());
+                    for (matrix, trans, rows, cols) in [
+                        (&op.a, op.trans_a, 3, 4),
+                        (&op.b, op.trans_b, 4, 5),
+                        (&op.d, false, 3, 5),
+                    ]
+                    .into_iter()
+                    .chain(op.c.iter().map(|c| (c, false, 3, 5)))
+                    {
+                        let tensor = view.class(&matrix.tensor);
+                        let literal = tensor.nodes_named("LayoutTensorLit").next().unwrap();
+                        let layout = luminal::layouts::DecodedLayout::from_class(
+                            &literal.child(1).unwrap(),
+                            Some(matrix.dtype),
+                        )
+                        .unwrap();
+                        let descriptor = matrix.resolve(&Default::default());
+                        assert_eq!(descriptor.batch_count, 2);
+                        for batch in 0..2 {
+                            for row in 0..rows {
+                                for col in 0..cols {
+                                    let (r, c) = if trans { (col, row) } else { (row, col) };
+                                    let within = match descriptor.order {
+                                        LtOrder::Row => r * descriptor.ld as usize + c,
+                                        LtOrder::Col => c * descriptor.ld as usize + r,
+                                    };
+                                    assert_eq!(
+                                        layout.element_index(&[batch, row, col]).unwrap(),
+                                        batch * descriptor.batch_stride_in_elements as usize
+                                            + within
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                for op in in_place {
+                    let call = op.resolve(&Default::default());
+                    assert_eq!(call.c.unwrap().descriptor, call.d);
+                    let tie = op.alias_info();
+                    assert_eq!(tie.len(), 1);
+                    assert_eq!((tie[0].operand, tie[0].result), (2, 0));
+                    assert_eq!(tie[0].sharing, luminal::layout_ir::Sharing::Must);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_admission_requires_the_complete_whitelist_row() {
+    let model = graph(DType::F32, false, false, true);
+    let (separate, in_place) = calls(&saturate(&model, ""));
+    assert!(separate.is_empty() && in_place.is_empty());
+    let (_, full_in_place) = calls(&saturate(&model, WHITELIST));
+    let key = whitelist::in_place_key(full_in_place.first().unwrap());
+    let table = format!("(cublaslt-approved-configuration {key})");
+    let (separate, in_place) = calls(&saturate(&model, &table));
+    assert!(!separate.is_empty() && !in_place.is_empty());
+    assert!(separate.iter().all(|op| whitelist::key(op) == key));
+    assert!(in_place.iter().all(|op| whitelist::in_place_key(op) == key));
+}
+
+#[test]
+fn symbolic_batch_count_requires_positive_int32_bounds() {
+    let mut model = Graph::new();
+    let a = model.tensor(vec![IntExpr::from('b'), 3.into(), 4.into()], DType::F32);
+    let b = model.tensor(vec![IntExpr::from('b'), 4.into(), 5.into()], DType::F32);
+    let _out = a.matmul(b);
+    let runtime = CudaRuntime::load(&model).unwrap();
+    for (low, high, admitted) in [
+        (0, 8, false),
+        (1, 8, true),
+        (1, i32::MAX as usize + 1, false),
+    ] {
+        let bounds = SymbolBounds::from_ranges([('b'.into(), (low, high))]).unwrap();
+        let (separate, _) = calls(&runtime.saturated_egraph(&bounds).unwrap());
+        assert_eq!(!separate.is_empty(), admitted, "batch bounds {low}..{high}");
+        for op in separate {
+            for batch in [1, 8] {
+                let dims = [('b'.into(), batch)].into_iter().collect();
+                assert_eq!(op.resolve(&dims).d.batch_count, batch as i64);
+            }
+        }
+    }
+}
+
+#[test]
+fn casts_between_batched_multiply_and_reduction_stop_fusion() {
+    for dtype in [DType::F32, DType::Bf16, DType::F16] {
+        let mut model = Graph::new();
+        let a = model.tensor([2, 3, 4], DType::Bf16).cast(dtype);
+        let b = model.tensor([2, 4, 5], DType::Bf16).cast(dtype);
+        let _out = a.matmul(b).cast(DType::F32);
+        let (separate, _) = calls(&saturate(&model, WHITELIST));
+        assert_eq!(!separate.is_empty(), dtype == DType::F32);
+        if dtype == DType::F32 {
+            assert!(
+                separate
+                    .iter()
+                    .any(|op| op.a.dtype == PlanDtype::Bf16 && op.b.dtype == PlanDtype::Bf16)
+            );
+        }
+    }
+    let mut model = Graph::new();
+    let a = model.tensor([2, 3, 4], DType::F32);
+    let b = model.tensor([2, 4, 5], DType::F32);
+    let products = a.expand_dim(2, 5) * b.permute(&[0, 2, 1]).expand_dim(1, 3);
+    let _out = products.cast(DType::Bf16).cast(DType::F32).sum(&[3]);
+    assert!(calls(&saturate(&model, WHITELIST)).0.is_empty());
+}
+
+#[test]
+fn matrix_readings_require_disjoint_full_padded_batches() {
+    let matchers: Vec<_> = luminal_cuda_lite::cuda_registry()
+        .into_iter()
+        .map(|row| row.matcher)
+        .collect();
+    let program = luminal::egglog_snippet::assembled_program_for(&matchers);
+    for (stride, accepted) in [(0, false), (20, false), (23, false), (24, true), (32, true)] {
+        let mut egraph = luminal::egglog_snippet::new_egraph();
+        let check = if accepted { "(check" } else { "(fail (check" };
+        let tail = if accepted { "))" } else { ")))" };
+        let source = format!(
+            r#"
+(let shape (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 3) (IntExprCons (IntLit 4) (IntExprNil))))))
+(let value (LogicalTensorInputLit (LogicalIdLit "padded") shape (F32)))
+(let tensor (LayoutTensorLit value (ElementStridedLayoutLit shape
+ (ElementStrideCons (ElementStrideExact (IntLit {stride}))
+  (ElementStrideCons (ElementStrideExact (IntLit 8))
+   (ElementStrideCons (ElementStrideExact (IntLit 1)) (ElementStrideNil)))) (BitWidthLit 32))))
+(cublaslt-strided-batch-layout-demand value)
+{}
+{check} (cublaslt-strided-batch-matrix-reading tensor (IntLit 2) (IntLit 3) (IntLit 4)
+ (F32) (CublasLtRowMajor) (CublasLtNoTranspose) ?descriptor{tail}
+"#,
+            luminal_cuda_lite::CudaBindings::SCHEDULE
+        );
+        egraph
+            .parse_and_run_program(None, &format!("{program}\n{source}"))
+            .unwrap();
+    }
+}
+
+#[test]
+fn bounds_checks_include_every_batch_and_detect_overflow() {
+    let mut descriptor = LtDesc::row(3, 4, 8);
+    descriptor.batch_count = 3;
+    descriptor.batch_stride_in_elements = 24;
+    validate_ld_bounds("batch", &descriptor, 68).unwrap();
+    assert!(validate_ld_bounds("batch", &descriptor, 67).is_err());
+    descriptor.batch_stride_in_elements = i64::MAX;
+    assert!(validate_ld_bounds("overflow", &descriptor, usize::MAX).is_err());
+}
+
+#[cfg(feature = "device")]
+#[test]
+fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration() {
+    use cudarc::driver::{CudaContext, DevicePtr};
+    use luminal_cuda_lite::ops::cublaslt::device_call::{DeviceRange, dispatch};
+    let stream = CudaContext::new(0).unwrap().new_stream().unwrap();
+    let mut witnesses = std::collections::BTreeMap::new();
+    for dtype in [DType::F32, DType::Bf16, DType::F16] {
+        for ta in [false, true] {
+            for tb in [false, true] {
+                let (separate, in_place) = calls(&saturate(&graph(dtype, ta, tb, true), WHITELIST));
+                for op in separate {
+                    witnesses
+                        .entry((whitelist::key(&op), false))
+                        .or_insert_with(|| op.resolve(&Default::default()));
+                }
+                for op in in_place {
+                    witnesses
+                        .entry((whitelist::in_place_key(&op), true))
+                        .or_insert_with(|| op.resolve(&Default::default()));
+                }
+                // Rank-three column-major *matrices* need an outer batch stride;
+                // the rank-three ColumnMajor boundary would put batch innermost.
+                let mut model = Graph::new();
+                let a_source = model.tensor(if ta { [2, 4, 3] } else { [2, 3, 4] }, dtype);
+                let b_source = model.tensor(if tb { [2, 5, 4] } else { [2, 4, 5] }, dtype);
+                let mut a = a_source.cast(DType::F32);
+                let mut b = b_source.cast(DType::F32);
+                if ta {
+                    a = a.permute(&[0, 2, 1]);
+                }
+                if tb {
+                    b = b.permute(&[0, 2, 1]);
+                }
+                let product = a.matmul(b);
+                let c = model.tensor([2, 3, 5], DType::F32);
+                let accumulated = product + c;
+                let layout =
+                    luminal_cuda_lite::bindings::BoundaryLayout::strided_literal([24, 1, 4]);
+                let mut bindings = luminal_cuda_lite::CudaBindings::new();
+                bindings.input(a_source.id);
+                bindings.input(b_source.id);
+                bindings.input_with(c.id, layout.clone());
+                bindings.output_with(product.id, layout.clone());
+                bindings.output_with(accumulated.id, layout);
+                let runtime =
+                    CudaRuntime::load_with(&model, bindings, luminal_cuda_lite::cuda_registry())
+                        .unwrap();
+                let (separate, in_place) =
+                    calls(&runtime.saturated_egraph(&Default::default()).unwrap());
+                for op in separate {
+                    witnesses
+                        .entry((whitelist::key(&op), false))
+                        .or_insert_with(|| op.resolve(&Default::default()));
+                }
+                for op in in_place {
+                    witnesses
+                        .entry((whitelist::in_place_key(&op), true))
+                        .or_insert_with(|| op.resolve(&Default::default()));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        witnesses.len(),
+        288,
+        "96 base, 96 separate C, and 96 in-place C configurations"
+    );
+    let at = |d: LtDesc, batch: usize, row: usize, col: usize| {
+        batch * d.batch_stride_in_elements as usize
+            + match d.order {
+                LtOrder::Row => row * d.ld as usize + col,
+                LtOrder::Col => col * d.ld as usize + row,
+            }
+    };
+    for ((_, alias), call) in witnesses {
+        let (m, n, k) = (call.m as usize, call.n as usize, call.k as usize);
+        let count = call.d.batch_count as usize;
+        let elements = |d: LtDesc| at(d, count - 1, d.rows as usize - 1, d.cols as usize - 1) + 1;
+        let mut payloads = Vec::new();
+        for (d, trans, rows, cols, dtype, value) in [
+            (call.a, call.trans_a, m, k, call.a_dtype, 0usize),
+            (call.b, call.trans_b, k, n, call.b_dtype, 1usize),
+        ]
+        .into_iter()
+        .chain(
+            call.c
+                .map(|c| (c.descriptor, false, m, n, c.data_type, 2usize)),
+        ) {
+            let mut data = vec![777.0f32; elements(d)];
+            for batch in 0..count {
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let (r, c) = if trans { (col, row) } else { (row, col) };
+                        data[at(d, batch, r, c)] = match value {
+                            0 => (batch + row + col + 1) as f32 / 8.0,
+                            1 => (batch + row + 2 * col + 1) as f32 / 16.0,
+                            _ => (batch + row + col) as f32 / 4.0,
+                        };
+                    }
+                }
+            }
+            let raw: Vec<u8> = match dtype {
+                PlanDtype::F32 => data.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+                PlanDtype::Bf16 => data
+                    .iter()
+                    .flat_map(|x| half::bf16::from_f32(*x).to_bits().to_ne_bytes())
+                    .collect(),
+                PlanDtype::F16 => data
+                    .iter()
+                    .flat_map(|x| half::f16::from_f32(*x).to_bits().to_ne_bytes())
+                    .collect(),
+                other => panic!("unexpected storage {other:?}"),
+            };
+            payloads.push(stream.clone_htod(&raw).unwrap());
+        }
+        let ranges: Vec<_> = payloads
+            .iter()
+            .map(|data| DeviceRange {
+                ptr: data.device_ptr(&stream).0,
+                bytes: data.len(),
+            })
+            .collect();
+        let output = stream.alloc_zeros::<f32>(elements(call.d)).unwrap();
+        let dest = if alias {
+            ranges[call.c.unwrap().operand]
+        } else {
+            DeviceRange {
+                ptr: output.device_ptr(&stream).0,
+                bytes: output.len() * 4,
+            }
+        };
+        dispatch(&call, &ranges, dest, &stream).unwrap();
+        let actual: Vec<f32> = if alias {
+            stream
+                .clone_dtoh(&payloads[call.c.unwrap().operand])
+                .unwrap()
+                .chunks_exact(4)
+                .map(|x| f32::from_ne_bytes(x.try_into().unwrap()))
+                .collect()
+        } else {
+            stream.clone_dtoh(&output).unwrap()
+        };
+        for batch in 0..count {
+            for row in 0..m {
+                for col in 0..n {
+                    let mut expected: f64 = (0..k)
+                        .map(|inner| {
+                            (batch + row + inner + 1) as f64 / 8.0
+                                * (batch + inner + 2 * col + 1) as f64
+                                / 16.0
+                        })
+                        .sum();
+                    if call.c.is_some() {
+                        expected += (batch + row + col) as f64 / 4.0;
+                    }
+                    assert_eq!(
+                        actual[at(call.d, batch, row, col)],
+                        expected as f32,
+                        "{call:?}, alias={alias}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "device")]
+#[test]
+fn changing_the_batch_count_replays_the_production_call() {
+    use support::TestTransfers;
+    let mut model = Graph::new();
+    let a = model.tensor(vec![IntExpr::from('b'), 3.into(), 4.into()], DType::F32);
+    let b = model.tensor(vec![IntExpr::from('b'), 4.into(), 5.into()], DType::F32);
+    let c = model.tensor(vec![IntExpr::from('b'), 3.into(), 5.into()], DType::F32);
+    let out = a.matmul(b) + c;
+    let registry = luminal_cuda_lite::cuda_registry_filtered(|row| {
+        !matches!(row.label(), "AddFunctionalGeneric" | "ReduceSumGeneric")
+    });
+    let mut runtime = CudaRuntime::load_with_registry(&model, registry).unwrap();
+    let inputs = FxHashMap::from_iter([
+        (a.id, luminal_cuda_lite::HostBuffer::from(vec![2.0; 24])),
+        (b.id, luminal_cuda_lite::HostBuffer::from(vec![0.25; 40])),
+        (c.id, luminal_cuda_lite::HostBuffer::from(vec![1.0; 30])),
+    ]);
+    runtime
+        .search(
+            &SymbolBounds::from_ranges([('b'.into(), (1, 3))]).unwrap(),
+            &[('b'.into(), 2)].into_iter().collect(),
+            &inputs,
+            &luminal_cuda_lite::harness_search_options(),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .plan()
+            .unwrap()
+            .dag
+            .node_weights()
+            .any(|node| matches!(node,
+        luminal::bufferize::BufferNode::Compute {op,..} if op.label().starts_with("CublasLt")))
+    );
+    let mut arena = support::allocate_arena(&runtime).unwrap();
+    let mut staging = runtime.allocate_staging().unwrap();
+    for count in [1, 3, 2, 1] {
+        runtime.set_dim('b', count);
+        runtime
+            .upload(&mut arena, a.id, vec![count as f32; count * 12])
+            .unwrap();
+        runtime
+            .upload(&mut arena, b.id, vec![0.25; count * 20])
+            .unwrap();
+        runtime
+            .upload(&mut arena, c.id, vec![1.0; count * 15])
+            .unwrap();
+        runtime.execute(arena.arena(), &mut staging).unwrap();
+        let (data, slot) = runtime.download(&arena, out.id).unwrap();
+        assert_eq!(
+            luminal_cuda_lite::layouts::dense_f32(&data.as_f32().unwrap(), &slot.layout).unwrap(),
+            vec![count as f32 + 1.0; count * 15]
+        );
+    }
+}

@@ -6,7 +6,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr};
 use luminal::dtype::PlanDtype;
 use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::device_call::{self, DeviceRange};
-use luminal_cuda_lite::ops::cublaslt::exec::{LtCall, LtDesc, LtOrder};
+use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtCall, LtDesc, LtOrder};
 use luminal_cuda_lite::{CudaRuntime, HostBuffer};
 use std::sync::Arc;
 use support::TestTransfers;
@@ -43,6 +43,10 @@ fn raw(data: &[f32], dtype: PlanDtype) -> Vec<u8> {
             .iter()
             .flat_map(|x| half::bf16::from_f32(*x).to_bits().to_ne_bytes())
             .collect(),
+        PlanDtype::F16 => data
+            .iter()
+            .flat_map(|x| half::f16::from_f32(*x).to_bits().to_ne_bytes())
+            .collect(),
         _ => panic!("unapproved storage"),
     }
 }
@@ -62,11 +66,12 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
         raw(&pack(&call.a, call.trans_a, m, k, &a), call.a_dtype),
         raw(&pack(&call.b, call.trans_b, k, n, &b), call.b_dtype),
     ];
-    if call.beta_is_one {
-        payloads.push(raw(&pack(&call.c, false, m, n, &c), PlanDtype::F32));
+    payloads.resize(call.form.lit_arity(), Vec::new());
+    if let Some(input) = call.c {
+        payloads[input.operand] = raw(&pack(&input.descriptor, false, m, n, &c), input.data_type);
     }
-    if call.bias_operand.is_some() {
-        payloads.push(raw(&bias, PlanDtype::F32));
+    if let Some(operand) = call.bias_operand {
+        payloads[operand] = raw(&bias, PlanDtype::F32);
     }
     let buffers: Vec<_> = payloads
         .iter()
@@ -75,12 +80,18 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     let inputs: Vec<_> = buffers.iter().map(|buffer| range(stream, buffer)).collect();
     let mut d = stream.alloc_zeros::<f32>(elements(&call.d)).unwrap();
     stream.memcpy_htod(&vec![777.0; d.len()], &mut d).unwrap();
-    let dest = if alias { inputs[2] } else { range(stream, &d) };
+    let dest = if alias {
+        inputs[call.c.unwrap().operand]
+    } else {
+        range(stream, &d)
+    };
     device_call::dispatch(call, &inputs, dest, stream)
         .unwrap_or_else(|error| panic!("approved call failed: {call:?}: {error:#}"));
     let mut actual = vec![0f32; elements(&call.d)];
     if alias {
-        let bytes = stream.clone_dtoh(&buffers[2]).unwrap();
+        let bytes = stream
+            .clone_dtoh(&buffers[call.c.unwrap().operand])
+            .unwrap();
         actual = bytes
             .chunks_exact(4)
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
@@ -99,11 +110,26 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
             if call.bias_operand.is_some() {
                 expected += f64::from(bias[r]);
             }
-            assert_eq!(
-                actual[at(&call.d, r, col)],
-                expected as f32,
-                "{call:?}, alias={alias}, ({r},{col})"
-            );
+            expected = match call.activation {
+                LtActivation::Identity => expected,
+                LtActivation::RectifiedLinear => expected.max(0.0),
+                LtActivation::GaussianErrorLinear => {
+                    0.5 * expected
+                        * (1.0
+                            + ((2.0 / std::f64::consts::PI).sqrt()
+                                * (expected + 0.044715 * expected.powi(3)))
+                            .tanh())
+                }
+            };
+            let got = actual[at(&call.d, r, col)];
+            if call.activation == LtActivation::GaussianErrorLinear {
+                assert!(
+                    (f64::from(got) - expected).abs() <= 5e-4 + 5e-4 * expected.abs(),
+                    "{call:?}: {got} vs {expected}"
+                );
+            } else {
+                assert_eq!(got, expected as f32, "{call:?}, alias={alias}, ({r},{col})");
+            }
         }
     }
 }
@@ -135,12 +161,12 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
             continue;
         }
         let call = op.resolve(&Default::default());
-        assert_eq!(call.c, call.d);
+        assert_eq!(call.c.unwrap().descriptor, call.d);
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if native_bf16 { 48 } else { 24 });
-    assert_eq!(aliases, if native_bf16 { 24 } else { 12 });
+    assert_eq!(ran, if native_bf16 { 672 } else { 448 });
+    assert_eq!(aliases, if native_bf16 { 336 } else { 224 });
 }
 
 #[test]

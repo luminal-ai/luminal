@@ -1,106 +1,158 @@
 # Production cuBLASLt admission
 
-`approved_rules.egg` proves `cublaslt-approved-call` only after joining a
-`cublaslt-approved-configuration` fact for the complete `CublasLtConfigurationOf`
-tuple with every logical and layout premise. Two final emission rules consume
-that same proof: `LayoutTensorOpCublasLtCall` uses an independent destination;
-`LayoutTensorOpCublasLtAccumulateInPlace` reads and overwrites C.
-Recognition, layout readings, C and bias cannot emit calls independently.
-An empty whitelist emits neither executable form, including
-from graphs containing C, bias, or ReLU. Removing one row removes that
-configuration and leaves the others available.
+The rules describe complete calls to `D = alpha * op(A) * op(B) + beta * C`,
+followed by an optional epilogue. Arithmetic recognition, layout proofs, approved
+API configurations, and executable emission are separate stages. Rust decodes
+the elected call and dispatches its descriptors unchanged.
 
-Names follow the cuBLASLt API: `D = alpha * op(A) * op(B) + beta * C`,
-followed by the selected epilogue. C is an optional full matrix with the output's
-dimensions; the epilogue bias is a separate vector. Rule variables keep `?m`,
-`?n`, and `?k` for the product dimensions. Shared layout proofs use
-`?LeadingDimension` for the API's leading dimension in elements. Matrix-specific
-proofs use `?D_LeadingDimension`; the in-place emission rule uses one
-`?C_and_D_LeadingDimension` variable to require equal C/D leading dimensions.
-Matrix descriptors use names such as `?A_matrix_descriptor`.
+## Rule ownership and style
 
-`approved_whitelist.egg` contains 48 configurations:
-
-| A / B storage | Logical multiply / reduce | C / bias / D | Epilogue |
-| --- | --- | --- | --- |
-| F32 / F32 | F32 / F32 | F32 | default or bias |
-| BF16 / BF16 | F32 / F32 | F32 | default or bias |
-
-The tuple also specifies compute type, scale type, bias type or absence, host
-alpha/beta, A/B/D order, and both transpose flags. Alpha is exactly 1; beta is
-0 without C and 1 with C. C has D's order and dimensions but may have a
-different leading dimension. The in-place form requires identical C/D descriptor
-geometry and the same layout. It carries one shared C/D descriptor and declares
-an unconditional `Sharing::Must` tie from C (operand 2) to result 0. Its inputs
-are A, B, C and optional bias, with no extra destination operand. The independent
-form appends a write-only destination during DPS conversion and grants no input
-alias permissions. Neither form has a conditional C/D alias flag.
-Bufferization may reuse writable, dead C storage or repair a conflict by copying
-the old C contents before executing the in-place form on the copy.
-Bias has the vendor's row length and column-ordered D. The rules transpose a
-complete expression to implement normal feature bias, preserving its operands
-and selected output layout.
-
-Only explicit F32 input casts authorize direct BF16 storage readings. Arithmetic
-precision comes from the logical operands and product. A BF16 product followed
-by an F32 output cast cannot become an F32-compute call. Casts between multiply,
-reduce, C addition, or bias addition stop fusion at that rounding boundary.
-Earlier narrowing casts remain in the graph, and final output casts remain
-separate operations. C and bias widening is materialized as F32. F32 reduction
-reassociation and FMA contraction retain the existing compiler policy.
-
-ReLU has no approved configurations: vendor ReLU normalizes negative zero,
-whereas the logical operation preserves it. ReLU executes through the generic
-path. F16 arithmetic, TF32, FP8, mixed A/B storage, narrow outputs, batched
-calls, arbitrary scalars, and other epilogues have no approved rows.
-
-ElementStride proofs use cons lists and relation facts, with no egglog
-containers. They retain exact alternatives independently and grant `Any` only
-on a proven singleton axis. A callable matrix needs positive rank-two extents,
-a unit minor stride, and a leading dimension at least the minor extent.
-Authored boundary strides supply whole shape-owned certificates. Overlapping,
-negative, broadcast, and nonunit-minor layouts cannot produce a reading.
-Unproved layouts remain available through generic operations/materialization.
-
-Extraction decodes the elected tuple and descriptors. Dispatch evaluates their
-integer expressions, checks backing capacities and vendor availability, and
-passes them unchanged to cuBLASLt. There is no Rust pattern selector, transpose
-bridge, destination rebinding, or legacy emitter. Device heuristics can still
-refuse a configuration on a particular GPU or geometry.
-
-Boundary value delivery uses `BufferCopyValue` with an explicit unchanged
-address span; both backing capacities must cover it. This permits dense output
-in a larger shared allocation while preserving unused tail bytes. A rejected
-read-modify-write tie whose C operand is a folded view uses the same value-span
-copy to initialize its tied result, without copying the larger parent allocation
-into a separate buffer. Ordinary
-`BufferCopy {src,dst}` retains exact-size whole-storage semantics.
-Reference compiled artifacts use schema version 3 to encode ElementStride
-layouts and value-copy spans; older artifacts must be regenerated.
-
-## Regression coverage
-
-The exploratory whitelist and historical marker emitters were removed after
-moving their useful checks to the production vocabulary:
-
-| Invariant from the former marker boards | Production coverage |
+| File | Responsibility |
 | --- | --- |
-| Complete admission, one-row removal, every configuration witnessed | `cublaslt_production_whitelist` |
-| Input/output cast placement and every arithmetic rounding stage | `cublaslt_precision_matches`, `precision_contract` |
-| Singleton, square, transposed and duplicate operands; distinct sites; chains; bounded growth | `cublaslt_production_proofs` |
-| Whole shape certificates, invalid pitches, correlated symbolic bounds, singleton specialization | `cublaslt_production_proofs`, core `element_stride` unit tests |
-| Sliced reduction extent, exact descriptor/layout address agreement | `cublaslt_production_proofs` |
-| C/bias ordering, destination descriptors and the distinct accumulating form | `cublaslt_production_proofs`, `cublaslt_bias_premise`, `cublaslt_in_place` |
-| Every table row dispatched numerically, in-place execution, signed-zero fallback, shared padded boundaries | `cublaslt_production_device`, `cublaslt_in_place` |
-| Dynamic geometry and graph replay | `dynamic_graphs`, `precision_contract` |
-| Buffer bounds, singleton reach, overflow, separate C/D pitches | `cublaslt_contracts_cpu`, `cublaslt_contracts` |
-| Folded view identity, lifetime repair, transpose termination | retained `test_runtime` fold/bufferizer/transpose suites |
-| Value-copy bounds, spare capacity and artifact round trip | reference `value_copy` |
+| `approved_constructors.egg` | Flat vendor layout data, storage descriptors, optional arguments, configuration and expression-frame types |
+| `approved_rules.egg` | Rank-two expression recognition, layout readings, precision proofs, and complete admission |
+| `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
+| `approved_whitelist.egg` | The 672 complete configurations allowed for execution |
+| `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
+| `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
-Tests about obsolete constructor child positions, old specification parsing,
-transpose bridges, destination rebinding, and diagnostic-only candidate counts
-were retired with those implementations. No old emitter remains registered as
-a test fixture.
+Write rules as named, local proof steps in `:ruleset backend`. Recognition facts
+name existing logical expressions; they do not imply permission to execute.
+Layout readings prove how one particular storage tensor is addressed. Complete
+admission joins these facts with one exact whitelist tuple. Only the final
+emission rules construct executable operations. There is no decorator that can
+bypass admission, and an empty whitelist emits neither executable form.
+
+Use the vendor's names and units. `?m`, `?n`, and `?k` describe the product.
+`?LeadingDimension` and `?BatchStrideInElements` are measured in elements.
+Variables such as `?A_matrix_descriptor` identify complete descriptors. Share a
+variable only when equality is required; independent C/D pitches have distinct
+variables. Keep an entire expression, its operands, and its call frame together.
+Never harvest descriptors from unrelated sites with matching dimensions.
+
+## Descriptor structure
+
+`CublasLtMatrixLayoutLit` is a flat value with seven fields: storage dtype,
+matrix order, rows, columns, leading dimension, batch count, and batch stride.
+`CublasLtMatrixDescriptorOf` pairs a storage `LayoutTensor` with that complete
+vendor layout. Logical tensors and storage are not inferred from one another in
+Rust. Both the rank-two and batched proofs construct this same descriptor type.
+Rank-two descriptors explicitly use batch count 1 and stride 0.
+
+C absence is structural: `CublasLtCMatrixAbsent` and
+`CublasLtNoCMatrixDataType` carry no fictitious storage input. Present C has its
+own descriptor, dtype, and operand position. Dispatch still supplies the valid
+placeholder C descriptor required by the vendor when beta is zero.
+
+The separate-destination form uses inputs A, B, optional C, optional bias, and a
+write-only destination appended by DPS conversion. It grants no input alias
+permission. The in-place form uses A, B, optional bias, then C as its destination;
+C is operand 2 without bias and operand 3 with bias. Its unconditional
+`Sharing::Must` tie connects that final operand to result 0. Its emission rule
+requires the same complete vendor layout and the same underlying layout for C
+and D. There is no conditional alias flag or Rust destination rebinding.
+
+## Approved configurations and precision
+
+The table contains **672 configurations**:
+
+- Matching F32/F32, BF16/BF16, or F16/F16 A/B storage: 3 choices.
+- Independent A/B matrix orders and transpose flags: 16 choices.
+- Absent C with beta 0 or F32 C with beta 1: 2 choices.
+- Default epilogue with either D order, or bias, ReLU, ReLU+bias, GELU,
+  GELU+bias with column-major D: 7 choices.
+
+Compute, scalar, D, and any present C or bias types are F32. Alpha is 1.
+Only explicit F32 input casts permit direct BF16 or F16 storage readings.
+Storage does not choose arithmetic precision. Casts between multiply, reduction,
+C addition, or bias addition remain rounding boundaries. Earlier narrowing and
+final output casts are retained. C and bias widening is materialized as F32.
+F32 reduction reassociation and FMA contraction follow the existing compiler
+policy. ReLU accepts a difference in the sign of zero; both frontend GELU
+spellings may use the vendor tanh approximation. These are explicit admission
+policies, not claims of bitwise equivalence.
+
+Bias has the vendor's row length and packed storage. The rank-two rules
+transpose a complete expression to implement normal feature bias. C is added
+before bias and activation; reversing floating operands or crossing casts does
+not authorize another fused expression. TF32, FP8, mixed A/B storage, narrow
+outputs, and arbitrary alpha/beta values have no approved configurations.
+
+## Element strides and strided batches
+
+Core represents coefficients with `ElementStrideExact IntExpr` and
+`ElementStrideAny`. Any is freedom on a statically proved singleton axis;
+it never unions global coefficients or turns conflicting exact proofs into
+freedom. Complete shape-owned certificates are validated before publishing
+backend-facing readings. Authored boundary strides preserve factors that index
+simplification can erase at singleton extents.
+
+The batched recognizer matches `A[B,m,k]` and `B[B,k,n]` broadcast into the exact
+`[B,m,n,k]` multiply domain followed by reduction over k. Both maps must use the
+batch coordinate, even when a matrix extent happens to equal B. A static B=1
+also permits its coordinate to be literal zero. Arithmetic remains F32, with
+explicit narrow-input widening handled by the shared storage-reading proofs.
+
+Batch descriptors require positive rank-three extents and one shared batch
+count that fits positive int32. Every matrix has unit minor stride and a legal
+leading dimension. A live batch stride must cover the **full padded matrix**:
+`rows * ld` in row order or `columns * ld` in column order. Covering only the
+last touched element is insufficient. A singleton batch may choose its
+canonical padded pitch from Any. Live zero/broadcast strides, overlapping
+batches, negative strides, and unproved geometry cannot become matrix readings.
+
+Batched admission currently covers a product and ordered product+C, without
+bias or activation. C and D share shape, dtype, order and count but may have
+independent leading dimensions and batch strides. In-place emission additionally
+requires identical complete descriptions and layouts. Multiple batch axes and
+arbitrary flattening are not part of this grammar. Unproved cases retain generic
+operations/materialization.
+
+Experimental literal-expression discovery is separately scheduled through
+`element-stride-discovery`; production schedules do not run it. Native stride
+composition handles permutations, broadcasts, zero selections and diagonals.
+Unsupported arithmetic view maps deliberately stall.
+
+## Extending the backend
+
+1. State the logical arithmetic and rounding contract, including exceptional
+   values, optional arguments, and allowed approximations.
+2. Add local egglog recognition and complete shape-owned layout proofs. Reuse
+   the flat vendor descriptor; give every new geometry field an explicit proof.
+3. Join the complete configuration whitelist at admission. Add only supported
+   rows, preserving the distinction between absent and present C/bias.
+4. Let the existing final emitters consume the approval, or add an emitter whose
+   storage contract is unconditional and proved before extraction.
+5. Extend Rust decoding only for new data variants. Dispatch may evaluate
+   expressions, validate backing capacities, and check vendor availability; it
+   must not match graphs, flip transposes, select layouts, or repair admission.
+6. Test whitelist ablation, every selectable descriptor's addresses, precision
+   boundaries, symbolic/singleton geometry, ties/repair, and numerical execution.
+   Use semantic references and fixed seeds rather than relying on a search win.
+
+Boundary value delivery and folded writing-tie repair use `BufferCopyValue` with
+an explicit unchanged address span, preserving spare allocation capacity.
+`BufferCopy` retains exact-size whole-storage semantics. Reference compiled
+artifacts use schema version 3 for element-stride layouts and value-copy spans.
+
+## Recovery provenance and validation
+
+These six `.egg` files were recovered byte for byte from two surviving libraries
+built on 2026-10-27 before the container rebuild; their SHA-256 values agree.
+The recovery bundle is `.recovery/cublaslt-2026-10-27/`, locally excluded from Git
+because it also preserves the binaries. Its manifest records archive sections,
+source bytes, and hashes. The core element-stride rule files match the recovered
+core library exactly and did not require replacement.
+
+The accompanying Rust wiring and missing batch test source were reconstructed
+from the surviving baseline, the exact rule types, and binary debug information;
+they are not claimed to be verbatim recovered Rust source. The preserved original
+batch board passes 14 CPU tests and 4 device tests on the A100. Source validation
+is recorded separately in the recovery bundle.
+
+The benchmark below is historical: it measures the older 48-row foundation on
+`77d3060f`, before this restored 672-row vocabulary and batched support. Its
+numbers do not measure the restored code.
 
 ## Accumulation performance comparison
 

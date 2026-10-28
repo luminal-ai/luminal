@@ -6,7 +6,7 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::exec::{CSource, LtCall, LtDesc, LtOrder};
+use super::exec::{LtActivation, LtCall, LtDesc, LtOrder};
 
 /// Workspace owned by US (contract: no silent fallback algos). 32 MiB —
 /// cuBLASLt's own recommendation ceiling for pre-Hopper devices is
@@ -115,6 +115,7 @@ impl Layout {
         let dtype = match dtype {
             luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
             luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
+            luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
             dtype => return Err(anyhow!("cuBLASLt unsupported matrix dtype {dtype:?}")),
         };
         let raw = lt::create_matrix_layout(
@@ -138,6 +139,27 @@ impl Layout {
             )
         }
         .map_err(|e| anyhow!("cublasLtMatrixLayoutSetAttribute({order:?}): {e:?}"))?;
+        let count =
+            i32::try_from(desc.batch_count).context("cuBLASLt batch count exceeds int32")?;
+        let stride = desc.batch_stride_in_elements;
+        unsafe {
+            lt::set_matrix_layout_attribute(
+                layout.raw,
+                sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                (&count) as *const _ as *const _,
+                std::mem::size_of::<i32>(),
+            )
+        }
+        .map_err(|e| anyhow!("cuBLASLt batch count: {e:?}"))?;
+        unsafe {
+            lt::set_matrix_layout_attribute(
+                layout.raw,
+                sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                (&stride) as *const _ as *const _,
+                std::mem::size_of::<i64>(),
+            )
+        }
+        .map_err(|e| anyhow!("cuBLASLt batch stride: {e:?}"))?;
         Ok(layout)
     }
 }
@@ -186,6 +208,7 @@ pub fn prepare(
         let dtype = match index {
             0 => call.a_dtype,
             1 => call.b_dtype,
+            i if call.c.is_some_and(|c| c.operand == i) => call.c.unwrap().data_type,
             _ => call.d_dtype,
         };
         elems.push(range.bytes / crate::host_buffer::dtype_bytes(dtype)?);
@@ -236,13 +259,21 @@ pub fn prepare(
         std::mem::size_of::<i32>(),
     )?;
 
-    // Epilogue: exactly the four the marker claims — Default / Relu /
-    // Bias / ReluBias. Nothing else is expressible from an LtCall.
-    let epilogue = match (call.relu, call.bias_operand.is_some()) {
-        (false, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
-        (true, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,
-        (false, true) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
-        (true, true) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU_BIAS,
+    // Decode only the elected activation and optional bias. Their admission
+    // and approximation policy are owned by the egglog configuration proof.
+    let epilogue = match (call.activation, call.bias_operand.is_some()) {
+        (LtActivation::Identity, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+        (LtActivation::RectifiedLinear, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,
+        (LtActivation::Identity, true) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
+        (LtActivation::RectifiedLinear, true) => {
+            sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU_BIAS
+        }
+        (LtActivation::GaussianErrorLinear, false) => {
+            sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU
+        }
+        (LtActivation::GaussianErrorLinear, true) => {
+            sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU_BIAS
+        }
     };
     set_desc(
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
@@ -265,7 +296,8 @@ pub fn prepare(
     // NULL Cdesc segfaults), plus D.
     let a_layout = Layout::new(&call.a, call.a_dtype)?;
     let b_layout = Layout::new(&call.b, call.b_dtype)?;
-    let c_layout = Layout::new(&call.c, call.d_dtype)?;
+    let c_descriptor = call.c.map_or(call.d, |c| c.descriptor);
+    let c_layout = Layout::new(&c_descriptor, call.c.map_or(call.d_dtype, |c| c.data_type))?;
     let d_layout = Layout::new(&call.d, call.d_dtype)?;
 
     let pref =
@@ -314,7 +346,7 @@ pub fn prepare(
             call.k,
             call.a.ld,
             call.b.ld,
-            call.c.ld,
+            c_descriptor.ld,
             call.d.ld
         )
     })?;
@@ -325,11 +357,11 @@ pub fn prepare(
     let a_ptr = operands[0].ptr;
     let b_ptr = operands[1].ptr;
     let d_ptr = dest.ptr;
-    let (c_ptr, beta): (u64, &'static f32) = match call.c_source {
-        CSource::AliasD => (d_ptr, &BETA_ZERO),
-        CSource::Operand(i) => {
+    let (c_ptr, beta): (u64, &'static f32) = match call.c {
+        None => (d_ptr, &BETA_ZERO),
+        Some(c) => {
             debug_assert!(call.beta_is_one);
-            (operands[i].ptr, &BETA_ONE)
+            (operands[c.operand].ptr, &BETA_ONE)
         }
     };
     Ok(PreparedCall {

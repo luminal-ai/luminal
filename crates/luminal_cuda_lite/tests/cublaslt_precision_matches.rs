@@ -55,9 +55,9 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
             assert_eq!(site.logical_dtype(&physical), Some(descriptor.dtype));
             match descriptor.dtype {
                 PlanDtype::F32 => assert_eq!(*semantic, physical),
-                PlanDtype::Bf16 => assert!(
+                PlanDtype::Bf16 | PlanDtype::F16 => assert!(
                     has_cast(&egraph, semantic, &physical, "F32"),
-                    "BF16 storage must be the source of this exact operand's widening cast"
+                    "narrow storage must be the source of this exact operand's widening cast"
                 ),
                 other => panic!("unsupported call input {other:?}"),
             }
@@ -68,7 +68,6 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
                 Some(PlanDtype::F32)
             );
         }
-        assert!(!call.relu, "unproved vendor ReLU must stay generic");
         specifications.push(call.clone());
     }
     // Both executable forms consume the same complete precision proof. Every
@@ -299,6 +298,10 @@ fn relu_cannot_cross_a_narrowing_cast() {
         let _output = product.relu().cast(DType::F16);
         let calls = candidates(&graph);
         assert!(!calls.is_empty());
-        assert!(calls.iter().all(|call| !call.relu));
+        assert_eq!(
+            calls.iter().any(|call| call.activation
+                == luminal_cuda_lite::ops::cublaslt::exec::LtActivation::RectifiedLinear),
+            !barrier
+        );
     }
 }

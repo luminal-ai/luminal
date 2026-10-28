@@ -2,7 +2,10 @@
 use luminal::dtype::PlanDtype;
 use luminal_cuda_lite::ops::cublaslt::{
     CublasLtForm,
-    exec::{CSource, LtCall, LtDesc, assert_bias_destination_order, validate_ld_bounds},
+    exec::{
+        LtActivation, LtCMatrixInput, LtCall, LtDesc, assert_bias_destination_order,
+        validate_ld_bounds,
+    },
 };
 
 fn call(form: CublasLtForm) -> LtCall {
@@ -23,15 +26,14 @@ fn call(form: CublasLtForm) -> LtCall {
         d_dtype: PlanDtype::F32,
         a: LtDesc::row(4, 5, 5),
         b: LtDesc::row(5, 3, 3),
-        c: d,
+        c: form.has_c().then_some(LtCMatrixInput {
+            descriptor: d,
+            data_type: PlanDtype::F32,
+            operand: 2,
+        }),
         d,
-        c_source: if form.has_c() {
-            CSource::Operand(2)
-        } else {
-            CSource::AliasD
-        },
         beta_is_one: form.has_c(),
-        relu: false,
+        activation: LtActivation::Identity,
         bias_operand: form.has_bias().then_some(if form.has_c() { 3 } else { 2 }),
     }
 }
@@ -92,26 +94,19 @@ fn every_operand_destination_and_optional_argument_is_capacity_checked() {
                 .is_err()
         );
         assert_eq!(call.beta_is_one, form.has_c());
-        assert_eq!(
-            call.c_source,
-            if form.has_c() {
-                CSource::Operand(2)
-            } else {
-                CSource::AliasD
-            }
-        );
+        assert_eq!(call.c.map(|c| c.operand), form.has_c().then_some(2));
         assert_bias_destination_order(&call, "test").unwrap();
     }
 }
 #[test]
 fn separate_c_and_d_pitches_are_preserved_and_checked_independently() {
     let mut call = call(CublasLtForm::Accumulate);
-    call.c = LtDesc::row(4, 3, 8);
+    call.c.as_mut().unwrap().descriptor = LtDesc::row(4, 3, 8);
     call.d = LtDesc::row(4, 3, 5);
     call.validate_against(&[20, 15, 27], 18).unwrap();
     assert!(call.validate_against(&[20, 15, 26], 18).is_err());
     assert!(call.validate_against(&[20, 15, 27], 17).is_err());
-    assert_eq!(call.c.ld, 8);
+    assert_eq!(call.c.unwrap().descriptor.ld, 8);
     assert_eq!(call.d.ld, 5);
 }
 #[test]

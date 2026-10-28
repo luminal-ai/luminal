@@ -1,7 +1,7 @@
 //! A complete call is admitted in egglog before extraction. This module only
 //! decodes the elected configuration and evaluates its descriptor expressions.
 use super::CublasLtForm;
-use super::exec::{CSource, LtCall, LtDesc, LtOrder};
+use super::exec::{LtActivation, LtCMatrixInput, LtCall, LtDesc, LtOrder};
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
 use luminal::egglog_snippet::{EgglogSnippet, SpliceCategory};
@@ -33,6 +33,10 @@ impl OpMatcher for ApprovedCublasLtMatcher {
             EgglogSnippet {
                 category: SpliceCategory::Match,
                 text: RULES,
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Match,
+                text: include_str!("egg/strided_batch_rules.egg"),
             },
             EgglogSnippet {
                 category: SpliceCategory::Match,
@@ -72,7 +76,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
         {
             Some(matrix(site, &site.class_of_child(node, 0).unwrap()))
         } else {
-            member(site, &c_arg, "CublasLtZeroCMatrix");
+            member(site, &c_arg, "CublasLtCMatrixAbsent");
             None
         };
         let bias_arg = site.child_class(4);
@@ -96,17 +100,10 @@ impl OpMatcher for ApprovedCublasLtMatcher {
             d,
             bias,
             scale: dtype(site, &child(1)),
-            storage: [
-                dtype(site, &child(2)),
-                dtype(site, &child(3)),
-                dtype(site, &child(4)),
-                dtype(site, &child(5)),
-            ],
             trans_a: enum_is(&child(12), "CublasLtTranspose"),
             trans_b: enum_is(&child(13), "CublasLtTranspose"),
             beta_one: enum_is(&child(7), "CublasLtHostScalarsAlphaOneBetaOne"),
-            relu: enum_is(&child(8), "CublasLtRectifiedLinearEpilogue")
-                || enum_is(&child(8), "CublasLtRectifiedLinearBiasEpilogue"),
+            activation: activation(site, &child(8)),
             dps: false,
         })
     }
@@ -132,6 +129,32 @@ pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
     panic!("cuBLASLt approved contract: unsupported dtype constructor in {class}");
 }
 
+pub(super) fn activation(site: &ExtractionSite<'_>, class: &ClassId) -> LtActivation {
+    if site
+        .nodes_in_class_value(class, "CublasLtRectifiedLinearEpilogue")
+        .next()
+        .is_some()
+        || site
+            .nodes_in_class_value(class, "CublasLtRectifiedLinearBiasEpilogue")
+            .next()
+            .is_some()
+    {
+        LtActivation::RectifiedLinear
+    } else if site
+        .nodes_in_class_value(class, "CublasLtGaussianErrorLinearEpilogue")
+        .next()
+        .is_some()
+        || site
+            .nodes_in_class_value(class, "CublasLtGaussianErrorLinearBiasEpilogue")
+            .next()
+            .is_some()
+    {
+        LtActivation::GaussianErrorLinear
+    } else {
+        LtActivation::Identity
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Matrix {
     pub tensor: ClassId,
@@ -140,20 +163,27 @@ pub struct Matrix {
     pub rows: IotaExpr,
     pub cols: IotaExpr,
     pub ld: IotaExpr,
+    pub batch_count: IotaExpr,
+    pub batch_stride_in_elements: IotaExpr,
 }
 
 pub(super) fn matrix(site: &ExtractionSite<'_>, class: &ClassId) -> Matrix {
     let node = member(site, class, "CublasLtMatrixDescriptorOf");
-    let child = |n| site.class_of_child(&node, n).unwrap();
+    let layout = member(
+        site,
+        &site.class_of_child(&node, 1).unwrap(),
+        "CublasLtMatrixLayoutLit",
+    );
+    let child = |n| site.class_of_child(&layout, n).unwrap();
     let expr = |n| {
         luminal::index_expr::parse_int_expr(site, &child(n), 128, None)
             .expect("descriptor integer expression")
     };
     Matrix {
-        tensor: child(0),
-        dtype: dtype(site, &child(1)),
+        tensor: site.class_of_child(&node, 0).unwrap(),
+        dtype: dtype(site, &child(0)),
         order: if site
-            .nodes_in_class_value(&child(2), "CublasLtRowMajor")
+            .nodes_in_class_value(&child(1), "CublasLtRowMajor")
             .next()
             .is_some()
         {
@@ -161,9 +191,11 @@ pub(super) fn matrix(site: &ExtractionSite<'_>, class: &ClassId) -> Matrix {
         } else {
             LtOrder::Col
         },
-        rows: expr(3),
-        cols: expr(4),
-        ld: expr(5),
+        rows: expr(2),
+        cols: expr(3),
+        ld: expr(4),
+        batch_count: expr(5),
+        batch_stride_in_elements: expr(6),
     }
 }
 
@@ -174,6 +206,8 @@ impl Matrix {
             cols: self.cols.eval_with_dims(&[], dims),
             ld: self.ld.eval_with_dims(&[], dims),
             order: self.order,
+            batch_count: self.batch_count.eval_with_dims(&[], dims),
+            batch_stride_in_elements: self.batch_stride_in_elements.eval_with_dims(&[], dims),
         }
     }
 }
@@ -191,11 +225,10 @@ pub struct ApprovedCublasLt {
     pub d: Matrix,
     pub bias: Option<ClassId>,
     pub scale: PlanDtype,
-    pub storage: [PlanDtype; 4],
     pub trans_a: bool,
     pub trans_b: bool,
     pub beta_one: bool,
-    pub relu: bool,
+    pub activation: LtActivation,
     dps: bool,
 }
 
@@ -208,6 +241,8 @@ impl ApprovedCublasLt {
             rows: IotaExpr::Lit(1),
             cols: IotaExpr::Lit(1),
             ld: IotaExpr::Lit(1),
+            batch_count: IotaExpr::Lit(1),
+            batch_stride_in_elements: IotaExpr::Lit(0),
         };
         Self {
             configuration: ClassId::from("prototype"),
@@ -221,11 +256,10 @@ impl ApprovedCublasLt {
             d: matrix,
             bias: None,
             scale: PlanDtype::F32,
-            storage: [PlanDtype::F32; 4],
             trans_a: false,
             trans_b: false,
             beta_one: false,
-            relu: false,
+            activation: LtActivation::Identity,
             dps: false,
         }
     }
@@ -256,15 +290,14 @@ impl ApprovedCublasLt {
             d_dtype: self.d.dtype,
             a,
             b,
-            c: self.c.as_ref().map_or(d, |c| c.resolve(dims)),
+            c: self.c.as_ref().map(|c| LtCMatrixInput {
+                descriptor: c.resolve(dims),
+                data_type: c.dtype,
+                operand: 2,
+            }),
             d,
-            c_source: if self.c.is_some() {
-                CSource::Operand(2)
-            } else {
-                CSource::AliasD
-            },
             beta_is_one: self.beta_one,
-            relu: self.relu,
+            activation: self.activation,
             bias_operand: self
                 .bias
                 .as_ref()
@@ -362,7 +395,13 @@ pub(super) fn capture_dimensions<'a>(
     }
     let mut out = std::collections::BTreeSet::new();
     for matrix in matrices {
-        for expr in [&matrix.rows, &matrix.cols, &matrix.ld] {
+        for expr in [
+            &matrix.rows,
+            &matrix.cols,
+            &matrix.ld,
+            &matrix.batch_count,
+            &matrix.batch_stride_in_elements,
+        ] {
             visit(expr, &mut out);
         }
     }

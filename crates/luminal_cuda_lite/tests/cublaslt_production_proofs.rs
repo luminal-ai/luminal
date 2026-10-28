@@ -75,7 +75,7 @@ fn singleton_any_is_local_and_live_broadcast_stays_exact_zero() {
 (check (cublaslt-element-stride-reading x_lt 1 (ElementStrideAny)))
 (check (cublaslt-element-stride-reading x_lt 0 (ElementStrideExact (IntLit 1))))
 (check (cublaslt-matrix-reading x_lt (IntLit 1) (IntLit 4) (F32) (CublasLtRowMajor) (CublasLtNoTranspose)
-  (CublasLtMatrixDescriptorOf x_lt (F32) (CublasLtRowMajor) (IntLit 1) (IntLit 4) (IntLit 4))))
+  (CublasLtMatrixDescriptorOf x_lt (CublasLtMatrixLayoutLit (F32) (CublasLtRowMajor) (IntLit 1) (IntLit 4) (IntLit 4) (IntLit 1) (IntLit 0)))))
 (check (cublaslt-element-stride-reading broadcast_lt 1 (ElementStrideExact (IntLit 0))))
 (fail (check (cublaslt-element-stride-reading broadcast_lt 1 (ElementStrideAny))))
 (fail (check (= (IntLit 1) (IntLit 4))))
@@ -107,13 +107,13 @@ fn strided_destinations_require_unit_minor_stride_and_nonoverlapping_pitch() {
         &body,
         r#"
 (check (cublaslt-matrix-reading padded_lt (IntLit 3) (IntLit 4) (F32) (CublasLtRowMajor) (CublasLtNoTranspose)
-  (CublasLtMatrixDescriptorOf padded_lt (F32) (CublasLtRowMajor) (IntLit 3) (IntLit 4) (IntLit 8))))
+  (CublasLtMatrixDescriptorOf padded_lt (CublasLtMatrixLayoutLit (F32) (CublasLtRowMajor) (IntLit 3) (IntLit 4) (IntLit 8) (IntLit 1) (IntLit 0)))))
 (check (cublaslt-destination-reading padded_lt (IntLit 3) (IntLit 4) (F32) (CublasLtRowMajor)
-  (CublasLtMatrixDescriptorOf padded_lt (F32) (CublasLtRowMajor) (IntLit 3) (IntLit 4) (IntLit 8))))
+  (CublasLtMatrixDescriptorOf padded_lt (CublasLtMatrixLayoutLit (F32) (CublasLtRowMajor) (IntLit 3) (IntLit 4) (IntLit 8) (IntLit 1) (IntLit 0)))))
 (check (cublaslt-destination-reading column_padded_lt (IntLit 3) (IntLit 4) (F32) (CublasLtColumnMajor)
-  (CublasLtMatrixDescriptorOf column_padded_lt (F32) (CublasLtColumnMajor) (IntLit 3) (IntLit 4) (IntLit 6))))
+  (CublasLtMatrixDescriptorOf column_padded_lt (CublasLtMatrixLayoutLit (F32) (CublasLtColumnMajor) (IntLit 3) (IntLit 4) (IntLit 6) (IntLit 1) (IntLit 0)))))
 (fail (check (cublaslt-matrix-reading short_pitch_lt (IntLit 3) (IntLit 4) (F32) (CublasLtRowMajor) (CublasLtNoTranspose)
-  (CublasLtMatrixDescriptorOf short_pitch_lt (F32) (CublasLtRowMajor) (IntLit 3) (IntLit 4) (IntLit 2)))))
+  (CublasLtMatrixDescriptorOf short_pitch_lt (CublasLtMatrixLayoutLit (F32) (CublasLtRowMajor) (IntLit 3) (IntLit 4) (IntLit 2) (IntLit 1) (IntLit 0))))))
 (fail (check (cublaslt-destination-reading short_pitch_lt ?m ?n ?dtype ?order ?matrix)))
 (fail (check (cublaslt-destination-reading short_column_pitch_lt ?m ?n ?dtype ?order ?matrix)))
 (fail (check (cublaslt-destination-reading nonunit_minor_lt ?m ?n ?dtype ?order ?matrix)))
@@ -130,9 +130,9 @@ fn symbolic_pitch_equal_to_extent_does_not_require_disjoint_bounds() {
         &body,
         r#"
 (check (cublaslt-matrix-reading x_lt (IntLit 3) n (F32) (CublasLtRowMajor) (CublasLtNoTranspose)
-  (CublasLtMatrixDescriptorOf x_lt (F32) (CublasLtRowMajor) (IntLit 3) n n)))
+  (CublasLtMatrixDescriptorOf x_lt (CublasLtMatrixLayoutLit (F32) (CublasLtRowMajor) (IntLit 3) n n (IntLit 1) (IntLit 0)))))
 (check (cublaslt-destination-reading x_lt (IntLit 3) n (F32) (CublasLtRowMajor)
-  (CublasLtMatrixDescriptorOf x_lt (F32) (CublasLtRowMajor) (IntLit 3) n n)))
+  (CublasLtMatrixDescriptorOf x_lt (CublasLtMatrixLayoutLit (F32) (CublasLtRowMajor) (IntLit 3) n n (IntLit 1) (IntLit 0)))))
 "#,
     );
 }
@@ -281,7 +281,7 @@ fn configuration_key(op: &ApprovedCublasLt) -> (bool, bool, bool, bool, bool, bo
     (
         op.c.is_some(),
         op.bias.is_some(),
-        op.relu,
+        (op.activation == luminal_cuda_lite::ops::cublaslt::exec::LtActivation::RectifiedLinear),
         op.d.order == LtOrder::Col,
         op.trans_a,
         op.trans_b,
@@ -289,16 +289,29 @@ fn configuration_key(op: &ApprovedCublasLt) -> (bool, bool, bool, bool, bool, bo
 }
 
 #[test]
-fn every_f32_configuration_has_a_coherent_descriptor_witness() {
+fn f32_fixture_configurations_have_coherent_descriptor_witnesses() {
     let graph = all_families();
     let calls = calls(&graph);
     let keys: std::collections::BTreeSet<_> = calls.iter().map(configuration_key).collect();
-    assert_eq!(keys.len(), 24);
+    assert_eq!(keys.len(), 40);
     for op in &calls {
         assert_eq!(op.scale, PlanDtype::F32);
-        assert_eq!(op.storage, [PlanDtype::F32; 4]);
+        assert_eq!(
+            [
+                op.a.dtype,
+                op.b.dtype,
+                op.c.as_ref().map_or(op.d.dtype, |c| c.dtype),
+                op.d.dtype
+            ],
+            [PlanDtype::F32; 4]
+        );
         assert_eq!(op.beta_one, op.c.is_some());
-        assert!(!op.relu && op.bias.is_none() || op.d.order == LtOrder::Col);
+        assert!(
+            !(op.activation
+                == luminal_cuda_lite::ops::cublaslt::exec::LtActivation::RectifiedLinear)
+                && op.bias.is_none()
+                || op.d.order == LtOrder::Col
+        );
         let call = op.resolve(&Default::default());
         let (ar, ak) = if call.trans_a {
             (call.a.cols, call.a.rows)
@@ -465,7 +478,8 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                 (
                     selected[0].c.is_some(),
                     selected[0].bias.is_some(),
-                    selected[0].relu
+                    (selected[0].activation
+                        == luminal_cuda_lite::ops::cublaslt::exec::LtActivation::RectifiedLinear)
                 ),
                 (has_c, has_bias, relu)
             );
@@ -682,7 +696,9 @@ fn assert_all_candidates_coherent(graph: &EGraph) -> usize {
     for op in &candidates {
         let call = op.resolve(&Default::default());
         assert_eq!(op.beta_one, op.c.is_some());
-        assert!(!op.relu);
+        if op.activation != luminal_cuda_lite::ops::cublaslt::exec::LtActivation::Identity {
+            assert_eq!(op.d.order, LtOrder::Col);
+        }
         for (matrix, trans, rows, cols) in [
             (&op.a, op.trans_a, call.m, call.k),
             (&op.b, op.trans_b, call.k, call.n),

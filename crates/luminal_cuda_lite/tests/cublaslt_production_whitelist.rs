@@ -6,6 +6,7 @@ use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::approved::{
     ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
 };
+use luminal_cuda_lite::ops::cublaslt::exec::LtActivation;
 
 fn saturate(model: &Graph, whitelist: &str) -> EGraph {
     let matchers: Vec<_> = luminal_cuda_lite::cuda_registry()
@@ -91,7 +92,9 @@ fn removing_one_configuration_disables_exactly_that_configuration() {
         .expect("the exact float32 configuration is whitelisted");
     let key = |call: &ApprovedCublasLt| {
         let resolved = call.resolve(&Default::default());
-        call.storage == [PlanDtype::F32; 4]
+        call.a.dtype == PlanDtype::F32
+            && call.b.dtype == PlanDtype::F32
+            && call.d.dtype == PlanDtype::F32
             && call.c.is_none()
             && call.bias.is_none()
             && !resolved.trans_a
@@ -155,10 +158,14 @@ fn removing_an_accumulation_configuration_disables_both_executable_forms() {
 }
 
 #[test]
-fn relu_stays_generic_until_its_special_value_semantics_match() {
+fn approved_relu_fuses_the_complete_accumulation_and_bias_expression() {
     let calls = calls(&saturate(&fixture(), WHITELIST));
     assert!(!calls.is_empty());
-    assert!(calls.iter().all(|call| !call.relu));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.activation == LtActivation::RectifiedLinear)
+    );
     assert!(
         calls
             .iter()
@@ -171,7 +178,7 @@ mod whitelist;
 #[test]
 fn every_approved_configuration_has_a_real_graph_witness_and_no_others_exist() {
     let witnesses = whitelist::witnesses();
-    assert_eq!(whitelist::approved_keys().len(), 48);
+    assert_eq!(whitelist::approved_keys().len(), 672);
     assert_eq!(
         witnesses
             .keys()
@@ -182,7 +189,7 @@ fn every_approved_configuration_has_a_real_graph_witness_and_no_others_exist() {
 }
 
 #[test]
-fn symbolic_bias_and_generic_relu_have_a_complete_production_extraction() {
+fn symbolic_bias_and_relu_have_a_complete_production_extraction() {
     let mut model = Graph::new();
     let a = model.tensor(vec![IntExpr::from('m'), 4.into()], DType::F32);
     let b = model.tensor(vec![4.into(), IntExpr::from('n')], DType::F32);
@@ -208,11 +215,12 @@ fn symbolic_bias_and_generic_relu_have_a_complete_production_extraction() {
             .expect("bias plus generic ReLU must extract with symbolic geometry");
     let mut library = 0;
     let mut select = 0;
+    let mut fused_relu = false;
     for node in extracted.dag.node_weights() {
         if let luminal::layout_ir::ExtractedNode::LayoutOp(node) = node {
             if let Some(op) = node.op.as_any().downcast_ref::<ApprovedCublasLt>() {
                 assert!(op.bias.is_some());
-                assert!(!op.relu);
+                fused_relu |= op.activation == LtActivation::RectifiedLinear;
                 library += 1;
             }
             if node.op.label().contains("Select") {
@@ -221,5 +229,5 @@ fn symbolic_bias_and_generic_relu_have_a_complete_production_extraction() {
         }
     }
     assert_eq!(library, 1);
-    assert!(select > 0);
+    assert!(select > 0 || fused_relu);
 }

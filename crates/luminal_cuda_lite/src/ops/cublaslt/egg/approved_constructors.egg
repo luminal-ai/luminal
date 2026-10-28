@@ -10,31 +10,40 @@
   (CublasLtDefaultEpilogue)
   (CublasLtRectifiedLinearEpilogue)
   (CublasLtBiasEpilogue)
-  (CublasLtRectifiedLinearBiasEpilogue))
+  (CublasLtRectifiedLinearBiasEpilogue)
+  (CublasLtGaussianErrorLinearEpilogue)
+  (CublasLtGaussianErrorLinearBiasEpilogue))
 (datatype CublasLtBiasDataType (CublasLtNoBiasDataType) (CublasLtBiasDataTypeOf Dtype))
+(datatype CublasLtCMatrixDataType (CublasLtNoCMatrixDataType) (CublasLtCMatrixDataTypeOf Dtype))
 (datatype CublasLtLogicalCMatrix (CublasLtNoCMatrix) (CublasLtCMatrixOf LogicalTensor))
 (datatype CublasLtLogicalBias (CublasLtNoBias) (CublasLtBiasOf LogicalTensor))
+(datatype CublasLtMatrixLayout
+  (CublasLtMatrixLayoutLit
+    Dtype                 ; StorageDataType
+    CublasLtMatrixOrder    ; MatrixOrder
+    IntExpr               ; Rows, before op(A) or op(B)
+    IntExpr               ; Columns, before op(A) or op(B)
+    IntExpr               ; LeadingDimension, in elements
+    IntExpr               ; BatchCount
+    IntExpr))             ; BatchStrideInElements
 (datatype CublasLtMatrixDescriptor
   (CublasLtMatrixDescriptorOf
     LayoutTensor          ; storage tensor
-    Dtype                 ; storage data type
-    CublasLtMatrixOrder    ; row-major or column-major order
-    IntExpr               ; descriptor rows, before op(A) or op(B)
-    IntExpr               ; descriptor columns, before op(A) or op(B)
-    IntExpr))             ; LeadingDimension: API ld parameter, in elements
+    CublasLtMatrixLayout)) ; complete vendor layout description
 (datatype CublasLtCMatrixArgument
-  (CublasLtZeroCMatrix CublasLtMatrixDescriptor)
+  (CublasLtCMatrixAbsent)
   (CublasLtCMatrixInput CublasLtMatrixDescriptor))
 (datatype CublasLtBiasArgument (CublasLtBiasAbsent) (CublasLtBiasInput LayoutTensor Dtype))
-; Full API configuration: compute, scale, A/B/C/D storage, bias storage,
-; host scalars, epilogue, A/B/D orders, A/B operations. Batch count is fixed at 1.
+; Full configuration: compute, scale, A/B/D storage, C/bias storage or absence,
+; host scalars, epilogue, A/B/D orders, A/B operations. Matrix and batch
+; geometry live in the descriptors and require the corresponding layout proofs.
 (datatype CublasLtConfiguration
   (CublasLtConfigurationOf
     CublasLtComputationType    ; computation precision
     Dtype                     ; alpha/beta scalar data type
     Dtype                     ; A storage data type
     Dtype                     ; B storage data type
-    Dtype                     ; C storage data type
+    CublasLtCMatrixDataType    ; C storage data type, or explicit absence
     Dtype                     ; D storage data type
     CublasLtBiasDataType       ; bias storage data type, or explicit absence
     CublasLtHostScalars        ; alpha and beta values
@@ -74,7 +83,7 @@
     CublasLtMatrixDescriptor   ; B matrix descriptor
     CublasLtMatrixDescriptor   ; shared C/D matrix descriptor, anchored on C
     CublasLtBiasArgument       ; optional epilogue bias vector
-    LayoutTensorList          ; A, B, C, optional bias; no extra destination
+    LayoutTensorList          ; A, B, optional bias, C; no extra destination
     CublasLtExpressionFrame)
   LayoutTensorOp)
 

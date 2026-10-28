@@ -213,17 +213,17 @@ fn all_accumulation_configurations_have_an_unconditional_one_operand_tie() {
             .collect::<std::collections::BTreeSet<_>>(),
         expected
     );
-    assert_eq!(witnesses.len(), 24);
+    assert_eq!(witnesses.len(), 336);
     for op in witnesses.values() {
         assert!(op.to_dps().is_none(), "C already is the destination");
         let ties = op.alias_info();
         assert_eq!(ties.len(), 1);
         assert_eq!(
             (ties[0].operand, ties[0].result, ties[0].sharing),
-            (2, 0, Sharing::Must)
+            (op.destination_operand(), 0, Sharing::Must)
         );
         let resolved = op.resolve(&Default::default());
-        assert_eq!(resolved.c, resolved.d);
+        assert_eq!(resolved.c.unwrap().descriptor, resolved.d);
         assert!(resolved.beta_is_one);
     }
 }
