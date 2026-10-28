@@ -524,7 +524,7 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
     }
     assert_eq!(
         witnesses.len(),
-        if ampere_or_newer { 576 } else { 288 },
+        if ampere_or_newer { 1152 } else { 576 },
         "each storage/computation mode covers base, separate C and in-place C configurations"
     );
     let at = |d: LtDesc, batch: usize, row: usize, col: usize| {
@@ -534,19 +534,32 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                 LtOrder::Col => col * d.ld as usize + row,
             }
     };
-    for ((_, alias), call) in witnesses {
+    for ((_, alias), mut call) in witnesses {
+        use luminal_cuda_lite::ops::cublaslt::exec::LtScalars;
+        let (alpha, beta) = (1.25f32, if call.c.is_some() { -0.5f32 } else { 0.0 });
+        if matches!(call.scalars, LtScalars::Host { .. }) {
+            call.scalars = LtScalars::host(alpha, beta);
+        }
         let (m, n, k) = (call.m as usize, call.n as usize, call.k as usize);
         let count = call.d.batch_count as usize;
         let elements = |d: LtDesc| at(d, count - 1, d.rows as usize - 1, d.cols as usize - 1) + 1;
-        let mut payloads = Vec::new();
-        for (d, trans, rows, cols, dtype, value) in [
-            (call.a, call.trans_a, m, k, call.a_dtype, 0usize),
-            (call.b, call.trans_b, k, n, call.b_dtype, 1usize),
+        let mut raw_inputs = vec![Vec::new(); call.form.lit_arity() + call.scalars.input_count()];
+        if let LtScalars::Device {
+            alpha_operand,
+            beta_operand,
+        } = call.scalars
+        {
+            raw_inputs[alpha_operand] = alpha.to_ne_bytes().to_vec();
+            raw_inputs[beta_operand] = beta.to_ne_bytes().to_vec();
+        }
+        for (d, trans, rows, cols, dtype, value, operand) in [
+            (call.a, call.trans_a, m, k, call.a_dtype, 0usize, 0usize),
+            (call.b, call.trans_b, k, n, call.b_dtype, 1usize, 1usize),
         ]
         .into_iter()
         .chain(
             call.c
-                .map(|c| (c.descriptor, false, m, n, c.data_type, 2usize)),
+                .map(|c| (c.descriptor, false, m, n, c.data_type, 2usize, c.operand)),
         ) {
             let mut data = vec![777.0f32; elements(d)];
             for batch in 0..count {
@@ -573,8 +586,12 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                     .collect(),
                 other => panic!("unexpected storage {other:?}"),
             };
-            payloads.push(stream.clone_htod(&raw).unwrap());
+            raw_inputs[operand] = raw;
         }
+        let payloads: Vec<_> = raw_inputs
+            .iter()
+            .map(|bytes| stream.clone_htod(bytes).unwrap())
+            .collect();
         let ranges: Vec<_> = payloads
             .iter()
             .map(|data| DeviceRange {
@@ -628,8 +645,9 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                                 / 16.0
                         })
                         .sum();
+                    expected *= f64::from(alpha);
                     if call.c.is_some() {
-                        expected += (batch + row + col) as f64 / 4.0;
+                        expected += f64::from(beta) * (batch + row + col) as f64 / 4.0;
                     }
                     assert_eq!(
                         actual[at(call.d, batch, row, col)],

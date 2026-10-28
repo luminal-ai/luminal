@@ -206,7 +206,11 @@ fn call_for(form: CublasLtForm) -> LtCall {
             operand: 2,
         }),
         d: cd,
-        beta_is_one: form.has_c(),
+        scale_dtype: PlanDtype::F32,
+        scalars: luminal_cuda_lite::ops::cublaslt::exec::LtScalars::host(
+            1.0,
+            if form.has_c() { 1.0 } else { 0.0 },
+        ),
         activation: LtActivation::Identity,
         bias: form
             .has_bias()
@@ -311,7 +315,8 @@ fn ld_bounds_violation_refuses_before_dispatch() {
         b: LtDesc::row(2, 8, 8),
         c: None,
         d: LtDesc::row(1, 8, 8),
-        beta_is_one: false,
+        scale_dtype: PlanDtype::F32,
+        scalars: luminal_cuda_lite::ops::cublaslt::exec::LtScalars::host(1.0, 0.0),
         activation: LtActivation::Identity,
         bias: None,
     };

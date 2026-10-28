@@ -42,7 +42,7 @@ impl CublasLtForm {
             Self::Base => &["a", "b"],
             Self::Bias => &["a", "b", "bias"],
             Self::Accumulate => &["a", "b", "c"],
-            Self::AccumulateBias => &["a", "b", "c", "bias"],
+            Self::AccumulateBias => &["a", "b", "bias", "c"],
         }
     }
 }

@@ -200,8 +200,8 @@ fn c_then_bias_is_the_only_fully_fused_addition_order() {
     run(
         &body,
         r#"
-(check (cublaslt-logical-expression ordered a b (CublasLtCMatrixOf c) (CublasLtBiasOf bias) (CublasLtBiasEpilogue)))
-(fail (check (cublaslt-logical-expression reversed a b (CublasLtCMatrixOf c) (CublasLtBiasOf bias) (CublasLtBiasEpilogue))))
+(check (cublaslt-logical-expression ordered a b (CublasLtCMatrixOf c) (CublasLtBiasOf bias) (CublasLtBiasEpilogue) (LogicalConstant 1.0) (LogicalConstant 1.0)))
+(fail (check (cublaslt-logical-expression reversed a b (CublasLtCMatrixOf c) (CublasLtBiasOf bias) (CublasLtBiasEpilogue) (LogicalConstant 1.0) (LogicalConstant 1.0))))
 (fail (check (= ordered reversed)))
 "#,
     );
@@ -305,7 +305,10 @@ fn f32_fixture_configurations_have_coherent_descriptor_witnesses() {
             ],
             [PlanDtype::F32; 4]
         );
-        assert_eq!(op.beta_one, op.c.is_some());
+        if let Some((alpha, beta)) = op.scalars.resolve().host_values() {
+            assert_eq!(alpha, 1.0);
+            assert_eq!(beta, if op.c.is_some() { 1.0 } else { 0.0 });
+        }
         assert!(
             !(op.activation
                 == luminal_cuda_lite::ops::cublaslt::exec::LtActivation::RectifiedLinear)
@@ -513,22 +516,13 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                     continue;
                 };
                 let call = op.resolve(&Default::default());
+                let destination = call.form.lit_arity() + call.scalars.input_count();
                 assert_eq!(
                     result_info[0].value, op.d.tensor,
                     "D stays tied to the selected output LT"
                 );
-                assert_eq!(
-                    ties,
-                    &[(
-                        (2 + usize::from(op.c.is_some()) + usize::from(op.bias.is_some())),
-                        0
-                    )]
-                );
-                assert_eq!(
-                    operand_info[2 + usize::from(op.c.is_some()) + usize::from(op.bias.is_some())]
-                        .buffer,
-                    result_info[0].buffer
-                );
+                assert_eq!(ties, &[(destination, 0)]);
+                assert_eq!(operand_info[destination].buffer, result_info[0].buffer);
                 for row in 0..call.m as usize {
                     for col in 0..call.n as usize {
                         let coords = [row, col];
@@ -542,10 +536,7 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                         );
                         assert_eq!(
                             luminal_cuda_lite::layouts::element_index(
-                                &operand_info[2
-                                    + usize::from(op.c.is_some())
-                                    + usize::from(op.bias.is_some())]
-                                .layout,
+                                &operand_info[destination].layout,
                                 &coords
                             )
                             .unwrap(),
@@ -574,13 +565,13 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                     }
                 }
                 if let Some(c) = &op.c {
-                    assert_eq!(operand_info[2].value, c.tensor);
+                    assert_eq!(operand_info[call.c.unwrap().operand].value, c.tensor);
                     let descriptor = c.resolve(&Default::default());
                     for row in 0..call.m as usize {
                         for col in 0..call.n as usize {
                             assert_eq!(
                                 luminal_cuda_lite::layouts::element_index(
-                                    &operand_info[2].layout,
+                                    &operand_info[call.c.unwrap().operand].layout,
                                     &[row, col]
                                 )
                                 .unwrap(),
@@ -590,14 +581,7 @@ fn real_frontend_expressions_keep_destination_and_operand_layouts_through_buffer
                     }
                 }
                 if let Some(bias) = &op.bias {
-                    assert_eq!(
-                        operand_info[(2
-                            + usize::from(op.c.is_some())
-                            + usize::from(op.bias.is_some()))
-                            - 1]
-                        .value,
-                        bias.tensor
-                    );
+                    assert_eq!(operand_info[call.bias.unwrap().operand].value, bias.tensor);
                 }
                 println!(
                     "PIPELINE C={has_c} bias={has_bias} relu={relu}: {}x{}x{}, D={:?}",
@@ -722,7 +706,10 @@ fn assert_all_candidates_coherent(graph: &EGraph) -> usize {
     let candidates = calls(graph);
     for op in &candidates {
         let call = op.resolve(&Default::default());
-        assert_eq!(op.beta_one, op.c.is_some());
+        if let Some((alpha, beta)) = op.scalars.resolve().host_values() {
+            assert_eq!(alpha, 1.0);
+            assert_eq!(beta, if op.c.is_some() { 1.0 } else { 0.0 });
+        }
         if op.activation != luminal_cuda_lite::ops::cublaslt::exec::LtActivation::Identity {
             assert_eq!(op.d.order, LtOrder::Col);
         }

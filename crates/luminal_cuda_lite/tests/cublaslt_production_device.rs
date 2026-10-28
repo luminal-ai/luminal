@@ -59,6 +59,13 @@ fn range<T>(stream: &Arc<CudaStream>, buffer: &CudaSlice<T>) -> DeviceRange {
     }
 }
 fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
+    use luminal_cuda_lite::ops::cublaslt::exec::LtScalars;
+    let mut call = call.clone();
+    let (alpha, beta) = (1.25, if call.c.is_some() { -0.5 } else { 0.0 });
+    if matches!(call.scalars, LtScalars::Host { .. }) {
+        call.scalars = LtScalars::host(alpha, beta);
+    }
+    let call = &call;
     let (m, n, k) = (call.m as usize, call.n as usize, call.k as usize);
     let mut a = values(m * k, 1);
     let mut b = values(k * n, 2);
@@ -100,7 +107,18 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
         raw(&pack(&call.a, call.trans_a, m, k, &a), call.a_dtype),
         raw(&pack(&call.b, call.trans_b, k, n, &b), call.b_dtype),
     ];
-    payloads.resize(call.form.lit_arity(), Vec::new());
+    payloads.resize(
+        call.form.lit_arity() + call.scalars.input_count(),
+        Vec::new(),
+    );
+    if let LtScalars::Device {
+        alpha_operand,
+        beta_operand,
+    } = call.scalars
+    {
+        payloads[alpha_operand] = raw(&[alpha], PlanDtype::F32);
+        payloads[beta_operand] = raw(&[beta], PlanDtype::F32);
+    }
     if let Some(input) = call.c {
         payloads[input.operand] = raw(&pack(&input.descriptor, false, m, n, &c), input.data_type);
     }
@@ -157,8 +175,9 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
             let mut expected = (0..k)
                 .map(|kk| f64::from(a[r * k + kk]) * f64::from(b[kk * n + col]))
                 .sum::<f64>();
-            if call.beta_is_one {
-                expected += f64::from(c[r * n + col]);
+            expected *= f64::from(alpha);
+            if call.c.is_some() {
+                expected += f64::from(beta) * f64::from(c[r * n + col]);
             }
             if call.bias.is_some() {
                 expected += f64::from(bias[r]);
@@ -227,8 +246,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 1088 } else { 544 });
-    assert_eq!(aliases, if ampere_or_newer { 544 } else { 272 });
+    assert_eq!(ran, if ampere_or_newer { 2176 } else { 1088 });
+    assert_eq!(aliases, if ampere_or_newer { 1088 } else { 544 });
 }
 
 #[test]

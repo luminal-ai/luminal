@@ -2,7 +2,7 @@
 //! decodes the elected configuration and evaluates its descriptor expressions.
 use super::CublasLtForm;
 use super::exec::{
-    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder,
+    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder, LtScalars,
 };
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
@@ -38,11 +38,19 @@ impl OpMatcher for ApprovedCublasLtMatcher {
             },
             EgglogSnippet {
                 category: SpliceCategory::Match,
+                text: include_str!("egg/scalar_rules.egg"),
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Match,
                 text: include_str!("egg/strided_batch_rules.egg"),
             },
             EgglogSnippet {
                 category: SpliceCategory::Match,
                 text: WHITELIST,
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Match,
+                text: include_str!("egg/call_inputs.egg"),
             },
             EgglogSnippet {
                 category: SpliceCategory::Match,
@@ -60,6 +68,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
             ("bias", 4),
             ("D_matrix_descriptor", 5),
             ("semantics", 7),
+            ("scalars", 8),
         ]
     }
 
@@ -101,7 +110,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
             scale: dtype(site, &child(1)),
             trans_a: enum_is(&child(12), "CublasLtTranspose"),
             trans_b: enum_is(&child(13), "CublasLtTranspose"),
-            beta_one: enum_is(&child(7), "CublasLtHostScalarsAlphaOneBetaOne"),
+            scalars: scalars(site, &site.child_class(8), &child(7)),
             activation: activation(site, &child(8)),
             dps: false,
         })
@@ -132,6 +141,62 @@ pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
 pub struct Bias {
     pub tensor: ClassId,
     pub dtype: PlanDtype,
+}
+
+/// Scalar arguments are decoded independently of the matrix element types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scalars {
+    Host { alpha_bits: u32, beta_bits: u32 },
+    Device { alpha: ClassId, beta: ClassId },
+}
+
+impl Scalars {
+    pub fn host(alpha: f32, beta: f32) -> Self {
+        Self::Host {
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+        }
+    }
+    pub fn resolve(&self) -> LtScalars {
+        match self {
+            Self::Host {
+                alpha_bits,
+                beta_bits,
+            } => LtScalars::Host {
+                alpha_bits: *alpha_bits,
+                beta_bits: *beta_bits,
+            },
+            Self::Device { .. } => LtScalars::Device {
+                alpha_operand: 2,
+                beta_operand: 3,
+            },
+        }
+    }
+}
+
+pub(super) fn scalars(site: &ExtractionSite<'_>, class: &ClassId, mode: &ClassId) -> Scalars {
+    if let Some(node) = site
+        .nodes_in_class_value(class, "CublasLtHostScalarArguments")
+        .next()
+    {
+        member(site, mode, "CublasLtHostScalarPointerMode");
+        let value = |index| {
+            let child = site.class_of_child(node, index).unwrap();
+            site.index
+                .nodes_of(&child)
+                .iter()
+                .find_map(|id| site.egraph.nodes[id].op.parse::<f64>().ok())
+                .expect("cuBLASLt host scalar literal") as f32
+        };
+        Scalars::host(value(0), value(1))
+    } else {
+        member(site, mode, "CublasLtDeviceScalarPointerMode");
+        let node = member(site, class, "CublasLtDeviceScalarArguments");
+        Scalars::Device {
+            alpha: site.class_of_child(&node, 0).unwrap(),
+            beta: site.class_of_child(&node, 1).unwrap(),
+        }
+    }
 }
 
 pub(super) fn bias(site: &ExtractionSite<'_>, class: &ClassId) -> Option<Bias> {
@@ -258,7 +323,7 @@ pub struct ApprovedCublasLt {
     pub scale: PlanDtype,
     pub trans_a: bool,
     pub trans_b: bool,
-    pub beta_one: bool,
+    pub scalars: Scalars,
     pub activation: LtActivation,
     dps: bool,
 }
@@ -290,13 +355,15 @@ impl ApprovedCublasLt {
             scale: PlanDtype::F32,
             trans_a: false,
             trans_b: false,
-            beta_one: false,
+            scalars: Scalars::host(1.0, 0.0),
             activation: LtActivation::Identity,
             dps: false,
         }
     }
     fn input_count(&self) -> usize {
-        2 + usize::from(self.c.is_some()) + usize::from(self.bias.is_some())
+        2 + self.scalars.resolve().input_count()
+            + usize::from(self.c.is_some())
+            + usize::from(self.bias.is_some())
     }
 
     /// Evaluate already-approved descriptor expressions. No layout inference,
@@ -326,13 +393,16 @@ impl ApprovedCublasLt {
             c: self.c.as_ref().map(|c| LtCMatrixInput {
                 descriptor: c.resolve(dims),
                 data_type: c.dtype,
-                operand: 2,
+                operand: 2
+                    + self.scalars.resolve().input_count()
+                    + usize::from(self.bias.is_some()),
             }),
             d,
-            beta_is_one: self.beta_one,
+            scale_dtype: self.scale,
+            scalars: self.scalars.resolve(),
             activation: self.activation,
             bias: self.bias.as_ref().map(|bias| LtBiasInput {
-                operand: 2 + usize::from(self.c.is_some()),
+                operand: 2 + self.scalars.resolve().input_count(),
                 data_type: bias.dtype,
             }),
         }

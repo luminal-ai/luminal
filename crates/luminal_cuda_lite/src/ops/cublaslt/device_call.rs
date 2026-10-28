@@ -6,7 +6,7 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::exec::{LtActivation, LtCall, LtComputation, LtDesc, LtOrder};
+use super::exec::{LtActivation, LtCall, LtComputation, LtDesc, LtOrder, LtScalars};
 
 /// Workspace owned by US (contract: no silent fallback algos). 32 MiB —
 /// cuBLASLt's own recommendation ceiling for pre-Hopper devices is
@@ -14,13 +14,6 @@ use super::exec::{LtActivation, LtCall, LtComputation, LtDesc, LtOrder};
 /// into the heuristic preference so the chosen algo fits what we hand
 /// over.
 const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
-
-/// alpha is ALWAYS the literal 1.0f (the marker has no alpha channel);
-/// beta's two legal literals are structural. POINTER_MODE_HOST reads
-/// these from host memory at the call.
-const ALPHA: f32 = 1.0;
-const BETA_ZERO: f32 = 0.0;
-const BETA_ONE: f32 = 1.0;
 
 /// The process-wide cuBLASLt handle. Creation runs the TF32 strictness
 /// detector once (contract 5); the raw handle is Send-guarded behind a
@@ -210,6 +203,9 @@ pub fn prepare(
             1 => call.b_dtype,
             i if call.c.is_some_and(|c| c.operand == i) => call.c.unwrap().data_type,
             i if call.bias.is_some_and(|bias| bias.operand == i) => call.bias.unwrap().data_type,
+            i if matches!(call.scalars, LtScalars::Device { alpha_operand, beta_operand } if i == alpha_operand || i == beta_operand) => {
+                call.scale_dtype
+            }
             _ => call.d_dtype,
         };
         elems.push(range.bytes / crate::host_buffer::dtype_bytes(dtype)?);
@@ -243,7 +239,10 @@ pub fn prepare(
         unsafe { lt::set_matmul_desc_attribute(desc.raw, attr, buf, size) }
             .map_err(|e| anyhow!("cublasLtMatmulDescSetAttribute({attr:?}): {e:?}"))
     };
-    let pointer_mode = sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST;
+    let pointer_mode = match call.scalars {
+        LtScalars::Host { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST,
+        LtScalars::Device { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_DEVICE,
+    };
     set_desc(
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_POINTER_MODE,
         (&pointer_mode) as *const _ as *const _,
@@ -399,19 +398,56 @@ pub fn prepare(
         )
     })?;
 
-    // Pointers. Literal HOST scalars (contract 2): alpha = 1.0f const;
-    // beta structural. C pointer: the c operand on the C-fold forms,
-    // the D pointer otherwise (beta = 0.0f, C never read — contract 3).
+    // Pointer location is an algorithm capability as well as a descriptor
+    // attribute. Refuse an unavailable elected mode rather than reading a GPU
+    // scalar on the host or substituting a different numerical contract.
+    let mut supported_pointer_modes: u32 = 0;
+    let mut written = 0usize;
+    let status = unsafe {
+        sys::cublasLtMatmulAlgoCapGetAttribute(
+            &heuristic.algo,
+            sys::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_POINTER_MODE_MASK,
+            (&mut supported_pointer_modes) as *mut _ as *mut _,
+            std::mem::size_of::<u32>(),
+            &mut written,
+        )
+    };
+    let required_pointer_mode = match call.scalars {
+        LtScalars::Host { .. } => {
+            sys::cublasLtPointerModeMask_t::CUBLASLT_POINTER_MODE_MASK_HOST as u32
+        }
+        LtScalars::Device { .. } => {
+            sys::cublasLtPointerModeMask_t::CUBLASLT_POINTER_MODE_MASK_DEVICE as u32
+        }
+    };
+    if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+        || written != std::mem::size_of::<u32>()
+        || supported_pointer_modes & required_pointer_mode == 0
+    {
+        anyhow::bail!(
+            "cuBLASLt algorithm does not support the elected alpha/beta pointer mode: {pointer_mode:?} ({status:?}, mask={supported_pointer_modes:#x})"
+        );
+    }
+
+    // The approved scalar arguments determine both pointers. Host literals
+    // are owned by PreparedCall; device values stay live graph dependencies.
+    let scalars = match call.scalars {
+        LtScalars::Host { .. } => {
+            let (alpha, beta) = call.scalars.host_values().unwrap();
+            PreparedScalars::Host { alpha, beta }
+        }
+        LtScalars::Device {
+            alpha_operand,
+            beta_operand,
+        } => PreparedScalars::Device {
+            alpha: operands[alpha_operand].ptr,
+            beta: operands[beta_operand].ptr,
+        },
+    };
     let a_ptr = operands[0].ptr;
     let b_ptr = operands[1].ptr;
     let d_ptr = dest.ptr;
-    let (c_ptr, beta): (u64, &'static f32) = match call.c {
-        None => (d_ptr, &BETA_ZERO),
-        Some(c) => {
-            debug_assert!(call.beta_is_one);
-            (operands[c.operand].ptr, &BETA_ONE)
-        }
-    };
+    let c_ptr = call.c.map_or(d_ptr, |c| operands[c.operand].ptr);
     Ok(PreparedCall {
         desc,
         a_layout,
@@ -423,7 +459,7 @@ pub fn prepare(
         b_ptr,
         c_ptr,
         d_ptr,
-        beta,
+        scalars,
         workspace,
     })
 }
@@ -440,20 +476,32 @@ pub struct PreparedCall {
     b_ptr: u64,
     c_ptr: u64,
     d_ptr: u64,
-    beta: &'static f32,
+    scalars: PreparedScalars,
     workspace: DeviceRange,
+}
+enum PreparedScalars {
+    Host { alpha: f32, beta: f32 },
+    Device { alpha: u64, beta: u64 },
 }
 impl PreparedHostOp for PreparedCall {
     unsafe fn record(&self, capture: &CaptureCtx<'_>) -> Result<()> {
         let guard = handle()?
             .lock()
             .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
+        let (alpha, beta): (*const std::ffi::c_void, *const std::ffi::c_void) = match &self.scalars
+        {
+            PreparedScalars::Host { alpha, beta } => (
+                alpha as *const f32 as *const _,
+                beta as *const f32 as *const _,
+            ),
+            PreparedScalars::Device { alpha, beta } => (*alpha as *const _, *beta as *const _),
+        };
         unsafe {
             lt::matmul(
                 guard.raw,
                 self.desc.raw,
-                (&ALPHA) as *const f32 as *const _,
-                self.beta as *const f32 as *const _,
+                alpha,
+                beta,
                 self.a_ptr as *const _,
                 self.a_layout.raw,
                 self.b_ptr as *const _,

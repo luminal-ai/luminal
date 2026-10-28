@@ -1,0 +1,98 @@
+; Approved argument assembly: A, B, optional device alpha/beta, optional bias, optional C.
+; Every source comes from the same approved call; no cross-site descriptor search.
+
+(rule
+  ((cublaslt-approved-call ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars)
+   (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
+   (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
+   (= ?C_argument (CublasLtCMatrixAbsent))
+   (= ?bias_argument (CublasLtBiasAbsent))
+   (= ?scalars (CublasLtHostScalarArguments ?alpha_value ?beta_value)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
+     (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorNil)))))
+  :ruleset backend
+  :name "cublaslt: assemble host scalar inputs without bias without C")
+
+(rule
+  ((cublaslt-approved-call ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars)
+   (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
+   (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
+   (= ?C_argument (CublasLtCMatrixAbsent))
+   (= ?bias_argument (CublasLtBiasAbsent))
+   (= ?scalars (CublasLtDeviceScalarArguments ?alpha_tensor ?beta_tensor)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
+     (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?alpha_tensor (LayoutTensorCons ?beta_tensor (LayoutTensorNil)))))))
+  :ruleset backend
+  :name "cublaslt: assemble device scalar inputs without bias without C")
+
+(rule
+  ((cublaslt-approved-call ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars)
+   (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
+   (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
+   (= ?C_argument (CublasLtCMatrixAbsent))
+   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
+   (= ?scalars (CublasLtHostScalarArguments ?alpha_value ?beta_value)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
+     (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorNil))))))
+  :ruleset backend
+  :name "cublaslt: assemble host scalar inputs with bias without C")
+
+(rule
+  ((cublaslt-approved-call ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars)
+   (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
+   (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
+   (= ?C_argument (CublasLtCMatrixAbsent))
+   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
+   (= ?scalars (CublasLtDeviceScalarArguments ?alpha_tensor ?beta_tensor)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
+     (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?alpha_tensor (LayoutTensorCons ?beta_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorNil))))))))
+  :ruleset backend
+  :name "cublaslt: assemble device scalar inputs with bias without C")
+
+(rule
+  ((cublaslt-approved-call ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars)
+   (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
+   (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
+   (= ?C_argument (CublasLtCMatrixInput (CublasLtMatrixDescriptorOf ?C_tensor ?C_layout)))
+   (= ?bias_argument (CublasLtBiasAbsent))
+   (= ?scalars (CublasLtHostScalarArguments ?alpha_value ?beta_value)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
+     (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?C_tensor (LayoutTensorNil))))))
+  :ruleset backend
+  :name "cublaslt: assemble host scalar inputs without bias with C")
+
+(rule
+  ((cublaslt-approved-call ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars)
+   (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
+   (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
+   (= ?C_argument (CublasLtCMatrixInput (CublasLtMatrixDescriptorOf ?C_tensor ?C_layout)))
+   (= ?bias_argument (CublasLtBiasAbsent))
+   (= ?scalars (CublasLtDeviceScalarArguments ?alpha_tensor ?beta_tensor)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
+     (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?alpha_tensor (LayoutTensorCons ?beta_tensor (LayoutTensorCons ?C_tensor (LayoutTensorNil))))))))
+  :ruleset backend
+  :name "cublaslt: assemble device scalar inputs without bias with C")
+
+(rule
+  ((cublaslt-approved-call ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars)
+   (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
+   (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
+   (= ?C_argument (CublasLtCMatrixInput (CublasLtMatrixDescriptorOf ?C_tensor ?C_layout)))
+   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
+   (= ?scalars (CublasLtHostScalarArguments ?alpha_value ?beta_value)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
+     (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorCons ?C_tensor (LayoutTensorNil)))))))
+  :ruleset backend
+  :name "cublaslt: assemble host scalar inputs with bias with C")
+
+(rule
+  ((cublaslt-approved-call ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars)
+   (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
+   (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
+   (= ?C_argument (CublasLtCMatrixInput (CublasLtMatrixDescriptorOf ?C_tensor ?C_layout)))
+   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
+   (= ?scalars (CublasLtDeviceScalarArguments ?alpha_tensor ?beta_tensor)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
+     (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?alpha_tensor (LayoutTensorCons ?beta_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorCons ?C_tensor (LayoutTensorNil)))))))))
+  :ruleset backend
+  :name "cublaslt: assemble device scalar inputs with bias with C")

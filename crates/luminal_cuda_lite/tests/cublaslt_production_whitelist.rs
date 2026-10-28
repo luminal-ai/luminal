@@ -97,6 +97,7 @@ fn removing_one_configuration_disables_exactly_that_configuration() {
             && call.d.dtype == PlanDtype::F32
             && call.c.is_none()
             && call.bias.is_none()
+            && resolved.scalars.pointer_mode_constructor() == "CublasLtHostScalarPointerMode"
             && !resolved.trans_a
             && !resolved.trans_b
             && resolved.a.order == luminal_cuda_lite::ops::cublaslt::exec::LtOrder::Row
@@ -117,7 +118,7 @@ fn removing_an_accumulation_configuration_disables_both_executable_forms() {
     };
     let mut prototype = ApprovedCublasLt::prototype();
     prototype.c = Some(prototype.d.clone());
-    prototype.beta_one = true;
+    prototype.scalars = luminal_cuda_lite::ops::cublaslt::approved::Scalars::host(1.0, 1.0);
     let configuration = whitelist::key(&prototype);
     let expected = format!("(cublaslt-approved-configuration {configuration})");
     let entry = WHITELIST
@@ -178,7 +179,7 @@ mod whitelist;
 #[test]
 fn every_approved_configuration_has_a_real_graph_witness_and_no_others_exist() {
     let witnesses = whitelist::witnesses();
-    assert_eq!(whitelist::approved_keys().len(), 1088);
+    assert_eq!(whitelist::approved_keys().len(), 2176);
     assert_eq!(
         witnesses
             .keys()

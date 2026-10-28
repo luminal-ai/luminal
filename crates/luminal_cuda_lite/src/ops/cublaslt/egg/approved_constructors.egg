@@ -7,7 +7,12 @@
 (datatype CublasLtComputationType
   (CublasLtFloat32Computation)
   (CublasLtTensorFloat32Computation))
-(datatype CublasLtHostScalars (CublasLtHostScalarsAlphaOneBetaZero) (CublasLtHostScalarsAlphaOneBetaOne))
+; Pointer location is an approved API capability; values belong to the call.
+(datatype CublasLtScalarPointerMode
+  (CublasLtHostScalarPointerMode) (CublasLtDeviceScalarPointerMode))
+(datatype CublasLtScalarArguments
+  (CublasLtHostScalarArguments f64 f64)
+  (CublasLtDeviceScalarArguments LayoutTensor LayoutTensor))
 (datatype CublasLtEpilogue
   (CublasLtDefaultEpilogue)
   (CublasLtRectifiedLinearEpilogue)
@@ -37,7 +42,7 @@
   (CublasLtCMatrixInput CublasLtMatrixDescriptor))
 (datatype CublasLtBiasArgument (CublasLtBiasAbsent) (CublasLtBiasInput LayoutTensor Dtype))
 ; Full configuration: compute, scale, A/B/D storage, C/bias storage or absence,
-; host scalars, epilogue, A/B/D orders, A/B operations. Matrix and batch
+; scalar pointer mode, epilogue, A/B/D orders, A/B operations. Matrix and batch
 ; geometry live in the descriptors and require the corresponding layout proofs.
 (datatype CublasLtConfiguration
   (CublasLtConfigurationOf
@@ -48,7 +53,7 @@
     CublasLtCMatrixDataType    ; C storage data type, or explicit absence
     Dtype                     ; D storage data type
     CublasLtBiasDataType       ; bias storage data type, or explicit absence
-    CublasLtHostScalars        ; alpha and beta values
+    CublasLtScalarPointerMode ; alpha and beta pointer location
     CublasLtEpilogue           ; epilogue operation
     CublasLtMatrixOrder        ; A order
     CublasLtMatrixOrder        ; B order
@@ -65,7 +70,9 @@
     LogicalTensor           ; logical B operand
     CublasLtLogicalCMatrix   ; logical C matrix, or explicit absence
     CublasLtLogicalBias      ; logical bias vector, or explicit absence
-    CublasLtEpilogue))
+    CublasLtEpilogue
+    LogicalTensor           ; alpha, rank-zero F32
+    LogicalTensor))         ; beta, rank-zero F32
 (constructor LayoutTensorOpCublasLtCall
   (CublasLtConfiguration       ; complete approved configuration
     CublasLtMatrixDescriptor   ; A matrix descriptor
@@ -74,7 +81,8 @@
     CublasLtBiasArgument       ; optional epilogue bias vector
     CublasLtMatrixDescriptor   ; D matrix descriptor
     LayoutTensorList          ; physical input tensors
-    CublasLtExpressionFrame)   ; complete logical expression
+    CublasLtExpressionFrame    ; complete logical expression
+    CublasLtScalarArguments)   ; literal host values or device scalar storage
   LayoutTensorOp)
 
 ; Read-modify-write form. One descriptor serves both C and D; the result
@@ -85,8 +93,9 @@
     CublasLtMatrixDescriptor   ; B matrix descriptor
     CublasLtMatrixDescriptor   ; shared C/D matrix descriptor, anchored on C
     CublasLtBiasArgument       ; optional epilogue bias vector
-    LayoutTensorList          ; A, B, optional bias, C; no extra destination
-    CublasLtExpressionFrame)
+    LayoutTensorList          ; A, B, optional device scalars, optional bias, C
+    CublasLtExpressionFrame
+    CublasLtScalarArguments)
   LayoutTensorOp)
 
 ; Computation contract, semantic F32 operand, physical descriptor source.

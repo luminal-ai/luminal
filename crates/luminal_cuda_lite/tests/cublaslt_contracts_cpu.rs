@@ -33,7 +33,11 @@ fn call(form: CublasLtForm) -> LtCall {
             operand: 2,
         }),
         d,
-        beta_is_one: form.has_c(),
+        scale_dtype: PlanDtype::F32,
+        scalars: luminal_cuda_lite::ops::cublaslt::exec::LtScalars::host(
+            1.0,
+            if form.has_c() { 1.0 } else { 0.0 },
+        ),
         activation: LtActivation::Identity,
         bias: form
             .has_bias()
@@ -99,7 +103,10 @@ fn every_operand_destination_and_optional_argument_is_capacity_checked() {
             call.validate_against(&sizes[..sizes.len() - 1], 12)
                 .is_err()
         );
-        assert_eq!(call.beta_is_one, form.has_c());
+        assert_eq!(
+            call.scalars.host_values(),
+            Some((1.0, if form.has_c() { 1.0 } else { 0.0 }))
+        );
         assert_eq!(call.c.map(|c| c.operand), form.has_c().then_some(2));
         assert_bias_destination_order(&call, "test").unwrap();
     }
@@ -140,4 +147,34 @@ fn zero_leading_dimension_is_a_read_only_c_permission_with_vector_bounds() {
         c.d.ld = 0;
         assert!(c.validate_against(&[20, 15, span], 12).is_err());
     }
+}
+
+#[test]
+fn scalar_dtype_and_device_scalar_capacity_are_checked_before_dispatch() {
+    use luminal_cuda_lite::ops::cublaslt::exec::LtScalars;
+    let mut op = call(CublasLtForm::Base);
+    for dtype in [
+        PlanDtype::F16,
+        PlanDtype::Bf16,
+        PlanDtype::F64,
+        PlanDtype::Int,
+    ] {
+        op.scale_dtype = dtype;
+        assert!(op.validate_against(&[100, 100], 100).is_err());
+    }
+    op.scale_dtype = PlanDtype::F32;
+    op.scalars = LtScalars::Device {
+        alpha_operand: 2,
+        beta_operand: 3,
+    };
+    op.validate_against(&[100, 100, 1, 1], 100).unwrap();
+    for elems in [[100, 100, 0, 1], [100, 100, 1, 0]] {
+        assert!(op.validate_against(&elems, 100).is_err());
+    }
+    assert!(op.validate_against(&[100, 100, 1], 100).is_err());
+    op.scalars = LtScalars::host(1.25, -0.5);
+    assert!(
+        op.validate_against(&[100, 100], 100).is_err(),
+        "absent C requires beta zero"
+    );
 }

@@ -46,11 +46,7 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
             || "(CublasLtNoBiasDataType)".to_string(),
             |bias| format!("(CublasLtBiasDataTypeOf ({:?}))", bias.data_type)
         ),
-        if call.beta_is_one {
-            "CublasLtHostScalarsAlphaOneBetaOne"
-        } else {
-            "CublasLtHostScalarsAlphaOneBetaZero"
-        },
+        call.scalars.pointer_mode_constructor(),
         match (call.activation, call.bias.is_some()) {
             (LtActivation::Identity, false) => "CublasLtDefaultEpilogue",
             (LtActivation::Identity, true) => "CublasLtBiasEpilogue",
@@ -234,6 +230,29 @@ pub fn narrow_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
             .collect()
     });
     table_registry(TABLE.as_str())
+}
+
+/// Force the elected scalar pointer mode, optionally requiring narrow output.
+pub fn scalar_registry(device: bool, narrow: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 4]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|index| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains(if index & 1 == 1 {
+                        "CublasLtDeviceScalarPointerMode"
+                    } else {
+                        "CublasLtHostScalarPointerMode"
+                    }) && (index & 2 == 0
+                        || ["Bf16", "F16"].iter().any(|dtype| {
+                            key.contains(&format!(") ({dtype}) (CublasLtNoBiasDataType)"))
+                        }))
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(device) + 2 * usize::from(narrow)])
 }
 
 fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredOp> {

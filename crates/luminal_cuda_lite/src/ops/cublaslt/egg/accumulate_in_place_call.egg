@@ -1,42 +1,14 @@
-; One read-modify-write C operand. Descriptor and layout equality are proved
-; before this op exists; its storage tie is unconditional after extraction.
+; The shared input assembly already puts C last. Its read-modify-write tie
+; stays unconditional for host and device scalars, with or without bias.
 (rule
-  ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
-     (CublasLtCMatrixInput ?C_matrix_descriptor) (CublasLtBiasAbsent) ?D_matrix_descriptor
-     ?input_tensors ?expression_frame)
-   (= ?C_matrix_descriptor
-     (CublasLtMatrixDescriptorOf ?C_layout_tensor ?C_and_D_matrix_layout))
-   (= ?D_matrix_descriptor
-     (CublasLtMatrixDescriptorOf ?D_layout_tensor ?C_and_D_matrix_layout))
-   (= ?C_layout_tensor (LayoutTensorLit ?C_matrix ?C_and_D_layout))
-   (= ?D_layout_tensor (LayoutTensorLit ?D_matrix ?C_and_D_layout)))
-  ((union (LayoutTensorOpLit ?input_tensors (LayoutTensorCons ?D_layout_tensor (LayoutTensorNil)))
-     (LayoutTensorOpCublasLtAccumulateInPlace ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
-       ?C_matrix_descriptor (CublasLtBiasAbsent) ?input_tensors ?expression_frame)))
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor
+     (CublasLtCMatrixInput ?C_descriptor) ?bias_argument ?D_descriptor ?frame ?scalars ?inputs)
+   (= ?C_descriptor (CublasLtMatrixDescriptorOf ?C_tensor ?matrix_layout))
+   (= ?D_descriptor (CublasLtMatrixDescriptorOf ?D_tensor ?matrix_layout))
+   (= ?C_tensor (LayoutTensorLit ?C ?layout))
+   (= ?D_tensor (LayoutTensorLit ?D ?layout)))
+  ((union (LayoutTensorOpLit ?inputs (LayoutTensorCons ?D_tensor (LayoutTensorNil)))
+     (LayoutTensorOpCublasLtAccumulateInPlace ?configuration ?A_descriptor ?B_descriptor
+       ?C_descriptor ?bias_argument ?inputs ?frame ?scalars)))
   :ruleset backend
-  :name "cublaslt: emit approved in place accumulation without bias with one shared C D descriptor")
-
-; One read-modify-write C operand. Descriptor and layout equality are proved
-; before this op exists; its storage tie is unconditional after extraction.
-(rule
-  ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
-     (CublasLtCMatrixInput ?C_matrix_descriptor) ?bias_argument ?D_matrix_descriptor
-     ?input_tensors ?expression_frame)
-   (= ?bias_argument (CublasLtBiasInput ?bias_layout_tensor ?bias_storage_data_type))
-   (= ?input_tensors
-     (LayoutTensorCons ?A_layout_tensor (LayoutTensorCons ?B_layout_tensor
-       (LayoutTensorCons ?C_layout_tensor (LayoutTensorCons ?bias_layout_tensor (LayoutTensorNil))))))
-   (= ?C_matrix_descriptor
-     (CublasLtMatrixDescriptorOf ?C_layout_tensor ?C_and_D_matrix_layout))
-   (= ?D_matrix_descriptor
-     (CublasLtMatrixDescriptorOf ?D_layout_tensor ?C_and_D_matrix_layout))
-   (= ?C_layout_tensor (LayoutTensorLit ?C_matrix ?C_and_D_layout))
-   (= ?D_layout_tensor (LayoutTensorLit ?D_matrix ?C_and_D_layout)))
-  ((let ?in_place_input_tensors
-     (LayoutTensorCons ?A_layout_tensor (LayoutTensorCons ?B_layout_tensor
-       (LayoutTensorCons ?bias_layout_tensor (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil))))))
-   (union (LayoutTensorOpLit ?in_place_input_tensors (LayoutTensorCons ?D_layout_tensor (LayoutTensorNil)))
-     (LayoutTensorOpCublasLtAccumulateInPlace ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
-       ?C_matrix_descriptor ?bias_argument ?in_place_input_tensors ?expression_frame)))
-  :ruleset backend
-  :name "cublaslt: emit approved in place accumulation with bias and trailing C destination")
+  :name "cublaslt: emit approved in place accumulation with one shared C D descriptor")

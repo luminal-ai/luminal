@@ -15,23 +15,32 @@
 (relation cublaslt-destination-reading
   (LayoutTensor IntExpr IntExpr Dtype CublasLtMatrixOrder CublasLtMatrixDescriptor))
 (relation cublaslt-logical-matrix-product (LogicalTensor LogicalTensor LogicalTensor))
-(relation cublaslt-product-with-C-matrix (LogicalTensor LogicalTensor LogicalTensor CublasLtLogicalCMatrix))
+(relation cublaslt-scaled-matrix-product (LogicalTensor LogicalTensor LogicalTensor LogicalTensor))
+(relation cublaslt-scalar-multiplication (LogicalTensor LogicalTensor LogicalTensor))
+(relation cublaslt-scalar-demand (LogicalTensor LogicalTensor))
+(relation cublaslt-scalar-arguments
+  (LogicalTensor LogicalTensor CublasLtScalarPointerMode CublasLtScalarArguments LayoutTensorList))
+(relation cublaslt-product-with-C-matrix
+  (LogicalTensor LogicalTensor LogicalTensor CublasLtLogicalCMatrix LogicalTensor LogicalTensor))
 (relation cublaslt-logical-expression
-  (LogicalTensor LogicalTensor LogicalTensor CublasLtLogicalCMatrix CublasLtLogicalBias CublasLtEpilogue))
+  (LogicalTensor LogicalTensor LogicalTensor CublasLtLogicalCMatrix CublasLtLogicalBias CublasLtEpilogue LogicalTensor LogicalTensor))
 (relation cublaslt-rectified-linear-activation (LogicalTensor LogicalTensor))
 (relation cublaslt-expression-frame (CublasLtExpressionFrame))
 (relation cublaslt-C-matrix-argument
-  (CublasLtExpressionFrame CublasLtMatrixDescriptor CublasLtCMatrixArgument CublasLtCMatrixDataType CublasLtHostScalars
+  (CublasLtExpressionFrame CublasLtMatrixDescriptor CublasLtCMatrixArgument CublasLtCMatrixDataType
     LayoutTensorList))
 (relation cublaslt-bias-argument
   (CublasLtExpressionFrame IntExpr CublasLtBiasArgument CublasLtBiasDataType LayoutTensorList))
-(relation cublaslt-remaining-inputs (LayoutTensorList LayoutTensorList LayoutTensorList))
 ; Complete, whitelist-approved call descriptions are proof facts, not ops.
 ; Executable forms consume this same admission result without reinterpreting it.
 (relation cublaslt-approved-call
   (CublasLtConfiguration CublasLtMatrixDescriptor CublasLtMatrixDescriptor
     CublasLtCMatrixArgument CublasLtBiasArgument CublasLtMatrixDescriptor
-    LayoutTensorList CublasLtExpressionFrame))
+    CublasLtExpressionFrame CublasLtScalarArguments))
+(relation cublaslt-approved-inputs
+  (CublasLtConfiguration CublasLtMatrixDescriptor CublasLtMatrixDescriptor
+    CublasLtCMatrixArgument CublasLtBiasArgument CublasLtMatrixDescriptor
+    CublasLtExpressionFrame CublasLtScalarArguments LayoutTensorList))
 
 ; Exact F32 values may use their own storage or an authored narrow-to-F32
 ; widening. This relation never bypasses TF32 input rounding.
@@ -224,31 +233,31 @@
    (= (dtype-of ?A_operand) (F32))
    (= (dtype-of ?B_operand) (F32))
    (= (dtype-of ?matrix_product) (F32)))
-  ((cublaslt-logical-matrix-product ?matrix_product ?A_operand ?B_operand)
-   (cublaslt-product-with-C-matrix ?matrix_product ?A_operand ?B_operand (CublasLtNoCMatrix)))
+  ((cublaslt-logical-matrix-product ?matrix_product ?A_operand ?B_operand))
   :ruleset backend
   :name "cublaslt: logical product")
 (rule
-  ((cublaslt-logical-matrix-product ?matrix_product ?A_operand ?B_operand)
+  ((cublaslt-scaled-matrix-product ?matrix_product ?A_operand ?B_operand ?alpha)
    (= ?expression (LogicalAdd ?matrix_product ?C_matrix))
    (= (shape-of ?matrix_product) (shape-of ?C_matrix)))
-  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix)))
+  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix)
+     ?alpha (LogicalConstant 1.0)))
   :ruleset backend
   :name "cublaslt: product then C in one order")
 (rule
-  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand ?C_matrix))
+  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand ?C_matrix ?alpha ?beta))
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix (CublasLtNoBias)
-     (CublasLtDefaultEpilogue)))
+     (CublasLtDefaultEpilogue) ?alpha ?beta))
   :ruleset backend
   :name "cublaslt: expression without bias")
 (rule
-  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand ?C_matrix)
+  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand ?C_matrix ?alpha ?beta)
    (= ?output_expression (LogicalAdd ?expression ?broadcast_bias))
    (= (shape-of ?expression) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil)))))
    (= ?broadcast_bias (LogicalHelperBroadcastAxis ?bias 1 ?m))
    (= (shape-of ?bias) (ShapeLit (IntExprCons ?n (IntExprNil)))))
   ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix (CublasLtBiasOf ?bias)
-     (CublasLtBiasEpilogue)))
+     (CublasLtBiasEpilogue) ?alpha ?beta))
   :ruleset backend
   :name "cublaslt: add feature bias after C")
 ; Minimal explicit select spelling, useful for adversarial fixtures.
@@ -320,17 +329,17 @@
   :ruleset backend
   :name "cublaslt: frontend ReLU")
 (rule
-  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias (CublasLtDefaultEpilogue))
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias (CublasLtDefaultEpilogue) ?alpha ?beta)
    (cublaslt-rectified-linear-activation ?output_expression ?expression))
   ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtRectifiedLinearEpilogue)))
+     (CublasLtRectifiedLinearEpilogue) ?alpha ?beta))
   :ruleset backend
   :name "cublaslt: ReLU of expression without bias")
 (rule
-  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias (CublasLtBiasEpilogue))
+  ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias (CublasLtBiasEpilogue) ?alpha ?beta)
    (cublaslt-rectified-linear-activation ?output_expression ?expression))
   ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtRectifiedLinearBiasEpilogue)))
+     (CublasLtRectifiedLinearBiasEpilogue) ?alpha ?beta))
   :ruleset backend
   :name "cublaslt: ReLU of biased expression")
 ; GELU recognition is local to F32 matrix expressions. These facts describe
@@ -348,14 +357,14 @@
   :name "cublaslt: exact scalar broadcast")
 (rule
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtDefaultEpilogue))
+     (CublasLtDefaultEpilogue) ?alpha ?beta)
    (= (dtype-of ?expression) (F32)))
   ((cublaslt-gaussian-error-linear-input ?expression))
   :ruleset backend
   :name "cublaslt: examine default expression for GELU")
 (rule
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtBiasEpilogue))
+     (CublasLtBiasEpilogue) ?alpha ?beta)
    (= (dtype-of ?expression) (F32)))
   ((cublaslt-gaussian-error-linear-input ?expression))
   :ruleset backend
@@ -433,48 +442,48 @@
   :name "cublaslt: frontend erf GELU")
 (rule
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtDefaultEpilogue))
+     (CublasLtDefaultEpilogue) ?alpha ?beta)
    (cublaslt-gaussian-error-linear-activation ?output_expression ?expression))
   ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtGaussianErrorLinearEpilogue)))
+     (CublasLtGaussianErrorLinearEpilogue) ?alpha ?beta))
   :ruleset backend
   :name "cublaslt: GELU of default expression")
 (rule
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtBiasEpilogue))
+     (CublasLtBiasEpilogue) ?alpha ?beta)
    (cublaslt-gaussian-error-linear-activation ?output_expression ?expression))
   ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix ?bias
-     (CublasLtGaussianErrorLinearBiasEpilogue)))
+     (CublasLtGaussianErrorLinearBiasEpilogue) ?alpha ?beta))
   :ruleset backend
   :name "cublaslt: GELU of bias expression")
 (rule
-  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix (CublasLtNoBias) ?epilogue))
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand ?C_matrix (CublasLtNoBias) ?epilogue ?alpha ?beta))
   ((cublaslt-expression-frame
      (CublasLtExpressionFrameOf ?output_expression ?output_expression ?A_operand ?B_operand ?C_matrix
-       (CublasLtNoBias) ?epilogue)))
+       (CublasLtNoBias) ?epilogue ?alpha ?beta)))
   :ruleset backend
   :name "cublaslt: direct expression frame")
 ; Transpose the COMPLETE expression once, so normal per-feature bias becomes
 ; the vendor's per-row bias. This is proof construction, not call decoration.
 (rule
-  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand (CublasLtNoCMatrix) ?bias ?epilogue))
+  ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand (CublasLtNoCMatrix) ?bias ?epilogue ?alpha ?beta))
   ((let ?transposed_expression (LogicalHelperMatrixTranspose ?output_expression))
    (union ?output_expression (LogicalHelperMatrixTranspose ?transposed_expression))
    (cublaslt-expression-frame
      (CublasLtExpressionFrameOf ?output_expression ?transposed_expression
        (LogicalHelperMatrixTranspose ?B_operand) (LogicalHelperMatrixTranspose ?A_operand)
-       (CublasLtNoCMatrix) ?bias ?epilogue)))
+       (CublasLtNoCMatrix) ?bias ?epilogue ?alpha ?beta)))
   :ruleset backend
   :name "cublaslt: transpose complete expression without C")
 (rule
   ((cublaslt-logical-expression ?output_expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix) ?bias
-     ?epilogue))
+     ?epilogue ?alpha ?beta))
   ((let ?transposed_expression (LogicalHelperMatrixTranspose ?output_expression))
    (union ?output_expression (LogicalHelperMatrixTranspose ?transposed_expression))
    (cublaslt-expression-frame
      (CublasLtExpressionFrameOf ?output_expression ?transposed_expression
        (LogicalHelperMatrixTranspose ?B_operand) (LogicalHelperMatrixTranspose ?A_operand)
-       (CublasLtCMatrixOf (LogicalHelperMatrixTranspose ?C_matrix)) ?bias ?epilogue)))
+       (CublasLtCMatrixOf (LogicalHelperMatrixTranspose ?C_matrix)) ?bias ?epilogue ?alpha ?beta)))
   :ruleset backend
   :name "cublaslt: transpose complete expression with C")
 
@@ -483,18 +492,18 @@
 (rule
   ((cublaslt-expression-frame
      (CublasLtExpressionFrameOf ?expression ?expression ?A_operand ?B_operand
-       ?C_matrix ?bias ?epilogue))
+       ?C_matrix ?bias ?epilogue ?alpha ?beta))
    (cublaslt-output-storage-reading ?expression ?rounded_expression)
    (cublaslt-narrow-storage-data-type (dtype-of ?rounded_expression)))
   ((cublaslt-expression-frame
      (CublasLtExpressionFrameOf ?rounded_expression ?rounded_expression ?A_operand ?B_operand
-       ?C_matrix ?bias ?epilogue)))
+       ?C_matrix ?bias ?epilogue ?alpha ?beta)))
   :ruleset backend
   :name "cublaslt: authored final rounding of the direct expression frame")
 (rule
   ((cublaslt-expression-frame
      (CublasLtExpressionFrameOf ?original_expression ?api_expression ?A_operand ?B_operand
-       ?C_matrix ?bias ?epilogue))
+       ?C_matrix ?bias ?epilogue ?alpha ?beta))
    (= ?original_expression (LogicalHelperMatrixTranspose ?api_expression))
    (cublaslt-output-storage-reading ?original_expression ?rounded_original)
    (cublaslt-narrow-storage-data-type (dtype-of ?rounded_original)))
@@ -502,7 +511,7 @@
    (union ?rounded_original (LogicalHelperMatrixTranspose ?rounded_api))
    (cublaslt-expression-frame
      (CublasLtExpressionFrameOf ?rounded_original ?rounded_api ?A_operand ?B_operand
-       ?C_matrix ?bias ?epilogue)))
+       ?C_matrix ?bias ?epilogue ?alpha ?beta)))
   :ruleset backend
   :name "cublaslt: transpose the complete authored rounded output")
 
@@ -510,11 +519,11 @@
   ((cublaslt-expression-frame ?expression_frame)
    (= ?expression_frame
      (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
-       (CublasLtNoCMatrix) ?bias ?epilogue))
+       (CublasLtNoCMatrix) ?bias ?epilogue ?alpha ?beta))
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?element_data_type ?matrix_order ?D_matrix_descriptor)
    (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?layout)))
   ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor
-     (CublasLtCMatrixAbsent) (CublasLtNoCMatrixDataType) (CublasLtHostScalarsAlphaOneBetaZero)
+     (CublasLtCMatrixAbsent) (CublasLtNoCMatrixDataType)
      (LayoutTensorNil)))
   :ruleset backend
   :name "cublaslt: prove absent C and beta zero")
@@ -522,7 +531,7 @@
   ((cublaslt-expression-frame ?expression_frame)
    (= ?expression_frame
      (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
-       (CublasLtCMatrixOf ?C_matrix) ?bias ?epilogue))
+       (CublasLtCMatrixOf ?C_matrix) ?bias ?epilogue ?alpha ?beta))
    (= ?D_matrix_descriptor
      (CublasLtMatrixDescriptorOf ?D_layout_tensor
        (CublasLtMatrixLayoutLit ?element_data_type ?matrix_order ?m ?n
@@ -536,7 +545,6 @@
      ?C_matrix_descriptor))
   ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor
      (CublasLtCMatrixInput ?C_matrix_descriptor) (CublasLtCMatrixDataTypeOf ?element_data_type)
-     (CublasLtHostScalarsAlphaOneBetaOne)
      (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil))))
   :ruleset backend
   :name "cublaslt: out of place C permits a different leading dimension")
@@ -544,7 +552,7 @@
   ((cublaslt-expression-frame ?expression_frame)
    (= ?expression_frame
      (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand ?C_matrix
-       (CublasLtNoBias) ?epilogue))
+       (CublasLtNoBias) ?epilogue ?alpha ?beta))
    (= (shape-of ?output_expression) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil))))))
   ((cublaslt-bias-argument ?expression_frame ?m (CublasLtBiasAbsent) (CublasLtNoBiasDataType)
      (LayoutTensorNil)))
@@ -554,7 +562,7 @@
   ((cublaslt-expression-frame ?expression_frame)
    (= ?expression_frame
      (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand ?C_matrix
-       (CublasLtBiasOf ?bias) ?epilogue))
+       (CublasLtBiasOf ?bias) ?epilogue ?alpha ?beta))
    (= (shape-of ?output_expression) (ShapeLit (IntExprCons ?m (IntExprCons ?n (IntExprNil)))))
    (= (shape-of ?bias) (ShapeLit (IntExprCons ?m (IntExprNil))))
    (cublaslt-f32-storage-reading ?bias ?bias_storage_tensor)
@@ -567,28 +575,12 @@
      (CublasLtBiasDataTypeOf ?element_data_type) (LayoutTensorCons ?bias_layout_tensor (LayoutTensorNil))))
   :ruleset backend
   :name "cublaslt: packed bias with exact row length")
-(rule
-  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
-     ?host_scalars (LayoutTensorNil))
-   (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors))
-  ((cublaslt-remaining-inputs (LayoutTensorNil) ?bias_input_tensors ?bias_input_tensors))
-  :ruleset backend
-  :name "cublaslt: argument tail without C")
-(rule
-  ((cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
-     ?host_scalars (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil)))
-   (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors))
-  ((cublaslt-remaining-inputs (LayoutTensorCons ?C_layout_tensor (LayoutTensorNil)) ?bias_input_tensors
-     (LayoutTensorCons ?C_layout_tensor ?bias_input_tensors)))
-  :ruleset backend
-  :name "cublaslt: argument tail with C")
-
 ; Shared admission gate. Every API field and every precision boundary is proved here.
 (rule
   ((cublaslt-expression-frame ?expression_frame)
    (= ?expression_frame
      (CublasLtExpressionFrameOf ?original_expression ?output_expression ?A_operand ?B_operand
-       ?logical_C_matrix ?logical_bias ?epilogue))
+       ?logical_C_matrix ?logical_bias ?epilogue ?alpha ?beta))
    (cublaslt-operand-storage-reading ?computation_type ?A_operand ?A_storage_tensor)
    (cublaslt-operand-storage-reading ?computation_type ?B_operand ?B_storage_tensor)
    (= (shape-of ?A_operand) (shape-of ?A_storage_tensor))
@@ -606,18 +598,17 @@
    (= (dtype-of ?A_operand) (F32))
    (= (dtype-of ?B_operand) (F32))
    (cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
-     ?scalar_arguments ?C_input_tensors)
+     ?C_input_tensors)
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors)
-   (cublaslt-remaining-inputs ?C_input_tensors ?bias_input_tensors ?remaining_input_tensors)
+   (cublaslt-scalar-arguments ?alpha ?beta ?scalar_pointer_mode ?scalar_arguments ?scalar_input_tensors)
+   (= ?scalar_data_type (F32))
    (= ?configuration
      (CublasLtConfigurationOf ?computation_type ?scalar_data_type ?A_storage_data_type ?B_storage_data_type
-       ?C_matrix_data_type ?D_storage_data_type ?bias_data_type ?scalar_arguments ?epilogue ?A_matrix_order
+       ?C_matrix_data_type ?D_storage_data_type ?bias_data_type ?scalar_pointer_mode ?epilogue ?A_matrix_order
        ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
    (cublaslt-approved-configuration ?configuration))
-  ((let ?input_tensors
-     (LayoutTensorCons ?A_layout_tensor (LayoutTensorCons ?B_layout_tensor ?remaining_input_tensors)))
-   (cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor ?C_matrix_argument
-     ?bias_argument ?D_matrix_descriptor ?input_tensors ?expression_frame))
+  ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor ?C_matrix_argument
+     ?bias_argument ?D_matrix_descriptor  ?expression_frame ?scalar_arguments))
   :ruleset backend
   :name "cublaslt: approve one complete configuration with exact logical semantics")
 

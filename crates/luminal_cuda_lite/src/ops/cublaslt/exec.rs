@@ -110,9 +110,53 @@ impl LtComputation {
     }
 }
 
-/// The fully-resolved host call: every number the dispatch needs,
-/// nothing the dispatch may reinterpret. NO scalar fields beyond the
-/// structural `beta_is_one`; admission owns the permitted literal scalars.
+/// Host values retain their FP32 bits, including signed zero and NaN payloads.
+/// Device values are ordinary read operands; replay reads their current bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtScalars {
+    Host {
+        alpha_bits: u32,
+        beta_bits: u32,
+    },
+    Device {
+        alpha_operand: usize,
+        beta_operand: usize,
+    },
+}
+
+impl LtScalars {
+    pub fn host(alpha: f32, beta: f32) -> Self {
+        Self::Host {
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+        }
+    }
+    pub fn host_values(self) -> Option<(f32, f32)> {
+        match self {
+            Self::Host {
+                alpha_bits,
+                beta_bits,
+            } => Some((f32::from_bits(alpha_bits), f32::from_bits(beta_bits))),
+            Self::Device { .. } => None,
+        }
+    }
+    pub fn input_count(self) -> usize {
+        if matches!(self, Self::Device { .. }) {
+            2
+        } else {
+            0
+        }
+    }
+    pub fn pointer_mode_constructor(self) -> &'static str {
+        match self {
+            Self::Host { .. } => "CublasLtHostScalarPointerMode",
+            Self::Device { .. } => "CublasLtDeviceScalarPointerMode",
+        }
+    }
+}
+
+/// A fully resolved vendor call. Every descriptor and scalar argument is elected
+/// in egglog; dispatch only validates backing capacities and vendor availability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LtCall {
     pub form: CublasLtForm,
@@ -131,8 +175,8 @@ pub struct LtCall {
     /// required placeholder descriptor without inventing a logical input.
     pub c: Option<LtCMatrixInput>,
     pub d: LtDesc,
-    /// beta is STRUCTURAL: `true` exactly on the C-fold forms.
-    pub beta_is_one: bool,
+    pub scale_dtype: luminal::dtype::PlanDtype,
+    pub scalars: LtScalars,
     pub activation: LtActivation,
     /// Physical bias storage, structurally absent on non-bias forms.
     pub bias: Option<LtBiasInput>,
@@ -212,20 +256,40 @@ pub fn assert_bias_destination_order(call: &LtCall, who: &str) -> Result<()> {
 
 impl LtCall {
     /// Validate every descriptor against its backing buffer's element
-    /// count — the pre-dispatch gate (contract 4). `elems` in Lit
-    /// operand order `[a, b, c?, bias?]`, then the destination.
+    /// count — the pre-dispatch gate (contract 4). `elems` follows the elected
+    /// read order; the destination's capacity is checked separately.
     pub fn validate_against(&self, operand_elems: &[usize], dest_elems: usize) -> Result<()> {
-        if operand_elems.len() != self.form.lit_arity() {
+        if self.scale_dtype != luminal::dtype::PlanDtype::F32 {
+            bail!(
+                "cuBLASLt: admitted compute modes require FP32 alpha/beta, got {:?}",
+                self.scale_dtype
+            );
+        }
+        let arity = self.form.lit_arity() + self.scalars.input_count();
+        if operand_elems.len() != arity {
             bail!(
                 "cuBLASLt {}: {} operand buffers for Lit arity {}",
                 format_args!("{:?}", self.form),
                 operand_elems.len(),
-                self.form.lit_arity()
+                arity
             );
         }
         validate_ld_bounds("A", &self.a, operand_elems[0])?;
         validate_ld_bounds("B", &self.b, operand_elems[1])?;
         validate_ld_bounds("D", &self.d, dest_elems)?;
+        if let LtScalars::Device {
+            alpha_operand,
+            beta_operand,
+        } = self.scalars
+        {
+            for (name, operand) in [("alpha", alpha_operand), ("beta", beta_operand)] {
+                if operand_elems.get(operand).is_none_or(|&len| len < 1) {
+                    bail!("cuBLASLt: device {name} operand {operand} needs one FP32 element");
+                }
+            }
+        } else if self.c.is_none() && self.scalars.host_values().unwrap().1 != 0.0 {
+            bail!("cuBLASLt: absent C requires beta zero");
+        }
         if let Some(c) = self.c {
             let Some(&elems) = operand_elems.get(c.operand) else {
                 bail!(

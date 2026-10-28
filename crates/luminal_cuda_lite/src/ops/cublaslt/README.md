@@ -11,8 +11,10 @@ the elected call and dispatches its descriptors unchanged.
 | --- | --- |
 | `approved_constructors.egg` | Flat vendor layout data, storage descriptors, optional arguments, configuration and expression-frame types |
 | `approved_rules.egg` | Rank-two expression recognition, layout readings, precision proofs, and complete admission |
+| `scalar_rules.egg` | Authored alpha/beta scaling and exact FP32 scalar storage/pointer proofs |
+| `call_inputs.egg` | Assemble approved matrix/scalar reads in one canonical order |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 1,088 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 2,176 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -44,17 +46,19 @@ C absence is structural: `CublasLtCMatrixAbsent` and
 own descriptor, dtype, and operand position. Dispatch still supplies the valid
 placeholder C descriptor required by the vendor when beta is zero.
 
-The separate-destination form uses inputs A, B, optional C, optional bias, and a
-write-only destination appended by DPS conversion. It grants no input alias
-permission. The in-place form uses A, B, optional bias, then C as its destination;
-C is operand 2 without bias and operand 3 with bias. Its unconditional
-`Sharing::Must` tie connects that final operand to result 0. Its emission rule
-requires the same complete vendor layout and the same underlying layout for C
-and D. There is no conditional alias flag or Rust destination rebinding.
+Both forms use inputs A, B, optional device alpha/beta, optional bias, then
+optional C. Host scalar literals are metadata; device scalars are ordinary
+FP32 read operands. The separate-destination form appends its write-only D
+operand during DPS conversion. The in-place form requires C and ties its final
+read operand to result 0 with unconditional `Sharing::Must`. Its emission rule
+requires the same complete vendor layout and underlying layout for C and D.
+There is no conditional alias flag or Rust destination rebinding. Scalar values,
+including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **1,088 complete configurations**:
+The table contains **2,176 complete configurations**: 1,088 for host scalar
+pointers and 1,088 for device scalar pointers. Each pointer mode admits:
 
 - 896 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
   FP16 A/B storage, plus explicit TF32 computation over F32 storage. Each has
@@ -67,8 +71,8 @@ The table contains **1,088 complete configurations**:
   in either D order or ReLU with column-major D. Native narrow bias and GELU
   epilogues have no approved rows.
 
-Scalars and accumulation remain FP32. Alpha is 1; beta is 0 without C and 1
-with C. Storage never chooses arithmetic precision. Only an authored exact
+Scalars and accumulation remain FP32. Alpha and beta are general FP32 values;
+absent C still requires literal beta zero. Storage never chooses arithmetic precision. Only an authored exact
 widening permits direct BF16/FP16 readings. Casts between multiplication,
 reduction, C addition, bias addition and activation remain boundaries; earlier
 narrowing is preserved. A separate output-storage proof recognizes an authored
@@ -78,8 +82,44 @@ whole rounded expression into the API frame and back to the caller's output.
 F32 reduction reassociation and FMA contraction follow the existing compiler
 policy. ReLU accepts a difference in the sign of zero; the FP32-output GELU rows
 accept the vendor tanh approximation. These are explicit admission policies,
-not claims of bitwise equivalence. FP8, mixed A/B storage and arbitrary
-alpha/beta values have no approved configurations.
+not claims of bitwise equivalence. FP8 and mixed A/B storage have no approved configurations.
+
+### General alpha and beta
+
+`scalar_rules.egg` recognizes one FP32 scalar multiplication of the completed
+product and one of C before addition: `alpha * (A @ B) + beta * C`, followed by
+optional bias/activation and authored output rounding. Scaling is not moved
+across casts or distributed over C, bias, activation, or multiple scalar
+multiplications. Rank-two and strided-batch calls share these scalar proofs.
+
+The vendor's [dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
+requires **FP32 alpha/beta** for all currently admitted modes: ordinary FP32
+computation over F32/FP16/BF16 storage and explicit TF32 computation over F32
+storage. Half matrix storage does not authorize half scalar pointers. An
+explicit scalar cast to F32 remains an executable operation when needed.
+
+The configuration records `CublasLtHostScalarPointerMode` or
+`CublasLtDeviceScalarPointerMode`; actual values/storage live in separate flat
+`CublasLtScalarArguments`. Host arguments require literal FP32 graph constants.
+Tensor coefficients require rank-zero FP32 storage and use GPU pointers. If a
+literal is paired with a tensor coefficient, the literal can be materialized as
+a GPU scalar so both pointers use DEVICE mode. There is no GPU-to-CPU scalar
+readback. The prepared CUDA graph reads updated device coefficients on every
+replay, including coefficients produced by preceding GPU operations.
+
+Only the vendor's ordinary scalar HOST and DEVICE [pointer modes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltpointermode-t)
+are admitted. Row vectors, per-batch coefficient arrays, and mixed host/device
+pointer modes are not inferred from tensor shapes. The selected vendor
+algorithm's pointer-mode capability is checked during preparation; unsupported
+geometries/modes are refused without substituting another precision contract.
+
+Scaling follows the practical cuBLAS numerical contract, including FMA and
+reduction-order differences. A zero coefficient may suppress a matrix read,
+so NaNs in a zero-weighted matrix need not propagate as they would through
+separate elementwise multiplication. A present C remains structurally present,
+including when beta is zero; this does not grant extra alias permissions or
+remove the scalar's graph dependency. Tests compare finite numerical inputs
+and retain explicit cast boundaries.
 
 ### Narrow C, bias and output storage
 
@@ -263,15 +303,15 @@ reference codec's tie choice on CUDA. The five-package landing sweep passes
 663 tests with 54 existing ignores; the targeted device-enabled cuBLASLt suites
 pass 23 tests. Formatting and device-enabled CUDA Lite/test-runtime Clippy pass.
 
-Narrow-storage validation executes all **1,088 separate-destination
+At the narrow-storage checkpoint, validation executed all **1,088 separate-destination
 configurations**, **544 in-place configurations**, and **576 batched dispatch
 witnesses** on the A100. Regressions cover exact widening and authored final
 rounding, retained earlier narrowing, packed broadcast-C bias without
 materialization, independent C/D pitches, changing batch counts, C reuse and
 read-only repair, FP32 split-K partial sums, and finite cancellation/GELU
 fallbacks for the deliberately excluded native narrow epilogues.
-The 14 narrow-storage regressions pass with device execution enabled. The
-five-package landing checks pass 673 tests with 54 existing ignores, including
+At that checkpoint, the 14 narrow-storage regressions passed with device execution enabled. The
+five-package landing checks passed 673 tests with 54 existing ignores, including
 the updated frontend proof that checks native-bias and broadcast-C operand
 addresses. Formatting and device-enabled CUDA Lite/reference/test-runtime
 Clippy with `-D warnings` pass.
