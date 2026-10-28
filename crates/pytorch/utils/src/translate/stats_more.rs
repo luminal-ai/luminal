@@ -53,6 +53,18 @@ fn row_major_strides(dims: &[IntExpr]) -> Vec<IntExpr> {
         .collect()
 }
 
+/// Round a value computed in its (wider) compute dtype to `dtype` and widen
+/// it back: the rounding a `scalar_t` operation performs when the
+/// translator computes half precision in F32. A no-op when the two agree.
+fn round_through(value: GraphTensor, dtype: DType) -> GraphTensor {
+    if value.dtype == dtype {
+        value
+    } else {
+        let compute = value.dtype;
+        value.cast(dtype).cast(compute)
+    }
+}
+
 /// Extract the `reduce` string of a `segment_reduce` node.
 fn segment_reduction_name(node: &Node) -> Result<String> {
     let input = node
@@ -910,9 +922,12 @@ impl Translator<'_> {
             candidates = candidates.merge_dims(last - 2, last - 1);
             logical_indices = logical_indices.merge_dims(last - 2, last - 1);
         }
+        // Half-precision keys widen to F32: the widening is exact and keeps
+        // the order (NaN included), and the sort's pairwise arithmetic is
+        // opmath, which the half formats do not carry.
         let key = match candidates.dtype {
-            DType::F64 | DType::F32 | DType::F16 | DType::Bf16 | DType::TF32 => candidates,
-            DType::Bool => candidates.cast(DType::F32),
+            DType::F64 | DType::F32 | DType::TF32 => candidates,
+            DType::F16 | DType::Bf16 | DType::Bool => candidates.cast(DType::F32),
             other => bail!(
                 "max pooling on {other:?} inputs is not ported: the stable-argsort \
                  selection needs a float key"
@@ -938,6 +953,26 @@ impl Translator<'_> {
         Ok([values, picked])
     }
 
+    /// `aten.fractional_max_pool{2,3}d.default`: values + int64 indices.
+    ///
+    /// INDEX INVARIANT: every index is exact, and none is a flat position
+    /// carried in a float or built by Int tensor arithmetic.
+    /// * The window starts follow ATen's `generate_intervals` in the sample
+    ///   dtype (that rounding is the op's semantics). A start is an integer
+    ///   below the axis extent, held exactly in the compute dtype (F32 or
+    ///   F64), and so is start + kernel offset; the coordinate is truncated
+    ///   to Int only after that addition. (The checked Int -> F32 casts of
+    ///   positions and extents refuse an axis longer than 2^24 loudly.)
+    /// * The input is read with a per-axis coordinate gather (batch/channel
+    ///   axis positions plus one coordinate per spatial axis), so no position
+    ///   over the whole input is ever formed.
+    /// * The returned within-plane index is read from a plane-position iota
+    ///   at the same spatial coordinates: a pure coordinate function, so no
+    ///   Int add or multiply (each proof-gated) enters the model, and it is
+    ///   exact for any plane an Int iota can address.
+    ///
+    /// A coordinate outside the input (ATen reads out of bounds there, for
+    /// `random_samples` far outside `[0, 1)`) is a loud gather refusal.
     pub(super) fn translate_fractional_max_pool(
         &mut self,
         node: &Node,
@@ -954,6 +989,16 @@ impl Translator<'_> {
             random_samples.rank() == 3 && random_samples.dims()[2].to_usize() == Some(rank),
             "fractional max pool random_samples must have shape [N, C, spatial_rank]"
         );
+        // ATen's `generate_intervals<scalar_t>` rounds every operation to
+        // the sample dtype. Half-precision samples are computed in F32 and
+        // rounded back after each operation, which is bit-identical (F32 has
+        // more than 2p + 2 bits for both narrow formats).
+        let sample_dtype = random_samples.dtype;
+        let compute_dtype = match sample_dtype {
+            DType::F64 | DType::F32 => sample_dtype,
+            DType::F16 | DType::Bf16 => DType::F32,
+            other => bail!("fractional max pool random_samples must be floating, got {other:?}"),
+        };
         let kernel = expand_spatial(&self.stats_pool_ints(node, "kernel_size", 1)?, rank, 0)?;
         anyhow::ensure!(
             kernel.iter().all(|&size| size > 0),
@@ -967,20 +1012,10 @@ impl Translator<'_> {
         let mut window_shape = output_shape.clone();
         window_shape.extend(kernel.iter().copied().map(IntExpr::from));
 
-        let strides = row_major_strides(&input_shape);
-        // Prefix (batch/channel) flat contributions are a pure coordinate
-        // function, so no Int tensor arithmetic enters the model.
-        let mut flat = self
-            .cx
-            .iota(window_shape.clone(), |c| {
-                (0..prefix_rank).fold(IntExpr::from(0), |acc, axis| acc + c[axis] * strides[axis])
-            })
-            .cast(DType::F32);
-        let mut logical = self
-            .cx
-            .constant_i32(0)
-            .cast(DType::F32)
-            .expand_rhs(window_shape.clone());
+        // Batch/channel coordinates are the window's own axis positions.
+        let mut coordinates: Vec<GraphTensor> = (0..prefix_rank)
+            .map(|axis| self.axis_positions(&window_shape, axis))
+            .collect();
 
         for spatial in 0..rank {
             let sample_lane = if rank == 2 {
@@ -997,75 +1032,77 @@ impl Translator<'_> {
             for output_size in output_spatial.iter().copied() {
                 sample = sample.expand_dim(sample.rank(), output_size);
             }
+            let sample = sample.cast(compute_dtype);
 
             let output_axis = prefix_rank + spatial;
             let output_position = self.axis_positions(&output_shape, output_axis);
-            let numerator = self
-                .cx
-                .constant_i32(input_spatial[spatial] - IntExpr::from(kernel[spatial]))
-                .cast(sample.dtype)
+            // inputSize - poolSize: the last valid window start.
+            let last_start = input_spatial[spatial] - IntExpr::from(kernel[spatial]);
+            // outputSize - 1: the terminal output position. A single output
+            // position is the terminal one, so its start is selected below;
+            // dividing by max(outputSize - 1, 1) only keeps the unselected
+            // ordinary starts finite.
+            let last_position = output_spatial[spatial] - IntExpr::from(1usize);
+            let steps = last_position.max(IntExpr::from(1usize));
+            // alpha = scalar_t(inputSize - poolSize) / scalar_t(outputSize - 1),
+            // one correctly rounded division. The frontend's F32 division is
+            // a reciprocal product, so the quotient is taken in F64 and
+            // rounded once to the sample dtype: binary64 has more than
+            // 2p + 2 bits for every sample format, so that double rounding
+            // equals ATen's single one.
+            let numerator = round_through(
+                self.cx.constant_i32(last_start).cast(compute_dtype),
+                sample_dtype,
+            );
+            let denominator = round_through(
+                self.cx.constant_i32(steps).cast(compute_dtype),
+                sample_dtype,
+            );
+            let alpha = (numerator.cast(DType::F64) / denominator.cast(DType::F64))
+                .cast(sample_dtype)
+                .cast(compute_dtype)
                 .expand_rhs(sample.dims());
-            let denominator = self
-                .cx
-                .constant_i32(output_spatial[spatial] - IntExpr::from(1usize))
-                .cast(sample.dtype)
-                .expand_rhs(sample.dims());
-            // Every select below is between finite values, so the LUM-804
-            // `nonfinite * 0` leak cannot trigger here.
-            let output_is_one = self.is_zero(denominator);
-            let one = self.constant_like(denominator, 1.0);
-            let safe_denominator = self.blend_select(output_is_one, one, denominator);
-            let alpha = numerator / safe_denominator;
-            let ordinary_start = ((output_position.cast(sample.dtype) + sample) * alpha).floor()
-                - (sample * alpha).floor();
-
-            let terminal_position = self
-                .cx
-                .constant_i32(output_spatial[spatial] - IntExpr::from(1usize))
-                .cast(DType::Int)
-                .expand_rhs(output_position.dims());
-            let final_position = output_position.eq(terminal_position);
+            // ATen: int64((i + sample) * alpha) - int64(sample * alpha). `i`
+            // is rounded to the sample dtype, each operation rounds there,
+            // and the int64 conversions truncate toward zero. Both truncated
+            // terms are integers of the compute dtype, so their difference
+            // is exact whenever the true difference is representable, which
+            // covers every in-bounds start.
+            let position = round_through(output_position.cast(compute_dtype), sample_dtype);
+            let shifted = round_through(position + sample, sample_dtype);
+            let upper = round_through(shifted * alpha, sample_dtype).trunc();
+            let lower = round_through(sample * alpha, sample_dtype).trunc();
+            let ordinary_start = upper - lower;
             let terminal_start = self
                 .cx
-                .constant_i32(input_spatial[spatial] - IntExpr::from(kernel[spatial]))
-                .cast(sample.dtype)
+                .constant_i32(last_start)
+                .cast(compute_dtype)
                 .expand_rhs(ordinary_start.dims());
-            let final_or_ordinary =
-                self.blend_select(final_position, terminal_start, ordinary_start);
-            let start = self.blend_select(output_is_one, terminal_start, final_or_ordinary);
+            let terminal_position = self
+                .cx
+                .constant_i32(last_position)
+                .expand_rhs(output_position.dims());
+            let is_terminal = output_position.eq(terminal_position);
+            let mut start = self.select(is_terminal, terminal_start, ordinary_start);
 
-            let mut coordinate = start;
             for size in kernel.iter().copied() {
-                coordinate = coordinate.expand_dim(coordinate.rank(), size);
+                start = start.expand_dim(start.rank(), size);
             }
             let kernel_axis = input_rank + spatial;
-            coordinate = coordinate
-                + self
-                    .axis_positions(&window_shape, kernel_axis)
-                    .cast(coordinate.dtype);
-            let stride = self
-                .cx
-                .constant_i32(strides[prefix_rank + spatial])
-                .cast(DType::F32)
-                .expand_rhs(coordinate.dims());
-            flat += coordinate * stride;
-
-            let spatial_stride =
-                super::dim_arith::product_of_dims(input_spatial[spatial + 1..].iter().copied());
-            let stride = self
-                .cx
-                .constant_i32(spatial_stride)
-                .cast(DType::F32)
-                .expand_rhs(coordinate.dims());
-            logical += coordinate * stride;
+            let offset = self
+                .axis_positions(&window_shape, kernel_axis)
+                .cast(compute_dtype);
+            coordinates.push((start + offset).trunc_cast(DType::Int));
         }
 
-        let flat_indices = flat.trunc_cast(DType::Int);
-        let logical_indices = logical.trunc_cast(DType::Int);
-        let candidates = util::reshape_tensor(
-            input.flatten().gather(&[flat_indices.flatten()]),
-            &window_shape,
-        );
+        let candidates = input.gather(&coordinates);
+        let plane_strides = row_major_strides(&input_spatial);
+        let plane_positions = self.cx.iota(input_spatial.clone(), |c| {
+            (0..rank).fold(IntExpr::from(0), |acc, axis| {
+                acc + c[axis] * plane_strides[axis]
+            })
+        });
+        let logical_indices = plane_positions.gather(&coordinates[prefix_rank..]);
         let [values, indices] =
             self.stats_select_pool_max(candidates, logical_indices, input_rank)?;
         self.bind_declared_prefix(node, &[values, indices])?;
@@ -1697,6 +1734,206 @@ mod tests {
             &["x", "rand"],
             &["values"],
         ));
+    }
+
+    /// ATen requires `random_samples` to share the input's dtype, so every
+    /// float input reaches the lowering with float samples of its own
+    /// width. The window starts round in that dtype (half precision through
+    /// F32) and the indices come from coordinate gathers, so no operand pairs
+    /// a sample-dtype tensor with an F32 index tensor.
+    #[test]
+    fn fractional_max_pool_records_every_float_dtype() {
+        const F16: u32 = 6;
+        const F64: u32 = 8;
+        const BF16: u32 = 13;
+        for dtype in [F64, F32, F16, BF16] {
+            for (target, input_shape, samples_shape, output_shape, kernel, size) in [
+                (
+                    "torch.ops.aten.fractional_max_pool2d.default",
+                    vec![1, 2, 7, 7],
+                    vec![1, 2, 2],
+                    vec![1, 2, 3, 3],
+                    &[2, 2][..],
+                    &[3, 3][..],
+                ),
+                (
+                    "torch.ops.aten.fractional_max_pool2d.default",
+                    vec![2, 7, 7],
+                    vec![1, 2, 2],
+                    vec![2, 3, 3],
+                    &[2, 2][..],
+                    &[3, 3][..],
+                ),
+                (
+                    "torch.ops.aten.fractional_max_pool3d.default",
+                    vec![1, 2, 6, 6, 6],
+                    vec![1, 2, 3],
+                    vec![1, 2, 3, 3, 3],
+                    &[2, 2, 2][..],
+                    &[3, 3, 3][..],
+                ),
+            ] {
+                assert!(
+                    translates(
+                        vec![node(
+                            target,
+                            vec![
+                                input("self", tensor_arg("x")),
+                                ints("kernel_size", kernel),
+                                ints("output_size", size),
+                                input("random_samples", tensor_arg("rand")),
+                            ],
+                            &["values", "indices"],
+                        )],
+                        &[
+                            ("x", dtype, input_shape.clone()),
+                            ("rand", dtype, samples_shape),
+                            ("values", dtype, output_shape.clone()),
+                            ("indices", I64, output_shape),
+                        ],
+                        &["x", "rand"],
+                        &["values", "indices"],
+                    ),
+                    "{target} on dtype code {dtype} over {input_shape:?} must translate"
+                );
+            }
+        }
+    }
+
+    /// The index invariant of `translate_fractional_max_pool` as graph
+    /// facts: the input is read with one coordinate per axis rather than
+    /// through a flat position, no Int add or multiply (proof-gated, and an
+    /// e-graph closure hazard) lies upstream of those coordinates, each
+    /// spatial coordinate is truncated to Int only after its float
+    /// arithmetic, and the within-plane index is a plane-position iota read
+    /// at the same coordinates.
+    #[test]
+    fn fractional_max_pool_gathers_by_coordinates_without_int_arithmetic() {
+        use luminal::prelude::petgraph::Direction;
+        use luminal::prelude::petgraph::visit::EdgeRef;
+        use luminal::prelude::*;
+
+        for (target, rank, input_shape, samples_shape, output_shape, kernel, size) in [
+            (
+                "torch.ops.aten.fractional_max_pool2d.default",
+                2,
+                &[2, 3, 7, 8][..],
+                &[2, 3, 2][..],
+                &[2, 3, 3, 3][..],
+                &[2, 3][..],
+                &[3, 3][..],
+            ),
+            (
+                "torch.ops.aten.fractional_max_pool3d.default",
+                3,
+                &[2, 6, 6, 6][..],
+                &[1, 2, 3][..],
+                &[2, 3, 3, 3][..],
+                &[2, 2, 2][..],
+                &[3, 3, 3][..],
+            ),
+        ] {
+            let translation = crate::translate::test_support::translate_one(
+                node(
+                    target,
+                    vec![
+                        input("self", tensor_arg("x")),
+                        ints("kernel_size", kernel),
+                        ints("output_size", size),
+                        input("random_samples", tensor_arg("rand")),
+                    ],
+                    &["values", "indices"],
+                ),
+                &[
+                    ("x", F32, input_shape),
+                    ("rand", F32, samples_shape),
+                    ("values", F32, output_shape),
+                    ("indices", I64, output_shape),
+                ],
+                &["x", "rand"],
+                &["values", "indices"],
+            );
+            let graph = translation.graph.logical.petgraph();
+            let operands = |id: NodeIndex| {
+                let mut edges: Vec<_> = graph
+                    .edges_directed(id, Direction::Incoming)
+                    .map(|edge| (edge.weight().0, edge.source()))
+                    .collect();
+                edges.sort_by_key(|(port, _)| *port);
+                edges
+                    .into_iter()
+                    .map(|(_, source)| source)
+                    .collect::<Vec<_>>()
+            };
+            let through_views = |mut id: NodeIndex| {
+                while matches!(graph[id].op, LogicalOp::IndexMapApply { .. }) {
+                    id = operands(id)[0];
+                }
+                id
+            };
+            let int_arithmetic_upstream = |root: NodeIndex| {
+                let mut stack = vec![root];
+                let mut seen = std::collections::HashSet::new();
+                while let Some(id) = stack.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let recorded = &graph[id];
+                    if matches!(recorded.op, LogicalOp::Add | LogicalOp::Mul)
+                        && matches!(recorded.dtype, DType::Int | DType::I64)
+                    {
+                        return true;
+                    }
+                    stack.extend(operands(id));
+                }
+                false
+            };
+
+            let input_gathers: Vec<_> = graph
+                .node_indices()
+                .filter(|id| matches!(graph[*id].op, LogicalOp::Gather))
+                .filter(|id| {
+                    matches!(
+                        &graph[through_views(operands(*id)[0])].op,
+                        LogicalOp::Input { label } if label == "x"
+                    )
+                })
+                .collect();
+            assert_eq!(input_gathers.len(), 1, "{target} gathers the input once");
+            let coordinates = operands(input_gathers[0])[1..].to_vec();
+            assert_eq!(
+                coordinates.len(),
+                input_shape.len(),
+                "{target} reads the input with one coordinate per axis"
+            );
+            for coordinate in &coordinates {
+                assert!(
+                    !int_arithmetic_upstream(*coordinate),
+                    "{target} builds a gather coordinate with Int arithmetic"
+                );
+            }
+            let spatial = &coordinates[coordinates.len() - rank..];
+            for coordinate in spatial {
+                assert!(
+                    matches!(
+                        graph[through_views(*coordinate)].op,
+                        LogicalOp::TruncCast(DType::Int)
+                    ),
+                    "{target} spatial coordinates are truncated after their float arithmetic"
+                );
+            }
+            assert!(
+                graph.node_indices().any(|id| {
+                    matches!(graph[id].op, LogicalOp::Gather)
+                        && matches!(
+                            graph[through_views(operands(id)[0])].op,
+                            LogicalOp::Iota { .. }
+                        )
+                        && operands(id)[1..] == *spatial
+                }),
+                "{target} reads the within-plane index from a plane-position iota"
+            );
+        }
     }
 
     #[test]

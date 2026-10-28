@@ -1504,6 +1504,92 @@ def test_fixed_shape_3d_sampling_composites() -> None:
     _check(module, *inputs)
 
 
+class FractionalMaxPool2d(torch.nn.Module):
+    def __init__(self, kernel_size, output_size):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.output_size = output_size
+
+    def forward(self, value, random_samples):
+        return torch.ops.aten.fractional_max_pool2d.default(
+            value, self.kernel_size, self.output_size, random_samples
+        )
+
+
+class FractionalMaxPool3d(FractionalMaxPool2d):
+    def forward(self, value, random_samples):
+        return torch.ops.aten.fractional_max_pool3d.default(
+            value, self.kernel_size, self.output_size, random_samples
+        )
+
+
+def _check_fractional_max_pool_real_path(module, value, random_samples):
+    """Compile through torch.compile, whose stage-1 translation keeps the
+    undecomposed fractional_max_pool arm, and require eager's exact values
+    and int64 indices."""
+    actual = torch.compile(module, backend=luminal_backend)(value, random_samples)
+    expected = module(value, random_samples)
+    assert len(actual) == len(expected) == 2
+    for index, (result, reference) in enumerate(zip(actual, expected)):
+        assert result.dtype == reference.dtype, f"output {index}"
+        assert result.shape == reference.shape, f"output {index}"
+        assert torch.equal(result, reference), f"output {index}"
+
+
+# (module, value shape, random_samples shape). The wide 2d case has
+# inputSize - poolSize = 301, which bfloat16 cannot hold, so the window
+# starts only match eager when every interval term rounds in the sample
+# dtype the way ATen's generate_intervals<scalar_t> does.
+_FRACTIONAL_MAX_POOL_CASES = {
+    "2d": (FractionalMaxPool2d([2, 3], [3, 2]), (2, 3, 7, 8), (2, 3, 2)),
+    "2d_unbatched": (FractionalMaxPool2d([3, 2], [4, 3]), (2, 9, 8), (1, 2, 2)),
+    "2d_wide": (FractionalMaxPool2d([2, 2], [7, 7]), (1, 2, 303, 40), (1, 2, 2)),
+    "3d": (FractionalMaxPool3d([2, 2, 3], [2, 3, 2]), (1, 2, 4, 5, 6), (1, 2, 3)),
+    "3d_unbatched": (
+        FractionalMaxPool3d([2, 2, 2], [3, 3, 3]),
+        (2, 6, 6, 6),
+        (1, 2, 3),
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float64, torch.bfloat16, torch.float16],
+    ids=lambda dtype: str(dtype).removeprefix("torch."),
+)
+@pytest.mark.parametrize("case", sorted(_FRACTIONAL_MAX_POOL_CASES))
+def test_fractional_max_pool_matches_eager_for_every_float_dtype(case, dtype) -> None:
+    # ATen requires random_samples in the input's dtype, so every float
+    # input brings samples of its own width into the interval arithmetic.
+    module, value_shape, samples_shape = _FRACTIONAL_MAX_POOL_CASES[case]
+    torch.manual_seed(7)
+    value = torch.randn(value_shape).to(dtype)
+    random_samples = torch.rand(samples_shape).to(dtype)
+    _check_fractional_max_pool_real_path(module, value, random_samples)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("case", ["one_plane", "many_planes"])
+def test_fractional_max_pool_indices_exact_past_f32_integers(case) -> None:
+    # Inputs past 2**24 elements: a flat position there is not an F32
+    # integer. One 4100 x 4100 plane puts the planted maximum at the odd
+    # within-plane index 16,809,999; 8 x 130 planes put whole-input
+    # positions past 2**24 while each plane stays small.
+    torch.manual_seed(11)
+    if case == "one_plane":
+        value = torch.randn(1, 1, 4100, 4100)
+        value[0, 0, 4099, 4099] = 100.0
+        module = FractionalMaxPool2d([2, 2], [8, 8])
+    else:
+        value = torch.randn(8, 130, 128, 128)
+        module = FractionalMaxPool2d([2, 2], [4, 4])
+    random_samples = torch.rand(value.shape[0], value.shape[1], 2)
+    _check_fractional_max_pool_real_path(module, value, random_samples)
+    if case == "one_plane":
+        assert module(value, random_samples)[1][0, 0, 7, 7].item() == 16_809_999
+
+
 class SegmentReductions(torch.nn.Module):
     def forward(self, value, lengths, offsets):
         return (
