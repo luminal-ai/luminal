@@ -1,6 +1,6 @@
-; One explicit batch axis. All facts are backend-local; no logical arithmetic
-; is generated or unioned by these proofs. A/B/C/D share one positive batch count.
-; Alpha is one; beta is zero without C and one with C. No bias or activation.
+; One explicit batch axis. Recognize existing contractions and scalar scaling
+; without reassociating them. A/B/C/D share one positive batch count.
+; Alpha/beta are FP32; beta is zero without C. No batched bias or activation.
 (relation cublaslt-strided-batch-coordinate (Shape IntExpr))
 (relation cublaslt-strided-batch-product
   (LogicalTensor LogicalTensor LogicalTensor IntExpr IntExpr IntExpr IntExpr))

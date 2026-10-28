@@ -72,8 +72,9 @@ pointers and 1,088 for device scalar pointers. Each pointer mode admits:
   epilogues have no approved rows.
 
 Scalars and accumulation remain FP32. Alpha and beta are general FP32 values;
-absent C still requires literal beta zero. Storage never chooses arithmetic precision. Only an authored exact
-widening permits direct BF16/FP16 readings. Casts between multiplication,
+absent C still requires literal beta zero. Storage never chooses arithmetic
+precision. Only an authored exact widening permits direct BF16/FP16 readings.
+Casts between multiplication,
 reduction, C addition, bias addition and activation remain boundaries; earlier
 narrowing is preserved. A separate output-storage proof recognizes an authored
 final cast of the complete FP32 expression. Pure-view transposition carries that
@@ -82,7 +83,8 @@ whole rounded expression into the API frame and back to the caller's output.
 F32 reduction reassociation and FMA contraction follow the existing compiler
 policy. ReLU accepts a difference in the sign of zero; the FP32-output GELU rows
 accept the vendor tanh approximation. These are explicit admission policies,
-not claims of bitwise equivalence. FP8 and mixed A/B storage have no approved configurations.
+not claims of bitwise equivalence. FP8 and mixed A/B storage have no approved
+configurations.
 
 ### General alpha and beta
 
@@ -303,18 +305,29 @@ reference codec's tie choice on CUDA. The five-package landing sweep passes
 663 tests with 54 existing ignores; the targeted device-enabled cuBLASLt suites
 pass 23 tests. Formatting and device-enabled CUDA Lite/test-runtime Clippy pass.
 
-At the narrow-storage checkpoint, validation executed all **1,088 separate-destination
-configurations**, **544 in-place configurations**, and **576 batched dispatch
+At the narrow-storage checkpoint, validation executed all **1,088
+separate-destination configurations**, **544 in-place configurations**, and **576 batched dispatch
 witnesses** on the A100. Regressions cover exact widening and authored final
 rounding, retained earlier narrowing, packed broadcast-C bias without
 materialization, independent C/D pitches, changing batch counts, C reuse and
 read-only repair, FP32 split-K partial sums, and finite cancellation/GELU
 fallbacks for the deliberately excluded native narrow epilogues.
-At that checkpoint, the 14 narrow-storage regressions passed with device execution enabled. The
-five-package landing checks passed 673 tests with 54 existing ignores, including
+At that checkpoint, the 14 narrow-storage regressions passed with device
+execution enabled. The five-package landing checks passed 673 tests with 54 existing ignores, including
 the updated frontend proof that checks native-bias and broadcast-C operand
 addresses. Formatting and device-enabled CUDA Lite/reference/test-runtime
-Clippy with `-D warnings` pass.
+Clippy with `-D warnings` passed.
+
+General alpha/beta validation executes all **2,176 configurations**, **1,088
+in-place configurations**, and **1,152 batched dispatch witnesses** on the A100
+with non-unit coefficients. The nine scalar regressions cover host literals,
+GPU inputs, mixed literal/tensor arguments, GPU-produced coefficients, changing
+values on replay, zero/negative coefficients, precision boundaries and exact
+whitelist ablation. Device-enabled cuBLASLt suites pass 52 tests; the five
+required package suites cover 678 passing tests with 54 existing ignores.
+Scalar dtype/capacity rejection and descriptor address/storage-tie proofs pass
+for both pointer modes. Formatting and device-enabled CUDA
+Lite/reference/test-runtime Clippy with `-D warnings` pass.
 
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its

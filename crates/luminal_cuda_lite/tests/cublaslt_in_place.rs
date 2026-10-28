@@ -300,12 +300,13 @@ fn batched_c_reuse_and_repair_preserve_every_batch_and_the_storage_tie() {
                 continue;
             };
             count += 1;
+            let c_operand = op.destination_operand();
             let call = op.resolve(&Default::default());
             assert_eq!(call.d.batch_count, 2);
             assert_eq!(call.c.unwrap().descriptor, call.d);
-            assert_eq!(ties, &[(2, 0)]);
-            assert_eq!(reads[2], writes[0]);
-            assert_eq!(&reads[2] == c_buffer, reuse);
+            assert_eq!(ties, &[(c_operand, 0)]);
+            assert_eq!(reads[c_operand], writes[0]);
+            assert_eq!(&reads[c_operand] == c_buffer, reuse);
             for batch in 0..2 {
                 for row in 0..3 {
                     for col in 0..4 {
@@ -313,7 +314,7 @@ fn batched_c_reuse_and_repair_preserve_every_batch_and_the_storage_tie() {
                             + row * call.d.ld as usize
                             + col;
                         assert_eq!(
-                            operand_info[2]
+                            operand_info[c_operand]
                                 .layout
                                 .element_index(&[batch, row, col])
                                 .unwrap(),
@@ -408,11 +409,15 @@ fn c_reuse_and_conflict_repair_preserve_the_required_storage_tie() {
                     continue;
                 };
                 calls += 1;
-                assert_eq!(reads.len(), 3, "no extra destination operand");
-                assert_eq!(ties, &[(2, 0)]);
-                assert_eq!(reads[2], writes[0], "{layout:?} {access:?} keep_c={keep_c}");
+                let c_operand = op.destination_operand();
+                assert_eq!(reads.len(), c_operand + 1, "no extra destination operand");
+                assert_eq!(ties, &[(c_operand, 0)]);
                 assert_eq!(
-                    reads[2] == c_buffer,
+                    reads[c_operand], writes[0],
+                    "{layout:?} {access:?} keep_c={keep_c}"
+                );
+                assert_eq!(
+                    reads[c_operand] == c_buffer,
                     reuse,
                     "{layout:?} {access:?} keep_c={keep_c}"
                 );
@@ -426,7 +431,7 @@ fn c_reuse_and_conflict_repair_preserve_the_required_storage_tie() {
                         } else {
                             c * call.d.ld as usize + r
                         };
-                        for info in [&operand_info[2], &result_info[0]] {
+                        for info in [&operand_info[c_operand], &result_info[0]] {
                             assert_eq!(
                                 luminal_cuda_lite::layouts::element_index(&info.layout, &[r, c])
                                     .unwrap(),
@@ -447,21 +452,28 @@ fn c_reuse_and_conflict_repair_preserve_the_required_storage_tie() {
 #[test]
 fn reading_a_through_the_c_operand_requires_copying_before_mutation() {
     let plan = plan(&repeated_a_fixture());
-    let (reads, writes) = plan
+    let (reads, writes, c_operand) = plan
         .dag
         .node_weights()
         .find_map(|node| match node {
             BufferNode::Compute {
                 op, reads, writes, ..
-            } if op.as_any().is::<CublasLtAccumulateInPlace>() => Some((reads, writes)),
+            } if op.as_any().is::<CublasLtAccumulateInPlace>() => Some((
+                reads,
+                writes,
+                op.as_any()
+                    .downcast_ref::<CublasLtAccumulateInPlace>()
+                    .unwrap()
+                    .destination_operand(),
+            )),
             _ => None,
         })
         .unwrap();
     assert_ne!(
-        reads[0], reads[2],
+        reads[0], reads[c_operand],
         "A must retain its old contents during the GEMM"
     );
-    assert_eq!(reads[2], writes[0]);
+    assert_eq!(reads[c_operand], writes[0]);
 }
 #[cfg(feature = "device")]
 fn execute_fixture(fixture: Fixture, keep_c: bool) {

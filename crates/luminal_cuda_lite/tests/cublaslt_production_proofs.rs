@@ -640,14 +640,14 @@ fn in_place_accumulation_requires_identical_layouts_and_bufferizer_honors_the_ti
                 in_place, !padded,
                 "padded C cannot be the dense D destination"
             );
-            assert_eq!(reads[2] == writes[0], in_place);
+            assert_eq!(reads[call.c.unwrap().operand] == writes[0], in_place);
             assert_ne!(reads[0], writes[0]);
             assert_ne!(reads[1], writes[0]);
             println!(
                 "ALIAS padded_C={padded}: C={:?}, D={:?}, same_buffer={}",
                 call.c,
                 call.d,
-                reads[2] == writes[0]
+                reads[call.c.unwrap().operand] == writes[0]
             );
         }
         assert_eq!(count, 1);

@@ -189,7 +189,10 @@ fn frontend_strided_batches_are_admitted_and_descriptors_match_every_address() {
                     assert_eq!(call.c.unwrap().descriptor, call.d);
                     let tie = op.alias_info();
                     assert_eq!(tie.len(), 1);
-                    assert_eq!((tie[0].operand, tie[0].result), (2, 0));
+                    assert_eq!(
+                        (tie[0].operand, tie[0].result),
+                        (op.destination_operand(), 0)
+                    );
                     assert_eq!(tie[0].sharing, luminal::layout_ir::Sharing::Must);
                 }
             }
@@ -372,9 +375,15 @@ fn batched_c_and_d_descriptor_pitches_are_proved_independently() {
     for call in witnesses {
         assert_eq!(call.c.unwrap().descriptor.batch_count, 2);
         assert_eq!(call.d.batch_count, 2);
-        call.validate_against(&[24, 40, 53], 39).unwrap();
-        assert!(call.validate_against(&[24, 40, 52], 39).is_err());
-        assert!(call.validate_against(&[24, 40, 53], 38).is_err());
+        let mut capacities = vec![1; call.form.lit_arity() + call.scalars.input_count()];
+        capacities[0] = 24;
+        capacities[1] = 40;
+        let c_operand = call.c.unwrap().operand;
+        capacities[c_operand] = 53;
+        call.validate_against(&capacities, 39).unwrap();
+        assert!(call.validate_against(&capacities, 38).is_err());
+        capacities[c_operand] = 52;
+        assert!(call.validate_against(&capacities, 39).is_err());
     }
     // Search may materialize C into another layout to enable accumulation;
     // every such in-place candidate must still prove one identical descriptor.
