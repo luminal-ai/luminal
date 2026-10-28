@@ -495,11 +495,30 @@ impl Translator<'_> {
         self.bool_or(positive, negative)
     }
 
+    /// torch's `x == 0`, elementwise: a `Bool` tensor that is true exactly
+    /// at the zeros (both signed zeros, and integer or Bool zero).
+    ///
+    /// Invariant: NaN is not zero, and neither is any nonzero value however
+    /// small. This is `ScalarLiteral::is_zero` for tensors. Callers that
+    /// mirror a torch `== 0` or truth test (`bool`, `any`, `nonzero`, the
+    /// order-0 norm's count) need exactly this. So does every guard that
+    /// substitutes a value at zero (`f(0)` endpoints, safe denominators):
+    /// a NaN must fall through to the general formula and propagate.
+    /// The ordered spelling `!(x < 0 || x > 0)` reads NaN as zero, because
+    /// both comparisons are false for NaN; the IEEE `eq` counts the
+    /// unordered case. The test runs at a precision that keeps zero-ness
+    /// exact. F64 stays F64, because narrowing to F32 flushes
+    /// `|x| <= 2^-150` to zero. Every other dtype widens to F32, where no
+    /// nonzero integer, Bool or narrower float rounds to zero and a NaN
+    /// stays NaN.
     pub(super) fn is_zero(&mut self, value: GraphTensor) -> GraphTensor {
-        let x = value.cast(DType::F32);
-        let zero = self.cx.constant_f32(0.0).expand_rhs(x.dims());
-        let nonzero = self.bool_or(x.lt(zero), x.gt(zero));
-        self.bool_not(nonzero)
+        let x = if value.dtype == DType::F64 {
+            value
+        } else {
+            value.cast(DType::F32)
+        };
+        let zero = self.constant_like(x, 0.0);
+        x.eq(zero)
     }
 
     /// The IEEE sign bit of a floating `value`, as `torch.signbit` reads it.

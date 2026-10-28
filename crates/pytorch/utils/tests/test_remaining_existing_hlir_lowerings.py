@@ -1177,6 +1177,227 @@ def test_pdist_pair_order_is_exact_past_f32_integer_range(monkeypatch, rows) -> 
     _check_pdist_real_path(monkeypatch, torch.randn(rows, 1), 1.0)
 
 
+# ---- zero tests read NaN as nonzero ----
+#
+# The order-0 "norm" counts the entries with `x != 0`. `NaN != 0` holds, so
+# a NaN difference (`nan - x`, `inf - inf`) counts, while two signed zeros
+# cancel to a zero that does not. Every other lowering that asks "is this
+# zero?" (the translator's `is_zero`, which is torch's `== 0`) must also read
+# NaN as nonzero, whether it counts nonzeros, tests truth, or substitutes a
+# value at zero. Each op below is a stage-1 arm, so these run the real
+# backend path.
+
+_NAN, _INF = float("nan"), float("inf")
+_NORM_ORDERS = (0, 1, 2, 3, 0.5, -1, _INF, -_INF)
+_DIFFERENCE_CASES = {
+    "nan-minus-finite": ([_NAN, 1.0, 0.0, 5.0], [0.0, 1.0, 0.0, 2.0]),
+    "inf-minus-inf": ([_INF, 1.0, -_INF, 5.0], [_INF, 1.0, -_INF, 2.0]),
+    "signed-zeros": ([-0.0, 0.0, -0.0, 3.0], [0.0, -0.0, -0.0, -1.0]),
+}
+_FLOAT_DTYPES = pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64], ids=str
+)
+
+
+class DistOrders(torch.nn.Module):
+    def __init__(self, orders):
+        super().__init__()
+        self.orders = orders
+
+    def forward(self, lhs, rhs):
+        return tuple(torch.dist(lhs, rhs, p) for p in self.orders)
+
+
+@_FLOAT_DTYPES
+@pytest.mark.parametrize("case", sorted(_DIFFERENCE_CASES))
+def test_dist_orders_count_nan_differences(case, dtype, monkeypatch) -> None:
+    lhs, rhs = _DIFFERENCE_CASES[case]
+    inputs = (torch.tensor(lhs, dtype=dtype), torch.tensor(rhs, dtype=dtype))
+    # A `-0` difference is checked at order 0 only: at the negative orders
+    # it meets a separate defect (the float `abs` keeps the sign of `-0`, so
+    # `|-0|^-1` is `-inf`).
+    orders = (0,) if case == "signed-zeros" else _NORM_ORDERS
+    module = DistOrders(orders)
+    compiled, attempts = _backend_path(module, monkeypatch)
+    actual = compiled(*inputs)
+    _assert_stage_one(attempts, "aten.dist.default")
+    expected = module(*inputs)
+    # The order-0 count is exact. The other orders go through pow at F32.
+    _assert_close(actual[0], expected[0], rtol=0, atol=0)
+    _assert_close(actual[1:], expected[1:], rtol=1e-5, atol=1e-6)
+
+
+class VectorNormOrderZero(torch.nn.Module):
+    def forward(self, value):
+        return (
+            torch.linalg.vector_norm(value, 0, dim=1),
+            torch.linalg.vector_norm(value, 0),
+        )
+
+
+@_FLOAT_DTYPES
+def test_vector_norm_order_zero_counts_nan(dtype, monkeypatch) -> None:
+    value = torch.tensor(
+        [[_NAN, 0.0, 1.0], [0.0, -0.0, _INF], [-0.0, _NAN, _NAN]], dtype=dtype
+    )
+    module = VectorNormOrderZero()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    actual = compiled(value)
+    _assert_stage_one(attempts, "aten.linalg_vector_norm.default")
+    _assert_close(actual, module(value), rtol=0, atol=0)
+
+
+class PairwiseOrderZero(torch.nn.Module):
+    def forward(self, x1, x2):
+        return torch.cdist(x1, x2, 0), torch.pdist(torch.cat([x1, x2]), 0)
+
+
+@_FLOAT_DTYPES
+def test_cdist_pdist_order_zero_follow_the_cpu_kernel_on_nan(
+    dtype, monkeypatch
+) -> None:
+    # Unlike dist and vector_norm, ATen's CPU cdist/pdist kernels map each
+    # |difference| d to min(ceil(d), 1). A NaN difference therefore makes
+    # that pair's count NaN, and an infinite one still counts 1. The CUDA
+    # kernel counts `d != 0` instead. The lowering follows the CPU kernel,
+    # so the reference is computed on CPU whatever the backend.
+    x1 = torch.tensor(
+        [[_NAN, 1.0, 0.0], [1.0, 2.0, 3.0], [_INF, 0.0, -0.0]], dtype=dtype
+    )
+    x2 = torch.tensor([[0.0, 1.0, 0.0], [1.0, 5.0, 3.0], [_INF, 0.0, 0.0]], dtype=dtype)
+    module = PairwiseOrderZero()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    actual = compiled(x1, x2)
+    _assert_stage_one(
+        attempts, "aten._cdist_forward.default", "aten._pdist_forward.default"
+    )
+    expected = module(x1.cpu(), x2.cpu())
+    _assert_close(tuple(value.cpu() for value in actual), expected, rtol=0, atol=0)
+
+
+class ZeroTestedFunctions(torch.nn.Module):
+    def forward(self, value, x, degree, samples, edges):
+        return (
+            torch.nonzero_static(value, size=8, fill_value=-3),
+            torch.special.spherical_bessel_j0(value),
+            torch.special.ndtri(value),
+            # Nonnegative and NaN inputs only: a negative real angle is a
+            # separate defect (the lowering's copy_sign reads a zero sign as 0).
+            torch.angle(value),
+            torch.special.chebyshev_polynomial_t(x, degree),
+            torch.histogram(samples, edges),
+        )
+
+
+@_FLOAT_DTYPES
+def test_zero_tests_read_nan_as_nonzero(dtype, monkeypatch) -> None:
+    # `tiny` is nonzero but below F32's range at F64: the test must not
+    # narrow it to zero.
+    tiny = 1e-300 if dtype == torch.float64 else 1e-30
+    inputs = (
+        torch.tensor([_NAN, 0.0, -0.0, tiny, 0.3, 1.0, 2.0, _INF], dtype=dtype),
+        torch.tensor([_NAN, _NAN, _NAN, 0.3, 1.0, -1.0], dtype=dtype),
+        torch.tensor([0.0, 1.0, 25.0, 25.0, 25.0, 25.0], dtype=dtype),
+        # An infinite last edge holds an equal infinite sample.
+        torch.tensor([0.5, _INF, 2.0, -1.0, _NAN, 1.0], dtype=dtype),
+        torch.tensor([0.0, 1.0, _INF], dtype=dtype),
+    )
+    module = ZeroTestedFunctions()
+    compiled, attempts = _backend_path(module, monkeypatch)
+    actual = compiled(*inputs)
+    _assert_stage_one(
+        attempts,
+        "aten.nonzero_static.default",
+        "aten.special_spherical_bessel_j0.default",
+        "aten.special_ndtri.default",
+        "aten.angle.default",
+        "aten.special_chebyshev_polynomial_t.default",
+        "aten.histogram.bins_tensor",
+    )
+    _assert_close(actual, module(*inputs))
+
+
+class ComplexZeroTests(torch.nn.Module):
+    def __init__(self, function):
+        super().__init__()
+        self.function = function
+
+    def forward(self, real, imag, other_real, other_imag):
+        return self.function(
+            torch.complex(real, imag), torch.complex(other_real, other_imag)
+        )
+
+
+# name -> (function of (z, w), z parts, w parts, stage-1 target). The complex
+# values are built in the graph from real inputs.
+_COMPLEX_ZERO_TEST_CASES = {
+    "bool": (
+        lambda z, w: z.bool(),
+        [[_NAN, 0.0], [0.0, _NAN], [0.0, 0.0], [1.0, 0.0]],
+        None,
+        "aten._to_copy.default",
+    ),
+    "any": (
+        lambda z, w: z.reshape(2, 2).any(dim=1),
+        [[_NAN, 0.0], [0.0, 0.0], [0.0, 0.0], [-0.0, 0.0]],
+        None,
+        "aten.any.dim",
+    ),
+    "logical_not": (
+        lambda z, w: torch.logical_not(z),
+        [[_NAN, 0.0], [0.0, _NAN], [0.0, 0.0], [1.0, 0.0]],
+        None,
+        "aten.logical_not.default",
+    ),
+    "sqrt": (
+        lambda z, w: torch.view_as_real(torch.sqrt(z)),
+        [[_NAN, 1.0], [0.0, _NAN], [0.0, 0.0], [4.0, 0.0]],
+        None,
+        "aten.sqrt.default",
+    ),
+    "div": (
+        lambda z, w: torch.view_as_real(w / z),
+        [[_NAN, 0.0], [0.0, _NAN], [2.0, 1.0]],
+        [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+        "aten.div.Tensor",
+    ),
+    "pow": (
+        lambda z, w: torch.view_as_real(w**z),
+        [[_NAN, 0.0], [0.0, _NAN], [0.0, 0.0]],
+        [[2.0, 1.0], [2.0, 1.0], [2.0, 1.0]],
+        "aten.pow.Tensor_Tensor",
+    ),
+    "acos": (
+        lambda z, w: torch.view_as_real(torch.acos(z)),
+        [[_NAN, _NAN], [0.0, _NAN], [0.5, 0.2]],
+        None,
+        "aten.acos.default",
+    ),
+    # A negative real part is a separate defect (copy_sign of a zero sign).
+    "angle": (
+        lambda z, w: torch.angle(z),
+        [[_NAN, 0.0], [0.0, _NAN], [0.0, 0.0], [1.0, 0.0]],
+        None,
+        "aten.angle.default",
+    ),
+}
+
+
+@_FLOAT_DTYPES
+@pytest.mark.parametrize("case", sorted(_COMPLEX_ZERO_TEST_CASES))
+def test_complex_zero_tests_read_nan_as_nonzero(case, dtype, monkeypatch) -> None:
+    function, z_parts, w_parts, target = _COMPLEX_ZERO_TEST_CASES[case]
+    z = torch.tensor(z_parts, dtype=dtype)
+    w = torch.tensor(z_parts if w_parts is None else w_parts, dtype=dtype)
+    inputs = (z[:, 0], z[:, 1], w[:, 0], w[:, 1])
+    inputs = tuple(value.contiguous() for value in inputs)
+    module = ComplexZeroTests(function)
+    compiled, attempts = _backend_path(module, monkeypatch)
+    actual = compiled(*inputs)
+    _assert_stage_one(attempts, target)
+    _assert_close(actual, module(*inputs))
+
+
 class TrilinearAndEmbeddingBag(torch.nn.Module):
     def forward(self, left, right, weight, bias, indices, offsets, sample_weights):
         return (

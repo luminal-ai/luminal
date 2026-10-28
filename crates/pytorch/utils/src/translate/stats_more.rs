@@ -30,22 +30,6 @@ pub(super) enum DistVariant {
     Pdist,
 }
 
-/// True for storage dtypes that can carry a NaN.
-fn dtype_can_contain_nan(dtype: DType) -> bool {
-    !matches!(
-        dtype,
-        DType::Int
-            | DType::I64
-            | DType::I4
-            | DType::U4
-            | DType::I8
-            | DType::U8
-            | DType::I16
-            | DType::U16
-            | DType::Bool
-    )
-}
-
 /// Expand `[k]` / `[k, k, ..]` spatial lists to exactly `spatial` entries.
 fn expand_spatial(values: &[i64], spatial: usize, default: i64) -> Result<Vec<usize>> {
     let values = if values.is_empty() {
@@ -188,23 +172,53 @@ impl Translator<'_> {
         }
     }
 
-    /// The p-norm of already-real-valued `magnitude` over `axes`.
-    fn p_norm(&mut self, magnitude: GraphTensor, p: f64, axes: Vec<usize>) -> GraphTensor {
-        if p == 0.0 {
-            let zero = self.constant_like(magnitude, 0.0);
-            let nonzero = self.bool_or(magnitude.lt(zero), magnitude.gt(zero));
-            nonzero.cast(magnitude.dtype).sum(axes)
-        } else if p == 1.0 {
+    /// `torch.linalg.vector_norm` of the already-real-valued `magnitude`
+    /// over `axes`. `dist(a, b, p)` is this norm of `a - b`.
+    ///
+    /// Order 0 counts the nonzero entries, torch's sum of `x != 0`. A NaN
+    /// entry is nonzero, so it counts once (`inf - inf` included):
+    /// `util::is_zero` is torch's `== 0`, which is false for NaN.
+    fn vector_norm_reduce(
+        &mut self,
+        magnitude: GraphTensor,
+        ord: f64,
+        axes: Vec<usize>,
+    ) -> GraphTensor {
+        if ord == 0.0 {
+            let zero = self.is_zero(magnitude);
+            zero.logical_not().cast(magnitude.dtype).sum(axes)
+        } else if ord == 1.0 {
             magnitude.sum(axes)
-        } else if p == 2.0 {
+        } else if ord == 2.0 {
             magnitude.square().sum(axes).sqrt()
-        } else if p == f64::INFINITY {
+        } else if ord == f64::INFINITY {
             magnitude.max(axes)
-        } else if p == f64::NEG_INFINITY {
+        } else if ord == f64::NEG_INFINITY {
             magnitude.min(axes)
         } else {
-            magnitude.pow(p as f32).sum(axes).pow((1.0 / p) as f32)
+            magnitude.pow(ord as f32).sum(axes).pow((1.0 / ord) as f32)
         }
+    }
+
+    /// The norm `_cdist_forward` and `_pdist_forward` take over each pair's
+    /// `|difference|` row. It is the vector norm, except at order 0.
+    ///
+    /// At order 0, ATen's CPU kernels (`zdist_calc` in
+    /// DistanceOpsKernel.cpp) map each entry `d` to `min(ceil(d), 1)`. That
+    /// is 0 at zero, 1 at any other ordered value, and NaN at NaN, so one NaN
+    /// difference makes the pair's count NaN. The vector norm and `dist`
+    /// count the same entry as 1. Eager disagrees with itself across these
+    /// ops, and this lowering follows each op. The CUDA kernel (`dists::zero`
+    /// in DistanceKernel.cu) counts `d != 0` instead; the parity oracle here
+    /// is CPU eager.
+    fn p_norm(&mut self, magnitude: GraphTensor, p: f64, axes: Vec<usize>) -> GraphTensor {
+        if p != 0.0 {
+            return self.vector_norm_reduce(magnitude, p, axes);
+        }
+        let zero = self.is_zero(magnitude);
+        let indicator = zero.logical_not().cast(magnitude.dtype);
+        let nan = magnitude.is_nan();
+        self.select(nan, magnitude, indicator).sum(axes)
     }
 
     /// `linalg_vector_norm` after the caller constructed real magnitudes.
@@ -238,30 +252,7 @@ impl Translator<'_> {
             );
         }
 
-        let reduced = if ord == 0.0 {
-            let zero = self.constant_like(magnitude, 0.0);
-            let ordered = self.bool_or(magnitude.lt(zero), magnitude.gt(zero));
-            let nonzero = if dtype_can_contain_nan(magnitude.dtype) {
-                let nan = self.is_nan(magnitude);
-                self.bool_or(ordered, nan)
-            } else {
-                ordered
-            };
-            nonzero.cast(output_dtype).sum(axes.clone())
-        } else if ord == 1.0 {
-            magnitude.sum(axes.clone())
-        } else if ord == 2.0 {
-            magnitude.square().sum(axes.clone()).sqrt()
-        } else if ord == f64::INFINITY {
-            magnitude.max(axes.clone())
-        } else if ord == f64::NEG_INFINITY {
-            magnitude.min(axes.clone())
-        } else {
-            magnitude
-                .pow(ord as f32)
-                .sum(axes.clone())
-                .pow((1.0 / ord) as f32)
-        };
+        let reduced = self.vector_norm_reduce(magnitude, ord, axes.clone());
         Ok(self.restore_reduced_dims(reduced, &axes, keepdim))
     }
 
@@ -284,7 +275,7 @@ impl Translator<'_> {
                 let magnitude = self.real_abs(difference).cast(self.compute_dtype(node)?);
                 let p = self.get_float_arg(node, 2).unwrap_or(2.0);
                 let axes = (0..magnitude.rank()).collect();
-                Ok(self.p_norm(magnitude, p, axes))
+                Ok(self.vector_norm_reduce(magnitude, p, axes))
             }
             DistVariant::Cdist => {
                 let lhs = self.get_input_tensor(node, 0)?;
@@ -707,7 +698,9 @@ impl Translator<'_> {
             let right = util::reshape_tensor(right, &edge_shape).expand(full_shape.clone());
 
             let below_right = column.lt(right);
-            let equal_right = self.is_zero(column - right);
+            // `column == right`, not `column - right == 0`: an infinite last
+            // edge holds an equal infinite sample, and `inf - inf` is NaN.
+            let equal_right = column.eq(right);
             let mut last_position = self.cx.arange(bins);
             let last_index = self
                 .cx
