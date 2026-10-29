@@ -173,7 +173,8 @@ were observed to choose ties away from zero. Both are accepted by this policy.
 `CublasLtTensorFloat32Computation` maps to `CUBLAS_COMPUTE_32F_FAST_TF32`.
 Both operands must prove the exact authored cast chain, including through pure
 views, and join the same computation variant and complete whitelist row. Its
-224 rows use F32 A/B storage, F32 accumulation and F32 output. The call reads
+448 rows across host/device scalar modes use F32 A/B storage, F32 accumulation
+and F32 output. The call reads
 pre-cast F32 storage and delegates input conversion to cuBLASLt. Earlier
 narrowing remains in that storage source. Casts after multiplication/reduction
 cannot authorize this mode. The proof composes with rank-two epilogues,
