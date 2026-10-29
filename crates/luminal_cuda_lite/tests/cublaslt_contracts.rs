@@ -189,6 +189,7 @@ fn call_for(form: CublasLtForm) -> LtCall {
     };
     LtCall {
         computation: luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32,
+        reduction_scheme_mask: luminal_cuda_lite::ops::cublaslt::exec::LtReductionSchemeMask::All,
         form,
         m,
         n,
@@ -302,6 +303,7 @@ fn ld_bounds_violation_refuses_before_dispatch() {
     // ROW order): D is 1x8 — needs 8 elements; give it 4.
     let call = LtCall {
         computation: luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32,
+        reduction_scheme_mask: luminal_cuda_lite::ops::cublaslt::exec::LtReductionSchemeMask::All,
         form: CublasLtForm::Base,
         m: 1,
         n: 8,

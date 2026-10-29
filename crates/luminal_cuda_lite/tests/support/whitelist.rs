@@ -32,7 +32,7 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
         }
     };
     format!(
-        "(CublasLtConfigurationOf ({}) ({:?}) ({:?}) ({:?}) {} ({:?}) {} ({}) ({}) ({}) ({}) ({}) ({}) ({}))",
+        "(CublasLtConfigurationOf ({}) ({:?}) ({:?}) ({:?}) {} ({:?}) {} ({}) ({}) ({}) ({}) ({}) ({}) ({}) ({}))",
         call.computation.egglog_constructor(),
         scale,
         call.a_dtype,
@@ -59,7 +59,8 @@ fn resolved_key(call: &LtCall, scale: luminal::dtype::PlanDtype) -> String {
         order(call.b.order),
         order(call.d.order),
         op(call.trans_a),
-        op(call.trans_b)
+        op(call.trans_b),
+        call.reduction_scheme_mask.egglog_constructor()
     )
 }
 pub fn approved_keys() -> std::collections::BTreeSet<String> {

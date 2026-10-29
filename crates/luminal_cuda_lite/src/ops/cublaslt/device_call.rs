@@ -6,7 +6,9 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::exec::{LtActivation, LtCall, LtComputation, LtDesc, LtOrder, LtScalars};
+use super::exec::{
+    LtActivation, LtCall, LtComputation, LtDesc, LtOrder, LtReductionSchemeMask, LtScalars,
+};
 
 /// Workspace owned by US (contract: no silent fallback algos). 32 MiB —
 /// cuBLASLt's own recommendation ceiling for pre-Hopper devices is
@@ -347,21 +349,23 @@ pub fn prepare(
     }
     .map_err(|e| anyhow!("workspace preference: {e:?}"))?;
 
-    if matches!(
-        call.d_dtype,
-        luminal::dtype::PlanDtype::F16 | luminal::dtype::PlanDtype::Bf16
-    ) {
-        // The graph rounds only the final output. Split-K reductions must
-        // keep their partial sums in FP32, never the narrow output type.
-        // NONE (zero) remains available alongside COMPUTE_TYPE.
-        let reduction_mask =
-            sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
-        unsafe {
-            lt::set_matmul_pref_attribute(pref.raw,
-                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
-                (&reduction_mask) as *const _ as *const _, std::mem::size_of::<u32>())
-        }.map_err(|e| anyhow!("FP32 intermediate reduction preference: {e:?}"))?;
+    let reduction_mask = match call.reduction_scheme_mask {
+        LtReductionSchemeMask::All => {
+            sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_MASK as u32
+        }
+        LtReductionSchemeMask::ComputeType => {
+            sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32
+        }
+    };
+    unsafe {
+        lt::set_matmul_pref_attribute(
+            pref.raw,
+            sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+            (&reduction_mask) as *const _ as *const _,
+            std::mem::size_of::<u32>(),
+        )
     }
+    .map_err(|e| anyhow!("reduction scheme preference: {e:?}"))?;
 
     if call.computation == LtComputation::TensorFloat32 {
         // FAST_TF32 alone permits a full-F32 algorithm (observed for 1x1 on

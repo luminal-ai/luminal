@@ -641,7 +641,7 @@
    (= ?configuration
      (CublasLtConfigurationOf ?computation_type ?scalar_data_type ?A_storage_data_type ?B_storage_data_type
        ?C_matrix_data_type ?D_storage_data_type ?bias_data_type ?scalar_pointer_mode ?epilogue ?A_matrix_order
-       ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
+       ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation ?reduction_scheme_mask))
    (cublaslt-approved-configuration ?configuration))
   ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor ?C_matrix_argument
      ?bias_argument ?D_matrix_descriptor  ?expression_frame ?scalar_arguments))

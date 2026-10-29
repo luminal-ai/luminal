@@ -112,6 +112,23 @@ impl LtComputation {
     }
 }
 
+/// Allowed reduction schemes, elected by the complete whitelist configuration.
+/// Both masks permit NONE (zero), so this does not require split-K execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtReductionSchemeMask {
+    All,
+    ComputeType,
+}
+
+impl LtReductionSchemeMask {
+    pub fn egglog_constructor(self) -> &'static str {
+        match self {
+            Self::All => "CublasLtReductionSchemeMaskAll",
+            Self::ComputeType => "CublasLtReductionSchemeMaskComputeType",
+        }
+    }
+}
+
 /// Host values retain their declared precision, including signed zero and NaN bits.
 /// Device values are ordinary read operands; replay reads their current bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +203,7 @@ impl LtScalars {
 pub struct LtCall {
     pub form: CublasLtForm,
     pub computation: LtComputation,
+    pub reduction_scheme_mask: LtReductionSchemeMask,
     pub m: i64,
     pub n: i64,
     pub k: i64,

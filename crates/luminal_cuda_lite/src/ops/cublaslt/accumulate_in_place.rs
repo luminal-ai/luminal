@@ -3,9 +3,11 @@
 use super::CublasLtForm;
 use super::approved::{
     Bias, DECLARATIONS, Matrix, RULES, Scalars, WHITELIST, activation, bias, capture_dimensions,
-    computation, dtype, matrix, member, scalars,
+    computation, dtype, matrix, member, reduction_scheme_mask, scalars,
 };
-use super::exec::{LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation};
+use super::exec::{
+    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtReductionSchemeMask,
+};
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
 use luminal::egglog_snippet::{EgglogSnippet, SpliceCategory};
@@ -77,6 +79,7 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
         Box::new(CublasLtAccumulateInPlace {
             configuration: site.child_class(0),
             computation,
+            reduction_scheme_mask: reduction_scheme_mask(site, &child(14)),
             logical_a: semantic(2),
             logical_b: semantic(3),
             logical_out: semantic(1),
@@ -98,6 +101,7 @@ impl OpMatcher for CublasLtAccumulateInPlaceMatcher {
 pub struct CublasLtAccumulateInPlace {
     pub configuration: ClassId,
     pub computation: LtComputation,
+    pub reduction_scheme_mask: LtReductionSchemeMask,
     pub logical_a: ClassId,
     pub logical_b: ClassId,
     pub logical_out: ClassId,
@@ -119,6 +123,7 @@ impl CublasLtAccumulateInPlace {
         Self {
             configuration: base.configuration,
             computation: base.computation,
+            reduction_scheme_mask: base.reduction_scheme_mask,
             logical_a: base.logical_a,
             logical_b: base.logical_b,
             logical_out: base.logical_out,
@@ -142,6 +147,7 @@ impl CublasLtAccumulateInPlace {
         let c_and_d = self.c_and_d.resolve(dims);
         LtCall {
             computation: self.computation,
+            reduction_scheme_mask: self.reduction_scheme_mask,
             form: if self.bias.is_some() {
                 CublasLtForm::AccumulateBias
             } else {

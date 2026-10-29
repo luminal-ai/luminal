@@ -339,7 +339,7 @@
    (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_data_type
      ?A_storage_data_type ?B_storage_data_type (CublasLtNoCMatrixDataType) ?D_storage_data_type
      (CublasLtNoBiasDataType) ?scalar_pointer_mode (CublasLtDefaultEpilogue)
-     ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
+     ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation ?reduction_scheme_mask))
    (cublaslt-approved-configuration ?configuration)
    (cublaslt-arithmetic-type ?scalar_data_type ?zero ?one)
    (cublaslt-scalar-arguments ?alpha ?zero ?scalar_data_type ?scalar_pointer_mode ?scalar_arguments ?scalar_inputs))
@@ -381,7 +381,7 @@
    (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_data_type
      ?A_storage_data_type ?B_storage_data_type (CublasLtCMatrixDataTypeOf ?D_storage_data_type) ?D_storage_data_type
      (CublasLtNoBiasDataType) ?scalar_pointer_mode (CublasLtDefaultEpilogue)
-     ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
+     ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation ?reduction_scheme_mask))
    (cublaslt-approved-configuration ?configuration)
    (cublaslt-scalar-arguments ?alpha ?beta ?scalar_data_type ?scalar_pointer_mode ?scalar_arguments ?scalar_inputs))
   ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor

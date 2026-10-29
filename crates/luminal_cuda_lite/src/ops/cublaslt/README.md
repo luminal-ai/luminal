@@ -179,9 +179,19 @@ product from activation after BF16 rounding. These tuples remain deliberately
 unwhitelisted. Their graphs retain FP32 calls and explicit final casts; adding
 cast tolerance does not authorize a new arithmetic boundary.
 
-For narrow outputs, dispatch restricts split-K reductions to FP32 workspace
-partials or no split-K reduction, excluding reduction through the narrow output
-type. The selected bias argument carries an explicit dtype and operand index;
+Every complete whitelist row explicitly selects its reduction-scheme mask.
+FP32/TF32-to-FP32 and FP64-to-FP64 rows allow all schemes (`0x7`). Narrow-output
+rows select compute-type workspace partials (`0x2`), preserving FP32 partial
+sums and excluding reduction through the narrow output type. Both masks allow
+`NONE` (`0`); neither requires split-K. Admission binds the mask from the row,
+both executable forms retain it, and dispatch translates it directly into
+`CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK`. The whitelist is the sole policy
+source; there is no independent dtype-derived mask or egglog policy relation.
+Table-validation tests check the agreed policy, and a restricted FP32 test row
+proves that changing the whitelist changes both executable forms for ordinary
+and batched calls.
+
+The selected bias argument carries an explicit dtype and operand index;
 dispatch configures its vendor type and checks capacities using its real width.
 The reference runtime has native two-byte FP16/BF16 payloads, exact widening,
 explicit narrowing, and bit-preserving payload movement for these graphs.

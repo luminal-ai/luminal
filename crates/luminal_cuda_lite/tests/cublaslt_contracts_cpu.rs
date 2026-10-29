@@ -16,6 +16,7 @@ fn call(form: CublasLtForm) -> LtCall {
     };
     LtCall {
         computation: luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32,
+        reduction_scheme_mask: luminal_cuda_lite::ops::cublaslt::exec::LtReductionSchemeMask::All,
         form,
         m: 4,
         n: 3,

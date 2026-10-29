@@ -2,7 +2,8 @@
 //! decodes the elected configuration and evaluates its descriptor expressions.
 use super::CublasLtForm;
 use super::exec::{
-    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder, LtScalars,
+    LtActivation, LtBiasInput, LtCMatrixInput, LtCall, LtComputation, LtDesc, LtOrder,
+    LtReductionSchemeMask, LtScalars,
 };
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
 use luminal::dtype::PlanDtype;
@@ -98,6 +99,7 @@ impl OpMatcher for ApprovedCublasLtMatcher {
         Box::new(ApprovedCublasLt {
             configuration: site.child_class(0),
             computation,
+            reduction_scheme_mask: reduction_scheme_mask(site, &child(14)),
             logical_a: semantic(2),
             logical_b: semantic(3),
             logical_out: semantic(1),
@@ -253,6 +255,25 @@ pub(super) fn computation(site: &ExtractionSite<'_>, class: &ClassId) -> LtCompu
     panic!("cuBLASLt approved contract: unsupported computation constructor in {class}");
 }
 
+pub(super) fn reduction_scheme_mask(
+    site: &ExtractionSite<'_>,
+    class: &ClassId,
+) -> LtReductionSchemeMask {
+    for mask in [
+        LtReductionSchemeMask::All,
+        LtReductionSchemeMask::ComputeType,
+    ] {
+        if site
+            .nodes_in_class_value(class, mask.egglog_constructor())
+            .next()
+            .is_some()
+        {
+            return mask;
+        }
+    }
+    panic!("cuBLASLt approved contract: unsupported reduction scheme mask in {class}");
+}
+
 pub(super) fn activation(site: &ExtractionSite<'_>, class: &ClassId) -> LtActivation {
     if site
         .nodes_in_class_value(class, "CublasLtRectifiedLinearEpilogue")
@@ -340,6 +361,7 @@ impl Matrix {
 pub struct ApprovedCublasLt {
     pub configuration: ClassId,
     pub computation: LtComputation,
+    pub reduction_scheme_mask: LtReductionSchemeMask,
     pub logical_a: ClassId,
     pub logical_b: ClassId,
     pub logical_out: ClassId,
@@ -372,6 +394,7 @@ impl ApprovedCublasLt {
         Self {
             configuration: ClassId::from("prototype"),
             computation: LtComputation::Float32,
+            reduction_scheme_mask: LtReductionSchemeMask::All,
             logical_a: matrix.tensor.clone(),
             logical_b: matrix.tensor.clone(),
             logical_out: matrix.tensor.clone(),
@@ -403,6 +426,7 @@ impl ApprovedCublasLt {
         let d = self.d.resolve(dims);
         LtCall {
             computation: self.computation,
+            reduction_scheme_mask: self.reduction_scheme_mask,
             form: match (self.c.is_some(), self.bias.is_some()) {
                 (false, false) => CublasLtForm::Base,
                 (false, true) => CublasLtForm::Bias,

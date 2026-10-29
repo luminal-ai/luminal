@@ -6,7 +6,7 @@ use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::approved::{
     ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST,
 };
-use luminal_cuda_lite::ops::cublaslt::exec::LtActivation;
+use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtReductionSchemeMask};
 
 fn saturate(model: &Graph, whitelist: &str) -> EGraph {
     let matchers: Vec<_> = luminal_cuda_lite::cuda_registry()
@@ -176,6 +176,149 @@ fn approved_relu_fuses_the_complete_accumulation_and_bias_expression() {
 
 #[path = "support/whitelist.rs"]
 mod whitelist;
+
+/// Read only the top-level fields: nested C/bias dtype constructors stay intact.
+fn configuration_fields(key: &str) -> Vec<&str> {
+    let body = key
+        .strip_prefix("(CublasLtConfigurationOf ")
+        .unwrap()
+        .strip_suffix(')')
+        .unwrap();
+    let mut fields = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, c) in body.char_indices() {
+        match c {
+            '(' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    fields.push(&body[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(depth, 0);
+    assert_eq!(fields.len(), 15);
+    fields
+}
+
+#[test]
+fn every_whitelist_row_declares_the_agreed_intermediate_reduction_policy() {
+    let keys = whitelist::approved_keys();
+    assert_eq!(keys.len(), 2304);
+    assert_eq!(
+        WHITELIST
+            .matches("(cublaslt-approved-configuration")
+            .count(),
+        keys.len()
+    );
+    let mut all = 0;
+    let mut compute_type = 0;
+    for key in keys {
+        let fields = configuration_fields(&key);
+        let expected = match (fields[0], fields[5]) {
+            ("(CublasLtFloat32Computation)", "(F16)" | "(Bf16)") => {
+                compute_type += 1;
+                "(CublasLtReductionSchemeMaskComputeType)"
+            }
+            ("(CublasLtFloat32Computation)" | "(CublasLtTensorFloat32Computation)", "(F32)")
+            | ("(CublasLtFloat64Computation)", "(F64)") => {
+                all += 1;
+                "(CublasLtReductionSchemeMaskAll)"
+            }
+            pair => panic!("unexpected computation/output combination: {pair:?}"),
+        };
+        assert_eq!(fields[14], expected, "{key}");
+    }
+    assert_eq!((all, compute_type), (1920, 384));
+}
+
+#[test]
+fn whitelist_mask_reaches_both_executable_forms_for_matrices_and_batches() {
+    use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
+        CONSTRUCTOR as IN_PLACE_CONSTRUCTOR, CublasLtAccumulateInPlace,
+        CublasLtAccumulateInPlaceMatcher,
+    };
+
+    for batched in [false, true] {
+        for with_c in [false, true] {
+            let mut model = Graph::new();
+            let shape = |rows, cols| {
+                if batched {
+                    vec![2, rows, cols]
+                } else {
+                    vec![rows, cols]
+                }
+            };
+            let a = model.tensor(shape(3, 8), DType::F32);
+            let b = model.tensor(shape(8, 4), DType::F32);
+            let product = a.matmul(b);
+            let mut prototype = ApprovedCublasLt::prototype();
+            if with_c {
+                let c = model.tensor(shape(3, 4), DType::F32);
+                let _out = product + c;
+                prototype.c = Some(prototype.d.clone());
+                prototype.scalars =
+                    luminal_cuda_lite::ops::cublaslt::approved::Scalars::host(1.0, 1.0);
+            }
+            for mask in [
+                LtReductionSchemeMask::All,
+                LtReductionSchemeMask::ComputeType,
+            ] {
+                // Deliberately restrict an F32 row too. The table must control
+                // dispatch even when this differs from the production policy.
+                prototype.reduction_scheme_mask = mask;
+                let key = whitelist::key(&prototype);
+                let table = format!("(cublaslt-approved-configuration {key})");
+                let graph = saturate(&model, &table);
+                let separate = calls(&graph);
+                assert!(
+                    !separate.is_empty(),
+                    "batched={batched}, C={with_c}, mask={mask:?}"
+                );
+                for call in separate {
+                    assert_eq!(whitelist::key(&call), key);
+                    assert_eq!(call.reduction_scheme_mask, mask);
+                    let resolved = call.resolve(&Default::default());
+                    assert_eq!(resolved.reduction_scheme_mask, mask);
+                    assert_eq!(resolved.d.batch_count, if batched { 2 } else { 1 });
+                }
+                let index = SerializedIndex::new(&graph);
+                let mut in_place = 0;
+                for (id, node) in &graph.nodes {
+                    if node.subsumed || node.op != IN_PLACE_CONSTRUCTOR {
+                        continue;
+                    }
+                    let op = CublasLtAccumulateInPlaceMatcher.extract(&ExtractionSite {
+                        egraph: &graph,
+                        node_id: id,
+                        node,
+                        index: &index,
+                    });
+                    let op = op
+                        .as_any()
+                        .downcast_ref::<CublasLtAccumulateInPlace>()
+                        .unwrap();
+                    assert_eq!(whitelist::in_place_key(op), key);
+                    assert_eq!(op.reduction_scheme_mask, mask);
+                    let resolved = op.resolve(&Default::default());
+                    assert_eq!(resolved.reduction_scheme_mask, mask);
+                    assert_eq!(resolved.d.batch_count, if batched { 2 } else { 1 });
+                    in_place += 1;
+                }
+                assert_eq!(in_place > 0, with_c);
+            }
+        }
+    }
+}
+
 #[test]
 fn every_approved_configuration_has_a_real_graph_witness_and_no_others_exist() {
     let witnesses = whitelist::witnesses();

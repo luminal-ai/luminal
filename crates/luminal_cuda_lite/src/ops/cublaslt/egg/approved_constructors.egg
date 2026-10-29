@@ -8,6 +8,11 @@
   (CublasLtFloat32Computation)
   (CublasLtTensorFloat32Computation)
   (CublasLtFloat64Computation))
+; This is selected by the complete whitelist row, not inferred from storage.
+; NONE (zero) is allowed by either mask; neither mask forces split-K.
+(datatype CublasLtReductionSchemeMask
+  (CublasLtReductionSchemeMaskAll)
+  (CublasLtReductionSchemeMaskComputeType))
 ; Pointer location is an approved API capability; values belong to the call.
 (datatype CublasLtScalarPointerMode
   (CublasLtHostScalarPointerMode) (CublasLtDeviceScalarPointerMode))
@@ -44,7 +49,7 @@
   (CublasLtCMatrixInput CublasLtMatrixDescriptor))
 (datatype CublasLtBiasArgument (CublasLtBiasAbsent) (CublasLtBiasInput LayoutTensor Dtype))
 ; Full configuration: compute, scale, A/B/D storage, C/bias storage or absence,
-; scalar pointer mode, epilogue, A/B/D orders, A/B operations. Matrix and batch
+; scalar pointer mode, epilogue, A/B/D orders, A/B operations, reduction mask. Matrix and batch
 ; geometry live in the descriptors and require the corresponding layout proofs.
 (datatype CublasLtConfiguration
   (CublasLtConfigurationOf
@@ -61,7 +66,8 @@
     CublasLtMatrixOrder        ; B order
     CublasLtMatrixOrder        ; D order; C must have the same order
     CublasLtMatrixOperation    ; op(A)
-    CublasLtMatrixOperation))  ; op(B)
+    CublasLtMatrixOperation    ; op(B)
+    CublasLtReductionSchemeMask)) ; allowed intermediate reduction schemes
 ; A frame ties every component to one complete expression. The first tensor
 ; is the original expression; the second is the output in the API call frame.
 (datatype CublasLtExpressionFrame
