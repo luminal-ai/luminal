@@ -371,7 +371,8 @@ exclude generic cast/view materializers so they must consume shared storage
 and fused rounding directly; production search still has those legal alternatives.
 All 17 device-enabled batch regressions pass, including the original 1,152
 disjoint-batch witnesses. Formatting and device-enabled CUDA Lite Clippy with
-`-D warnings` pass.
+`-D warnings` pass. The five-package landing sweep passes 681 tests with 54
+existing ignores.
 
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its
