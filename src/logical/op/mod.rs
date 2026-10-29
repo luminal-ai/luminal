@@ -139,6 +139,9 @@ impl LogicalOp for LogicalTensorNamed {
 }
 
 mod add;
+mod and;
+mod bits_to_bools;
+mod bools_to_bits;
 mod cast;
 mod ceil;
 mod constant;
@@ -154,6 +157,8 @@ mod less_than;
 mod log2;
 mod modulo;
 mod mul;
+mod not;
+mod or;
 mod recip;
 mod reduce_max;
 mod reduce_sum;
@@ -171,6 +176,9 @@ mod unspecified_order_scan_prod;
 mod unspecified_order_scan_sum;
 
 pub use add::LogicalAdd;
+pub use and::LogicalAnd;
+pub use bits_to_bools::LogicalBitsToBools;
+pub use bools_to_bits::LogicalBoolsToBits;
 pub use cast::LogicalCast;
 pub use ceil::LogicalCeil;
 pub use constant::LogicalConstant;
@@ -186,6 +194,8 @@ pub use less_than::LogicalLessThan;
 pub use log2::LogicalLog2;
 pub use modulo::LogicalMod;
 pub use mul::LogicalMul;
+pub use not::LogicalNot;
+pub use or::LogicalOr;
 pub use recip::LogicalRecip;
 pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
@@ -213,6 +223,11 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
         vec![
             Box::new(LogicalTensorInputLit),
             Box::new(LogicalTensorNamed),
+            Box::new(LogicalBitsToBools),
+            Box::new(LogicalBoolsToBits),
+            Box::new(LogicalAnd),
+            Box::new(LogicalOr),
+            Box::new(LogicalNot),
             Box::new(LogicalSqrt),
             Box::new(LogicalExp),
             Box::new(LogicalFloor),

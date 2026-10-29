@@ -63,6 +63,9 @@ pub mod dps;
 pub mod egglog_snippet;
 pub mod extraction;
 pub mod index_expr;
+#[cfg(test)]
+#[path = "egglog_core/int_normalization_tests.rs"]
+mod int_normalization_tests;
 #[path = "layout/ir.rs"]
 pub mod layout_ir;
 #[path = "buffer/memory.rs"]

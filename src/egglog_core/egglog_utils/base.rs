@@ -242,6 +242,7 @@ pub struct BaseSorts {
     /// Egglog sort for `DType::I64`. Named `"Int64"` (not `"I64"`) to avoid
     /// shadowing egglog's built-in `I64` primitive sort.
     pub int64_dt: SortDef,
+    pub uint64_dt: SortDef,
     pub bool_dt: SortDef,
     pub f4e2m1_dt: SortDef,
     pub f8e4m3fn_dt: SortDef,
@@ -336,6 +337,7 @@ impl BaseSorts {
             bf16_dt: sort(DTYPE, "Bf16", &[]),
             int_dt: sort(DTYPE, "Int", &[]),
             int64_dt: sort(DTYPE, "Int64", &[]),
+            uint64_dt: sort(DTYPE, "UInt64", &[]),
             bool_dt: sort(DTYPE, "Bool", &[]),
             f4e2m1_dt: sort(DTYPE, "F4E2M1", &[]),
             f8e4m3fn_dt: sort(DTYPE, "F8E4M3FN", &[]),
@@ -405,6 +407,7 @@ impl BaseSorts {
             &self.bf16_dt,
             &self.int_dt,
             &self.int64_dt,
+            &self.uint64_dt,
             &self.bool_dt,
             &self.f4e2m1_dt,
             &self.f8e4m3fn_dt,

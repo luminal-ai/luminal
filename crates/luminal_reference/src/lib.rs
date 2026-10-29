@@ -15,6 +15,7 @@
 //! 2026-09-04; it was a verbatim copy here through Phases 1-7).
 
 pub mod bindings;
+mod bit_encoding;
 pub mod compiled_artifact;
 /// The e-graph walk, in core: every runtime calls it with its own
 /// matcher list and it names no runtime type. Kept under this crate's
@@ -24,6 +25,7 @@ mod egraph_postpass;
 pub mod harness;
 pub mod kernels;
 pub mod layouts;
+pub mod narrow_float;
 pub mod ops;
 pub mod runtime;
 pub mod search;

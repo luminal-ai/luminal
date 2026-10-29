@@ -1,0 +1,2 @@
+(rule ((= ?out (LogicalOr ?a ?b)) (= ?s (shape-of ?a)) (= ?s (shape-of ?b)))
+    ((set (shape-of ?out) ?s)) :ruleset prop :name "or/shape")

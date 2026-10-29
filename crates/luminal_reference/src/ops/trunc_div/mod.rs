@@ -134,6 +134,10 @@ pub(crate) fn kernel(
                 anyhow::anyhow!("i32 trunc-div refuses: {a} / {b} (zero divisor or MIN/-1)")
             })
         }),
+        TypedBuffer::U64(_) => ctx.binary_elementwise_u64(|a, b| {
+            a.checked_div(b)
+                .ok_or_else(|| anyhow::anyhow!("uint64 division by zero"))
+        }),
         TypedBuffer::I64(_) => ctx.binary_elementwise_i64(|a, b| {
             a.checked_div(b).ok_or_else(|| {
                 anyhow::anyhow!("i64 trunc-div refuses: {a} / {b} (zero divisor or MIN/-1)")

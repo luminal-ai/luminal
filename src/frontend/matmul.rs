@@ -41,126 +41,75 @@ impl GraphTensor {
         self.matmul_body(rhs)
     }
 
-    fn matmul_body(mut self, rhs: GraphTensor) -> Self {
-        // FOLD-2 REMOVED (Austin's ruling 2026-08-26): matmul records
-        // DIRECT broadcast applies — one apply per operand mapping it
-        // into the shared mul space P, via record_view_map — instead of
-        // permute/expand/merge scaffolding. The recorded chain is exactly
-        // the canonical form ReduceSum(Mul(apply(a,...,P), apply(b,...,P))).
-        // A user's own permute stays an explicit view node feeding these.
-        if (self.rank() == 1 || self.rank() == 2) && rhs.rank() == 2 {
-            let vec = self.rank() == 1;
-            if vec {
-                self = self.expand_dim(0, 1);
-            }
-            let (m, k) = self.dims2();
-            let (rk, n) = rhs.dims2();
-            assert_dims_eq(k, rk, "contract dim");
-            // P = [m, n, k]: lhs map (c2, c0), rhs map (c0, c1).
-            let p = vec![m, n, k];
-            let mul = self.record_view_map(vec![c(2, m), c(0, k)], p.clone())
-                * rhs.record_view_map(vec![c(0, k), c(1, n)], p);
-
-            // Sum Reduce
-            let mut ret = mul.sum(vec![2]);
-            if vec {
-                ret = ret.squeeze(0);
-            }
-            ret
-        } else if self.rank() == 3 {
-            let (a, b, k) = self.dims3();
-            if rhs.rank() == 2 {
-                // ABKxKD -> ABD
-                let (rk, d) = rhs.dims2();
-                assert_dims_eq(k, rk, "contract dim");
-                // P = [a, b, d, k]: lhs (c3, c2, c0), rhs (c0, c1).
-                let p = vec![a, b, d, k];
-                let mul = self.record_view_map(vec![c(3, a), c(2, b), c(0, k)], p.clone())
-                    * rhs.record_view_map(vec![c(0, k), c(1, d)], p);
-
-                // Sum Reduce
-                mul.sum(vec![3])
-            } else if rhs.rank() == 3 {
-                // ABKxAKD -> ABD
-                let (ra, rk, d) = rhs.dims3();
-                assert_dims_eq(a, ra, "batch dim 0");
-                assert_dims_eq(k, rk, "contract dim");
-                // P = [a, b, d, k]: lhs (c3, c2, c0), rhs (c3, c0, c1).
-                let p = vec![a, b, d, k];
-                let mul = self.record_view_map(vec![c(3, a), c(2, b), c(0, k)], p.clone())
-                    * rhs.record_view_map(vec![c(3, a), c(0, k), c(1, d)], p);
-
-                // Sum Reduce
-                mul.sum(vec![3])
-            } else {
-                panic!(
-                    "Can't matmul lhs {:?} and rhs {:?}",
-                    self.dims(),
-                    rhs.dims()
-                )
-            }
-        } else if self.rank() == 4 {
-            let (a, b, cc, k) = self.dims4();
-            if rhs.rank() == 2 {
-                // ABCKxKE -> ABCE
-                let (rk, e) = rhs.dims2();
-                assert_dims_eq(k, rk, "contract dim");
-                // P = [a, b, c, e, k]: lhs (c4, c3, c2, c0), rhs (c0, c1).
-                let p = vec![a, b, cc, e, k];
-                let mul = self
-                    .record_view_map(vec![c(4, a), c(3, b), c(2, cc), c(0, k)], p.clone())
-                    * rhs.record_view_map(vec![c(0, k), c(1, e)], p);
-
-                // Sum Reduce
-                mul.sum(vec![4])
-            } else if rhs.rank() == 4 {
-                // ABCKxABKE -> ABCE
-                let (ra, rb, rk, e) = rhs.dims4();
-                assert_dims_eq(a, ra, "batch dim 0");
-                assert_dims_eq(b, rb, "batch dim 1");
-                assert_dims_eq(k, rk, "contract dim");
-                // P = [a, b, c, e, k]: lhs (c4, c3, c2, c0), rhs (c4, c3, c0, c1).
-                let p = vec![a, b, cc, e, k];
-                let mul = self
-                    .record_view_map(vec![c(4, a), c(3, b), c(2, cc), c(0, k)], p.clone())
-                    * rhs.record_view_map(vec![c(4, a), c(3, b), c(0, k), c(1, e)], p);
-
-                // Sum Reduce
-                mul.sum(vec![4])
-            } else {
-                panic!(
-                    "Can't matmul lhs {:?} and rhs {:?}",
-                    self.dims(),
-                    rhs.dims()
-                )
-            }
-        } else if self.rank() == 5 && rhs.rank() == 5 {
-            // ABCDKxABCKF -> ABCDF — fully direct, rank-preserving: the
-            // old merge/merge/permute/expand + post-sum split/split
-            // scaffolding dies with fold 2.
-            let (a, b, cc, d, k) = self.dims5();
-            let (ra, rb, rc, rk, f) = rhs.dims5();
-            assert_dims_eq(a, ra, "batch dim 0");
-            assert_dims_eq(b, rb, "batch dim 1");
-            assert_dims_eq(cc, rc, "batch dim 2");
-            assert_dims_eq(k, rk, "contract dim");
-            // P = [a, b, c, d, f, k]: lhs (c5, c4, c3, c2, c0), rhs (c5, c4, c3, c0, c1).
-            let p = vec![a, b, cc, d, f, k];
-            let mul = self.record_view_map(
-                vec![c(5, a), c(4, b), c(3, cc), c(2, d), c(0, k)],
-                p.clone(),
-            ) * rhs
-                .record_view_map(vec![c(5, a), c(4, b), c(3, cc), c(0, k), c(1, f)], p);
-
-            // Sum Reduce
-            mul.sum(vec![5])
-        } else {
-            panic!(
-                "Can't matmul lhs {:?} and rhs {:?}",
-                self.dims(),
-                rhs.dims()
-            )
+    fn matmul_body(mut self, mut rhs: GraphTensor) -> Self {
+        assert!(
+            self.rank() > 0 && rhs.rank() > 0,
+            "matmul requires non-scalar operands"
+        );
+        let lhs_vector = self.rank() == 1;
+        let rhs_vector = rhs.rank() == 1;
+        if lhs_vector {
+            self = self.expand_dim(0, 1);
         }
+        if rhs_vector {
+            rhs = rhs.expand_dim(1, 1);
+        }
+        let ad = self.dims();
+        let bd = rhs.dims();
+        let (m, k) = (ad[ad.len() - 2], ad[ad.len() - 1]);
+        let (rk, n) = (bd[bd.len() - 2], bd[bd.len() - 1]);
+        assert_dims_eq(k, rk, "contract dim");
+        let batches = (ad.len() - 2).max(bd.len() - 2);
+        let mut p = Vec::with_capacity(batches + 3);
+        for axis in 0..batches {
+            let a = axis.checked_sub(batches - (ad.len() - 2)).map(|i| ad[i]);
+            let b = axis.checked_sub(batches - (bd.len() - 2)).map(|i| bd[i]);
+            p.push(match (a, b) {
+                (Some(a), Some(b)) if a.to_usize() == Some(1) => b,
+                (Some(a), Some(b)) if b.to_usize() == Some(1) => a,
+                (Some(a), Some(b)) => {
+                    assert_dims_eq(a, b, "batch dim");
+                    a
+                }
+                (Some(d), None) | (None, Some(d)) => d,
+                (None, None) => unreachable!(),
+            });
+        }
+        p.extend([m, n, k]);
+        // Direct maps into [..., M, N, K] preserve the contraction's canonical
+        // form at every rank. A broadcast batch reads coordinate zero.
+        let batch_map = |dims: &[IntExpr]| {
+            let rank = dims.len() - 2;
+            (0..rank)
+                .map(|axis| {
+                    if dims[axis].to_usize() == Some(1) {
+                        MapEntry::Lit(0.into())
+                    } else {
+                        c(rank - axis + 2, dims[axis])
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut am = batch_map(&ad);
+        am.extend([c(2, m), c(0, k)]);
+        let mut bm = batch_map(&bd);
+        bm.extend([c(0, k), c(1, n)]);
+        let mut out = if k.to_usize() == Some(0) {
+            // An empty contraction is the additive identity, with no operand reads.
+            // Record it before constructing maps over an empty reduction domain.
+            p.pop();
+            self.graph().constant_i32(0).cast(self.dtype).expand_rhs(p)
+        } else {
+            let product = self.record_view_map(am, p.clone()) * rhs.record_view_map(bm, p);
+            product.sum(vec![batches + 2])
+        };
+        if rhs_vector {
+            out = out.squeeze(batches + 1);
+        }
+        if lhs_vector {
+            out = out.squeeze(batches);
+        }
+        out
     }
 
     /// Simple dot product of two vectors
@@ -250,6 +199,135 @@ mod tests {
                     .matmul(&b.reshape((12, 5, 6)).unwrap())
                     .unwrap()
                     .reshape((2, 2, 3, 4, 6))
+                    .unwrap()
+            },
+        );
+    }
+
+    #[test]
+    fn empty_contractions_are_zero_without_operand_reads() {
+        for (ad, bd, shape) in [
+            (vec![2, 0], vec![0, 3], vec![2, 3]),
+            (vec![0], vec![0], vec![]),
+        ] {
+            let mut cx = Graph::new();
+            let a = cx.tensor(ad, DType::F32);
+            let b = cx.tensor(bd, DType::F32);
+            let out = a.matmul(b);
+            assert_eq!(
+                out.dims()
+                    .iter()
+                    .map(|d| d.to_usize().unwrap())
+                    .collect::<Vec<_>>(),
+                shape
+            );
+            let rt = luminal_reference::harness::run_reference(
+                &cx,
+                &[
+                    (a.id, Vec::<f32>::new().into()),
+                    (b.id, Vec::<f32>::new().into()),
+                ],
+            );
+            assert!(rt.get_f32(out.id).unwrap().iter().all(|&v| v == 0.));
+        }
+    }
+
+    #[test]
+    fn vector_batch_reads_every_batch() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(vec![5], DType::F32);
+        let b = cx.tensor(vec![2, 5, 3], DType::F32);
+        let out = a.matmul(b);
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (a.id, vec![1f32, 2., 3., 4., 5.].into()),
+                (b.id, (0..30).map(|i| i as f32).collect::<Vec<_>>().into()),
+            ],
+        );
+        assert_eq!(
+            rt.get_f32(out.id).unwrap(),
+            &[120., 135., 150., 345., 360., 375.]
+        );
+    }
+
+    #[test]
+    fn vector_and_broadcast_matmuls_match_reference() {
+        test_binary(
+            vec![5],
+            vec![5],
+            |a, b| a.matmul(b),
+            |a, b| a.mul(&b).unwrap().sum_all().unwrap(),
+        );
+        test_binary(
+            vec![3, 5],
+            vec![5],
+            |a, b| a.matmul(b),
+            |a, b| {
+                a.matmul(&b.reshape((5, 1)).unwrap())
+                    .unwrap()
+                    .squeeze(1)
+                    .unwrap()
+            },
+        );
+        test_binary(
+            vec![5],
+            vec![2, 5, 3],
+            |a, b| a.matmul(b),
+            |a, b| {
+                a.reshape((1, 1, 5))
+                    .unwrap()
+                    .broadcast_as((2, 1, 5))
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
+                    .matmul(&b)
+                    .unwrap()
+                    .squeeze(1)
+                    .unwrap()
+            },
+        );
+        test_binary(
+            vec![2, 1, 3, 5],
+            vec![4, 5, 2],
+            |a, b| a.matmul(b),
+            |a, b| {
+                a.broadcast_as((2, 4, 3, 5))
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
+                    .reshape((8, 3, 5))
+                    .unwrap()
+                    .matmul(
+                        &b.broadcast_as((2, 4, 5, 2))
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((8, 5, 2))
+                            .unwrap(),
+                    )
+                    .unwrap()
+            },
+        );
+        test_binary(
+            vec![2, 1, 2, 1, 3, 5],
+            vec![2, 4, 5, 2],
+            |a, b| a.matmul(b),
+            |a, b| {
+                a.broadcast_as((2, 1, 2, 4, 3, 5))
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
+                    .reshape((16, 3, 5))
+                    .unwrap()
+                    .matmul(
+                        &b.broadcast_as((2, 1, 2, 4, 5, 2))
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((16, 5, 2))
+                            .unwrap(),
+                    )
                     .unwrap()
             },
         );

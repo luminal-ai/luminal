@@ -1,0 +1,5 @@
+(constructor LogicalBitsToBools (LogicalTensor) LogicalTensor)
+(constructor BitAppendDim (IntExprList IntExpr) IntExprList)
+(constructor BitPrefixCoords (IntExprList Shape i64) IntExprList)
+(relation bit-splitting-view (LogicalTensor Layout Layout))
+(relation bit-dims-complete (IntExprList))

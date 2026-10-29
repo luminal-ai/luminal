@@ -9,6 +9,7 @@
     (= ?out_logical (LogicalIota ?index_expression ?shape))
     (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
     (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
   )
   (
     (let ?layout_tensor_op

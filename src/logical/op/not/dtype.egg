@@ -1,0 +1,4 @@
+(rule ((= ?out (LogicalNot ?a)) (= ?dt (dtype-of ?a)))
+    ((set (dtype-of ?out) ?dt)) :ruleset prop :name "not/dtype")
+(rule ((= ?out (LogicalNot ?a)) (!= (dtype-of ?a) (Bool)) (!= (dtype-of ?a) (Bool8)))
+    ((panic "Boolean operation requires Bool or Bool8")) :ruleset main_ruleset :name "not/reject_non_boolean")

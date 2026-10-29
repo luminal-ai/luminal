@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpBoolsToBitsGeneric (LayoutTensor Dtype i64 Layout) LayoutTensorOp)

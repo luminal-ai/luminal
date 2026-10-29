@@ -126,8 +126,12 @@ pub trait ProgramSeams {
 /// primitives the core preamble contracts for. `(bigint-to-i64 z)` is the
 /// bounds lattice's only way back out of BigInt — PARTIAL, unmatched
 /// outside i64 range — and its one rule-side use is the [n,n] pin-collapse
-/// rule in the bounds section. A bare `EGraph::default()` cannot even
-/// parse the assembled program, so every runner goes through here.
+/// rule in the bounds section. `(exact-div a b)` is the partial exact
+/// quotient (i64 and BigInt) that the literal exact-division rules bind
+/// instead of carrying a nonzero-divisor premise, a zero-remainder
+/// premise and a bare `/` in the action. A bare `EGraph::default()`
+/// cannot even parse the assembled program, so every runner goes through
+/// here.
 pub fn new_egraph() -> egglog::EGraph {
     use egglog::sort::Z;
 
@@ -140,6 +144,22 @@ pub fn new_egraph() -> egglog::EGraph {
     egglog::add_primitive!(&mut egraph, "bigint-to-i64" = |a: Z| -?> i64 {
         i64::try_from(&*a).ok()
     });
+    // `(exact-div a b)`: the quotient when b divides a exactly — PARTIAL
+    // otherwise (b = 0, a nonzero remainder, or i64 overflow on MIN / -1).
+    // The rule-side spelling of "exact or no match": a rule that binds the
+    // result simply does not fire for inexact division, which is the one
+    // precondition every literal cancellation needs. Overloaded on i64
+    // (IntLit payloads) and BigInt (the bounds lattice).
+    egglog::add_primitive!(&mut egraph, "exact-div" = |a: i64, b: i64| -?> i64 {
+        match a.checked_rem(b) {
+            Some(0) => a.checked_div(b),
+            _ => None,
+        }
+    });
+    egglog::add_primitive!(&mut egraph, "exact-div" = |a: Z, b: Z| -?> Z {
+        (!num_traits::Zero::is_zero(&*b) && num_traits::Zero::is_zero(&*(a.clone() % b.clone())))
+            .then(|| a / b)
+    });
     // The vendored substitution primitive (egglog-experimental PR #60):
     // the preamble's subst road calls it from a :naive rule. The skip
     // set names the MEMO constructors the walk must treat as opaque
@@ -148,6 +168,16 @@ pub fn new_egraph() -> egglog::EGraph {
     egraph.add_full_primitive(
         crate::subst_primitive::Subst {
             skip: ["int-subst-of".to_string()].into_iter().collect(),
+        },
+        None,
+    );
+    egraph.add_full_primitive(
+        crate::subst_primitive::MemoizedSubst {
+            name: "memoized-int-subst".to_owned(),
+            cache_table: "int-subst-cache".to_owned(),
+            inner: crate::subst_primitive::Subst {
+                skip: ["int-subst-of".to_owned()].into_iter().collect(),
+            },
         },
         None,
     );
@@ -289,6 +319,45 @@ mod tests {
 "#,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn exact_div_is_partial_outside_exact_division() {
+        let mut eg = new_egraph();
+        eg.parse_and_run_program(
+            None,
+            r#"
+          (check (= (exact-div 6 2) 3))
+          (check (= (exact-div -6 2) -3))
+          (check (= (exact-div 6 -2) -3))
+          (check (= (exact-div 0 5) 0))
+          (fail (check (= (exact-div 7 2) 3)))
+          (fail (check (= (exact-div 7 2) 4)))
+          (fail (check (= (exact-div 6 0) 0)))
+          (fail (check (= (exact-div -9223372036854775808 -1) 0)))
+          (check (= (exact-div (bigint 6) (bigint 2)) (bigint 3)))
+          (fail (check (= (exact-div (bigint 7) (bigint 2)) (bigint 3))))
+          (fail (check (= (exact-div (bigint 7) (bigint 0)) (bigint 0))))
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn uint64_wraparound_does_not_acquire_an_unbounded_integer_interval() {
+        let mut eg = new_egraph();
+        eg.parse_and_run_program(None, &assembled_program_for(&[]))
+            .unwrap();
+        eg.parse_and_run_program(None,r#"
+          (let minus (LogicalCast (LogicalIota (IntLit -1) (ShapeLit (IntExprNil))) (UInt64)))
+          (let one (LogicalCast (LogicalIota (IntLit 1) (ShapeLit (IntExprNil))) (UInt64)))
+          (let wrap (LogicalAdd minus one))
+          (let square (LogicalMul minus minus))
+          (run-schedule (repeat 8 (seq (saturate (run prop)) (run main_ruleset))))
+          (check (= (value-lower-bound-of wrap) (bigint 0)))
+          (check (= (value-upper-bound-of wrap) (- (* (bigint 4294967296) (bigint 4294967296)) (bigint 1))))
+          (check (= (value-lower-bound-of square) (bigint 0)))
+        "#).unwrap();
     }
 
     /// The `prop` ruleset holds exactly the shape-of / dtype-of / rank-of

@@ -995,34 +995,18 @@ impl GraphTensor {
         self.pad_impl(padding, Some(elem))
     }
 
-    /// The shared pad body. `elem == None` is the zero fill: the masked
-    /// read alone, with no fill term recorded (zero padding of an F32
-    /// tensor is by far the common case and must not grow the graph).
-    fn pad_impl(self, padding: impl ToPad, elem: Option<GraphTensor>) -> GraphTensor {
-        let mut padding = padding.to_pad_vec();
-        padding.extend(vec![(0.into(), 0.into()); self.rank() - padding.len()]); // Make sure we have a padding per dim
-        if padding.iter().all(|(s, e)| *s == 0 && *e == 0) {
-            return self;
-        }
-        // Structure-preserving seam (see SliceView): the read half is a
-        // total clamped VIEW, the mask half a per-axis-structured indicator
-        // iota; both nodes lower to the legacy flat forms for the existing
-        // pipeline via their to_egglog.
-        let dims = self.dims();
-        let befores: Vec<IntExpr> = padding.iter().map(|(s, _)| *s).collect();
-        let afters: Vec<IntExpr> = padding.iter().map(|(_, e)| *e).collect();
-        // Frontend simplification restored (revert ruling 2026-08-27).
-        let out_dims: Vec<IntExpr> = dims
-            .iter()
-            .zip(&padding)
-            .map(|(d, (s, e))| (*d + *s + *e).simplify())
-            .collect();
-
-        // Pad's read half recorded as the TOTAL clamped view — per parent
-        // axis min(max(c - before, 0), dim - 1), clamp sides only where
-        // padding exists.
+    /// A total, range-safe read view over a padded output domain. Padding and
+    /// concatenation share the same coordinate mapping; selection decides which
+    /// source contributes each output value without arithmetic on that value.
+    fn clamped_padding_view(
+        self,
+        befores: &[IntExpr],
+        afters: &[IntExpr],
+        out_dims: Vec<IntExpr>,
+    ) -> GraphTensor {
         let clamped_id;
         {
+            let dims = self.dims();
             let rank = dims.len();
             let entries: Vec<crate::graph::MapEntry> = (0..rank)
                 .map(|k| {
@@ -1057,35 +1041,39 @@ impl GraphTensor {
                     .logical
                     .view_op(&operand, &entries, out_dims.clone(), self.dtype);
         }
-        let clamped =
-            GraphTensor::from_id(clamped_id, out_dims.clone(), self.graph_ref, self.dtype);
+        GraphTensor::from_id(clamped_id, out_dims, self.graph_ref, self.dtype)
+    }
 
+    /// Pad by selecting the source or fill, preserving non-finite values and
+    /// signed zero. Never emulate selection by multiplying by a numeric mask.
+    fn pad_impl(self, padding: impl ToPad, elem: Option<GraphTensor>) -> GraphTensor {
+        let mut padding = padding.to_pad_vec();
+        padding.extend(vec![(0.into(), 0.into()); self.rank() - padding.len()]);
+        if padding.iter().all(|(s, e)| *s == 0 && *e == 0) {
+            return self;
+        }
+        let dims = self.dims();
+        let befores: Vec<IntExpr> = padding.iter().map(|(s, _)| *s).collect();
+        let afters: Vec<IntExpr> = padding.iter().map(|(_, e)| *e).collect();
+        let out_dims: Vec<IntExpr> = dims
+            .iter()
+            .zip(&padding)
+            .map(|(d, (s, e))| (*d + *s + *e).simplify())
+            .collect();
+        let fill = elem
+            .unwrap_or_else(|| self.graph().constant_i32(0).cast(self.dtype))
+            .expand_rhs(out_dims.clone());
+        if dims.iter().any(|dim| dim.to_usize() == Some(0)) {
+            return fill;
+        }
+        let clamped = self.clamped_padding_view(&befores, &afters, out_dims.clone());
         let mask_id = self
             .graph()
             .logical
             .record_mask_iota(&befores, &afters, &dims);
-        // ARITHMETIC MASKING, restored 2026-09-03. Main #406's select_by_index
-        // (packed 2N iota + two scatter1d + gather1d, PR #471) was NaN-safe
-        // but made egglog saturation stop converging for rank >= 2 pads
-        // (core lib tests 15 s -> >76 min; LUM-805). KNOWN LEAK, tracked as
-        // LUM-804: the clamped view repeats edge values into the pad region
-        // and `0 * NaN` / `0 * Inf` is NaN, so padding a tensor that holds
-        // non-finite values poisons its padding. The fix owed is a native
-        // Bool8 select op, not a gather construction.
-        let mask = GraphTensor::from_id(mask_id, out_dims.clone(), self.graph_ref, DType::Int)
-            .cast(self.dtype);
-        let masked = clamped * mask;
-        match elem {
-            None => masked,
-            Some(elem) => {
-                let one = self
-                    .graph()
-                    .constant_i32(1)
-                    .cast(self.dtype)
-                    .expand_rhs(out_dims.clone());
-                masked + (one - mask) * elem.expand_rhs(out_dims)
-            }
-        }
+        let condition =
+            GraphTensor::from_id(mask_id, out_dims, self.graph_ref, DType::Int).cast(DType::Bool);
+        condition.select(clamped, fill)
     }
 
     /// Pad out dimensions of a tensor with an `f32` convenience value.
@@ -1097,14 +1085,14 @@ impl GraphTensor {
         if padding.iter().all(|(s, e)| *s == 0 && *e == 0) {
             return self;
         }
-        if elem == 0.0 {
+        if elem.to_bits() == 0 {
             return self.pad_impl(padding, None);
         }
         // The fill must be built in the tensor's own dtype: a float literal
         // cast to an integer tensor is a refused lossy read.
         let fill = match self.dtype {
             DType::F64 => self.graph().constant_f64(elem as f64),
-            DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
+            DType::Int | DType::I64 | DType::U64 | DType::I8 | DType::U8 | DType::I16 => {
                 self.graph().constant_i32(elem as i64).cast(self.dtype)
             }
             _ => self.graph().constant_f32(elem).cast(self.dtype),
@@ -1127,9 +1115,41 @@ impl GraphTensor {
 
     /// Concat along an existing dimension
     pub fn concat_along(self, rhs: GraphTensor, axis: usize) -> GraphTensor {
-        // Pad and add
-        self.pad_along(0, rhs.dims()[axis], axis, 0.)
-            + rhs.pad_along(self.dims()[axis], 0, axis, 0.)
+        let dims = self.dims();
+        let rhs_dims = rhs.dims();
+        assert_eq!(dims.len(), rhs_dims.len(), "concat ranks must match");
+        assert!(axis < dims.len(), "concat axis out of range");
+        assert_eq!(self.dtype, rhs.dtype, "concat dtypes must match");
+        for (dim, (left, right)) in dims.iter().zip(&rhs_dims).enumerate() {
+            assert!(
+                dim == axis || left.simplify().egglog_equal(right.simplify()),
+                "non-concatenated dimensions must match"
+            );
+        }
+        // A statically empty branch has no address that a clamped view can
+        // read. Concatenating it is exactly the other operand.
+        if dims[axis].to_usize() == Some(0) {
+            return rhs;
+        }
+        if rhs_dims[axis].to_usize() == Some(0) {
+            return self;
+        }
+        let mut out_dims = dims.clone();
+        out_dims[axis] = (dims[axis] + rhs_dims[axis]).simplify();
+        let zeros = vec![IntExpr::from(0); dims.len()];
+        let mut afters = zeros.clone();
+        afters[axis] = rhs_dims[axis];
+        let mut befores = zeros.clone();
+        befores[axis] = dims[axis];
+        let left = self.clamped_padding_view(&zeros, &afters, out_dims.clone());
+        let right = rhs.clamped_padding_view(&befores, &zeros, out_dims.clone());
+        let mask_id = self
+            .graph()
+            .logical
+            .record_mask_iota(&zeros, &afters, &dims);
+        let condition =
+            GraphTensor::from_id(mask_id, out_dims, self.graph_ref, DType::Int).cast(DType::Bool);
+        condition.select(left, right)
     }
 }
 

@@ -66,6 +66,149 @@ fn static_resize_dimensions(
 }
 
 impl Translator<'_> {
+    /// Rank-generic spatial resize. Batch and channel dimensions pass through;
+    /// only interpolation has arithmetic and it runs at the opmath dtype.
+    pub(super) fn translate_resize(&mut self, node: &Node, target: &str) -> Result<GraphTensor> {
+        let mut input = self.operand(&node.inputs[0])?;
+        let out = self.output_meta_shape(node)?;
+        let spatial = if target.contains("1d") {
+            1
+        } else if target.contains("2d") {
+            2
+        } else {
+            3
+        };
+        anyhow::ensure!(
+            input.rank() == spatial + 2 && out.len() == input.rank(),
+            "resize spatial rank mismatch"
+        );
+        let nearest = target.contains("nearest");
+        let exact = target.contains("exact");
+        let cubic = target.contains("bicubic");
+        let align = self.named_bool_arg(node, "align_corners").unwrap_or(false);
+        let vector_scales = node
+            .inputs
+            .iter()
+            .find(|i| i.name == "scale_factors")
+            .and_then(float_list_arg);
+        let names = match spatial {
+            1 => vec!["scales"],
+            2 => vec!["scales_h", "scales_w"],
+            _ => vec!["scales_d", "scales_h", "scales_w"],
+        };
+        for (dimension, scale_name) in names.iter().enumerate() {
+            let axis = dimension + 2;
+            let size = input.dims()[axis]
+                .to_usize()
+                .context("resize requires a static spatial input extent")?;
+            let output = out[axis]
+                .to_usize()
+                .context("resize requires a static spatial output extent")?;
+            anyhow::ensure!(
+                size > 0 && output > 0,
+                "resize requires positive spatial extents"
+            );
+            let scale = vector_scales
+                .as_ref()
+                .and_then(|s| s.get(dimension).copied())
+                .or_else(|| self.named_float_arg(node, scale_name));
+            if nearest && !exact {
+                input =
+                    self.upsample_nearest_axis(input, axis, size, output, scale, spatial == 2)?;
+                continue;
+            }
+            if size == output && ((!nearest && !cubic) || align || scale.is_none_or(|s| s == 1.0)) {
+                continue;
+            }
+            let coord_dtype = if input.dtype == DType::F64 && !nearest {
+                DType::F64
+            } else {
+                DType::F32
+            };
+            let pos = self.cx.arange(output).cast(coord_dtype);
+            let inverse = if align && !nearest {
+                if output > 1 {
+                    (size - 1) as f64 / (output - 1) as f64
+                } else {
+                    0.0
+                }
+            } else {
+                scale
+                    .filter(|s| *s > 0.0)
+                    .map_or(size as f64 / output as f64, |s| 1.0 / s)
+            };
+            let inv = self.constant_like(pos, inverse);
+            let half = self.constant_like(pos, 0.5);
+            let mut source = if align && !nearest {
+                pos * inv
+            } else {
+                (pos + half) * inv
+                    - if nearest {
+                        self.constant_like(pos, 0.0)
+                    } else {
+                        half
+                    }
+            };
+            if !cubic {
+                let zero = self.constant_like(source, 0.0);
+                source = source.maximum(zero);
+            }
+            let expand_index = |mut v: GraphTensor, shape: &[IntExpr]| {
+                for (d, &s) in shape.iter().enumerate() {
+                    if d != axis {
+                        v = v.expand_dim(d, s);
+                    }
+                }
+                v
+            };
+            let shape = input.dims();
+            if nearest {
+                let max = self.constant_like(source, (size - 1) as f64);
+                let index = source.minimum(max).trunc_cast(DType::Int);
+                input = self.upsample_gather_elements(input, expand_index(index, &shape), axis);
+            } else if cubic {
+                let base = source.floor();
+                let mut result = None;
+                for offset in -1..=2 {
+                    let off = self.constant_like(base, offset as f64);
+                    let unbounded = base + off;
+                    let distance = (source - unbounded).abs();
+                    let one = self.constant_like(distance, 1.0);
+                    let two = self.constant_like(distance, 2.0);
+                    let a = self.constant_like(distance, -0.75);
+                    let near = ((a + 2.0) * distance - (a + 3.0)) * distance * distance + one;
+                    let far = ((a * distance - a * 5.0) * distance + a * 8.0) * distance - a * 4.0;
+                    let zero = self.constant_like(distance, 0.0);
+                    let far = self.select(distance.lt(two), far, zero);
+                    let weight = self.select(distance.le(one), near, far).cast(input.dtype);
+                    let zero = self.constant_like(unbounded, 0.0);
+                    let max = self.constant_like(unbounded, (size - 1) as f64);
+                    let index = unbounded.maximum(zero).minimum(max).trunc_cast(DType::Int);
+                    let sample =
+                        self.upsample_gather_elements(input, expand_index(index, &shape), axis);
+                    let term = sample * expand_index(weight, &shape);
+                    result = Some(if let Some(sum) = result {
+                        sum + term
+                    } else {
+                        term
+                    });
+                }
+                input = result.unwrap();
+            } else {
+                let lower = source.trunc_cast(DType::Int);
+                let one = self.constant_like(source, 1.0);
+                let max = self.constant_like(source, (size - 1) as f64);
+                let upper = (source + one).minimum(max).trunc_cast(DType::Int);
+                let weight = (source - lower.cast(coord_dtype)).cast(input.dtype);
+                let left = self.upsample_gather_elements(input, expand_index(lower, &shape), axis);
+                let right = self.upsample_gather_elements(input, expand_index(upper, &shape), axis);
+                let weight = expand_index(weight, &shape);
+                let one = self.constant_like(weight, 1.0);
+                input = left * (one - weight) + right * weight;
+            }
+        }
+        Ok(input)
+    }
     /// Wrap negative gather indices into `[0, axis_dim)`. Mirrors the old
     /// translator's F32-based normalization (Int arithmetic is proof-gated);
     /// the upsample callers never emit negative indices, so this is a no-op
@@ -103,59 +246,6 @@ impl Translator<'_> {
         data.gather(&coordinates)
     }
 
-    pub(super) fn translate_upsample_nearest2d(&mut self, node: &Node) -> Result<GraphTensor> {
-        let input = self.operand(&node.inputs[0])?;
-        anyhow::ensure!(
-            input.rank() == 4,
-            "upsample_nearest2d expects a 4D (N, C, H, W) input, got {}D",
-            input.rank()
-        );
-
-        let input_height = input.dims()[2]
-            .to_usize()
-            .context("upsample_nearest2d requires a static input height")?;
-        let input_width = input.dims()[3]
-            .to_usize()
-            .context("upsample_nearest2d requires a static input width")?;
-
-        let output_shape = self.output_meta_shape(node)?;
-        anyhow::ensure!(
-            output_shape.len() == 4,
-            "upsample_nearest2d expects a 4D output, got {}D",
-            output_shape.len()
-        );
-        let output_height = output_shape[2]
-            .to_usize()
-            .context("upsample_nearest2d requires a static output height")?;
-        let output_width = output_shape[3]
-            .to_usize()
-            .context("upsample_nearest2d requires a static output width")?;
-
-        anyhow::ensure!(
-            input_height != 0 && input_width != 0 && output_height != 0 && output_width != 0,
-            "upsample_nearest2d requires non-zero spatial dims \
-             (in {input_height}x{input_width} -> out {output_height}x{output_width})"
-        );
-
-        // Optional explicit scale_factors (arg 2): ATen's general branch
-        // indexes by floor(j / s) when scales are provided, which differs
-        // from floor(j * in / out) when in * s is non-integral.
-        let scales: Option<(f64, f64)> =
-            node.inputs
-                .get(2)
-                .and_then(float_list_arg)
-                .and_then(|values| match values.as_slice() {
-                    [height, width] => Some((*height, *width)),
-                    _ => None,
-                });
-
-        let result =
-            self.upsample_nearest_axis(input, 2, input_height, output_height, scales.map(|s| s.0))?;
-        let result =
-            self.upsample_nearest_axis(result, 3, input_width, output_width, scales.map(|s| s.1))?;
-        Ok(result)
-    }
-
     /// Nearest-neighbor resample of one axis. `out == in` and `out == 2*in`
     /// are ATen kernel fast paths that ignore the scale, and integer scales
     /// matching out/in are pure shape movement (`expand_dim` + `merge_dims`).
@@ -169,11 +259,12 @@ impl Translator<'_> {
         in_dim: usize,
         out_dim: usize,
         scale: Option<f64>,
+        aten_2d_fast_path: bool,
     ) -> Result<GraphTensor> {
         if out_dim.is_multiple_of(in_dim) {
             let k = out_dim / in_dim;
             let scale_matches = scale.is_none_or(|s| (s - k as f64).abs() < 1e-9);
-            if k <= 2 || scale_matches {
+            if scale_matches || (aten_2d_fast_path && k <= 2) {
                 if k == 1 {
                     return Ok(t);
                 }
@@ -504,6 +595,8 @@ mod tests {
             TensorMeta {
                 dtype,
                 sizes: sizes(in_shape),
+                strides: None,
+                storage_offset: None,
                 layout: None,
                 device: None,
             },
@@ -513,6 +606,8 @@ mod tests {
             TensorMeta {
                 dtype,
                 sizes: sizes(out_shape),
+                strides: None,
+                storage_offset: None,
                 layout: None,
                 device: None,
             },

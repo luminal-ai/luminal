@@ -58,13 +58,13 @@ impl Translator<'_> {
         let a = self.operand(&node.inputs[0])?;
         let b = self.operand(&node.inputs[1])?;
         let (a, b) = util::broadcast_binary(a, b);
-        let (af, bf) = (a.cast(DType::F32), b.cast(DType::F32));
+        let (a, b) = (self.truth(a), self.truth(b));
         Ok(if or {
-            (af + bf).cast(DType::Bool)
+            a.logical_or(b)
         } else if xor {
-            af.ne(bf)
+            a.logical_or(b).logical_and(a.logical_and(b).logical_not())
         } else {
-            (af * bf).cast(DType::Bool)
+            a.logical_and(b)
         })
     }
 
@@ -78,7 +78,11 @@ impl Translator<'_> {
         let a = self.operand(&node.inputs[0])?;
         let b = self.operand(&node.inputs[1])?;
         let (a, b) = util::broadcast_binary(a, b);
-        Ok((b * a.log2()).exp2())
+        let result = (b * a.log2()).exp2();
+        // The logarithmic form yields NaN for zero exponents at zero or nonfinite bases.
+        let zero = self.constant_like(b, 0.0);
+        let one = self.constant_like(a, 1.0);
+        Ok(b.eq(zero).select(one, result))
     }
 
     pub(super) fn pow_scalar_base(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -87,14 +91,13 @@ impl Translator<'_> {
         let log_base = self
             .floating_scalar(base.ln(), b.dtype)
             .expand_rhs(b.dims());
-        Ok((b * log_base).exp())
+        let result = (b * log_base).exp();
+        let zero = self.constant_like(b, 0.0);
+        let one = self.constant_like(b, 1.0);
+        Ok(b.eq(zero).select(one, result))
     }
 
     pub(super) fn fmod_remainder(&mut self, node: &Node, fmod: bool) -> Result<GraphTensor> {
-        if fmod {
-            return self.binary(&node.inputs, |a, b| a % b);
-        }
-        // Python-style remainder: a - floor(a/b)*b.
         let a = self.operand(&node.inputs[0])?;
         let b = if let Some(t) = self.optional_tensor_operand(&node.inputs[1])? {
             t
@@ -102,6 +105,29 @@ impl Translator<'_> {
             self.scalar(&node.inputs[1], a.dtype)?
         };
         let (a, b) = util::broadcast_binary(a, b);
+        if matches!(
+            a.dtype,
+            DType::Int | DType::I64 | DType::I8 | DType::I16 | DType::U8
+        ) {
+            let dtype = a.dtype;
+            // Small integers compute in i32. Never pass integer payloads
+            // through floating division: even f64 cannot represent all i64s.
+            let (a, b) = if matches!(dtype, DType::Int | DType::I64) {
+                (a, b)
+            } else {
+                (a.cast(DType::Int), b.cast(DType::Int))
+            };
+            let r = a.trunc_rem(b);
+            if fmod {
+                return Ok(r.cast(dtype));
+            }
+            let adjust = self.remainder_sign_disagreement(r, b);
+            return Ok((r + b * adjust).cast(dtype));
+        }
+        if fmod {
+            return Ok(a % b);
+        }
+        // Floating Python-style remainder: a - floor(a/b)*b.
         Ok(a - (a / b).floor() * b)
     }
 
@@ -184,8 +210,26 @@ impl Translator<'_> {
             _ => x.dims()[dim],
         };
         let step = node.inputs.get(4).and_then(|i| i.arg.as_int()).unwrap_or(1);
+        anyhow::ensure!(step > 0, "slice step must be positive, got {step}");
         if step != 1 {
-            bail!("slice step {step} != 1 is not ported");
+            let name = Self::tensor_output_names(node)
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("slice has no output metadata"))?;
+            let shape = self.tensor_meta_to_shape(self.tensor_meta(&name)?)?;
+            let start = start.max(0).min(x.dims()[dim]);
+            let coords = (0..rank)
+                .map(|axis| {
+                    self.cx.iota(shape.clone(), |c| {
+                        if axis == dim {
+                            start + c[axis] * IntExpr::from(step)
+                        } else {
+                            c[axis]
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(x.gather(&coords));
         }
         let mut ranges: Vec<(IntExpr, IntExpr)> = x.dims().iter().map(|d| (0.into(), *d)).collect();
         ranges[dim] = (start, end);
@@ -256,7 +300,7 @@ impl Translator<'_> {
             .arg
             .as_tensors()
             .ok_or_else(|| anyhow::anyhow!("stack: first operand is not a tensor list"))?;
-        let axis = self.named_int_arg(node, "dim").unwrap_or(0).max(0) as usize;
+        let raw_axis = self.named_int_arg(node, "dim").unwrap_or(0);
         let mut values = Vec::with_capacity(tensors.len());
         for t in tensors {
             values.push(
@@ -266,6 +310,19 @@ impl Translator<'_> {
                     .ok_or_else(|| anyhow::anyhow!("stack: unknown tensor {}", t.name))?,
             );
         }
+        let first = values.first().context("stack: empty tensor list")?;
+        let output_rank = first.rank() + 1;
+        let axis = if raw_axis < 0 {
+            raw_axis + output_rank as i64
+        } else {
+            raw_axis
+        };
+        let axis = usize::try_from(axis)
+            .ok()
+            .filter(|axis| *axis < output_rank)
+            .with_context(|| {
+                format!("stack: axis {raw_axis} out of range for output rank {output_rank}")
+            })?;
         Ok(self.cx.stack(&values, axis))
     }
 
@@ -318,13 +375,30 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|i| i.arg.as_bool()))
             .unwrap_or(false);
         let dim = node.inputs.get(1).and_then(|i| i.arg.as_int());
-        let (result, axis) = match dim {
-            Some(d) => {
-                let axis = normalize_dim(d, x.rank());
-                let r = if max { x.argmax(axis) } else { x.argmin(axis) };
-                (r, Some(axis))
+        let rank = x.rank();
+        let axes = match dim {
+            Some(d) if rank == 0 => {
+                anyhow::ensure!(d == 0 || d == -1, "argextremum: scalar dim must be 0 or -1");
+                Vec::new()
             }
-            None => (if max { x.argmax(0) } else { x.argmin(0) }, None),
+            Some(d) => vec![normalize_dim(d, rank)],
+            None => (0..rank).collect(),
+        };
+        for &axis in &axes {
+            anyhow::ensure!(
+                x.dims()[axis].to_usize() != Some(0),
+                "argextremum: reduction axis {axis} must be nonempty"
+            );
+        }
+        let result = if rank == 0 {
+            self.cx.constant_i32(0)
+        } else if dim.is_none() {
+            let flat = util::reshape_tensor(x, &[x.dims().into_iter().product()]);
+            if max { flat.argmax(0) } else { flat.argmin(0) }
+        } else if max {
+            x.argmax(axes[0])
+        } else {
+            x.argmin(axes[0])
         };
         let dtype = self.output_meta_dtype(node).unwrap_or(DType::I64);
         let result = if result.dtype != dtype {
@@ -332,31 +406,6 @@ impl Translator<'_> {
         } else {
             result
         };
-        Ok(match (keepdim, axis) {
-            (true, Some(axis)) => result.expand_dim(axis, 1usize),
-            _ => result,
-        })
-    }
-
-    pub(super) fn translate_var(&mut self, node: &Node, std: bool) -> Result<GraphTensor> {
-        let x = self.operand(&node.inputs[0])?;
-        let dims = self.optional_int_list(node, 1)?;
-        let rank = x.rank();
-        let axes: Vec<usize> = if dims.is_empty() {
-            (0..rank).collect()
-        } else {
-            dims.iter().map(|&d| normalize_dim(d, rank)).collect()
-        };
-        let correction = self.named_int_arg(node, "correction").unwrap_or(1) as usize;
-        let result = if std {
-            x.std_options(axes.clone(), correction)
-        } else {
-            x.var_options(axes.clone(), correction)
-        };
-        let keepdim = self
-            .inputs_bool(node, "keepdim")
-            .or_else(|| node.inputs.get(3).and_then(|i| i.arg.as_bool()))
-            .unwrap_or(false);
         Ok(if keepdim {
             keep_axes(result, &axes)
         } else {
@@ -371,7 +420,8 @@ impl Translator<'_> {
         // output metadata has already resolved both cases, even when the
         // exported node has no dtype argument or explicit cast. Luminal's
         // scans themselves preserve their operand dtype.
-        let x = super::convert(x, self.output_meta_dtype(node)?);
+        let result = self.output_meta_dtype(node)?;
+        let x = super::convert(x, result);
         let dim = self.get_int_arg(node, 1)?;
         // A rank-0 scan is the identity AFTER the dtype conversion.
         if x.rank() == 0 {
@@ -381,11 +431,18 @@ impl Translator<'_> {
             return Ok(x);
         }
         let dim = normalize_dim(dim, x.rank());
-        Ok(if prod {
+        // The running total accumulates in the result dtype's opmath
+        // (ATen's `acc_type`: F32 for F16/BF16) and each partial sum is
+        // rounded to the result dtype once. A half-precision scan that
+        // rounded every step would drift by whole ulps of the total.
+        let compute = super::opmath_compute(result);
+        let x = super::convert(x, compute);
+        let scanned = if prod {
             x.cumprod(vec![dim])
         } else {
             x.cumsum(vec![dim])
-        })
+        };
+        Ok(super::convert(scanned, result))
     }
 
     /// `max.dim` / `min.dim`: values and indices into one graph.
@@ -492,14 +549,7 @@ impl Translator<'_> {
 
     pub(super) fn translate_scalar_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
         let dtype = self.output_meta_dtype(node)?;
-        let value = self.get_float_arg(node, 0)?;
-        let scalar = match dtype {
-            DType::F64 => self.cx.constant_f64(value),
-            DType::Int => self.cx.constant_i64(value as i64).cast(DType::Int),
-            DType::I64 => self.cx.constant_i64(value as i64),
-            _ => self.cx.constant_f32(value as f32).cast(dtype),
-        };
-        Ok(scalar)
+        self.scalar(&node.inputs[0], dtype)
     }
 
     pub(super) fn translate_where(
@@ -525,36 +575,26 @@ impl Translator<'_> {
     pub(super) fn translate_masked_fill_scalar(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
         let mask = self.operand(&node.inputs[1])?;
-        let value = self.get_float_arg(node, 2)? as f32;
-        let fill = self
-            .cx
-            .constant_f32(value)
-            .cast(x.dtype)
-            .expand_rhs(x.dims());
+        let fill = self.scalar(&node.inputs[2], x.dtype)?.expand_rhs(x.dims());
         // `masked_fill(mask, value)` = `where(mask, value, x)`.
         Ok(self.select(mask, fill, x))
     }
 
     pub(super) fn translate_clamp(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
-        let min = node.inputs.get(1).and_then(|i| i.arg.as_float());
-        let max = node.inputs.get(2).and_then(|i| i.arg.as_float());
-        let mut out = x;
-        if let Some(min) = min {
-            let bound = self
-                .cx
-                .constant_f32(min as f32)
-                .cast(x.dtype)
-                .expand_rhs(x.dims());
-            out = out.maximum(bound);
-        }
-        if let Some(max) = max {
-            let bound = self
-                .cx
-                .constant_f32(max as f32)
-                .cast(x.dtype)
-                .expand_rhs(x.dims());
-            out = out.minimum(bound);
+        let dtype = self.output_meta_dtype(node)?;
+        let mut out = super::convert(x, dtype);
+        for name in ["min", "max"] {
+            if let Some(input) = node.inputs.iter().find(|input| input.name == name)
+                && (input.arg.as_int().is_some() || input.arg.as_float().is_some())
+            {
+                let bound = self.scalar(input, dtype)?.expand_rhs(x.dims());
+                out = if name == "min" {
+                    out.maximum(bound)
+                } else {
+                    out.minimum(bound)
+                };
+            }
         }
         Ok(out)
     }
@@ -562,11 +602,11 @@ impl Translator<'_> {
     pub(super) fn translate_clamp_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
         let mut out = x;
-        if let Some(min) = self.optional_tensor_operand(&node.inputs[1])? {
+        if let Some(min) = self.named_tensor_operand(node, "min")? {
             let (out_b, min) = util::broadcast_binary(out, min);
             out = out_b.maximum(min);
         }
-        if let Some(max) = self.optional_tensor_operand(&node.inputs[2])? {
+        if let Some(max) = self.named_tensor_operand(node, "max")? {
             let (out_b, max) = util::broadcast_binary(out, max);
             out = out_b.minimum(max);
         }
@@ -677,4 +717,95 @@ fn keep_axes(mut t: GraphTensor, axes: &[usize]) -> GraphTensor {
         t = t.expand_dim(axis, 1usize);
     }
     t
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::super::test_support::*;
+    use crate::pt2_schema::{Argument, TensorName, TensorsArg};
+    use crate::translate::translate;
+
+    #[test]
+    fn stack_axes_use_the_output_rank() {
+        for input_shape in [vec![], vec![5], vec![2, 3]] {
+            let output_rank = input_shape.len() + 1;
+            for axis in 0..output_rank {
+                for raw_axis in [axis as i64, axis as i64 - output_rank as i64] {
+                    let mut shape = input_shape.clone();
+                    shape.insert(axis, 2);
+                    let parsed = parsed_nodes(
+                        vec![node(
+                            "torch.ops.aten.stack.default",
+                            vec![
+                                input(
+                                    "tensors",
+                                    Argument::Tensors(TensorsArg {
+                                        as_tensors: vec![
+                                            TensorName { name: "a".into() },
+                                            TensorName { name: "b".into() },
+                                        ],
+                                    }),
+                                ),
+                                scalar_int("dim", raw_axis),
+                            ],
+                            &["out"],
+                        )],
+                        &[
+                            ("a", FLOAT, &input_shape),
+                            ("b", FLOAT, &input_shape),
+                            ("out", FLOAT, &shape),
+                        ],
+                        &["a", "b"],
+                        &["out"],
+                    );
+                    let translated = translate(&parsed).unwrap();
+                    let actual = translated
+                        .graph
+                        .logical
+                        .value_dims(translated.outputs[0].tensor);
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|d| d.to_usize().unwrap())
+                            .collect::<Vec<_>>(),
+                        shape.iter().map(|d| *d as usize).collect::<Vec<_>>(),
+                        "axis {raw_axis}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stack_rejects_out_of_range_axes() {
+        for axis in [-3, 2] {
+            let parsed = parsed_nodes(
+                vec![node(
+                    "torch.ops.aten.stack.default",
+                    vec![
+                        input(
+                            "tensors",
+                            Argument::Tensors(TensorsArg {
+                                as_tensors: vec![
+                                    TensorName { name: "a".into() },
+                                    TensorName { name: "b".into() },
+                                ],
+                            }),
+                        ),
+                        scalar_int("dim", axis),
+                    ],
+                    &["out"],
+                )],
+                &[
+                    ("a", FLOAT, &[5]),
+                    ("b", FLOAT, &[5]),
+                    ("out", FLOAT, &[5, 2]),
+                ],
+                &["a", "b"],
+                &["out"],
+            );
+            let error = translate(&parsed).err().expect("invalid axis must fail");
+            assert!(format!("{error:#}").contains("out of range"));
+        }
+    }
 }

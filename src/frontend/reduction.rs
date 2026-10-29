@@ -18,6 +18,36 @@ impl GraphTensor {
         let mut axes = axes.to_axes();
         for dim in 0..axes.len() {
             let operand_dims = dims.clone();
+            // The empty sum is its dtype's additive identity. Do not make
+            // an empty producer executable just to discover there is no data
+            // to read (e.g. a rank-local dot over an uneven DTensor shard).
+            if !is_max && operand_dims[axes[dim]].to_usize() == Some(0) {
+                let mut out_dims = operand_dims;
+                out_dims.remove(axes[dim]);
+                let zero = match self.dtype {
+                    DType::F64 => self.graph().constant_f64(0.0),
+                    DType::Int
+                    | DType::I64
+                    | DType::U64
+                    | DType::I8
+                    | DType::U8
+                    | DType::I16
+                    | DType::U16
+                    | DType::I4
+                    | DType::U4
+                    | DType::Bool => self.graph().constant_i32(0).cast(self.dtype),
+                    _ => self.graph().constant_f32(0.0).cast(self.dtype),
+                };
+                id = zero.expand_rhs(out_dims.clone()).id;
+                dims = out_dims;
+                let axis = axes[dim];
+                for ax in &mut axes {
+                    if *ax > axis {
+                        *ax -= 1;
+                    }
+                }
+                continue;
+            }
             if is_max {
                 // The empty max has no value (extent-0 ruling
                 // 2026-08-13): the reduced axis contracts to >= 1 —
@@ -88,7 +118,7 @@ impl GraphTensor {
                 // literal cast to an integer tensor is a refused lossy read.
                 let one = match t.dtype {
                     DType::F64 => t.graph().constant_f64(1.0),
-                    DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
+                    DType::Int | DType::I64 | DType::U64 | DType::I8 | DType::U8 | DType::I16 => {
                         t.graph().constant_i32(1).cast(t.dtype)
                     }
                     _ => t.graph().constant_f32(1.0).cast(t.dtype),
@@ -228,6 +258,30 @@ mod tests {
         let rt =
             luminal_reference::harness::run_reference(&cx, &[(a.id, Vec::<f32>::new().into())]);
         assert_exact(rt.get_f32(b.id).unwrap(), &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn sum_over_empty_axes_is_zero_in_either_axis_order() {
+        for axes in [
+            vec![1],
+            vec![0, 1],
+            vec![1, 0],
+            vec![2, 1],
+            vec![1, 2],
+            vec![2, 0, 1],
+        ] {
+            let mut cx = Graph::new();
+            let a = cx.tensor(vec![2, 0, 3], DType::F32);
+            let b = a.sum(axes);
+            let count = b
+                .dims()
+                .iter()
+                .map(|d| d.to_usize().unwrap())
+                .product::<usize>();
+            let rt =
+                luminal_reference::harness::run_reference(&cx, &[(a.id, Vec::<f32>::new().into())]);
+            assert_exact(rt.get_f32(b.id).unwrap(), &vec![0.; count]);
+        }
     }
 
     /// `max` is IEEE 754-2019 `maximum`: a NaN anywhere in the slice is the

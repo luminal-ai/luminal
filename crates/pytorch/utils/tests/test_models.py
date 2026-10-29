@@ -2482,7 +2482,8 @@ class SdpaCausalModel(torch.nn.Module):
     """`F.scaled_dot_product_attention(q, k, v, is_causal=True)`.
 
     Tests the `is_causal` branch of `translate_sdpa`, which materializes a
-    triangular mask and adds `-1e9 * mask` to the pre-softmax scores.
+    triangular mask and selects `-inf` for the pre-softmax scores above the
+    diagonal.
     """
 
     def forward(
@@ -2524,6 +2525,61 @@ class SdpaGqaModel(torch.nn.Module):
         return torch.nn.functional.scaled_dot_product_attention(
             q, k, v, is_causal=self.is_causal, enable_gqa=True
         )
+
+
+class SdpaProjectedModel(torch.nn.Module):
+    """A QKV projection feeding SDPA. Its parameters require grad, so in
+    default grad mode AOTAutograd lowers SDPA to a fused variant and the
+    forward graph also returns the variant's saved-for-backward slots
+    (logsumexp, RNG state) as graph outputs."""
+
+    def __init__(self, is_causal: bool = False) -> None:
+        super().__init__()
+        self.qkv = torch.nn.Linear(16, 48)
+        self.is_causal = is_causal
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = (t.reshape(1, 8, 2, 8).transpose(1, 2) for t in (q, k, v))
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=self.is_causal
+        )
+
+
+class SdpaFusedCpuLogsumexpModel(torch.nn.Module):
+    """Both slots of torch's CPU fused kernel,
+    `_scaled_dot_product_flash_attention_for_cpu`: the attention output
+    and its per-query-row logsumexp. `mask` is `"none"`, `"float"` (an
+    additive bias) or `"bool"` (a keep-mask, handed to the kernel as the
+    `where(keep, 0, -inf)` bias torch.compile derives from a bool mask;
+    the kernel itself takes only a mask of the query dtype)."""
+
+    def __init__(self, is_causal: bool = False, mask: str = "none") -> None:
+        super().__init__()
+        self.is_causal = is_causal
+        self.mask = mask
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        if self.mask == "none":
+            attn_mask = None
+        elif self.mask == "bool":
+            attn_mask = torch.where(
+                mask,
+                torch.full((), 0.0, dtype=q.dtype),
+                torch.full((), float("-inf"), dtype=q.dtype),
+            )
+        else:
+            attn_mask = mask
+        out, lse = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu(
+            q, k, v, is_causal=self.is_causal, attn_mask=attn_mask
+        )
+        return out, lse
 
 
 class ReductionParityModel(torch.nn.Module):

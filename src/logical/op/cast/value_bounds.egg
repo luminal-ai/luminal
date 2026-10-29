@@ -59,3 +59,32 @@
   ((set (value-upper-bound-of ?out) ?upper))
   :ruleset main_ruleset :name "cast/value_bounds: Int64 to Int cast carries the upper bound"
 )
+
+; UInt64 is a wrapping unsigned ring. Its domain bounds are always sound;
+; signed-to-unsigned casts refine them only inside one modulo interval.
+(rule ((= (dtype-of ?out) (UInt64)))
+ ((set (value-lower-bound-of ?out) (bigint 0))
+  (set (value-upper-bound-of ?out) (- (* (bigint 4294967296) (bigint 4294967296)) (bigint 1))))
+ :ruleset main_ruleset :name "uint64/value_bounds: unsigned storage domain")
+(rule ((= ?out (LogicalCast ?in (UInt64)))
+       (= ?lo (value-lower-bound-of ?in)) (= ?hi (value-upper-bound-of ?in))
+       (>= ?lo (bigint 0)) (< ?hi (* (bigint 4294967296) (bigint 4294967296))))
+ ((set (value-lower-bound-of ?out) ?lo) (set (value-upper-bound-of ?out) ?hi))
+ :ruleset main_ruleset :name "uint64/value_bounds: nonnegative cast interval")
+(rule ((= ?out (LogicalCast ?in (UInt64)))
+       (= ?lo (value-lower-bound-of ?in)) (= ?hi (value-upper-bound-of ?in))
+       (>= ?lo (bigint -9223372036854775808)) (< ?hi (bigint 0)))
+ ((set (value-lower-bound-of ?out) (+ ?lo (* (bigint 4294967296) (bigint 4294967296))))
+  (set (value-upper-bound-of ?out) (+ ?hi (* (bigint 4294967296) (bigint 4294967296)))))
+ :ruleset main_ruleset :name "uint64/value_bounds: negative cast wraps by 2^64")
+
+; A bounded UInt64 -> Int conversion preserves its interval when every
+; source value fits. Outside this interval the conversion may wrap, so it
+; must not carry the unsigned bounds into signed arithmetic.
+(rule ((= ?out (LogicalCast ?in (Int)))
+       (= (dtype-of ?in) (UInt64))
+       (= ?lo (value-lower-bound-of ?in)) (= ?hi (value-upper-bound-of ?in))
+       (>= ?lo (bigint 0)) (<= ?hi (bigint 2147483647)))
+ ((set (value-lower-bound-of ?out) ?lo)
+  (set (value-upper-bound-of ?out) ?hi))
+ :ruleset main_ruleset :name "cast/value_bounds: in-range UInt64 to Int preserves bounds")

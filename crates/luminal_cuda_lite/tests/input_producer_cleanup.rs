@@ -521,8 +521,9 @@ fn subsumed_ops(egraph: &EGraph) -> BTreeMap<String, usize> {
 /// turn into class ids. This pin therefore asserts the two routes stay
 /// LIVE while the stripping happens, and — against the WITHOUT-CLEANUP
 /// baseline (the same program on the same schedule minus
-/// `(saturate (run cleanup))`) — that the ONLY spelling the stratum
-/// newly subsumes anywhere in the e-graph is `LayoutTensorOpLit`.
+/// `(saturate (run cleanup))`) — that the stratum newly subsumes only
+/// `LayoutTensorOpLit` and the copied base cuBLASLt routes which the
+/// direct-input preference intentionally retires on this marker graph.
 #[test]
 fn named_input_keeps_its_name_bearing_spellings() {
     let cx = named_marker_matmul();
@@ -609,7 +610,7 @@ fn named_input_keeps_its_name_bearing_spellings() {
          list holds a bound input leaf, names or no names"
     );
 
-    // ---- (d) the stratum subsumes NOTHING but LayoutTensorOpLit. ----
+    // ---- (d) the stratum subsumes only its two intentional routes. ----
     // Direct check first: no name-bearing or boundary spelling anywhere
     // in the e-graph is retired.
     const MUST_STAY_LIVE: [&str; 4] = [
@@ -653,9 +654,15 @@ fn named_input_keeps_its_name_bearing_spellings() {
         .collect();
     assert_eq!(
         newly_subsumed,
-        ["LayoutTensorOpLit".to_string()].iter().collect(),
+        [
+            "LayoutTensorOpCublasLt".to_string(),
+            "LayoutTensorOpLit".to_string(),
+        ]
+        .iter()
+        .collect(),
         "the cleanup stratum may retire the generic LayoutTensorOpLit spelling \
-         and NOTHING else; with={with_cleanup:?} without={without_cleanup:?}"
+         and copied base cuBLASLt routes only; with={with_cleanup:?} \
+         without={without_cleanup:?}"
     );
     for (op, before) in &without_cleanup {
         let after = with_cleanup.get(op).copied().unwrap_or(0);

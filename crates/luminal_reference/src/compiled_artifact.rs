@@ -470,6 +470,9 @@ impl OpWire {
             BufferAlloc,
             BufferFree,
             luminal::buffer_tensor_ir::Poison,
+            ops::AndDps,
+            ops::OrDps,
+            ops::NotDps,
             ops::AddFunctionalDps,
             ops::MulFunctionalDps,
             ops::DivFunctionalDps,
@@ -491,7 +494,11 @@ impl OpWire {
             ops::LessThanDps,
             ops::SelectFunctionalDps
         );
-        let (kind, payload) = if let Some(v) = any.downcast_ref::<ops::ConstantDps>() {
+        let (kind, payload) = if let Some(v) = any.downcast_ref::<ops::BitsToBoolsDps>() {
+            ("ops::BitsToBoolsDps", serde_json::json!(v.width))
+        } else if let Some(v) = any.downcast_ref::<ops::BoolsToBitsDps>() {
+            ("ops::BoolsToBitsDps", serde_json::json!(v.width))
+        } else if let Some(v) = any.downcast_ref::<ops::ConstantDps>() {
             ("ops::ConstantDps", serde_json::json!(v.value.to_bits()))
         } else if let Some(v) = any.downcast_ref::<ops::GatherDps>() {
             ("ops::GatherDps", serde_json::json!(v.rank))
@@ -532,6 +539,9 @@ impl OpWire {
             BufferAlloc,
             BufferFree,
             luminal::buffer_tensor_ir::Poison,
+            ops::AndDps,
+            ops::OrDps,
+            ops::NotDps,
             ops::AddFunctionalDps,
             ops::MulFunctionalDps,
             ops::DivFunctionalDps,
@@ -556,6 +566,12 @@ impl OpWire {
         let kind = self.kind.as_str();
         let payload = self.payload;
         Ok(match kind {
+            "ops::BitsToBoolsDps" => Box::new(ops::BitsToBoolsDps {
+                width: serde_json::from_value(payload)?,
+            }),
+            "ops::BoolsToBitsDps" => Box::new(ops::BoolsToBitsDps {
+                width: serde_json::from_value(payload)?,
+            }),
             "ops::ConstantDps" => Box::new(ops::ConstantDps {
                 value: f64::from_bits(serde_json::from_value(payload)?),
             }),

@@ -1,0 +1,11 @@
+(rule ((= ?out (LogicalNot ?a))
+ (= ?it (LayoutTensorLit ?a ?il))
+ (= ?os (shape-of ?out)) (= ?ow (bits-of (dtype-of ?out)))
+ (= ?ol (RightMajorContiguousElementLayoutLit ?os ?ow))
+ (= ?ot (LayoutTensorLit ?out ?ol))
+ (= (injectivity-of ?ot) (Injective)))
+ ((let op (LayoutTensorOpLit
+   (LayoutTensorCons ?it (LayoutTensorNil))
+   (LayoutTensorCons ?ot (LayoutTensorNil))))
+  (union op (LayoutTensorOpNotGeneric ?it ?ol)))
+ :ruleset backend :name "cuda_lite/not/materialize")

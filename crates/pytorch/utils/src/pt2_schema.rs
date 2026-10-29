@@ -368,6 +368,12 @@ impl Argument {
 pub struct TensorMeta {
     pub dtype: u32,
     pub sizes: Vec<DimSize>,
+    /// Physical geometry is required by storage-addressed ATen operations.
+    /// Older hand-built fixtures omit it and denote contiguous, zero-offset values.
+    #[serde(default)]
+    pub strides: Option<Vec<DimSize>>,
+    #[serde(default)]
+    pub storage_offset: Option<DimSize>,
     /// Torch's storage-kind code; see [`crate::torch_layout::TorchLayout`].
     #[serde(default)]
     pub layout: Option<u32>,

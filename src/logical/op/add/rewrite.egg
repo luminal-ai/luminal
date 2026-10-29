@@ -1,6 +1,30 @@
-; Logical Commutativity : Add
-(rewrite
-  (LogicalAdd ?lhs ?rhs)
-  (LogicalAdd ?rhs ?lhs)
-  :ruleset main_ruleset :name "add/rewrite: commutativity of LogicalAdd"
-)
+; Encoding bits are observable. Float operand permutation can change a NaN
+; payload, so unqualified floating commutativity is not a bit-exact equality.
+; Retain the law for exact integer encodings only (fail closed on unknown dtype).
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (Int)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, Int")
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (Int64)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, Int64")
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (UInt64)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, UInt64")
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (I4)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, I4")
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (U4)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, U4")
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (I8)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, I8")
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (U8)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, U8")
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (I16)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, I16")
+(rule ((= ?out (LogicalAdd ?lhs ?rhs)) (= (dtype-of ?out) (U16)))
+ ((union ?out (LogicalAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "add/rewrite: commutativity, U16")

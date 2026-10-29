@@ -960,6 +960,57 @@ def test_shape_reshape_view_batch(device: torch.device):
     assert torch.allclose(output, original)
 
 
+# A view of a zero-element tensor reads no element, so torch accepts any
+# zero-element target: a strict prefix of the source shape, a zero extent past
+# the first axis, unit axes inside the rest. The non-empty cases pin the
+# unchanged-prefix lowering those share a helper with. Each view feeds an add,
+# so the output is a computed tensor rather than an alias of the input.
+_VIEW_CASES = [
+    ("flatten_0x3", lambda x: x.flatten(), [(0, 3)]),
+    ("reshape_neg1_0x3", lambda x: x.reshape(-1), [(0, 3)]),
+    ("view_0_0x3", lambda x: x.view(0), [(0, 3)]),
+    ("ravel_0x3", lambda x: x.ravel(), [(0, 3)]),
+    ("view_as_0x3_to_0", lambda x, o: x.view_as(o), [(0, 3), (0,)]),
+    ("reshape_as_0x3_to_0", lambda x, o: x.reshape_as(o), [(0, 3), (0,)]),
+    ("reshape_0x3_to_3x0", lambda x: x.reshape(3, 0), [(0, 3)]),
+    ("reshape_0x6_to_0x3x2", lambda x: x.reshape(0, 3, 2), [(0, 6)]),
+    ("flatten_2x0", lambda x: x.flatten(), [(2, 0)]),
+    ("reshape_0_to_0x1x5", lambda x: x.reshape(0, 1, 5), [(0,)]),
+    ("reshape_2x3x4_to_2x12", lambda x: x.reshape(2, 12), [(2, 3, 4)]),
+    ("reshape_2x3x1_to_2x3", lambda x: x.reshape(2, 3), [(2, 3, 1)]),
+    ("view_2x1x1_to_2", lambda x: x.view(2), [(2, 1, 1)]),
+    ("view_2x3x4_to_2x3x2x2", lambda x: x.view(2, 3, 2, 2), [(2, 3, 4)]),
+]
+
+
+class _ViewThenAdd(torch.nn.Module):
+    def __init__(self, view: Callable[..., torch.Tensor]) -> None:
+        super().__init__()
+        self.view = view
+
+    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+        return self.view(*inputs) + 1
+
+
+@pytest.mark.parametrize(
+    ("view", "shapes"),
+    [pytest.param(view, shapes, id=name) for name, view, shapes in _VIEW_CASES],
+)
+def test_view_then_add_matches_eager(
+    device: torch.device,
+    view: Callable[..., torch.Tensor],
+    shapes: list[tuple[int, ...]],
+) -> None:
+    generator = torch.Generator().manual_seed(0)
+    inputs = [torch.rand(shape, generator=generator).to(device) for shape in shapes]
+    model = _ViewThenAdd(view)
+    expected = model(*inputs)
+    actual = torch.compile(model, backend=luminal_backend)(*inputs)
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    assert torch.allclose(actual, expected)
+
+
 # ========== PT2 Less Node Tests ==========
 # These tests verify parse_less_node in ops_parse.rs
 
@@ -1144,6 +1195,130 @@ def test_squeeze_in_expression(device: torch.device):
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original)
+
+
+# torch removes only the named axes whose extent is 1. Any other named axis
+# is a no-op, and so is every dim of a 0-d tensor. torch.compile translates
+# the undecomposed graph first, so `x.squeeze(d)` reaches the translator as
+# `aten.squeeze.dim` (decomposition would rewrite it to `squeeze.dims`).
+_SQUEEZE_CASES = {
+    "dim_non_unit": (lambda x: x.squeeze(1), (1, 3, 1, 4)),
+    "dim_non_unit_negative": (lambda x: x.squeeze(-1), (1, 3, 1, 4)),
+    "dim_non_unit_then_mul": (lambda x: x.squeeze(1) * 2.0, (1, 3, 1, 4)),
+    "dim_unit": (lambda x: x.squeeze(2), (1, 3, 1, 4)),
+    "dim_unit_negative": (lambda x: x.squeeze(-2), (1, 3, 1, 4)),
+    "dims_mixed": (lambda x: x.squeeze((0, 1)), (1, 3, 1, 4)),
+    "dims_mixed_negative": (lambda x: x.squeeze((-1, -4)), (1, 3, 1, 4)),
+    "default_mixed": (lambda x: x.squeeze(), (1, 3, 1, 4)),
+    "default_all_unit": (lambda x: x.squeeze(), (1, 1, 1)),
+    "scalar_dim": (lambda x: x.squeeze(0), ()),
+    "scalar_dim_negative": (lambda x: x.squeeze(-1), ()),
+    "scalar_dim_then_add": (lambda x: x.squeeze(0) + 1.0, ()),
+    "scalar_dims": (lambda x: x.squeeze((0,)), ()),
+    "scalar_dims_negative": (lambda x: x.squeeze((-1,)), ()),
+    "scalar_default": (lambda x: x.squeeze(), ()),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SQUEEZE_CASES))
+def test_squeeze_matches_torch_semantics(device: torch.device, case: str):
+    fn, shape = _SQUEEZE_CASES[case]
+
+    class Squeeze(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return fn(x)
+
+    model = Squeeze().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    numel = torch.Size(shape).numel()
+    x = (torch.arange(numel, dtype=torch.float32, device=device) + 1.5).reshape(shape)
+    expected = model(x)
+    actual = compiled(x)
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "dims, shape",
+    [
+        (1, (1, 3, 1, 4)),
+        (2, (1, 3, 1, 4)),
+        ((0, 1), (1, 3, 1, 4)),
+        (None, (1, 3, 1, 4)),
+        (0, ()),
+        ((-1,), ()),
+    ],
+    ids=[
+        "dim_non_unit",
+        "dim_unit",
+        "dims_mixed",
+        "default",
+        "scalar_dim",
+        "scalar_dims",
+    ],
+)
+def test_complex_squeeze_matches_torch_semantics(
+    device: torch.device, dims: int | tuple[int, ...] | None, shape: tuple[int, ...]
+):
+    """Complex values lower to real components; squeeze applies the same rule."""
+
+    class ComplexSqueeze(torch.nn.Module):
+        def forward(self, real: torch.Tensor, imag: torch.Tensor) -> torch.Tensor:
+            z = torch.complex(real, imag)
+            z = z.squeeze() if dims is None else z.squeeze(dims)
+            return torch.view_as_real(z * 2.0)
+
+    model = ComplexSqueeze().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    numel = torch.Size(shape).numel()
+    real = torch.arange(numel, dtype=torch.float32, device=device).reshape(shape)
+    imag = -real - 0.5
+    expected = model(real, imag)
+    actual = compiled(real, imag)
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+def test_squeeze_keeps_a_dynamic_axis(device: torch.device):
+    """A dynamic extent is not provably 1, so torch's export keeps that axis.
+
+    The translator must keep it too, without panicking, while the static
+    unit axis still goes. One compiled graph serves every batch size.
+    """
+
+    class Squeezes(torch.nn.Module):
+        def forward(self, x: torch.Tensor):
+            return (
+                x.squeeze(0) * 2.0,
+                x.squeeze(2) + 1.0,
+                x.squeeze() - 1.0,
+                x.squeeze((0, 2)),
+            )
+
+    model = Squeezes().to(device)
+    runs: list[None] = []
+
+    def counting_backend(gm, example_inputs):
+        compiled_graph = luminal_backend(gm, example_inputs)
+
+        def run(*args):
+            runs.append(None)
+            return compiled_graph(*args)
+
+        return run
+
+    compiled = torch.compile(model, backend=counting_backend)
+    torch.manual_seed(0)
+    first = torch.randn(2, 3, 1, 4, device=device)
+    torch._dynamo.mark_dynamic(first, 0)
+    for batch in (2, 3, 5):
+        x = first if batch == 2 else torch.randn(batch, 3, 1, 4, device=device)
+        expected = model(x)
+        actual = compiled(x)
+        for e, a in zip(expected, actual, strict=True):
+            assert a.shape == e.shape
+            assert torch.equal(a, e)
+    assert len(runs) == 3, runs
 
 
 # ========== PT2 ReduceSum Node Tests ==========
@@ -2218,6 +2393,160 @@ def test_sdpa_bool_mask_fully_masked_row_bf16_4d(device: torch.device):
     )
 
 
+# Tolerances against eager on the rows that admit a key, per dtype.
+_MASKED_ROW_ATOL = {
+    torch.float32: 1e-5,
+    torch.float64: 1e-10,
+    torch.bfloat16: 1e-2,
+    torch.float16: 1e-2,
+}
+
+
+@pytest.mark.parametrize(
+    "dtype,rank",
+    [
+        (torch.float32, 2),
+        (torch.float64, 2),
+        (torch.bfloat16, 4),
+        (torch.float16, 4),
+    ],
+    ids=["f32_2d", "f64_2d", "bf16_4d", "f16_4d"],
+)
+def test_sdpa_float_mask_fully_masked_row(
+    dtype: torch.dtype, rank: int, device: torch.device
+):
+    """A float `attn_mask` whose row is all -inf admits no key, and that row
+    is exactly zero (torch CPU-kernel semantics), never NaN: `exp(s - max)`
+    is `exp(-inf - -inf)` there. torch.compile also hands a bool mask to
+    the lowering in this form (`where(mask, 0, -inf)`)."""
+    from test_models import SdpaWithBiasModel
+
+    model: torch.nn.Module = SdpaWithBiasModel().to(device)
+    q, k, v = (t.to(dtype) for t in _sdpa_qkv(device))
+    s_q, s_k = q.shape[-2], k.shape[-2]
+    bias = torch.zeros(s_q, s_k, dtype=dtype, device=device)
+    bias[1, :] = float("-inf")  # query row 1 admits no key
+    bias[2, 0] = float("-inf")  # query row 2 admits three
+    if rank == 4:
+        bias = bias.reshape(1, 1, s_q, s_k)
+    with torch.no_grad():
+        expected: torch.Tensor = model(q, k, v, bias)
+        actual: torch.Tensor = torch.compile(model, backend=luminal_backend)(
+            q, k, v, bias
+        )
+    assert actual.dtype == expected.dtype
+    assert not actual.isnan().any(), "a fully-masked row leaked NaN"
+    assert torch.all(actual[..., 1, :] == 0.0), (
+        f"fully-masked row must be zeros, got absmax "
+        f"{actual[..., 1, :].abs().max().item():.4f}"
+    )
+    if device.type == "cpu":
+        assert torch.equal(actual[..., 1, :], expected[..., 1, :])
+    defined = [0, 2, 3]
+    assert torch.allclose(
+        actual[..., defined, :].double(),
+        expected[..., defined, :].double(),
+        atol=_MASKED_ROW_ATOL[dtype],
+    ), (
+        f"max_diff="
+        f"{(actual[..., defined, :].double() - expected[..., defined, :].double()).abs().max().item():.2e}"
+    )
+
+
+@pytest.mark.parametrize(
+    "is_causal,mask,dtype",
+    [
+        (False, "float", torch.float32),
+        (False, "bool", torch.float32),
+        (True, "float", torch.float32),
+        (False, "float", torch.float64),
+        (False, "float", torch.bfloat16),
+        (True, "bool", torch.float16),
+    ],
+    ids=[
+        "float_mask",
+        "bool_mask",
+        "causal_float_mask",
+        "f64",
+        "bf16",
+        "f16_causal_bool",
+    ],
+)
+def test_sdpa_fused_cpu_masked_rows_match_eager(
+    is_causal: bool, mask: str, dtype: torch.dtype, device: torch.device
+):
+    """`_scaled_dot_product_flash_attention_for_cpu` on query rows that admit
+    no key returns output 0 and logsumexp 0, as eager does; every other row
+    matches eager. With `is_causal`, a row whose mask admits only keys above
+    the diagonal admits none: the causal mask excludes keys exactly as the
+    mask does (a finite causal offset would average V instead)."""
+    if device.type != "cpu":
+        pytest.skip("_scaled_dot_product_flash_attention_for_cpu is the CPU kernel")
+    from test_models import SdpaFusedCpuLogsumexpModel
+
+    g = torch.Generator().manual_seed(0)
+    q = torch.randn(2, 4, 5, 8, generator=g).to(dtype)
+    k = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
+    v = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
+    empty = [3]
+    if mask == "bool":
+        keep = torch.rand(5, 6, generator=g) > 0.4
+        keep[:, 0] = True
+        keep[3, :] = False
+        if is_causal:
+            keep[0, 0] = False  # row 0 keeps only keys the causal mask drops
+            empty = [0, 3]
+        mask_input = keep
+    else:
+        mask_input = (torch.randn(5, 6, generator=g) * 2.0).to(dtype)
+        mask_input[3, :] = float("-inf")
+        mask_input[1, 2] = float("-inf")
+        if is_causal:
+            mask_input[0, 0] = float("-inf")
+            empty = [0, 3]
+    model = SdpaFusedCpuLogsumexpModel(is_causal=is_causal, mask=mask)
+    with torch.no_grad():
+        expected_out, expected_lse = model(q, k, v, mask_input)
+        actual_out, actual_lse = torch.compile(model, backend=luminal_backend)(
+            q, k, v, mask_input
+        )
+    assert actual_out.dtype == expected_out.dtype
+    assert actual_lse.dtype == expected_lse.dtype
+    assert actual_lse.shape == expected_lse.shape == (2, 4, 5)
+    # The contract, as eager states it: zeros and logsumexp 0, no NaN.
+    assert torch.all(expected_out[..., empty, :] == 0.0)
+    assert torch.all(expected_lse[..., empty] == 0.0)
+    assert not actual_out.isnan().any() and not actual_lse.isnan().any()
+    assert torch.equal(actual_out[..., empty, :], expected_out[..., empty, :]), (
+        f"empty-row output absmax {actual_out[..., empty, :].abs().max().item():.4f}"
+    )
+    assert torch.equal(actual_lse[..., empty], expected_lse[..., empty]), (
+        f"empty-row logsumexp {actual_lse[..., empty].flatten()[:4].tolist()}"
+    )
+    defined = [row for row in range(5) if row not in empty]
+    # torch's half CPU kernel uses a fast vectorised exp (~5e-5 off the exact
+    # logsumexp); 1e-3 holds that, the output carries the dtype's rounding.
+    lse_atol = (
+        1e-3 if dtype in (torch.bfloat16, torch.float16) else _MASKED_ROW_ATOL[dtype]
+    )
+    assert torch.allclose(
+        actual_lse[..., defined].double(),
+        expected_lse[..., defined].double(),
+        atol=lse_atol,
+    ), (
+        f"logsumexp max_diff="
+        f"{(actual_lse[..., defined].double() - expected_lse[..., defined].double()).abs().max().item():.2e}"
+    )
+    assert torch.allclose(
+        actual_out[..., defined, :].double(),
+        expected_out[..., defined, :].double(),
+        atol=_MASKED_ROW_ATOL[dtype],
+    ), (
+        f"output max_diff="
+        f"{(actual_out[..., defined, :].double() - expected_out[..., defined, :].double()).abs().max().item():.2e}"
+    )
+
+
 def _gqa_qkv(device: torch.device, dtype: torch.dtype = torch.float32):
     """Q with 4 heads, K/V with 2 — the grouped-query head layout."""
     torch.manual_seed(0)
@@ -2263,6 +2592,108 @@ def test_sdpa_f32_unaffected_by_upcast(device: torch.device):
     # ~1.4-1.7e-5 vs eager (cpu/cuda); reduction ordering, not a bug.
     assert torch.allclose(actual, expected, atol=1e-4), (
         f"max_diff={torch.max(torch.abs(actual - expected)).item():.2e}"
+    )
+
+
+# ---- SDPA tuple slots ------------------------------------------------------
+#
+# The fused SDPA variants return tuples (output, logsumexp, RNG state, ...).
+# In default grad mode AOTAutograd's forward graph returns the
+# saved-for-backward slots as graph outputs, so translate_sdpa binds every
+# slot the variant's schema declares.
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_sdpa_grad_mode_compile_binds_saved_slots(
+    is_causal: bool, device: torch.device
+):
+    """A parameterised model in default grad mode: the forward graph also
+    returns SDPA's logsumexp, which must be produced for the compile to
+    succeed. The forward output matches eager."""
+    from test_models import SdpaProjectedModel
+
+    torch.manual_seed(0)
+    model = SdpaProjectedModel(is_causal=is_causal).to(device)
+    x = torch.randn(1, 8, 16, device=device)
+    assert torch.is_grad_enabled()
+    expected = model(x)
+    actual = torch.compile(model, backend=luminal_backend)(x)
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    assert torch.allclose(actual.detach(), expected.detach(), atol=1e-5), (
+        f"max_diff={(actual - expected).abs().max().item():.2e}"
+    )
+
+
+@pytest.mark.parametrize(
+    "is_causal,mask,dtype",
+    [
+        (False, "none", torch.float32),
+        (True, "none", torch.float32),
+        (False, "float", torch.float32),
+        (False, "bool", torch.float32),
+        (True, "float", torch.float32),
+        (False, "float", torch.float64),
+        (False, "none", torch.bfloat16),
+    ],
+    ids=[
+        "plain",
+        "causal",
+        "float_mask",
+        "bool_mask",
+        "causal_float_mask",
+        "f64",
+        "bf16",
+    ],
+)
+def test_sdpa_fused_cpu_logsumexp_matches_eager(
+    is_causal: bool, mask: str, dtype: torch.dtype, device: torch.device
+):
+    """`_scaled_dot_product_flash_attention_for_cpu` returns (output,
+    logsumexp); the logsumexp is the real per-row value over the scaled,
+    masked scores, at torch's computation dtype (F32 for bf16)."""
+    if device.type != "cpu":
+        pytest.skip("_scaled_dot_product_flash_attention_for_cpu is the CPU kernel")
+    from test_models import SdpaFusedCpuLogsumexpModel
+
+    g = torch.Generator().manual_seed(0)
+    q = torch.randn(2, 4, 5, 8, generator=g).to(dtype)
+    k = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
+    v = torch.randn(2, 4, 6, 8, generator=g).to(dtype)
+    if mask == "bool":
+        # Every query row keeps a key; test_sdpa_fused_cpu_masked_rows_match_eager
+        # covers the rows that keep none.
+        keep = torch.rand(5, 6, generator=g) > 0.4
+        keep[:, 0] = True
+        mask_input = keep
+    else:
+        mask_input = (torch.randn(5, 6, generator=g) * 2.0).to(dtype)
+        mask_input[1, 2] = float("-inf")
+    model = SdpaFusedCpuLogsumexpModel(is_causal=is_causal, mask=mask)
+    expected_out, expected_lse = model(q, k, v, mask_input)
+    actual_out, actual_lse = torch.compile(model, backend=luminal_backend)(
+        q, k, v, mask_input
+    )
+    assert actual_lse.dtype == expected_lse.dtype
+    assert actual_lse.shape == expected_lse.shape == (2, 4, 5)
+    assert actual_out.dtype == expected_out.dtype
+    if dtype == torch.bfloat16:
+        # torch's bf16 CPU kernel uses a fast vectorised exp (~5e-5 off the
+        # exact logsumexp); bound luminal by the fp64 reference instead, as
+        # _assert_sdpa_parity does for the output.
+        ref_lse = model(q.double(), k.double(), v.double(), mask_input)[1]
+        err_eager = (expected_lse.double() - ref_lse).abs().max().item()
+        err_luminal = (actual_lse.double() - ref_lse).abs().max().item()
+        assert err_luminal <= 3.0 * err_eager + 1e-6, (
+            f"logsumexp error {err_luminal:.2e} vs fp64 exceeds 3x torch's {err_eager:.2e}"
+        )
+        out_atol = 1e-2
+    else:
+        assert torch.allclose(actual_lse, expected_lse, atol=1e-5), (
+            f"logsumexp max_diff={(actual_lse - expected_lse).abs().max().item():.2e}"
+        )
+        out_atol = 1e-5
+    assert torch.allclose(actual_out.double(), expected_out.double(), atol=out_atol), (
+        f"output max_diff={(actual_out.double() - expected_out.double()).abs().max().item():.2e}"
     )
 
 

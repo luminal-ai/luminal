@@ -123,6 +123,11 @@ pub enum LogicalOp {
     },
     Cast(DType),
     TruncCast(DType),
+    BitsToBools,
+    BoolsToBits(DType),
+    And,
+    Or,
+    Not,
     Sqrt,
     Exp,
     Exp2,
@@ -178,6 +183,11 @@ impl LogicalOp {
             Self::Iota { .. } => "LogicalIota",
             Self::Cast(_) => "LogicalCast",
             Self::TruncCast(_) => "LogicalTruncCast",
+            Self::BitsToBools => "LogicalBitsToBools",
+            Self::BoolsToBits(_) => "LogicalBoolsToBits",
+            Self::And => "LogicalAnd",
+            Self::Or => "LogicalOr",
+            Self::Not => "LogicalNot",
             Self::Sqrt => "LogicalSqrt",
             Self::Exp => "LogicalExp",
             Self::Exp2 => "LogicalExp2",
@@ -215,11 +225,61 @@ impl LogicalOp {
         }
     }
 
+    /// Whether this op computes a value by arithmetic: a math function,
+    /// a rounding, an arithmetic combination, a sum or product reduction
+    /// or scan, or a truncating float-to-integer conversion. The other
+    /// ops move, select, compare, convert or create values and compute
+    /// nothing a narrower format could round differently.
+    pub fn is_arithmetic(&self) -> bool {
+        match self {
+            Self::Sqrt
+            | Self::Exp
+            | Self::Exp2
+            | Self::Log2
+            | Self::Sin
+            | Self::Floor
+            | Self::Ceil
+            | Self::Trunc
+            | Self::Round
+            | Self::Recip
+            | Self::Add
+            | Self::Mul
+            | Self::Div
+            | Self::Mod
+            | Self::TruncDiv
+            | Self::TruncRem
+            | Self::TruncCast(_)
+            | Self::ReduceSum { .. }
+            | Self::UnspecifiedOrderScanSum { .. }
+            | Self::UnspecifiedOrderScanProd { .. } => true,
+            Self::Input { .. }
+            | Self::Constant(_)
+            | Self::ConstantF64(_)
+            | Self::Iota { .. }
+            | Self::Cast(_)
+            | Self::BitsToBools
+            | Self::BoolsToBits(_)
+            | Self::And
+            | Self::Or
+            | Self::Not
+            | Self::LessThan
+            | Self::ReduceMax { .. }
+            | Self::UnspecifiedOrderScanMax { .. }
+            | Self::Gather
+            | Self::Scatter
+            | Self::Select
+            | Self::IndexMapApply { .. } => false,
+        }
+    }
+
     fn fixed_arity(&self) -> Option<usize> {
         Some(match self {
             Self::Input { .. } | Self::Constant(_) | Self::ConstantF64(_) | Self::Iota { .. } => 0,
             Self::Cast(_)
             | Self::TruncCast(_)
+            | Self::BitsToBools
+            | Self::BoolsToBits(_)
+            | Self::Not
             | Self::Sqrt
             | Self::Exp
             | Self::Exp2
@@ -236,7 +296,9 @@ impl LogicalOp {
             | Self::UnspecifiedOrderScanProd { .. }
             | Self::UnspecifiedOrderScanMax { .. }
             | Self::IndexMapApply { .. } => 1,
-            Self::Add
+            Self::And
+            | Self::Or
+            | Self::Add
             | Self::Mul
             | Self::Div
             | Self::Mod
@@ -1147,9 +1209,9 @@ impl LogicalGraph {
                         parts.push(value_expr.clone());
                         parts.push(shape);
                     }
-                    LogicalOp::Cast(dtype) | LogicalOp::TruncCast(dtype) => {
-                        parts.push(Self::dtype_term(*dtype))
-                    }
+                    LogicalOp::Cast(dtype)
+                    | LogicalOp::TruncCast(dtype)
+                    | LogicalOp::BoolsToBits(dtype) => parts.push(Self::dtype_term(*dtype)),
                     LogicalOp::ReduceSum { axis_from_end }
                     | LogicalOp::ReduceMax { axis_from_end }
                     | LogicalOp::UnspecifiedOrderScanSum { axis_from_end }
@@ -1304,6 +1366,40 @@ impl LogicalGraph {
         self.graph[id].dtype
     }
 
+    /// The values among `ids` whose op is arithmetic
+    /// ([`LogicalOp::is_arithmetic`]) over a narrow float
+    /// ([`DType::is_narrow_float`]): the op's own dtype, or an operand's
+    /// (a truncating cast reads one and produces an integer). Each entry
+    /// is the value and the narrow dtype it computes on.
+    pub fn narrow_float_arithmetic(
+        &self,
+        ids: impl IntoIterator<Item = ValueId>,
+    ) -> Vec<(ValueId, DType)> {
+        let mut found = Vec::new();
+        for id in ids {
+            let node = &self.graph[id];
+            if !node.op.is_arithmetic() {
+                continue;
+            }
+            let narrow = std::iter::once(node.dtype)
+                .chain(
+                    self.graph
+                        .neighbors_directed(id, Direction::Incoming)
+                        .map(|operand| self.graph[operand].dtype),
+                )
+                .find(|dtype| dtype.is_narrow_float());
+            if let Some(dtype) = narrow {
+                found.push((id, dtype));
+            }
+        }
+        found
+    }
+
+    /// The op recorded for a value.
+    pub fn value_op(&self, id: ValueId) -> &LogicalOp {
+        &self.graph[id].op
+    }
+
     /// The egglog `let` a boundary attaches to. A Bool input enters as a
     /// Bool8 wire (`input_wire_v{n}`) that the model casts to Bool — the
     /// one storage representation the renderer states.
@@ -1401,6 +1497,29 @@ pub(crate) fn int_expr_term(expr: &IntExpr, coord_terms: &[String], at: &str) ->
 mod logical_petgraph_tests {
     use super::*;
     use crate::graph::Graph;
+
+    /// Arithmetic over a narrow float is found by the op's own dtype or by
+    /// an operand's (a truncating cast reads F16 and yields an integer);
+    /// casts, comparisons and selections over narrow floats are not
+    /// arithmetic.
+    #[test]
+    fn narrow_float_arithmetic_names_only_computing_ops() {
+        let mut cx = Graph::new();
+        let half = cx.tensor(vec![4usize], DType::F16);
+        let widened = half.cast(DType::F32);
+        let sum = widened + widened;
+        let rounded = sum.cast(DType::F16);
+        let picked = half.cond(half.lt(rounded), rounded);
+        let product = picked * half;
+        let truncated = half.trunc_cast(DType::Int);
+        let found = cx
+            .logical
+            .narrow_float_arithmetic(cx.logical.petgraph().node_indices());
+        assert_eq!(
+            found,
+            vec![(product.id, DType::F16), (truncated.id, DType::F16)]
+        );
+    }
 
     #[test]
     fn tensor_ids_are_petgraph_values_with_ported_operand_edges() {

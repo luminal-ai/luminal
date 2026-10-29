@@ -1,0 +1,2 @@
+(rule ((= ?out (LogicalNot ?a)) (= ?s (shape-of ?a)))
+    ((set (shape-of ?out) ?s)) :ruleset prop :name "not/shape")

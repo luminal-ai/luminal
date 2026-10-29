@@ -1,0 +1,3 @@
+(rule ((= ?out (LogicalNot ?a)) (= ?s (shape-of ?out)) (= ?w (bits-of (dtype-of ?out))))
+    ((let lt (LayoutTensorLit ?out (RightMajorContiguousElementLayoutLit ?s ?w))))
+    :ruleset main_ruleset :name "not/canonical_layout")

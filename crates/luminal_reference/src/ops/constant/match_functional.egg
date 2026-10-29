@@ -6,6 +6,7 @@
     (= ?out_logical (LogicalConstant ?constant_value))
     (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
     (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
   )
   (
     (let ?layout_tensor_op
@@ -26,6 +27,7 @@
     (= ?out_logical (LogicalConstantF64 ?constant_value))
     (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
     (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
   )
   (
     (let ?layout_tensor_op

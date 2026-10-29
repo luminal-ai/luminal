@@ -10,11 +10,71 @@
 //! The atan origin is additionally steered to a finite ratio (`0/1` rather
 //! than `0/0`) so the intermediate angle is finite before the final select.
 
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
 use luminal::prelude::*;
 
 use super::{Translator, util};
 use crate::pt2_schema::Node;
+
+/// The axes torch's `squeeze` removes from a tensor with extents `dims`,
+/// ascending and distinct. `requested` is `None` for `squeeze.default`
+/// (every axis is a candidate), else the dims `squeeze.dim` / `squeeze.dims`
+/// name.
+///
+/// INVARIANT (torch semantics): squeeze removes exactly the requested axes
+/// whose extent is PROVABLY 1, and every other requested axis is a no-op.
+/// "Provably 1" is `to_usize() == Some(1)`: the extent evaluates to 1 with
+/// no dimension bound. A static extent other than 1 stays, as torch's
+/// `squeeze(dim)` leaves it alone. A symbolic extent stays too. Export only
+/// drops an axis it knows is 1, and then it records the literal 1, so a
+/// symbol here names an axis torch kept (its size-oblivious reasoning
+/// treats a dynamic extent as not 1). `Translator::squeeze_axes` checks
+/// the result against the rank the export declares, so a squeeze that
+/// broke this assumption would be refused rather than mistranslated.
+///
+/// Requested dims wrap against `max(rank, 1)`, as torch's `maybe_wrap_dim`
+/// does for a scalar. A rank-0 tensor accepts dim 0 and -1 and comes back
+/// unchanged. A dim out of that range, or one named twice, is an error, as
+/// it is in torch.
+pub(super) fn squeezable_axes(dims: &[IntExpr], requested: Option<&[i64]>) -> Result<Vec<usize>> {
+    let rank = dims.len();
+    let candidates: Vec<usize> = match requested {
+        None => (0..rank).collect(),
+        Some(requested) => {
+            let wrap = rank.max(1) as i64;
+            let mut axes = Vec::with_capacity(requested.len());
+            for &dim in requested {
+                let axis = if dim < 0 { dim + wrap } else { dim };
+                ensure!(
+                    (0..wrap).contains(&axis),
+                    "squeeze dim {dim} out of range [{}, {}] for rank {rank}",
+                    -wrap,
+                    wrap - 1
+                );
+                let axis = axis as usize;
+                ensure!(
+                    !axes.contains(&axis),
+                    "squeeze dim {axis} appears multiple times in the list of dims"
+                );
+                axes.push(axis);
+            }
+            axes
+        }
+    };
+    let mut axes: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&axis| axis < rank && dims[axis].to_usize() == Some(1))
+        .collect();
+    axes.sort_unstable();
+    Ok(axes)
+}
+
+/// Remove `axes` (ascending and distinct, each of extent 1: see
+/// [`squeezable_axes`]) from `tensor`. The highest goes first, so every
+/// remaining index still names its original axis.
+pub(super) fn remove_axes(tensor: GraphTensor, axes: &[usize]) -> GraphTensor {
+    axes.iter().rev().fold(tensor, |t, &axis| t.squeeze(axis))
+}
 
 impl Translator<'_> {
     /// Non-arithmetic `select`: the native ternary `LogicalSelect`, preceded
@@ -34,14 +94,6 @@ impl Translator<'_> {
             condition.cast(DType::Bool)
         };
         condition.select(if_true, if_false)
-    }
-
-    /// `abs(magnitude)` with the sign of `sign`.
-    fn exact_copy_sign(&mut self, magnitude: GraphTensor, sign: GraphTensor) -> GraphTensor {
-        let (magnitude, sign) = util::broadcast_binary(magnitude, sign);
-        let negative = magnitude * -1.0;
-        let signbit = self.signbit(sign);
-        self.real_select(signbit, negative, magnitude)
     }
 
     /// `value == 0` that, unlike `util::is_zero`, is false for NaN.
@@ -75,9 +127,11 @@ impl Translator<'_> {
     fn exact_atan(&mut self, input: GraphTensor) -> GraphTensor {
         let x = input.abs();
         let one = self.constant_like(x, 1.0);
-        // Nudge a zero magnitude off zero so the reciprocal branch is a
-        // finite value: `1/0 = inf` cannot be selected away on this branch
-        // yet (LUM-804), because the selection leaks `inf * 0`.
+        // `x_safe` keeps the unselected reciprocal branch finite at `x = 0`.
+        // Correctness does not depend on it: `real_select` is the native
+        // `LogicalSelect`, a true selection, so an unselected `1/0 = inf`
+        // never reaches the result, and the reciprocal is selected only
+        // where `x > 1`, where `x_safe == x`.
         let x_safe = x + self.exact_is_zero(x).cast(x.dtype);
         let reciprocal_branch = x.gt(one);
         let reduced = self.real_select(reciprocal_branch, x_safe.reciprocal(), x);
@@ -98,22 +152,28 @@ impl Translator<'_> {
         let base = self.real_select(quarter_turn_branch, quarter_pi + base, base);
         let half_pi = self.constant_like(z, std::f64::consts::FRAC_PI_2);
         let angle = self.real_select(reciprocal_branch, half_pi - base, base);
-        self.exact_copy_sign(angle, input)
+        self.copy_sign(angle, input)
     }
 
     /// `atan2(y, x)` with the full branch-cut, infinity and signed-zero
-    /// cases. The origin is nudged so `y/x` is `0/1` there rather than
+    /// cases. The origin is steered so `y/x` is `0/1` there rather than
     /// `0/0`, keeping the intermediate angle finite before the final select.
     fn exact_atan2(&mut self, y: GraphTensor, x: GraphTensor) -> GraphTensor {
         let x_zero = self.exact_is_zero(x);
         let y_zero = self.exact_is_zero(y);
         let both_zero = self.bool_and(x_zero, y_zero);
-        let safe_x = x + both_zero.cast(x.dtype);
+        // Invariant: away from the origin the ratio divides by `x` itself,
+        // so `y/x` and the quadrant correction below (`signbit(x)`) read
+        // the same sign of `x`. Steer the origin by selection: adding the
+        // `both_zero` indicator would compute `-0.0 + 0.0 = +0.0` and turn
+        // `atan2(-1, -0.0)` into `-3pi/2`.
+        let one = self.constant_like(x, 1.0);
+        let safe_x = self.real_select(both_zero, one, x);
         let ratio = y / safe_x;
         let mut angle = self.exact_atan(ratio);
         let x_negative = self.signbit(x);
         let pi = self.constant_like(y, std::f64::consts::PI);
-        let signed_pi = self.exact_copy_sign(pi, y);
+        let signed_pi = self.copy_sign(pi, y);
         angle = self.real_select(x_negative, angle + signed_pi, angle);
 
         let x_inf = self.is_inf(x);
@@ -122,11 +182,11 @@ impl Translator<'_> {
         let quarter = self.constant_like(y, std::f64::consts::FRAC_PI_4);
         let three_quarters = self.constant_like(y, 3.0 * std::f64::consts::FRAC_PI_4);
         let infinite_angle = self.real_select(x_negative, three_quarters, quarter);
-        let infinite_angle = self.exact_copy_sign(infinite_angle, y);
+        let infinite_angle = self.copy_sign(infinite_angle, y);
         angle = self.real_select(both_inf, infinite_angle, angle);
 
         let zero = self.constant_like(y, 0.0);
-        let signed_zero = self.exact_copy_sign(zero, y);
+        let signed_zero = self.copy_sign(zero, y);
         let zero_angle = self.real_select(x_negative, signed_pi, signed_zero);
         self.real_select(both_zero, zero_angle, angle)
     }
@@ -151,7 +211,9 @@ impl Translator<'_> {
             } else {
                 raw.cast(dtype)
             };
-            let magnitude = self.real_abs(magnitude);
+            // `ieee_abs`, not `abs()`: `abs(-0.0)` keeps the sign bit, so
+            // `copysign(-0.0, 0.0)` would come out `-0.0`.
+            let magnitude = self.ieee_abs(magnitude);
             let sign = node.inputs[1]
                 .arg
                 .as_int()
@@ -167,38 +229,105 @@ impl Translator<'_> {
             });
         }
         let (magnitude, sign) = self.promoted_binary_inputs(node)?;
-        let magnitude = self.real_abs(magnitude);
-        Ok(self.exact_copy_sign(magnitude, sign))
+        Ok(self.copy_sign(magnitude, sign))
     }
 
+    /// `torch.fmax` / `torch.fmin`: the larger / smaller operand, where a
+    /// NaN operand is skipped rather than propagated.
+    ///
+    /// Invariant (what torch's CPU kernel returns for every dtype with IEEE
+    /// NaN):
+    /// - exactly one operand NaN: the other operand; both NaN: NaN;
+    /// - otherwise the larger / smaller operand in the order
+    ///   `-inf < ... < -0.0 < +0.0 < ... < +inf`, so a pair of zeros of
+    ///   opposite sign gives `+0.0` from fmax and `-0.0` from fmin.
+    ///
+    /// For non-NaN operands, `a` is picked as the smaller (`b` as the larger)
+    /// iff `a < b`, or `a` has its sign bit set and `b < a` does not hold.
+    /// The second clause adds exactly the ties `a == b` with a sign-bit-set
+    /// `a`: `(-0.0, +0.0)`, which it orders, and pairs with equal encodings
+    /// (`(-0.0, -0.0)`, `(-2.0, -2.0)`), where both picks are the same
+    /// value. Every choice is the native `LogicalSelect`, which never blends
+    /// the branch it drops, so a NaN or infinite operand cannot leak into
+    /// the result.
+    /// Integer and Bool operands have neither NaN nor signed zeros, so the
+    /// plain `maximum` / `minimum` already is the rule.
     pub(super) fn translate_fmax_fmin(&mut self, node: &Node, max: bool) -> Result<GraphTensor> {
         let (a, b) = self.promoted_binary_inputs(node)?;
-        // Finite-input semantics. torch.fmax/fmin skip a NaN operand, which
-        // requires selecting a non-finite branch away; that is blocked on
-        // the core's NaN-safe select (LUM-804: arithmetic/e-graph selection
-        // leaks `NaN * 0`). A NaN operand therefore propagates here.
-        Ok(if max { a.maximum(b) } else { a.minimum(b) })
+        if !matches!(
+            a.dtype,
+            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
+        ) {
+            return Ok(if max { a.maximum(b) } else { a.minimum(b) });
+        }
+        let a_negative_tie = self.signbit(a).logical_and(b.lt(a).logical_not());
+        let a_first = a.lt(b).logical_or(a_negative_tie);
+        let ordered = if max {
+            a_first.select(b, a)
+        } else {
+            a_first.select(a, b)
+        };
+        let b_skipped = b.is_nan().select(a, ordered);
+        Ok(a.is_nan().select(b, b_skipped))
     }
 
-    /// Stable hypot: scale by the larger magnitude to avoid overflow.
+    /// `hypot(a, b) = sqrt(a^2 + b^2)` with the C99 Annex F special values
+    /// torch follows, in this order of precedence:
+    ///   1. if either operand is +-inf the result is +inf, even when the
+    ///      other is NaN;
+    ///   2. otherwise, if either operand is NaN the result is NaN;
+    ///   3. otherwise `hypot(+-0, +-0) = +0`, and every other pair is the
+    ///      overflow-safe `larger * sqrt(1 + (smaller / larger)^2)`.
+    ///
+    /// INVARIANT: each case is a native select (`real_select`, a true
+    /// selection) on a predicate of the operands themselves, nested so the
+    /// outer case wins. The scaled formula is therefore only observed on
+    /// finite operands off the origin, where the ratio is in `[0, 1]`: no
+    /// intermediate overflows (only the final product can, exactly when the
+    /// true result is out of the dtype's range), and an underflowing
+    /// `ratio^2` only drops a term below `1`'s precision. Its `inf / inf`
+    /// and `0 / 0` elsewhere are selected away, never multiplied by a mask.
+    /// The origin's `+0` is a constant rather than the formula's value:
+    /// core `abs` is `select(x < 0, -x, x)`, which keeps `-0.0`.
     pub(super) fn translate_hypot(&mut self, node: &Node) -> Result<GraphTensor> {
         let (lhs, rhs) = self.promoted_binary_inputs(node)?;
         let lhs = self.real_abs(lhs);
         let rhs = self.real_abs(rhs);
         let larger = lhs.maximum(rhs);
         let smaller = lhs.minimum(rhs);
-        // Nudge a zero larger off zero so `smaller/larger` is finite
-        // (0/0 would poison the result; the core cannot yet select an inf
-        // or NaN branch away — LUM-804).
-        let larger_safe = larger + self.exact_is_zero(larger).cast(larger.dtype);
-        let ratio = smaller / larger_safe;
-        let finite = larger * (self.constant_like(larger, 1.0) + ratio.square()).sqrt();
-        // Zero the origin multiplicatively rather than by select: at the
-        // origin `finite` is already 0, and an infinite `finite` only
-        // occurs away from it, so no `inf * 0` arises.
-        let both_zero = self.exact_is_zero(larger);
-        let keep = self.constant_like(finite, 1.0) - both_zero.cast(finite.dtype);
-        Ok(finite * keep)
+        let zero = self.constant_like(larger, 0.0);
+        let one = self.constant_like(larger, 1.0);
+
+        // The ratio's divisor must have a finite, normal reciprocal: core
+        // division below F64 is `smaller * (1 / larger)`, and in F32
+        // `1 / larger` overflows for a subnormal `larger` (and is itself
+        // subnormal, so inexact, above 2^126). The ratio is invariant under
+        // scaling both magnitudes by one power of two, which is exact while
+        // they stay normal, so scale before dividing: by 2^64 below 1, by
+        // 2^-64 from 1 up, which puts an F32 `larger` in [2^-85, 2^64). A
+        // `smaller` the down-scaling takes out of the normal range is below
+        // 2^-62 * `larger`, where `ratio^2` is below `1`'s precision anyway.
+        // F64 divides directly; the same exact scaling is harmless there.
+        // The result multiplies the unscaled `larger`, so the scaling adds
+        // no rounding.
+        let up = self.constant_like(larger, 2f64.powi(64));
+        let down = self.constant_like(larger, 2f64.powi(-64));
+        let scale = self.real_select(larger.lt(one), up, down);
+        let ratio = (smaller * scale) / (larger * scale);
+        let scaled = larger * (one + ratio.square()).sqrt();
+        // IEEE `==` (false for NaN): both magnitudes are zero.
+        let origin = larger.eq(zero);
+        let finite = self.real_select(origin, zero, scaled);
+
+        let any_nan = self.bool_or(lhs.is_nan(), rhs.is_nan());
+        let nan = self.constant_like(larger, f64::NAN);
+        let result = self.real_select(any_nan, nan, finite);
+
+        let lhs_inf = self.is_inf(lhs);
+        let rhs_inf = self.is_inf(rhs);
+        let any_inf = self.bool_or(lhs_inf, rhs_inf);
+        let infinity = self.constant_like(larger, f64::INFINITY);
+        Ok(self.real_select(any_inf, infinity, result))
     }
 
     pub(super) fn translate_gcd(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -218,11 +347,16 @@ impl Translator<'_> {
     fn translate_gcd_unrolled(&mut self, node: &Node) -> Result<GraphTensor> {
         let output_dtype = self.output_meta_dtype(node)?;
         let (lhs, rhs) = self.promoted_binary_inputs(node)?;
+        // The unroll is exact only if it runs every division Euclid can
+        // need; an unfinished state is a wrong answer, not an approximation.
+        // The round count is a function of the operands' dtype, taken
+        // before the widening cast below (see `gcd_euclid_rounds`).
+        let rounds = gcd_euclid_rounds(gcd_magnitude_bound(lhs.dtype));
         let mut lhs = lhs.cast(DType::I64);
         let mut rhs = rhs.cast(DType::I64);
         let one = self.constant_like(lhs, 1.0);
         let zero = self.constant_like(lhs, 0.0);
-        for _ in 0..32 {
+        for _ in 0..rounds {
             let finished = self.exact_is_zero(rhs);
             // Zero-free divisor: `maximum(|rhs|, 1)` is `|rhs|` whenever
             // `rhs != 0` and `1` when `rhs == 0`. Euclid is invariant under
@@ -272,54 +406,95 @@ impl Translator<'_> {
         Ok(self.real_select(value.gt(zero), value, negative))
     }
 
-    pub(super) fn translate_bitwise(&mut self, node: &Node, or: bool) -> Result<GraphTensor> {
-        // Boolean semantics, matching the parked translator: torch exports
-        // `bitwise_and`/`bitwise_or` for boolean attention masks, and the
-        // integer forms are not exercised by any exported model. The result
-        // is cast to the node's declared dtype so a Bool intermediate never
-        // disagrees with the recorded output metadata.
-        let dtype = self.output_meta_dtype(node).unwrap_or(DType::Bool);
+    pub(super) fn translate_bitwise(
+        &mut self,
+        node: &Node,
+        or: bool,
+        xor: bool,
+    ) -> Result<GraphTensor> {
         let a = self.operand(&node.inputs[0])?;
-        let b = self.operand(&node.inputs[1])?;
-        let (a, b) = util::broadcast_binary(a, b);
-        let value = if or {
-            self.bool_or(a, b)
+        let dtype = self.output_meta_dtype(node).unwrap_or(a.dtype);
+        anyhow::ensure!(
+            matches!(
+                dtype,
+                DType::Bool
+                    | DType::I8
+                    | DType::U8
+                    | DType::I16
+                    | DType::Int
+                    | DType::I64
+                    | DType::U64
+            ),
+            "bitwise operations require integer or Bool operands"
+        );
+        let b = if let Some(b) = self.optional_tensor_operand(&node.inputs[1])? {
+            b
         } else {
-            (a.cast(DType::F32) * b.cast(DType::F32)).cast(DType::Bool)
+            self.scalar(&node.inputs[1], dtype)?
         };
-        Ok(if value.dtype == dtype {
+        let (a, b) = util::broadcast_binary(a.cast(dtype), b.cast(dtype));
+        let dims = a.dims();
+        let (a, b) = if dtype == DType::Bool {
+            (a, b)
+        } else {
+            (a.bits_to_bools(), b.bits_to_bools())
+        };
+        let value = if or {
+            a.logical_or(b)
+        } else if xor {
+            a.logical_or(b).logical_and(a.logical_and(b).logical_not())
+        } else {
+            a.logical_and(b)
+        };
+        Ok(if dtype == DType::Bool {
             value
         } else {
-            value.cast(dtype)
+            value.bools_to_bits(dtype).squeeze(dims.len())
         })
     }
 
-    pub(super) fn translate_squeeze(&mut self, node: &Node, all: bool) -> Result<GraphTensor> {
-        let mut result = self.operand(&node.inputs[0])?;
-        let rank = result.rank();
-        let dims: Vec<i64> = if all {
-            result
-                .dims()
-                .iter()
-                .enumerate()
-                .filter_map(|(axis, dim)| (dim.to_usize() == Some(1)).then_some(axis as i64))
-                .collect()
-        } else {
-            self.get_ints_arg(node, 1)?
+    /// `squeeze.default`, `squeeze.dim` and `squeeze.dims`: remove the
+    /// axes [`Self::squeeze_axes`] selects.
+    pub(super) fn translate_squeeze(&mut self, node: &Node, target: &str) -> Result<GraphTensor> {
+        let x = self.operand(&node.inputs[0])?;
+        let axes = self.squeeze_axes(node, target, &x.dims())?;
+        Ok(remove_axes(x, &axes))
+    }
+
+    /// The axes a squeeze overload removes from an operand with extents
+    /// `dims`: the requested axes that [`squeezable_axes`] proves are 1.
+    /// The real and the complex lowerings both take their axes from here,
+    /// so all three overloads share one rule.
+    ///
+    /// The export's declared output rank is checked against the result. An
+    /// axis torch removed that the rule keeps (or the reverse) is a loud
+    /// error, not a silently different shape.
+    pub(super) fn squeeze_axes(
+        &self,
+        node: &Node,
+        target: &str,
+        dims: &[IntExpr],
+    ) -> Result<Vec<usize>> {
+        let requested = match target {
+            "squeeze.default" => None,
+            "squeeze.dim" => Some(vec![self.get_int_arg(node, 1)?]),
+            "squeeze.dims" => Some(self.get_ints_arg(node, 1)?),
+            other => bail!("{other} is not a squeeze overload"),
         };
-        let mut sorted: Vec<usize> = dims
-            .iter()
-            .map(|&dim| util::normalize_dim(dim, rank))
-            .collect();
-        sorted.sort_unstable();
-        let mut offset = 0;
-        for dim in sorted {
-            if result.dims()[dim - offset].to_usize() == Some(1) {
-                result = result.squeeze(dim - offset);
-                offset += 1;
-            }
+        let axes = squeezable_axes(dims, requested.as_deref())?;
+        if let Some(name) = Self::tensor_output_names(node).first()
+            && let Ok(meta) = self.tensor_meta(name)
+        {
+            let rank = dims.len() - axes.len();
+            ensure!(
+                rank == meta.sizes.len(),
+                "{}: removing axes {axes:?} of extents {dims:?} gives rank {rank}, \
+                 but the export declares rank {}",
+                node.target,
+                meta.sizes.len()
+            );
         }
-        Ok(result)
+        Ok(axes)
     }
 
     pub(super) fn translate_triangular(&mut self, node: &Node, upper: bool) -> Result<GraphTensor> {
@@ -351,6 +526,53 @@ impl Translator<'_> {
     }
 }
 
+/// The largest magnitude an operand of `dtype` carries into gcd's I64
+/// Euclid loop. An integer dtype is bounded by its own range. Every other
+/// dtype (U64, and anything non-integer) reaches the loop through the cast
+/// to I64, whose range bounds every magnitude by `2^63` (that of
+/// `i64::MIN`); that bound is also the safe answer for any dtype added later.
+pub(super) fn gcd_magnitude_bound(dtype: DType) -> u64 {
+    match dtype {
+        DType::Bool => 1,
+        DType::I4 => 1 << 3,
+        DType::U4 => (1 << 4) - 1,
+        DType::I8 => 1 << 7,
+        DType::U8 => u8::MAX as u64,
+        DType::I16 => 1 << 15,
+        DType::U16 => u16::MAX as u64,
+        DType::Int => 1 << 31,
+        _ => 1 << 63,
+    }
+}
+
+/// The number of Euclid divisions after which every pair with
+/// `|a|, |b| <= max_magnitude` has reached `b == 0`.
+///
+/// Lamé's theorem: if `a >= b > 0` and Euclid takes `n` divisions, then
+/// `b >= F(n+1)` and `a >= F(n+2)`, with `F(1) = F(2) = 1`. When `|a| < |b|`
+/// the first division only swaps the pair (`a rem b == a`), which costs one
+/// more. So, with `K` the largest index such that `F(K) <= max_magnitude`,
+/// every pair finishes within `K - 1` divisions, and the swapped consecutive
+/// pair `(F(K-1), F(K))` needs exactly that many, so the bound is tight.
+/// The truncated remainder by `|b|` has magnitude `|a| mod |b|`, so signs
+/// never change the count.
+///
+/// I64 (`2^63`, `K = 92`) needs 91 rounds; Int (`2^31`, `K = 46`) 45;
+/// I16 22; U8 12; I8 10.
+pub(super) fn gcd_euclid_rounds(max_magnitude: u64) -> usize {
+    // `(previous, current) = (F(index - 1), F(index))`, from `index = 2`.
+    let (mut previous, mut current, mut index) = (1u64, 1u64, 2usize);
+    loop {
+        match previous.checked_add(current) {
+            Some(next) if next <= max_magnitude => {
+                (previous, current) = (current, next);
+                index += 1;
+            }
+            _ => return index - 1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -360,8 +582,11 @@ mod tests {
         Argument, DimInt, DimSize, ExportedProgram, FloatArg, Graph, GraphModule, IntArg, IntsArg,
         Node, NodeInput, Signature, TensorArg, TensorMeta, TensorName, TensorRef,
     };
+    use luminal::prelude::IntExpr;
     use luminal_reference::{ReferenceRuntime, TypedBuffer, harness_search_options};
     use rustc_hash::FxHashMap;
+
+    use super::squeezable_axes;
 
     fn tensor_ref(name: &str) -> TensorRef {
         TensorRef {
@@ -429,6 +654,8 @@ mod tests {
             TensorMeta {
                 dtype,
                 sizes: sizes(in_shape),
+                strides: None,
+                storage_offset: None,
                 layout: None,
                 device: None,
             },
@@ -438,6 +665,8 @@ mod tests {
             TensorMeta {
                 dtype,
                 sizes: sizes(out_shape),
+                strides: None,
+                storage_offset: None,
                 layout: None,
                 device: None,
             },
@@ -508,6 +737,51 @@ mod tests {
             )
             .expect("search");
         runtime.set_data(input.tensor, TypedBuffer::F32(x.to_vec()));
+        runtime.execute().expect("execute");
+        translation
+            .outputs
+            .first()
+            .map(|output| runtime.get_f32(output.tensor).expect("f32 output").clone())
+            .expect("one output")
+    }
+
+    /// Translate and execute a two-tensor binary node `target(x, w)` on the
+    /// reference runtime, returning the F32 output.
+    fn run_binary_f32(target: &str, shape: &[i64], x: &[f32], w: &[f32]) -> Vec<f32> {
+        let mut parsed = program(
+            target,
+            binary(input("other", tensor_arg("w"))),
+            F32,
+            shape,
+            shape,
+        );
+        let graph = &mut parsed.program.graph_module.graph;
+        graph.inputs.push(tensor_ref("w"));
+        let x_meta = graph.tensor_values["x"].clone();
+        graph.tensor_values.insert("w".to_string(), x_meta);
+        let translation = crate::translate::translate(&parsed).expect("translate");
+        let mut runtime = ReferenceRuntime::load(&translation.graph).expect("load");
+        let dims: luminal::shape::DynMap = translation.dims.iter().map(|(s, v)| (*s, *v)).collect();
+        let staged = |name: &str| match name {
+            "x" => x.to_vec(),
+            "w" => w.to_vec(),
+            other => panic!("unexpected input {other}"),
+        };
+        let mut data: FxHashMap<_, TypedBuffer> = FxHashMap::default();
+        for bound in &translation.inputs {
+            data.insert(bound.tensor, TypedBuffer::F32(staged(&bound.graph_name)));
+        }
+        runtime
+            .search(
+                &luminal::shape::SymbolBounds::exact(&dims).unwrap(),
+                &dims,
+                &data,
+                &harness_search_options(),
+            )
+            .expect("search");
+        for bound in &translation.inputs {
+            runtime.set_data(bound.tensor, TypedBuffer::F32(staged(&bound.graph_name)));
+        }
         runtime.execute().expect("execute");
         translation
             .outputs
@@ -612,7 +886,7 @@ mod tests {
             assert!(translates(
                 target,
                 binary(input("other", tensor_arg("x"))),
-                F32,
+                I64,
                 &[2, 2],
                 &[2, 2],
             ));
@@ -715,12 +989,8 @@ mod tests {
         assert_close(&min, &[1.0, 3.0, -2.0], 1e-6);
     }
 
-    /// torch.fmax/fmin skip a NaN operand, but selecting a NaN branch away
-    /// needs a true selection. The recorder's `select`/`cond` and its
-    /// `stack`-based gather all leak `NaN * 0` (core LUM-804), so a NaN
-    /// operand propagates instead. Un-ignore once LUM-804 lands.
+    /// torch.fmax/fmin skip a NaN operand.
     #[test]
-    #[ignore = "blocked on core NaN-safe select (LUM-804): selection leaks NaN*0"]
     fn fmax_fmin_ignore_nan() {
         let x = [f32::NAN, 5.0, -2.0];
         let max = run_f32(
@@ -741,6 +1011,42 @@ mod tests {
         assert_close(&min, &[3.0, 3.0, -2.0], 1e-6);
     }
 
+    /// torch.fmax/fmin with tensors on both sides: a NaN on either side is
+    /// skipped, two NaNs stay NaN, infinities order normally, and zeros
+    /// order `-0.0 < +0.0` (torch's CPU kernel: fmax(-0.0, +0.0) = +0.0 and
+    /// fmin(+0.0, -0.0) = -0.0, in both operand orders).
+    #[test]
+    fn fmax_fmin_skip_nan_and_order_signed_zeros() {
+        let nan = f32::NAN;
+        let inf = f32::INFINITY;
+        let x = [
+            nan, 1.0, nan, inf, nan, -inf, -0.0, 0.0, -0.0, 0.0, -2.0, 3.0,
+        ];
+        let w = [
+            1.0, nan, nan, nan, -inf, 2.0, 0.0, -0.0, -0.0, 0.0, -2.0, -4.0,
+        ];
+        let expected_max = [
+            1.0, 1.0, nan, inf, -inf, 2.0, 0.0, 0.0, -0.0, 0.0, -2.0, 3.0,
+        ];
+        let expected_min = [
+            1.0, 1.0, nan, inf, -inf, -inf, -0.0, -0.0, -0.0, 0.0, -2.0, -4.0,
+        ];
+        for (target, expected) in [
+            ("torch.ops.aten.fmax.default", expected_max),
+            ("torch.ops.aten.fmin.default", expected_min),
+        ] {
+            let out = run_binary_f32(target, &[12], &x, &w);
+            for (i, (got, want)) in out.iter().zip(expected).enumerate() {
+                let same = if want.is_nan() {
+                    got.is_nan()
+                } else {
+                    got.to_bits() == want.to_bits()
+                };
+                assert!(same, "{target} index {i}: got {got:?}, expected {want:?}");
+            }
+        }
+    }
+
     #[test]
     fn hypot_matches_reference() {
         let x = [0.0f32, 3.0];
@@ -752,6 +1058,82 @@ mod tests {
             &x,
         );
         assert_close(&out, &[0.0, (18.0f32).sqrt()], 1e-6);
+    }
+
+    /// hypot against libm's `hypotf`: +inf wins over NaN, NaN wins over a
+    /// finite value, the origin is +0 for either zero sign, and the scaled
+    /// formula neither overflows below `f32::MAX` nor flushes subnormals.
+    #[test]
+    fn hypot_follows_c_special_values() {
+        fn check(actual: &[f32], lhs: &[f32], rhs: &[f32]) {
+            assert_eq!(actual.len(), lhs.len(), "length mismatch");
+            for (i, (&got, (&a, &b))) in actual.iter().zip(lhs.iter().zip(rhs)).enumerate() {
+                let want = a.hypot(b);
+                let agrees = if want.is_finite() && want != 0.0 {
+                    ((got - want) / want).abs() <= 2.0 * f32::EPSILON
+                } else {
+                    got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan())
+                };
+                assert!(
+                    agrees,
+                    "index {i}: hypot({a}, {b}) got {got:e}, expected {want:e}"
+                );
+            }
+        }
+        let tiny = f32::from_bits(1);
+        // hypot(x, x): the `inf / inf` and `0 / 0` ratios are selected away.
+        let x = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -0.0,
+            0.0,
+            3.0,
+            -1e38,
+            3e38,
+            tiny,
+            f32::MIN_POSITIVE,
+        ];
+        let out = run_f32(
+            "torch.ops.aten.hypot.default",
+            binary(input("other", tensor_arg("x"))),
+            F32,
+            &[x.len() as i64],
+            &x,
+        );
+        check(&out, &x, &x);
+        // An infinite operand gives +inf even beside a NaN.
+        let x = [f32::NAN, 1.0, -0.0, f32::NEG_INFINITY];
+        let out = run_f32(
+            "torch.ops.aten.hypot.default",
+            binary(flt("other", f64::INFINITY)),
+            F32,
+            &[x.len() as i64],
+            &x,
+        );
+        check(&out, &x, &[f32::INFINITY; 4]);
+        // A NaN operand gives NaN unless the other is infinite.
+        let x = [f32::INFINITY, f32::NEG_INFINITY, 1.0, -0.0, 1e38];
+        let out = run_f32(
+            "torch.ops.aten.hypot.default",
+            binary(flt("other", f64::NAN)),
+            F32,
+            &[x.len() as i64],
+            &x,
+        );
+        check(&out, &x, &[f32::NAN; 5]);
+        // A subnormal partner: the ratio's divisor may be subnormal, and a
+        // ratio far below 1 must leave the largest finite magnitude intact.
+        let partner = 1e-39f64;
+        let x = [3e-39, tiny, 0.0, -0.0, -f32::MAX, 1.0];
+        let out = run_f32(
+            "torch.ops.aten.hypot.default",
+            binary(flt("other", partner)),
+            F32,
+            &[x.len() as i64],
+            &x,
+        );
+        check(&out, &x, &[partner as f32; 6]);
     }
 
     #[test]
@@ -773,5 +1155,109 @@ mod tests {
             &x,
         );
         assert_close(&upper, &[0.0, 1.0, 2.0, 0.0, 0.0, 5.0], 1e-6);
+    }
+
+    fn extents(values: &[i64]) -> Vec<IntExpr> {
+        values.iter().map(|&value| IntExpr::from(value)).collect()
+    }
+
+    /// The squeeze rule: only requested axes whose extent is provably 1 go;
+    /// every other requested axis is a no-op, as in torch.
+    #[test]
+    fn squeeze_removes_only_provable_unit_axes() {
+        let dims = extents(&[1, 3, 1, 4]);
+        let axes = |requested: Option<&[i64]>| squeezable_axes(&dims, requested).unwrap();
+        // squeeze.dim on an extent != 1 (positive and negative) is a no-op.
+        assert_eq!(axes(Some(&[1])), Vec::<usize>::new());
+        assert_eq!(axes(Some(&[-1])), Vec::<usize>::new());
+        assert_eq!(axes(Some(&[2])), vec![2]);
+        assert_eq!(axes(Some(&[-2])), vec![2]);
+        // squeeze.dims mixing unit and non-unit axes keeps the non-unit ones.
+        assert_eq!(axes(Some(&[0, 1, 2])), vec![0, 2]);
+        assert_eq!(axes(Some(&[-1, -4])), vec![0]);
+        assert_eq!(axes(Some(&[2, 0])), vec![0, 2]);
+        // squeeze.default: every unit axis.
+        assert_eq!(axes(None), vec![0, 2]);
+        assert_eq!(
+            squeezable_axes(&extents(&[1, 1]), None).unwrap(),
+            vec![0, 1]
+        );
+    }
+
+    /// A symbolic extent is never squeezed: export only drops an axis it
+    /// knows is 1, and then the extent is the literal 1.
+    #[test]
+    fn squeeze_keeps_a_symbolic_extent() {
+        let dims = vec![IntExpr::from('a'), IntExpr::from(1i64), IntExpr::from(3i64)];
+        assert_eq!(
+            squeezable_axes(&dims, Some(&[0])).unwrap(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(squeezable_axes(&dims, Some(&[0, 1])).unwrap(), vec![1]);
+        assert_eq!(squeezable_axes(&dims, None).unwrap(), vec![1]);
+    }
+
+    /// A rank-0 tensor wraps dims against rank 1 (torch's `maybe_wrap_dim`
+    /// for a scalar): dim 0 and -1 are accepted and remove nothing.
+    #[test]
+    fn squeeze_of_a_scalar_is_a_no_op() {
+        let none = Vec::<usize>::new();
+        assert_eq!(squeezable_axes(&[], Some(&[0])).unwrap(), none);
+        assert_eq!(squeezable_axes(&[], Some(&[-1])).unwrap(), none);
+        assert_eq!(squeezable_axes(&[], None).unwrap(), none);
+        assert!(squeezable_axes(&[], Some(&[1])).is_err());
+        assert!(squeezable_axes(&[], Some(&[-2])).is_err());
+        assert!(squeezable_axes(&[], Some(&[0, -1])).is_err());
+    }
+
+    #[test]
+    fn squeeze_refuses_what_torch_refuses() {
+        let dims = extents(&[1, 3]);
+        assert!(squeezable_axes(&dims, Some(&[2])).is_err());
+        assert!(squeezable_axes(&dims, Some(&[-3])).is_err());
+        assert!(squeezable_axes(&dims, Some(&[0, -2])).is_err());
+    }
+
+    /// Every overload, on non-unit axes and on a scalar, translates to
+    /// the shape torch declares (`squeeze.dim` used to panic on both).
+    #[test]
+    fn squeeze_overloads_translate_to_the_declared_shape() {
+        let check = |target: &str, dim: Option<NodeInput>, from: &[i64], to: &[i64]| {
+            let target = format!("torch.ops.aten.{target}");
+            let mut args = vec![input("self", tensor_arg("x"))];
+            args.extend(dim);
+            assert!(
+                translates(&target, args, F32, from, to),
+                "{target} {from:?} -> {to:?}"
+            );
+        };
+        let shape = [1, 3, 1, 4];
+        check("squeeze.dim", Some(int("dim", 1)), &shape, &shape);
+        check("squeeze.dim", Some(int("dim", -1)), &shape, &shape);
+        check("squeeze.dim", Some(int("dim", 2)), &shape, &[1, 3, 4]);
+        check(
+            "squeeze.dims",
+            Some(ints("dim", &[0, 1])),
+            &shape,
+            &[3, 1, 4],
+        );
+        check("squeeze.default", None, &shape, &[3, 4]);
+        check("squeeze.dim", Some(int("dim", 0)), &[], &[]);
+        check("squeeze.dim", Some(int("dim", -1)), &[], &[]);
+        check("squeeze.dims", Some(ints("dim", &[0])), &[], &[]);
+        check("squeeze.default", None, &[], &[]);
+    }
+
+    /// The export's declared rank is checked: a squeeze that would give a
+    /// different rank than torch recorded is refused, not translated.
+    #[test]
+    fn squeeze_refuses_a_rank_torch_did_not_declare() {
+        assert!(!translates(
+            "torch.ops.aten.squeeze.dim",
+            vec![input("self", tensor_arg("x")), int("dim", 1)],
+            F32,
+            &[1, 3, 1, 4],
+            &[1, 1, 4],
+        ));
     }
 }

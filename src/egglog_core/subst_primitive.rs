@@ -228,6 +228,14 @@ impl Walk<'_> {
             if self.snapshot.nodes.contains_key(&value) {
                 continue;
             }
+            // A key is replaced wholesale, including every alternative in its
+            // e-class. Keep the leaf for `mark`, but do not follow structure
+            // that cannot contribute to the result. A descendant shared by an
+            // un-replaced branch is still collected through that branch.
+            if self.map.contains_key(&value) {
+                self.snapshot.nodes.insert(value, Vec::new());
+                continue;
+            }
             // E-class ids all come from one counter, so probing a constructor
             // of the wrong sort just finds nothing. That is what makes the
             // root's unknown sort affordable: it costs one probe per eq-sorted
@@ -632,6 +640,62 @@ impl FullPrim for Subst {
     }
 }
 
+/// A substitution whose completed results live in an e-graph function table.
+///
+/// The caller must declare `cache_table` as `(R, Map<K, K>) -> R`, with
+/// `:merge old`. Egglog rebuilds the keys and result when classes merge. Once
+/// computed, an image remains valid: later equalities only add equivalent
+/// spellings of the same source function, and equal maps have equal images.
+/// Rewalking those spellings can feed an unbounded syntactic orbit back into
+/// layout composition, even though it cannot change the function's result.
+///
+/// Use only after the caller has established substitution's domain/range
+/// contract and committed the source rows. The uncached primitive remains
+/// available when a caller explicitly needs to copy newly discovered syntax.
+#[derive(Clone)]
+pub struct MemoizedSubst {
+    pub name: String,
+    pub cache_table: String,
+    pub inner: Subst,
+}
+
+impl Primitive for MemoizedSubst {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
+        self.inner.get_type_constraints(span)
+    }
+}
+
+impl FullPrim for MemoizedSubst {
+    fn apply<'a, 'db>(&self, mut state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        let [root, map] = args else { return None };
+        let result = (|| {
+            if let Some(image) = state.lookup(&self.cache_table, RawValues(args.to_vec()))? {
+                return Ok(image);
+            }
+            let entries = state
+                .value_to_container::<MapContainer>(*map)
+                .ok_or_else(|| error(format!("{map:?} is not a Map container value")))?
+                .data
+                .clone();
+            let image = substitute(&mut state, *root, &entries, &self.inner.skip)?;
+            state.set(&self.cache_table, RawValues(args.to_vec()), image)?;
+            Ok::<_, Error>(image)
+        })();
+        match result {
+            Ok(image) => Some(image),
+            Err(err) => {
+                eprintln!("[{}] {err}", self.name);
+                state.panic();
+                None
+            }
+        }
+    }
+}
+
 /// `(unstable-subst root map) : (R, Map<K, K>) -> R` for any eq-sort `R`.
 ///
 /// `R` is free rather than pinned to `K` because a substitution reaches through
@@ -701,5 +765,143 @@ impl TypeConstraint for SubstTypeConstraint {
         ));
 
         cs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egglog::prelude::exprs;
+
+    #[test]
+    fn replacement_is_a_leaf_even_when_its_eclass_contains_a_cycle() {
+        let mut eg = crate::egglog_snippet::new_egraph();
+        eg.parse_and_run_program(
+            None,
+            r#"
+            (datatype Term (Atom i64) (Pair Term Term))
+            (sort TermMap (Map Term Term))
+            (let key (Atom 0))
+            (let hidden (Pair (Atom 1) (Atom 2)))
+            (union key (Pair key hidden))
+            (let root (Pair key key))
+            (let replacement (Pair key (Atom 7)))
+            (let sigma (map-insert (map-empty) key replacement))
+        "#,
+        )
+        .unwrap();
+        let root = eg.eval_expr(&exprs::var("root")).unwrap().1;
+        let key = eg.eval_expr(&exprs::var("key")).unwrap().1;
+        let replacement = eg.eval_expr(&exprs::var("replacement")).unwrap().1;
+        let map = BTreeMap::from([(key, replacement)]);
+        eg.update(|state| {
+            let ctors = constructors(&state, &HashSet::new());
+            let mut by_output: HashMap<String, Vec<usize>> = HashMap::new();
+            for (index, ctor) in ctors.iter().enumerate() {
+                by_output
+                    .entry(ctor.output.name().to_owned())
+                    .or_default()
+                    .push(index);
+            }
+            let mut walk = Walk {
+                ctors,
+                by_output,
+                map: &map,
+                snapshot: Snapshot::default(),
+                affected: HashSet::new(),
+                images: HashMap::new(),
+                container_images: HashMap::new(),
+                container_leaves: HashMap::new(),
+            };
+            walk.collect(&state, root)?;
+            assert_eq!(
+                walk.snapshot.nodes.len(),
+                2,
+                "only the root and replacement key should be visited"
+            );
+            walk.mark();
+            assert!(walk.affected.contains(&root));
+            Ok(())
+        })
+        .unwrap();
+        // The replacement itself contains the key: simultaneous substitution
+        // must splice it as-is, without substituting recursively inside it.
+        eg.parse_and_run_program(
+            None,
+            r#"
+            (let result (unstable-subst root sigma))
+            (check (= result (Pair replacement replacement)))
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn descendants_reachable_outside_a_replacement_still_get_substituted() {
+        let mut eg = crate::egglog_snippet::new_egraph();
+        eg.parse_and_run_program(
+            None,
+            r#"
+            (datatype Term (Atom i64) (Pair Term Term))
+            (sort TermMap (Map Term Term))
+            (let key (Atom 0))
+            (let shared (Pair (Atom 1) (Atom 2)))
+            (union key (Pair key shared))
+            (let root (Pair shared key))
+            (let sigma (map-insert
+                (map-insert (map-empty) key (Atom 7)) (Atom 1) (Atom 8)))
+            (let result (unstable-subst root sigma))
+            (check (= result (Pair (Pair (Atom 8) (Atom 2)) (Atom 7))))
+        "#,
+        )
+        .unwrap();
+    }
+    #[test]
+    fn memoized_substitution_follows_key_and_result_merges() {
+        let mut eg = crate::egglog_snippet::new_egraph();
+        eg.add_full_primitive(
+            MemoizedSubst {
+                name: "cached-subst".into(),
+                cache_table: "test-subst-cache".into(),
+                inner: Subst {
+                    skip: Default::default(),
+                },
+            },
+            None,
+        );
+        eg.parse_and_run_program(
+            None,
+            r#"
+            (datatype Term (Atom i64) (Pair Term Term))
+            (sort TermMap (Map Term Term))
+            (function test-subst-cache (Term TermMap) Term :merge old)
+            (let key (Atom 0))
+            (let left (Atom 1))
+            (let right (Atom 2))
+            (let root-left (Pair key left))
+            (let root-right (Pair key right))
+            (let sigma (map-insert (map-empty) key (Atom 3)))
+            (let image-left (cached-subst root-left sigma))
+            (let image-right (cached-subst root-right sigma))
+            (check (= image-left (Pair (Atom 3) left)))
+            (check (= image-right (Pair (Atom 3) right)))
+            (union left right)
+            (check (= image-left image-right))
+            (let cached-after-root-merge (cached-subst root-right sigma))
+            (check (= cached-after-root-merge image-left))
+            (union (Atom 3) (Atom 4))
+            (let sigma2 (map-insert (map-empty) key (Atom 4)))
+            (let cached-after-map-merge (cached-subst root-left sigma2))
+            (check (= cached-after-map-merge (Pair (Atom 4) left)))
+        "#,
+        )
+        .unwrap();
+        eg.update(|state| {
+            let mut rows = 0;
+            state.function_entries("test-subst-cache", |_| rows += 1)?;
+            assert_eq!(rows, 1, "cache keys should merge with their source and map");
+            Ok(())
+        })
+        .unwrap();
     }
 }

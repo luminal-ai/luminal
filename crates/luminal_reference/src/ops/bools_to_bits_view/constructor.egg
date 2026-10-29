@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpBoolsToBitsView (LayoutTensor Dtype Layout) LayoutTensorOp)

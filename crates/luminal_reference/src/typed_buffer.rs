@@ -14,6 +14,7 @@
 //! runs BOTH runtimes to compare them, the reference side of that test
 //! stages a `TypedBuffer` and the CL side a `HostBuffer`.
 
+use crate::narrow_float::{F8E4M3FNUZ, F8E5M2FNUZ, NarrowFloat};
 use anyhow::Result;
 
 /// Typed reference storage (rulings 2026-07-28, 2026-07-30, and the
@@ -21,9 +22,8 @@ use anyhow::Result;
 /// another type — "no smuggling data in invalid types"). Floats live
 /// as f32, or as f64 where the model asked for double precision
 /// (ruling 2026-09-02: F64 is a real executable dtype here, never an
-/// F32 bridge wearing an F64 tag). TF32 uses its own validated value
-/// type in 32-bit backing words; widening to F32 is explicit.
-/// The 32-bit integers live as i32 and 64-bit integers as i64, NATIVE values
+/// F32 bridge wearing an F64 tag); 32-bit integers as i32 and 64-bit
+/// as i64, NATIVE values
 /// (every bit pattern legal — total-code dtypes), which is what makes
 /// index arithmetic exact past f32's 2^24 ceiling; the NARROW integers
 /// I8/U8/I16 likewise store native, at their own width, never widened
@@ -38,12 +38,7 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedBuffer {
     F32(Vec<f32>),
-    /// IEEE FP16 storage; arithmetic follows explicit widening casts.
-    F16(Vec<half::f16>),
-    /// BF16 storage; arithmetic follows explicit widening casts.
-    Bf16(Vec<half::bf16>),
-    /// TF32 precision in a distinct typed payload with 32-bit backing words.
-    /// Arithmetic requires an explicit widening cast to F32.
+    /// TF32 precision in validated 32-bit backing words; arithmetic requires widening.
     TF32(Vec<crate::tf32::Tf32>),
     /// Double-precision floats. A model that declares F64 executes in
     /// F64: silently bridging through F32 would hide a precision
@@ -52,6 +47,7 @@ pub enum TypedBuffer {
     F64(Vec<f64>),
     I32(Vec<i32>),
     I64(Vec<i64>),
+    U64(Vec<u64>),
     /// Narrow signed byte integers. Stored at their OWN width: a
     /// narrow value silently widened to i32 is exactly the smuggling
     /// the typed-buffer ruling forbids, and it also loses the
@@ -69,15 +65,127 @@ pub enum TypedBuffer {
     /// own dtype; arithmetic happens after an explicit widening cast.
     /// OCP e4m3fn codes (the `float8` crate's `F8E4M3` is that encoding).
     F8E4M3FN(Vec<float8::F8E4M3>),
+    /// IEEE binary16 codes. STORAGE ONLY, like every narrow float: the
+    /// translator computes half-precision math in F32 (torch's opmath),
+    /// so this variant is staged, cast, moved and read back — never
+    /// operated on. The conversion contract is [`crate::narrow_float`].
+    F16(Vec<half::f16>),
+    /// bfloat16 codes — storage only, see [`Self::F16`].
+    Bf16(Vec<half::bf16>),
+    /// OCP e5m2 codes — storage only, see [`Self::F16`].
+    F8E5M2(Vec<float8::F8E5M2>),
+    /// e4m3fnuz codes (torch `float8_e4m3fnuz`) — storage only.
+    F8E4M3FNUZ(Vec<F8E4M3FNUZ>),
+    /// e5m2fnuz codes (torch `float8_e5m2fnuz`) — storage only.
+    F8E5M2FNUZ(Vec<F8E5M2FNUZ>),
 }
 
-/// Typed accessors share one implementation across narrow float and integer
-/// storage. The narrow-integer family (I8/U8/I16) uses this at three
-/// widths: typed accessors that refuse by name rather than coerce,
-/// exactly like the hand-written F32/I32/I64 pairs above. Written as a
-/// macro because three verbatim copies of a seven-line accessor is not
-/// three decisions — it is one, repeated. Anything that DIFFERS between
-/// the widths (there is nothing, today) belongs outside the macro.
+/// THE narrow-float variant list, written once. `$codes` binds the
+/// payload `Vec<T>` and `$body` is instantiated per format, so a body
+/// written against the [`crate::narrow_float::NarrowFloat`] trait serves
+/// every format; anything that is not a narrow float falls to
+/// `$fallback` with the buffer bound to `$other`. A new format is one
+/// line here plus its `TypedBuffer` variant and trait impl — the
+/// exhaustive matches below are the compiler's checklist for the rest.
+macro_rules! narrow_float_match {
+    ($buffer:expr, $codes:ident => $body:expr, $other:ident => $fallback:expr) => {
+        match $buffer {
+            $crate::typed_buffer::TypedBuffer::F16($codes) => $body,
+            $crate::typed_buffer::TypedBuffer::Bf16($codes) => $body,
+            $crate::typed_buffer::TypedBuffer::F8E4M3FN($codes) => $body,
+            $crate::typed_buffer::TypedBuffer::F8E5M2($codes) => $body,
+            $crate::typed_buffer::TypedBuffer::F8E4M3FNUZ($codes) => $body,
+            $crate::typed_buffer::TypedBuffer::F8E5M2FNUZ($codes) => $body,
+            $other => $fallback,
+        }
+    };
+}
+pub(crate) use narrow_float_match;
+
+/// Two buffers of the SAME variant, every variant: `$body` runs with the
+/// two payload vectors bound (monomorphized per element type), and a
+/// variant mismatch falls to `$fallback` with the two buffers bound. This
+/// is the payload-move primitive: gathers, scatters, selects and
+/// same-type casts are "copy elements between two vectors of one type"
+/// and must never be written once per variant.
+macro_rules! same_variant_match {
+    (($lhs:expr, $rhs:expr), ($a:ident, $b:ident) => $body:expr, ($s:ident, $d:ident) => $fallback:expr) => {
+        match ($lhs, $rhs) {
+            (
+                $crate::typed_buffer::TypedBuffer::F32($a),
+                $crate::typed_buffer::TypedBuffer::F32($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::TF32($a),
+                $crate::typed_buffer::TypedBuffer::TF32($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::F64($a),
+                $crate::typed_buffer::TypedBuffer::F64($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::I32($a),
+                $crate::typed_buffer::TypedBuffer::I32($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::I64($a),
+                $crate::typed_buffer::TypedBuffer::I64($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::U64($a),
+                $crate::typed_buffer::TypedBuffer::U64($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::I8($a),
+                $crate::typed_buffer::TypedBuffer::I8($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::U8($a),
+                $crate::typed_buffer::TypedBuffer::U8($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::I16($a),
+                $crate::typed_buffer::TypedBuffer::I16($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::Bool8($a),
+                $crate::typed_buffer::TypedBuffer::Bool8($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::F8E4M3FN($a),
+                $crate::typed_buffer::TypedBuffer::F8E4M3FN($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::F16($a),
+                $crate::typed_buffer::TypedBuffer::F16($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::Bf16($a),
+                $crate::typed_buffer::TypedBuffer::Bf16($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::F8E5M2($a),
+                $crate::typed_buffer::TypedBuffer::F8E5M2($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::F8E4M3FNUZ($a),
+                $crate::typed_buffer::TypedBuffer::F8E4M3FNUZ($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::F8E5M2FNUZ($a),
+                $crate::typed_buffer::TypedBuffer::F8E5M2FNUZ($b),
+            ) => $body,
+            ($s, $d) => $fallback,
+        }
+    };
+}
+pub(crate) use same_variant_match;
+
+/// Typed accessors that refuse by name rather than coerce, exactly like
+/// the hand-written F32/I32/I64 pairs below. Written as a macro because
+/// a verbatim copy of a seven-line accessor per variant is not a
+/// decision per variant — it is one, repeated. Anything that DIFFERS
+/// between variants belongs outside the macro.
 macro_rules! typed_accessors {
     ($variant:ident, $prim:ty, $get:ident, $get_mut:ident, $article:literal) => {
         pub fn $get(&self) -> Result<&Vec<$prim>> {
@@ -105,30 +213,14 @@ macro_rules! typed_accessors {
 impl TypedBuffer {
     /// Copy a value's declared storage span while preserving spare capacity.
     pub fn copy_prefix_from(&mut self, source: &Self, count: usize) -> Result<()> {
-        macro_rules! copy {
-            ($a:expr, $b:expr) => {{
-                anyhow::ensure!(
-                    count <= $a.len() && count <= $b.len(),
-                    "value copy exceeds buffer capacity"
-                );
-                $a[..count].copy_from_slice(&$b[..count]);
-            }};
-        }
-        match (self, source) {
-            (Self::F16(a), Self::F16(b)) => copy!(a, b),
-            (Self::Bf16(a), Self::Bf16(b)) => copy!(a, b),
-            (Self::F32(a), Self::F32(b)) => copy!(a, b),
-            (Self::TF32(a), Self::TF32(b)) => copy!(a, b),
-            (Self::F64(a), Self::F64(b)) => copy!(a, b),
-            (Self::I32(a), Self::I32(b)) => copy!(a, b),
-            (Self::I64(a), Self::I64(b)) => copy!(a, b),
-            (Self::I8(a), Self::I8(b)) => copy!(a, b),
-            (Self::U8(a), Self::U8(b)) => copy!(a, b),
-            (Self::I16(a), Self::I16(b)) => copy!(a, b),
-            (Self::Bool8(a), Self::Bool8(b)) => copy!(a, b),
-            (Self::F8E4M3FN(a), Self::F8E4M3FN(b)) => copy!(a, b),
-            _ => anyhow::bail!("value copy dtype mismatch"),
-        }
+        same_variant_match!(
+            (self, source),
+            (dest, source) => {
+                anyhow::ensure!(count <= dest.len() && count <= source.len(), "value copy exceeds buffer capacity");
+                dest[..count].copy_from_slice(&source[..count]);
+            },
+            (_dest, _source) => anyhow::bail!("value copy dtype mismatch")
+        );
         Ok(())
     }
 
@@ -150,18 +242,22 @@ impl TypedBuffer {
 
     pub fn len(&self) -> usize {
         match self {
-            TypedBuffer::F16(values) => values.len(),
-            TypedBuffer::Bf16(values) => values.len(),
             TypedBuffer::F32(values) => values.len(),
             TypedBuffer::TF32(values) => values.len(),
             TypedBuffer::F64(values) => values.len(),
             TypedBuffer::I32(values) => values.len(),
             TypedBuffer::I64(values) => values.len(),
+            TypedBuffer::U64(values) => values.len(),
             TypedBuffer::I8(values) => values.len(),
             TypedBuffer::U8(values) => values.len(),
             TypedBuffer::I16(values) => values.len(),
             TypedBuffer::Bool8(bits) => bits.len(),
             TypedBuffer::F8E4M3FN(codes) => codes.len(),
+            TypedBuffer::F16(codes) => codes.len(),
+            TypedBuffer::Bf16(codes) => codes.len(),
+            TypedBuffer::F8E5M2(codes) => codes.len(),
+            TypedBuffer::F8E4M3FNUZ(codes) => codes.len(),
+            TypedBuffer::F8E5M2FNUZ(codes) => codes.len(),
         }
     }
 
@@ -171,24 +267,32 @@ impl TypedBuffer {
 
     pub fn type_name(&self) -> &'static str {
         match self {
-            TypedBuffer::F16(_) => "f16",
-            TypedBuffer::Bf16(_) => "bf16",
             TypedBuffer::F32(_) => "f32",
             TypedBuffer::TF32(_) => "tf32",
             TypedBuffer::F64(_) => "f64",
             TypedBuffer::I32(_) => "i32",
             TypedBuffer::I64(_) => "i64",
+            TypedBuffer::U64(_) => "u64",
             TypedBuffer::I8(_) => "i8",
             TypedBuffer::U8(_) => "u8",
             TypedBuffer::I16(_) => "i16",
             TypedBuffer::Bool8(_) => "bool8",
-            TypedBuffer::F8E4M3FN(_) => "f8e4m3fn",
+            TypedBuffer::F8E4M3FN(_) => <float8::F8E4M3 as NarrowFloat>::NAME,
+            TypedBuffer::F16(_) => <half::f16 as NarrowFloat>::NAME,
+            TypedBuffer::Bf16(_) => <half::bf16 as NarrowFloat>::NAME,
+            TypedBuffer::F8E5M2(_) => <float8::F8E5M2 as NarrowFloat>::NAME,
+            TypedBuffer::F8E4M3FNUZ(_) => <F8E4M3FNUZ as NarrowFloat>::NAME,
+            TypedBuffer::F8E5M2FNUZ(_) => <F8E5M2FNUZ as NarrowFloat>::NAME,
         }
     }
 
-    typed_accessors!(F16, half::f16, as_f16, as_f16_mut, "an f16");
+    /// Whether this buffer holds one of the narrow-float formats (storage
+    /// only; see [`crate::narrow_float`]).
+    pub fn is_narrow_float(&self) -> bool {
+        narrow_float_match!(self, _codes => true, _other => false)
+    }
 
-    typed_accessors!(Bf16, half::bf16, as_bf16, as_bf16_mut, "a bf16");
+    typed_accessors!(TF32, crate::tf32::Tf32, as_tf32, as_tf32_mut, "a tf32");
 
     pub fn as_f32(&self) -> Result<&Vec<f32>> {
         match self {
@@ -201,20 +305,6 @@ impl TypedBuffer {
         match self {
             TypedBuffer::F32(values) => Ok(values),
             other => anyhow::bail!("expected an f32 buffer, found {}", other.type_name()),
-        }
-    }
-
-    pub fn as_tf32(&self) -> Result<&Vec<crate::tf32::Tf32>> {
-        match self {
-            Self::TF32(values) => Ok(values),
-            other => anyhow::bail!("expected a tf32 buffer, found {}", other.type_name()),
-        }
-    }
-
-    pub fn as_tf32_mut(&mut self) -> Result<&mut Vec<crate::tf32::Tf32>> {
-        match self {
-            Self::TF32(values) => Ok(values),
-            other => anyhow::bail!("expected a tf32 buffer, found {}", other.type_name()),
         }
     }
 
@@ -260,23 +350,43 @@ impl TypedBuffer {
         }
     }
 
+    typed_accessors!(U64, u64, as_u64, as_u64_mut, "a u64");
     typed_accessors!(I8, i8, as_i8, as_i8_mut, "an i8");
     typed_accessors!(U8, u8, as_u8, as_u8_mut, "a u8");
     typed_accessors!(I16, i16, as_i16, as_i16_mut, "an i16");
 
-    pub fn as_f8e4m3(&self) -> Result<&Vec<float8::F8E4M3>> {
-        match self {
-            TypedBuffer::F8E4M3FN(codes) => Ok(codes),
-            other => anyhow::bail!("expected an f8e4m3 buffer, found {}", other.type_name()),
-        }
-    }
-
-    pub fn as_f8e4m3_mut(&mut self) -> Result<&mut Vec<float8::F8E4M3>> {
-        match self {
-            TypedBuffer::F8E4M3FN(codes) => Ok(codes),
-            other => anyhow::bail!("expected an f8e4m3 buffer, found {}", other.type_name()),
-        }
-    }
+    // The narrow-float family: code vectors, never values (see
+    // `crate::narrow_float` for the one conversion contract).
+    typed_accessors!(
+        F8E4M3FN,
+        float8::F8E4M3,
+        as_f8e4m3,
+        as_f8e4m3_mut,
+        "an f8e4m3fn"
+    );
+    typed_accessors!(
+        F8E5M2,
+        float8::F8E5M2,
+        as_f8e5m2,
+        as_f8e5m2_mut,
+        "an f8e5m2"
+    );
+    typed_accessors!(F16, half::f16, as_f16, as_f16_mut, "an f16");
+    typed_accessors!(Bf16, half::bf16, as_bf16, as_bf16_mut, "a bf16");
+    typed_accessors!(
+        F8E4M3FNUZ,
+        F8E4M3FNUZ,
+        as_f8e4m3fnuz,
+        as_f8e4m3fnuz_mut,
+        "an f8e4m3fnuz"
+    );
+    typed_accessors!(
+        F8E5M2FNUZ,
+        F8E5M2FNUZ,
+        as_f8e5m2fnuz,
+        as_f8e5m2fnuz_mut,
+        "an f8e5m2fnuz"
+    );
 
     pub fn as_bool8(&self) -> Result<&Vec<u8>> {
         match self {
@@ -295,7 +405,7 @@ impl TypedBuffer {
     /// Physical reference storage width, distinct from logical precision.
     pub(crate) fn element_bytes(&self) -> usize {
         match self {
-            Self::F64(_) | Self::I64(_) => 8,
+            Self::F64(_) | Self::I64(_) | Self::U64(_) => 8,
             Self::F32(_) | Self::TF32(_) | Self::I32(_) => 4,
             Self::F16(_) | Self::Bf16(_) | Self::I16(_) => 2,
             _ => 1,
@@ -319,26 +429,28 @@ impl TypedBuffer {
     pub(crate) fn zeroed(dtype: luminal::dtype::PlanDtype, n: usize) -> Result<Self> {
         use luminal::dtype::PlanDtype as D;
         Ok(match dtype {
-            D::F16 => Self::F16(vec![half::f16::ZERO; n]),
-            D::Bf16 => Self::Bf16(vec![half::bf16::ZERO; n]),
             D::F32 => Self::F32(vec![0.; n]),
             D::TF32 => Self::TF32(vec![crate::tf32::Tf32::default(); n]),
             D::F64 => Self::F64(vec![0.; n]),
             D::Int => Self::I32(vec![0; n]),
             D::Int64 => Self::I64(vec![0; n]),
+            D::UInt64 => Self::U64(vec![0; n]),
             D::I8 => Self::I8(vec![0; n]),
             D::U8 => Self::U8(vec![0; n]),
             D::I16 => Self::I16(vec![0; n]),
             D::Bool | D::Bool8 => Self::Bool8(vec![0; n]),
-            D::F8E4M3FN => Self::F8E4M3FN(vec![float8::F8E4M3::from_bits(0); n]),
+            D::F8E4M3FN => Self::F8E4M3FN(vec![<float8::F8E4M3 as NarrowFloat>::ZERO; n]),
+            D::F8E5M2 => Self::F8E5M2(vec![<float8::F8E5M2 as NarrowFloat>::ZERO; n]),
+            D::F16 => Self::F16(vec![<half::f16 as NarrowFloat>::ZERO; n]),
+            D::Bf16 => Self::Bf16(vec![<half::bf16 as NarrowFloat>::ZERO; n]),
+            D::F8E4M3FNUZ => Self::F8E4M3FNUZ(vec![<F8E4M3FNUZ as NarrowFloat>::ZERO; n]),
+            D::F8E5M2FNUZ => Self::F8E5M2FNUZ(vec![<F8E5M2FNUZ as NarrowFloat>::ZERO; n]),
             _ => anyhow::bail!("reference runtime cannot allocate {dtype:?}"),
         })
     }
 
     pub fn zeroed_like(&self) -> TypedBuffer {
         match self {
-            TypedBuffer::F16(values) => TypedBuffer::F16(vec![half::f16::ZERO; values.len()]),
-            TypedBuffer::Bf16(values) => TypedBuffer::Bf16(vec![half::bf16::ZERO; values.len()]),
             TypedBuffer::F32(values) => TypedBuffer::F32(vec![0.0; values.len()]),
             TypedBuffer::TF32(values) => {
                 TypedBuffer::TF32(vec![crate::tf32::Tf32::default(); values.len()])
@@ -346,14 +458,75 @@ impl TypedBuffer {
             TypedBuffer::F64(values) => TypedBuffer::F64(vec![0.0; values.len()]),
             TypedBuffer::I32(values) => TypedBuffer::I32(vec![0; values.len()]),
             TypedBuffer::I64(values) => TypedBuffer::I64(vec![0; values.len()]),
+            TypedBuffer::U64(values) => TypedBuffer::U64(vec![0; values.len()]),
             TypedBuffer::I8(values) => TypedBuffer::I8(vec![0; values.len()]),
             TypedBuffer::U8(values) => TypedBuffer::U8(vec![0; values.len()]),
             TypedBuffer::I16(values) => TypedBuffer::I16(vec![0; values.len()]),
             TypedBuffer::Bool8(bits) => TypedBuffer::Bool8(vec![0u8; bits.len()]),
             TypedBuffer::F8E4M3FN(codes) => {
-                TypedBuffer::F8E4M3FN(vec![float8::F8E4M3::from_bits(0); codes.len()])
+                TypedBuffer::F8E4M3FN(vec![<float8::F8E4M3 as NarrowFloat>::ZERO; codes.len()])
+            }
+            TypedBuffer::F16(codes) => {
+                TypedBuffer::F16(vec![<half::f16 as NarrowFloat>::ZERO; codes.len()])
+            }
+            TypedBuffer::Bf16(codes) => {
+                TypedBuffer::Bf16(vec![<half::bf16 as NarrowFloat>::ZERO; codes.len()])
+            }
+            TypedBuffer::F8E5M2(codes) => {
+                TypedBuffer::F8E5M2(vec![<float8::F8E5M2 as NarrowFloat>::ZERO; codes.len()])
+            }
+            TypedBuffer::F8E4M3FNUZ(codes) => {
+                TypedBuffer::F8E4M3FNUZ(vec![<F8E4M3FNUZ as NarrowFloat>::ZERO; codes.len()])
+            }
+            TypedBuffer::F8E5M2FNUZ(codes) => {
+                TypedBuffer::F8E5M2FNUZ(vec![<F8E5M2FNUZ as NarrowFloat>::ZERO; codes.len()])
             }
         }
+    }
+
+    /// Every narrow-float code widened EXACTLY to f64 (the only read a
+    /// kernel may make of narrow storage); `None` for any other variant.
+    pub fn narrow_float_to_f64(&self) -> Option<Vec<f64>> {
+        narrow_float_match!(
+            self,
+            codes => Some(codes.iter().map(|code| code.to_f64()).collect()),
+            _other => None
+        )
+    }
+
+    /// Fill a narrow-float buffer from f64 values, ONE rounding per
+    /// element in the destination format (round-to-nearest-even plus
+    /// the format's overflow policy). `Ok(false)` if this is not a
+    /// narrow-float buffer; the caller then takes its own path.
+    pub fn fill_narrow_float_from_f64(&mut self, values: &[f64]) -> Result<bool> {
+        narrow_float_match!(
+            self,
+            codes => {
+                anyhow::ensure!(codes.len() == values.len(), "cast length mismatch");
+                for (code, value) in codes.iter_mut().zip(values) {
+                    *code = NarrowFloat::from_f64(*value);
+                }
+                Ok(true)
+            },
+            _other => Ok(false)
+        )
+    }
+
+    /// The f32 twin of [`Self::fill_narrow_float_from_f64`]: an F32
+    /// source rounds from f32 directly (a detour through f64 would be
+    /// exact too, but this is the conversion torch spells).
+    pub fn fill_narrow_float_from_f32(&mut self, values: &[f32]) -> Result<bool> {
+        narrow_float_match!(
+            self,
+            codes => {
+                anyhow::ensure!(codes.len() == values.len(), "cast length mismatch");
+                for (code, value) in codes.iter_mut().zip(values) {
+                    *code = NarrowFloat::from_f32(*value);
+                }
+                Ok(true)
+            },
+            _other => Ok(false)
+        )
     }
 }
 
@@ -374,11 +547,6 @@ impl From<Vec<f32>> for TypedBuffer {
         TypedBuffer::F32(values)
     }
 }
-impl From<Vec<crate::tf32::Tf32>> for TypedBuffer {
-    fn from(values: Vec<crate::tf32::Tf32>) -> Self {
-        Self::TF32(values)
-    }
-}
 impl From<Vec<i32>> for TypedBuffer {
     fn from(values: Vec<i32>) -> Self {
         TypedBuffer::I32(values)
@@ -387,6 +555,11 @@ impl From<Vec<i32>> for TypedBuffer {
 impl From<Vec<i64>> for TypedBuffer {
     fn from(values: Vec<i64>) -> Self {
         TypedBuffer::I64(values)
+    }
+}
+impl From<Vec<u64>> for TypedBuffer {
+    fn from(values: Vec<u64>) -> Self {
+        Self::U64(values)
     }
 }
 impl From<Vec<i8>> for TypedBuffer {
@@ -407,6 +580,31 @@ impl From<Vec<i16>> for TypedBuffer {
 impl From<Vec<float8::F8E4M3>> for TypedBuffer {
     fn from(codes: Vec<float8::F8E4M3>) -> Self {
         TypedBuffer::F8E4M3FN(codes)
+    }
+}
+impl From<Vec<float8::F8E5M2>> for TypedBuffer {
+    fn from(codes: Vec<float8::F8E5M2>) -> Self {
+        TypedBuffer::F8E5M2(codes)
+    }
+}
+impl From<Vec<half::f16>> for TypedBuffer {
+    fn from(codes: Vec<half::f16>) -> Self {
+        TypedBuffer::F16(codes)
+    }
+}
+impl From<Vec<half::bf16>> for TypedBuffer {
+    fn from(codes: Vec<half::bf16>) -> Self {
+        TypedBuffer::Bf16(codes)
+    }
+}
+impl From<Vec<F8E4M3FNUZ>> for TypedBuffer {
+    fn from(codes: Vec<F8E4M3FNUZ>) -> Self {
+        TypedBuffer::F8E4M3FNUZ(codes)
+    }
+}
+impl From<Vec<F8E5M2FNUZ>> for TypedBuffer {
+    fn from(codes: Vec<F8E5M2FNUZ>) -> Self {
+        TypedBuffer::F8E5M2FNUZ(codes)
     }
 }
 
@@ -432,13 +630,15 @@ pub struct ReferenceKernelCtx {
     pub dims: luminal::shape::DynMap,
 }
 
-/// The elementwise-binary, axis-reduce and axis-scan helpers for one narrow
-/// integer width — the I8/U8/I16 twins of
-/// [`ReferenceKernelCtx::binary_elementwise_i32`],
-/// [`ReferenceKernelCtx::reduce_axis_i32`] and
-/// [`ReferenceKernelCtx::scan_axis_i32`], whose bodies are identical once the
-/// primitive type is fixed.
-macro_rules! narrow_int_kernel_helpers {
+/// The elementwise-binary, axis-reduce and axis-scan helpers for one
+/// primitive element type, written ONCE: the bodies are identical once the
+/// type is fixed, so every width with fallible (checked or wrapping)
+/// arithmetic is one instantiation below — F64, I32, I64, U64 and the
+/// narrow ints. The closures return `Result` so a checked overflow or a
+/// zero divisor refuses loudly; what each op MEANS (checked vs wrapping)
+/// is written at its call site, in the op's own folder. F32 keeps its
+/// infallible hand-written helpers because most float kernels use them.
+macro_rules! typed_kernel_helpers {
     ($prim:ty, $get:ident, $get_mut:ident, $binary:ident, $reduce:ident, $scan:ident) => {
         /// dest0[i] = f(operand0[i], operand1[i]) at this narrow width.
         pub fn $binary(&mut self, f: impl Fn($prim, $prim) -> Result<$prim>) -> Result<()> {
@@ -592,44 +792,10 @@ impl ReferenceKernelCtx {
         Ok(())
     }
 
-    /// dest0[i] = f(operand0[i], operand1[i]) over i32 values; `f`
-    /// returns Result so checked arithmetic refuses loudly (ints are
-    /// semantically NON-WRAPPING — ruling 2026-08-11; an overflow is a
-    /// loud kernel error, never a wrapped value).
-    pub fn binary_elementwise_i32(&mut self, f: impl Fn(i32, i32) -> Result<i32>) -> Result<()> {
-        let lhs = self.operands[0].as_i32()?;
-        let rhs = self.operands[1].as_i32()?;
-        anyhow::ensure!(
-            lhs.len() == rhs.len() && lhs.len() == self.dests[0].len(),
-            "binary kernel length mismatch"
-        );
-        let (lhs, rhs) = (lhs.clone(), rhs.clone());
-        let dest = self.dests[0].as_i32_mut()?;
-        for (index, out) in dest.iter_mut().enumerate() {
-            *out = f(lhs[index], rhs[index])?;
-        }
-        Ok(())
-    }
-
-    /// The i64 twin of [`Self::binary_elementwise_i32`].
-    pub fn binary_elementwise_i64(&mut self, f: impl Fn(i64, i64) -> Result<i64>) -> Result<()> {
-        let lhs = self.operands[0].as_i64()?;
-        let rhs = self.operands[1].as_i64()?;
-        anyhow::ensure!(
-            lhs.len() == rhs.len() && lhs.len() == self.dests[0].len(),
-            "binary kernel length mismatch"
-        );
-        let (lhs, rhs) = (lhs.clone(), rhs.clone());
-        let dest = self.dests[0].as_i64_mut()?;
-        for (index, out) in dest.iter_mut().enumerate() {
-            *out = f(lhs[index], rhs[index])?;
-        }
-        Ok(())
-    }
-
-    // ---- the narrow-integer family (ruling 2026-09-02, main #399) ----
+    // ---- the fallible-arithmetic widths ----
     //
-    // CARVE-OUT, to be confirmed at review. I8/U8/I16 follow TORCH's
+    // Integer overflow policy (narrow-int carve-out, ruling 2026-09-02,
+    // main #399). CARVE-OUT, to be confirmed at review. I8/U8/I16 follow TORCH's
     // semantics, which main #399 adopted: arithmetic WRAPS at the type's
     // own width. I32 and I64 keep the non-wrapping ruling of 2026-08-11
     // — a checked overflow is a loud kernel error there, and the
@@ -639,13 +805,45 @@ impl ReferenceKernelCtx {
     // narrow-int op mints through the UNGATED arm and needs no proof; a
     // wrap is a defined result at these widths, not an escaped error.
     //
-    // The closures still return `Result` — same shape as the i32/i64
-    // helpers — because wrapping is not the only failure mode: a
+    // The closures return `Result` at every width because wrapping is
+    // not the only failure mode: a
     // zero divisor is undefined at every width, and the trunc-div and
     // trunc-rem kernels refuse it loudly. What each op MEANS shows up at
     // its call site (`Ok(a.wrapping_add(b))`), in its own folder, which
     // is where this branch keeps op semantics.
-    narrow_int_kernel_helpers!(
+    typed_kernel_helpers!(
+        i32,
+        as_i32,
+        as_i32_mut,
+        binary_elementwise_i32,
+        reduce_axis_i32,
+        scan_axis_i32
+    );
+    typed_kernel_helpers!(
+        i64,
+        as_i64,
+        as_i64_mut,
+        binary_elementwise_i64,
+        reduce_axis_i64,
+        scan_axis_i64
+    );
+    typed_kernel_helpers!(
+        f64,
+        as_f64,
+        as_f64_mut,
+        binary_elementwise_f64,
+        reduce_axis_f64,
+        scan_axis_f64
+    );
+    typed_kernel_helpers!(
+        u64,
+        as_u64,
+        as_u64_mut,
+        binary_elementwise_u64,
+        reduce_axis_u64,
+        scan_axis_u64
+    );
+    typed_kernel_helpers!(
         i8,
         as_i8,
         as_i8_mut,
@@ -653,7 +851,7 @@ impl ReferenceKernelCtx {
         reduce_axis_i8,
         scan_axis_i8
     );
-    narrow_int_kernel_helpers!(
+    typed_kernel_helpers!(
         u8,
         as_u8,
         as_u8_mut,
@@ -661,7 +859,7 @@ impl ReferenceKernelCtx {
         reduce_axis_u8,
         scan_axis_u8
     );
-    narrow_int_kernel_helpers!(
+    typed_kernel_helpers!(
         i16,
         as_i16,
         as_i16_mut,
@@ -669,6 +867,97 @@ impl ReferenceKernelCtx {
         reduce_axis_i16,
         scan_axis_i16
     );
+
+    /// The narrow-float twin of [`Self::reduce_axis`], for folds that
+    /// SELECT rather than compute (max, min): the result is one of the
+    /// inputs or the init, so widening to f64, folding, and encoding back
+    /// is exact at every format. This is the only arithmetic a storage-
+    /// only format may see; a fold that rounds (sum, prod) stays refused
+    /// — the translator widens those to F32 first.
+    pub fn reduce_axis_narrow_float(
+        &mut self,
+        axis_from_end: i64,
+        init: f64,
+        fold: impl Fn(f64, f64) -> f64,
+    ) -> Result<()> {
+        let dims = &self.operand_dims[0];
+        let rank = dims.len();
+        anyhow::ensure!(
+            (axis_from_end as usize) < rank,
+            "reduce axis {axis_from_end} out of rank {rank}"
+        );
+        let axis = rank - 1 - axis_from_end as usize;
+        let reduced = dims[axis];
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        let input = self.operands[0]
+            .narrow_float_to_f64()
+            .ok_or_else(|| anyhow::anyhow!("expected a narrow-float operand"))?;
+        anyhow::ensure!(
+            self.dests[0].len() == outer * inner && input.len() == outer * reduced * inner,
+            "reduce kernel geometry mismatch"
+        );
+        let mut out = vec![init; outer * inner];
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut acc = init;
+                for r in 0..reduced {
+                    acc = fold(acc, input[o * reduced * inner + r * inner + i]);
+                }
+                out[o * inner + i] = acc;
+            }
+        }
+        anyhow::ensure!(
+            self.dests[0].fill_narrow_float_from_f64(&out)?,
+            "reduce over a narrow-float operand needs a narrow-float destination, found {}",
+            self.dests[0].type_name()
+        );
+        Ok(())
+    }
+
+    /// The scan twin of [`Self::reduce_axis_narrow_float`] (cummax,
+    /// cummin): selection only, exact at every format.
+    pub fn scan_axis_narrow_float(
+        &mut self,
+        axis_from_end: i64,
+        init: f64,
+        fold: impl Fn(f64, f64) -> f64,
+    ) -> Result<()> {
+        let dims = &self.operand_dims[0];
+        let rank = dims.len();
+        anyhow::ensure!(
+            (axis_from_end as usize) < rank,
+            "scan axis {axis_from_end} out of rank {rank}"
+        );
+        let axis = rank - 1 - axis_from_end as usize;
+        let reduced = dims[axis];
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        let input = self.operands[0]
+            .narrow_float_to_f64()
+            .ok_or_else(|| anyhow::anyhow!("expected a narrow-float operand"))?;
+        anyhow::ensure!(
+            self.dests[0].len() == input.len() && input.len() == outer * reduced * inner,
+            "scan kernel geometry mismatch"
+        );
+        let mut out = vec![init; input.len()];
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut acc = init;
+                for r in 0..reduced {
+                    let k = o * reduced * inner + r * inner + i;
+                    acc = fold(acc, input[k]);
+                    out[k] = acc;
+                }
+            }
+        }
+        anyhow::ensure!(
+            self.dests[0].fill_narrow_float_from_f64(&out)?,
+            "scan over a narrow-float operand needs a narrow-float destination, found {}",
+            self.dests[0].type_name()
+        );
+        Ok(())
+    }
 
     /// Contiguous fold over one axis (zero-based FROM THE END — the house
     /// nth-from-end convention, matching the reduce ops' metadata).
@@ -699,42 +988,6 @@ impl ReferenceKernelCtx {
                 let mut acc = init;
                 for r in 0..reduced {
                     acc = fold(acc, input[o * reduced * inner + r * inner + i]);
-                }
-                dest[o * inner + i] = acc;
-            }
-        }
-        Ok(())
-    }
-
-    /// The i32 twin of [`Self::reduce_axis`]; the fold returns Result so
-    /// checked accumulation (non-wrapping Int sums) refuses loudly.
-    pub fn reduce_axis_i32(
-        &mut self,
-        axis_from_end: i64,
-        init: i32,
-        fold: impl Fn(i32, i32) -> Result<i32>,
-    ) -> Result<()> {
-        let dims = &self.operand_dims[0];
-        let rank = dims.len();
-        anyhow::ensure!(
-            (axis_from_end as usize) < rank,
-            "reduce axis {axis_from_end} out of rank {rank}"
-        );
-        let axis = rank - 1 - axis_from_end as usize;
-        let reduced = dims[axis];
-        let inner: usize = dims[axis + 1..].iter().product();
-        let outer: usize = dims[..axis].iter().product();
-        let input = self.operands[0].as_i32()?.clone();
-        let dest = self.dests[0].as_i32_mut()?;
-        anyhow::ensure!(
-            dest.len() == outer * inner && input.len() == outer * reduced * inner,
-            "reduce kernel geometry mismatch"
-        );
-        for o in 0..outer {
-            for i in 0..inner {
-                let mut acc = init;
-                for r in 0..reduced {
-                    acc = fold(acc, input[o * reduced * inner + r * inner + i])?;
                 }
                 dest[o * inner + i] = acc;
             }
@@ -779,53 +1032,10 @@ impl ReferenceKernelCtx {
         }
         Ok(())
     }
-
-    /// The i32 twin of [`Self::scan_axis`]; the fold returns Result so
-    /// checked accumulation (non-wrapping Int scans) refuses loudly.
-    pub fn scan_axis_i32(
-        &mut self,
-        axis_from_end: i64,
-        init: i32,
-        fold: impl Fn(i32, i32) -> Result<i32>,
-    ) -> Result<()> {
-        let dims = &self.operand_dims[0];
-        let rank = dims.len();
-        anyhow::ensure!(
-            (axis_from_end as usize) < rank,
-            "scan axis {axis_from_end} out of rank {rank}"
-        );
-        let axis = rank - 1 - axis_from_end as usize;
-        let reduced = dims[axis];
-        let inner: usize = dims[axis + 1..].iter().product();
-        let outer: usize = dims[..axis].iter().product();
-        let input = self.operands[0].as_i32()?.clone();
-        let dest = self.dests[0].as_i32_mut()?;
-        anyhow::ensure!(
-            dest.len() == input.len() && input.len() == outer * reduced * inner,
-            "scan kernel geometry mismatch"
-        );
-        for o in 0..outer {
-            for i in 0..inner {
-                let mut acc = init;
-                for r in 0..reduced {
-                    let k = o * reduced * inner + r * inner + i;
-                    acc = fold(acc, input[k])?;
-                    dest[k] = acc;
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
-impl From<Vec<half::f16>> for TypedBuffer {
-    fn from(values: Vec<half::f16>) -> Self {
-        Self::F16(values)
-    }
-}
-
-impl From<Vec<half::bf16>> for TypedBuffer {
-    fn from(values: Vec<half::bf16>) -> Self {
-        Self::Bf16(values)
+impl From<Vec<crate::tf32::Tf32>> for TypedBuffer {
+    fn from(values: Vec<crate::tf32::Tf32>) -> Self {
+        Self::TF32(values)
     }
 }

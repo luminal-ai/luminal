@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, math_function, unary};
 use anyhow::Result;
 
 /// `TruncFunctionalGeneric(input) -> out` — pure dataflow form.
@@ -91,7 +91,8 @@ impl LayoutIrOp for TruncFunctionalDps {}
 /// The CUDA lowering, colocated with its op.
 impl KernelOp for TruncFunctionalDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-        unary(ctx, "truncf(a[i])")
+        let function = math_function(ctx, 1, "truncf", "trunc")?;
+        unary(ctx, &format!("{function}(a[i])"))
     }
 }
 

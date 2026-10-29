@@ -21,28 +21,55 @@ use std::mem::{Discriminant, discriminant};
 use anyhow::{Context, Result, anyhow, bail};
 use luminal::prelude::*;
 
+#[cfg(test)]
+mod add_sub_tests;
 mod array_extra;
 mod attention;
 mod cat;
+#[cfg(test)]
+mod clamp_tests;
 mod complex;
 mod conv;
 mod dim_arith;
 mod elementwise_more;
 mod expr;
+mod frexp;
+#[cfg(test)]
+mod gcd_tests;
 mod grouped_mm;
 mod index;
+#[cfg(test)]
+mod index_tests;
+#[cfg(test)]
+mod integer_carrier_tests;
+mod linalg;
+#[cfg(test)]
+mod matmul_tests;
 mod movement_more;
+mod opinfo_more;
+#[cfg(test)]
+mod opinfo_more_tests;
 #[cfg(test)]
 mod opmath_tests;
 mod ops;
 mod pooling;
 #[cfg(test)]
+mod power_tests;
+#[cfg(test)]
 mod reduction_dtype_tests;
 mod reductions_more;
 #[cfg(test)]
+mod remainder_tests;
+#[cfg(test)]
 mod scan_tests;
+mod shifts;
 mod special;
+#[cfg(test)]
+mod special_tests;
 mod stats_more;
+mod strided;
+#[cfg(test)]
+mod strided_tests;
 mod sympy;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -58,7 +85,7 @@ use crate::declared_dtype::DeclaredDtype;
 use crate::dim_range::{self, DimRange};
 use crate::dtype::TorchDType;
 use crate::pt2_parser::{InputKind, ParsedPT2};
-use crate::pt2_schema::{DimSize, Node, NodeInput, RangeConstraint, TensorMeta};
+use crate::pt2_schema::{Argument, DimSize, Node, NodeInput, RangeConstraint, TensorMeta};
 
 /// One bound graph input, in export order.
 pub struct TranslatedInput {
@@ -120,7 +147,7 @@ struct OpMath {
 }
 
 /// Torch's opmath: half-precision math is performed in F32.
-fn opmath_compute(common: DType) -> DType {
+pub(crate) fn opmath_compute(common: DType) -> DType {
     match common {
         DType::F16 | DType::Bf16 => DType::F32,
         dtype => dtype,
@@ -145,6 +172,8 @@ struct Translator<'a> {
     /// The dtype pattern of the op being translated, when torch performs
     /// that op in opmath; `None` for the ops that round nothing.
     opmath: Option<OpMath>,
+    storage_values: HashMap<String, strided::Backing>,
+    storage_geometries: HashMap<String, (Vec<IntExpr>, IntExpr)>,
     /// One widening per (value, common dtype), so several nodes widening
     /// the same value share one cast.
     widened: HashMap<(NodeIndex, Discriminant<DType>), GraphTensor>,
@@ -193,6 +222,8 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
         parsed,
         dims: HashMap::new(),
         opmath: None,
+        storage_values: HashMap::new(),
+        storage_geometries: HashMap::new(),
         widened: HashMap::new(),
     };
 
@@ -273,8 +304,10 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
 
     // 2. Nodes, in topological order.
     for node in &parsed.program.graph_module.graph.nodes {
+        let recorded = t.cx.logical.petgraph().node_count();
         t.dispatch(node)
             .with_context(|| format!("translating `{}`", node.target))?;
+        t.refuse_narrow_float_arithmetic(node, recorded)?;
     }
 
     // 3. Outputs, in export order: one row per output spec, keyed by the
@@ -535,19 +568,87 @@ impl Translator<'_> {
     /// read at the dtype the op computes in (F64 keeps the double).
     fn scalar(&mut self, input: &NodeInput, dtype: DType) -> Result<GraphTensor> {
         if let Some(v) = input.arg.as_float() {
-            return Ok(match dtype {
-                DType::F64 => self.cx.constant_f64(v),
-                dtype => self.cx.constant_f32(v as f32).cast(dtype),
-            });
+            return Ok(self.typed_scalar(v, dtype));
         }
         if let Some(v) = input.arg.as_int() {
+            if dtype == DType::F64 {
+                return Ok(self.cx.constant_f64(v as f64));
+            }
+            if matches!(dtype, DType::I64 | DType::U64) || i32::try_from(v).is_err() {
+                return Ok(self.cx.constant_i64(v).cast(dtype));
+            }
             return Ok(self.cx.constant_i32(v).cast(dtype));
+        }
+        if let Some(v) = input.arg.as_bool() {
+            return Ok(self.typed_scalar(if v { 1.0 } else { 0.0 }, dtype));
         }
         bail!(
             "operand {:?} is not a scalar (arg: {:?})",
             input.name,
             input.arg
         )
+    }
+
+    /// An arithmetic op's ATen `Scalar` as a rank-0 tensor of `dtype`: a
+    /// Python literal (`scalar`), or a symbolic integer, which export
+    /// records as a `SymInt` (`x.shape[0]`, `x.shape[0] + 1`). A symbolic
+    /// scalar IS its dimension expression: it is materialised as an `Int`
+    /// iota of that expression, the frontend's own `tensor * IntExpr`
+    /// spelling, and converted to `dtype` like an integer literal. The iota
+    /// is 32-bit, so a dimension beyond `i32` refuses at the iota rather
+    /// than wrapping. A `SymFloat` or `SymBool` has no dimension expression
+    /// and stays refused.
+    fn scalar_operand(&mut self, input: &NodeInput, dtype: DType) -> Result<GraphTensor> {
+        if !matches!(input.arg, Argument::SymInt(_) | Argument::Expr(_)) {
+            return self.scalar(input, dtype);
+        }
+        let expr = self.resolve_arg_as_expression(&input.arg).ok_or_else(|| {
+            anyhow!(
+                "operand {:?}: cannot resolve its symbolic integer (arg: {:?})",
+                input.name,
+                input.arg
+            )
+        })?;
+        Ok(convert(self.cx.constant_i32(expr), dtype))
+    }
+
+    /// The two operands of an elementwise arithmetic op, broadcast to a
+    /// common shape. Export records a Python number in EITHER slot (`1 - x`
+    /// decomposes to `sub.Tensor(1.0, x)`; the `.Scalar` overloads put it
+    /// second; `rsub` swaps its operands), so operands are resolved by
+    /// kind, never by position. At least one is a tensor, and a scalar is
+    /// materialised at that tensor's dtype. For an opmath op that is the
+    /// compute dtype (`operand` has widened the tensor), so the scalar
+    /// never decides the result dtype: the export's declared result, which
+    /// opmath's `common` is, already applies torch's promotion rule for a
+    /// Python scalar (it counts only by category), and the scalar is read
+    /// at the dtype the math runs in (an F64 op keeps the double).
+    fn arithmetic_operands(
+        &mut self,
+        lhs: &NodeInput,
+        rhs: &NodeInput,
+    ) -> Result<(GraphTensor, GraphTensor)> {
+        let lhs_tensor = self.optional_tensor_operand(lhs)?;
+        let rhs_tensor = self.optional_tensor_operand(rhs)?;
+        let dtype = match (lhs_tensor, rhs_tensor) {
+            (Some(tensor), _) | (None, Some(tensor)) => tensor.dtype,
+            (None, None) => bail!(
+                "neither operand {:?} nor {:?} is a tensor (args: {:?}, {:?})",
+                lhs.name,
+                rhs.name,
+                lhs.arg,
+                rhs.arg
+            ),
+        };
+        let a = match lhs_tensor {
+            Some(tensor) => tensor,
+            None => self.scalar_operand(lhs, dtype)?,
+        };
+        let b = match rhs_tensor {
+            Some(tensor) => tensor,
+            None => self.scalar_operand(rhs, dtype)?,
+        };
+        Ok(broadcast_pair(a, b))
     }
 
     /// A tensor operand of an opmath op: rounded to the op's common dtype
@@ -592,7 +693,7 @@ impl Translator<'_> {
         // F32 can fold those indicators without changing their truth value.
         if matches!(
             target,
-            "sum.default" | "sum.dim_IntList" | "prod.default" | "prod.dim_int"
+            "sum.default" | "sum.dim_IntList" | "prod.default" | "prod.dim_int" | "nansum.default"
         ) {
             return Ok(OpMath {
                 common: declared,
@@ -623,6 +724,18 @@ impl Translator<'_> {
         Ok(OpMath {
             common,
             compute: opmath_compute(common),
+        })
+    }
+
+    /// The widening an exact op's operands take: narrow storage computes
+    /// in F32. The common dtype is the operands' own, not the result's (an
+    /// argsort's int64 indices say nothing about where its values meet);
+    /// an op over wider dtypes takes no pattern at all.
+    fn storage_widening_for(&self, node: &Node) -> Option<OpMath> {
+        let common = self.promoted_operand_dtype(node)?;
+        common.is_narrow_float().then_some(OpMath {
+            common,
+            compute: DType::F32,
         })
     }
 
@@ -721,6 +834,32 @@ impl Translator<'_> {
         Ok(())
     }
 
+    /// Torch performs half-precision math in F32 (opmath), and narrow
+    /// floats are storage in the graphs this translator emits: every
+    /// arithmetic op over F16, BF16 or an fp8 format is preceded by an
+    /// explicit widening cast and followed by an explicit rounding cast.
+    /// This checks that contract for the ops `node` recorded (every value
+    /// id at or above `recorded`), so a lowering that computes in a narrow
+    /// format is refused here, naming its ATen op, rather than by a
+    /// backend kernel or not at all.
+    fn refuse_narrow_float_arithmetic(&self, node: &Node, recorded: usize) -> Result<()> {
+        let logical = &self.cx.logical;
+        let fresh = logical
+            .petgraph()
+            .node_indices()
+            .filter(|id| id.index() >= recorded);
+        if let Some((id, dtype)) = logical.narrow_float_arithmetic(fresh).first() {
+            bail!(
+                "`{}` lowered to {} over {dtype:?}: narrow floats are storage only \
+                 (torch computes them in F32), so the lowering must widen its operands \
+                 and round its result with explicit casts",
+                node.target,
+                logical.value_op(*id).constructor()
+            );
+        }
+        Ok(())
+    }
+
     fn dispatch(&mut self, node: &Node) -> Result<()> {
         let target = node
             .target
@@ -783,19 +922,118 @@ impl Translator<'_> {
         }
 
         // The op's dtype pattern is set for the whole arm and cleared on
-        // every exit, so its operands widen and its outputs round once.
+        // every exit, so its operands widen and its outputs round once. An
+        // exact op that still computes (`neg` is a multiply) widens the
+        // same way: narrow floats are storage, and widening, computing and
+        // rounding back reproduces its exact result bit for bit.
         if opmath_target(target) {
             self.opmath = Some(self.opmath_for(node, target)?);
+        } else if exact_arithmetic_target(target) {
+            self.opmath = self.storage_widening_for(node);
         }
         let result = self.dispatch_target(node, target);
+        if result.is_ok() && self.opmath.is_some() {
+            self.round_widened_outputs(node);
+        }
         self.opmath = None;
         result
+    }
+
+    /// Every output of a widened node that the export declares as a narrow
+    /// float is rounded to that dtype, however its lowering bound it (most
+    /// bind through `bind_value`, which already rounds; this holds the
+    /// contract for the ones that store directly).
+    fn round_widened_outputs(&mut self, node: &Node) {
+        for name in Self::tensor_output_names(node) {
+            let Some(value) = self.values.get(&name).copied() else {
+                continue;
+            };
+            let Some(declared) = self
+                .tensor_meta(&name)
+                .ok()
+                .and_then(|meta| dtype_of(meta.dtype).ok())
+            else {
+                continue;
+            };
+            if declared.is_narrow_float() && value.dtype != declared {
+                self.values.insert(name, convert(value, declared));
+            }
+        }
     }
 
     fn dispatch_target(&mut self, node: &Node, target: &str) -> Result<()> {
         let n = &node.inputs;
 
         let value = match target {
+            "mvlgamma.default" => self.translate_mvlgamma(node)?,
+            "lu_unpack.default" => {
+                self.translate_lu_unpack(node)?;
+                return Ok(());
+            }
+            "nextafter.default" => self.translate_nextafter(node)?,
+            "rms_norm.default" => self.translate_rms_norm(node)?,
+            math @ ("logit.default"
+            | "logaddexp.default"
+            | "logaddexp2.default"
+            | "xlogy.Tensor"
+            | "special_xlog1py.default"
+            | "sinc.default"
+            | "softplus.default"
+            | "mish.default"
+            | "celu.default"
+            | "clamp_min.Tensor"
+            | "clamp_max.Tensor") => self.translate_small_math(node, math)?,
+            loss @ ("smooth_l1_loss.default"
+            | "soft_margin_loss.default"
+            | "binary_cross_entropy_with_logits.default") => {
+                self.translate_simple_loss(node, loss)?
+            }
+            "glu.default" => self.translate_glu(node)?,
+            "nansum.default" => self.translate_nansum(node)?,
+            "ones.default" => {
+                let shape = self.get_int_exprs_arg(node, 0)?;
+                let dtype = self.output_meta_dtype(node)?;
+                self.full_tensor(shape, dtype, 1.0)
+            }
+            "dot.default" | "vdot.default" => {
+                let a = self.operand(&n[0])?;
+                let b = self.operand(&n[1])?;
+                anyhow::ensure!(
+                    a.rank() == 1 && b.rank() == 1 && util::same_dim(a.dims()[0], b.dims()[0]),
+                    "dot requires equal length vectors"
+                );
+                (a * b).sum(vec![0])
+            }
+            "split.Tensor" => {
+                self.translate_split(node)?;
+                return Ok(());
+            }
+            "kthvalue.default" => {
+                self.translate_kthvalue(node)?;
+                return Ok(());
+            }
+            "mode.default" => {
+                self.translate_mode(node)?;
+                return Ok(());
+            }
+            "triangular_solve.default" => {
+                self.translate_legacy_triangular_solve(node)?;
+                return Ok(());
+            }
+            "rrelu_with_noise_functional.default" => {
+                self.translate_rrelu_inference(node)?;
+                return Ok(());
+            }
+
+            "linalg_solve_triangular.default" => self.translate_triangular_solve(node)?,
+            "cholesky_solve.default" => self.translate_cholesky_solve(node)?,
+            "cholesky_inverse.default" => self.translate_cholesky_inverse(node)?,
+            "frexp.Tensor" | "prims.frexp.default" => {
+                self.translate_frexp(node)?;
+                return Ok(());
+            }
+            "as_strided.default" | "as_strided_copy.default" => self.translate_as_strided(node)?,
+            "as_strided_scatter.default" => self.translate_as_strided_scatter(node)?,
             // ---- linear ----
             "linear.default" => {
                 let x = self.operand(&n[0])?;
@@ -823,12 +1061,26 @@ impl Translator<'_> {
                 self.translate_grouped_mm(node)?
             }
             // ---- elementwise unary ----
-            "relu.default" => self.operand(&n[0])?.relu(),
+            "relu.default" => {
+                let value = self.operand(&n[0])?;
+                let zero = self.constant_like(value, 0.0);
+                value.maximum(zero)
+            }
             "sigmoid.default" => self.operand(&n[0])?.sigmoid(),
             "tanh.default" => self.operand(&n[0])?.tanh(),
             "log.default" => self.operand(&n[0])?.log(),
             "sqrt.default" => self.operand(&n[0])?.sqrt(),
-            "abs.default" => self.operand(&n[0])?.abs(),
+            "abs.default" => {
+                // A float's magnitude clears its sign bit (`abs(-0.0)` is
+                // `+0.0`); core `abs` selects on the ordered `x < 0`, which
+                // cannot see a zero's sign, and keeps integer wrapping.
+                let x = self.operand(&n[0])?;
+                if is_float(x.dtype) {
+                    self.ieee_abs(x)
+                } else {
+                    x.abs()
+                }
+            }
             "neg.default" => -self.operand(&n[0])?,
             "silu.default" => self.operand(&n[0])?.silu(),
             "gelu.default" => self.operand(&n[0])?.gelu(),
@@ -848,8 +1100,10 @@ impl Translator<'_> {
                 self.operand(&n[0])?.round()
             }
             // ---- elementwise binary ----
-            "add.Tensor" | "add.Scalar" => self.binary(n, |a, b| a + b)?,
-            "sub.Tensor" | "sub.Scalar" => self.binary(n, |a, b| a - b)?,
+            "add.Tensor" | "add.Scalar" => self.add_sub(&n[0], &n[1], alpha_input(n), false)?,
+            "sub.Tensor" | "sub.Scalar" => self.add_sub(&n[0], &n[1], alpha_input(n), true)?,
+            // `rsub(self, other, alpha)` is `other - alpha * self`.
+            "rsub.Tensor" | "rsub.Scalar" => self.add_sub(&n[1], &n[0], alpha_input(n), true)?,
             "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
@@ -877,12 +1131,6 @@ impl Translator<'_> {
                     dim
                 } as usize;
                 x.unsqueeze(dim)
-            }
-            "squeeze.dim" => {
-                let x = self.operand(&n[0])?;
-                let dim = self.int_arg(&n[1])?;
-                let dim = if dim < 0 { dim + x.rank() as i64 } else { dim } as usize;
-                x.squeeze(dim)
             }
             // ---- reductions ----
             "sum.default" | "sum.dim_IntList" => {
@@ -924,8 +1172,7 @@ impl Translator<'_> {
             "logical_xor.default" => self.logical_binary(node, false, true)?,
             "logical_not.default" => {
                 let x = self.operand(&n[0])?;
-                let one = self.cx.constant_f32(1.0).expand_rhs(x.dims());
-                (one - x.cast(DType::F32)).cast(DType::Bool)
+                self.truth(x).logical_not()
             }
             // ---- power / modulo ----
             "pow.Tensor_Scalar" => self.pow_tensor_scalar(node)?,
@@ -945,10 +1192,30 @@ impl Translator<'_> {
             "log2.default" => self.translate_log2(node)?,
             "isnan.default" => self.translate_isnan(node)?,
             "leaky_relu.default" => self.translate_leaky_relu(node)?,
-            "bitwise_and.Tensor" | "__and__.Tensor" => self.translate_bitwise(node, false)?,
-            "bitwise_or.Tensor" | "__or__.Tensor" => self.translate_bitwise(node, true)?,
-            "squeeze.default" => self.translate_squeeze(node, true)?,
-            "squeeze.dims" => self.translate_squeeze(node, false)?,
+            "bitwise_and.Tensor" | "bitwise_and.Scalar" | "__and__.Tensor" => {
+                self.translate_bitwise(node, false, false)?
+            }
+            "bitwise_or.Tensor" | "bitwise_or.Scalar" | "__or__.Tensor" => {
+                self.translate_bitwise(node, true, false)?
+            }
+            "bitwise_xor.Tensor" | "bitwise_xor.Scalar" | "__xor__.Tensor" => {
+                self.translate_bitwise(node, false, true)?
+            }
+            "prims.shift_left.default"
+            | "bitwise_left_shift.Tensor"
+            | "bitwise_left_shift.Tensor_Scalar"
+            | "bitwise_left_shift.Scalar_Tensor"
+            | "__lshift__.Tensor"
+            | "__lshift__.Scalar" => self.translate_shift(node, false)?,
+            "prims.shift_right_arithmetic.default"
+            | "bitwise_right_shift.Tensor"
+            | "bitwise_right_shift.Tensor_Scalar"
+            | "bitwise_right_shift.Scalar_Tensor"
+            | "__rshift__.Tensor"
+            | "__rshift__.Scalar" => self.translate_shift(node, true)?,
+            squeeze @ ("squeeze.default" | "squeeze.dim" | "squeeze.dims") => {
+                self.translate_squeeze(node, squeeze)?
+            }
             "tril.default" => self.translate_triangular(node, false)?,
             "triu.default" => self.translate_triangular(node, true)?,
             // ---- batch 8: reductions, linalg, copies, constructors ----
@@ -1052,6 +1319,7 @@ impl Translator<'_> {
             | "_scaled_dot_product_efficient_attention.default"
             | "_scaled_dot_product_flash_attention.default"
             | "_scaled_dot_product_flash_attention_for_cpu.default"
+            | "_scaled_dot_product_fused_attention_overrideable.default"
             | "_scaled_dot_product_cudnn_attention.default" => {
                 self.translate_sdpa(node)?;
                 return Ok(());
@@ -1088,6 +1356,7 @@ impl Translator<'_> {
             "sign.default" => self.translate_sign(node)?,
             "signbit.default" => self.translate_signbit(node)?,
             "isinf.default" => self.translate_isinf(node)?,
+            "isfinite.default" => self.translate_isfinite(node)?,
             "bitwise_not.default" => self.translate_bitwise_not(node)?,
             "ldexp.Tensor" => self.translate_ldexp(node)?,
             "floor_divide.default" => self.translate_floor_divide(node)?,
@@ -1116,7 +1385,25 @@ impl Translator<'_> {
             "convolution.default" => self.translate_conv(node)?,
             "conv2d.default" => self.translate_conv(node)?,
             // ---- upsample / resize (batch 6) ----
-            "upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
+            resize @ ("upsample_nearest1d.default"
+            | "upsample_nearest1d.vec"
+            | "upsample_nearest2d.default"
+            | "upsample_nearest2d.vec"
+            | "upsample_nearest3d.default"
+            | "upsample_nearest3d.vec"
+            | "_upsample_nearest_exact1d.default"
+            | "_upsample_nearest_exact1d.vec"
+            | "_upsample_nearest_exact2d.default"
+            | "_upsample_nearest_exact2d.vec"
+            | "_upsample_nearest_exact3d.default"
+            | "_upsample_nearest_exact3d.vec"
+            | "upsample_linear1d.default"
+            | "upsample_linear1d.vec"
+            | "upsample_bilinear2d.default"
+            | "upsample_trilinear3d.default"
+            | "upsample_trilinear3d.vec"
+            | "upsample_bicubic2d.default"
+            | "upsample_bicubic2d.vec") => self.translate_resize(node, resize)?,
             "upsample_bilinear2d.vec" => self.translate_upsample_bilinear2d(node)?,
             "_upsample_bilinear2d_aa.default" | "_upsample_bilinear2d_aa.vec" => {
                 self.translate_upsample_bilinear2d_aa(node)?
@@ -1134,22 +1421,22 @@ impl Translator<'_> {
                 self.translate_batch_norm_functional(node)?;
                 return Ok(());
             }
-            "_fused_rms_norm.default" => self.translate_fused_rms_norm(node)?,
+            "_fused_rms_norm.default" => {
+                self.translate_fused_rms_norm(node)?;
+                return Ok(());
+            }
             "native_group_norm.default" | "group_norm.default" => {
                 self.translate_group_norm(node)?;
                 return Ok(());
             }
             // ---- cast ----
-            "to.dtype" | "to.dtype_layout" | "_to_copy.default" => {
+            "to.dtype"
+            | "to.dtype_layout"
+            | "_to_copy.default"
+            | "prims.convert_element_type.default" => {
                 let x = self.operand(&n[0])?;
                 let dtype = self.scalar_type_arg(&n[1])?;
-                // Lossless casts go through `cast`; float -> int is the
-                // explicit truncating conversion (`torch.int()`).
-                if is_float(x.dtype) && is_int(dtype) {
-                    x.trunc_cast(dtype)
-                } else {
-                    x.cast(dtype)
-                }
+                convert(x, dtype)
             }
             // ---- cat ----
             "cat.default" => {
@@ -1200,7 +1487,7 @@ impl Translator<'_> {
             // `F.unfold` exports as `im2col.default`; both share one lowering.
             "unfold.default" | "im2col.default" => self.translate_unfold(node)?,
             "narrow_copy.default" => self.translate_narrow_copy(node)?,
-            "unbind_copy.int" => {
+            "unbind.int" | "unbind_copy.int" => {
                 self.translate_unbind_copy(node)?;
                 return Ok(());
             }
@@ -1317,18 +1604,73 @@ impl Translator<'_> {
         self.bind_outputs(node, vec![value])
     }
 
+    /// `torch.add(self, other, alpha)` / `torch.sub(...)`: `self ± alpha *
+    /// other`, with `alpha` multiplied in the op's compute dtype (opmath
+    /// for F16/BF16, like torch). An omitted or unit alpha records a
+    /// plain add/sub — no multiply. Eager's CPU kernel fuses the multiply
+    /// and add for floats (`vec::fmadd`); this records two roundings, so a
+    /// non-unit, non-power-of-two alpha can differ from eager in the last
+    /// ulp.
+    ///
+    /// `lhs` is the operand `alpha * rhs` is added to or subtracted from:
+    /// `self` for add/sub, `other` for `rsub` (`other - alpha * self`).
+    /// Either may be a Python or symbolic scalar (`arithmetic_operands`),
+    /// and so may `alpha`.
+    ///
+    /// Bool: torch defines `bool + bool` as logical OR and scales `other`
+    /// by `alpha` in Boolean space, so a zero alpha drops it and any other
+    /// leaves its truth value; there is no Boolean add in the IR. Torch
+    /// refuses `bool - bool`, so a Bool subtraction never reaches here.
+    fn add_sub(
+        &mut self,
+        lhs: &NodeInput,
+        rhs: &NodeInput,
+        alpha: Option<&NodeInput>,
+        subtract: bool,
+    ) -> Result<GraphTensor> {
+        let (a, b) = self.arithmetic_operands(lhs, rhs)?;
+        if a.dtype == DType::Bool {
+            anyhow::ensure!(!subtract, "torch refuses subtraction of Bool tensors");
+            // Whether a symbolic alpha drops `other` is its runtime value,
+            // which this lowering would have to select on; refused instead.
+            if let Some(alpha) = alpha
+                && matches!(alpha.arg, Argument::SymInt(_) | Argument::Expr(_))
+            {
+                bail!(
+                    "a symbolic alpha on a Bool add is not supported (arg: {:?})",
+                    alpha.arg
+                );
+            }
+            let alpha_is_zero = alpha.is_some_and(|alpha| {
+                alpha.arg.as_bool() == Some(false)
+                    || alpha.arg.as_int() == Some(0)
+                    || alpha.arg.as_float() == Some(0.0)
+            });
+            return Ok(if alpha_is_zero { a } else { a.logical_or(b) });
+        }
+        let unit_alpha = alpha.is_none_or(|alpha| {
+            alpha.arg.as_bool() == Some(true)
+                || alpha.arg.as_int() == Some(1)
+                || alpha.arg.as_float() == Some(1.0)
+        });
+        let b = match alpha {
+            Some(alpha) if !unit_alpha => {
+                let alpha = self.scalar_operand(alpha, b.dtype)?.expand_rhs(b.dims());
+                b * alpha
+            }
+            _ => b,
+        };
+        Ok(if subtract { a - b } else { a + b })
+    }
+
+    /// An elementwise binary op whose operands may be a tensor and a
+    /// Python or symbolic scalar on either side (`arithmetic_operands`).
     fn binary(
         &mut self,
         n: &[NodeInput],
         op: impl FnOnce(GraphTensor, GraphTensor) -> GraphTensor,
     ) -> Result<GraphTensor> {
-        let a = self.operand(&n[0])?;
-        let b = if let Some(t) = self.optional_tensor_operand(&n[1])? {
-            t
-        } else {
-            self.scalar(&n[1], a.dtype)?
-        };
-        let (a, b) = broadcast_pair(a, b);
+        let (a, b) = self.arithmetic_operands(&n[0], &n[1])?;
         Ok(op(a, b))
     }
 
@@ -1370,12 +1712,18 @@ impl Translator<'_> {
     }
 }
 
+/// The `alpha` argument of add/sub/rsub, which export records by name.
+fn alpha_input(n: &[NodeInput]) -> Option<&NodeInput> {
+    n.iter().find(|input| input.name == "alpha")
+}
+
 /// Right-aligned PyTorch broadcasting: prepend size-1 dims, then expand.
-fn broadcast_to(mut t: GraphTensor, target: &[IntExpr]) -> GraphTensor {
-    while t.rank() < target.len() {
-        t = t.expand_dim(0, 1usize);
+fn broadcast_to(t: GraphTensor, target: &[IntExpr]) -> GraphTensor {
+    let mut view = t.view();
+    while view.rank() < target.len() {
+        view = view.unsqueeze(0);
     }
-    t.expand(target.to_vec())
+    view.expand(target.to_vec()).finish()
 }
 
 /// Broadcast a binary pair to a common shape.
@@ -1409,20 +1757,67 @@ fn broadcast_pair(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) 
 }
 
 /// Convert a value to `dtype`: `cast` is lossless-only, so a float -> int
-/// conversion is the explicit truncating read, and a float -> narrow-int
-/// conversion, which the frontend has no op for, leaves the value alone.
+/// conversion is an explicit truncating read. Narrow integer storage uses
+/// an Int32 truncation followed by an integer-width conversion, preserving
+/// both the rounding operation and the requested result dtype. A narrow
+/// float is storage, so it widens to F32 (exactly: every narrow format is
+/// a subset of F32) before the truncation reads it.
 fn convert(value: GraphTensor, dtype: DType) -> GraphTensor {
     if value.dtype == dtype {
         return value;
     }
     if is_float(value.dtype) && is_narrowing_int(dtype) {
-        return if is_int(dtype) {
-            value.trunc_cast(dtype)
+        let value = if value.dtype.is_narrow_float() {
+            value.cast(DType::F32)
         } else {
             value
         };
+        return if is_int(dtype) {
+            value.trunc_cast(dtype)
+        } else {
+            value.trunc_cast(DType::Int).cast(dtype)
+        };
     }
     value.cast(dtype)
+}
+
+/// The ops torch computes at their own dtype because their result is
+/// exact in it (a negation, a magnitude, a rounding to an integer, a
+/// selection or ordering of values), whose lowerings nevertheless record
+/// arithmetic: core spells `neg` as a multiply, `min` through negation and
+/// `stable_argsort` with a materialising multiply. Narrow floats are
+/// storage in the translated graph, so these widen to F32; the exact
+/// result is representable in the narrow format, so rounding it back
+/// changes no bit. Every operand of these ops is a value (no integer
+/// index operand rides the widening).
+fn exact_arithmetic_target(target: &str) -> bool {
+    matches!(
+        target,
+        "abs.default"
+            | "neg.default"
+            | "floor.default"
+            | "ceil.default"
+            | "trunc.default"
+            | "round.default"
+            // `min` is `-max(-x)`
+            | "min.default"
+            | "min.dim"
+            | "amin.default"
+            | "argmin.default"
+            // ordering by `stable_argsort`
+            | "sort.default"
+            | "sort.stable"
+            | "argsort.default"
+            | "topk.default"
+            | "median.default"
+            | "median.dim"
+            | "nanmedian.default"
+            | "nanmedian.dim"
+            | "max_pool2d_with_indices.default"
+            | "max_pool3d_with_indices.default"
+            | "adaptive_max_pool2d.default"
+            | "adaptive_max_pool3d.default"
+    )
 }
 
 /// Whether torch performs this op in opmath — half-precision math in F32,
@@ -1443,6 +1838,8 @@ fn opmath_target(target: &str) -> bool {
             | "add.Scalar"
             | "sub.Tensor"
             | "sub.Scalar"
+            | "rsub.Tensor"
+            | "rsub.Scalar"
             | "mul.Tensor"
             | "mul.Scalar"
             | "div.Tensor"
@@ -1467,6 +1864,17 @@ fn opmath_target(target: &str) -> bool {
             | "ldexp.Tensor"
             | "square.default"
             | "reciprocal.default"
+            | "round.decimals"
+            | "logit.default" | "logaddexp.default" | "logaddexp2.default"
+            | "xlogy.Tensor" | "special_xlog1py.default" | "sinc.default"
+            | "softplus.default" | "mish.default" | "celu.default" | "glu.default"
+            | "rms_norm.default" | "smooth_l1_loss.default" | "soft_margin_loss.default"
+            | "mvlgamma.default"
+            | "binary_cross_entropy_with_logits.default" | "dot.default" | "vdot.default"
+            | "rrelu_with_noise_functional.default" | "clamp_min.Tensor" | "clamp_max.Tensor"
+            | "upsample_linear1d.default" | "upsample_linear1d.vec"
+            | "upsample_bilinear2d.default" | "upsample_trilinear3d.default" | "upsample_trilinear3d.vec"
+            | "upsample_bicubic2d.default" | "upsample_bicubic2d.vec"
             // unary math
             | "sigmoid.default"
             | "tanh.default"
@@ -1505,6 +1913,7 @@ fn opmath_target(target: &str) -> bool {
             // reductions
             | "sum.default"
             | "sum.dim_IntList"
+            | "nansum.default"
             | "mean.default"
             | "mean.dim"
             | "prod.default"
@@ -1521,7 +1930,8 @@ fn opmath_target(target: &str) -> bool {
             | "linalg_vector_norm.default"
             | "logcumsumexp.default"
             // cumsum/cumprod stay outside generic opmath. Their translator
-            // casts to the resolved result dtype before the core scan.
+            // casts to the resolved result dtype, scans in that dtype's
+            // opmath (F32 for half: ATen's acc_type) and rounds once.
             | "dist.default"
             | "_cdist_forward.default"
             | "_pdist_forward.default"
@@ -1568,6 +1978,7 @@ fn opmath_target(target: &str) -> bool {
             | "_scaled_dot_product_efficient_attention.default"
             | "_scaled_dot_product_flash_attention.default"
             | "_scaled_dot_product_flash_attention_for_cpu.default"
+            | "_scaled_dot_product_fused_attention_overrideable.default"
             | "_scaled_dot_product_cudnn_attention.default"
             // comparisons: torch compares at the promoted operand dtype
             | "eq.Tensor"
@@ -1604,7 +2015,7 @@ fn is_float(dtype: DType) -> bool {
 
 /// Integer storage dtypes the truncating cast may target.
 fn is_int(dtype: DType) -> bool {
-    matches!(dtype, DType::Int | DType::I64)
+    matches!(dtype, DType::Int | DType::I64 | DType::U64)
 }
 
 /// Integer dtypes a float may not be `cast` into (the frontend refuses a
@@ -1612,7 +2023,7 @@ fn is_int(dtype: DType) -> bool {
 fn is_narrowing_int(dtype: DType) -> bool {
     matches!(
         dtype,
-        DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16
+        DType::Int | DType::I64 | DType::U64 | DType::I8 | DType::U8 | DType::I16
     )
 }
 
@@ -1692,3 +2103,9 @@ mod dim_expr_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod boolean_tests;
+
+#[cfg(test)]
+mod dispatch_tests;

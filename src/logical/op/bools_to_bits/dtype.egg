@@ -1,0 +1,4 @@
+(rule ((= ?out (LogicalBoolsToBits ?in ?dt))) ((set (dtype-of ?out) ?dt))
+ :ruleset prop :name "bools_to_bits/dtype")
+(rule ((= ?out (LogicalBoolsToBits ?in ?dt)) (!= (dtype-of ?in) (Bool)))
+ ((panic "BoolsToBits requires one-bit Bool")) :ruleset main_ruleset :name "bools_to_bits/reject_input")

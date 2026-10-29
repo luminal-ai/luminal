@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, unary};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, math_function, unary};
 use anyhow::Result;
 
 /// `CeilFunctionalGeneric(input) -> out` — pure dataflow form.
@@ -91,7 +91,8 @@ impl LayoutIrOp for CeilFunctionalDps {}
 /// The CUDA lowering, colocated with its op.
 impl KernelOp for CeilFunctionalDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-        unary(ctx, "ceilf(a[i])")
+        let function = math_function(ctx, 1, "ceilf", "ceil")?;
+        unary(ctx, &format!("{function}(a[i])"))
     }
 }
 

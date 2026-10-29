@@ -33,6 +33,11 @@ impl Graph {
         result
     }
 
+    /// An exact unsigned scalar; the signed-to-unsigned cast preserves its low bits.
+    pub fn constant_u64(&mut self, value: u64) -> GraphTensor {
+        self.constant_i64(value as i64).cast(DType::U64)
+    }
+
     /// An exact scalar `F32` constant. The term stores the `f64` number but
     /// the logical dtype is F32 (the parity rule); narrow float constants
     /// are casts of this.
@@ -207,7 +212,7 @@ impl GraphTensor {
             self.dtype
         );
         assert!(
-            matches!(dtype, DType::Int | DType::I64),
+            matches!(dtype, DType::Int | DType::I64 | DType::U64),
             "trunc_cast target must be an integer, got {dtype:?}"
         );
         let operand = (self.id, self.dims());

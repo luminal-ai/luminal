@@ -26,7 +26,9 @@ pub fn dtype_bytes(dtype: PlanDtype) -> Result<usize> {
         PlanDtype::F16 => 2,
         PlanDtype::Bf16 => 2,
         PlanDtype::Int => 4,
-        PlanDtype::Int64 => 8,
+        PlanDtype::Int64 | PlanDtype::UInt64 => 8,
+        PlanDtype::I8 | PlanDtype::U8 => 1,
+        PlanDtype::I16 | PlanDtype::U16 => 2,
         PlanDtype::Bool | PlanDtype::Bool8 => 1,
         other => bail!("cuda-lite has no device representation for {other:?}"),
     })

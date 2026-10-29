@@ -1,0 +1,6 @@
+(rule ((= ?out (LogicalOr ?a ?b)) (= ?dt (dtype-of ?a)) (= ?dt (dtype-of ?b)))
+    ((set (dtype-of ?out) ?dt)) :ruleset prop :name "or/dtype")
+(rule ((= ?out (LogicalOr ?a ?b)) (!= (dtype-of ?a) (Bool)) (!= (dtype-of ?a) (Bool8)))
+    ((panic "Boolean operation requires Bool or Bool8")) :ruleset main_ruleset :name "or/reject_non_boolean")
+(rule ((= ?out (LogicalOr ?a ?b)) (!= (dtype-of ?a) (dtype-of ?b)))
+    ((panic "Boolean operand dtypes must match")) :ruleset main_ruleset :name "or/reject_mixed")

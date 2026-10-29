@@ -108,6 +108,8 @@ mod tests {
             TensorMeta {
                 dtype: FLOAT,
                 sizes: sizes(&[4]),
+                strides: None,
+                storage_offset: None,
                 layout: Some(1),
                 device: None,
             },
@@ -117,6 +119,8 @@ mod tests {
             TensorMeta {
                 dtype: FLOAT,
                 sizes: sizes(&[4]),
+                strides: None,
+                storage_offset: None,
                 layout: Some(7),
                 device: None,
             },

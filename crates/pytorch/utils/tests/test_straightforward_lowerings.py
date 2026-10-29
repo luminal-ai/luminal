@@ -1,5 +1,6 @@
 """Regression coverage for composite linear algebra and movement lowerings."""
 
+import math
 import warnings
 
 import torch
@@ -271,6 +272,28 @@ def test_zero_coefficients_structurally_ignore_nan_inputs() -> None:
     )
     module = ZeroCoefficientLinearComposites()
     _assert_outputs(_compile(module, *inputs)(*inputs), module(*inputs))
+
+
+def test_bool_coefficients_are_literal_zero_and_one() -> None:
+    # A Python-bool beta/alpha is the literal 0 or 1 (False == 0, True == 1),
+    # so False drops its term exactly like the integer 0 above and the NaN
+    # inputs never reach the result.
+    shapes = ((2,), (2, 3), (3,), (2, 4), (3, 2, 5), (3, 5, 4))
+    nan_inputs = tuple(torch.full(shape, float("nan")) for shape in shapes)
+    module = LinearComposites(alpha=False, beta=False)
+    _assert_outputs(_compile(module, *nan_inputs)(*nan_inputs), module(*nan_inputs))
+    # Integer tensors take bool coefficients too. The real-dtype test above
+    # is xfailed for a bf16 rounding difference, so int16 is covered here.
+    integer_inputs = tuple(
+        torch.arange(math.prod(shape), dtype=torch.int16).reshape(shape)
+        for shape in shapes
+    )
+    for beta, alpha in ((False, True), (True, False), (True, True)):
+        module = LinearComposites(alpha=alpha, beta=beta)
+        _assert_outputs(
+            _compile(module, *integer_inputs)(*integer_inputs),
+            module(*integer_inputs),
+        )
 
 
 def test_movement_lowerings_support_noncontiguous_real_and_complex_values() -> None:

@@ -66,6 +66,62 @@ fn typed_buffer(dtype: DType, bytes: &[u8]) -> Result<TypedBuffer> {
         DType::U8 => TypedBuffer::U8(bytes.to_vec()),
         DType::I16 => prim!(i16, I16),
         DType::Bool => TypedBuffer::bool8(bytes.to_vec())?,
+        // Narrow floats stage as CODES (storage only; the translator
+        // computes them in F32). Every bit pattern is a legal code.
+        DType::F16 => {
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                "F16 input is {} bytes, not even",
+                bytes.len()
+            );
+            TypedBuffer::F16(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| half::f16::from_bits(u16::from_ne_bytes(*c)))
+                    .collect(),
+            )
+        }
+        DType::Bf16 => {
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                "Bf16 input is {} bytes, not even",
+                bytes.len()
+            );
+            TypedBuffer::Bf16(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| half::bf16::from_bits(u16::from_ne_bytes(*c)))
+                    .collect(),
+            )
+        }
+        DType::F8E4M3FN => TypedBuffer::F8E4M3FN(
+            bytes
+                .iter()
+                .map(|b| float8::F8E4M3::from_bits(*b))
+                .collect(),
+        ),
+        DType::F8E5M2 => TypedBuffer::F8E5M2(
+            bytes
+                .iter()
+                .map(|b| float8::F8E5M2::from_bits(*b))
+                .collect(),
+        ),
+        DType::F8E4M3FNUZ => TypedBuffer::F8E4M3FNUZ(
+            bytes
+                .iter()
+                .map(|b| luminal_reference::narrow_float::F8E4M3FNUZ(*b))
+                .collect(),
+        ),
+        DType::F8E5M2FNUZ => TypedBuffer::F8E5M2FNUZ(
+            bytes
+                .iter()
+                .map(|b| luminal_reference::narrow_float::F8E5M2FNUZ(*b))
+                .collect(),
+        ),
         other => bail!("reference backend does not support {other:?} inputs yet"),
     })
 }
@@ -539,6 +595,13 @@ impl CompiledGraph {
             DType::U8 => as_bytes(read!(get_u8, as_u8).map_err(to_py)?),
             DType::I16 => as_bytes(read!(get_i16, as_i16).map_err(to_py)?),
             DType::Bool => read!(get_bool8, as_bool8).map_err(to_py)?.to_vec(),
+            // Narrow floats read back as their codes, in storage width.
+            DType::F16 => as_bytes(read!(get_f16, as_f16).map_err(to_py)?),
+            DType::Bf16 => as_bytes(read!(get_bf16, as_bf16).map_err(to_py)?),
+            DType::F8E4M3FN => as_bytes(read!(get_f8e4m3, as_f8e4m3).map_err(to_py)?),
+            DType::F8E5M2 => as_bytes(read!(get_f8e5m2, as_f8e5m2).map_err(to_py)?),
+            DType::F8E4M3FNUZ => as_bytes(read!(get_f8e4m3fnuz, as_f8e4m3fnuz).map_err(to_py)?),
+            DType::F8E5M2FNUZ => as_bytes(read!(get_f8e5m2fnuz, as_f8e5m2fnuz).map_err(to_py)?),
             other => {
                 return Err(PyRuntimeError::new_err(format!(
                     "reference backend cannot read {other:?} outputs yet"

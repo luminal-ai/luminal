@@ -374,6 +374,7 @@
     (Bf16)
     (Int)
     (Int64)
+    (UInt64)
     (Bool)
     ; Bool8 (Austin's ruling 2026-07-30): the C++/device boolean — an
     ; 8-BIT CODE with exactly TWO legal states, 0x00 = false and
@@ -977,6 +978,7 @@
 (set (bits-of (Bf16)) (BitWidthLit 16))
 (set (bits-of (Int)) (BitWidthLit 32))
 (set (bits-of (Int64)) (BitWidthLit 64))
+(set (bits-of (UInt64)) (BitWidthLit 64))
 (set (bits-of (Bool)) (BitWidthLit 1)) ; DELIBERATE DIVERGENCE from luminal's byte-backed bools (user ruling 2026-07-24: bit-packed Bool is an update we will persist and see through the integration)
 (set (bits-of (Bool8)) (BitWidthLit 8)) ; the C++/device boolean: 8-bit code, two legal states (ruling 2026-07-30; see the Dtype declaration)
 (set (bits-of (F4E2M1)) (BitWidthLit 4))
@@ -1360,8 +1362,11 @@
 ; division, so the trunc folds are the primitives verbatim; the ceil
 ; folds are trunc PLUS ONE exactly when the division is inexact and the
 ; operand signs agree (positive true quotient) — the sign-gated rule
-; family, verified over the full mixed-sign grid. Custom rounding
-; primitives can replace this split later without changing any meaning.
+; family, verified over the full mixed-sign grid. The exact ceil arm
+; binds `(exact-div a b)`, the harness primitive that is PARTIAL unless
+; b is nonzero and divides a: one premise carries both guards and the
+; quotient. Custom rounding primitives can replace the inexact split
+; later without changing any meaning.
 (rule
   ((= ?expr (IntTruncDiv (IntLit ?dividend) (IntLit ?divisor))) (!= ?divisor 0))
   ((union ?expr (IntLit (/ ?dividend ?divisor))))
@@ -1376,10 +1381,9 @@
 (rule
   (
     (= ?expr (IntCeilDiv (IntLit ?dividend) (IntLit ?divisor)))
-    (!= ?divisor 0)
-    (= 0 (% ?dividend ?divisor))
+    (= ?quotient (exact-div ?dividend ?divisor))
   )
-  ((union ?expr (IntLit (/ ?dividend ?divisor))))
+  ((union ?expr (IntLit ?quotient)))
   :ruleset main_ruleset :name "core: IntCeilDiv folding, exact division"
 )
 ; ...inexact with agreeing signs (positive true quotient): trunc + 1...
@@ -2375,13 +2379,13 @@
 ; fact pays).
 (relation provably-exact-division-expression (IntExpr IntExpr))
 
-; The literal route (subsumes luminal's (= 0 (% a b)) guards).
+; The literal route: exact-div is PARTIAL, so binding its result IS the
+; nonzero-divisor and zero-remainder check in one premise.
 (rule
   (
     (= ?dividend (IntLit ?dividend_value))
     (= ?divisor (IntLit ?divisor_value))
-    (!= ?divisor_value 0)
-    (= 0 (% ?dividend_value ?divisor_value))
+    (= ?quotient (exact-div ?dividend_value ?divisor_value))
   )
   ((provably-exact-division-expression ?dividend ?divisor))
   :ruleset main_ruleset :name "core: exact division: both operands literal, remainder 0"
@@ -2800,6 +2804,22 @@
   :ruleset main_ruleset :name "core: div/rem recomposition of the dividend, negative divisor"
 )
 
+; Adjacent digits of a mixed-radix decomposition reconstruct the lower
+; combined digit: a*((n/a)%b) + n%a = n%(a*b), for a,b > 0.
+; Truncation preserves the sign of n in each digit, so negative dividends
+; are valid too. This exposes the existing div/rem recomposition rule for
+; three or more digits without unrestricted additive reassociation.
+; In particular, nested flatten/unflatten substitutions must recognize
+; their identity before the next walk can substitute through it again.
+(rule
+ ((= ?sum (IntAdd
+      (IntMul (IntTruncRem (IntTruncDiv ?n ?inner) ?outer) ?inner)
+      (IntTruncRem ?n ?inner)))
+  (= ?inner_lower (lower-bound-of ?inner)) (>= ?inner_lower (bigint 1))
+  (= ?outer_lower (lower-bound-of ?outer)) (>= ?outer_lower (bigint 1)))
+ ((union ?sum (IntTruncRem ?n (IntMul ?inner ?outer))))
+ :ruleset main_ruleset :name "core: recompose adjacent mixed-radix digits")
+
 ; FUSION: dividing twice by positive divisors is dividing once by the
 ; product (verified for truncation over ALL dividends — no dividend
 ; premise needed).
@@ -3031,44 +3051,72 @@
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-; ASSOCIATIVITY, CERTIFICATE-GUARDED (Stage I3). Regrouping THROUGH a
-; zero-equivalent inner node is the divergence move of the recorded
-; cancellation-pair hang (a folded pair like 3 + (-3) joins the zero
-; class; unguarded associativity then re-associates every sum through
-; that class's briefly-live views forever — the base system diverges
-; with NO distributivity involved, forensics record). The guard requires
-; the matched INNER node's class to carry the nonzero certificate:
-; monotone, fail-closed, and semantically free — regrouping through a
-; genuinely-zero inner is exactly the move with no derivational value
-; (the collapse rules already decide everything in the zero cone).
-; Uncertified-unknown inners stall conservatively.
-;
-; Empirical note (review record): today's fixtures pass byte-identically
-; with associativity DELETED — its only real consumer is future
-; distributivity normalization — so the guard cannot regress the suite;
-; the positive merge pins in the fence fixture keep it honest instead.
+; INTEGER NORMALIZATION. Addition uses reducing offset rules below;
+; unrestricted reassociation can pump even through nonzero, nonconstant
+; classes, as the shifted-coordinate cancellation regression demonstrates.
+; Multiplication retains its nonzero/nonconstant fence: zero-equivalent
+; or point-bound inner classes contain identity/factorization spellings
+; that must not be used to manufacture fresh regroupings.
 
-; Associativity : IntAdd
-; [G2 FENCE, ruled 2026-08-27]: refuse CONSTANT inner classes (point
-; bounds, lower == upper). A point-bound class is a known constant owned
-; by the fold/pin machinery; regrouping constants is the pin-collapse
-; orbit's fuel. Associativity is equivalence discovery for UNKNOWNS.
-; Regression suite: src/test_support.rs, mod ring_ignition_battery (the
-; battery fails loudly if any of the three G2 premises is weakened).
-; Analysis: the Ring Ignition dossier (raw-spelling repro, 2026-08-27).
+; CANONICAL LITERAL OFFSETS. A shifted index has the form base + c.
+; Combine offsets atomically instead of enumerating associativity on every
+; spelling of an e-class. In particular, (q + 1) + (-1) must join q AND
+; retire both orientations of the original outer row in the same action.
+; Otherwise that live row becomes q = (q + 1) - 1 and reassociation pumps
+; fresh shifts forever. This also arises from legitimate slice substitution.
+;
+; The nonconstant inner gate excludes preserved factorizations of literals.
+; Add offsets in BigInt and admit only representable i64 results: overflow
+; must not silently turn an integer identity into a wrapped one.
 (rule
-  (
-    (= ?expr (IntAdd ?inner ?outer))
-    (= ?inner (IntAdd ?lhs ?rhs))
-    (provably-cannot-union-with-zero ?inner)
-    (= ?inner_lower (lower-bound-of ?inner))
-    (= ?inner_upper (upper-bound-of ?inner))
-    (< ?inner_lower ?inner_upper)
-  )
-  ((union ?expr (IntAdd ?lhs (IntAdd ?rhs ?outer))))
-  :name "int-add-associate"
-  :ruleset main_ruleset
-)
+  ((= ?expr (IntAdd ?inner (IntLit ?outer_offset)))
+   (= ?inner (IntAdd ?base (IntLit ?inner_offset)))
+   (!= ?inner_offset 0)
+   (= ?lo (lower-bound-of ?inner))
+   (= ?hi (upper-bound-of ?inner))
+   (< ?lo ?hi)
+   (= ?offset (bigint-to-i64 (+ (bigint ?inner_offset) (bigint ?outer_offset))))
+   (= ?offset 0))
+  ((union ?expr ?base)
+   (subsume (IntAdd ?inner (IntLit ?outer_offset)))
+   (subsume (IntAdd (IntLit ?outer_offset) ?inner)))
+  :name "core: normalize literal offsets, cancellation"
+  :ruleset main_ruleset)
+(rule
+  ((= ?expr (IntAdd ?inner (IntLit ?outer_offset)))
+   (= ?inner (IntAdd ?base (IntLit ?inner_offset)))
+   (!= ?inner_offset 0)
+   (= ?lo (lower-bound-of ?inner))
+   (= ?hi (upper-bound-of ?inner))
+   (< ?lo ?hi)
+   (= ?offset (bigint-to-i64 (+ (bigint ?inner_offset) (bigint ?outer_offset))))
+   (!= ?offset 0))
+  ((union ?expr (IntAdd ?base (IntLit ?offset)))
+   (subsume (IntAdd ?inner (IntLit ?outer_offset)))
+   (subsume (IntAdd (IntLit ?outer_offset) ?inner)))
+  :name "core: normalize literal offsets, combined offset"
+  :ruleset main_ruleset)
+
+; Hoist a literal offset out of a sum with a symbolic operand. The result
+; exposes adjacent offsets to the two atomic rules above. Every firing
+; removes the old outer spelling; there is no reverse expansion rule.
+; Symbolic reassociations are deliberately not enumerated. Coefficients
+; continue to be combined by the atomic like-term rules below.
+(rule
+  ((= ?expr (IntAdd ?inner ?other))
+   (= ?inner (IntAdd ?base (IntLit ?offset)))
+   (!= ?offset 0)
+   (= ?inner_lo (lower-bound-of ?inner))
+   (= ?inner_hi (upper-bound-of ?inner))
+   (< ?inner_lo ?inner_hi)
+   (= ?other_lo (lower-bound-of ?other))
+   (= ?other_hi (upper-bound-of ?other))
+   (< ?other_lo ?other_hi))
+  ((union ?expr (IntAdd (IntAdd ?base ?other) (IntLit ?offset)))
+   (subsume (IntAdd ?inner ?other))
+   (subsume (IntAdd ?other ?inner)))
+  :name "core: normalize literal offsets, hoist out of a symbolic sum"
+  :ruleset main_ruleset)
 
 ; Associativity : IntMul
 ; [G2 FENCE, ruled 2026-08-27]: same constant-class refusal.
@@ -4076,7 +4124,7 @@
 
 
 ; ================= THE SUBSTITUTION WALK (landed 2026-08-17) ============
-; Images are built by ONE call per composition site to the vendored
+; Images are built by ONE uncached call per canonical (root, sigma) to the vendored
 ; `unstable-subst` primitive (egglog-experimental #60, vendored in
 ; src/subst_primitive.rs with three audited deltas: subsumed source
 ; rows copy BORN-RETIRED via the local add_subsumed engine patch; memo
@@ -4085,10 +4133,11 @@
 ; spelling at once, simultaneous by construction — from a :naive rule
 ; in the subst-walk ruleset. The schedule runs that ruleset as an
 ; OUTER STRATUM ((saturate (saturate (run main_ruleset) (run prop)) (run subst-walk))): the
-; ring saturates between walk generations, so re-walks happen per
-; GENERATION, not per round. Both halves are load-bearing: per-round
-; re-walks cost 2-9x on model-scale searches, and per-generation
-; arrival is what lets the rejoin family saturate.
+; ring saturates between walk generations. Each generation can introduce
+; new source roots/maps, but a completed image remains the same function
+; when more equivalent source spellings arrive. memoized-int-subst reuses
+; that image instead of repeatedly copying the growing orbit. The cache is
+; e-graph-local and its keys/results participate in congruence rebuilding.
 ;
 ; DEMANDS ARE ROOT-ONLY (the old operand-demand decomposition is gone
 ; — it was the divergence's transmission channel: every ring-bred
@@ -4179,6 +4228,9 @@
       ((int-subst-closed ?e ?m)) :ruleset main_ruleset :name "core: in-domain CoordVar is closed, same-extent arm")
 (relation bool-subst-closed (BoolExpr IndexMap))
 (sort SigmaMap (Map IntExpr IntExpr))
+; Completed function images, not term syntax. Rebuild canonicalizes both
+; source/map keys and results; when keys merge either result remains valid.
+(function int-subst-cache (IntExpr SigmaMap) IntExpr :merge old)
 (relation sigma-walk (IndexMap IntExprList i64 SigmaMap))
 (function sigma-out (IndexMap) SigmaMap :no-merge)
 
@@ -4312,10 +4364,10 @@
   ((int-subst-demand ?expr ?map)
    (int-subst-closed ?expr ?map)
    (= ?sigma (sigma-out ?map)))
-  ((union (int-subst-of ?expr ?map) (unstable-subst ?expr ?sigma)))
+  ((union (int-subst-of ?expr ?map) (memoized-int-subst ?expr ?sigma)))
   :ruleset subst-walk
   :naive
-  :name "core: the walk: int-subst-of is unstable-subst under σ"
+  :name "core: the walk: int-subst-of is memoized substitution under σ"
 )
 ; ================== END SUBST-PRIMITIVE ROAD BLOCK ==================
 

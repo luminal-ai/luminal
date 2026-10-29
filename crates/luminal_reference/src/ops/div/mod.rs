@@ -147,6 +147,7 @@ pub(crate) fn kernel(
     ctx: &mut ReferenceKernelCtx,
 ) -> anyhow::Result<()> {
     match &ctx.operands[0] {
+        TypedBuffer::F64(_) => ctx.binary_elementwise_f64(|a, b| Ok(a / b)),
         TypedBuffer::F32(_) => ctx.binary_elementwise(|a, b| a / b),
         other => anyhow::bail!(
             "Div has no {} arm: integer division is TruncDiv, not Div",

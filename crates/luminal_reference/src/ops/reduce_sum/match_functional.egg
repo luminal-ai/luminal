@@ -10,6 +10,7 @@
     (!= ?value_dtype (Int))
     (!= ?value_dtype (Int64))
     (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
   )
   (
     (let ?layout_tensor_op
@@ -39,6 +40,7 @@
     (>= ?value_lower (bigint -2147483648))
     (<= ?value_upper (bigint 2147483647))
     (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
   )
   (
     (let ?layout_tensor_op
@@ -68,6 +70,7 @@
     (>= ?value_lower (bigint -9223372036854775808))
     (<= ?value_upper (bigint 9223372036854775807))
     (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
   )
   (
     (let ?layout_tensor_op

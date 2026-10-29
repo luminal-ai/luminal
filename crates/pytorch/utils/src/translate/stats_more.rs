@@ -30,20 +30,17 @@ pub(super) enum DistVariant {
     Pdist,
 }
 
-/// True for storage dtypes that can carry a NaN.
-fn dtype_can_contain_nan(dtype: DType) -> bool {
-    !matches!(
-        dtype,
-        DType::Int
-            | DType::I64
-            | DType::I4
-            | DType::U4
-            | DType::I8
-            | DType::U8
-            | DType::I16
-            | DType::U16
-            | DType::Bool
-    )
+/// Which of ATen's CPU histogram kernels (`native/cpu/HistogramKernel.cpp`)
+/// assigns samples to bins; see [`Translator::histogram_bin_onehot`].
+#[derive(Clone, Copy)]
+enum HistogramBinSearch {
+    /// `BINARY_SEARCH`, used by `histogramdd_stub` for caller-supplied edge
+    /// tensors: `upper_bound` over every edge.
+    Binary,
+    /// `LINEAR_INTERPOLATION_WITH_LOCAL_SEARCH`, used by
+    /// `histogramdd_linear_stub` for bin counts: `upper_bound` over the
+    /// three edges around the interpolated bin.
+    LocalSearch,
 }
 
 /// Expand `[k]` / `[k, k, ..]` spatial lists to exactly `spatial` entries.
@@ -67,6 +64,18 @@ fn row_major_strides(dims: &[IntExpr]) -> Vec<IntExpr> {
     (0..dims.len())
         .map(|i| super::dim_arith::product_of_dims(dims[i + 1..].iter().copied()))
         .collect()
+}
+
+/// Round a value computed in its (wider) compute dtype to `dtype` and widen
+/// it back: the rounding a `scalar_t` operation performs when the
+/// translator computes half precision in F32. A no-op when the two agree.
+fn round_through(value: GraphTensor, dtype: DType) -> GraphTensor {
+    if value.dtype == dtype {
+        value
+    } else {
+        let compute = value.dtype;
+        value.cast(dtype).cast(compute)
+    }
 }
 
 /// Extract the `reduce` string of a `segment_reduce` node.
@@ -143,11 +152,7 @@ impl Translator<'_> {
 
     /// A dtype-preserving rank-0 constant scalar.
     fn scalar_value(&mut self, value: f64, dtype: DType) -> GraphTensor {
-        match dtype {
-            DType::F64 => self.cx.constant_f64(value),
-            DType::Int | DType::I64 => self.cx.constant_i64(value as i64).cast(dtype),
-            _ => self.cx.constant_f32(value as f32).cast(dtype),
-        }
+        self.typed_scalar(value, dtype)
     }
 
     /// A dtype-preserving constant scalar expanded to `tensor`'s shape.
@@ -161,22 +166,7 @@ impl Translator<'_> {
     /// An explicit float -> int read (`trunc_cast`); every other conversion
     /// is an ordinary `cast`.
     fn lossy_cast(&mut self, tensor: GraphTensor, dtype: DType) -> GraphTensor {
-        if tensor.dtype == dtype {
-            return tensor;
-        }
-        if super::is_float(tensor.dtype) && super::is_int(dtype) {
-            tensor.trunc_cast(dtype)
-        } else {
-            tensor.cast(dtype)
-        }
-    }
-
-    /// A tensor operand by input name (`None` for absent / non-tensor).
-    fn named_tensor_operand(&mut self, node: &Node, name: &str) -> Result<Option<GraphTensor>> {
-        match named_index(node, name) {
-            Some(index) => self.optional_tensor_operand(&node.inputs[index]),
-            None => Ok(None),
-        }
+        super::convert(tensor, dtype)
     }
 
     /// Re-insert reduced axes as size-1 extents (keepdim).
@@ -207,23 +197,53 @@ impl Translator<'_> {
         }
     }
 
-    /// The p-norm of already-real-valued `magnitude` over `axes`.
-    fn p_norm(&mut self, magnitude: GraphTensor, p: f64, axes: Vec<usize>) -> GraphTensor {
-        if p == 0.0 {
-            let zero = self.constant_like(magnitude, 0.0);
-            let nonzero = self.bool_or(magnitude.lt(zero), magnitude.gt(zero));
-            nonzero.cast(magnitude.dtype).sum(axes)
-        } else if p == 1.0 {
+    /// `torch.linalg.vector_norm` of the already-real-valued `magnitude`
+    /// over `axes`. `dist(a, b, p)` is this norm of `a - b`.
+    ///
+    /// Order 0 counts the nonzero entries, torch's sum of `x != 0`. A NaN
+    /// entry is nonzero, so it counts once (`inf - inf` included):
+    /// `util::is_zero` is torch's `== 0`, which is false for NaN.
+    fn vector_norm_reduce(
+        &mut self,
+        magnitude: GraphTensor,
+        ord: f64,
+        axes: Vec<usize>,
+    ) -> GraphTensor {
+        if ord == 0.0 {
+            let zero = self.is_zero(magnitude);
+            zero.logical_not().cast(magnitude.dtype).sum(axes)
+        } else if ord == 1.0 {
             magnitude.sum(axes)
-        } else if p == 2.0 {
+        } else if ord == 2.0 {
             magnitude.square().sum(axes).sqrt()
-        } else if p == f64::INFINITY {
+        } else if ord == f64::INFINITY {
             magnitude.max(axes)
-        } else if p == f64::NEG_INFINITY {
+        } else if ord == f64::NEG_INFINITY {
             magnitude.min(axes)
         } else {
-            magnitude.pow(p as f32).sum(axes).pow((1.0 / p) as f32)
+            magnitude.pow(ord as f32).sum(axes).pow((1.0 / ord) as f32)
         }
+    }
+
+    /// The norm `_cdist_forward` and `_pdist_forward` take over each pair's
+    /// `|difference|` row. It is the vector norm, except at order 0.
+    ///
+    /// At order 0, ATen's CPU kernels (`zdist_calc` in
+    /// DistanceOpsKernel.cpp) map each entry `d` to `min(ceil(d), 1)`. That
+    /// is 0 at zero, 1 at any other ordered value, and NaN at NaN, so one NaN
+    /// difference makes the pair's count NaN. The vector norm and `dist`
+    /// count the same entry as 1. Eager disagrees with itself across these
+    /// ops, and this lowering follows each op. The CUDA kernel (`dists::zero`
+    /// in DistanceKernel.cu) counts `d != 0` instead; the parity oracle here
+    /// is CPU eager.
+    fn p_norm(&mut self, magnitude: GraphTensor, p: f64, axes: Vec<usize>) -> GraphTensor {
+        if p != 0.0 {
+            return self.vector_norm_reduce(magnitude, p, axes);
+        }
+        let zero = self.is_zero(magnitude);
+        let indicator = zero.logical_not().cast(magnitude.dtype);
+        let nan = magnitude.is_nan();
+        self.select(nan, magnitude, indicator).sum(axes)
     }
 
     /// `linalg_vector_norm` after the caller constructed real magnitudes.
@@ -257,30 +277,7 @@ impl Translator<'_> {
             );
         }
 
-        let reduced = if ord == 0.0 {
-            let zero = self.constant_like(magnitude, 0.0);
-            let ordered = self.bool_or(magnitude.lt(zero), magnitude.gt(zero));
-            let nonzero = if dtype_can_contain_nan(magnitude.dtype) {
-                let nan = self.is_nan(magnitude);
-                self.bool_or(ordered, nan)
-            } else {
-                ordered
-            };
-            nonzero.cast(output_dtype).sum(axes.clone())
-        } else if ord == 1.0 {
-            magnitude.sum(axes.clone())
-        } else if ord == 2.0 {
-            magnitude.square().sum(axes.clone()).sqrt()
-        } else if ord == f64::INFINITY {
-            magnitude.max(axes.clone())
-        } else if ord == f64::NEG_INFINITY {
-            magnitude.min(axes.clone())
-        } else {
-            magnitude
-                .pow(ord as f32)
-                .sum(axes.clone())
-                .pow((1.0 / ord) as f32)
-        };
+        let reduced = self.vector_norm_reduce(magnitude, ord, axes.clone());
         Ok(self.restore_reduced_dims(reduced, &axes, keepdim))
     }
 
@@ -303,7 +300,7 @@ impl Translator<'_> {
                 let magnitude = self.real_abs(difference).cast(self.compute_dtype(node)?);
                 let p = self.get_float_arg(node, 2).unwrap_or(2.0);
                 let axes = (0..magnitude.rank()).collect();
-                Ok(self.p_norm(magnitude, p, axes))
+                Ok(self.vector_norm_reduce(magnitude, p, axes))
             }
             DistVariant::Cdist => {
                 let lhs = self.get_input_tensor(node, 0)?;
@@ -340,23 +337,7 @@ impl Translator<'_> {
                 let columns = input.dims()[1];
                 let output_shape = self.output_meta_shape(node)?;
                 let pairs = output_shape[0];
-                let k = self.cx.arange(pairs).cast(DType::F32);
-                let rows_f = self
-                    .cx
-                    .constant_i32(rows)
-                    .cast(DType::F32)
-                    .expand_rhs(k.dims());
-                let discriminant = k * -8.0f32 + rows_f * (rows_f - 1.0f32) * 4.0f32 - 7.0f32;
-                let i = (rows_f
-                    - 2.0f32
-                    - (discriminant.sqrt() * 0.5f32 - 0.5f32)
-                        .trunc_cast(DType::Int)
-                        .cast(DType::F32))
-                .trunc_cast(DType::Int);
-                let i_f = i.cast(DType::F32);
-                let j = (k + i_f + 1.0f32 - rows_f * (rows_f - 1.0f32) * 0.5f32
-                    + (rows_f - i_f) * (rows_f - i_f - 1.0f32) * 0.5f32)
-                    .trunc_cast(DType::Int);
+                let (i, j) = self.pdist_pair_indices(rows, pairs);
                 let i = i.expand_dim(1, columns);
                 let j = j.expand_dim(1, columns);
                 let pair_shape = vec![pairs, columns];
@@ -369,6 +350,46 @@ impl Translator<'_> {
                 Ok(self.p_norm(magnitude, p, vec![1]))
             }
         }
+    }
+
+    /// The row-major upper-triangle pair `(i, j)`, `i < j`, of every flat
+    /// pdist index `k in 0..pairs` (`pairs = n(n-1)/2`, `n = rows`): two
+    /// `Int` tensors of shape `[pairs]`, in torch.pdist's output order.
+    ///
+    /// Invariant: every value below is an INTEGER held in F64 whose
+    /// magnitude stays under `8n^2`, which is below `2^53` for every
+    /// `n <= 2^25`, so each add, multiply, halving (of an even product) and
+    /// compare is exact. That bound covers every pdist this lowering can
+    /// express: `k` is an Int (i32) iota, which refuses loudly once
+    /// `pairs > i32::MAX` (`n > 65536`). Floating point only SEEDS the row:
+    /// the closed-form inverse `n - 2 - floor((sqrt(4n(n-1) - 8k - 7) - 1) / 2)`
+    /// can land one row off when the backend's F64 square root or floor is
+    /// not correctly rounded (CUDA-lite currently emits `sqrtf`/`floorf`,
+    /// i.e. F32 precision, for F64 operands). The seed is then fixed by
+    /// exact comparisons: the true row is the unique `r` with
+    /// `row_start(r) <= k < row_start(r + 1)`, where
+    /// `row_start(r) = r(2n - r - 1)/2` counts the pairs before row `r`, and
+    /// one step each way recovers it from any seed within one row of it
+    /// (`row_start` is nondecreasing on `-1..=n`, so the seeds `-1` and
+    /// `n - 1` correct too). The old lowering ran the whole inverse in F32,
+    /// which cannot hold `k` or `4n(n-1)` exactly past `2^24`: its pairs went
+    /// wrong (and out of bounds) from `n = 4609`.
+    fn pdist_pair_indices(&mut self, rows: IntExpr, pairs: IntExpr) -> (GraphTensor, GraphTensor) {
+        let k = self.cx.arange(pairs).cast(DType::F64);
+        let n = self
+            .cx
+            .constant_i32(rows)
+            .cast(DType::F64)
+            .expand_rhs(k.dims());
+        let row_start = |row: GraphTensor| row * (n * 2.0 - row - 1.0) * 0.5;
+        let discriminant = n * (n - 1.0) * 4.0 - k * 8.0 - 7.0;
+        let seed = n - 2.0 - ((discriminant.sqrt() - 1.0) * 0.5).floor();
+        let next = seed + 1.0;
+        let row = k
+            .lt(row_start(seed))
+            .select(seed - 1.0, k.lt(row_start(next)).select(seed, next));
+        let column = k - row_start(row) + row + 1.0;
+        (row.trunc_cast(DType::Int), column.trunc_cast(DType::Int))
     }
 
     /// torch forms a distance's pairwise difference in the operand dtype
@@ -452,7 +473,17 @@ impl Translator<'_> {
         let matches = input_expanded.eq(bins_expanded);
 
         let out_dtype = self.output_meta_dtype(node)?;
-        Ok(matches.cast(out_dtype).sum(vec![1]))
+        // A narrow-float count is summed in F32 (exact below 2^24) and
+        // rounded once to the declared storage dtype.
+        let count_dtype = if out_dtype.is_narrow_float() {
+            DType::F32
+        } else {
+            out_dtype
+        };
+        Ok(super::util::round_to_storage(
+            matches.cast(count_dtype).sum(vec![1]),
+            out_dtype,
+        ))
     }
 
     pub(super) fn translate_histogram(
@@ -481,7 +512,12 @@ impl Translator<'_> {
                 .map(|range| (range[0], range[1]));
             self.uniform_histogram_edges(values, bins, range)
         };
-        let histogram = self.histogram_from_edges(&[values], &[edges], weight, density)?;
+        let search = if bins_tensor {
+            HistogramBinSearch::Binary
+        } else {
+            HistogramBinSearch::LocalSearch
+        };
+        let histogram = self.histogram_from_edges(&[values], &[edges], weight, density, search)?;
         self.bind_declared_prefix(node, &[histogram, edges])?;
         Ok(histogram)
     }
@@ -527,8 +563,13 @@ impl Translator<'_> {
         };
         let (columns, sample_count) = self.histogram_columns(input, dimensions)?;
         let weight = self.histogram_weight(node, sample_count, out_dtype)?;
-        let histogram =
-            self.histogram_from_edges(&columns, &edges, weight, Self::histogram_density(node))?;
+        let search = if tensor_edges {
+            HistogramBinSearch::Binary
+        } else {
+            HistogramBinSearch::LocalSearch
+        };
+        let density = Self::histogram_density(node);
+        let histogram = self.histogram_from_edges(&columns, &edges, weight, density, search)?;
         self.bind_single_declared(node, histogram)?;
         Ok(histogram)
     }
@@ -579,29 +620,120 @@ impl Translator<'_> {
             .unwrap_or(false)
     }
 
+    /// The `bins + 1` uniform edges of one histogram axis, built the way
+    /// ATen builds them.
+    ///
+    /// `select_outer_bin_edges` picks the range in double: the explicit
+    /// `range`, else (0, 1) for an empty input, else the column's min and
+    /// max. A range with equal ends is widened by 0.5 on each side. The
+    /// edges are then `linspace(lower, upper, bins + 1)` in the values dtype
+    /// ([`Self::aten_linspace`]). So `edges[0]` is the lower end and
+    /// `edges[bins]` the upper end exactly, and the maximum sample always
+    /// lands in the closed last bin.
     fn uniform_histogram_edges(
         &mut self,
         values: GraphTensor,
         bins: usize,
         explicit_range: Option<(f64, f64)>,
     ) -> GraphTensor {
-        let (mut lower, mut upper) = if let Some((lower, upper)) = explicit_range {
-            (
-                self.scalar_value(lower, values.dtype),
-                self.scalar_value(upper, values.dtype),
-            )
-        } else {
-            (values.min(vec![0]), values.max(vec![0]))
+        let dtype = values.dtype;
+        let empty = values.dims()[0].to_usize() == Some(0);
+        let (lower, upper) = match explicit_range.or(empty.then_some((0.0, 1.0))) {
+            // A static range is widened in double, as torch does, and only
+            // then rounded to the values dtype.
+            Some((lower, upper)) => {
+                let (lower, upper) = if lower == upper {
+                    (lower - 0.5, upper + 0.5)
+                } else {
+                    (lower, upper)
+                };
+                (
+                    self.scalar_value(lower, dtype),
+                    self.scalar_value(upper, dtype),
+                )
+            }
+            // min/max are values of the dtype, so torch's double `min - 0.5`
+            // rounds to the same value as the one rounding of `min - 0.5`
+            // in the dtype.
+            None => {
+                let lower = values.min(vec![0]);
+                let upper = values.max(vec![0]);
+                let ordered = lower.lt(upper);
+                let degenerate = self.bool_not(ordered);
+                let half = self.scalar_value(0.5, dtype);
+                let widened_lower = self.select(degenerate, lower - half, lower);
+                let widened_upper = self.select(degenerate, upper + half, upper);
+                (widened_lower, widened_upper)
+            }
         };
-        // A degenerate range is widened by half a unit, matching torch.
-        let equal = self.is_zero(upper - lower);
-        lower = self.blend_select(equal, lower - 0.5f32, lower);
-        upper = self.blend_select(equal, upper + 0.5f32, upper);
-        let position = self.cx.arange(bins + 1).cast(values.dtype);
-        let edge_shape = position.dims();
-        let lower_expanded = lower.expand_rhs(edge_shape.clone());
-        let width = (upper - lower).expand_rhs(edge_shape);
-        lower_expanded + position * width / bins as f32
+        self.aten_linspace(lower, upper, bins + 1)
+    }
+
+    /// `linspace(start, end, steps)` for `steps >= 2` and rank-0 `start`
+    /// and `end`, computed the way ATen's linspace kernel computes it
+    /// (`native/cpu/RangeFactoriesKernel.cpp`; the CUDA kernel uses the same
+    /// formula). Both ends are in the values dtype `T`.
+    /// `step = (end - start) / (steps - 1)` is rounded once in `T`. The
+    /// kernel is two-sided:
+    ///
+    /// ```text
+    /// out[i] = start + step * i                  for i < steps / 2
+    /// out[i] = end - step * (steps - 1 - i)      otherwise
+    /// ```
+    ///
+    /// So `out[0] == start` and `out[steps - 1] == end` exactly, whatever
+    /// `step` rounds to. Each half is non-decreasing because rounding is
+    /// monotone. The halves meet in order unless `steps` approaches the
+    /// reciprocal of `T`'s epsilon. So the edges are non-decreasing, as
+    /// [`Self::histogram_bin_onehot`] requires.
+    ///
+    /// Rounding invariant: ATen compiles this kernel with floating-point
+    /// contraction. Each `base ± step * n` is then a fused multiply-add
+    /// that rounds once. This matched eager bit-for-bit on aarch64 for
+    /// random F32 and F64 ranges, and nvcc contracts the CUDA kernel the
+    /// same way. The IR has no fused multiply-add, so the edge is evaluated
+    /// in F64 and rounded to `T` once:
+    /// - For an F32 `T`, `step * n` is exact in F64: a 24-bit step times an
+    ///   integer below 2^29. The F64 add is the only other rounding. It is
+    ///   exact unless `base` and `step` are more than about 28 binades apart.
+    ///   So the cast gives the fused result.
+    /// - For F64 there is no wider type. The product and the sum each
+    ///   round, so an interior edge can sit one ulp from eager's.
+    fn aten_linspace(&mut self, start: GraphTensor, end: GraphTensor, steps: usize) -> GraphTensor {
+        assert!(steps >= 2, "aten_linspace needs at least two points");
+        let dtype = start.dtype;
+        let wide = DType::F64;
+        let intervals = self.scalar_value((steps - 1) as f64, dtype);
+        let step = self.rounded_quotient(end - start, intervals).cast(wide);
+        let half = steps / 2;
+        // n = i on the rising half, n = steps - 1 - i on the falling half.
+        let rising = self.cx.arange(half).cast(wide);
+        let falling_len = steps - half;
+        let falling = self
+            .cx
+            .iota(vec![falling_len], move |c| (falling_len - 1) - c[0])
+            .cast(wide);
+        let rising_dims = rising.dims();
+        let falling_dims = falling.dims();
+        let below = start.cast(wide).expand_rhs(rising_dims.clone())
+            + step.expand_rhs(rising_dims) * rising;
+        let above = end.cast(wide).expand_rhs(falling_dims.clone())
+            - step.expand_rhs(falling_dims) * falling;
+        below.concat_along(above, 0).cast(dtype)
+    }
+
+    /// `a / b` rounded once in `a`'s dtype, as IEEE division and ATen do.
+    ///
+    /// The frontend's F32 `/` is a reciprocal multiply, which rounds twice.
+    /// A binary64 quotient holds more than 2p + 2 bits of a p-bit float's
+    /// quotient (p = 24 for F32). Rounding it to the narrow dtype therefore
+    /// gives the correctly rounded quotient: double rounding is harmless for
+    /// division at that width (Figueroa, 1995). F64 `/` already rounds once.
+    fn rounded_quotient(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if a.dtype == DType::F64 {
+            return a / b;
+        }
+        (a.cast(DType::F64) / b.cast(DType::F64)).cast(a.dtype)
     }
 
     fn histogramdd_uniform_edges(
@@ -661,6 +793,7 @@ impl Translator<'_> {
         edges: &[GraphTensor],
         weight: GraphTensor,
         density: bool,
+        search: HistogramBinSearch,
     ) -> Result<GraphTensor> {
         anyhow::ensure!(
             !columns.is_empty(),
@@ -680,56 +813,41 @@ impl Translator<'_> {
 
         let mut full_shape = vec![sample_count];
         full_shape.extend_from_slice(&bin_shape);
-        // NaN never lands in a bin (torch drops it), and the boolean lattice
-        // here is exact, so no non-finite value is selected away.
-        let mut membership = self
-            .cx
-            .constant_i32(1)
-            .cast(DType::Bool)
-            .expand_rhs(full_shape.clone());
+        // A sample lands in the bin it hits on every axis. The Boolean
+        // lattice is exact, so no non-finite value is selected away.
+        let mut membership = None;
         for (dimension, (column, edge)) in columns.iter().zip(edges).enumerate() {
-            let bins = bin_shape[dimension];
-            let left = edge.slice_along(IntExpr::from(0usize)..bins, 0);
-            let right = edge.slice_along(IntExpr::from(1usize)..(bins + IntExpr::from(1usize)), 0);
-
-            let mut column_shape = vec![IntExpr::from(1); columns.len() + 1];
-            column_shape[0] = sample_count;
-            let mut column = util::reshape_tensor(*column, &column_shape);
-            column = column.expand(full_shape.clone());
-            let mut edge_shape = vec![IntExpr::from(1); columns.len() + 1];
-            edge_shape[dimension + 1] = bins;
-            let left = util::reshape_tensor(left, &edge_shape).expand(full_shape.clone());
-            let right = util::reshape_tensor(right, &edge_shape).expand(full_shape.clone());
-
-            let below_right = column.lt(right);
-            let equal_right = self.is_zero(column - right);
-            let mut last_position = self.cx.arange(bins);
-            let last_index = self
-                .cx
-                .constant_i32(bins - IntExpr::from(1usize))
-                .expand_rhs(last_position.dims());
-            last_position = last_position.eq(last_index);
-            let last_position =
-                util::reshape_tensor(last_position, &edge_shape).expand(full_shape.clone());
-            let inclusive_last = self.bool_and(equal_right, last_position);
-            let upper = self.bool_or(below_right, inclusive_last);
-            let in_bin = self.bool_and(column.ge(left), upper);
-            let column_nan = self.is_nan(column);
-            let not_nan = self.bool_not(column_nan);
-            let in_bin = self.bool_and(in_bin, not_nan);
-            membership = self.bool_and(membership, in_bin);
+            let hit = self.histogram_bin_onehot(*column, *edge, search);
+            let mut hit_shape = vec![IntExpr::from(1); columns.len() + 1];
+            hit_shape[0] = sample_count;
+            hit_shape[dimension + 1] = bin_shape[dimension];
+            let hit = util::reshape_tensor(hit, &hit_shape).expand(full_shape.clone());
+            membership = Some(match membership {
+                Some(membership) => self.bool_and(membership, hit),
+                None => hit,
+            });
         }
+        let membership = membership.expect("a histogram has at least one dimension");
 
         let mut weight_shape = vec![IntExpr::from(1); columns.len() + 1];
         weight_shape[0] = sample_count;
         let weight = util::reshape_tensor(weight, &weight_shape).expand(full_shape);
         let mut histogram = (membership.cast(weight.dtype) * weight).sum(vec![0]);
         if density {
+            // torch's density divides by the total weight, then by each axis'
+            // bin widths in turn. Keeping that order (not one divide by a
+            // product volume) lets F64, whose `/` rounds once, round as eager
+            // does. An all-zero histogram gives 0/0 = NaN in every bin, as in
+            // eager.
+            //
+            // Shape invariant: `histogram` is `bin_shape`. Each divisor starts
+            // below that rank and is expanded to `bin_shape` once: the rank-0
+            // total, and each width vector reshaped to `[1, .., bins_d, .., 1]`.
+            // Never expand a tensor that is already `bin_shape`: `expand_rhs`
+            // appends axes, giving `bin_shape ++ bin_shape`.
             let axes = (0..bin_shape.len()).collect::<Vec<_>>();
             let total = histogram.sum(axes).expand_rhs(bin_shape.clone());
-            let mut volume = self
-                .scalar_like(histogram, 1.0)
-                .expand_rhs(bin_shape.clone());
+            histogram /= total;
             for (dimension, edge) in edges.iter().enumerate() {
                 let bins = bin_shape[dimension];
                 let widths = edge
@@ -738,11 +856,106 @@ impl Translator<'_> {
                 let mut width_shape = vec![IntExpr::from(1); edges.len()];
                 width_shape[dimension] = bins;
                 let widths = util::reshape_tensor(widths, &width_shape).expand(bin_shape.clone());
-                volume *= widths;
+                histogram /= widths;
             }
-            histogram = histogram / total / volume;
         }
         Ok(histogram)
+    }
+
+    /// The bin of each sample of `column`, one-hot over the bins of `edges`
+    /// (`[samples, bins]`, Bool). This follows ATen's histogram kernel
+    /// (`native/cpu/HistogramKernel.cpp`, `histogramdd_cpu_contiguous`).
+    ///
+    /// A sample is counted iff it is not NaN and
+    /// `edges[0] <= x <= edges[bins]`. Its bin is
+    /// `upper_bound(window, x) - 1`, and a bin of `bins` becomes `bins - 1`,
+    /// which closes the last bin on the right. The window is every edge for
+    /// [`HistogramBinSearch::Binary`]. For
+    /// [`HistogramBinSearch::LocalSearch`] it is the edges
+    /// `[max(0, est - 1), min(est + 2, bins + 1))` around the interpolated
+    /// `est = trunc((x - edges[0]) * bins / (edges[bins] - edges[0]))`.
+    ///
+    /// Invariant: the edges are non-decreasing. torch requires this of edge
+    /// tensors, and uniform edges satisfy it (see [`Self::aten_linspace`]).
+    /// On a non-decreasing window, `upper_bound(window, x)` equals the
+    /// window's start plus the number of its edges `<= x`, and that count is
+    /// what this computes. The local window must be reproduced exactly, not
+    /// approximated by a full search. When the range spans only a few ulps
+    /// per bin, the edges repeat, and eager's bin is the last repeat inside
+    /// the window, not the last repeat overall. `est` uses the same rounded
+    /// subtract, multiply and divide as eager. Every index is a small
+    /// integer, held exactly in the values dtype.
+    fn histogram_bin_onehot(
+        &mut self,
+        column: GraphTensor,
+        edges: GraphTensor,
+        search: HistogramBinSearch,
+    ) -> GraphTensor {
+        let dtype = column.dtype;
+        let samples = column.dims()[0];
+        let edge_count = edges.dims()[0];
+        let bins = edge_count - IntExpr::from(1usize);
+        let first = edges.slice_along(IntExpr::from(0usize)..IntExpr::from(1usize), 0);
+        let first = util::reshape_tensor(first, &[]).expand_rhs(vec![samples]);
+        let last = util::reshape_tensor(edges.slice_along(bins..edge_count, 0), &[])
+            .expand_rhs(vec![samples]);
+        let below = column.lt(first);
+        let above = last.lt(column);
+        let outside = self.bool_or(below, above);
+        let nan = self.is_nan(column);
+        let skipped = self.bool_or(outside, nan);
+        let counted = self.bool_not(skipped);
+
+        // `edges[k] <= x` for each (sample, edge). Ordered `<` is false at
+        // NaN, and `counted` drops NaN samples.
+        let sample_grid = column.expand_dim(1, edge_count);
+        let edge_grid = edges.expand_dim(0, samples);
+        let exceeds = sample_grid.lt(edge_grid);
+        let at_or_below = self.bool_not(exceeds);
+        let zero = self.constant_like(column, 0.0);
+        let one = self.constant_like(column, 1.0);
+        let (in_window, window_start) = match search {
+            HistogramBinSearch::Binary => (at_or_below, zero),
+            HistogramBinSearch::LocalSearch => {
+                let bin_count = self
+                    .cx
+                    .constant_i32(bins)
+                    .cast(dtype)
+                    .expand_rhs(vec![samples]);
+                let scaled = (column - first) * bin_count;
+                let estimate = self.rounded_quotient(scaled, last - first).trunc();
+                let start = estimate - one;
+                let end = estimate + self.constant_like(column, 2.0);
+                let position = self
+                    .cx
+                    .arange(edge_count)
+                    .cast(dtype)
+                    .expand_dim(0, samples);
+                let before_start = position.lt(start.expand_dim(1, edge_count));
+                let from_start = self.bool_not(before_start);
+                let before_end = position.lt(end.expand_dim(1, edge_count));
+                let window = self.bool_and(from_start, before_end);
+                (self.bool_and(at_or_below, window), start.maximum(zero))
+            }
+        };
+        let count = in_window.cast(dtype).sum(vec![1]);
+        let last_bin = self
+            .cx
+            .constant_i32(bins - IntExpr::from(1usize))
+            .cast(dtype)
+            .expand_rhs(vec![samples]);
+        let bin = (window_start + count - one).minimum(last_bin);
+        // `bin - 1 < index < bin + 1` is the integer `index == bin`, and is
+        // false at a NaN `bin`. A NaN only comes from a zero span, where
+        // eager's integer cast is undefined; such a sample is dropped
+        // rather than counted in every bin.
+        let index = self.cx.arange(bins).cast(dtype).expand_dim(0, samples);
+        let bin_grid = bin.expand_dim(1, bins);
+        let one_grid = one.expand_dim(1, bins);
+        let not_below = (bin_grid - one_grid).lt(index);
+        let not_above = index.lt(bin_grid + one_grid);
+        let hit = self.bool_and(not_below, not_above);
+        self.bool_and(hit, counted.expand_dim(1, bins))
     }
 
     // -----------------------------------------------------------------
@@ -751,6 +964,14 @@ impl Translator<'_> {
 
     pub(super) fn translate_segment_reduce(&mut self, node: &Node) -> Result<GraphTensor> {
         let data = self.get_input_tensor(node, 0)?;
+        // Narrow storage reduces in F32 and rounds each segment's result
+        // once to the storage dtype.
+        let storage = data.dtype;
+        let reduced = self.segment_reduce_values(node, util::widen_storage(data))?;
+        Ok(util::round_to_storage(reduced, storage))
+    }
+
+    fn segment_reduce_values(&mut self, node: &Node, data: GraphTensor) -> Result<GraphTensor> {
         let reduction = segment_reduction_name(node)?;
         let axis = self.named_int_arg(node, "axis").unwrap_or(0);
         let axis = util::normalize_dim(axis, data.rank());
@@ -760,14 +981,28 @@ impl Translator<'_> {
 
         let lengths = self.named_tensor_operand(node, "lengths")?;
         let offsets = self.named_tensor_operand(node, "offsets")?;
+        // INVARIANT: segment bounds, input positions, and segment sizes are
+        // exact integers compared and counted in Int; no float carries
+        // them (F32 rounds past 2^24 and moves a segment boundary). The
+        // ends are an Int scan of the lengths (the scan kernels check
+        // integer overflow) and the starts are the same scan shifted one
+        // segment right with a zero fill (an exclusive scan, so no
+        // unproven Int subtraction of caller data); the positions are an
+        // Int iota; a segment size counts 0/1 membership indicators.
         let (starts, ends) = if let Some(lengths) = lengths {
-            // All the segment bookkeeping runs in F32: the candidate axis is
-            // short and this avoids proof-gated Int cumsum/subtract.
-            let lengths = lengths.cast(DType::F32);
-            let ends = lengths.cumsum(vec![axis]);
-            (ends - lengths, ends)
+            let ends = lengths.cast(DType::Int).cumsum(vec![axis]);
+            let starts = if segment_count.to_usize() == Some(0) {
+                ends
+            } else {
+                ends.slice_along(
+                    IntExpr::from(0usize)..segment_count - IntExpr::from(1),
+                    axis,
+                )
+                .pad_along(1, 0, axis, 0.0)
+            };
+            (starts, ends)
         } else if let Some(offsets) = offsets {
-            let offsets = offsets.cast(DType::F32);
+            let offsets = offsets.cast(DType::Int);
             (
                 offsets.slice_along(IntExpr::from(0usize)..segment_count, axis),
                 offsets.slice_along(
@@ -788,13 +1023,18 @@ impl Translator<'_> {
             ends = ends.expand_dim(ends.rank(), suffix);
         }
         let candidate_axis = axis + 1;
-        let positions = self
-            .cx
-            .iota(pair_shape, |c| c[candidate_axis])
-            .cast(DType::F32);
+        let positions = self.cx.iota(pair_shape, |c| c[candidate_axis]);
         let membership = self.bool_and(positions.ge(starts), positions.lt(ends));
         let expanded = data.expand_dim(axis, segment_count);
-        let count = membership.cast(DType::F32).sum(vec![candidate_axis]);
+        let count = membership.cast(DType::Int).sum(vec![candidate_axis]);
+        // The mean's divisor in the data dtype. A narrow float goes through
+        // F32 (exact for any count to 2^24, then one rounding), as the old
+        // F32 count did: a direct Int -> F16/BF16 cast is checked-exact and
+        // would refuse counts past 2048/256.
+        let divisor = |count: GraphTensor| match data.dtype {
+            DType::F16 | DType::Bf16 => count.cast(DType::F32).cast(data.dtype),
+            dtype => count.cast(dtype),
+        };
 
         let initial = named_index(node, "initial")
             .and_then(|index| self.get_number_arg(node, index).ok())
@@ -819,28 +1059,35 @@ impl Translator<'_> {
                 }
                 if has_initial {
                     // Empty segments keep the initial value: replace a zero
-                    // count by one arithmetically (no branch selection).
-                    let zero_count = self.cx.constant_f32(0.0).expand_rhs(count.dims());
+                    // count by one (an Int add of a [0, 1] indicator, in
+                    // width by the count's bounds).
+                    let zero_count = self.cx.constant_i32(0).expand_rhs(count.dims());
                     let nonempty = count.gt(zero_count);
-                    let empty = self.bool_not(nonempty).cast(DType::F32);
+                    let empty = self.bool_not(nonempty).cast(DType::Int);
                     let safe_count = count + empty;
-                    Ok(sum / safe_count.cast(data.dtype))
+                    Ok(sum / divisor(safe_count))
                 } else {
                     // An empty segment is 0/0 -> NaN, exactly torch's mean.
-                    Ok(sum / count.cast(data.dtype))
+                    Ok(sum / divisor(count))
                 }
             }
             "prod" => {
                 let selected = self.blend_select(membership, expanded, one);
                 let magnitude = self.real_abs(selected).prod(vec![candidate_axis]);
+                // The parity of an exact Int count of negative factors: an
+                // F32 count rounds past 2^24 and can flip the sign. The
+                // remainder by 2 lies in [0, 1] and the sign in [-1, 1],
+                // each in width by the value bounds. Sign multiplication
+                // avoids a select (and preserves infinities instead of
+                // leaking inf * 0).
                 let negative_count = self
                     .signbit(selected)
-                    .cast(DType::F32)
+                    .cast(DType::Int)
                     .sum(vec![candidate_axis]);
-                // odd in {0, 1}; sign multiplication avoids a select (and
-                // preserves infinities instead of leaking inf * 0).
-                let odd = negative_count - (negative_count * 0.5f32).floor() * 2.0f32;
-                let sign = 1.0f32 - 2.0f32 * odd;
+                let two = self.cx.constant_i32(2).expand_rhs(negative_count.dims());
+                let odd = negative_count.trunc_rem(two);
+                let one = self.cx.constant_i32(1).expand_rhs(odd.dims());
+                let sign = one - odd * two;
                 let mut product = magnitude * sign.cast(magnitude.dtype);
                 if let Some(initial) = initial {
                     product *= initial;
@@ -904,9 +1151,12 @@ impl Translator<'_> {
             candidates = candidates.merge_dims(last - 2, last - 1);
             logical_indices = logical_indices.merge_dims(last - 2, last - 1);
         }
+        // Half-precision keys widen to F32: the widening is exact and keeps
+        // the order (NaN included), and the sort's pairwise arithmetic is
+        // opmath, which the half formats do not carry.
         let key = match candidates.dtype {
-            DType::F64 | DType::F32 | DType::F16 | DType::Bf16 | DType::TF32 => candidates,
-            DType::Bool => candidates.cast(DType::F32),
+            DType::F64 | DType::F32 | DType::TF32 => candidates,
+            DType::F16 | DType::Bf16 | DType::Bool => candidates.cast(DType::F32),
             other => bail!(
                 "max pooling on {other:?} inputs is not ported: the stable-argsort \
                  selection needs a float key"
@@ -932,6 +1182,26 @@ impl Translator<'_> {
         Ok([values, picked])
     }
 
+    /// `aten.fractional_max_pool{2,3}d.default`: values + int64 indices.
+    ///
+    /// INDEX INVARIANT: every index is exact, and none is a flat position
+    /// carried in a float or built by Int tensor arithmetic.
+    /// * The window starts follow ATen's `generate_intervals` in the sample
+    ///   dtype (that rounding is the op's semantics). A start is an integer
+    ///   below the axis extent, held exactly in the compute dtype (F32 or
+    ///   F64), and so is start + kernel offset; the coordinate is truncated
+    ///   to Int only after that addition. (The checked Int -> F32 casts of
+    ///   positions and extents refuse an axis longer than 2^24 loudly.)
+    /// * The input is read with a per-axis coordinate gather (batch/channel
+    ///   axis positions plus one coordinate per spatial axis), so no position
+    ///   over the whole input is ever formed.
+    /// * The returned within-plane index is read from a plane-position iota
+    ///   at the same spatial coordinates: a pure coordinate function, so no
+    ///   Int add or multiply (each proof-gated) enters the model, and it is
+    ///   exact for any plane an Int iota can address.
+    ///
+    /// A coordinate outside the input (ATen reads out of bounds there, for
+    /// `random_samples` far outside `[0, 1)`) is a loud gather refusal.
     pub(super) fn translate_fractional_max_pool(
         &mut self,
         node: &Node,
@@ -948,6 +1218,16 @@ impl Translator<'_> {
             random_samples.rank() == 3 && random_samples.dims()[2].to_usize() == Some(rank),
             "fractional max pool random_samples must have shape [N, C, spatial_rank]"
         );
+        // ATen's `generate_intervals<scalar_t>` rounds every operation to
+        // the sample dtype. Half-precision samples are computed in F32 and
+        // rounded back after each operation, which is bit-identical (F32 has
+        // more than 2p + 2 bits for both narrow formats).
+        let sample_dtype = random_samples.dtype;
+        let compute_dtype = match sample_dtype {
+            DType::F64 | DType::F32 => sample_dtype,
+            DType::F16 | DType::Bf16 => DType::F32,
+            other => bail!("fractional max pool random_samples must be floating, got {other:?}"),
+        };
         let kernel = expand_spatial(&self.stats_pool_ints(node, "kernel_size", 1)?, rank, 0)?;
         anyhow::ensure!(
             kernel.iter().all(|&size| size > 0),
@@ -961,20 +1241,10 @@ impl Translator<'_> {
         let mut window_shape = output_shape.clone();
         window_shape.extend(kernel.iter().copied().map(IntExpr::from));
 
-        let strides = row_major_strides(&input_shape);
-        // Prefix (batch/channel) flat contributions are a pure coordinate
-        // function, so no Int tensor arithmetic enters the model.
-        let mut flat = self
-            .cx
-            .iota(window_shape.clone(), |c| {
-                (0..prefix_rank).fold(IntExpr::from(0), |acc, axis| acc + c[axis] * strides[axis])
-            })
-            .cast(DType::F32);
-        let mut logical = self
-            .cx
-            .constant_i32(0)
-            .cast(DType::F32)
-            .expand_rhs(window_shape.clone());
+        // Batch/channel coordinates are the window's own axis positions.
+        let mut coordinates: Vec<GraphTensor> = (0..prefix_rank)
+            .map(|axis| self.axis_positions(&window_shape, axis))
+            .collect();
 
         for spatial in 0..rank {
             let sample_lane = if rank == 2 {
@@ -991,75 +1261,77 @@ impl Translator<'_> {
             for output_size in output_spatial.iter().copied() {
                 sample = sample.expand_dim(sample.rank(), output_size);
             }
+            let sample = sample.cast(compute_dtype);
 
             let output_axis = prefix_rank + spatial;
             let output_position = self.axis_positions(&output_shape, output_axis);
-            let numerator = self
-                .cx
-                .constant_i32(input_spatial[spatial] - IntExpr::from(kernel[spatial]))
-                .cast(sample.dtype)
+            // inputSize - poolSize: the last valid window start.
+            let last_start = input_spatial[spatial] - IntExpr::from(kernel[spatial]);
+            // outputSize - 1: the terminal output position. A single output
+            // position is the terminal one, so its start is selected below;
+            // dividing by max(outputSize - 1, 1) only keeps the unselected
+            // ordinary starts finite.
+            let last_position = output_spatial[spatial] - IntExpr::from(1usize);
+            let steps = last_position.max(IntExpr::from(1usize));
+            // alpha = scalar_t(inputSize - poolSize) / scalar_t(outputSize - 1),
+            // one correctly rounded division. The frontend's F32 division is
+            // a reciprocal product, so the quotient is taken in F64 and
+            // rounded once to the sample dtype: binary64 has more than
+            // 2p + 2 bits for every sample format, so that double rounding
+            // equals ATen's single one.
+            let numerator = round_through(
+                self.cx.constant_i32(last_start).cast(compute_dtype),
+                sample_dtype,
+            );
+            let denominator = round_through(
+                self.cx.constant_i32(steps).cast(compute_dtype),
+                sample_dtype,
+            );
+            let alpha = (numerator.cast(DType::F64) / denominator.cast(DType::F64))
+                .cast(sample_dtype)
+                .cast(compute_dtype)
                 .expand_rhs(sample.dims());
-            let denominator = self
-                .cx
-                .constant_i32(output_spatial[spatial] - IntExpr::from(1usize))
-                .cast(sample.dtype)
-                .expand_rhs(sample.dims());
-            // Every select below is between finite values, so the LUM-804
-            // `nonfinite * 0` leak cannot trigger here.
-            let output_is_one = self.is_zero(denominator);
-            let one = self.constant_like(denominator, 1.0);
-            let safe_denominator = self.blend_select(output_is_one, one, denominator);
-            let alpha = numerator / safe_denominator;
-            let ordinary_start = ((output_position.cast(sample.dtype) + sample) * alpha).floor()
-                - (sample * alpha).floor();
-
-            let terminal_position = self
-                .cx
-                .constant_i32(output_spatial[spatial] - IntExpr::from(1usize))
-                .cast(DType::Int)
-                .expand_rhs(output_position.dims());
-            let final_position = output_position.eq(terminal_position);
+            // ATen: int64((i + sample) * alpha) - int64(sample * alpha). `i`
+            // is rounded to the sample dtype, each operation rounds there,
+            // and the int64 conversions truncate toward zero. Both truncated
+            // terms are integers of the compute dtype, so their difference
+            // is exact whenever the true difference is representable, which
+            // covers every in-bounds start.
+            let position = round_through(output_position.cast(compute_dtype), sample_dtype);
+            let shifted = round_through(position + sample, sample_dtype);
+            let upper = round_through(shifted * alpha, sample_dtype).trunc();
+            let lower = round_through(sample * alpha, sample_dtype).trunc();
+            let ordinary_start = upper - lower;
             let terminal_start = self
                 .cx
-                .constant_i32(input_spatial[spatial] - IntExpr::from(kernel[spatial]))
-                .cast(sample.dtype)
+                .constant_i32(last_start)
+                .cast(compute_dtype)
                 .expand_rhs(ordinary_start.dims());
-            let final_or_ordinary =
-                self.blend_select(final_position, terminal_start, ordinary_start);
-            let start = self.blend_select(output_is_one, terminal_start, final_or_ordinary);
+            let terminal_position = self
+                .cx
+                .constant_i32(last_position)
+                .expand_rhs(output_position.dims());
+            let is_terminal = output_position.eq(terminal_position);
+            let mut start = self.select(is_terminal, terminal_start, ordinary_start);
 
-            let mut coordinate = start;
             for size in kernel.iter().copied() {
-                coordinate = coordinate.expand_dim(coordinate.rank(), size);
+                start = start.expand_dim(start.rank(), size);
             }
             let kernel_axis = input_rank + spatial;
-            coordinate = coordinate
-                + self
-                    .axis_positions(&window_shape, kernel_axis)
-                    .cast(coordinate.dtype);
-            let stride = self
-                .cx
-                .constant_i32(strides[prefix_rank + spatial])
-                .cast(DType::F32)
-                .expand_rhs(coordinate.dims());
-            flat += coordinate * stride;
-
-            let spatial_stride =
-                super::dim_arith::product_of_dims(input_spatial[spatial + 1..].iter().copied());
-            let stride = self
-                .cx
-                .constant_i32(spatial_stride)
-                .cast(DType::F32)
-                .expand_rhs(coordinate.dims());
-            logical += coordinate * stride;
+            let offset = self
+                .axis_positions(&window_shape, kernel_axis)
+                .cast(compute_dtype);
+            coordinates.push((start + offset).trunc_cast(DType::Int));
         }
 
-        let flat_indices = flat.trunc_cast(DType::Int);
-        let logical_indices = logical.trunc_cast(DType::Int);
-        let candidates = util::reshape_tensor(
-            input.flatten().gather(&[flat_indices.flatten()]),
-            &window_shape,
-        );
+        let candidates = input.gather(&coordinates);
+        let plane_strides = row_major_strides(&input_spatial);
+        let plane_positions = self.cx.iota(input_spatial.clone(), |c| {
+            (0..rank).fold(IntExpr::from(0), |acc, axis| {
+                acc + c[axis] * plane_strides[axis]
+            })
+        });
+        let logical_indices = plane_positions.gather(&coordinates[prefix_rank..]);
         let [values, indices] =
             self.stats_select_pool_max(candidates, logical_indices, input_rank)?;
         self.bind_declared_prefix(node, &[values, indices])?;
@@ -1070,42 +1342,72 @@ impl Translator<'_> {
     // Max pool backward
     // -----------------------------------------------------------------
 
+    /// `aten.max_pool2d_with_indices_backward.default`: add each
+    /// `grad_output` element into a zero gradient at the input position its
+    /// window's max came from.
+    ///
+    /// Destination invariant: the forward op's `indices` are flat positions
+    /// WITHIN one `H*W` plane, so the destination is addressed in COORDINATE
+    /// form on a `[planes, H*W]` view of the gradient. The plane coordinate
+    /// (batch and channel) is an iota over the grad shape; the in-plane
+    /// coordinate is `indices` itself. No flat `plane_offset + index` sum is
+    /// formed. That sum mixes a DATA operand into the arithmetic, so it needs
+    /// either Int arithmetic on a value with no proven range (proof-gated) or
+    /// float arithmetic (inexact past 2^24 elements). Each coordinate is
+    /// checked against its own axis by the gather/scatter contract
+    /// (out-of-bounds is UB, refused loudly by the reference), so an index
+    /// outside `[0, H*W)` cannot silently land in a neighbouring plane.
     pub(super) fn translate_max_pool_backward(&mut self, node: &Node) -> Result<GraphTensor> {
         let updates = self.get_input_tensor(node, 0)?;
         let input = self.get_input_tensor(node, 1)?;
         let indices = self.get_input_tensor(node, 7)?.cast(DType::Int);
         let input_shape = input.dims();
+        anyhow::ensure!(
+            matches!(input_shape.len(), 3 | 4),
+            "max_pool2d_with_indices_backward expects a 3-D or 4-D input, got rank {}",
+            input_shape.len()
+        );
         let prefix_rank = input_shape.len() - 2;
-        let strides = row_major_strides(&input_shape);
         let output_shape = updates.dims();
-        // Indices are flattened-within-plane; only the batch/channel prefix
-        // needs a stride contribution.
-        let base = self
-            .cx
-            .iota(output_shape.clone(), |c| {
-                (0..prefix_rank).fold(IntExpr::from(0), |acc, axis| acc + c[axis] * strides[axis])
+
+        let prefix = &input_shape[..prefix_rank];
+        let plane_shape = vec![
+            super::dim_arith::product_of_dims(prefix.iter().copied()),
+            super::dim_arith::product_of_dims(input_shape[prefix_rank..].iter().copied()),
+        ];
+        // The two Int coordinates of `plane_shape`, each over the grad shape:
+        // the plane number is a coordinate function of the grad position
+        // (bounded by construction), the in-plane position is `indices`.
+        let prefix_strides = row_major_strides(prefix);
+        let planes = self.cx.iota(output_shape.clone(), |c| {
+            (0..prefix_rank).fold(IntExpr::from(0), |acc, axis| {
+                acc + c[axis] * prefix_strides[axis]
             })
-            .cast(DType::F32);
-        let destinations = (base + indices.cast(DType::F32))
-            .trunc_cast(DType::Int)
-            .flatten();
+        });
+        let coordinates = [planes.flatten(), indices.flatten()];
 
         let count = super::dim_arith::product_of_dims(output_shape.iter().copied())
             .to_usize()
             .context("max_pool2d_with_indices_backward requires a concrete output element count")?;
         let flat_updates = updates.flatten();
-        let mut output = self
-            .full_tensor(input_shape.clone(), input.dtype, 0.0)
-            .flatten();
+        let mut output = self.full_tensor(plane_shape, input.dtype, 0.0);
         // Duplicate destinations (overlapping windows selecting the same max)
         // must accumulate; the recorder's `scatter` is overwrite-only, so one
-        // read/modify/write step per update element, as in the parked
-        // translator's scatter-reduce helper.
+        // read/modify/write step per update element, in grad row-major order
+        // (ATen's CPU kernel order).
         for step in 0..count {
-            let destination = destinations.slice_along(step..step + 1, 0);
+            let destination: Vec<GraphTensor> = coordinates
+                .iter()
+                .map(|coordinate| coordinate.slice_along(step..step + 1, 0))
+                .collect();
             let update = flat_updates.slice_along(step..step + 1, 0);
-            let current = output.gather(&[destination]);
-            output = output.scatter(&[destination], current + update);
+            let current = output.gather(&destination);
+            // Each step rounds to the gradient's dtype, as torch's
+            // sequential kernel does; narrow storage adds in F32.
+            output = output.scatter(
+                &destination,
+                util::storage_step(current, update, |a, b| a + b),
+            );
         }
         Ok(util::reshape_tensor(output, &input_shape))
     }
@@ -1217,6 +1519,8 @@ mod tests {
                 TensorMeta {
                     dtype: *dtype,
                     sizes: sizes(shape),
+                    strides: None,
+                    storage_offset: None,
                     layout: None,
                     device: None,
                 },
@@ -1436,6 +1740,87 @@ mod tests {
         ));
     }
 
+    /// `density=True` normalises a `bin_shape` histogram by the total and by
+    /// each axis' bin widths; every divisor must reach `bin_shape` exactly
+    /// (a second `expand_rhs` of an already-`bin_shape` tensor used to panic
+    /// in the frontend with "Dims must match to multiply tensors").
+    #[test]
+    fn histogram_density_records() {
+        assert!(translates(
+            vec![node(
+                "torch.ops.aten.histogram.bin_ct",
+                vec![
+                    input("self", tensor_arg("x")),
+                    scalar_int("bins", 4),
+                    scalar_bool("density", true),
+                ],
+                &["hist", "bin_edges"],
+            )],
+            &[
+                ("x", F32, vec![7]),
+                ("hist", F32, vec![4]),
+                ("bin_edges", F32, vec![5]),
+            ],
+            &["x"],
+            &["hist", "bin_edges"],
+        ));
+        assert!(translates(
+            vec![node(
+                "torch.ops.aten.histogram.bins_tensor",
+                vec![
+                    input("self", tensor_arg("x")),
+                    input("bins", tensor_arg("edges")),
+                    input("weight", tensor_arg("w")),
+                    scalar_bool("density", true),
+                ],
+                &["hist"],
+            )],
+            &[
+                ("x", F32, vec![6]),
+                ("edges", F32, vec![5]),
+                ("w", F32, vec![6]),
+                ("hist", F32, vec![4]),
+            ],
+            &["x", "edges", "w"],
+            &["hist"],
+        ));
+        assert!(translates(
+            vec![node(
+                "torch.ops.aten._histogramdd_from_bin_cts.default",
+                vec![
+                    input("self", tensor_arg("x")),
+                    ints("bins", &[3, 4]),
+                    scalar_bool("density", true),
+                ],
+                &["hist"],
+            )],
+            &[("x", F32, vec![8, 2]), ("hist", F32, vec![3, 4])],
+            &["x"],
+            &["hist"],
+        ));
+        assert!(translates(
+            vec![node(
+                "torch.ops.aten._histogramdd_from_bin_tensors.default",
+                vec![
+                    input("self", tensor_arg("x")),
+                    input("bins", tensors_arg(&["e0", "e1"])),
+                    input("weight", tensor_arg("w")),
+                    scalar_bool("density", true),
+                ],
+                &["hist"],
+            )],
+            &[
+                ("x", F32, vec![8, 2]),
+                ("e0", F32, vec![4]),
+                ("e1", F32, vec![5]),
+                ("w", F32, vec![8]),
+                ("hist", F32, vec![3, 4]),
+            ],
+            &["x", "e0", "e1", "w"],
+            &["hist"],
+        ));
+    }
+
     #[test]
     fn histogramdd_record() {
         assert!(translates(
@@ -1585,6 +1970,206 @@ mod tests {
         ));
     }
 
+    /// ATen requires `random_samples` to share the input's dtype, so every
+    /// float input reaches the lowering with float samples of its own
+    /// width. The window starts round in that dtype (half precision through
+    /// F32) and the indices come from coordinate gathers, so no operand pairs
+    /// a sample-dtype tensor with an F32 index tensor.
+    #[test]
+    fn fractional_max_pool_records_every_float_dtype() {
+        const F16: u32 = 6;
+        const F64: u32 = 8;
+        const BF16: u32 = 13;
+        for dtype in [F64, F32, F16, BF16] {
+            for (target, input_shape, samples_shape, output_shape, kernel, size) in [
+                (
+                    "torch.ops.aten.fractional_max_pool2d.default",
+                    vec![1, 2, 7, 7],
+                    vec![1, 2, 2],
+                    vec![1, 2, 3, 3],
+                    &[2, 2][..],
+                    &[3, 3][..],
+                ),
+                (
+                    "torch.ops.aten.fractional_max_pool2d.default",
+                    vec![2, 7, 7],
+                    vec![1, 2, 2],
+                    vec![2, 3, 3],
+                    &[2, 2][..],
+                    &[3, 3][..],
+                ),
+                (
+                    "torch.ops.aten.fractional_max_pool3d.default",
+                    vec![1, 2, 6, 6, 6],
+                    vec![1, 2, 3],
+                    vec![1, 2, 3, 3, 3],
+                    &[2, 2, 2][..],
+                    &[3, 3, 3][..],
+                ),
+            ] {
+                assert!(
+                    translates(
+                        vec![node(
+                            target,
+                            vec![
+                                input("self", tensor_arg("x")),
+                                ints("kernel_size", kernel),
+                                ints("output_size", size),
+                                input("random_samples", tensor_arg("rand")),
+                            ],
+                            &["values", "indices"],
+                        )],
+                        &[
+                            ("x", dtype, input_shape.clone()),
+                            ("rand", dtype, samples_shape),
+                            ("values", dtype, output_shape.clone()),
+                            ("indices", I64, output_shape),
+                        ],
+                        &["x", "rand"],
+                        &["values", "indices"],
+                    ),
+                    "{target} on dtype code {dtype} over {input_shape:?} must translate"
+                );
+            }
+        }
+    }
+
+    /// The index invariant of `translate_fractional_max_pool` as graph
+    /// facts: the input is read with one coordinate per axis rather than
+    /// through a flat position, no Int add or multiply (proof-gated, and an
+    /// e-graph closure hazard) lies upstream of those coordinates, each
+    /// spatial coordinate is truncated to Int only after its float
+    /// arithmetic, and the within-plane index is a plane-position iota read
+    /// at the same coordinates.
+    #[test]
+    fn fractional_max_pool_gathers_by_coordinates_without_int_arithmetic() {
+        use luminal::prelude::petgraph::Direction;
+        use luminal::prelude::petgraph::visit::EdgeRef;
+        use luminal::prelude::*;
+
+        for (target, rank, input_shape, samples_shape, output_shape, kernel, size) in [
+            (
+                "torch.ops.aten.fractional_max_pool2d.default",
+                2,
+                &[2, 3, 7, 8][..],
+                &[2, 3, 2][..],
+                &[2, 3, 3, 3][..],
+                &[2, 3][..],
+                &[3, 3][..],
+            ),
+            (
+                "torch.ops.aten.fractional_max_pool3d.default",
+                3,
+                &[2, 6, 6, 6][..],
+                &[1, 2, 3][..],
+                &[2, 3, 3, 3][..],
+                &[2, 2, 2][..],
+                &[3, 3, 3][..],
+            ),
+        ] {
+            let translation = crate::translate::test_support::translate_one(
+                node(
+                    target,
+                    vec![
+                        input("self", tensor_arg("x")),
+                        ints("kernel_size", kernel),
+                        ints("output_size", size),
+                        input("random_samples", tensor_arg("rand")),
+                    ],
+                    &["values", "indices"],
+                ),
+                &[
+                    ("x", F32, input_shape),
+                    ("rand", F32, samples_shape),
+                    ("values", F32, output_shape),
+                    ("indices", I64, output_shape),
+                ],
+                &["x", "rand"],
+                &["values", "indices"],
+            );
+            let graph = translation.graph.logical.petgraph();
+            let operands = |id: NodeIndex| {
+                let mut edges: Vec<_> = graph
+                    .edges_directed(id, Direction::Incoming)
+                    .map(|edge| (edge.weight().0, edge.source()))
+                    .collect();
+                edges.sort_by_key(|(port, _)| *port);
+                edges
+                    .into_iter()
+                    .map(|(_, source)| source)
+                    .collect::<Vec<_>>()
+            };
+            let through_views = |mut id: NodeIndex| {
+                while matches!(graph[id].op, LogicalOp::IndexMapApply { .. }) {
+                    id = operands(id)[0];
+                }
+                id
+            };
+            let int_arithmetic_upstream = |root: NodeIndex| {
+                let mut stack = vec![root];
+                let mut seen = std::collections::HashSet::new();
+                while let Some(id) = stack.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let recorded = &graph[id];
+                    if matches!(recorded.op, LogicalOp::Add | LogicalOp::Mul)
+                        && matches!(recorded.dtype, DType::Int | DType::I64)
+                    {
+                        return true;
+                    }
+                    stack.extend(operands(id));
+                }
+                false
+            };
+
+            let input_gathers: Vec<_> = graph
+                .node_indices()
+                .filter(|id| matches!(graph[*id].op, LogicalOp::Gather))
+                .filter(|id| {
+                    matches!(
+                        &graph[through_views(operands(*id)[0])].op,
+                        LogicalOp::Input { label } if label == "x"
+                    )
+                })
+                .collect();
+            assert_eq!(input_gathers.len(), 1, "{target} gathers the input once");
+            let coordinates = operands(input_gathers[0])[1..].to_vec();
+            assert_eq!(
+                coordinates.len(),
+                input_shape.len(),
+                "{target} reads the input with one coordinate per axis"
+            );
+            for coordinate in &coordinates {
+                assert!(
+                    !int_arithmetic_upstream(*coordinate),
+                    "{target} builds a gather coordinate with Int arithmetic"
+                );
+            }
+            let spatial = &coordinates[coordinates.len() - rank..];
+            for coordinate in spatial {
+                assert!(
+                    matches!(
+                        graph[through_views(*coordinate)].op,
+                        LogicalOp::TruncCast(DType::Int)
+                    ),
+                    "{target} spatial coordinates are truncated after their float arithmetic"
+                );
+            }
+            assert!(
+                graph.node_indices().any(|id| {
+                    matches!(graph[id].op, LogicalOp::Gather)
+                        && matches!(
+                            graph[through_views(operands(id)[0])].op,
+                            LogicalOp::Iota { .. }
+                        )
+                        && operands(id)[1..] == *spatial
+                }),
+                "{target} reads the within-plane index from a plane-position iota"
+            );
+        }
+    }
+
     #[test]
     fn max_pool_backward_records() {
         assert!(translates(
@@ -1611,5 +2196,71 @@ mod tests {
             &["grad", "x", "indices"],
             &["grad_input"],
         ));
+    }
+
+    /// The destination of every accumulation step is addressed in
+    /// coordinate form on a `[planes, H*W]` view of the gradient: the
+    /// in-plane coordinate is the data `indices`, never folded into a flat
+    /// sum, so no float detour (inexact past 2^24) and no unproven Int add
+    /// is recorded even when one plane holds more than 2^24 elements.
+    #[test]
+    fn max_pool_backward_scatters_plane_coordinates_without_flat_offsets() {
+        use luminal::prelude::{DType, IntExpr, LogicalOp};
+
+        let translation = crate::translate::test_support::translate_one(
+            node(
+                "torch.ops.aten.max_pool2d_with_indices_backward.default",
+                vec![
+                    input("grad_output", tensor_arg("grad")),
+                    input("self", tensor_arg("x")),
+                    ints("kernel_size", &[2050, 2050]),
+                    ints("stride", &[2050, 2050]),
+                    ints("padding", &[0, 0]),
+                    ints("dilation", &[1, 1]),
+                    scalar_bool("ceil_mode", false),
+                    input("indices", tensor_arg("indices")),
+                ],
+                &["grad_input"],
+            ),
+            &[
+                ("grad", F32, &[1, 2, 2, 2]),
+                ("x", F32, &[1, 2, 4100, 4100]),
+                ("indices", I64, &[1, 2, 2, 2]),
+                ("grad_input", F32, &[1, 2, 4100, 4100]),
+            ],
+            &["grad", "x", "indices"],
+            &["grad_input"],
+        );
+        let graph = translation.graph.logical.petgraph();
+        for node in graph.node_weights() {
+            assert!(
+                !matches!(
+                    node.op,
+                    LogicalOp::Cast(DType::F32) | LogicalOp::TruncCast(_)
+                ),
+                "no float detour for destinations: found {:?} -> {:?}",
+                node.op,
+                node.dtype
+            );
+            assert!(
+                !(matches!(node.op, LogicalOp::Add) && node.dtype == DType::Int),
+                "no flat Int offset sum over the data indices"
+            );
+        }
+        let plane_view: Vec<IntExpr> = [2usize, 4100 * 4100]
+            .into_iter()
+            .map(IntExpr::from)
+            .collect();
+        let scatters: Vec<_> = graph
+            .node_weights()
+            .filter(|node| matches!(node.op, LogicalOp::Scatter))
+            .collect();
+        assert_eq!(scatters.len(), 8, "one accumulation step per grad element");
+        for scatter in scatters {
+            assert_eq!(
+                scatter.dims, plane_view,
+                "each step writes the [planes, H*W] view"
+            );
+        }
     }
 }

@@ -39,6 +39,13 @@ impl Tf32 {
     pub fn to_bits(self) -> u32 {
         self.0
     }
+
+    /// Read a logical 19-bit encoding from an exact bit view. This moves
+    /// encoding bits without a numerical cast or NaN canonicalization.
+    pub(crate) fn from_precision_bits(code: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(code < (1 << 19), "TF32 encoding exceeds nineteen bits");
+        Ok(Self((code as u32) << 13))
+    }
 }
 
 #[cfg(test)]

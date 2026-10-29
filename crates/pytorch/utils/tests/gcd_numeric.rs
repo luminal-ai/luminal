@@ -7,9 +7,9 @@
 //! sign-aware `trunc_rem` bounds rule keeps the remainder bounded. No
 //! runtime logic is involved.
 //!
-//! The 32-round unroll is a deep DAG; this test runs on the default test
-//! stack on purpose, guarding the extractor's iterative (non-recursive)
-//! traversal.
+//! The I64 unroll (91 rounds, the Lamé bound for 64-bit magnitudes) is a
+//! deep DAG; this test runs on the default test stack on purpose, guarding
+//! the extractor's iterative (non-recursive) traversal.
 
 use luminal_pytorch_utils::{InputKind, parse_pt2, translate};
 use luminal_reference::{ReferenceRuntime, TypedBuffer, harness_search_options};

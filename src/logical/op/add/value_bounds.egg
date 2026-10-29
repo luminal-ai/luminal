@@ -2,6 +2,7 @@
 (rule
   (
     (= ?out (LogicalAdd ?lhs ?rhs))
+    (!= (dtype-of ?out) (UInt64))
     (= ?lhs_lower (value-lower-bound-of ?lhs))
     (= ?rhs_lower (value-lower-bound-of ?rhs))
   )
@@ -11,6 +12,7 @@
 (rule
   (
     (= ?out (LogicalAdd ?lhs ?rhs))
+    (!= (dtype-of ?out) (UInt64))
     (= ?lhs_upper (value-upper-bound-of ?lhs))
     (= ?rhs_upper (value-upper-bound-of ?rhs))
   )

@@ -113,61 +113,6 @@ impl Translator<'_> {
         input.log() + (one + (one - reciprocal_squared).sqrt()).log()
     }
 
-    /// Range-reduced odd Taylor series for atan (same approximation as the
-    /// recorder `unary.rs` private `real_atan`).
-    fn special_atan(&mut self, input: GraphTensor) -> GraphTensor {
-        let x = input.abs();
-        let one = self.constant_like(x, 1.0);
-        let reciprocal_branch = x.gt(one);
-        let reduced = self.special_select(reciprocal_branch, x.reciprocal(), x);
-
-        let threshold = self.constant_like(reduced, std::f64::consts::SQRT_2 - 1.0);
-        let quarter_turn_branch = reduced.gt(threshold);
-        let transformed = (reduced - one) / (reduced + one);
-        let z = self.special_select(quarter_turn_branch, transformed, reduced);
-        let z2 = z.square();
-
-        let mut polynomial = self.constant_like(z, -1.0 / 27.0);
-        for degree in (0..13).rev() {
-            let coefficient = if degree % 2 == 0 { 1.0 } else { -1.0 } / (2 * degree + 1) as f64;
-            polynomial = polynomial * z2 + self.constant_like(z, coefficient);
-        }
-        let base = z * polynomial;
-        let quarter_pi = self.constant_like(z, std::f64::consts::FRAC_PI_4);
-        let base = self.special_select(quarter_turn_branch, quarter_pi + base, base);
-        let half_pi = self.constant_like(z, std::f64::consts::FRAC_PI_2);
-        let angle = self.special_select(reciprocal_branch, half_pi - base, base);
-        self.copy_sign(angle, input)
-    }
-
-    /// Parked real-domain `real_atan2` (from the complex port): quadrants
-    /// from the sign of `x`, the two-infinite axis case, and signed zero.
-    fn special_atan2(&mut self, y: GraphTensor, x: GraphTensor) -> GraphTensor {
-        let ratio = y / x;
-        let mut angle = self.special_atan(ratio);
-        let x_negative = self.signbit(x);
-        let pi = self.constant_like(y, std::f64::consts::PI);
-        let signed_pi = self.copy_sign(pi, y);
-        angle = self.special_select(x_negative, angle + signed_pi, angle);
-
-        let x_inf = self.is_inf(x);
-        let y_inf = self.is_inf(y);
-        let both_inf = self.bool_and(x_inf, y_inf);
-        let quarter = self.constant_like(y, std::f64::consts::FRAC_PI_4);
-        let three_quarters = self.constant_like(y, 3.0 * std::f64::consts::FRAC_PI_4);
-        let infinite_angle = self.special_select(x_negative, three_quarters, quarter);
-        let infinite_angle = self.copy_sign(infinite_angle, y);
-        angle = self.special_select(both_inf, infinite_angle, angle);
-
-        let x_zero = self.is_zero(x);
-        let y_zero = self.is_zero(y);
-        let both_zero = self.bool_and(x_zero, y_zero);
-        let zero = self.constant_like(y, 0.0);
-        let signed_zero = self.copy_sign(zero, y);
-        let zero_angle = self.special_select(x_negative, signed_pi, signed_zero);
-        self.special_select(both_zero, zero_angle, angle)
-    }
-
     /// Parked polynomial real `acos` (used only by the Chebyshev separators).
     #[allow(clippy::excessive_precision)]
     fn special_acos(&mut self, input: GraphTensor) -> GraphTensor {
@@ -411,8 +356,11 @@ impl Translator<'_> {
             * (squared - self.constant_like(value, 49.2184563216946036703));
         let large = self.special_cylindrical_bessel_asymptotic(absolute, 1, false);
         let threshold = self.constant_like(value, 5.0);
-        let magnitude = self.special_select(absolute.le(threshold), small, large);
-        self.copy_sign(magnitude, value)
+        let positive_argument = self.special_select(absolute.le(threshold), small, large);
+        // J1 oscillates for positive arguments; reflect its sign only for negative inputs.
+        let zero = self.constant_like(value, 0.0);
+        let signed = self.special_select(value.lt(zero), -positive_argument, positive_argument);
+        self.special_select(value.eq(zero), value, signed)
     }
 
     #[allow(clippy::excessive_precision)]
@@ -1270,10 +1218,9 @@ impl Translator<'_> {
         let expanded = maximum.expand_dim(reduction_axis, windows.dims()[reduction_axis]);
         let ordinary = maximum + (windows - expanded).exp().sum(vec![reduction_axis]).log();
 
-        // Positive infinity is detected directly: `util::signbit` reads the
-        // sign through `reciprocal().lt(0)`, and `reciprocal(-inf)` is `-0.0`
-        // which is not `< 0`, so the `-inf` window fill would otherwise be
-        // counted as a positive infinity.
+        // Positive infinity is detected directly, as a value above the
+        // largest finite one, so the `-inf` window fill never counts as a
+        // positive infinity.
         let largest = match windows.dtype {
             DType::F64 => f64::MAX,
             _ => f32::MAX as f64,
@@ -1299,10 +1246,23 @@ impl Translator<'_> {
     // angle
     // -----------------------------------------------------------------
 
+    /// Real `torch.angle`: `pi` where `x < 0`, `+0` where `x >= 0`, and NaN
+    /// for NaN (ATen's `angle_impl` is `isnan(x) ? x : (x < 0 ? pi : 0)`).
+    ///
+    /// Invariant: the result reads only the ordered `x < 0` and `x > 0`, so
+    /// both zeros give `+0`. This is NOT `atan2(0, x)`, which reads the sign
+    /// bit of `x` and gives `pi` at `x = -0.0`. On the branch where neither
+    /// comparison holds, `x` is `+-0` or NaN, and there `x * x` is exactly
+    /// `+0` for both zeros and NaN for NaN. Ordered comparisons also lower on
+    /// zero-element inputs, which the encoding view `is_nan` reads does not.
+    /// Complex inputs are lowered in `complex.rs`.
     pub(super) fn translate_angle(&mut self, node: &Node) -> Result<GraphTensor> {
         let value = self.special_input(node)?;
         let zero = self.constant_like(value, 0.0);
-        Ok(self.special_atan2(zero, value))
+        let pi = self.constant_like(value, std::f64::consts::PI);
+        let zero_or_nan = value.square();
+        let nonnegative = self.select(value.gt(zero), zero, zero_or_nan);
+        Ok(self.select(value.lt(zero), pi, nonnegative))
     }
 }
 

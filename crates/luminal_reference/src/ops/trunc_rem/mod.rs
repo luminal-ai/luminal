@@ -133,6 +133,10 @@ pub(crate) fn kernel(
                 anyhow::anyhow!("i32 trunc-rem refuses: {a} % {b} (zero divisor or MIN/-1)")
             })
         }),
+        TypedBuffer::U64(_) => ctx.binary_elementwise_u64(|a, b| {
+            a.checked_rem(b)
+                .ok_or_else(|| anyhow::anyhow!("uint64 remainder by zero"))
+        }),
         TypedBuffer::I64(_) => ctx.binary_elementwise_i64(|a, b| {
             a.checked_rem(b).ok_or_else(|| {
                 anyhow::anyhow!("i64 trunc-rem refuses: {a} % {b} (zero divisor or MIN/-1)")

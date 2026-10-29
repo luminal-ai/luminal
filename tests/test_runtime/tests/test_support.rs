@@ -3062,22 +3062,19 @@ mod ring_ignition_battery {
     /// THE FENCE TEXT TRIPWIRE (repo precedent: subst_guard_study's
     /// guard anchors). The Assoc-IntMul G2 premise has no known
     /// behavioral detonator, so behavior tests alone cannot catch its
-    /// removal — the fence is ALSO pinned textually: each of the three
+    /// removal — the fence is ALSO pinned textually: each of the remaining
     /// guarded rules must appear verbatim in the assembled program, and
     /// each rule action exactly once (no unguarded twin beside a
     /// guarded original).
     #[test]
     fn g2_fence_text_is_intact() {
-        const ASSOC_INTADD: &str = "(rule\n  (\n    (= ?expr (IntAdd ?inner ?outer))\n    (= ?inner (IntAdd ?lhs ?rhs))\n    (provably-cannot-union-with-zero ?inner)\n    (= ?inner_lower (lower-bound-of ?inner))\n    (= ?inner_upper (upper-bound-of ?inner))\n    (< ?inner_lower ?inner_upper)\n  )\n  ((union ?expr (IntAdd ?lhs (IntAdd ?rhs ?outer))))\n  :name \"int-add-associate\"\n  :ruleset main_ruleset\n)";
         const ASSOC_INTMUL: &str = "(rule\n  (\n    (= ?expr (IntMul ?inner ?outer))\n    (= ?inner (IntMul ?lhs ?rhs))\n    (provably-cannot-union-with-zero ?inner)\n    (= ?inner_lower (lower-bound-of ?inner))\n    (= ?inner_upper (upper-bound-of ?inner))\n    (< ?inner_lower ?inner_upper)\n  )\n  ((union ?expr (IntMul ?lhs (IntMul ?rhs ?outer))))\n  :name \"int-mul-associate\"\n  :ruleset main_ruleset\n)";
         const DIST_EXPAND: &str = "(rule\n  (\n    (= ?expr (IntMul ?summands ?factor))\n    (= ?summands (IntAdd ?lhs ?rhs))\n    (provably-cannot-union-with-zero ?expr)\n    (provably-cannot-union-with-zero ?lhs)\n    (provably-cannot-union-with-zero ?rhs)\n    (provably-cannot-union-with-zero ?factor)\n    (= ?summands_lower (lower-bound-of ?summands))\n    (= ?summands_upper (upper-bound-of ?summands))\n    (< ?summands_lower ?summands_upper)\n  )\n  ((union ?expr (IntAdd (IntMul ?lhs ?factor) (IntMul ?rhs ?factor))))\n  :name \"int-distribute-expand\"\n  :ruleset main_ruleset\n)";
         let program = luminal_reference::assembled_program();
+        // Additive reassociation was replaced by atomic offset normalization.
+        // Its behavioral termination tests live in core's int_normalization_tests.
+        assert!(!program.contains(":name \"int-add-associate\""));
         for (name, rule, action) in [
-            (
-                "Assoc-IntAdd",
-                ASSOC_INTADD,
-                "((union ?expr (IntAdd ?lhs (IntAdd ?rhs ?outer))))",
-            ),
             (
                 "Assoc-IntMul",
                 ASSOC_INTMUL,

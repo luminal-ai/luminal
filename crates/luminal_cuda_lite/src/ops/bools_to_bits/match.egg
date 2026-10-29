@@ -1,0 +1,12 @@
+(rule ((= ?out (LogicalBoolsToBits ?a ?dt))
+ (= ?it (LayoutTensorLit ?a ?il))
+ (= (bits-of ?dt) (BitWidthLit ?w))
+ (= ?os (shape-of ?out)) (= ?ow (bits-of (dtype-of ?out)))
+ (= ?ol (RightMajorContiguousElementLayoutLit ?os ?ow))
+ (= ?ot (LayoutTensorLit ?out ?ol))
+ (= (injectivity-of ?ot) (Injective)))
+ ((let op (LayoutTensorOpLit
+   (LayoutTensorCons ?it (LayoutTensorNil))
+   (LayoutTensorCons ?ot (LayoutTensorNil))))
+  (union op (LayoutTensorOpBoolsToBitsGeneric ?it ?dt ?w ?ol)))
+ :ruleset backend :name "cuda_lite/bools_to_bits/materialize")

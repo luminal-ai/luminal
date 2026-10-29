@@ -145,12 +145,14 @@ pub(crate) fn kernel(
     ctx: &mut ReferenceKernelCtx,
 ) -> anyhow::Result<()> {
     match &ctx.operands[0] {
+        TypedBuffer::F64(_) => ctx.binary_elementwise_f64(|a, b| Ok(a * b)),
         TypedBuffer::F32(_) => ctx.binary_elementwise(|a, b| a * b),
         TypedBuffer::I32(_) => ctx.binary_elementwise_i32(|a, b| {
             a.checked_mul(b).ok_or_else(|| {
                 anyhow::anyhow!("i32 mul overflow: {a} * {b} (ints are non-wrapping)")
             })
         }),
+        TypedBuffer::U64(_) => ctx.binary_elementwise_u64(|a, b| Ok(a.wrapping_mul(b))),
         TypedBuffer::I64(_) => ctx.binary_elementwise_i64(|a, b| {
             a.checked_mul(b).ok_or_else(|| {
                 anyhow::anyhow!("i64 mul overflow: {a} * {b} (ints are non-wrapping)")

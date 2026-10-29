@@ -1,6 +1,30 @@
-; Logical Commutativity : Mul
-(rewrite
-  (LogicalMul ?lhs ?rhs)
-  (LogicalMul ?rhs ?lhs)
-  :ruleset main_ruleset :name "mul/rewrite: commutativity of LogicalMul"
-)
+; Encoding bits are observable. Float operand permutation can change a NaN
+; payload, so unqualified floating commutativity is not a bit-exact equality.
+; Retain the law for exact integer encodings only (fail closed on unknown dtype).
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (Int)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, Int")
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (Int64)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, Int64")
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (UInt64)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, UInt64")
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (I4)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, I4")
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (U4)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, U4")
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (I8)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, I8")
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (U8)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, U8")
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (I16)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, I16")
+(rule ((= ?out (LogicalMul ?lhs ?rhs)) (= (dtype-of ?out) (U16)))
+ ((union ?out (LogicalMul ?rhs ?lhs)))
+ :ruleset main_ruleset :name "mul/rewrite: commutativity, U16")

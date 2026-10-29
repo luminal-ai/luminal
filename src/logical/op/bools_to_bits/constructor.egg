@@ -1,0 +1,12 @@
+(constructor LogicalBoolsToBits (LogicalTensor Dtype) LogicalTensor)
+(constructor BitPackDims (IntExprList i64) IntExprList)
+(constructor BitPackCoords (IntExprList Shape i64 i64) IntExprList)
+(constructor BitGroupCoords (IntExprList Shape i64 i64) IntExprList)
+; Only this relation certifies a view: same bits, same order, no holes within a group.
+(relation bit-packing-view (LogicalTensor Layout Layout))
+(function bit-pack-remainder (IntExpr i64) IntExpr :no-merge)
+; Demand-local certificate f(c,k) = r(c) + slope*k. The group lane has
+; extent > 1, so a constant BigInt slope is unique; no arithmetic terms
+; are generated while discovering it.
+(relation bit-lane-demand (IntExpr Shape))
+(relation bit-lane-slope (IntExpr Shape BigInt))

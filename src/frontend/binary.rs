@@ -113,16 +113,35 @@ impl Div<GraphTensor> for GraphTensor {
     type Output = GraphTensor;
 
     fn div(self, rhs: GraphTensor) -> Self::Output {
-        self * rhs.reciprocal()
+        if self.dtype == DType::F64 {
+            // Binary64 division must round once. A reciprocal may overflow
+            // even when the final quotient is finite (e.g. minsub/minsub).
+            assert!(self.dims_agree(&rhs));
+            assert_eq!(self.dtype, rhs.dtype);
+            let dims = self.dims();
+            let id = self.graph().logical.op(
+                LogicalOp::Div,
+                &[(self.id, dims.clone()), (rhs.id, dims.clone())],
+                dims.clone(),
+                self.dtype,
+            );
+            GraphTensor::from_id(id, dims, self.graph_ref, self.dtype)
+        } else {
+            self * rhs.reciprocal()
+        }
     }
 }
 
 #[allow(clippy::suspicious_arithmetic_impl)]
 impl Div<GraphTensor> for f32 {
     type Output = GraphTensor;
-
     fn div(self, rhs: GraphTensor) -> Self::Output {
-        self * rhs.reciprocal()
+        if rhs.dtype == DType::F64 {
+            let lhs = rhs.graph().constant_f64(self as f64).expand_rhs(rhs.dims());
+            lhs / rhs
+        } else {
+            self * rhs.reciprocal()
+        }
     }
 }
 
@@ -144,6 +163,27 @@ impl Rem<GraphTensor> for GraphTensor {
             self.dtype, rhs.dtype,
             "Dtypes must match to mod tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
+        );
+        // Mod is the FLOAT remainder (C `fmod`); every runtime implements
+        // it that way. Integer remainder is `trunc_rem`, which carries the
+        // nonzero-divisor proof Mod has no way to state — recording an
+        // integer Mod would build a graph no backend can execute exactly.
+        assert!(
+            !matches!(
+                self.dtype,
+                DType::Int
+                    | DType::I64
+                    | DType::U64
+                    | DType::I4
+                    | DType::U4
+                    | DType::I8
+                    | DType::U8
+                    | DType::I16
+                    | DType::U16
+                    | DType::Bool
+            ),
+            "`%` is the float remainder; use trunc_rem for {:?}",
+            self.dtype
         );
         let new_id = self.graph().logical.op(
             LogicalOp::Mod,
@@ -241,6 +281,13 @@ impl Div<f32> for GraphTensor {
     type Output = GraphTensor;
 
     fn div(self, rhs: f32) -> Self::Output {
+        if self.dtype == DType::F64 {
+            let divisor = self
+                .graph()
+                .constant_f64(rhs as f64)
+                .expand_rhs(self.dims());
+            return self / divisor;
+        }
         self * self
             .graph()
             .constant_f32(rhs.recip())
@@ -296,7 +343,7 @@ impl GraphTensor {
             "{constructor}: operands must share one dtype"
         );
         assert!(
-            matches!(self.dtype, DType::Int | DType::I64),
+            matches!(self.dtype, DType::Int | DType::I64 | DType::U64),
             "{constructor} is an INTEGER op (got {:?})",
             self.dtype
         );
@@ -344,31 +391,137 @@ impl GraphTensor {
         rhs.lt(self)
     }
 
-    /// Less than or equal
+    /// IEEE NaN test: a `Bool` tensor, true exactly at the NaN elements.
+    ///
+    /// Built from `LessThan` alone, on the operand's own dtype. Every ordered
+    /// value satisfies `x < +inf` or `-inf < x` (+inf fails only the first,
+    /// -inf only the second, a finite value neither), and a NaN, being
+    /// unordered, satisfies neither. So the count `[x < +inf] + [-inf < x]`
+    /// is 0 exactly at NaN, and `count < 1` is the test. It needs no
+    /// bit-slicing and no arithmetic in the operand dtype (so it holds for
+    /// the storage-only narrow floats), and it is total on zero-element
+    /// tensors.
+    ///
+    /// Integer, Bool and the NaN-free narrow formats (fp6, fp4) give all
+    /// false. The fp8 formats do have NaN codes but are storage formats
+    /// (some have no infinity to compare against): widen them first.
+    pub fn is_nan(self) -> GraphTensor {
+        match self.dtype {
+            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32 => {
+                let ordered = self.lt(self.float_splat(f64::INFINITY)).cast(DType::F32)
+                    + self
+                        .float_splat(f64::NEG_INFINITY)
+                        .lt(self)
+                        .cast(DType::F32);
+                none_of(ordered)
+            }
+            DType::Int
+            | DType::I64
+            | DType::U64
+            | DType::I4
+            | DType::U4
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16
+            | DType::Bool
+            | DType::F6E2M3
+            | DType::F6E3M2
+            | DType::F4E2M1 => {
+                let zero = self.graph().constant_f32(0.0).expand_rhs(self.dims());
+                zero.lt(zero)
+            }
+            DType::F8UE8M0
+            | DType::F8E4M3FN
+            | DType::F8E4M3FNUZ
+            | DType::F8E5M2
+            | DType::F8E5M2FNUZ => panic!(
+                "is_nan on {:?} is not supported: fp8 is a storage format, widen it first",
+                self.dtype
+            ),
+        }
+    }
+
+    // THE DERIVED COMPARISONS. `LessThan` is the one comparison primitive and
+    // it is IEEE `<`: false whenever either side is NaN. The derived forms
+    // must also agree with IEEE (and torch) on unordered pairs, where `!=` is
+    // true and `==`, `<=`, `>=` are false. A `!(b < a)` spelling of `a <= b`
+    // is true on NaN, so it is correct only for dtypes without NaN, which keep
+    // it unchanged. The NaN-carrying dtypes ([`has_ieee_nan`]) count the
+    // unordered case explicitly:
+    //   a != b  iff  any of   a < b, b < a, isnan(a), isnan(b)
+    //   a == b  iff  none of  a < b, b < a, isnan(a), isnan(b)
+    //   a <= b  iff  none of  b < a, isnan(a), isnan(b)
+    //   a >= b  iff  none of  a < b, isnan(a), isnan(b)
+    // Each condition is a sum of {0,1} F32 indicators of `LessThan` results,
+    // kept numeric until ONE final comparison lands it in Bool (`any_of`,
+    // `none_of`). No comparison is built by negating another's result (eq as
+    // !ne): that adds a Bool -> F32 -> Bool round trip, forcing backends
+    // without Bool storage to materialize an otherwise internal boolean
+    // buffer. The isnan terms are themselves `count < 1` comparisons cast to
+    // F32, one level deeper than the lt/gt terms; that is the depth the
+    // ordered-only spelling already had inside its `cast(Bool)` projection.
+
+    /// Less than or equal. IEEE `<=`: false when either side is NaN.
     pub fn le(self, rhs: GraphTensor) -> GraphTensor {
+        if has_ieee_nan(self.dtype) {
+            return none_of(self.gt(rhs).cast(DType::F32) + self.unordered_count(rhs));
+        }
         (-self.gt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
     }
 
-    /// Greater than or equal
+    /// Greater than or equal. IEEE `>=`: false when either side is NaN.
     pub fn ge(self, rhs: GraphTensor) -> GraphTensor {
+        if has_ieee_nan(self.dtype) {
+            return none_of(self.lt(rhs).cast(DType::F32) + self.unordered_count(rhs));
+        }
         (-self.lt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
     }
 
     /// Not equal. Returns `Bool`, like every other comparison here
-    /// (`lt`/`gt`/`le`/`ge`); the `lt + gt` sum is an internal numeric
-    /// indicator, not the result type.
+    /// (`lt`/`gt`/`le`/`ge`); the indicator sum is internal, not the result
+    /// type. IEEE `!=`: true when either side is NaN.
     pub fn ne(self, rhs: GraphTensor) -> GraphTensor {
+        if has_ieee_nan(self.dtype) {
+            return any_of(self.inequality_count(rhs));
+        }
         (self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32)).cast(DType::Bool)
     }
 
-    /// Equal
+    /// Equal. IEEE `==`: false when either side is NaN.
     pub fn eq(self, rhs: GraphTensor) -> GraphTensor {
+        if has_ieee_nan(self.dtype) {
+            return none_of(self.inequality_count(rhs));
+        }
         // Keep the inequality indicator numeric until the final cast. Calling
         // `ne` here would create a Bool -> F32 round trip, forcing backends
         // without Bool storage to materialize an otherwise internal boolean
         // buffer.
         let not_equal = self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32);
         (-not_equal + 1.0).cast(DType::Bool)
+    }
+
+    /// `[a < b] + [b < a] + [isnan a] + [isnan b]`, an F32 count that is
+    /// nonzero exactly when `a != b` under IEEE.
+    fn inequality_count(self, rhs: GraphTensor) -> GraphTensor {
+        self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32) + self.unordered_count(rhs)
+    }
+
+    /// `[isnan a] + [isnan b]`, an F32 count that is nonzero exactly when the
+    /// pair is unordered.
+    fn unordered_count(self, rhs: GraphTensor) -> GraphTensor {
+        self.is_nan().cast(DType::F32) + rhs.is_nan().cast(DType::F32)
+    }
+
+    /// A scalar float literal in this tensor's own float dtype, expanded to
+    /// its shape. F64 gets a binary64 constant; the narrower floats are casts
+    /// of an F32 constant (exact for the values used here: +-inf).
+    fn float_splat(self, value: f64) -> GraphTensor {
+        match self.dtype {
+            DType::F64 => self.graph().constant_f64(value),
+            _ => self.graph().constant_f32(value as f32).cast(self.dtype),
+        }
+        .expand_rhs(self.dims())
     }
 
     /// Raise the tensor to a power.
@@ -398,25 +551,12 @@ impl GraphTensor {
     /// explodes when such expressions chain. `Select` is also NaN-safe.
     ///
     /// `maximum` PROPAGATES NaN (unlike `fmax`): if either operand is NaN the
-    /// result is NaN, so the two NaN cases are steered through `Select` too.
+    /// result is NaN. `select(a < b, b, a)` already returns a NaN `a`, because
+    /// every ordered comparison with NaN is false; it would drop only a NaN
+    /// `b`, so one more `Select` returns `b` wherever `b` is NaN.
     pub fn maximum(self, rhs: GraphTensor) -> GraphTensor {
-        let nan_guard = |tensor: GraphTensor, picked: GraphTensor| -> GraphTensor {
-            if !matches!(
-                tensor.dtype,
-                DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
-            ) {
-                return picked;
-            }
-            let dims = picked.dims();
-            let nan = match tensor.dtype {
-                DType::F64 => tensor.graph().constant_f64(f64::NAN),
-                _ => tensor.graph().constant_f32(f32::NAN).cast(tensor.dtype),
-            }
-            .expand_rhs(dims);
-            tensor.ne(tensor).select(nan, picked)
-        };
         let picked = self.lt(rhs).select(rhs, self);
-        nan_guard(rhs, nan_guard(self, picked))
+        rhs.nan_overrides(picked)
     }
 
     /// Take the elementwise maximum of a tensor and a float
@@ -435,25 +575,22 @@ impl GraphTensor {
     }
 
     /// Take the elementwise minimum of two tensors. See [`Self::maximum`]
-    /// for why this is a native select.
+    /// for why this is a native select and how NaN propagates: here too
+    /// `select(b < a, b, a)` keeps a NaN `a`, and only a NaN `b` needs the
+    /// extra `Select`.
     pub fn minimum(self, rhs: GraphTensor) -> GraphTensor {
-        let nan_guard = |tensor: GraphTensor, picked: GraphTensor| -> GraphTensor {
-            if !matches!(
-                tensor.dtype,
-                DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
-            ) {
-                return picked;
-            }
-            let dims = picked.dims();
-            let nan = match tensor.dtype {
-                DType::F64 => tensor.graph().constant_f64(f64::NAN),
-                _ => tensor.graph().constant_f32(f32::NAN).cast(tensor.dtype),
-            }
-            .expand_rhs(dims);
-            tensor.ne(tensor).select(nan, picked)
-        };
         let picked = self.gt(rhs).select(rhs, self);
-        nan_guard(rhs, nan_guard(self, picked))
+        rhs.nan_overrides(picked)
+    }
+
+    /// `select(isnan(self), self, picked)` for NaN-carrying dtypes; `picked`
+    /// unchanged otherwise.
+    fn nan_overrides(self, picked: GraphTensor) -> GraphTensor {
+        if has_ieee_nan(self.dtype) {
+            self.is_nan().select(self, picked)
+        } else {
+            picked
+        }
     }
 
     /// Take the elementwise minimum of a tensor and a float
@@ -599,6 +736,31 @@ impl F32Pow for f32 {
     }
 }
 
+/// The dtypes whose values include IEEE NaN and that the frontend computes
+/// in (the float sources of `GraphTensor::cast`). Their derived comparisons
+/// and `maximum`/`minimum` treat a NaN operand as unordered.
+fn has_ieee_nan(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
+    )
+}
+
+/// Bool `0 < count` for a nonnegative F32 indicator count: any indicator set.
+fn any_of(count: GraphTensor) -> GraphTensor {
+    count
+        .graph()
+        .constant_f32(0.0)
+        .expand_rhs(count.dims())
+        .lt(count)
+}
+
+/// Bool `count < 1` for a nonnegative integral F32 indicator count: no
+/// indicator set.
+fn none_of(count: GraphTensor) -> GraphTensor {
+    count.lt(count.graph().constant_f32(1.0).expand_rhs(count.dims()))
+}
+
 // #[cfg(test)]
 #[cfg(test)]
 pub(super) mod tests {
@@ -700,6 +862,15 @@ pub(super) mod tests {
         let mut cx = Graph::new();
         let a = cx.tensor(vec![2, 3], luminal::dtype::DType::F32);
         let b = cx.tensor(vec![1, 3], luminal::dtype::DType::F32);
+        let _ = a % b;
+    }
+
+    #[test]
+    #[should_panic(expected = "`%` is the float remainder; use trunc_rem for Int64")]
+    fn test_mod_rejects_integer_operands() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(vec![3], luminal::dtype::DType::I64);
+        let b = cx.tensor(vec![3], luminal::dtype::DType::I64);
         let _ = a % b;
     }
 
@@ -1030,5 +1201,240 @@ pub(super) mod tests {
                 refer.where_cond(&a, &b).unwrap()
             },
         );
+    }
+
+    // ---- IEEE NaN semantics of the comparisons and of maximum/minimum ----
+
+    type LuminalDType = luminal::dtype::DType;
+
+    /// Every ordered pair over NaN, both infinities, both zeros and two
+    /// finite values, as (lhs, rhs) columns.
+    fn special_pairs() -> (Vec<f64>, Vec<f64>) {
+        let specials = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            1.5,
+            -2.0,
+        ];
+        specials
+            .iter()
+            .flat_map(|&a| specials.iter().map(move |&b| (a, b)))
+            .unzip()
+    }
+
+    fn staged(values: &[f64], dtype: LuminalDType) -> luminal_reference::TypedBuffer {
+        use luminal_reference::TypedBuffer;
+        match dtype {
+            LuminalDType::F32 => TypedBuffer::F32(values.iter().map(|&v| v as f32).collect()),
+            LuminalDType::F64 => TypedBuffer::F64(values.to_vec()),
+            LuminalDType::F16 => {
+                TypedBuffer::F16(values.iter().map(|&v| half::f16::from_f64(v)).collect())
+            }
+            LuminalDType::Bf16 => {
+                TypedBuffer::Bf16(values.iter().map(|&v| half::bf16::from_f64(v)).collect())
+            }
+            other => panic!("no staging for {other:?}"),
+        }
+    }
+
+    type Comparison = fn(GraphTensor, GraphTensor) -> GraphTensor;
+
+    /// Runs each comparison on its own copy of the special pairs (distinct
+    /// inputs, so no two outputs share an e-class) and reads the Bool rows.
+    fn run_comparisons(dtype: LuminalDType, comparisons: &[Comparison]) -> Vec<Vec<bool>> {
+        let (lhs, rhs) = special_pairs();
+        let mut cx = Graph::new();
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for compare in comparisons {
+            let a = cx.tensor(vec![lhs.len()], dtype);
+            let b = cx.tensor(vec![rhs.len()], dtype);
+            let out = compare(a, b);
+            assert_eq!(out.dtype, LuminalDType::Bool);
+            inputs.push((a.id, staged(&lhs, dtype)));
+            inputs.push((b.id, staged(&rhs, dtype)));
+            outputs.push(out.id);
+        }
+        let bindings = luminal_reference::ReferenceBindings::dense(&cx.logical, &outputs);
+        let rt = luminal_reference::harness::run_reference_bound(&cx, bindings, &inputs, &[]);
+        outputs
+            .iter()
+            .map(|&id| {
+                rt.get_bool8(id)
+                    .unwrap()
+                    .iter()
+                    .map(|&code| code == 1)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `LessThan` is IEEE `<`, so the derived comparisons used to be wrong on
+    /// unordered pairs: `!(b < a)` made `NaN <= x` true and `!(a<b | b<a)`
+    /// made `NaN == x` true. They must agree with IEEE (and torch) for every
+    /// float dtype the frontend computes in, the storage-only narrow floats
+    /// included.
+    #[test]
+    fn comparisons_are_ieee_on_unordered_pairs() {
+        type FloatCase = (&'static str, Comparison, fn(f64, f64) -> bool);
+        let comparisons: [FloatCase; 7] = [
+            ("lt", |a, b| a.lt(b), |a, b| a < b),
+            ("gt", |a, b| a.gt(b), |a, b| a > b),
+            ("le", |a, b| a.le(b), |a, b| a <= b),
+            ("ge", |a, b| a.ge(b), |a, b| a >= b),
+            ("eq", |a, b| a.eq(b), |a, b| a == b),
+            ("ne", |a, b| a.ne(b), |a, b| a != b),
+            ("is_nan", |a, _| a.is_nan(), |a, _| a.is_nan()),
+        ];
+        let (lhs, rhs) = special_pairs();
+        for dtype in [
+            LuminalDType::F32,
+            LuminalDType::F64,
+            LuminalDType::F16,
+            LuminalDType::Bf16,
+        ] {
+            let builders: Vec<Comparison> = comparisons.iter().map(|c| c.1).collect();
+            let rows = run_comparisons(dtype, &builders);
+            for ((name, _, expected), row) in comparisons.iter().zip(&rows) {
+                for ((&a, &b), &got) in lhs.iter().zip(&rhs).zip(row) {
+                    assert_eq!(got, expected(a, b), "{name} on {dtype:?} at ({a}, {b})");
+                }
+            }
+        }
+    }
+
+    /// Integer comparisons keep their NaN-free spelling and stay exact, and
+    /// `is_nan` of an integer tensor is all false.
+    #[test]
+    fn integer_comparisons_and_is_nan_are_unchanged() {
+        let values = [i32::MIN, -7, -1, 0, 1, 7, i32::MAX];
+        let (lhs, rhs): (Vec<i32>, Vec<i32>) = values
+            .iter()
+            .flat_map(|&a| values.iter().map(move |&b| (a, b)))
+            .unzip();
+        type IntCase = (Comparison, fn(i32, i32) -> bool);
+        let comparisons: [IntCase; 5] = [
+            (|a, b| a.le(b), |a, b| a <= b),
+            (|a, b| a.ge(b), |a, b| a >= b),
+            (|a, b| a.eq(b), |a, b| a == b),
+            (|a, b| a.ne(b), |a, b| a != b),
+            (|a, _| a.is_nan(), |_, _| false),
+        ];
+        let mut cx = Graph::new();
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for (compare, _) in &comparisons {
+            let a = cx.tensor(vec![lhs.len()], LuminalDType::Int);
+            let b = cx.tensor(vec![rhs.len()], LuminalDType::Int);
+            outputs.push(compare(a, b).id);
+            inputs.push((a.id, lhs.clone().into()));
+            inputs.push((b.id, rhs.clone().into()));
+        }
+        let bindings = luminal_reference::ReferenceBindings::dense(&cx.logical, &outputs);
+        let rt = luminal_reference::harness::run_reference_bound(&cx, bindings, &inputs, &[]);
+        for ((_, expected), &id) in comparisons.iter().zip(&outputs) {
+            let row = rt.get_bool8(id).unwrap();
+            for ((&a, &b), &code) in lhs.iter().zip(&rhs).zip(row) {
+                assert_eq!(code == 1, expected(a, b), "({a}, {b})");
+            }
+        }
+    }
+
+    fn same_value(actual: f32, expected: f32) -> bool {
+        (actual.is_nan() && expected.is_nan()) || actual == expected
+    }
+
+    /// `maximum`/`minimum` propagate a NaN from EITHER side (torch semantics,
+    /// unlike `fmax`/`fmin`). The old guard tested `x != x`, which the
+    /// ordered-only `ne` made false for NaN, so `maximum(1, NaN)` was 1 while
+    /// `maximum(NaN, 1)` was NaN.
+    #[test]
+    fn maximum_and_minimum_propagate_nan_from_either_side() {
+        let (lhs, rhs) = special_pairs();
+        let lhs: Vec<f32> = lhs.iter().map(|&v| v as f32).collect();
+        let rhs: Vec<f32> = rhs.iter().map(|&v| v as f32).collect();
+        let mut cx = Graph::new();
+        let a1 = cx.tensor(vec![lhs.len()], LuminalDType::F32);
+        let b1 = cx.tensor(vec![rhs.len()], LuminalDType::F32);
+        let a2 = cx.tensor(vec![lhs.len()], LuminalDType::F32);
+        let b2 = cx.tensor(vec![rhs.len()], LuminalDType::F32);
+        let max = a1.maximum(b1);
+        let min = a2.minimum(b2);
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (a1.id, lhs.clone().into()),
+                (b1.id, rhs.clone().into()),
+                (a2.id, lhs.clone().into()),
+                (b2.id, rhs.clone().into()),
+            ],
+        );
+        let max_row = rt.get_f32(max.id).unwrap();
+        let min_row = rt.get_f32(min.id).unwrap();
+        for (i, (&a, &b)) in lhs.iter().zip(&rhs).enumerate() {
+            let nan = a.is_nan() || b.is_nan();
+            let (want_max, want_min) = if nan {
+                (f32::NAN, f32::NAN)
+            } else {
+                (a.max(b), a.min(b))
+            };
+            assert!(
+                same_value(max_row[i], want_max),
+                "maximum({a}, {b}) = {}",
+                max_row[i]
+            );
+            assert!(
+                same_value(min_row[i], want_min),
+                "minimum({a}, {b}) = {}",
+                min_row[i]
+            );
+        }
+    }
+
+    /// A NaN clamp bound makes every element NaN (torch.clamp(x, min=nan)),
+    /// and a NaN input stays NaN under finite bounds.
+    #[test]
+    fn clip_propagates_nan_bounds_and_nan_inputs() {
+        let values = vec![
+            f32::NAN,
+            f32::NEG_INFINITY,
+            -1.5,
+            -0.0,
+            0.5,
+            2.0,
+            f32::INFINITY,
+        ];
+        type ClampCase = (fn(GraphTensor) -> GraphTensor, fn(f32) -> f32);
+        let clamps: [ClampCase; 5] = [
+            (
+                |x| x.clip(-1.0, 1.0),
+                |v| if v.is_nan() { v } else { v.clamp(-1.0, 1.0) },
+            ),
+            (|x| x.clip(f32::NAN, 1.0), |_| f32::NAN),
+            (|x| x.clip(-1.0, f32::NAN), |_| f32::NAN),
+            (|x| x.maximum_f32(f32::NAN), |_| f32::NAN),
+            (|x| x.minimum_f32(f32::NAN), |_| f32::NAN),
+        ];
+        let mut cx = Graph::new();
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for (clamp, _) in &clamps {
+            let x = cx.tensor(vec![values.len()], LuminalDType::F32);
+            outputs.push(clamp(x).id);
+            inputs.push((x.id, values.clone().into()));
+        }
+        let rt = luminal_reference::harness::run_reference(&cx, &inputs);
+        for (case, ((_, expected), &id)) in clamps.iter().zip(&outputs).enumerate() {
+            let row = rt.get_f32(id).unwrap();
+            for (&v, &got) in values.iter().zip(row) {
+                assert!(
+                    same_value(got, expected(v)),
+                    "clamp case {case} at {v}: {got}"
+                );
+            }
+        }
     }
 }

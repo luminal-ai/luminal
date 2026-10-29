@@ -24,7 +24,12 @@
 // Kernel-bearing op modules are visible to the rest of this crate: the
 // kernel registry's table rows point at
 // `<op_module>::kernel` (op-folder ruling 2026-08-13).
-pub(crate) mod add;
+mod add;
+mod and;
+pub(crate) mod bits_to_bools;
+mod bits_to_bools_view;
+mod bools_to_bits;
+mod bools_to_bits_view;
 pub(crate) mod cast;
 pub(crate) mod ceil;
 pub(crate) mod constant;
@@ -39,6 +44,8 @@ pub(crate) mod less_than;
 pub(crate) mod log2;
 pub(crate) mod modulo;
 pub(crate) mod mul;
+mod not;
+mod or;
 pub(crate) mod trunc_div;
 pub(crate) mod trunc_rem;
 // (poison moved to core `luminal::poison` in Step B; re-exported below.)
@@ -66,6 +73,9 @@ pub(crate) mod trunc_cast;
 // created by its matcher's `extract` (or derived via `to_dps` / synthesized
 // by the DPS pass, for Poison) — a hygiene convention, not a privacy fence.
 pub use add::AddFunctional;
+pub use and::AndDps;
+pub use bits_to_bools::BitsToBoolsDps;
+pub use bools_to_bits::BoolsToBitsDps;
 pub use cast::Cast;
 pub use ceil::CeilFunctional;
 pub use constant::Constant;
@@ -84,6 +94,8 @@ pub use log2::Log2Functional;
 pub use luminal::buffer_tensor_ir::Poison;
 pub use modulo::ModFunctional;
 pub use mul::MulFunctional;
+pub use not::NotDps;
+pub use or::OrDps;
 pub use recip::RecipFunctional;
 pub use reduce_max::ReduceMax;
 pub use reduce_sum::ReduceSum;
@@ -159,6 +171,11 @@ pub use trunc_rem::{TruncRemFunctional, TruncRemFunctionalDps, TruncRemFunctiona
 /// The matcher half of [`reference_ops`] — what the extractor builds its
 /// constructor-name registry from. Not a list in its own right: every
 /// entry comes from a row that also carries the op's kernel.
+pub(crate) fn is_bit_view(op: &dyn luminal::buffer_tensor_ir::BufferTensorIrOp) -> bool {
+    op.as_any().is::<bits_to_bools_view::BitsToBoolsView>()
+        || op.as_any().is::<bools_to_bits_view::BoolsToBitsView>()
+}
+
 pub fn built_in_matchers() -> Vec<Box<dyn luminal::layout_ir::OpMatcher>> {
     reference_ops().iter().map(|op| (op.matcher)()).collect()
 }
@@ -200,6 +217,46 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
     static OPS: std::sync::OnceLock<Vec<ReferenceOp>> = std::sync::OnceLock::new();
     OPS.get_or_init(|| {
         vec![
+            ReferenceOp {
+                matcher: || Box::new(bits_to_bools::BitsToBoolsMatcher),
+                kernel: entry::<bits_to_bools::BitsToBoolsDps>(
+                    "BitsToBoolsGeneric",
+                    bits_to_bools::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || Box::new(bits_to_bools_view::BitsToBoolsViewMatcher),
+                kernel: entry::<bits_to_bools_view::BitsToBoolsView>(
+                    "BitsToBoolsView",
+                    bits_to_bools_view::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || Box::new(bools_to_bits::BoolsToBitsMatcher),
+                kernel: entry::<bools_to_bits::BoolsToBitsDps>(
+                    "BoolsToBitsGeneric",
+                    bools_to_bits::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || Box::new(bools_to_bits_view::BoolsToBitsViewMatcher),
+                kernel: entry::<bools_to_bits_view::BoolsToBitsView>(
+                    "BoolsToBitsView",
+                    bools_to_bits_view::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || Box::new(and::AndMatcher),
+                kernel: entry::<and::AndDps>("AndGeneric", and::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(or::OrMatcher),
+                kernel: entry::<or::OrDps>("OrGeneric", or::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(not::NotMatcher),
+                kernel: entry::<not::NotDps>("NotGeneric", not::kernel),
+            },
             // ── elementwise binary ──
             ReferenceOp {
                 matcher: || Box::new(AddFunctionalMatcher),

@@ -154,9 +154,14 @@ pub(crate) fn kernel(
     let op = expect_op::<LeftSequentialScanProdDps>(op)?;
     match &ctx.operands[0] {
         TypedBuffer::F32(_) => ctx.scan_axis(op.axis, 1.0, |acc, x| acc * x),
+        TypedBuffer::F64(_) => ctx.scan_axis_f64(op.axis, 1.0, |acc, x| Ok(acc * x)),
         TypedBuffer::I32(_) => ctx.scan_axis_i32(op.axis, 1, |acc, x| {
             acc.checked_mul(x)
                 .ok_or_else(|| anyhow::anyhow!("i32 scan-prod overflow (ints are non-wrapping)"))
+        }),
+        TypedBuffer::I64(_) => ctx.scan_axis_i64(op.axis, 1, |acc, x| {
+            acc.checked_mul(x)
+                .ok_or_else(|| anyhow::anyhow!("i64 scan-prod overflow (ints are non-wrapping)"))
         }),
         TypedBuffer::I8(_) => ctx.scan_axis_i8(op.axis, 1, |acc, x| {
             acc.checked_mul(x)
@@ -166,6 +171,7 @@ pub(crate) fn kernel(
             acc.checked_mul(x)
                 .ok_or_else(|| anyhow::anyhow!("u8 scan-prod overflow (ints are non-wrapping)"))
         }),
+        TypedBuffer::U64(_) => ctx.scan_axis_u64(op.axis, 1, |a, b| Ok(a.wrapping_mul(b))),
         TypedBuffer::I16(_) => ctx.scan_axis_i16(op.axis, 1, |acc, x| {
             acc.checked_mul(x)
                 .ok_or_else(|| anyhow::anyhow!("i16 scan-prod overflow (ints are non-wrapping)"))

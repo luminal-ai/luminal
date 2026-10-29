@@ -10,6 +10,7 @@
     (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
     (= ?out_logical (LogicalSelect ?cond_logical ?if_true_logical ?if_false_logical))
     (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
   )
   (
     (let ?layout_tensor_op

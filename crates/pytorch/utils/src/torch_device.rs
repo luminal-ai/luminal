@@ -117,6 +117,8 @@ mod tests {
                 TensorMeta {
                     dtype: FLOAT,
                     sizes: vec![DimSize::Int(DimInt { as_int: 4 })],
+                    strides: None,
+                    storage_offset: None,
                     layout: Some(7),
                     device: dev,
                 },

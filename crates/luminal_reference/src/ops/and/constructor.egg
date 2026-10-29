@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpAndGeneric (LayoutTensor LayoutTensor Layout) LayoutTensorOp)

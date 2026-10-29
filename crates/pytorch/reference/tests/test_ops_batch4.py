@@ -185,6 +185,39 @@ def test_max_pool_values() -> None:
     assert out.shape == eager.shape and torch.allclose(out, eager, atol=1e-5)
 
 
+class ScaledMaxPool(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.randn(2, 2, 7, 7))
+
+    def forward(self, x):
+        # Overlapping windows, so one input position can collect several
+        # gradient contributions in max_pool2d_with_indices_backward.
+        pooled = F.max_pool2d(x * self.scale, 3, stride=2, padding=1)
+        return (pooled * pooled).sum()
+
+
+def test_max_pool_training_step_gradients() -> None:
+    torch.manual_seed(3)
+    model = ScaledMaxPool()
+    expected_model = ScaledMaxPool()
+    expected_model.load_state_dict(model.state_dict())
+    x = torch.randn(2, 2, 7, 7, requires_grad=True)
+    expected_x = x.detach().clone().requires_grad_()
+    backend = luminal_reference.Compiler()
+    loss = torch.compile(model, backend=backend)(x)
+    expected_loss = expected_model(expected_x)
+    loss.backward()
+    expected_loss.backward()
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(model.scale.grad, expected_model.scale.grad)
+    torch.testing.assert_close(x.grad, expected_x.grad)
+    assert any(
+        graph.phase == "backward" and "max_pool2d_with_indices_backward" in graph.code
+        for graph in backend.graphs
+    ), "the compiled backward must run the max-pool backward lowering"
+
+
 def test_conv2d() -> None:
     _check(Conv(), torch.randn(2, 3, 8, 8))
 

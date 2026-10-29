@@ -1,0 +1,6 @@
+(rule ((= ?out (LogicalBoolsToBits ?a ?dt))
+ (= ?it (LayoutTensorLit ?a ?il)) (bit-packing-view ?out ?il ?ol)
+ (= ?ot (LayoutTensorLit ?out ?ol)))
+ ((let op (LayoutTensorOpLit (LayoutTensorCons ?it (LayoutTensorNil)) (LayoutTensorCons ?ot (LayoutTensorNil))))
+ (union op (LayoutTensorOpBoolsToBitsView ?it ?dt ?ol)))
+ :ruleset backend :name "reference/bools_to_bits/view")

@@ -1,0 +1,2 @@
+(rule ((= ?out (LogicalBitsToBools ?in))) ((set (dtype-of ?out) (Bool)))
+ :ruleset prop :name "bits_to_bools/dtype")

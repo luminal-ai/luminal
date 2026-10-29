@@ -19,6 +19,7 @@ use crate::dtype::TorchDType;
 use crate::pt2_schema::Node;
 
 use super::Translator;
+use super::elementwise_more::remove_axes;
 use super::ops::ReductionOp;
 use super::util::{
     broadcast_binary, materialize_tensor, normalize_dim, normalize_slice_bound, reshape_tensor,
@@ -128,18 +129,6 @@ fn interleave(cx: &mut Graph, first: GraphTensor, second: GraphTensor) -> GraphT
     odd[shape.len()] = cx.iota(shape.clone(), |_| IntExpr::from(1));
     let with_real = zero.scatter(&even, first);
     with_real.scatter(&odd, second)
-}
-
-fn squeeze_dims(mut tensor: GraphTensor, dims: &[usize]) -> GraphTensor {
-    let mut removed = 0;
-    for &original_dim in dims {
-        let dim = original_dim - removed;
-        if tensor.dims()[dim].to_usize() == Some(1) {
-            tensor = tensor.squeeze(dim);
-            removed += 1;
-        }
-    }
-    tensor
 }
 
 fn float_max(dtype: DType) -> f64 {
@@ -509,6 +498,13 @@ impl Translator<'_> {
                 let out = self.cx_atan2(value.imag, value.real);
                 self.values.insert(output_name.to_string(), out);
             }
+            "isfinite.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let real = self.is_finite(value.real);
+                let imag = self.is_finite(value.imag);
+                self.values
+                    .insert(output_name.to_string(), real.logical_and(imag));
+            }
             "isinf.default" => {
                 let value = self.get_complex_input(node, 0)?;
                 let real = self.is_inf(value.real);
@@ -529,10 +525,18 @@ impl Translator<'_> {
                 let (magnitude, angle) = broadcast_binary(magnitude, angle);
                 let dtype = self.output_complex_dtype(output_name)?;
                 let component_dtype = dtype.complex_component_dtype().unwrap();
-                let magnitude = magnitude.cast(component_dtype);
-                let angle = angle.cast(component_dtype);
-                let real = magnitude * self.cx_cos(angle);
-                let imag = magnitude * angle.sin();
+                // complex32's half components are storage: compute in F32
+                // and round each component once.
+                let compute = if component_dtype.is_narrow_float() {
+                    DType::F32
+                } else {
+                    component_dtype
+                };
+                let magnitude = magnitude.cast(compute);
+                let angle = angle.cast(compute);
+                let real =
+                    super::util::round_to_storage(magnitude * self.cx_cos(angle), component_dtype);
+                let imag = super::util::round_to_storage(magnitude * angle.sin(), component_dtype);
                 self.store_complex(output_name, ComplexTensor::new(real, imag, dtype));
             }
 
@@ -673,30 +677,12 @@ impl Translator<'_> {
                 let dim = normalize_dim(self.get_int_arg(node, 1)?, value.real.rank() + 1);
                 self.store_complex(output_name, value.map(|component| component.unsqueeze(dim)));
             }
-            "squeeze.dims" | "squeeze.default" => {
+            "squeeze.default" | "squeeze.dim" | "squeeze.dims" => {
                 let value = self.get_complex_input(node, 0)?;
-                let dims = if target == "squeeze.dims" {
-                    self.get_ints_arg(node, 1)?
-                } else {
-                    value
-                        .real
-                        .dims()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(axis, dim)| {
-                            (dim.to_usize() == Some(1)).then_some(axis as i64)
-                        })
-                        .collect()
-                };
-                let rank = value.real.rank();
-                let mut dims: Vec<usize> = dims
-                    .into_iter()
-                    .map(|dim| normalize_dim(dim, rank))
-                    .collect();
-                dims.sort_unstable();
+                let axes = self.squeeze_axes(node, target, &value.real.dims())?;
                 self.store_complex(
                     output_name,
-                    value.map(|component| squeeze_dims(component, &dims)),
+                    value.map(|component| remove_axes(component, &axes)),
                 );
             }
             "expand.default" => {

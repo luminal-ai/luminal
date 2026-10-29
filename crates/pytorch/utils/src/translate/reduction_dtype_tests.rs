@@ -120,17 +120,33 @@ fn explicit_reduction_and_scan_dtypes_override_default_promotion() {
     }
 }
 
+/// A floating scan accumulates in the result dtype's opmath: F32 scans
+/// add no cast at all; half-precision scans widen to F32 and round the
+/// partial sums back once (ATen's `acc_type` — eager `cumsum` on a half
+/// tensor equals the f32 cumsum rounded per element, and a scan that
+/// rounded every step would drift by whole ulps of the total).
 #[test]
-fn default_floating_scans_do_not_add_opmath_widening() {
+fn floating_scans_accumulate_in_opmath() {
     for target in ["cumsum.default", "cumprod.default"] {
-        for dtype in [TorchDType::Float, TorchDType::Half, TorchDType::BFloat16] {
-            let t = case(target, dtype, dtype, false, false);
-            assert!(
-                !t.graph
-                    .logical
-                    .petgraph()
-                    .node_weights()
-                    .any(|node| matches!(node.op, LogicalOp::Cast(_)))
+        let casts = |dtype: TorchDType| {
+            case(target, dtype, dtype, false, false)
+                .graph
+                .logical
+                .petgraph()
+                .node_weights()
+                .filter(|node| matches!(node.op, LogicalOp::Cast(_)))
+                .count()
+        };
+        assert_eq!(
+            casts(TorchDType::Float),
+            0,
+            "{target}: F32 scans need no opmath cast"
+        );
+        for dtype in [TorchDType::Half, TorchDType::BFloat16] {
+            assert_eq!(
+                casts(dtype),
+                2,
+                "{target}: {dtype:?} widens to F32 and rounds back"
             );
         }
     }
@@ -156,4 +172,89 @@ fn argmax_int64_result_does_not_convert_float_input_to_int64() {
             .node_weights()
             .any(|node| matches!(node.op, LogicalOp::TruncCast(_)))
     );
+}
+
+#[test]
+fn argextrema_reduce_globally_or_on_the_named_axis_with_first_ties() {
+    for (name, max) in [("argmax", true), ("argmin", false)] {
+        for (dim, keepdim) in [
+            (None, false),
+            (None, true),
+            (Some(-1), false),
+            (Some(-1), true),
+        ] {
+            let shape: &[i64] = match (dim, keepdim) {
+                (None, false) => &[],
+                (None, true) => &[1, 1],
+                (Some(_), false) => &[2],
+                (Some(_), true) => &[2, 1],
+            };
+            let t = translate_one(
+                node(
+                    &format!("torch.ops.aten.{name}.default"),
+                    vec![
+                        tensor_input("self", "x"),
+                        dim.map_or_else(|| none("dim"), |d| scalar_int("dim", d)),
+                        scalar_bool("keepdim", keepdim),
+                    ],
+                    &["y"],
+                ),
+                &[("x", FLOAT, &[2, 3]), ("y", TorchDType::Long.code(), shape)],
+                &["x"],
+                &["y"],
+            );
+            assert_eq!(
+                t.graph
+                    .logical
+                    .value_dims(t.outputs[0].tensor)
+                    .iter()
+                    .map(|d| d.to_usize().unwrap())
+                    .collect::<Vec<_>>(),
+                shape.iter().map(|&d| d as usize).collect::<Vec<_>>()
+            );
+            let rt = luminal_reference::harness::run_reference(
+                &t.graph,
+                &[(t.inputs[0].tensor, vec![1_f32, 6., 6., 7., 7., 0.].into())],
+            );
+            let expected: &[i64] = match (max, dim) {
+                (true, None) => &[3],
+                (false, None) => &[5],
+                (true, Some(_)) => &[1, 0],
+                (false, Some(_)) => &[0, 2],
+            };
+            assert_eq!(
+                rt.get_i64(t.outputs[0].tensor).unwrap(),
+                expected,
+                "{name} {dim:?} {keepdim}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scalar_argextrema_return_zero_without_adding_dimensions() {
+    for name in ["argmax", "argmin"] {
+        for dim in [None, Some(0), Some(-1)] {
+            let t = translate_one(
+                node(
+                    &format!("torch.ops.aten.{name}.default"),
+                    vec![
+                        tensor_input("self", "x"),
+                        dim.map_or_else(|| none("dim"), |d| scalar_int("dim", d)),
+                        scalar_bool("keepdim", true),
+                    ],
+                    &["y"],
+                ),
+                &[("x", FLOAT, &[]), ("y", TorchDType::Long.code(), &[])],
+                &["x"],
+                &["y"],
+            );
+            assert!(t.graph.logical.value_dims(t.outputs[0].tensor).is_empty());
+            let rt = luminal_reference::harness::run_reference(
+                &t.graph,
+                &[(t.inputs[0].tensor, vec![3_f32].into())],
+            );
+            assert_eq!(rt.get_i64(t.outputs[0].tensor).unwrap(), &[0]);
+        }
+    }
 }

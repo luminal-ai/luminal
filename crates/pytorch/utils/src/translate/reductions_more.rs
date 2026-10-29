@@ -9,7 +9,7 @@ use luminal::prelude::*;
 
 use super::Translator;
 use super::util;
-use crate::pt2_schema::Node;
+use crate::pt2_schema::{Argument, Node};
 
 /// Which linear-algebra composite an `addmm`-family target is.
 #[derive(Clone, Copy)]
@@ -31,6 +31,11 @@ fn normalize_axes(axes: &[i64], rank: usize) -> Result<Vec<usize>> {
                 .ok_or_else(|| anyhow::anyhow!("axis {a} out of range for rank {rank}"))
         })
         .collect()
+}
+
+/// An explicit `None` argument (PT2 spells it `{"as_none": ...}`).
+fn is_none_arg(arg: &Argument) -> bool {
+    matches!(arg, Argument::Other(value) if value.is_null() || value.get("as_none").is_some())
 }
 
 /// Re-insert the reduced axes as size-1 extents (keepdim).
@@ -116,22 +121,45 @@ impl Translator<'_> {
         })
     }
 
+    /// `var.*` / `std.*`: the shared variance lowering, square-rooted for
+    /// `std` (torch takes the root in the accumulate type, before rounding).
+    pub(super) fn translate_var(&mut self, node: &Node, std: bool) -> Result<GraphTensor> {
+        let (_, axes, variance) = self.lower_variance(node)?;
+        let result = if std { variance.sqrt() } else { variance };
+        Ok(if self.keepdim_flag(node, 3) {
+            keep_reduced(result, &axes)
+        } else {
+            result
+        })
+    }
+
     /// `var_mean.default` / `var_mean.dim` / `var_mean.correction` -> (var, mean).
     pub(super) fn translate_var_mean(&mut self, node: &Node) -> Result<()> {
-        let input = self.operand(&node.inputs[0])?;
-        let axes = self.reduction_axes(node, 1, input.rank())?;
-        let correction = self.variance_correction(node);
-        let dtype = self.compute_dtype(node).unwrap_or(input.dtype);
-        let input = input.cast(dtype);
-        let variance = input.var_options(&axes, correction);
+        let (input, axes, variance) = self.lower_variance(node)?;
         let mean = input.mean(&axes);
-        let keepdim = self.keepdim_flag(node, 3);
-        let (variance, mean) = if keepdim {
+        let (variance, mean) = if self.keepdim_flag(node, 3) {
             (keep_reduced(variance, &axes), keep_reduced(mean, &axes))
         } else {
             (variance, mean)
         };
         self.bind_outputs(node, vec![variance, mean])
+    }
+
+    /// The ONE variance lowering behind `var.*`, `std.*` and `var_mean.*`
+    /// (`std_mean` has no arm and reaches `var_mean` through its
+    /// decomposition). Returns the operand at the compute dtype (opmath
+    /// widens half precision to F32, torch's accumulate type), the reduced
+    /// axes, and the variance over them. The correction stays real-valued
+    /// all the way into core `var_correction`, which owns the divisor rule
+    /// `max(0, N - correction)` and the NaN of an empty reduction.
+    fn lower_variance(&mut self, node: &Node) -> Result<(GraphTensor, Vec<usize>, GraphTensor)> {
+        let input = self.operand(&node.inputs[0])?;
+        let axes = self.reduction_axes(node, 1, input.rank())?;
+        let correction = self.variance_correction(node)?;
+        let dtype = self.compute_dtype(node).unwrap_or(input.dtype);
+        let input = input.cast(dtype);
+        let variance = input.var_correction(&axes, correction);
+        Ok((input, axes, variance))
     }
 
     /// `addmm` / `addbmm` / `addmv`:
@@ -222,7 +250,8 @@ impl Translator<'_> {
     }
 
     /// The reduced axes for a variance/reduction node. A missing or empty
-    /// dim list means "reduce every axis".
+    /// dim list means "reduce every axis". A rank-0 operand has no axis to
+    /// reduce; torch accepts dim 0 or -1 for it.
     fn reduction_axes(&self, node: &Node, index: usize, rank: usize) -> Result<Vec<usize>> {
         let dims = match node.inputs.get(index) {
             Some(input) if input.arg.as_ints().is_some() || input.arg.as_sym_ints().is_some() => {
@@ -230,19 +259,46 @@ impl Translator<'_> {
             }
             _ => Vec::new(),
         };
+        if rank == 0 {
+            anyhow::ensure!(
+                dims.iter().all(|&d| d == 0 || d == -1),
+                "{}: dims {dims:?} out of range for a rank-0 operand",
+                node.target
+            );
+            return Ok(Vec::new());
+        }
         Ok(if dims.is_empty() {
             (0..rank).collect()
         } else {
-            dims.iter().map(|&d| util::normalize_dim(d, rank)).collect()
+            normalize_axes(&dims, rank)?
         })
     }
 
-    /// `correction` (degrees-of-freedom offset) or the `unbiased` bool.
-    fn variance_correction(&self, node: &Node) -> usize {
-        if let Some(correction) = self.named_float_arg(node, "correction") {
-            return correction.max(0.0) as usize;
+    /// The degrees-of-freedom correction, kept real-valued: torch's
+    /// `Scalar? correction` may be any Python float or int (0.5 and -1 are
+    /// legal), so truncating it to an unsigned integer changes the answer.
+    /// A named `correction` wins; an absent or `None` one falls back to the
+    /// `unbiased` bool of the `.default`/`.dim` overloads (true is Bessel's
+    /// 1, false is 0), and then to torch's default of 1. A correction this
+    /// arm cannot read as a literal number is refused, never defaulted.
+    fn variance_correction(&self, node: &Node) -> Result<f64> {
+        if let Some(input) = node.inputs.iter().find(|input| input.name == "correction") {
+            if let Some(correction) = input.arg.as_float() {
+                return Ok(correction);
+            }
+            if let Some(correction) = input.arg.as_int() {
+                return Ok(correction as f64);
+            }
+            anyhow::ensure!(
+                is_none_arg(&input.arg),
+                "{}: correction {:?} is not a literal number",
+                node.target,
+                input.arg
+            );
         }
-        self.named_bool_arg(node, "unbiased").map_or(1, usize::from)
+        Ok(self
+            .named_bool_arg(node, "unbiased")
+            .map_or(1.0, |unbiased| if unbiased { 1.0 } else { 0.0 }))
     }
 
     fn keepdim_flag(&self, node: &Node, positional: usize) -> bool {
@@ -251,23 +307,43 @@ impl Translator<'_> {
             .unwrap_or(false)
     }
 
-    /// Scale `value` by the named scalar `name`, defaulting to 1.0.
+    /// Scale `value` by the addmm-family coefficient `name` (`beta` or
+    /// `alpha`); an absent coefficient is 1.
+    ///
+    /// Invariant: torch treats a coefficient equal to 0 as dropping its
+    /// term, not as a multiply. `beta == 0` ignores `input` and `alpha == 0`
+    /// ignores the product, so NaN/inf in the dropped term never reach the
+    /// result (`NaN * 0` would). A coefficient equal to 1 is no multiply.
+    /// Both tests are on the literal's value, so every spelling of 0 and 1
+    /// takes them: `False`/`True`, `0`/`1`, and `0.0`/`-0.0`/`1.0`. A
+    /// symbolic coefficient is refused, because whether it is 0 is only
+    /// known at run time.
     fn scale_by_named_scalar(
         &mut self,
         node: &Node,
         name: &str,
         value: GraphTensor,
     ) -> Result<GraphTensor> {
-        let Some(scalar) = self.named_float_arg(node, name) else {
+        let Some(scalar) = node.inputs.iter().find(|input| input.name == name) else {
             return Ok(value);
         };
-        if scalar == 1.0 {
+        let Some(literal) = util::ScalarLiteral::of(&scalar.arg) else {
+            anyhow::bail!(
+                "{} coefficient {name:?} is not a literal real scalar (arg: {:?})",
+                node.target,
+                scalar.arg
+            );
+        };
+        if literal.is_one() {
             return Ok(value);
         }
-        if scalar == 0.0 {
+        if literal.is_zero() {
             return Ok(self.constant_like(value, 0.0));
         }
-        Ok(value * self.constant_like(value, scalar))
+        // Preserve integer literals before any conversion to the compute dtype.
+        // Going through f64 would discard low bits above 2^53.
+        let factor = self.scalar(scalar, value.dtype)?.expand_rhs(value.dims());
+        Ok(value * factor)
     }
 }
 
@@ -353,6 +429,8 @@ mod tests {
                 TensorMeta {
                     dtype: *dtype,
                     sizes: sizes(shape),
+                    strides: None,
+                    storage_offset: None,
                     layout: None,
                     device: None,
                 },
@@ -649,5 +727,360 @@ mod tests {
             &["x"],
             &["y"],
         ));
+    }
+}
+
+#[cfg(test)]
+mod scalar_precision_tests {
+    use crate::translate::{Translator, test_support::*};
+    use luminal::prelude::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn addmm_scaling_preserves_large_integer_literal_bits() {
+        let parsed = parsed_nodes(Vec::new(), &[], &[], &[]);
+        let mut translator = Translator {
+            cx: Graph::new(),
+            values: HashMap::new(),
+            input_values: HashMap::new(),
+            symbols: HashMap::new(),
+            ranges: HashMap::new(),
+            complex_tensors: HashMap::new(),
+            parsed: &parsed,
+            dims: HashMap::new(),
+            opmath: None,
+            storage_values: HashMap::new(),
+            storage_geometries: HashMap::new(),
+            widened: HashMap::new(),
+        };
+        let x = translator.cx.tensor(vec![1], DType::I64);
+        let alpha = (1i64 << 54) + 3;
+        let beta = (1i64 << 54) + 1;
+        let node = node(
+            "torch.ops.aten.addmm.default",
+            vec![scalar_int("alpha", alpha), scalar_int("beta", beta)],
+            &[],
+        );
+        let a = translator.scale_by_named_scalar(&node, "alpha", x).unwrap();
+        let b = translator.scale_by_named_scalar(&node, "beta", x).unwrap();
+        let rt = luminal_reference::harness::run_reference_with_ranges(
+            &translator.cx,
+            &[(
+                x.id,
+                luminal_reference::typed_buffer::TypedBuffer::I64(vec![1]),
+            )],
+            &[(x.id, 1, 1)],
+        );
+        assert_eq!(rt.get_i64(a.id).unwrap(), &[alpha]);
+        assert_eq!(rt.get_i64(b.id).unwrap(), &[beta]);
+    }
+}
+
+#[cfg(test)]
+mod variance_tests {
+    use crate::pt2_schema::{Argument, NodeInput, ScalarName, SymFloatArg};
+    use crate::translate::test_support::*;
+
+    const ROWS: [[f32; 4]; 3] = [
+        [1.0, 2.0, 4.0, 8.0],
+        [0.5, -1.0, 3.0, 2.5],
+        [2.0, 2.0, 2.0, 5.0],
+    ];
+
+    /// Independent two-pass variance in f64 with torch's divisor rule.
+    fn torch_variance(values: &[f32], correction: f64) -> f64 {
+        let n = values.len() as f64;
+        let mean = values.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let squares: f64 = values.iter().map(|&v| (v as f64 - mean).powi(2)).sum();
+        let degrees = if n > correction && n > 0.0 {
+            n - correction
+        } else {
+            0.0
+        };
+        squares / degrees
+    }
+
+    fn per_row(correction: f64) -> Vec<f64> {
+        ROWS.iter()
+            .map(|row| torch_variance(row, correction))
+            .collect()
+    }
+
+    fn everything(correction: f64) -> Vec<f64> {
+        let flat: Vec<f32> = ROWS.iter().flatten().copied().collect();
+        vec![torch_variance(&flat, correction)]
+    }
+
+    /// Translate one variance node over the 3x4 `x` and run it on the
+    /// reference runtime, returning every output.
+    fn run(target: &str, args: Vec<NodeInput>, outputs: &[(&str, &[i64])]) -> Vec<Vec<f32>> {
+        let mut inputs = vec![tensor_input("self", "x")];
+        inputs.extend(args);
+        let names: Vec<&str> = outputs.iter().map(|(name, _)| *name).collect();
+        let mut tensors: Vec<(&str, u32, &[i64])> = vec![("x", FLOAT, &[3, 4])];
+        tensors.extend(outputs.iter().map(|(name, shape)| (*name, FLOAT, *shape)));
+        let t = translate_one(
+            node(&format!("torch.ops.aten.{target}"), inputs, &names),
+            &tensors,
+            &["x"],
+            &names,
+        );
+        let flat: Vec<f32> = ROWS.iter().flatten().copied().collect();
+        let rt = luminal_reference::harness::run_reference(
+            &t.graph,
+            &[(t.inputs[0].tensor, flat.into())],
+        );
+        t.outputs
+            .iter()
+            .map(|output| rt.get_f32(output.tensor).unwrap().to_vec())
+            .collect()
+    }
+
+    fn assert_matches(got: &[f32], expected: &[f64], what: &str) {
+        assert_eq!(got.len(), expected.len(), "{what}: length");
+        for (index, (&got, &expected)) in got.iter().zip(expected).enumerate() {
+            let expected = expected as f32;
+            let same = (got.is_nan() && expected.is_nan())
+                || got == expected
+                || (got - expected).abs() <= 1e-5 * expected.abs().max(1.0);
+            assert!(same, "{what}[{index}]: got {got}, expected {expected}");
+        }
+    }
+
+    /// Every variance arm reads torch's correction as a real number: the
+    /// `unbiased` bool of `.default`/`.dim`, a float or int `correction`
+    /// (fractional, negative, past N), and the default of 1 for `None`.
+    #[test]
+    fn variance_arms_read_the_real_valued_correction() {
+        let out = run(
+            "var.default",
+            vec![scalar_bool("unbiased", false)],
+            &[("y", &[])],
+        );
+        assert_matches(&out[0], &everything(0.0), "var.default unbiased=False");
+
+        let out = run(
+            "var.dim",
+            vec![
+                ints("dim", &[1]),
+                scalar_bool("unbiased", false),
+                scalar_bool("keepdim", true),
+            ],
+            &[("y", &[3, 1])],
+        );
+        assert_matches(&out[0], &per_row(0.0), "var.dim unbiased=False");
+
+        let out = run(
+            "var.correction",
+            vec![ints("dim", &[1]), scalar_float("correction", 0.5)],
+            &[("y", &[3])],
+        );
+        assert_matches(&out[0], &per_row(0.5), "var.correction 0.5");
+
+        let out = run(
+            "std.correction",
+            vec![ints("dim", &[-1]), scalar_int("correction", 5)],
+            &[("y", &[3])],
+        );
+        let std: Vec<f64> = per_row(5.0).iter().map(|v| v.sqrt()).collect();
+        assert!(std.iter().all(|v| *v == f64::INFINITY));
+        assert_matches(&out[0], &std, "std.correction 5 > N");
+
+        let out = run(
+            "var_mean.correction",
+            vec![
+                ints("dim", &[1]),
+                scalar_int("correction", -1),
+                scalar_bool("keepdim", true),
+            ],
+            &[("var", &[3, 1]), ("mean", &[3, 1])],
+        );
+        assert_matches(&out[0], &per_row(-1.0), "var_mean.correction -1 variance");
+        let means: Vec<f64> = ROWS
+            .iter()
+            .map(|row| row.iter().map(|&v| v as f64).sum::<f64>() / 4.0)
+            .collect();
+        assert_matches(&out[1], &means, "var_mean.correction -1 mean");
+
+        let out = run(
+            "var.correction",
+            vec![none("dim"), none("correction")],
+            &[("y", &[])],
+        );
+        assert_matches(&out[0], &everything(1.0), "var.correction None");
+    }
+
+    /// A correction that is not a literal number is refused by name rather
+    /// than silently replaced by the default.
+    #[test]
+    fn variance_refuses_a_non_literal_correction() {
+        let parsed = parsed_nodes(
+            vec![node(
+                "torch.ops.aten.var.correction",
+                vec![
+                    tensor_input("self", "x"),
+                    ints("dim", &[1]),
+                    input(
+                        "correction",
+                        Argument::SymFloat(SymFloatArg {
+                            as_sym_float: ScalarName {
+                                as_name: "c".to_string(),
+                            },
+                        }),
+                    ),
+                ],
+                &["y"],
+            )],
+            &[("x", FLOAT, &[3, 4]), ("y", FLOAT, &[3])],
+            &["x"],
+            &["y"],
+        );
+        let error = crate::translate::translate(&parsed)
+            .err()
+            .expect("a symbolic correction must be refused");
+        assert!(
+            format!("{error:#}").contains("is not a literal number"),
+            "{error:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bool_coefficient_tests {
+    use crate::pt2_schema::NodeInput;
+    use crate::translate::test_support::*;
+    use luminal_reference::harness::run_reference;
+
+    const NAN: f32 = f32::NAN;
+    const INF: f32 = f32::INFINITY;
+
+    /// One addmm-family target over f32 operands, named as in its ATen
+    /// schema, with finite data and a poisoned (NaN/inf) replacement for
+    /// the `input` and for the left matrix operand.
+    struct Case {
+        target: &'static str,
+        names: [&'static str; 3],
+        shapes: [&'static [i64]; 3],
+        output: &'static [i64],
+        data: [Vec<f32>; 3],
+        poisoned_input: Vec<f32>,
+        poisoned_lhs: Vec<f32>,
+        /// The variant's product of `data[1]` and `data[2]`.
+        product: Vec<f32>,
+    }
+
+    impl Case {
+        /// Translate and execute the node with `operands` and `coefficients`.
+        fn run(&self, operands: [Vec<f32>; 3], coefficients: Vec<NodeInput>) -> Vec<f32> {
+            let mut args: Vec<NodeInput> = self
+                .names
+                .iter()
+                .map(|name| tensor_input(name, name))
+                .collect();
+            args.extend(coefficients);
+            let mut tensors: Vec<(&str, u32, &[i64])> = self
+                .names
+                .iter()
+                .zip(self.shapes)
+                .map(|(name, shape)| (*name, FLOAT, shape))
+                .collect();
+            tensors.push(("out", FLOAT, self.output));
+            let t = translate_one(
+                node(self.target, args, &["out"]),
+                &tensors,
+                &self.names,
+                &["out"],
+            );
+            let inputs = t
+                .inputs
+                .iter()
+                .zip(operands)
+                .map(|(input, data)| (input.tensor, data.into()))
+                .collect::<Vec<_>>();
+            let rt = run_reference(&t.graph, &inputs);
+            rt.get_f32(t.outputs[0].tensor).unwrap().clone()
+        }
+    }
+
+    fn cases() -> [Case; 3] {
+        [
+            Case {
+                target: "torch.ops.aten.addmm.default",
+                names: ["self", "mat1", "mat2"],
+                shapes: [&[2, 2], &[2, 2], &[2, 2]],
+                output: &[2, 2],
+                // An identity mat1: the product is mat2.
+                data: [
+                    vec![1., 2., 3., 4.],
+                    vec![1., 0., 0., 1.],
+                    vec![5., 6., 7., 8.],
+                ],
+                poisoned_input: vec![NAN, INF, -INF, NAN],
+                poisoned_lhs: vec![INF, NAN, -INF, INF],
+                product: vec![5., 6., 7., 8.],
+            },
+            Case {
+                target: "torch.ops.aten.addmv.default",
+                names: ["self", "mat", "vec"],
+                shapes: [&[2], &[2, 2], &[2]],
+                output: &[2],
+                data: [vec![1., 2.], vec![1., 0., 0., 1.], vec![5., 6.]],
+                poisoned_input: vec![NAN, INF],
+                poisoned_lhs: vec![INF, NAN, -INF, INF],
+                product: vec![5., 6.],
+            },
+            Case {
+                target: "torch.ops.aten.addbmm.default",
+                names: ["self", "batch1", "batch2"],
+                shapes: [&[2, 2], &[2, 2, 2], &[2, 2, 2]],
+                output: &[2, 2],
+                // Two identity batches: the product sums batch2's matrices.
+                data: [
+                    vec![1., 2., 3., 4.],
+                    vec![1., 0., 0., 1., 1., 0., 0., 1.],
+                    vec![5., 6., 7., 8., 1., 1., 1., 1.],
+                ],
+                poisoned_input: vec![NAN, INF, -INF, NAN],
+                poisoned_lhs: vec![INF, NAN, -INF, INF, 1., 0., 0., 1.],
+                product: vec![6., 7., 8., 9.],
+            },
+        ]
+    }
+
+    /// A Python-bool `beta`/`alpha` is the literal 0 or 1. `False` drops its
+    /// term, so NaN/inf there never reach the result (`NaN * 0` would), and
+    /// `True` keeps the term unscaled.
+    #[test]
+    fn bool_coefficients_drop_or_keep_their_term() {
+        for case in cases() {
+            let target = case.target;
+            let [input, lhs, rhs] = case.data.clone();
+            for coefficients in [
+                vec![scalar_bool("beta", false)],
+                vec![scalar_bool("beta", false), scalar_bool("alpha", true)],
+            ] {
+                let operands = [case.poisoned_input.clone(), lhs.clone(), rhs.clone()];
+                let got = case.run(operands, coefficients);
+                assert_eq!(got, case.product, "{target}: beta=False drops the input");
+            }
+            for coefficients in [
+                vec![scalar_bool("alpha", false)],
+                vec![scalar_bool("beta", true), scalar_bool("alpha", false)],
+            ] {
+                let operands = [input.clone(), case.poisoned_lhs.clone(), rhs.clone()];
+                let got = case.run(operands, coefficients);
+                assert_eq!(got, input, "{target}: alpha=False drops the product");
+            }
+            let sum: Vec<f32> = input
+                .iter()
+                .zip(&case.product)
+                .map(|(x, y)| x + y)
+                .collect();
+            let got = case.run(
+                [input, lhs, rhs],
+                vec![scalar_bool("beta", true), scalar_bool("alpha", true)],
+            );
+            assert_eq!(got, sum, "{target}: True coefficients are 1");
+        }
     }
 }

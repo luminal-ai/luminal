@@ -6,6 +6,7 @@
     (= ?out_shape (shape-of ?out_logical))
     (= ?out_logical (LogicalIndexMapApply ?in_logical ?index_map ?out_shape))
     (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
   )
   (
     (let ?layout_tensor_op

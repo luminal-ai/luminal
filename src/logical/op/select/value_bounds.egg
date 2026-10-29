@@ -19,39 +19,33 @@
   :ruleset main_ruleset :name "select/value_bounds: upper bound is the max over the two branches"
 )
 
-; Structural refinement: the masked max/min idioms carry tighter bounds than
-; the generic union above. `select(a < b, b, a)` IS `maximum(a, b)`, which is
-; at least each operand; `select(b < a, b, a)` IS `minimum(a, b)`, at most
-; each operand. The two patterns are distinct (comparisons are not
-; commutative), so only one fires. Bounds merge monotonically, so these
-; tighten rather than replace the union.
-(rule
-  (
-    (= ?cond (LogicalLessThan ?a ?b))
-    (= ?out (LogicalSelect ?cond ?b ?a))
-    (= ?a_lower (value-lower-bound-of ?a))
-    (= ?b_lower (value-lower-bound-of ?b))
-    (= ?a_upper (value-upper-bound-of ?a))
-    (= ?b_upper (value-upper-bound-of ?b))
-  )
-  (
-    (set (value-lower-bound-of ?out) (max ?a_lower ?b_lower))
-    (set (value-upper-bound-of ?out) (max ?a_upper ?b_upper))
-  )
-  :ruleset main_ruleset :name "select/value_bounds: tighter bounds for the maximum idiom select(a<b,b,a)"
-)
-(rule
-  (
-    (= ?cond (LogicalLessThan ?b ?a))
-    (= ?out (LogicalSelect ?cond ?b ?a))
-    (= ?a_lower (value-lower-bound-of ?a))
-    (= ?b_lower (value-lower-bound-of ?b))
-    (= ?a_upper (value-upper-bound-of ?a))
-    (= ?b_upper (value-upper-bound-of ?b))
-  )
-  (
-    (set (value-lower-bound-of ?out) (min ?a_lower ?b_lower))
-    (set (value-upper-bound-of ?out) (min ?a_upper ?b_upper))
-  )
-  :ruleset main_ruleset :name "select/value_bounds: tighter bounds for the minimum idiom select(b<a,b,a)"
-)
+; Structural max/min refinements need only the bounds relevant to the
+; conclusion. In particular, max(opaque,lo) >= lo and min(opaque,hi) <= hi
+; hold even when opaque has no known interval. This lets a nested clamp
+; establish a finite interval without declaring a range on caller data.
+(rule ((= ?out (LogicalSelect (LogicalLessThan ?a ?b) ?b ?a))
+       (= ?lower (value-lower-bound-of ?a)))
+      ((set (value-lower-bound-of ?out) ?lower))
+ :ruleset main_ruleset :name "select/value_bounds: maximum is at least its first operand")
+(rule ((= ?out (LogicalSelect (LogicalLessThan ?a ?b) ?b ?a))
+       (= ?lower (value-lower-bound-of ?b)))
+      ((set (value-lower-bound-of ?out) ?lower))
+ :ruleset main_ruleset :name "select/value_bounds: maximum is at least its second operand")
+(rule ((= ?out (LogicalSelect (LogicalLessThan ?a ?b) ?b ?a))
+       (= ?a_upper (value-upper-bound-of ?a))
+       (= ?b_upper (value-upper-bound-of ?b)))
+      ((set (value-upper-bound-of ?out) (max ?a_upper ?b_upper)))
+ :ruleset main_ruleset :name "select/value_bounds: maximum upper bound uses both upper bounds")
+(rule ((= ?out (LogicalSelect (LogicalLessThan ?b ?a) ?b ?a))
+       (= ?upper (value-upper-bound-of ?a)))
+      ((set (value-upper-bound-of ?out) ?upper))
+ :ruleset main_ruleset :name "select/value_bounds: minimum is at most its first operand")
+(rule ((= ?out (LogicalSelect (LogicalLessThan ?b ?a) ?b ?a))
+       (= ?upper (value-upper-bound-of ?b)))
+      ((set (value-upper-bound-of ?out) ?upper))
+ :ruleset main_ruleset :name "select/value_bounds: minimum is at most its second operand")
+(rule ((= ?out (LogicalSelect (LogicalLessThan ?b ?a) ?b ?a))
+       (= ?a_lower (value-lower-bound-of ?a))
+       (= ?b_lower (value-lower-bound-of ?b)))
+      ((set (value-lower-bound-of ?out) (min ?a_lower ?b_lower)))
+ :ruleset main_ruleset :name "select/value_bounds: minimum lower bound uses both lower bounds")

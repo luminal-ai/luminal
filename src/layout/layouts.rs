@@ -1712,6 +1712,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn strided_span_of_an_empty_domain_is_zero() {
+        let empty = StridedElementLayout {
+            shape: ShapeTerm(vec![lit(1), lit(0), lit(3), lit(23)]),
+            chain: vec![
+                lit(0),
+                mul(coord(2), lit(96)),
+                mul(coord(1), lit(32)),
+                coord(0),
+            ],
+            width: BitWidthTerm(1),
+        };
+        assert_eq!(empty.span().eval_literal(), Some(0));
+        let full = StridedElementLayout {
+            shape: ShapeTerm(vec![lit(1), lit(2), lit(3), lit(23)]),
+            ..empty
+        };
+        // Largest offset (1*96 + 2*32 + 22) + 1.
+        assert_eq!(full.span().eval_literal(), Some(183));
+
+        // A symbolic extent that is 0 at run time sizes to 0 as well, and
+        // the capacity over a domain that includes 0 stays non-negative.
+        let n = || IntExprTerm::Var("n".to_string());
+        let padded = StridedElementLayout {
+            shape: ShapeTerm(vec![n(), lit(128)]),
+            chain: vec![coord(0), mul(coord(1), lit(160))],
+            width: w32(),
+        };
+        for (rows, reach) in [(0usize, 0i64), (1, 128), (3, 2 * 160 + 128)] {
+            let dims: DynMap = [('n'.into(), rows)].into_iter().collect();
+            assert_eq!(padded.span().eval_dims(&dims).unwrap(), reach);
+        }
+        let bounds: DimBounds = [('n'.into(), (0i64, 3i64))].into_iter().collect();
+        assert_eq!(padded.span().capacity_elements(&bounds).unwrap(), 448);
+    }
+
     /// A hand-built layout compares structurally on its SPELLING SET —
     /// assertion convenience for runtime tests (the bufferizer's bound
     /// is `Clone + Debug` only; no planner check compares layouts).

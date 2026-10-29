@@ -329,6 +329,8 @@ mod tests {
                 TensorMeta {
                     dtype: FLOAT,
                     sizes: vec![symbolic.clone(), DimSize::Int(DimInt { as_int: 4 })],
+                    strides: None,
+                    storage_offset: None,
                     layout: None,
                     device: None,
                 },

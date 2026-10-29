@@ -1,0 +1,1 @@
+(constructor LogicalNot (LogicalTensor) LogicalTensor)

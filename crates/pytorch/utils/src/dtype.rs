@@ -160,6 +160,7 @@ impl TryFrom<TorchDType> for DType {
             TorchDType::Short => DType::I16,
             TorchDType::Int => DType::Int,
             TorchDType::Long => DType::I64,
+            TorchDType::Uint64 => DType::U64,
             TorchDType::Half => DType::F16,
             TorchDType::Float => DType::F32,
             TorchDType::Double => DType::F64,
@@ -171,7 +172,6 @@ impl TryFrom<TorchDType> for DType {
             TorchDType::Float8E5m2Fnuz => DType::F8E5M2FNUZ,
             TorchDType::Uint16
             | TorchDType::Uint32
-            | TorchDType::Uint64
             | TorchDType::Float8E8m0Fnu
             | TorchDType::Unknown
             | TorchDType::ComplexHalf
@@ -201,6 +201,7 @@ impl TryFrom<DType> for TorchDType {
             DType::Bf16 => TorchDType::BFloat16,
             DType::Int => TorchDType::Int,
             DType::I64 => TorchDType::Long,
+            DType::U64 => TorchDType::Uint64,
             DType::I8 => TorchDType::Char,
             DType::U8 => TorchDType::Byte,
             DType::I16 => TorchDType::Short,
@@ -237,6 +238,7 @@ mod tests {
             DType::Bf16,
             DType::Int,
             DType::I64,
+            DType::U64,
             DType::I8,
             DType::U8,
             DType::I16,
