@@ -2810,6 +2810,92 @@ mod tests {
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![1000i32]);
     }
 
+    /// STORAGE BOUNDS: a value read from storage lies in its dtype's range,
+    /// so an unattested Int / Int64 input is bounded by its dtype and an
+    /// add of zero proves in width. Two full-range inputs still do not
+    /// (`int_add_proof_gating`): only stored values are seeded, never
+    /// arithmetic results.
+    #[test]
+    fn int_inputs_carry_their_dtype_range() {
+        for dtype in [DType::Int, DType::I64] {
+            let mut cx = luminal::graph::Graph::new();
+            let a = cx.tensor(vec![3], dtype);
+            let zero = cx.constant_i32(0).cast(dtype).expand_rhs(a.dims());
+            let out = a + zero;
+            let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+            let mut data = FxHashMap::default();
+            let staged: TypedBuffer = match dtype {
+                DType::Int => vec![i32::MIN, -7, i32::MAX].into(),
+                _ => vec![i64::MIN, -7, i64::MAX].into(),
+            };
+            data.insert(a.id, staged.clone());
+            rt.search(
+                &Default::default(),
+                &Default::default(),
+                &data,
+                &crate::search::harness_search_options(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("{dtype:?} input + 0 proves from storage bounds: {err:#}")
+            });
+            rt.set_data(a.id, staged);
+            rt.execute().expect("bounded add executes");
+            match dtype {
+                DType::Int => {
+                    assert_eq!(rt.get_i32(out.id).unwrap(), &vec![i32::MIN, -7, i32::MAX])
+                }
+                _ => assert_eq!(rt.get_i64(out.id).unwrap(), &vec![i64::MIN, -7, i64::MAX]),
+            }
+        }
+    }
+
+    /// A widening cast from narrow-integer storage carries the SOURCE
+    /// dtype's range (narrow ints wrap, so every stored value is in range):
+    /// negating a widened U8 is provably in Int64 width.
+    #[test]
+    fn widened_narrow_int_carries_its_source_range() {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![3], DType::U8);
+        let out = -a.cast(DType::I64);
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        let mut data = FxHashMap::default();
+        data.insert(a.id, TypedBuffer::U8(vec![0, 7, 255]));
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .unwrap_or_else(|err| panic!("negating a widened U8 proves: {err:#}"));
+        rt.set_data(a.id, TypedBuffer::U8(vec![0, 7, 255]));
+        rt.execute().expect("bounded negation executes");
+        assert_eq!(rt.get_i64(out.id).unwrap(), &vec![0, -7, -255]);
+    }
+
+    /// A truncating cast is checked, so its result lies in the target
+    /// dtype's range and can feed proof-gated arithmetic.
+    #[test]
+    fn truncating_cast_lies_in_its_target_range() {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![3], DType::F32);
+        let truncated = a.trunc_cast(DType::Int);
+        let zero = cx.constant_i32(0).expand_rhs(truncated.dims());
+        let out = truncated + zero;
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        let mut data = FxHashMap::default();
+        data.insert(a.id, vec![-2.5f32, 0.75, 41.9].into());
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .unwrap_or_else(|err| panic!("trunc_cast + 0 proves: {err:#}"));
+        rt.set_data(a.id, vec![-2.5f32, 0.75, 41.9]);
+        rt.execute().expect("bounded add executes");
+        assert_eq!(rt.get_i32(out.id).unwrap(), &vec![-2, 0, 41]);
+    }
+
     /// Int sum scans need NO attestation: the kernel checks every integer
     /// addition, so nothing is proof-gated.
     #[test]

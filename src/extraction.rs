@@ -397,10 +397,10 @@ impl<'a> ExtractionSession<'a> {
             }
             Some(if bounded.contains(&logical) {
                 format!(
-                    "{gated_op} on {dtype:?} has value bounds but they do not \
-                     discharge the proof obligations (width, or a divisor \
-                     range admitting zero) — tighten the attested input \
-                     ranges (non-wrapping ruling 2026-08-11)"
+                    "{gated_op} on {dtype:?} is UNPROVEN — its value bounds do \
+                     not discharge the proof obligations (width, or a divisor \
+                     range admitting zero); attest tighter input ranges with \
+                     bind_value_range (non-wrapping ruling 2026-08-11)"
                 )
             } else {
                 format!(

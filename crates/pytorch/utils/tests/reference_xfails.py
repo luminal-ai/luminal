@@ -112,14 +112,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "LayoutIR extraction dead-ends on int32/int64 and empty-input graphs (outputs with no plan)"
         ),
         tests=(
-            "test_cpu_staging.py::test_empty_cpu_input_preserves_shape_and_dtype[int32]",
-            "test_cpu_staging.py::test_empty_cpu_input_preserves_shape_and_dtype[int64]",
-            "test_dtype_boundary.py::test_boundary_noop_preserves_dtype_and_values[int32]",
-            "test_dtype_boundary.py::test_boundary_noop_preserves_dtype_and_values[int64_i32_range]",
-            "test_dtype_boundary.py::test_boundary_noop_preserves_dtype_and_values[int64_outside_i32_range]",
-            "test_dtype_boundary.py::test_matching_dtype_does_not_raise[int32]",
-            "test_dtype_boundary.py::test_matching_dtype_does_not_raise[int64_i32_range]",
-            "test_dtype_boundary.py::test_matching_dtype_does_not_raise[int64_outside_i32_range]",
             "test_hlir_ops.py::test_reduce_sum_all_axes_int64_preserves_dtype",
             "test_ops_batch5.py::test_upsample_bilinear",
             "test_remaining_existing_hlir_lowerings.py::test_antialiased_bilinear_resize_float_and_uint8",
