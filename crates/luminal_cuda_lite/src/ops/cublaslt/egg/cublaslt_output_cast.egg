@@ -1,0 +1,190 @@
+; Fold only a FINAL cast of the F32 computation, including its epilogue.
+; No arithmetic moves across a low-precision rounding boundary. In particular,
+; cast_f32(matmul_bf16(...)) is not an F32-compute site.
+;
+; cuBLASLt requires matching C/D types for these configurations. A residual
+; must therefore be an explicit widening of a C buffer in the final D type.
+; Likewise the enumerated bias type is D's type: peel only its lossless
+; widening, never reinterpret an F32 buffer as half storage.
+;
+; The final cast's canonical right-major output is presented to the existing
+; transpose-sandwich call as a left-major transpose view. Layout construction
+; does not set logical dtype facts; core derives those from the graph.
+
+(rule
+  (
+    (= ?op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b ?desc_d ?epilogue ?config))
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
+    (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
+    (= ?y_lt (LayoutTensorLit ?y ?inner_layout))
+    (= ?y (LogicalHelperMatrixTranspose ?y_outer))
+    (= ?ishape (shape-of ?y))
+    (= ?oshape (shape-of ?y_outer))
+    (= ?inner_layout (LeftMajorContiguousElementLayoutLit ?ishape (bits-of (F32))))
+    (= ?out (LogicalCast ?y_outer ?dt))
+    (!= ?dt (F32))
+    (= ?bits (bits-of ?dt))
+    (= ?next_config (CublasLtConfigLit ?adt ?bdt ?dt ?dt
+      (CublasLtCompute32F) (F32) ?dt))
+    (cublaslt-supported-config ?next_config)
+    (= ?outer_layout (RightMajorContiguousElementLayoutLit ?oshape ?bits))
+    (= ?outer_lt (LayoutTensorLit ?out ?outer_layout))
+    (= (injectivity-of ?outer_lt) (Injective))
+    (= ?desc_a (CublasLtOperandADescriptor ?site ?a_lt ?a_op))
+    (= ?desc_b (CublasLtOperandBDescriptor ?site ?b_lt ?b_op))
+  )
+  (
+    (let ?inner_out (LogicalHelperMatrixTranspose ?out))
+    (let ?next_layout (LeftMajorContiguousElementLayoutLit ?ishape ?bits))
+    (let ?out_lt (LayoutTensorLit ?inner_out ?next_layout))
+    (union ?out (LogicalHelperMatrixTranspose ?inner_out))
+    (let ?next_op (LayoutTensorOpLit
+      (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorNil)))
+      (LayoutTensorCons ?out_lt (LayoutTensorNil))))
+    (union ?next_op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b
+      (CublasLtOutputDDescriptor ?site ?out_lt) ?epilogue ?next_config))
+  )
+  :ruleset backend
+  :name "cuda_lite/cublaslt: final output cast on LayoutTensorOpCublasLt"
+)
+
+(rule
+  (
+    (= ?op (LayoutTensorOpCublasLtBias ?site ?desc_a ?desc_b ?desc_d ?bias_lt ?epilogue ?config))
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
+    (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
+    (= ?y_lt (LayoutTensorLit ?y ?inner_layout))
+    (= ?y (LogicalHelperMatrixTranspose ?y_outer))
+    (= ?ishape (shape-of ?y))
+    (= ?oshape (shape-of ?y_outer))
+    (= ?inner_layout (LeftMajorContiguousElementLayoutLit ?ishape (bits-of (F32))))
+    (= ?out (LogicalCast ?y_outer ?dt))
+    (!= ?dt (F32))
+    (= ?bits (bits-of ?dt))
+    (= ?next_config (CublasLtConfigLit ?adt ?bdt ?dt ?dt
+      (CublasLtCompute32F) (F32) ?dt))
+    (cublaslt-supported-config ?next_config)
+    (= ?outer_layout (RightMajorContiguousElementLayoutLit ?oshape ?bits))
+    (= ?outer_lt (LayoutTensorLit ?out ?outer_layout))
+    (= (injectivity-of ?outer_lt) (Injective))
+    (= ?desc_a (CublasLtOperandADescriptor ?site ?a_lt ?a_op))
+    (= ?desc_b (CublasLtOperandBDescriptor ?site ?b_lt ?b_op))
+    (= ?bias_lt (LayoutTensorLit (LogicalCast ?bias_low (F32)) ?bias_layout))
+    (= (dtype-of ?bias_low) ?dt)
+    (= ?bias_shape (shape-of ?bias_low))
+    (= ?bias_low_lt (LayoutTensorLit ?bias_low
+      (RightMajorContiguousElementLayoutLit ?bias_shape ?bits)))
+  )
+  (
+    (let ?inner_out (LogicalHelperMatrixTranspose ?out))
+    (let ?next_layout (LeftMajorContiguousElementLayoutLit ?ishape ?bits))
+    (let ?out_lt (LayoutTensorLit ?inner_out ?next_layout))
+    (union ?out (LogicalHelperMatrixTranspose ?inner_out))
+    (let ?next_op (LayoutTensorOpLit
+      (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorCons ?bias_low_lt (LayoutTensorNil))))
+      (LayoutTensorCons ?out_lt (LayoutTensorNil))))
+    (union ?next_op (LayoutTensorOpCublasLtBias ?site ?desc_a ?desc_b
+      (CublasLtOutputDDescriptor ?site ?out_lt) ?bias_low_lt ?epilogue ?next_config))
+  )
+  :ruleset backend
+  :name "cuda_lite/cublaslt: final output cast on LayoutTensorOpCublasLtBias"
+)
+
+(rule
+  (
+    (= ?op (LayoutTensorOpCublasLtAccumulate ?site ?desc_a ?desc_b ?desc_d ?c_lt ?epilogue ?config))
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
+    (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
+    (= ?y_lt (LayoutTensorLit ?y ?inner_layout))
+    (= ?y (LogicalHelperMatrixTranspose ?y_outer))
+    (= ?ishape (shape-of ?y))
+    (= ?oshape (shape-of ?y_outer))
+    (= ?inner_layout (LeftMajorContiguousElementLayoutLit ?ishape (bits-of (F32))))
+    (= ?out (LogicalCast ?y_outer ?dt))
+    (!= ?dt (F32))
+    (= ?bits (bits-of ?dt))
+    (= ?next_config (CublasLtConfigLit ?adt ?bdt ?dt ?dt
+      (CublasLtCompute32F) (F32) ?dt))
+    (cublaslt-supported-config ?next_config)
+    (= ?outer_layout (RightMajorContiguousElementLayoutLit ?oshape ?bits))
+    (= ?outer_lt (LayoutTensorLit ?out ?outer_layout))
+    (= (injectivity-of ?outer_lt) (Injective))
+    (= ?desc_a (CublasLtOperandADescriptor ?site ?a_lt ?a_op))
+    (= ?desc_b (CublasLtOperandBDescriptor ?site ?b_lt ?b_op))
+    (= ?c_lt (LayoutTensorLit ?c_wide ?inner_layout))
+    (= ?c_wide (LogicalHelperMatrixTranspose (LogicalCast ?c_low (F32))))
+    (= (dtype-of ?c_low) ?dt)
+    (= ?c_outer_lt (LayoutTensorLit ?c_low ?outer_layout))
+  )
+  (
+    (let ?inner_out (LogicalHelperMatrixTranspose ?out))
+    (let ?next_layout (LeftMajorContiguousElementLayoutLit ?ishape ?bits))
+    (let ?out_lt (LayoutTensorLit ?inner_out ?next_layout))
+    (union ?out (LogicalHelperMatrixTranspose ?inner_out))
+    (let ?c_low_lt (LayoutTensorLit
+      (LogicalHelperMatrixTranspose ?c_low) ?next_layout))
+    (let ?next_op (LayoutTensorOpLit
+      (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorCons ?c_low_lt (LayoutTensorNil))))
+      (LayoutTensorCons ?out_lt (LayoutTensorNil))))
+    (union ?next_op (LayoutTensorOpCublasLtAccumulate ?site ?desc_a ?desc_b
+      (CublasLtOutputDDescriptor ?site ?out_lt) ?c_low_lt ?epilogue ?next_config))
+  )
+  :ruleset backend
+  :name "cuda_lite/cublaslt: final output cast on LayoutTensorOpCublasLtAccumulate"
+)
+
+(rule
+  (
+    (= ?op (LayoutTensorOpCublasLtAccumulateBias ?site ?desc_a ?desc_b ?desc_d ?c_lt ?bias_lt ?epilogue ?config))
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
+    (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
+    (= ?y_lt (LayoutTensorLit ?y ?inner_layout))
+    (= ?y (LogicalHelperMatrixTranspose ?y_outer))
+    (= ?ishape (shape-of ?y))
+    (= ?oshape (shape-of ?y_outer))
+    (= ?inner_layout (LeftMajorContiguousElementLayoutLit ?ishape (bits-of (F32))))
+    (= ?out (LogicalCast ?y_outer ?dt))
+    (!= ?dt (F32))
+    (= ?bits (bits-of ?dt))
+    (= ?next_config (CublasLtConfigLit ?adt ?bdt ?dt ?dt
+      (CublasLtCompute32F) (F32) ?dt))
+    (cublaslt-supported-config ?next_config)
+    (= ?outer_layout (RightMajorContiguousElementLayoutLit ?oshape ?bits))
+    (= ?outer_lt (LayoutTensorLit ?out ?outer_layout))
+    (= (injectivity-of ?outer_lt) (Injective))
+    (= ?desc_a (CublasLtOperandADescriptor ?site ?a_lt ?a_op))
+    (= ?desc_b (CublasLtOperandBDescriptor ?site ?b_lt ?b_op))
+    (= ?c_lt (LayoutTensorLit ?c_wide ?inner_layout))
+    (= ?c_wide (LogicalHelperMatrixTranspose (LogicalCast ?c_low (F32))))
+    (= (dtype-of ?c_low) ?dt)
+    (= ?c_outer_lt (LayoutTensorLit ?c_low ?outer_layout))
+    (= ?bias_lt (LayoutTensorLit (LogicalCast ?bias_low (F32)) ?bias_layout))
+    (= (dtype-of ?bias_low) ?dt)
+    (= ?bias_shape (shape-of ?bias_low))
+    (= ?bias_low_lt (LayoutTensorLit ?bias_low
+      (RightMajorContiguousElementLayoutLit ?bias_shape ?bits)))
+  )
+  (
+    (let ?inner_out (LogicalHelperMatrixTranspose ?out))
+    (let ?next_layout (LeftMajorContiguousElementLayoutLit ?ishape ?bits))
+    (let ?out_lt (LayoutTensorLit ?inner_out ?next_layout))
+    (union ?out (LogicalHelperMatrixTranspose ?inner_out))
+    (let ?c_low_lt (LayoutTensorLit
+      (LogicalHelperMatrixTranspose ?c_low) ?next_layout))
+    (let ?next_op (LayoutTensorOpLit
+      (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorCons ?c_low_lt (LayoutTensorCons ?bias_low_lt (LayoutTensorNil)))))
+      (LayoutTensorCons ?out_lt (LayoutTensorNil))))
+    (union ?next_op (LayoutTensorOpCublasLtAccumulateBias ?site ?desc_a ?desc_b
+      (CublasLtOutputDDescriptor ?site ?out_lt) ?c_low_lt ?bias_low_lt ?epilogue ?next_config))
+  )
+  :ruleset backend
+  :name "cuda_lite/cublaslt: final output cast on LayoutTensorOpCublasLtAccumulateBias"
+)

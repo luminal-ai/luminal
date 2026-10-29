@@ -6,7 +6,18 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use super::LtComputeType;
 use super::exec::{CSource, LtCall, LtDesc, LtOrder};
+
+fn cuda_dtype(dtype: luminal::dtype::PlanDtype) -> Result<sys::cudaDataType_t> {
+    use luminal::dtype::PlanDtype;
+    Ok(match dtype {
+        PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+        PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
+        PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
+        dtype => return Err(anyhow!("cuBLASLt unsupported storage dtype {dtype:?}")),
+    })
+}
 
 /// Workspace owned by US (contract: no silent fallback algos). 32 MiB —
 /// cuBLASLt's own recommendation ceiling for pre-Hopper devices is
@@ -114,11 +125,7 @@ struct Layout {
 
 impl Layout {
     fn new(desc: &LtDesc, dtype: luminal::dtype::PlanDtype) -> Result<Self> {
-        let dtype = match dtype {
-            luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
-            luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
-            dtype => return Err(anyhow!("cuBLASLt unsupported matrix dtype {dtype:?}")),
-        };
+        let dtype = cuda_dtype(dtype)?;
         let raw = lt::create_matrix_layout(
             dtype,
             u64::try_from(desc.rows).map_err(|_| anyhow!("negative rows"))?,
@@ -187,19 +194,20 @@ pub fn prepare(
     // rejects BIAS/RELU_BIAS on a ROW-order D).
     super::exec::assert_bias_destination_order(call, "dispatch")?;
     // Pre-dispatch bounds gate (contract 4) — LOUD, before any library
-    // call, byte counts converted to f32 element counts.
+    // call, byte counts converted using each operand's storage type.
     let mut elems = Vec::with_capacity(operands.len());
     for (index, range) in operands.iter().enumerate() {
         let dtype = match index {
-            0 => call.a_dtype,
-            1 => call.b_dtype,
-            _ => call.d_dtype,
+            0 => call.config.a_dtype,
+            1 => call.config.b_dtype,
+            i if Some(i) == call.bias_operand => call.config.bias_dtype,
+            _ => call.config.c_dtype,
         };
         elems.push(range.bytes / crate::host_buffer::dtype_bytes(dtype)?);
     }
     call.validate_against(
         &elems,
-        dest.bytes / crate::host_buffer::dtype_bytes(call.d_dtype)?,
+        dest.bytes / crate::host_buffer::dtype_bytes(call.config.d_dtype)?,
     )
     .context("cuBLASLt pre-dispatch bounds validation")?;
 
@@ -208,14 +216,20 @@ pub fn prepare(
         .lock()
         .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
 
-    // Matmul descriptor: strict F32 compute (contract 1/5), HOST
-    // pointer mode (contract 2), transposes, epilogue.
+    // The elected configuration determines arithmetic and scalar precision,
+    // independently of the A/B/C/D storage descriptors below.
+    let compute_type = match call.config.compute_type {
+        LtComputeType::F32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+    };
+    // The host scalar payloads below are f32. Additional scale types need
+    // their own payloads as well as an enumerated egglog configuration.
+    anyhow::ensure!(
+        call.config.scale_dtype == luminal::dtype::PlanDtype::F32,
+        "cuBLASLt host scalars require F32 scale type"
+    );
     let desc = Desc {
-        raw: lt::create_matmul_desc(
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cudaDataType_t::CUDA_R_32F,
-        )
-        .map_err(|e| anyhow!("cublasLtMatmulDescCreate: {e:?}"))?,
+        raw: lt::create_matmul_desc(compute_type, cuda_dtype(call.config.scale_dtype)?)
+            .map_err(|e| anyhow!("cublasLtMatmulDescCreate: {e:?}"))?,
     };
     let set_desc = |attr: sys::cublasLtMatmulDescAttributes_t,
                     buf: *const std::ffi::c_void,
@@ -257,6 +271,12 @@ pub fn prepare(
         std::mem::size_of::<sys::cublasLtEpilogue_t>(),
     )?;
     if let Some(bias_idx) = call.bias_operand {
+        let bias_dtype = cuda_dtype(call.config.bias_dtype)?;
+        set_desc(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+            (&bias_dtype) as *const _ as *const _,
+            std::mem::size_of::<sys::cudaDataType_t>(),
+        )?;
         let bias_ptr = operands
             .get(bias_idx)
             .ok_or_else(|| anyhow!("bias operand {bias_idx} missing"))?
@@ -270,10 +290,10 @@ pub fn prepare(
 
     // Layouts: A, B, and a VALID Cdesc on EVERY call (contract 3 — a
     // NULL Cdesc segfaults), plus D.
-    let a_layout = Layout::new(&call.a, call.a_dtype)?;
-    let b_layout = Layout::new(&call.b, call.b_dtype)?;
-    let c_layout = Layout::new(&call.c, call.d_dtype)?;
-    let d_layout = Layout::new(&call.d, call.d_dtype)?;
+    let a_layout = Layout::new(&call.a, call.config.a_dtype)?;
+    let b_layout = Layout::new(&call.b, call.config.b_dtype)?;
+    let c_layout = Layout::new(&call.c, call.config.c_dtype)?;
+    let d_layout = Layout::new(&call.d, call.config.d_dtype)?;
 
     let pref =
         lt::create_matmul_pref().map_err(|e| anyhow!("cublasLtMatmulPreferenceCreate: {e:?}"))?;

@@ -60,6 +60,39 @@ fn single_pinned(text: &str) -> (CublasLt, Vec<String>) {
     ops.remove(0)
 }
 
+#[test]
+fn low_precision_storage_extracts_one_call_with_f32_epilogue_and_final_cast() {
+    use luminal::dtype::PlanDtype;
+    use test_runtime::cublaslt_marker::{CublasLtForm, LtComputeType};
+
+    for (dtype, storage) in [(DType::F16, PlanDtype::F16), (DType::Bf16, PlanDtype::Bf16)] {
+        let mut cx = Graph::new();
+        let a = cx.tensor(vec![4usize, 8], dtype).cast(DType::F32);
+        let b = cx
+            .tensor(vec![3usize, 8], dtype)
+            .cast(DType::F32)
+            .permute(vec![1, 0]);
+        let c = cx.tensor(vec![4usize, 3], dtype).cast(DType::F32);
+        let bias = cx
+            .tensor(vec![3usize], dtype)
+            .cast(DType::F32)
+            .expand_dim(0, 4usize);
+        let _out = ((a.matmul(b) + c) + bias).relu().cast(dtype);
+        let (op, inputs) = single_pinned(&test_runtime::bind_leaves(&cx));
+        let spec = op.spec.unwrap();
+        assert_eq!(spec.form, CublasLtForm::AccumulateBias);
+        assert_eq!(spec.epilogue, CuEpilogue::ReluBias);
+        assert_eq!(spec.config.a_dtype, storage);
+        assert_eq!(spec.config.b_dtype, storage);
+        assert_eq!(spec.config.c_dtype, storage);
+        assert_eq!(spec.config.d_dtype, storage);
+        assert_eq!(spec.config.bias_dtype, storage);
+        assert_eq!(spec.config.compute_type, LtComputeType::F32);
+        assert_eq!(spec.config.scale_dtype, PlanDtype::F32);
+        assert_eq!(inputs.len(), 4);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixture 1 — plain 2D canonical form A[m,k],B[k,n]: x[2,4] @ w[4,3], live recorder.
 // ---------------------------------------------------------------------------

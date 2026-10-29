@@ -1149,7 +1149,7 @@ fn rc1_four_way_reading_product_coherent() {
 (let xb (CublasLtOperandBDescriptor xsite x_lt0
   (CublasLtOperationN)))
 (let xd (CublasLtOutputDDescriptor xsite out_lt0))
-(let xop (LayoutTensorOpCublasLt xsite xa xb xd (CublasLtEpilogueDefault)))
+(let xop (LayoutTensorOpCublasLt xsite xa xb xd (CublasLtEpilogueDefault) (CublasLtConfigLit (F32) (F32) (F32) (F32) (CublasLtCompute32F) (F32) (F32))))
 (union xop (LayoutTensorOpLit
   (LayoutTensorCons x_lt1 (LayoutTensorCons w_lt0 (LayoutTensorNil)))
   (LayoutTensorCons out_lt0 (LayoutTensorNil))))
@@ -2152,7 +2152,7 @@ fn rs3_symbolic_ld_refuses_even_with_parseable_classmate() {
   (CublasLtOperationN)))
 (let real_desc_d (CublasLtOutputDDescriptor bogus_site out_lt0))
 (let bogus_op (LayoutTensorOpCublasLt bogus_site bogus_desc_a real_desc_b real_desc_d
-  (CublasLtEpilogueDefault)))
+  (CublasLtEpilogueDefault) (CublasLtConfigLit (F32) (F32) (F32) (F32) (CublasLtCompute32F) (F32) (F32))))
 (union bogus_op (LayoutTensorOpLit
   (LayoutTensorCons w_lt0 (LayoutTensorCons x_lt0 (LayoutTensorNil)))
   (LayoutTensorCons out_lt0 (LayoutTensorNil))))

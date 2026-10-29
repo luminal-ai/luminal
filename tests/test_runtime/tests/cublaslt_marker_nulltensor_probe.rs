@@ -91,7 +91,7 @@ fn nulltensor_probe_extraction_side() {
   (CublasLtOperationN)))
 (let probe_desc_d (CublasLtOutputDDescriptor probe_site {stem}_layout_tensor))
 (let probe_op (LayoutTensorOpCublasLt probe_site probe_desc_a probe_desc_b probe_desc_d
-  (CublasLtEpilogueDefault)))
+  (CublasLtEpilogueDefault) (CublasLtConfigLit (F32) (F32) (F32) (F32) (CublasLtCompute32F) (F32) (F32))))
 (let probe_lit (LayoutTensorOpLit
   (LayoutTensorCons nat0_layout_tensor
     (LayoutTensorCons nat1_layout_tensor

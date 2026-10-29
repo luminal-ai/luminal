@@ -9,8 +9,11 @@
 //! unit-testable without a device; the cudarc dispatch lives in
 //! `device_call` (feature-gated) and consumes an `LtCall` verbatim.
 //!
-//! THE A100 EXECUTOR CONTRACTS (verified findings; load-bearing):
-//! 1. F32-only end to end (inputs, outputs, CUBLAS_COMPUTE_32F).
+//! HOST-CALL CONTRACTS (type tuples from the cuBLASLt API; the layout and
+//! bounds findings below were originally verified on A100):
+//! 1. The enumerated configuration supplies A/B/C/D and bias storage types,
+//!    compute precision and scale type. The current five tuples all use
+//!    CUBLAS_COMPUTE_32F and F32 scalars; F16/BF16 D is a final output cast.
 //! 2. POINTER_MODE_HOST with LITERAL scalars: alpha = 1.0f always
 //!    (the marker has no alpha channel); beta is STRUCTURAL — 1.0f on
 //!    the C-fold (Accumulate) forms, 0.0f otherwise. There is no
@@ -210,9 +213,7 @@ pub struct LtCall {
     pub k: i64,
     pub trans_a: bool,
     pub trans_b: bool,
-    pub a_dtype: luminal::dtype::PlanDtype,
-    pub b_dtype: luminal::dtype::PlanDtype,
-    pub d_dtype: luminal::dtype::PlanDtype,
+    pub config: super::LtConfig,
     pub a: LtDesc,
     pub b: LtDesc,
     /// ALWAYS present (contract 3): on the no-C forms this mirrors `d`.
@@ -290,7 +291,7 @@ pub fn validate_ld_bounds(who: &str, desc: &LtDesc, elems: usize) -> Result<()> 
 /// only ONE of them is disposable:
 ///
 ///  1. E-GRAPH RE-CHECKS — re-verifying a fact a rule PREMISE already
-///     guarantees (the marker's F32 end-to-end scope, C's dims and fold
+///     guarantees (the marker's supported type tuple, C's dims and fold
 ///     status matching D's by rule guard). These are OUT: they restate
 ///     the e-graph's own postconditions in the executor's voice and
 ///     rot. Correction 4 of 2026-08-31 removed them; they stay removed.
@@ -554,9 +555,7 @@ pub fn plan_call_from_spec(spec: &LtMatmulSpec) -> Result<LtCall> {
         k,
         trans_a,
         trans_b,
-        a_dtype: spec.a_dtype,
-        b_dtype: spec.b_dtype,
-        d_dtype: spec.d_dtype,
+        config: spec.config,
         a,
         b,
         c,

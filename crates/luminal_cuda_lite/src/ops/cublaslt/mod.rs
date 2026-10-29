@@ -7,7 +7,7 @@
 //! stratum keep them — that is exactly the distinction). Three
 //! canonicalization rewrites fold every recorded matmul spelling into the
 //! canonical chain A[m,k], B[k,n] -> out[m,n] (non-canonically-stored
-//! operands become rank-2 transpose VIEWS); ONE site rule matches that
+//! operands become rank-2 transpose VIEWS); site rules match that
 //! form; ONE transpose-sandwich rewrite mints the sibling; the
 //! double-transpose collapse anchors termination. Layout variety is then
 //! matched entirely by the descriptor arms, per operand, off composed
@@ -16,6 +16,16 @@
 //! One matcher family over four fixed-arity op constructors (base / Bias /
 //! Accumulate / AccumulateBias), each with a Lit arity that is a CONSTANT
 //! of its name; one [`LtMatmulSpec`] endpoint for every path (R2).
+//!
+//! PRECISION: `egg/cublaslt_config.egg` enumerates the supported API tuples.
+//! A candidate carries its configuration as its final metadata child, after
+//! the epilogue. F16/BF16 storage is matched underneath explicit F32 input
+//! casts; the graph's multiply, reduction, residual and activation stay F32.
+//! `cublaslt_output_cast.egg` can match a final F16/BF16 store, including
+//! widened C/bias inputs in the required storage types. It never absorbs a
+//! cast between the product and its epilogue, nor treats a cast after a
+//! low-precision matmul as F32 computation. Logical dtype propagation is
+//! entirely owned by core. Rust reads the selected configuration verbatim.
 //!
 //! PARSER DISCIPLINE (the per-enode contract): spec data is read ONLY from
 //! the matched enode's own children — never from class-mates (a class can
@@ -87,6 +97,9 @@ pub mod election;
 /// CPU-side host-call planning + the executor-owned validation the
 /// library does not provide (ld bounds, descriptor construction).
 pub mod exec;
+
+pub mod config;
+pub use config::{LtComputeType, LtConfig};
 
 type ClassId = luminal::prelude::egraph_serialize::ClassId;
 
@@ -215,9 +228,7 @@ pub struct LtMatmulSpec {
     pub k: CuDim,
     pub trans_a: bool,
     pub trans_b: bool,
-    pub a_dtype: luminal::dtype::PlanDtype,
-    pub b_dtype: luminal::dtype::PlanDtype,
-    pub d_dtype: luminal::dtype::PlanDtype,
+    pub config: LtConfig,
     /// lds are CuDim like m/n/k (RULING 1): contiguous forms may carry a
     /// symbolic storage extent — the executor binds it at call time.
     pub lda: CuDim,
@@ -773,9 +784,7 @@ pub fn parse_spec(site: &ExtractionSite<'_>, form: CublasLtForm) -> Option<LtMat
         k,
         trans_a,
         trans_b,
-        a_dtype: site.logical_dtype(&logical_a)?,
-        b_dtype: site.logical_dtype(&logical_b)?,
-        d_dtype: site.logical_dtype(&logical_out)?,
+        config: LtConfig::parse(site, ep_slot + 1)?,
         lda,
         ldb,
         ldc: ldd.clone(), // C is guarded onto the D layout; ldc = ldd
@@ -979,6 +988,10 @@ impl OpMatcher for CublasLtMarkerMatcher {
         vec![
             EgglogSnippet {
                 category: SpliceCategory::LayoutOpConstructors,
+                text: include_str!("egg/cublaslt_config.egg"),
+            },
+            EgglogSnippet {
+                category: SpliceCategory::LayoutOpConstructors,
                 text: include_str!("egg/cublaslt_marker_constructors.egg"),
             },
             EgglogSnippet {
@@ -1015,6 +1028,10 @@ impl OpMatcher for CublasLtMarkerMatcher {
             },
             EgglogSnippet {
                 category: SpliceCategory::Match,
+                text: include_str!("egg/cublaslt_output_cast.egg"),
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Match,
                 text: include_str!("egg/cublaslt_marker_direct_input.egg"),
             },
         ]
@@ -1028,6 +1045,7 @@ impl OpMatcher for CublasLtMarkerMatcher {
                 ("cublaslt_b_descriptor", 2),
                 ("cublaslt_d_descriptor", 3),
                 ("cublaslt_epilogue", 4),
+                ("cublaslt_config", 5),
             ],
             CublasLtForm::Bias => &[
                 ("cublaslt_site", 0),
@@ -1036,6 +1054,7 @@ impl OpMatcher for CublasLtMarkerMatcher {
                 ("cublaslt_d_descriptor", 3),
                 ("cublaslt_bias_tensor", 4),
                 ("cublaslt_epilogue", 5),
+                ("cublaslt_config", 6),
             ],
             CublasLtForm::Accumulate => &[
                 ("cublaslt_site", 0),
@@ -1044,6 +1063,7 @@ impl OpMatcher for CublasLtMarkerMatcher {
                 ("cublaslt_d_descriptor", 3),
                 ("cublaslt_c_tensor", 4),
                 ("cublaslt_epilogue", 5),
+                ("cublaslt_config", 6),
             ],
             CublasLtForm::AccumulateBias => &[
                 ("cublaslt_site", 0),
@@ -1053,6 +1073,7 @@ impl OpMatcher for CublasLtMarkerMatcher {
                 ("cublaslt_c_tensor", 4),
                 ("cublaslt_bias_tensor", 5),
                 ("cublaslt_epilogue", 6),
+                ("cublaslt_config", 7),
             ],
         }
     }

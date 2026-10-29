@@ -69,14 +69,14 @@
     (cublaslt-direct-input-layout ?direct_lt ?leaf)
     (cublaslt-copied-input-layout ?copied_lt ?leaf)
     (= ?direct_op (LayoutTensorOpCublasLt
-      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_epilogue))
+      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_epilogue ?config))
     (= ?copied_op (LayoutTensorOpCublasLt
-      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_epilogue))
+      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_epilogue ?config))
     (= (output-layout-tensor-list-of ?direct_op)
        (output-layout-tensor-list-of ?copied_op))
   )
   ((subsume (LayoutTensorOpCublasLt
-    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_epilogue)))
+    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_epilogue ?config)))
   :ruleset cleanup
   :name "cuda_lite/cublaslt: direct A dominates copied A for an equivalent base call"
 )
@@ -87,14 +87,14 @@
     (cublaslt-direct-input-layout ?direct_lt ?leaf)
     (cublaslt-copied-input-layout ?copied_lt ?leaf)
     (= ?direct_op (LayoutTensorOpCublasLt
-      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_epilogue))
+      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_epilogue ?config))
     (= ?copied_op (LayoutTensorOpCublasLt
-      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_epilogue))
+      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_epilogue ?config))
     (= (output-layout-tensor-list-of ?direct_op)
        (output-layout-tensor-list-of ?copied_op))
   )
   ((subsume (LayoutTensorOpCublasLt
-    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_epilogue)))
+    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_epilogue ?config)))
   :ruleset cleanup
   :name "cuda_lite/cublaslt: direct B dominates copied B for an equivalent base call"
 )
@@ -106,14 +106,14 @@
     (cublaslt-direct-input-layout ?direct_lt ?leaf)
     (cublaslt-copied-input-layout ?copied_lt ?leaf)
     (= ?direct_op (LayoutTensorOpCublasLtBias
-      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_bias ?direct_epilogue))
+      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_bias ?direct_epilogue ?config))
     (= ?copied_op (LayoutTensorOpCublasLtBias
-      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_bias ?copied_epilogue))
+      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_bias ?copied_epilogue ?config))
     (= (output-layout-tensor-list-of ?direct_op)
        (output-layout-tensor-list-of ?copied_op))
   )
   ((subsume (LayoutTensorOpCublasLtBias
-    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_bias ?copied_epilogue)))
+    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_bias ?copied_epilogue ?config)))
   :ruleset cleanup
   :name "cuda_lite/cublaslt: direct A dominates copied A for an equivalent bias call"
 )
@@ -124,14 +124,14 @@
     (cublaslt-direct-input-layout ?direct_lt ?leaf)
     (cublaslt-copied-input-layout ?copied_lt ?leaf)
     (= ?direct_op (LayoutTensorOpCublasLtBias
-      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_bias ?direct_epilogue))
+      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_bias ?direct_epilogue ?config))
     (= ?copied_op (LayoutTensorOpCublasLtBias
-      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_bias ?copied_epilogue))
+      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_bias ?copied_epilogue ?config))
     (= (output-layout-tensor-list-of ?direct_op)
        (output-layout-tensor-list-of ?copied_op))
   )
   ((subsume (LayoutTensorOpCublasLtBias
-    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_bias ?copied_epilogue)))
+    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_bias ?copied_epilogue ?config)))
   :ruleset cleanup
   :name "cuda_lite/cublaslt: direct B dominates copied B for an equivalent bias call"
 )
@@ -143,14 +143,14 @@
     (cublaslt-direct-input-layout ?direct_lt ?leaf)
     (cublaslt-copied-input-layout ?copied_lt ?leaf)
     (= ?direct_op (LayoutTensorOpCublasLtAccumulate
-      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_c ?direct_epilogue))
+      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_c ?direct_epilogue ?config))
     (= ?copied_op (LayoutTensorOpCublasLtAccumulate
-      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_epilogue))
+      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_epilogue ?config))
     (= (output-layout-tensor-list-of ?direct_op)
        (output-layout-tensor-list-of ?copied_op))
   )
   ((subsume (LayoutTensorOpCublasLtAccumulate
-    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_epilogue)))
+    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_epilogue ?config)))
   :ruleset cleanup
   :name "cuda_lite/cublaslt: direct A dominates copied A for an equivalent accumulate call"
 )
@@ -161,14 +161,14 @@
     (cublaslt-direct-input-layout ?direct_lt ?leaf)
     (cublaslt-copied-input-layout ?copied_lt ?leaf)
     (= ?direct_op (LayoutTensorOpCublasLtAccumulate
-      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_c ?direct_epilogue))
+      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_c ?direct_epilogue ?config))
     (= ?copied_op (LayoutTensorOpCublasLtAccumulate
-      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_epilogue))
+      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_epilogue ?config))
     (= (output-layout-tensor-list-of ?direct_op)
        (output-layout-tensor-list-of ?copied_op))
   )
   ((subsume (LayoutTensorOpCublasLtAccumulate
-    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_epilogue)))
+    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_epilogue ?config)))
   :ruleset cleanup
   :name "cuda_lite/cublaslt: direct B dominates copied B for an equivalent accumulate call"
 )
@@ -180,14 +180,14 @@
     (cublaslt-direct-input-layout ?direct_lt ?leaf)
     (cublaslt-copied-input-layout ?copied_lt ?leaf)
     (= ?direct_op (LayoutTensorOpCublasLtAccumulateBias
-      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_c ?direct_bias ?direct_epilogue))
+      ?direct_site ?direct_desc ?direct_b ?direct_d ?direct_c ?direct_bias ?direct_epilogue ?config))
     (= ?copied_op (LayoutTensorOpCublasLtAccumulateBias
-      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_bias ?copied_epilogue))
+      ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_bias ?copied_epilogue ?config))
     (= (output-layout-tensor-list-of ?direct_op)
        (output-layout-tensor-list-of ?copied_op))
   )
   ((subsume (LayoutTensorOpCublasLtAccumulateBias
-    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_bias ?copied_epilogue)))
+    ?copied_site ?copied_desc ?copied_b ?copied_d ?copied_c ?copied_bias ?copied_epilogue ?config)))
   :ruleset cleanup
   :name "cuda_lite/cublaslt: direct A dominates copied A for an equivalent accumulate-bias call"
 )
@@ -198,14 +198,14 @@
     (cublaslt-direct-input-layout ?direct_lt ?leaf)
     (cublaslt-copied-input-layout ?copied_lt ?leaf)
     (= ?direct_op (LayoutTensorOpCublasLtAccumulateBias
-      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_c ?direct_bias ?direct_epilogue))
+      ?direct_site ?direct_a ?direct_desc ?direct_d ?direct_c ?direct_bias ?direct_epilogue ?config))
     (= ?copied_op (LayoutTensorOpCublasLtAccumulateBias
-      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_bias ?copied_epilogue))
+      ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_bias ?copied_epilogue ?config))
     (= (output-layout-tensor-list-of ?direct_op)
        (output-layout-tensor-list-of ?copied_op))
   )
   ((subsume (LayoutTensorOpCublasLtAccumulateBias
-    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_bias ?copied_epilogue)))
+    ?copied_site ?copied_a ?copied_desc ?copied_d ?copied_c ?copied_bias ?copied_epilogue ?config)))
   :ruleset cleanup
   :name "cuda_lite/cublaslt: direct B dominates copied B for an equivalent accumulate-bias call"
 )

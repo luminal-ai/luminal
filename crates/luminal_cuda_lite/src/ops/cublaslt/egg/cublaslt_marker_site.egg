@@ -1,4 +1,4 @@
-; Stage 0 — ROUND 11: ONE site rule, on the canonical logical form only.
+; Stage 0 — sites for F32 arithmetic over the canonical logical form.
 ;
 ; Austin's round-11 ruling: logical rules are named by SHAPES; N and T are
 ; layout descriptions and never appear at this stratum. Every recorded
@@ -51,21 +51,22 @@
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_site: matmul site from the canonical MatrixMultiply helper"
 )
 
-; BF16 tensor-core linear: the logical matmul rounds both inputs to BF16,
-; accumulates in the backend, and the graph explicitly widens its result.
-; The cast is part of the matched semantic shape so the F32 destination is
-; never confused with a BF16-output matmul.
+; Low-precision STORAGE with explicit F32 arithmetic in the graph. The
+; widening casts are consumed by the call, not unioned with their inputs.
+; A cast AFTER a low-precision matmul does not match this contract.
 (rule
   (
-    (= ?out (LogicalCast ?product (F32)))
-    (= ?product (LogicalHelperMatrixMultiply ?a ?b))
-    (= (dtype-of ?a) (Bf16))
-    (= (dtype-of ?b) (Bf16))
-    (= (dtype-of ?product) (Bf16))
+    (= ?out (LogicalHelperMatrixMultiply ?a_wide ?b_wide))
+    (= ?a_wide (LogicalCast ?a (F32)))
+    (= ?b_wide (LogicalCast ?b (F32)))
+    (= ?a_dtype (dtype-of ?a))
+    (= ?b_dtype (dtype-of ?b))
     (= (dtype-of ?out) (F32))
+    (cublaslt-supported-config
+      (CublasLtConfigLit ?a_dtype ?b_dtype (F32) (F32)
+        (CublasLtCompute32F) (F32) (F32)))
   )
   ((let ?site (CublasLtLogicalMatmulSite ?a ?b ?out)))
   :ruleset backend
-  :name "cuda_lite/cublaslt/egg/cublaslt_marker_site: BF16 matmul with F32 output"
+  :name "cuda_lite/cublaslt: F32 matmul of explicitly widened storage operands"
 )
-; ============================================================================

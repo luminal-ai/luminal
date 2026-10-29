@@ -195,7 +195,7 @@
         (IntAffineExprCons ?e_hi
           (IntAffineExprCons ?e_lo (IntAffineExprNil)))
         ?out_bits))
-    (= ?out_bits (bits-of (F32)))
+    (= ?out_bits (bits-of (dtype-of ?out)))
     ; THE READING: unit stride on m (the outer axis of [m, n]).
     (= ?e_hi (CoordVar ?out_shape 1))
     ; ld source = the n stride: non-negative via the lattice.

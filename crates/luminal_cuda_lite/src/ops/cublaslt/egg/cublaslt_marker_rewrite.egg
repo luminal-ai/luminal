@@ -51,27 +51,14 @@
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_rewrite: transpose sandwich: A x B is transpose of Bt x At"
 )
 
-; The BF16 product is widened to F32. Preserve that widening around the
-; transpose sibling so a right-major F32 destination can be elected without
-; introducing any F32 operand materialization.
+; Transpose commutes with an elementwise cast, preserving both its input
+; and output precision. This exposes casts under the sandwich's operand
+; views and also the final output cast. Dtype propagation remains in core.
 (rule
-  (
-    (= ?product (LogicalHelperMatrixMultiply ?a ?b))
-    (= ?out (LogicalCast ?product (F32)))
-    (= (dtype-of ?a) (Bf16))
-    (= (dtype-of ?b) (Bf16))
-    (= (dtype-of ?product) (Bf16))
-  )
-  (
-    (union (LogicalHelperMatrixTranspose ?out)
-      (LogicalCast
-        (LogicalHelperMatrixMultiply
-          (LogicalHelperMatrixTranspose ?b)
-          (LogicalHelperMatrixTranspose ?a))
-        (F32)))
-  )
+  ((= ?view (LogicalHelperMatrixTranspose (LogicalCast ?x ?dtype))))
+  ((union ?view (LogicalCast (LogicalHelperMatrixTranspose ?x) ?dtype)))
   :ruleset backend
-  :name "cuda_lite/cublaslt/egg/cublaslt_marker_rewrite: BF16 to F32 transpose sandwich"
+  :name "cuda_lite/cublaslt: transpose of a cast preserves the cast"
 )
 ; ============================================================================
 ; TRANSPOSE-VIEW INJECTIVITY TRANSPORT.

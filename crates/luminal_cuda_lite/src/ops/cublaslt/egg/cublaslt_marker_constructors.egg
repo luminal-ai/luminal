@@ -29,8 +29,8 @@
 ; The order sort is gone too: every reading is COL by convention (R9); a
 ; future ROW-convention family would be new FORM values, not numerics.
 ;
-; Four fixed-arity contract constructors (round 4) are unchanged in shape;
-; only the descriptor sorts slimmed. Lit arity stays a constant of the
+; Four fixed-arity contract constructors carry a final precision configuration.
+; Lit dataflow arity stays a constant of the
 ; constructor name: base [a,b] / Bias [a,b,bias] / Accumulate [a,b,c] /
 ; AccumulateBias [a,b,c,bias].
 ; ============================================================================
@@ -76,8 +76,7 @@
 ; unit-inner row-pitch shape, injectivity IS the ld clamp, and Ruling 1
 ; made symbolic pitches walkable. Injectivity still arrives by creator
 ; assertion (the padding rewrite in cublaslt_marker_desc.egg).
-; ROUND 8c: the cuBLASLt vocabulary declares ZERO relations and owns no
-; rewrite. Padding is entirely the bucketing ESTATE's business: the
+; Padding is entirely the bucketing ESTATE's business: the
 ; estate decides what to pad and to what pitch, mints the padded layout
 ; tensors, and asserts their injectivity. cuBLASLt only CONSUMES layout
 ; tensors + injectivity facts through its ordinary reading arms, so
@@ -88,27 +87,27 @@
 (constructor LayoutTensorOpCublasLt
   (CublasLtLogicalSite
    CublasLtOperandDescriptor CublasLtOperandDescriptor
-   CublasLtOutputDescriptor CublasLtEpilogue)
+   CublasLtOutputDescriptor CublasLtEpilogue CublasLtConfig)
   LayoutTensorOp)
 ; D = act(alpha * op(A)op(B) + bias)                
  ; Lit [a, b, bias]
 (constructor LayoutTensorOpCublasLtBias
   (CublasLtLogicalSite
    CublasLtOperandDescriptor CublasLtOperandDescriptor
-   CublasLtOutputDescriptor LayoutTensor CublasLtEpilogue)
+   CublasLtOutputDescriptor LayoutTensor CublasLtEpilogue CublasLtConfig)
   LayoutTensorOp)
 ; D = act(alpha * op(A)op(B) + beta * C)            
  ; Lit [a, b, c]
 (constructor LayoutTensorOpCublasLtAccumulate
   (CublasLtLogicalSite
    CublasLtOperandDescriptor CublasLtOperandDescriptor
-   CublasLtOutputDescriptor LayoutTensor CublasLtEpilogue)
+   CublasLtOutputDescriptor LayoutTensor CublasLtEpilogue CublasLtConfig)
   LayoutTensorOp)
 ; D = act(alpha * op(A)op(B) + beta * C + bias)     
  ; Lit [a, b, c, bias]
 (constructor LayoutTensorOpCublasLtAccumulateBias
   (CublasLtLogicalSite
    CublasLtOperandDescriptor CublasLtOperandDescriptor
-   CublasLtOutputDescriptor LayoutTensor LayoutTensor CublasLtEpilogue)
+   CublasLtOutputDescriptor LayoutTensor LayoutTensor CublasLtEpilogue CublasLtConfig)
   LayoutTensorOp)
 ; ============================================================================

@@ -429,7 +429,7 @@ fn r10_debug_p1() {
 (let bad_desc_a (CublasLtOperandADescriptor bad_site out_lt (CublasLtOperationN)))
 (let bad_desc_b (CublasLtOperandBDescriptor bad_site x_lt (CublasLtOperationN)))
 (let bad_desc_d (CublasLtOutputDDescriptor bad_site out_lt))
-(let bad_op (LayoutTensorOpCublasLt bad_site bad_desc_a bad_desc_b bad_desc_d (CublasLtEpilogueDefault)))
+(let bad_op (LayoutTensorOpCublasLt bad_site bad_desc_a bad_desc_b bad_desc_d (CublasLtEpilogueDefault) (CublasLtConfigLit (F32) (F32) (F32) (F32) (CublasLtCompute32F) (F32) (F32))))
 {sched}
 "#
         );

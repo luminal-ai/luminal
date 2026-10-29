@@ -289,7 +289,8 @@ fn decorated_d_logicals(s: &EGraph) -> BTreeSet<ClassId> {
         .values()
         .filter(|n| n.op.starts_with("LayoutTensorOpCublasLt"))
     {
-        let Some(ep) = n.children.last().and_then(class_of) else {
+        // The final child is the explicit precision configuration.
+        let Some(ep) = n.children.iter().rev().nth(1).and_then(class_of) else {
             continue;
         };
         if !s
@@ -3071,7 +3072,7 @@ fn attack_p1_form_layout_mismatch_panics_loudly() {
   (CublasLtOperationN)))
 (let bad_desc_d (CublasLtOutputDDescriptor bad_site out_lt))
 (let bad_op (LayoutTensorOpCublasLt bad_site bad_desc_a bad_desc_b bad_desc_d
-  (CublasLtEpilogueDefault)))
+  (CublasLtEpilogueDefault) (CublasLtConfigLit (F32) (F32) (F32) (F32) (CublasLtCompute32F) (F32) (F32))))
 {SCHEDULE}"#
         ),
     );
@@ -4027,7 +4028,7 @@ fn attack_u6_c_layout_mismatch_panics_loudly() {
   (CublasLtOperationN)))
 (let bad_d (CublasLtOutputDDescriptor bad_site out_lt))
 (let bad_acc (LayoutTensorOpCublasLtAccumulate bad_site bad_a bad_b bad_d
-  c_lt_lm (CublasLtEpilogueDefault)))"#
+  c_lt_lm (CublasLtEpilogueDefault) (CublasLtConfigLit (F32) (F32) (F32) (F32) (CublasLtCompute32F) (F32) (F32))))"#
             .into(),
         ..Default::default()
     }

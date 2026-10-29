@@ -54,7 +54,11 @@
 (rule
   (
     (= ?op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b ?desc_d
-        (CublasLtEpilogueDefault)))
+        (CublasLtEpilogueDefault) ?config))
+    ; Epilogues operate in F32 BEFORE a possible final output cast.
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
     (= ?op (LayoutTensorOpLit
         (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorNil)))
@@ -73,6 +77,7 @@
     (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
     ; the dance, in the recorder frame: out2 = y_outer + c.
     (= ?out2 (LogicalAdd ?y_outer ?c_logical))
+    (= (dtype-of ?c_logical) (F32))
     (= ?c_lt (LayoutTensorLit ?c_logical ?d_layout))
     (= ?out2_outer_lt (LayoutTensorLit ?out2 ?d_layout))
     (= (injectivity-of ?out2_outer_lt) (Injective))
@@ -98,7 +103,7 @@
       (LayoutTensorCons ?out2_lt (LayoutTensorNil))))
     (union ?op2 (LayoutTensorOpCublasLtAccumulate ?site ?desc_a ?desc_b
       (CublasLtOutputDDescriptor ?site ?out2_lt)
-      ?c_view_lt (CublasLtEpilogueDefault)))
+      ?c_view_lt (CublasLtEpilogueDefault) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: C-fold: CublasLt to CublasLtAccumulate"
@@ -107,7 +112,11 @@
 (rule
   (
     (= ?op (LayoutTensorOpCublasLtBias ?site ?desc_a ?desc_b ?desc_d
-        ?bias_lt (CublasLtEpilogueDefault)))
+        ?bias_lt (CublasLtEpilogueDefault) ?config))
+    ; Epilogues operate in F32 BEFORE a possible final output cast.
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
     (= ?op (LayoutTensorOpLit
         (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt
@@ -124,6 +133,7 @@
     (= ?composed_d (int-subst-of ?d_expr ?tmap))
     (= ?inner_L (BitOffsetExpressionLayoutLit ?composed_d ?ishape ?d_bits))
     (= ?out2 (LogicalAdd ?y_outer ?c_logical))
+    (= (dtype-of ?c_logical) (F32))
     (= ?c_lt (LayoutTensorLit ?c_logical ?d_layout))
     (= ?out2_outer_lt (LayoutTensorLit ?out2 ?d_layout))
     (= (injectivity-of ?out2_outer_lt) (Injective))
@@ -146,7 +156,7 @@
       (LayoutTensorCons ?out2_lt (LayoutTensorNil))))
     (union ?op2 (LayoutTensorOpCublasLtAccumulateBias ?site ?desc_a ?desc_b
       (CublasLtOutputDDescriptor ?site ?out2_lt)
-      ?c_view_lt ?bias_lt (CublasLtEpilogueDefault)))
+      ?c_view_lt ?bias_lt (CublasLtEpilogueDefault) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: C-fold: CublasLtBias to CublasLtAccumulateBias"
@@ -160,7 +170,11 @@
 (rule
   (
     (= ?op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b ?desc_d
-        (CublasLtEpilogueDefault)))
+        (CublasLtEpilogueDefault) ?config))
+    ; Epilogues operate in F32 BEFORE a possible final output cast.
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
     (= ?op (LayoutTensorOpLit
         (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorNil)))
@@ -193,6 +207,7 @@
         ?bias_shape))
     (= (shape-of ?bias_logical) ?bias_shape)
     (= ?bias_shape (ShapeLit (IntExprCons ?n (IntExprNil))))
+    (= (dtype-of ?bias_logical) (F32))
     (= ?bias_lt (LayoutTensorLit ?bias_logical ?bias_layout))
     (= ?bias_layout (RightMajorContiguousElementLayoutLit ?bias_shape ?bias_bits))
     (= ?out2_outer_lt (LayoutTensorLit ?out2 ?d_layout))
@@ -214,7 +229,7 @@
       (LayoutTensorCons ?out2_lt (LayoutTensorNil))))
     (union ?op2 (LayoutTensorOpCublasLtBias ?site ?desc_a ?desc_b
       (CublasLtOutputDDescriptor ?site ?out2_lt)
-      ?bias_lt (CublasLtEpilogueDefault)))
+      ?bias_lt (CublasLtEpilogueDefault) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: bias: CublasLt to CublasLtBias"
@@ -223,7 +238,11 @@
 (rule
   (
     (= ?op (LayoutTensorOpCublasLtAccumulate ?site ?desc_a ?desc_b ?desc_d
-        ?c_lt (CublasLtEpilogueDefault)))
+        ?c_lt (CublasLtEpilogueDefault) ?config))
+    ; Epilogues operate in F32 BEFORE a possible final output cast.
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
     (= ?op (LayoutTensorOpLit
         (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt
@@ -257,6 +276,7 @@
         ?bias_shape))
     (= (shape-of ?bias_logical) ?bias_shape)
     (= ?bias_shape (ShapeLit (IntExprCons ?n (IntExprNil))))
+    (= (dtype-of ?bias_logical) (F32))
     (= ?bias_lt (LayoutTensorLit ?bias_logical ?bias_layout))
     (= ?bias_layout (RightMajorContiguousElementLayoutLit ?bias_shape ?bias_bits))
     (= ?out2_outer_lt (LayoutTensorLit ?out2 ?d_layout))
@@ -278,7 +298,7 @@
       (LayoutTensorCons ?out2_lt (LayoutTensorNil))))
     (union ?op2 (LayoutTensorOpCublasLtAccumulateBias ?site ?desc_a ?desc_b
       (CublasLtOutputDDescriptor ?site ?out2_lt)
-      ?c_lt ?bias_lt (CublasLtEpilogueDefault)))
+      ?c_lt ?bias_lt (CublasLtEpilogueDefault) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: bias: CublasLtAccumulate to CublasLtAccumulateBias"
@@ -294,7 +314,11 @@
 (rule
   (
     (= ?op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b ?desc_d
-        (CublasLtEpilogueDefault)))
+        (CublasLtEpilogueDefault) ?config))
+    ; Epilogues operate in F32 BEFORE a possible final output cast.
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
     (= ?op (LayoutTensorOpLit ?ins (LayoutTensorCons ?y_lt (LayoutTensorNil))))
     (= ?y_lt (LayoutTensorLit ?y ?inner_L))
@@ -332,7 +356,7 @@
     (let ?op2 (LayoutTensorOpLit ?ins (LayoutTensorCons ?relu_lt (LayoutTensorNil))))
     (union ?op2 (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b
       (CublasLtOutputDDescriptor ?site ?relu_lt)
-      (CublasLtEpilogueRelu)))
+      (CublasLtEpilogueRelu) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLt"
@@ -340,7 +364,11 @@
 (rule
   (
     (= ?op (LayoutTensorOpCublasLtBias ?site ?desc_a ?desc_b ?desc_d
-        ?bias_lt (CublasLtEpilogueDefault)))
+        ?bias_lt (CublasLtEpilogueDefault) ?config))
+    ; Epilogues operate in F32 BEFORE a possible final output cast.
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
     (= ?op (LayoutTensorOpLit ?ins (LayoutTensorCons ?y_lt (LayoutTensorNil))))
     (= ?y_lt (LayoutTensorLit ?y ?inner_L))
@@ -378,7 +406,7 @@
     (let ?op2 (LayoutTensorOpLit ?ins (LayoutTensorCons ?relu_lt (LayoutTensorNil))))
     (union ?op2 (LayoutTensorOpCublasLtBias ?site ?desc_a ?desc_b
       (CublasLtOutputDDescriptor ?site ?relu_lt)
-      ?bias_lt (CublasLtEpilogueRelu)))
+      ?bias_lt (CublasLtEpilogueRelu) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLtBias"
@@ -386,7 +414,11 @@
 (rule
   (
     (= ?op (LayoutTensorOpCublasLtAccumulate ?site ?desc_a ?desc_b ?desc_d
-        ?c_lt (CublasLtEpilogueDefault)))
+        ?c_lt (CublasLtEpilogueDefault) ?config))
+    ; Epilogues operate in F32 BEFORE a possible final output cast.
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
     (= ?op (LayoutTensorOpLit ?ins (LayoutTensorCons ?y_lt (LayoutTensorNil))))
     (= ?y_lt (LayoutTensorLit ?y ?inner_L))
@@ -424,7 +456,7 @@
     (let ?op2 (LayoutTensorOpLit ?ins (LayoutTensorCons ?relu_lt (LayoutTensorNil))))
     (union ?op2 (LayoutTensorOpCublasLtAccumulate ?site ?desc_a ?desc_b
       (CublasLtOutputDDescriptor ?site ?relu_lt)
-      ?c_lt (CublasLtEpilogueRelu)))
+      ?c_lt (CublasLtEpilogueRelu) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLtAccumulate"
@@ -432,7 +464,11 @@
 (rule
   (
     (= ?op (LayoutTensorOpCublasLtAccumulateBias ?site ?desc_a ?desc_b ?desc_d
-        ?c_lt ?bias_lt (CublasLtEpilogueDefault)))
+        ?c_lt ?bias_lt (CublasLtEpilogueDefault) ?config))
+    ; Epilogues operate in F32 BEFORE a possible final output cast.
+    (= ?config (CublasLtConfigLit ?adt ?bdt (F32) (F32)
+      (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?y_lt))
     (= ?op (LayoutTensorOpLit ?ins (LayoutTensorCons ?y_lt (LayoutTensorNil))))
     (= ?y_lt (LayoutTensorLit ?y ?inner_L))
@@ -470,7 +506,7 @@
     (let ?op2 (LayoutTensorOpLit ?ins (LayoutTensorCons ?relu_lt (LayoutTensorNil))))
     (union ?op2 (LayoutTensorOpCublasLtAccumulateBias ?site ?desc_a ?desc_b
       (CublasLtOutputDDescriptor ?site ?relu_lt)
-      ?c_lt ?bias_lt (CublasLtEpilogueRelu)))
+      ?c_lt ?bias_lt (CublasLtEpilogueRelu) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_decorate: relu epilogue on CublasLtAccumulateBias"

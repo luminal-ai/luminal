@@ -23,13 +23,16 @@
     (= ?desc_d (CublasLtOutputDDescriptor ?site ?out_lt))
     (= ?out_lt (LayoutTensorLit ?out ?out_layout))
     (= (injectivity-of ?out_lt) (Injective))
+    (= ?config (CublasLtConfigLit (dtype-of ?a) (dtype-of ?b)
+      (F32) (dtype-of ?out) (CublasLtCompute32F) (F32) (F32)))
+    (cublaslt-supported-config ?config)
   )
   (
     (let ?op (LayoutTensorOpLit
       (LayoutTensorCons ?a_lt (LayoutTensorCons ?b_lt (LayoutTensorNil)))
       (LayoutTensorCons ?out_lt (LayoutTensorNil))))
     (union ?op (LayoutTensorOpCublasLt ?site ?desc_a ?desc_b ?desc_d
-      (CublasLtEpilogueDefault)))
+      (CublasLtEpilogueDefault) ?config))
   )
   :ruleset backend
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_assemble: base CublasLt op from one coherent reading set"

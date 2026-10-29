@@ -1,0 +1,20 @@
+; Explicit cuBLASLt type contracts. This is an allow-list, not a Cartesian
+; product of independently supported dtypes. Compute precision and scalar
+; precision are separate from every matrix's storage type and the bias type.
+; Source: CUDA 12.8 cuBLASLtMatmul regular row/column-major datatype table:
+; https://docs.nvidia.com/cuda/archive/12.8.2/cublas/index.html#cublasltmatmul
+(datatype CublasLtComputeType (CublasLtCompute32F))
+(datatype CublasLtConfig
+  (CublasLtConfigLit Dtype Dtype Dtype Dtype CublasLtComputeType Dtype Dtype))
+;                    A     B     C     D       compute          scale bias
+(relation cublaslt-supported-config (CublasLtConfig))
+(cublaslt-supported-config
+  (CublasLtConfigLit (F32) (F32) (F32) (F32) (CublasLtCompute32F) (F32) (F32)))
+(cublaslt-supported-config
+  (CublasLtConfigLit (F16) (F16) (F16) (F16) (CublasLtCompute32F) (F32) (F16)))
+(cublaslt-supported-config
+  (CublasLtConfigLit (F16) (F16) (F32) (F32) (CublasLtCompute32F) (F32) (F32)))
+(cublaslt-supported-config
+  (CublasLtConfigLit (Bf16) (Bf16) (Bf16) (Bf16) (CublasLtCompute32F) (F32) (Bf16)))
+(cublaslt-supported-config
+  (CublasLtConfigLit (Bf16) (Bf16) (F32) (F32) (CublasLtCompute32F) (F32) (F32)))
