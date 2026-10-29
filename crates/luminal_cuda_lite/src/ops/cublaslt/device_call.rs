@@ -347,7 +347,10 @@ pub fn prepare(
     }
     .map_err(|e| anyhow!("workspace preference: {e:?}"))?;
 
-    if call.d_dtype != luminal::dtype::PlanDtype::F32 {
+    if matches!(
+        call.d_dtype,
+        luminal::dtype::PlanDtype::F16 | luminal::dtype::PlanDtype::Bf16
+    ) {
         // The graph rounds only the final output. Split-K reductions must
         // keep their partial sums in FP32, never the narrow output type.
         // NONE (zero) remains available alongside COMPUTE_TYPE.
