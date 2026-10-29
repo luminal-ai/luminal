@@ -21,6 +21,19 @@
   :ruleset backend
   :name "cublaslt: one FP32 scalar multiplication at its authored position")
 (rule
+  ((= ?scaled (LogicalMul ?broadcast ?value))
+   (= ?broadcast (LogicalIndexMapApply ?scalar
+     (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape))
+   (= (shape-of ?scalar) (ShapeLit (IntExprNil)))
+   (= (dtype-of ?scalar) (F32))
+   (= (dtype-of ?value) (F32))
+   (= (dtype-of ?scaled) (F32))
+   (= (shape-of ?value) ?shape)
+   (= (shape-of ?scaled) ?shape))
+  ((cublaslt-scalar-multiplication ?scaled ?value ?scalar))
+  :ruleset backend
+  :name "cublaslt: FP32 scalar on the left at its authored position")
+(rule
   ((cublaslt-logical-matrix-product ?product ?A ?B))
   ((cublaslt-scaled-matrix-product ?product ?A ?B (LogicalConstant 1.0)))
   :ruleset backend
@@ -45,6 +58,14 @@
   ((cublaslt-product-with-C-matrix ?expression ?A ?B (CublasLtCMatrixOf ?C) ?alpha ?beta))
   :ruleset backend
   :name "cublaslt: beta scales C before its addition to the product")
+(rule
+  ((cublaslt-scaled-matrix-product ?product ?A ?B ?alpha)
+   (= ?expression (LogicalAdd ?scaled_C ?product))
+   (cublaslt-scalar-multiplication ?scaled_C ?C ?beta)
+   (= (shape-of ?product) (shape-of ?C)))
+  ((cublaslt-product-with-C-matrix ?expression ?A ?B (CublasLtCMatrixOf ?C) ?alpha ?beta))
+  :ruleset backend
+  :name "cublaslt: scaled C precedes the product in the authored addition")
 (rule
   ((cublaslt-scalar-demand ?alpha ?beta)
    (= ?alpha (LogicalConstant ?alpha_value))

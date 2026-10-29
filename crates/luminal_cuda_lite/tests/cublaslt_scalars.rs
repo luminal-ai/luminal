@@ -42,6 +42,18 @@ fn fixture(
     activation: usize,
     with_bias: bool,
 ) -> Fixture {
+    fixture_with_operand_order(batch, dtype, sources, with_c, activation, with_bias, false)
+}
+
+fn fixture_with_operand_order(
+    batch: bool,
+    dtype: DType,
+    sources: [Source; 2],
+    with_c: bool,
+    activation: usize,
+    with_bias: bool,
+    scalar_and_c_first: bool,
+) -> Fixture {
     let mut graph = Graph::new();
     let mut inputs = Vec::new();
     let mut input = |graph: &mut Graph, shape: Vec<usize>| {
@@ -90,10 +102,20 @@ fn fixture(
         }
     };
     let mut arithmetic = wide(a).matmul(wide(b));
-    arithmetic = arithmetic * values[0].expand_rhs(arithmetic.dims());
+    let alpha = values[0].expand_rhs(arithmetic.dims());
+    arithmetic = if scalar_and_c_first {
+        alpha * arithmetic
+    } else {
+        arithmetic * alpha
+    };
     if let Some(c) = c {
         let c = if dtype == DType::TF32 { c } else { wide(c) };
-        arithmetic += c * values[1].expand_rhs(c.dims());
+        let beta = values[1].expand_rhs(c.dims());
+        arithmetic = if scalar_and_c_first {
+            beta * c + arithmetic
+        } else {
+            arithmetic + c * beta
+        };
     }
     if let Some(bias) = bias {
         arithmetic += bias.expand_dim(0, 3);
@@ -218,6 +240,31 @@ fn host_values_and_device_pointers_compose_with_all_existing_compute_and_output_
                     resolved.form.lit_arity() + resolved.scalars.input_count() - 1
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn authored_scalar_and_c_operand_orders_do_not_require_global_float_commutation() {
+    for batch in [false, true] {
+        for dtype in [DType::F32, DType::F16, DType::Bf16, DType::TF32] {
+            let f = fixture_with_operand_order(
+                batch,
+                dtype,
+                [Source::Host(1.25), Source::Host(-0.5)],
+                true,
+                0,
+                false,
+                true,
+            );
+            let (ops, tied) = calls(&saturate(&f.graph, WHITELIST));
+            assert!(ops.iter().any(
+                |op| op.c.is_some() && op.scalars.resolve().host_values() == Some((1.25, -0.5))
+            ));
+            assert!(
+                tied.iter()
+                    .any(|op| op.scalars.resolve().host_values() == Some((1.25, -0.5)))
+            );
         }
     }
 }
@@ -513,6 +560,28 @@ mod execution {
                         .find(|(input, _)| input.id == c.id)
                         .unwrap()
                         .1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authored_scalar_and_c_first_execute_against_reference() {
+        for batch in [false, true] {
+            for alias in [false, true] {
+                run(
+                    fixture_with_operand_order(
+                        batch,
+                        DType::F32,
+                        [Source::Device, Source::Host(-0.5)],
+                        true,
+                        0,
+                        false,
+                        true,
+                    ),
+                    true,
+                    alias,
+                    alias,
                 );
             }
         }

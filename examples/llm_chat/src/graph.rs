@@ -652,14 +652,10 @@ mod tests {
         }
     }
 
-    /// Half-precision chat stores weights narrow and computes in F32: the
-    /// only arithmetic over a narrow float is each matmul's multiply and
-    /// sum, which a runtime lowers to a GEMM. Norms, softmax, activations
-    /// and rope never compute in F16/BF16, so a runtime that refuses math
-    /// functions on narrow floats (cuda-lite's `sqrt`, `exp2`, ...) runs
-    /// every half-precision chat model.
+    /// Checkpoint storage precision never selects arithmetic precision. Each
+    /// narrow parameter enters the model through an explicit F32 widening.
     #[test]
-    fn half_precision_graphs_compute_only_matmuls_in_storage_dtype() {
+    fn narrow_weight_sources_have_explicit_widening_before_model_arithmetic() {
         for dtype in [DType::Bf16, DType::F16] {
             for (name, config) in [
                 ("llama3", ModelConfig::Llama3(Llama3Dims::tiny())),
@@ -669,21 +665,30 @@ mod tests {
             ] {
                 let graph = LlmGraph::build_with_parameter_dtype(config, dtype, 8, 2).unwrap();
                 let logical = &graph.graph.logical;
-                let narrow = logical.narrow_float_arithmetic(logical.petgraph().node_indices());
                 assert!(
-                    !narrow.is_empty(),
-                    "{name} {dtype:?}: matmuls run at storage dtype"
+                    logical
+                        .narrow_float_arithmetic(logical.petgraph().node_indices())
+                        .is_empty(),
+                    "{name} {dtype:?}: weight storage must not introduce narrow arithmetic"
                 );
-                for (id, found) in narrow {
-                    let op = logical.value_op(id);
+                assert!(!graph.parameters.is_empty());
+                for parameter in &graph.parameters {
+                    assert_eq!(logical.value_dtype(parameter.input), dtype);
+                    let consumers: Vec<_> = logical
+                        .petgraph()
+                        .neighbors_directed(
+                            parameter.input,
+                            luminal::prelude::petgraph::Direction::Outgoing,
+                        )
+                        .collect();
+                    assert!(!consumers.is_empty(), "parameter has no model input cast");
                     assert!(
-                        matches!(
-                            op,
-                            luminal::logical_ir::LogicalOp::Mul
-                                | luminal::logical_ir::LogicalOp::ReduceSum { .. }
-                        ),
-                        "{name} {dtype:?}: {} computes in {found:?}",
-                        op.constructor()
+                        consumers.into_iter().all(|id| matches!(
+                            logical.value_op(id),
+                            luminal::logical_ir::LogicalOp::Cast(DType::F32)
+                        )),
+                        "{name} {dtype:?}: parameter {} bypassed explicit widening",
+                        parameter.namespace
                     );
                 }
             }

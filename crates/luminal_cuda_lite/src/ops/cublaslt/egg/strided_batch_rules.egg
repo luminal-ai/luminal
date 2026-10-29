@@ -98,6 +98,15 @@
   :name "cublaslt: beta scales batched C before addition")
 
 (rule
+  ((cublaslt-strided-batch-scaled-product ?product ?A ?B ?batch ?m ?n ?k ?alpha)
+   (= ?expression (LogicalAdd ?scaled_C ?product))
+   (cublaslt-scalar-multiplication ?scaled_C ?C ?beta)
+   (= (shape-of ?C) (shape-of ?product)))
+  ((cublaslt-strided-batch-product-with-C-matrix ?expression ?A ?B ?C ?batch ?m ?n ?k ?alpha ?beta))
+  :ruleset backend
+  :name "cublaslt: scaled batched C precedes the product in the authored addition")
+
+(rule
   ((cublaslt-strided-batch-scaled-product ?matrix_product ?A_operand ?B_operand ?BatchCount ?m ?n ?k ?alpha)
    (= ?output_expression (LogicalAdd ?matrix_product ?C_matrix))
    (= (shape-of ?C_matrix) (shape-of ?matrix_product))
@@ -107,6 +116,16 @@
      ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k ?alpha (LogicalConstant 1.0)))
   :ruleset backend
   :name "cublaslt: batched F32 product then C in one order")
+(rule
+  ((cublaslt-strided-batch-scaled-product ?matrix_product ?A_operand ?B_operand ?BatchCount ?m ?n ?k ?alpha)
+   (= ?output_expression (LogicalAdd ?C_matrix ?matrix_product))
+   (= (shape-of ?C_matrix) (shape-of ?matrix_product))
+   (= (dtype-of ?C_matrix) (F32))
+   (= (dtype-of ?output_expression) (F32)))
+  ((cublaslt-strided-batch-product-with-C-matrix
+     ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k ?alpha (LogicalConstant 1.0)))
+  :ruleset backend
+  :name "cublaslt: batched F32 C then product in one authored addition")
 (rule
   ((cublaslt-strided-batch-product-with-C-matrix
      ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k ?alpha ?beta)

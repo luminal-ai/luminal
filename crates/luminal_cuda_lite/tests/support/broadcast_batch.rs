@@ -310,20 +310,13 @@ mod execution {
         let registry = whitelist::scalar_registry(device, narrow)
             .into_iter()
             .filter(|row| {
-                !matches!(
-                    row.label(),
-                    "AddFunctionalGeneric"
-                        | "MulFunctionalGeneric"
-                        | "ReduceSumGeneric"
-                        | "IndexMapApplyMaterialize"
-                        | "Tf32RoundTrip"
-                        | "CastGeneric"
-                ) && row.label()
-                    != if alias {
-                        "CublasLtCall"
-                    } else {
-                        "CublasLtAccumulateInPlace"
-                    }
+                row.label() == "IndexMapApplyViewGeneric"
+                    || row.label()
+                        == if alias {
+                            "CublasLtAccumulateInPlace"
+                        } else {
+                            "CublasLtCall"
+                        }
             })
             .collect();
         let mut runtime = CudaRuntime::load_with(&graph, bindings, registry).unwrap();

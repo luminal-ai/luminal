@@ -477,8 +477,8 @@ fn batched_c_keeps_cast_boundaries_and_floating_addition_order() {
         };
         let (separate, in_place) = calls(&saturate(&model, WHITELIST));
         let accumulating: Vec<_> = separate.iter().filter(|op| op.c.is_some()).collect();
-        // Core already equates the two operands of an addition. The backend
-        // consumes that equality, but cannot cross a narrowing of the product.
+        // Each authored binary operand order is recognized locally. Admission
+        // does not reassociate additions or cross a narrowing of the product.
         assert_eq!(
             !accumulating.is_empty(),
             matches!(case, 0 | 1 | 3),

@@ -654,14 +654,9 @@ fn named_input_keeps_its_name_bearing_spellings() {
         .collect();
     assert_eq!(
         newly_subsumed,
-        [
-            "LayoutTensorOpCublasLt".to_string(),
-            "LayoutTensorOpLit".to_string(),
-        ]
-        .iter()
-        .collect(),
-        "the cleanup stratum may retire the generic LayoutTensorOpLit spelling \
-         and copied base cuBLASLt routes only; with={with_cleanup:?} \
+        ["LayoutTensorOpLit".to_string()].iter().collect(),
+        "the cleanup stratum retires generic LayoutTensorOpLit spellings; \
+         complete cuBLASLt admission does not invent producers for boundary inputs; with={with_cleanup:?} \
          without={without_cleanup:?}"
     );
     for (op, before) in &without_cleanup {

@@ -245,6 +245,14 @@
   :ruleset backend
   :name "cublaslt: product then C in one order")
 (rule
+  ((cublaslt-scaled-matrix-product ?matrix_product ?A_operand ?B_operand ?alpha)
+   (= ?expression (LogicalAdd ?C_matrix ?matrix_product))
+   (= (shape-of ?matrix_product) (shape-of ?C_matrix)))
+  ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix)
+     ?alpha (LogicalConstant 1.0)))
+  :ruleset backend
+  :name "cublaslt: C then product in one authored addition")
+(rule
   ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand ?C_matrix ?alpha ?beta))
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix (CublasLtNoBias)
      (CublasLtDefaultEpilogue) ?alpha ?beta))
@@ -355,6 +363,25 @@
   ((cublaslt-float32-scalar-broadcast ?broadcast ?value ?shape))
   :ruleset backend
   :name "cublaslt: exact scalar broadcast")
+; The current frontend maximum(x, 0) keeps x when x is NaN and guards
+; only the zero operand with isnan. Its exact ordered-comparison count is
+; two, so that guard is false. Recognize the whole result, including this
+; guard, so an authored final cast can round after the fused ReLU.
+(rule
+  ((= ?shape (shape-of ?activation_input))
+   (= (dtype-of ?activation_input) (F32))
+   (cublaslt-float32-scalar-broadcast ?zero 0.0 ?shape)
+   (cublaslt-float32-scalar-broadcast ?one 1.0 ?shape)
+   (cublaslt-float32-scalar-broadcast ?positive_infinity inf ?shape)
+   (cublaslt-float32-scalar-broadcast ?negative_infinity -inf ?shape)
+   (= ?ordered_count (LogicalAdd
+     (LogicalCast (LogicalLessThan ?zero ?positive_infinity) (F32))
+     (LogicalCast (LogicalLessThan ?negative_infinity ?zero) (F32))))
+   (= ?output_expression (LogicalSelect (LogicalLessThan ?ordered_count ?one) ?zero
+     (LogicalSelect (LogicalLessThan ?activation_input ?zero) ?zero ?activation_input))))
+  ((cublaslt-rectified-linear-activation ?output_expression ?activation_input))
+  :ruleset backend
+  :name "cublaslt: frontend ReLU with zero operand NaN guard")
 (rule
   ((cublaslt-logical-expression ?expression ?A_operand ?B_operand ?C_matrix ?bias
      (CublasLtDefaultEpilogue) ?alpha ?beta)

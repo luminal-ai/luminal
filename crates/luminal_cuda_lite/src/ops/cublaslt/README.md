@@ -93,6 +93,9 @@ product and one of C before addition: `alpha * (A @ B) + beta * C`, followed by
 optional bias/activation and authored output rounding. Scaling is not moved
 across casts or distributed over C, bias, activation, or multiple scalar
 multiplications. Rank-two and strided-batch calls share these scalar proofs.
+Both authored operand orders of a scalar multiplication and the product/C
+addition are recognized locally within this contract. Admission does not depend
+on global floating-point commutation or reassociate a chain of additions.
 
 The vendor's [dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
 requires **FP32 alpha/beta** for all currently admitted modes: ordinary FP32
