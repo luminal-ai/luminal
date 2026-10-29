@@ -1039,7 +1039,7 @@ impl Translator<'_> {
             "linear.default" => {
                 let x = self.operand(&n[0])?;
                 let w = self.operand(&n[1])?;
-                let mut out = x.matmul(w.t());
+                let mut out = self.torch_matmul(x, w.t());
                 if let Some(bias) = n
                     .get(2)
                     .map(|b| self.optional_tensor_operand(b))
@@ -1047,7 +1047,7 @@ impl Translator<'_> {
                     .flatten()
                 {
                     let dims = out.dims();
-                    out += broadcast_to(bias, &dims);
+                    out = self.torch_add(out, broadcast_to(bias, &dims));
                 }
                 out
             }
@@ -1055,7 +1055,7 @@ impl Translator<'_> {
             "mm.default" | "bmm.default" | "matmul.default" => {
                 let a = self.operand(&n[0])?;
                 let b = self.operand(&n[1])?;
-                a.matmul(b)
+                self.torch_matmul(a, b)
             }
             // ---- grouped GEMM (batch 6) ----
             "_grouped_mm.default" | "transformers.grouped_mm_fallback.default" => {
@@ -1487,6 +1487,7 @@ impl Translator<'_> {
             "scatter_reduce.two" => self.translate_scatter(node, 5)?,
             "index_put.default" => self.translate_index_put(node)?,
             "index_reduce.default" => self.translate_index_reduce(node)?,
+            "index_add.default" => self.translate_index_add(node)?,
             "masked_scatter.default" => self.translate_masked_scatter(node)?,
             "put.default" => self.translate_put(node)?,
             "nonzero_static.default" => self.translate_nonzero_static(node)?,

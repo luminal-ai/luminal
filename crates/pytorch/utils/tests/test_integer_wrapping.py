@@ -113,3 +113,57 @@ def test_narrow_integers_keep_wrapping(stage_one_only):
     _run(Binary(lambda x, y: x * y), a, a)
     u = torch.tensor([255, 0, 128, 7], dtype=torch.uint8)
     _run(Binary(lambda x, y: x + y), u, u)
+
+
+MATMULS = (
+    pytest.param(lambda a, b: a @ b, id="mm"),
+    pytest.param(lambda a, b: torch.bmm(a[None], b[None]), id="bmm"),
+    pytest.param(lambda a, b: a[0] @ b, id="vector_matmul"),
+    pytest.param(lambda a, b: torch.addmm(a, a, b, beta=2, alpha=3), id="addmm"),
+    pytest.param(lambda a, b: torch.addmv(a[0], a, b[0], beta=2, alpha=3), id="addmv"),
+    pytest.param(lambda a, b: torch.addbmm(a, a[None], b[None]), id="addbmm"),
+    pytest.param(lambda a, b: torch.nn.functional.linear(a, b, a[0]), id="linear"),
+)
+
+
+@pytest.mark.parametrize("dtype", WIDE)
+@pytest.mark.parametrize("fn", MATMULS)
+def test_integer_matmuls_wrap_like_eager(stage_one_only, fn, dtype):
+    """Integer matmuls accumulate in the operand dtype and wrap."""
+    a = _edges(dtype).reshape(3, 3)
+    _run(Binary(fn), a, a.flip(0))
+
+
+def _scatter_inputs(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    info = torch.iinfo(dtype)
+    data = torch.tensor([info.max, info.min, 2**24, -7], dtype=dtype)
+    updates = torch.tensor([1, -1, 1, info.max, 3, -5], dtype=dtype)
+    return data, updates
+
+
+INDEX = torch.tensor([0, 1, 2, 0, 3, 3])
+
+SCATTERS = (
+    pytest.param(lambda t, u: t.scatter_add(0, INDEX, u), id="scatter_add"),
+    pytest.param(lambda t, u: t.index_add(0, INDEX, u), id="index_add"),
+    pytest.param(
+        lambda t, u: t.index_put((INDEX,), u, accumulate=True), id="index_put_acc"
+    ),
+    pytest.param(lambda t, u: t.scatter_reduce(0, INDEX, u, "sum"), id="sum"),
+    pytest.param(lambda t, u: t.scatter_reduce(0, INDEX, u, "prod"), id="prod"),
+    pytest.param(lambda t, u: t.scatter_reduce(0, INDEX, u, "mean"), id="mean"),
+    pytest.param(
+        lambda t, u: t.scatter_reduce(0, INDEX, u, "mean", include_self=False),
+        id="mean_exclude_self",
+    ),
+    pytest.param(lambda t, u: t.scatter_reduce(0, INDEX, u, "amax"), id="amax"),
+    pytest.param(lambda t, u: t.scatter_reduce(0, INDEX, u, "amin"), id="amin"),
+)
+
+
+@pytest.mark.parametrize("dtype", WIDE)
+@pytest.mark.parametrize("fn", SCATTERS)
+def test_integer_scatter_accumulation_wraps_like_eager(stage_one_only, fn, dtype):
+    """Scatter accumulation runs in the data dtype: exact past 2^24 and
+    wrapping on overflow; an integer mean floor-divides."""
+    _run(Binary(fn), *_scatter_inputs(dtype))

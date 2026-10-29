@@ -163,6 +163,7 @@ mod recip;
 mod reduce_max;
 mod reduce_sum;
 mod round;
+mod rounding_cast;
 mod scatter;
 mod select;
 mod sin;
@@ -207,6 +208,7 @@ pub use recip::LogicalRecip;
 pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
 pub use round::LogicalRound;
+pub use rounding_cast::LogicalRoundingCast;
 pub use scatter::LogicalScatter;
 pub use select::LogicalSelect;
 pub use sin::LogicalSin;
@@ -267,6 +269,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalLessThan),
             Box::new(LogicalCast),
             Box::new(LogicalTruncCast),
+            Box::new(LogicalRoundingCast),
             Box::new(LogicalIota),
             Box::new(LogicalConstant),
             Box::new(LogicalConstantF64),

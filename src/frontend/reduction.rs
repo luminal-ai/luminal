@@ -112,12 +112,23 @@ impl GraphTensor {
     }
 
     /// Reduce a dimension of the tensor by taking the mean of all elements along that axis.
+    ///
+    /// An F32/F64 mean divides by the element count converted with one
+    /// rounding ([`Self::rounding_cast`]), as PyTorch's `sum /
+    /// static_cast<acc_t>(n)` does: an exact cast would refuse every count
+    /// the float cannot represent (most counts past 2^24 for F32).
     pub fn mean(self, axes: impl ToAxes) -> GraphTensor {
-        let reduced_elements = axes
-            .to_axes()
-            .into_iter()
-            .map(|i| self.dims()[i])
-            .product::<IntExpr>();
+        let axes = axes.to_axes();
+        let reduced_elements = axes.iter().map(|&i| self.dims()[i]).product::<IntExpr>();
+        if matches!(self.dtype, DType::F32 | DType::F64) {
+            let sum = self.sum(axes);
+            let count = self
+                .graph()
+                .constant_i32(reduced_elements)
+                .rounding_cast(self.dtype)
+                .expand_rhs(sum.dims());
+            return sum / count;
+        }
         self.sum(axes) / reduced_elements
     }
 

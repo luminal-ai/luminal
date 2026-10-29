@@ -61,6 +61,7 @@ pub mod recip;
 pub mod reduce_max;
 pub mod reduce_sum;
 pub mod round;
+pub mod rounding_cast;
 pub mod scatter;
 pub mod select;
 pub mod sin;
@@ -190,6 +191,10 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(trunc::TruncFunctionalMatcher, trunc::TruncFunctional),
         reg(round::RoundFunctionalMatcher, round::RoundFunctional),
         reg(trunc_cast::TruncCastMatcher, trunc_cast::TruncCast),
+        reg(
+            rounding_cast::RoundingCastMatcher,
+            rounding_cast::RoundingCast,
+        ),
         reg(exp::ExpFunctionalMatcher, exp::ExpFunctional),
         reg(mul::MulFunctionalMatcher, mul::MulFunctional),
         reg(

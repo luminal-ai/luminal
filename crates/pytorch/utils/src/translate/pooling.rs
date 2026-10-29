@@ -353,11 +353,10 @@ impl Translator<'_> {
         // The window size is an exact Int count of 0/1 membership indicators
         // (an F32 count saturates at 2^24 and silently skews the mean, e.g.
         // a global pool of a 4097 x 4097 map). It converts to the compute
-        // dtype only as the divisor, through the checked-exact int -> float
-        // cast, which refuses loudly where the count is not representable,
-        // as `mean` does.
+        // dtype only as the divisor, with one rounding, as `mean` does.
         let count = membership.cast(DType::Int).sum(reduction_axes);
-        Ok((sum / count.cast(compute_dtype)).cast(in_dtype))
+        let divisor = super::util::count_divisor(count, compute_dtype);
+        Ok((sum / divisor).cast(in_dtype))
     }
 
     /// Binds (values, indices) for the max-pool family.

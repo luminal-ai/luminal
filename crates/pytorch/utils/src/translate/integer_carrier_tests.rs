@@ -32,7 +32,8 @@ fn assert_no_float_to_int(t: &Translation, what: &str) {
     );
 }
 
-/// Casts that convert an integer value to a float. A Bool indicator is an
+/// Conversions (exact or rounding casts) of an integer value to a float. A
+/// Bool indicator is an
 /// exact 0/1 and does not count.
 fn int_to_float_casts(t: &Translation) -> usize {
     let graph = t.graph.logical.petgraph();
@@ -42,6 +43,7 @@ fn int_to_float_casts(t: &Translation) -> usize {
             matches!(
                 graph[id].op,
                 LogicalOp::Cast(DType::F32 | DType::F16 | DType::Bf16 | DType::F64)
+                    | LogicalOp::RoundingCast(_)
             ) && graph
                 .neighbors_directed(id, Direction::Incoming)
                 .any(|source| {
@@ -623,5 +625,49 @@ fn embedding_bag_counts_are_i64_sums() {
             &[1, 0, 2]
         };
         assert_eq!(runtime.get_i64(t.outputs[3].tensor).unwrap(), max_indices);
+    }
+}
+
+/// A float divisor made from an element count converts with ONE rounding
+/// (`rounding_cast`), as torch's `sum / static_cast<acc_t>(n)` does; the
+/// exact cast would refuse the count past 2^24. Pinned structurally at
+/// 2^24 + 1 elements: executing would sweep 16.7M elements per candidate.
+#[test]
+fn count_divisors_round_past_2_24() {
+    let n = (1i64 << 24) + 1;
+    let cases: [(&str, Vec<_>, Vec<i64>, Vec<i64>); 3] = [
+        (
+            "torch.ops.aten.mean.dim",
+            vec![tensor_input("self", "x"), ints("dim", &[0])],
+            vec![n],
+            vec![],
+        ),
+        (
+            "torch.ops.aten.var.correction",
+            vec![tensor_input("self", "x"), scalar_int("correction", 1)],
+            vec![n],
+            vec![],
+        ),
+        (
+            "torch.ops.aten._adaptive_avg_pool2d.default",
+            vec![tensor_input("self", "x"), ints("output_size", &[1, 1])],
+            vec![1, 1, 1, n],
+            vec![1, 1, 1, 1],
+        ),
+    ];
+    for (target, args, in_shape, out_shape) in cases {
+        let t = translate_one(
+            node(target, args, &["y"]),
+            &[("x", FLOAT, &in_shape), ("y", FLOAT, &out_shape)],
+            &["x"],
+            &["y"],
+        );
+        let rounding = count(&t, |op| matches!(op, LogicalOp::RoundingCast(_)));
+        assert!(rounding >= 1, "{target}: the count divisor must round");
+        assert_eq!(
+            int_to_float_casts(&t),
+            rounding,
+            "{target}: no count takes the exact int -> float cast"
+        );
     }
 }

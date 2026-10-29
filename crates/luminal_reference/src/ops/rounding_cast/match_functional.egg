@@ -1,0 +1,20 @@
+; Layout Tensor Op RoundingCast Generic — the explicit rounding conversion:
+; never a view (the element bit width changes underfoot).
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_logical (LogicalRoundingCast ?in_logical ?target_dtype))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpRoundingCastGeneric ?in_layout_tensor ?target_dtype ?out_layout))
+  )
+  :ruleset main_ruleset :name "reference/rounding_cast/match_functional: RoundingCastGeneric mint, the explicit rounding conversion"
+)

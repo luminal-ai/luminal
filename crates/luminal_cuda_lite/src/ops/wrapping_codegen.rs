@@ -1,6 +1,8 @@
-//! The wrapping family computes in the same-width unsigned type: signed
-//! overflow is undefined behaviour in C++, unsigned overflow wraps modulo
-//! 2^w. Codegen runs on any host, so this needs no device.
+//! Integer arithmetic and conversion codegen. The wrapping family computes
+//! in the same-width unsigned type: signed overflow is undefined behaviour
+//! in C++, unsigned overflow wraps modulo 2^w. The rounding int -> float
+//! conversion names its round-to-nearest intrinsic. Codegen runs on any
+//! host, so this needs no device.
 
 use crate::kernels::{CodegenCtx, KernelOp};
 use luminal::dtype::PlanDtype;
@@ -104,4 +106,22 @@ fn unsigned_wrapping_arithmetic_is_native_and_floats_are_refused() {
     assert!(src.contains("a[i] + b[i]"), "{src}");
     let err = source(&add, &ctx(2, &[4], &[4], PlanDtype::F32)).unwrap_err();
     assert!(err.to_string().contains("no F32 arm"), "{err}");
+}
+
+#[test]
+fn rounding_cast_names_the_round_to_nearest_intrinsic() {
+    let op = super::rounding_cast::RoundingCastDps;
+    for (from, to, intrinsic) in [
+        (PlanDtype::Int, PlanDtype::F32, "__int2float_rn(a[i])"),
+        (PlanDtype::Int64, PlanDtype::F32, "__ll2float_rn(a[i])"),
+        (PlanDtype::Int, PlanDtype::F64, "__int2double_rn(a[i])"),
+        (PlanDtype::Int64, PlanDtype::F64, "__ll2double_rn(a[i])"),
+    ] {
+        let mut c = ctx(1, &[4], &[4], from);
+        c.dest_dtypes = vec![to];
+        c.operand_dtypes[1] = to;
+        c.operand_layouts[1] = layout(&[4], to);
+        let src = source(&op, &c).unwrap();
+        assert!(src.contains(intrinsic), "missing `{intrinsic}`:\n{src}");
+    }
 }

@@ -462,23 +462,19 @@ impl Translator<'_> {
             }
             view.finish()
         };
+        // Int/I64 data accumulates in its own dtype and wraps, as torch's
+        // integer kernels do; an F32 carrier would round past 2^24.
         let int_data = idx_is_int(data.dtype);
-        let work_dtype = if int_data { DType::F32 } else { data.dtype };
-        let original_work = to_working(if int_data {
-            data.cast(DType::F32)
-        } else {
-            data
-        });
+        let original_work = to_working(data);
         let mut output = original_work;
-        let flat_updates = if int_data {
-            updates.flatten().cast(DType::F32)
-        } else {
-            updates.flatten()
-        };
+        let flat_updates = updates.flatten();
         let track_counts = !include_self || matches!(reduction, IdxReduce::Mean);
+        // Torch counts in the data dtype for integer data (`count` is
+        // `ones_like(self)` plus a `scatter_add_` of ones).
+        let count_dtype = if int_data { data.dtype } else { DType::F32 };
         let mut counts = self.full_tensor(
             original_work.dims(),
-            DType::F32,
+            count_dtype,
             if include_self { 1.0 } else { 0.0 },
         );
         for step in 0..count {
@@ -494,6 +490,8 @@ impl Translator<'_> {
                 IdxReduce::Sum | IdxReduce::Mean => {
                     if bool_data {
                         self.bool_or(current, update)
+                    } else if int_data {
+                        self.torch_add(current, update)
                     } else {
                         storage_step(current, update, |a, b| a + b)
                     }
@@ -501,6 +499,8 @@ impl Translator<'_> {
                 IdxReduce::Prod => {
                     if bool_data {
                         self.bool_and(current, update)
+                    } else if int_data {
+                        self.torch_mul(current, update)
                     } else {
                         storage_step(current, update, |a, b| a * b)
                     }
@@ -522,24 +522,33 @@ impl Translator<'_> {
             };
             if track_counts {
                 // The per-destination update count is bounded by the
-                // number of unrolled steps, far below 2^24, so its F32
-                // carrier (also the mean's divisor dtype) is exact.
+                // number of unrolled steps, far below 2^24, so an F32 count
+                // (also the mean's divisor dtype) is exact.
                 let count_here = counts.gather(&dest);
                 if !include_self {
-                    let zero = self.cx.constant_f32(0.0).expand_rhs(count_here.dims());
+                    let zero = self.constant_like(count_here, 0.0);
                     let first_update = count_here.eq(zero);
                     combined = self.idx_cond(first_update, update, combined);
                 }
-                let one = self.cx.constant_f32(1.0).expand_rhs(count_here.dims());
-                counts = counts.scatter(&dest, count_here + one);
+                let one = self.constant_like(count_here, 1.0);
+                let next_count = self.torch_add(count_here, one);
+                counts = counts.scatter(&dest, next_count);
             }
             output = output.scatter(&dest, combined);
         }
         if matches!(reduction, IdxReduce::Mean) {
-            let zero = self.cx.constant_f32(0.0).expand_rhs(counts.dims());
+            let zero = self.constant_like(counts, 0.0);
             let has_values = counts.gt(zero);
-            let divisor = counts.cast(work_dtype);
-            let means = storage_step(output, divisor, |a, b| a / b);
+            let means = if int_data {
+                // Torch fills empty counts with one and floor-divides an
+                // integer total.
+                let one = self.constant_like(counts, 1.0);
+                let divisor = counts.maximum(one);
+                self.idx_floor_div_by_positive(output, divisor)
+            } else {
+                let divisor = counts.cast(output.dtype);
+                storage_step(output, divisor, |a, b| a / b)
+            };
             output = self.idx_cond(has_values, means, original_work);
         }
         // Split the plane axis back into the structural axes and restore
@@ -560,11 +569,18 @@ impl Translator<'_> {
         } else {
             output
         };
-        Ok(if int_data {
-            super::convert(output, data.dtype)
-        } else {
-            output
-        })
+        Ok(output)
+    }
+
+    /// Integer `floor(a / b)` for a divisor of at least one: the truncated
+    /// quotient, one lower where the remainder is negative. A negative
+    /// remainder needs `b >= 2`, so the quotient is above the dtype minimum
+    /// and the adjustment never wraps.
+    fn idx_floor_div_by_positive(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        let quotient = a.trunc_div(b);
+        let zero = self.constant_like(a, 0.0);
+        let negative = a.trunc_rem(b).lt(zero).cast(a.dtype);
+        self.torch_sub(quotient, negative)
     }
 
     /// Scatter coordinates for an update at `[.., index[c], ..]` (ONNX
@@ -1001,15 +1017,60 @@ impl Translator<'_> {
             bail!("index_reduce does not support the sum reduction");
         }
         let include_self = self.idx_include_self(node);
+        self.idx_reduce_along(
+            "index_reduce",
+            data,
+            raw_dim,
+            index,
+            source,
+            reduction,
+            include_self,
+        )
+    }
+
+    /// `index_add.default(self, dim, index, source, *, alpha=1)`:
+    /// `self[.., index[i], ..] += alpha * source[.., i, ..]` in update
+    /// order, accumulating in the data dtype.
+    pub(super) fn translate_index_add(&mut self, node: &Node) -> Result<GraphTensor> {
+        let data = self.operand(&node.inputs[0])?;
+        let raw_dim = self.get_int_arg(node, 1)?;
+        let index = self.operand(&node.inputs[2])?.cast(DType::Int);
+        let source = self.operand(&node.inputs[3])?;
+        let source = self.idx_cast_like(source, data.dtype);
+        let source = self.scale_by_named_scalar(node, "alpha", source)?;
+        self.idx_reduce_along(
+            "index_add",
+            data,
+            raw_dim,
+            index,
+            source,
+            IdxReduce::Sum,
+            true,
+        )
+    }
+
+    /// Reduce `source` slices into `data` at `index` along `raw_dim`
+    /// (`index_reduce`, `index_add`).
+    #[allow(clippy::too_many_arguments)]
+    fn idx_reduce_along(
+        &mut self,
+        op: &str,
+        data: GraphTensor,
+        raw_dim: i64,
+        index: GraphTensor,
+        source: GraphTensor,
+        reduction: IdxReduce,
+        include_self: bool,
+    ) -> Result<GraphTensor> {
         if data.rank() == 0 {
             if !matches!(raw_dim, -1 | 0) {
-                bail!("index_reduce dim {raw_dim} out of range for a scalar");
+                bail!("{op} dim {raw_dim} out of range for a scalar");
             }
             if index.rank() != 1 || index.dims()[0].to_usize() != Some(1) {
-                bail!("scalar index_reduce requires a one-element index");
+                bail!("scalar {op} requires a one-element index");
             }
             if source.rank() != 0 {
-                bail!("scalar index_reduce requires a scalar source");
+                bail!("scalar {op} requires a scalar source");
             }
             let data = data.unsqueeze(0);
             let source = source.unsqueeze(0);
@@ -1026,17 +1087,17 @@ impl Translator<'_> {
         }
         let dim = normalize_dim(raw_dim, data.rank());
         if index.rank() != 1 {
-            bail!("index_reduce index must be one-dimensional");
+            bail!("{op} index must be one-dimensional");
         }
         if source.rank() != data.rank() {
-            bail!("index_reduce source rank must match self");
+            bail!("{op} source rank must match self");
         }
         if !util::same_dim(source.dims()[dim], index.dims()[0]) {
-            bail!("index_reduce index length must equal source size along the reduced dimension");
+            bail!("{op} index length must equal source size along the reduced dimension");
         }
         for axis in 0..data.rank() {
             if axis != dim && !util::same_dim(source.dims()[axis], data.dims()[axis]) {
-                bail!("index_reduce source/self sizes must match outside the reduced dimension");
+                bail!("{op} source/self sizes must match outside the reduced dimension");
             }
         }
         let inserted: Vec<usize> = (0..data.rank()).filter(|axis| *axis != dim).collect();
@@ -1294,7 +1355,8 @@ impl Translator<'_> {
             1 => {
                 let one = self.full_tensor(vec![bag_count], DType::I64, 1.0);
                 let safe_counts = self.idx_cond(nonempty, counts, one);
-                let divisor = safe_counts.cast(accumulate).expand_dim(1, embedding_size);
+                let divisor = super::util::count_divisor(safe_counts, accumulate)
+                    .expand_dim(1, embedding_size);
                 (sum / divisor, counts)
             }
             _ => {

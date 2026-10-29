@@ -223,6 +223,31 @@ impl GraphTensor {
             .op(LogicalOp::TruncCast(dtype), &[operand], out_dims, dtype);
         GraphTensor::from_id(id, self.dims(), self.graph_ref, dtype)
     }
+
+    /// THE EXPLICIT ROUNDING CONVERSION: integer -> float, to the nearest
+    /// representable value with ties to even (C++'s `static_cast<float>`).
+    /// [`Self::cast`] stays exact-only, so an integer past the float's
+    /// exact range (2^24 for F32, 2^53 for F64) refuses there; this is the
+    /// named op an author (or translator) opts into instead, e.g. PyTorch's
+    /// `sum / static_cast<acc_t>(n)` mean divisor.
+    pub fn rounding_cast(self, dtype: DType) -> GraphTensor {
+        assert!(
+            matches!(self.dtype, DType::Int | DType::I64),
+            "rounding_cast source must be Int or I64, got {:?}",
+            self.dtype
+        );
+        assert!(
+            matches!(dtype, DType::F32 | DType::F64),
+            "rounding_cast target must be F32 or F64, got {dtype:?}"
+        );
+        let operand = (self.id, self.dims());
+        let out_dims = self.dims();
+        let id =
+            self.graph()
+                .logical
+                .op(LogicalOp::RoundingCast(dtype), &[operand], out_dims, dtype);
+        GraphTensor::from_id(id, self.dims(), self.graph_ref, dtype)
+    }
 }
 
 #[cfg(test)]

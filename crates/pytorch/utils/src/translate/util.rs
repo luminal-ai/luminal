@@ -167,6 +167,20 @@ pub(super) fn storage_step(
     round_to_storage(f(widen_storage(a), widen_storage(b)), storage)
 }
 
+/// An exact Int/I64 `count` as a divisor in `dtype`. A float divisor is
+/// converted with one rounding, as PyTorch's `static_cast<acc_t>(n)` is (a
+/// narrow float rounds once more from F32, to storage); an integer divisor
+/// is the exact cast.
+pub(super) fn count_divisor(count: GraphTensor, dtype: DType) -> GraphTensor {
+    match dtype {
+        DType::F32 | DType::F64 => count.rounding_cast(dtype),
+        narrow if narrow.is_narrow_float() => {
+            round_to_storage(count.rounding_cast(DType::F32), narrow)
+        }
+        _ => count.cast(dtype),
+    }
+}
+
 pub(super) fn ensure_same_dtype(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
     if a.dtype == b.dtype {
         return (a, b);
@@ -686,6 +700,15 @@ impl Translator<'_> {
             a.wrapping_sum(axes)
         } else {
             a.sum(axes)
+        }
+    }
+
+    /// Torch's `a @ b` (`mm`/`bmm`/`matmul`).
+    pub(super) fn torch_matmul(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_matmul(b)
+        } else {
+            a.matmul(b)
         }
     }
 

@@ -123,6 +123,9 @@ pub enum LogicalOp {
     },
     Cast(DType),
     TruncCast(DType),
+    /// The explicit rounding integer -> float conversion (nearest, ties to
+    /// even).
+    RoundingCast(DType),
     BitsToBools,
     BoolsToBits(DType),
     And,
@@ -204,6 +207,7 @@ impl LogicalOp {
             Self::Iota { .. } => "LogicalIota",
             Self::Cast(_) => "LogicalCast",
             Self::TruncCast(_) => "LogicalTruncCast",
+            Self::RoundingCast(_) => "LogicalRoundingCast",
             Self::BitsToBools => "LogicalBitsToBools",
             Self::BoolsToBits(_) => "LogicalBoolsToBits",
             Self::And => "LogicalAnd",
@@ -277,6 +281,7 @@ impl LogicalOp {
             | Self::WrappingAdd
             | Self::WrappingMul
             | Self::TruncCast(_)
+            | Self::RoundingCast(_)
             | Self::ReduceSum { .. }
             | Self::WrappingReduceSum { .. }
             | Self::UnspecifiedOrderScanSum { .. }
@@ -308,6 +313,7 @@ impl LogicalOp {
             Self::Input { .. } | Self::Constant(_) | Self::ConstantF64(_) | Self::Iota { .. } => 0,
             Self::Cast(_)
             | Self::TruncCast(_)
+            | Self::RoundingCast(_)
             | Self::BitsToBools
             | Self::BoolsToBits(_)
             | Self::Not
@@ -1247,6 +1253,7 @@ impl LogicalGraph {
                     }
                     LogicalOp::Cast(dtype)
                     | LogicalOp::TruncCast(dtype)
+                    | LogicalOp::RoundingCast(dtype)
                     | LogicalOp::BoolsToBits(dtype) => parts.push(Self::dtype_term(*dtype)),
                     LogicalOp::ReduceSum { axis_from_end }
                     | LogicalOp::WrappingReduceSum { axis_from_end }

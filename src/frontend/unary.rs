@@ -379,7 +379,13 @@ impl GraphTensor {
         if correction.is_nan() {
             return zero;
         }
-        let count = self.graph().constant_i32(n).cast(dtype);
+        // The count converts with one rounding, as `mean`'s does.
+        let count = self.graph().constant_i32(n);
+        let count = if matches!(dtype, DType::F32 | DType::F64) {
+            count.rounding_cast(dtype)
+        } else {
+            count.cast(dtype)
+        };
         let threshold = scalar(self.graph(), correction.max(0.0));
         let degrees = count - scalar(self.graph(), correction);
         count.gt(threshold).select(degrees, zero)

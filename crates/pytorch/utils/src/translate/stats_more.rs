@@ -1027,14 +1027,9 @@ impl Translator<'_> {
         let membership = self.bool_and(positions.ge(starts), positions.lt(ends));
         let expanded = data.expand_dim(axis, segment_count);
         let count = membership.cast(DType::Int).sum(vec![candidate_axis]);
-        // The mean's divisor in the data dtype. A narrow float goes through
-        // F32 (exact for any count to 2^24, then one rounding), as the old
-        // F32 count did: a direct Int -> F16/BF16 cast is checked-exact and
-        // would refuse counts past 2048/256.
-        let divisor = |count: GraphTensor| match data.dtype {
-            DType::F16 | DType::Bf16 => count.cast(DType::F32).cast(data.dtype),
-            dtype => count.cast(dtype),
-        };
+        // The mean's divisor in the data dtype, converted with one rounding
+        // (a narrow float rounds once more from F32, to storage).
+        let divisor = |count: GraphTensor| super::util::count_divisor(count, data.dtype);
 
         let initial = named_index(node, "initial")
             .and_then(|index| self.get_number_arg(node, index).ok())

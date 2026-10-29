@@ -92,6 +92,7 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "SinFunctionalGeneric"
         | "SqrtFunctionalGeneric"
         | "TruncCastGeneric"
+        | "RoundingCastGeneric"
         | "TruncDivFunctionalGeneric"
         | "TruncFunctionalGeneric"
         | "TruncRemFunctionalGeneric"
@@ -1233,6 +1234,7 @@ mod tests {
             "LayoutTensorOpSinFunctionalGeneric",
             "LayoutTensorOpSqrtFunctionalGeneric",
             "LayoutTensorOpTruncCastGeneric",
+            "LayoutTensorOpRoundingCastGeneric",
             "LayoutTensorOpTruncDivFunctionalGeneric",
             "LayoutTensorOpTruncFunctionalGeneric",
             "LayoutTensorOpTruncRemFunctionalGeneric",
@@ -2972,6 +2974,43 @@ mod tests {
         let rt = run_unattested(&cx, data);
         assert_eq!(rt.get_i64(rows.id).unwrap(), &vec![i64::MIN, 2]);
         assert_eq!(rt.get_i64(all.id).unwrap(), &vec![i64::MIN + 2]);
+    }
+
+    /// The explicit rounding conversion rounds to nearest, ties to even,
+    /// where the exact cast would refuse (past 2^24 for F32, 2^53 for F64).
+    #[test]
+    fn rounding_cast_rounds_to_nearest_even() {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![5], DType::Int);
+        let b = cx.tensor(vec![4], DType::I64);
+        let a32 = a.rounding_cast(DType::F32);
+        let b64 = b.rounding_cast(DType::F64);
+        let b32 = b.rounding_cast(DType::F32);
+        let data = FxHashMap::from_iter([
+            (
+                a.id,
+                vec![(1 << 24) + 1, (1 << 24) + 3, -(1 << 24) - 1, 7, i32::MAX].into(),
+            ),
+            (
+                b.id,
+                vec![(1i64 << 53) + 1, (1 << 53) + 3, i64::MIN, (1 << 62) + 1].into(),
+            ),
+        ]);
+        let rt = run_unattested(&cx, data);
+        assert_eq!(
+            rt.get_f32(a32.id).unwrap(),
+            &vec![16777216.0, 16777220.0, -16777216.0, 7.0, 2147483648.0]
+        );
+        assert_eq!(
+            rt.get_f64(b64.id).unwrap(),
+            &vec![
+                9007199254740992.0,
+                9007199254740996.0,
+                -9223372036854775808.0,
+                4611686018427387904.0
+            ]
+        );
+        assert_eq!(rt.get_f32(b32.id).unwrap()[0], 9007199254740992.0);
     }
 
     /// Wrapping prefix scans and the wrapping product (PyTorch's integer

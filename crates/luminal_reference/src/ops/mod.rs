@@ -61,6 +61,7 @@ pub(crate) mod recip;
 pub(crate) mod reduce_max;
 pub(crate) mod reduce_sum;
 pub(crate) mod round;
+pub(crate) mod rounding_cast;
 pub(crate) mod scatter;
 pub(crate) mod select;
 pub(crate) mod sin;
@@ -105,6 +106,7 @@ pub use recip::RecipFunctional;
 pub use reduce_max::ReduceMax;
 pub use reduce_sum::ReduceSum;
 pub use round::RoundFunctional;
+pub use rounding_cast::RoundingCast;
 pub use scatter::ScatterFunctional;
 pub use sin::SinFunctional;
 pub use sqrt::SqrtFunctional;
@@ -139,6 +141,7 @@ pub use recip::RecipFunctionalDps;
 pub use reduce_max::ReduceMaxDps;
 pub use reduce_sum::ReduceSumDps;
 pub use round::RoundFunctionalDps;
+pub use rounding_cast::RoundingCastDps;
 pub use scatter::ScatterFunctionalDps;
 pub use sin::SinFunctionalDps;
 pub use sqrt::SqrtFunctionalDps;
@@ -172,6 +175,7 @@ pub use recip::RecipFunctionalMatcher;
 pub use reduce_max::ReduceMaxMatcher;
 pub use reduce_sum::ReduceSumMatcher;
 pub use round::RoundFunctionalMatcher;
+pub use rounding_cast::RoundingCastMatcher;
 pub use scatter::ScatterFunctionalMatcher;
 pub use select::{SelectFunctional, SelectFunctionalDps, SelectFunctionalMatcher};
 pub use sin::SinFunctionalMatcher;
@@ -346,6 +350,10 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(TruncCastMatcher),
                 kernel: entry::<TruncCastDps>("TruncCastGeneric", trunc_cast::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(RoundingCastMatcher),
+                kernel: entry::<RoundingCastDps>("RoundingCastGeneric", rounding_cast::kernel),
             },
             ReferenceOp {
                 matcher: || Box::new(ExpFunctionalMatcher),

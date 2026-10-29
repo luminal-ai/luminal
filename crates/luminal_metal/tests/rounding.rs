@@ -76,3 +76,40 @@ fn trunc_cast_executes_on_device() {
         vec![1, 1, 0, 0, -1, -1]
     );
 }
+
+/// `rounding_cast` is the explicit rounding int -> float conversion (to
+/// nearest, ties to even), and `mean` divides by its count through it.
+#[test]
+fn rounding_cast_and_mean_execute_on_device() {
+    let mut g = Graph::new();
+    let x = g.tensor(vec![5], DType::Int);
+    let y = g.tensor(vec![2, 3], DType::F32);
+    let rounded = x.rounding_cast(DType::F32);
+    let mean = y.mean(vec![1]);
+    let mut rt = MetalRuntime::load(&g).unwrap();
+    rt.search(
+        &Default::default(),
+        &Default::default(),
+        &[(x.id, vec![1i32; 5].into()), (y.id, vec![1f32; 6].into())]
+            .into_iter()
+            .collect(),
+        &harness_search_options(),
+    )
+    .unwrap();
+    let mut arena_rt = support::allocate_arena(&rt).expect("allocate execution arena");
+
+    rt.upload(
+        &mut arena_rt,
+        x.id,
+        vec![(1 << 24) + 1, (1 << 24) + 3, -(1 << 24) - 1, 7, i32::MAX],
+    )
+    .unwrap();
+    rt.upload(&mut arena_rt, y.id, vec![1.0f32, 2.0, 6.0, -3.0, 0.0, 0.0])
+        .unwrap();
+    rt.execute(arena_rt.buffer()).unwrap();
+    assert_eq!(
+        rt.read_f32(&arena_rt, rounded.id).unwrap(),
+        vec![16777216.0, 16777220.0, -16777216.0, 7.0, 2147483648.0]
+    );
+    assert_eq!(rt.read_f32(&arena_rt, mean.id).unwrap(), vec![3.0, -1.0]);
+}

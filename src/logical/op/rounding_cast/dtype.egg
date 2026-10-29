@@ -1,0 +1,11 @@
+; Dtype Propagation : LogicalRoundingCast — the TARGET dtype, carried in the term.
+(rule
+  (
+    (= ?out_logical_tensor (LogicalRoundingCast ?in_logical ?target_dtype))
+  )
+  (
+    (set (dtype-of ?out_logical_tensor) ?target_dtype)
+  )
+  :ruleset prop
+  :name "rounding_cast/dtype: dtype of LogicalRoundingCast is the target in the term"
+)
