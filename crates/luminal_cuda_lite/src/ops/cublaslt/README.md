@@ -215,11 +215,41 @@ authored final BF16/FP16 cast can select the matching narrow D and C storage.
 
 Batch descriptors require positive rank-three extents and one shared batch
 count that fits positive int32. Every matrix has unit minor stride and a legal
-leading dimension. A live batch stride must cover the **full padded matrix**:
+leading dimension. A nonzero live batch stride must cover the **full padded matrix**:
 `rows * ld` in row order or `columns * ld` in column order. Covering only the
 last touched element is insufficient. A singleton batch may choose its
-canonical padded pitch from Any. Live zero/broadcast strides, overlapping
-batches, negative strides, and unproved geometry cannot become matrix readings.
+canonical padded pitch from Any. Overlapping nonzero batch strides, negative
+strides, and unproved geometry cannot become matrix readings.
+
+A and B may **independently share one matrix** across that batch axis. The
+frontend states this with an explicit broadcast, for example:
+
+```rust,ignore
+let a = graph.tensor([g, m, k], DType::F32);
+let b = graph.tensor([k, n], DType::F32).expand_dim(0, g);
+let y = a.matmul(b); // y[g] = a[g] @ b
+```
+
+Broadcasting A instead gives `y[g] = a @ b[g]`; broadcasting both repeats the
+same product, optionally adding a different C for each batch. Expanding an
+existing singleton batch axis is also supported. These are pure views: the
+shared operand needs only one physical matrix, including its row/column pitch.
+No repeated matrix buffer is required. This feature does not insert frontend
+broadcasts or flatten multiple batch axes.
+
+`cublaslt-strided-batch-operand-reading` admits the existing disjoint readings
+or a shape-owned **exact zero batch stride**, with the same unit minor stride
+and legal leading dimension. This relation is used only for A and B. Every
+vendor descriptor still carries the common logical batch count; sharing is
+represented by stride zero, not a descriptor count of one. The independent
+[layout attributes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatrixlayoutattribute-t)
+are dispatched unchanged. Precision/storage proofs and the complete 2,176-row
+configuration whitelist remain shared with ordinary batches.
+
+Read sharing never publishes a disjoint matrix or destination proof. C and D
+retain the full padded, non-overlapping batch footprint, including in-place
+calls. Thus a shared A/B reading cannot authorize an overlapping output or a
+shared C/D write. Partial matrix overlap remains unsupported.
 
 Batched admission currently covers a product and product+C, without
 bias or activation. C and D share shape, dtype, order and count but may have

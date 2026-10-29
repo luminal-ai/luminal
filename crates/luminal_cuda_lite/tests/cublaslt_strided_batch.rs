@@ -14,6 +14,12 @@ use luminal_cuda_lite::ops::cublaslt::approved::{
 };
 use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtDesc, LtOrder, validate_ld_bounds};
 
+#[path = "support/broadcast_batch.rs"]
+mod broadcast_batch;
+
+// Profiling/context synchronization must not overlap another test's capture.
+#[cfg(feature = "device")]
+static DEVICE_EXECUTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(feature = "device")]
 mod support;
 #[path = "support/whitelist.rs"]
@@ -78,22 +84,65 @@ fn graph_with_output(
     tf32: bool,
     narrow: bool,
 ) -> Graph {
+    graph_with_sharing(
+        dtype,
+        transpose_a,
+        transpose_b,
+        with_c,
+        tf32,
+        narrow,
+        (false, false),
+    )
+}
+
+fn graph_with_sharing(
+    dtype: DType,
+    transpose_a: bool,
+    transpose_b: bool,
+    with_c: bool,
+    tf32: bool,
+    narrow: bool,
+    (shared_a, shared_b): (bool, bool),
+) -> Graph {
     let mut graph = Graph::new();
+    let a_shape = if transpose_a { vec![4, 3] } else { vec![3, 4] };
+    let b_shape = if transpose_b { vec![5, 4] } else { vec![4, 5] };
+    let shape = |shared, matrix: Vec<usize>| {
+        if shared {
+            matrix
+        } else {
+            [vec![2], matrix].concat()
+        }
+    };
     let mut a = graph
-        .tensor(if transpose_a { [2, 4, 3] } else { [2, 3, 4] }, dtype)
+        .tensor(shape(shared_a, a_shape), dtype)
         .cast(DType::F32);
     let mut b = graph
-        .tensor(if transpose_b { [2, 5, 4] } else { [2, 4, 5] }, dtype)
+        .tensor(shape(shared_b, b_shape), dtype)
         .cast(DType::F32);
     if tf32 {
         a = a.cast(DType::TF32).cast(DType::F32);
         b = b.cast(DType::TF32).cast(DType::F32);
     }
     if transpose_a {
-        a = a.permute(&[0, 2, 1]);
+        a = a.permute(if shared_a {
+            &[1, 0][..]
+        } else {
+            &[0, 2, 1][..]
+        });
     }
     if transpose_b {
-        b = b.permute(&[0, 2, 1]);
+        b = b.permute(if shared_b {
+            &[1, 0][..]
+        } else {
+            &[0, 2, 1][..]
+        });
+    }
+    if shared_a {
+        a = a.expand_dim(0, 2);
+    }
+    if shared_b {
+        b = b.expand_dim(0, 2);
     }
     let mut output = a.matmul(b);
     if with_c {
@@ -270,10 +319,23 @@ fn matrix_readings_require_disjoint_full_padded_batches() {
         .map(|row| row.matcher)
         .collect();
     let program = luminal::egglog_snippet::assembled_program_for(&matchers);
-    for (stride, accepted) in [(0, false), (20, false), (23, false), (24, true), (32, true)] {
+    for (stride, accepted) in [
+        (-1, false),
+        (0, false),
+        (20, false),
+        (23, false),
+        (24, true),
+        (32, true),
+    ] {
         let mut egraph = luminal::egglog_snippet::new_egraph();
         let check = if accepted { "(check" } else { "(fail (check" };
         let tail = if accepted { "))" } else { ")))" };
+        let operand_check = if accepted || stride == 0 {
+            "(check"
+        } else {
+            "(fail (check"
+        };
+        let operand_tail = if accepted || stride == 0 { "))" } else { ")))" };
         let source = format!(
             r#"
 (let shape (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 3) (IntExprCons (IntLit 4) (IntExprNil))))))
@@ -286,6 +348,10 @@ fn matrix_readings_require_disjoint_full_padded_batches() {
 {}
 {check} (cublaslt-strided-batch-matrix-reading tensor (IntLit 2) (IntLit 3) (IntLit 4)
  (F32) (CublasLtRowMajor) (CublasLtNoTranspose) ?descriptor{tail}
+{operand_check} (cublaslt-strided-batch-operand-reading tensor (IntLit 2) (IntLit 3) (IntLit 4)
+ (F32) (CublasLtRowMajor) (CublasLtNoTranspose) ?descriptor{operand_tail}
+{check} (cublaslt-strided-batch-destination-reading tensor (IntLit 2) (IntLit 3) (IntLit 4)
+ (F32) (CublasLtRowMajor) ?descriptor{tail}
 "#,
             luminal_cuda_lite::CudaBindings::SCHEDULE
         );
@@ -447,93 +513,167 @@ fn bounds_checks_include_every_batch_and_detect_overflow() {
 #[cfg(feature = "device")]
 #[test]
 fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration() {
+    dispatch_batch_configurations(false);
+}
+
+#[cfg(feature = "device")]
+fn dispatch_batch_configurations(broadcast: bool) {
+    let _execution = DEVICE_EXECUTION.lock().unwrap();
     use cudarc::driver::{CudaContext, DevicePtr};
     use luminal_cuda_lite::ops::cublaslt::device_call::{DeviceRange, dispatch};
     let context = CudaContext::new(0).unwrap();
     let ampere_or_newer = context.compute_capability().unwrap().0 >= 8;
     let stream = context.new_stream().unwrap();
     let mut witnesses = std::collections::BTreeMap::new();
-    for (dtype, tf32, narrow) in [
-        (DType::F32, false, false),
-        (DType::Bf16, false, false),
-        (DType::F16, false, false),
-        (DType::F32, true, false),
-        (DType::Bf16, false, true),
-        (DType::F16, false, true),
-    ] {
-        if !ampere_or_newer && (dtype == DType::Bf16 || tf32) {
-            continue;
-        }
-        for ta in [false, true] {
-            for tb in [false, true] {
-                let (separate, in_place) = calls(&saturate(
-                    &graph_with_output(dtype, ta, tb, true, tf32, narrow),
-                    WHITELIST,
-                ));
-                for op in separate {
-                    witnesses
-                        .entry((whitelist::key(&op), false))
-                        .or_insert_with(|| op.resolve(&Default::default()));
-                }
-                for op in in_place {
-                    witnesses
-                        .entry((whitelist::in_place_key(&op), true))
-                        .or_insert_with(|| op.resolve(&Default::default()));
-                }
-                // Rank-three column-major *matrices* need an outer batch stride;
-                // the rank-three ColumnMajor boundary would put batch innermost.
-                let mut model = Graph::new();
-                let a_source = model.tensor(if ta { [2, 4, 3] } else { [2, 3, 4] }, dtype);
-                let b_source = model.tensor(if tb { [2, 5, 4] } else { [2, 4, 5] }, dtype);
-                let mut a = a_source.cast(DType::F32);
-                let mut b = b_source.cast(DType::F32);
-                if tf32 {
-                    a = a.cast(DType::TF32).cast(DType::F32);
-                    b = b.cast(DType::TF32).cast(DType::F32);
-                }
-                if ta {
-                    a = a.permute(&[0, 2, 1]);
-                }
-                if tb {
-                    b = b.permute(&[0, 2, 1]);
-                }
-                let product = a.matmul(b);
-                let c = model.tensor([2, 3, 5], if narrow { dtype } else { DType::F32 });
-                let accumulated = product + c.cast(DType::F32);
-                let (product, accumulated) = if narrow {
-                    (product.cast(dtype), accumulated.cast(dtype))
-                } else {
-                    (product, accumulated)
-                };
-                let layout =
-                    luminal_cuda_lite::bindings::BoundaryLayout::strided_literal([24, 1, 4]);
-                let mut bindings = luminal_cuda_lite::CudaBindings::new();
-                bindings.input(a_source.id);
-                bindings.input(b_source.id);
-                bindings.input_with(c.id, layout.clone());
-                bindings.output_with(product.id, layout.clone());
-                bindings.output_with(accumulated.id, layout);
-                let runtime =
-                    CudaRuntime::load_with(&model, bindings, luminal_cuda_lite::cuda_registry())
-                        .unwrap();
-                let (separate, in_place) =
-                    calls(&runtime.saturated_egraph(&Default::default()).unwrap());
-                for op in separate {
-                    witnesses
-                        .entry((whitelist::key(&op), false))
-                        .or_insert_with(|| op.resolve(&Default::default()));
-                }
-                for op in in_place {
-                    witnesses
-                        .entry((whitelist::in_place_key(&op), true))
-                        .or_insert_with(|| op.resolve(&Default::default()));
+    let sharing: &[(bool, bool)] = if broadcast {
+        &[(true, false), (false, true), (true, true)]
+    } else {
+        &[(false, false)]
+    };
+    for &(shared_a, shared_b) in sharing {
+        for (dtype, tf32, narrow) in [
+            (DType::F32, false, false),
+            (DType::Bf16, false, false),
+            (DType::F16, false, false),
+            (DType::F32, true, false),
+            (DType::Bf16, false, true),
+            (DType::F16, false, true),
+        ] {
+            if !ampere_or_newer && (dtype == DType::Bf16 || tf32) {
+                continue;
+            }
+            for ta in [false, true] {
+                for tb in [false, true] {
+                    let (separate, in_place) = calls(&saturate(
+                        &graph_with_sharing(
+                            dtype,
+                            ta,
+                            tb,
+                            true,
+                            tf32,
+                            narrow,
+                            (shared_a, shared_b),
+                        ),
+                        WHITELIST,
+                    ));
+                    for op in separate {
+                        let call = op.resolve(&Default::default());
+                        if (call.a.batch_stride_in_elements == 0) != shared_a
+                            || (call.b.batch_stride_in_elements == 0) != shared_b
+                        {
+                            continue;
+                        }
+                        witnesses
+                            .entry((whitelist::key(&op), false, shared_a, shared_b))
+                            .or_insert_with(|| op.resolve(&Default::default()));
+                    }
+                    for op in in_place {
+                        let call = op.resolve(&Default::default());
+                        if (call.a.batch_stride_in_elements == 0) != shared_a
+                            || (call.b.batch_stride_in_elements == 0) != shared_b
+                        {
+                            continue;
+                        }
+                        witnesses
+                            .entry((whitelist::in_place_key(&op), true, shared_a, shared_b))
+                            .or_insert_with(|| op.resolve(&Default::default()));
+                    }
+                    // Rank-three column-major *matrices* need an outer batch stride;
+                    // the rank-three ColumnMajor boundary would put batch innermost.
+                    let mut model = Graph::new();
+                    let shape = |shared, transposed, rows, cols| {
+                        let matrix = if transposed {
+                            vec![cols, rows]
+                        } else {
+                            vec![rows, cols]
+                        };
+                        if shared {
+                            matrix
+                        } else {
+                            [vec![2], matrix].concat()
+                        }
+                    };
+                    let a_source = model.tensor(shape(shared_a, ta, 3, 4), dtype);
+                    let b_source = model.tensor(shape(shared_b, tb, 4, 5), dtype);
+                    let mut a = a_source.cast(DType::F32);
+                    let mut b = b_source.cast(DType::F32);
+                    if tf32 {
+                        a = a.cast(DType::TF32).cast(DType::F32);
+                        b = b.cast(DType::TF32).cast(DType::F32);
+                    }
+                    if ta {
+                        a = a.permute(if shared_a {
+                            &[1, 0][..]
+                        } else {
+                            &[0, 2, 1][..]
+                        });
+                    }
+                    if tb {
+                        b = b.permute(if shared_b {
+                            &[1, 0][..]
+                        } else {
+                            &[0, 2, 1][..]
+                        });
+                    }
+                    if shared_a {
+                        a = a.expand_dim(0, 2);
+                    }
+                    if shared_b {
+                        b = b.expand_dim(0, 2);
+                    }
+                    let product = a.matmul(b);
+                    let c = model.tensor([2, 3, 5], if narrow { dtype } else { DType::F32 });
+                    let accumulated = product + c.cast(DType::F32);
+                    let (product, accumulated) = if narrow {
+                        (product.cast(dtype), accumulated.cast(dtype))
+                    } else {
+                        (product, accumulated)
+                    };
+                    let layout =
+                        luminal_cuda_lite::bindings::BoundaryLayout::strided_literal([24, 1, 4]);
+                    let mut bindings = luminal_cuda_lite::CudaBindings::new();
+                    bindings.input(a_source.id);
+                    bindings.input(b_source.id);
+                    bindings.input_with(c.id, layout.clone());
+                    bindings.output_with(product.id, layout.clone());
+                    bindings.output_with(accumulated.id, layout);
+                    let runtime = CudaRuntime::load_with(
+                        &model,
+                        bindings,
+                        luminal_cuda_lite::cuda_registry(),
+                    )
+                    .unwrap();
+                    let (separate, in_place) =
+                        calls(&runtime.saturated_egraph(&Default::default()).unwrap());
+                    for op in separate {
+                        let call = op.resolve(&Default::default());
+                        if (call.a.batch_stride_in_elements == 0) != shared_a
+                            || (call.b.batch_stride_in_elements == 0) != shared_b
+                        {
+                            continue;
+                        }
+                        witnesses
+                            .entry((whitelist::key(&op), false, shared_a, shared_b))
+                            .or_insert_with(|| op.resolve(&Default::default()));
+                    }
+                    for op in in_place {
+                        let call = op.resolve(&Default::default());
+                        if (call.a.batch_stride_in_elements == 0) != shared_a
+                            || (call.b.batch_stride_in_elements == 0) != shared_b
+                        {
+                            continue;
+                        }
+                        witnesses
+                            .entry((whitelist::in_place_key(&op), true, shared_a, shared_b))
+                            .or_insert_with(|| op.resolve(&Default::default()));
+                    }
                 }
             }
         }
     }
     assert_eq!(
         witnesses.len(),
-        if ampere_or_newer { 1152 } else { 576 },
+        sharing.len() * if ampere_or_newer { 1152 } else { 576 },
         "each storage/computation mode covers base, separate C and in-place C configurations"
     );
     let at = |d: LtDesc, batch: usize, row: usize, col: usize| {
@@ -543,7 +683,11 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                 LtOrder::Col => col * d.ld as usize + row,
             }
     };
-    for ((_, alias), mut call) in witnesses {
+    for ((_, alias, shared_a, shared_b), mut call) in witnesses {
+        // Require a native broadcast witness for each complete configuration,
+        // rather than accepting its materialized, disjoint alternative.
+        assert_eq!(call.a.batch_stride_in_elements == 0, shared_a);
+        assert_eq!(call.b.batch_stride_in_elements == 0, shared_b);
         use luminal_cuda_lite::ops::cublaslt::exec::LtScalars;
         let (alpha, beta) = (1.25f32, if call.c.is_some() { -0.5f32 } else { 0.0 });
         if matches!(call.scalars, LtScalars::Host { .. }) {
@@ -571,7 +715,11 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                 .map(|c| (c.descriptor, false, m, n, c.data_type, 2usize, c.operand)),
         ) {
             let mut data = vec![777.0f32; elements(d)];
-            for batch in 0..count {
+            for batch in 0..if d.batch_stride_in_elements == 0 {
+                1
+            } else {
+                count
+            } {
                 for row in 0..rows {
                     for col in 0..cols {
                         let (r, c) = if trans { (col, row) } else { (row, col) };
@@ -649,8 +797,8 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
                 for col in 0..n {
                     let mut expected: f64 = (0..k)
                         .map(|inner| {
-                            (batch + row + inner + 1) as f64 / 8.0
-                                * (batch + inner + 2 * col + 1) as f64
+                            (if shared_a { 0 } else { batch } + row + inner + 1) as f64 / 8.0
+                                * (if shared_b { 0 } else { batch } + inner + 2 * col + 1) as f64
                                 / 16.0
                         })
                         .sum();
@@ -677,6 +825,7 @@ fn recovered_source_dispatches_every_basic_and_accumulating_batch_configuration(
 #[cfg(feature = "device")]
 #[test]
 fn changing_the_batch_count_replays_the_production_call() {
+    let _execution = DEVICE_EXECUTION.lock().unwrap();
     use support::TestTransfers;
     for tf32 in [false, true] {
         if tf32

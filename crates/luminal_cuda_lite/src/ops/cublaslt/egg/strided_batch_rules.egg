@@ -15,6 +15,8 @@
 (relation cublaslt-legal-batch-stride (ElementStride IntExpr IntExpr))
 (relation cublaslt-strided-batch-matrix-reading
   (LayoutTensor IntExpr IntExpr IntExpr Dtype CublasLtMatrixOrder CublasLtMatrixOperation CublasLtMatrixDescriptor))
+(relation cublaslt-strided-batch-operand-reading
+  (LayoutTensor IntExpr IntExpr IntExpr Dtype CublasLtMatrixOrder CublasLtMatrixOperation CublasLtMatrixDescriptor))
 (relation cublaslt-strided-batch-destination-reading
   (LayoutTensor IntExpr IntExpr IntExpr Dtype CublasLtMatrixOrder CublasLtMatrixDescriptor))
 
@@ -244,6 +246,51 @@
   :ruleset backend
   :name "cublaslt: disjoint strided batch destination")
 
+; A and B may independently reuse one physical matrix across the logical
+; batch axis. Keep this permission out of matrix-reading: C and D still require
+; disjoint batches, and a shared read must never authorize overlapping writes.
+(rule
+  ((cublaslt-strided-batch-matrix-reading ?layout_tensor ?BatchCount ?rows ?columns
+     ?storage_data_type ?matrix_order ?operation ?matrix_descriptor))
+  ((cublaslt-strided-batch-operand-reading ?layout_tensor ?BatchCount ?rows ?columns
+     ?storage_data_type ?matrix_order ?operation ?matrix_descriptor))
+  :ruleset backend
+  :name "cublaslt: disjoint batches are valid A and B operands")
+(rule
+  ((cublaslt-strided-batch-geometry ?layout_tensor ?BatchCount ?rows ?columns
+     ?storage_data_type (ElementStrideExact (IntLit 0)) ?row_stride ?column_stride)
+   (cublaslt-unit-element-stride ?column_stride)
+   (cublaslt-legal-leading-dimension ?row_stride ?columns ?LeadingDimension))
+  ((cublaslt-strided-batch-operand-reading ?layout_tensor ?BatchCount ?rows ?columns
+     ?storage_data_type (CublasLtRowMajor) (CublasLtNoTranspose)
+     (CublasLtMatrixDescriptorOf ?layout_tensor
+       (CublasLtMatrixLayoutLit ?storage_data_type (CublasLtRowMajor) ?rows ?columns
+         ?LeadingDimension ?BatchCount (IntLit 0))))
+   (cublaslt-strided-batch-operand-reading ?layout_tensor ?BatchCount ?rows ?columns
+     ?storage_data_type (CublasLtColumnMajor) (CublasLtTranspose)
+     (CublasLtMatrixDescriptorOf ?layout_tensor
+       (CublasLtMatrixLayoutLit ?storage_data_type (CublasLtColumnMajor) ?columns ?rows
+         ?LeadingDimension ?BatchCount (IntLit 0)))))
+  :ruleset backend
+  :name "cublaslt: shared row matrix is an A or B operand")
+(rule
+  ((cublaslt-strided-batch-geometry ?layout_tensor ?BatchCount ?rows ?columns
+     ?storage_data_type (ElementStrideExact (IntLit 0)) ?row_stride ?column_stride)
+   (cublaslt-unit-element-stride ?row_stride)
+   (cublaslt-legal-leading-dimension ?column_stride ?rows ?LeadingDimension))
+  ((cublaslt-strided-batch-operand-reading ?layout_tensor ?BatchCount ?rows ?columns
+     ?storage_data_type (CublasLtColumnMajor) (CublasLtNoTranspose)
+     (CublasLtMatrixDescriptorOf ?layout_tensor
+       (CublasLtMatrixLayoutLit ?storage_data_type (CublasLtColumnMajor) ?rows ?columns
+         ?LeadingDimension ?BatchCount (IntLit 0))))
+   (cublaslt-strided-batch-operand-reading ?layout_tensor ?BatchCount ?rows ?columns
+     ?storage_data_type (CublasLtRowMajor) (CublasLtTranspose)
+     (CublasLtMatrixDescriptorOf ?layout_tensor
+       (CublasLtMatrixLayoutLit ?storage_data_type (CublasLtRowMajor) ?columns ?rows
+         ?LeadingDimension ?BatchCount (IntLit 0)))))
+  :ruleset backend
+  :name "cublaslt: shared column matrix is an A or B operand")
+
 ; The batch geometry is part of the three descriptors. Computation, scalar,
 ; storage, order and transpose policy still require the complete whitelist row.
 ; This gate admits the basic product. C addition has its own complete gate below.
@@ -258,9 +305,9 @@
    (cublaslt-output-storage-reading ?output_expression ?stored_expression)
    (= ?D_storage_data_type (dtype-of ?stored_expression))
    (= ?D_layout_tensor (LayoutTensorLit ?stored_expression ?D_layout))
-   (cublaslt-strided-batch-matrix-reading ?A_layout_tensor ?BatchCount ?m ?k ?A_storage_data_type
+   (cublaslt-strided-batch-operand-reading ?A_layout_tensor ?BatchCount ?m ?k ?A_storage_data_type
      ?A_matrix_order ?A_transpose_operation ?A_matrix_descriptor)
-   (cublaslt-strided-batch-matrix-reading ?B_layout_tensor ?BatchCount ?k ?n ?B_storage_data_type
+   (cublaslt-strided-batch-operand-reading ?B_layout_tensor ?BatchCount ?k ?n ?B_storage_data_type
      ?B_matrix_order ?B_transpose_operation ?B_matrix_descriptor)
    (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order ?D_matrix_descriptor)
@@ -296,9 +343,9 @@
    (cublaslt-output-storage-reading ?output_expression ?stored_expression)
    (= ?D_storage_data_type (dtype-of ?stored_expression))
    (= ?D_layout_tensor (LayoutTensorLit ?stored_expression ?D_layout))
-   (cublaslt-strided-batch-matrix-reading ?A_layout_tensor ?BatchCount ?m ?k ?A_storage_data_type
+   (cublaslt-strided-batch-operand-reading ?A_layout_tensor ?BatchCount ?m ?k ?A_storage_data_type
      ?A_matrix_order ?A_transpose_operation ?A_matrix_descriptor)
-   (cublaslt-strided-batch-matrix-reading ?B_layout_tensor ?BatchCount ?k ?n ?B_storage_data_type
+   (cublaslt-strided-batch-operand-reading ?B_layout_tensor ?BatchCount ?k ?n ?B_storage_data_type
      ?B_matrix_order ?B_transpose_operation ?B_matrix_descriptor)
    (cublaslt-strided-batch-matrix-reading ?C_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order (CublasLtNoTranspose) ?C_matrix_descriptor)
