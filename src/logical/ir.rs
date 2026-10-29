@@ -145,7 +145,18 @@ pub enum LogicalOp {
     LessThan,
     TruncDiv,
     TruncRem,
+    /// Two's-complement addition modulo 2^w: PyTorch's integer `+`. Total
+    /// (no proof gates it); unioned with the exact `Add` where bounds prove
+    /// the exact sum in width.
+    WrappingAdd,
+    /// Two's-complement multiplication modulo 2^w: PyTorch's integer `*`.
+    WrappingMul,
     ReduceSum {
+        axis_from_end: usize,
+    },
+    /// Two's-complement sum along one axis, modulo 2^w: PyTorch's integer
+    /// `sum`.
+    WrappingReduceSum {
         axis_from_end: usize,
     },
     ReduceMax {
@@ -161,6 +172,16 @@ pub enum LogicalOp {
     },
     /// Inclusive scan along one axis, evaluation order unspecified.
     UnspecifiedOrderScanMax {
+        axis_from_end: usize,
+    },
+    /// Inclusive two's-complement sum scan along one axis, modulo 2^w:
+    /// PyTorch's integer `cumsum`.
+    WrappingScanSum {
+        axis_from_end: usize,
+    },
+    /// Inclusive two's-complement product scan along one axis, modulo 2^w:
+    /// PyTorch's integer `cumprod`.
+    WrappingScanProd {
         axis_from_end: usize,
     },
     Gather,
@@ -205,12 +226,17 @@ impl LogicalOp {
             Self::LessThan => "LogicalLessThan",
             Self::TruncDiv => "LogicalTruncDiv",
             Self::TruncRem => "LogicalTruncRem",
+            Self::WrappingAdd => "LogicalWrappingAdd",
+            Self::WrappingMul => "LogicalWrappingMul",
             Self::Select => "LogicalSelect",
             Self::ReduceSum { .. } => "LogicalReduceSum",
+            Self::WrappingReduceSum { .. } => "LogicalWrappingReduceSum",
             Self::ReduceMax { .. } => "LogicalReduceMax",
             Self::UnspecifiedOrderScanSum { .. } => "LogicalUnspecifiedOrderScanSum",
             Self::UnspecifiedOrderScanProd { .. } => "LogicalUnspecifiedOrderScanProd",
             Self::UnspecifiedOrderScanMax { .. } => "LogicalUnspecifiedOrderScanMax",
+            Self::WrappingScanSum { .. } => "LogicalWrappingScanSum",
+            Self::WrappingScanProd { .. } => "LogicalWrappingScanProd",
             Self::Gather => "LogicalGather",
             Self::Scatter => "LogicalScatter",
             Self::IndexMapApply { .. } => "LogicalIndexMapApply",
@@ -248,10 +274,15 @@ impl LogicalOp {
             | Self::Mod
             | Self::TruncDiv
             | Self::TruncRem
+            | Self::WrappingAdd
+            | Self::WrappingMul
             | Self::TruncCast(_)
             | Self::ReduceSum { .. }
+            | Self::WrappingReduceSum { .. }
             | Self::UnspecifiedOrderScanSum { .. }
-            | Self::UnspecifiedOrderScanProd { .. } => true,
+            | Self::UnspecifiedOrderScanProd { .. }
+            | Self::WrappingScanSum { .. }
+            | Self::WrappingScanProd { .. } => true,
             Self::Input { .. }
             | Self::Constant(_)
             | Self::ConstantF64(_)
@@ -291,10 +322,13 @@ impl LogicalOp {
             | Self::Round
             | Self::Recip
             | Self::ReduceSum { .. }
+            | Self::WrappingReduceSum { .. }
             | Self::ReduceMax { .. }
             | Self::UnspecifiedOrderScanSum { .. }
             | Self::UnspecifiedOrderScanProd { .. }
             | Self::UnspecifiedOrderScanMax { .. }
+            | Self::WrappingScanSum { .. }
+            | Self::WrappingScanProd { .. }
             | Self::IndexMapApply { .. } => 1,
             Self::And
             | Self::Or
@@ -304,7 +338,9 @@ impl LogicalOp {
             | Self::Mod
             | Self::LessThan
             | Self::TruncDiv
-            | Self::TruncRem => 2,
+            | Self::TruncRem
+            | Self::WrappingAdd
+            | Self::WrappingMul => 2,
             Self::Select => 3,
             Self::Gather | Self::Scatter => return None,
         })
@@ -1213,10 +1249,13 @@ impl LogicalGraph {
                     | LogicalOp::TruncCast(dtype)
                     | LogicalOp::BoolsToBits(dtype) => parts.push(Self::dtype_term(*dtype)),
                     LogicalOp::ReduceSum { axis_from_end }
+                    | LogicalOp::WrappingReduceSum { axis_from_end }
                     | LogicalOp::ReduceMax { axis_from_end }
                     | LogicalOp::UnspecifiedOrderScanSum { axis_from_end }
                     | LogicalOp::UnspecifiedOrderScanProd { axis_from_end }
-                    | LogicalOp::UnspecifiedOrderScanMax { axis_from_end } => {
+                    | LogicalOp::UnspecifiedOrderScanMax { axis_from_end }
+                    | LogicalOp::WrappingScanSum { axis_from_end }
+                    | LogicalOp::WrappingScanProd { axis_from_end } => {
                         parts.push(axis_from_end.to_string());
                     }
                     LogicalOp::IndexMapApply { entries } => {

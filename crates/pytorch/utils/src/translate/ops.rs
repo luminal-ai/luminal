@@ -70,8 +70,30 @@ impl Translator<'_> {
 
     pub(super) fn pow_tensor_scalar(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.operand(&node.inputs[0])?;
-        let exponent = self.get_float_arg(node, 1)? as f32;
-        Ok(a.pow(exponent))
+        let exponent = self.get_float_arg(node, 1)?;
+        if Self::torch_wraps(a.dtype) {
+            // Torch's integer power is exact repeated multiplication, which
+            // wraps modulo 2^w: square-and-multiply through the wrapping
+            // family. Torch refuses a negative integer power of an integer.
+            anyhow::ensure!(
+                exponent >= 0.0 && exponent.fract() == 0.0,
+                "integer pow needs a non-negative integer exponent, got {exponent}"
+            );
+            let mut remaining = exponent as u64;
+            let mut result = self.constant_like(a, 1.0);
+            let mut base = a;
+            while remaining > 0 {
+                if remaining & 1 == 1 {
+                    result = self.torch_mul(result, base);
+                }
+                remaining >>= 1;
+                if remaining > 0 {
+                    base = self.torch_mul(base, base);
+                }
+            }
+            return Ok(result);
+        }
+        Ok(a.pow(exponent as f32))
     }
 
     pub(super) fn pow_tensor_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -355,11 +377,11 @@ impl Translator<'_> {
             .or_else(|| node.inputs.get(2).and_then(|i| i.arg.as_bool()))
             .unwrap_or(false);
         let result = match op {
-            ReductionOp::Sum => x.sum(axes.clone()),
+            ReductionOp::Sum => self.torch_sum(x, axes.clone()),
             ReductionOp::Mean => x.mean(axes.clone()),
             ReductionOp::Max => x.max(axes.clone()),
             ReductionOp::Min => x.min(axes.clone()),
-            ReductionOp::Prod => x.prod(axes.clone()),
+            ReductionOp::Prod => self.torch_prod(x, axes.clone()),
         };
         Ok(if keepdim {
             keep_axes(result, &axes)
@@ -437,11 +459,7 @@ impl Translator<'_> {
         // rounded every step would drift by whole ulps of the total.
         let compute = super::opmath_compute(result);
         let x = super::convert(x, compute);
-        let scanned = if prod {
-            x.cumprod(vec![dim])
-        } else {
-            x.cumsum(vec![dim])
-        };
+        let scanned = self.torch_scan(x, dim, prod);
         Ok(super::convert(scanned, result))
     }
 

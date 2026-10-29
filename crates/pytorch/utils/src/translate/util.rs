@@ -616,6 +616,98 @@ impl Translator<'_> {
         negative.logical_or(negative_zero)
     }
 
+    // ---- PyTorch integer arithmetic: two's complement, modulo 2^w ----
+    //
+    // PyTorch's integer `+`, `-`, `*` and `sum` wrap (eager CPU de facto,
+    // pytorch/pytorch#108520). Core `Int`/`I64` arithmetic is exact and
+    // proof-gated, so torch's integer ops lower to the wrapping family for
+    // those dtypes; every other dtype keeps its plain op (floats are IEEE,
+    // narrow ints and `U64` already wrap). The translator's own index
+    // arithmetic stays exact: it is bounded by construction.
+
+    /// Whether torch's integer arithmetic at `dtype` needs the wrapping family.
+    pub(super) fn torch_wraps(dtype: DType) -> bool {
+        matches!(dtype, DType::Int | DType::I64)
+    }
+
+    /// Torch's `a + b`.
+    pub(super) fn torch_add(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_add(b)
+        } else {
+            a + b
+        }
+    }
+
+    /// Torch's `a * b`.
+    pub(super) fn torch_mul(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_mul(b)
+        } else {
+            a * b
+        }
+    }
+
+    /// Torch's `-a` (`neg(MIN) == MIN` for a wrapping dtype).
+    pub(super) fn torch_neg(&mut self, a: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            let minus_one = self.constant_like(a, -1.0);
+            a.wrapping_mul(minus_one)
+        } else {
+            -a
+        }
+    }
+
+    /// Torch's `a - b`.
+    pub(super) fn torch_sub(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            let negated = self.torch_neg(b);
+            a.wrapping_add(negated)
+        } else {
+            a - b
+        }
+    }
+
+    /// Torch's integer `abs` (`abs(MIN) == MIN` for a wrapping dtype); any
+    /// other dtype takes core `abs`.
+    pub(super) fn torch_int_abs(&mut self, a: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            let zero = self.constant_like(a, 0.0);
+            let negated = self.torch_neg(a);
+            a.lt(zero).select(negated, a)
+        } else {
+            a.abs()
+        }
+    }
+
+    /// Torch's `sum` over `axes`.
+    pub(super) fn torch_sum(&mut self, a: GraphTensor, axes: Vec<usize>) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_sum(axes)
+        } else {
+            a.sum(axes)
+        }
+    }
+
+    /// Torch's `prod` over `axes`.
+    pub(super) fn torch_prod(&mut self, a: GraphTensor, axes: Vec<usize>) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_prod(axes)
+        } else {
+            a.prod(axes)
+        }
+    }
+
+    /// Torch's `cumsum` (or `cumprod`) along `axis`.
+    pub(super) fn torch_scan(&mut self, a: GraphTensor, axis: usize, prod: bool) -> GraphTensor {
+        match (Self::torch_wraps(a.dtype), prod) {
+            (true, false) => a.wrapping_cumsum(vec![axis]),
+            (true, true) => a.wrapping_cumprod(vec![axis]),
+            (false, false) => a.cumsum(vec![axis]),
+            (false, true) => a.cumprod(vec![axis]),
+        }
+    }
+
     /// The IEEE absolute value of a floating `value`: its sign bit cleared,
     /// so `-0.0` becomes `+0.0`. `abs()` cannot see a zero's sign (it
     /// selects on the ordered `x < 0`) and keeps `-0.0`; this selects on

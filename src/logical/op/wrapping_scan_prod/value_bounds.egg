@@ -1,0 +1,11 @@
+; Value bounds : LogicalWrappingScanProd — a two's-complement prefix product
+; is a stored value of its dtype, so it lies in the dtype's range (PyTorch's
+; integer cumsum/cumprod wrap). It is total: no proof gates it.
+(rule ((= ?out (LogicalWrappingScanProd ?in ?axis)) (= (dtype-of ?out) (Int)))
+ ((set (value-lower-bound-of ?out) (bigint -2147483648))
+  (set (value-upper-bound-of ?out) (bigint 2147483647)))
+ :ruleset main_ruleset :name "wrapping_scan_prod/value_bounds: an Int prefix prod lies in the Int range")
+(rule ((= ?out (LogicalWrappingScanProd ?in ?axis)) (= (dtype-of ?out) (Int64)))
+ ((set (value-lower-bound-of ?out) (bigint -9223372036854775808))
+  (set (value-upper-bound-of ?out) (bigint 9223372036854775807)))
+ :ruleset main_ruleset :name "wrapping_scan_prod/value_bounds: a Int64 prefix prod lies in the Int64 range")

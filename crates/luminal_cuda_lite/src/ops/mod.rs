@@ -70,6 +70,13 @@ pub mod trunc;
 pub mod trunc_cast;
 pub mod trunc_div;
 pub mod trunc_rem;
+pub mod wrapping_add;
+#[cfg(test)]
+mod wrapping_codegen;
+pub mod wrapping_left_sequential_scan_prod;
+pub mod wrapping_left_sequential_scan_sum;
+pub mod wrapping_mul;
+pub mod wrapping_reduce_sum;
 
 use luminal::layout_ir::{LayoutIrOp, OpMatcher};
 
@@ -185,6 +192,14 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(trunc_cast::TruncCastMatcher, trunc_cast::TruncCast),
         reg(exp::ExpFunctionalMatcher, exp::ExpFunctional),
         reg(mul::MulFunctionalMatcher, mul::MulFunctional),
+        reg(
+            wrapping_add::WrappingAddFunctionalMatcher,
+            wrapping_add::WrappingAddFunctional,
+        ),
+        reg(
+            wrapping_mul::WrappingMulFunctionalMatcher,
+            wrapping_mul::WrappingMulFunctional,
+        ),
         reg(div::DivFunctionalMatcher, div::DivFunctional),
         reg(
             trunc_div::TruncDivFunctionalMatcher,
@@ -197,6 +212,10 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(
             reduce_sum::ReduceSumMatcher,
             reduce_sum::ReduceSum { axis: 0 },
+        ),
+        reg(
+            wrapping_reduce_sum::WrappingReduceSumMatcher,
+            wrapping_reduce_sum::WrappingReduceSum { axis: 0 },
         ),
         reg(
             reduce_max::ReduceMaxMatcher,
@@ -213,6 +232,14 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         reg(
             left_sequential_scan_max::LeftSequentialScanMaxMatcher,
             left_sequential_scan_max::LeftSequentialScanMax { axis: 0 },
+        ),
+        reg(
+            wrapping_left_sequential_scan_sum::WrappingLeftSequentialScanSumMatcher,
+            wrapping_left_sequential_scan_sum::WrappingLeftSequentialScanSum { axis: 0 },
+        ),
+        reg(
+            wrapping_left_sequential_scan_prod::WrappingLeftSequentialScanProdMatcher,
+            wrapping_left_sequential_scan_prod::WrappingLeftSequentialScanProd { axis: 0 },
         ),
         reg(iota::IotaMatcher, iota::Iota { expr: None }),
         reg(gather::GatherMatcher, gather::Gather { rank: 1 }),

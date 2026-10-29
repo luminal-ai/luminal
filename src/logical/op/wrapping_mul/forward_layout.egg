@@ -1,0 +1,13 @@
+; Forward LayoutTensor Propagation : Logical Mul
+(rule
+  (
+    (= ?out_logical (LogicalWrappingMul ?in1_logical ?in2_logical))
+    (= ?in1_layout_tensor (LayoutTensorLit ?in1_logical ?in1_layout))
+    (= ?in2_layout_tensor (LayoutTensorLit ?in2_logical ?in2_layout))
+  )
+  (
+    (let ?out_layout_tensor1 (LayoutTensorLit ?out_logical ?in1_layout))
+    (let ?out_layout_tensor2 (LayoutTensorLit ?out_logical ?in2_layout))
+  )
+  :ruleset main_ruleset :name "wrapping_mul/forward_layout: LogicalWrappingMul result in each operand's layout"
+)

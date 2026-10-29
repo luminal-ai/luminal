@@ -671,6 +671,25 @@ impl GraphTensor {
         })
     }
 
+    /// Two's-complement cumulative sum, modulo 2^w: PyTorch's integer
+    /// `cumsum`. Unlike [`Self::cumsum`] on `Int`/`I64`, whose overflow is a
+    /// loud error, an overflow wraps; see [`Self::wrapping_add`].
+    pub fn wrapping_cumsum(self, axes: impl ToAxes) -> Self {
+        self.assert_wrapping_dtype("wrapping_cumsum");
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::WrappingScanSum {
+            axis_from_end,
+        })
+    }
+
+    /// Two's-complement cumulative product, modulo 2^w: PyTorch's integer
+    /// `cumprod`.
+    pub fn wrapping_cumprod(self, axes: impl ToAxes) -> Self {
+        self.assert_wrapping_dtype("wrapping_cumprod");
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::WrappingScanProd {
+            axis_from_end,
+        })
+    }
+
     /// One recorded scan per axis, in the given order. A scan keeps the
     /// operand's dims and dtype, so no axis bookkeeping is needed.
     fn scan_per_axis(self, axes: impl ToAxes, op: impl Fn(usize) -> LogicalOp) -> Self {

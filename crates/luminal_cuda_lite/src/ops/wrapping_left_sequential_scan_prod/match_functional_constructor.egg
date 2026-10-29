@@ -1,0 +1,2 @@
+; Scan Ops
+(constructor LayoutTensorOpWrappingLeftSequentialScanProd (LayoutTensor i64 Layout) LayoutTensorOp)

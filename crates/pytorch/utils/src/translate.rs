@@ -1002,7 +1002,8 @@ impl Translator<'_> {
                     a.rank() == 1 && b.rank() == 1 && util::same_dim(a.dims()[0], b.dims()[0]),
                     "dot requires equal length vectors"
                 );
-                (a * b).sum(vec![0])
+                let products = self.torch_mul(a, b);
+                self.torch_sum(products, vec![0])
             }
             "split.Tensor" => {
                 self.translate_split(node)?;
@@ -1078,15 +1079,25 @@ impl Translator<'_> {
                 if is_float(x.dtype) {
                     self.ieee_abs(x)
                 } else {
-                    x.abs()
+                    self.torch_int_abs(x)
                 }
             }
-            "neg.default" => -self.operand(&n[0])?,
+            "neg.default" => {
+                let x = self.operand(&n[0])?;
+                self.torch_neg(x)
+            }
             "silu.default" => self.operand(&n[0])?.silu(),
             "gelu.default" => self.operand(&n[0])?.gelu(),
             "reciprocal.default" => self.operand(&n[0])?.reciprocal(),
             "sin.default" => self.operand(&n[0])?.sin(),
-            "square.default" => self.operand(&n[0])?.square(),
+            "square.default" => {
+                let x = self.operand(&n[0])?;
+                if Self::torch_wraps(x.dtype) {
+                    self.torch_mul(x, x)
+                } else {
+                    x.square()
+                }
+            }
             // ---- rounding (dtype-preserving; no casts) ----
             "floor.default" => self.operand(&n[0])?.floor(),
             "ceil.default" => self.operand(&n[0])?.ceil(),
@@ -1104,7 +1115,10 @@ impl Translator<'_> {
             "sub.Tensor" | "sub.Scalar" => self.add_sub(&n[0], &n[1], alpha_input(n), true)?,
             // `rsub(self, other, alpha)` is `other - alpha * self`.
             "rsub.Tensor" | "rsub.Scalar" => self.add_sub(&n[1], &n[0], alpha_input(n), true)?,
-            "mul.Tensor" | "mul.Scalar" => self.binary(n, |a, b| a * b)?,
+            "mul.Tensor" | "mul.Scalar" => {
+                let (a, b) = self.arithmetic_operands(&n[0], &n[1])?;
+                self.torch_mul(a, b)
+            }
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
             "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
             "minimum.default" => self.binary(n, |a, b| a.minimum(b))?,
@@ -1656,11 +1670,15 @@ impl Translator<'_> {
         let b = match alpha {
             Some(alpha) if !unit_alpha => {
                 let alpha = self.scalar_operand(alpha, b.dtype)?.expand_rhs(b.dims());
-                b * alpha
+                self.torch_mul(b, alpha)
             }
             _ => b,
         };
-        Ok(if subtract { a - b } else { a + b })
+        Ok(if subtract {
+            self.torch_sub(a, b)
+        } else {
+            self.torch_add(a, b)
+        })
     }
 
     /// An elementwise binary op whose operands may be a tensor and a

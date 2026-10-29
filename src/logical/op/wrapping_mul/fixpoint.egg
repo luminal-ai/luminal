@@ -1,0 +1,13 @@
+(rule
+  (
+    (= ?out_logical (LogicalWrappingMul ?in1_logical ?in2_logical))
+    (= ?in1_shape (shape-of ?in1_logical))
+    (= ?in2_shape (shape-of ?in2_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?in1_shape)
+    (set (shape-of ?out_logical) ?in2_shape)
+  )
+  :ruleset fixpoint-invariants
+  :name "wrapping_mul/fixpoint: shape of LogicalWrappingMul closed from the operands"
+)

@@ -1,0 +1,2 @@
+; Functional (out-of-place) Binary Ops
+(constructor LayoutTensorOpWrappingAddFunctionalGeneric (LayoutTensor LayoutTensor Layout) LayoutTensorOp)

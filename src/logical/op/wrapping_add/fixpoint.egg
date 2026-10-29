@@ -1,0 +1,16 @@
+; Shape closure, binary ops: forward (duplicative — BOTH operands write
+; the out slot; disagreement = illegal merge = the error) and backward
+; (the out shape writes both operand slots).
+(rule
+  (
+    (= ?out_logical (LogicalWrappingAdd ?in1_logical ?in2_logical))
+    (= ?in1_shape (shape-of ?in1_logical))
+    (= ?in2_shape (shape-of ?in2_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?in1_shape)
+    (set (shape-of ?out_logical) ?in2_shape)
+  )
+  :ruleset fixpoint-invariants
+  :name "wrapping_add/fixpoint: LogicalWrappingAdd shape closure, operands to output"
+)

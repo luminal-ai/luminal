@@ -1,0 +1,20 @@
+; Shape Propagation : LogicalWrappingAdd — POSITIVELY GATED on the operands'
+; shapes being ONE CLASS already (?shape binds both premises): propagation
+; waits for the equality proof instead of optimistically setting both and
+; letting :no-merge panic on PENDING-equal classes (user ruling
+; 2026-07-23; the duplicative-set tripwire is legal only for ATOM-valued
+; functions like dtype, whose values can never become equal later).
+; Fail-open: operands whose shapes are never proven equal propagate no
+; shape, stay unimplementable, and fail loudly at extraction.
+(rule
+  (
+    (= ?out_logical (LogicalWrappingAdd ?in1_logical ?in2_logical))
+    (= ?shape (shape-of ?in1_logical))
+    (= ?shape (shape-of ?in2_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?shape)
+  )
+  :ruleset prop
+  :name "wrapping_add/shape: shape of LogicalWrappingAdd at proven-equal operand shapes"
+)

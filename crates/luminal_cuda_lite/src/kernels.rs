@@ -629,6 +629,39 @@ pub(crate) fn math_function(
     })
 }
 
+/// The signed and same-width unsigned CUDA types of a wrapping integer
+/// dtype, or `None` when the dtype is already unsigned (and so already
+/// wraps). Signed overflow is undefined behaviour in C++, so two's-complement
+/// arithmetic runs in the unsigned type, which is defined to wrap modulo 2^w,
+/// and converts back.
+fn wrapping_types(dtype: PlanDtype) -> Result<Option<(&'static str, &'static str)>> {
+    Ok(match dtype {
+        PlanDtype::Int => Some(("int", "unsigned int")),
+        PlanDtype::Int64 => Some(("long long", "unsigned long long")),
+        PlanDtype::UInt64 => None,
+        other => bail!("cuda-lite wrapping arithmetic has no {other:?} arm"),
+    })
+}
+
+/// `a[i] {op} b[i]` in two's-complement arithmetic for the operands' dtype.
+pub(crate) fn wrapping_binary_expr(ctx: &CodegenCtx, op: &str) -> Result<String> {
+    let Some(&dtype) = ctx.operand_dtypes.first() else {
+        bail!("wrapping arithmetic has no operand");
+    };
+    Ok(match wrapping_types(dtype)? {
+        Some((signed, unsigned)) => format!("({signed})(({unsigned})a[i] {op} ({unsigned})b[i])"),
+        None => format!("a[i] {op} b[i]"),
+    })
+}
+
+/// A reduction fold `acc {op} v` in two's-complement arithmetic.
+pub(crate) fn wrapping_fold(dtype: PlanDtype, op: &str) -> Result<String> {
+    Ok(match wrapping_types(dtype)? {
+        Some((signed, unsigned)) => format!("({signed})(({unsigned})acc {op} ({unsigned})v)"),
+        None => format!("acc {op} v"),
+    })
+}
+
 /// Generate a three-input elementwise kernel (`c ? a : b`), reading each input
 /// through its layout. The condition is Bool8; the branches and destination
 /// share one dtype. The expression copies a value verbatim, so no arithmetic

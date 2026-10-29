@@ -365,12 +365,18 @@ impl Translator<'_> {
             // statically — the proof the I64 `trunc_rem` needs. (The previous
             // `finished.select(1, rhs)` was correct but had only the generic
             // union bounds, which included 0.)
-            let safe_rhs = rhs.abs().maximum(one);
+            let magnitude = self.torch_int_abs(rhs);
+            let safe_rhs = magnitude.maximum(one);
             let remainder = lhs.trunc_rem(safe_rhs);
             lhs = finished.select(lhs, rhs);
             rhs = finished.select(zero, remainder);
         }
-        Ok(lhs.abs().cast(output_dtype))
+        // Every Euclid state is an operand or a remainder smaller in
+        // magnitude than one, so `lhs` fits the output dtype and this cast
+        // is exact. The magnitude is taken AFTER it, at the output dtype, so
+        // `gcd(MIN, 0)` wraps to MIN the way torch's same-width abs does.
+        let signed = lhs.cast(output_dtype);
+        Ok(self.torch_int_abs(signed))
     }
 
     pub(super) fn translate_exp2(&mut self, node: &Node) -> Result<GraphTensor> {

@@ -1,0 +1,1 @@
+(constructor LayoutTensorOpWrappingMulFunctionalGeneric (LayoutTensor LayoutTensor Layout) LayoutTensorOp)

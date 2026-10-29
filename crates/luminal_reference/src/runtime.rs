@@ -95,6 +95,11 @@ fn kernel_scratch_bytes(label: &str, ctx: &ReferenceKernelCtx) -> Result<usize> 
         | "TruncDivFunctionalGeneric"
         | "TruncFunctionalGeneric"
         | "TruncRemFunctionalGeneric"
+        | "WrappingAddFunctionalGeneric"
+        | "WrappingMulFunctionalGeneric"
+        | "WrappingReduceSumGeneric"
+        | "WrappingLeftSequentialScanSum"
+        | "WrappingLeftSequentialScanProd"
         | "BufferAlloc"
         | "BufferFree" => Some(0),
         _ => anyhow::bail!("reference kernel {label} has no scratch allocation bound"),
@@ -1231,6 +1236,11 @@ mod tests {
             "LayoutTensorOpTruncDivFunctionalGeneric",
             "LayoutTensorOpTruncFunctionalGeneric",
             "LayoutTensorOpTruncRemFunctionalGeneric",
+            "LayoutTensorOpWrappingAddFunctionalGeneric",
+            "LayoutTensorOpWrappingMulFunctionalGeneric",
+            "LayoutTensorOpWrappingReduceSumGeneric",
+            "LayoutTensorOpWrappingLeftSequentialScanSum",
+            "LayoutTensorOpWrappingLeftSequentialScanProd",
         ];
         expected.sort_unstable();
         assert_eq!(allow, expected, "derived allow list drifted");
@@ -2894,6 +2904,144 @@ mod tests {
         rt.set_data(a.id, vec![-2.5f32, 0.75, 41.9]);
         rt.execute().expect("bounded add executes");
         assert_eq!(rt.get_i32(out.id).unwrap(), &vec![-2, 0, 41]);
+    }
+
+    /// Search, stage `data`, execute: the shared driver of the wrapping tests.
+    fn run_unattested(
+        cx: &luminal::graph::Graph,
+        data: FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
+    ) -> ReferenceRuntime {
+        let mut rt = ReferenceRuntime::load(cx).expect("native load");
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .unwrap_or_else(|err| panic!("wrapping arithmetic needs no proof: {err:#}"));
+        for (id, value) in data {
+            rt.set_data(id, value);
+        }
+        rt.execute().expect("wrapping arithmetic executes");
+        rt
+    }
+
+    /// WRAPPING ARITHMETIC (PyTorch's integer semantics): total, so it plans
+    /// over unattested caller data, and an overflow wraps modulo 2^w.
+    #[test]
+    fn wrapping_add_and_mul_wrap_on_overflow() {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![3], DType::Int);
+        let b = cx.tensor(vec![3], DType::Int);
+        let sum = a.wrapping_add(b);
+        let product = a.wrapping_mul(b);
+        let data = FxHashMap::from_iter([
+            (a.id, vec![i32::MAX, -5, i32::MIN].into()),
+            (b.id, vec![1i32, 7, -1].into()),
+        ]);
+        let rt = run_unattested(&cx, data);
+        assert_eq!(rt.get_i32(sum.id).unwrap(), &vec![i32::MIN, 2, i32::MAX]);
+        assert_eq!(
+            rt.get_i32(product.id).unwrap(),
+            &vec![i32::MAX, -35, i32::MIN]
+        );
+
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![2], DType::I64);
+        let b = cx.tensor(vec![2], DType::I64);
+        let sum = a.wrapping_add(b);
+        let product = a.wrapping_mul(b);
+        let data = FxHashMap::from_iter([
+            (a.id, vec![i64::MAX, 3].into()),
+            (b.id, vec![2i64, -4].into()),
+        ]);
+        let rt = run_unattested(&cx, data);
+        assert_eq!(rt.get_i64(sum.id).unwrap(), &vec![i64::MIN + 1, -1]);
+        assert_eq!(rt.get_i64(product.id).unwrap(), &vec![-2i64, -12]);
+    }
+
+    /// A wrapping sum along an axis wraps modulo 2^w, and an empty axis sums
+    /// to zero.
+    #[test]
+    fn wrapping_sum_wraps_on_overflow() {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![2, 2], DType::I64);
+        let rows = a.wrapping_sum(vec![1]);
+        let all = a.wrapping_sum(vec![0, 1]);
+        let data = FxHashMap::from_iter([(a.id, vec![i64::MAX, 1, -3, 5].into())]);
+        let rt = run_unattested(&cx, data);
+        assert_eq!(rt.get_i64(rows.id).unwrap(), &vec![i64::MIN, 2]);
+        assert_eq!(rt.get_i64(all.id).unwrap(), &vec![i64::MIN + 2]);
+    }
+
+    /// Wrapping prefix scans and the wrapping product (PyTorch's integer
+    /// `cumsum`, `cumprod` and `prod`) wrap modulo 2^w where the exact
+    /// scans' checked accumulators would refuse.
+    #[test]
+    fn wrapping_scans_and_prod_wrap_on_overflow() {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![2, 2], DType::Int);
+        let cumsum = a.wrapping_cumsum(vec![1]);
+        let cumprod = a.wrapping_cumprod(vec![0]);
+        let prod = a.wrapping_prod(vec![0, 1]);
+        let data = FxHashMap::from_iter([(a.id, vec![i32::MAX, 1, 2, -3].into())]);
+        let rt = run_unattested(&cx, data);
+        assert_eq!(
+            rt.get_i32(cumsum.id).unwrap(),
+            &vec![i32::MAX, i32::MIN, 2, -1]
+        );
+        assert_eq!(rt.get_i32(cumprod.id).unwrap(), &vec![i32::MAX, 1, -2, -3]);
+        assert_eq!(rt.get_i32(prod.id).unwrap(), &vec![6]);
+
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![3], DType::I64);
+        let cumsum = a.wrapping_cumsum(vec![0]);
+        let cumprod = a.wrapping_cumprod(vec![0]);
+        let data = FxHashMap::from_iter([(a.id, vec![i64::MIN, -1, 2].into())]);
+        let rt = run_unattested(&cx, data);
+        assert_eq!(
+            rt.get_i64(cumsum.id).unwrap(),
+            &vec![i64::MIN, i64::MAX, i64::MIN + 1]
+        );
+        assert_eq!(
+            rt.get_i64(cumprod.id).unwrap(),
+            &vec![i64::MIN, i64::MIN, 0]
+        );
+    }
+
+    /// Where attested bounds prove the exact result in width, the wrapping
+    /// op is unioned with its exact twin (both spellings are selectable and
+    /// agree); UInt64 arithmetic already wraps, so its bridge always holds.
+    #[test]
+    fn wrapping_ops_bridge_to_their_exact_twins() {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![2], DType::Int);
+        let b = cx.tensor(vec![2], DType::Int);
+        let out = a.wrapping_add(b).wrapping_mul(a);
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        rt.bind_value_range(a.id, -100, 100).expect("range binds");
+        rt.bind_value_range(b.id, -100, 100).expect("range binds");
+        let data =
+            FxHashMap::from_iter([(a.id, vec![7i32, -9].into()), (b.id, vec![3i32, 4].into())]);
+        rt.search(
+            &Default::default(),
+            &Default::default(),
+            &data,
+            &crate::search::harness_search_options(),
+        )
+        .expect("proven wrapping arithmetic implements");
+        for (id, value) in data {
+            rt.set_data(id, value);
+        }
+        rt.execute().expect("proven wrapping arithmetic executes");
+        assert_eq!(rt.get_i32(out.id).unwrap(), &vec![70, 45]);
+
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor(vec![2], DType::U64);
+        let sum = a.wrapping_add(a);
+        let data = FxHashMap::from_iter([(a.id, TypedBuffer::U64(vec![u64::MAX, 3]))]);
+        let rt = run_unattested(&cx, data);
+        assert_eq!(rt.get_u64(sum.id).unwrap(), &vec![u64::MAX - 1, 6]);
     }
 
     /// Int sum scans need NO attestation: the kernel checks every integer

@@ -106,21 +106,24 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
     ),
     KnownFailure(
-        ticket="LUM-1097",
-        url="https://linear.app/luminalai/issue/LUM-1097/layoutir-extraction-dead-ends-on-int32int64-and-empty-input-graphs",
+        ticket="LUM-1139",
+        url="https://linear.app/luminalai/issue/LUM-1139/bilinear-bicubic-and-trilinear-interpolation-find-no-executable-plan",
         reason=(
-            "LayoutIR extraction dead-ends on int32/int64 and empty-input graphs (outputs with no plan)"
+            "interpolation that blends gathered samples finds no executable plan "
+            "(the upsample lowering's coordinate-form gathers)"
         ),
         tests=(
-            "test_hlir_ops.py::test_reduce_sum_all_axes_int64_preserves_dtype",
-            "test_ops_batch5.py::test_upsample_bilinear",
             "test_remaining_existing_hlir_lowerings.py::test_antialiased_bilinear_resize_float_and_uint8",
-            "test_remaining_existing_hlir_lowerings.py::test_integer_gcd_static_euclidean_rounds",
-            "test_scalars.py::test_dot_float_shorthand_on_0d",
-            "test_scalars.py::test_int_sum_produces_int_scalar",
-            "test_writeback_mutations.py::test_static_cache_prefill_smoke",
-            "test_writeback_mutations.py::test_writeback_metadata_exposed",
         ),
+    ),
+    KnownFailure(
+        ticket="LUM-1144",
+        url="https://linear.app/luminalai/issue/LUM-1144/test-writeback-metadata-exposed-reads-writeback-inputs-from-the-aot",
+        reason=(
+            "the test reads writeback_inputs from the AOT backend's boxed callable, "
+            "not from its compiled regions"
+        ),
+        tests=("test_writeback_mutations.py::test_writeback_metadata_exposed",),
     ),
     KnownFailure(
         ticket="LUM-1098",

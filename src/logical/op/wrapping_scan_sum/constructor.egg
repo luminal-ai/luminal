@@ -1,0 +1,3 @@
+; Inclusive two's-complement sum scan along one axis, modulo 2^w. Modular
+; arithmetic is associative and commutative, so the order is immaterial.
+(constructor LogicalWrappingScanSum (LogicalTensor i64) LogicalTensor)

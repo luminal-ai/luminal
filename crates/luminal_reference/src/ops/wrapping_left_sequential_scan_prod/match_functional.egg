@@ -1,0 +1,21 @@
+; Two's-complement scans are total: the wrapping scan mints at every
+; injective right-major destination.
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_logical (LogicalWrappingScanProd ?in_logical ?axis))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpWrappingLeftSequentialScanProd ?in_layout_tensor ?axis ?out_layout))
+  )
+  :ruleset backend
+  :name "reference/wrapping_left_sequential_scan_prod/match_functional: WrappingLeftSequentialScanProd mint, total"
+)

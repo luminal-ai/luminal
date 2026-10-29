@@ -48,6 +48,11 @@ mod not;
 mod or;
 pub(crate) mod trunc_div;
 pub(crate) mod trunc_rem;
+pub(crate) mod wrapping_add;
+pub(crate) mod wrapping_left_sequential_scan_prod;
+pub(crate) mod wrapping_left_sequential_scan_sum;
+pub(crate) mod wrapping_mul;
+pub(crate) mod wrapping_reduce_sum;
 // (poison moved to core `luminal::poison` in Step B; re-exported below.)
 pub(crate) mod left_sequential_scan_max;
 pub(crate) mod left_sequential_scan_prod;
@@ -105,6 +110,9 @@ pub use sin::SinFunctional;
 pub use sqrt::SqrtFunctional;
 pub use trunc::TruncFunctional;
 pub use trunc_cast::TruncCast;
+pub use wrapping_add::WrappingAddFunctional;
+pub use wrapping_mul::WrappingMulFunctional;
+pub use wrapping_reduce_sum::WrappingReduceSum;
 
 // DPS forms, re-exported for the reference runtime's kernel registry
 // (reference::kernels downcasts plan ops to these concrete types —
@@ -136,6 +144,11 @@ pub use sin::SinFunctionalDps;
 pub use sqrt::SqrtFunctionalDps;
 pub use trunc::TruncFunctionalDps;
 pub use trunc_cast::TruncCastDps;
+pub use wrapping_add::WrappingAddFunctionalDps;
+pub use wrapping_left_sequential_scan_prod::WrappingLeftSequentialScanProdDps;
+pub use wrapping_left_sequential_scan_sum::WrappingLeftSequentialScanSumDps;
+pub use wrapping_mul::WrappingMulFunctionalDps;
+pub use wrapping_reduce_sum::WrappingReduceSumDps;
 
 pub use add::AddFunctionalMatcher;
 pub use cast::CastMatcher;
@@ -167,6 +180,9 @@ pub use trunc::TruncFunctionalMatcher;
 pub use trunc_cast::TruncCastMatcher;
 pub use trunc_div::{TruncDivFunctional, TruncDivFunctionalDps, TruncDivFunctionalMatcher};
 pub use trunc_rem::{TruncRemFunctional, TruncRemFunctionalDps, TruncRemFunctionalMatcher};
+pub use wrapping_add::WrappingAddFunctionalMatcher;
+pub use wrapping_mul::WrappingMulFunctionalMatcher;
+pub use wrapping_reduce_sum::WrappingReduceSumMatcher;
 
 /// The matcher half of [`reference_ops`] — what the extractor builds its
 /// constructor-name registry from. Not a list in its own right: every
@@ -267,6 +283,20 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
                 kernel: entry::<MulFunctionalDps>("MulFunctionalGeneric", mul::kernel),
             },
             ReferenceOp {
+                matcher: || Box::new(WrappingAddFunctionalMatcher),
+                kernel: entry::<WrappingAddFunctionalDps>(
+                    "WrappingAddFunctionalGeneric",
+                    wrapping_add::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || Box::new(WrappingMulFunctionalMatcher),
+                kernel: entry::<WrappingMulFunctionalDps>(
+                    "WrappingMulFunctionalGeneric",
+                    wrapping_mul::kernel,
+                ),
+            },
+            ReferenceOp {
                 matcher: || Box::new(DivFunctionalMatcher),
                 kernel: entry::<DivFunctionalDps>("DivFunctionalGeneric", div::kernel),
             },
@@ -354,6 +384,35 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(ReduceSumMatcher),
                 kernel: entry::<ReduceSumDps>("ReduceSumGeneric", reduce_sum::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(WrappingReduceSumMatcher),
+                kernel: entry::<WrappingReduceSumDps>(
+                    "WrappingReduceSumGeneric",
+                    wrapping_reduce_sum::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || {
+                    Box::new(
+                        wrapping_left_sequential_scan_sum::WrappingLeftSequentialScanSumMatcher,
+                    )
+                },
+                kernel: entry::<WrappingLeftSequentialScanSumDps>(
+                    "WrappingLeftSequentialScanSum",
+                    wrapping_left_sequential_scan_sum::kernel,
+                ),
+            },
+            ReferenceOp {
+                matcher: || {
+                    Box::new(
+                        wrapping_left_sequential_scan_prod::WrappingLeftSequentialScanProdMatcher,
+                    )
+                },
+                kernel: entry::<WrappingLeftSequentialScanProdDps>(
+                    "WrappingLeftSequentialScanProd",
+                    wrapping_left_sequential_scan_prod::kernel,
+                ),
             },
             ReferenceOp {
                 matcher: || Box::new(ReduceMaxMatcher),

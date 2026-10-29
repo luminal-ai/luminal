@@ -1,0 +1,12 @@
+(rule
+  (
+    (= ?out_logical (LogicalWrappingAdd ?in1_logical ?in2_logical))
+    (= ?out_shape (shape-of ?out_logical))
+  )
+  (
+    (set (shape-of ?in1_logical) ?out_shape)
+    (set (shape-of ?in2_logical) ?out_shape)
+  )
+  :ruleset fixpoint-invariants
+  :name "wrapping_add/fixpoint_2: LogicalWrappingAdd shape closure, output back to operands"
+)

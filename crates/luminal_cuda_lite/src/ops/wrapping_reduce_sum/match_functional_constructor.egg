@@ -1,0 +1,2 @@
+; Reduction Ops
+(constructor LayoutTensorOpWrappingReduceSumGeneric (LayoutTensor i64 Layout) LayoutTensorOp)

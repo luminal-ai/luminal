@@ -1,0 +1,11 @@
+; Value bounds : LogicalWrappingScanSum — a two's-complement prefix sum
+; is a stored value of its dtype, so it lies in the dtype's range (PyTorch's
+; integer cumsum/cumprod wrap). It is total: no proof gates it.
+(rule ((= ?out (LogicalWrappingScanSum ?in ?axis)) (= (dtype-of ?out) (Int)))
+ ((set (value-lower-bound-of ?out) (bigint -2147483648))
+  (set (value-upper-bound-of ?out) (bigint 2147483647)))
+ :ruleset main_ruleset :name "wrapping_scan_sum/value_bounds: an Int prefix sum lies in the Int range")
+(rule ((= ?out (LogicalWrappingScanSum ?in ?axis)) (= (dtype-of ?out) (Int64)))
+ ((set (value-lower-bound-of ?out) (bigint -9223372036854775808))
+  (set (value-upper-bound-of ?out) (bigint 9223372036854775807)))
+ :ruleset main_ruleset :name "wrapping_scan_sum/value_bounds: a Int64 prefix sum lies in the Int64 range")

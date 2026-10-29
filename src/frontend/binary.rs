@@ -368,6 +368,21 @@ impl GraphTensor {
         self.int_binary(rhs, LogicalOp::TruncRem)
     }
 
+    /// Two's-complement integer addition, modulo 2^w: PyTorch's integer
+    /// `+`. Unlike `+` on `Int`/`I64`, which is exact and executes only
+    /// where value bounds prove the sum in width, this is total: an
+    /// overflow wraps. Where the bounds do prove the exact sum in width, the
+    /// two are the same value and the e-graph unions them.
+    pub fn wrapping_add(self, rhs: GraphTensor) -> GraphTensor {
+        self.int_binary(rhs, LogicalOp::WrappingAdd)
+    }
+
+    /// Two's-complement integer multiplication, modulo 2^w: PyTorch's
+    /// integer `*`. See [`Self::wrapping_add`].
+    pub fn wrapping_mul(self, rhs: GraphTensor) -> GraphTensor {
+        self.int_binary(rhs, LogicalOp::WrappingMul)
+    }
+
     /// Less than comparison
     pub fn lt(self, rhs: GraphTensor) -> GraphTensor {
         assert!(self.dims_agree(&rhs), "Dims must match to lt tensors.");

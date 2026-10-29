@@ -475,6 +475,8 @@ impl OpWire {
             ops::NotDps,
             ops::AddFunctionalDps,
             ops::MulFunctionalDps,
+            ops::WrappingAddFunctionalDps,
+            ops::WrappingMulFunctionalDps,
             ops::DivFunctionalDps,
             ops::TruncDivFunctionalDps,
             ops::TruncRemFunctionalDps,
@@ -506,6 +508,8 @@ impl OpWire {
             ("ops::ScatterFunctionalDps", serde_json::json!(v.rank))
         } else if let Some(v) = any.downcast_ref::<ops::ReduceSumDps>() {
             ("ops::ReduceSumDps", serde_json::json!(v.axis))
+        } else if let Some(v) = any.downcast_ref::<ops::WrappingReduceSumDps>() {
+            ("ops::WrappingReduceSumDps", serde_json::json!(v.axis))
         } else if let Some(v) = any.downcast_ref::<ops::ReduceMaxDps>() {
             ("ops::ReduceMaxDps", serde_json::json!(v.axis))
         } else if let Some(v) = any.downcast_ref::<ops::LeftSequentialScanSumDps>() {
@@ -514,6 +518,16 @@ impl OpWire {
             ("ops::LeftSequentialScanProdDps", serde_json::json!(v.axis))
         } else if let Some(v) = any.downcast_ref::<ops::LeftSequentialScanMaxDps>() {
             ("ops::LeftSequentialScanMaxDps", serde_json::json!(v.axis))
+        } else if let Some(v) = any.downcast_ref::<ops::WrappingLeftSequentialScanSumDps>() {
+            (
+                "ops::WrappingLeftSequentialScanSumDps",
+                serde_json::json!(v.axis),
+            )
+        } else if let Some(v) = any.downcast_ref::<ops::WrappingLeftSequentialScanProdDps>() {
+            (
+                "ops::WrappingLeftSequentialScanProdDps",
+                serde_json::json!(v.axis),
+            )
         } else if let Some(v) = any.downcast_ref::<ops::IotaDps>() {
             ("ops::IotaDps", serde_json::to_value(&v.expr)?)
         } else if let Some(v) = any.downcast_ref::<ops::IndexMapApplyMaterializeDps>() {
@@ -544,6 +558,8 @@ impl OpWire {
             ops::NotDps,
             ops::AddFunctionalDps,
             ops::MulFunctionalDps,
+            ops::WrappingAddFunctionalDps,
+            ops::WrappingMulFunctionalDps,
             ops::DivFunctionalDps,
             ops::TruncDivFunctionalDps,
             ops::TruncRemFunctionalDps,
@@ -584,6 +600,9 @@ impl OpWire {
             "ops::ReduceSumDps" => Box::new(ops::ReduceSumDps {
                 axis: serde_json::from_value(payload)?,
             }),
+            "ops::WrappingReduceSumDps" => Box::new(ops::WrappingReduceSumDps {
+                axis: serde_json::from_value(payload)?,
+            }),
             "ops::ReduceMaxDps" => Box::new(ops::ReduceMaxDps {
                 axis: serde_json::from_value(payload)?,
             }),
@@ -596,6 +615,16 @@ impl OpWire {
             "ops::LeftSequentialScanMaxDps" => Box::new(ops::LeftSequentialScanMaxDps {
                 axis: serde_json::from_value(payload)?,
             }),
+            "ops::WrappingLeftSequentialScanSumDps" => {
+                Box::new(ops::WrappingLeftSequentialScanSumDps {
+                    axis: serde_json::from_value(payload)?,
+                })
+            }
+            "ops::WrappingLeftSequentialScanProdDps" => {
+                Box::new(ops::WrappingLeftSequentialScanProdDps {
+                    axis: serde_json::from_value(payload)?,
+                })
+            }
             "ops::IotaDps" => Box::new(ops::IotaDps {
                 expr: serde_json::from_value::<Option<IotaExpr>>(payload)?,
             }),

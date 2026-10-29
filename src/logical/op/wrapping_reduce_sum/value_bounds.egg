@@ -1,0 +1,39 @@
+; Value bounds and the exact bridge : LogicalWrappingReduceSum — two's-complement
+; arithmetic modulo 2^w (PyTorch's integer semantics; eager CPU wraps de
+; facto, pytorch/pytorch#108520). It is total: no proof gates it. Its
+; result is a stored value of its dtype, so it lies in the dtype's range.
+; Where the operands' bounds prove the EXACT result in width, wrapping
+; changes nothing and the op IS the exact LogicalReduceSum — the bridge unions
+; the two, so a proven program keeps the exact rewrites and the exact
+; interval. UInt64 LogicalReduceSum already wraps, so its bridge is unconditional.
+(rule ((= ?out (LogicalWrappingReduceSum ?in ?axis)) (= (dtype-of ?out) (Int)))
+ ((set (value-lower-bound-of ?out) (bigint -2147483648))
+  (set (value-upper-bound-of ?out) (bigint 2147483647)))
+ :ruleset main_ruleset :name "LogicalWrappingReduceSum/value_bounds: an Int result lies in the Int range")
+(rule ((= ?out (LogicalWrappingReduceSum ?in ?axis)) (= (dtype-of ?out) (Int64)))
+ ((set (value-lower-bound-of ?out) (bigint -9223372036854775808))
+  (set (value-upper-bound-of ?out) (bigint 9223372036854775807)))
+ :ruleset main_ruleset :name "LogicalWrappingReduceSum/value_bounds: a Int64 result lies in the Int64 range")
+(rule ((= ?out (LogicalWrappingReduceSum ?in ?axis)) (= (dtype-of ?out) (Int))
+       (= (shape-of ?in) (ShapeLit ?dims))
+       (= ?extent (expr-list-nth-from-end ?dims ?axis))
+       (= ?n_lower (lower-bound-of ?extent)) (= ?n_upper (upper-bound-of ?extent))
+       (>= ?n_lower (bigint 0))
+       (= ?lower (value-lower-bound-of ?in)) (= ?upper (value-upper-bound-of ?in))
+       (>= (min (* ?n_lower ?lower) (* ?n_upper ?lower)) (bigint -2147483648))
+       (<= (max (* ?n_lower ?upper) (* ?n_upper ?upper)) (bigint 2147483647)))
+ ((union ?out (LogicalReduceSum ?in ?axis)))
+ :ruleset main_ruleset :name "wrapping_reduce_sum/bridge: an Int wrapping sum proven in width is the exact sum")
+(rule ((= ?out (LogicalWrappingReduceSum ?in ?axis)) (= (dtype-of ?out) (Int64))
+       (= (shape-of ?in) (ShapeLit ?dims))
+       (= ?extent (expr-list-nth-from-end ?dims ?axis))
+       (= ?n_lower (lower-bound-of ?extent)) (= ?n_upper (upper-bound-of ?extent))
+       (>= ?n_lower (bigint 0))
+       (= ?lower (value-lower-bound-of ?in)) (= ?upper (value-upper-bound-of ?in))
+       (>= (min (* ?n_lower ?lower) (* ?n_upper ?lower)) (bigint -9223372036854775808))
+       (<= (max (* ?n_lower ?upper) (* ?n_upper ?upper)) (bigint 9223372036854775807)))
+ ((union ?out (LogicalReduceSum ?in ?axis)))
+ :ruleset main_ruleset :name "wrapping_reduce_sum/bridge: a Int64 wrapping sum proven in width is the exact sum")
+(rule ((= ?out (LogicalWrappingReduceSum ?in ?axis)) (= (dtype-of ?out) (UInt64)))
+ ((union ?out (LogicalReduceSum ?in ?axis)))
+ :ruleset main_ruleset :name "wrapping_reduce_sum/bridge: UInt64 summation already wraps")

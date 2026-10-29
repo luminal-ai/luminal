@@ -1,0 +1,13 @@
+; Shape Propagation : LogicalWrappingMul — positively gated (see LogicalAdd).
+(rule
+  (
+    (= ?out_logical (LogicalWrappingMul ?in1_logical ?in2_logical))
+    (= ?shape (shape-of ?in1_logical))
+    (= ?shape (shape-of ?in2_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?shape)
+  )
+  :ruleset prop
+  :name "wrapping_mul/shape: shape of LogicalWrappingMul at agreeing operand shapes"
+)
