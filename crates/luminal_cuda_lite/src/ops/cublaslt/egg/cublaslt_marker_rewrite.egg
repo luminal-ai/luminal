@@ -51,16 +51,17 @@
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_rewrite: transpose sandwich: A x B is transpose of Bt x At"
 )
 
-; The BF16 product is widened to F32. Preserve that widening around the
+; The 16-bit product is widened to F32. Preserve that widening around the
 ; transpose sibling so a right-major F32 destination can be elected without
 ; introducing any F32 operand materialization.
 (rule
   (
     (= ?product (LogicalHelperMatrixMultiply ?a ?b))
     (= ?out (LogicalCast ?product (F32)))
-    (= (dtype-of ?a) (Bf16))
-    (= (dtype-of ?b) (Bf16))
-    (= (dtype-of ?product) (Bf16))
+    (= ?dtype (dtype-of ?a))
+    (cublaslt-widened-operand-dtype ?dtype)
+    (= (dtype-of ?b) ?dtype)
+    (= (dtype-of ?product) ?dtype)
   )
   (
     (union (LogicalHelperMatrixTranspose ?out)
@@ -71,7 +72,7 @@
         (F32)))
   )
   :ruleset backend
-  :name "cuda_lite/cublaslt/egg/cublaslt_marker_rewrite: BF16 to F32 transpose sandwich"
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_rewrite: 16-bit to F32 transpose sandwich"
 )
 ; ============================================================================
 ; TRANSPOSE-VIEW INJECTIVITY TRANSPORT.

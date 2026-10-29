@@ -116,6 +116,7 @@ impl Layout {
     fn new(desc: &LtDesc, dtype: luminal::dtype::PlanDtype) -> Result<Self> {
         let dtype = match dtype {
             luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+            luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
             luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
             dtype => return Err(anyhow!("cuBLASLt unsupported matrix dtype {dtype:?}")),
         };

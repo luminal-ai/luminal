@@ -217,6 +217,26 @@ fn bf16_matmul_widened_to_f32_mints_cublaslt_candidate() {
     );
 }
 
+#[test]
+fn f16_matmul_widened_to_f32_mints_cublaslt_candidate() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(vec![4usize, 8usize], DType::F16);
+    let b = cx.tensor(vec![8usize, 3usize], DType::F16);
+    let _out = a.matmul(b).cast(DType::F32);
+    let runtime = CudaRuntime::load_with_registry(&cx, luminal_cuda_lite::cuda_registry())
+        .expect("load mixed F16 graph");
+    let egraph = runtime
+        .saturated_egraph(&Default::default())
+        .expect("saturate mixed F16 graph");
+    assert!(
+        egraph
+            .nodes
+            .values()
+            .any(|node| node.op == "LayoutTensorOpCublasLt"),
+        "F16 x F16 followed by an F32 cast must offer a cuBLASLt candidate"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // THE PIN: the shape the marker DOES match.
 // ---------------------------------------------------------------------------

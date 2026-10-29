@@ -51,21 +51,25 @@
   :name "cuda_lite/cublaslt/egg/cublaslt_marker_site: matmul site from the canonical MatrixMultiply helper"
 )
 
-; BF16 tensor-core linear: the logical matmul rounds both inputs to BF16,
-; accumulates in the backend, and the graph explicitly widens its result.
-; The cast is part of the matched semantic shape so the F32 destination is
-; never confused with a BF16-output matmul.
+; BF16/F16 tensor-core linear: the logical matmul rounds both inputs to a
+; 16-bit float, accumulates in the backend, and the graph explicitly widens
+; its result. The cast is part of the matched semantic shape so the F32
+; destination is never confused with a 16-bit-output matmul.
+(relation cublaslt-widened-operand-dtype (Dtype))
+(cublaslt-widened-operand-dtype (Bf16))
+(cublaslt-widened-operand-dtype (F16))
 (rule
   (
     (= ?out (LogicalCast ?product (F32)))
     (= ?product (LogicalHelperMatrixMultiply ?a ?b))
-    (= (dtype-of ?a) (Bf16))
-    (= (dtype-of ?b) (Bf16))
-    (= (dtype-of ?product) (Bf16))
+    (= ?dtype (dtype-of ?a))
+    (cublaslt-widened-operand-dtype ?dtype)
+    (= (dtype-of ?b) ?dtype)
+    (= (dtype-of ?product) ?dtype)
     (= (dtype-of ?out) (F32))
   )
   ((let ?site (CublasLtLogicalMatmulSite ?a ?b ?out)))
   :ruleset backend
-  :name "cuda_lite/cublaslt/egg/cublaslt_marker_site: BF16 matmul with F32 output"
+  :name "cuda_lite/cublaslt/egg/cublaslt_marker_site: 16-bit matmul with F32 output"
 )
 ; ============================================================================
