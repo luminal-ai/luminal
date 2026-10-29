@@ -6,12 +6,14 @@
 (datatype CublasLtMatrixOperation (CublasLtNoTranspose) (CublasLtTranspose))
 (datatype CublasLtComputationType
   (CublasLtFloat32Computation)
-  (CublasLtTensorFloat32Computation))
+  (CublasLtTensorFloat32Computation)
+  (CublasLtFloat64Computation))
 ; Pointer location is an approved API capability; values belong to the call.
 (datatype CublasLtScalarPointerMode
   (CublasLtHostScalarPointerMode) (CublasLtDeviceScalarPointerMode))
 (datatype CublasLtScalarArguments
   (CublasLtHostScalarArguments f64 f64)
+  (CublasLtHostFloat64ScalarArguments f64 f64)
   (CublasLtDeviceScalarArguments LayoutTensor LayoutTensor))
 (datatype CublasLtEpilogue
   (CublasLtDefaultEpilogue)
@@ -71,8 +73,8 @@
     CublasLtLogicalCMatrix   ; logical C matrix, or explicit absence
     CublasLtLogicalBias      ; logical bias vector, or explicit absence
     CublasLtEpilogue
-    LogicalTensor           ; alpha, rank-zero F32
-    LogicalTensor))         ; beta, rank-zero F32
+    LogicalTensor           ; alpha, rank-zero arithmetic dtype
+    LogicalTensor))         ; beta, rank-zero arithmetic dtype
 (constructor LayoutTensorOpCublasLtCall
   (CublasLtConfiguration       ; complete approved configuration
     CublasLtMatrixDescriptor   ; A matrix descriptor
@@ -98,6 +100,6 @@
     CublasLtScalarArguments)
   LayoutTensorOp)
 
-; Computation contract, semantic F32 operand, physical descriptor source.
+; Computation contract, semantic arithmetic operand, physical descriptor source.
 ; Bypassing a rounding cast is valid only for the computation that performs it.
 (relation cublaslt-operand-storage-reading (CublasLtComputationType LogicalTensor LogicalTensor))

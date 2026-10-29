@@ -89,6 +89,7 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     let mut graphs = Vec::new();
     for (dtype, tf32, narrow) in [
         (DType::F32, false, false),
+        (DType::F64, false, false),
         (DType::Bf16, false, false),
         (DType::F16, false, false),
         (DType::F32, true, false),
@@ -98,15 +99,20 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
         for ta in [false, true] {
             for tb in [false, true] {
                 let mut model = Graph::new();
+                let compute = if dtype == DType::F64 {
+                    DType::F64
+                } else {
+                    DType::F32
+                };
                 let mut a = model
                     .tensor(if ta { [8, 3] } else { [3, 8] }, dtype)
-                    .cast(DType::F32);
+                    .cast(compute);
                 let mut b = model
                     .tensor(if tb { [4, 8] } else { [8, 4] }, dtype)
-                    .cast(DType::F32);
+                    .cast(compute);
                 if tf32 {
-                    a = a.cast(DType::TF32).cast(DType::F32);
-                    b = b.cast(DType::TF32).cast(DType::F32);
+                    a = a.cast(DType::TF32).cast(compute);
+                    b = b.cast(DType::TF32).cast(compute);
                 }
                 if ta {
                     a = a.permute(&[1, 0]);
@@ -115,11 +121,11 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
                     b = b.permute(&[1, 0]);
                 }
                 let p = a.matmul(b);
-                let addend_dtype = if narrow { dtype } else { DType::F32 };
-                let c = model.tensor([3, 4], addend_dtype).cast(DType::F32);
+                let addend_dtype = if narrow { dtype } else { compute };
+                let c = model.tensor([3, 4], addend_dtype).cast(compute);
                 let bias = model
                     .tensor([4], addend_dtype)
-                    .cast(DType::F32)
+                    .cast(compute)
                     .expand_dim(0, 3);
                 let _acc = p + c;
                 let _biased = p + bias;

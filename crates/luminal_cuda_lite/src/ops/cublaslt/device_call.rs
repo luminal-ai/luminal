@@ -107,6 +107,7 @@ impl Layout {
     fn new(desc: &LtDesc, dtype: luminal::dtype::PlanDtype) -> Result<Self> {
         let dtype = match dtype {
             luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+            luminal::dtype::PlanDtype::F64 => sys::cudaDataType_t::CUDA_R_64F,
             luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
             luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
             dtype => return Err(anyhow!("cuBLASLt unsupported matrix dtype {dtype:?}")),
@@ -227,9 +228,15 @@ pub fn prepare(
     let computation = match call.computation {
         LtComputation::Float32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
         LtComputation::TensorFloat32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+        LtComputation::Float64 => sys::cublasComputeType_t::CUBLAS_COMPUTE_64F,
+    };
+    let scalar_type = match call.scale_dtype {
+        luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+        luminal::dtype::PlanDtype::F64 => sys::cudaDataType_t::CUDA_R_64F,
+        other => anyhow::bail!("unsupported cuBLASLt scalar storage {other:?}"),
     };
     let desc = Desc {
-        raw: lt::create_matmul_desc(computation, sys::cudaDataType_t::CUDA_R_32F)
+        raw: lt::create_matmul_desc(computation, scalar_type)
             .map_err(|e| anyhow!("cublasLtMatmulDescCreate: {e:?}"))?,
     };
     let set_desc = |attr: sys::cublasLtMatmulDescAttributes_t,
@@ -240,7 +247,9 @@ pub fn prepare(
             .map_err(|e| anyhow!("cublasLtMatmulDescSetAttribute({attr:?}): {e:?}"))
     };
     let pointer_mode = match call.scalars {
-        LtScalars::Host { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST,
+        LtScalars::Host { .. } | LtScalars::HostF64 { .. } => {
+            sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST
+        }
         LtScalars::Device { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_DEVICE,
     };
     set_desc(
@@ -413,7 +422,7 @@ pub fn prepare(
         )
     };
     let required_pointer_mode = match call.scalars {
-        LtScalars::Host { .. } => {
+        LtScalars::Host { .. } | LtScalars::HostF64 { .. } => {
             sys::cublasLtPointerModeMask_t::CUBLASLT_POINTER_MODE_MASK_HOST as u32
         }
         LtScalars::Device { .. } => {
@@ -435,6 +444,10 @@ pub fn prepare(
         LtScalars::Host { .. } => {
             let (alpha, beta) = call.scalars.host_values().unwrap();
             PreparedScalars::Host { alpha, beta }
+        }
+        LtScalars::HostF64 { .. } => {
+            let (alpha, beta) = call.scalars.host_values_f64().unwrap();
+            PreparedScalars::HostF64 { alpha, beta }
         }
         LtScalars::Device {
             alpha_operand,
@@ -481,6 +494,7 @@ pub struct PreparedCall {
 }
 enum PreparedScalars {
     Host { alpha: f32, beta: f32 },
+    HostF64 { alpha: f64, beta: f64 },
     Device { alpha: u64, beta: u64 },
 }
 impl PreparedHostOp for PreparedCall {
@@ -493,6 +507,10 @@ impl PreparedHostOp for PreparedCall {
             PreparedScalars::Host { alpha, beta } => (
                 alpha as *const f32 as *const _,
                 beta as *const f32 as *const _,
+            ),
+            PreparedScalars::HostF64 { alpha, beta } => (
+                alpha as *const f64 as *const _,
+                beta as *const f64 as *const _,
             ),
             PreparedScalars::Device { alpha, beta } => (*alpha as *const _, *beta as *const _),
         };

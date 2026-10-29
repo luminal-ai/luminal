@@ -105,6 +105,11 @@ fn graph_with_sharing(
     (shared_a, shared_b): (bool, bool),
 ) -> Graph {
     let mut graph = Graph::new();
+    let compute = if dtype == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
     let a_shape = if transpose_a { vec![4, 3] } else { vec![3, 4] };
     let b_shape = if transpose_b { vec![5, 4] } else { vec![4, 5] };
     let shape = |shared, matrix: Vec<usize>| {
@@ -114,15 +119,11 @@ fn graph_with_sharing(
             [vec![2], matrix].concat()
         }
     };
-    let mut a = graph
-        .tensor(shape(shared_a, a_shape), dtype)
-        .cast(DType::F32);
-    let mut b = graph
-        .tensor(shape(shared_b, b_shape), dtype)
-        .cast(DType::F32);
+    let mut a = graph.tensor(shape(shared_a, a_shape), dtype).cast(compute);
+    let mut b = graph.tensor(shape(shared_b, b_shape), dtype).cast(compute);
     if tf32 {
-        a = a.cast(DType::TF32).cast(DType::F32);
-        b = b.cast(DType::TF32).cast(DType::F32);
+        a = a.cast(DType::TF32).cast(compute);
+        b = b.cast(DType::TF32).cast(compute);
     }
     if transpose_a {
         a = a.permute(if shared_a {
@@ -147,8 +148,8 @@ fn graph_with_sharing(
     let mut output = a.matmul(b);
     if with_c {
         output += graph
-            .tensor([2, 3, 5], if narrow { dtype } else { DType::F32 })
-            .cast(DType::F32);
+            .tensor([2, 3, 5], if narrow { dtype } else { compute })
+            .cast(compute);
     }
     if narrow {
         let _out = output.cast(dtype);
@@ -533,12 +534,18 @@ fn dispatch_batch_configurations(broadcast: bool) {
     for &(shared_a, shared_b) in sharing {
         for (dtype, tf32, narrow) in [
             (DType::F32, false, false),
+            (DType::F64, false, false),
             (DType::Bf16, false, false),
             (DType::F16, false, false),
             (DType::F32, true, false),
             (DType::Bf16, false, true),
             (DType::F16, false, true),
         ] {
+            let compute = if dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            };
             if !ampere_or_newer && (dtype == DType::Bf16 || tf32) {
                 continue;
             }
@@ -595,11 +602,11 @@ fn dispatch_batch_configurations(broadcast: bool) {
                     };
                     let a_source = model.tensor(shape(shared_a, ta, 3, 4), dtype);
                     let b_source = model.tensor(shape(shared_b, tb, 4, 5), dtype);
-                    let mut a = a_source.cast(DType::F32);
-                    let mut b = b_source.cast(DType::F32);
+                    let mut a = a_source.cast(compute);
+                    let mut b = b_source.cast(compute);
                     if tf32 {
-                        a = a.cast(DType::TF32).cast(DType::F32);
-                        b = b.cast(DType::TF32).cast(DType::F32);
+                        a = a.cast(DType::TF32).cast(compute);
+                        b = b.cast(DType::TF32).cast(compute);
                     }
                     if ta {
                         a = a.permute(if shared_a {
@@ -622,8 +629,8 @@ fn dispatch_batch_configurations(broadcast: bool) {
                         b = b.expand_dim(0, 2);
                     }
                     let product = a.matmul(b);
-                    let c = model.tensor([2, 3, 5], if narrow { dtype } else { DType::F32 });
-                    let accumulated = product + c.cast(DType::F32);
+                    let c = model.tensor([2, 3, 5], if narrow { dtype } else { compute });
+                    let accumulated = product + c.cast(compute);
                     let (product, accumulated) = if narrow {
                         (product.cast(dtype), accumulated.cast(dtype))
                     } else {
@@ -673,7 +680,7 @@ fn dispatch_batch_configurations(broadcast: bool) {
     }
     assert_eq!(
         witnesses.len(),
-        sharing.len() * if ampere_or_newer { 1152 } else { 576 },
+        sharing.len() * if ampere_or_newer { 1344 } else { 768 },
         "each storage/computation mode covers base, separate C and in-place C configurations"
     );
     let at = |d: LtDesc, batch: usize, row: usize, col: usize| {
@@ -684,6 +691,10 @@ fn dispatch_batch_configurations(broadcast: bool) {
             }
     };
     for ((_, alias, shared_a, shared_b), mut call) in witnesses {
+        if call.computation == luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float64 {
+            support::fp64::execute_call(&stream, &call, alias);
+            continue;
+        }
         // Require a native broadcast witness for each complete configuration,
         // rather than accepting its materialized, disjoint alternative.
         assert_eq!(call.a.batch_stride_in_elements == 0, shared_a);

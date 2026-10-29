@@ -1,6 +1,6 @@
 ; One explicit batch axis. Recognize existing contractions and scalar scaling
 ; without reassociating them. A/B/C/D share one positive batch count.
-; Alpha/beta are FP32; beta is zero without C. No batched bias or activation.
+; Alpha/beta share the arithmetic dtype; beta is zero without C. No batched epilogues.
 (relation cublaslt-strided-batch-coordinate (Shape IntExpr))
 (relation cublaslt-strided-batch-product
   (LogicalTensor LogicalTensor LogicalTensor IntExpr IntExpr IntExpr IntExpr))
@@ -21,8 +21,9 @@
   (LayoutTensor IntExpr IntExpr IntExpr Dtype CublasLtMatrixOrder CublasLtMatrixDescriptor))
 
 (rule
-  ((cublaslt-strided-batch-scaled-product ?product ?A ?B ?batch ?m ?n ?k ?alpha))
-  ((cublaslt-scalar-demand ?alpha (LogicalConstant 0.0)))
+  ((cublaslt-strided-batch-scaled-product ?product ?A ?B ?batch ?m ?n ?k ?alpha)
+   (cublaslt-arithmetic-type (dtype-of ?product) ?zero ?one))
+  ((cublaslt-scalar-demand ?alpha ?zero))
   :ruleset backend
   :name "cublaslt: demand batched product scalars")
 (rule
@@ -68,18 +69,20 @@
    (= (shape-of ?B_operand) ?B_shape)
    (= (shape-of ?output_expression)
      (ShapeLit (IntExprCons ?BatchCount (IntExprCons ?m (IntExprCons ?n (IntExprNil))))))
-   (= (dtype-of ?A_operand) (F32))
-   (= (dtype-of ?B_operand) (F32))
-   (= (dtype-of ?products) (F32))
-   (= (dtype-of ?output_expression) (F32)))
+   (= ?arithmetic_type (dtype-of ?output_expression))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one)
+   (= (dtype-of ?A_operand) ?arithmetic_type)
+   (= (dtype-of ?B_operand) ?arithmetic_type)
+   (= (dtype-of ?products) ?arithmetic_type))
   ((cublaslt-strided-batch-product ?output_expression ?A_operand ?B_operand ?BatchCount ?m ?n ?k))
   :ruleset backend
-  :name "cublaslt: exact single axis batched F32 contraction")
+  :name "cublaslt: exact single axis batched floating contraction")
 
 
 (rule
-  ((cublaslt-strided-batch-product ?product ?A ?B ?batch ?m ?n ?k))
-  ((cublaslt-strided-batch-scaled-product ?product ?A ?B ?batch ?m ?n ?k (LogicalConstant 1.0)))
+  ((cublaslt-strided-batch-product ?product ?A ?B ?batch ?m ?n ?k)
+   (cublaslt-arithmetic-type (dtype-of ?product) ?zero ?one))
+  ((cublaslt-strided-batch-scaled-product ?product ?A ?B ?batch ?m ?n ?k ?one))
   :ruleset backend
   :name "cublaslt: unscaled batched product has alpha one")
 (rule
@@ -110,26 +113,28 @@
   ((cublaslt-strided-batch-scaled-product ?matrix_product ?A_operand ?B_operand ?BatchCount ?m ?n ?k ?alpha)
    (= ?output_expression (LogicalAdd ?matrix_product ?C_matrix))
    (= (shape-of ?C_matrix) (shape-of ?matrix_product))
-   (= (dtype-of ?C_matrix) (F32))
-   (= (dtype-of ?output_expression) (F32)))
+   (= ?arithmetic_type (dtype-of ?output_expression))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one)
+   (= (dtype-of ?C_matrix) ?arithmetic_type))
   ((cublaslt-strided-batch-product-with-C-matrix
-     ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k ?alpha (LogicalConstant 1.0)))
+     ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k ?alpha ?one))
   :ruleset backend
-  :name "cublaslt: batched F32 product then C in one order")
+  :name "cublaslt: batched product then C in one order")
 (rule
   ((cublaslt-strided-batch-scaled-product ?matrix_product ?A_operand ?B_operand ?BatchCount ?m ?n ?k ?alpha)
    (= ?output_expression (LogicalAdd ?C_matrix ?matrix_product))
    (= (shape-of ?C_matrix) (shape-of ?matrix_product))
-   (= (dtype-of ?C_matrix) (F32))
-   (= (dtype-of ?output_expression) (F32)))
+   (= ?arithmetic_type (dtype-of ?output_expression))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one)
+   (= (dtype-of ?C_matrix) ?arithmetic_type))
   ((cublaslt-strided-batch-product-with-C-matrix
-     ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k ?alpha (LogicalConstant 1.0)))
+     ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k ?alpha ?one))
   :ruleset backend
-  :name "cublaslt: batched F32 C then product in one authored addition")
+  :name "cublaslt: batched C then product in one authored addition")
 (rule
   ((cublaslt-strided-batch-product-with-C-matrix
      ?output_expression ?A_operand ?B_operand ?C_matrix ?BatchCount ?m ?n ?k ?alpha ?beta)
-   (cublaslt-f32-storage-reading ?C_matrix ?C_storage_tensor)
+   (cublaslt-exact-storage-reading (dtype-of ?A_operand) ?C_matrix ?C_storage_tensor)
    (cublaslt-output-storage-reading ?output_expression ?stored_expression))
   ((cublaslt-strided-batch-layout-demand ?C_storage_tensor)
    (cublaslt-strided-batch-layout-demand ?stored_expression))
@@ -330,17 +335,19 @@
      ?B_matrix_order ?B_transpose_operation ?B_matrix_descriptor)
    (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order ?D_matrix_descriptor)
-   (= ?configuration (CublasLtConfigurationOf ?computation_type (F32)
+   (= ?scalar_data_type (dtype-of ?A_operand))
+   (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_data_type
      ?A_storage_data_type ?B_storage_data_type (CublasLtNoCMatrixDataType) ?D_storage_data_type
      (CublasLtNoBiasDataType) ?scalar_pointer_mode (CublasLtDefaultEpilogue)
      ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
    (cublaslt-approved-configuration ?configuration)
-   (cublaslt-scalar-arguments ?alpha (LogicalConstant 0.0) ?scalar_pointer_mode ?scalar_arguments ?scalar_inputs))
+   (cublaslt-arithmetic-type ?scalar_data_type ?zero ?one)
+   (cublaslt-scalar-arguments ?alpha ?zero ?scalar_data_type ?scalar_pointer_mode ?scalar_arguments ?scalar_inputs))
   ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
      (CublasLtCMatrixAbsent) (CublasLtBiasAbsent) ?D_matrix_descriptor
 
      (CublasLtExpressionFrameOf ?stored_expression ?stored_expression ?A_operand ?B_operand
-       (CublasLtNoCMatrix) (CublasLtNoBias) (CublasLtDefaultEpilogue) ?alpha (LogicalConstant 0.0)) ?scalar_arguments))
+       (CublasLtNoCMatrix) (CublasLtNoBias) (CublasLtDefaultEpilogue) ?alpha ?zero) ?scalar_arguments))
   :ruleset backend
   :name "cublaslt: approve complete strided batch product configuration")
 
@@ -356,7 +363,7 @@
    (= (shape-of ?B_operand) (shape-of ?B_storage_tensor))
    (= ?A_layout_tensor (LayoutTensorLit ?A_storage_tensor ?A_layout))
    (= ?B_layout_tensor (LayoutTensorLit ?B_storage_tensor ?B_layout))
-   (cublaslt-f32-storage-reading ?C_matrix ?C_storage_tensor)
+   (cublaslt-exact-storage-reading (dtype-of ?A_operand) ?C_matrix ?C_storage_tensor)
    (= (shape-of ?C_matrix) (shape-of ?C_storage_tensor))
    (= ?C_layout_tensor (LayoutTensorLit ?C_storage_tensor ?C_layout))
    (cublaslt-output-storage-reading ?output_expression ?stored_expression)
@@ -370,12 +377,13 @@
      ?D_matrix_order (CublasLtNoTranspose) ?C_matrix_descriptor)
    (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order ?D_matrix_descriptor)
-   (= ?configuration (CublasLtConfigurationOf ?computation_type (F32)
+   (= ?scalar_data_type (dtype-of ?A_operand))
+   (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_data_type
      ?A_storage_data_type ?B_storage_data_type (CublasLtCMatrixDataTypeOf ?D_storage_data_type) ?D_storage_data_type
      (CublasLtNoBiasDataType) ?scalar_pointer_mode (CublasLtDefaultEpilogue)
      ?A_matrix_order ?B_matrix_order ?D_matrix_order ?A_transpose_operation ?B_transpose_operation))
    (cublaslt-approved-configuration ?configuration)
-   (cublaslt-scalar-arguments ?alpha ?beta ?scalar_pointer_mode ?scalar_arguments ?scalar_inputs))
+   (cublaslt-scalar-arguments ?alpha ?beta ?scalar_data_type ?scalar_pointer_mode ?scalar_arguments ?scalar_inputs))
   ((cublaslt-approved-call ?configuration ?A_matrix_descriptor ?B_matrix_descriptor
      (CublasLtCMatrixInput ?C_matrix_descriptor) (CublasLtBiasAbsent) ?D_matrix_descriptor
 

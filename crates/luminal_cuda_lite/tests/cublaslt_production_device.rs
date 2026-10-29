@@ -59,6 +59,10 @@ fn range<T>(stream: &Arc<CudaStream>, buffer: &CudaSlice<T>) -> DeviceRange {
     }
 }
 fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
+    if call.computation == LtComputation::Float64 {
+        support::fp64::execute_call(stream, call, alias);
+        return;
+    }
     use luminal_cuda_lite::ops::cublaslt::exec::LtScalars;
     let mut call = call.clone();
     let (alpha, beta) = (1.25, if call.c.is_some() { -0.5 } else { 0.0 });
@@ -246,8 +250,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 2176 } else { 1088 });
-    assert_eq!(aliases, if ampere_or_newer { 1088 } else { 544 });
+    assert_eq!(ran, if ampere_or_newer { 2304 } else { 1216 });
+    assert_eq!(aliases, if ampere_or_newer { 1152 } else { 608 });
 }
 
 #[test]

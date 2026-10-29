@@ -99,6 +99,7 @@ pub enum LtActivation {
 pub enum LtComputation {
     Float32,
     TensorFloat32,
+    Float64,
 }
 
 impl LtComputation {
@@ -106,17 +107,22 @@ impl LtComputation {
         match self {
             Self::Float32 => "CublasLtFloat32Computation",
             Self::TensorFloat32 => "CublasLtTensorFloat32Computation",
+            Self::Float64 => "CublasLtFloat64Computation",
         }
     }
 }
 
-/// Host values retain their FP32 bits, including signed zero and NaN payloads.
+/// Host values retain their declared precision, including signed zero and NaN bits.
 /// Device values are ordinary read operands; replay reads their current bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LtScalars {
     Host {
         alpha_bits: u32,
         beta_bits: u32,
+    },
+    HostF64 {
+        alpha_bits: u64,
+        beta_bits: u64,
     },
     Device {
         alpha_operand: usize,
@@ -137,6 +143,25 @@ impl LtScalars {
                 alpha_bits,
                 beta_bits,
             } => Some((f32::from_bits(alpha_bits), f32::from_bits(beta_bits))),
+            Self::HostF64 { .. } | Self::Device { .. } => None,
+        }
+    }
+    pub fn host_f64(alpha: f64, beta: f64) -> Self {
+        Self::HostF64 {
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+        }
+    }
+    /// Inspect host values without narrowing. FP32 arguments widen exactly.
+    pub fn host_values_f64(self) -> Option<(f64, f64)> {
+        match self {
+            Self::HostF64 {
+                alpha_bits,
+                beta_bits,
+            } => Some((f64::from_bits(alpha_bits), f64::from_bits(beta_bits))),
+            Self::Host { .. } => self
+                .host_values()
+                .map(|(a, b)| (f64::from(a), f64::from(b))),
             Self::Device { .. } => None,
         }
     }
@@ -149,7 +174,7 @@ impl LtScalars {
     }
     pub fn pointer_mode_constructor(self) -> &'static str {
         match self {
-            Self::Host { .. } => "CublasLtHostScalarPointerMode",
+            Self::Host { .. } | Self::HostF64 { .. } => "CublasLtHostScalarPointerMode",
             Self::Device { .. } => "CublasLtDeviceScalarPointerMode",
         }
     }
@@ -259,11 +284,23 @@ impl LtCall {
     /// count — the pre-dispatch gate (contract 4). `elems` follows the elected
     /// read order; the destination's capacity is checked separately.
     pub fn validate_against(&self, operand_elems: &[usize], dest_elems: usize) -> Result<()> {
-        if self.scale_dtype != luminal::dtype::PlanDtype::F32 {
+        let scalar_dtype = match self.computation {
+            LtComputation::Float32 | LtComputation::TensorFloat32 => luminal::dtype::PlanDtype::F32,
+            LtComputation::Float64 => luminal::dtype::PlanDtype::F64,
+        };
+        if self.scale_dtype != scalar_dtype {
             bail!(
-                "cuBLASLt: admitted compute modes require FP32 alpha/beta, got {:?}",
+                "cuBLASLt: {:?} requires {scalar_dtype:?} alpha/beta, got {:?}",
+                self.computation,
                 self.scale_dtype
             );
+        }
+        if matches!(self.scalars, LtScalars::Host { .. })
+            && scalar_dtype != luminal::dtype::PlanDtype::F32
+            || matches!(self.scalars, LtScalars::HostF64 { .. })
+                && scalar_dtype != luminal::dtype::PlanDtype::F64
+        {
+            bail!("cuBLASLt: host scalar storage does not match {scalar_dtype:?}");
         }
         let arity = self.form.lit_arity() + self.scalars.input_count();
         if operand_elems.len() != arity {
@@ -284,10 +321,12 @@ impl LtCall {
         {
             for (name, operand) in [("alpha", alpha_operand), ("beta", beta_operand)] {
                 if operand_elems.get(operand).is_none_or(|&len| len < 1) {
-                    bail!("cuBLASLt: device {name} operand {operand} needs one FP32 element");
+                    bail!(
+                        "cuBLASLt: device {name} operand {operand} needs one {scalar_dtype:?} element"
+                    );
                 }
             }
-        } else if self.c.is_none() && self.scalars.host_values().unwrap().1 != 0.0 {
+        } else if self.c.is_none() && self.scalars.host_values_f64().unwrap().1 != 0.0 {
             bail!("cuBLASLt: absent C requires beta zero");
         }
         if let Some(c) = self.c {

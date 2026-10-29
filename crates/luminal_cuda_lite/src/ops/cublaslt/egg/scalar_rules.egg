@@ -1,6 +1,17 @@
 ; Scalar values and pointer location are independent of matrix storage types.
-; All currently admitted compute modes require FP32 scaleType, even for half
-; matrices. A tensor scalar stays on the device; no host readback is introduced.
+; FP32 and TF32 computation require FP32 scales; FP64 requires FP64 scales.
+; A tensor scalar stays on the device; no host readback is introduced.
+(relation cublaslt-host-scalar-arguments (CublasLtScalarArguments))
+(rule
+  ((= ?arguments (CublasLtHostScalarArguments ?alpha ?beta)))
+  ((cublaslt-host-scalar-arguments ?arguments))
+  :ruleset backend
+  :name "cublaslt: FP32 host arguments have no scalar read operands")
+(rule
+  ((= ?arguments (CublasLtHostFloat64ScalarArguments ?alpha ?beta)))
+  ((cublaslt-host-scalar-arguments ?arguments))
+  :ruleset backend
+  :name "cublaslt: FP64 host arguments have no scalar read operands")
 (rule
   ((cublaslt-expression-frame
      (CublasLtExpressionFrameOf ?root ?out ?A ?B ?C ?bias ?epilogue ?alpha ?beta)))
@@ -12,30 +23,33 @@
    (= ?broadcast (LogicalIndexMapApply ?scalar
      (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape))
    (= (shape-of ?scalar) (ShapeLit (IntExprNil)))
-   (= (dtype-of ?scalar) (F32))
-   (= (dtype-of ?value) (F32))
-   (= (dtype-of ?scaled) (F32))
+   (= ?arithmetic_type (dtype-of ?value))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one)
+   (= (dtype-of ?scalar) ?arithmetic_type)
+   (= (dtype-of ?scaled) ?arithmetic_type)
    (= (shape-of ?value) ?shape)
    (= (shape-of ?scaled) ?shape))
   ((cublaslt-scalar-multiplication ?scaled ?value ?scalar))
   :ruleset backend
-  :name "cublaslt: one FP32 scalar multiplication at its authored position")
+  :name "cublaslt: one typed scalar multiplication at its authored position")
 (rule
   ((= ?scaled (LogicalMul ?broadcast ?value))
    (= ?broadcast (LogicalIndexMapApply ?scalar
      (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape))
    (= (shape-of ?scalar) (ShapeLit (IntExprNil)))
-   (= (dtype-of ?scalar) (F32))
-   (= (dtype-of ?value) (F32))
-   (= (dtype-of ?scaled) (F32))
+   (= ?arithmetic_type (dtype-of ?value))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one)
+   (= (dtype-of ?scalar) ?arithmetic_type)
+   (= (dtype-of ?scaled) ?arithmetic_type)
    (= (shape-of ?value) ?shape)
    (= (shape-of ?scaled) ?shape))
   ((cublaslt-scalar-multiplication ?scaled ?value ?scalar))
   :ruleset backend
-  :name "cublaslt: FP32 scalar on the left at its authored position")
+  :name "cublaslt: typed scalar on the left at its authored position")
 (rule
-  ((cublaslt-logical-matrix-product ?product ?A ?B))
-  ((cublaslt-scaled-matrix-product ?product ?A ?B (LogicalConstant 1.0)))
+  ((cublaslt-logical-matrix-product ?product ?A ?B)
+   (cublaslt-arithmetic-type (dtype-of ?product) ?zero ?one))
+  ((cublaslt-scaled-matrix-product ?product ?A ?B ?one))
   :ruleset backend
   :name "cublaslt: an unscaled product has alpha one")
 (rule
@@ -45,9 +59,10 @@
   :ruleset backend
   :name "cublaslt: alpha scales the completed product")
 (rule
-  ((cublaslt-scaled-matrix-product ?product ?A ?B ?alpha))
+  ((cublaslt-scaled-matrix-product ?product ?A ?B ?alpha)
+   (cublaslt-arithmetic-type (dtype-of ?product) ?zero ?one))
   ((cublaslt-product-with-C-matrix ?product ?A ?B (CublasLtNoCMatrix)
-     ?alpha (LogicalConstant 0.0)))
+     ?alpha ?zero))
   :ruleset backend
   :name "cublaslt: absent C requires literal beta zero")
 (rule
@@ -70,7 +85,7 @@
   ((cublaslt-scalar-demand ?alpha ?beta)
    (= ?alpha (LogicalConstant ?alpha_value))
    (= ?beta (LogicalConstant ?beta_value)))
-  ((cublaslt-scalar-arguments ?alpha ?beta (CublasLtHostScalarPointerMode)
+  ((cublaslt-scalar-arguments ?alpha ?beta (F32) (CublasLtHostScalarPointerMode)
      (CublasLtHostScalarArguments ?alpha_value ?beta_value) (LayoutTensorNil)))
   :ruleset backend
   :name "cublaslt: literal FP32 alpha and beta use host scalar pointers")
@@ -78,15 +93,25 @@
   ((cublaslt-scalar-demand ?alpha ?beta)
    (= (shape-of ?alpha) (ShapeLit (IntExprNil)))
    (= (shape-of ?beta) (ShapeLit (IntExprNil)))
-   (= (dtype-of ?alpha) (F32))
-   (= (dtype-of ?beta) (F32))
-   (= ?scalar_bits (bits-of (F32))))
+   (= ?scalar_type (dtype-of ?alpha))
+   (cublaslt-arithmetic-type ?scalar_type ?zero ?one)
+   (= (dtype-of ?beta) ?scalar_type)
+   (= ?scalar_bits (bits-of ?scalar_type)))
   ((let ?scalar_layout
      (RightMajorContiguousElementLayoutLit (ShapeLit (IntExprNil)) ?scalar_bits))
    (let ?alpha_tensor (LayoutTensorLit ?alpha ?scalar_layout))
    (let ?beta_tensor (LayoutTensorLit ?beta ?scalar_layout))
-   (cublaslt-scalar-arguments ?alpha ?beta (CublasLtDeviceScalarPointerMode)
+   (cublaslt-scalar-arguments ?alpha ?beta ?scalar_type (CublasLtDeviceScalarPointerMode)
      (CublasLtDeviceScalarArguments ?alpha_tensor ?beta_tensor)
      (LayoutTensorCons ?alpha_tensor (LayoutTensorCons ?beta_tensor (LayoutTensorNil)))))
   :ruleset backend
-  :name "cublaslt: rank zero FP32 alpha and beta use device scalar pointers")
+  :name "cublaslt: rank zero typed alpha and beta use device scalar pointers")
+
+(rule
+  ((cublaslt-scalar-demand ?alpha ?beta)
+   (= ?alpha (LogicalConstantF64 ?alpha_value))
+   (= ?beta (LogicalConstantF64 ?beta_value)))
+  ((cublaslt-scalar-arguments ?alpha ?beta (F64) (CublasLtHostScalarPointerMode)
+     (CublasLtHostFloat64ScalarArguments ?alpha_value ?beta_value) (LayoutTensorNil)))
+  :ruleset backend
+  :name "cublaslt: literal FP64 alpha and beta use host double pointers")

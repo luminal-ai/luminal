@@ -7,7 +7,7 @@
    (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
    (= ?C_argument (CublasLtCMatrixAbsent))
    (= ?bias_argument (CublasLtBiasAbsent))
-   (= ?scalars (CublasLtHostScalarArguments ?alpha_value ?beta_value)))
+   (cublaslt-host-scalar-arguments ?scalars))
   ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
      (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorNil)))))
   :ruleset backend
@@ -31,7 +31,7 @@
    (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
    (= ?C_argument (CublasLtCMatrixAbsent))
    (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
-   (= ?scalars (CublasLtHostScalarArguments ?alpha_value ?beta_value)))
+   (cublaslt-host-scalar-arguments ?scalars))
   ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
      (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorNil))))))
   :ruleset backend
@@ -55,7 +55,7 @@
    (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
    (= ?C_argument (CublasLtCMatrixInput (CublasLtMatrixDescriptorOf ?C_tensor ?C_layout)))
    (= ?bias_argument (CublasLtBiasAbsent))
-   (= ?scalars (CublasLtHostScalarArguments ?alpha_value ?beta_value)))
+   (cublaslt-host-scalar-arguments ?scalars))
   ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
      (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?C_tensor (LayoutTensorNil))))))
   :ruleset backend
@@ -79,7 +79,7 @@
    (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
    (= ?C_argument (CublasLtCMatrixInput (CublasLtMatrixDescriptorOf ?C_tensor ?C_layout)))
    (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
-   (= ?scalars (CublasLtHostScalarArguments ?alpha_value ?beta_value)))
+   (cublaslt-host-scalar-arguments ?scalars))
   ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
      (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorCons ?C_tensor (LayoutTensorNil)))))))
   :ruleset backend

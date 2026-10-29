@@ -11,10 +11,10 @@ the elected call and dispatches its descriptors unchanged.
 | --- | --- |
 | `approved_constructors.egg` | Flat vendor layout data, storage descriptors, optional arguments, configuration and expression-frame types |
 | `approved_rules.egg` | Rank-two expression recognition, layout readings, precision proofs, and complete admission |
-| `scalar_rules.egg` | Authored alpha/beta scaling and exact FP32 scalar storage/pointer proofs |
+| `scalar_rules.egg` | Authored alpha/beta scaling and exact FP32/FP64 scalar storage/pointer proofs |
 | `call_inputs.egg` | Assemble approved matrix/scalar reads in one canonical order |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 2,176 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 2,304 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -48,8 +48,8 @@ placeholder C descriptor required by the vendor when beta is zero.
 
 Both forms use inputs A, B, optional device alpha/beta, optional bias, then
 optional C. Host scalar literals are metadata; device scalars are ordinary
-FP32 read operands. The separate-destination form appends its write-only D
-operand during DPS conversion. The in-place form requires C and ties its final
+reads in the declared scalar dtype. The separate-destination form appends its
+write-only D operand during DPS conversion. The in-place form requires C and ties its final
 read operand to result 0 with unconditional `Sharing::Must`. Its emission rule
 requires the same complete vendor layout and underlying layout for C and D.
 There is no conditional alias flag or Rust destination rebinding. Scalar values,
@@ -57,8 +57,8 @@ including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **2,176 complete configurations**: 1,088 for host scalar
-pointers and 1,088 for device scalar pointers. Each pointer mode admits:
+The table contains **2,304 complete configurations**: 1,152 for host scalar
+pointers and 1,152 for device scalar pointers. Each pointer mode admits:
 
 - 896 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
   FP16 A/B storage, plus explicit TF32 computation over F32 storage. Each has
@@ -70,9 +70,13 @@ pointers and 1,088 for device scalar pointers. Each pointer mode admits:
   order/transpose combinations, absent/present matching narrow C, and default
   in either D order or ReLU with column-major D. Native narrow bias and GELU
   epilogues have no approved rows.
+- 64 FP64-output rows: FP64 A/B/C/D storage, computation and alpha/beta,
+  with 16 A/B order/transpose combinations, absent/present C, and default
+  epilogue in either D order.
 
-Scalars and accumulation remain FP32. Alpha and beta are general FP32 values;
-absent C still requires literal beta zero. Storage never chooses arithmetic
+FP32/TF32 computation uses FP32 scalars; FP64 computation uses FP64 scalars.
+Alpha and beta are general values in that arithmetic dtype; absent C still
+requires a literal beta zero in the same dtype. Storage never chooses arithmetic
 precision. Only an authored exact widening permits direct BF16/FP16 readings.
 Casts between multiplication,
 reduction, C addition, bias addition and activation remain boundaries; earlier
@@ -88,8 +92,8 @@ configurations.
 
 ### General alpha and beta
 
-`scalar_rules.egg` recognizes one FP32 scalar multiplication of the completed
-product and one of C before addition: `alpha * (A @ B) + beta * C`, followed by
+`scalar_rules.egg` recognizes one multiplication of the completed product and
+one of C by scalars in their arithmetic dtype, before addition: `alpha * (A @ B) + beta * C`, followed by
 optional bias/activation and authored output rounding. Scaling is not moved
 across casts or distributed over C, bias, activation, or multiple scalar
 multiplications. Rank-two and strided-batch calls share these scalar proofs.
@@ -98,16 +102,17 @@ addition are recognized locally within this contract. Admission does not depend
 on global floating-point commutation or reassociate a chain of additions.
 
 The vendor's [dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
-requires **FP32 alpha/beta** for all currently admitted modes: ordinary FP32
-computation over F32/FP16/BF16 storage and explicit TF32 computation over F32
-storage. Half matrix storage does not authorize half scalar pointers. An
-explicit scalar cast to F32 remains an executable operation when needed.
+requires **FP32 alpha/beta** for ordinary FP32 computation over F32/FP16/BF16
+storage and explicit TF32 computation over F32 storage. FP64 computation instead
+requires **FP64 alpha/beta**, including eight-byte device scalar reads. Half
+matrix storage does not authorize half scalar pointers. An explicit scalar
+cast to the required dtype remains executable when needed.
 
 The configuration records `CublasLtHostScalarPointerMode` or
 `CublasLtDeviceScalarPointerMode`; actual values/storage live in separate flat
-`CublasLtScalarArguments`. Host arguments require literal FP32 graph constants.
-Tensor coefficients require rank-zero FP32 storage and use GPU pointers. If a
-literal is paired with a tensor coefficient, the literal can be materialized as
+`CublasLtScalarArguments`. Host arguments require graph constants in the scalar
+dtype. Tensor coefficients require rank-zero storage in the computation's scalar
+dtype and use GPU pointers. If a literal is paired with a tensor coefficient, the literal can be materialized as
 a GPU scalar so both pointers use DEVICE mode. There is no GPU-to-CPU scalar
 readback. The prepared CUDA graph reads updated device coefficients on every
 replay, including coefficients produced by preceding GPU operations.
@@ -125,6 +130,27 @@ separate elementwise multiplication. A present C remains structurally present,
 including when beta is zero; this does not grant extra alias permissions or
 remove the scalar's graph dependency. Tests compare finite numerical inputs
 and retain explicit cast boundaries.
+
+### FP64 arithmetic and scalar storage
+
+`CublasLtFloat64Computation` maps to `CUBLAS_COMPUTE_64F`. Logical F64
+multiplication and reduction authorize F64 matrix storage and F64 scalars,
+with both ordinary and one-axis strided-batched geometry. Shared A/B inputs,
+independent C/D pitches, separate destinations, and in-place ties use the same
+layout proofs as the other computation modes.
+
+Use `graph.constant_f64(value)` for a host literal and a rank-zero F64 graph
+tensor for a device coefficient. Mixed host/device coefficients materialize the
+literal in F64 device storage. Host arguments retain their f64 bits in distinct
+metadata and owned double-width storage through CUDA graph capture; no f32
+conversion or scalar readback occurs. GPU-produced coefficients and changed
+values on replay remain ordinary graph dependencies.
+
+The initial whitelist admits the default epilogue. Explicit final output casts
+remain separate operations. FP64 reduction order and FMA contraction follow the
+same practical BLAS policy, including zero-coefficient read suppression, at
+double precision. The [vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
+specifies the FP64 computation and scalar ABI.
 
 ### Narrow C, bias and output storage
 
@@ -213,7 +239,7 @@ simplification can erase at singleton extents.
 The batched recognizer matches `A[B,m,k]` and `B[B,k,n]` broadcast into the exact
 `[B,m,n,k]` multiply domain followed by reduction over k. Both maps must use the
 batch coordinate, even when a matrix extent happens to equal B. A static B=1
-also permits its coordinate to be literal zero. Arithmetic remains F32, with
+also permits its coordinate to be literal zero. Arithmetic is F32 or F64, with
 explicit narrow-input widening handled by the shared storage-reading proofs. An
 authored final BF16/FP16 cast can select the matching narrow D and C storage.
 
@@ -247,7 +273,7 @@ and legal leading dimension. This relation is used only for A and B. Every
 vendor descriptor still carries the common logical batch count; sharing is
 represented by stride zero, not a descriptor count of one. The independent
 [layout attributes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatrixlayoutattribute-t)
-are dispatched unchanged. Precision/storage proofs and the complete 2,176-row
+are dispatched unchanged. Precision/storage proofs and the complete 2,304-row
 configuration whitelist remain shared with ordinary batches.
 
 Read sharing never publishes a disjoint matrix or destination proof. C and D

@@ -353,7 +353,7 @@ fn all_accumulation_configurations_have_an_unconditional_one_operand_tie() {
             .collect::<std::collections::BTreeSet<_>>(),
         expected
     );
-    assert_eq!(witnesses.len(), 1088);
+    assert_eq!(witnesses.len(), 1152);
     for op in witnesses.values() {
         assert!(op.to_dps().is_none(), "C already is the destination");
         let ties = op.alias_info();

@@ -1,3 +1,9 @@
+; Arithmetic precision supplies typed identities and the scalar ABI. Storage
+; never selects it; both semantic operands must have this same arithmetic dtype.
+(relation cublaslt-arithmetic-type (Dtype LogicalTensor LogicalTensor))
+(cublaslt-arithmetic-type (F32) (LogicalConstant 0.0) (LogicalConstant 1.0))
+(cublaslt-arithmetic-type (F64) (LogicalConstantF64 0.0) (LogicalConstantF64 1.0))
+(relation cublaslt-exact-storage-reading (Dtype LogicalTensor LogicalTensor))
 ; Production proof relations. None of these helper facts is an executable call.
 (relation cublaslt-approved-configuration (CublasLtConfiguration))
 (relation cublaslt-layout-axis (LayoutTensor Shape i64 IntExpr IntExpr))
@@ -19,7 +25,7 @@
 (relation cublaslt-scalar-multiplication (LogicalTensor LogicalTensor LogicalTensor))
 (relation cublaslt-scalar-demand (LogicalTensor LogicalTensor))
 (relation cublaslt-scalar-arguments
-  (LogicalTensor LogicalTensor CublasLtScalarPointerMode CublasLtScalarArguments LayoutTensorList))
+  (LogicalTensor LogicalTensor Dtype CublasLtScalarPointerMode CublasLtScalarArguments LayoutTensorList))
 (relation cublaslt-product-with-C-matrix
   (LogicalTensor LogicalTensor LogicalTensor CublasLtLogicalCMatrix LogicalTensor LogicalTensor))
 (relation cublaslt-logical-expression
@@ -50,10 +56,11 @@
 (cublaslt-narrow-storage-data-type (Bf16))
 (cublaslt-narrow-storage-data-type (F16))
 (rule
-  ((= (dtype-of ?arithmetic_expression) (F32)))
+  ((= ?arithmetic_type (dtype-of ?arithmetic_expression))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one))
   ((cublaslt-output-storage-reading ?arithmetic_expression ?arithmetic_expression))
   :ruleset backend
-  :name "cublaslt: F32 output preserves the arithmetic expression")
+  :name "cublaslt: output storage preserves its arithmetic dtype")
 (rule
   ((= ?stored_expression (LogicalCast ?arithmetic_expression ?storage_data_type))
    (cublaslt-narrow-storage-data-type ?storage_data_type)
@@ -230,26 +237,29 @@
 ; Recognize complete logical expressions; never match an existing library call.
 (rule
   ((= ?matrix_product (LogicalHelperMatrixMultiply ?A_operand ?B_operand))
-   (= (dtype-of ?A_operand) (F32))
-   (= (dtype-of ?B_operand) (F32))
-   (= (dtype-of ?matrix_product) (F32)))
+   (= ?arithmetic_type (dtype-of ?matrix_product))
+   (cublaslt-arithmetic-type ?arithmetic_type ?zero ?one)
+   (= (dtype-of ?A_operand) ?arithmetic_type)
+   (= (dtype-of ?B_operand) ?arithmetic_type))
   ((cublaslt-logical-matrix-product ?matrix_product ?A_operand ?B_operand))
   :ruleset backend
   :name "cublaslt: logical product")
 (rule
   ((cublaslt-scaled-matrix-product ?matrix_product ?A_operand ?B_operand ?alpha)
    (= ?expression (LogicalAdd ?matrix_product ?C_matrix))
-   (= (shape-of ?matrix_product) (shape-of ?C_matrix)))
+   (= (shape-of ?matrix_product) (shape-of ?C_matrix))
+   (cublaslt-arithmetic-type (dtype-of ?matrix_product) ?zero ?one))
   ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix)
-     ?alpha (LogicalConstant 1.0)))
+     ?alpha ?one))
   :ruleset backend
   :name "cublaslt: product then C in one order")
 (rule
   ((cublaslt-scaled-matrix-product ?matrix_product ?A_operand ?B_operand ?alpha)
    (= ?expression (LogicalAdd ?C_matrix ?matrix_product))
-   (= (shape-of ?matrix_product) (shape-of ?C_matrix)))
+   (= (shape-of ?matrix_product) (shape-of ?C_matrix))
+   (cublaslt-arithmetic-type (dtype-of ?matrix_product) ?zero ?one))
   ((cublaslt-product-with-C-matrix ?expression ?A_operand ?B_operand (CublasLtCMatrixOf ?C_matrix)
-     ?alpha (LogicalConstant 1.0)))
+     ?alpha ?one))
   :ruleset backend
   :name "cublaslt: C then product in one authored addition")
 (rule
@@ -565,7 +575,7 @@
          ?D_LeadingDimension (IntLit 1) (IntLit 0))))
    (= ?D_layout_tensor (LayoutTensorLit ?output_expression ?layout))
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?element_data_type ?matrix_order ?D_matrix_descriptor)
-   (cublaslt-f32-storage-reading ?C_matrix ?C_storage_tensor)
+   (cublaslt-exact-storage-reading (dtype-of ?A_operand) ?C_matrix ?C_storage_tensor)
    (= (shape-of ?C_matrix) (shape-of ?C_storage_tensor))
    (= ?C_layout_tensor (LayoutTensorLit ?C_storage_tensor ?C_layout))
    (cublaslt-C-matrix-reading ?C_layout_tensor ?m ?n ?element_data_type ?matrix_order
@@ -622,13 +632,12 @@
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?D_storage_data_type ?D_matrix_order
      ?D_matrix_descriptor)
    (= (dtype-of ?output_expression) ?D_storage_data_type)
-   (= (dtype-of ?A_operand) (F32))
-   (= (dtype-of ?B_operand) (F32))
+   (= ?scalar_data_type (dtype-of ?A_operand))
+   (= (dtype-of ?B_operand) ?scalar_data_type)
    (cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
      ?C_input_tensors)
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors)
-   (cublaslt-scalar-arguments ?alpha ?beta ?scalar_pointer_mode ?scalar_arguments ?scalar_input_tensors)
-   (= ?scalar_data_type (F32))
+   (cublaslt-scalar-arguments ?alpha ?beta ?scalar_data_type ?scalar_pointer_mode ?scalar_arguments ?scalar_input_tensors)
    (= ?configuration
      (CublasLtConfigurationOf ?computation_type ?scalar_data_type ?A_storage_data_type ?B_storage_data_type
        ?C_matrix_data_type ?D_storage_data_type ?bias_data_type ?scalar_pointer_mode ?epilogue ?A_matrix_order
@@ -680,3 +689,16 @@
      ?logical_operand ?storage_source))
   :ruleset backend
   :name "cublaslt: explicit device TF32 rounding then F32 arithmetic reads F32 storage")
+
+; Exact F64 storage remains distinct from the FP32 and TF32 input contracts.
+(rule
+  ((cublaslt-f32-storage-reading ?logical_operand ?storage_source))
+  ((cublaslt-exact-storage-reading (F32) ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: exact FP32 C storage proof")
+(rule
+  ((= (dtype-of ?logical_operand) (F64)))
+  ((cublaslt-exact-storage-reading (F64) ?logical_operand ?logical_operand)
+   (cublaslt-operand-storage-reading (CublasLtFloat64Computation) ?logical_operand ?logical_operand))
+  :ruleset backend
+  :name "cublaslt: FP64 arithmetic reads FP64 storage")
