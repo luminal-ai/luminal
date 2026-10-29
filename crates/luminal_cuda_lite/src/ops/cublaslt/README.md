@@ -359,6 +359,20 @@ Scalar dtype/capacity rejection and descriptor address/storage-tie proofs pass
 for both pointer modes. Formatting and device-enabled CUDA
 Lite/reference/test-runtime Clippy with `-D warnings` pass.
 
+Explicit broadcast-batch validation executes **3,456 shared-batch dispatch
+witnesses** on the A100, covering shared A, shared B and both across every
+currently admitted batched configuration and both executable forms. Descriptor
+addresses, exact single-matrix capacities, expanded singleton axes, padded
+row/column storage, positive symbolic counts, whitelist ablation and rejection
+of partial overlap/shared destinations are checked independently. Reference
+comparisons exercise F32, FP16/BF16 storage and explicit TF32, non-unit host/GPU
+scalars, retained C, and batch-count/scalar changes on replay. Execution tests
+exclude generic cast/view materializers so they must consume shared storage
+and fused rounding directly; production search still has those legal alternatives.
+All 17 device-enabled batch regressions pass, including the original 1,152
+disjoint-batch witnesses. Formatting and device-enabled CUDA Lite Clippy with
+`-D warnings` pass.
+
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its
 numbers do not measure the restored code.

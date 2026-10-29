@@ -121,8 +121,40 @@ mod execution {
     use luminal::layout_ir::{Access, FreedBy};
     use luminal_cuda_lite::ops::cublaslt::exec::{LtComputation, LtScalars};
     use luminal_cuda_lite::{CudaBindings, HostBuffer};
-    use luminal_reference::{ReferenceBindings, ReferenceRuntime};
+    use luminal_reference::{ReferenceBindings, ReferenceRuntime, TypedBuffer};
     use support::TestTransfers;
+
+    fn payload(dtype: DType, data: &[f32]) -> (HostBuffer, TypedBuffer) {
+        match dtype {
+            DType::F16 => {
+                let values: Vec<_> = data.iter().map(|x| half::f16::from_f32(*x)).collect();
+                let raw = values
+                    .iter()
+                    .flat_map(|x| x.to_bits().to_ne_bytes())
+                    .collect();
+                (
+                    HostBuffer::new(PlanDtype::F16, raw).unwrap(),
+                    TypedBuffer::F16(values),
+                )
+            }
+            DType::Bf16 => {
+                let values: Vec<_> = data.iter().map(|x| half::bf16::from_f32(*x)).collect();
+                let raw = values
+                    .iter()
+                    .flat_map(|x| x.to_bits().to_ne_bytes())
+                    .collect();
+                (
+                    HostBuffer::new(PlanDtype::Bf16, raw).unwrap(),
+                    TypedBuffer::Bf16(values),
+                )
+            }
+            DType::F32 => (
+                HostBuffer::from(data.to_vec()),
+                TypedBuffer::F32(data.to_vec()),
+            ),
+            other => panic!("unexpected input storage {other:?}"),
+        }
+    }
 
     fn run(dtype: DType, sharing: (bool, bool), device: bool, alias: bool, dynamic: bool) {
         let _execution = DEVICE_EXECUTION.lock().unwrap();
@@ -143,6 +175,8 @@ mod execution {
         } else {
             2.into()
         };
+        let narrow = matches!(dtype, DType::F16 | DType::Bf16);
+        let storage = if narrow { dtype } else { DType::F32 };
         let shape = |shared, matrix: Vec<IntExpr>| {
             if shared {
                 matrix
@@ -150,14 +184,14 @@ mod execution {
                 [vec![count], matrix].concat()
             }
         };
-        let a_source = graph.tensor(shape(shared_a, vec![4.into(), 3.into()]), DType::F32);
-        let b_source = graph.tensor(shape(shared_b, vec![4.into(), 5.into()]), DType::F32);
-        let c_source = graph.tensor(vec![count, 3.into(), 5.into()], DType::F32);
+        let a_source = graph.tensor(shape(shared_a, vec![4.into(), 3.into()]), storage);
+        let b_source = graph.tensor(shape(shared_b, vec![4.into(), 5.into()]), storage);
+        let c_source = graph.tensor(vec![count, 3.into(), 5.into()], storage);
         let wide = |x: GraphTensor| {
-            if dtype == DType::F32 {
-                x
+            if dtype == DType::TF32 {
+                x.cast(DType::TF32).cast(DType::F32)
             } else {
-                x.cast(dtype).cast(DType::F32)
+                x.cast(DType::F32)
             }
         };
         let mut a = wide(a_source).permute(if shared_a {
@@ -187,7 +221,6 @@ mod execution {
             + c * beta
                 .unwrap_or_else(|| graph.constant_f32(-0.5))
                 .expand_rhs(c.dims());
-        let narrow = matches!(dtype, DType::F16 | DType::Bf16);
         let out = if narrow {
             arithmetic.cast(dtype)
         } else {
@@ -230,9 +263,18 @@ mod execution {
             data
         };
         let initial = inputs(2);
+        // Stage the actual matrix storage type in both runtimes. The fused
+        // call must consume its authored widening and output rounding directly.
+        let input_dtype = |id| {
+            if [a_source.id, b_source.id, c_source.id].contains(&id) {
+                storage
+            } else {
+                DType::F32
+            }
+        };
         let reference_inputs = initial
             .iter()
-            .map(|(id, data)| (*id, data.clone().into()))
+            .map(|(id, data)| (*id, payload(input_dtype(*id), data).1))
             .collect();
         let mut reference = ReferenceRuntime::load_with(
             &graph,
@@ -275,6 +317,7 @@ mod execution {
                         | "ReduceSumGeneric"
                         | "IndexMapApplyMaterialize"
                         | "Tf32RoundTrip"
+                        | "CastGeneric"
                 ) && row.label()
                     != if alias {
                         "CublasLtCall"
@@ -286,7 +329,7 @@ mod execution {
         let mut runtime = CudaRuntime::load_with(&graph, bindings, registry).unwrap();
         let cuda_inputs = initial
             .iter()
-            .map(|(id, data)| (*id, HostBuffer::from(data.clone())))
+            .map(|(id, data)| (*id, payload(input_dtype(*id), data).0))
             .collect();
         runtime
             .search(
@@ -307,12 +350,21 @@ mod execution {
                     selected.push(op.resolve(&dims(2)));
                 }
                 assert_ne!(op.label(), "IndexMapApplyMaterialize");
+                assert_ne!(op.label(), "CastGeneric");
             }
         }
         assert_eq!(selected.len(), 1);
         let call = &selected[0];
-        assert_eq!(call.a.batch_stride_in_elements == 0, shared_a);
-        assert_eq!(call.b.batch_stride_in_elements == 0, shared_b);
+        assert_eq!(
+            call.a.batch_stride_in_elements == 0,
+            shared_a,
+            "{dtype:?} {sharing:?} alias={alias}: {call:?}"
+        );
+        assert_eq!(
+            call.b.batch_stride_in_elements == 0,
+            shared_b,
+            "{dtype:?} {sharing:?} alias={alias}: {call:?}"
+        );
         assert_eq!(matches!(call.scalars, LtScalars::Device { .. }), device);
         assert_eq!(
             call.computation == LtComputation::TensorFloat32,
@@ -323,7 +375,10 @@ mod execution {
             (a_source.id, 12 * if shared_a { 1 } else { 2 }),
             (b_source.id, 20 * if shared_b { 1 } else { 2 }),
         ] {
-            assert_eq!(runtime.input_arena_range(id).unwrap().bytes, elements * 4);
+            assert_eq!(
+                runtime.input_arena_range(id).unwrap().bytes,
+                elements * if narrow { 2 } else { 4 }
+            );
         }
         let mut arena = support::allocate_arena(&runtime).unwrap();
         let mut staging = runtime.allocate_staging().unwrap();
@@ -334,8 +389,9 @@ mod execution {
             }
             let data = inputs(n);
             for (id, values) in &data {
-                reference.set_data(*id, values.clone());
-                runtime.upload(&mut arena, *id, values.clone()).unwrap();
+                let (cuda, reference_data) = payload(input_dtype(*id), values);
+                reference.set_data(*id, reference_data);
+                runtime.upload(&mut arena, *id, cuda).unwrap();
             }
             reference.execute().unwrap();
             let expected = reference.get_f32(arithmetic.id).unwrap();
@@ -371,12 +427,8 @@ mod execution {
                 );
             }
             if alias {
-                let (kept, binding) = runtime.download(&arena, c_source.id).unwrap();
-                assert_eq!(
-                    luminal_cuda_lite::layouts::dense_f32(&kept.as_f32().unwrap(), &binding.layout)
-                        .unwrap(),
-                    data[&c_source.id]
-                );
+                let (kept, _) = runtime.download(&arena, c_source.id).unwrap();
+                assert_eq!(kept, payload(storage, &data[&c_source.id]).0);
             }
         }
     }
