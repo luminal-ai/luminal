@@ -404,6 +404,23 @@ disjoint-batch witnesses. Formatting and device-enabled CUDA Lite Clippy with
 `-D warnings` pass. The five-package landing sweep passes 681 tests with 54
 existing ignores.
 
+At the FP64 checkpoint, the table contains **2,304 configurations** and
+**1,152 in-place configurations**. The A100 execution boards cover all of them,
+plus **1,344 disjoint-batch witnesses** and **4,032 shared-A/B/both witnesses**.
+The FP64 numerical checks use matrix values and coefficients with significant
+bits beyond FP32 precision. Seven FP64 regressions cover typed default scalars,
+full-width host literals, GPU inputs, mixed host/device coefficients,
+GPU-produced coefficients, authored operand orders, shared storage, in-place
+C preservation, and symbolic batch-count/coefficient replay against the
+reference runtime. Whitelist ablation and wrong scalar ABI/capacity refusal
+remain explicit admission checks.
+
+The five-package landing sweep passes **777 tests with 54 existing ignores**.
+The seven device-enabled cuBLASLt suites cover **67 distinct passing tests**;
+FP64 is rerun with the final double-precision reduction preference. Formatting,
+workspace Clippy with the CI exclusions, and device-enabled CUDA Lite Clippy
+with `-D warnings` pass.
+
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its
 numbers do not measure the restored code.
