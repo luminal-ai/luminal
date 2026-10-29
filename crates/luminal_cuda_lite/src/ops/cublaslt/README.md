@@ -14,7 +14,7 @@ the elected call and dispatches its descriptors unchanged.
 | `scalar_rules.egg` | Authored alpha/beta scaling and exact FP32/FP64 scalar storage/pointer proofs |
 | `call_inputs.egg` | Assemble approved matrix/scalar reads in one canonical order |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 2,304 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 2,624 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -57,8 +57,8 @@ including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **2,304 complete configurations**: 1,152 for host scalar
-pointers and 1,152 for device scalar pointers. Each pointer mode admits:
+The table contains **2,624 complete configurations**: 1,312 for host scalar
+pointers and 1,312 for device scalar pointers. Each pointer mode admits:
 
 - 896 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
   FP16 A/B storage, plus explicit TF32 computation over F32 storage. Each has
@@ -70,9 +70,10 @@ pointers and 1,152 for device scalar pointers. Each pointer mode admits:
   order/transpose combinations, absent/present matching narrow C, and default
   in either D order or ReLU with column-major D. Native narrow bias and GELU
   epilogues have no approved rows.
-- 64 FP64-output rows: FP64 A/B/C/D storage, computation and alpha/beta,
-  with 16 A/B order/transpose combinations, absent/present C, and default
-  epilogue in either D order.
+- 224 FP64-output rows: FP64 A/B/C/D storage, computation and alpha/beta,
+  with 16 A/B order/transpose combinations, absent/present C, and seven
+  destination/epilogue combinations: default in either D order, plus bias,
+  ReLU, ReLU+bias, GELU or GELU+bias with column-major D and FP64 bias.
 
 FP32/TF32 computation uses FP32 scalars; FP64 computation uses FP64 scalars.
 Alpha and beta are general values in that arithmetic dtype; absent C still
@@ -146,10 +147,25 @@ metadata and owned double-width storage through CUDA graph capture; no f32
 conversion or scalar readback occurs. GPU-produced coefficients and changed
 values on replay remain ordinary graph dependencies.
 
-The initial whitelist admits the default epilogue. Explicit final output casts
-remain separate operations. FP64 reduction order and FMA contraction follow the
-same practical BLAS policy, including zero-coefficient read suppression, at
-double precision. The [vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
+Rank-two FP64 calls admit default, bias, ReLU, ReLU+bias, GELU and GELU+bias
+epilogues. Native probing on CUDA 12.8/A100 verifies both host/device scalar
+pointers and separate/in-place destinations. Activation and bias require
+column-major D; whole-expression transposition carries frontend feature bias
+into the vendor's per-row frame. Bias remains packed FP64 storage, and both
+forms consume the shared exact storage proof keyed by arithmetic dtype.
+
+ReLU accepts the vendor's sign-of-zero difference. Both frontend GELU spellings
+accept the vendor tanh approximation under the same policy as FP32-output calls.
+Native probing found about `2.5e-10` maximum absolute
+GELU error on its finite fixture against an independent double tanh formula.
+Activation matching proves every constant's dtype and value. The frontend's
+F32 literals widened to F64 retain their exact authored F32 values; no arbitrary
+cast chain is folded. Casts between GEMM and an epilogue remain boundaries.
+
+Explicit final output casts remain separate operations. FP64 reduction order
+and FMA contraction follow the same practical BLAS policy, including
+zero-coefficient read suppression, at double precision. The
+[vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
 specifies the FP64 computation and scalar ABI.
 
 ### Narrow C, bias and output storage
@@ -283,7 +299,7 @@ and legal leading dimension. This relation is used only for A and B. Every
 vendor descriptor still carries the common logical batch count; sharing is
 represented by stride zero, not a descriptor count of one. The independent
 [layout attributes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatrixlayoutattribute-t)
-are dispatched unchanged. Precision/storage proofs and the complete 2,304-row
+are dispatched unchanged. Precision/storage proofs and the complete 2,624-row
 configuration whitelist remain shared with ordinary batches.
 
 Read sharing never publishes a disjoint matrix or destination proof. C and D

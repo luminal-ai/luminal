@@ -7,7 +7,7 @@ use luminal_cuda_lite::ops::cublaslt::{
         CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
     },
     approved::{ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST},
-    exec::{LtComputation, LtScalars},
+    exec::{LtActivation, LtComputation, LtOrder, LtScalars},
 };
 #[cfg(feature = "device")]
 mod support;
@@ -33,6 +33,8 @@ struct Fixture {
     scalars: [Option<GraphTensor>; 2],
     sharing: (bool, bool),
     dynamic: bool,
+    activation: LtActivation,
+    bias: Option<GraphTensor>,
 }
 
 fn values(len: usize, seed: usize) -> Vec<f64> {
@@ -55,6 +57,17 @@ fn fixture_with_count(
     sharing: (bool, bool),
     sources: [Source; 2],
     scalar_first: bool,
+) -> Fixture {
+    fixture_with_epilogue(count, sharing, sources, scalar_first, false, 0)
+}
+
+fn fixture_with_epilogue(
+    count: Option<IntExpr>,
+    sharing: (bool, bool),
+    sources: [Source; 2],
+    scalar_first: bool,
+    with_bias: bool,
+    activation: usize,
 ) -> Fixture {
     let dynamic = count.is_some_and(|count| count.to_usize().is_none());
     let mut graph = Graph::new();
@@ -112,10 +125,30 @@ fn fixture_with_count(
     let product = a.matmul(b);
     let alpha = values[0].expand_rhs(product.dims());
     let beta = values[1].expand_rhs(c.dims());
-    let out = if scalar_first {
+    let mut out = if scalar_first {
         beta * c + alpha * product
     } else {
         product * alpha + c * beta
+    };
+    let bias = if with_bias {
+        let bias = graph.tensor([4], DType::F64);
+        inputs.push((bias, self::values(4, 7)));
+        out += bias.expand_dim(0, 3);
+        Some(bias)
+    } else {
+        None
+    };
+    out = match activation {
+        0 => out,
+        1 => out.relu(),
+        2 => out.gelu_fast_tanh_approximation(),
+        3 => out.gelu(),
+        _ => unreachable!(),
+    };
+    let activation = match activation {
+        0 => LtActivation::Identity,
+        1 => LtActivation::RectifiedLinear,
+        _ => LtActivation::GaussianErrorLinear,
     };
     Fixture {
         graph,
@@ -125,7 +158,13 @@ fn fixture_with_count(
         scalars,
         sharing,
         dynamic,
+        activation,
+        bias,
     }
+}
+
+fn epilogue_fixture(sources: [Source; 2], bias: bool, activation: usize) -> Fixture {
+    fixture_with_epilogue(None, (false, false), sources, false, bias, activation)
 }
 
 fn calls(graph: &Graph, table: &str) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
@@ -311,6 +350,108 @@ fn fp64_admission_requires_exact_configuration_and_scalar_precision() {
     assert!(call.validate_against(&[100, 100, 0, 1, 100], 100).is_err());
 }
 
+#[test]
+fn fp64_epilogues_keep_typed_bias_scalars_and_column_destinations() {
+    for device in [false, true] {
+        for bias in [false, true] {
+            for activation in 0..4 {
+                let sources = if device {
+                    [Source::Device; 2]
+                } else {
+                    [Source::Host(ALPHA), Source::Host(BETA)]
+                };
+                let f = epilogue_fixture(sources, bias, activation);
+                let (separate, tied) = calls(&f.graph, WHITELIST);
+                let matching = |call: &luminal_cuda_lite::ops::cublaslt::exec::LtCall| {
+                    call.c.is_some()
+                        && call.bias.is_some() == bias
+                        && call.activation == f.activation
+                        && matches!(call.scalars, LtScalars::Device { .. }) == device
+                };
+                let separate: Vec<_> = separate
+                    .iter()
+                    .map(|op| op.resolve(&Default::default()))
+                    .filter(matching)
+                    .collect();
+                let tied: Vec<_> = tied
+                    .iter()
+                    .map(|op| op.resolve(&Default::default()))
+                    .filter(matching)
+                    .collect();
+                assert!(
+                    !separate.is_empty() && !tied.is_empty(),
+                    "bias={bias}, activation={activation}, device={device}"
+                );
+                for call in separate.into_iter().chain(tied) {
+                    assert_eq!(call.computation, LtComputation::Float64);
+                    assert_eq!(call.scale_dtype, PlanDtype::F64);
+                    assert_eq!(matches!(call.scalars, LtScalars::Device { .. }), device);
+                    if bias || activation != 0 {
+                        assert_eq!(call.d.order, LtOrder::Col);
+                    }
+                    if let Some(bias) = call.bias {
+                        assert_eq!(bias.data_type, PlanDtype::F64);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fp64_epilogues_require_the_complete_row_and_exact_bias_storage() {
+    let f = epilogue_fixture([Source::Host(ALPHA), Source::Host(BETA)], true, 1);
+    let (separate, _) = calls(&f.graph, WHITELIST);
+    let op = separate
+        .iter()
+        .find(|op| {
+            op.c.is_some() && op.bias.is_some() && op.activation == LtActivation::RectifiedLinear
+        })
+        .unwrap();
+    let key = whitelist::key(op);
+    let table = format!("(cublaslt-approved-configuration {key})");
+    let (separate, tied) = calls(&f.graph, &table);
+    assert!(!separate.is_empty() && !tied.is_empty());
+    assert!(separate.iter().all(|op| whitelist::key(op) == key));
+    assert!(tied.iter().all(|op| whitelist::in_place_key(op) == key));
+    for table in [
+        String::new(),
+        table.replace(
+            "(CublasLtBiasDataTypeOf (F64))",
+            "(CublasLtBiasDataTypeOf (F32))",
+        ),
+    ] {
+        let (separate, tied) = calls(&f.graph, &table);
+        assert!(separate.is_empty() && tied.is_empty());
+    }
+}
+
+#[test]
+fn fp64_rounding_between_gemm_and_epilogues_stays_an_arithmetic_boundary() {
+    for activation in 0..4 {
+        let mut graph = Graph::new();
+        let a = graph.tensor([3, 8], DType::F64);
+        let b = graph.tensor([8, 4], DType::F64);
+        let bias = graph.tensor([4], DType::F64);
+        let rounded = a.matmul(b).cast(DType::F32).cast(DType::F64);
+        let biased = rounded + bias.expand_dim(0, 3);
+        let _out = match activation {
+            0 => biased,
+            1 => biased.relu(),
+            2 => biased.gelu_fast_tanh_approximation(),
+            _ => biased.gelu(),
+        };
+        let (separate, tied) = calls(&graph, WHITELIST);
+        assert!(!separate.is_empty());
+        assert!(tied.is_empty());
+        assert!(
+            separate
+                .iter()
+                .all(|op| op.bias.is_none() && op.activation == LtActivation::Identity)
+        );
+    }
+}
+
 #[cfg(feature = "device")]
 mod execution {
     use super::*;
@@ -380,7 +521,7 @@ mod execution {
             bindings.output(f.c.id);
         }
         bindings.output(f.out.id);
-        let registry = whitelist::scalar_registry(device, false)
+        let registry = whitelist::fp64_epilogue_registry(device, f.bias.is_some(), f.activation)
             .into_iter()
             .filter(|row| {
                 if f.sharing.0 || f.sharing.1 {
@@ -435,6 +576,8 @@ mod execution {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].computation, LtComputation::Float64);
         assert_eq!(resolved[0].scale_dtype, PlanDtype::F64);
+        assert_eq!(resolved[0].activation, f.activation);
+        assert_eq!(resolved[0].bias.is_some(), f.bias.is_some());
         if resolved[0].a.batch_count > 1 {
             assert_eq!(
                 (
@@ -520,10 +663,19 @@ mod execution {
                     linear /= dims[axis];
                 }
                 let got = actual[binding.layout.element_index(&coords).unwrap()];
-                assert!(
-                    (got - expected).abs() <= 2e-13 * (1.0 + expected.abs()),
-                    "{got:.17e} vs {expected:.17e}"
-                );
+                let tolerance = if f.activation == LtActivation::GaussianErrorLinear {
+                    5e-4
+                } else {
+                    2e-13
+                };
+                let agrees = if expected.is_nan() {
+                    got.is_nan()
+                } else if !expected.is_finite() || expected.is_subnormal() {
+                    got == *expected
+                } else {
+                    (got - expected).abs() <= tolerance * (1.0 + expected.abs())
+                };
+                assert!(agrees, "{got:.17e} vs {expected:.17e}");
             }
             if keep_c {
                 assert_eq!(
@@ -536,6 +688,63 @@ mod execution {
                     data[&f.c.id].as_f64().unwrap()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fp64_epilogues_execute_fused_with_host_device_scalars_and_c_preservation() {
+        for alias in [false, true] {
+            for device in [false, true] {
+                for bias in [false, true] {
+                    for activation in 0..4 {
+                        if !bias && activation == 0 {
+                            continue;
+                        }
+                        let sources = if device {
+                            [Source::Device; 2]
+                        } else {
+                            [Source::Host(ALPHA), Source::Host(BETA)]
+                        };
+                        run(
+                            fixture_with_epilogue(
+                                None,
+                                (false, false),
+                                sources,
+                                alias,
+                                bias,
+                                activation,
+                            ),
+                            device,
+                            alias,
+                            alias,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fp64_relu_preserves_nan_infinity_and_subnormals() {
+        for alias in [false, true] {
+            let mut f = epilogue_fixture([Source::Host(1.0); 2], false, 1);
+            f.inputs[0].1.fill(0.0);
+            f.inputs[1].1.fill(0.0);
+            f.inputs[2].1 = vec![
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                -0.0,
+                0.0,
+                -1.0,
+                1.0,
+                1e-310,
+                -1e-310,
+                1e100,
+                -1e100,
+                0.25,
+            ];
+            run(f, false, alias, false);
         }
     }
 

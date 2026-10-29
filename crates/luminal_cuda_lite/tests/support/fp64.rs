@@ -52,8 +52,6 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
             PlanDtype::F64
         )
     );
-    assert!(call.bias.is_none());
-    assert_eq!(call.activation, LtActivation::Identity);
     let mut call = call.clone();
     let beta = if call.c.is_some() { BETA } else { 0.0 };
     if matches!(call.scalars, LtScalars::HostF64 { .. }) {
@@ -62,6 +60,9 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     let a = values(&call.a, 1);
     let b = values(&call.b, 2);
     let c = call.c.map(|c| values(&c.descriptor, 3));
+    let bias: Vec<_> = (0..call.m as usize)
+        .map(|row| (row as f64 - 1.5) / 4.0 + (row + 1) as f64 * 2f64.powi(-29))
+        .collect();
     let mut payloads = vec![raw(&a), raw(&b)];
     payloads.resize(
         call.form.lit_arity() + call.scalars.input_count(),
@@ -77,6 +78,10 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     }
     if let Some(input) = call.c {
         payloads[input.operand] = raw(c.as_ref().unwrap());
+    }
+    if let Some(input) = call.bias {
+        assert_eq!(input.data_type, PlanDtype::F64);
+        payloads[input.operand] = raw(&bias);
     }
     let buffers: Vec<_> = payloads
         .iter()
@@ -104,7 +109,7 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     for batch in 0..call.d.batch_count as usize {
         for row in 0..call.m as usize {
             for col in 0..call.n as usize {
-                let expected = ALPHA
+                let mut expected = ALPHA
                     * (0..call.k as usize)
                         .map(|k| {
                             let (ar, ac) = if call.trans_a { (k, row) } else { (row, k) };
@@ -115,9 +120,30 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
                     + call.c.map_or(0.0, |input| {
                         beta * c.as_ref().unwrap()[at(&input.descriptor, batch, row, col)]
                     });
+                if call.bias.is_some() {
+                    expected += bias[row];
+                }
+                expected = match call.activation {
+                    LtActivation::Identity => expected,
+                    LtActivation::RectifiedLinear => expected.max(0.0),
+                    LtActivation::GaussianErrorLinear => {
+                        0.5 * expected
+                            * (1.0
+                                + (std::f64::consts::FRAC_2_PI.sqrt()
+                                    * (expected + 0.044715 * expected.powi(3)))
+                                .tanh())
+                    }
+                };
                 let got = actual[at(&call.d, batch, row, col)];
+                // GEMM, C and bias stay double precision. GELU uses the same
+                // explicit vendor-approximation contract as FP32 epilogues.
+                let tolerance = if call.activation == LtActivation::GaussianErrorLinear {
+                    5e-4
+                } else {
+                    2e-13
+                };
                 assert!(
-                    (got - expected).abs() <= 2e-13 * (1.0 + expected.abs()),
+                    (got - expected).abs() <= tolerance * (1.0 + expected.abs()),
                     "{call:?}, alias={alias}, ({batch},{row},{col}): {got:.17e} vs {expected:.17e}"
                 );
             }
@@ -127,6 +153,12 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
         assert_eq!(
             stream.clone_dtoh(&buffers[c.operand]).unwrap(),
             payloads[c.operand]
+        );
+    }
+    if let Some(input) = call.bias {
+        assert_eq!(
+            stream.clone_dtoh(&buffers[input.operand]).unwrap(),
+            payloads[input.operand]
         );
     }
 }

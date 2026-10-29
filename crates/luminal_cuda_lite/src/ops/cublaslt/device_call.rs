@@ -301,6 +301,7 @@ pub fn prepare(
             .ptr;
         let bias_type = match bias.data_type {
             luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+            luminal::dtype::PlanDtype::F64 => sys::cudaDataType_t::CUDA_R_64F,
             luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
             luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
             other => anyhow::bail!("unsupported cuBLASLt bias storage {other:?}"),

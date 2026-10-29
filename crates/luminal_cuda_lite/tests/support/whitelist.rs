@@ -262,6 +262,47 @@ pub fn scalar_registry(device: bool, narrow: bool) -> Vec<luminal_cuda_lite::Reg
     table_registry(&TABLES[usize::from(device) + 2 * usize::from(narrow)])
 }
 
+/// Require the requested FP64 epilogue, so generic activation kernels cannot
+/// hide missing recognition or let profiling choose a decomposed substitute.
+pub fn fp64_epilogue_registry(
+    device: bool,
+    bias: bool,
+    activation: LtActivation,
+) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 12]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|index| {
+            let epilogue = match (index / 4, index & 2 != 0) {
+                (0, false) => "CublasLtDefaultEpilogue",
+                (0, true) => "CublasLtBiasEpilogue",
+                (1, false) => "CublasLtRectifiedLinearEpilogue",
+                (1, true) => "CublasLtRectifiedLinearBiasEpilogue",
+                (2, false) => "CublasLtGaussianErrorLinearEpilogue",
+                (2, true) => "CublasLtGaussianErrorLinearBiasEpilogue",
+                _ => unreachable!(),
+            };
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains("(CublasLtFloat64Computation)")
+                        && key.contains(&format!("({epilogue})"))
+                        && key.contains(if index & 1 == 1 {
+                            "CublasLtDeviceScalarPointerMode"
+                        } else {
+                            "CublasLtHostScalarPointerMode"
+                        })
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    let activation = match activation {
+        LtActivation::Identity => 0,
+        LtActivation::RectifiedLinear => 1,
+        LtActivation::GaussianErrorLinear => 2,
+    };
+    table_registry(&TABLES[usize::from(device) + 2 * usize::from(bias) + 4 * activation])
+}
+
 fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredOp> {
     use luminal::egglog_snippet::EgglogSnippet;
     use luminal::layout_ir::LayoutIrOp;

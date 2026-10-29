@@ -250,8 +250,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 2304 } else { 1216 });
-    assert_eq!(aliases, if ampere_or_newer { 1152 } else { 608 });
+    assert_eq!(ran, if ampere_or_newer { 2624 } else { 1536 });
+    assert_eq!(aliases, if ampere_or_newer { 1312 } else { 768 });
 }
 
 #[test]
@@ -282,7 +282,14 @@ fn shared_padded_c_supports_dense_and_pitched_output_bindings() {
             &graph,
             bindings,
             luminal_cuda_lite::cuda_registry_filtered(|row| {
-                !matches!(row.label(), "ReduceSumGeneric" | "AddFunctionalGeneric")
+                // Exercise direct GEMM output delivery into the declared C
+                // buffer. Folded view outputs use the bufferizer's separate
+                // escape-and-disclose contract and may return another backing
+                // buffer with its elected layout instead.
+                !matches!(
+                    row.label(),
+                    "ReduceSumGeneric" | "AddFunctionalGeneric" | "IndexMapApplyViewGeneric"
+                )
             }),
         )
         .unwrap();
