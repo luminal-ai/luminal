@@ -212,7 +212,7 @@ fn configuration_fields(key: &str) -> Vec<&str> {
 #[test]
 fn every_whitelist_row_declares_the_agreed_intermediate_reduction_policy() {
     let keys = whitelist::approved_keys();
-    assert_eq!(keys.len(), 2624);
+    assert_eq!(keys.len(), 3520);
     assert_eq!(
         WHITELIST
             .matches("(cublaslt-approved-configuration")
@@ -228,7 +228,13 @@ fn every_whitelist_row_declares_the_agreed_intermediate_reduction_policy() {
                 compute_type += 1;
                 "(CublasLtReductionSchemeMaskComputeType)"
             }
-            ("(CublasLtFloat32Computation)" | "(CublasLtTensorFloat32Computation)", "(F32)")
+            (
+                "(CublasLtFloat32Computation)"
+                | "(CublasLtTensorFloat32Computation)"
+                | "(CublasLtFloat32FastFloat16Computation)"
+                | "(CublasLtFloat32FastBfloat16Computation)",
+                "(F32)",
+            )
             | ("(CublasLtFloat64Computation)", "(F64)") => {
                 all += 1;
                 "(CublasLtReductionSchemeMaskAll)"
@@ -237,7 +243,7 @@ fn every_whitelist_row_declares_the_agreed_intermediate_reduction_policy() {
         };
         assert_eq!(fields[14], expected, "{key}");
     }
-    assert_eq!((all, compute_type), (2240, 384));
+    assert_eq!((all, compute_type), (3136, 384));
 }
 
 #[test]
@@ -322,7 +328,7 @@ fn whitelist_mask_reaches_both_executable_forms_for_matrices_and_batches() {
 #[test]
 fn every_approved_configuration_has_a_real_graph_witness_and_no_others_exist() {
     let witnesses = whitelist::witnesses();
-    assert_eq!(whitelist::approved_keys().len(), 2624);
+    assert_eq!(whitelist::approved_keys().len(), 3520);
     assert_eq!(
         witnesses
             .keys()

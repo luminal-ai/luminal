@@ -740,6 +740,32 @@
   :ruleset backend
   :name "cublaslt: explicit device TF32 rounding then F32 arithmetic reads F32 storage")
 
+; F32 storage, explicit F16 rounding, exact widening, then F32 arithmetic.
+; This permission belongs only to this computation mode. Ordinary F32 calls
+; still read a materialized rounded operand; earlier casts remain in the source.
+(rule
+  ((= ?logical_operand (LogicalCast (LogicalCast ?storage_source (F16)) (F32)))
+   (= (dtype-of ?storage_source) (F32))
+   (= (dtype-of ?logical_operand) (F32))
+   (= (shape-of ?logical_operand) (shape-of ?storage_source)))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32FastFloat16Computation)
+     ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: explicit F16 rounding then F32 arithmetic reads F32 storage")
+
+; F32 storage, explicit Bf16 rounding, exact widening, then F32 arithmetic.
+; This permission belongs only to this computation mode. Ordinary F32 calls
+; still read a materialized rounded operand; earlier casts remain in the source.
+(rule
+  ((= ?logical_operand (LogicalCast (LogicalCast ?storage_source (Bf16)) (F32)))
+   (= (dtype-of ?storage_source) (F32))
+   (= (dtype-of ?logical_operand) (F32))
+   (= (shape-of ?logical_operand) (shape-of ?storage_source)))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32FastBfloat16Computation)
+     ?logical_operand ?storage_source))
+  :ruleset backend
+  :name "cublaslt: explicit Bf16 rounding then F32 arithmetic reads F32 storage")
+
 ; Exact F64 storage remains distinct from the FP32 and TF32 input contracts.
 (rule
   ((cublaslt-f32-storage-reading ?logical_operand ?storage_source))

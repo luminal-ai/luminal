@@ -231,7 +231,11 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
     let mut aliases = 0;
     for op in witnesses.values() {
         if !ampere_or_newer
-            && (op.a.dtype == PlanDtype::Bf16 || op.computation == LtComputation::TensorFloat32)
+            && (op.a.dtype == PlanDtype::Bf16
+                || matches!(
+                    op.computation,
+                    LtComputation::TensorFloat32 | LtComputation::Float32FastBfloat16
+                ))
         {
             continue;
         }
@@ -241,7 +245,11 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
     }
     for op in whitelist::in_place_witnesses().values() {
         if !ampere_or_newer
-            && (op.a.dtype == PlanDtype::Bf16 || op.computation == LtComputation::TensorFloat32)
+            && (op.a.dtype == PlanDtype::Bf16
+                || matches!(
+                    op.computation,
+                    LtComputation::TensorFloat32 | LtComputation::Float32FastBfloat16
+                ))
         {
             continue;
         }
@@ -250,8 +258,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 2624 } else { 1536 });
-    assert_eq!(aliases, if ampere_or_newer { 1312 } else { 768 });
+    assert_eq!(ran, if ampere_or_newer { 3520 } else { 1984 });
+    assert_eq!(aliases, if ampere_or_newer { 1760 } else { 992 });
 }
 
 #[test]

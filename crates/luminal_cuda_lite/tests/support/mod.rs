@@ -112,3 +112,5 @@ pub fn download_plan(
 pub fn allocate_arena(runtime: &CudaRuntime) -> Result<Allocation> {
     Allocation::new(runtime.cuda_stream()?.clone(), runtime.arena_bytes()?)
 }
+
+pub mod input_rounding;

@@ -242,6 +242,8 @@ pub(super) fn computation(site: &ExtractionSite<'_>, class: &ClassId) -> LtCompu
     for mode in [
         LtComputation::Float32,
         LtComputation::TensorFloat32,
+        LtComputation::Float32FastFloat16,
+        LtComputation::Float32FastBfloat16,
         LtComputation::Float64,
     ] {
         if site

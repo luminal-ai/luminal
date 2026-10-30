@@ -230,6 +230,10 @@ pub fn prepare(
     let computation = match call.computation {
         LtComputation::Float32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
         LtComputation::TensorFloat32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+        LtComputation::Float32FastFloat16 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+        LtComputation::Float32FastBfloat16 => {
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
+        }
         LtComputation::Float64 => sys::cublasComputeType_t::CUBLAS_COMPUTE_64F,
     };
     let scalar_type = match call.scale_dtype {
@@ -368,15 +372,19 @@ pub fn prepare(
     }
     .map_err(|e| anyhow!("reduction scheme preference: {e:?}"))?;
 
-    if call.computation == LtComputation::TensorFloat32 {
-        // FAST_TF32 alone permits a full-F32 algorithm (observed for 1x1 on
-        // A100), which would skip authored input rounding. Request algorithms
-        // whose multiplication inputs actually use TF32 precision. Unsupported
-        // geometries retain ordinary materialized-rounding candidates.
+    let input_implementation = match call.computation {
+        LtComputation::Float32 | LtComputation::Float64 => None,
+        LtComputation::TensorFloat32 => Some(0x04_u64 << 16),
+        LtComputation::Float32FastFloat16 => Some(0x01_u64 << 16),
+        LtComputation::Float32FastBfloat16 => Some(0x02_u64 << 16),
+    };
+    if let Some(input_implementation) = input_implementation {
+        // FAST modes alone may choose another input precision. The authored
+        // round trip requires this exact inner dot-product input type.
+        // Unsupported geometries retain materialized-rounding alternatives.
         // cublasLt.h macros are absent from cudarc's generated Rust bindings.
         const INPUT_TYPE_MASK: u64 = 0xff << 16;
-        const INPUT_TF32: u64 = 0x04 << 16;
-        let implementation_mask = !INPUT_TYPE_MASK | INPUT_TF32;
+        let implementation_mask = !INPUT_TYPE_MASK | input_implementation;
         unsafe {
             lt::set_matmul_pref_attribute(
                 pref.raw,
@@ -385,7 +393,7 @@ pub fn prepare(
                 std::mem::size_of::<u64>(),
             )
         }
-        .map_err(|e| anyhow!("TF32 numerical implementation preference: {e:?}"))?;
+        .map_err(|e| anyhow!("input precision implementation preference: {e:?}"))?;
     }
 
     let heuristic = unsafe {

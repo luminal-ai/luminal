@@ -8,6 +8,7 @@ use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::ops::cublaslt::approved::{
     ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
 };
+use luminal_cuda_lite::ops::cublaslt::exec::LtComputation;
 
 fn logical_of(graph: &EGraph, layout_tensor: &ClassId) -> ClassId {
     let node = graph
@@ -66,11 +67,34 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
             other => panic!("unsupported call output {other:?}"),
         }
         assert_eq!(call.a.dtype, call.b.dtype);
+        let input_rounding = match call.computation {
+            LtComputation::Float32 => None,
+            LtComputation::TensorFloat32 => Some("TF32"),
+            LtComputation::Float32FastFloat16 => Some("F16"),
+            LtComputation::Float32FastBfloat16 => Some("Bf16"),
+            LtComputation::Float64 => unreachable!("these fixtures use FP32 arithmetic"),
+        };
         for (semantic, descriptor) in [(&call.logical_a, &call.a), (&call.logical_b, &call.b)] {
             let physical = logical_of(&egraph, &descriptor.tensor);
             assert_eq!(site.logical_dtype(&physical), Some(descriptor.dtype));
             match descriptor.dtype {
-                PlanDtype::F32 => assert_eq!(*semantic, physical),
+                PlanDtype::F32 => {
+                    if let Some(rounding) = input_rounding {
+                        assert!(
+                            egraph.nodes.values().any(|outer| {
+                                if outer.eclass != *semantic || outer.op != "LogicalCast" {
+                                    return false;
+                                }
+                                let narrowed = &egraph.nodes[&outer.children[0]].eclass;
+                                has_cast(&egraph, semantic, narrowed, "F32")
+                                    && has_cast(&egraph, narrowed, &physical, rounding)
+                            }),
+                            "pre-cast FP32 storage requires the exact mode-specific roundtrip"
+                        );
+                    } else {
+                        assert_eq!(*semantic, physical);
+                    }
+                }
                 PlanDtype::Bf16 | PlanDtype::F16 => assert!(
                     has_cast(&egraph, semantic, &physical, "F32"),
                     "narrow storage must be the source of this exact operand's widening cast"

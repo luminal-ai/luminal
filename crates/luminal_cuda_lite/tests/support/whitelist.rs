@@ -88,14 +88,16 @@ pub fn approved_keys() -> std::collections::BTreeSet<String> {
 }
 fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     let mut graphs = Vec::new();
-    for (dtype, tf32, narrow) in [
-        (DType::F32, false, false),
-        (DType::F64, false, false),
-        (DType::Bf16, false, false),
-        (DType::F16, false, false),
-        (DType::F32, true, false),
-        (DType::Bf16, false, true),
-        (DType::F16, false, true),
+    for (dtype, input_rounding, narrow) in [
+        (DType::F32, None, false),
+        (DType::F64, None, false),
+        (DType::Bf16, None, false),
+        (DType::F16, None, false),
+        (DType::F32, Some(DType::TF32), false),
+        (DType::F32, Some(DType::F16), false),
+        (DType::F32, Some(DType::Bf16), false),
+        (DType::Bf16, None, true),
+        (DType::F16, None, true),
     ] {
         for ta in [false, true] {
             for tb in [false, true] {
@@ -111,9 +113,9 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
                 let mut b = model
                     .tensor(if tb { [4, 8] } else { [8, 4] }, dtype)
                     .cast(compute);
-                if tf32 {
-                    a = a.cast(DType::TF32).cast(compute);
-                    b = b.cast(DType::TF32).cast(compute);
+                if let Some(rounding) = input_rounding {
+                    a = a.cast(rounding).cast(compute);
+                    b = b.cast(rounding).cast(compute);
                 }
                 if ta {
                     a = a.permute(&[1, 0]);
@@ -219,6 +221,23 @@ pub fn tf32_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
             .collect()
     });
     table_registry(TABLE.as_str())
+}
+
+pub fn fast16_registry(bfloat: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        [
+            "CublasLtFloat32FastFloat16Computation",
+            "CublasLtFloat32FastBfloat16Computation",
+        ]
+        .map(|mode| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| key.contains(mode))
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(bfloat)])
 }
 
 /// Require a complete narrow-output row; generic FP32 calls cannot hide a

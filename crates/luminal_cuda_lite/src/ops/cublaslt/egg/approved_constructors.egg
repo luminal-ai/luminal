@@ -7,6 +7,8 @@
 (datatype CublasLtComputationType
   (CublasLtFloat32Computation)
   (CublasLtTensorFloat32Computation)
+  (CublasLtFloat32FastFloat16Computation)
+  (CublasLtFloat32FastBfloat16Computation)
   (CublasLtFloat64Computation))
 ; This is selected by the complete whitelist row, not inferred from storage.
 ; NONE (zero) is allowed by either mask; neither mask forces split-K.

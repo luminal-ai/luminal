@@ -99,6 +99,8 @@ pub enum LtActivation {
 pub enum LtComputation {
     Float32,
     TensorFloat32,
+    Float32FastFloat16,
+    Float32FastBfloat16,
     Float64,
 }
 
@@ -107,6 +109,8 @@ impl LtComputation {
         match self {
             Self::Float32 => "CublasLtFloat32Computation",
             Self::TensorFloat32 => "CublasLtTensorFloat32Computation",
+            Self::Float32FastFloat16 => "CublasLtFloat32FastFloat16Computation",
+            Self::Float32FastBfloat16 => "CublasLtFloat32FastBfloat16Computation",
             Self::Float64 => "CublasLtFloat64Computation",
         }
     }
@@ -303,7 +307,10 @@ impl LtCall {
     /// read order; the destination's capacity is checked separately.
     pub fn validate_against(&self, operand_elems: &[usize], dest_elems: usize) -> Result<()> {
         let scalar_dtype = match self.computation {
-            LtComputation::Float32 | LtComputation::TensorFloat32 => luminal::dtype::PlanDtype::F32,
+            LtComputation::Float32
+            | LtComputation::TensorFloat32
+            | LtComputation::Float32FastFloat16
+            | LtComputation::Float32FastBfloat16 => luminal::dtype::PlanDtype::F32,
             LtComputation::Float64 => luminal::dtype::PlanDtype::F64,
         };
         if self.scale_dtype != scalar_dtype {

@@ -102,6 +102,26 @@ fn graph_with_sharing(
     with_c: bool,
     tf32: bool,
     narrow: bool,
+    sharing: (bool, bool),
+) -> Graph {
+    graph_with_input_rounding(
+        dtype,
+        transpose_a,
+        transpose_b,
+        with_c,
+        tf32.then_some(DType::TF32),
+        narrow,
+        sharing,
+    )
+}
+
+fn graph_with_input_rounding(
+    dtype: DType,
+    transpose_a: bool,
+    transpose_b: bool,
+    with_c: bool,
+    input_rounding: Option<DType>,
+    narrow: bool,
     (shared_a, shared_b): (bool, bool),
 ) -> Graph {
     let mut graph = Graph::new();
@@ -121,9 +141,9 @@ fn graph_with_sharing(
     };
     let mut a = graph.tensor(shape(shared_a, a_shape), dtype).cast(compute);
     let mut b = graph.tensor(shape(shared_b, b_shape), dtype).cast(compute);
-    if tf32 {
-        a = a.cast(DType::TF32).cast(compute);
-        b = b.cast(DType::TF32).cast(compute);
+    if let Some(rounding) = input_rounding {
+        a = a.cast(rounding).cast(compute);
+        b = b.cast(rounding).cast(compute);
     }
     if transpose_a {
         a = a.permute(if shared_a {
@@ -532,32 +552,37 @@ fn dispatch_batch_configurations(broadcast: bool) {
         &[(false, false)]
     };
     for &(shared_a, shared_b) in sharing {
-        for (dtype, tf32, narrow) in [
-            (DType::F32, false, false),
-            (DType::F64, false, false),
-            (DType::Bf16, false, false),
-            (DType::F16, false, false),
-            (DType::F32, true, false),
-            (DType::Bf16, false, true),
-            (DType::F16, false, true),
+        for (dtype, input_rounding, narrow) in [
+            (DType::F32, None, false),
+            (DType::F64, None, false),
+            (DType::Bf16, None, false),
+            (DType::F16, None, false),
+            (DType::F32, Some(DType::TF32), false),
+            (DType::F32, Some(DType::F16), false),
+            (DType::F32, Some(DType::Bf16), false),
+            (DType::Bf16, None, true),
+            (DType::F16, None, true),
         ] {
             let compute = if dtype == DType::F64 {
                 DType::F64
             } else {
                 DType::F32
             };
-            if !ampere_or_newer && (dtype == DType::Bf16 || tf32) {
+            if !ampere_or_newer
+                && (dtype == DType::Bf16
+                    || matches!(input_rounding, Some(DType::TF32 | DType::Bf16)))
+            {
                 continue;
             }
             for ta in [false, true] {
                 for tb in [false, true] {
                     let (separate, in_place) = calls(&saturate(
-                        &graph_with_sharing(
+                        &graph_with_input_rounding(
                             dtype,
                             ta,
                             tb,
                             true,
-                            tf32,
+                            input_rounding,
                             narrow,
                             (shared_a, shared_b),
                         ),
@@ -604,9 +629,9 @@ fn dispatch_batch_configurations(broadcast: bool) {
                     let b_source = model.tensor(shape(shared_b, tb, 4, 5), dtype);
                     let mut a = a_source.cast(compute);
                     let mut b = b_source.cast(compute);
-                    if tf32 {
-                        a = a.cast(DType::TF32).cast(compute);
-                        b = b.cast(DType::TF32).cast(compute);
+                    if let Some(rounding) = input_rounding {
+                        a = a.cast(rounding).cast(compute);
+                        b = b.cast(rounding).cast(compute);
                     }
                     if ta {
                         a = a.permute(if shared_a {
@@ -680,7 +705,8 @@ fn dispatch_batch_configurations(broadcast: bool) {
     }
     assert_eq!(
         witnesses.len(),
-        sharing.len() * if ampere_or_newer { 1344 } else { 768 },
+        // Each family has 64 base, 64 separate-C and 64 in-place-C witnesses.
+        sharing.len() * if ampere_or_newer { 1728 } else { 960 },
         "each storage/computation mode covers base, separate C and in-place C configurations"
     );
     let at = |d: LtDesc, batch: usize, row: usize, col: usize| {
