@@ -791,3 +791,86 @@ fn read_comparator_requires_naive_rules_and_returns_boolean_for_all_readings() {
         &rule.replace(":ruleset backend)", ":ruleset backend :naive)"),
     );
 }
+
+/// How many `ElementStridedLayoutLit` spellings each layout class holds.
+fn element_stride_spellings_per_layout(g: &mut EGraph) -> Vec<usize> {
+    let snapshot = g.serialize(egglog::SerializeConfig::default()).egraph;
+    let mut per_class = std::collections::BTreeMap::<String, usize>::new();
+    for node in snapshot
+        .nodes
+        .values()
+        .filter(|node| node.op == "ElementStridedLayoutLit")
+    {
+        *per_class.entry(node.eclass.to_string()).or_default() += 1;
+    }
+    per_class.into_values().collect()
+}
+
+#[test]
+fn rules_publish_only_the_canonical_list_on_singleton_axes() {
+    // Right-major strides for [1, 4] are [4, 1]. The singleton's 4 never
+    // reaches an address, so the seam publishes only the Any spelling.
+    let mut g = graph();
+    run(
+        &mut g,
+        &(r#"
+(let rm_shape (ShapeLit (IntExprCons (IntLit 1) (IntExprCons (IntLit 4) (IntExprNil)))))
+(let rm_layout (RightMajorContiguousElementLayoutLit rm_shape (BitWidthLit 32)))
+"#
+        .to_string()
+            + SATURATE),
+    );
+    run(
+        &mut g,
+        r#"
+(check (= rm_layout (ElementStridedLayoutLit rm_shape
+ (ElementStrideCons (ElementStrideAny)
+  (ElementStrideCons (ElementStrideExact (IntLit 1)) (ElementStrideNil))) (BitWidthLit 32))))
+(fail (check (= rm_layout (ElementStridedLayoutLit rm_shape
+ (ElementStrideCons (ElementStrideExact (IntLit 4))
+  (ElementStrideCons (ElementStrideExact (IntLit 1)) (ElementStrideNil))) (BitWidthLit 32)))))
+"#,
+    );
+}
+
+#[test]
+fn singleton_coefficients_do_not_multiply_through_view_chains() {
+    // LUM-1147: composing from every spelling of a parent turned each
+    // arbitrary singleton coefficient into further child spellings, up to
+    // 1,912 for one layout of a rank-8 max-pool. Swap the two singleton axes
+    // of a right-major [1, 2, 1, 3] (strides 6, 3, 3, 1) three times.
+    let mut g = graph();
+    let swap = "(IndexMapLit (IntExprCons (CoordVar x_shape 1) (IntExprCons (CoordVar x_shape 2) \
+                (IntExprCons (CoordVar x_shape 3) (IntExprCons (CoordVar x_shape 0) (IntExprNil))))) \
+                x_shape)";
+    run(
+        &mut g,
+        &format!(
+            r#"
+(let x_shape (ShapeLit (IntExprCons (IntLit 1) (IntExprCons (IntLit 2)
+ (IntExprCons (IntLit 1) (IntExprCons (IntLit 3) (IntExprNil)))))))
+(let x_logical (LogicalTensorInputLit (LogicalIdLit "x") x_shape (F32)))
+(let x_lt (LayoutTensorLit x_logical
+ (RightMajorContiguousElementLayoutLit x_shape (BitWidthLit 32))))
+(let v1 (LogicalIndexMapApply x_logical {swap} x_shape))
+(let v2 (LogicalIndexMapApply v1 {swap} x_shape))
+(let v3 (LogicalIndexMapApply v2 {swap} x_shape))
+{SATURATE}
+"#
+        ),
+    );
+    run(
+        &mut g,
+        r#"
+(check (element-stride-reading (LayoutTensorLit v3 ?layout) 0 (ElementStrideExact (IntLit 1))))
+(check (element-stride-reading (LayoutTensorLit v3 ?layout) 2 (ElementStrideExact (IntLit 3))))
+(check (element-stride-reading (LayoutTensorLit v3 ?layout) 3 (ElementStrideAny)))
+"#,
+    );
+    let spellings = element_stride_spellings_per_layout(&mut g);
+    assert!(!spellings.is_empty());
+    assert!(
+        spellings.iter().all(|&count| count == 1),
+        "ElementStridedLayoutLit spellings per layout class: {spellings:?}"
+    );
+}

@@ -46,6 +46,21 @@
        (element-stride-normalized-list ?dims ?ss ?ns))
  ((union ?l (ElementStridedLayoutLit ?shape ?ns ?w))) :ruleset main_ruleset)
 
+; Canonical publication (LUM-1147). Rules place only NORMALIZED lists in a layout
+; class: Any exactly on static singleton axes. A singleton's coefficient never
+; reaches an address, but egglog cannot retract a published spelling, and every
+; spelling of a parent seeds composition, so arbitrary singleton coefficients
+; would compose into ever more variants of one layout. Raw lists stay inside
+; relations; the union above remains the backstop for authored lists and for an
+; extent proved to be one only after its list was published.
+(relation element-stride-certificate (Layout Shape ElementStrideList BitWidth))
+(rule ((element-stride-certificate ?l ?shape ?ss ?w) (= ?shape (ShapeLit ?dims)))
+ ((element-stride-normalization-demand ?dims ?ss)) :ruleset main_ruleset)
+(rule ((element-stride-certificate ?l ?shape ?ss ?w) (= ?shape (ShapeLit ?dims))
+       (element-stride-normalized-list ?dims ?ss ?canonical))
+ ((union ?l (ElementStridedLayoutLit ?shape ?canonical ?w)))
+ :ruleset main_ruleset :name "element-stride: publish a declared certificate canonically")
+
 ; Existing authored scalar strides are a trusted source of exact coefficients,
 ; including dynamic extents spanning one. No factor is recovered from a zero class.
 (relation element-stride-list-from-expressions-demand (IntExprList))
@@ -58,7 +73,11 @@
  :ruleset main_ruleset)
 (rule ((strided-lists ?l ?shape ?dims ?ss ?w)) ((element-stride-list-from-expressions-demand ?ss)) :ruleset main_ruleset)
 (rule ((strided-lists ?l ?shape ?dims ?ss ?w) (element-stride-list-from-expressions ?ss ?packed))
- ((union ?l (ElementStridedLayoutLit ?shape ?packed ?w))) :ruleset main_ruleset)
+ ((element-stride-normalization-demand ?dims ?packed)) :ruleset main_ruleset)
+(rule ((strided-lists ?l ?shape ?dims ?ss ?w) (element-stride-list-from-expressions ?ss ?packed)
+       (element-stride-normalized-list ?dims ?packed ?canonical))
+ ((union ?l (ElementStridedLayoutLit ?shape ?canonical ?w)))
+ :ruleset main_ruleset :name "element-stride: publish authored strides canonically")
 
 ; The reverse bridge selects zero for a singleton Any. It is an address-equivalent
 ; representative, never an equality between global Any and Exact(0) values.
@@ -141,9 +160,12 @@
        (element-stride-list-length ?st ?n) (> ?n ?axis) (element-stride-accumulated-at-axis ?st ?axis ?value ?tail))
  ((element-stride-accumulated-at-axis (ElementStrideCons ?s ?st) ?axis ?value (ElementStrideCons ?s ?tail))) :ruleset main_ruleset)
 (relation element-stride-view-composition-state (LogicalTensor Shape BitWidth IntExprList ElementStrideList ElementStrideList))
+; Compose from the canonical parent only: every other spelling of the same layout
+; differs on singleton axes alone and composes to the same addresses.
 (rule ((= ?out (LogicalIndexMapApply ?in (IndexMapLit ?entries ?inshape) ?outshape))
        (= ?parent (LayoutTensorLit ?in (ElementStridedLayoutLit ?inshape ?ss ?w)))
        (= ?inshape (ShapeLit ?indims)) (element-stride-expressions-from-list ?indims ?ss ?plain)
+       (element-stride-normalized-list ?indims ?ss ?ss)
        (= ?outshape (ShapeLit ?dims)) (element-stride-zero-list ?dims ?zeros))
  ((element-stride-view-composition-state ?out ?outshape ?w ?entries ?ss ?zeros))
  :ruleset main_ruleset :name "element-stride: seed view composition during saturation")
@@ -160,6 +182,10 @@
           (ElementStrideCons (ElementStrideExact ?s) ?st) ?partial)
        (element-stride-accumulated-at-axis ?partial ?axis ?s ?placed))
  ((element-stride-view-composition-state ?out ?shape ?w ?et ?st ?placed)) :ruleset main_ruleset)
-(rule ((element-stride-view-composition-state ?out ?shape ?w (IntExprNil) (ElementStrideNil) ?final))
- ((LayoutTensorLit ?out (ElementStridedLayoutLit ?shape ?final ?w)))
+(rule ((element-stride-view-composition-state ?out ?shape ?w (IntExprNil) (ElementStrideNil) ?final)
+       (= ?shape (ShapeLit ?dims)))
+ ((element-stride-normalization-demand ?dims ?final)) :ruleset main_ruleset)
+(rule ((element-stride-view-composition-state ?out ?shape ?w (IntExprNil) (ElementStrideNil) ?final)
+       (= ?shape (ShapeLit ?dims)) (element-stride-normalized-list ?dims ?final ?canonical))
+ ((LayoutTensorLit ?out (ElementStridedLayoutLit ?shape ?canonical ?w)))
  :ruleset main_ruleset :name "element-stride: publish the composed view's layout")

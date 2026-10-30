@@ -76,7 +76,8 @@ impl BoundaryLayout {
     }
     /// The declaration supplies the whole coefficient list before index
     /// simplification can erase singleton factors. This is a shape-owned
-    /// equality certificate, not recovery from an arbitrary e-class spelling.
+    /// equality certificate, not recovery from an arbitrary e-class spelling;
+    /// core publishes it only in its normalized form (Any on singleton axes).
     fn stride_certificate(&self, layout: &str, shape: &str, width: &str) -> Result<String, String> {
         let Self::Strided { strides } = self else {
             return Ok(String::new());
@@ -87,7 +88,7 @@ impl BoundaryLayout {
             list = format!("(ElementStrideCons (ElementStrideExact {value}) {list})");
         }
         Ok(format!(
-            "(union {layout} (ElementStridedLayoutLit {shape} {list} {width}))\n"
+            "(element-stride-certificate {layout} {shape} {list} {width})\n"
         ))
     }
 }
