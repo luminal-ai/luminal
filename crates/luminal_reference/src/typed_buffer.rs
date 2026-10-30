@@ -65,14 +65,13 @@ pub enum TypedBuffer {
     /// own dtype; arithmetic happens after an explicit widening cast.
     /// OCP e4m3fn codes (the `float8` crate's `F8E4M3` is that encoding).
     F8E4M3FN(Vec<float8::F8E4M3>),
-    /// IEEE binary16 codes. STORAGE ONLY, like every narrow float: the
-    /// translator computes half-precision math in F32 (torch's opmath),
-    /// so this variant is staged, cast, moved and read back — never
-    /// operated on. The conversion contract is [`crate::narrow_float`].
+    /// IEEE binary16 values. Explicitly authored FP16 add, multiply and
+    /// reduce-sum round at each operation; frontends wanting FP32 opmath
+    /// must state widening casts. See [`crate::narrow_float`] for conversion.
     F16(Vec<half::f16>),
-    /// bfloat16 codes — storage only, see [`Self::F16`].
+    /// bfloat16 codes — arithmetic requires an explicit widening cast.
     Bf16(Vec<half::bf16>),
-    /// OCP e5m2 codes — storage only, see [`Self::F16`].
+    /// OCP e5m2 codes — arithmetic requires an explicit widening cast.
     F8E5M2(Vec<float8::F8E5M2>),
     /// e4m3fnuz codes (torch `float8_e4m3fnuz`) — storage only.
     F8E4M3FNUZ(Vec<F8E4M3FNUZ>),
@@ -826,6 +825,14 @@ impl ReferenceKernelCtx {
         binary_elementwise_i64,
         reduce_axis_i64,
         scan_axis_i64
+    );
+    typed_kernel_helpers!(
+        half::f16,
+        as_f16,
+        as_f16_mut,
+        binary_elementwise_f16,
+        reduce_axis_f16,
+        scan_axis_f16
     );
     typed_kernel_helpers!(
         f64,

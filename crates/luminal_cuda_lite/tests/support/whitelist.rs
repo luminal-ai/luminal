@@ -88,21 +88,24 @@ pub fn approved_keys() -> std::collections::BTreeSet<String> {
 }
 fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     let mut graphs = Vec::new();
-    for (dtype, input_rounding, narrow) in [
-        (DType::F32, None, false),
-        (DType::F64, None, false),
-        (DType::Bf16, None, false),
-        (DType::F16, None, false),
-        (DType::F32, Some(DType::TF32), false),
-        (DType::F32, Some(DType::F16), false),
-        (DType::F32, Some(DType::Bf16), false),
-        (DType::Bf16, None, true),
-        (DType::F16, None, true),
+    for (dtype, input_rounding, narrow, native_half) in [
+        (DType::F16, None, false, true),
+        (DType::F32, None, false, false),
+        (DType::F64, None, false, false),
+        (DType::Bf16, None, false, false),
+        (DType::F16, None, false, false),
+        (DType::F32, Some(DType::TF32), false, false),
+        (DType::F32, Some(DType::F16), false, false),
+        (DType::F32, Some(DType::Bf16), false, false),
+        (DType::Bf16, None, true, false),
+        (DType::F16, None, true, false),
     ] {
         for ta in [false, true] {
             for tb in [false, true] {
                 let mut model = Graph::new();
-                let compute = if dtype == DType::F64 {
+                let compute = if native_half {
+                    DType::F16
+                } else if dtype == DType::F64 {
                     DType::F64
                 } else {
                     DType::F32
@@ -221,6 +224,26 @@ pub fn tf32_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
             .collect()
     });
     table_registry(TABLE.as_str())
+}
+
+pub fn fp16_registry(device: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|index| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains("CublasLtFloat16Computation")
+                        && key.contains(if index == 1 {
+                            "CublasLtDeviceScalarPointerMode"
+                        } else {
+                            "CublasLtHostScalarPointerMode"
+                        })
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(device)])
 }
 
 pub fn fast16_registry(bfloat: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {

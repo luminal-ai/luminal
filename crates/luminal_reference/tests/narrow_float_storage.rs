@@ -181,3 +181,47 @@ fn narrow_payload_views_and_select_preserve_bits() {
         assert_eq!(bits, vec![raw[0], raw[3], raw[1], raw[4], raw[2], raw[5]]);
     }
 }
+
+#[test]
+fn explicitly_authored_fp16_arithmetic_rounds_each_product_add_and_sum() {
+    let mut graph = Graph::new();
+    let a = graph.tensor([1, 3], DType::F16);
+    let b = graph.tensor([3, 1], DType::F16);
+    let x = graph.tensor([4], DType::F16);
+    let y = graph.tensor([4], DType::F16);
+    let narrow = a.matmul(b);
+    let wide = a.cast(DType::F32).matmul(b.cast(DType::F32));
+    let product = x * y;
+    let added = x + y;
+    let inputs = [
+        (a, payload(DType::F16, &[2048.0, 1.0, -2048.0])),
+        (b, payload(DType::F16, &[1.0, 1.0, 1.0])),
+        (
+            x,
+            payload(
+                DType::F16,
+                &[1.0 + 1.0 / 1024.0, 65504.0, 2.0f32.powi(-24), -0.0],
+            ),
+        ),
+        (y, payload(DType::F16, &[1.0 + 1.0 / 1024.0, 2.0, 0.5, 1.0])),
+    ];
+    let runtime = run(&graph, &[narrow, wide, product, added], &inputs);
+    assert_eq!(runtime.get_f16(narrow.id).unwrap(), &vec![f16::ZERO]);
+    assert_eq!(runtime.get_f32(wide.id).unwrap(), &vec![1.0]);
+    let left = widened(&inputs[2].1);
+    let right = widened(&inputs[3].1);
+    for (out, multiply) in [(product, true), (added, false)] {
+        let expected: Vec<_> = left
+            .iter()
+            .zip(&right)
+            .map(|(a, b)| f16::from_f32(if multiply { a * b } else { a + b }).to_bits())
+            .collect();
+        let got: Vec<_> = runtime
+            .get_f16(out.id)
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        assert_eq!(got, expected);
+    }
+}

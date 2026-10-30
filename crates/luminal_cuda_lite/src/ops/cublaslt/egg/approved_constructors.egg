@@ -5,6 +5,7 @@
 (datatype CublasLtMatrixOrder (CublasLtRowMajor) (CublasLtColumnMajor))
 (datatype CublasLtMatrixOperation (CublasLtNoTranspose) (CublasLtTranspose))
 (datatype CublasLtComputationType
+  (CublasLtFloat16Computation)
   (CublasLtFloat32Computation)
   (CublasLtTensorFloat32Computation)
   (CublasLtFloat32FastFloat16Computation)
@@ -19,6 +20,7 @@
 (datatype CublasLtScalarPointerMode
   (CublasLtHostScalarPointerMode) (CublasLtDeviceScalarPointerMode))
 (datatype CublasLtScalarArguments
+  (CublasLtHostFloat16ScalarArguments f64 f64)
   (CublasLtHostScalarArguments f64 f64)
   (CublasLtHostFloat64ScalarArguments f64 f64)
   (CublasLtDeviceScalarArguments LayoutTensor LayoutTensor))

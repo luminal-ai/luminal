@@ -150,6 +150,9 @@ pub(crate) fn kernel(
 ) -> anyhow::Result<()> {
     let op = expect_op::<ReduceSumDps>(op)?;
     match &ctx.operands[0] {
+        TypedBuffer::F16(_) => ctx.reduce_axis_f16(op.axis, half::f16::ZERO, |a, b| {
+            Ok(half::f16::from_f32(a.to_f32() + b.to_f32()))
+        }),
         TypedBuffer::F32(_) => ctx.reduce_axis(op.axis, 0.0, |acc, x| acc + x),
         TypedBuffer::F64(_) => ctx.reduce_axis_f64(op.axis, 0.0, |acc, x| Ok(acc + x)),
         TypedBuffer::I32(_) => ctx.reduce_axis_i32(op.axis, 0, |acc, x| {

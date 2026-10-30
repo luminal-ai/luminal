@@ -14,7 +14,7 @@ the elected call and dispatches its descriptors unchanged.
 | `scalar_rules.egg` | Authored alpha/beta scaling and exact FP32/FP64 scalar storage/pointer proofs |
 | `call_inputs.egg` | Assemble approved matrix/scalar reads in one canonical order |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 3,520 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 3,648 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -57,8 +57,8 @@ including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **3,520 complete configurations**: 1,760 for host scalar
-pointers and 1,760 for device scalar pointers. Each pointer mode admits:
+The table contains **3,648 complete configurations**: 1,824 for host scalar
+pointers and 1,824 for device scalar pointers. Each pointer mode admits:
 
 - 1,344 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
   FP16 A/B storage, plus explicit TF32, FP16 or BF16 input conversion over F32
@@ -71,12 +71,16 @@ pointers and 1,760 for device scalar pointers. Each pointer mode admits:
   order/transpose combinations, absent/present matching narrow C, and default
   in either D order or ReLU with column-major D. Native narrow bias and GELU
   epilogues have no approved rows.
+- 64 native FP16 rows: FP16 arithmetic, matrix storage and alpha/beta,
+  with 16 A/B order/transpose combinations, absent/present FP16 C, default
+  epilogue and either D order.
 - 224 FP64-output rows: FP64 A/B/C/D storage, computation and alpha/beta,
   with 16 A/B order/transpose combinations, absent/present C, and seven
   destination/epilogue combinations: default in either D order, plus bias,
   ReLU, ReLU+bias, GELU or GELU+bias with column-major D and FP64 bias.
 
-All FP32 accumulation modes use FP32 scalars; FP64 computation uses FP64 scalars.
+Native FP16 computation uses FP16 scalars. All FP32 accumulation modes use FP32
+scalars; FP64 computation uses FP64 scalars.
 Alpha and beta are general values in that arithmetic dtype; absent C still
 requires a literal beta zero in the same dtype. Storage never chooses arithmetic
 precision. Only an authored exact widening permits direct BF16/FP16 readings.
@@ -133,6 +137,44 @@ separate elementwise multiplication. A present C remains structurally present,
 including when beta is zero; this does not grant extra alias permissions or
 remove the scalar's graph dependency. Tests compare finite numerical inputs
 and retain explicit cast boundaries.
+
+### Native FP16 arithmetic and scalar storage
+
+`CublasLtFloat16Computation` maps to `CUBLAS_COMPUTE_16F`. Both operands,
+multiplication and reduction must be logically F16. Matrix A/B/C/D storage and
+alpha/beta are F16. For example, `a.matmul(b)` on F16 tensors requests native
+half computation; `a.cast(DType::F32).matmul(b.cast(DType::F32))` retains FP32
+computation, even if the result is subsequently cast to F16. Storage alone or a
+final output cast never authorizes reducing arithmetic precision.
+
+The 128 complete rows cover both scalar pointer modes, both destination
+orders, all 16 A/B order/transpose combinations, and absent/present C. Ordinary
+and one-axis strided batches share them, including independently shared A/B,
+separate destinations and in-place accumulation. Bias and activation epilogues
+are outside this initial native FP16 admission. Subsequent casts remain separate.
+
+Host literals are explicit F32 constants cast to F16. Decoding performs that
+same nearest-even conversion once and retains the two-byte payload in a distinct
+host scalar variant through CUDA graph capture. GPU coefficients are rank-zero
+F16 reads; a literal paired with a GPU coefficient can materialize in F16, and
+GPU-produced F16 casts remain ordinary graph dependencies. Bounds checks use
+two-byte scalar elements. No FP32 pointer is passed under an FP16 descriptor.
+
+The [vendor compute contract](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublascomputetype-t)
+permits compute and intermediates of at least FP16 precision, Tensor Cores,
+reduction reassociation and FMA contraction. Native half GEMM follows this same
+practical BLAS policy; it does not promise the reference's sequential reduction
+or a separately rounded product at every multiply. Explicit intermediate casts
+remain boundaries. All reduction schemes are permitted by these rows because
+compute and output types are both FP16. As for the other modes, zero coefficients
+may suppress matrix reads. The reference implements authored FP16 add, multiply
+and sequential sum with half rounding at each step; exact dyadic witnesses
+compare the fused and decomposed paths independently of permitted association.
+
+CUDA 12.8/A100 probes and tests verify genuine half-accumulator algorithms,
+host/device scalar pointers, ordinary/batched descriptors, shared inputs,
+retained C, and coefficient updates on replay. Supported storage/scalar types
+are specified in the [vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul).
 
 ### FP64 arithmetic and scalar storage
 
@@ -295,7 +337,7 @@ simplification can erase at singleton extents.
 The batched recognizer matches `A[B,m,k]` and `B[B,k,n]` broadcast into the exact
 `[B,m,n,k]` multiply domain followed by reduction over k. Both maps must use the
 batch coordinate, even when a matrix extent happens to equal B. A static B=1
-also permits its coordinate to be literal zero. Arithmetic is F32 or F64, with
+also permits its coordinate to be literal zero. Arithmetic is F16, F32 or F64, with
 explicit narrow-input widening handled by the shared storage-reading proofs. An
 authored final BF16/FP16 cast can select the matching narrow D and C storage.
 
@@ -329,7 +371,7 @@ and legal leading dimension. This relation is used only for A and B. Every
 vendor descriptor still carries the common logical batch count; sharing is
 represented by stride zero, not a descriptor count of one. The independent
 [layout attributes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatrixlayoutattribute-t)
-are dispatched unchanged. Precision/storage proofs and the complete 3,520-row
+are dispatched unchanged. Precision/storage proofs and the complete 3,648-row
 configuration whitelist remain shared with ordinary batches.
 
 Read sharing never publishes a disjoint matrix or destination proof. C and D

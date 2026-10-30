@@ -59,6 +59,10 @@ fn range<T>(stream: &Arc<CudaStream>, buffer: &CudaSlice<T>) -> DeviceRange {
     }
 }
 fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
+    if call.computation == LtComputation::Float16 {
+        support::fp16::execute_call(stream, call, alias);
+        return;
+    }
     if call.computation == LtComputation::Float64 {
         support::fp64::execute_call(stream, call, alias);
         return;
@@ -258,8 +262,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 3520 } else { 1984 });
-    assert_eq!(aliases, if ampere_or_newer { 1760 } else { 992 });
+    assert_eq!(ran, if ampere_or_newer { 3648 } else { 2112 });
+    assert_eq!(aliases, if ampere_or_newer { 1824 } else { 1056 });
 }
 
 #[test]

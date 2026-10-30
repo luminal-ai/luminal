@@ -149,6 +149,7 @@ pub struct Bias {
 /// Scalar arguments are decoded independently of the matrix element types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scalars {
+    HostF16 { alpha_bits: u16, beta_bits: u16 },
     Host { alpha_bits: u32, beta_bits: u32 },
     HostF64 { alpha_bits: u64, beta_bits: u64 },
     Device { alpha: ClassId, beta: ClassId },
@@ -163,6 +164,13 @@ impl Scalars {
     }
     pub fn resolve(&self) -> LtScalars {
         match self {
+            Self::HostF16 {
+                alpha_bits,
+                beta_bits,
+            } => LtScalars::HostF16 {
+                alpha_bits: *alpha_bits,
+                beta_bits: *beta_bits,
+            },
             Self::Host {
                 alpha_bits,
                 beta_bits,
@@ -192,6 +200,26 @@ impl Scalars {
 }
 
 pub(super) fn scalars(site: &ExtractionSite<'_>, class: &ClassId, mode: &ClassId) -> Scalars {
+    if let Some(node) = site
+        .nodes_in_class_value(class, "CublasLtHostFloat16ScalarArguments")
+        .next()
+    {
+        member(site, mode, "CublasLtHostScalarPointerMode");
+        let bits = |n| {
+            let child = site.class_of_child(node, n).unwrap();
+            let value = site
+                .index
+                .nodes_of(&child)
+                .iter()
+                .find_map(|id| site.egraph.nodes[id].op.parse::<f64>().ok())
+                .expect("cuBLASLt host FP16 scalar literal");
+            half::f16::from_f32(value as f32).to_bits()
+        };
+        return Scalars::HostF16 {
+            alpha_bits: bits(0),
+            beta_bits: bits(1),
+        };
+    }
     let host = site
         .nodes_in_class_value(class, "CublasLtHostScalarArguments")
         .next()
@@ -240,6 +268,7 @@ pub(super) fn bias(site: &ExtractionSite<'_>, class: &ClassId) -> Option<Bias> {
 
 pub(super) fn computation(site: &ExtractionSite<'_>, class: &ClassId) -> LtComputation {
     for mode in [
+        LtComputation::Float16,
         LtComputation::Float32,
         LtComputation::TensorFloat32,
         LtComputation::Float32FastFloat16,

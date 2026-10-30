@@ -47,6 +47,35 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
         };
         let op = ApprovedCublasLtMatcher.extract(&site);
         let call = op.as_any().downcast_ref::<ApprovedCublasLt>().unwrap();
+        if call.computation == LtComputation::Float16 {
+            assert_eq!(site.logical_dtype(&call.logical_a), Some(PlanDtype::F16));
+            assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::F16));
+            assert_eq!(
+                (call.a.dtype, call.b.dtype, call.d.dtype, call.scale),
+                (
+                    PlanDtype::F16,
+                    PlanDtype::F16,
+                    PlanDtype::F16,
+                    PlanDtype::F16
+                )
+            );
+            assert_eq!(logical_of(&egraph, &call.a.tensor), call.logical_a);
+            assert_eq!(logical_of(&egraph, &call.b.tensor), call.logical_b);
+            assert_eq!(site.logical_dtype(&call.logical_out), Some(PlanDtype::F16));
+            assert_eq!(site.logical_dtype(&call.logical_root), Some(PlanDtype::F16));
+            // The API frame may transpose the complete expression while the
+            // original caller-facing root keeps its orientation.
+            assert!(
+                call.logical_out == call.logical_root
+                    || egraph.nodes.values().any(|node| {
+                        node.eclass == call.logical_out
+                            && node.op == "LogicalHelperMatrixTranspose"
+                            && egraph.nodes[&node.children[0]].eclass == call.logical_root
+                    })
+            );
+            specifications.push(call.clone());
+            continue;
+        }
         assert_eq!(site.logical_dtype(&call.logical_a), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_out), Some(call.d.dtype));
@@ -72,7 +101,9 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
             LtComputation::TensorFloat32 => Some("TF32"),
             LtComputation::Float32FastFloat16 => Some("F16"),
             LtComputation::Float32FastBfloat16 => Some("Bf16"),
-            LtComputation::Float64 => unreachable!("these fixtures use FP32 arithmetic"),
+            LtComputation::Float16 | LtComputation::Float64 => {
+                unreachable!("these fixtures use FP32 arithmetic")
+            }
         };
         for (semantic, descriptor) in [(&call.logical_a, &call.a), (&call.logical_b, &call.b)] {
             let physical = logical_of(&egraph, &descriptor.tensor);
@@ -190,7 +221,7 @@ fn output_casts_do_not_authorize_changing_narrow_arithmetic() {
             let calls = candidates(&graph);
             assert_eq!(
                 !calls.is_empty(),
-                arithmetic == DType::F32,
+                matches!(arithmetic, DType::F32 | DType::F16),
                 "arithmetic={arithmetic:?}, destination={destination:?}"
             );
         }
@@ -214,7 +245,8 @@ fn product_and_reduction_precision_must_both_match() {
             let calls = candidates(&graph);
             assert_eq!(
                 !calls.is_empty(),
-                product_dtype == DType::F32 && reduction_dtype == DType::F32,
+                product_dtype == reduction_dtype
+                    && matches!(product_dtype, DType::F32 | DType::F16),
                 "product={product_dtype:?}, reduction={reduction_dtype:?}"
             );
         }

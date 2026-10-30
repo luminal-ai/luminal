@@ -228,6 +228,7 @@ pub fn prepare(
     // cast proofs and a complete whitelist row; there is no global math flag.
     // As agreed, the configured mode executes and NVIDIA_TF32_OVERRIDE is unset.
     let computation = match call.computation {
+        LtComputation::Float16 => sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
         LtComputation::Float32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
         LtComputation::TensorFloat32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
         LtComputation::Float32FastFloat16 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
@@ -237,6 +238,7 @@ pub fn prepare(
         LtComputation::Float64 => sys::cublasComputeType_t::CUBLAS_COMPUTE_64F,
     };
     let scalar_type = match call.scale_dtype {
+        luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
         luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
         luminal::dtype::PlanDtype::F64 => sys::cudaDataType_t::CUDA_R_64F,
         other => anyhow::bail!("unsupported cuBLASLt scalar storage {other:?}"),
@@ -253,7 +255,7 @@ pub fn prepare(
             .map_err(|e| anyhow!("cublasLtMatmulDescSetAttribute({attr:?}): {e:?}"))
     };
     let pointer_mode = match call.scalars {
-        LtScalars::Host { .. } | LtScalars::HostF64 { .. } => {
+        LtScalars::Host { .. } | LtScalars::HostF16 { .. } | LtScalars::HostF64 { .. } => {
             sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST
         }
         LtScalars::Device { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_DEVICE,
@@ -373,7 +375,7 @@ pub fn prepare(
     .map_err(|e| anyhow!("reduction scheme preference: {e:?}"))?;
 
     let input_implementation = match call.computation {
-        LtComputation::Float32 | LtComputation::Float64 => None,
+        LtComputation::Float16 | LtComputation::Float32 | LtComputation::Float64 => None,
         LtComputation::TensorFloat32 => Some(0x04_u64 << 16),
         LtComputation::Float32FastFloat16 => Some(0x01_u64 << 16),
         LtComputation::Float32FastBfloat16 => Some(0x02_u64 << 16),
@@ -438,7 +440,7 @@ pub fn prepare(
         )
     };
     let required_pointer_mode = match call.scalars {
-        LtScalars::Host { .. } | LtScalars::HostF64 { .. } => {
+        LtScalars::Host { .. } | LtScalars::HostF16 { .. } | LtScalars::HostF64 { .. } => {
             sys::cublasLtPointerModeMask_t::CUBLASLT_POINTER_MODE_MASK_HOST as u32
         }
         LtScalars::Device { .. } => {
@@ -457,6 +459,13 @@ pub fn prepare(
     // The approved scalar arguments determine both pointers. Host literals
     // are owned by PreparedCall; device values stay live graph dependencies.
     let scalars = match call.scalars {
+        LtScalars::HostF16 {
+            alpha_bits,
+            beta_bits,
+        } => PreparedScalars::HostF16 {
+            alpha: alpha_bits,
+            beta: beta_bits,
+        },
         LtScalars::Host { .. } => {
             let (alpha, beta) = call.scalars.host_values().unwrap();
             PreparedScalars::Host { alpha, beta }
@@ -509,6 +518,7 @@ pub struct PreparedCall {
     workspace: DeviceRange,
 }
 enum PreparedScalars {
+    HostF16 { alpha: u16, beta: u16 },
     Host { alpha: f32, beta: f32 },
     HostF64 { alpha: f64, beta: f64 },
     Device { alpha: u64, beta: u64 },
@@ -520,6 +530,10 @@ impl PreparedHostOp for PreparedCall {
             .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
         let (alpha, beta): (*const std::ffi::c_void, *const std::ffi::c_void) = match &self.scalars
         {
+            PreparedScalars::HostF16 { alpha, beta } => (
+                alpha as *const u16 as *const _,
+                beta as *const u16 as *const _,
+            ),
             PreparedScalars::Host { alpha, beta } => (
                 alpha as *const f32 as *const _,
                 beta as *const f32 as *const _,

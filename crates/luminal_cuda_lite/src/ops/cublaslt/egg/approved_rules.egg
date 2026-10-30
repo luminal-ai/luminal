@@ -1,6 +1,7 @@
 ; Arithmetic precision supplies typed identities and the scalar ABI. Storage
 ; never selects it; both semantic operands must have this same arithmetic dtype.
 (relation cublaslt-arithmetic-type (Dtype LogicalTensor LogicalTensor))
+(cublaslt-arithmetic-type (F16) (LogicalCast (LogicalConstant 0.0) (F16)) (LogicalCast (LogicalConstant 1.0) (F16)))
 (cublaslt-arithmetic-type (F32) (LogicalConstant 0.0) (LogicalConstant 1.0))
 (cublaslt-arithmetic-type (F64) (LogicalConstantF64 0.0) (LogicalConstantF64 1.0))
 (relation cublaslt-exact-storage-reading (Dtype LogicalTensor LogicalTensor))
@@ -778,3 +779,11 @@
    (cublaslt-operand-storage-reading (CublasLtFloat64Computation) ?logical_operand ?logical_operand))
   :ruleset backend
   :name "cublaslt: FP64 arithmetic reads FP64 storage")
+
+; Native FP16 arithmetic must read FP16 values, never the source of a cast.
+(rule
+  ((= (dtype-of ?operand) (F16)))
+  ((cublaslt-exact-storage-reading (F16) ?operand ?operand)
+   (cublaslt-operand-storage-reading (CublasLtFloat16Computation) ?operand ?operand))
+  :ruleset backend
+  :name "cublaslt: native FP16 arithmetic reads FP16 storage")

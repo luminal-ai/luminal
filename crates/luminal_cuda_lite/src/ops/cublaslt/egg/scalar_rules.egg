@@ -1,5 +1,5 @@
 ; Scalar values and pointer location are independent of matrix storage types.
-; FP32 and TF32 computation require FP32 scales; FP64 requires FP64 scales.
+; Native FP16 uses FP16 scales; FP32 modes use FP32; FP64 uses FP64.
 ; A tensor scalar stays on the device; no host readback is introduced.
 (relation cublaslt-host-scalar-arguments (CublasLtScalarArguments))
 (rule
@@ -115,3 +115,17 @@
      (CublasLtHostFloat64ScalarArguments ?alpha_value ?beta_value) (LayoutTensorNil)))
   :ruleset backend
   :name "cublaslt: literal FP64 alpha and beta use host double pointers")
+
+(rule
+  ((= ?arguments (CublasLtHostFloat16ScalarArguments ?alpha ?beta)))
+  ((cublaslt-host-scalar-arguments ?arguments))
+  :ruleset backend
+  :name "cublaslt: FP16 host arguments have no scalar read operands")
+(rule
+  ((cublaslt-scalar-demand ?alpha ?beta)
+   (= ?alpha (LogicalCast (LogicalConstant ?alpha_value) (F16)))
+   (= ?beta (LogicalCast (LogicalConstant ?beta_value) (F16))))
+  ((cublaslt-scalar-arguments ?alpha ?beta (F16) (CublasLtHostScalarPointerMode)
+     (CublasLtHostFloat16ScalarArguments ?alpha_value ?beta_value) (LayoutTensorNil)))
+  :ruleset backend
+  :name "cublaslt: explicitly narrowed FP16 literal alpha and beta use host half pointers")

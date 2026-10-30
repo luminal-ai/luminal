@@ -6,6 +6,7 @@ use luminal::{bufferize::OutputBinding, layouts::DecodedLayout, prelude::NodeInd
 use luminal_cuda_lite::{CudaRuntime, HostBuffer};
 
 use luminal_cuda_lite::CudaArena;
+pub mod fp16;
 pub mod fp64;
 mod memory;
 pub use memory::Allocation;

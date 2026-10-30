@@ -97,6 +97,7 @@ pub enum LtActivation {
 /// The explicitly admitted input-rounding and computation contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LtComputation {
+    Float16,
     Float32,
     TensorFloat32,
     Float32FastFloat16,
@@ -107,6 +108,7 @@ pub enum LtComputation {
 impl LtComputation {
     pub fn egglog_constructor(self) -> &'static str {
         match self {
+            Self::Float16 => "CublasLtFloat16Computation",
             Self::Float32 => "CublasLtFloat32Computation",
             Self::TensorFloat32 => "CublasLtTensorFloat32Computation",
             Self::Float32FastFloat16 => "CublasLtFloat32FastFloat16Computation",
@@ -137,6 +139,10 @@ impl LtReductionSchemeMask {
 /// Device values are ordinary read operands; replay reads their current bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LtScalars {
+    HostF16 {
+        alpha_bits: u16,
+        beta_bits: u16,
+    },
     Host {
         alpha_bits: u32,
         beta_bits: u32,
@@ -152,6 +158,12 @@ pub enum LtScalars {
 }
 
 impl LtScalars {
+    pub fn host_f16(alpha: half::f16, beta: half::f16) -> Self {
+        Self::HostF16 {
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+        }
+    }
     pub fn host(alpha: f32, beta: f32) -> Self {
         Self::Host {
             alpha_bits: alpha.to_bits(),
@@ -160,6 +172,13 @@ impl LtScalars {
     }
     pub fn host_values(self) -> Option<(f32, f32)> {
         match self {
+            Self::HostF16 {
+                alpha_bits,
+                beta_bits,
+            } => Some((
+                half::f16::from_bits(alpha_bits).to_f32(),
+                half::f16::from_bits(beta_bits).to_f32(),
+            )),
             Self::Host {
                 alpha_bits,
                 beta_bits,
@@ -173,14 +192,14 @@ impl LtScalars {
             beta_bits: beta.to_bits(),
         }
     }
-    /// Inspect host values without narrowing. FP32 arguments widen exactly.
+    /// Inspect host values without narrowing. FP16 and FP32 widen exactly.
     pub fn host_values_f64(self) -> Option<(f64, f64)> {
         match self {
             Self::HostF64 {
                 alpha_bits,
                 beta_bits,
             } => Some((f64::from_bits(alpha_bits), f64::from_bits(beta_bits))),
-            Self::Host { .. } => self
+            Self::Host { .. } | Self::HostF16 { .. } => self
                 .host_values()
                 .map(|(a, b)| (f64::from(a), f64::from(b))),
             Self::Device { .. } => None,
@@ -195,7 +214,9 @@ impl LtScalars {
     }
     pub fn pointer_mode_constructor(self) -> &'static str {
         match self {
-            Self::Host { .. } | Self::HostF64 { .. } => "CublasLtHostScalarPointerMode",
+            Self::Host { .. } | Self::HostF16 { .. } | Self::HostF64 { .. } => {
+                "CublasLtHostScalarPointerMode"
+            }
             Self::Device { .. } => "CublasLtDeviceScalarPointerMode",
         }
     }
@@ -307,6 +328,7 @@ impl LtCall {
     /// read order; the destination's capacity is checked separately.
     pub fn validate_against(&self, operand_elems: &[usize], dest_elems: usize) -> Result<()> {
         let scalar_dtype = match self.computation {
+            LtComputation::Float16 => luminal::dtype::PlanDtype::F16,
             LtComputation::Float32
             | LtComputation::TensorFloat32
             | LtComputation::Float32FastFloat16
@@ -320,8 +342,10 @@ impl LtCall {
                 self.scale_dtype
             );
         }
-        if matches!(self.scalars, LtScalars::Host { .. })
-            && scalar_dtype != luminal::dtype::PlanDtype::F32
+        if matches!(self.scalars, LtScalars::HostF16 { .. })
+            && scalar_dtype != luminal::dtype::PlanDtype::F16
+            || matches!(self.scalars, LtScalars::Host { .. })
+                && scalar_dtype != luminal::dtype::PlanDtype::F32
             || matches!(self.scalars, LtScalars::HostF64 { .. })
                 && scalar_dtype != luminal::dtype::PlanDtype::F64
         {
