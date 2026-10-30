@@ -316,7 +316,31 @@ fn casts_between_batched_multiply_and_reduction_stop_fusion() {
         let b = model.tensor([2, 4, 5], DType::Bf16).cast(dtype);
         let _out = a.matmul(b).cast(DType::F32);
         let (separate, _) = calls(&saturate(&model, WHITELIST));
-        assert_eq!(!separate.is_empty(), dtype == DType::F32);
+        assert_eq!(
+            !separate.is_empty(),
+            matches!(dtype, DType::F32 | DType::F16)
+        );
+        for op in &separate {
+            assert_eq!(
+                op.computation,
+                if dtype == DType::F16 {
+                    luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float16
+                } else {
+                    luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32
+                }
+            );
+            if dtype == DType::F16 {
+                assert_eq!(
+                    (op.a.dtype, op.b.dtype, op.d.dtype, op.scale),
+                    (
+                        PlanDtype::F16,
+                        PlanDtype::F16,
+                        PlanDtype::F16,
+                        PlanDtype::F16
+                    )
+                );
+            }
+        }
         if dtype == DType::F32 {
             assert!(
                 separate
