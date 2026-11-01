@@ -815,6 +815,19 @@ impl Translator<'_> {
         self.get_bool_arg(node, idx).ok()
     }
 
+    /// A string argument by name: the serialized `{"as_string": ...}`
+    /// form, or a bare JSON string.
+    pub(super) fn named_str_arg(&self, node: &Node, name: &str) -> Option<String> {
+        let input = node.inputs.iter().find(|input| input.name == name)?;
+        let crate::pt2_schema::Argument::Other(value) = &input.arg else {
+            return None;
+        };
+        value
+            .as_str()
+            .or_else(|| value.get("as_string").and_then(|v| v.as_str()))
+            .map(str::to_string)
+    }
+
     /// All tensor output names of a node, multi-output ops included.
     pub(super) fn tensor_output_names(node: &Node) -> Vec<String> {
         node.outputs

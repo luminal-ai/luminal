@@ -36,6 +36,8 @@ mod expr;
 mod frexp;
 #[cfg(test)]
 mod gcd_tests;
+#[cfg(test)]
+mod gelu_tests;
 mod grouped_mm;
 mod index;
 #[cfg(test)]
@@ -1083,7 +1085,16 @@ impl Translator<'_> {
             }
             "neg.default" => -self.operand(&n[0])?,
             "silu.default" => self.operand(&n[0])?.silu(),
-            "gelu.default" => self.operand(&n[0])?.gelu(),
+            "gelu.default" => {
+                // `approximate="tanh"` is a different function (PyTorch's
+                // tanh approximation, ~3e-4 from the erf form), not a hint
+                let x = self.operand(&n[0])?;
+                match self.named_str_arg(node, "approximate").as_deref() {
+                    None | Some("none") => x.gelu(),
+                    Some("tanh") => x.gelu_fast_tanh_approximation(),
+                    Some(other) => bail!("gelu: approximate={other:?} is not ported"),
+                }
+            }
             "reciprocal.default" => self.operand(&n[0])?.reciprocal(),
             "sin.default" => self.operand(&n[0])?.sin(),
             "square.default" => self.operand(&n[0])?.square(),
