@@ -112,6 +112,7 @@ impl Layout {
             luminal::dtype::PlanDtype::F64 => sys::cudaDataType_t::CUDA_R_64F,
             luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
             luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
+            luminal::dtype::PlanDtype::I8 => sys::cudaDataType_t::CUDA_R_8I,
             dtype => return Err(anyhow!("cuBLASLt unsupported matrix dtype {dtype:?}")),
         };
         let raw = lt::create_matrix_layout(

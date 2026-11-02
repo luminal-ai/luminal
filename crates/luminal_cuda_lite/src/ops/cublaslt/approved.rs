@@ -132,6 +132,7 @@ pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
         ("F64", PlanDtype::F64),
         ("F16", PlanDtype::F16),
         ("Bf16", PlanDtype::Bf16),
+        ("I8", PlanDtype::I8),
     ] {
         if site.nodes_in_class_value(class, name).next().is_some() {
             return dtype;

@@ -577,6 +577,7 @@ fn dispatch_batch_configurations(broadcast: bool) {
     };
     for &(shared_a, shared_b) in sharing {
         for (dtype, input_rounding, narrow) in [
+            (DType::I8, None, false),
             (DType::F32, None, false),
             (DType::F64, None, false),
             (DType::Bf16, None, false),
@@ -730,7 +731,7 @@ fn dispatch_batch_configurations(broadcast: bool) {
     assert_eq!(
         witnesses.len(),
         // Each family has 64 base, 64 separate-C and 64 in-place-C witnesses.
-        sharing.len() * if ampere_or_newer { 1728 } else { 960 },
+        sharing.len() * if ampere_or_newer { 1920 } else { 1152 },
         "each storage/computation mode covers base, separate C and in-place C configurations"
     );
     let at = |d: LtDesc, batch: usize, row: usize, col: usize| {
@@ -741,6 +742,10 @@ fn dispatch_batch_configurations(broadcast: bool) {
             }
     };
     for ((_, alias, shared_a, shared_b), mut call) in witnesses {
+        if call.a_dtype == PlanDtype::I8 {
+            support::int8::execute_call(&stream, &call, alias);
+            continue;
+        }
         if call.computation == luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float64 {
             support::fp64::execute_call(&stream, &call, alias);
             continue;

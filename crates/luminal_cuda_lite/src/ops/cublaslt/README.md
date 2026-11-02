@@ -11,10 +11,10 @@ the elected call and dispatches its descriptors unchanged.
 | --- | --- |
 | `approved_constructors.egg` | Flat vendor layout data, storage descriptors, optional arguments, configuration and expression-frame types |
 | `approved_rules.egg` | Rank-two expression recognition, layout readings, precision proofs, and complete admission |
-| `scalar_rules.egg` | Authored alpha/beta scaling and exact FP32/FP64 scalar storage/pointer proofs |
+| `scalar_rules.egg` | Authored alpha/beta scaling and exact FP16/FP32/FP64 scalar storage/pointer proofs |
 | `call_inputs.egg` | Assemble approved matrix/scalar reads in one canonical order |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 3,648 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 3,776 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -57,8 +57,8 @@ including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **3,648 complete configurations**: 1,824 for host scalar
-pointers and 1,824 for device scalar pointers. Each pointer mode admits:
+The table contains **3,776 complete configurations**: 1,888 for host scalar
+pointers and 1,888 for device scalar pointers. Each pointer mode admits:
 
 - 1,344 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
   FP16 A/B storage, plus explicit TF32, FP16 or BF16 input conversion over F32
@@ -66,6 +66,9 @@ pointers and 1,824 for device scalar pointers. Each pointer mode admits:
   16 A/B order/transpose combinations, absent/present F32 C, and seven
   destination/epilogue combinations (default in either D order; bias, ReLU,
   ReLU+bias, GELU or GELU+bias with column-major D).
+- 64 INT8-storage rows: signed I8 A/B explicitly widened to FP32, FP32
+  computation/scalars/C/D, default epilogue, 16 A/B order/transpose
+  combinations, absent/present C and either D order.
 - 192 narrow-output rows: matching BF16 or FP16 A/B storage, FP32 arithmetic,
   and an authored final cast to the matching narrow dtype. Each has 16 A/B
   order/transpose combinations, absent/present matching narrow C, and default
@@ -83,7 +86,7 @@ Native FP16 computation uses FP16 scalars. All FP32 accumulation modes use FP32
 scalars; FP64 computation uses FP64 scalars.
 Alpha and beta are general values in that arithmetic dtype; absent C still
 requires a literal beta zero in the same dtype. Storage never chooses arithmetic
-precision. Only an authored exact widening permits direct BF16/FP16 readings.
+precision. Only an authored exact widening permits direct BF16/FP16/I8 A/B readings.
 Casts between multiplication,
 reduction, C addition, bias addition and activation remain boundaries; earlier
 narrowing is preserved. A separate output-storage proof recognizes an authored
@@ -137,6 +140,47 @@ separate elementwise multiplication. A present C remains structurally present,
 including when beta is zero; this does not grant extra alias permissions or
 remove the scalar's graph dependency. Tests compare finite numerical inputs
 and retain explicit cast boundaries.
+
+### Signed INT8 storage with FP32 arithmetic
+
+An authored `I8 -> F32` cast on each matrix operand permits
+`CublasLtFloat32Computation` to read signed byte A/B storage directly. For example:
+
+```rust,ignore
+let out = a_i8.cast(DType::F32).matmul(b_i8.cast(DType::F32));
+```
+
+Every signed INT8 value widens exactly to FP32. The call absorbs these two
+widening materializations while preserving earlier narrowing in the storage
+source. Integer multiplication/reduction followed by a final F32 cast does not
+qualify. Unsigned inputs, mixed A/B storage, and implicit quantization scales or
+zero points have no approved rows. Scaling or offsets before the contraction
+remain at their authored positions.
+
+The [vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
+explicitly permits `CUBLAS_COMPUTE_32F`, `CUDA_R_8I` A/B, FP32 alpha/beta, and
+FP32 C/D. This is distinct from INT32 accumulation with FP32 scaling. The 128
+complete rows admit only the default epilogue, both scalar pointer modes,
+both destination orders, every A/B order/transpose combination, and optional
+FP32 C. New storage permission is specific to A/B; INT8 C or bias must still
+materialize their FP32 widenings. Final output casts and activations remain
+outside the call. All reduction schemes are permitted through the whitelist
+because both the computation and output are FP32.
+
+Ordinary and one-axis strided batches share the same flat descriptors and
+admission, including independently shared A/B, independent C/D pitches,
+separate results and in-place accumulation. CPU literals and GPU tensor
+coefficients use the existing FP32 scalar ABI and remain live during replay.
+Native CUDA 12.8/A100 probes validate transposes, row/column orders, odd padded
+pitches, strided/shared batches and both scalar pointer modes. The IMMA-specific
+multiple-of-four geometry restrictions do not apply to the tested FMA route.
+
+The observed implementations report FMA instructions, INT8 inputs and FP32
+accumulators through the [numerical implementation flags](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltnumericalimplflags-t).
+This feature makes no integer Tensor Core performance promise. It avoids
+separate FP32 input buffers; library availability remains descriptor-dependent,
+and preparation refuses unsupported candidates. FP32 reassociation/FMA and
+zero-coefficient read suppression follow the existing practical BLAS policy.
 
 ### Native FP16 arithmetic and scalar storage
 
@@ -371,7 +415,7 @@ and legal leading dimension. This relation is used only for A and B. Every
 vendor descriptor still carries the common logical batch count; sharing is
 represented by stride zero, not a descriptor count of one. The independent
 [layout attributes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatrixlayoutattribute-t)
-are dispatched unchanged. Precision/storage proofs and the complete 3,648-row
+are dispatched unchanged. Precision/storage proofs and the complete 3,776-row
 configuration whitelist remain shared with ordinary batches.
 
 Read sharing never publishes a disjoint matrix or destination proof. C and D

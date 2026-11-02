@@ -90,6 +90,7 @@ fn witness_graphs() -> Vec<luminal::prelude::egraph_serialize::EGraph> {
     let mut graphs = Vec::new();
     for (dtype, input_rounding, narrow, native_half) in [
         (DType::F16, None, false, true),
+        (DType::I8, None, false, false),
         (DType::F32, None, false, false),
         (DType::F64, None, false, false),
         (DType::Bf16, None, false, false),
@@ -224,6 +225,26 @@ pub fn tf32_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
             .collect()
     });
     table_registry(TABLE.as_str())
+}
+
+pub fn int8_registry(device: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|index| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains("(I8) (I8)")
+                        && key.contains(if index == 1 {
+                            "CublasLtDeviceScalarPointerMode"
+                        } else {
+                            "CublasLtHostScalarPointerMode"
+                        })
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(device)])
 }
 
 pub fn fp16_registry(device: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {

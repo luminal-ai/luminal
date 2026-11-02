@@ -8,6 +8,7 @@ use luminal_cuda_lite::{CudaRuntime, HostBuffer};
 use luminal_cuda_lite::CudaArena;
 pub mod fp16;
 pub mod fp64;
+pub mod int8;
 mod memory;
 pub use memory::Allocation;
 

@@ -126,7 +126,7 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
                         assert_eq!(*semantic, physical);
                     }
                 }
-                PlanDtype::Bf16 | PlanDtype::F16 => assert!(
+                PlanDtype::I8 | PlanDtype::Bf16 | PlanDtype::F16 => assert!(
                     has_cast(&egraph, semantic, &physical, "F32"),
                     "narrow storage must be the source of this exact operand's widening cast"
                 ),
