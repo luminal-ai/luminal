@@ -389,7 +389,7 @@ fn native_epilogue_registry(
     )
 }
 
-fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredOp> {
+pub fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredOp> {
     use luminal::egglog_snippet::EgglogSnippet;
     use luminal::layout_ir::LayoutIrOp;
     #[derive(Debug)]

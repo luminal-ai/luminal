@@ -209,8 +209,9 @@ order/transpose combinations, and absent/present C. Default epilogues support
 both destination orders. Bias, ReLU, ReLU+bias, GELU and GELU+bias require
 column-major D; bias is a packed F16 vector broadcast along the vendor matrix's
 columns. Separate destinations and in-place accumulation share these rows.
-The 128 default rows also support one-axis strided batches, including
-independently shared A/B. Batched epilogues remain outside admission.
+The 128 default rows and 128 no-bias ReLU/GELU rows also support one-axis
+strided batches, including independently shared A/B. Batched bias remains
+outside admission.
 Subsequent casts remain separate.
 
 Native ReLU and ReLU+bias follow the vendor NaN policy above. CUDA 12.8/A100
@@ -461,10 +462,29 @@ retain the full padded, non-overlapping batch footprint, including in-place
 calls. Thus a shared A/B reading cannot authorize an overlapping output or a
 shared C/D write. Partial matrix overlap remains unsupported.
 
-Batched admission currently covers a product and product+C, without
-bias or activation. C and D share shape, dtype, order and count but may have
-independent leading dimensions and batch strides. In-place emission additionally
-requires identical complete descriptions and layouts. Multiple batch axes and
+Batched admission covers a scaled product and scaled product+C, optionally
+followed by ReLU or GELU. It reuses the shared typed activation recognizers,
+including both frontend GELU spellings, and the existing precision-specific
+storage/scalar proofs. Recognition describes the complete expression before its
+final output cast. Intervening casts remain arithmetic boundaries: rounding
+before activation cannot be moved after activation. Native narrow-output GELU
+and INT8 epilogues remain excluded by the existing whitelist.
+
+Activations require column-major vendor D. Dense row-major logical outputs use
+a pure `[batch,m,n] -> [batch,n,m]` view of the complete activated expression,
+with `B^T`, `A^T` and optional `C^T` as operands. The inverse view restores the
+logical result, preserving the batch coordinate throughout. These are existing
+`LogicalIndexMapApply` views, not materialized transposes. Both direct and
+transposed frames join the same complete whitelist rows; no new configurations
+or dispatch modes are needed. The 1,152 no-bias activation rows admit batched
+calls as well as ordinary calls, including 576 in-place configurations.
+Exact transpose views are recognized after cast commuting, and two transposes
+cancel. This keeps the same equivalence available below explicit casts and
+prevents inverse result views from creating an unbounded cast/view ladder.
+
+C and D share shape, dtype, order and count but may have independent leading
+dimensions and batch strides. In-place emission additionally requires identical
+complete descriptions and layouts. Native batched bias, multiple batch axes and
 arbitrary flattening are not part of this grammar. Unproved cases retain generic
 operations/materialization.
 

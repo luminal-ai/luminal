@@ -193,6 +193,25 @@
 ; A pure last-two-axis permutation: [batch,r,c] -> [batch,c,r].
 ; Its inverse restores the original tensor; the batch coordinate stays axis 2.
 ; Use existing IndexMapApply views, with no new executable transpose operation.
+; Recognize the same views introduced by cast commuting, not only demanded
+; operands. Otherwise inverse views can grow an unbounded cast/view ladder.
+(rule
+  ((= ?source_shape (shape-of ?source))
+   (= ?source_shape (ShapeLit (IntExprCons ?batch (IntExprCons ?rows (IntExprCons ?columns (IntExprNil))))))
+   (= ?transposed_shape (ShapeLit (IntExprCons ?batch (IntExprCons ?columns (IntExprCons ?rows (IntExprNil))))))
+   (= ?transposed (LogicalIndexMapApply ?source
+     (IndexMapLit (IntExprCons (CoordVar ?transposed_shape 2)
+       (IntExprCons (CoordVar ?transposed_shape 0)
+         (IntExprCons (CoordVar ?transposed_shape 1) (IntExprNil)))) ?source_shape) ?transposed_shape)))
+  ((cublaslt-strided-batch-transpose ?source ?transposed))
+  :ruleset backend
+  :name "cublaslt: recognize pure batched matrix axis transpose views")
+(rule
+  ((cublaslt-strided-batch-transpose ?source ?transposed)
+   (cublaslt-strided-batch-transpose ?transposed ?restored))
+  ((union ?source ?restored))
+  :ruleset backend
+  :name "cublaslt: cancel inverse batched matrix axis transpose views")
 (rule
   ((cublaslt-strided-batch-transpose-demand ?source)
    (= ?source_shape (shape-of ?source))
@@ -202,14 +221,23 @@
      (IndexMapLit (IntExprCons (CoordVar ?transposed_shape 2)
        (IntExprCons (CoordVar ?transposed_shape 0)
          (IntExprCons (CoordVar ?transposed_shape 1) (IntExprNil)))) ?source_shape) ?transposed_shape))
-   (union ?source (LogicalIndexMapApply ?transposed
-     (IndexMapLit (IntExprCons (CoordVar ?source_shape 2)
-       (IntExprCons (CoordVar ?source_shape 0)
-         (IntExprCons (CoordVar ?source_shape 1) (IntExprNil)))) ?transposed_shape) ?source_shape))
    (cublaslt-strided-batch-transpose ?source ?transposed)
    (cublaslt-strided-batch-transpose ?transposed ?source))
   :ruleset backend
-  :name "cublaslt: transpose batched matrix axes with a proven inverse")
+  :name "cublaslt: construct a demanded batched matrix axis transpose")
+(rule
+  ((cublaslt-strided-batch-expression ?expression ?A ?B ?C ?batch ?m ?n ?k ?epilogue ?alpha ?beta)
+   (cublaslt-strided-batch-activation-epilogue ?epilogue)
+   (cublaslt-output-storage-reading ?expression ?stored_expression)
+   (cublaslt-strided-batch-transpose ?stored_expression ?api_expression)
+   (= ?source_shape (shape-of ?stored_expression))
+   (= ?transposed_shape (shape-of ?api_expression)))
+  ((union ?stored_expression (LogicalIndexMapApply ?api_expression
+     (IndexMapLit (IntExprCons (CoordVar ?source_shape 2)
+       (IntExprCons (CoordVar ?source_shape 0)
+         (IntExprCons (CoordVar ?source_shape 1) (IntExprNil)))) ?transposed_shape) ?source_shape)))
+  :ruleset backend
+  :name "cublaslt: restore the complete activated batch through its inverse view")
 (rule
   ((cublaslt-strided-batch-expression ?expression ?A ?B ?C ?batch ?m ?n ?k ?epilogue ?alpha ?beta)
    (cublaslt-strided-batch-activation-epilogue ?epilogue)
