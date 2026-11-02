@@ -15,7 +15,8 @@
 ; is always allowed; the mask permits schemes without requiring split-K.
 ; Accumulation and scalars use the declared FP16, FP32 or FP64 computation contract.
 ; TF32, FP16 and BF16 input conversion over F32 storage have distinct computation variants.
-; ReLU ignores the sign of zero; GELU accepts the vendor approximation.
+; ReLU accepts the selected vendor kernel's NaN handling and sign of zero.
+; GELU accepts the vendor approximation.
 ; Activation and bias epilogues require column-major D.
 ; Alpha/beta values are separately proved call arguments; absent C requires beta zero.
 
@@ -41586,8 +41587,6 @@
 
 ; Native FP16 bias and GELU epilogues. Half arithmetic, storage and scalars;
 ; column-major destination, independent A/B order/transpose, C absent or present.
-; Native half ReLU suppresses NaNs on CUDA 12.8/A100, unlike the frontend.
-; ReLU and ReLU+bias are deliberately unwhitelisted; retain an explicit ReLU.
 (cublaslt-approved-configuration
   (CublasLtConfigurationOf
     (CublasLtFloat16Computation) (F16)
@@ -43505,6 +43504,1416 @@
     (CublasLtBiasDataTypeOf (F16))
     (CublasLtDeviceScalarPointerMode)
     (CublasLtGaussianErrorLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+; Native FP16 ReLU and ReLU+bias. The selected cuBLASLt kernel determines
+; whether a NaN propagates or becomes zero; admission explicitly accepts both.
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtHostScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtRowMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtRowMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtNoTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtNoTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtNoCMatrixDataType) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtNoBiasDataType)
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearEpilogue)
+    (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
+    (CublasLtTranspose) (CublasLtTranspose)
+    (CublasLtReductionSchemeMaskAll)))
+
+(cublaslt-approved-configuration
+  (CublasLtConfigurationOf
+    (CublasLtFloat16Computation) (F16)
+    (F16) (F16) (CublasLtCMatrixDataTypeOf (F16)) (F16)
+    (CublasLtBiasDataTypeOf (F16))
+    (CublasLtDeviceScalarPointerMode)
+    (CublasLtRectifiedLinearBiasEpilogue)
     (CublasLtColumnMajor) (CublasLtColumnMajor) (CublasLtColumnMajor)
     (CublasLtTranspose) (CublasLtTranspose)
     (CublasLtReductionSchemeMaskAll)))

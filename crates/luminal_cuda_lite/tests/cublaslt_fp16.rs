@@ -431,10 +431,6 @@ fn half_epilogues_keep_typed_bias_scalars_and_column_destinations() {
                     .map(|op| op.resolve(&Default::default()))
                     .filter(matching)
                     .collect();
-                if activation == 1 {
-                    assert!(separate.is_empty() && tied.is_empty());
-                    continue;
-                }
                 assert!(
                     !separate.is_empty() && !tied.is_empty(),
                     "bias={bias}, activation={activation}, device={device}"
@@ -572,8 +568,7 @@ fn run_compiled_half_case(
     };
     let expected_activation = match activation {
         0 => LtActivation::Identity,
-        // Native half ReLU suppresses NaNs, so this stays a separate op.
-        1 => LtActivation::Identity,
+        1 => LtActivation::RectifiedLinear,
         _ => LtActivation::GaussianErrorLinear,
     };
     let mut a_values: Vec<_> = (0..if batched { 16 } else { 8 })
@@ -609,8 +604,7 @@ fn run_compiled_half_case(
         .into_iter()
         .filter(|row| {
             row.label() != "ReduceSumGeneric"
-                && (activation == 1
-                    || !matches!(row.label(), "AddFunctionalGeneric" | "MulFunctionalGeneric"))
+                && !matches!(row.label(), "AddFunctionalGeneric" | "MulFunctionalGeneric")
                 && row.label()
                     != if alias {
                         "CublasLtCall"
@@ -751,7 +745,13 @@ fn run_compiled_half_case(
             .collect();
         for (actual, expected) in actual.iter().zip(expected) {
             if expected.is_nan() {
-                assert!(actual.is_nan());
+                if expected_activation == LtActivation::RectifiedLinear {
+                    // Approved ReLU uses the vendor kernel's NaN policy;
+                    // both propagation and suppression to zero are accepted.
+                    assert!(actual.is_nan() || *actual == 0.0);
+                } else {
+                    assert!(actual.is_nan());
+                }
             } else if expected.is_infinite() {
                 assert_eq!(*actual, expected);
             } else if expected_activation == LtActivation::GaussianErrorLinear {
@@ -909,8 +909,10 @@ fn half_gelu_preserves_nan_and_infinity_classifications() {
 
 #[cfg(feature = "device")]
 #[test]
-fn half_relu_remains_decomposed_and_preserves_nan_and_subnormal_c() {
-    for alias in [false, true] {
-        run_compiled_half_case(false, alias, 4, false, 1);
+fn half_relu_accepts_vendor_nan_policy_and_preserves_other_special_values() {
+    for bias in [false, true] {
+        for alias in [false, true] {
+            run_compiled_half_case(false, alias, 4, bias, 1);
+        }
     }
 }

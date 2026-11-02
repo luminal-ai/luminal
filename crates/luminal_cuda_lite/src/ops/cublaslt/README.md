@@ -14,7 +14,7 @@ the elected call and dispatches its descriptors unchanged.
 | `scalar_rules.egg` | Authored alpha/beta scaling and exact FP16/FP32/FP64 scalar storage/pointer proofs |
 | `call_inputs.egg` | Assemble approved matrix/scalar reads in one canonical order |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 3,968 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 4,096 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -57,8 +57,8 @@ including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **3,968 complete configurations**: 1,984 for host scalar
-pointers and 1,984 for device scalar pointers. Each pointer mode admits:
+The table contains **4,096 complete configurations**: 2,048 for host scalar
+pointers and 2,048 for device scalar pointers. Each pointer mode admits:
 
 - 1,344 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
   FP16 A/B storage, plus explicit TF32, FP16 or BF16 input conversion over F32
@@ -74,11 +74,10 @@ pointers and 1,984 for device scalar pointers. Each pointer mode admits:
   order/transpose combinations, absent/present matching narrow C, and default
   in either D order or ReLU with column-major D. Bias and GELU epilogues
   have no approved rows for this FP32-compute narrow-output family.
-- 160 native FP16 rows: FP16 arithmetic, matrix storage and alpha/beta,
-  with 16 A/B order/transpose combinations, absent/present FP16 C, and five
+- 224 native FP16 rows: FP16 arithmetic, matrix storage and alpha/beta,
+  with 16 A/B order/transpose combinations, absent/present FP16 C, and seven
   destination/epilogue combinations: default in either D order, plus bias,
-  GELU or GELU+bias with column-major D and FP16 bias. Native ReLU is excluded
-  because its NaN behavior differs from the frontend.
+  ReLU, ReLU+bias, GELU or GELU+bias with column-major D and FP16 bias.
 - 224 FP64-output rows: FP64 A/B/C/D storage, computation and alpha/beta,
   with 16 A/B order/transpose combinations, absent/present C, and seven
   destination/epilogue combinations: default in either D order, plus bias,
@@ -96,10 +95,22 @@ final cast of the complete FP32 expression. Pure-view transposition carries that
 whole rounded expression into the API frame and back to the caller's output.
 
 F32 reduction reassociation and FMA contraction follow the existing compiler
-policy. ReLU accepts a difference in the sign of zero; the FP32-output GELU rows
-accept the vendor tanh approximation. These are explicit admission policies,
-not claims of bitwise equivalence. FP8 and mixed A/B storage have no approved
-configurations.
+policy. ReLU accepts a difference in the sign of zero and the selected vendor
+kernel's NaN handling: a NaN may propagate or become zero. This explicit
+relaxation applies to all approved ReLU epilogues, including native FP16 and
+FP32 computation with narrow storage/output. NaN behavior can vary with the
+algorithm and geometry; arithmetic dtype alone does not select it. Generic and
+reference ReLU remain NaN-preserving, so fused and decomposed paths need not
+agree on NaNs under this admission policy. Finite values and infinities retain
+the ordinary ReLU contract. cuBLASLt describes ReLU as
+[`max(x, 0)`](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltepilogue-t)
+without an explicit NaN-propagation guarantee, and an
+[NVIDIA forum report](https://forums.developer.nvidia.com/t/incorrect-result-of-cublasltmatmul-with-cublaslt-epilogue-relu-when-input-is-nan/329783)
+records the same NaN-to-zero behavior. Strict fused NaN propagation is deferred.
+
+The FP32-output GELU rows accept the vendor tanh approximation. These are
+explicit admission policies, not claims of bitwise equivalence. FP8 and mixed
+A/B storage have no approved configurations.
 
 ### General alpha and beta
 
@@ -193,22 +204,22 @@ half computation; `a.cast(DType::F32).matmul(b.cast(DType::F32))` retains FP32
 computation, even if the result is subsequently cast to F16. Storage alone or a
 final output cast never authorizes reducing arithmetic precision.
 
-The 320 complete rows cover both scalar pointer modes, all 16 A/B
+The 448 complete rows cover both scalar pointer modes, all 16 A/B
 order/transpose combinations, and absent/present C. Default epilogues support
-both destination orders. Bias, GELU and GELU+bias require
+both destination orders. Bias, ReLU, ReLU+bias, GELU and GELU+bias require
 column-major D; bias is a packed F16 vector broadcast along the vendor matrix's
 columns. Separate destinations and in-place accumulation share these rows.
 The 128 default rows also support one-axis strided batches, including
 independently shared A/B. Batched epilogues remain outside admission.
 Subsequent casts remain separate.
 
-Native ReLU and ReLU+bias are deliberately unwhitelisted. On CUDA 12.8/A100,
-all returned native half algorithms in the special-value probe suppressed NaNs
-to zero, while the frontend's ordered-select ReLU preserves them. This is a
-semantic difference, beyond the rounding/association policy. ReLU graphs still
-use native FP16 GEMM or bias followed by the separate NaN-preserving activation;
-no input-finiteness assumption or algorithm-dependent exception is introduced.
-Bias and GELU propagate NaNs in the probe and have direct regression coverage.
+Native ReLU and ReLU+bias follow the vendor NaN policy above. CUDA 12.8/A100
+probes found both NaN-preserving and NaN-suppressing kernels for native half
+computation and for FP32 computation with FP16 storage/output. Tests require
+fused epilogues with host/device scalars, compare finite results against the
+reference, and accept either NaN or zero when a ReLU input is NaN. Independent
+C outputs retain their original bits, including NaNs. Bias and GELU retain
+their separate special-value regression coverage.
 
 Host literals are explicit F32 constants cast to F16. Decoding performs that
 same nearest-even conversion once and retains the two-byte payload in a distinct
@@ -442,7 +453,7 @@ and legal leading dimension. This relation is used only for A and B. Every
 vendor descriptor still carries the common logical batch count; sharing is
 represented by stride zero, not a descriptor count of one. The independent
 [layout attributes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatrixlayoutattribute-t)
-are dispatched unchanged. Precision/storage proofs and the complete 3,968-row
+are dispatched unchanged. Precision/storage proofs and the complete 4,096-row
 configuration whitelist remain shared with ordinary batches.
 
 Read sharing never publishes a disjoint matrix or destination proof. C and D
