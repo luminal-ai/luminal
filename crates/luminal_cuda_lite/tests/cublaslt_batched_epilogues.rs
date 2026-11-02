@@ -731,20 +731,23 @@ mod execution {
             .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
             .collect();
         assert!(!table.is_empty(), "{case:?}");
+        // Materialized casts/views are legal production alternatives. Exclude
+        // them here to require fused rounding and native single-matrix sharing.
         whitelist::table_registry(Box::leak(table.into_boxed_str()))
             .into_iter()
             .filter(|row| {
-                !matches!(
+                matches!(
                     row.label(),
-                    "AddFunctionalGeneric"
-                        | "MulFunctionalGeneric"
-                        | "ReduceSumGeneric"
-                        | "IndexMapApplyMaterialize"
+                    "IndexMapApplyViewGeneric"
+                        | "ConstantGeneric"
+                        | "CublasLtCall"
+                        | "CublasLtAccumulateInPlace"
                 )
             })
             .collect()
     }
     fn run(case: Case, alias: bool) {
+        eprintln!("compiled batch activation: {case:?}, alias={alias}");
         let f = fixture(case);
         let mut bindings = CudaBindings::new();
         for t in &f.inputs {
@@ -881,8 +884,16 @@ mod execution {
                 } else {
                     case.shared
                 };
-                assert_eq!(call.a.batch_stride_in_elements == 0, sharing.0);
-                assert_eq!(call.b.batch_stride_in_elements == 0, sharing.1);
+                assert_eq!(
+                    call.a.batch_stride_in_elements == 0,
+                    sharing.0,
+                    "{case:?}: {call:?}"
+                );
+                assert_eq!(
+                    call.b.batch_stride_in_elements == 0,
+                    sharing.1,
+                    "{case:?}: {call:?}"
+                );
                 assert_eq!(
                     matches!(call.scalars, LtScalars::Device { .. }),
                     case.device

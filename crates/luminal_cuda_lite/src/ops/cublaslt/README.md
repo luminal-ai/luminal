@@ -488,6 +488,18 @@ complete descriptions and layouts. Native batched bias, multiple batch axes and
 arbitrary flattening are not part of this grammar. Unproved cases retain generic
 operations/materialization.
 
+`cublaslt_batched_epilogues` proves all 1,152 no-bias activation configurations
+and executes all 1,728 separate/in-place batched witnesses against independent
+arithmetic on CUDA 12.8/A100. Compiled reference comparisons cover the ten
+floating storage/computation families, both GELU spellings, shared A/B/both,
+host/device coefficients, retained C, final narrowing and symbolic batch replay.
+These execution tests restrict the selectable registry to fused calls, pure
+views and scalar constants, so a materialized operand cannot conceal a missing
+shared-storage proof. The
+production registry retains its legal materialization alternatives. Admission
+tests also cover complete-row ablation, cast boundaries and independent C/D
+pitches. The explicit whitelist remains 4,096 rows.
+
 Experimental literal-expression discovery is separately scheduled through
 `element-stride-discovery`; production schedules do not run it. Native stride
 composition handles permutations, broadcasts, zero selections and diagonals.
