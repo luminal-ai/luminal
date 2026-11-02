@@ -525,6 +525,16 @@ The flat descriptors, dtype/precision proofs, alpha/beta arguments, complete
 whitelist tuples and dispatch are unchanged. In particular, this does not add
 native bias epilogues or admit the excluded narrow-output bias/GELU tuples.
 
+Broadcast-C regressions prove and execute all 1,280 existing no-bias C-present
+configurations on CUDA 12.8/A100. Reference comparisons cover both vector axes,
+shared vectors/matrices, all eleven storage/computation families, live device
+coefficients, padded vector pitches, retained read-only inputs and changing
+batch counts. Large FP16/BF16 cancellation fixtures check that C is added before
+the authored final narrowing. Negative tests reject incomplete whitelist rows,
+partial vector/matrix overlap, non-packed vectors and writable broadcast layouts.
+The whitelist remains 4,096 rows; these are additional geometry proofs for its
+existing tuples.
+
 `cublaslt_batched_epilogues` proves all 1,152 no-bias activation configurations
 and executes all 1,728 separate/in-place batched witnesses against independent
 arithmetic on CUDA 12.8/A100. Compiled reference comparisons cover the ten

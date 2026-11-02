@@ -241,6 +241,8 @@ struct Case {
     c_reading: CReading,
     c_shared: bool,
     cancellation: bool,
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    c_padding: usize,
 }
 impl Case {
     fn new(family: Family) -> Self {
@@ -255,6 +257,7 @@ impl Case {
             c_reading: CReading::Matrix,
             c_shared: false,
             cancellation: false,
+            c_padding: 0,
         }
     }
 }
@@ -796,7 +799,22 @@ mod execution {
         let f = fixture(case);
         let mut bindings = CudaBindings::new();
         for t in &f.inputs {
-            bindings.input(t.id);
+            if case.c_padding > 0 && f.c.is_some_and(|c| c.id == t.id) {
+                let minor = if case.c_reading == CReading::RowVector {
+                    N
+                } else {
+                    M
+                };
+                bindings.input_with(
+                    t.id,
+                    luminal_cuda_lite::bindings::BoundaryLayout::strided_literal([
+                        (minor + case.c_padding) as i64,
+                        1,
+                    ]),
+                );
+            } else {
+                bindings.input(t.id);
+            }
         }
         if let Some(c) = f.c {
             let i = f.inputs.iter().position(|t| t.id == c.id).unwrap();
@@ -807,7 +825,22 @@ mod execution {
                     FreedBy::Caller,
                 );
             }
-            bindings.output(c.id);
+            if case.c_padding > 0 {
+                let minor = if case.c_reading == CReading::RowVector {
+                    N
+                } else {
+                    M
+                };
+                bindings.output_with(
+                    c.id,
+                    luminal_cuda_lite::bindings::BoundaryLayout::strided_literal([
+                        (minor + case.c_padding) as i64,
+                        1,
+                    ]),
+                );
+            } else {
+                bindings.output(c.id);
+            }
         }
         if case.c_reading == CReading::ColumnVector {
             bindings.output_with(
@@ -918,7 +951,23 @@ mod execution {
                     }
                     (dtype, values)
                 };
-                data.insert(t.id, cuda_buffer(dtype, &values));
+                if case.c_padding > 0 && f.c.is_some_and(|c| c.id == t.id) {
+                    assert!(!case.c_shared && case.c_reading != CReading::Matrix);
+                    let minor = if case.c_reading == CReading::RowVector {
+                        N
+                    } else {
+                        M
+                    };
+                    let pitch = minor + case.c_padding;
+                    let mut physical = vec![777.0; (count - 1) * pitch + minor];
+                    for batch in 0..count {
+                        physical[batch * pitch..batch * pitch + minor]
+                            .copy_from_slice(&values[batch * minor..(batch + 1) * minor]);
+                    }
+                    data.insert(t.id, cuda_buffer(dtype, &physical));
+                } else {
+                    data.insert(t.id, cuda_buffer(dtype, &values));
+                }
                 ref_data.insert(t.id, reference_buffer(dtype, &values));
             }
             if execution.is_none() {

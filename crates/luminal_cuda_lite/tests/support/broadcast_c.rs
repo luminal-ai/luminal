@@ -79,9 +79,13 @@ fn packed_and_shared_c_descriptors_read_the_authored_vector_addresses() {
             for op in separate {
                 let call = op.resolve(&Default::default());
                 let Some(c) = call.c else { continue };
+                let minor = if reading == CReading::RowVector { N } else { M };
                 if call.activation != LtActivation::GaussianErrorLinear
                     || c.descriptor.ld != 0
                     || (c.descriptor.batch_stride_in_elements == 0) != shared
+                    // Packed copies are legal alternatives. This address
+                    // check specifically requires the original padded input.
+                    || (!shared && c.descriptor.batch_stride_in_elements != (minor + 5) as i64)
                 {
                     continue;
                 }
@@ -94,7 +98,6 @@ fn packed_and_shared_c_descriptors_read_the_authored_vector_addresses() {
                 )
                 .unwrap();
                 let transposed = call.m == N as i64;
-                let minor = if reading == CReading::RowVector { N } else { M };
                 for batch in 0..2 {
                     for row in 0..call.m as usize {
                         for col in 0..call.n as usize {
@@ -238,11 +241,7 @@ static WITNESSES: std::sync::LazyLock<std::collections::BTreeMap<String, LtCall>
                 .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
                 .collect();
             eprintln!("broadcast C witnesses: {family:?}");
-            for reading in [
-                CReading::RowVector,
-                CReading::ColumnVector,
-                CReading::Matrix,
-            ] {
+            for reading in [CReading::RowVector, CReading::ColumnVector] {
                 for ta in [false, true] {
                     for tb in [false, true] {
                         let mut case = Case::new(family);
@@ -328,7 +327,7 @@ mod execution {
             for reading in [CReading::RowVector, CReading::ColumnVector] {
                 let mut case = Case::new(family);
                 case.c_reading = reading;
-                case.c_shared = reading == CReading::Matrix || i % 2 == 0;
+                case.c_shared = i % 2 == 0;
                 case.device = i % 2 == 0;
                 case.transposed = (true, i % 2 == 0);
                 case.shared = (i % 2 == 0, true);
@@ -356,6 +355,14 @@ mod execution {
         case.c_shared = true;
         case.device = true;
         crate::execution::run(case, false);
+        for (index, reading) in [(8, CReading::RowVector), (3, CReading::ColumnVector)] {
+            let mut case = Case::new(Family::all()[index]);
+            case.c_reading = reading;
+            case.c_padding = 5;
+            case.device = true;
+            case.batch = 'b'.into();
+            crate::execution::run(case, false);
+        }
     }
 
     #[test]
@@ -374,6 +381,26 @@ mod execution {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn shared_full_c_reads_original_matrix_for_all_storage_modes() {
+        let _execution = crate::execution::DEVICE_EXECUTION.lock().unwrap();
+        for (i, family) in families().into_iter().enumerate() {
+            let mut case = Case::new(family);
+            case.c_shared = true;
+            case.device = true;
+            case.shared = (i % 2 == 0, true);
+            case.transposed = (true, true);
+            case.activation = if family.input == DType::I8 {
+                0
+            } else if family.arithmetic == family.output {
+                2
+            } else {
+                1
+            };
+            crate::execution::run(case, false);
         }
     }
 }
