@@ -171,11 +171,33 @@ fn int64_gcd_finishes_the_worst_case_fibonacci_pairs() {
         (-12, 18),
         (18, -24),
     ];
-    // The attested range is the whole I64 range but `i64::MIN`, whose
-    // magnitude I64 cannot hold (`|rhs|` would overflow).
+    // `i64::MIN` has its own test below: its magnitude is not an I64.
     let actual = run_gcd(TorchDType::Long, &pairs, (-i64::MAX, i64::MAX));
     let expected = pairs.iter().map(|&(a, b)| gcd(a, b)).collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+/// Torch's int64 gcd is the true gcd wrapped to I64: `gcd(MIN, 0)` is
+/// `2^63`, which wraps to MIN. As a divisor, MIN's magnitude once wrapped to
+/// MIN and clamped to 1, which ended Euclid early: gcd(MAX, MIN) came out
+/// as MIN instead of 1 (LUM-1134).
+#[test]
+fn int64_gcd_at_the_minimum_matches_torch() {
+    let (min, max) = (i64::MIN, i64::MAX);
+    let cases = [
+        ((max, min), 1),
+        ((min, max), 1),
+        ((6, min), 2),
+        ((min, 6), 2),
+        ((-1, min), 1),
+        ((min, -1), 1),
+        ((0, min), min),
+        ((min, 0), min),
+        ((min, min), min),
+    ];
+    let pairs = cases.map(|(pair, _)| pair);
+    let actual = run_gcd(TorchDType::Long, &pairs, (min, max));
+    assert_eq!(actual, cases.map(|(_, expected)| expected));
 }
 
 #[test]

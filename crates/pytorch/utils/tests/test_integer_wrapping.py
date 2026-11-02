@@ -167,3 +167,13 @@ def test_integer_scatter_accumulation_wraps_like_eager(stage_one_only, fn, dtype
     """Scatter accumulation runs in the data dtype: exact past 2^24 and
     wrapping on overflow; an integer mean floor-divides."""
     _run(Binary(fn), *_scatter_inputs(dtype))
+
+
+@pytest.mark.parametrize("dtype", WIDE)
+def test_integer_gcd_at_the_minimum_wraps_like_eager(stage_one_only, dtype):
+    """gcd takes abs(MIN) == MIN, as eager does, so gcd(MIN, 0) == MIN
+    rather than a refusal (LUM-1134)."""
+    a = _edges(dtype)
+    lhs = torch.cat([a, a, a])
+    rhs = torch.cat([a.flip(0), torch.zeros_like(a), a])
+    _run(Binary(torch.gcd), lhs, rhs)
