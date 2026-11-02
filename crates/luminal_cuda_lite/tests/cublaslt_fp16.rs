@@ -431,6 +431,10 @@ fn half_epilogues_keep_typed_bias_scalars_and_column_destinations() {
                     .map(|op| op.resolve(&Default::default()))
                     .filter(matching)
                     .collect();
+                if activation == 1 {
+                    assert!(separate.is_empty() && tied.is_empty());
+                    continue;
+                }
                 assert!(
                     !separate.is_empty() && !tied.is_empty(),
                     "bias={bias}, activation={activation}, device={device}"
@@ -453,12 +457,14 @@ fn half_epilogues_keep_typed_bias_scalars_and_column_destinations() {
 
 #[test]
 fn half_epilogues_require_the_complete_row_and_exact_bias_storage() {
-    let graph = epilogue_fixture(false, true, 1);
+    let graph = epilogue_fixture(false, true, 2);
     let (separate, _) = calls(&graph, WHITELIST);
     let op = separate
         .iter()
         .find(|op| {
-            op.c.is_some() && op.bias.is_some() && op.activation == LtActivation::RectifiedLinear
+            op.c.is_some()
+                && op.bias.is_some()
+                && op.activation == LtActivation::GaussianErrorLinear
         })
         .unwrap();
     let key = whitelist::key(op);
@@ -528,7 +534,7 @@ fn run_compiled_half_case(
         )
         .unwrap()
     };
-    let device = source != 0;
+    let device = source != 0 && source != 4;
     let mut graph = Graph::new();
     let a = graph.tensor(if batched { vec![2, 2, 4] } else { vec![2, 4] }, DType::F16);
     let b = graph.tensor([4, 3], DType::F16);
@@ -537,8 +543,10 @@ fn run_compiled_half_case(
     let mut scalar_inputs = [None, None];
     let scalar_type = if source == 2 { DType::F32 } else { DType::F16 };
     let mut scalar = |index: usize, value: f32| {
-        if source == 0 || source == 3 && index == 0 {
-            graph.constant_f32(value).cast(DType::F16)
+        if source == 0 || source == 4 || source == 3 && index == 0 {
+            graph
+                .constant_f32(if source == 4 { 1.0 } else { value })
+                .cast(DType::F16)
         } else {
             let tensor = graph.tensor([] as [usize; 0], scalar_type);
             inputs.push(tensor);
@@ -564,14 +572,28 @@ fn run_compiled_half_case(
     };
     let expected_activation = match activation {
         0 => LtActivation::Identity,
-        1 => LtActivation::RectifiedLinear,
+        // Native half ReLU suppresses NaNs, so this stays a separate op.
+        1 => LtActivation::Identity,
         _ => LtActivation::GaussianErrorLinear,
     };
-    let a_values: Vec<_> = (0..if batched { 16 } else { 8 })
+    let mut a_values: Vec<_> = (0..if batched { 16 } else { 8 })
         .map(|i| (i % 5) as f32 / 4.0 - 0.5)
         .collect();
-    let b_values: Vec<_> = (0..12).map(|i| (i % 3) as f32 / 4.0 - 0.25).collect();
-    let c_values = vec![0.25; if batched { 12 } else { 6 }];
+    let mut b_values: Vec<_> = (0..12).map(|i| (i % 3) as f32 / 4.0 - 0.25).collect();
+    let mut c_values = vec![0.25; if batched { 12 } else { 6 }];
+    if source == 4 {
+        assert!(!batched);
+        a_values.fill(0.0);
+        b_values.fill(0.0);
+        c_values = vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            2.0_f32.powi(-24),
+            -2.0_f32.powi(-24),
+            -0.0,
+        ];
+    }
     let mut bindings = CudaBindings::new();
     for input in &inputs {
         bindings.input(input.id);
@@ -586,15 +608,15 @@ fn run_compiled_half_case(
     let registry = whitelist::fp16_epilogue_registry(device, bias, expected_activation)
         .into_iter()
         .filter(|row| {
-            !matches!(
-                row.label(),
-                "AddFunctionalGeneric" | "MulFunctionalGeneric" | "ReduceSumGeneric"
-            ) && row.label()
-                != if alias {
-                    "CublasLtCall"
-                } else {
-                    "CublasLtAccumulateInPlace"
-                }
+            row.label() != "ReduceSumGeneric"
+                && (activation == 1
+                    || !matches!(row.label(), "AddFunctionalGeneric" | "MulFunctionalGeneric"))
+                && row.label()
+                    != if alias {
+                        "CublasLtCall"
+                    } else {
+                        "CublasLtAccumulateInPlace"
+                    }
         })
         .collect();
     let mut runtime = CudaRuntime::load_with(&graph, bindings, registry).unwrap();
@@ -690,7 +712,7 @@ fn run_compiled_half_case(
             assert_eq!(calls[0].computation, LtComputation::Float16);
             assert_eq!(calls[0].activation, expected_activation);
             assert_eq!(calls[0].bias.is_some(), bias);
-            if bias || activation != 0 {
+            if bias || expected_activation != LtActivation::Identity {
                 assert_eq!(calls[0].d.order, LtOrder::Col);
             }
             assert_eq!(matches!(calls[0].scalars, LtScalars::Device { .. }), device);
@@ -728,7 +750,11 @@ fn run_compiled_half_case(
             .map(|v| v.to_f32())
             .collect();
         for (actual, expected) in actual.iter().zip(expected) {
-            if expected_activation == LtActivation::GaussianErrorLinear {
+            if expected.is_nan() {
+                assert!(actual.is_nan());
+            } else if expected.is_infinite() {
+                assert_eq!(*actual, expected);
+            } else if expected_activation == LtActivation::GaussianErrorLinear {
                 assert!(
                     (actual - expected).abs() <= 0.003 + 0.002 * expected.abs(),
                     "bias={bias}, activation={activation}, alias={alias}, source={source}: {actual} vs {expected}"
@@ -742,8 +768,16 @@ fn run_compiled_half_case(
         }
         let (kept, binding) = runtime.download(arena, c.id).unwrap();
         assert_eq!(
-            luminal_cuda_lite::layouts::dense_f32(&decode(&kept), &binding.layout).unwrap(),
+            luminal_cuda_lite::layouts::dense_f32(&decode(&kept), &binding.layout)
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
             c_values
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -788,21 +822,21 @@ fn half_gelu_requires_authored_coefficients_and_a_valid_sign_spelling() {
 
 #[cfg(feature = "device")]
 #[test]
-fn half_relu_preserves_nan_infinities_and_subnormal_c_values() {
+fn half_gelu_preserves_nan_and_infinity_classifications() {
     use cudarc::driver::DevicePtr;
     use luminal_cuda_lite::ops::cublaslt::device_call::{self, DeviceRange};
     let mut graph = Graph::new();
     let a = graph.tensor([2, 4], DType::F16);
     let b = graph.tensor([4, 3], DType::F16);
     let c = graph.tensor([2, 3], DType::F16);
-    let _out = (a.matmul(b) + c).relu();
+    let _out = (a.matmul(b) + c).gelu_fast_tanh_approximation();
     let (separate, _) = calls(&graph, WHITELIST);
     let call = separate
         .iter()
         .find(|op| {
             op.c.as_ref().is_some_and(|c| {
                 c.resolve(&Default::default()) == op.d.resolve(&Default::default())
-            }) && op.activation == LtActivation::RectifiedLinear
+            }) && op.activation == LtActivation::GaussianErrorLinear
                 && op.scalars.resolve().host_values() == Some((1.0, 1.0))
         })
         .unwrap()
@@ -817,7 +851,17 @@ fn half_relu_preserves_nan_infinities_and_subnormal_c_values() {
                 .flat_map(|x| x.to_ne_bytes())
                 .collect::<Vec<_>>()
         };
-        let mut payloads = vec![raw(&[0; 8]), raw(&[0; 12])];
+        // The vendor's transposed expression frame may exchange A and B.
+        // Size physical reads from their selected descriptors.
+        let zeros = |d: &luminal_cuda_lite::ops::cublaslt::exec::LtDesc| {
+            let major = if d.order == LtOrder::Row {
+                d.rows
+            } else {
+                d.cols
+            };
+            raw(&vec![0; (major * d.ld) as usize])
+        };
+        let mut payloads = vec![zeros(&call.a), zeros(&call.b)];
         payloads.resize(call.form.lit_arity(), Vec::new());
         payloads[call.c.unwrap().operand] = raw(&c_values);
         let buffers: Vec<_> = payloads
@@ -840,7 +884,7 @@ fn half_relu_preserves_nan_infinities_and_subnormal_c_values() {
         for (bytes, expected) in
             actual
                 .chunks_exact(2)
-                .zip([f32::NAN, f32::INFINITY, 0.0, 2.0_f32.powi(-24), 0.0, 0.0])
+                .zip([f32::NAN, f32::INFINITY, f32::NAN, 0.0, 0.0, 0.0])
         {
             let got = half::f16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).to_f32();
             assert!(
@@ -860,5 +904,13 @@ fn half_relu_preserves_nan_infinities_and_subnormal_c_values() {
                 raw(&c_values)
             );
         }
+    }
+}
+
+#[cfg(feature = "device")]
+#[test]
+fn half_relu_remains_decomposed_and_preserves_nan_and_subnormal_c() {
+    for alias in [false, true] {
+        run_compiled_half_case(false, alias, 4, false, 1);
     }
 }

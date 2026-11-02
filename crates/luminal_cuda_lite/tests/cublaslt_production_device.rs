@@ -266,8 +266,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 4096 } else { 2560 });
-    assert_eq!(aliases, if ampere_or_newer { 2048 } else { 1280 });
+    assert_eq!(ran, if ampere_or_newer { 3968 } else { 2432 });
+    assert_eq!(aliases, if ampere_or_newer { 1984 } else { 1216 });
 }
 
 #[test]
@@ -470,7 +470,7 @@ fn production_and_decomposed_search_are_measured_with_identical_precision_and_da
                     .0
                     .as_f32()
                     .unwrap(),
-                vec![8.0; 4096]
+                vec![8.0; 3968]
             );
         }
     }
