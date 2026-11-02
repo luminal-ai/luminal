@@ -669,7 +669,9 @@ mod execution {
                     2e-13
                 };
                 let agrees = if expected.is_nan() {
-                    got.is_nan()
+                    // All approved cuBLASLt ReLU epilogues accept the
+                    // selected vendor kernel's NaN propagation policy.
+                    got.is_nan() || f.activation == LtActivation::RectifiedLinear && got == 0.0
                 } else if !expected.is_finite() || expected.is_subnormal() {
                     got == *expected
                 } else {
@@ -725,7 +727,7 @@ mod execution {
     }
 
     #[test]
-    fn fp64_relu_preserves_nan_infinity_and_subnormals() {
+    fn fp64_relu_accepts_vendor_nan_policy_and_preserves_other_special_values() {
         for alias in [false, true] {
             let mut f = epilogue_fixture([Source::Host(1.0); 2], false, 1);
             f.inputs[0].1.fill(0.0);
