@@ -44,6 +44,10 @@ impl LogicalOp for LogicalCast {
             },
             EgglogSnippet {
                 category: SpliceCategory::Rewrites,
+                text: include_str!("rewrite.egg"),
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Rewrites,
                 text: include_str!("rewrite_view.egg"),
             },
             EgglogSnippet {
@@ -90,5 +94,39 @@ mod tests {
                 .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
                 .unwrap();
         }
+    }
+
+    /// A constant's round trip through a narrower dtype is the constant
+    /// exactly when the narrow dtype holds it: `1.0`, a power of two and a
+    /// small integer do; the GELU's `0.044715` does not in either; `257.0`
+    /// (nine significant bits) fits f16's eleven, not bf16's eight.
+    #[test]
+    fn an_exact_constants_round_trip_through_a_narrow_dtype_is_the_constant() {
+        let script = r#"
+(let one (LogicalConstant 1.0))
+(let one_bf16 (LogicalCast (LogicalCast one (Bf16)) (F32)))
+(let one_f16 (LogicalCast (LogicalCast one (F16)) (F32)))
+(let tiny (LogicalConstant 0.00000095367431640625))
+(let tiny_bf16 (LogicalCast (LogicalCast tiny (Bf16)) (F32)))
+(let gelu (LogicalConstant 0.044715))
+(let gelu_bf16 (LogicalCast (LogicalCast gelu (Bf16)) (F32)))
+(let gelu_f16 (LogicalCast (LogicalCast gelu (F16)) (F32)))
+(let nine_bits (LogicalConstant 257.0))
+(let nine_bits_bf16 (LogicalCast (LogicalCast nine_bits (Bf16)) (F32)))
+(let nine_bits_f16 (LogicalCast (LogicalCast nine_bits (F16)) (F32)))
+(run-schedule (saturate (run prop))
+  (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)))
+(check (= one_bf16 one))
+(check (= one_f16 one))
+(check (= tiny_bf16 tiny))
+(check (= (dtype-of one_bf16) (F32)))
+(fail (check (= gelu_bf16 gelu)))
+(fail (check (= gelu_f16 gelu)))
+(fail (check (= nine_bits_bf16 nine_bits)))
+(check (= nine_bits_f16 nine_bits))
+"#;
+        new_egraph()
+            .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
+            .unwrap();
     }
 }

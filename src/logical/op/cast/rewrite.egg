@@ -1,0 +1,31 @@
+; Rewrite : an exact constant's round trip through a narrower dtype is the
+; constant. A typed scalar is recorded as the f32 constant cast to its
+; dtype (`scalar_tensor(1.0, bf16)`), and torch's opmath widens it back
+; before the op: `(LogicalCast (LogicalCast (LogicalConstant 1.0) (Bf16))
+; (F32))`. A chain recorded at f32 has `(LogicalConstant 1.0)`. When the
+; value is exactly representable in the narrow dtype (`exact-in-bf16` /
+; `exact-in-f16`, partial primitives), the two are one tensor: same dtype
+; (F32 by the constant's dtype rule), same shape (rank 0). An inexact
+; constant (0.044715) keeps its rounding.
+(rule
+  (
+    (= ?wide (LogicalCast (LogicalCast (LogicalConstant ?v) (Bf16)) (F32)))
+    (= ?v (exact-in-bf16 ?v))
+  )
+  (
+    (union ?wide (LogicalConstant ?v))
+  )
+  :ruleset main_ruleset
+  :name "cast/rewrite: an exact constant's round trip through Bf16 is the constant"
+)
+(rule
+  (
+    (= ?wide (LogicalCast (LogicalCast (LogicalConstant ?v) (F16)) (F32)))
+    (= ?v (exact-in-f16 ?v))
+  )
+  (
+    (union ?wide (LogicalConstant ?v))
+  )
+  :ruleset main_ruleset
+  :name "cast/rewrite: an exact constant's round trip through F16 is the constant"
+)

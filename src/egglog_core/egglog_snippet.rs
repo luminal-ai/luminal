@@ -132,8 +132,15 @@ pub trait ProgramSeams {
 /// premise and a bare `/` in the action. A bare `EGraph::default()`
 /// cannot even parse the assembled program, so every runner goes through
 /// here.
+/// Does the f64 literal survive the round trip through f32 and then
+/// through the narrow dtype `round` stands for?
+fn exact_in_narrow(v: f64, round: impl Fn(f32) -> f32) -> Option<()> {
+    let narrow = v as f32;
+    (v.is_finite() && narrow as f64 == v && round(narrow) == narrow).then_some(())
+}
+
 pub fn new_egraph() -> egglog::EGraph {
-    use egglog::sort::Z;
+    use egglog::sort::{F, Z};
 
     let mut egraph = egglog::EGraph::default();
     crate::element_stride::register(&mut egraph);
@@ -159,6 +166,18 @@ pub fn new_egraph() -> egglog::EGraph {
     egglog::add_primitive!(&mut egraph, "exact-div" = |a: Z, b: Z| -?> Z {
         (!num_traits::Zero::is_zero(&*b) && num_traits::Zero::is_zero(&*(a.clone() % b.clone())))
             .then(|| a / b)
+    });
+    // `(exact-in-bf16 v)` / `(exact-in-f16 v)`: `v` itself when the f64
+    // literal is exactly representable in that narrow dtype (through f32,
+    // as a typed scalar is recorded) -- PARTIAL otherwise, so a rule that
+    // binds the result fires only for an exact constant. What lets a
+    // constant's round trip through bf16 or f16 (torch's opmath widening of
+    // a typed scalar) collapse to the constant.
+    egglog::add_primitive!(&mut egraph, "exact-in-bf16" = |v: F| -?> F {
+        exact_in_narrow(**v, |narrow| half::bf16::from_f32(narrow).to_f32()).map(|_| v)
+    });
+    egglog::add_primitive!(&mut egraph, "exact-in-f16" = |v: F| -?> F {
+        exact_in_narrow(**v, |narrow| half::f16::from_f32(narrow).to_f32()).map(|_| v)
     });
     // The vendored substitution primitive (egglog-experimental PR #60):
     // the preamble's subst road calls it from a :naive rule. The skip
