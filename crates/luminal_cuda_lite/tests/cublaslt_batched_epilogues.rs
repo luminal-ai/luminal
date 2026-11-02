@@ -16,6 +16,8 @@ use luminal_cuda_lite::ops::cublaslt::exec::{
 #[cfg(feature = "device")]
 #[path = "support/batched_epilogues.rs"]
 mod batch_device;
+#[path = "support/broadcast_c.rs"]
+mod broadcast_c;
 #[cfg(feature = "device")]
 mod support;
 #[path = "support/whitelist.rs"]
@@ -200,6 +202,7 @@ fn plan_dtype(dtype: DType) -> PlanDtype {
         DType::F64 => PlanDtype::F64,
         DType::F16 => PlanDtype::F16,
         DType::Bf16 => PlanDtype::Bf16,
+        DType::I8 => PlanDtype::I8,
         _ => unreachable!(),
     }
 }
@@ -220,6 +223,12 @@ fn vendor_activation(kind: usize) -> LtActivation {
         _ => unreachable!(),
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CReading {
+    Matrix,
+    RowVector,
+    ColumnVector,
+}
 #[derive(Clone, Copy, Debug)]
 struct Case {
     family: Family,
@@ -229,6 +238,9 @@ struct Case {
     device: bool,
     activation: usize,
     with_c: bool,
+    c_reading: CReading,
+    c_shared: bool,
+    cancellation: bool,
 }
 impl Case {
     fn new(family: Family) -> Self {
@@ -240,6 +252,9 @@ impl Case {
             device: false,
             activation: 1,
             with_c: true,
+            c_reading: CReading::Matrix,
+            c_shared: false,
+            cancellation: false,
         }
     }
 }
@@ -311,9 +326,18 @@ fn fixture(case: Case) -> Fixture {
         b = b.expand_dim(0, case.batch);
     }
     let c = case.with_c.then(|| {
+        let matrix = match case.c_reading {
+            CReading::Matrix => vec![M.into(), N.into()],
+            CReading::RowVector => vec![N.into()],
+            CReading::ColumnVector => vec![M.into()],
+        };
         input(
             &mut graph,
-            vec![case.batch, M.into(), N.into()],
+            (!case.c_shared)
+                .then_some(case.batch)
+                .into_iter()
+                .chain(matrix)
+                .collect(),
             case.family.output,
         )
     });
@@ -331,11 +355,30 @@ fn fixture(case: Case) -> Fixture {
                 .cast(case.family.arithmetic)
         }
     };
-    let alpha = scalar(0, 1.5);
-    let beta = scalar(1, if case.with_c { -0.5 } else { 0.0 });
+    let alpha = scalar(0, if case.cancellation { 1.0 } else { 1.5 });
+    let beta = scalar(
+        1,
+        if !case.with_c {
+            0.0
+        } else if case.cancellation {
+            1.0
+        } else {
+            -0.5
+        },
+    );
     let p = a.matmul(b);
     let product = p * alpha.expand_rhs(p.dims());
     let sum = c.map_or(product, |c| {
+        let c = match case.c_reading {
+            CReading::Matrix => c,
+            CReading::RowVector => c.expand_dim(if case.c_shared { 0 } else { 1 }, M),
+            CReading::ColumnVector => c.expand_dim(if case.c_shared { 1 } else { 2 }, N),
+        };
+        let c = if case.c_shared {
+            c.expand_dim(0, case.batch)
+        } else {
+            c
+        };
         product + c.cast(case.family.arithmetic) * beta.expand_rhs(c.dims())
     });
     let out = activation(sum, case.activation).cast(case.family.output);
@@ -618,7 +661,7 @@ mod execution {
     use luminal_reference::{ReferenceBindings, ReferenceRuntime, TypedBuffer};
     use support::TestTransfers;
 
-    static DEVICE_EXECUTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static DEVICE_EXECUTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn every_approved_batched_activation_dispatches_against_independent_arithmetic() {
@@ -649,6 +692,7 @@ mod execution {
                     .map(|x| half::bf16::from_f32(*x as f32))
                     .collect(),
             ),
+            DType::I8 => TypedBuffer::I8(data.iter().map(|x| *x as i8).collect()),
             _ => unreachable!(),
         }
     }
@@ -667,6 +711,7 @@ mod execution {
                 .iter()
                 .flat_map(|x| half::bf16::from_f32(*x as f32).to_bits().to_ne_bytes())
                 .collect(),
+            DType::I8 => data.iter().map(|x| *x as i8 as u8).collect(),
             _ => unreachable!(),
         };
         HostBuffer::new(plan_dtype(dtype), bytes).unwrap()
@@ -724,7 +769,7 @@ mod execution {
                         LtActivation::GaussianErrorLinear => {
                             "(CublasLtGaussianErrorLinearEpilogue)"
                         }
-                        _ => unreachable!(),
+                        LtActivation::Identity => "(CublasLtDefaultEpilogue)",
                     })
                     && key.contains("CublasLtNoCMatrixDataType") != case.with_c
             })
@@ -746,7 +791,7 @@ mod execution {
             })
             .collect()
     }
-    fn run(case: Case, alias: bool) {
+    pub(super) fn run(case: Case, alias: bool) {
         eprintln!("compiled batch activation: {case:?}, alias={alias}");
         let f = fixture(case);
         let mut bindings = CudaBindings::new();
@@ -755,14 +800,27 @@ mod execution {
         }
         if let Some(c) = f.c {
             let i = f.inputs.iter().position(|t| t.id == c.id).unwrap();
-            bindings.declare(
-                bindings.inputs()[i].buffer,
-                Access::ReadWrite,
-                FreedBy::Caller,
-            );
+            if case.c_reading == CReading::Matrix && !case.c_shared {
+                bindings.declare(
+                    bindings.inputs()[i].buffer,
+                    Access::ReadWrite,
+                    FreedBy::Caller,
+                );
+            }
             bindings.output(c.id);
         }
-        bindings.output(f.out.id);
+        if case.c_reading == CReading::ColumnVector {
+            bindings.output_with(
+                f.out.id,
+                luminal_cuda_lite::bindings::BoundaryLayout::strided_literal([
+                    (M * N) as i64,
+                    1,
+                    M as i64,
+                ]),
+            );
+        } else {
+            bindings.output(f.out.id);
+        }
         let registry = registry(case)
             .into_iter()
             .filter(|row| {
@@ -813,20 +871,47 @@ mod execution {
                 } else if f.scalars[1].is_some_and(|x| x.id == t.id) {
                     (case.family.arithmetic, vec![beta])
                 } else {
-                    let len = if i == 0 {
-                        (if case.shared.0 { 1 } else { count }) * M * K
-                    } else if i == 1 {
-                        (if case.shared.1 { 1 } else { count }) * K * N
-                    } else {
-                        count * M * N
-                    };
+                    let len = t.dims().iter().map(|d| d.exec(&dims).unwrap()).product();
                     let dtype = if i < 2 {
                         case.family.input
                     } else {
                         case.family.output
                     };
                     let values = (0..len)
-                        .map(|j| ((j * 3 + i) % 7) as f64 / 8.0 - 0.375)
+                        .map(|j| {
+                            if case.cancellation {
+                                let large = if case.family.input == DType::F16 {
+                                    65504.0
+                                } else {
+                                    half::bf16::from_bits(0x7f7e).to_f32() as f64
+                                };
+                                match i {
+                                    0 => {
+                                        if j % K == 0 {
+                                            large
+                                        } else {
+                                            0.0
+                                        }
+                                    }
+                                    1 => {
+                                        if j % (K * N) < N {
+                                            1.0 + if case.family.input == DType::F16 {
+                                                1.0 / 1024.0
+                                            } else {
+                                                1.0 / 128.0
+                                            }
+                                        } else {
+                                            0.0
+                                        }
+                                    }
+                                    _ => -large,
+                                }
+                            } else if dtype == DType::I8 {
+                                ((j * 3 + i) % 7) as f64 - 3.0
+                            } else {
+                                ((j * 3 + i) % 7) as f64 / 8.0 - 0.375
+                            }
+                        })
                         .collect::<Vec<_>>();
                     if f.c.is_some_and(|c| c.id == t.id) {
                         c_values = values.clone();
@@ -877,8 +962,26 @@ mod execution {
                 assert_eq!(call.activation, vendor_activation(case.activation));
                 assert_eq!(call.c.is_some(), case.with_c);
                 assert!(call.bias.is_none());
-                assert_eq!(call.d.order, LtOrder::Col);
+                assert_eq!(
+                    call.d.order,
+                    if case.activation == 0 && case.c_reading != CReading::ColumnVector {
+                        LtOrder::Row
+                    } else {
+                        LtOrder::Col
+                    }
+                );
                 assert_eq!(call.d.batch_count, count as i64);
+                if let Some(c) = call.c {
+                    if case.c_reading != CReading::Matrix {
+                        assert_eq!(c.descriptor.ld, 0, "{case:?}");
+                    }
+                    assert_eq!(
+                        c.descriptor.batch_stride_in_elements == 0,
+                        case.c_shared,
+                        "{case:?}"
+                    );
+                    assert_eq!(c.descriptor.order, call.d.order);
+                }
                 let sharing = if call.m == N as i64 {
                     (case.shared.1, case.shared.0)
                 } else {
@@ -956,7 +1059,19 @@ mod execution {
             }
             if let Some(c) = f.c {
                 let (kept, binding) = runtime.download(arena, c.id).unwrap();
-                assert_eq!(dense(&decode(&kept), &binding.layout, count), c_values);
+                let shape: Vec<_> = c.dims().iter().map(|d| d.exec(&dims).unwrap()).collect();
+                let values = decode(&kept);
+                let kept: Vec<_> = (0..c_values.len())
+                    .map(|mut linear| {
+                        let mut coordinates = vec![0; shape.len()];
+                        for (coordinate, extent) in coordinates.iter_mut().zip(&shape).rev() {
+                            *coordinate = linear % extent;
+                            linear /= extent;
+                        }
+                        values[binding.layout.element_index(&coordinates).unwrap()]
+                    })
+                    .collect();
+                assert_eq!(kept, c_values);
             }
         }
     }

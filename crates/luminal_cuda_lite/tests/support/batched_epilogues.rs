@@ -62,7 +62,6 @@ fn decode(dtype: PlanDtype, bytes: &[u8]) -> Vec<f32> {
 pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     assert_eq!(call.scale_dtype, PlanDtype::F32);
     assert!(call.bias.is_none());
-    assert_ne!(call.activation, LtActivation::Identity);
     let mut call = call.clone();
     let (alpha, beta) = (1.5f32, if call.c.is_some() { -0.5f32 } else { 0.0 });
     if matches!(call.scalars, LtScalars::Host { .. }) {
@@ -140,7 +139,7 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
                                     * (1.0 + 0.044_715 * expected * expected))
                                     .tanh())
                     }
-                    LtActivation::Identity => unreachable!(),
+                    LtActivation::Identity => expected,
                 };
                 let expected = match call.d_dtype {
                     PlanDtype::F32 => expected as f32,

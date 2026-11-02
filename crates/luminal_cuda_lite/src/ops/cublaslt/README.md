@@ -361,7 +361,8 @@ pre-cast F32 storage and delegates input conversion to cuBLASLt. Earlier
 narrowing remains in that storage source. Casts after multiplication/reduction
 cannot authorize this mode. The proof composes with rank-two epilogues,
 strided batches, separate destinations, in-place accumulation and subsequent
-output casts. Batched bias/activation remain outside the existing batch grammar.
+output casts. Batched activations share these proofs; native batched bias remains
+outside the batch grammar.
 
 Operand storage proofs are parameterized by computation mode. A global fact
 allowing rounded operands to read pre-cast storage would also let ordinary F32
@@ -457,10 +458,11 @@ represented by stride zero, not a descriptor count of one. The independent
 are dispatched unchanged. Precision/storage proofs and the complete 4,096-row
 configuration whitelist remain shared with ordinary batches.
 
-Read sharing never publishes a disjoint matrix or destination proof. C and D
-retain the full padded, non-overlapping batch footprint, including in-place
-calls. Thus a shared A/B reading cannot authorize an overlapping output or a
-shared C/D write. Partial matrix overlap remains unsupported.
+Read sharing never publishes a disjoint matrix or destination proof. Every D
+retains the full padded, non-overlapping batch footprint, including in-place
+calls. C has a separate read-only relation for shared matrices and broadcast
+vectors; those permissions never authorize a shared C/D write. Partial matrix
+overlap remains unsupported.
 
 Batched admission covers a scaled product and scaled product+C, optionally
 followed by ReLU or GELU. It reuses the shared typed activation recognizers,
@@ -487,6 +489,41 @@ dimensions and batch strides. In-place emission additionally requires identical
 complete descriptions and layouts. Native batched bias, multiple batch axes and
 arbitrary flattening are not part of this grammar. Unproved cases retain generic
 operations/materialization.
+
+### Read-only broadcast C
+
+The C-specific batch reading accepts ordinary disjoint matrices, a matrix
+explicitly shared across batches, and packed row/column vectors. For example:
+
+```rust,ignore
+let c = graph.tensor([g, n], DType::F32).expand_dim(1, m);
+let y = a.matmul(b) + c; // each batch reads its own packed feature vector
+```
+
+A single `[n]` vector expanded over both m and g instead uses batch stride
+zero. `[g,m]` expanded over n gives the column-vector form. Broadcasting is
+authored by the frontend; backend rules consume its complete shape-owned stride
+certificate. The broadcast matrix axis must have an exact zero coefficient,
+and the vector's minor stride must be unit (or locally free on a singleton).
+C uses leading dimension zero; distinct vectors require a batch pitch covering
+the whole vector, including any inter-vector padding. An exact zero batch stride
+shares the vector. Partial vector overlap and non-packed vectors retain generic
+materialization alternatives.
+
+C and D still require the same vendor memory order. Row-major C with zero
+leading dimension broadcasts rows; column-major C broadcasts columns. The
+whole-expression transpose frame carries C with the activated result. As in
+rank-two admission, the chosen D layout must support that broadcast orientation;
+the column-vector execution tests use column-major matrix output boundaries.
+
+`cublaslt-strided-batch-C-matrix-reading` alone grants these read permissions.
+It never publishes a destination or disjoint-matrix reading. Every destination
+keeps a positive leading dimension and full padded batch pitch; native broadcast
+or shared C therefore cannot become an in-place destination. Existing in-place
+calls over ordinary full C storage retain their identical-descriptor proof.
+The flat descriptors, dtype/precision proofs, alpha/beta arguments, complete
+whitelist tuples and dispatch are unchanged. In particular, this does not add
+native bias epilogues or admit the excluded narrow-output bias/GELU tuples.
 
 `cublaslt_batched_epilogues` proves all 1,152 no-bias activation configurations
 and executes all 1,728 separate/in-place batched witnesses against independent
