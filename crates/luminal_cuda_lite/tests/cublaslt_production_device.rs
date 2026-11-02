@@ -470,7 +470,7 @@ fn production_and_decomposed_search_are_measured_with_identical_precision_and_da
                     .0
                     .as_f32()
                     .unwrap(),
-                vec![8.0; 3968]
+                vec![8.0; 64 * 64]
             );
         }
     }
