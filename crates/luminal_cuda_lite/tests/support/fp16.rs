@@ -51,8 +51,6 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
             PlanDtype::F16
         )
     );
-    assert!(call.bias.is_none());
-    assert_eq!(call.activation, LtActivation::Identity);
     let mut call = call.clone();
     let beta = if call.c.is_some() { BETA } else { 0.0 };
     if matches!(call.scalars, LtScalars::HostF16 { .. }) {
@@ -61,6 +59,11 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     let a = values(&call.a, 1);
     let b = values(&call.b, 2);
     let c = call.c.map(|c| values(&c.descriptor, 3));
+    let bias = call.bias.map(|_| {
+        (0..call.m as usize)
+            .map(|i| ((i + 1) % 5) as f32 / 4.0 - 0.5)
+            .collect::<Vec<_>>()
+    });
     let mut payloads = vec![raw(&a), raw(&b)];
     payloads.resize(
         call.form.lit_arity() + call.scalars.input_count(),
@@ -76,6 +79,10 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     }
     if let Some(input) = call.c {
         payloads[input.operand] = raw(c.as_ref().unwrap());
+    }
+    if let Some(input) = call.bias {
+        assert_eq!(input.data_type, PlanDtype::F16);
+        payloads[input.operand] = raw(bias.as_ref().unwrap());
     }
     let buffers: Vec<_> = payloads
         .iter()
@@ -103,7 +110,7 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     for batch in 0..call.d.batch_count as usize {
         for row in 0..call.m as usize {
             for col in 0..call.n as usize {
-                let expected = ALPHA
+                let mut expected = ALPHA
                     * (0..call.k as usize)
                         .map(|k| {
                             let (ar, ac) = if call.trans_a { (k, row) } else { (row, k) };
@@ -114,14 +121,36 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
                     + call.c.map_or(0.0, |input| {
                         beta * c.as_ref().unwrap()[at(&input.descriptor, batch, row, col)]
                     });
+                if let Some(bias) = &bias {
+                    expected += bias[row];
+                }
+                expected = match call.activation {
+                    LtActivation::Identity => expected,
+                    LtActivation::RectifiedLinear => expected.max(0.0),
+                    LtActivation::GaussianErrorLinear => {
+                        0.5 * expected
+                            * (1.0
+                                + (0.797_884_6
+                                    * expected
+                                    * (1.0 + 0.044_715 * expected * expected))
+                                    .tanh())
+                    }
+                };
                 let got = actual[at(&call.d, batch, row, col)];
                 // Inputs and coefficients are small dyadics. Every product,
                 // partial sum, and scaling result is exactly representable in
                 // FP16, so reduction order and FMA contraction cannot affect it.
-                assert_eq!(
-                    got, expected,
-                    "{call:?}, alias={alias}, ({batch},{row},{col})"
-                );
+                if call.activation == LtActivation::GaussianErrorLinear {
+                    assert!(
+                        (got - expected).abs() <= 0.003 + 0.002 * expected.abs(),
+                        "{call:?}, alias={alias}, ({batch},{row},{col}): {got} vs {expected}"
+                    );
+                } else {
+                    assert_eq!(
+                        got, expected,
+                        "{call:?}, alias={alias}, ({batch},{row},{col})"
+                    );
+                }
             }
         }
     }

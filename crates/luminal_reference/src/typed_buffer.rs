@@ -742,14 +742,21 @@ impl ReferenceKernelCtx {
         Ok(())
     }
 
-    /// dest0[i] = f64_fn(operand0[i]) over an F64 operand, or
-    /// f32_fn(operand0[i]) over an F32 one — main's `UnaryKernels`
-    /// struct (#398) re-expressed for this branch's storage. Main
-    /// carried four widths (f32/f16/bf16/f64); there is no f16 or
-    /// bf16 TypedBuffer here, so this carries two, and every other
-    /// variant refuses BY NAME rather than bridging through f32: a
-    /// caller who asked for double precision must not be handed
-    /// single-precision arithmetic behind an F64 tag.
+    /// Apply one half operation and retain half storage at its output boundary.
+    /// The caller supplies the operation's rounding policy explicitly.
+    pub fn unary_elementwise_f16(&mut self, f: impl Fn(half::f16) -> half::f16) -> Result<()> {
+        let input = self.operands[0].as_f16()?;
+        let dest = self.dests[0].as_f16_mut()?;
+        anyhow::ensure!(input.len() == dest.len(), "unary kernel length mismatch");
+        for (out, x) in dest.iter_mut().zip(input) {
+            *out = f(*x);
+        }
+        Ok(())
+    }
+
+    /// Apply the supplied operation at the declared F32 or F64 width.
+    /// Half operations use their explicit helper; other types return an error
+    /// rather than silently changing arithmetic precision.
     pub fn unary_elementwise_typed(
         &mut self,
         f32_fn: impl Fn(f32) -> f32,

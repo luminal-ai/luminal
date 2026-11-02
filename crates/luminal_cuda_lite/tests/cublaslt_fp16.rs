@@ -7,7 +7,7 @@ use luminal_cuda_lite::ops::cublaslt::{
         CONSTRUCTOR as IN_PLACE, CublasLtAccumulateInPlace, CublasLtAccumulateInPlaceMatcher,
     },
     approved::{ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, WHITELIST},
-    exec::{LtComputation, LtScalars},
+    exec::{LtActivation, LtComputation, LtOrder, LtScalars},
 };
 #[cfg(feature = "device")]
 mod support;
@@ -74,6 +74,36 @@ fn fixture(batch: bool, sharing: (bool, bool), device: bool, transposed: (bool, 
     let p = a.matmul(b);
     let _scaled = p * alpha.expand_rhs(p.dims());
     let _acc = _scaled + c * beta.expand_rhs(c.dims());
+    graph
+}
+
+fn epilogue_fixture(device: bool, bias: bool, activation: usize) -> Graph {
+    let mut graph = Graph::new();
+    // Build a separate expression here so every activation uses authored F16
+    // constants and the same transposed-view storage proofs as the base GEMM.
+    let a = graph.tensor([8, 3], DType::F16).permute(&[1, 0]);
+    let b = graph.tensor([4, 8], DType::F16).permute(&[1, 0]);
+    let c = graph.tensor([3, 4], DType::F16);
+    let scalar = |graph: &mut Graph, value| {
+        if device {
+            graph.tensor([] as [usize; 0], DType::F16)
+        } else {
+            graph.constant_f32(value).cast(DType::F16)
+        }
+    };
+    let alpha = scalar(&mut graph, 1.5);
+    let beta = scalar(&mut graph, -0.5);
+    let product = a.matmul(b);
+    let mut out = product * alpha.expand_rhs(product.dims()) + c * beta.expand_rhs(c.dims());
+    if bias {
+        out += graph.tensor([4], DType::F16).expand_dim(0, 3);
+    }
+    let _out = match activation {
+        0 => out,
+        1 => out.relu(),
+        2 => out.gelu_fast_tanh_approximation(),
+        _ => out.gelu(),
+    };
     graph
 }
 
@@ -343,6 +373,146 @@ fn every_exposed_shared_half_batch_configuration_executes() {
 #[cfg(feature = "device")]
 #[test]
 fn compiled_half_calls_match_reference_with_live_coefficients_and_retained_c() {
+    for batched in [false, true] {
+        for alias in [false, true] {
+            for source in 0..4 {
+                run_compiled_half_case(batched, alias, source, false, 0);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "device")]
+#[test]
+fn compiled_half_epilogues_match_reference_with_live_coefficients_and_retained_c() {
+    for (bias, activation) in [
+        (true, 0),
+        (false, 1),
+        (true, 1),
+        (false, 2),
+        (true, 2),
+        (false, 3),
+        (true, 3),
+    ] {
+        for alias in [false, true] {
+            // Literal, live GPU, and GPU-produced half coefficients.
+            for source in 0..3 {
+                run_compiled_half_case(false, alias, source, bias, activation);
+            }
+        }
+    }
+}
+
+#[test]
+fn half_epilogues_keep_typed_bias_scalars_and_column_destinations() {
+    for device in [false, true] {
+        for bias in [false, true] {
+            for activation in 0..4 {
+                let graph = epilogue_fixture(device, bias, activation);
+                let expected_activation = match activation {
+                    0 => LtActivation::Identity,
+                    1 => LtActivation::RectifiedLinear,
+                    _ => LtActivation::GaussianErrorLinear,
+                };
+                let (separate, tied) = calls(&graph, WHITELIST);
+                let matching = |call: &luminal_cuda_lite::ops::cublaslt::exec::LtCall| {
+                    call.c.is_some()
+                        && call.bias.is_some() == bias
+                        && call.activation == expected_activation
+                        && matches!(call.scalars, LtScalars::Device { .. }) == device
+                };
+                let separate: Vec<_> = separate
+                    .iter()
+                    .map(|op| op.resolve(&Default::default()))
+                    .filter(matching)
+                    .collect();
+                let tied: Vec<_> = tied
+                    .iter()
+                    .map(|op| op.resolve(&Default::default()))
+                    .filter(matching)
+                    .collect();
+                assert!(
+                    !separate.is_empty() && !tied.is_empty(),
+                    "bias={bias}, activation={activation}, device={device}"
+                );
+                for call in separate.into_iter().chain(tied) {
+                    assert_eq!(call.computation, LtComputation::Float16);
+                    assert_eq!(call.scale_dtype, PlanDtype::F16);
+                    assert_eq!(matches!(call.scalars, LtScalars::Device { .. }), device);
+                    if bias || activation != 0 {
+                        assert_eq!(call.d.order, LtOrder::Col);
+                    }
+                    if let Some(bias) = call.bias {
+                        assert_eq!(bias.data_type, PlanDtype::F16);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn half_epilogues_require_the_complete_row_and_exact_bias_storage() {
+    let graph = epilogue_fixture(false, true, 1);
+    let (separate, _) = calls(&graph, WHITELIST);
+    let op = separate
+        .iter()
+        .find(|op| {
+            op.c.is_some() && op.bias.is_some() && op.activation == LtActivation::RectifiedLinear
+        })
+        .unwrap();
+    let key = whitelist::key(op);
+    let table = format!("(cublaslt-approved-configuration {key})");
+    let (separate, tied) = calls(&graph, &table);
+    assert!(!separate.is_empty() && !tied.is_empty());
+    assert!(separate.iter().all(|op| whitelist::key(op) == key));
+    assert!(tied.iter().all(|op| whitelist::in_place_key(op) == key));
+    for table in [
+        String::new(),
+        table.replace(
+            "(CublasLtBiasDataTypeOf (F16))",
+            "(CublasLtBiasDataTypeOf (Bf16))",
+        ),
+    ] {
+        let (separate, tied) = calls(&graph, &table);
+        assert!(separate.is_empty() && tied.is_empty());
+    }
+}
+
+#[test]
+fn half_rounding_between_gemm_and_epilogues_stays_an_arithmetic_boundary() {
+    for activation in 0..4 {
+        let mut graph = Graph::new();
+        let a = graph.tensor([3, 8], DType::F16);
+        let b = graph.tensor([8, 4], DType::F16);
+        let bias = graph.tensor([4], DType::F16);
+        let rounded = a.matmul(b).cast(DType::Bf16).cast(DType::F16);
+        let biased = rounded + bias.expand_dim(0, 3);
+        let _out = match activation {
+            0 => biased,
+            1 => biased.relu(),
+            2 => biased.gelu_fast_tanh_approximation(),
+            _ => biased.gelu(),
+        };
+        let (separate, tied) = calls(&graph, WHITELIST);
+        assert!(!separate.is_empty());
+        assert!(tied.is_empty());
+        assert!(
+            separate
+                .iter()
+                .all(|op| op.bias.is_none() && op.activation == LtActivation::Identity)
+        );
+    }
+}
+
+#[cfg(feature = "device")]
+fn run_compiled_half_case(
+    batched: bool,
+    alias: bool,
+    source: usize,
+    bias: bool,
+    activation: usize,
+) {
     use luminal::bufferize::BufferNode;
     use luminal::layout_ir::{Access, FreedBy};
     use luminal_cuda_lite::{CudaBindings, CudaRuntime, HostBuffer};
@@ -358,203 +528,337 @@ fn compiled_half_calls_match_reference_with_live_coefficients_and_retained_c() {
         )
         .unwrap()
     };
-    for batched in [false, true] {
-        for alias in [false, true] {
-            // Host half literals, GPU half scalars, GPU-produced half scalars,
-            // and a host literal paired with a GPU scalar.
-            for source in 0..4 {
-                let device = source != 0;
-                let mut graph = Graph::new();
-                let a = graph.tensor(if batched { vec![2, 2, 4] } else { vec![2, 4] }, DType::F16);
-                let b = graph.tensor([4, 3], DType::F16);
-                let c = graph.tensor(if batched { vec![2, 2, 3] } else { vec![2, 3] }, DType::F16);
-                let mut inputs = vec![a, b, c];
-                let mut scalar_inputs = [None, None];
-                let scalar_type = if source == 2 { DType::F32 } else { DType::F16 };
-                let mut scalar = |index: usize, value: f32| {
-                    if source == 0 || source == 3 && index == 0 {
-                        graph.constant_f32(value).cast(DType::F16)
-                    } else {
-                        let tensor = graph.tensor([] as [usize; 0], scalar_type);
-                        inputs.push(tensor);
-                        scalar_inputs[index] = Some(tensor);
-                        tensor.cast(DType::F16)
-                    }
-                };
-                let alpha = scalar(0, 1.5);
-                let beta = scalar(1, -0.5);
-                let b_view = if batched { b.expand_dim(0, 2) } else { b };
-                let product = a.matmul(b_view);
-                let out =
-                    product * alpha.expand_rhs(product.dims()) + c * beta.expand_rhs(c.dims());
-                let a_values: Vec<_> = (0..if batched { 16 } else { 8 })
-                    .map(|i| (i % 5) as f32 / 4.0 - 0.5)
-                    .collect();
-                let b_values: Vec<_> = (0..12).map(|i| (i % 3) as f32 / 4.0 - 0.25).collect();
-                let c_values = vec![0.25; if batched { 12 } else { 6 }];
-                let mut bindings = CudaBindings::new();
-                for input in &inputs {
-                    bindings.input(input.id);
+    let device = source != 0;
+    let mut graph = Graph::new();
+    let a = graph.tensor(if batched { vec![2, 2, 4] } else { vec![2, 4] }, DType::F16);
+    let b = graph.tensor([4, 3], DType::F16);
+    let c = graph.tensor(if batched { vec![2, 2, 3] } else { vec![2, 3] }, DType::F16);
+    let mut inputs = vec![a, b, c];
+    let mut scalar_inputs = [None, None];
+    let scalar_type = if source == 2 { DType::F32 } else { DType::F16 };
+    let mut scalar = |index: usize, value: f32| {
+        if source == 0 || source == 3 && index == 0 {
+            graph.constant_f32(value).cast(DType::F16)
+        } else {
+            let tensor = graph.tensor([] as [usize; 0], scalar_type);
+            inputs.push(tensor);
+            scalar_inputs[index] = Some(tensor);
+            tensor.cast(DType::F16)
+        }
+    };
+    let alpha = scalar(0, 1.5);
+    let beta = scalar(1, -0.5);
+    let b_view = if batched { b.expand_dim(0, 2) } else { b };
+    let product = a.matmul(b_view);
+    let mut out = product * alpha.expand_rhs(product.dims()) + c * beta.expand_rhs(c.dims());
+    let bias_input = bias.then(|| graph.tensor([3], DType::F16));
+    if let Some(bias) = bias_input {
+        inputs.push(bias);
+        out += bias.expand_dim(0, 2);
+    }
+    out = match activation {
+        0 => out,
+        1 => out.relu(),
+        2 => out.gelu_fast_tanh_approximation(),
+        _ => out.gelu(),
+    };
+    let expected_activation = match activation {
+        0 => LtActivation::Identity,
+        1 => LtActivation::RectifiedLinear,
+        _ => LtActivation::GaussianErrorLinear,
+    };
+    let a_values: Vec<_> = (0..if batched { 16 } else { 8 })
+        .map(|i| (i % 5) as f32 / 4.0 - 0.5)
+        .collect();
+    let b_values: Vec<_> = (0..12).map(|i| (i % 3) as f32 / 4.0 - 0.25).collect();
+    let c_values = vec![0.25; if batched { 12 } else { 6 }];
+    let mut bindings = CudaBindings::new();
+    for input in &inputs {
+        bindings.input(input.id);
+    }
+    bindings.declare(
+        bindings.inputs()[2].buffer,
+        Access::ReadWrite,
+        FreedBy::Caller,
+    );
+    bindings.output(c.id);
+    bindings.output(out.id);
+    let registry = whitelist::fp16_epilogue_registry(device, bias, expected_activation)
+        .into_iter()
+        .filter(|row| {
+            !matches!(
+                row.label(),
+                "AddFunctionalGeneric" | "MulFunctionalGeneric" | "ReduceSumGeneric"
+            ) && row.label()
+                != if alias {
+                    "CublasLtCall"
+                } else {
+                    "CublasLtAccumulateInPlace"
                 }
-                bindings.declare(
-                    bindings.inputs()[2].buffer,
-                    Access::ReadWrite,
-                    FreedBy::Caller,
+        })
+        .collect();
+    let mut runtime = CudaRuntime::load_with(&graph, bindings, registry).unwrap();
+    let mut reference =
+        ReferenceRuntime::load_with(&graph, ReferenceBindings::dense(&graph.logical, &[out.id]))
+            .unwrap();
+    let mut searched = false;
+    let mut execution = None;
+    for (alpha, beta) in [(1.5, -0.5), (-0.75, 2.0)] {
+        if searched && !device {
+            break;
+        }
+        let mut data: FxHashMap<_, _> = [
+            (a.id, payload(&a_values)),
+            (b.id, payload(&b_values)),
+            (c.id, payload(&c_values)),
+        ]
+        .into_iter()
+        .collect();
+        let mut ref_data: FxHashMap<_, _> =
+            [(a.id, &a_values), (b.id, &b_values), (c.id, &c_values)]
+                .into_iter()
+                .map(|(id, v)| {
+                    (
+                        id,
+                        TypedBuffer::F16(v.iter().copied().map(half::f16::from_f32).collect()),
+                    )
+                })
+                .collect();
+        if let Some(bias) = bias_input {
+            data.insert(bias.id, payload(&[-0.25, 0.125, 0.5]));
+            ref_data.insert(
+                bias.id,
+                TypedBuffer::F16([-0.25, 0.125, 0.5].map(half::f16::from_f32).to_vec()),
+            );
+        }
+        for (index, value) in [alpha, beta].into_iter().enumerate() {
+            if let Some(tensor) = scalar_inputs[index] {
+                data.insert(
+                    tensor.id,
+                    if scalar_type == DType::F32 {
+                        HostBuffer::from(vec![value])
+                    } else {
+                        payload(&[value])
+                    },
                 );
-                bindings.output(c.id);
-                bindings.output(out.id);
-                let registry = whitelist::fp16_registry(device)
-                    .into_iter()
-                    .filter(|row| {
-                        !matches!(
-                            row.label(),
-                            "AddFunctionalGeneric" | "MulFunctionalGeneric" | "ReduceSumGeneric"
-                        ) && row.label()
-                            != if alias {
-                                "CublasLtCall"
-                            } else {
-                                "CublasLtAccumulateInPlace"
-                            }
-                    })
-                    .collect();
-                let mut runtime = CudaRuntime::load_with(&graph, bindings, registry).unwrap();
-                let mut reference = ReferenceRuntime::load_with(
-                    &graph,
-                    ReferenceBindings::dense(&graph.logical, &[out.id]),
+                ref_data.insert(
+                    tensor.id,
+                    if scalar_type == DType::F32 {
+                        TypedBuffer::F32(vec![value])
+                    } else {
+                        TypedBuffer::F16(vec![half::f16::from_f32(value)])
+                    },
+                );
+            }
+        }
+        if !searched {
+            runtime
+                .search(
+                    &Default::default(),
+                    &Default::default(),
+                    &data,
+                    &luminal_cuda_lite::harness_search_options(),
                 )
                 .unwrap();
-                let mut searched = false;
-                let mut execution = None;
-                for (alpha, beta) in [(1.5, -0.5), (-0.75, 2.0)] {
-                    if searched && !device {
-                        break;
-                    }
-                    let mut data: FxHashMap<_, _> = [
-                        (a.id, payload(&a_values)),
-                        (b.id, payload(&b_values)),
-                        (c.id, payload(&c_values)),
-                    ]
-                    .into_iter()
-                    .collect();
-                    let mut ref_data: FxHashMap<_, _> =
-                        [(a.id, &a_values), (b.id, &b_values), (c.id, &c_values)]
-                            .into_iter()
-                            .map(|(id, v)| {
-                                (
-                                    id,
-                                    TypedBuffer::F16(
-                                        v.iter().copied().map(half::f16::from_f32).collect(),
-                                    ),
-                                )
-                            })
-                            .collect();
-                    for (index, value) in [alpha, beta].into_iter().enumerate() {
-                        if let Some(tensor) = scalar_inputs[index] {
-                            data.insert(
-                                tensor.id,
-                                if scalar_type == DType::F32 {
-                                    HostBuffer::from(vec![value])
-                                } else {
-                                    payload(&[value])
-                                },
-                            );
-                            ref_data.insert(
-                                tensor.id,
-                                if scalar_type == DType::F32 {
-                                    TypedBuffer::F32(vec![value])
-                                } else {
-                                    TypedBuffer::F16(vec![half::f16::from_f32(value)])
-                                },
-                            );
-                        }
-                    }
-                    if !searched {
-                        runtime
-                            .search(
-                                &Default::default(),
-                                &Default::default(),
-                                &data,
-                                &luminal_cuda_lite::harness_search_options(),
-                            )
-                            .unwrap();
-                        reference
-                            .search(
-                                &Default::default(),
-                                &Default::default(),
-                                &ref_data,
-                                &luminal_reference::harness_search_options(),
-                            )
-                            .unwrap();
-                        let calls: Vec<_> = runtime
-                            .plan()
-                            .unwrap()
-                            .dag
-                            .node_weights()
-                            .filter_map(|node| {
-                                let BufferNode::Compute { op, .. } = node else {
-                                    return None;
-                                };
-                                if let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>() {
-                                    Some(op.resolve(&Default::default()))
-                                } else {
-                                    op.as_any()
-                                        .downcast_ref::<CublasLtAccumulateInPlace>()
-                                        .map(|op| op.resolve(&Default::default()))
-                                }
-                            })
-                            .collect();
-                        assert_eq!(calls.len(), 1);
-                        assert_eq!(calls[0].computation, LtComputation::Float16);
-                        assert_eq!(matches!(calls[0].scalars, LtScalars::Device { .. }), device);
-                        if batched {
-                            assert_eq!(calls[0].b.batch_stride_in_elements, 0);
-                        }
-                        execution = Some((
-                            support::allocate_arena(&runtime).unwrap(),
-                            runtime.allocate_staging().unwrap(),
-                        ));
-                        searched = true;
-                    }
-                    for (id, values) in ref_data {
-                        reference.set_data(id, values);
-                    }
-                    reference.execute().unwrap();
-                    let (arena, staging) = execution.as_mut().unwrap();
-                    for (id, values) in data {
-                        runtime.upload(arena, id, values).unwrap();
-                    }
-                    runtime.execute(arena.arena(), staging).unwrap();
-                    let (actual, binding) = runtime.download(arena, out.id).unwrap();
-                    let decode = |data: &HostBuffer| {
-                        data.bytes
-                            .chunks_exact(2)
-                            .map(|v| {
-                                half::f16::from_bits(u16::from_ne_bytes(v.try_into().unwrap()))
-                                    .to_f32()
-                            })
-                            .collect::<Vec<_>>()
+            reference
+                .search(
+                    &Default::default(),
+                    &Default::default(),
+                    &ref_data,
+                    &luminal_reference::harness_search_options(),
+                )
+                .unwrap();
+            let calls: Vec<_> = runtime
+                .plan()
+                .unwrap()
+                .dag
+                .node_weights()
+                .filter_map(|node| {
+                    let BufferNode::Compute { op, .. } = node else {
+                        return None;
                     };
-                    let actual =
-                        luminal_cuda_lite::layouts::dense_f32(&decode(&actual), &binding.layout)
-                            .unwrap();
-                    let expected: Vec<_> = reference
-                        .get_f16(out.id)
-                        .unwrap()
-                        .iter()
-                        .map(|v| v.to_f32())
-                        .collect();
-                    assert_eq!(
-                        actual, expected,
-                        "batch={batched}, alias={alias}, source={source}"
-                    );
-                    let (kept, binding) = runtime.download(arena, c.id).unwrap();
-                    assert_eq!(
-                        luminal_cuda_lite::layouts::dense_f32(&decode(&kept), &binding.layout)
-                            .unwrap(),
-                        c_values
-                    );
-                }
+                    if let Some(op) = op.as_any().downcast_ref::<ApprovedCublasLt>() {
+                        Some(op.resolve(&Default::default()))
+                    } else {
+                        op.as_any()
+                            .downcast_ref::<CublasLtAccumulateInPlace>()
+                            .map(|op| op.resolve(&Default::default()))
+                    }
+                })
+                .collect();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].computation, LtComputation::Float16);
+            assert_eq!(calls[0].activation, expected_activation);
+            assert_eq!(calls[0].bias.is_some(), bias);
+            if bias || activation != 0 {
+                assert_eq!(calls[0].d.order, LtOrder::Col);
             }
+            assert_eq!(matches!(calls[0].scalars, LtScalars::Device { .. }), device);
+            if batched {
+                assert_eq!(calls[0].b.batch_stride_in_elements, 0);
+            }
+            execution = Some((
+                support::allocate_arena(&runtime).unwrap(),
+                runtime.allocate_staging().unwrap(),
+            ));
+            searched = true;
+        }
+        for (id, values) in ref_data {
+            reference.set_data(id, values);
+        }
+        reference.execute().unwrap();
+        let (arena, staging) = execution.as_mut().unwrap();
+        for (id, values) in data {
+            runtime.upload(arena, id, values).unwrap();
+        }
+        runtime.execute(arena.arena(), staging).unwrap();
+        let (actual, binding) = runtime.download(arena, out.id).unwrap();
+        let decode = |data: &HostBuffer| {
+            data.bytes
+                .chunks_exact(2)
+                .map(|v| half::f16::from_bits(u16::from_ne_bytes(v.try_into().unwrap())).to_f32())
+                .collect::<Vec<_>>()
+        };
+        let actual =
+            luminal_cuda_lite::layouts::dense_f32(&decode(&actual), &binding.layout).unwrap();
+        let expected: Vec<_> = reference
+            .get_f16(out.id)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        for (actual, expected) in actual.iter().zip(expected) {
+            if expected_activation == LtActivation::GaussianErrorLinear {
+                assert!(
+                    (actual - expected).abs() <= 0.003 + 0.002 * expected.abs(),
+                    "bias={bias}, activation={activation}, alias={alias}, source={source}: {actual} vs {expected}"
+                );
+            } else {
+                assert_eq!(
+                    *actual, expected,
+                    "bias={bias}, activation={activation}, alias={alias}, source={source}"
+                );
+            }
+        }
+        let (kept, binding) = runtime.download(arena, c.id).unwrap();
+        assert_eq!(
+            luminal_cuda_lite::layouts::dense_f32(&decode(&kept), &binding.layout).unwrap(),
+            c_values
+        );
+    }
+}
+
+#[test]
+fn half_gelu_requires_authored_coefficients_and_a_valid_sign_spelling() {
+    for legacy_erf in [false, true] {
+        let mut graph = Graph::new();
+        let a = graph.tensor([3, 8], DType::F16);
+        let b = graph.tensor([8, 4], DType::F16);
+        let x = a.matmul(b);
+        let _out = if legacy_erf {
+            let u = x * std::f32::consts::FRAC_1_SQRT_2;
+            let t = (1.0 + 0.327_591_1 * u.abs()).reciprocal();
+            let poly = ((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72)
+                * t
+                + 0.254_829_6)
+                * t;
+            // This epsilon becomes half zero. At x=0 the sign is 0/0,
+            // whereas native GELU returns zero, so this graph cannot fuse.
+            let sign = u * (u.abs() + 1.0e-10).reciprocal();
+            0.5 * x * (1.0 + sign * (1.0 - poly * (-(u * u)).exp()))
+        } else {
+            // Similar shape is insufficient: a different cubic coefficient
+            // cannot borrow the frontend GELU's vendor approximation contract.
+            let scaled = 1.595_769_2 * x * (1.0 + 0.05 * x * x);
+            x * scaled.sigmoid()
+        };
+        let (separate, tied) = calls(&graph, WHITELIST);
+        assert!(!separate.is_empty());
+        assert!(
+            separate
+                .iter()
+                .all(|op| op.activation != LtActivation::GaussianErrorLinear)
+        );
+        assert!(
+            tied.iter()
+                .all(|op| op.activation != LtActivation::GaussianErrorLinear)
+        );
+    }
+}
+
+#[cfg(feature = "device")]
+#[test]
+fn half_relu_preserves_nan_infinities_and_subnormal_c_values() {
+    use cudarc::driver::DevicePtr;
+    use luminal_cuda_lite::ops::cublaslt::device_call::{self, DeviceRange};
+    let mut graph = Graph::new();
+    let a = graph.tensor([2, 4], DType::F16);
+    let b = graph.tensor([4, 3], DType::F16);
+    let c = graph.tensor([2, 3], DType::F16);
+    let _out = (a.matmul(b) + c).relu();
+    let (separate, _) = calls(&graph, WHITELIST);
+    let call = separate
+        .iter()
+        .find(|op| {
+            op.c.as_ref().is_some_and(|c| {
+                c.resolve(&Default::default()) == op.d.resolve(&Default::default())
+            }) && op.activation == LtActivation::RectifiedLinear
+                && op.scalars.resolve().host_values() == Some((1.0, 1.0))
+        })
+        .unwrap()
+        .resolve(&Default::default());
+    let context = cudarc::driver::CudaContext::new(0).unwrap();
+    let stream = context.default_stream();
+    let c_values = [0x7e01, 0x7c00, 0xfc00, 0x0001, 0x8001, 0x8000];
+    for alias in [false, true] {
+        let raw = |values: &[u16]| {
+            values
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let mut payloads = vec![raw(&[0; 8]), raw(&[0; 12])];
+        payloads.resize(call.form.lit_arity(), Vec::new());
+        payloads[call.c.unwrap().operand] = raw(&c_values);
+        let buffers: Vec<_> = payloads
+            .iter()
+            .map(|v| stream.clone_htod(v).unwrap())
+            .collect();
+        let range = |v: &cudarc::driver::CudaSlice<u8>| DeviceRange {
+            ptr: v.device_ptr(&stream).0,
+            bytes: v.len(),
+        };
+        let inputs: Vec<_> = buffers.iter().map(range).collect();
+        let d = stream.clone_htod(&raw(&[0; 6])).unwrap();
+        let output = if alias {
+            &buffers[call.c.unwrap().operand]
+        } else {
+            &d
+        };
+        device_call::dispatch(&call, &inputs, range(output), &stream).unwrap();
+        let actual = stream.clone_dtoh(output).unwrap();
+        for (bytes, expected) in
+            actual
+                .chunks_exact(2)
+                .zip([f32::NAN, f32::INFINITY, 0.0, 2.0_f32.powi(-24), 0.0, 0.0])
+        {
+            let got = half::f16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).to_f32();
+            assert!(
+                if expected.is_nan() {
+                    got.is_nan()
+                } else {
+                    got == expected
+                },
+                "alias={alias}: {got} vs {expected}"
+            );
+        }
+        if !alias {
+            assert_eq!(
+                stream
+                    .clone_dtoh(&buffers[call.c.unwrap().operand])
+                    .unwrap(),
+                raw(&c_values)
+            );
         }
     }
 }

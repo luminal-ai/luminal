@@ -346,10 +346,11 @@ fn epilogues_that_can_round_early_have_no_narrow_whitelist_row() {
         whitelist::approved_keys()
             .iter()
             .filter(|key| {
-                ["Bf16", "F16"].iter().any(|dtype| {
-                    key.contains(&format!(") ({dtype}) (CublasLtNoBiasDataType)"))
-                        || key.contains(&format!(") ({dtype}) (CublasLtBiasDataTypeOf"))
-                })
+                key.contains("(CublasLtFloat32Computation)")
+                    && ["Bf16", "F16"].iter().any(|dtype| {
+                        key.contains(&format!(") ({dtype}) (CublasLtNoBiasDataType)"))
+                            || key.contains(&format!(") ({dtype}) (CublasLtBiasDataTypeOf"))
+                    })
             })
             .all(|key| key.contains("CublasLtNoBiasDataType")
                 && !key.contains("GaussianErrorLinear"))

@@ -14,7 +14,7 @@ the elected call and dispatches its descriptors unchanged.
 | `scalar_rules.egg` | Authored alpha/beta scaling and exact FP16/FP32/FP64 scalar storage/pointer proofs |
 | `call_inputs.egg` | Assemble approved matrix/scalar reads in one canonical order |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 3,776 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 4,096 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -57,8 +57,8 @@ including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **3,776 complete configurations**: 1,888 for host scalar
-pointers and 1,888 for device scalar pointers. Each pointer mode admits:
+The table contains **4,096 complete configurations**: 2,048 for host scalar
+pointers and 2,048 for device scalar pointers. Each pointer mode admits:
 
 - 1,344 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
   FP16 A/B storage, plus explicit TF32, FP16 or BF16 input conversion over F32
@@ -72,11 +72,12 @@ pointers and 1,888 for device scalar pointers. Each pointer mode admits:
 - 192 narrow-output rows: matching BF16 or FP16 A/B storage, FP32 arithmetic,
   and an authored final cast to the matching narrow dtype. Each has 16 A/B
   order/transpose combinations, absent/present matching narrow C, and default
-  in either D order or ReLU with column-major D. Native narrow bias and GELU
-  epilogues have no approved rows.
-- 64 native FP16 rows: FP16 arithmetic, matrix storage and alpha/beta,
-  with 16 A/B order/transpose combinations, absent/present FP16 C, default
-  epilogue and either D order.
+  in either D order or ReLU with column-major D. Bias and GELU epilogues
+  have no approved rows for this FP32-compute narrow-output family.
+- 224 native FP16 rows: FP16 arithmetic, matrix storage and alpha/beta,
+  with 16 A/B order/transpose combinations, absent/present FP16 C, and seven
+  destination/epilogue combinations: default in either D order, plus bias,
+  ReLU, ReLU+bias, GELU or GELU+bias with column-major D and FP16 bias.
 - 224 FP64-output rows: FP64 A/B/C/D storage, computation and alpha/beta,
   with 16 A/B order/transpose combinations, absent/present C, and seven
   destination/epilogue combinations: default in either D order, plus bias,
@@ -191,11 +192,14 @@ half computation; `a.cast(DType::F32).matmul(b.cast(DType::F32))` retains FP32
 computation, even if the result is subsequently cast to F16. Storage alone or a
 final output cast never authorizes reducing arithmetic precision.
 
-The 128 complete rows cover both scalar pointer modes, both destination
-orders, all 16 A/B order/transpose combinations, and absent/present C. Ordinary
-and one-axis strided batches share them, including independently shared A/B,
-separate destinations and in-place accumulation. Bias and activation epilogues
-are outside this initial native FP16 admission. Subsequent casts remain separate.
+The 448 complete rows cover both scalar pointer modes, all 16 A/B
+order/transpose combinations, and absent/present C. Default epilogues support
+both destination orders. Bias, ReLU, ReLU+bias, GELU and GELU+bias require
+column-major D; bias is a packed F16 vector broadcast along the vendor matrix's
+columns. Separate destinations and in-place accumulation share these rows.
+The 128 default rows also support one-axis strided batches, including
+independently shared A/B. Batched epilogues remain outside admission.
+Subsequent casts remain separate.
 
 Host literals are explicit F32 constants cast to F16. Decoding performs that
 same nearest-even conversion once and retains the two-byte payload in a distinct
@@ -214,6 +218,20 @@ compute and output types are both FP16. As for the other modes, zero coefficient
 may suppress matrix reads. The reference implements authored FP16 add, multiply
 and sequential sum with half rounding at each step; exact dyadic witnesses
 compare the fused and decomposed paths independently of permitted association.
+
+Native FP16 GELU follows the existing vendor tanh-approximation policy for both
+frontend tanh and erf spellings. Its coefficient proofs recognize each authored
+F32 literal explicitly cast to F16, including log2(e); the proof records the
+source literal, without claiming that its rounded half value equals that source.
+The reference rounds each exp2 and reciprocal output to F16, as it does add and
+multiply. The legacy smoothed-sign erf spelling is excluded for half arithmetic:
+its epsilon underflows to zero and would produce 0/0 at zero. Explicit casts
+inside the expression remain fusion boundaries. Tests use exact dyadic answers
+for bias/ReLU and an absolute-plus-relative `0.003 + 0.002 * abs(reference)`
+bound for the permitted half GELU approximation. A CUDA 12.8/A100 scan across
+[-6, 6] found a maximum absolute difference of 0.001953125 from the decomposed
+half tanh spelling, with and without C/bias and in both scalar pointer modes.
+These samples validate the implementation; they are not a universal error bound.
 
 CUDA 12.8/A100 probes and tests verify genuine half-accumulator algorithms,
 host/device scalar pointers, ordinary/batched descriptors, shared inputs,
@@ -274,7 +292,7 @@ destinations retain their ordinary non-overlapping proofs. A broadcast C cannot
 become an in-place destination. This consumes C's argument slot, so a separate
 residual C plus feature bias still uses the FP32-output path.
 
-Native narrow bias/GELU epilogues can round an intermediate result before the
+FP32-compute narrow-output bias/GELU epilogues can round an intermediate result before the
 authored final cast. On CUDA 12.8/A100, cancellation tests exposed infinity where
 the FP32 graph remains finite: `65504 + 32 - 65504` should produce FP16 32, but
 rounding after the C addition overflows first. Other layouts also exposed this
@@ -415,7 +433,7 @@ and legal leading dimension. This relation is used only for A and B. Every
 vendor descriptor still carries the common logical batch count; sharing is
 represented by stride zero, not a descriptor count of one. The independent
 [layout attributes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatrixlayoutattribute-t)
-are dispatched unchanged. Precision/storage proofs and the complete 3,776-row
+are dispatched unchanged. Precision/storage proofs and the complete 4,096-row
 configuration whitelist remain shared with ordinary batches.
 
 Read sharing never publishes a disjoint matrix or destination proof. C and D

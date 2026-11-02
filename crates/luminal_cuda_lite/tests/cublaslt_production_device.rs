@@ -266,8 +266,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 3776 } else { 2240 });
-    assert_eq!(aliases, if ampere_or_newer { 1888 } else { 1120 });
+    assert_eq!(ran, if ampere_or_newer { 4096 } else { 2560 });
+    assert_eq!(aliases, if ampere_or_newer { 2048 } else { 1280 });
 }
 
 #[test]

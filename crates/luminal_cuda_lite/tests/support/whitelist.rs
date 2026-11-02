@@ -325,16 +325,33 @@ pub fn scalar_registry(device: bool, narrow: bool) -> Vec<luminal_cuda_lite::Reg
     table_registry(&TABLES[usize::from(device) + 2 * usize::from(narrow)])
 }
 
-/// Require the requested FP64 epilogue, so generic activation kernels cannot
+/// Require the requested native epilogue, so generic activation kernels cannot
 /// hide missing recognition or let profiling choose a decomposed substitute.
+pub fn fp16_epilogue_registry(
+    device: bool,
+    bias: bool,
+    activation: LtActivation,
+) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    native_epilogue_registry(true, device, bias, activation)
+}
+
 pub fn fp64_epilogue_registry(
     device: bool,
     bias: bool,
     activation: LtActivation,
 ) -> Vec<luminal_cuda_lite::RegisteredOp> {
-    static TABLES: std::sync::LazyLock<[String; 12]> = std::sync::LazyLock::new(|| {
+    native_epilogue_registry(false, device, bias, activation)
+}
+
+fn native_epilogue_registry(
+    half: bool,
+    device: bool,
+    bias: bool,
+    activation: LtActivation,
+) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 24]> = std::sync::LazyLock::new(|| {
         std::array::from_fn(|index| {
-            let epilogue = match (index / 4, index & 2 != 0) {
+            let epilogue = match ((index % 12) / 4, index & 2 != 0) {
                 (0, false) => "CublasLtDefaultEpilogue",
                 (0, true) => "CublasLtBiasEpilogue",
                 (1, false) => "CublasLtRectifiedLinearEpilogue",
@@ -346,8 +363,11 @@ pub fn fp64_epilogue_registry(
             approved_keys()
                 .into_iter()
                 .filter(|key| {
-                    key.contains("(CublasLtFloat64Computation)")
-                        && key.contains(&format!("({epilogue})"))
+                    key.contains(if index >= 12 {
+                        "(CublasLtFloat16Computation)"
+                    } else {
+                        "(CublasLtFloat64Computation)"
+                    }) && key.contains(&format!("({epilogue})"))
                         && key.contains(if index & 1 == 1 {
                             "CublasLtDeviceScalarPointerMode"
                         } else {
@@ -363,7 +383,10 @@ pub fn fp64_epilogue_registry(
         LtActivation::RectifiedLinear => 1,
         LtActivation::GaussianErrorLinear => 2,
     };
-    table_registry(&TABLES[usize::from(device) + 2 * usize::from(bias) + 4 * activation])
+    table_registry(
+        &TABLES
+            [12 * usize::from(half) + usize::from(device) + 2 * usize::from(bias) + 4 * activation],
+    )
 }
 
 fn table_registry(table: &'static str) -> Vec<luminal_cuda_lite::RegisteredOp> {

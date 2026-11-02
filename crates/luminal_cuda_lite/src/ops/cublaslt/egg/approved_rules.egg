@@ -365,34 +365,45 @@
 ; GELU recognition is local to typed matrix expressions. These facts describe
 ; existing frontend DAGs; they neither construct arithmetic nor union tensors.
 ; Both frontend GELU approximations may use the vendor tanh approximation.
-; Scalars retain their authored precision. F32 constants widened to F64 have
-; exactly their original F32 value; this never folds arbitrary cast chains.
+; Scalar proofs describe the authored literal and its one explicit cast.
+; Their f64 field is the source literal, not the rounded result: F16 coefficients
+; retain that cast, while widening an F32 constant to F64 preserves its value.
+; These syntax facts never publish storage readings or fold arbitrary cast chains.
 (relation cublaslt-gaussian-error-linear-input (LogicalTensor))
 (relation cublaslt-gaussian-error-linear-activation (LogicalTensor LogicalTensor))
 (relation cublaslt-gaussian-error-linear-sign (LogicalTensor LogicalTensor))
-(relation cublaslt-arithmetic-scalar-broadcast (Dtype LogicalTensor f64 Shape))
+(relation cublaslt-authored-scalar-broadcast (Dtype LogicalTensor f64 Shape))
 ; exp() authors a full-width log2(e) constant for F64, unlike its F32 spelling.
 (relation cublaslt-elementary-exponential-scale (Dtype f64))
+(cublaslt-elementary-exponential-scale (F16) 1.4426950216293335)
 (cublaslt-elementary-exponential-scale (F32) 1.4426950216293335)
 (cublaslt-elementary-exponential-scale (F64) 1.4426950408889634)
 (rule
   ((= ?broadcast (LogicalIndexMapApply (LogicalConstant ?value)
        (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
-  ((cublaslt-arithmetic-scalar-broadcast (F32) ?broadcast ?value ?shape))
+  ((cublaslt-authored-scalar-broadcast (F32) ?broadcast ?value ?shape))
   :ruleset backend
   :name "cublaslt: exact FP32 scalar broadcast")
 (rule
   ((= ?broadcast (LogicalIndexMapApply (LogicalConstantF64 ?value)
        (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
-  ((cublaslt-arithmetic-scalar-broadcast (F64) ?broadcast ?value ?shape))
+  ((cublaslt-authored-scalar-broadcast (F64) ?broadcast ?value ?shape))
   :ruleset backend
   :name "cublaslt: exact FP64 scalar broadcast")
 (rule
   ((= ?broadcast (LogicalIndexMapApply (LogicalCast (LogicalConstant ?value) (F64))
        (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
-  ((cublaslt-arithmetic-scalar-broadcast (F64) ?broadcast ?value ?shape))
+  ((cublaslt-authored-scalar-broadcast (F64) ?broadcast ?value ?shape))
   :ruleset backend
   :name "cublaslt: exact widening of an authored FP32 scalar to FP64")
+; Native half frontend arithmetic casts each F32 coefficient to F16. Match
+; that exact authored operation; do not call its unrounded source an F16 value.
+(rule
+  ((= ?broadcast (LogicalIndexMapApply (LogicalCast (LogicalConstant ?value) (F16))
+       (IndexMapLit (IntExprNil) (ShapeLit (IntExprNil))) ?shape)))
+  ((cublaslt-authored-scalar-broadcast (F16) ?broadcast ?value ?shape))
+  :ruleset backend
+  :name "cublaslt: authored FP32 scalar explicitly rounded to FP16")
 ; The current frontend maximum(x, 0) keeps x when x is NaN and guards
 ; only the zero operand with isnan. Its exact ordered-comparison count is
 ; two, so that guard is false. Recognize the whole result, including this
@@ -401,10 +412,10 @@
   ((= ?shape (shape-of ?activation_input))
    (= ?arithmetic_type (dtype-of ?activation_input))
    (cublaslt-arithmetic-type ?arithmetic_type ?zero_literal ?one_literal)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
-   (cublaslt-arithmetic-scalar-broadcast (F32) ?one 1.0 ?shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?positive_infinity inf ?shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?negative_infinity -inf ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
+   (cublaslt-authored-scalar-broadcast (F32) ?one 1.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?positive_infinity inf ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_infinity -inf ?shape)
    (= ?ordered_count (LogicalAdd
      (LogicalCast (LogicalLessThan ?zero ?positive_infinity) (F32))
      (LogicalCast (LogicalLessThan ?negative_infinity ?zero) (F32))))
@@ -431,12 +442,12 @@
   ((cublaslt-gaussian-error-linear-input ?activation_input)
    (= ?activation_shape (shape-of ?activation_input))
    (= ?arithmetic_type (dtype-of ?activation_input))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?one 1.0 ?activation_shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?one 1.0 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?activation_shape)
    (cublaslt-elementary-exponential-scale ?arithmetic_type ?exponential_value)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?exponential_scale ?exponential_value ?activation_shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?tanh_scale 1.5957691669464111 ?activation_shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?cubic_coefficient 0.044714998453855515 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?exponential_scale ?exponential_value ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?tanh_scale 1.5957691669464111 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?cubic_coefficient 0.044714998453855515 ?activation_shape)
    (= ?scaled_input (LogicalMul ?activation_input ?cubic_coefficient))
    (= ?quadratic_term (LogicalMul ?scaled_input ?activation_input))
    (= ?linear_term (LogicalMul ?activation_input ?tanh_scale))
@@ -453,13 +464,18 @@
   :name "cublaslt: frontend tanh GELU")
 ; Match the sign's complete authored spelling. The current frontend uses
 ; exact ordered selects; the older erf graph used x / (abs(x) + epsilon).
+; The legacy epsilon underflows to zero in F16, so that spelling must not
+; authorize a half GELU (it would create 0/0 at zero).
+(relation cublaslt-legacy-smoothed-sign-arithmetic (Dtype))
+(cublaslt-legacy-smoothed-sign-arithmetic (F32))
+(cublaslt-legacy-smoothed-sign-arithmetic (F64))
 (rule
   ((= ?arithmetic_type (dtype-of ?input))
    (cublaslt-arithmetic-type ?arithmetic_type ?zero_literal ?one_literal)
    (= ?shape (shape-of ?input))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?one 1.0 ?shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?one 1.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?shape)
    (= ?negative (LogicalSelect (LogicalLessThan ?input ?zero) ?negative_one ?input))
    (= ?sign (LogicalSelect (LogicalLessThan ?zero ?input) ?one ?negative)))
   ((cublaslt-gaussian-error-linear-sign ?input ?sign))
@@ -469,9 +485,10 @@
   ((= ?arithmetic_type (dtype-of ?input))
    (cublaslt-arithmetic-type ?arithmetic_type ?zero_literal ?one_literal)
    (= ?shape (shape-of ?input))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?epsilon 1.000000013351432e-10 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?zero 0.0 ?shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?shape)
+   (cublaslt-legacy-smoothed-sign-arithmetic ?arithmetic_type)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?epsilon 1.000000013351432e-10 ?shape)
    (= ?negative (LogicalMul ?input ?negative_one))
    (= ?absolute (LogicalSelect (LogicalLessThan ?input ?zero) ?negative ?input))
    (= ?denominator (LogicalAdd ?absolute ?epsilon))
@@ -484,14 +501,14 @@
   ((cublaslt-gaussian-error-linear-input ?activation_input)
    (= ?activation_shape (shape-of ?activation_input))
    (= ?arithmetic_type (dtype-of ?activation_input))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?one 1.0 ?activation_shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?one 1.0 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?negative_one -1.0 ?activation_shape)
    (cublaslt-elementary-exponential-scale ?arithmetic_type ?exponential_value)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?exponential_scale ?exponential_value ?activation_shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?inverse_square_root_two 0.7071067690849304 ?activation_shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?zero 0.0 ?activation_shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?polynomial_scale 0.32759109139442444 ?activation_shape)
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?half 0.5 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?exponential_scale ?exponential_value ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?inverse_square_root_two 0.7071067690849304 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?zero 0.0 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_scale 0.32759109139442444 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?half 0.5 ?activation_shape)
    (= ?scaled_activation_input (LogicalMul ?activation_input ?inverse_square_root_two))
    (= ?negative_input_predicate (LogicalLessThan ?scaled_activation_input ?zero))
    (= ?negative_input (LogicalMul ?scaled_activation_input ?negative_one))
@@ -499,18 +516,18 @@
    (= ?scaled_absolute_input (LogicalMul ?absolute_input ?polynomial_scale))
    (= ?polynomial_denominator (LogicalAdd ?scaled_absolute_input ?one))
    (= ?polynomial_argument (LogicalRecip ?polynomial_denominator))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_five 1.0614054203033447 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_five 1.0614054203033447 ?activation_shape)
    (= ?polynomial_degree_five (LogicalMul ?polynomial_argument ?polynomial_coefficient_five))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_4 -1.453152060508728 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_4 -1.453152060508728 ?activation_shape)
    (= ?polynomial_sum_4 (LogicalAdd ?polynomial_degree_five ?polynomial_coefficient_4))
    (= ?polynomial_degree_4 (LogicalMul ?polynomial_sum_4 ?polynomial_argument))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_3 1.421413779258728 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_3 1.421413779258728 ?activation_shape)
    (= ?polynomial_sum_3 (LogicalAdd ?polynomial_degree_4 ?polynomial_coefficient_3))
    (= ?polynomial_degree_3 (LogicalMul ?polynomial_sum_3 ?polynomial_argument))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_2 -0.2844967246055603 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_2 -0.2844967246055603 ?activation_shape)
    (= ?polynomial_sum_2 (LogicalAdd ?polynomial_degree_3 ?polynomial_coefficient_2))
    (= ?polynomial_degree_2 (LogicalMul ?polynomial_sum_2 ?polynomial_argument))
-   (cublaslt-arithmetic-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_1 0.2548295855522156 ?activation_shape)
+   (cublaslt-authored-scalar-broadcast ?arithmetic_type ?polynomial_coefficient_1 0.2548295855522156 ?activation_shape)
    (= ?polynomial_sum_1 (LogicalAdd ?polynomial_degree_2 ?polynomial_coefficient_1))
    (= ?polynomial_degree_1 (LogicalMul ?polynomial_sum_1 ?polynomial_argument))
    (cublaslt-gaussian-error-linear-sign ?scaled_activation_input ?input_sign)
