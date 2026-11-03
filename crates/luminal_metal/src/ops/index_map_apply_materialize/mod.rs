@@ -1,9 +1,8 @@
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use luminal::index_expr::{IotaExpr, ParseMemo, parse_int_expr_memo};
+use luminal::index_expr::IotaExpr;
 use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
-use luminal::prelude::egraph_serialize;
 
 use crate::kernels::{
     CodegenCtx, Coords, KernelOp, KernelSource, coord_prelude, layout_read_index, lower_expr,
@@ -161,57 +160,8 @@ impl OpMatcher for IndexMapApplyMaterializeMatcher {
 
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
         Box::new(IndexMapApplyMaterialize {
-            entries: parse_map_entries(site),
+            entries: luminal::index_expr::parse_index_map_entries(site, 1, 2),
         })
     }
 }
 
-fn parse_map_entries(site: &ExtractionSite<'_>) -> Option<Vec<IotaExpr>> {
-    let map_class = site.child_class(1);
-    let out_shape = site.child_class(2);
-    let mut memo = std::collections::HashMap::new();
-    for map_node in site.nodes_in_class_value(&map_class, "IndexMapLit") {
-        let Some(head) = site.class_of_child(map_node, 0) else {
-            continue;
-        };
-        if let Some(entries) = parse_entry_list(site, &head, 64, &out_shape, &mut memo) {
-            return Some(entries);
-        }
-    }
-    None
-}
-
-fn parse_entry_list(
-    site: &ExtractionSite<'_>,
-    class: &egraph_serialize::ClassId,
-    depth: usize,
-    out_shape: &egraph_serialize::ClassId,
-    memo: &mut std::collections::HashMap<egraph_serialize::ClassId, ParseMemo>,
-) -> Option<Vec<IotaExpr>> {
-    if depth == 0 {
-        return None;
-    }
-    if site
-        .nodes_in_class_value(class, "IntExprNil")
-        .next()
-        .is_some()
-    {
-        return Some(Vec::new());
-    }
-    for cons in site.nodes_in_class_value(class, "IntExprCons") {
-        let Some(element) = site.class_of_child(cons, 0) else {
-            continue;
-        };
-        let Some(tail) = site.class_of_child(cons, 1) else {
-            continue;
-        };
-        let Some(expr) = parse_int_expr_memo(site, &element, 64, Some(out_shape), memo) else {
-            continue;
-        };
-        if let Some(mut rest) = parse_entry_list(site, &tail, depth - 1, out_shape, memo) {
-            rest.insert(0, expr);
-            return Some(rest);
-        }
-    }
-    None
-}

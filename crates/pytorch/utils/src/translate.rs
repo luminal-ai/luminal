@@ -38,6 +38,8 @@ mod frexp;
 mod gcd_tests;
 #[cfg(test)]
 mod gelu_tests;
+#[cfg(test)]
+mod view_compose_tests;
 mod grouped_mm;
 mod index;
 #[cfg(test)]
