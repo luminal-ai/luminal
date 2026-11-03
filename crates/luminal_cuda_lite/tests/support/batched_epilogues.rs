@@ -61,7 +61,6 @@ fn decode(dtype: PlanDtype, bytes: &[u8]) -> Vec<f32> {
 }
 pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     assert_eq!(call.scale_dtype, PlanDtype::F32);
-    assert!(call.bias.is_none());
     let mut call = call.clone();
     let (alpha, beta) = (1.5f32, if call.c.is_some() { -0.5f32 } else { 0.0 });
     if matches!(call.scalars, LtScalars::Host { .. }) {
@@ -70,9 +69,17 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     let a = values(call.a, 1);
     let b = values(call.b, 2);
     let c = call.c.map(|c| values(c.descriptor, 3));
+    let bias = call.bias.map(|bias| {
+        (0..((call.d.batch_count - 1) * bias.batch_stride_in_elements + call.m) as usize)
+            .map(|i| ((i + 1) % 5) as f32 / 4.0 - 0.5)
+            .collect::<Vec<_>>()
+    });
     let mut payloads = vec![Vec::new(); call.form.lit_arity() + call.scalars.input_count()];
     payloads[0] = raw(call.a_dtype, &a);
     payloads[1] = raw(call.b_dtype, &b);
+    if let Some(input) = call.bias {
+        payloads[input.operand] = raw(input.data_type, bias.as_ref().unwrap());
+    }
     if let Some(input) = call.c {
         payloads[input.operand] = raw(input.data_type, c.as_ref().unwrap());
     }
@@ -129,6 +136,12 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
                         f64::from(beta)
                             * f64::from(c.as_ref().unwrap()[at(input.descriptor, batch, row, col)])
                     });
+                if let Some(input) = call.bias {
+                    expected += f64::from(
+                        bias.as_ref().unwrap()
+                            [batch * input.batch_stride_in_elements as usize + row],
+                    );
+                }
                 expected = match call.activation {
                     LtActivation::RectifiedLinear => expected.max(0.0),
                     LtActivation::GaussianErrorLinear => {
@@ -159,6 +172,12 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
                 );
             }
         }
+    }
+    if let Some(input) = call.bias {
+        assert_eq!(
+            stream.clone_dtoh(&buffers[input.operand]).unwrap(),
+            payloads[input.operand]
+        );
     }
     if !alias && let Some(c) = call.c {
         assert_eq!(

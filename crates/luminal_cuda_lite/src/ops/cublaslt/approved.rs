@@ -145,6 +145,7 @@ pub(super) fn dtype(site: &ExtractionSite<'_>, class: &ClassId) -> PlanDtype {
 pub struct Bias {
     pub tensor: ClassId,
     pub dtype: PlanDtype,
+    pub batch_stride_in_elements: IotaExpr,
 }
 
 /// Scalar arguments are decoded independently of the matrix element types.
@@ -260,6 +261,13 @@ pub(super) fn bias(site: &ExtractionSite<'_>, class: &ClassId) -> Option<Bias> {
         Some(Bias {
             tensor: site.class_of_child(node, 0).unwrap(),
             dtype: dtype(site, &site.class_of_child(node, 1).unwrap()),
+            batch_stride_in_elements: luminal::index_expr::parse_int_expr(
+                site,
+                &site.class_of_child(node, 2).unwrap(),
+                128,
+                None,
+            )
+            .expect("bias batch stride expression"),
         })
     } else {
         member(site, class, "CublasLtBiasAbsent");
@@ -489,6 +497,7 @@ impl ApprovedCublasLt {
             bias: self.bias.as_ref().map(|bias| LtBiasInput {
                 operand: 2 + self.scalars.resolve().input_count(),
                 data_type: bias.dtype,
+                batch_stride_in_elements: bias.batch_stride_in_elements.eval_with_dims(&[], dims),
             }),
         }
     }
@@ -539,6 +548,7 @@ impl crate::HostOp for ApprovedCublasLt {
     fn capture_dims(&self) -> Option<Vec<luminal::shape::Symbol>> {
         Some(capture_dimensions(
             [&self.a, &self.b, &self.d].into_iter().chain(self.c.iter()),
+            self.bias.as_ref(),
         ))
     }
 
@@ -560,6 +570,7 @@ impl crate::HostOp for ApprovedCublasLt {
 /// Capture dependencies of the already-selected descriptor expressions.
 pub(super) fn capture_dimensions<'a>(
     matrices: impl IntoIterator<Item = &'a Matrix>,
+    bias: Option<&Bias>,
 ) -> Vec<luminal::shape::Symbol> {
     fn visit(expr: &IotaExpr, out: &mut std::collections::BTreeSet<luminal::shape::Symbol>) {
         use IotaExpr::*;
@@ -592,6 +603,9 @@ pub(super) fn capture_dimensions<'a>(
         ] {
             visit(expr, &mut out);
         }
+    }
+    if let Some(bias) = bias {
+        visit(&bias.batch_stride_in_elements, &mut out);
     }
     out.into_iter().collect()
 }

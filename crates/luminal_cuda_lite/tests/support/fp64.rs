@@ -60,7 +60,9 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     let a = values(&call.a, 1);
     let b = values(&call.b, 2);
     let c = call.c.map(|c| values(&c.descriptor, 3));
-    let bias: Vec<_> = (0..call.m as usize)
+    let bias: Vec<_> = (0..call.bias.map_or(call.m, |bias| {
+        (call.d.batch_count - 1) * bias.batch_stride_in_elements + call.m
+    }) as usize)
         .map(|row| (row as f64 - 1.5) / 4.0 + (row + 1) as f64 * 2f64.powi(-29))
         .collect();
     let mut payloads = vec![raw(&a), raw(&b)];
@@ -120,8 +122,8 @@ pub fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
                     + call.c.map_or(0.0, |input| {
                         beta * c.as_ref().unwrap()[at(&input.descriptor, batch, row, col)]
                     });
-                if call.bias.is_some() {
-                    expected += bias[row];
+                if let Some(input) = call.bias {
+                    expected += bias[batch * input.batch_stride_in_elements as usize + row];
                 }
                 expected = match call.activation {
                     LtActivation::Identity => expected,

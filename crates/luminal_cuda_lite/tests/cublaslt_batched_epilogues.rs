@@ -16,6 +16,8 @@ use luminal_cuda_lite::ops::cublaslt::exec::{
 #[cfg(feature = "device")]
 #[path = "support/batched_epilogues.rs"]
 mod batch_device;
+#[path = "support/batched_bias.rs"]
+mod batched_bias;
 #[path = "support/broadcast_c.rs"]
 mod broadcast_c;
 #[cfg(feature = "device")]
@@ -243,6 +245,9 @@ struct Case {
     cancellation: bool,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     c_padding: usize,
+    // Some(true): shared feature vector; Some(false): one vector per batch.
+    bias: Option<bool>,
+    bias_pitch: Option<IntExpr>,
 }
 impl Case {
     fn new(family: Family) -> Self {
@@ -258,6 +263,8 @@ impl Case {
             c_shared: false,
             cancellation: false,
             c_padding: 0,
+            bias: None,
+            bias_pitch: None,
         }
     }
 }
@@ -271,6 +278,7 @@ struct Fixture {
     inputs: Vec<GraphTensor>,
     c: Option<GraphTensor>,
     scalars: [Option<GraphTensor>; 2],
+    bias: Option<GraphTensor>,
 }
 fn fixture(case: Case) -> Fixture {
     let mut graph = Box::new(Graph::new());
@@ -384,7 +392,23 @@ fn fixture(case: Case) -> Fixture {
         };
         product + c.cast(case.family.arithmetic) * beta.expand_rhs(c.dims())
     });
-    let out = activation(sum, case.activation).cast(case.family.output);
+    let bias = case.bias.map(|shared| {
+        let dims = if shared {
+            vec![N.into()]
+        } else {
+            vec![case.batch, N.into()]
+        };
+        input(&mut graph, dims, case.family.arithmetic)
+    });
+    let biased = bias.map_or(sum, |bias| {
+        let bias = if case.bias == Some(true) {
+            bias.expand_dim(0, M).expand_dim(0, case.batch)
+        } else {
+            bias.expand_dim(1, M)
+        };
+        sum + bias
+    });
+    let out = activation(biased, case.activation).cast(case.family.output);
     Fixture {
         graph,
         out,
@@ -393,6 +417,7 @@ fn fixture(case: Case) -> Fixture {
         inputs,
         c,
         scalars,
+        bias,
     }
 }
 
@@ -761,20 +786,38 @@ mod execution {
         let table: String = whitelist::approved_keys()
             .into_iter()
             .filter(|key| {
-                case.family.key_matches(key)
-                    && key.contains(if case.device {
-                        "CublasLtDeviceScalarPointerMode"
-                    } else {
-                        "CublasLtHostScalarPointerMode"
-                    })
-                    && key.contains(match vendor_activation(case.activation) {
-                        LtActivation::RectifiedLinear => "(CublasLtRectifiedLinearEpilogue)",
-                        LtActivation::GaussianErrorLinear => {
+                case.family.key_matches(&if case.bias.is_some() {
+                    key.replace(
+                        &format!(
+                            "(CublasLtBiasDataTypeOf ({:?}))",
+                            plan_dtype(case.family.arithmetic)
+                        ),
+                        "(CublasLtNoBiasDataType)",
+                    )
+                } else {
+                    key.clone()
+                }) && key.contains(if case.device {
+                    "CublasLtDeviceScalarPointerMode"
+                } else {
+                    "CublasLtHostScalarPointerMode"
+                }) && key.contains(
+                    match (case.bias.is_some(), vendor_activation(case.activation)) {
+                        (false, LtActivation::RectifiedLinear) => {
+                            "(CublasLtRectifiedLinearEpilogue)"
+                        }
+                        (true, LtActivation::RectifiedLinear) => {
+                            "(CublasLtRectifiedLinearBiasEpilogue)"
+                        }
+                        (false, LtActivation::GaussianErrorLinear) => {
                             "(CublasLtGaussianErrorLinearEpilogue)"
                         }
-                        LtActivation::Identity => "(CublasLtDefaultEpilogue)",
-                    })
-                    && key.contains("CublasLtNoCMatrixDataType") != case.with_c
+                        (true, LtActivation::GaussianErrorLinear) => {
+                            "(CublasLtGaussianErrorLinearBiasEpilogue)"
+                        }
+                        (false, LtActivation::Identity) => "(CublasLtDefaultEpilogue)",
+                        (true, LtActivation::Identity) => "(CublasLtBiasEpilogue)",
+                    },
+                ) && key.contains("CublasLtNoCMatrixDataType") != case.with_c
             })
             .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
             .collect();
@@ -799,7 +842,17 @@ mod execution {
         let f = fixture(case);
         let mut bindings = CudaBindings::new();
         for t in &f.inputs {
-            if case.c_padding > 0 && f.c.is_some_and(|c| c.id == t.id) {
+            if let Some(pitch) = case
+                .bias_pitch
+                .filter(|_| f.bias.is_some_and(|b| b.id == t.id))
+            {
+                bindings.input_with(
+                    t.id,
+                    luminal_cuda_lite::bindings::BoundaryLayout::Strided {
+                        strides: vec![pitch, 1.into()],
+                    },
+                );
+            } else if case.c_padding > 0 && f.c.is_some_and(|c| c.id == t.id) {
                 let minor = if case.c_reading == CReading::RowVector {
                     N
                 } else {
@@ -814,6 +867,18 @@ mod execution {
                 );
             } else {
                 bindings.input(t.id);
+            }
+        }
+        if let Some(bias) = f.bias {
+            if let Some(pitch) = case.bias_pitch {
+                bindings.output_with(
+                    bias.id,
+                    luminal_cuda_lite::bindings::BoundaryLayout::Strided {
+                        strides: vec![pitch, 1.into()],
+                    },
+                );
+            } else {
+                bindings.output(bias.id);
             }
         }
         if let Some(c) = f.c {
@@ -872,21 +937,26 @@ mod execution {
         )
         .unwrap();
         let dynamic = case.batch.to_usize().is_none();
-        let bounds = if dynamic {
-            SymbolBounds::from_ranges([('b'.into(), (1, 3))]).unwrap()
-        } else {
-            Default::default()
-        };
+        let dynamic_pitch = case.bias_pitch.is_some_and(|p| p.to_usize().is_none());
+        let bounds = SymbolBounds::from_ranges(
+            dynamic
+                .then_some(('b'.into(), (1, 3)))
+                .into_iter()
+                .chain(dynamic_pitch.then_some(('p'.into(), (2, 4)))),
+        )
+        .unwrap();
         let mut execution = None;
         let replays = if dynamic {
             vec![(1, 1.5, -0.5), (3, -0.75, 2.0), (2, 0.5, -0.25)]
+        } else if dynamic_pitch {
+            vec![(2, 1.5, -0.5), (2, 1.5, -0.5), (2, 1.5, -0.5)]
         } else if case.device {
             vec![(2, 1.5, -0.5), (2, -0.75, 2.0)]
         } else {
             vec![(2, 1.5, -0.5)]
         };
-        for (count, alpha, beta) in replays {
-            let dims = if dynamic {
+        for (replay, (count, alpha, beta)) in replays.into_iter().enumerate() {
+            let mut dims: FxHashMap<Symbol, usize> = if dynamic {
                 [('b'.into(), count)].into_iter().collect()
             } else {
                 Default::default()
@@ -895,9 +965,15 @@ mod execution {
                 runtime.set_dim('b', count);
                 reference.set_dim('b', count);
             }
+            if dynamic_pitch {
+                let pitch_units = replay + 2;
+                dims.insert('p'.into(), pitch_units);
+                runtime.set_dim('p', pitch_units);
+            }
             let mut data = FxHashMap::default();
             let mut ref_data = FxHashMap::default();
             let mut c_values = Vec::new();
+            let mut bias_values = Vec::new();
             for (i, t) in f.inputs.iter().enumerate() {
                 let (dtype, values) = if f.scalars[0].is_some_and(|x| x.id == t.id) {
                     (case.family.arithmetic, vec![alpha])
@@ -907,6 +983,8 @@ mod execution {
                     let len = t.dims().iter().map(|d| d.exec(&dims).unwrap()).product();
                     let dtype = if i < 2 {
                         case.family.input
+                    } else if f.bias.is_some_and(|b| b.id == t.id) {
+                        case.family.arithmetic
                     } else {
                         case.family.output
                     };
@@ -949,9 +1027,23 @@ mod execution {
                     if f.c.is_some_and(|c| c.id == t.id) {
                         c_values = values.clone();
                     }
+                    if f.bias.is_some_and(|b| b.id == t.id) {
+                        bias_values = values.clone();
+                    }
                     (dtype, values)
                 };
-                if case.c_padding > 0 && f.c.is_some_and(|c| c.id == t.id) {
+                if let Some(pitch) = case
+                    .bias_pitch
+                    .filter(|_| f.bias.is_some_and(|b| b.id == t.id))
+                {
+                    let pitch = pitch.exec(&dims).unwrap();
+                    let mut physical = vec![777.0; (count - 1) * pitch + N];
+                    for batch in 0..count {
+                        physical[batch * pitch..batch * pitch + N]
+                            .copy_from_slice(&values[batch * N..(batch + 1) * N]);
+                    }
+                    data.insert(t.id, cuda_buffer(dtype, &physical));
+                } else if case.c_padding > 0 && f.c.is_some_and(|c| c.id == t.id) {
                     assert!(!case.c_shared && case.c_reading != CReading::Matrix);
                     let minor = if case.c_reading == CReading::RowVector {
                         N
@@ -979,10 +1071,15 @@ mod execution {
                         &luminal_cuda_lite::harness_search_options(),
                     )
                     .unwrap();
+                // Bias pitch is CUDA boundary layout metadata; the dense
+                // reference graph has no p dimension.
+                let reference_bounds =
+                    SymbolBounds::from_ranges(dynamic.then_some(('b'.into(), (1, 3)))).unwrap();
+                let reference_dims = dynamic.then_some(('b'.into(), count)).into_iter().collect();
                 reference
                     .search(
-                        &bounds,
-                        &dims,
+                        &reference_bounds,
+                        &reference_dims,
                         &ref_data,
                         &luminal_reference::harness_search_options(),
                     )
@@ -1010,10 +1107,24 @@ mod execution {
                 assert!(case.family.matches(call), "{case:?}: {call:?}");
                 assert_eq!(call.activation, vendor_activation(case.activation));
                 assert_eq!(call.c.is_some(), case.with_c);
-                assert!(call.bias.is_none());
+                assert_eq!(call.bias.is_some(), case.bias.is_some());
+                if let Some(bias) = call.bias {
+                    assert_eq!(bias.data_type, plan_dtype(case.family.arithmetic));
+                    assert_eq!(
+                        bias.batch_stride_in_elements,
+                        if case.bias == Some(true) {
+                            0
+                        } else {
+                            case.bias_pitch.unwrap_or(N.into()).exec(&dims).unwrap() as i64
+                        }
+                    );
+                }
                 assert_eq!(
                     call.d.order,
-                    if case.activation == 0 && case.c_reading != CReading::ColumnVector {
+                    if case.activation == 0
+                        && case.bias.is_none()
+                        && case.c_reading != CReading::ColumnVector
+                    {
                         LtOrder::Row
                     } else {
                         LtOrder::Col
@@ -1106,11 +1217,12 @@ mod execution {
                     "{case:?}, alias={alias}: {got} vs {want}"
                 );
             }
-            if let Some(c) = f.c {
+            for (c, expected) in [(f.c, c_values), (f.bias, bias_values)] {
+                let Some(c) = c else { continue };
                 let (kept, binding) = runtime.download(arena, c.id).unwrap();
                 let shape: Vec<_> = c.dims().iter().map(|d| d.exec(&dims).unwrap()).collect();
                 let values = decode(&kept);
-                let kept: Vec<_> = (0..c_values.len())
+                let kept: Vec<_> = (0..expected.len())
                     .map(|mut linear| {
                         let mut coordinates = vec![0; shape.len()];
                         for (coordinate, extent) in coordinates.iter_mut().zip(&shape).rev() {
@@ -1120,7 +1232,7 @@ mod execution {
                         values[binding.layout.element_index(&coordinates).unwrap()]
                     })
                     .collect();
-                assert_eq!(kept, c_values);
+                assert_eq!(kept, expected);
             }
         }
     }

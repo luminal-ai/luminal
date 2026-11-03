@@ -51,7 +51,9 @@
 (datatype CublasLtCMatrixArgument
   (CublasLtCMatrixAbsent)
   (CublasLtCMatrixInput CublasLtMatrixDescriptor))
-(datatype CublasLtBiasArgument (CublasLtBiasAbsent) (CublasLtBiasInput LayoutTensor Dtype))
+; Packed bias storage and its vendor batch stride in elements. Rank-two calls
+; and shared vectors explicitly use stride zero; the D descriptor owns count/m.
+(datatype CublasLtBiasArgument (CublasLtBiasAbsent) (CublasLtBiasInput LayoutTensor Dtype IntExpr))
 ; Full configuration: compute, scale, A/B/D storage, C/bias storage or absence,
 ; scalar pointer mode, epilogue, A/B/D orders, A/B operations, reduction mask. Matrix and batch
 ; geometry live in the descriptors and require the corresponding layout proofs.

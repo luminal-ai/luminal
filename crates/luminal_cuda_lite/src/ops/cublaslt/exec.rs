@@ -85,6 +85,7 @@ pub struct LtCMatrixInput {
 pub struct LtBiasInput {
     pub data_type: luminal::dtype::PlanDtype,
     pub operand: usize,
+    pub batch_stride_in_elements: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,12 +395,32 @@ impl LtCall {
             let Some(&elems) = operand_elems.get(i) else {
                 bail!("cuBLASLt: bias operand index {i} out of operand range");
             };
-            // The bias vector is length m: one entry per vendor D row.
-            if (elems as i128) < self.m as i128 {
+            if bias.batch_stride_in_elements < 0 || self.m < 1 {
+                bail!("cuBLASLt bias: invalid vector length or negative batch stride");
+            }
+            let needed = (self.d.batch_count - 1)
+                .checked_mul(bias.batch_stride_in_elements)
+                .and_then(|n| n.checked_add(self.m))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cuBLASLt bias: batched element reach overflows i64")
+                })?;
+            // Match the conservative egglog bias layout contract. Keeping
+            // this guard here also protects direct descriptor callers.
+            let alignment_elements = 128 / bias.data_type.egglog_bits();
+            if bias.batch_stride_in_elements % alignment_elements != 0 {
+                bail!("cuBLASLt bias: batch pitch must preserve 16-byte alignment");
+            }
+            if self.d.batch_count > 1
+                && bias.batch_stride_in_elements != 0
+                && bias.batch_stride_in_elements < self.m
+            {
+                bail!("cuBLASLt bias: nonzero batch pitch overlaps feature vectors");
+            }
+            if (elems as i128) < needed as i128 {
                 bail!(
-                    "cuBLASLt bias: buffer holds {elems} elements, epilogue reads m = {} \
+                    "cuBLASLt bias: buffer holds {elems} elements, epilogue needs {} \
                      — refused before dispatch",
-                    self.m
+                    needed
                 );
             }
         }

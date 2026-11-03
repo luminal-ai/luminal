@@ -209,9 +209,8 @@ order/transpose combinations, and absent/present C. Default epilogues support
 both destination orders. Bias, ReLU, ReLU+bias, GELU and GELU+bias require
 column-major D; bias is a packed F16 vector broadcast along the vendor matrix's
 columns. Separate destinations and in-place accumulation share these rows.
-The 128 default rows and 128 no-bias ReLU/GELU rows also support one-axis
-strided batches, including independently shared A/B. Batched bias remains
-outside admission.
+All 448 rows also support one-axis strided batches, including independently
+shared A/B and shared or per-batch feature bias (see the layout requirements below).
 Subsequent casts remain separate.
 
 Native ReLU and ReLU+bias follow the vendor NaN policy above. CUDA 12.8/A100
@@ -361,8 +360,7 @@ pre-cast F32 storage and delegates input conversion to cuBLASLt. Earlier
 narrowing remains in that storage source. Casts after multiplication/reduction
 cannot authorize this mode. The proof composes with rank-two epilogues,
 strided batches, separate destinations, in-place accumulation and subsequent
-output casts. Batched activations share these proofs; native batched bias remains
-outside the batch grammar.
+output casts. Batched activations and feature bias share these proofs.
 
 Operand storage proofs are parameterized by computation mode. A global fact
 allowing rounded operands to read pre-cast storage would also let ordinary F32
@@ -465,7 +463,7 @@ vectors; those permissions never authorize a shared C/D write. Partial matrix
 overlap remains unsupported.
 
 Batched admission covers a scaled product and scaled product+C, optionally
-followed by ReLU or GELU. It reuses the shared typed activation recognizers,
+followed by feature bias and ReLU or GELU. It reuses the shared typed activation recognizers,
 including both frontend GELU spellings, and the existing precision-specific
 storage/scalar proofs. Recognition describes the complete expression before its
 final output cast. Intervening casts remain arithmetic boundaries: rounding
@@ -486,9 +484,56 @@ prevents inverse result views from creating an unbounded cast/view ladder.
 
 C and D share shape, dtype, order and count but may have independent leading
 dimensions and batch strides. In-place emission additionally requires identical
-complete descriptions and layouts. Native batched bias, multiple batch axes and
-arbitrary flattening are not part of this grammar. Unproved cases retain generic
+complete descriptions and layouts. Multiple batch axes and arbitrary flattening
+are not part of this grammar. Unproved cases retain generic
 operations/materialization.
+
+### Batched feature bias alongside residual C
+
+The native bias argument is independent of C. The authored expression is
+`activation(alpha * A[b] @ B[b] + beta * C[b] + bias[b])`; without C, beta is
+zero. For example:
+
+```rust,ignore
+let residual = graph.tensor([g, m, n], DType::F32);
+let bias = graph.tensor([g, n], DType::F32).expand_dim(1, m);
+let y = (a.matmul(b) + residual + bias).relu();
+```
+
+A shared `[n]` bias instead explicitly expands over m and g. In either form,
+bias storage is a packed feature vector: unit feature stride, zero broadcast
+stride, and batch pitch zero (shared) or a disjoint pitch covering n elements.
+Per-batch pitches must preserve **16-byte alignment**: multiples of four F32,
+two F64 or eight F16/BF16 elements. Padded and symbolic pitches are supported
+when the proof establishes these properties. This is a conservative safety
+contract: CUDA 12.8/A100's heuristic selected a TF32 kernel that faults with a
+nine-F32 bias pitch, while aligned pitches passed. Unaligned layouts retain
+legal copy/unfused alternatives; no unsafe pitch is emitted. The underlying
+[`BIAS_BATCH_STRIDE` attribute](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmuldescattributes-t)
+is in elements and defaults to zero.
+
+Recognition carries the full logical broadcast into the whole-expression
+transpose frame. Storage proofs then check the vendor bias axis, including
+when m, n and batch extents happen to be equal. The full C input keeps its own
+descriptor and may use full/shared matrices or a compatible broadcast layout.
+C/D still share API order: a native feature bias composes with a feature-vector
+C broadcast; a C vector varying over the other matrix axis needs full-matrix
+materialization before the biased call.
+Exact-storage proofs preserve casts; bias is not reassociated across C addition
+or activation. Separate and in-place emission share the complete admission
+proof, and bias remains read-only in both. The bias descriptor owns its dtype
+and batch pitch; D owns the row length and batch count. Capacity validation
+checks the last vector, and capture dependencies include bias-only symbols.
+
+All **1,536 existing native-bias whitelist rows** now accept batched geometry:
+ordinary F32, F16/BF16 inputs with F32 output, F64, native F16, TF32 and both fast
+F32-storage conversion modes. Bias dtype still follows the complete row.
+The 4,096-row whitelist is unchanged. F32-compute narrow-output bias/GELU and
+INT8 native epilogues remain unwhitelisted. The rule tests require both shared
+and per-batch witnesses for every admitted row, including both executable forms
+for C-present configurations. Device tests execute those 4,608 witnesses and
+compare compiled graphs with `ReferenceRuntime`, including symbolic bias pitch
+replay, typed live coefficients and retained C/bias.
 
 ### Read-only broadcast C
 

@@ -676,7 +676,7 @@
    (= ?bias_layout_tensor
      (LayoutTensorLit ?bias_storage_tensor
        (RightMajorContiguousElementLayoutLit (shape-of ?bias_storage_tensor) (bits-of ?element_data_type)))))
-  ((cublaslt-bias-argument ?expression_frame ?m (CublasLtBiasInput ?bias_layout_tensor ?element_data_type)
+  ((cublaslt-bias-argument ?expression_frame ?m (CublasLtBiasInput ?bias_layout_tensor ?element_data_type (IntLit 0))
      (CublasLtBiasDataTypeOf ?element_data_type) (LayoutTensorCons ?bias_layout_tensor (LayoutTensorNil))))
   :ruleset backend
   :name "cublaslt: packed bias with exact row length")

@@ -218,6 +218,7 @@ fn call_for(form: CublasLtForm) -> LtCall {
             .then_some(luminal_cuda_lite::ops::cublaslt::exec::LtBiasInput {
                 operand: if form.has_c() { 3 } else { 2 },
                 data_type: luminal::dtype::PlanDtype::F32,
+                batch_stride_in_elements: 0,
             }),
     }
 }

@@ -175,6 +175,7 @@ impl CublasLtAccumulateInPlace {
             bias: self.bias.as_ref().map(|bias| LtBiasInput {
                 operand: 2 + self.scalars.resolve().input_count(),
                 data_type: bias.dtype,
+                batch_stride_in_elements: bias.batch_stride_in_elements.eval_with_dims(&[], dims),
             }),
         }
     }
@@ -224,7 +225,10 @@ impl ToDps for CublasLtAccumulateInPlace {
 impl LayoutIrOp for CublasLtAccumulateInPlace {}
 impl crate::HostOp for CublasLtAccumulateInPlace {
     fn capture_dims(&self) -> Option<Vec<luminal::shape::Symbol>> {
-        Some(capture_dimensions([&self.a, &self.b, &self.c_and_d]))
+        Some(capture_dimensions(
+            [&self.a, &self.b, &self.c_and_d],
+            self.bias.as_ref(),
+        ))
     }
     fn workspace_bytes(&self, _: &crate::symbolic::Bounds) -> anyhow::Result<usize> {
         Ok(32 * 1024 * 1024)

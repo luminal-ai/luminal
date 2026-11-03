@@ -301,6 +301,11 @@ pub fn prepare(
         std::mem::size_of::<sys::cublasLtEpilogue_t>(),
     )?;
     if let Some(bias) = call.bias {
+        set_desc(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE,
+            (&bias.batch_stride_in_elements) as *const _ as *const _,
+            std::mem::size_of::<i64>(),
+        )?;
         let bias_idx = bias.operand;
         let bias_ptr = operands
             .get(bias_idx)

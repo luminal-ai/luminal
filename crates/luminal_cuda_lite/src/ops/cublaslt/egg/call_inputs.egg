@@ -30,7 +30,7 @@
    (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
    (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
    (= ?C_argument (CublasLtCMatrixAbsent))
-   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
+   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type ?bias_batch_stride))
    (cublaslt-host-scalar-arguments ?scalars))
   ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
      (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorNil))))))
@@ -42,7 +42,7 @@
    (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
    (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
    (= ?C_argument (CublasLtCMatrixAbsent))
-   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
+   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type ?bias_batch_stride))
    (= ?scalars (CublasLtDeviceScalarArguments ?alpha_tensor ?beta_tensor)))
   ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
      (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?alpha_tensor (LayoutTensorCons ?beta_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorNil))))))))
@@ -78,7 +78,7 @@
    (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
    (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
    (= ?C_argument (CublasLtCMatrixInput (CublasLtMatrixDescriptorOf ?C_tensor ?C_layout)))
-   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
+   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type ?bias_batch_stride))
    (cublaslt-host-scalar-arguments ?scalars))
   ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
      (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorCons ?C_tensor (LayoutTensorNil)))))))
@@ -90,7 +90,7 @@
    (= ?A_descriptor (CublasLtMatrixDescriptorOf ?A_tensor ?A_layout))
    (= ?B_descriptor (CublasLtMatrixDescriptorOf ?B_tensor ?B_layout))
    (= ?C_argument (CublasLtCMatrixInput (CublasLtMatrixDescriptorOf ?C_tensor ?C_layout)))
-   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type))
+   (= ?bias_argument (CublasLtBiasInput ?bias_tensor ?bias_type ?bias_batch_stride))
    (= ?scalars (CublasLtDeviceScalarArguments ?alpha_tensor ?beta_tensor)))
   ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument ?bias_argument ?D_descriptor ?frame ?scalars
      (LayoutTensorCons ?A_tensor (LayoutTensorCons ?B_tensor (LayoutTensorCons ?alpha_tensor (LayoutTensorCons ?beta_tensor (LayoutTensorCons ?bias_tensor (LayoutTensorCons ?C_tensor (LayoutTensorNil)))))))))
