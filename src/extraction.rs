@@ -2652,10 +2652,35 @@ impl<'a> ClassRenderer<'a> {
     }
 
     fn readable_index_map(&self, class: &ClassId) -> Option<String> {
-        let node_id = self.node_with_op(class, "IndexMapLit")?;
-        let node = self.egraph.nodes.get(node_id)?;
-        let exprs_class = child_class(self.egraph, node, 0)?;
-        self.readable_expr_list_display(&exprs_class)
+        self.readable_index_map_visiting(class, &mut HashSet::new())
+    }
+
+    // A literal renders its entries; a closed composite (`IndexMapCompose
+    // inner outer`, the view-of-a-view lambda left unreduced) renders both
+    // halves. The visiting set is the cycle guard of `readable_expr_list`.
+    fn readable_index_map_visiting(
+        &self,
+        class: &ClassId,
+        visiting: &mut HashSet<ClassId>,
+    ) -> Option<String> {
+        if !visiting.insert(class.clone()) {
+            return None;
+        }
+        let rendered = if let Some(node_id) = self.node_with_op(class, "IndexMapLit") {
+            let node = self.egraph.nodes.get(node_id)?;
+            let exprs_class = child_class(self.egraph, node, 0)?;
+            self.readable_expr_list_display(&exprs_class)
+        } else {
+            let node_id = self.node_with_op(class, "IndexMapCompose")?;
+            let node = self.egraph.nodes.get(node_id)?;
+            let inner = child_class(self.egraph, node, 0)?;
+            let outer = child_class(self.egraph, node, 1)?;
+            let inner = self.readable_index_map_visiting(&inner, visiting)?;
+            let outer = self.readable_index_map_visiting(&outer, visiting)?;
+            Some(format!("compose(inner={inner}, outer={outer})"))
+        };
+        visiting.remove(class);
+        rendered
     }
 
     fn readable_expr_list_display(&self, class: &ClassId) -> Option<String> {
@@ -4350,6 +4375,7 @@ const RENDER_PREFERRED_OPS: &[&str] = &[
     "LeftMajorContiguousElementLayoutLit",
     "StridedElementLayoutLit",
     "IndexMapLit",
+    "IndexMapCompose",
     "ShapeLit",
     "IntExprCons",
     "IntExprNil",
