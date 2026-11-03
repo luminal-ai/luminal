@@ -1,0 +1,33 @@
+; Rewrite : a view through the identity map is its operand. The map's tag
+; is the operand's shape, the view's shape is that same shape, and each
+; entry is the box's own coordinate for its axis (entries run highest axis
+; first, so the k-th entry from the end is axis k). Such a view reads every
+; element at its own coordinate: it is the operand. Composed maps that
+; cancel (a clamp the bounds collapse, a pad undone by the slice that reads
+; back the padded operand) end here. Shape and dtype of the two agree, so
+; no function merges.
+(rule
+  ((= ?view (LogicalIndexMapApply ?operand (IndexMapLit ?entries ?shape) ?shape)))
+  ((index-map-identity-suffix (IntExprNil) ?shape))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: the empty entry suffix is the identity on no axis"
+)
+(rule
+  (
+    (index-map-identity-suffix ?tail ?shape)
+    (= ?list (IntExprCons (CoordVar ?shape ?axis) ?tail))
+    (= ?axis (expr-list-length-of ?tail))
+  )
+  ((index-map-identity-suffix ?list ?shape))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a suffix led by its own axis coordinate stays the identity"
+)
+(rule
+  (
+    (= ?view (LogicalIndexMapApply ?operand (IndexMapLit ?entries ?shape) ?shape))
+    (index-map-identity-suffix ?entries ?shape)
+  )
+  ((union ?view ?operand))
+  :ruleset main_ruleset
+  :name "index_map_apply/rewrite: a view through the identity map is its operand"
+)
