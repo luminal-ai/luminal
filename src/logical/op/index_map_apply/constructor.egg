@@ -1,2 +1,5 @@
 ; All view ops
 (constructor LogicalIndexMapApply (LogicalTensor IndexMap Shape) LogicalTensor)
+; The relation of rewrite.egg, declared with the constructor so every op's
+; rewrites can name it whatever the splice order: the identity-map fold.
+(relation index-map-identity-suffix (IntExprList Shape))

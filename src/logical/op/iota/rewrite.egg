@@ -1,0 +1,26 @@
+; Rewrite : a view of an iota is the iota of the substituted expression.
+; The iota holds its index expression at every coordinate, and the view
+; reads it at the map's image of each of its own coordinates: the view is
+; the iota of that expression under the map (`int-subst-of`, the view's
+; map substituting the iota shape's coordinates). The bounds machinery
+; then decides what it can about the substituted expression, which is how
+; a slice of a concatenation learns which side it reads (select/rewrite.egg).
+; The iota is minted only once the image EXISTS (an `int-subst-of` row
+; exists exactly when an arm or the walk resolved it): minted on the
+; demand alone, an iota over an unresolved memo node would be a spelling
+; no decoder can read.
+(rule
+  ((= ?view (LogicalIndexMapApply (LogicalIota ?expr ?iota_shape) ?map ?shape)))
+  ((int-subst-demand ?expr ?map))
+  :ruleset main_ruleset
+  :name "iota/rewrite: a view of an iota demands the substituted expression"
+)
+(rule
+  (
+    (= ?view (LogicalIndexMapApply (LogicalIota ?expr ?iota_shape) ?map ?shape))
+    (= ?image (int-subst-of ?expr ?map))
+  )
+  ((union ?view (LogicalIota ?image ?shape)))
+  :ruleset main_ruleset
+  :name "iota/rewrite: a view of an iota is the iota of the substituted expression"
+)
