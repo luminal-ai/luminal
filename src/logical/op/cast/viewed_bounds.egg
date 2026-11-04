@@ -1,0 +1,41 @@
+; Viewed bounds of a cast: the demand descends to the operand; a cast of an
+; integral tensor (Bool, Int) carries its viewed bounds, the values being
+; exact in every target.
+(rule
+  ((viewed-bounds-demand ?out ?map) (= ?out (LogicalCast ?in ?dtype)))
+  ((viewed-bounds-demand ?in ?map))
+  :ruleset main_ruleset
+  :name "cast/viewed_bounds: a viewed cast demands its operand"
+)
+(rule
+  (
+    (viewed-bounds-demand ?out ?map)
+    (= ?out (LogicalCast ?in ?dtype))
+    (= ?in_dtype (dtype-of ?in))
+    (= ?in_dtype (Bool))
+    (= ?lower (viewed-lower-bound-of ?in ?map))
+    (= ?upper (viewed-upper-bound-of ?in ?map))
+  )
+  (
+    (set (viewed-lower-bound-of ?out ?map) ?lower)
+    (set (viewed-upper-bound-of ?out ?map) ?upper)
+  )
+  :ruleset main_ruleset
+  :name "cast/viewed_bounds: a cast of a Bool carries its viewed bounds"
+)
+(rule
+  (
+    (viewed-bounds-demand ?out ?map)
+    (= ?out (LogicalCast ?in ?dtype))
+    (= ?in_dtype (dtype-of ?in))
+    (= ?in_dtype (Int))
+    (= ?lower (viewed-lower-bound-of ?in ?map))
+    (= ?upper (viewed-upper-bound-of ?in ?map))
+  )
+  (
+    (set (viewed-lower-bound-of ?out ?map) ?lower)
+    (set (viewed-upper-bound-of ?out ?map) ?upper)
+  )
+  :ruleset main_ruleset
+  :name "cast/viewed_bounds: a cast of an Int carries its viewed bounds"
+)

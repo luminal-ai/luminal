@@ -1,0 +1,38 @@
+; Viewed bounds of a comparison: the demand descends to the operands; the
+; comparison is decided over the view where their viewed bounds separate,
+; else it is the indicator [0, 1].
+(rule
+  ((viewed-bounds-demand ?out ?map) (= ?out (LogicalLessThan ?lhs ?rhs)))
+  (
+    (viewed-bounds-demand ?lhs ?map)
+    (viewed-bounds-demand ?rhs ?map)
+    (set (viewed-lower-bound-of ?out ?map) (bigint 0))
+    (set (viewed-upper-bound-of ?out ?map) (bigint 1))
+  )
+  :ruleset main_ruleset
+  :name "less_than/viewed_bounds: a viewed comparison demands its operands and is the indicator"
+)
+(rule
+  (
+    (viewed-bounds-demand ?out ?map)
+    (= ?out (LogicalLessThan ?lhs ?rhs))
+    (= ?lhs_upper (viewed-upper-bound-of ?lhs ?map))
+    (= ?rhs_lower (viewed-lower-bound-of ?rhs ?map))
+    (< ?lhs_upper ?rhs_lower)
+  )
+  ((set (viewed-lower-bound-of ?out ?map) (bigint 1)))
+  :ruleset main_ruleset
+  :name "less_than/viewed_bounds: decided true over the view"
+)
+(rule
+  (
+    (viewed-bounds-demand ?out ?map)
+    (= ?out (LogicalLessThan ?lhs ?rhs))
+    (= ?lhs_lower (viewed-lower-bound-of ?lhs ?map))
+    (= ?rhs_upper (viewed-upper-bound-of ?rhs ?map))
+    (>= ?lhs_lower ?rhs_upper)
+  )
+  ((set (viewed-upper-bound-of ?out ?map) (bigint 0)))
+  :ruleset main_ruleset
+  :name "less_than/viewed_bounds: decided false over the view"
+)

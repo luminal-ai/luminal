@@ -36,6 +36,14 @@ impl LogicalOp for LogicalIota {
                 text: include_str!("dtype.egg"),
             },
             EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("rewrite.egg"),
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("viewed_bounds.egg"),
+            },
+            EgglogSnippet {
                 category: SpliceCategory::Shape,
                 text: include_str!("shape.egg"),
             },
@@ -44,5 +52,33 @@ impl LogicalOp for LogicalIota {
                 text: include_str!("forward_layout.egg"),
             },
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::egglog_snippet::{assembled_program_for, new_egraph};
+
+    /// A window into a position iota is the iota of the shifted expression:
+    /// the view's map substitutes the iota's coordinate, and the shifted
+    /// expression's bounds follow the window ([3, 5] here).
+    #[test]
+    fn a_view_of_an_iota_is_the_iota_of_the_substituted_expression() {
+        let script = r#"
+(let wide (ShapeLit (IntExprCons (IntLit 8) (IntExprNil))))
+(let narrow (ShapeLit (IntExprCons (IntLit 3) (IntExprNil))))
+(let positions (LogicalIota (CoordVar wide 0) wide))
+(let window (LogicalIndexMapApply positions
+  (IndexMapLit (IntExprCons (IntAdd (CoordVar narrow 0) (IntLit 3)) (IntExprNil)) wide) narrow))
+(let shifted (LogicalIota (IntAdd (CoordVar narrow 0) (IntLit 3)) narrow))
+(run-schedule (saturate (run prop))
+  (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)))
+(check (= window shifted))
+(check (= (value-lower-bound-of window) (bigint 3)))
+(check (= (value-upper-bound-of window) (bigint 5)))
+"#;
+        new_egraph()
+            .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
+            .unwrap();
     }
 }

@@ -4,3 +4,24 @@
 ; setter that used to live here was retired 2026-09-01: it keyed a route
 ; fact (parent rank) on a value (the apply's output class) and fired on
 ; sound unions of two apply spellings with different-rank parents.
+
+; COMPOSITE MAP-TAG COHERENCE: an apply whose map is a composite reads its
+; parent through the inner map, so the composite's tag (`index-map-tag`,
+; the inner's) must be the parent's shape — the preamble's MAP-TAG
+; COHERENCE lock, stated for the composite spelling. The structural rule
+; (rewrite.egg) cannot mint an incoherent composite (it binds the outer
+; map's tag to the inner view's shape); this catches a hand-seeded one.
+; An opened composite is also a literal and is checked by the literal
+; locks (VIEW ARITY LOCK, the map-entry range lock) through it.
+(rule
+  (
+    (= ?view (LogicalIndexMapApply ?operand ?map ?out_shape))
+    (= ?map (IndexMapCompose ?inner ?outer))
+    (= ?tag (index-map-tag ?map))
+    (= ?operand_shape (shape-of ?operand))
+    (!= ?tag ?operand_shape)
+  )
+  ((panic "IndexMapCompose tag (its inner map's source tag) disagrees with the apply's parent shape"))
+  :ruleset fixpoint-invariants
+  :name "index_map_apply/fixpoint: composite map-tag coherence"
+)

@@ -1,2 +1,54 @@
 ; All view ops
 (constructor LogicalIndexMapApply (LogicalTensor IndexMap Shape) LogicalTensor)
+
+; THE COMPOSITION CLOSURE. An index map is a lambda: the apply's out shape
+; binds the coordinates, the entries are the body, the tag is the parent
+; shape it reads. `(IndexMapCompose inner outer)` is the lambda for a view
+; of a view, held CLOSED: first the outer map (the view's coordinates into
+; the intermediate box; its tag is the intermediate shape), then the inner
+; (the intermediate box into the parent; its tag is the parent shape). The
+; composite's tag is the inner's. Its body is never written into the
+; e-graph by the structural rule (rewrite.egg): beta reduction happens
+; once, under `index-map-open-demand`, when the composite is unioned with
+; its `IndexMapLit`; a kernel elected over a closed composite has its two
+; literals composed in Rust after extraction (`index_expr::parse_index_map`).
+; The structural rule composes LITERAL pairs only, so a closed composite
+; never feeds another composition and a cyclic class holds at most one
+; composite per literal pair.
+(constructor IndexMapCompose (IndexMap IndexMap) IndexMap)
+; The source-shape tag of any map: a literal's own child, a composite's
+; inner's. :no-merge — a map with two tags is corrupt, and a composite
+; opened to a literal of another tag collides here.
+(function index-map-tag (IndexMap) Shape :no-merge)
+
+; The relations of rewrite.egg, declared with the constructor so every op's
+; rewrites can name them whatever the splice order.
+; The identity-map fold.
+(relation index-map-identity-suffix (IntExprList Shape))
+; Opening a composite: the demand (a consumer demands a NAMED composite,
+; never every composite of a class — on a cyclic class that would
+; enumerate the powers of the map), the entry walk (the inner's entries
+; substituted under the outer map, one `int-subst-of` row per entry), and
+; the coordinate-only analysis under which a composite opens without
+; demand.
+(relation index-map-open-demand (IndexMap))
+(relation composed-entries-demand (IntExprList IndexMap))
+(relation composed-entries (IntExprList IndexMap IntExprList))
+(relation coordinate-only-entries-demand (IntExprList))
+(relation coordinate-only-entries (IntExprList))
+(relation index-map-coordinate-only (IndexMap))
+; VIEWED BOUNDS: the value bounds of a tensor restricted to what a view of
+; it reads, keyed by the view's map, derived ON DEMAND (`viewed-bounds-demand`)
+; and only as facts: no view of the tensor is minted. A view of a select
+; demands its condition's viewed bounds; the demand descends the
+; condition's pointwise chain (comparison, cast, sum, a view) to its
+; sources (an iota: the bounds of its expression substituted under the map;
+; anything with value bounds: those, a view reads a subset); the comparison
+; is decided where its operands' viewed bounds separate; a select whose
+; condition is decided over the view is, through that view, the view of
+; the decided branch (select/rewrite.egg). This is how a slice of a
+; concatenation (a select on a mask over clamped padding views) reaches the
+; operand it reads, without distributing the view into the condition.
+(relation viewed-bounds-demand (LogicalTensor IndexMap))
+(function viewed-lower-bound-of (LogicalTensor IndexMap) BigInt :merge (max old new))
+(function viewed-upper-bound-of (LogicalTensor IndexMap) BigInt :merge (min old new))
