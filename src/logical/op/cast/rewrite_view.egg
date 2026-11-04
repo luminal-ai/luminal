@@ -17,3 +17,20 @@
   :ruleset main_ruleset
   :name "cast/rewrite_view: pure index views commute with an explicit cast"
 )
+
+; ... and the other way round: the cast of a view is the view of the cast,
+; so the two are one class whichever side torch spells the cast on
+; (`aten.linear` casts its weight before the transpose, `aten.matmul` after
+; the permute, a convolution before the reshape). Over a chain of k views
+; the cast has k+1 positions, finite; the pair once failed to saturate
+; because the layout ladder composed a fresh offset body per position,
+; and that road is gone since a view of a view composes as a closure
+; (`IndexMapCompose`, index_map_apply/rewrite.egg). Measured with the
+; Trainium backend's census, both directions over the closure: every
+; fixture saturates, the three channels-last VAE fixtures in 16 to 19 s.
+(rule
+  ((= ?cast (LogicalCast (LogicalIndexMapApply ?input ?map ?output_shape) ?target_dtype)))
+  ((union ?cast (LogicalIndexMapApply (LogicalCast ?input ?target_dtype) ?map ?output_shape)))
+  :ruleset main_ruleset
+  :name "cast/rewrite_view: the cast of a view is the view of the cast"
+)
