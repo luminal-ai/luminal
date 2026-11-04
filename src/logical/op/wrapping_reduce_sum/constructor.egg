@@ -1,0 +1,2 @@
+; Reduction Ops ; In reality the reduction order needs to be specified.
+(constructor LogicalWrappingReduceSum (LogicalTensor i64) LogicalTensor)

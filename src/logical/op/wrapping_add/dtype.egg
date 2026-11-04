@@ -1,0 +1,14 @@
+;Dtype Propagation : LogicalWrappingAdd
+(rule
+  (
+    (= ?out_logical_tensor (LogicalWrappingAdd ?in1_logical ?in2_logical))
+    (= ?in1_dtype (dtype-of ?in1_logical))
+    (= ?in2_dtype (dtype-of ?in2_logical))
+  )
+  (
+    (set (dtype-of ?out_logical_tensor) ?in1_dtype) ; DUPLICATIVE This is to trigger no merge runtime errors
+    (set (dtype-of ?out_logical_tensor) ?in2_dtype) ; DUPLICATIVE This is to trigger no merge runtime errors
+  )
+  :ruleset prop
+  :name "wrapping_add/dtype: dtype of LogicalWrappingAdd from both operands"
+)

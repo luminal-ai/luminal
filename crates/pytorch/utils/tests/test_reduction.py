@@ -405,6 +405,7 @@ class ScatterAndIndexReductions(torch.nn.Module):
             torch.ops.aten.index_reduce.default(
                 value, 1, index, index_source, "amin", include_self=True
             ),
+            torch.ops.aten.index_add.default(value, 1, index, index_source, alpha=0.5),
         )
 
 
@@ -560,3 +561,19 @@ def test_scalar_scatter_and_index_reductions():
         expected = module(value, scatter_index, index, source)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+class FullMean(torch.nn.Module):
+    def forward(self, a: torch.Tensor) -> torch.Tensor:
+        return a.mean()
+
+
+def test_mean_count_past_2_24_rounds_like_eager(stage_one_only):
+    """A mean's count converts to F32 with one rounding, as eager's
+    `sum / static_cast<float>(n)` does: 2^24 + 1 rounds to 2^24. (var and
+    the pools share the divisor; their structure is pinned in the
+    translator's `count_divisors_round_past_2_24`.)"""
+    values = (torch.arange(2**24 + 1) % 3).to(torch.float32)
+    torch._dynamo.reset()
+    compiled = torch.compile(FullMean(), backend=luminal_backend, fullgraph=True)
+    torch.testing.assert_close(compiled(values), FullMean()(values), rtol=1e-6, atol=0)

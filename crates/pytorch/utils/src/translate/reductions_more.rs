@@ -173,22 +173,23 @@ impl Translator<'_> {
         let lhs = self.operand(&node.inputs[1])?;
         let rhs = self.operand(&node.inputs[2])?;
         let product = match variant {
-            AddMmVariant::AddMm => lhs.matmul(rhs),
+            AddMmVariant::AddMm => self.torch_matmul(lhs, rhs),
             AddMmVariant::AddBmm => {
                 anyhow::ensure!(lhs.rank() == 3, "addbmm batch1 must be rank 3");
                 anyhow::ensure!(rhs.rank() == 3, "addbmm batch2 must be rank 3");
-                lhs.matmul(rhs).sum(vec![0])
+                let batched = self.torch_matmul(lhs, rhs);
+                self.torch_sum(batched, vec![0])
             }
             AddMmVariant::AddMv => {
                 anyhow::ensure!(lhs.rank() == 2, "addmv matrix must be rank 2");
                 anyhow::ensure!(rhs.rank() == 1, "addmv vector must be rank 1");
-                lhs.matmul(rhs.unsqueeze(1)).squeeze(1)
+                self.torch_matmul(lhs, rhs.unsqueeze(1)).squeeze(1)
             }
         };
         let input = self.scale_by_named_scalar(node, "beta", input)?;
         let product = self.scale_by_named_scalar(node, "alpha", product)?;
         let (input, product) = util::broadcast_binary(input, product);
-        Ok(input + product)
+        Ok(self.torch_add(input, product))
     }
 
     /// `copy.default(destination, source)`: source broadcast into the
@@ -318,7 +319,7 @@ impl Translator<'_> {
     /// takes them: `False`/`True`, `0`/`1`, and `0.0`/`-0.0`/`1.0`. A
     /// symbolic coefficient is refused, because whether it is 0 is only
     /// known at run time.
-    fn scale_by_named_scalar(
+    pub(super) fn scale_by_named_scalar(
         &mut self,
         node: &Node,
         name: &str,
@@ -343,7 +344,7 @@ impl Translator<'_> {
         // Preserve integer literals before any conversion to the compute dtype.
         // Going through f64 would discard low bits above 2^53.
         let factor = self.scalar(scalar, value.dtype)?.expand_rhs(value.dims());
-        Ok(value * factor)
+        Ok(self.torch_mul(value, factor))
     }
 }
 

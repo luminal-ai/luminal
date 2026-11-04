@@ -88,3 +88,58 @@
  ((set (value-lower-bound-of ?out) ?lo)
   (set (value-upper-bound-of ?out) ?hi))
  :ruleset main_ruleset :name "cast/value_bounds: in-range UInt64 to Int preserves bounds")
+
+; Storage bounds through casts (2026-10-28). Narrow-integer storage
+; always lies in its own dtype's range (narrow ints wrap), so a widening
+; cast to Int / Int64 carries the SOURCE dtype's range. Int -> Int64 does
+; NOT: an Int source may be an arithmetic result, and its dtype range
+; would assume that arithmetic did not overflow (the carry rules above
+; pass on whatever the lattice proved instead).
+(rule ((= ?out (LogicalCast ?in (Int))) (= (dtype-of ?in) (I8)))
+ ((set (value-lower-bound-of ?out) (bigint -128))
+  (set (value-upper-bound-of ?out) (bigint 127)))
+ :ruleset main_ruleset :name "cast/value_bounds: I8 to Int carries the I8 range")
+(rule ((= ?out (LogicalCast ?in (Int64))) (= (dtype-of ?in) (I8)))
+ ((set (value-lower-bound-of ?out) (bigint -128))
+  (set (value-upper-bound-of ?out) (bigint 127)))
+ :ruleset main_ruleset :name "cast/value_bounds: I8 to Int64 carries the I8 range")
+(rule ((= ?out (LogicalCast ?in (Int))) (= (dtype-of ?in) (U8)))
+ ((set (value-lower-bound-of ?out) (bigint 0))
+  (set (value-upper-bound-of ?out) (bigint 255)))
+ :ruleset main_ruleset :name "cast/value_bounds: U8 to Int carries the U8 range")
+(rule ((= ?out (LogicalCast ?in (Int64))) (= (dtype-of ?in) (U8)))
+ ((set (value-lower-bound-of ?out) (bigint 0))
+  (set (value-upper-bound-of ?out) (bigint 255)))
+ :ruleset main_ruleset :name "cast/value_bounds: U8 to Int64 carries the U8 range")
+(rule ((= ?out (LogicalCast ?in (Int))) (= (dtype-of ?in) (I16)))
+ ((set (value-lower-bound-of ?out) (bigint -32768))
+  (set (value-upper-bound-of ?out) (bigint 32767)))
+ :ruleset main_ruleset :name "cast/value_bounds: I16 to Int carries the I16 range")
+(rule ((= ?out (LogicalCast ?in (Int64))) (= (dtype-of ?in) (I16)))
+ ((set (value-lower-bound-of ?out) (bigint -32768))
+  (set (value-upper-bound-of ?out) (bigint 32767)))
+ :ruleset main_ruleset :name "cast/value_bounds: I16 to Int64 carries the I16 range")
+(rule ((= ?out (LogicalCast ?in (Int))) (= (dtype-of ?in) (U16)))
+ ((set (value-lower-bound-of ?out) (bigint 0))
+  (set (value-upper-bound-of ?out) (bigint 65535)))
+ :ruleset main_ruleset :name "cast/value_bounds: U16 to Int carries the U16 range")
+(rule ((= ?out (LogicalCast ?in (Int64))) (= (dtype-of ?in) (U16)))
+ ((set (value-lower-bound-of ?out) (bigint 0))
+  (set (value-upper-bound-of ?out) (bigint 65535)))
+ :ruleset main_ruleset :name "cast/value_bounds: U16 to Int64 carries the U16 range")
+
+; A narrowing or unsigned-to-signed cast yields a stored value of the
+; TARGET dtype (Int64 -> Int is checked; UInt64 -> signed may wrap), so
+; the result lies in the target range; carried source bounds tighten it.
+(rule ((= ?out (LogicalCast ?in (Int))) (= (dtype-of ?in) (Int64)))
+ ((set (value-lower-bound-of ?out) (bigint -2147483648))
+  (set (value-upper-bound-of ?out) (bigint 2147483647)))
+ :ruleset main_ruleset :name "cast/value_bounds: Int64 to Int lies in the Int range")
+(rule ((= ?out (LogicalCast ?in (Int))) (= (dtype-of ?in) (UInt64)))
+ ((set (value-lower-bound-of ?out) (bigint -2147483648))
+  (set (value-upper-bound-of ?out) (bigint 2147483647)))
+ :ruleset main_ruleset :name "cast/value_bounds: UInt64 to Int lies in the Int range")
+(rule ((= ?out (LogicalCast ?in (Int64))) (= (dtype-of ?in) (UInt64)))
+ ((set (value-lower-bound-of ?out) (bigint -9223372036854775808))
+  (set (value-upper-bound-of ?out) (bigint 9223372036854775807)))
+ :ruleset main_ruleset :name "cast/value_bounds: UInt64 to Int64 lies in the Int64 range")

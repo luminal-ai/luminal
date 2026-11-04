@@ -1,0 +1,12 @@
+; Propagate shape — a scan keeps the operand's shape.
+(rule
+  (
+    (= ?out (LogicalWrappingScanProd ?in ?axis))
+    (= ?shape (shape-of ?in))
+  )
+  (
+    (set (shape-of ?out) ?shape)
+  )
+  :ruleset prop
+  :name "wrapping_scan_prod/shape: shape of LogicalWrappingScanProd is the operand shape"
+)

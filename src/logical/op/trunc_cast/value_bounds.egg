@@ -1,0 +1,11 @@
+; Value bounds : LogicalTruncCast. The conversion is checked (NaN,
+; infinities and out-of-range values refuse), so its result is a stored
+; value of the target dtype and lies in that dtype's range.
+(rule ((= ?out (LogicalTruncCast ?in (Int))))
+ ((set (value-lower-bound-of ?out) (bigint -2147483648))
+  (set (value-upper-bound-of ?out) (bigint 2147483647)))
+ :ruleset main_ruleset :name "trunc_cast/value_bounds: a truncating cast to Int lies in the Int range")
+(rule ((= ?out (LogicalTruncCast ?in (Int64))))
+ ((set (value-lower-bound-of ?out) (bigint -9223372036854775808))
+  (set (value-upper-bound-of ?out) (bigint 9223372036854775807)))
+ :ruleset main_ruleset :name "trunc_cast/value_bounds: a truncating cast to Int64 lies in the Int64 range")

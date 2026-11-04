@@ -1,0 +1,13 @@
+; Propagate shape
+(rule
+  (
+    (= ?out_logical (LogicalWrappingReduceSum ?in_logical ?reduction_index))
+    (= (shape-of ?in_logical) (ShapeLit ?dims))
+    (= ?out_dims (expr-list-remove-axis-from-end ?dims ?reduction_index))
+  )
+  (
+    (set (shape-of ?out_logical) (ShapeLit ?out_dims))
+  )
+  :ruleset prop
+  :name "wrapping_reduce_sum/shape: shape of LogicalWrappingReduceSum drops the summed axis"
+)

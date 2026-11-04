@@ -379,7 +379,13 @@ impl GraphTensor {
         if correction.is_nan() {
             return zero;
         }
-        let count = self.graph().constant_i32(n).cast(dtype);
+        // The count converts with one rounding, as `mean`'s does.
+        let count = self.graph().constant_i32(n);
+        let count = if matches!(dtype, DType::F32 | DType::F64) {
+            count.rounding_cast(dtype)
+        } else {
+            count.cast(dtype)
+        };
         let threshold = scalar(self.graph(), correction.max(0.0));
         let degrees = count - scalar(self.graph(), correction);
         count.gt(threshold).select(degrees, zero)
@@ -667,6 +673,25 @@ impl GraphTensor {
     /// Apply a cumulative product along dimensions — one inclusive scan per axis.
     pub fn cumprod(self, axes: impl ToAxes) -> Self {
         self.scan_per_axis(axes, |axis_from_end| LogicalOp::UnspecifiedOrderScanProd {
+            axis_from_end,
+        })
+    }
+
+    /// Two's-complement cumulative sum, modulo 2^w: PyTorch's integer
+    /// `cumsum`. Unlike [`Self::cumsum`] on `Int`/`I64`, whose overflow is a
+    /// loud error, an overflow wraps; see [`Self::wrapping_add`].
+    pub fn wrapping_cumsum(self, axes: impl ToAxes) -> Self {
+        self.assert_wrapping_dtype("wrapping_cumsum");
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::WrappingScanSum {
+            axis_from_end,
+        })
+    }
+
+    /// Two's-complement cumulative product, modulo 2^w: PyTorch's integer
+    /// `cumprod`.
+    pub fn wrapping_cumprod(self, axes: impl ToAxes) -> Self {
+        self.assert_wrapping_dtype("wrapping_cumprod");
+        self.scan_per_axis(axes, |axis_from_end| LogicalOp::WrappingScanProd {
             axis_from_end,
         })
     }

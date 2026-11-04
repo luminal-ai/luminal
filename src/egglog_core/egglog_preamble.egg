@@ -1845,6 +1845,22 @@
 (function value-lower-bound-of (LogicalTensor) BigInt :merge (max old new))
 (function value-upper-bound-of (LogicalTensor) BigInt :merge (min old new))
 
+; STORAGE BOUNDS (2026-10-28): a value read from storage lies in its
+; dtype's range, so a declared Int / Int64 input carries that range as
+; its bounds. Only producers whose result is a stored value of their
+; dtype are seeded this way (inputs here; casts and truncating casts in
+; their op modules). An ARITHMETIC result is never seeded: its bounds are
+; exactly what the proof gates check, and a dtype-range seed would
+; assert that no overflow happened.
+(rule ((= ?t (LogicalTensorInputLit ?id ?shape (Int))))
+ ((set (value-lower-bound-of ?t) (bigint -2147483648))
+  (set (value-upper-bound-of ?t) (bigint 2147483647)))
+ :ruleset main_ruleset :name "core: an Int input holds values in the Int range")
+(rule ((= ?t (LogicalTensorInputLit ?id ?shape (Int64))))
+ ((set (value-lower-bound-of ?t) (bigint -9223372036854775808))
+  (set (value-upper-bound-of ?t) (bigint 9223372036854775807)))
+ :ruleset main_ruleset :name "core: an Int64 input holds values in the Int64 range")
+
 ; Iota inheritance: an iota's values ARE its index expression over the
 ; shape's coordinates, and the scalar lattice already bounds that
 ; expression (CoordVar seeds ride the shape extents) — the tensor

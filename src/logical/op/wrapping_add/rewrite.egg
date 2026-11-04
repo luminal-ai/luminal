@@ -1,0 +1,8 @@
+; Commutativity holds exactly in Z/2^w (integer encodings only; fail closed
+; on an unknown dtype).
+(rule ((= ?out (LogicalWrappingAdd ?lhs ?rhs)) (= (dtype-of ?out) (Int)))
+ ((union ?out (LogicalWrappingAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "wrapping_add/rewrite: commutativity, Int")
+(rule ((= ?out (LogicalWrappingAdd ?lhs ?rhs)) (= (dtype-of ?out) (Int64)))
+ ((union ?out (LogicalWrappingAdd ?rhs ?lhs)))
+ :ruleset main_ruleset :name "wrapping_add/rewrite: commutativity, Int64")

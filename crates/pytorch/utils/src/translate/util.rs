@@ -167,6 +167,20 @@ pub(super) fn storage_step(
     round_to_storage(f(widen_storage(a), widen_storage(b)), storage)
 }
 
+/// An exact Int/I64 `count` as a divisor in `dtype`. A float divisor is
+/// converted with one rounding, as PyTorch's `static_cast<acc_t>(n)` is (a
+/// narrow float rounds once more from F32, to storage); an integer divisor
+/// is the exact cast.
+pub(super) fn count_divisor(count: GraphTensor, dtype: DType) -> GraphTensor {
+    match dtype {
+        DType::F32 | DType::F64 => count.rounding_cast(dtype),
+        narrow if narrow.is_narrow_float() => {
+            round_to_storage(count.rounding_cast(DType::F32), narrow)
+        }
+        _ => count.cast(dtype),
+    }
+}
+
 pub(super) fn ensure_same_dtype(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
     if a.dtype == b.dtype {
         return (a, b);
@@ -614,6 +628,107 @@ impl Translator<'_> {
         let negative = value.lt(zero);
         let negative_zero = value.reciprocal().lt(zero);
         negative.logical_or(negative_zero)
+    }
+
+    // ---- PyTorch integer arithmetic: two's complement, modulo 2^w ----
+    //
+    // PyTorch's integer `+`, `-`, `*` and `sum` wrap (eager CPU de facto,
+    // pytorch/pytorch#108520). Core `Int`/`I64` arithmetic is exact and
+    // proof-gated, so torch's integer ops lower to the wrapping family for
+    // those dtypes; every other dtype keeps its plain op (floats are IEEE,
+    // narrow ints and `U64` already wrap). The translator's own index
+    // arithmetic stays exact: it is bounded by construction.
+
+    /// Whether torch's integer arithmetic at `dtype` needs the wrapping family.
+    pub(super) fn torch_wraps(dtype: DType) -> bool {
+        matches!(dtype, DType::Int | DType::I64)
+    }
+
+    /// Torch's `a + b`.
+    pub(super) fn torch_add(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_add(b)
+        } else {
+            a + b
+        }
+    }
+
+    /// Torch's `a * b`.
+    pub(super) fn torch_mul(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_mul(b)
+        } else {
+            a * b
+        }
+    }
+
+    /// Torch's `-a` (`neg(MIN) == MIN` for a wrapping dtype).
+    pub(super) fn torch_neg(&mut self, a: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            let minus_one = self.constant_like(a, -1.0);
+            a.wrapping_mul(minus_one)
+        } else {
+            -a
+        }
+    }
+
+    /// Torch's `a - b`.
+    pub(super) fn torch_sub(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            let negated = self.torch_neg(b);
+            a.wrapping_add(negated)
+        } else {
+            a - b
+        }
+    }
+
+    /// Torch's integer `abs` (`abs(MIN) == MIN` for a wrapping dtype); any
+    /// other dtype takes core `abs`.
+    pub(super) fn torch_int_abs(&mut self, a: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            let zero = self.constant_like(a, 0.0);
+            let negated = self.torch_neg(a);
+            a.lt(zero).select(negated, a)
+        } else {
+            a.abs()
+        }
+    }
+
+    /// Torch's `sum` over `axes`.
+    pub(super) fn torch_sum(&mut self, a: GraphTensor, axes: Vec<usize>) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_sum(axes)
+        } else {
+            a.sum(axes)
+        }
+    }
+
+    /// Torch's `a @ b` (`mm`/`bmm`/`matmul`).
+    pub(super) fn torch_matmul(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_matmul(b)
+        } else {
+            a.matmul(b)
+        }
+    }
+
+    /// Torch's `prod` over `axes`.
+    pub(super) fn torch_prod(&mut self, a: GraphTensor, axes: Vec<usize>) -> GraphTensor {
+        if Self::torch_wraps(a.dtype) {
+            a.wrapping_prod(axes)
+        } else {
+            a.prod(axes)
+        }
+    }
+
+    /// Torch's `cumsum` (or `cumprod`) along `axis`.
+    pub(super) fn torch_scan(&mut self, a: GraphTensor, axis: usize, prod: bool) -> GraphTensor {
+        match (Self::torch_wraps(a.dtype), prod) {
+            (true, false) => a.wrapping_cumsum(vec![axis]),
+            (true, true) => a.wrapping_cumprod(vec![axis]),
+            (false, false) => a.cumsum(vec![axis]),
+            (false, true) => a.cumprod(vec![axis]),
+        }
     }
 
     /// The IEEE absolute value of a floating `value`: its sign bit cleared,

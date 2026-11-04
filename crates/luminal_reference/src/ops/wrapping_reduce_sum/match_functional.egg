@@ -1,0 +1,22 @@
+; Two's-complement arithmetic is total: the wrapping op mints at every
+; injective right-major destination, with no value-bounds proof (contrast
+; the proof-gated exact LogicalReduceSum).
+(rule
+  (
+    (= ?in_layout_tensor (LayoutTensorLit ?in_logical ?in_layout))
+    (= ?out_layout_tensor (LayoutTensorLit ?out_logical ?out_layout))
+    (= ?out_logical (LogicalWrappingReduceSum ?in_logical ?reduction_dim))
+    (= (injectivity-of ?out_layout_tensor) (Injective))
+    (= ?out_layout (RightMajorContiguousElementLayoutLit ?reference_write_shape ?reference_write_bits))
+  )
+  (
+    (let ?layout_tensor_op
+      (LayoutTensorOpLit
+        (LayoutTensorCons ?in_layout_tensor (LayoutTensorNil))
+        (LayoutTensorCons ?out_layout_tensor (LayoutTensorNil))))
+    (union ?layout_tensor_op
+      (LayoutTensorOpWrappingReduceSumGeneric ?in_layout_tensor ?reduction_dim ?out_layout))
+  )
+  :ruleset backend
+  :name "reference/wrapping_reduce_sum/match_functional: WrappingReduceSumGeneric mint, total"
+)

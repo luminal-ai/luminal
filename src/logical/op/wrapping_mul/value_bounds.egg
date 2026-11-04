@@ -1,0 +1,31 @@
+; Value bounds and the exact bridge : LogicalWrappingMul — two's-complement
+; arithmetic modulo 2^w (PyTorch's integer semantics; eager CPU wraps de
+; facto, pytorch/pytorch#108520). It is total: no proof gates it. Its
+; result is a stored value of its dtype, so it lies in the dtype's range.
+; Where the operands' bounds prove the EXACT result in width, wrapping
+; changes nothing and the op IS the exact LogicalMul — the bridge unions
+; the two, so a proven program keeps the exact rewrites and the exact
+; interval. UInt64 LogicalMul already wraps, so its bridge is unconditional.
+(rule ((= ?out (LogicalWrappingMul ?lhs ?rhs)) (= (dtype-of ?out) (Int)))
+ ((set (value-lower-bound-of ?out) (bigint -2147483648))
+  (set (value-upper-bound-of ?out) (bigint 2147483647)))
+ :ruleset main_ruleset :name "LogicalWrappingMul/value_bounds: an Int result lies in the Int range")
+(rule ((= ?out (LogicalWrappingMul ?lhs ?rhs)) (= (dtype-of ?out) (Int64)))
+ ((set (value-lower-bound-of ?out) (bigint -9223372036854775808))
+  (set (value-upper-bound-of ?out) (bigint 9223372036854775807)))
+ :ruleset main_ruleset :name "LogicalWrappingMul/value_bounds: a Int64 result lies in the Int64 range")
+(rule ((= ?out (LogicalWrappingMul ?lhs ?rhs)) (= (dtype-of ?out) (Int))
+       (= ?ll (value-lower-bound-of ?lhs)) (= ?lu (value-upper-bound-of ?lhs))
+       (= ?rl (value-lower-bound-of ?rhs)) (= ?ru (value-upper-bound-of ?rhs))
+       (>= (min (min (* ?ll ?rl) (* ?ll ?ru)) (min (* ?lu ?rl) (* ?lu ?ru))) (bigint -2147483648)) (<= (max (max (* ?ll ?rl) (* ?ll ?ru)) (max (* ?lu ?rl) (* ?lu ?ru))) (bigint 2147483647)))
+ ((union ?out (LogicalMul ?lhs ?rhs)))
+ :ruleset main_ruleset :name "wrapping_mul/bridge: an Int wrapping product proven in width is the exact product")
+(rule ((= ?out (LogicalWrappingMul ?lhs ?rhs)) (= (dtype-of ?out) (Int64))
+       (= ?ll (value-lower-bound-of ?lhs)) (= ?lu (value-upper-bound-of ?lhs))
+       (= ?rl (value-lower-bound-of ?rhs)) (= ?ru (value-upper-bound-of ?rhs))
+       (>= (min (min (* ?ll ?rl) (* ?ll ?ru)) (min (* ?lu ?rl) (* ?lu ?ru))) (bigint -9223372036854775808)) (<= (max (max (* ?ll ?rl) (* ?ll ?ru)) (max (* ?lu ?rl) (* ?lu ?ru))) (bigint 9223372036854775807)))
+ ((union ?out (LogicalMul ?lhs ?rhs)))
+ :ruleset main_ruleset :name "wrapping_mul/bridge: a Int64 wrapping product proven in width is the exact product")
+(rule ((= ?out (LogicalWrappingMul ?lhs ?rhs)) (= (dtype-of ?out) (UInt64)))
+ ((union ?out (LogicalMul ?lhs ?rhs)))
+ :ruleset main_ruleset :name "wrapping_mul/bridge: UInt64 multiplication already wraps")

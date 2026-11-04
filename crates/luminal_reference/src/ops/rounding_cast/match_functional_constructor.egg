@@ -1,0 +1,2 @@
+; The explicit rounding integer -> float conversion (nearest, ties to even).
+(constructor LayoutTensorOpRoundingCastGeneric (LayoutTensor Dtype Layout) LayoutTensorOp)

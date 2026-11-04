@@ -1,0 +1,13 @@
+; Shape Propagation : LogicalRoundingCast — the shape is the input's (only
+; the element type changes).
+(rule
+  (
+    (= ?out_logical (LogicalRoundingCast ?in_logical ?target_dtype))
+    (= ?shape (shape-of ?in_logical))
+  )
+  (
+    (set (shape-of ?out_logical) ?shape)
+  )
+  :ruleset prop
+  :name "rounding_cast/shape: shape of LogicalRoundingCast from its operand"
+)

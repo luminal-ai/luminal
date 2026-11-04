@@ -163,6 +163,7 @@ mod recip;
 mod reduce_max;
 mod reduce_sum;
 mod round;
+mod rounding_cast;
 mod scatter;
 mod select;
 mod sin;
@@ -174,6 +175,13 @@ mod trunc_rem;
 mod unspecified_order_scan_max;
 mod unspecified_order_scan_prod;
 mod unspecified_order_scan_sum;
+mod wrapping_add;
+mod wrapping_mul;
+mod wrapping_reduce_sum;
+mod wrapping_scan_prod;
+mod wrapping_scan_sum;
+#[cfg(test)]
+mod wrapping_tests;
 
 pub use add::LogicalAdd;
 pub use and::LogicalAnd;
@@ -200,6 +208,7 @@ pub use recip::LogicalRecip;
 pub use reduce_max::LogicalReduceMax;
 pub use reduce_sum::LogicalReduceSum;
 pub use round::LogicalRound;
+pub use rounding_cast::LogicalRoundingCast;
 pub use scatter::LogicalScatter;
 pub use select::LogicalSelect;
 pub use sin::LogicalSin;
@@ -211,6 +220,11 @@ pub use trunc_rem::LogicalTruncRem;
 pub use unspecified_order_scan_max::LogicalUnspecifiedOrderScanMax;
 pub use unspecified_order_scan_prod::LogicalUnspecifiedOrderScanProd;
 pub use unspecified_order_scan_sum::LogicalUnspecifiedOrderScanSum;
+pub use wrapping_add::LogicalWrappingAdd;
+pub use wrapping_mul::LogicalWrappingMul;
+pub use wrapping_reduce_sum::LogicalWrappingReduceSum;
+pub use wrapping_scan_prod::LogicalWrappingScanProd;
+pub use wrapping_scan_sum::LogicalWrappingScanSum;
 
 /// THE registration list for logical ops. Order matters twice: it is the
 /// renderer's preference order when an e-class holds several logical nodes,
@@ -236,8 +250,13 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalRound),
             Box::new(LogicalAdd),
             Box::new(LogicalMul),
+            Box::new(LogicalWrappingAdd),
+            Box::new(LogicalWrappingMul),
             Box::new(LogicalDiv),
             Box::new(LogicalReduceSum),
+            Box::new(LogicalWrappingReduceSum),
+            Box::new(LogicalWrappingScanSum),
+            Box::new(LogicalWrappingScanProd),
             Box::new(LogicalReduceMax),
             Box::new(LogicalUnspecifiedOrderScanSum),
             Box::new(LogicalUnspecifiedOrderScanProd),
@@ -250,6 +269,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
             Box::new(LogicalLessThan),
             Box::new(LogicalCast),
             Box::new(LogicalTruncCast),
+            Box::new(LogicalRoundingCast),
             Box::new(LogicalIota),
             Box::new(LogicalConstant),
             Box::new(LogicalConstantF64),

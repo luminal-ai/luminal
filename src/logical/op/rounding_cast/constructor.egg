@@ -1,0 +1,6 @@
+; Logical Rounding Cast : the EXPLICIT rounding integer -> float
+; conversion, to the nearest representable value with ties to even (C++'s
+; `static_cast<float>(n)`, PyTorch's count divisors). Total. The TARGET
+; dtype rides in the term; the bit width changes, so this is always a
+; materializer, never a view. Plain LogicalCast stays lossless-only.
+(constructor LogicalRoundingCast (LogicalTensor Dtype) LogicalTensor)

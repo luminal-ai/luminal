@@ -1,19 +1,45 @@
 use crate::prelude::*;
 
+/// Which reduction a recorded reduce performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reduce {
+    Sum,
+    WrappingSum,
+    Max,
+}
+
 impl GraphTensor {
     /// Reduce a dimension of the tensor by summing all elements along that axis.
     pub fn sum(self, axes: impl ToAxes) -> GraphTensor {
-        self.reduce(false, axes)
+        self.reduce(Reduce::Sum, axes)
+    }
+
+    /// Two's-complement integer sum along the axes, modulo 2^w: PyTorch's
+    /// integer `sum`. Unlike [`Self::sum`] on `Int`/`I64`, which is exact
+    /// and proof-gated, an overflow wraps; see [`Self::wrapping_add`].
+    pub fn wrapping_sum(self, axes: impl ToAxes) -> GraphTensor {
+        self.assert_wrapping_dtype("wrapping_sum");
+        self.reduce(Reduce::WrappingSum, axes)
+    }
+
+    /// The wrapping family is defined on the wide integer dtypes.
+    pub(crate) fn assert_wrapping_dtype(self, op: &str) {
+        assert!(
+            matches!(self.dtype, DType::Int | DType::I64 | DType::U64),
+            "{op} is an INTEGER op (got {:?})",
+            self.dtype
+        );
     }
 
     /// Reduce a dimension of the tensor by taking the maximum of all elements along that axis.
     pub fn max(self, axes: impl ToAxes) -> GraphTensor {
-        self.reduce(true, axes)
+        self.reduce(Reduce::Max, axes)
     }
 
     /// One recorded reduce per axis; the operand for the FIRST reduce is
     /// self's value, later reduces consume the previous reduce's result.
-    fn reduce(self, is_max: bool, axes: impl ToAxes) -> GraphTensor {
+    fn reduce(self, kind: Reduce, axes: impl ToAxes) -> GraphTensor {
+        let is_max = kind == Reduce::Max;
         let (mut dims, mut id) = (self.dims(), self.id);
         let mut axes = axes.to_axes();
         for dim in 0..axes.len() {
@@ -60,10 +86,10 @@ impl GraphTensor {
             let axis_from_end = rank - 1 - axes[dim];
             let mut out_dims = operand_dims.clone();
             out_dims.remove(axes[dim]);
-            let op = if is_max {
-                LogicalOp::ReduceMax { axis_from_end }
-            } else {
-                LogicalOp::ReduceSum { axis_from_end }
+            let op = match kind {
+                Reduce::Max => LogicalOp::ReduceMax { axis_from_end },
+                Reduce::Sum => LogicalOp::ReduceSum { axis_from_end },
+                Reduce::WrappingSum => LogicalOp::WrappingReduceSum { axis_from_end },
             };
             id = self
                 .graph()
@@ -86,18 +112,44 @@ impl GraphTensor {
     }
 
     /// Reduce a dimension of the tensor by taking the mean of all elements along that axis.
+    ///
+    /// An F32/F64 mean divides by the element count converted with one
+    /// rounding ([`Self::rounding_cast`]), as PyTorch's `sum /
+    /// static_cast<acc_t>(n)` does: an exact cast would refuse every count
+    /// the float cannot represent (most counts past 2^24 for F32).
     pub fn mean(self, axes: impl ToAxes) -> GraphTensor {
-        let reduced_elements = axes
-            .to_axes()
-            .into_iter()
-            .map(|i| self.dims()[i])
-            .product::<IntExpr>();
+        let axes = axes.to_axes();
+        let reduced_elements = axes.iter().map(|&i| self.dims()[i]).product::<IntExpr>();
+        if matches!(self.dtype, DType::F32 | DType::F64) {
+            let sum = self.sum(axes);
+            let count = self
+                .graph()
+                .constant_i32(reduced_elements)
+                .rounding_cast(self.dtype)
+                .expand_rhs(sum.dims());
+            return sum / count;
+        }
         self.sum(axes) / reduced_elements
     }
 
     /// Reduce a dimension of the tensor by multiplying all elements along that
     /// axis: the exact product is the last position of an inclusive product scan.
     pub fn prod(self, axes: impl ToAxes) -> GraphTensor {
+        self.prod_by_scan(axes, |axis_from_end| LogicalOp::UnspecifiedOrderScanProd {
+            axis_from_end,
+        })
+    }
+
+    /// Two's-complement integer product along the axes, modulo 2^w: PyTorch's
+    /// integer `prod`, the last position of a wrapping product scan.
+    pub fn wrapping_prod(self, axes: impl ToAxes) -> GraphTensor {
+        self.assert_wrapping_dtype("wrapping_prod");
+        self.prod_by_scan(axes, |axis_from_end| LogicalOp::WrappingScanProd {
+            axis_from_end,
+        })
+    }
+
+    fn prod_by_scan(self, axes: impl ToAxes, scan: impl Fn(usize) -> LogicalOp) -> GraphTensor {
         // A rank-0 product is the value itself (torch parity): there is no
         // axis to scan.
         if self.dims().is_empty() {
@@ -136,9 +188,7 @@ impl GraphTensor {
             t.graph().logical.contract_extent_at_least(&extent, 1);
             let rank = dims.len();
             let id = t.graph().logical.op(
-                LogicalOp::UnspecifiedOrderScanProd {
-                    axis_from_end: rank - 1 - axis,
-                },
+                scan(rank - 1 - axis),
                 &[(t.id, dims.clone())],
                 dims.clone(),
                 t.dtype,

@@ -38,10 +38,23 @@ impl GraphTensor {
                 self.dtype, rhs.dtype
             ));
         }
-        self.matmul_body(rhs)
+        self.matmul_body(rhs, false)
     }
 
-    fn matmul_body(mut self, mut rhs: GraphTensor) -> Self {
+    /// Two's-complement integer matrix multiply, modulo 2^w: PyTorch's
+    /// integer `mm`/`bmm`/`matmul`, which accumulate in the operand dtype
+    /// and wrap. The same broadcast + reduce as [`Self::matmul`], spelled
+    /// with [`Self::wrapping_mul`] and [`Self::wrapping_sum`].
+    pub fn wrapping_matmul(self, rhs: GraphTensor) -> Self {
+        assert_eq!(
+            self.dtype, rhs.dtype,
+            "wrapping_matmul: operands must share one dtype"
+        );
+        self.assert_wrapping_dtype("wrapping_matmul");
+        self.matmul_body(rhs, true)
+    }
+
+    fn matmul_body(mut self, mut rhs: GraphTensor, wrapping: bool) -> Self {
         assert!(
             self.rank() > 0 && rhs.rank() > 0,
             "matmul requires non-scalar operands"
@@ -100,8 +113,15 @@ impl GraphTensor {
             p.pop();
             self.graph().constant_i32(0).cast(self.dtype).expand_rhs(p)
         } else {
-            let product = self.record_view_map(am, p.clone()) * rhs.record_view_map(bm, p);
-            product.sum(vec![batches + 2])
+            let (lhs, rhs) = (
+                self.record_view_map(am, p.clone()),
+                rhs.record_view_map(bm, p),
+            );
+            if wrapping {
+                lhs.wrapping_mul(rhs).wrapping_sum(vec![batches + 2])
+            } else {
+                (lhs * rhs).sum(vec![batches + 2])
+            }
         };
         if rhs_vector {
             out = out.squeeze(batches + 1);

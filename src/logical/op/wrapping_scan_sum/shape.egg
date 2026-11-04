@@ -1,0 +1,12 @@
+; Propagate shape — a scan keeps the operand's shape.
+(rule
+  (
+    (= ?out (LogicalWrappingScanSum ?in ?axis))
+    (= ?shape (shape-of ?in))
+  )
+  (
+    (set (shape-of ?out) ?shape)
+  )
+  :ruleset prop
+  :name "wrapping_scan_sum/shape: shape of LogicalWrappingScanSum is the operand shape"
+)
