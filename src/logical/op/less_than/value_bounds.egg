@@ -1,0 +1,34 @@
+; Value bounds : LogicalLessThan. A Bool tensor's bounds are its truth
+; bounds, false 0 and true 1 (the indicator the Bool -> Int cast carries).
+; The comparison is decided by its operands' bounds where they separate:
+; true everywhere when the left's upper bound is below the right's lower,
+; false everywhere when the left's lower bound is at or above the right's
+; upper; otherwise [0, 1].
+(rule
+  ((= ?out (LogicalLessThan ?lhs ?rhs)))
+  (
+    (set (value-lower-bound-of ?out) (bigint 0))
+    (set (value-upper-bound-of ?out) (bigint 1))
+  )
+  :ruleset main_ruleset :name "less_than/value_bounds: a comparison is the indicator [0, 1]"
+)
+(rule
+  (
+    (= ?out (LogicalLessThan ?lhs ?rhs))
+    (= ?lhs_upper (value-upper-bound-of ?lhs))
+    (= ?rhs_lower (value-lower-bound-of ?rhs))
+    (< ?lhs_upper ?rhs_lower)
+  )
+  ((set (value-lower-bound-of ?out) (bigint 1)))
+  :ruleset main_ruleset :name "less_than/value_bounds: decided true everywhere by the operands' bounds"
+)
+(rule
+  (
+    (= ?out (LogicalLessThan ?lhs ?rhs))
+    (= ?lhs_lower (value-lower-bound-of ?lhs))
+    (= ?rhs_upper (value-upper-bound-of ?rhs))
+    (>= ?lhs_lower ?rhs_upper)
+  )
+  ((set (value-upper-bound-of ?out) (bigint 0)))
+  :ruleset main_ruleset :name "less_than/value_bounds: decided false everywhere by the operands' bounds"
+)

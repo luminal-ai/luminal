@@ -88,3 +88,20 @@
  ((set (value-lower-bound-of ?out) ?lo)
   (set (value-upper-bound-of ?out) ?hi))
  :ruleset main_ruleset :name "cast/value_bounds: in-range UInt64 to Int preserves bounds")
+; A cast to a float carries integral bounds over: the Bool indicator's
+; [0, 1], an Int's bounds. The float holds those integers exactly.
+(rule
+  (
+    (= ?out (LogicalCast ?in ?dtype))
+    (= ?lower (value-lower-bound-of ?in))
+    (= ?upper (value-upper-bound-of ?in))
+    (!= ?dtype (UInt64))
+    (!= ?dtype (Int))
+    (!= ?dtype (Int64))
+  )
+  (
+    (set (value-lower-bound-of ?out) ?lower)
+    (set (value-upper-bound-of ?out) ?upper)
+  )
+  :ruleset main_ruleset :name "cast/value_bounds: a cast to a float carries integral bounds"
+)

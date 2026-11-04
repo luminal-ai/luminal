@@ -34,3 +34,4 @@
   :ruleset main_ruleset
   :name "cast/rewrite_view: the cast of a view is the view of the cast"
 )
+

@@ -49,6 +49,10 @@ impl LogicalOp for LogicalIndexMapApply {
                 text: include_str!("rewrite.egg"),
             },
             EgglogSnippet {
+                category: SpliceCategory::Rewrites,
+                text: include_str!("viewed_bounds.egg"),
+            },
+            EgglogSnippet {
                 category: SpliceCategory::Shape,
                 text: include_str!("shape.egg"),
             },
