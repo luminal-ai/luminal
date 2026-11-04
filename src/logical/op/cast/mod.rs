@@ -129,4 +129,36 @@ mod tests {
             .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
             .unwrap();
     }
+
+    /// Views and casts commute both ways: the export's "permute, then cast"
+    /// and "cast, then permute" of one operand are one tensor, and so are
+    /// the cast of a broadcast and the broadcast of the cast; the shapes
+    /// and dtypes of the two spellings agree (no function merges), and a
+    /// chain of two views over a cast saturates with the cast at every
+    /// position.
+    #[test]
+    fn a_cast_and_a_view_commute_both_ways() {
+        let script = r#"
+(let shape (ShapeLit (IntExprCons (IntLit 3) (IntExprCons (IntLit 5) (IntExprNil)))))
+(let x (LogicalTensorInputLit (LogicalIdLit "x") shape (Bf16)))
+(let cast_then_transpose (LogicalHelperMatrixTranspose (LogicalCast x (F32))))
+(let transpose_then_cast (LogicalCast (LogicalHelperMatrixTranspose x) (F32)))
+(let wide_shape (ShapeLit (IntExprCons (IntLit 3) (IntExprCons (IntLit 4) (IntExprCons (IntLit 5) (IntExprNil))))))
+(let cast_then_broadcast (LogicalHelperBroadcastAxis (LogicalCast x (F32)) 1 (IntLit 4)))
+(let broadcast_then_cast (LogicalCast (LogicalHelperBroadcastAxis x 1 (IntLit 4)) (F32)))
+(let twice (LogicalHelperMatrixTranspose (LogicalCast (LogicalHelperMatrixTranspose x) (F32))))
+(run-schedule (saturate (run prop))
+  (saturate (saturate (run main_ruleset) (run prop)) (run subst-walk)))
+(check (= cast_then_transpose transpose_then_cast))
+(check (= (dtype-of cast_then_transpose) (F32)))
+(check (= (shape-of cast_then_transpose) (ShapeLit (IntExprCons (IntLit 5) (IntExprCons (IntLit 3) (IntExprNil))))))
+(check (= cast_then_broadcast broadcast_then_cast))
+(check (= (dtype-of cast_then_broadcast) (F32)))
+(check (= (shape-of cast_then_broadcast) wide_shape))
+(check (= twice (LogicalCast x (F32))))
+"#;
+        new_egraph()
+            .parse_and_run_program(None, &format!("{}\n{script}", assembled_program_for(&[])))
+            .unwrap();
+    }
 }
