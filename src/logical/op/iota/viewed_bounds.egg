@@ -1,0 +1,31 @@
+; Viewed bounds of an iota: the bounds of its expression substituted under
+; the view's map (`int-subst-of`, demanded here; the substitution road
+; decides what it can about the substituted expression).
+(rule
+  ((viewed-bounds-demand ?iota ?map) (= ?iota (LogicalIota ?expr ?shape)))
+  ((int-subst-demand ?expr ?map))
+  :ruleset main_ruleset
+  :name "iota/viewed_bounds: a viewed iota demands its substituted expression"
+)
+(rule
+  (
+    (viewed-bounds-demand ?iota ?map)
+    (= ?iota (LogicalIota ?expr ?shape))
+    (= ?image (int-subst-of ?expr ?map))
+    (= ?lower (lower-bound-of ?image))
+  )
+  ((set (viewed-lower-bound-of ?iota ?map) ?lower))
+  :ruleset main_ruleset
+  :name "iota/viewed_bounds: lower bound of a viewed iota"
+)
+(rule
+  (
+    (viewed-bounds-demand ?iota ?map)
+    (= ?iota (LogicalIota ?expr ?shape))
+    (= ?image (int-subst-of ?expr ?map))
+    (= ?upper (upper-bound-of ?image))
+  )
+  ((set (viewed-upper-bound-of ?iota ?map) ?upper))
+  :ruleset main_ruleset
+  :name "iota/viewed_bounds: upper bound of a viewed iota"
+)

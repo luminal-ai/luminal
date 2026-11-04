@@ -44,6 +44,10 @@ impl LogicalOp for LogicalCast {
             },
             EgglogSnippet {
                 category: SpliceCategory::Rewrites,
+                text: include_str!("viewed_bounds.egg"),
+            },
+            EgglogSnippet {
+                category: SpliceCategory::Rewrites,
                 text: include_str!("rewrite.egg"),
             },
             EgglogSnippet {

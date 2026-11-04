@@ -37,3 +37,18 @@
 (relation coordinate-only-entries-demand (IntExprList))
 (relation coordinate-only-entries (IntExprList))
 (relation index-map-coordinate-only (IndexMap))
+; VIEWED BOUNDS: the value bounds of a tensor restricted to what a view of
+; it reads, keyed by the view's map, derived ON DEMAND (`viewed-bounds-demand`)
+; and only as facts: no view of the tensor is minted. A view of a select
+; demands its condition's viewed bounds; the demand descends the
+; condition's pointwise chain (comparison, cast, sum, a view) to its
+; sources (an iota: the bounds of its expression substituted under the map;
+; anything with value bounds: those, a view reads a subset); the comparison
+; is decided where its operands' viewed bounds separate; a select whose
+; condition is decided over the view is, through that view, the view of
+; the decided branch (select/rewrite.egg). This is how a slice of a
+; concatenation (a select on a mask over clamped padding views) reaches the
+; operand it reads, without distributing the view into the condition.
+(relation viewed-bounds-demand (LogicalTensor IndexMap))
+(function viewed-lower-bound-of (LogicalTensor IndexMap) BigInt :merge (max old new))
+(function viewed-upper-bound-of (LogicalTensor IndexMap) BigInt :merge (min old new))

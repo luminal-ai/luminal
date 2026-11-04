@@ -1,0 +1,14 @@
+; Value bounds : an integral constant is its own bounds (the truth test of
+; a tensor compares against a broadcast 0.0).
+(rule
+  (
+    (= ?out (LogicalConstant ?value))
+    (= ?int (to-i64 ?value))
+    (= ?value (to-f64 ?int))
+  )
+  (
+    (set (value-lower-bound-of ?out) (bigint ?int))
+    (set (value-upper-bound-of ?out) (bigint ?int))
+  )
+  :ruleset main_ruleset :name "constant/value_bounds: an integral constant is its own bounds"
+)

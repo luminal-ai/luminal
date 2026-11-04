@@ -43,6 +43,8 @@ mod gcd_tests;
 mod gelu_tests;
 #[cfg(test)]
 mod view_compose_tests;
+#[cfg(test)]
+mod cat_slice_tests;
 mod grouped_mm;
 mod index;
 #[cfg(test)]

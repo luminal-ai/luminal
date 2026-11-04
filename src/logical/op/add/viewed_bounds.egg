@@ -1,0 +1,31 @@
+; Viewed bounds of a sum: the demand descends to the operands; interval sum.
+(rule
+  ((viewed-bounds-demand ?out ?map) (= ?out (LogicalAdd ?lhs ?rhs)))
+  ((viewed-bounds-demand ?lhs ?map) (viewed-bounds-demand ?rhs ?map))
+  :ruleset main_ruleset
+  :name "add/viewed_bounds: a viewed sum demands its operands"
+)
+(rule
+  (
+    (viewed-bounds-demand ?out ?map)
+    (= ?out (LogicalAdd ?lhs ?rhs))
+    (!= (dtype-of ?out) (UInt64))
+    (= ?lhs_lower (viewed-lower-bound-of ?lhs ?map))
+    (= ?rhs_lower (viewed-lower-bound-of ?rhs ?map))
+  )
+  ((set (viewed-lower-bound-of ?out ?map) (+ ?lhs_lower ?rhs_lower)))
+  :ruleset main_ruleset
+  :name "add/viewed_bounds: lower bound of a viewed sum"
+)
+(rule
+  (
+    (viewed-bounds-demand ?out ?map)
+    (= ?out (LogicalAdd ?lhs ?rhs))
+    (!= (dtype-of ?out) (UInt64))
+    (= ?lhs_upper (viewed-upper-bound-of ?lhs ?map))
+    (= ?rhs_upper (viewed-upper-bound-of ?rhs ?map))
+  )
+  ((set (viewed-upper-bound-of ?out ?map) (+ ?lhs_upper ?rhs_upper)))
+  :ruleset main_ruleset
+  :name "add/viewed_bounds: upper bound of a viewed sum"
+)
