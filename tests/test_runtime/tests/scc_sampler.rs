@@ -45,8 +45,12 @@ use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use test_runtime::extractor::{ExtractionSession, Genome, SamplingSpace, edges_have_cycle};
-use test_runtime::sampler::{ProducerIndex, mutate_genome_with_seed, sample_genome_with_seed};
+use test_runtime::sampler::{
+    ProducerIndex, mutate_genome_reporting, mutate_genome_with_seed, sample_genome_with_seed,
+};
 
 // ---------------------------------------------------------------------------
 // Shared machinery.
@@ -316,6 +320,72 @@ fn cross_check(name: &str, egraph: &EGraph) -> (usize, usize) {
         space.components.len()
     );
     (space.components.len(), checked_exactly)
+}
+
+/// A POINT MUTATION MUST CHANGE THE GENOME.
+///
+/// Directing every flip at ONE class isolates the flip rule from the class
+/// draw, and for a single class the outcome has to be all or nothing across
+/// seeds. Either the cycle filter pins the class to its incumbent and no
+/// seed moves it, or an alternative survives the filter and every seed
+/// elects one. A class that moves on some seeds and not others means the
+/// draw re-elected the incumbent, and a child identical to its parent costs
+/// a whole extraction that the fingerprint cache then throws away.
+///
+/// Fallback seeds are excluded: a flip with no admissible candidate draws
+/// from the full list on purpose, so it may legitimately land anywhere.
+fn directed_flips_are_all_or_nothing(name: &str, egraph: &EGraph) {
+    let matchers = test_runtime::matchers();
+    let session = ExtractionSession::new_with_matcher_set(egraph, None, &matchers);
+    let index = session.producer_index();
+    let space = session.sampling_space(&index);
+    let (parent, _) = sample_genome_with_seed(&index, &space, 11);
+    let mut classes_with_an_alternative = 0usize;
+    for class in index.keys() {
+        let directed = [class.clone()];
+        let moved: Vec<bool> = (0..64u64)
+            .filter_map(|seed| {
+                let (child, fallbacks) = mutate_genome_reporting(
+                    &parent,
+                    &index,
+                    &space,
+                    &directed,
+                    &mut StdRng::seed_from_u64(seed),
+                    1,
+                );
+                fallbacks
+                    .is_empty()
+                    .then(|| child.choices[class] != parent.choices[class])
+            })
+            .collect();
+        let movers = moved.iter().filter(|&&m| m).count();
+        assert!(
+            movers == 0 || movers == moved.len(),
+            "{name} class {class}: a directed flip moved the genome on {movers} of {} \
+             non-fallback seeds, so the draw re-elected the incumbent on the rest",
+            moved.len()
+        );
+        classes_with_an_alternative += usize::from(movers > 0);
+    }
+    assert!(
+        classes_with_an_alternative > 0,
+        "{name}: no class has an admissible alternative, so this board proves nothing"
+    );
+}
+
+#[test]
+fn directed_flips_move_the_basic_program_fixture() {
+    let source = std::fs::read_to_string(test_runtime::fixture_path("basic_program.egg"))
+        .expect("fixture readable");
+    directed_flips_are_all_or_nothing("basic_program", &test_runtime::serialize_fixture(&source));
+}
+
+#[test]
+fn directed_flips_move_the_marker_matmul_fixture() {
+    directed_flips_are_all_or_nothing(
+        "marker_matmul",
+        &test_runtime::serialize_fixture(&marker_matmul_program()),
+    );
 }
 
 // ---------------------------------------------------------------------------
