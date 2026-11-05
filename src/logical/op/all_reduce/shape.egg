@@ -1,0 +1,12 @@
+; Propagate shape: the sum over the group has the operand's shape
+(rule
+  (
+    (= ?out (LogicalAllReduce ?x ?group ?width ?sequence))
+    (= ?shape (shape-of ?x))
+  )
+  (
+    (set (shape-of ?out) ?shape)
+  )
+  :ruleset prop
+  :name "all_reduce/shape: LogicalAllReduce keeps its operand's shape"
+)

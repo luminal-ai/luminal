@@ -1,0 +1,12 @@
+; Dtype Propagation : LogicalAllReduce keeps its operand's dtype
+(rule
+  (
+    (= ?out (LogicalAllReduce ?x ?group ?width ?sequence))
+    (= ?dtype (dtype-of ?x))
+  )
+  (
+    (set (dtype-of ?out) ?dtype)
+  )
+  :ruleset prop
+  :name "all_reduce/dtype: LogicalAllReduce keeps its operand's dtype"
+)

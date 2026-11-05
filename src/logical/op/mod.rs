@@ -11,6 +11,8 @@
 
 mod all_gather;
 use all_gather::LogicalAllGather;
+mod all_reduce;
+pub use all_reduce::LogicalAllReduce;
 
 use crate::snapshot::compact::Node;
 
@@ -248,6 +250,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
         vec![
             Box::new(LogicalTensorInputLit),
             Box::new(LogicalAllGather),
+            Box::new(LogicalAllReduce),
             Box::new(LogicalTensorNamed),
             Box::new(LogicalBitsToBools),
             Box::new(LogicalBoolsToBits),
