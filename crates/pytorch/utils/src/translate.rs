@@ -1463,8 +1463,11 @@ impl Translator<'_> {
                 self.torch_mul(a, b)
             }
             "div.Tensor" | "div.Scalar" => self.binary(n, |a, b| a / b)?,
-            "maximum.default" => self.binary(n, |a, b| a.maximum(b))?,
-            "minimum.default" => self.binary(n, |a, b| a.minimum(b))?,
+            // `torch.max(a, b)` / `torch.min(a, b)` export as the binary `.other`
+            // overloads: aliases of `maximum` / `minimum` (NaN-propagating), so
+            // they record identically
+            "maximum.default" | "max.other" => self.binary(n, |a, b| a.maximum(b))?,
+            "minimum.default" | "min.other" => self.binary(n, |a, b| a.minimum(b))?,
             // ---- movement ----
             "t.default" => self.operand(&n[0])?.t(),
             "transpose.int" => {
@@ -2191,6 +2194,8 @@ fn opmath_target(target: &str) -> bool {
             | "floor_divide.default"
             | "maximum.default"
             | "minimum.default"
+            | "max.other"
+            | "min.other"
             | "fmax.default"
             | "fmin.default"
             | "pow.Tensor_Scalar"
