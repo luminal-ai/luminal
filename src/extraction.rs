@@ -1218,30 +1218,52 @@ impl<'a> Extractor<'a> {
                 .filter(|(_, spec)| spec.outputs.contains(class))
                 .collect()
         };
+        // every producer of a class with its state or the input it waits on,
+        // following each waiting input a few levels (the first class reached
+        // twice is not expanded again)
+        fn explain(
+            class: &ClassId,
+            depth: usize,
+            seen: &mut HashSet<ClassId>,
+            producers_of: &dyn Fn(&ClassId) -> Vec<(ClassId, Option<ClassId>)>,
+            op_of: &dyn Fn(&ClassId) -> String,
+            out: &mut Vec<String>,
+        ) {
+            if !seen.insert(class.clone()) || depth > 4 {
+                return;
+            }
+            let producers = producers_of(class);
+            if producers.is_empty() {
+                out.push(format!("{class}: no producer"));
+                return;
+            }
+            for (op_class, waiting) in producers.iter().take(4) {
+                match waiting {
+                    Some(input) => out.push(format!("{class} <- {} waits on {input}", op_of(op_class))),
+                    None => out.push(format!("{class} <- {}", op_of(op_class))),
+                }
+            }
+            for (_, waiting) in producers.iter().take(4) {
+                if let Some(input) = waiting {
+                    explain(input, depth + 1, seen, producers_of, op_of, out);
+                }
+            }
+        }
+        let waits = |class: &ClassId| -> Vec<(ClassId, Option<ClassId>)> {
+            producers_of(class)
+                .into_iter()
+                .map(|(op_class, spec)| {
+                    let waiting = matched(op_class)
+                        .then(|| spec.inputs.iter().find(|input| !viable.contains(*input)).cloned())
+                        .flatten();
+                    (op_class.clone(), waiting)
+                })
+                .collect()
+        };
         let mut chains = Vec::new();
         for dead in &self.no_candidates {
             let mut steps = Vec::new();
-            let mut class = dead.clone();
-            let mut seen = HashSet::new();
-            while seen.insert(class.clone()) {
-                let producers = producers_of(&class);
-                let waiting = producers.iter().find_map(|(op_class, spec)| {
-                    matched(op_class)
-                        .then(|| spec.inputs.iter().find(|input| !viable.contains(*input)).map(|input| (*op_class, input.clone())))
-                        .flatten()
-                });
-                match waiting {
-                    Some((op_class, input)) => {
-                        steps.push(format!("{class} <- {} waits on {input}", op_of(op_class)));
-                        class = input;
-                    }
-                    None => {
-                        let ops: Vec<String> = producers.iter().map(|(op_class, _)| op_of(op_class)).collect();
-                        steps.push(format!("{class}: no live producer {ops:?}"));
-                        break;
-                    }
-                }
-            }
+            explain(dead, 0, &mut HashSet::new(), &waits, &op_of, &mut steps);
             chains.push(steps.join("; "));
         }
         chains
