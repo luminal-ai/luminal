@@ -440,13 +440,15 @@ impl<'a> ExtractionSession<'a> {
                 None => format!("{} ({class})", class_label(class)),
             })
             .collect();
+        let chains = extractor.dead_end_chains();
         let summary = format!(
-            "{} unplanned classes; choice-cycles: {} {:?}; dead-ends: {} {:?}",
+            "{} unplanned classes; choice-cycles: {} {:?}; dead-ends: {} {:?}; why: {:?}",
             extractor.blocked.len() + extractor.no_candidates.len(),
             cycles.len(),
             cycles.iter().take(3).collect::<Vec<_>>(),
             dead_ends.len(),
-            dead_ends.iter().take(5).collect::<Vec<_>>()
+            dead_ends.iter().take(5).collect::<Vec<_>>(),
+            chains.iter().take(3).collect::<Vec<_>>()
         );
         (!cycles.is_empty(), !dead_ends.is_empty(), summary)
     }
@@ -1155,6 +1157,96 @@ impl<'a> Extractor<'a> {
     /// extraction needs this (the plain derivation walk backtracks past dead
     /// candidates on its own), and the fixpoint is too expensive to pay
     /// on every plain extraction.
+    /// Why each dead end has no candidate. The viability filter prunes every
+    /// producer one of whose inputs no live producer can make, so a dead end
+    /// is often only where the walk from the outputs stopped: the cause is
+    /// upstream, a class whose every producer was retired (subsumed) or is not
+    /// registered. For each dead end, the chain of producers that lost
+    /// viability, each naming the input it waits on, down to that class and
+    /// its producers' ops and states. The viability fixpoint is recomputed
+    /// here (the filter keeps no record of it).
+    fn dead_end_chains(&self) -> Vec<String> {
+        let matched = |op_class: &ClassId| {
+            self.class_nodes.get(op_class).into_iter().flatten().any(|node_id| {
+                self.egraph.nodes.get(node_id).is_some_and(|node| !node.subsumed && self.matchers.contains_key(node.op.as_str()))
+            })
+        };
+        let mut viable: HashSet<ClassId> = self.input_terminals.keys().cloned().collect();
+        loop {
+            let mut changed = false;
+            for (op_class, specs) in &self.op_specs {
+                if !matched(op_class) {
+                    continue;
+                }
+                for spec in specs {
+                    if spec.inputs.iter().all(|class| viable.contains(class)) {
+                        for output in &spec.outputs {
+                            changed |= viable.insert(output.clone());
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let op_of = |op_class: &ClassId| -> String {
+            let ops: Vec<String> = self
+                .class_nodes
+                .get(op_class)
+                .into_iter()
+                .flatten()
+                .filter_map(|node_id| self.egraph.nodes.get(node_id))
+                .filter(|node| node.op != "LayoutTensorOpLit")
+                .map(|node| {
+                    let state = if node.subsumed {
+                        "retired"
+                    } else if self.matchers.contains_key(node.op.as_str()) {
+                        "live"
+                    } else {
+                        "unregistered"
+                    };
+                    format!("{} [{state}]", node.op.trim_start_matches("LayoutTensorOp"))
+                })
+                .collect();
+            if ops.is_empty() { format!("{op_class}") } else { ops.join(" | ") }
+        };
+        let producers_of = |class: &ClassId| -> Vec<(&ClassId, &OpSpec)> {
+            self.op_specs
+                .iter()
+                .flat_map(|(op_class, specs)| specs.iter().map(move |spec| (op_class, spec)))
+                .filter(|(_, spec)| spec.outputs.contains(class))
+                .collect()
+        };
+        let mut chains = Vec::new();
+        for dead in &self.no_candidates {
+            let mut steps = Vec::new();
+            let mut class = dead.clone();
+            let mut seen = HashSet::new();
+            while seen.insert(class.clone()) {
+                let producers = producers_of(&class);
+                let waiting = producers.iter().find_map(|(op_class, spec)| {
+                    matched(op_class)
+                        .then(|| spec.inputs.iter().find(|input| !viable.contains(*input)).map(|input| (*op_class, input.clone())))
+                        .flatten()
+                });
+                match waiting {
+                    Some((op_class, input)) => {
+                        steps.push(format!("{class} <- {} waits on {input}", op_of(op_class)));
+                        class = input;
+                    }
+                    None => {
+                        let ops: Vec<String> = producers.iter().map(|(op_class, _)| op_of(op_class)).collect();
+                        steps.push(format!("{class}: no live producer {ops:?}"));
+                        break;
+                    }
+                }
+            }
+            chains.push(steps.join("; "));
+        }
+        chains
+    }
+
     fn apply_viability_filter(&mut self) {
         // The candidate memo is keyed on the choice and reads the
         // producer index; this is the one place that edits it.
