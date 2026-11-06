@@ -1264,6 +1264,28 @@ impl<'a> Extractor<'a> {
         for dead in &self.no_candidates {
             let mut steps = Vec::new();
             explain(dead, 0, &mut HashSet::new(), &waits, &op_of, &mut steps);
+            // and the one path down to where the starvation starts: each class's
+            // first waiting producer, followed until a class nothing waits through
+            let mut path = Vec::new();
+            let mut class = dead.clone();
+            let mut seen = HashSet::new();
+            while seen.insert(class.clone()) {
+                let producers = waits(&class);
+                match producers.iter().find_map(|(op_class, waiting)| waiting.clone().map(|input| (op_class.clone(), input))) {
+                    Some((op_class, input)) => {
+                        path.push(format!("{class} <- {}", op_of(&op_class)));
+                        class = input;
+                    }
+                    None => {
+                        let ops: Vec<String> = producers.iter().map(|(op_class, _)| op_of(op_class)).collect();
+                        path.push(format!("ROOT {class}: {ops:?}"));
+                        break;
+                    }
+                }
+            }
+            let depth = path.len();
+            let tail: Vec<String> = path.into_iter().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+            steps.push(format!("path of {depth} classes, its last: {}", tail.join(" / ")));
             chains.push(steps.join("; "));
         }
         chains
