@@ -1260,32 +1260,160 @@ impl<'a> Extractor<'a> {
                 })
                 .collect()
         };
+        // Where the starvation starts. The dead class's cone: every unviable
+        // input of every matched producer, followed transitively. Its roots
+        // are the unviable classes no matched producer makes (every producer
+        // retired or unregistered, or none at all). A root is SUFFICIENT when
+        // making it alone viable makes the dead class viable: that is the
+        // class whose loss starved it (often one of many roots: the rest are
+        // alternatives a fusion retired on purpose).
+        let specs: Vec<&OpSpec> = self
+            .op_specs
+            .iter()
+            .filter(|(op_class, _)| matched(op_class))
+            .flat_map(|(_, specs)| specs.iter())
+            .collect();
+        let mut consumers: HashMap<&ClassId, Vec<usize>> = HashMap::new();
+        let mut missing: Vec<usize> = Vec::with_capacity(specs.len());
+        for (i, spec) in specs.iter().enumerate() {
+            let mut inputs: Vec<&ClassId> = spec.inputs.iter().collect();
+            inputs.sort();
+            inputs.dedup();
+            missing.push(inputs.iter().filter(|class| !viable.contains(**class)).count());
+            for class in inputs {
+                consumers.entry(class).or_default().push(i);
+            }
+        }
+        // the classes viable once `root` is: a worklist over the counts
+        let unblocked = |root: &ClassId, dead: &ClassId| -> bool {
+            let mut missing = missing.clone();
+            let mut reached: HashSet<&ClassId> = HashSet::new();
+            let mut work: Vec<&ClassId> = vec![root];
+            reached.insert(root);
+            while let Some(class) = work.pop() {
+                if class == dead {
+                    return true;
+                }
+                for &i in consumers.get(class).map(Vec::as_slice).unwrap_or(&[]) {
+                    missing[i] -= 1;
+                    if missing[i] == 0 {
+                        for output in &specs[i].outputs {
+                            if !viable.contains(output) && reached.insert(output) {
+                                work.push(output);
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        };
         let mut chains = Vec::new();
         for dead in &self.no_candidates {
             let mut steps = Vec::new();
             explain(dead, 0, &mut HashSet::new(), &waits, &op_of, &mut steps);
-            // and the one path down to where the starvation starts: each class's
-            // first waiting producer, followed until a class nothing waits through
-            let mut path = Vec::new();
-            let mut class = dead.clone();
-            let mut seen = HashSet::new();
-            while seen.insert(class.clone()) {
-                let producers = waits(&class);
-                match producers.iter().find_map(|(op_class, waiting)| waiting.clone().map(|input| (op_class.clone(), input))) {
-                    Some((op_class, input)) => {
-                        path.push(format!("{class} <- {}", op_of(&op_class)));
-                        class = input;
-                    }
-                    None => {
-                        let ops: Vec<String> = producers.iter().map(|(op_class, _)| op_of(op_class)).collect();
-                        path.push(format!("ROOT {class}: {ops:?}"));
-                        break;
+            let mut parent: HashMap<ClassId, (ClassId, ClassId)> = HashMap::new();
+            let mut cone: Vec<ClassId> = vec![dead.clone()];
+            let mut visited: HashSet<ClassId> = HashSet::from([dead.clone()]);
+            let mut roots: Vec<ClassId> = Vec::new();
+            let mut head = 0;
+            while head < cone.len() && cone.len() < 200_000 {
+                let class = cone[head].clone();
+                head += 1;
+                let producers = producers_of(&class);
+                let live: Vec<_> = producers.iter().filter(|(op_class, _)| matched(op_class)).collect();
+                if live.is_empty() {
+                    roots.push(class);
+                    continue;
+                }
+                for (op_class, spec) in live {
+                    for input in &spec.inputs {
+                        if !viable.contains(input) && visited.insert(input.clone()) {
+                            parent.insert(input.clone(), (class.clone(), (*op_class).clone()));
+                            cone.push(input.clone());
+                        }
                     }
                 }
             }
-            let depth = path.len();
-            let tail: Vec<String> = path.into_iter().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
-            steps.push(format!("path of {depth} classes, its last: {}", tail.join(" / ")));
+            // `LUMINAL_DEAD_END_DUMP=path`: the whole cone, every producer of
+            // every class with all the inputs it waits on, for offline reading
+            if let Some(path) = std::env::var_os("LUMINAL_DEAD_END_DUMP") {
+                let mut text = String::new();
+                for class in &cone {
+                    let producers = producers_of(class);
+                    if producers.is_empty() {
+                        // what the tensor is: its literal's value and layout classes,
+                        // and the logical ops in the value class
+                        let mut described = Vec::new();
+                        for node_id in self.class_nodes.get(class).into_iter().flatten() {
+                            let Some(node) = self.egraph.nodes.get(node_id) else { continue };
+                            if node.op != "LayoutTensorLit" || node.children.len() < 2 {
+                                continue;
+                            }
+                            let child = |i: usize| self.egraph.nodes.get(&node.children[i]).map(|n| n.eclass.clone());
+                            if let (Some(value), Some(layout)) = (child(0), child(1)) {
+                                let ops: Vec<String> = self
+                                    .class_nodes
+                                    .get(&value)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|id| self.egraph.nodes.get(id))
+                                    .map(|n| format!("{}{}", n.op, if n.subsumed { "[retired]" } else { "" }))
+                                    .collect();
+                                described.push(format!("value={value} layout={layout} value_ops={}", ops.join("|")));
+                            }
+                        }
+                        text.push_str(&format!("{class} NONE {}\n", described.join(" ")));
+                    }
+                    for (op_class, spec) in producers {
+                        let waiting: Vec<String> =
+                            spec.inputs.iter().filter(|input| !viable.contains(*input)).map(|c| c.to_string()).collect();
+                        let inputs: Vec<String> = spec.inputs.iter().map(|c| c.to_string()).collect();
+                        text.push_str(&format!(
+                            "{class} {op_class} {} live={} inputs={} waits={}\n",
+                            op_of(op_class).replace(' ', "_"),
+                            matched(op_class),
+                            inputs.join(","),
+                            waiting.join(",")
+                        ));
+                    }
+                }
+                let _ = std::fs::write(&path, text);
+            }
+            // a root some producer of which was retired is one the cleanup
+            // made (a policy starved it); one nothing ever produced is an
+            // alternative that never was viable, and says nothing
+            let retired_root = |class: &ClassId| {
+                producers_of(class).iter().any(|(op_class, _)| {
+                    self.class_nodes.get(*op_class).into_iter().flatten().any(|node_id| {
+                        self.egraph.nodes.get(node_id).is_some_and(|node| node.subsumed && node.op != "LayoutTensorOpLit")
+                    })
+                })
+            };
+            let made: Vec<&ClassId> = roots.iter().filter(|root| retired_root(root)).collect();
+            let sufficient: Vec<&ClassId> = made.iter().copied().take(256).filter(|root| unblocked(root, dead)).take(4).collect();
+            steps.push(format!(
+                "cone of {} classes, {} roots ({} of them retired by a cleanup), {} of the first {} retired roots sufficient alone",
+                cone.len(),
+                roots.len(),
+                made.len(),
+                sufficient.len(),
+                made.len().min(256)
+            ));
+            for root in sufficient {
+                let producers: Vec<String> = producers_of(root).iter().map(|(op_class, _)| op_of(op_class)).collect();
+                let mut path = Vec::new();
+                let mut class = root.clone();
+                while let Some((consumer, op_class)) = parent.get(&class) {
+                    path.push(format!("{class} -> {} = {consumer}", op_of(op_class)));
+                    class = consumer.clone();
+                }
+                let depth = path.len();
+                let near: Vec<String> = path.into_iter().take(6).collect();
+                steps.push(format!(
+                    "SUFFICIENT ROOT {root} (producers {producers:?}), {depth} classes below the dead end, read as: {}",
+                    near.join(" / ")
+                ));
+            }
             chains.push(steps.join("; "));
         }
         chains
