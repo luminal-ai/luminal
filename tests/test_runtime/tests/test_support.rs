@@ -1537,8 +1537,8 @@ mod intcoordvar_probe {
 
 #[cfg(test)]
 mod stage4b_probes {
-    use luminal::prelude::CompactSnapshotExt;
     use luminal::dtype::DType;
+    use luminal::prelude::CompactSnapshotExt;
     use luminal::shape::SliceRange;
 
     /// (History: this module held the Step-4b degenerate-broadcast
