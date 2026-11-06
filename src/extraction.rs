@@ -12,12 +12,13 @@
 
 use once_cell::unsync::Lazy;
 
+use crate::snapshot::compact::{Children, DenseMap};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::snapshot::compact::{ClassId, EGraph, Node, NodeId};
 use anyhow::{Context, Result, bail};
-use egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::layout_ir::{
@@ -26,6 +27,8 @@ use crate::layout_ir::{
     OpNode, OutputNode, OutputSlot, SerializedIndex,
 };
 use crate::logical_op::{LogicalRender, logical_op_for};
+
+mod viability;
 
 /// The genome-independent candidate memo: (produced class, chosen enode,
 /// chosen output slot) → that choice's candidates. See the field on
@@ -42,7 +45,7 @@ struct Extractor<'a> {
     /// filtered). This registry is the ONLY dispatch: an enode whose label
     /// has no entry here simply offers no implementation candidate.
     matchers: HashMap<&'static str, &'a dyn OpMatcher>,
-    class_nodes: HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: ClassNodeIndex,
     /// The serialized index every [`ExtractionSite`] this extractor
     /// builds reads through: class → its e-nodes, constructor → its
     /// e-nodes, and (constructor, child 0's class) → its fact rows, ALL
@@ -240,6 +243,21 @@ impl<'a> ExtractionSession<'a> {
         Self { extractor }
     }
 
+    /// Share an immutable snapshot with deferred diagnostic renderers. The
+    /// caller retains its graph and all extraction/read semantics; no second
+    /// copy of every enode is needed merely to keep lazy text alive.
+    pub fn new_with_shared_matcher_set(
+        egraph: &'a Rc<EGraph>,
+        allowed_ops: Option<&[&str]>,
+        matchers: &'a [Box<dyn crate::layout_ir::OpMatcher>],
+    ) -> Self {
+        let allowed = allowed_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect());
+        let render = Rc::new(RenderCtx::shared(Rc::clone(egraph)));
+        let mut extractor = Extractor::new_with_render(egraph, allowed, None, matchers, render);
+        extractor.apply_viability_filter();
+        Self { extractor }
+    }
+
     /// The genome sampling index over this session's matcher set —
     /// derivable without consuming the session, so runtime callers
     /// need not supply their matchers twice.
@@ -332,7 +350,7 @@ impl<'a> ExtractionSession<'a> {
         };
         // Tarjan over the blocked graph via petgraph.
         let mut graph = petgraph::graph::DiGraph::<ClassId, ()>::new();
-        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::default();
         for class in extractor.blocked.keys() {
             let index = graph.add_node(class.clone());
             nodes.insert(class.clone(), index);
@@ -429,6 +447,67 @@ impl<'a> ExtractionSession<'a> {
         (!cycles.is_empty(), !dead_ends.is_empty(), summary)
     }
 
+    /// Trace a failed viability closure back through the original producer
+    /// contracts to inputs with no registered, live producer. Diagnostic only:
+    /// it neither changes the genome nor restores rejected implementations.
+    pub fn viability_frontier(&self) -> String {
+        let ex = &self.extractor;
+        let specs: Vec<_> = ex
+            .op_specs
+            .iter()
+            .filter(|(class, _)| {
+                ex.class_nodes.get(class).into_iter().flatten().any(|id| {
+                    ex.egraph
+                        .nodes
+                        .get(id)
+                        .is_some_and(|n| !n.subsumed && ex.matchers.contains_key(n.op.as_str()))
+                })
+            })
+            .flat_map(|(_, specs)| specs)
+            .collect();
+        let viable = viability::transitively_viable(
+            ex.input_terminals.keys(),
+            specs
+                .iter()
+                .map(|s| (s.inputs.as_slice(), s.outputs.as_slice())),
+        );
+        let mut producers: HashMap<&ClassId, Vec<&OpSpec>> = HashMap::default();
+        for spec in specs {
+            for output in &spec.outputs {
+                producers.entry(output).or_default().push(spec);
+            }
+        }
+        let mut pending = ex.no_candidates.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut frontier = std::collections::BTreeSet::new();
+        while let Some(class) = pending.pop() {
+            if viable.contains(&class) || !seen.insert(class.clone()) {
+                continue;
+            }
+            if let Some(specs) = producers.get(&class) {
+                for spec in specs {
+                    pending.extend(spec.inputs.iter().filter(|c| !viable.contains(*c)).cloned());
+                }
+            } else {
+                frontier.insert(class);
+            }
+        }
+        let mut result = format!("viability frontier: {} classes\n", frontier.len());
+        for class in frontier {
+            use std::fmt::Write;
+            let parts = ex.layout_tensor_parts(&class);
+            writeln!(result, "{class}: {parts:?}").unwrap();
+            let logical = parts.as_ref().map_or(&class, |(logical, _)| logical);
+            for id in ex.class_nodes.get(logical).into_iter().flatten() {
+                let node = &ex.egraph.nodes[id];
+                if node.op.starts_with("Logical") {
+                    writeln!(result, "  {} {:?}", node.op, node.children).unwrap();
+                }
+            }
+        }
+        result
+    }
+
     /// Deep anatomy of the last failure's cyclic SCCs, for the
     /// semantics question "what ARE these welded pairs": per member, the
     /// LayoutTensorLit children (logical class, layout class) and every
@@ -451,7 +530,7 @@ impl<'a> ExtractionSession<'a> {
         };
         let mut out = String::new();
         let mut graph = petgraph::graph::DiGraph::<ClassId, ()>::new();
-        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::new();
+        let mut nodes: HashMap<ClassId, petgraph::graph::NodeIndex> = HashMap::default();
         for class in ex.blocked.keys() {
             nodes.insert(class.clone(), graph.add_node(class.clone()));
         }
@@ -485,7 +564,7 @@ impl<'a> ExtractionSession<'a> {
                         .as_ref()
                         .and_then(|id| ex.egraph.nodes.get(id))
                         .map(|n| n.op.clone())
-                        .unwrap_or_else(|| "?".to_string());
+                        .unwrap_or_else(|| "?".into());
                     let inputs: Vec<String> = candidate
                         .children
                         .iter()
@@ -606,7 +685,7 @@ fn producer_index_from(
                     continue;
                 }
                 entries.push((
-                    node.op.clone(),
+                    node.op.to_string(),
                     ProducerChoice {
                         enode: node_id.clone(),
                         output_index: producer.output_index,
@@ -616,7 +695,7 @@ fn producer_index_from(
         }
         if !entries.is_empty() {
             entries.sort_by_key(|(name, choice)| {
-                (name.clone(), choice.enode.to_string(), choice.output_index)
+                (name.clone(), choice.enode.clone(), choice.output_index)
             });
             index.insert(class.clone(), entries);
         }
@@ -828,7 +907,7 @@ pub fn edges_have_cycle(edges: &std::collections::BTreeMap<ClassId, Vec<ClassId>
         Open,
         Done,
     }
-    let mut colour: HashMap<&ClassId, Colour> = HashMap::new();
+    let mut colour: HashMap<&ClassId, Colour> = HashMap::default();
     for root in edges.keys() {
         if colour.contains_key(root) {
             continue;
@@ -919,6 +998,22 @@ impl<'a> Extractor<'a> {
         genome: Option<&Genome>,
         matcher_set: &'a [Box<dyn OpMatcher>],
     ) -> Self {
+        Self::new_with_render(
+            egraph,
+            allowed_ops,
+            genome,
+            matcher_set,
+            Rc::new(RenderCtx::new(egraph)),
+        )
+    }
+
+    fn new_with_render(
+        egraph: &'a EGraph,
+        allowed_ops: Option<HashSet<String>>,
+        genome: Option<&Genome>,
+        matcher_set: &'a [Box<dyn OpMatcher>],
+        render: Rc<RenderCtx>,
+    ) -> Self {
         // THE MATCHER SET IS LENT, NOT OWNED (Phase 2, 2026-09-03): the
         // vocabulary belongs to the runtime INSTANCE that was loaded
         // with it, and one instance extracts many candidate genomes.
@@ -938,7 +1033,6 @@ impl<'a> Extractor<'a> {
             .collect();
         let class_nodes = class_nodes(egraph);
         let site_index = SerializedIndex::new(egraph);
-        let render = Rc::new(RenderCtx::new(egraph));
         let (op_specs, mut producer_index) = collect_op_specs(egraph, &render.class_nodes);
         let output_buffer_classes = collect_output_buffer_classes(egraph, &class_nodes);
         let input_buffer_classes = collect_input_buffer_classes(egraph, &class_nodes);
@@ -996,8 +1090,8 @@ impl<'a> Extractor<'a> {
             producer_index,
             input_terminals,
             genome: genome.cloned(),
-            memo: HashMap::new(),
-            blocked: HashMap::new(),
+            memo: HashMap::default(),
+            blocked: HashMap::default(),
             no_candidates: Vec::new(),
             op_cache: Default::default(),
             buffer_access_index: Default::default(),
@@ -1037,27 +1131,14 @@ impl<'a> Extractor<'a> {
                 (op_class, matched)
             })
             .collect();
-        let mut viable: HashSet<ClassId> = self.input_terminals.keys().cloned().collect();
-        loop {
-            let mut changed = false;
-            for (op_class, specs) in &self.op_specs {
-                if !op_matched.get(op_class).copied().unwrap_or(false) {
-                    continue;
-                }
-                for spec in specs {
-                    if spec.inputs.iter().all(|class| viable.contains(class)) {
-                        for output in &spec.outputs {
-                            if viable.insert(output.clone()) {
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+        let viable = viability::transitively_viable(
+            self.input_terminals.keys(),
+            self.op_specs
+                .iter()
+                .filter(|(op_class, _)| op_matched.get(op_class).copied().unwrap_or(false))
+                .flat_map(|(_, specs)| specs)
+                .map(|spec| (spec.inputs.as_slice(), spec.outputs.as_slice())),
+        );
         let op_matched: HashMap<ClassId, bool> = op_matched
             .into_iter()
             .map(|(k, v)| (k.clone(), v))
@@ -1220,7 +1301,7 @@ impl<'a> Extractor<'a> {
     /// Pure construction — no planning, no memo.
     fn discover(&self, roots: &[ClassId]) -> Universe {
         // Discover the class universe reachable through candidates.
-        let mut discovered: HashSet<ClassId> = HashSet::new();
+        let mut discovered: HashSet<ClassId> = HashSet::default();
         let mut universe: Vec<ClassId> = Vec::new();
         let mut candidate_lists: Vec<Vec<Candidate>> = Vec::new();
         let mut queue: std::collections::VecDeque<ClassId> = roots.iter().cloned().collect();
@@ -1888,8 +1969,8 @@ impl Candidate {
 /// The render memo's key: an e-class, the remaining render depth, and the
 /// preferred constructor. `preferred_op` is `&'static str` because every
 /// caller names a constructor literally (or goes through
-/// [`metadata_preferred_op`]), so a lookup allocates nothing; `ClassId` is
-/// an `Arc<str>`, whose clone is a refcount bump.
+/// [`metadata_preferred_op`]), so a lookup allocates nothing. Production
+/// class identities are numeric and copied directly.
 type RenderKey = (ClassId, usize, Option<&'static str>);
 
 /// The rendering state every renderer view shares: the e-graph, the
@@ -1904,24 +1985,28 @@ type RenderKey = (ClassId, usize, Option<&'static str>);
 /// outlives `ExtractionSession::extract_with_genome`'s cache clearing,
 /// exactly like `op_cache` and `stable_key_cache`.
 ///
-/// The e-graph here is OWNED (a clone of the caller's). Lazy text
+/// The e-graph here is OWNED (a clone sharing the caller's immutable rows). Lazy text
 /// closures hold an `Rc<RenderCtx>` and are forced after extraction
 /// returns, by which time the caller's `&EGraph` is frequently gone (the
 /// fixture harnesses drop the deserialized e-graph on return), so a
 /// borrow could not carry them.
 #[derive(Debug)]
 struct RenderCtx {
-    egraph: EGraph,
-    class_nodes: HashMap<ClassId, Vec<NodeId>>,
+    egraph: Rc<EGraph>,
+    class_nodes: ClassNodeIndex,
     memo: RefCell<HashMap<RenderKey, Rc<str>>>,
 }
 
 impl RenderCtx {
     fn new(egraph: &EGraph) -> Self {
+        Self::shared(Rc::new(egraph.clone()))
+    }
+
+    fn shared(egraph: Rc<EGraph>) -> Self {
         Self {
-            class_nodes: render_class_nodes(egraph),
-            egraph: egraph.clone(),
-            memo: RefCell::new(HashMap::new()),
+            class_nodes: render_class_nodes(&egraph),
+            egraph,
+            memo: RefCell::new(HashMap::default()),
         }
     }
 
@@ -1936,7 +2021,7 @@ impl RenderCtx {
 
 struct ClassRenderer<'a> {
     egraph: &'a EGraph,
-    class_nodes: &'a HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: &'a ClassNodeIndex,
     memo: &'a RefCell<HashMap<RenderKey, Rc<str>>>,
 }
 
@@ -1988,7 +2073,7 @@ impl LogicalRender for LogicalRenderCtx<'_, '_, '_> {
 
     fn child_int_expr(&mut self, node: &Node, index: usize) -> Option<String> {
         child_class(self.renderer.egraph, node, index)
-            .map(|class| self.renderer.readable_expr(&class, &mut HashSet::new()))
+            .map(|class| self.renderer.readable_expr(&class, &mut HashSet::default()))
     }
 }
 
@@ -2005,7 +2090,7 @@ impl<'a> ClassRenderer<'a> {
         self.egraph
             .class_data
             .get(class)
-            .and_then(|data| data.typ.clone())
+            .and_then(|data| data.typ.as_ref().map(ToString::to_string))
     }
 
     /// MEMOIZED per (class, depth, preference) for the session
@@ -2023,7 +2108,7 @@ impl<'a> ClassRenderer<'a> {
         preferred_op: Option<&'static str>,
     ) -> String {
         if depth == 0 {
-            return class.to_string();
+            return self.egraph.class_label(class);
         }
 
         let key = (class.clone(), depth, preferred_op);
@@ -2041,7 +2126,7 @@ impl<'a> ClassRenderer<'a> {
             .and_then(|node_ids| choose_render_node(self.egraph, node_ids, preferred_op))
         {
             Some(node_id) => self.render_node(node_id, depth),
-            None => class.to_string(),
+            None => self.egraph.class_label(class),
         };
         self.memo
             .borrow_mut()
@@ -2069,15 +2154,15 @@ impl<'a> ClassRenderer<'a> {
                 .egraph
                 .nodes
                 .get(node_id)
-                .map(|node| node.eclass.to_string())
-                .unwrap_or_else(|| node_id.to_string());
+                .map(|node| self.egraph.class_label(&node.eclass))
+                .unwrap_or_else(|| self.egraph.node_label(node_id));
         }
 
         let Some(node) = self.egraph.nodes.get(node_id) else {
-            return node_id.to_string();
+            return self.egraph.node_label(node_id);
         };
         if node.children.is_empty() {
-            return node.op.clone();
+            return node.op.to_string();
         }
 
         let args = node
@@ -2153,7 +2238,7 @@ impl<'a> ClassRenderer<'a> {
             self.layout_tensor_parts(class)
                 .map(|(logical, _)| self.logical_label(&logical))
                 .or_else(|| self.logical_name_from_layout_tensor(class))
-                .unwrap_or_else(|| class.to_string())
+                .unwrap_or_else(|| self.egraph.class_label(class))
         })
     }
 
@@ -2172,17 +2257,17 @@ impl<'a> ClassRenderer<'a> {
     fn logical_label(&self, class: &ClassId) -> String {
         self.display_name(class, || {
             let Some(node_id) = self.choose_logical_node(class) else {
-                return class.to_string();
+                return self.egraph.class_label(class);
             };
             let Some(node) = self.egraph.nodes.get(node_id) else {
-                return class.to_string();
+                return self.egraph.class_label(class);
             };
             match logical_op_for(node.op.as_str()) {
                 Some(op) => op.display_label(
                     node,
                     &mut LogicalRenderCtx {
                         renderer: self,
-                        visiting: &mut HashSet::new(),
+                        visiting: &mut HashSet::default(),
                         depth: 8,
                     },
                 ),
@@ -2195,7 +2280,7 @@ impl<'a> ClassRenderer<'a> {
         let mut details = self.class_details(class);
         details.push((
             "expr".to_string(),
-            self.readable_logical_expr(class, &mut HashSet::new()),
+            self.readable_logical_expr(class, &mut HashSet::default()),
         ));
         if let Some(shape) = self.logical_shape(class) {
             details.push(("shape".to_string(), shape));
@@ -2234,7 +2319,7 @@ impl<'a> ClassRenderer<'a> {
     fn logical_op_name(&self, class: &ClassId) -> Option<String> {
         let node_id = self.choose_logical_node(class)?;
         let node = self.egraph.nodes.get(node_id)?;
-        Some(node.op.clone())
+        Some(node.op.to_string())
     }
 
     fn choose_logical_node(&self, class: &ClassId) -> Option<&NodeId> {
@@ -2290,7 +2375,7 @@ impl<'a> ClassRenderer<'a> {
                     None => self.render_node(node_id, 16),
                 })
             })
-            .unwrap_or_else(|| class.to_string());
+            .unwrap_or_else(|| self.egraph.class_label(class));
 
         visiting.remove(class);
         rendered
@@ -2488,7 +2573,7 @@ impl<'a> ClassRenderer<'a> {
     }
 
     fn readable_expr_list_display(&self, class: &ClassId) -> Option<String> {
-        let exprs = self.readable_expr_list(class, &mut HashSet::new())?;
+        let exprs = self.readable_expr_list(class, &mut HashSet::default())?;
         Some(format!("[{}]", exprs.join(", ")))
     }
 
@@ -2508,7 +2593,7 @@ impl<'a> ClassRenderer<'a> {
             let cons = self.egraph.nodes.get(cons_id)?;
             let head_class = child_class(self.egraph, cons, 0)?;
             let tail_class = child_class(self.egraph, cons, 1)?;
-            let mut dims = vec![self.readable_expr(&head_class, &mut HashSet::new())];
+            let mut dims = vec![self.readable_expr(&head_class, &mut HashSet::default())];
             dims.extend(self.readable_expr_list(&tail_class, visiting)?);
             Some(dims)
         };
@@ -2519,7 +2604,7 @@ impl<'a> ClassRenderer<'a> {
 
     fn readable_expr(&self, class: &ClassId, visiting: &mut HashSet<ClassId>) -> String {
         if !visiting.insert(class.clone()) {
-            return class.to_string();
+            return self.egraph.class_label(class);
         }
 
         let rendered = self
@@ -2673,7 +2758,10 @@ impl<'a> ClassRenderer<'a> {
         {
             let mut details = self.class_details(class);
             details.push(("logical".to_string(), self.logical_label(&logical_class)));
-            details.push(("logical_eclass".to_string(), logical_class.to_string()));
+            details.push((
+                "logical_eclass".to_string(),
+                self.egraph.class_label(&logical_class),
+            ));
             if let Some(shape) = self.logical_shape(&logical_class) {
                 details.push(("shape".to_string(), shape));
             }
@@ -2691,7 +2779,10 @@ impl<'a> ClassRenderer<'a> {
                 details.push(("dtype".to_string(), dtype));
             }
             details.push(("layout".to_string(), self.canonical_layout(&layout_class)));
-            details.push(("layout_eclass".to_string(), layout_class.to_string()));
+            details.push((
+                "layout_eclass".to_string(),
+                self.egraph.class_label(&layout_class),
+            ));
             details
         }
     }
@@ -3010,8 +3101,8 @@ impl<'a> Extractor<'a> {
         let mut builder = IrBuilder {
             extractor: self,
             dag: DiGraph::new(),
-            value_producer: HashMap::new(),
-            op_nodes: HashMap::new(),
+            value_producer: HashMap::default(),
+            op_nodes: HashMap::default(),
         };
         let mut outputs = Vec::with_capacity(roots.len());
         for root in roots {
@@ -3039,7 +3130,7 @@ impl<'a> Extractor<'a> {
 
         let (logical, layout) = match self.layout_tensor_parts(class) {
             Some((logical_class, layout_class)) => (
-                self.logical_info(&logical_class, &mut HashSet::new(), 4),
+                self.logical_info(&logical_class, &mut HashSet::default(), 4),
                 self.layout_info(&layout_class),
             ),
             None => (
@@ -3222,9 +3313,9 @@ impl<'a> Extractor<'a> {
     fn with_buffer_access_index<R>(&self, read: impl FnOnce(&HashMap<ClassId, Access>) -> R) -> R {
         let mut slot = self.buffer_access_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, Access> = HashMap::new();
-            for (node_id, node) in &self.egraph.nodes {
-                if node.subsumed || node.op != "buffer-access-of" {
+            let mut index: HashMap<ClassId, Access> = HashMap::default();
+            for (node_id, node) in self.egraph.operator_nodes("buffer-access-of") {
+                if node.subsumed {
                     continue;
                 }
                 let Some(arg_class) = child_class(self.egraph, node, 0) else {
@@ -3267,9 +3358,9 @@ impl<'a> Extractor<'a> {
     ) -> R {
         let mut slot = self.buffer_freed_by_index.borrow_mut();
         if slot.is_none() {
-            let mut index: HashMap<ClassId, FreedBy> = HashMap::new();
-            for (node_id, node) in &self.egraph.nodes {
-                if node.subsumed || node.op != "buffer-freed-by" {
+            let mut index: HashMap<ClassId, FreedBy> = HashMap::default();
+            for (node_id, node) in self.egraph.operator_nodes("buffer-freed-by") {
+                if node.subsumed {
                     continue;
                 }
                 let Some(arg_class) = child_class(self.egraph, node, 0) else {
@@ -3388,8 +3479,10 @@ impl<'e, 'a> IrBuilder<'e, 'a> {
                             // fresh synthetic value identity (the poison-id
                             // idiom) makes bufferize allocate scratch instead
                             // of double-writing the class's real home.
-                            info.eclass =
-                                ClassId::from(format!("genome$waste${source_enode}${slot}"));
+                            info.eclass = ClassId::from(format!(
+                                "genome$waste${}${slot}",
+                                self.extractor.egraph.node_label(&source_enode)
+                            ));
                             info.label = format!("{} (unclaimed)", info.label);
                         }
                         info
@@ -3727,32 +3820,48 @@ fn enqueue(index: u32, in_queue: &mut [bool], queue: &mut std::collections::VecD
     }
 }
 
-fn class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
-    let mut classes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
-    for (node_id, node) in &egraph.nodes {
-        if node.subsumed || node.op == "[...]" {
-            continue;
-        }
-        classes
-            .entry(node.eclass.clone())
-            .or_default()
-            .push(node_id.clone());
-    }
-    classes
+/// Filtered views retain the common class membership arena. Only classes
+/// whose membership changes need a private list; no second full class map.
+#[derive(Debug)]
+struct ClassNodeIndex {
+    shared: std::sync::Arc<crate::snapshot::compact::GraphIndexes>,
+    changed: DenseMap<ClassId, Children>,
 }
-
-fn render_class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
-    let mut classes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
-    for (node_id, node) in &egraph.nodes {
-        if node.op == "[...]" {
+impl ClassNodeIndex {
+    fn get(&self, id: &ClassId) -> Option<&Children> {
+        let nodes = self
+            .changed
+            .get(id)
+            .or_else(|| self.shared.classes.get(id).map(|c| &c.nodes))?;
+        (!nodes.is_empty()).then_some(nodes)
+    }
+}
+fn indexed_class_nodes(egraph: &EGraph, live_only: bool) -> ClassNodeIndex {
+    let shared = egraph.indexes().clone();
+    let mut changed: DenseMap<ClassId, Children> = DenseMap::default();
+    for node in egraph.nodes.values() {
+        if node.op != "[...]" && (!live_only || !node.subsumed) {
             continue;
         }
-        classes
-            .entry(node.eclass.clone())
-            .or_default()
-            .push(node_id.clone());
+        changed.entry(node.eclass.clone()).or_insert_with(|| {
+            shared.classes[&node.eclass]
+                .nodes
+                .iter()
+                .filter(|id| {
+                    let n = &egraph.nodes[*id];
+                    n.op != "[...]" && (!live_only || !n.subsumed)
+                })
+                .cloned()
+                .collect()
+        });
     }
-    classes
+    ClassNodeIndex { shared, changed }
+}
+fn class_nodes(egraph: &EGraph) -> ClassNodeIndex {
+    indexed_class_nodes(egraph, true)
+}
+fn render_class_nodes(egraph: &EGraph) -> ClassNodeIndex {
+    indexed_class_nodes(egraph, false)
 }
 
 /// THE INPUT-PRODUCER FACT (cleanup stratum, ruling 2026-09-02): the
@@ -3783,9 +3892,9 @@ fn render_class_nodes(egraph: &EGraph) -> HashMap<ClassId, Vec<NodeId>> {
 /// its own constructor into that same class and a core rule cannot name
 /// them all.
 fn collect_input_producer_ops(egraph: &EGraph) -> HashSet<ClassId> {
-    let mut ops = HashSet::new();
-    for node in egraph.nodes.values() {
-        if node.subsumed || node.op != "input-producer" {
+    let mut ops = HashSet::default();
+    for (_, node) in egraph.operator_nodes("input-producer") {
+        if node.subsumed {
             continue;
         }
         if let Some(op_class) = child_class(egraph, node, 0) {
@@ -3797,15 +3906,28 @@ fn collect_input_producer_ops(egraph: &EGraph) -> HashSet<ClassId> {
 
 fn collect_op_specs(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: &ClassNodeIndex,
 ) -> (
     HashMap<ClassId, Vec<OpSpec>>,
     HashMap<ClassId, Vec<ProducerRef>>,
 ) {
-    let mut op_specs: HashMap<ClassId, Vec<OpSpec>> = HashMap::new();
-    let mut producer_index: HashMap<ClassId, Vec<ProducerRef>> = HashMap::new();
+    let mut op_specs: HashMap<ClassId, Vec<OpSpec>> = HashMap::default();
+    let mut producer_index: HashMap<ClassId, Vec<ProducerRef>> = HashMap::default();
 
-    for (op_class, node_ids) in class_nodes {
+    let mut op_classes: Vec<_> = egraph
+        .indexes()
+        .operators
+        .get("LayoutTensorOpLit")
+        .into_iter()
+        .flatten()
+        .map(|id| egraph.nodes[id].eclass.clone())
+        .collect();
+    op_classes.sort_unstable_by_key(|id| egraph.classes().insertion_index(id));
+    op_classes.dedup();
+    for op_class in &op_classes {
+        let Some(node_ids) = class_nodes.get(op_class) else {
+            continue;
+        };
         for node_id in node_ids {
             let Some(node) = egraph.nodes.get(node_id) else {
                 continue;
@@ -3824,7 +3946,7 @@ fn collect_op_specs(
                 egraph,
                 class_nodes,
                 &input_list_class,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             ) else {
                 continue;
             };
@@ -3832,7 +3954,7 @@ fn collect_op_specs(
                 egraph,
                 class_nodes,
                 &output_list_class,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             ) else {
                 continue;
             };
@@ -3869,7 +3991,7 @@ fn collect_op_specs(
 
 fn layout_tensor_list_items(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: &ClassNodeIndex,
     list_class: &ClassId,
     visiting: &mut HashSet<ClassId>,
 ) -> Option<Vec<ClassId>> {
@@ -3903,27 +4025,27 @@ fn layout_tensor_list_items(
 
 fn output_root_classes(egraph: &EGraph) -> Vec<ClassId> {
     let mut roots = egraph
-        .nodes
-        .values()
-        .filter(|node| !node.subsumed && node.op == "BufferOutputLit")
+        .operator_nodes("BufferOutputLit")
+        .map(|(_, node)| node)
+        .filter(|node| !node.subsumed)
         .map(|node| node.eclass.clone())
         .collect::<Vec<_>>();
-    roots.sort_by_key(ToString::to_string);
+    roots.sort();
     roots.dedup();
     roots
 }
 
 fn collect_output_buffer_classes(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: &ClassNodeIndex,
 ) -> HashSet<ClassId> {
-    let mut output_buffers = HashSet::new();
-    let mut visited_lists = HashSet::new();
+    let mut output_buffers = HashSet::default();
+    let mut visited_lists = HashSet::default();
 
     for node in egraph
-        .nodes
-        .values()
-        .filter(|node| !node.subsumed && node.op == "BufferOutputLit")
+        .operator_nodes("BufferOutputLit")
+        .map(|(_, node)| node)
+        .filter(|node| !node.subsumed)
     {
         let Some(list_class) = child_class(egraph, node, 0) else {
             continue;
@@ -3940,17 +4062,14 @@ fn collect_output_buffer_classes(
     output_buffers
 }
 
-fn collect_input_buffer_classes(
-    egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
-) -> HashSet<ClassId> {
-    let mut input_buffers = HashSet::new();
-    let mut visited_lists = HashSet::new();
+fn collect_input_buffer_classes(egraph: &EGraph, class_nodes: &ClassNodeIndex) -> HashSet<ClassId> {
+    let mut input_buffers = HashSet::default();
+    let mut visited_lists = HashSet::default();
 
     for node in egraph
-        .nodes
-        .values()
-        .filter(|node| !node.subsumed && node.op == "BufferInputLit")
+        .operator_nodes("BufferInputLit")
+        .map(|(_, node)| node)
+        .filter(|node| !node.subsumed)
     {
         let Some(list_class) = child_class(egraph, node, 0) else {
             continue;
@@ -3969,7 +4088,7 @@ fn collect_input_buffer_classes(
 
 fn collect_buffer_list(
     egraph: &EGraph,
-    class_nodes: &HashMap<ClassId, Vec<NodeId>>,
+    class_nodes: &ClassNodeIndex,
     list_class: &ClassId,
     visited_lists: &mut HashSet<ClassId>,
     buffers: &mut HashSet<ClassId>,
@@ -4003,7 +4122,7 @@ fn collect_input_terminals(
     output_buffer_classes: &HashSet<ClassId>,
     input_buffer_classes: &HashSet<ClassId>,
 ) -> HashMap<ClassId, InputInfo> {
-    let mut terminals = HashMap::new();
+    let mut terminals = HashMap::default();
     let egraph = &render.egraph;
     // Through the session's renderer, so these session-start renders
     // populate (and later hit) the same memo as everything else.
@@ -4145,13 +4264,10 @@ pub enum ChainStride {
 /// a slot is opaque (e.g. an accumulated diagonal summand) — fail
 /// closed, never guess.
 pub fn chain_strides(egraph: &EGraph, layout: &ClassId) -> Option<Vec<Option<ChainStride>>> {
-    let mut class_nodes: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
-    for node_id in egraph.nodes.keys() {
-        class_nodes
-            .entry(egraph.nid_to_cid(node_id).clone())
-            .or_default()
-            .push(node_id.clone());
-    }
+    let class_nodes = ClassNodeIndex {
+        shared: egraph.indexes().clone(),
+        changed: DenseMap::default(),
+    };
     let find = |class: &ClassId, op: &str| -> Option<NodeId> {
         class_nodes
             .get(class)?
@@ -4261,7 +4377,7 @@ mod render_memo_tests {
     //! return the string the uncached walk would have returned, and it
     //! must not deadlock on its own recursion.
 
-    use egraph_serialize::{ClassId, EGraph, Node, NodeId};
+    use crate::snapshot::compact::{ClassId, EGraph, Node, NodeId};
 
     use super::{ClassRenderer, RenderCtx};
 
@@ -4274,7 +4390,7 @@ mod render_memo_tests {
             egraph.add_node(
                 NodeId::from(id),
                 Node {
-                    op: op.to_string(),
+                    op: op.into(),
                     children: children.into_iter().map(NodeId::from).collect(),
                     eclass: ClassId::from(format!("class-{id}")),
                     cost: ordered_float::NotNan::new(1.0).unwrap(),
@@ -4374,6 +4490,7 @@ mod render_memo_tests {
 /// twice and the two builds' types do not unify.
 #[cfg(test)]
 mod chain_stride_tests {
+    use crate::snapshot::CompactSnapshotExt;
     /// Austin's stride-destructuring contract (chain world, 2026-08-04):
     /// live axes yield their stride class, stride-1 axes yield Unit, a
     /// zero slot on a live axis is the DETERMINED broadcast Some(Zero),
@@ -4398,7 +4515,7 @@ mod chain_stride_tests {
         egraph
             .parse_and_run_program(None, &full)
             .expect("program runs");
-        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
+        let serialized = egraph.serialize_compact_filtered(|_| true);
 
         let by_let = |name: &str| {
             serialized

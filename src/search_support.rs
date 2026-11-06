@@ -10,9 +10,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::snapshot::compact::ClassId;
 use anyhow::{Result, anyhow};
 use colored::Colorize;
-use egraph_serialize::ClassId;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rustc_hash::FxHashSet;
@@ -750,7 +750,7 @@ pub fn bufferize_cycle_tripwire(
 mod sampler_tests {
     use std::collections::BTreeMap;
 
-    use egraph_serialize::{ClassId, NodeId};
+    use crate::snapshot::compact::{ClassId, NodeId};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -1085,7 +1085,7 @@ mod sampler_tests {
         let text = format!("{err:#}");
         assert!(text.contains("sampler invariant violated"), "{text}");
         assert!(
-            text.contains("a <- [ClassId(\"b\")]") && text.contains("b <- []"),
+            text.contains("a <- [Text(\"b\")]") && text.contains("b <- []"),
             "the bail names the genome's chosen intra-component edges: {text}"
         );
         assert!(

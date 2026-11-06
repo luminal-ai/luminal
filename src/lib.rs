@@ -70,6 +70,7 @@ mod int_normalization_tests;
 pub mod layout_ir;
 #[path = "buffer/memory.rs"]
 pub mod memory;
+pub mod snapshot;
 #[path = "egglog_core/subst_primitive.rs"]
 pub mod subst_primitive;
 // The `Layout` sort's constructor structs, `LayoutFacts`, `DecodedLayout`
@@ -101,12 +102,14 @@ pub mod prelude {
     pub use crate::frontend::*;
     pub use crate::graph::*;
     pub use crate::shape::*;
+    pub use crate::snapshot::CompactSnapshotExt;
+    pub use crate::snapshot::compact as egraph_serialize;
+    pub use crate::snapshot::compact::NodeId as ENodeId;
     pub use crate::visualization::{ToDot, ToHtml};
+    pub use ::egraph_serialize as legacy_egraph_serialize;
     pub use anyhow;
     pub use egglog;
     pub use egglog::ast as egglog_ast;
-    pub use egraph_serialize;
-    pub use egraph_serialize::NodeId as ENodeId;
     pub use float8;
     pub use half::{bf16, f16};
     pub use petgraph;

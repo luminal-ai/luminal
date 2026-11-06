@@ -42,8 +42,8 @@ use crate::egglog_utils::eclass::{
     ConstructorDecoder, DynFacts, EClass, EGraphView, ENode, EgglogConstructor, Sort, Spellings,
 };
 use crate::shape::{DynMap, Symbol};
+use crate::snapshot::compact::ClassId;
 use anyhow::{Result, anyhow, bail, ensure};
-use egraph_serialize::ClassId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -847,6 +847,10 @@ enum ParseMemo {
 
 /// `(BitWidthLit i64)`.
 pub fn bit_width(class: &EClass<'_>) -> Option<BitWidthTerm> {
+    class.cached_read("bit-width", None, || bit_width_uncached(class))
+}
+
+fn bit_width_uncached(class: &EClass<'_>) -> Option<BitWidthTerm> {
     for node in class.nodes_named("BitWidthLit") {
         if let Some(bits) = node.child(0).and_then(|c| c.i64_literal()) {
             return Some(BitWidthTerm(bits));
@@ -858,6 +862,10 @@ pub fn bit_width(class: &EClass<'_>) -> Option<BitWidthTerm> {
 /// `(ShapeLit IntExprList)` — one extent expression per axis, outermost
 /// first.
 pub fn shape_term(class: &EClass<'_>) -> Option<ShapeTerm> {
+    class.cached_read("shape-term", None, || shape_term_uncached(class))
+}
+
+fn shape_term_uncached(class: &EClass<'_>) -> Option<ShapeTerm> {
     for node in class.nodes_named("ShapeLit") {
         let Some(head) = node.child(0) else {
             continue;
@@ -874,6 +882,12 @@ pub fn shape_term(class: &EClass<'_>) -> Option<ShapeTerm> {
 /// guarded to the layout's OWN shape (a foreign shape's coordinate is
 /// not this domain's and fails that spelling — the owner-shape guard).
 pub fn affine_chain(class: &EClass<'_>, owner_shape: &EClass<'_>) -> Option<Vec<IntExprTerm>> {
+    class.cached_read("affine-chain", Some(owner_shape.id()), || {
+        affine_chain_uncached(class, owner_shape)
+    })
+}
+
+fn affine_chain_uncached(class: &EClass<'_>, owner_shape: &EClass<'_>) -> Option<Vec<IntExprTerm>> {
     let mut memo = HashMap::new();
     expr_list(
         class,
@@ -888,6 +902,12 @@ pub fn affine_chain(class: &EClass<'_>, owner_shape: &EClass<'_>) -> Option<Vec<
 /// One `IntExpr` class into a term, optionally under the owner-shape
 /// guard.
 pub fn int_expr(class: &EClass<'_>, owner_shape: Option<&EClass<'_>>) -> Option<IntExprTerm> {
+    class.cached_read("int-expr", owner_shape.map(EClass::id), || {
+        int_expr_uncached(class, owner_shape)
+    })
+}
+
+fn int_expr_uncached(class: &EClass<'_>, owner_shape: Option<&EClass<'_>>) -> Option<IntExprTerm> {
     let owner = owner_shape.map(|c| c.id().clone());
     let mut memo = HashMap::new();
     parse_int_expr(class, 64, owner.as_ref(), &mut memo)

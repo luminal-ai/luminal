@@ -1,4 +1,5 @@
 use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
@@ -39,7 +40,7 @@ fn saturate(model: &Graph, table: &str) -> EGraph {
             ),
         )
         .unwrap();
-    graph.serialize(Default::default()).egraph
+    graph.serialize_compact_filtered(|_| true)
 }
 
 fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {

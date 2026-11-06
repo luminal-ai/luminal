@@ -77,9 +77,9 @@ impl IotaExpr {
 /// carries the burden instead.
 pub fn parse_int_expr(
     site: &ExtractionSite<'_>,
-    class: &egraph_serialize::ClassId,
+    class: &crate::snapshot::compact::ClassId,
     depth: usize,
-    expected_shape: Option<&egraph_serialize::ClassId>,
+    expected_shape: Option<&crate::snapshot::compact::ClassId>,
 ) -> Option<IotaExpr> {
     parse_int_expr_memo(
         site,
@@ -110,20 +110,20 @@ pub enum ParseMemo {
 /// exponential-blowup protection.
 pub fn parse_int_expr_memo(
     site: &ExtractionSite<'_>,
-    class: &egraph_serialize::ClassId,
+    class: &crate::snapshot::compact::ClassId,
     depth: usize,
-    expected_shape: Option<&egraph_serialize::ClassId>,
-    memo: &mut std::collections::HashMap<egraph_serialize::ClassId, ParseMemo>,
+    expected_shape: Option<&crate::snapshot::compact::ClassId>,
+    memo: &mut std::collections::HashMap<crate::snapshot::compact::ClassId, ParseMemo>,
 ) -> Option<IotaExpr> {
     parse_int_expr_tainting(site, class, depth, expected_shape, memo, &mut false)
 }
 
 fn parse_int_expr_tainting(
     site: &ExtractionSite<'_>,
-    class: &egraph_serialize::ClassId,
+    class: &crate::snapshot::compact::ClassId,
     depth: usize,
-    expected_shape: Option<&egraph_serialize::ClassId>,
-    memo: &mut std::collections::HashMap<egraph_serialize::ClassId, ParseMemo>,
+    expected_shape: Option<&crate::snapshot::compact::ClassId>,
+    memo: &mut std::collections::HashMap<crate::snapshot::compact::ClassId, ParseMemo>,
     tainted: &mut bool,
 ) -> Option<IotaExpr> {
     match memo.get(class) {
@@ -149,10 +149,10 @@ fn parse_int_expr_tainting(
 
 fn parse_int_expr_uncached(
     site: &ExtractionSite<'_>,
-    class: &egraph_serialize::ClassId,
+    class: &crate::snapshot::compact::ClassId,
     depth: usize,
-    expected_shape: Option<&egraph_serialize::ClassId>,
-    memo: &mut std::collections::HashMap<egraph_serialize::ClassId, ParseMemo>,
+    expected_shape: Option<&crate::snapshot::compact::ClassId>,
+    memo: &mut std::collections::HashMap<crate::snapshot::compact::ClassId, ParseMemo>,
     tainted: &mut bool,
 ) -> Option<IotaExpr> {
     if depth == 0 {
@@ -294,10 +294,10 @@ pub fn parse_index_map_entries(
 
 fn parse_entry_list(
     site: &ExtractionSite<'_>,
-    class: &egraph_serialize::ClassId,
+    class: &crate::snapshot::compact::ClassId,
     depth: usize,
-    out_shape: &egraph_serialize::ClassId,
-    memo: &mut std::collections::HashMap<egraph_serialize::ClassId, ParseMemo>,
+    out_shape: &crate::snapshot::compact::ClassId,
+    memo: &mut std::collections::HashMap<crate::snapshot::compact::ClassId, ParseMemo>,
 ) -> Option<Vec<IotaExpr>> {
     if depth == 0 {
         return None;

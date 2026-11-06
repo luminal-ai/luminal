@@ -34,6 +34,7 @@
 //! execute plans, so it has nothing to price them with.
 
 pub use luminal::extraction as extractor;
+use luminal::prelude::CompactSnapshotExt;
 pub use luminal::search_support as sampler;
 
 pub mod bindings;
@@ -149,15 +150,13 @@ fn try_extract_text_with_ops(
 /// fixture script, run to saturation and serialized — the raw material
 /// for every extraction below. Panics on any failure: these are fixtures.
 pub fn serialize_fixture(script_text: &str) -> luminal::prelude::egraph_serialize::EGraph {
-    use luminal::prelude::egglog::SerializeConfig;
-
     let preamble = luminal::egglog_snippet::assembled_program_for(&matchers());
     let program = format!("{preamble}\n\n{script_text}");
     let mut egraph = luminal::egglog_snippet::new_egraph();
     egraph
         .parse_and_run_program(None, &program)
         .unwrap_or_else(|err| panic!("egglog failed on fixture: {err}"));
-    egraph.serialize(SerializeConfig::default()).egraph
+    egraph.serialize_compact_filtered(|_| true)
 }
 
 /// Deterministic (minimum-height) extraction of a fixture script on this

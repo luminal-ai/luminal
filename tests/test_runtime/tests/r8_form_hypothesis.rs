@@ -39,7 +39,7 @@ fn layout_classes(s: &EGraph) -> BTreeMap<ClassId, BTreeSet<String>> {
             .nodes
             .values()
             .filter(|m| m.eclass == class)
-            .map(|m| m.op.clone())
+            .map(|m| m.op.to_string())
             .filter(|op| op.ends_with("ElementLayoutLit"))
             .collect();
         out.insert(class, names);
