@@ -181,3 +181,108 @@ fn narrow_payload_views_and_select_preserve_bits() {
         assert_eq!(bits, vec![raw[0], raw[3], raw[1], raw[4], raw[2], raw[5]]);
     }
 }
+
+#[test]
+fn explicitly_authored_fp16_arithmetic_rounds_each_product_add_and_sum() {
+    let mut graph = Graph::new();
+    let a = graph.tensor([1, 3], DType::F16);
+    let b = graph.tensor([3, 1], DType::F16);
+    let x = graph.tensor([4], DType::F16);
+    let y = graph.tensor([4], DType::F16);
+    let narrow = a.matmul(b);
+    let wide = a.cast(DType::F32).matmul(b.cast(DType::F32));
+    let product = x * y;
+    let added = x + y;
+    let inputs = [
+        (a, payload(DType::F16, &[2048.0, 1.0, -2048.0])),
+        (b, payload(DType::F16, &[1.0, 1.0, 1.0])),
+        (
+            x,
+            payload(
+                DType::F16,
+                &[1.0 + 1.0 / 1024.0, 65504.0, 2.0f32.powi(-24), -0.0],
+            ),
+        ),
+        (y, payload(DType::F16, &[1.0 + 1.0 / 1024.0, 2.0, 0.5, 1.0])),
+    ];
+    let runtime = run(&graph, &[narrow, wide, product, added], &inputs);
+    assert_eq!(runtime.get_f16(narrow.id).unwrap(), &vec![f16::ZERO]);
+    assert_eq!(runtime.get_f32(wide.id).unwrap(), &vec![1.0]);
+    let left = widened(&inputs[2].1);
+    let right = widened(&inputs[3].1);
+    for (out, multiply) in [(product, true), (added, false)] {
+        let expected: Vec<_> = left
+            .iter()
+            .zip(&right)
+            .map(|(a, b)| f16::from_f32(if multiply { a * b } else { a + b }).to_bits())
+            .collect();
+        let got: Vec<_> = runtime
+            .get_f16(out.id)
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        assert_eq!(got, expected);
+    }
+}
+
+#[test]
+fn half_exp2_and_reciprocal_round_each_output_and_keep_special_values() {
+    // Independent binary16 answers include underflow, overflow, signed zeros,
+    // exact powers of two, and irrational/non-dyadic rounded results.
+    for (exponential, values, expected) in [
+        (
+            true,
+            vec![
+                -25.0,
+                -24.0,
+                -15.0,
+                0.0,
+                0.5,
+                15.0,
+                16.0,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NAN,
+            ],
+            vec![
+                0x0000, 0x0001, 0x0200, 0x3c00, 0x3da8, 0x7800, 0x7c00, 0x7c00, 0x0000, 0x7e00,
+            ],
+        ),
+        (
+            false,
+            vec![
+                0.0,
+                -0.0,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                2.0_f32.powi(-24),
+                2.0_f32.powi(-14),
+                3.0,
+                65504.0,
+                f32::NAN,
+            ],
+            vec![
+                0x7c00, 0xfc00, 0x0000, 0x8000, 0x7c00, 0x7400, 0x3555, 0x0100, 0x7e00,
+            ],
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.tensor([values.len()], DType::F16);
+        let out = if exponential {
+            x.exp2()
+        } else {
+            x.reciprocal()
+        };
+        let runtime = run(&graph, &[out], &[(x, payload(DType::F16, &values))]);
+        let actual = runtime.get_f16(out.id).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, bits) in actual.iter().zip(expected) {
+            if f16::from_bits(bits).is_nan() {
+                assert!(actual.is_nan());
+            } else {
+                assert_eq!(actual.to_bits(), bits, "exp2={exponential}");
+            }
+        }
+    }
+}

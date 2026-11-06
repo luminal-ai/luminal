@@ -20,6 +20,8 @@ device = ["dep:cudarc", "cudarc/cublaslt"]
 [dependencies]
 luminal = { path = "../.." }
 anyhow = "1"
+# Native half-width cuBLASLt host scalar storage and conversion.
+half = "2.7.1"
 rustc-hash = "2"
 # The runtime-owned extractor + search (Phase 1 of the #420/#422 rejoin).
 # The petgraph version tracks luminal's exactly: the types must UNIFY with
@@ -40,8 +42,6 @@ cudarc = { git = "https://github.com/luminal-ai/cudarc.git", rev = "a42f3897b6d0
 # Step B: the reference inventory the subset test pins against now lives
 # in its own crate.
 luminal_reference = { path = "../luminal_reference" }
-# Half/bfloat host payloads for the dtype tests.
-half = "2.7.1"
 # M4 Phase 5: the refusal-accounting ladder (the cycle-anatomy L1-L8
 # discipline) runs the nn llama-block graphs through THIS runtime's
 # search with views admitted.
