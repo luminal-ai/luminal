@@ -9,6 +9,9 @@
 //! nothing else: the renderer and the program assembler both consult this
 //! registry.
 
+mod all_gather;
+use all_gather::LogicalAllGather;
+
 use crate::snapshot::compact::Node;
 
 use crate::egglog_snippet::EgglogSnippet;
@@ -236,6 +239,7 @@ pub fn built_in_logical_ops() -> &'static [Box<dyn LogicalOp + Send + Sync>] {
     OPS.get_or_init(|| {
         vec![
             Box::new(LogicalTensorInputLit),
+            Box::new(LogicalAllGather),
             Box::new(LogicalTensorNamed),
             Box::new(LogicalBitsToBools),
             Box::new(LogicalBoolsToBits),

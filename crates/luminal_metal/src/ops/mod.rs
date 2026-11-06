@@ -2,6 +2,7 @@
 //! Kernel execution is claimed through the DPS operation interface.
 
 pub mod add;
+pub mod all_gather;
 pub mod cast;
 pub mod ceil;
 pub mod constant;
@@ -126,6 +127,17 @@ pub fn metal_registry() -> Vec<RegisteredOp> {
         ),
         reg(iota::IotaMatcher, iota::Iota { expr: None }),
         reg(gather::GatherMatcher, gather::Gather { rank: 1 }),
+        reg(
+            all_gather::AllGatherMatcher,
+            all_gather::AllGather {
+                spec: luminal::collective::AllGatherSpec {
+                    group: String::new(),
+                    width: 1,
+                    sequence: 0,
+                },
+                dtype: luminal::dtype::PlanDtype::F32,
+            },
+        ),
         reg(constant::ConstantMatcher, constant::Constant { value: 0.0 }),
         reg(
             scatter::ScatterFunctionalMatcher,

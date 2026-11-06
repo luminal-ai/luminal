@@ -194,6 +194,7 @@ fn profile_on_reference_runtime(
     best_so_far: Option<u128>,
     memory_budget_bytes: usize,
 ) -> Result<u128> {
+    ensure!(!plan.dag.node_weights().any(|node| matches!(node, luminal::bufferize::BufferNode::Compute { op, .. } if op.label() == "AllGather")), "AllGather plans require compile(), not rank-local profiling");
     let input_bytes = input_data.values().try_fold(0usize, |n, v| {
         n.checked_add(v.byte_len())
             .ok_or_else(|| anyhow::anyhow!("input size overflow"))

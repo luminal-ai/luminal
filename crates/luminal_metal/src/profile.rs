@@ -54,6 +54,7 @@ pub fn profile_candidate_at(
     shapes: &crate::symbolic::ShapeEnv,
     arena_budget: Option<usize>,
 ) -> Result<Measurement, ProfileFailure> {
+    luminal::collective::ensure_local_profile(plan).map_err(ProfileFailure::Prepare)?;
     let staged = prepare_candidate(device, plan, staged, shapes, arena_budget)
         .map_err(ProfileFailure::Prepare)?;
     let mut arena = ProfilingMemory::new(device.device(), device.queue(), device.slab_bytes())
@@ -133,6 +134,7 @@ fn prepare_candidate<'a>(
     shapes: &crate::symbolic::ShapeEnv,
     arena_budget: Option<usize>,
 ) -> anyhow::Result<FxHashMap<i64, std::borrow::Cow<'a, HostBuffer>>> {
+    luminal::collective::ensure_local_profile(plan)?;
     let mut owned = FxHashMap::default();
     for buffer in plan.buffers.values() {
         if let Some(lit) = buffer.lit

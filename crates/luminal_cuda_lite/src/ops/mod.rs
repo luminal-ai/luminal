@@ -30,6 +30,7 @@
 //! dispatch entry; a familiar label alone never makes an op executable.
 
 pub mod add;
+pub mod all_gather;
 pub mod and;
 pub mod bits_to_bools;
 pub mod bools_to_bits;
@@ -248,6 +249,17 @@ pub fn cuda_registry_without_cublaslt() -> Vec<RegisteredOp> {
         ),
         reg(iota::IotaMatcher, iota::Iota { expr: None }),
         reg(gather::GatherMatcher, gather::Gather { rank: 1 }),
+        reg(
+            all_gather::AllGatherMatcher,
+            all_gather::AllGather {
+                spec: luminal::collective::AllGatherSpec {
+                    group: String::new(),
+                    width: 1,
+                    sequence: 0,
+                },
+                dtype: luminal::dtype::PlanDtype::F32,
+            },
+        ),
         reg(constant::ConstantMatcher, constant::Constant { value: 0.0 }),
         reg(
             scatter::ScatterFunctionalMatcher,
