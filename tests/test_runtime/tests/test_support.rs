@@ -1,4 +1,3 @@
-use luminal::prelude::CompactSnapshotExt;
 #[cfg(test)]
 mod harness_tests {
     use std::fs;
@@ -1538,6 +1537,7 @@ mod intcoordvar_probe {
 
 #[cfg(test)]
 mod stage4b_probes {
+    use luminal::prelude::CompactSnapshotExt;
     use luminal::dtype::DType;
     use luminal::shape::SliceRange;
 
