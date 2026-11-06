@@ -74,6 +74,22 @@ def run_cargo_test():
     )
 
 
+@app.function(image=cuda_image, gpu="T4:2", timeout=modal_timeout)
+def run_nccl_all_gather():
+    """Exercise the native collective on two ranks and two CUDA devices."""
+    subprocess.run(
+        [
+            "cargo", "test", "--release", "-p", "luminal_cuda_lite",
+            "--features", "device", "--test", "all_gather",
+            "nccl_all_gather_replays_with_new_shapes_and_arenas",
+            "--", "--ignored", "--nocapture",
+        ],
+        cwd=WORKDIR,
+        check=True,
+    )
+
+
 @app.local_entrypoint()
 def main():
     run_cargo_test.remote()
+    run_nccl_all_gather.remote()

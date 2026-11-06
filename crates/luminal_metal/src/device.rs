@@ -173,6 +173,9 @@ impl MetalExecutable {
                     {
                         continue;
                     }
+                    if crate::as_host_op(op.as_ref()).is_some() {
+                        continue;
+                    }
                     let kernel = crate::as_kernel_op(op.as_ref())
                         .ok_or_else(|| anyhow!("no Metal kernel for {}", op.label()))?;
                     let ctx = CodegenCtx::from_descriptors(op.label(), operand_info, result_info)?;
@@ -334,7 +337,8 @@ impl MetalExecutable {
                 params.len() * 8,
             );
         }
-        let command = self.queue.new_command_buffer();
+        let mut command = self.queue.new_command_buffer();
+        let mut host_staging = Vec::new();
         if !params.is_empty() {
             let blit = command.new_blit_command_encoder();
             blit.copy_from_buffer(
@@ -380,10 +384,92 @@ impl MetalExecutable {
                         blit.end_encoding();
                     }
                     BufferNode::Compute {
+                        op,
                         operand_info,
                         result_info,
                         ..
                     } => {
+                        if let Some(host) = crate::as_host_op(op.as_ref()) {
+                            ensure!(
+                                operand_info.len() == 2 && result_info.len() == 1,
+                                "AllGather slot arity mismatch"
+                            );
+                            // Finish every preceding producer before reading its bytes on the host.
+                            command.commit();
+                            command.wait_until_completed();
+                            ensure!(
+                                command.status() == MTLCommandBufferStatus::Completed,
+                                "Metal producer command failed"
+                            );
+                            let source = &operand_info[0];
+                            let source_bytes = symbolic::bytes(&source.layout, dims)?;
+                            let staging_input = self.device.new_buffer(
+                                source_bytes.max(1) as u64,
+                                MTLResourceOptions::StorageModeShared,
+                            );
+                            let transfer = self.queue.new_command_buffer();
+                            if source_bytes > 0 {
+                                let (buffer, offset) = resolve(&source.buffer)?;
+                                let blit = transfer.new_blit_command_encoder();
+                                blit.copy_from_buffer(
+                                    buffer,
+                                    offset,
+                                    &staging_input,
+                                    0,
+                                    source_bytes as u64,
+                                );
+                                blit.end_encoding();
+                            }
+                            transfer.commit();
+                            transfer.wait_until_completed();
+                            ensure!(
+                                transfer.status() == MTLCommandBufferStatus::Completed,
+                                "Metal AllGather download failed"
+                            );
+                            // The shared buffer is owned here and its GPU writes have completed.
+                            let input = unsafe {
+                                std::slice::from_raw_parts(
+                                    staging_input.contents().cast::<u8>(),
+                                    source_bytes,
+                                )
+                            };
+                            let output = host.execute(input, &source.layout, dims)?;
+                            let expected = symbolic::bytes(&result_info[0].layout, dims)?;
+                            ensure!(
+                                output.len() == expected,
+                                "AllGather output byte count mismatch"
+                            );
+                            let staging_output = self.device.new_buffer(
+                                expected.max(1) as u64,
+                                MTLResourceOptions::StorageModeShared,
+                            );
+                            if expected > 0 {
+                                // Both allocations are live, disjoint, and exactly sized.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        output.as_ptr(),
+                                        staging_output.contents().cast::<u8>(),
+                                        expected,
+                                    );
+                                }
+                            }
+                            command = self.queue.new_command_buffer();
+                            if expected > 0 {
+                                let (buffer, offset) = resolve(&result_info[0].buffer)?;
+                                let blit = command.new_blit_command_encoder();
+                                blit.copy_from_buffer(
+                                    &staging_output,
+                                    0,
+                                    buffer,
+                                    offset,
+                                    expected as u64,
+                                );
+                                blit.end_encoding();
+                            }
+                            // Retain host upload memory until the final command completes.
+                            host_staging.push(staging_output);
+                            continue;
+                        }
                         let Some(kernels) = p.kernels.get(node) else {
                             continue;
                         };

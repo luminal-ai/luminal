@@ -25,6 +25,7 @@
 // kernel registry's table rows point at
 // `<op_module>::kernel` (op-folder ruling 2026-08-13).
 mod add;
+mod all_gather;
 mod and;
 pub(crate) mod bits_to_bools;
 mod bits_to_bools_view;
@@ -79,6 +80,7 @@ pub(crate) mod trunc_cast;
 // created by its matcher's `extract` (or derived via `to_dps` / synthesized
 // by the DPS pass, for Poison) — a hygiene convention, not a privacy fence.
 pub use add::AddFunctional;
+pub use all_gather::{AllGather, AllGatherDps, AllGatherMatcher};
 pub use and::AndDps;
 pub use bits_to_bools::BitsToBoolsDps;
 pub use bools_to_bits::BoolsToBitsDps;
@@ -378,6 +380,10 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
             ReferenceOp {
                 matcher: || Box::new(CastMatcher),
                 kernel: entry::<CastDps>("CastGeneric", cast::kernel),
+            },
+            ReferenceOp {
+                matcher: || Box::new(AllGatherMatcher),
+                kernel: entry::<AllGatherDps>("AllGather", all_gather::kernel),
             },
             // ── sources ──
             ReferenceOp {

@@ -786,6 +786,9 @@ pub(crate) fn validate_plan(plan: &crate::MetalPlan) -> Result<()> {
                 "{}: malformed Metal kernel slots",
                 op.label()
             );
+            if crate::as_host_op(op.as_ref()).is_some() {
+                continue;
+            }
             let ctx = CodegenCtx::from_descriptors(op.label(), operand_info, result_info)?;
             let kernel = crate::as_kernel_op(op.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("{} has no Metal kernel interface", op.label()))?;
