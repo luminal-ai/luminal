@@ -75,14 +75,19 @@ impl Translator<'_> {
             full_stride[axis] = IntExpr::from(stride[spatial]);
             full_dilation[axis] = IntExpr::from(dilation[spatial]);
         }
-        let mut windows = padded.unfold(full_kernel, full_stride, full_dilation);
-        for spatial in 0..spatial_rank {
-            let axis = first_spatial + spatial;
-            windows = windows.slice_along(IntExpr::from(0)..output_shape[axis], axis);
-        }
-        // Remove the size-one kernel axes belonging to batch/channel axes.
+        // Window construction is one view: compose away the size-one batch
+        // and channel kernel axes before recording it, rather than asking
+        // egglog to enumerate every intermediate composition.
+        let mut windows = padded.unfold_view(full_kernel, full_stride, full_dilation);
         for axis in (0..first_spatial).rev() {
             windows = windows.squeeze(rank + axis);
+        }
+        let mut windows = windows.finish();
+        for spatial in 0..spatial_rank {
+            let axis = first_spatial + spatial;
+            if windows.dims()[axis] != output_shape[axis] {
+                windows = windows.slice_along(IntExpr::from(0)..output_shape[axis], axis);
+            }
         }
         windows
     }
@@ -106,8 +111,7 @@ impl Translator<'_> {
     }
 
     /// The max-pool padding value: negative infinity for floats, false
-    /// for Bool. Integer inputs bail — the stable-argsort selection key
-    /// is built with a float multiplier.
+    /// for Bool. Integer inputs are not supported by this pooling lowering.
     fn pool_lowest(&mut self, dtype: DType) -> Result<GraphTensor> {
         Ok(match dtype {
             DType::F64 => self.cx.constant_f64(f64::NEG_INFINITY),
@@ -115,14 +119,11 @@ impl Translator<'_> {
                 self.cx.constant_f32(f32::NEG_INFINITY).cast(dtype)
             }
             DType::Bool => self.cx.constant_f32(0.0).cast(DType::Bool),
-            other => bail!(
-                "max pooling on {other:?} inputs is not ported: the stable-argsort \
-                 selection needs a float key"
-            ),
+            other => bail!("max pooling on {other:?} inputs is not supported"),
         })
     }
 
-    /// Max over the trailing axis, selecting via one stable-argsort pass.
+    /// Max over the trailing axis, with first ties and last-NaN selection.
     /// `candidates`/`indices` carry `[prefix..., out_spatial..., flatten]`
     /// and the result is the top-1 slice along the flattened axis. The
     /// index gathered from `indices` is PyTorch's flattened-within-plane
@@ -141,16 +142,27 @@ impl Translator<'_> {
         let key = match candidates.dtype {
             DType::F64 | DType::F32 | DType::F16 | DType::Bf16 | DType::TF32 => candidates,
             DType::Bool => candidates.cast(DType::F32),
-            other => bail!(
-                "max pooling on {other:?} inputs is not ported: the stable-argsort \
-                 selection needs a float key"
-            ),
+            other => bail!("max pooling on {other:?} inputs is not supported"),
         };
         let axis = output_rank;
-        let selected = key
-            .stable_argsort(axis, true)
-            .slice_along(0..1, axis)
-            .squeeze(axis);
+        // Pooling only needs one winner. Sorting every window creates a
+        // quadratic comparison/scatter graph and can exhaust saturation.
+        // Keep tie selection linear and gather the original value afterwards
+        // so equal signed zeros and narrow storage retain their input bits.
+        let dims = key.dims();
+        let extent = dims[axis];
+        let maximum = key.max(vec![axis]).expand_dim(axis, extent);
+        let winners = key.eq(maximum);
+        let ranks = self.cx.iota(dims.clone(), |c| extent - c[axis]);
+        let zero_rank = self.cx.constant_i32(0).expand_rhs(dims.clone());
+        let first = -winners.select(ranks, zero_rank).max(vec![axis]) + extent;
+        // ATen max-pool replaces the winner for every NaN encountered, hence
+        // the last NaN wins even though ordinary maximum ties choose first.
+        let nan = key.is_nan();
+        let positions = self.cx.iota(dims, |c| c[axis] + IntExpr::from(1));
+        let last_nan = nan.select(positions, zero_rank).max(vec![axis]);
+        let zero = self.cx.constant_i32(0).expand_rhs(last_nan.dims());
+        let selected = last_nan.gt(zero).select(last_nan - 1, first);
         // Coordinate gather; nothing here mints flat Int arithmetic.
         let out_shape = selected.dims();
         let mut coordinates: Vec<GraphTensor> = (0..axis)

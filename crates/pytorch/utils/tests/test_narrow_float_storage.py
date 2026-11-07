@@ -222,3 +222,23 @@ def test_histc_counts_into_narrow_storage(stage_one_only, dtype):
     x = torch.tensor([0.0, 1.0, 1.0, 3.0, 2.0, 1.0, 0.0], dtype=dtype)
     compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
     _assert_bitwise(compiled(x), model(x))
+
+
+@pytest.mark.parametrize(
+    "dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+)
+@pytest.mark.parametrize(
+    "values",
+    (
+        [2.0, 2.0, 1.0, 2.0],
+        [-0.0, 0.0, -0.0, 0.0],
+        [float("nan"), 1.0, float("nan"), 2.0],
+    ),
+)
+def test_max_pool_preserves_first_ties_and_last_nan(stage_one_only, dtype, values):
+    model = Unary(lambda x: torch.nn.functional.max_pool1d(x, 4, return_indices=True))
+    x = torch.tensor([[values]], dtype=dtype)
+    actual = torch.compile(model, backend=luminal_backend, fullgraph=True)(x)
+    expected = model(x)
+    _assert_bitwise(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])

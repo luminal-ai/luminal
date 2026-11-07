@@ -145,6 +145,9 @@ impl TcpAllGather {
         );
         let deadline = Instant::now() + timeout;
         let configure = |stream: &TcpStream| -> Result<()> {
+            // Accepted sockets inherit O_NONBLOCK on BSD/macOS. The wire
+            // protocol uses blocking reads/writes bounded by these timeouts.
+            stream.set_nonblocking(false)?;
             stream.set_nodelay(true)?;
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))?;
