@@ -179,6 +179,12 @@ class Accumulate(torch.nn.Module):
 
 _INDEX = torch.tensor([0, 2, 0, 1, 2, 0])
 
+
+@pytest.fixture(autouse=True)
+def index_device(device, monkeypatch):
+    monkeypatch.setitem(globals(), "_INDEX", _INDEX.to(device))
+
+
 ACCUMULATING_OPS = (
     pytest.param(lambda x, s: x.scatter_add(0, _INDEX, s), id="scatter_add"),
     pytest.param(
