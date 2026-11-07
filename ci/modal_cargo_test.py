@@ -4,7 +4,8 @@ import subprocess
 
 import modal
 
-gpu_type = os.environ.get("GPU_TYPE", "T4")
+# The precision suites exercise BF16 and TF32 cuBLASLt modes (SM80+).
+gpu_type = os.environ.get("GPU_TYPE", "A100")
 modal_timeout = int(os.environ.get("MODAL_TIMEOUT", "7200"))
 CUDARC_CUDA_VERSION = "12080"
 
