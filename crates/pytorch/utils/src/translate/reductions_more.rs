@@ -742,6 +742,7 @@ mod scalar_precision_tests {
         let parsed = parsed_nodes(Vec::new(), &[], &[], &[]);
         let mut translator = Translator {
             cx: Graph::new(),
+            device: None,
             values: HashMap::new(),
             input_values: HashMap::new(),
             symbols: HashMap::new(),

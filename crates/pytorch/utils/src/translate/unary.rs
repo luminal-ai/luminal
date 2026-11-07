@@ -188,6 +188,26 @@ impl Translator<'_> {
         Ok(one - self.real_erf(x))
     }
 
+    pub(super) fn translate_gelu(&mut self, node: &Node) -> Result<GraphTensor> {
+        let x = self.unary_input(node)?;
+        let result = x.gelu();
+        let output_dtype = self.output_meta_dtype(node)?;
+        let cpu = self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cpu");
+        if cpu && output_dtype != DType::F64 {
+            // ATen's CPU GELU kernel canonicalizes every exact zero to +0 for
+            // FP16/BF16/FP32. CUDA and CPU FP64 preserve the input sign at an
+            // underflowed zero, so this normalization is deliberately gated
+            // by both the captured placement and authored output dtype.
+            let zero = self.constant_like(result, 0.0);
+            Ok(self.is_zero(result).select(zero, result))
+        } else {
+            Ok(result)
+        }
+    }
+
     /// Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
     fn real_erf(&mut self, u: GraphTensor) -> GraphTensor {
         const P: f64 = 0.3275911;

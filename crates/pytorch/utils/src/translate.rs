@@ -157,6 +157,9 @@ pub(crate) fn opmath_compute(common: DType) -> DType {
 
 struct Translator<'a> {
     cx: Graph,
+    /// The single device stated by the exported program. Some ATen
+    /// operations have observable device-specific IEEE edge behavior.
+    device: Option<crate::torch_device::TorchDevice>,
     values: HashMap<String, GraphTensor>,
     /// Input values by graph name.
     input_values: HashMap<String, GraphTensor>,
@@ -219,6 +222,7 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
     let symbol_ranges = sympy::sym_char_ranges(&sym_dim_map);
     let mut t = Translator {
         cx: Graph::new(),
+        device: device.clone(),
         values: HashMap::new(),
         input_values: HashMap::new(),
         symbols: sym_dim_map.sym_to_symbol.clone(),
@@ -1176,7 +1180,7 @@ impl Translator<'_> {
                 self.torch_neg(x)
             }
             "silu.default" => self.operand(&n[0])?.silu(),
-            "gelu.default" => self.operand(&n[0])?.gelu(),
+            "gelu.default" => self.translate_gelu(node)?,
             "reciprocal.default" => self.operand(&n[0])?.reciprocal(),
             "sin.default" => self.operand(&n[0])?.sin(),
             "square.default" => {

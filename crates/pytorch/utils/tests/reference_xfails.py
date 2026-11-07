@@ -218,7 +218,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype2]",
             "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype3]",
             "test_complex.py::test_acos_and_acosh_take_the_side_of_the_cut_from_a_signed_zero[torch.float64]",
-            "test_unary.py::test_erf_family_is_odd_through_an_exact_sign[gelu]",
         ),
         machines=("x86_64", "AMD64"),
     ),
