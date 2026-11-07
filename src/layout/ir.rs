@@ -15,10 +15,10 @@
 // bufferization layer and are not yet read by the visualization.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::rc::Rc;
 
-use egraph_serialize::{ClassId, NodeId};
+use crate::snapshot::compact::{ClassId, NodeId};
 use once_cell::{sync::OnceCell, unsync::Lazy};
 use petgraph::graph::{DiGraph, NodeIndex};
 
@@ -243,7 +243,7 @@ impl Clone for Box<dyn LayoutIrOp> {
 /// extraction session and handed to every [`ExtractionSite`]:
 ///
 ///  * BY CLASS — every e-node of an e-class, the inverse of
-///    [`egraph_serialize::Node::eclass`].
+///    [`crate::snapshot::compact::Node::eclass`].
 ///  * BY OP — every e-node spelling a given constructor.
 ///  * DTYPE — authoritative `dtype-of` facts, shared by extraction and matchers.
 ///
@@ -265,78 +265,48 @@ impl Clone for Box<dyn LayoutIrOp> {
 /// returns.
 #[derive(Debug, Clone, Default)]
 pub struct SerializedIndex {
-    by_class: HashMap<ClassId, Vec<NodeId>>,
-    by_op: HashMap<String, Vec<NodeId>>,
+    shared: std::sync::Arc<crate::snapshot::compact::GraphIndexes>,
     dtype: OnceCell<HashMap<ClassId, crate::dtype::PlanDtype>>,
 }
 
-/// The bucket for `op`, minting it on first sight. Keyed by the op's
-/// own text so a lookup can hash a `&str`; the `String` is allocated
-/// once per DISTINCT constructor rather than once per node.
-fn op_bucket<'m, V: Default>(map: &'m mut HashMap<String, V>, op: &str) -> &'m mut V {
-    if !map.contains_key(op) {
-        map.insert(op.to_string(), V::default());
-    }
-    map.get_mut(op).expect("bucket just minted")
-}
-
 impl SerializedIndex {
-    /// Index an e-graph's nodes by e-class and by constructor — one pass.
-    pub fn new(egraph: &egraph_serialize::EGraph) -> Self {
-        let mut by_class: HashMap<ClassId, Vec<NodeId>> = HashMap::new();
-        let mut by_op: HashMap<String, Vec<NodeId>> = HashMap::new();
-        for (node_id, node) in &egraph.nodes {
-            by_class
-                .entry(node.eclass.clone())
-                .or_default()
-                .push(node_id.clone());
-            op_bucket(&mut by_op, &node.op).push(node_id.clone());
-        }
+    /// All readers of one immutable snapshot reuse its numeric class/operator
+    /// indexes. Neither subsumption nor graph iteration order is filtered here.
+    pub fn new(egraph: &crate::snapshot::compact::EGraph) -> Self {
         Self {
-            by_class,
-            by_op,
+            shared: egraph.indexes().clone(),
             dtype: OnceCell::new(),
         }
     }
-
-    /// The class's e-nodes, in e-graph order.
-    ///
-    /// A miss is NOT "the class is empty" — an e-class exists precisely
-    /// because a node names it, so a miss means this index was built
-    /// from a different e-graph than the one being read. Refuse loudly:
-    /// the answer would be about the wrong program.
     pub fn nodes_of(&self, class: &ClassId) -> &[NodeId] {
-        self.by_class
+        &self
+            .shared
+            .classes
             .get(class)
-            .map(Vec::as_slice)
-            .unwrap_or_else(|| {
-                panic!(
-                    "class index invariant: class {class} has no entry — the index \
-                     was built from a different e-graph than the site reads"
-                )
-            })
+            .unwrap_or_else(|| panic!("class index invariant: class {class} has no entry"))
+            .nodes
     }
-
-    /// Every e-node spelling `op`, in e-graph order. A miss is EMPTY,
-    /// not an error: a program that mints no `BufferInputLit` simply has
-    /// no explicit inputs.
     pub fn nodes_of_op(&self, op: &str) -> &[NodeId] {
-        self.by_op.get(op).map(Vec::as_slice).unwrap_or_default()
+        self.shared
+            .operators
+            .get(op)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// The core's dtype fact index, shared with matchers. Build it once from
     /// indexed `dtype-of` rows; never search the graph for each candidate.
     pub(crate) fn with_dtype_index<R>(
         &self,
-        egraph: &egraph_serialize::EGraph,
+        egraph: &crate::snapshot::compact::EGraph,
         read: impl FnOnce(&HashMap<ClassId, crate::dtype::PlanDtype>) -> R,
     ) -> R {
         let index = self.dtype.get_or_init(|| {
-            let mut index = HashMap::new();
+            let mut index = HashMap::default();
             // Every `dtype-of` row of a type shares its value class. Decode
             // that class once, including its divergence check, rather than
             // revisiting all of its rows for every tensor.
-            let mut dtype_values = HashMap::new();
+            let mut dtype_values = HashMap::default();
             for node_id in self.nodes_of_op("dtype-of") {
                 let row = &egraph.nodes[node_id];
                 let Some(arg) = row.children.first().and_then(|id| egraph.nodes.get(id)) else {
@@ -374,9 +344,7 @@ impl SerializedIndex {
     }
 }
 
-/// The matched enode, handed to [`OpMatcher::extract`]. A borrowed view of
-/// everything a matcher may read while building an instance. Today's
-/// instances are nullary and ignore it; ops whose instances carry extracted
+/// An extraction site reads constructor metadata from the shared snapshot;
 /// data (layouts, axes, index maps) read their children through it. Extending
 /// this struct is the sanctioned way to grow the extraction contract —
 /// matchers take `&ExtractionSite`, so new fields cost existing impls nothing.
@@ -387,9 +355,9 @@ impl SerializedIndex {
 /// returns in `egraph`.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractionSite<'a> {
-    pub egraph: &'a egraph_serialize::EGraph,
+    pub egraph: &'a crate::snapshot::compact::EGraph,
     pub node_id: &'a NodeId,
-    pub node: &'a egraph_serialize::Node,
+    pub node: &'a crate::snapshot::compact::Node,
     pub index: &'a SerializedIndex,
 }
 
@@ -397,7 +365,7 @@ impl ExtractionSite<'_> {
     /// Read the unique serialized `dtype-of` fact for a logical tensor class.
     pub fn logical_dtype(
         &self,
-        logical: &egraph_serialize::ClassId,
+        logical: &crate::snapshot::compact::ClassId,
     ) -> Option<crate::dtype::PlanDtype> {
         self.index
             .with_dtype_index(self.egraph, |index| index.get(logical).copied())
@@ -411,8 +379,8 @@ impl ExtractionSite<'_> {
     /// [`SerializedIndex::nodes_of`] describes.
     fn members<'s>(
         &'s self,
-        class: &egraph_serialize::ClassId,
-    ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
+        class: &crate::snapshot::compact::ClassId,
+    ) -> impl Iterator<Item = &'s crate::snapshot::compact::Node> + use<'s> {
         self.resolve_all(self.index.nodes_of(class))
     }
 
@@ -422,7 +390,7 @@ impl ExtractionSite<'_> {
     fn resolve_all<'s>(
         &'s self,
         ids: &'s [NodeId],
-    ) -> impl Iterator<Item = &'s egraph_serialize::Node> + use<'s> {
+    ) -> impl Iterator<Item = &'s crate::snapshot::compact::Node> + use<'s> {
         let egraph = self.egraph;
         ids.iter().map(move |node_id| {
             egraph.nodes.get(node_id).unwrap_or_else(|| {
@@ -450,9 +418,9 @@ impl ExtractionSite<'_> {
     /// the metadata-walking helper for data-carrying instances.
     pub fn node_in_class(
         &self,
-        class: &egraph_serialize::ClassId,
+        class: &crate::snapshot::compact::ClassId,
         op: &str,
-    ) -> Option<&egraph_serialize::Node> {
+    ) -> Option<&crate::snapshot::compact::Node> {
         self.members(class)
             .find(|node| node.op == op && !node.subsumed)
     }
@@ -468,9 +436,9 @@ impl ExtractionSite<'_> {
     /// strict accessor.
     pub fn nodes_in_class_value<'a>(
         &'a self,
-        class: &'a egraph_serialize::ClassId,
+        class: &'a crate::snapshot::compact::ClassId,
         op: &'a str,
-    ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
+    ) -> impl Iterator<Item = &'a crate::snapshot::compact::Node> + 'a {
         self.nodes_in_class_ordered(class, move |spelling| spelling == op)
     }
 
@@ -480,9 +448,9 @@ impl ExtractionSite<'_> {
     /// [`Self::nodes_in_class_value`].
     pub fn nodes_in_class_value_any<'a>(
         &'a self,
-        class: &'a egraph_serialize::ClassId,
+        class: &'a crate::snapshot::compact::ClassId,
         ops: &'a [&'a str],
-    ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
+    ) -> impl Iterator<Item = &'a crate::snapshot::compact::Node> + 'a {
         self.nodes_in_class_ordered(class, move |spelling| ops.contains(&spelling))
     }
 
@@ -492,9 +460,9 @@ impl ExtractionSite<'_> {
     /// spelling of a class and a value reader must not starve.
     fn nodes_in_class_ordered<'a>(
         &'a self,
-        class: &'a egraph_serialize::ClassId,
+        class: &'a crate::snapshot::compact::ClassId,
         keep: impl Fn(&str) -> bool + Copy + 'a,
-    ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
+    ) -> impl Iterator<Item = &'a crate::snapshot::compact::Node> + 'a {
         self.members(class)
             .filter(move |node| keep(&node.op) && !node.subsumed)
             .chain(
@@ -507,15 +475,18 @@ impl ExtractionSite<'_> {
     /// must backtrack across a saturated class's many representations.
     pub fn nodes_in_class<'a>(
         &'a self,
-        class: &'a egraph_serialize::ClassId,
+        class: &'a crate::snapshot::compact::ClassId,
         op: &'a str,
-    ) -> impl Iterator<Item = &'a egraph_serialize::Node> + 'a {
+    ) -> impl Iterator<Item = &'a crate::snapshot::compact::Node> + 'a {
         self.members(class)
             .filter(move |node| node.op == op && !node.subsumed)
     }
 
     /// Any literal-i64 node inside an arbitrary class.
-    pub fn node_in_class_parse_i64(&self, class: &egraph_serialize::ClassId) -> Option<i64> {
+    pub fn node_in_class_parse_i64(
+        &self,
+        class: &crate::snapshot::compact::ClassId,
+    ) -> Option<i64> {
         self.members(class)
             .find_map(|node| node.op.parse::<i64>().ok())
     }
@@ -523,9 +494,9 @@ impl ExtractionSite<'_> {
     /// The e-class of an arbitrary node's child.
     pub fn class_of_child(
         &self,
-        node: &egraph_serialize::Node,
+        node: &crate::snapshot::compact::Node,
         index: usize,
-    ) -> Option<egraph_serialize::ClassId> {
+    ) -> Option<crate::snapshot::compact::ClassId> {
         let child = node.children.get(index)?;
         Some(self.egraph.nodes.get(child)?.eclass.clone())
     }
@@ -549,7 +520,7 @@ impl ExtractionSite<'_> {
     /// The e-class of the matched enode's child at `index`. Panics on a
     /// missing child — a matched enode's arity is fixed by its constructor,
     /// so a short child list is schema drift (see the validity contract).
-    pub fn child_class(&self, index: usize) -> egraph_serialize::ClassId {
+    pub fn child_class(&self, index: usize) -> crate::snapshot::compact::ClassId {
         let child_id = self.node.children.get(index).unwrap_or_else(|| {
             panic!(
                 "schema drift: {} enode {} has no child {index}",
@@ -882,7 +853,7 @@ impl ExtractedGraph {
 
         // Index every value by e-class so op operand edges can resolve to the
         // LayoutTensor node emitted for the producing op / input.
-        let mut values: HashMap<&ClassId, &LayoutTensorInfo> = HashMap::new();
+        let mut values: HashMap<&ClassId, &LayoutTensorInfo> = HashMap::default();
         for node in self.dag.node_weights() {
             match node {
                 ExtractedNode::BufferInput(input) => {
@@ -1048,11 +1019,11 @@ impl DotEmitter {
         Self {
             body: String::new(),
             next_id: 0,
-            value_ids: HashMap::new(),
-            logical_ids: HashMap::new(),
-            buffer_tensor_ids: HashMap::new(),
-            buffer_id_ids: HashMap::new(),
-            residence_ids: HashMap::new(),
+            value_ids: HashMap::default(),
+            logical_ids: HashMap::default(),
+            buffer_tensor_ids: HashMap::default(),
+            buffer_id_ids: HashMap::default(),
+            residence_ids: HashMap::default(),
         }
     }
 
@@ -1407,7 +1378,7 @@ pub(crate) fn slot_port(slot: &str) -> String {
 mod dtype_tests {
     use super::*;
     use crate::dtype::PlanDtype;
-    use egraph_serialize::{EGraph, Node};
+    use crate::snapshot::compact::{EGraph, Node};
 
     fn node(graph: &mut EGraph, id: &str, op: &str, class: &str, children: &[&str]) {
         graph.add_node(
@@ -1449,8 +1420,8 @@ mod dtype_tests {
         });
         let site = ExtractionSite {
             egraph: &graph,
-            node_id: graph.nodes.get_index(0).unwrap().0,
-            node: graph.nodes.get_index(0).unwrap().1,
+            node_id: graph.nodes.iter().next().unwrap().0,
+            node: graph.nodes.iter().next().unwrap().1,
             index: &index,
         };
         assert_eq!(

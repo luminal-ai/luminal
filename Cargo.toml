@@ -13,6 +13,7 @@ experimental-stride-primitive = []
 experimental-element-stride = []
 
 [dependencies]
+luminal_snapshot = { path = "crates/luminal_snapshot" }
 once_cell = "1.21"
 itertools = "0.11.0"
 num-traits = "0.2.16"
@@ -35,10 +36,10 @@ serde_json = "1.0.140"
 # The luminal-ai fork carries the atomic add_subsumed write the substitution
 # walk needs (proposed upstream alongside egglog-experimental #60), on branch
 # `luminal/subsumed-c2c0f151`. Bumping egglog = rebasing that branch, new rev.
-# Core is the ONLY crate that names egglog; every other crate uses
+# Core and its snapshot crate pin egglog together; backends use
 # `luminal::prelude::{egglog, egglog_ast, egraph_serialize}`.
-egglog = { git = "https://github.com/luminal-ai/egglog", rev = "1bb30831e11121bd639caf93d84465d8d110e3f7" }
-egglog-ast = { git = "https://github.com/luminal-ai/egglog", rev = "1bb30831e11121bd639caf93d84465d8d110e3f7" }
+egglog = { git = "https://github.com/luminal-ai/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
+egglog-ast = { git = "https://github.com/luminal-ai/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
 # egglog-reports: crate absorbed upstream; RunReport types re-export via egglog (pin bump 2026-08-11)
 egraph-serialize = { version = "0.3.0", default-features = false, features = ["graphviz", "serde"]}
 tracing = "0.1.43"
@@ -73,6 +74,7 @@ proptest = "1.9.0"
 # The model_zoo crate contains backend-neutral graph definitions;
 # executable applications live in examples or under a runtime crate.
 members = [
+    "crates/luminal_snapshot",
     "crates/luminal_cuda_lite",
     "crates/luminal_metal",
     "crates/luminal_reference",

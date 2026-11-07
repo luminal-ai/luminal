@@ -152,20 +152,11 @@ fn constructors<'db>(
     state: &FullState<'_, 'db>,
     skip: &std::collections::HashSet<String>,
 ) -> Vec<Constructor<'db>> {
-    let names: Vec<String> = state
-        .table_sizes()
+    state
+        .constructor_schemas()
+        .expect("substitution requires declaration schemas")
         .into_iter()
-        .map(|(name, _)| name.to_owned())
-        .filter(|name| !skip.contains(name))
-        .collect();
-    names
-        .into_iter()
-        .filter_map(|name| {
-            // `constructor_schema` rejects the function tables, which is also
-            // what keeps globals out: they lower to function tables.
-            let func_type = state.constructor_schema(&name).ok()?;
-            func_type.output.is_eq_sort().then_some(func_type)
-        })
+        .filter(|schema| !skip.contains(&schema.name) && schema.output.is_eq_sort())
         .collect()
 }
 

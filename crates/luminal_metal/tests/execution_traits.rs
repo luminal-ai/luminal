@@ -168,6 +168,7 @@ fn external_kernel_is_claimed_bufferized_cloned_and_executed() {
             &harness_search_options(),
         )
         .unwrap();
+    #[cfg(target_os = "macos")]
     let mut arena_runtime = support::allocate_arena(&runtime).expect("allocate execution arena");
     let plan = runtime.plan().unwrap().clone();
     let mut found = false;

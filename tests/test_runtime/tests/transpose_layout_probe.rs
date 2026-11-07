@@ -12,7 +12,7 @@ fn ops_in(s: &EGraph, class: &ClassId) -> Vec<String> {
         .nodes
         .values()
         .filter(|n| &n.eclass == class)
-        .map(|n| n.op.clone())
+        .map(|n| n.op.to_string())
         .collect();
     v.sort();
     v.dedup();
@@ -41,7 +41,7 @@ fn render(s: &EGraph, class: &ClassId, depth: usize) -> String {
         .map(|c| render(s, &c.eclass, depth + 1))
         .collect();
     if kids.is_empty() {
-        node.op.clone()
+        node.op.to_string()
     } else {
         format!("({} {})", node.op, kids.join(" "))
     }
@@ -204,7 +204,7 @@ fn probe_a_bare_transpose_view() {
         .nodes
         .values()
         .filter(|n| n.op.starts_with("LayoutTensorOp"))
-        .map(|n| n.op.clone())
+        .map(|n| n.op.to_string())
         .collect();
     opnames.sort();
     opnames.dedup();
@@ -232,7 +232,7 @@ fn probe_b_matmul_amk_bnk() {
                 .children
                 .first()
                 .and_then(|c| s.nodes.get(c))
-                .map(|c| c.op.clone())
+                .map(|c| c.op.to_string())
                 .unwrap_or_default();
             println!("input {id} class {}", n.eclass);
             dump_layouts_for(&s, &format!("input {id}"), &n.eclass);

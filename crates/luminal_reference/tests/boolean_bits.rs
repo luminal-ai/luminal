@@ -1,3 +1,4 @@
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::*;
 use luminal_reference::{ReferenceRuntime, TypedBuffer, harness_search_options};
 use rustc_hash::FxHashMap;
@@ -451,9 +452,7 @@ fn noncontiguous_bit_input_packs_directly_into_its_destination() {
         ),
     )
     .unwrap();
-    let serialized = eg
-        .serialize(luminal::prelude::egglog::SerializeConfig::default())
-        .egraph;
+    let serialized = eg.serialize_compact_filtered(|_| true);
     let extracted = luminal_reference::extract_layout_ir(&serialized)
         .unwrap()
         .unwrap();

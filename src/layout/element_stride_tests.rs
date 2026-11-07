@@ -1,4 +1,5 @@
 use super::*;
+use crate::snapshot::CompactSnapshotExt;
 
 #[test]
 fn addresses_and_spans_observe_singletons_padding_and_empty_domains() {
@@ -418,20 +419,12 @@ fn literal_expression_recovery_preserves_origin_and_singleton_freedom() {
 (fail (check (= (ElementStrideAny) (ElementStrideExact (IntLit 999)))))
 "#,
     );
-    let before = g
-        .serialize(egglog::SerializeConfig::default())
-        .egraph
-        .nodes
-        .len();
+    let before = g.serialize_compact_filtered(|_| true).nodes.len();
     run(
         &mut g,
         "(run-schedule (repeat 40 (run element-stride-discovery) (run main_ruleset) (run prop)))",
     );
-    let after = g
-        .serialize(egglog::SerializeConfig::default())
-        .egraph
-        .nodes
-        .len();
+    let after = g.serialize_compact_filtered(|_| true).nodes.len();
     assert_eq!(
         before, after,
         "a claimed fixpoint grew on another 40 rounds"
@@ -496,8 +489,16 @@ fn cons_list_certificates_preserve_signed_intermediates_and_publication_limits()
             "recovered".into(),
         ))
         .unwrap();
-    let recovered_class = g.value_to_class_id(&sort, value);
-    let serialized = g.serialize(egglog::SerializeConfig::default()).egraph;
+    let serialized = g.serialize_compact_filtered(|_| true);
+    let recovered_class = serialized
+        .class_data
+        .iter()
+        .find_map(|(id, data)| {
+            (data.typ.as_deref() == Some(sort.name())
+                && data.value == Some(egglog::snapshot::value_bits(value)))
+            .then(|| id.clone())
+        })
+        .expect("recovered layout class");
     let registry = ConstructorRegistry::new(crate::egglog_snippet::core_decoders()).unwrap();
     let view = EGraphView::new(&serialized, &registry);
     let mut checked = 0;
@@ -631,7 +632,7 @@ fn recovered_layout_decoders_agree_on_every_coordinate_in_a_small_corpus() {
             &format!("(check (element-stride-discovered layout_{i}))"),
         );
     }
-    let serialized = g.serialize(egglog::SerializeConfig::default()).egraph;
+    let serialized = g.serialize_compact_filtered(|_| true);
     let registry = ConstructorRegistry::new(crate::egglog_snippet::core_decoders()).unwrap();
     let view = EGraphView::new(&serialized, &registry);
     let classes: std::collections::HashSet<_> = serialized
@@ -675,13 +676,7 @@ fn recovered_layout_decoders_agree_on_every_coordinate_in_a_small_corpus() {
         &mut g,
         "(run-schedule (repeat 40 (run element-stride-discovery) (run main_ruleset) (run prop)))",
     );
-    assert_eq!(
-        before,
-        g.serialize(egglog::SerializeConfig::default())
-            .egraph
-            .nodes
-            .len()
-    );
+    assert_eq!(before, g.serialize_compact_filtered(|_| true).nodes.len());
     println!(
         "{} expression sources: {addresses} decoded addresses agree; {before} nodes plateau",
         cases.len()
@@ -735,7 +730,7 @@ fn empty_authored_layouts_have_zero_span_through_the_shared_decoder() {
             &["(IntLit 8)", "(IntLit 1)"],
         ) + SATURATE),
     );
-    let serialized = g.serialize(egglog::SerializeConfig::default()).egraph;
+    let serialized = g.serialize_compact_filtered(|_| true);
     let registry = ConstructorRegistry::new(crate::egglog_snippet::core_decoders()).unwrap();
     let view = EGraphView::new(&serialized, &registry);
     let mut checked = 0;

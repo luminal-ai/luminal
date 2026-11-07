@@ -1,6 +1,7 @@
 //! Every production call must be admitted by the complete configuration table.
 use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::approved::{
@@ -30,7 +31,7 @@ fn saturate(model: &Graph, whitelist: &str) -> EGraph {
             ),
         )
         .unwrap();
-    graph.serialize(Default::default()).egraph
+    graph.serialize_compact_filtered(|_| true)
 }
 
 fn calls(graph: &EGraph) -> Vec<ApprovedCublasLt> {

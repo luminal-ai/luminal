@@ -1,6 +1,7 @@
 //! Scalar location/type is an explicit part of complete cuBLASLt admission.
 use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
@@ -168,7 +169,7 @@ fn saturate(graph: &Graph, table: &str) -> EGraph {
             ),
         )
         .unwrap();
-    egraph.serialize(Default::default()).egraph
+    egraph.serialize_compact_filtered(|_| true)
 }
 fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
     let index = SerializedIndex::new(graph);

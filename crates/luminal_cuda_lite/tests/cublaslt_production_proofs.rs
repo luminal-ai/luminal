@@ -1,6 +1,7 @@
 //! Production proof, descriptor coherence, and bufferization regressions.
 use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{ExtractedNode, ExtractionSite, OpMatcher};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
     CONSTRUCTOR as IN_PLACE_CONSTRUCTOR, CublasLtAccumulateInPlace,
@@ -30,9 +31,7 @@ fn run(body: &str, checks: &str) -> EGraph {
     egraph
         .parse_and_run_program(None, &source)
         .unwrap_or_else(|error| panic!("experiment egglog: {error}"));
-    egraph
-        .serialize(luminal::prelude::egglog::SerializeConfig::default())
-        .egraph
+    egraph.serialize_compact_filtered(|_| true)
 }
 
 fn input(name: &str, rows: &str, cols: &str, strides: Option<(&str, &str)>, dtype: &str) -> String {

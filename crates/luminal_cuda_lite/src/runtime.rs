@@ -10,6 +10,7 @@
 use crate::host_buffer::HostBuffer;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::bufferize::BufferIrGraph;
+use luminal::prelude::CompactSnapshotExt;
 
 use crate::search::{CompileOptions, SearchOutcome};
 use luminal::graph;
@@ -429,8 +430,8 @@ impl CudaRuntime {
         // decoded sort has exactly one decoder, checked against the LIVE
         // schema before anything reads a serialized class.
         self.decoders.check(&egraph)?;
-        let serialized = egraph.serialize(luminal::prelude::egglog::SerializeConfig::default());
-        Ok((serialized.egraph, program))
+        let serialized = egraph.serialize_compact_filtered(|_| true);
+        Ok((serialized, program))
     }
 
     /// Assemble, saturate, and search — with THIS backend's allow list.
