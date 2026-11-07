@@ -48,7 +48,6 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 from luminal_reference.dimensions import export_specs, profile_value
 from luminal_reference.export_utils import (
     _box_scalar_graph_outputs,
@@ -59,6 +58,7 @@ from luminal_reference.export_utils import (
     _register_cache_serialization,
     private_graph_copy,
 )
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.export import export
 
 from . import _luminal
@@ -454,7 +454,9 @@ class CompiledModel:
         )
 
     def configure_region(self, *, static_outputs=False, external_cuda_graph=False):
-        """Give a region its own persistent PyTorch-owned boundary storage."""
+        """Give a region persistent boundary storage. Retain this binding while
+        captured graphs use it; bind separate instances for different shapes.
+        """
         if external_cuda_graph and not static_outputs:
             raise ValueError("external CUDA graph capture requires static_outputs=True")
         self._region_current = True
@@ -463,6 +465,7 @@ class CompiledModel:
         self._region_allocations = {}
         self._region_mutations = {}
         self._region_arena = None
+        self._captured_signature = None
 
     @property
     def writeback_inputs(self):
@@ -503,6 +506,13 @@ class CompiledModel:
             side = self._side_stream
         static = getattr(self, "_region_static", False)
         signature = tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in inputs)
+        if (
+            getattr(self, "_captured_signature", None) is not None
+            and self._captured_signature != signature
+        ):
+            raise ValueError(
+                "capture shape changed; bind a separate region instance per capture shape"
+            )
         execution_key = (id(self), signature, side.cuda_stream)
         warmed = self._region_execution_state.get("last") == execution_key
         capturing = torch.cuda.is_current_stream_capturing()
@@ -677,6 +687,10 @@ class CompiledModel:
             else:
                 self._graph.execute(arena, arena_bytes, self._host_staging)
             self._region_execution_state["last"] = execution_key
+            if capturing:
+                # Graph memcpy nodes retain the pinned dimension staging. A
+                # different shape needs another binding with independent staging.
+                self._captured_signature = signature
         finally:
             if not static:
                 torch.cuda.caching_allocator_delete(arena)

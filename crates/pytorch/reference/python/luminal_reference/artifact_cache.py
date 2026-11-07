@@ -233,7 +233,15 @@ class CompiledArtifact:
             raise RuntimeError(
                 "artifact device type differs from the requested runtime"
             )
-        program = torch.export.load(io.BytesIO(base64.b64decode(payload["program"])))
+        # Region examples are metadata-only FakeTensors, serialized by
+        # torch.export's own reducer. Keep weights-only loading and scope the
+        # allowlist to that upstream reconstruction function.
+        from torch._export.serde.serialize import _reconstruct_fake_tensor
+
+        with torch.serialization.safe_globals([_reconstruct_fake_tensor]):
+            program = torch.export.load(
+                io.BytesIO(base64.b64decode(payload["program"]))
+            )
         return compile_exported(
             program,
             device_type=target,
