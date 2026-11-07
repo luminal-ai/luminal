@@ -633,12 +633,18 @@ impl Translator<'_> {
 
     pub(super) fn translate_softmax(&mut self, node: &Node, log: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
+        // ATen treats a scalar's dim 0/-1 as a singleton axis. Lower that
+        // axis explicitly so max/sum stay in range and infinities retain
+        // the same IEEE behavior as a length-one softmax.
+        let scalar = x.rank() == 0;
+        let x = if scalar { x.expand_dim(0, 1usize) } else { x };
         let dim = normalize_dim(self.get_int_arg(node, 1)?, x.rank());
-        Ok(if log {
+        let result = if log {
             x.log_softmax(vec![dim])
         } else {
             x.softmax(vec![dim])
-        })
+        };
+        Ok(if scalar { result.squeeze(0) } else { result })
     }
 
     /// `embedding(weight, indices)`: coordinate gather over `[rows, cols]`.
