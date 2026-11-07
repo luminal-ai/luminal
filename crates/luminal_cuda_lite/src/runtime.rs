@@ -1017,7 +1017,9 @@ impl CudaRuntime {
     /// # Safety
     /// The caller must retain all memory and the stream until GPU completion,
     /// and must not modify or reuse that storage while GPU work is in flight.
-    /// Outer graph captures require these bindings to remain valid for replay.
+    /// Outer graph captures require the runtime and bindings to remain alive
+    /// for replay, with parameter staging unchanged. Use independent staging
+    /// for each captured shape.
     pub unsafe fn execute_async(
         &mut self,
         arena: CudaArena<'_>,
