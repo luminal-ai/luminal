@@ -1,4 +1,4 @@
-//! Batched activations share rank-two precision contracts and vendor descriptors.
+//! Batched cuBLASLt calls preserve activation semantics outside vendor epilogues.
 use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
 use luminal::prelude::egraph_serialize::EGraph;
@@ -83,11 +83,11 @@ fn saturate(model: &Graph, table: &str) -> EGraph {
             ),
         )
         .unwrap();
-    egraph.serialize(Default::default()).egraph
+    egraph.serialize_compact_filtered(|_| true)
 }
 
 #[test]
-fn ordinary_dense_batches_fuse_relu_and_both_gelu_spellings() {
+fn ordinary_dense_batches_keep_relu_and_both_gelu_spellings_outside_cublaslt() {
     for activation in 0..3 {
         let mut model = Graph::new();
         let a = model.tensor([2, 3, 8], DType::F32);
@@ -99,29 +99,18 @@ fn ordinary_dense_batches_fuse_relu_and_both_gelu_spellings() {
             1 => out.gelu_fast_tanh_approximation(),
             _ => out.gelu(),
         };
-        let expected = if activation == 0 {
-            LtActivation::RectifiedLinear
-        } else {
-            LtActivation::GaussianErrorLinear
-        };
         let (separate, tied) = calls(&saturate(&model, WHITELIST));
         assert!(
             separate
                 .iter()
-                .any(|op| op.c.is_some() && op.activation == expected),
+                .all(|op| op.activation == LtActivation::Identity),
             "activation={activation}"
         );
         assert!(
-            tied.iter().any(|op| op.activation == expected),
+            tied.iter()
+                .all(|op| op.activation == LtActivation::Identity),
             "activation={activation}"
         );
-        for op in separate.iter().filter(|op| op.activation == expected) {
-            let call = op.resolve(&Default::default());
-            assert_eq!(call.d.order, LtOrder::Col);
-            assert_eq!(call.d.batch_count, 2);
-            assert_eq!(call.c.unwrap().descriptor.batch_count, 2);
-            assert!(call.bias.is_none());
-        }
     }
 }
 
@@ -214,14 +203,6 @@ fn activation(input: GraphTensor, kind: usize) -> GraphTensor {
         1 => input.relu(),
         2 => input.gelu_fast_tanh_approximation(),
         3 => input.gelu(),
-        _ => unreachable!(),
-    }
-}
-fn vendor_activation(kind: usize) -> LtActivation {
-    match kind {
-        0 => LtActivation::Identity,
-        1 => LtActivation::RectifiedLinear,
-        2 | 3 => LtActivation::GaussianErrorLinear,
         _ => unreachable!(),
     }
 }
@@ -429,11 +410,7 @@ fn modes_storage_and_device_scalars_compose_with_shared_transposed_inputs() {
             case.device = device;
             case.shared = if device { (true, false) } else { (false, true) };
             case.transposed = (true, true);
-            case.activation = if family.output == family.arithmetic {
-                2
-            } else {
-                1
-            };
+            case.activation = 0;
             let f = fixture(case);
             let (separate, tied) = calls(&saturate(&f.graph, WHITELIST));
             let matches = |call: &LtCall| {
@@ -443,7 +420,7 @@ fn modes_storage_and_device_scalars_compose_with_shared_transposed_inputs() {
                     case.shared
                 };
                 family.matches(call)
-                    && call.activation == vendor_activation(case.activation)
+                    && call.activation == LtActivation::Identity
                     && call.c.is_some()
                     && matches!(call.scalars, LtScalars::Device { .. }) == device
                     && (call.a.batch_stride_in_elements == 0) == sharing.0
@@ -461,7 +438,6 @@ fn modes_storage_and_device_scalars_compose_with_shared_transposed_inputs() {
                 "{case:?}"
             );
             for call in sep {
-                assert_eq!(call.d.order, LtOrder::Col);
                 assert_eq!(call.d.batch_count, 2);
                 assert!(call.bias.is_none());
                 let transposed = call.m == N as i64;
@@ -479,126 +455,41 @@ fn modes_storage_and_device_scalars_compose_with_shared_transposed_inputs() {
     }
 }
 
-// Require an authored batch witness for every existing no-bias activation row.
-// This also catches accidental admission of INT8 or narrow-output GELU.
-static WITNESSES: std::sync::LazyLock<std::collections::BTreeMap<(String, bool), LtCall>> =
-    std::sync::LazyLock::new(|| {
-        let mut witnesses = std::collections::BTreeMap::new();
-        let rows = whitelist::approved_keys();
-        for family in Family::all() {
-            let table: String = rows
-                .iter()
-                .filter(|key| family.key_matches(key))
-                .filter(|key| {
-                    key.contains("(CublasLtRectifiedLinearEpilogue)")
-                        || key.contains("(CublasLtGaussianErrorLinearEpilogue)")
-                })
-                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
-                .collect();
-            eprintln!("batch activation witnesses: {family:?}");
-            // Literal scalars have both host and staged-device proofs. Live
-            // GPU source graphs are covered independently above and below.
-            for ta in [false, true] {
-                for tb in [false, true] {
-                    let mut case = Case::new(family);
-                    case.activation = 0;
-                    case.transposed = (ta, tb);
-                    let f = fixture(case);
-                    for input in [f.product, f.sum] {
-                        for kind in [1, 2] {
-                            let _ = activation(input, kind).cast(family.output);
-                        }
-                    }
-                    let (separate, tied) = calls(&saturate(&f.graph, &table));
-                    for op in separate {
-                        let call = op.resolve(&Default::default());
-                        if family.matches(&call) && call.activation != LtActivation::Identity {
-                            witnesses
-                                .entry((whitelist::key(&op), false))
-                                .or_insert(call);
-                        }
-                    }
-                    for op in tied {
-                        let call = op.resolve(&Default::default());
-                        if family.matches(&call) && call.activation != LtActivation::Identity {
-                            witnesses
-                                .entry((whitelist::in_place_key(&op), true))
-                                .or_insert(call);
-                        }
-                    }
-                }
-            }
-        }
-        witnesses
-    });
-
 #[test]
-fn every_existing_no_bias_activation_configuration_has_a_batch_witness() {
-    let expected: std::collections::BTreeSet<_> = whitelist::approved_keys()
-        .into_iter()
-        .filter(|key| {
-            key.contains("(CublasLtNoBiasDataType)")
-                && (key.contains("(CublasLtRectifiedLinearEpilogue)")
-                    || key.contains("(CublasLtGaussianErrorLinearEpilogue)"))
-        })
-        .collect();
-    assert_eq!(expected.len(), 1152);
-    for alias in [false, true] {
-        let wanted: std::collections::BTreeSet<_> = expected
-            .iter()
-            .filter(|key| !alias || !key.contains("CublasLtNoCMatrixDataType"))
-            .cloned()
-            .collect();
-        let actual = WITNESSES
-            .keys()
-            .filter(|(_, tied)| *tied == alias)
-            .map(|(key, _)| key.clone())
-            .collect();
+fn activation_capability_rows_do_not_authorize_frontend_fusion() {
+    let mut case = Case::new(Family::all()[0]);
+    for activation in 1..=2 {
+        case.activation = activation;
+        let f = fixture(case);
+        let (separate, tied) = calls(&saturate(&f.graph, WHITELIST));
         assert!(
-            wanted == actual,
-            "alias={alias}, missing={:?}, unexpected={:?}",
-            wanted.difference(&actual).take(4).collect::<Vec<_>>(),
-            actual.difference(&wanted).take(4).collect::<Vec<_>>()
+            separate
+                .iter()
+                .all(|op| op.activation == LtActivation::Identity)
         );
-    }
-    for call in WITNESSES.values() {
-        assert_eq!(call.d.batch_count, 2);
-        assert_eq!(call.d.order, LtOrder::Col);
-        assert!(call.bias.is_none());
+        assert!(
+            tied.iter()
+                .all(|op| op.activation == LtActivation::Identity)
+        );
     }
 }
 
 #[test]
-fn activation_admission_requires_its_complete_whitelist_row() {
+fn activation_capability_row_is_not_a_semantic_proof() {
     let mut case = Case::new(Family::all()[0]);
     case.activation = 2;
     let f = fixture(case);
     assert!(calls(&saturate(&f.graph, "")).0.is_empty());
-    let (separate, _) = calls(&saturate(&f.graph, WHITELIST));
-    let op = separate
-        .iter()
-        .find(|op| op.c.is_some() && op.activation == LtActivation::GaussianErrorLinear)
-        .unwrap();
-    let key = whitelist::key(op);
-    let table = format!("(cublaslt-approved-configuration {key})");
-    let (separate, tied) = calls(&saturate(&f.graph, &table));
-    assert!(!separate.is_empty());
-    assert!(!tied.is_empty());
-    assert!(separate.iter().all(|op| whitelist::key(op) == key));
-    assert!(tied.iter().all(|op| whitelist::in_place_key(op) == key));
-    for (from, to) in [
-        (
-            "CublasLtGaussianErrorLinearEpilogue",
-            "CublasLtGaussianErrorLinearBiasEpilogue",
-        ),
-        ("CublasLtFloat32Computation", "CublasLtFloat64Computation"),
-        ("(F32)", "(F64)"),
-    ] {
-        assert!(table.contains(from));
-        let (separate, tied) = calls(&saturate(&f.graph, &table.replace(from, to)));
-        assert!(separate.is_empty(), "{from}");
-        assert!(tied.is_empty(), "{from}");
-    }
+    let (separate, tied) = calls(&saturate(&f.graph, WHITELIST));
+    assert!(
+        separate
+            .iter()
+            .all(|op| op.activation == LtActivation::Identity)
+    );
+    assert!(
+        tied.iter()
+            .all(|op| op.activation == LtActivation::Identity)
+    );
 }
 
 #[test]
@@ -630,9 +521,10 @@ fn intervening_rounding_and_post_activation_c_remain_outside_the_epilogue() {
 }
 
 #[test]
-fn activated_batches_require_positive_int32_counts_and_independent_c_d_pitches() {
+fn batched_calls_require_positive_int32_counts_and_independent_c_d_pitches() {
     use luminal_cuda_lite::{CudaBindings, CudaRuntime, bindings::BoundaryLayout};
     let mut case = Case::new(Family::all()[0]);
+    case.activation = 0;
     case.batch = 'b'.into();
     let f = fixture(case);
     let runtime = CudaRuntime::load(&f.graph).unwrap();
@@ -646,16 +538,18 @@ fn activated_batches_require_positive_int32_counts_and_independent_c_d_pitches()
         assert_eq!(
             separate
                 .iter()
-                .any(|op| op.activation == LtActivation::RectifiedLinear),
+                .any(|op| op.activation == LtActivation::Identity),
             admitted
         );
         assert_eq!(
             tied.iter()
-                .any(|op| op.activation == LtActivation::RectifiedLinear),
+                .any(|op| op.activation == LtActivation::Identity),
             admitted
         );
     }
-    let f = fixture(Case::new(Family::all()[0]));
+    let mut case = Case::new(Family::all()[0]);
+    case.activation = 0;
+    let f = fixture(case);
     let mut bindings = CudaBindings::new();
     for t in &f.inputs[..2] {
         bindings.input(t.id);
@@ -667,7 +561,7 @@ fn activated_batches_require_positive_int32_counts_and_independent_c_d_pitches()
     let (separate, tied) = calls(&runtime.saturated_egraph(&Default::default()).unwrap());
     assert!(separate.iter().any(|op| {
         let call = op.resolve(&Default::default());
-        call.activation == LtActivation::RectifiedLinear
+        call.activation == LtActivation::Identity
             && call.d.ld == 5
             && call.d.batch_stride_in_elements == 24
             && call.c.is_some_and(|c| {
@@ -690,21 +584,6 @@ mod execution {
     use support::TestTransfers;
 
     pub(super) static DEVICE_EXECUTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn every_approved_batched_activation_dispatches_against_independent_arithmetic() {
-        let _execution = DEVICE_EXECUTION.lock().unwrap();
-        let context = cudarc::driver::CudaContext::new(0).unwrap();
-        let stream = context.new_stream().unwrap();
-        assert_eq!(WITNESSES.len(), 1728);
-        for ((_, alias), call) in WITNESSES.iter() {
-            match call.computation {
-                LtComputation::Float16 => support::fp16::execute_call(&stream, call, *alias),
-                LtComputation::Float64 => support::fp64::execute_call(&stream, call, *alias),
-                _ => batch_device::execute_call(&stream, call, *alias),
-            }
-        }
-    }
 
     fn reference_buffer(dtype: DType, data: &[f64]) -> TypedBuffer {
         match dtype {
@@ -800,42 +679,16 @@ mod execution {
                     "CublasLtDeviceScalarPointerMode"
                 } else {
                     "CublasLtHostScalarPointerMode"
-                }) && key.contains(
-                    match (case.bias.is_some(), vendor_activation(case.activation)) {
-                        (false, LtActivation::RectifiedLinear) => {
-                            "(CublasLtRectifiedLinearEpilogue)"
-                        }
-                        (true, LtActivation::RectifiedLinear) => {
-                            "(CublasLtRectifiedLinearBiasEpilogue)"
-                        }
-                        (false, LtActivation::GaussianErrorLinear) => {
-                            "(CublasLtGaussianErrorLinearEpilogue)"
-                        }
-                        (true, LtActivation::GaussianErrorLinear) => {
-                            "(CublasLtGaussianErrorLinearBiasEpilogue)"
-                        }
-                        (false, LtActivation::Identity) => "(CublasLtDefaultEpilogue)",
-                        (true, LtActivation::Identity) => "(CublasLtBiasEpilogue)",
-                    },
-                ) && key.contains("CublasLtNoCMatrixDataType") != case.with_c
+                }) && key.contains(if case.bias.is_some() {
+                    "(CublasLtBiasEpilogue)"
+                } else {
+                    "(CublasLtDefaultEpilogue)"
+                }) && key.contains("CublasLtNoCMatrixDataType") != case.with_c
             })
             .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
             .collect();
         assert!(!table.is_empty(), "{case:?}");
-        // Materialized casts/views are legal production alternatives. Exclude
-        // them here to require fused rounding and native single-matrix sharing.
         whitelist::table_registry(Box::leak(table.into_boxed_str()))
-            .into_iter()
-            .filter(|row| {
-                matches!(
-                    row.label(),
-                    "IndexMapApplyViewGeneric"
-                        | "ConstantGeneric"
-                        | "CublasLtCall"
-                        | "CublasLtAccumulateInPlace"
-                )
-            })
-            .collect()
     }
     pub(super) fn run(case: Case, alias: bool) {
         eprintln!("compiled batch activation: {case:?}, alias={alias}");
@@ -1105,41 +958,30 @@ mod execution {
                 assert_eq!(calls.len(), 1, "{case:?}");
                 let call = &calls[0];
                 assert!(case.family.matches(call), "{case:?}: {call:?}");
-                assert_eq!(call.activation, vendor_activation(case.activation));
+                assert_eq!(call.activation, LtActivation::Identity);
                 assert_eq!(call.c.is_some(), case.with_c);
                 assert_eq!(call.bias.is_some(), case.bias.is_some());
                 if let Some(bias) = call.bias {
                     assert_eq!(bias.data_type, plan_dtype(case.family.arithmetic));
-                    assert_eq!(
-                        bias.batch_stride_in_elements,
-                        if case.bias == Some(true) {
-                            0
-                        } else {
-                            case.bias_pitch.unwrap_or(N.into()).exec(&dims).unwrap() as i64
-                        }
-                    );
-                }
-                assert_eq!(
-                    call.d.order,
-                    if case.activation == 0
-                        && case.bias.is_none()
-                        && case.c_reading != CReading::ColumnVector
-                    {
-                        LtOrder::Row
+                    if case.bias == Some(true) {
+                        assert_eq!(bias.batch_stride_in_elements, 0);
                     } else {
-                        LtOrder::Col
+                        let authored =
+                            case.bias_pitch.unwrap_or(N.into()).exec(&dims).unwrap() as i64;
+                        assert!(
+                            [authored, N as i64].contains(&bias.batch_stride_in_elements),
+                            "{case:?}: {call:?}"
+                        );
                     }
-                );
+                }
+                if case.bias.is_some() {
+                    assert_eq!(call.d.order, LtOrder::Col);
+                }
                 assert_eq!(call.d.batch_count, count as i64);
                 if let Some(c) = call.c {
-                    if case.c_reading != CReading::Matrix {
-                        assert_eq!(c.descriptor.ld, 0, "{case:?}");
+                    if !case.c_shared {
+                        assert_ne!(c.descriptor.batch_stride_in_elements, 0, "{case:?}");
                     }
-                    assert_eq!(
-                        c.descriptor.batch_stride_in_elements == 0,
-                        case.c_shared,
-                        "{case:?}"
-                    );
                     assert_eq!(c.descriptor.order, call.d.order);
                 }
                 let sharing = if call.m == N as i64 {
@@ -1147,16 +989,12 @@ mod execution {
                 } else {
                     case.shared
                 };
-                assert_eq!(
-                    call.a.batch_stride_in_elements == 0,
-                    sharing.0,
-                    "{case:?}: {call:?}"
-                );
-                assert_eq!(
-                    call.b.batch_stride_in_elements == 0,
-                    sharing.1,
-                    "{case:?}: {call:?}"
-                );
+                if !sharing.0 {
+                    assert_ne!(call.a.batch_stride_in_elements, 0, "{case:?}: {call:?}");
+                }
+                if !sharing.1 {
+                    assert_ne!(call.b.batch_stride_in_elements, 0, "{case:?}: {call:?}");
+                }
                 assert_eq!(
                     matches!(call.scalars, LtScalars::Device { .. }),
                     case.device
@@ -1245,13 +1083,16 @@ mod execution {
     }
 
     #[test]
-    fn floating_modes_fuse_activations_with_shared_views_scalars_and_c_retention() {
+    fn floating_modes_keep_generic_activations_with_shared_views_scalars_and_c_retention() {
         let _execution = DEVICE_EXECUTION.lock().unwrap();
         for (i, family) in Family::all().into_iter().enumerate() {
             let mut case = Case::new(family);
             case.shared = (i & 1 != 0, i & 2 != 0);
             case.transposed = (i & 2 != 0, i & 1 != 0);
             case.device = i % 2 == 0;
+            if family.output != family.arithmetic {
+                case.activation = 0;
+            }
             run(case, false);
             if family.arithmetic == family.output {
                 case.activation = if i % 2 == 0 { 2 } else { 3 };

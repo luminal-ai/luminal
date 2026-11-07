@@ -231,7 +231,7 @@ fn over_budget_offspring_never_reach_device_profiling() {
         .expect_err("every complete mini-llama plan exceeds a 1 KiB arena");
     let message = format!("{err:#}");
     assert!(
-        message.contains("arena:") && message.contains("exceeds budget 1024"),
+        message.contains("arena:") && message.contains("exceeds total budget 1024"),
         "the rejection must come from pre-profile arena admission: {message}"
     );
 }

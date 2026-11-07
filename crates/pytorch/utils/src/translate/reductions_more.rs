@@ -746,6 +746,7 @@ mod scalar_precision_tests {
             input_values: HashMap::new(),
             symbols: HashMap::new(),
             ranges: HashMap::new(),
+            symbol_ranges: Default::default(),
             complex_tensors: HashMap::new(),
             parsed: &parsed,
             dims: HashMap::new(),

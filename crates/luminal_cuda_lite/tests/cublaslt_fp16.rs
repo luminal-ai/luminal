@@ -128,7 +128,7 @@ fn calls(graph: &Graph, table: &str) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccu
             ),
         )
         .unwrap();
-    let graph = egraph.serialize(Default::default()).egraph;
+    let graph = egraph.serialize_compact_filtered(|_| true);
     let index = SerializedIndex::new(&graph);
     let mut separate = Vec::new();
     let mut tied = Vec::new();
@@ -384,16 +384,8 @@ fn compiled_half_calls_match_reference_with_live_coefficients_and_retained_c() {
 
 #[cfg(feature = "device")]
 #[test]
-fn compiled_half_epilogues_match_reference_with_live_coefficients_and_retained_c() {
-    for (bias, activation) in [
-        (true, 0),
-        (false, 1),
-        (true, 1),
-        (false, 2),
-        (true, 2),
-        (false, 3),
-        (true, 3),
-    ] {
+fn compiled_half_bias_matches_reference_with_live_coefficients_and_retained_c() {
+    for (bias, activation) in [(true, 0)] {
         for alias in [false, true] {
             // Literal, live GPU, and GPU-produced half coefficients.
             for source in 0..3 {
@@ -404,21 +396,16 @@ fn compiled_half_epilogues_match_reference_with_live_coefficients_and_retained_c
 }
 
 #[test]
-fn half_epilogues_keep_typed_bias_scalars_and_column_destinations() {
+fn half_bias_epilogues_keep_typed_bias_scalars_and_column_destinations() {
     for device in [false, true] {
         for bias in [false, true] {
             for activation in 0..4 {
                 let graph = epilogue_fixture(device, bias, activation);
-                let expected_activation = match activation {
-                    0 => LtActivation::Identity,
-                    1 => LtActivation::RectifiedLinear,
-                    _ => LtActivation::GaussianErrorLinear,
-                };
                 let (separate, tied) = calls(&graph, WHITELIST);
                 let matching = |call: &luminal_cuda_lite::ops::cublaslt::exec::LtCall| {
                     call.c.is_some()
                         && call.bias.is_some() == bias
-                        && call.activation == expected_activation
+                        && call.activation == LtActivation::Identity
                         && matches!(call.scalars, LtScalars::Device { .. }) == device
                 };
                 let separate: Vec<_> = separate
@@ -439,7 +426,7 @@ fn half_epilogues_keep_typed_bias_scalars_and_column_destinations() {
                     assert_eq!(call.computation, LtComputation::Float16);
                     assert_eq!(call.scale_dtype, PlanDtype::F16);
                     assert_eq!(matches!(call.scalars, LtScalars::Device { .. }), device);
-                    if bias || activation != 0 {
+                    if bias {
                         assert_eq!(call.d.order, LtOrder::Col);
                     }
                     if let Some(bias) = call.bias {
@@ -452,16 +439,12 @@ fn half_epilogues_keep_typed_bias_scalars_and_column_destinations() {
 }
 
 #[test]
-fn half_epilogues_require_the_complete_row_and_exact_bias_storage() {
-    let graph = epilogue_fixture(false, true, 2);
+fn half_bias_requires_the_complete_row_and_exact_storage() {
+    let graph = epilogue_fixture(false, true, 0);
     let (separate, _) = calls(&graph, WHITELIST);
     let op = separate
         .iter()
-        .find(|op| {
-            op.c.is_some()
-                && op.bias.is_some()
-                && op.activation == LtActivation::GaussianErrorLinear
-        })
+        .find(|op| op.c.is_some() && op.bias.is_some() && op.activation == LtActivation::Identity)
         .unwrap();
     let key = whitelist::key(op);
     let table = format!("(cublaslt-approved-configuration {key})");
@@ -822,7 +805,8 @@ fn half_gelu_requires_authored_coefficients_and_a_valid_sign_spelling() {
 
 #[cfg(feature = "device")]
 #[test]
-fn half_gelu_preserves_nan_and_infinity_classifications() {
+#[ignore = "vendor GELU is capability-only; frontend GELU remains generic"]
+fn vendor_half_gelu_capability_classifies_nan_and_infinity() {
     use cudarc::driver::DevicePtr;
     use luminal_cuda_lite::ops::cublaslt::device_call::{self, DeviceRange};
     let mut graph = Graph::new();
@@ -909,7 +893,8 @@ fn half_gelu_preserves_nan_and_infinity_classifications() {
 
 #[cfg(feature = "device")]
 #[test]
-fn half_relu_accepts_vendor_nan_policy_and_preserves_other_special_values() {
+#[ignore = "vendor ReLU is capability-only; frontend ReLU remains generic"]
+fn vendor_half_relu_capability_exposes_its_nan_behavior() {
     for bias in [false, true] {
         for alias in [false, true] {
             run_compiled_half_case(false, alias, 4, bias, 1);

@@ -5,6 +5,18 @@ and profiling use `CudaDevice::execute`. Graph compilation and instantiation are
 outside timed trials. An execution stages inputs, launches the graph, waits for
 completion, and returns owned host output bytes.
 
+## Semantic boundary
+
+CUDA Lite implements the authored logical graph; it does not define or relax
+model semantics. Every CUDA kernel, library call, fusion, layout, and memory
+plan admitted by egglog must preserve the model's dtypes, accumulator/output
+dtypes and explicit rounding boundaries, shapes, aliasing, and distribution
+contract over the complete declared domain. Reduction order may vary when the
+logical operator leaves it unspecified, but the backend cannot change
+accumulator dtype or cross an explicit cast/rounding boundary. Memory filtering may reject candidates but cannot rewrite the
+model to fit. If CUDA or a vendor library cannot implement the exact contract,
+that candidate—or compilation as a whole—must be refused.
+
 ## Compilation and memory
 
 Egglog selects all operations. Bucket searches extract from range-seeded e-graphs,

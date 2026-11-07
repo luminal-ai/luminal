@@ -175,27 +175,10 @@
   :name "cublaslt: complete batched accumulation expression")
 (rule
   ((cublaslt-strided-batch-expression ?expression ?A ?B ?C ?bias ?batch ?m ?n ?k
-     (CublasLtDefaultEpilogue) ?alpha ?beta)
-   (cublaslt-rectified-linear-activation ?activated ?expression))
-  ((cublaslt-strided-batch-expression ?activated ?A ?B ?C ?bias ?batch ?m ?n ?k
-     (CublasLtRectifiedLinearEpilogue) ?alpha ?beta))
-  :ruleset backend
-  :name "cublaslt: ReLU after the complete batched expression")
-(rule
-  ((cublaslt-strided-batch-expression ?expression ?A ?B ?C ?bias ?batch ?m ?n ?k
      (CublasLtDefaultEpilogue) ?alpha ?beta))
   ((cublaslt-gaussian-error-linear-input ?expression))
   :ruleset backend
   :name "cublaslt: examine the complete batched expression for GELU")
-(rule
-  ((cublaslt-strided-batch-expression ?expression ?A ?B ?C ?bias ?batch ?m ?n ?k
-     (CublasLtDefaultEpilogue) ?alpha ?beta)
-   (cublaslt-gaussian-error-linear-activation ?activated ?expression))
-  ((cublaslt-strided-batch-expression ?activated ?A ?B ?C ?bias ?batch ?m ?n ?k
-     (CublasLtGaussianErrorLinearEpilogue) ?alpha ?beta))
-  :ruleset backend
-  :name "cublaslt: GELU after the complete batched expression")
-
 ; Round the complete activated expression before choosing its API frame.
 (rule
   ((cublaslt-strided-batch-expression ?expression ?A ?B ?C (CublasLtNoBias) ?batch ?m ?n ?k ?epilogue ?alpha ?beta)
@@ -649,26 +632,13 @@
   :name "cublaslt: commuted bias after complete batched C addition")
 (rule
   ((cublaslt-strided-batch-expression ?expression ?A ?B ?C ?bias
-     ?batch ?m ?n ?k (CublasLtBiasEpilogue) ?alpha ?beta)
-   (cublaslt-rectified-linear-activation ?activated ?expression))
-  ((cublaslt-strided-batch-expression ?activated ?A ?B ?C ?bias
-     ?batch ?m ?n ?k (CublasLtRectifiedLinearBiasEpilogue) ?alpha ?beta))
-  :ruleset backend
-  :name "cublaslt: ReLU after complete batched bias expression")
-(rule
-  ((cublaslt-strided-batch-expression ?expression ?A ?B ?C ?bias
      ?batch ?m ?n ?k (CublasLtBiasEpilogue) ?alpha ?beta))
   ((cublaslt-gaussian-error-linear-input ?expression))
   :ruleset backend
   :name "cublaslt: examine complete batched bias expression for GELU")
-(rule
-  ((cublaslt-strided-batch-expression ?expression ?A ?B ?C ?bias
-     ?batch ?m ?n ?k (CublasLtBiasEpilogue) ?alpha ?beta)
-   (cublaslt-gaussian-error-linear-activation ?activated ?expression))
-  ((cublaslt-strided-batch-expression ?activated ?A ?B ?C ?bias
-     ?batch ?m ?n ?k (CublasLtGaussianErrorLinearBiasEpilogue) ?alpha ?beta))
-  :ruleset backend
-  :name "cublaslt: GELU after complete batched bias expression")
+; As in the rank-two path, recognized ReLU/GELU expressions are not promoted
+; to vendor epilogues without a proof of equivalence over the full authored
+; domain. The current vendor behaviors do not satisfy that requirement.
 (rule
   ((cublaslt-strided-batch-expression ?expression ?A ?B ?C (CublasLtBiasOf ?bias)
      ?batch ?m ?n ?k ?epilogue ?alpha ?beta))

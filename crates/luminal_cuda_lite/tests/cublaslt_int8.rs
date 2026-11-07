@@ -88,7 +88,7 @@ fn calls(graph: &Graph, table: &str) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccu
             ),
         )
         .unwrap();
-    let graph = egraph.serialize(Default::default()).egraph;
+    let graph = egraph.serialize_compact_filtered(|_| true);
     let index = SerializedIndex::new(&graph);
     let mut separate = Vec::new();
     let mut tied = Vec::new();

@@ -5,8 +5,11 @@
 //! destination or in-place accumulating op is constructed. Extraction decodes
 //! the elected descriptors; dispatch does not reinterpret them.
 //!
-//! F32 reduction reassociation and FMA contraction remain permitted. Explicit
-//! casts retain their rounding boundaries; unproved epilogues remain generic.
+//! Every elected call must implement the authored logical operator's numerical
+//! contract. Reduction reassociation and contraction are permitted where the
+//! logical operator leaves order unspecified, but cannot change accumulator
+//! dtype or cross explicit cast/rounding boundaries. Unproved epilogues remain
+//! generic.
 pub mod accumulate_in_place;
 pub mod approved;
 #[cfg(feature = "device")]

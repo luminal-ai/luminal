@@ -245,14 +245,15 @@ pub(super) fn reshape_tensor(t: GraphTensor, target: &[IntExpr]) -> GraphTensor 
     while flat.rank() > prefix + 1 {
         flat = flat.merge_dims(prefix, prefix + 1);
     }
-    // `split_dims(axis, inner)` leaves `old / inner` at `axis` and inserts
-    // `inner` directly after it, so each leading target dim is split off by
-    // the product of the REMAINING dims; splitting by the leading dim itself
-    // would reverse the target. `product_of_dims` canonicalises the operand
-    // order, so a symbolic product compares equal across call sites.
-    for i in prefix..target.len().saturating_sub(1) {
-        let inner = super::dim_arith::product_of_dims(target[i + 1..].iter().copied());
-        flat = flat.split_dims(i, inner);
+    // Split the merged remainder from right to left. Each split divisor is a
+    // SINGLE authored target extent: `A*B*C / C -> A*B`, followed by
+    // `A*B / B -> A`. This is both simpler and more provable than splitting
+    // by the product of every remaining extent (`A*B*C / (B*C)`), especially
+    // when a dynamic extent repeats as in attention's `[32, S, S]` views.
+    // Inserting each new inner axis directly after `prefix` builds the target
+    // in its original order.
+    for i in (prefix + 1..target.len()).rev() {
+        flat = flat.split_dims(prefix, target[i]);
     }
     flat.finish()
 }
@@ -1109,5 +1110,17 @@ mod reshape_order_tests {
                 IntExpr::from(4usize)
             ]
         );
+    }
+
+    #[test]
+    fn reshape_cancels_repeated_symbolic_extents_one_at_a_time() {
+        let mut cx = Graph::new();
+        let sequence = IntExpr::from(Symbol::try_new_dim("sequence").unwrap());
+        let merged = (IntExpr::from(32) * sequence) * sequence;
+        let x = cx.tensor(vec![merged], DType::F32);
+
+        let out = reshape_tensor(x, &[IntExpr::from(32), sequence, sequence]);
+
+        assert_eq!(out.dims(), vec![IntExpr::from(32), sequence, sequence]);
     }
 }

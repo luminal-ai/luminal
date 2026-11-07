@@ -419,13 +419,33 @@ fn expr_is_offset_by_small_const(lhs: IntExpr, rhs: IntExpr) -> bool {
 
 fn split_add_const(expr: IntExpr) -> Option<(i64, IntExpr)> {
     let terms = expr.terms.read();
-    if terms.len() >= 3 && terms.last() == Some(&Term::Add) {
-        if let Some(Term::Num(n)) = terms.first() {
-            return Some((*n, IntExpr::new(terms[1..terms.len() - 1].to_vec())));
+    if terms.len() < 3 || terms.last() != Some(&Term::Add) {
+        return None;
+    }
+
+    // Locate the right operand of the outermost postfix `Add`. Looking only
+    // at the first term is incorrect: the left operand can itself begin with
+    // a numeric leaf, as in `min(1, s) + s`, without being a constant.
+    let mut needed = 1usize;
+    let mut rhs_start = None;
+    for index in (0..terms.len() - 1).rev() {
+        needed = match terms[index] {
+            Term::Num(_) | Term::Var(_) | Term::Coord(_) => needed.checked_sub(1)?,
+            _ => needed + 1,
+        };
+        if needed == 0 {
+            rhs_start = Some(index);
+            break;
         }
-        if let Some(Term::Num(n)) = terms.get(terms.len() - 2) {
-            return Some((*n, IntExpr::new(terms[..terms.len() - 2].to_vec())));
-        }
+    }
+    let rhs_start = rhs_start?;
+    let lhs = &terms[..rhs_start];
+    let rhs = &terms[rhs_start..terms.len() - 1];
+    if let [Term::Num(n)] = lhs {
+        return Some((*n, IntExpr::new(rhs.to_vec())));
+    }
+    if let [Term::Num(n)] = rhs {
+        return Some((*n, IntExpr::new(lhs.to_vec())));
     }
     None
 }
@@ -776,5 +796,39 @@ mod tests {
         let expr = parse_sympy_expr_with_ranges("Symbol('s0', integer=True)", &sym_map(), &ranges)
             .expect("bounded symbol should parse");
         assert_eq!(expr, IntExpr::from(Symbol::try_new_dim("a").unwrap()));
+    }
+
+    #[test]
+    fn range_constrained_slice_lengths_compare_equal() {
+        let symbol = Symbol::try_new_dim("a").unwrap();
+        let size = IntExpr::from(symbol);
+        let one = IntExpr::from(1);
+        let left = ((size.min(one) + size).min(one + size) - one).simplify();
+        let right = (size.min(one) + size).min(size).simplify();
+
+        let valid_prompt_lengths: FxHashMap<_, _> = [(
+            symbol,
+            ExprBounds {
+                min: Some(1),
+                max: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            canonical_equal_expr(left, right, &valid_prompt_lengths),
+            Some(size)
+        );
+
+        let possibly_empty: FxHashMap<_, _> = [(
+            symbol,
+            ExprBounds {
+                min: Some(0),
+                max: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(canonical_equal_expr(left, right, &possibly_empty), None);
     }
 }

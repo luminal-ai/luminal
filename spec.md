@@ -25,9 +25,29 @@ Frontend Program (PyTorch Core Aten IR, GraphTensor API, StableHLO (future), etc
 
 ## Global Contracts
 
-- Every selectable LLIR graph for a given HLIR graph must be semantically equivalent for all valid inputs, dtypes, shapes, strides, and dynamic dims.
+- The authored frontend model is the single source of functional truth. This is
+  the captured PyTorch program for the PyTorch frontend and the recorded
+  `GraphTensor` program for Rust. Its operations, dtypes, casts, accumulator and
+  output dtypes, explicit rounding boundaries, shapes, constants,
+  mutation/aliasing behavior, sharding
+  placements, collectives, and collective order are semantic requirements.
+- Every selectable LLIR graph for a given HLIR graph must preserve those
+  requirements and be semantically equivalent for all valid inputs, dtypes,
+  shapes, strides, placements, shards, and dynamic dimensions.
 - `ReferenceRuntime` is the full semantic reference backend, ran on CPU. All HLIR semantics are supported. Performance is not a priority, correctness is.
-- Frontend-exported (HLIR) programs are specifications of intended semantics. Do not change them to hide compiler, search, runtime, or backend bugs.
+- Frontend-exported programs and their distribution metadata are specifications,
+  not optimization suggestions. The compiler cannot introduce mixed precision,
+  quantization, different accumulator/output dtypes, casts, resharding,
+  replication, or collective changes unless the authored program contains that
+  transformation.
+- Reduction association and evaluation order are unspecified unless the
+  frontend explicitly authors an ordered or sequential operation. Reassociation,
+  tree reduction, and contraction are valid implementation choices only within
+  the authored operand/accumulator/output dtypes and explicit cast or rounding
+  boundaries.
+- A backend that cannot implement the specification must refuse compilation.
+  Numerical tolerance, vendor behavior, performance, and memory pressure do not
+  authorize a semantic change.
 
 ## Frontend
 
@@ -129,6 +149,9 @@ Search samples choices from the saturated e-graph using a genetic algorithm, ext
   declared dynamic domain, not only the representative point.
 - Search may rank performance only after semantic equivalence is established.
   It must not select around a known incorrect candidate.
+- Search cannot choose precision, dtype, sharding, placement, or collective
+  semantics. Those decisions belong to the authored frontend program; search
+  may choose only equivalent physical implementations.
 
 ## Dynamism
 

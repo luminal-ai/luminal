@@ -20,6 +20,7 @@ use std::mem::{Discriminant, discriminant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use luminal::prelude::*;
+use rustc_hash::FxHashMap;
 
 #[cfg(test)]
 mod add_sub_tests;
@@ -163,6 +164,9 @@ struct Translator<'a> {
     symbols: HashMap<String, Symbol>,
     /// PT2 symbol name -> torch's exported range constraint.
     ranges: HashMap<String, RangeConstraint>,
+    /// Recorder symbols with the same exported ranges, used when shape
+    /// equivalence depends on the valid dynamic-shape domain.
+    symbol_ranges: FxHashMap<Symbol, sympy::ExprBounds>,
     /// Complex-is-a-virtual-type table: value name -> the two real
     /// components that carry it. HLIR never sees a complex dtype.
     complex_tensors: HashMap<String, complex::ComplexTensor>,
@@ -212,12 +216,14 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
     }
     let device = crate::torch_device::program_device(parsed)?;
     let sym_dim_map = parsed.build_sym_dim_map();
+    let symbol_ranges = sympy::sym_char_ranges(&sym_dim_map);
     let mut t = Translator {
         cx: Graph::new(),
         values: HashMap::new(),
         input_values: HashMap::new(),
         symbols: sym_dim_map.sym_to_symbol.clone(),
         ranges: sym_dim_map.ranges,
+        symbol_ranges,
         complex_tensors: HashMap::new(),
         parsed,
         dims: HashMap::new(),
@@ -648,7 +654,90 @@ impl Translator<'_> {
             Some(tensor) => tensor,
             None => self.scalar_operand(rhs, dtype)?,
         };
-        Ok(broadcast_pair(a, b))
+        Ok(self.broadcast_pair(a, b))
+    }
+
+    /// Right-aligned PyTorch broadcasting over the complete exported shape
+    /// domain. Shape expressions produced by decomposition can be equivalent
+    /// only under an input's range constraint (for example, a slice length
+    /// containing ``min(s, 1)`` when export states ``s >= 1``), so structural
+    /// equality alone is insufficient.
+    fn broadcast_pair(&self, a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
+        let ad = a.dims();
+        let bd = b.dims();
+        let rank = ad.len().max(bd.len());
+        let mut out = Vec::with_capacity(rank);
+        for i in 0..rank {
+            let ax = ad.len().checked_sub(rank - i).and_then(|j| ad.get(j));
+            let bx = bd.len().checked_sub(rank - i).and_then(|j| bd.get(j));
+            let dim = match (ax, bx) {
+                (Some(x), Some(y)) => {
+                    if let Some(equal) = sympy::canonical_equal_expr(*x, *y, &self.symbol_ranges) {
+                        equal
+                    } else {
+                        let x = sympy::simplify_expr_with_ranges(*x, &self.symbol_ranges);
+                        let y = sympy::simplify_expr_with_ranges(*y, &self.symbol_ranges);
+                        if x.to_usize() == Some(1) {
+                            y
+                        } else if y.to_usize() == Some(1) {
+                            x
+                        } else {
+                            panic!("broadcast: incompatible dims {x:?} and {y:?}");
+                        }
+                    }
+                }
+                (Some(x), None) => *x,
+                (None, Some(y)) => *y,
+                (None, None) => unreachable!(),
+            };
+            out.push(dim);
+        }
+        (
+            self.broadcast_to_proven(a, &out),
+            self.broadcast_to_proven(b, &out),
+        )
+    }
+
+    /// Broadcast to `target`, permitting an axis to be respelled when its
+    /// equality has been proved over the exported shape domain. Core's public
+    /// `expand` deliberately accepts only structural equality or a singleton;
+    /// the PT2 translator has the additional range proof and records the same
+    /// coordinate identity map with the canonical extent spelling.
+    fn broadcast_to_proven(&self, mut tensor: GraphTensor, target: &[IntExpr]) -> GraphTensor {
+        while tensor.rank() < target.len() {
+            tensor = tensor.unsqueeze(0);
+        }
+        let current = tensor.dims();
+        if current == target {
+            return tensor;
+        }
+        let rank = target.len();
+        let entries = current
+            .iter()
+            .zip(target)
+            .enumerate()
+            .map(|(axis, (source, destination))| {
+                if source == destination
+                    || sympy::same_expr_with_ranges(*source, *destination, &self.symbol_ranges)
+                {
+                    luminal::graph::MapEntry::Coord {
+                        from_end: rank - 1 - axis,
+                        extent: *destination,
+                    }
+                } else if source.to_usize() == Some(1) {
+                    luminal::graph::MapEntry::Lit(0.into())
+                } else {
+                    panic!("broadcast: incompatible dims {source:?} and {destination:?}");
+                }
+            })
+            .collect::<Vec<_>>();
+        let id = tensor.graph().logical.view_op(
+            &(tensor.id, current),
+            &entries,
+            target.to_vec(),
+            tensor.dtype,
+        );
+        GraphTensor::from_id(id, target, tensor.graph_ref, tensor.dtype)
     }
 
     /// A tensor operand of an opmath op: rounded to the op's common dtype
@@ -1743,36 +1832,6 @@ fn broadcast_to(t: GraphTensor, target: &[IntExpr]) -> GraphTensor {
         view = view.unsqueeze(0);
     }
     view.expand(target.to_vec()).finish()
-}
-
-/// Broadcast a binary pair to a common shape.
-fn broadcast_pair(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
-    let ad = a.dims();
-    let bd = b.dims();
-    let rank = ad.len().max(bd.len());
-    let mut out = Vec::with_capacity(rank);
-    for i in 0..rank {
-        let ax = ad.len().checked_sub(rank - i).and_then(|j| ad.get(j));
-        let bx = bd.len().checked_sub(rank - i).and_then(|j| bd.get(j));
-        let dim = match (ax, bx) {
-            (Some(x), Some(y)) => {
-                if x == y {
-                    *x
-                } else if x.to_usize() == Some(1) {
-                    *y
-                } else if y.to_usize() == Some(1) {
-                    *x
-                } else {
-                    panic!("broadcast: incompatible dims {x:?} and {y:?}");
-                }
-            }
-            (Some(x), None) => *x,
-            (None, Some(y)) => *y,
-            (None, None) => unreachable!(),
-        };
-        out.push(dim);
-    }
-    (broadcast_to(a, &out), broadcast_to(b, &out))
 }
 
 /// Convert a value to `dtype`: `cast` is lossless-only, so a float -> int

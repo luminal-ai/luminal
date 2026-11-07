@@ -228,14 +228,7 @@ fn narrow_storage_is_admitted_only_with_authored_final_rounding_and_exact_wideni
                 }
                 let with_bias = !batch && !with_c;
                 for narrow_output in [false, true] {
-                    let f = fixture_with_c(
-                        dtype,
-                        batch,
-                        narrow_output,
-                        with_bias,
-                        if batch { 0 } else { 1 },
-                        with_c,
-                    );
+                    let f = fixture_with_c(dtype, batch, narrow_output, with_bias, 0, with_c);
                     let (separate, in_place) = calls(&saturate(&f.graph, WHITELIST));
                     let narrow: Vec<_> = separate
                         .iter()
@@ -278,7 +271,7 @@ fn narrow_storage_is_admitted_only_with_authored_final_rounding_and_exact_wideni
 #[test]
 fn narrow_calls_require_the_complete_whitelist_row_for_both_forms() {
     for dtype in [DType::Bf16, DType::F16] {
-        let f = fixture(dtype, false, true, false, 1);
+        let f = fixture(dtype, false, true, false, 0);
         let (all, _) = calls(&saturate(&f.graph, WHITELIST));
         let op = all
             .iter()

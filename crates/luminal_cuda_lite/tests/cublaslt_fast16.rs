@@ -47,7 +47,7 @@ fn saturate(model: &Graph, table: &str) -> EGraph {
             ),
         )
         .unwrap();
-    graph.serialize(Default::default()).egraph
+    graph.serialize_compact_filtered(|_| true)
 }
 
 fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {

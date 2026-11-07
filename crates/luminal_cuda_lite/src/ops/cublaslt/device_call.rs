@@ -279,8 +279,9 @@ pub fn prepare(
         std::mem::size_of::<i32>(),
     )?;
 
-    // Decode only the elected activation and optional bias. Their admission
-    // and approximation policy are owned by the egglog configuration proof.
+    // Decode only the elected activation and optional bias. Egglog must already
+    // have proved the complete call equivalent to the authored expression;
+    // dispatch does not introduce an approximation policy.
     let epilogue = match (call.activation, call.bias.is_some()) {
         (LtActivation::Identity, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
         (LtActivation::RectifiedLinear, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,

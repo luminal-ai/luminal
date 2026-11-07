@@ -65,7 +65,7 @@ fn packed_and_shared_c_descriptors_read_the_authored_vector_addresses() {
             let mut case = Case::new(Family::all()[0]);
             case.c_reading = reading;
             case.c_shared = shared;
-            case.activation = 2;
+            case.activation = 0;
             case.shared = (true, false);
             case.transposed = (true, true);
             case.device = true;
@@ -80,7 +80,7 @@ fn packed_and_shared_c_descriptors_read_the_authored_vector_addresses() {
                 let call = op.resolve(&Default::default());
                 let Some(c) = call.c else { continue };
                 let minor = if reading == CReading::RowVector { N } else { M };
-                if call.activation != LtActivation::GaussianErrorLinear
+                if call.activation != LtActivation::Identity
                     || c.descriptor.ld != 0
                     || (c.descriptor.batch_stride_in_elements == 0) != shared
                     // Packed copies are legal alternatives. This address
@@ -230,6 +230,8 @@ fn shared_full_c_is_read_only_and_broadcast_c_requires_its_whitelist_row() {
         && op.resolve(&Default::default()).c.unwrap().descriptor.ld > 0));
 }
 
+const EXPECTED_BROADCAST_C_WITNESSES: usize = 704;
+
 static WITNESSES: std::sync::LazyLock<std::collections::BTreeMap<String, LtCall>> =
     std::sync::LazyLock::new(|| {
         let mut witnesses = std::collections::BTreeMap::new();
@@ -237,7 +239,11 @@ static WITNESSES: std::sync::LazyLock<std::collections::BTreeMap<String, LtCall>
         for family in families() {
             let table: String = rows
                 .iter()
-                .filter(|key| family.key_matches(key) && !key.contains("CublasLtNoCMatrixDataType"))
+                .filter(|key| {
+                    family.key_matches(key)
+                        && !key.contains("CublasLtNoCMatrixDataType")
+                        && key.contains("(CublasLtDefaultEpilogue)")
+                })
                 .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
                 .collect();
             eprintln!("broadcast C witnesses: {family:?}");
@@ -249,11 +255,7 @@ static WITNESSES: std::sync::LazyLock<std::collections::BTreeMap<String, LtCall>
                         case.c_reading = reading;
                         case.transposed = (ta, tb);
                         let f = fixture(case);
-                        let outputs = [
-                            f.out,
-                            activation(f.sum, 1).cast(family.output),
-                            activation(f.sum, 2).cast(family.output),
-                        ];
+                        let outputs = [f.out];
                         let (separate, tied) =
                             calls(&bound_graph(&f, &outputs, case, table.clone(), false));
                         for op in separate {
@@ -278,10 +280,12 @@ fn every_existing_c_configuration_has_a_broadcast_batch_witness() {
     let expected: std::collections::BTreeSet<_> = whitelist::approved_keys()
         .into_iter()
         .filter(|key| {
-            key.contains("CublasLtNoBiasDataType") && !key.contains("CublasLtNoCMatrixDataType")
+            key.contains("CublasLtNoBiasDataType")
+                && !key.contains("CublasLtNoCMatrixDataType")
+                && key.contains("(CublasLtDefaultEpilogue)")
         })
         .collect();
-    assert_eq!(expected.len(), 1280);
+    assert_eq!(expected.len(), EXPECTED_BROADCAST_C_WITNESSES);
     let actual = WITNESSES.keys().cloned().collect();
     assert!(
         expected == actual,
@@ -308,7 +312,7 @@ mod execution {
         let _execution = crate::execution::DEVICE_EXECUTION.lock().unwrap();
         let context = cudarc::driver::CudaContext::new(0).unwrap();
         let stream = context.new_stream().unwrap();
-        assert_eq!(WITNESSES.len(), 1280);
+        assert_eq!(WITNESSES.len(), EXPECTED_BROADCAST_C_WITNESSES);
         for call in WITNESSES.values() {
             match call.computation {
                 LtComputation::Float16 => support::fp16::execute_call(&stream, call, false),
@@ -331,13 +335,7 @@ mod execution {
                 case.device = i % 2 == 0;
                 case.transposed = (true, i % 2 == 0);
                 case.shared = (i % 2 == 0, true);
-                case.activation = if family.input == DType::I8 {
-                    0
-                } else if family.output == family.arithmetic {
-                    2
-                } else {
-                    1
-                };
+                case.activation = 0;
                 crate::execution::run(case, false);
             }
         }
@@ -348,12 +346,13 @@ mod execution {
             case.device = true;
             case.batch = 'b'.into();
             case.shared = (true, false);
-            case.activation = 1;
+            case.activation = 0;
             crate::execution::run(case, false);
         }
         let mut case = Case::new(Family::all()[0]);
         case.c_shared = true;
         case.device = true;
+        case.activation = 0;
         crate::execution::run(case, false);
         for (index, reading) in [(8, CReading::RowVector), (3, CReading::ColumnVector)] {
             let mut case = Case::new(Family::all()[index]);
@@ -361,6 +360,7 @@ mod execution {
             case.c_padding = 5;
             case.device = true;
             case.batch = 'b'.into();
+            case.activation = 0;
             crate::execution::run(case, false);
         }
     }
@@ -371,14 +371,12 @@ mod execution {
         for family in [Family::all()[8], Family::all()[9]] {
             for reading in [CReading::RowVector, CReading::ColumnVector] {
                 for shared in [false, true] {
-                    for activation in [0, 1] {
-                        let mut case = Case::new(family);
-                        case.c_reading = reading;
-                        case.c_shared = shared;
-                        case.activation = activation;
-                        case.cancellation = true;
-                        crate::execution::run(case, false);
-                    }
+                    let mut case = Case::new(family);
+                    case.c_reading = reading;
+                    case.c_shared = shared;
+                    case.activation = 0;
+                    case.cancellation = true;
+                    crate::execution::run(case, false);
                 }
             }
         }
@@ -393,13 +391,7 @@ mod execution {
             case.device = true;
             case.shared = (i % 2 == 0, true);
             case.transposed = (true, true);
-            case.activation = if family.input == DType::I8 {
-                0
-            } else if family.arithmetic == family.output {
-                2
-            } else {
-                1
-            };
+            case.activation = 0;
             crate::execution::run(case, false);
         }
     }

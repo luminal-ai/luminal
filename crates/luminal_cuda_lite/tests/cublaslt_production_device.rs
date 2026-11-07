@@ -477,11 +477,14 @@ fn production_and_decomposed_search_are_measured_with_identical_precision_and_da
 }
 
 #[test]
-fn native_bf16_product_is_elected_and_executes_through_cublaslt() {
+fn widened_bf16_storage_product_is_elected_and_executes_through_cublaslt() {
     let mut graph = Graph::new();
     let a = graph.tensor([64, 128], DType::Bf16);
     let b = graph.tensor([128, 64], DType::Bf16);
-    let out = a.matmul(b);
+    let out = a
+        .cast(DType::F32)
+        .matmul(b.cast(DType::F32))
+        .cast(DType::Bf16);
     let input = |value| {
         HostBuffer::new(
             PlanDtype::Bf16,
