@@ -89,6 +89,10 @@ _PT2_TO_TORCH = {
     8: torch.float64,
     12: torch.bool,
     13: torch.bfloat16,
+    29: torch.float8_e4m3fn,
+    30: torch.float8_e5m2,
+    31: torch.float8_e4m3fnuz,
+    32: torch.float8_e5m2fnuz,
 }
 
 # The output specs this backend declares to the runtime. Anything else
