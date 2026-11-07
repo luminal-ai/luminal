@@ -722,6 +722,7 @@ struct CompiledPlan {
     live_resources: Vec<Rc<HostVariant>>,
     actions: Vec<Action>,
     params: ArenaSlice,
+    empty_copy_source: u64,
     schema: Vec<Symbol>,
     deps: BTreeMap<Symbol, Vec<usize>>,
     last_dims: DynMap,
@@ -937,6 +938,7 @@ impl CompiledPlan {
             live_resources: vec![],
             actions: vec![],
             params,
+            empty_copy_source: staging.ptr() as u64,
             schema,
             deps: BTreeMap::new(),
             last_dims: dims.clone(),
@@ -1184,7 +1186,18 @@ impl CompiledPlan {
                     kind,
                     bytes,
                     ..
-                } => graph.copy(&deps, &copy_params(*src, *dst, *bytes, *kind))?,
+                } => {
+                    // CUDA validates even disabled memcpy nodes. Empty
+                    // external tensors may have null addresses, so use a
+                    // valid one-byte staging copy until this node is enabled.
+                    // A later memory-kind change takes the normal rebuild path.
+                    let params = if *bytes == 0 {
+                        copy_params(self.empty_copy_source, self.base, 1, CopyKind::HtoD)
+                    } else {
+                        copy_params(*src, *dst, *bytes, *kind)
+                    };
+                    graph.copy(&deps, &params)?
+                }
                 Action::Host(h) => graph.child(&deps, &h.variants.front().unwrap().graph)?,
                 Action::Kernel {
                     func, args, launch, ..
