@@ -341,3 +341,58 @@ fn the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced() {
     rt.execute(arena_rt.arena(), &mut staging_arena_rt)
         .expect("the plan the lattice installed executes on the device");
 }
+
+/// CUDA-event measurements keep the trial/early-stop/timeout contract, including
+/// normalization of zero trials and a timeout on the final trial.
+#[test]
+fn event_profile_preserves_trial_accounting() {
+    use luminal_cuda_lite::device::CudaDevice;
+    use luminal_cuda_lite::profile::{Measurement, profile_candidate};
+    use std::time::Duration;
+
+    let mut graph = Graph::new();
+    let _out = graph.iota(vec![1024], |c| c[0]);
+    let mut runtime = CudaRuntime::load(&graph).unwrap();
+    runtime
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &luminal_cuda_lite::harness_search_options(),
+        )
+        .unwrap();
+    let plan = runtime.plan().unwrap();
+    let mut device = CudaDevice::new(0).unwrap().executable();
+    for (trials, best, timeout, expected, timed_out) in [
+        (0, None, None, 1, false),
+        (3, None, None, 3, false),
+        (4, Some(0), None, 1, false),
+        (3, None, Some(Duration::ZERO), 1, true),
+        (1, None, Some(Duration::ZERO), 1, true),
+    ] {
+        let before = device.stats().launches;
+        let result = profile_candidate(
+            &mut device,
+            plan,
+            &Default::default(),
+            trials,
+            best,
+            timeout,
+        )
+        .unwrap();
+        let (nanos, completed, was_timeout) = match result {
+            Measurement::Timed {
+                mean_nanos,
+                completed_trials,
+            } => (mean_nanos, completed_trials, false),
+            Measurement::TimedOut {
+                elapsed_nanos,
+                completed_trials,
+            } => (elapsed_nanos, completed_trials, true),
+        };
+        assert!(nanos > 0, "events must measure actual device work");
+        assert_eq!(completed, expected);
+        assert_eq!(was_timeout, timed_out);
+        assert_eq!(device.stats().launches - before, 1 + completed as u64);
+    }
+}

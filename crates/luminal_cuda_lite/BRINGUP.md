@@ -19,7 +19,10 @@ the self-contained repo-side summary.
 - `CudaRuntime::allow_list()` derives from registered operations' DPS
   execution interfaces and plan-transparent effects. Kernel and host
   implementations can be provided externally without a dispatch-table edit.
-- Candidate ranking always measures device execution time (`src/profile.rs`).
+- Candidate ranking uses timing-enabled CUDA events around graph replay on its
+  launch stream (`src/profile.rs`). Host setup, input restoration, and host
+  synchronization overhead are excluded. Candidate timeouts use accumulated
+  device time, not wall-clock time.
   Search requires the `device` feature and a CUDA GPU. There is no static
   byte-cost ranking or profiling option. Loading, saturation, and kernel
   code generation can still be inspected on a host without CUDA.

@@ -1,17 +1,18 @@
 //! Search profiling uses the serving graph path. Preparation/instantiation is
-//! outside the timed trials. Trials measure device execution and synchronization.
+//! outside the timed trials. Timing-enabled CUDA events bracket graph replay on
+//! its launch stream, excluding host preparation and synchronization overhead.
 //! The profiling caller owns candidate storage and restores staged inputs per trial.
 use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, sys::CUevent_flags};
 use std::sync::Arc;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use luminal::bufferize::BufferIrGraph;
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::FxHashMap;
 
-use crate::device::CudaExecutable;
+use crate::device::{CudaExecutable, ExecutionMode};
 use crate::host_buffer::HostBuffer;
 use crate::search::early_stop_exceeded;
 
@@ -64,10 +65,11 @@ impl std::fmt::Display for ProfileFailure {
 }
 
 /// Compile and instantiate once, warm up once, then time the same execution
-/// path used for serving: parameter binding, graph launch, synchronization.
+/// graph used for serving with CUDA events on its launch stream. Parameter
+/// binding and host synchronization are outside the measured device interval.
 /// The profiling harness restores tensor inputs before each timed trial.
-/// Timeouts cover timed trials only. The caller releases candidate graphs and
-/// arena afterwards, retaining the shared context and compiled module cache.
+/// Timeouts cover accumulated device time in timed trials only. The caller releases
+/// candidate graphs and arena afterwards, retaining the context and module cache.
 #[allow(clippy::too_many_arguments)]
 pub fn profile_candidate_at(
     device: &mut CudaExecutable,
@@ -94,17 +96,40 @@ pub fn profile_candidate_at(
         .execute(arena.arena(), &mut staging, &shapes.values)
         .map_err(ProfileFailure::Prepare)?;
 
+    // Reuse one timing-enabled event pair across trials. cudarc's default
+    // events disable timing, so request CU_EVENT_DEFAULT explicitly.
+    let start = device
+        .stream()
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(|error| ProfileFailure::Prepare(error.into()))?;
+    let stop = device
+        .stream()
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(|error| ProfileFailure::Prepare(error.into()))?;
     let total = trials.max(1);
     let mut sum = 0u128;
     for trial in 0..total {
         // Mutable/donated inputs are restored by the profiling harness, not the executable.
         initialize_inputs(device, plan, &mut arena, &staged, &shapes.values)
             .map_err(ProfileFailure::Prepare)?;
-        let start = Instant::now();
         device
-            .execute(arena.arena(), &mut staging, &shapes.values)
+            .execute_external_mode(
+                arena.arena(),
+                &mut staging,
+                &shapes.values,
+                &Default::default(),
+                ExecutionMode::Profile {
+                    start: &start,
+                    stop: &stop,
+                },
+            )
             .map_err(ProfileFailure::Execute)?;
-        sum += start.elapsed().as_nanos();
+        let elapsed_ms = start
+            .elapsed_ms(&stop)
+            .map_err(|error| ProfileFailure::Execute(error.into()))?;
+        sum += (f64::from(elapsed_ms) * 1_000_000.0).round() as u128;
         let completed = trial + 1;
         if completed == total {
             break;

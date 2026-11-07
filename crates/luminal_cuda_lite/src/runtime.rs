@@ -934,7 +934,12 @@ impl CudaRuntime {
                     )
                 })
                 .collect();
-            device.execute_external_mode(arena, staging, &self.dims, &external, asynchronous)?;
+            let mode = if asynchronous {
+                crate::device::ExecutionMode::Asynchronous
+            } else {
+                crate::device::ExecutionMode::Synchronous
+            };
+            device.execute_external_mode(arena, staging, &self.dims, &external, mode)?;
             Ok(())
         }
         #[cfg(not(feature = "device"))]
