@@ -225,7 +225,7 @@ def create_app(backend: str, local_project_dir: Path):
                 or arg.startswith("--maxfail=")
                 for arg in sanitized_pytest_args
             ):
-                sanitized_pytest_args.append("--maxfail=10")
+                sanitized_pytest_args.append("--maxfail=30")
             if profile_enabled:
                 sanitized_pytest_args.append("--profile")
                 if dot_available:
