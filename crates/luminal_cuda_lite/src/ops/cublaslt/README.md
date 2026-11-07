@@ -11,10 +11,10 @@ the elected call and dispatches its descriptors unchanged.
 | --- | --- |
 | `approved_constructors.egg` | Flat vendor layout data, storage descriptors, optional arguments, configuration and expression-frame types |
 | `approved_rules.egg` | Rank-two expression recognition, layout readings, precision proofs, and complete admission |
-| `scalar_rules.egg` | Authored alpha/beta scaling and exact FP32 scalar storage/pointer proofs |
+| `scalar_rules.egg` | Authored alpha/beta scaling and exact FP16/FP32/FP64 scalar storage/pointer proofs |
 | `call_inputs.egg` | Assemble approved matrix/scalar reads in one canonical order |
 | `strided_batch_rules.egg` | One explicit batch axis, batch layout proofs, and complete product/accumulation admission |
-| `approved_whitelist.egg` | The 2,176 complete configurations allowed for execution |
+| `approved_whitelist.egg` | The 4,096 complete configurations allowed for execution |
 | `separate_destination_call.egg` | Emit an independently allocated destination from an approved call |
 | `accumulate_in_place_call.egg` | Emit a required C/D storage tie after proving identical descriptions and layouts |
 
@@ -48,8 +48,8 @@ placeholder C descriptor required by the vendor when beta is zero.
 
 Both forms use inputs A, B, optional device alpha/beta, optional bias, then
 optional C. Host scalar literals are metadata; device scalars are ordinary
-FP32 read operands. The separate-destination form appends its write-only D
-operand during DPS conversion. The in-place form requires C and ties its final
+reads in the declared scalar dtype. The separate-destination form appends its
+write-only D operand during DPS conversion. The in-place form requires C and ties its final
 read operand to result 0 with unconditional `Sharing::Must`. Its emission rule
 requires the same complete vendor layout and underlying layout for C and D.
 There is no conditional alias flag or Rust destination rebinding. Scalar values,
@@ -57,23 +57,46 @@ including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **2,176 complete configurations**: 1,088 for host scalar
-pointers and 1,088 for device scalar pointers. Each pointer mode admits:
+The table contains **4,096 complete configurations**: 2,048 for host scalar
+pointers and 2,048 for device scalar pointers. Each pointer mode admits:
 
-- 896 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
-  FP16 A/B storage, plus explicit TF32 computation over F32 storage. Each has
+- 1,344 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
+  FP16 A/B storage, plus explicit TF32, FP16 or BF16 input conversion over F32
+  storage. Each has
   16 A/B order/transpose combinations, absent/present F32 C, and seven
   destination/epilogue combinations (default in either D order; bias, ReLU,
   ReLU+bias, GELU or GELU+bias with column-major D).
+- 64 INT8-storage rows: signed I8 A/B explicitly widened to FP32, FP32
+  computation/scalars/C/D, default epilogue, 16 A/B order/transpose
+  combinations, absent/present C and either D order.
 - 192 narrow-output rows: matching BF16 or FP16 A/B storage, FP32 arithmetic,
   and an authored final cast to the matching narrow dtype. Each has 16 A/B
   order/transpose combinations, absent/present matching narrow C, and default
-  in either D order or ReLU with column-major D. Native narrow bias and GELU
-  epilogues have no approved rows.
+  in either D order or ReLU with column-major D. Bias and GELU epilogues
+  have no approved rows for this FP32-compute narrow-output family.
+- 224 native FP16 rows: FP16 arithmetic, matrix storage and alpha/beta,
+  with 16 A/B order/transpose combinations, absent/present FP16 C, and seven
+  destination/epilogue combinations: default in either D order, plus bias,
+  ReLU, ReLU+bias, GELU or GELU+bias with column-major D and FP16 bias.
+- 224 FP64-output rows: FP64 A/B/C/D storage, computation and alpha/beta,
+  with 16 A/B order/transpose combinations, absent/present C, and seven
+  destination/epilogue combinations: default in either D order, plus bias,
+  ReLU, ReLU+bias, GELU or GELU+bias with column-major D and FP64 bias.
 
-Scalars and accumulation remain FP32. Alpha and beta are general FP32 values;
-absent C still requires literal beta zero. Storage never chooses arithmetic
-precision. Only an authored exact widening permits direct BF16/FP16 readings.
+Native FP16 computation uses FP16 scalars. All FP32 accumulation modes use FP32
+scalars; FP64 computation uses FP64 scalars.
+Alpha and beta are general values in that arithmetic dtype; absent C still
+requires a literal beta zero in the same dtype. Storage never chooses arithmetic
+precision. Only an authored exact widening permits direct BF16/FP16/I8 A/B readings.
+
+A direct BF16 matrix product may also use the vendor's BF16 matrix contract:
+BF16 A/B/D storage, FP32 accumulation, and one BF16 rounding when D is written.
+Because cuBLASLt has no BF16 scale ABI, this path admits only the exact host
+identities for an unscaled product (`alpha = 1`, `beta = 0`). It does not move
+arbitrary BF16 coefficients, residual C, or bias across the matrix-product
+boundary. Explicit BF16-to-F32 operand casts remain the separate FP32-arithmetic
+contract described above.
+
 Casts between multiplication,
 reduction, C addition, bias addition and activation remain boundaries; earlier
 narrowing is preserved. A separate output-storage proof recognizes an authored
@@ -81,15 +104,27 @@ final cast of the complete FP32 expression. Pure-view transposition carries that
 whole rounded expression into the API frame and back to the caller's output.
 
 F32 reduction reassociation and FMA contraction follow the existing compiler
-policy. ReLU accepts a difference in the sign of zero; the FP32-output GELU rows
-accept the vendor tanh approximation. These are explicit admission policies,
-not claims of bitwise equivalence. FP8 and mixed A/B storage have no approved
-configurations.
+policy. ReLU accepts a difference in the sign of zero and the selected vendor
+kernel's NaN handling: a NaN may propagate or become zero. This explicit
+relaxation applies to all approved ReLU epilogues, including native FP16 and
+FP32 computation with narrow storage/output. NaN behavior can vary with the
+algorithm and geometry; arithmetic dtype alone does not select it. Generic and
+reference ReLU remain NaN-preserving, so fused and decomposed paths need not
+agree on NaNs under this admission policy. Finite values and infinities retain
+the ordinary ReLU contract. cuBLASLt describes ReLU as
+[`max(x, 0)`](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltepilogue-t)
+without an explicit NaN-propagation guarantee, and an
+[NVIDIA forum report](https://forums.developer.nvidia.com/t/incorrect-result-of-cublasltmatmul-with-cublaslt-epilogue-relu-when-input-is-nan/329783)
+records the same NaN-to-zero behavior. Strict fused NaN propagation is deferred.
+
+The FP32-output GELU rows accept the vendor tanh approximation. These are
+explicit admission policies, not claims of bitwise equivalence. FP8 and mixed
+A/B storage have no approved configurations.
 
 ### General alpha and beta
 
-`scalar_rules.egg` recognizes one FP32 scalar multiplication of the completed
-product and one of C before addition: `alpha * (A @ B) + beta * C`, followed by
+`scalar_rules.egg` recognizes one multiplication of the completed product and
+one of C by scalars in their arithmetic dtype, before addition: `alpha * (A @ B) + beta * C`, followed by
 optional bias/activation and authored output rounding. Scaling is not moved
 across casts or distributed over C, bias, activation, or multiple scalar
 multiplications. Rank-two and strided-batch calls share these scalar proofs.
@@ -98,16 +133,18 @@ addition are recognized locally within this contract. Admission does not depend
 on global floating-point commutation or reassociate a chain of additions.
 
 The vendor's [dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
-requires **FP32 alpha/beta** for all currently admitted modes: ordinary FP32
-computation over F32/FP16/BF16 storage and explicit TF32 computation over F32
-storage. Half matrix storage does not authorize half scalar pointers. An
-explicit scalar cast to F32 remains an executable operation when needed.
+requires **FP32 alpha/beta** for ordinary FP32 computation over F32/FP16/BF16
+storage and explicit TF32/FP16/BF16 input conversion over F32 storage. FP64
+computation instead
+requires **FP64 alpha/beta**, including eight-byte device scalar reads. Half
+matrix storage does not authorize half scalar pointers. An explicit scalar
+cast to the required dtype remains executable when needed.
 
 The configuration records `CublasLtHostScalarPointerMode` or
 `CublasLtDeviceScalarPointerMode`; actual values/storage live in separate flat
-`CublasLtScalarArguments`. Host arguments require literal FP32 graph constants.
-Tensor coefficients require rank-zero FP32 storage and use GPU pointers. If a
-literal is paired with a tensor coefficient, the literal can be materialized as
+`CublasLtScalarArguments`. Host arguments require graph constants in the scalar
+dtype. Tensor coefficients require rank-zero storage in the computation's scalar
+dtype and use GPU pointers. If a literal is paired with a tensor coefficient, the literal can be materialized as
 a GPU scalar so both pointers use DEVICE mode. There is no GPU-to-CPU scalar
 readback. The prepared CUDA graph reads updated device coefficients on every
 replay, including coefficients produced by preceding GPU operations.
@@ -125,6 +162,146 @@ separate elementwise multiplication. A present C remains structurally present,
 including when beta is zero; this does not grant extra alias permissions or
 remove the scalar's graph dependency. Tests compare finite numerical inputs
 and retain explicit cast boundaries.
+
+### Signed INT8 storage with FP32 arithmetic
+
+An authored `I8 -> F32` cast on each matrix operand permits
+`CublasLtFloat32Computation` to read signed byte A/B storage directly. For example:
+
+```rust,ignore
+let out = a_i8.cast(DType::F32).matmul(b_i8.cast(DType::F32));
+```
+
+Every signed INT8 value widens exactly to FP32. The call absorbs these two
+widening materializations while preserving earlier narrowing in the storage
+source. Integer multiplication/reduction followed by a final F32 cast does not
+qualify. Unsigned inputs, mixed A/B storage, and implicit quantization scales or
+zero points have no approved rows. Scaling or offsets before the contraction
+remain at their authored positions.
+
+The [vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
+explicitly permits `CUBLAS_COMPUTE_32F`, `CUDA_R_8I` A/B, FP32 alpha/beta, and
+FP32 C/D. This is distinct from INT32 accumulation with FP32 scaling. The 128
+complete rows admit only the default epilogue, both scalar pointer modes,
+both destination orders, every A/B order/transpose combination, and optional
+FP32 C. New storage permission is specific to A/B; INT8 C or bias must still
+materialize their FP32 widenings. Final output casts and activations remain
+outside the call. All reduction schemes are permitted through the whitelist
+because both the computation and output are FP32.
+
+Ordinary and one-axis strided batches share the same flat descriptors and
+admission, including independently shared A/B, independent C/D pitches,
+separate results and in-place accumulation. CPU literals and GPU tensor
+coefficients use the existing FP32 scalar ABI and remain live during replay.
+Native CUDA 12.8/A100 probes validate transposes, row/column orders, odd padded
+pitches, strided/shared batches and both scalar pointer modes. The IMMA-specific
+multiple-of-four geometry restrictions do not apply to the tested FMA route.
+
+The observed implementations report FMA instructions, INT8 inputs and FP32
+accumulators through the [numerical implementation flags](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltnumericalimplflags-t).
+This feature makes no integer Tensor Core performance promise. It avoids
+separate FP32 input buffers; library availability remains descriptor-dependent,
+and preparation refuses unsupported candidates. FP32 reassociation/FMA and
+zero-coefficient read suppression follow the existing practical BLAS policy.
+
+### Native FP16 arithmetic and scalar storage
+
+`CublasLtFloat16Computation` maps to `CUBLAS_COMPUTE_16F`. Both operands,
+multiplication and reduction must be logically F16. Matrix A/B/C/D storage and
+alpha/beta are F16. For example, `a.matmul(b)` on F16 tensors requests native
+half computation; `a.cast(DType::F32).matmul(b.cast(DType::F32))` retains FP32
+computation, even if the result is subsequently cast to F16. Storage alone or a
+final output cast never authorizes reducing arithmetic precision.
+
+The 448 complete rows cover both scalar pointer modes, all 16 A/B
+order/transpose combinations, and absent/present C. Default epilogues support
+both destination orders. Bias, ReLU, ReLU+bias, GELU and GELU+bias require
+column-major D; bias is a packed F16 vector broadcast along the vendor matrix's
+columns. Separate destinations and in-place accumulation share these rows.
+All 448 rows also support one-axis strided batches, including independently
+shared A/B and shared or per-batch feature bias (see the layout requirements below).
+Subsequent casts remain separate.
+
+Native ReLU and ReLU+bias follow the vendor NaN policy above. CUDA 12.8/A100
+probes found both NaN-preserving and NaN-suppressing kernels for native half
+computation and for FP32 computation with FP16 storage/output. Tests require
+fused epilogues with host/device scalars, compare finite results against the
+reference, and accept either NaN or zero when a ReLU input is NaN. Independent
+C outputs retain their original bits, including NaNs. Bias and GELU retain
+their separate special-value regression coverage.
+
+Host literals are explicit F32 constants cast to F16. Decoding performs that
+same nearest-even conversion once and retains the two-byte payload in a distinct
+host scalar variant through CUDA graph capture. GPU coefficients are rank-zero
+F16 reads; a literal paired with a GPU coefficient can materialize in F16, and
+GPU-produced F16 casts remain ordinary graph dependencies. Bounds checks use
+two-byte scalar elements. No FP32 pointer is passed under an FP16 descriptor.
+
+The [vendor compute contract](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublascomputetype-t)
+permits compute and intermediates of at least FP16 precision, Tensor Cores,
+reduction reassociation and FMA contraction. Native half GEMM follows this same
+practical BLAS policy; it does not promise the reference's sequential reduction
+or a separately rounded product at every multiply. Explicit intermediate casts
+remain boundaries. All reduction schemes are permitted by these rows because
+compute and output types are both FP16. As for the other modes, zero coefficients
+may suppress matrix reads. The reference implements authored FP16 add, multiply
+and sequential sum with half rounding at each step; exact dyadic witnesses
+compare the fused and decomposed paths independently of permitted association.
+
+Native FP16 GELU follows the existing vendor tanh-approximation policy for both
+frontend tanh and erf spellings. Its coefficient proofs recognize each authored
+F32 literal explicitly cast to F16, including log2(e); the proof records the
+source literal, without claiming that its rounded half value equals that source.
+The reference rounds each exp2 and reciprocal output to F16, as it does add and
+multiply. The legacy smoothed-sign erf spelling is excluded for half arithmetic:
+its epsilon underflows to zero and would produce 0/0 at zero. Explicit casts
+inside the expression remain fusion boundaries. Tests use exact dyadic answers
+for bias/ReLU and an absolute-plus-relative `0.003 + 0.002 * abs(reference)`
+bound for the permitted half GELU approximation. A CUDA 12.8/A100 scan across
+[-6, 6] found a maximum absolute difference of 0.001953125 from the decomposed
+half tanh spelling, with and without C/bias and in both scalar pointer modes.
+These samples validate the implementation; they are not a universal error bound.
+
+CUDA 12.8/A100 probes and tests verify genuine half-accumulator algorithms,
+host/device scalar pointers, ordinary/batched descriptors, shared inputs,
+retained C, and coefficient updates on replay. Supported storage/scalar types
+are specified in the [vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul).
+
+### FP64 arithmetic and scalar storage
+
+`CublasLtFloat64Computation` maps to `CUBLAS_COMPUTE_64F`. Logical F64
+multiplication and reduction authorize F64 matrix storage and F64 scalars,
+with both ordinary and one-axis strided-batched geometry. Shared A/B inputs,
+independent C/D pitches, separate destinations, and in-place ties use the same
+layout proofs as the other computation modes.
+
+Use `graph.constant_f64(value)` for a host literal and a rank-zero F64 graph
+tensor for a device coefficient. Mixed host/device coefficients materialize the
+literal in F64 device storage. Host arguments retain their f64 bits in distinct
+metadata and owned double-width storage through CUDA graph capture; no f32
+conversion or scalar readback occurs. GPU-produced coefficients and changed
+values on replay remain ordinary graph dependencies.
+
+Rank-two FP64 calls admit default, bias, ReLU, ReLU+bias, GELU and GELU+bias
+epilogues. Native probing on CUDA 12.8/A100 verifies both host/device scalar
+pointers and separate/in-place destinations. Activation and bias require
+column-major D; whole-expression transposition carries frontend feature bias
+into the vendor's per-row frame. Bias remains packed FP64 storage, and both
+forms consume the shared exact storage proof keyed by arithmetic dtype.
+
+ReLU accepts the vendor's sign-of-zero difference. Both frontend GELU spellings
+accept the vendor tanh approximation under the same policy as FP32-output calls.
+Native probing found about `2.5e-10` maximum absolute
+GELU error on its finite fixture against an independent double tanh formula.
+Activation matching proves every constant's dtype and value. The frontend's
+F32 literals widened to F64 retain their exact authored F32 values; no arbitrary
+cast chain is folded. Casts between GEMM and an epilogue remain boundaries.
+
+Explicit final output casts remain separate operations. FP64 reduction order
+and FMA contraction follow the same practical BLAS policy, including
+zero-coefficient read suppression, at double precision. The
+[vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
+specifies the FP64 computation and scalar ABI.
 
 ### Narrow C, bias and output storage
 
@@ -144,7 +321,7 @@ destinations retain their ordinary non-overlapping proofs. A broadcast C cannot
 become an in-place destination. This consumes C's argument slot, so a separate
 residual C plus feature bias still uses the FP32-output path.
 
-Native narrow bias/GELU epilogues can round an intermediate result before the
+FP32-compute narrow-output bias/GELU epilogues can round an intermediate result before the
 authored final cast. On CUDA 12.8/A100, cancellation tests exposed infinity where
 the FP32 graph remains finite: `65504 + 32 - 65504` should produce FP16 32, but
 rounding after the C addition overflows first. Other layouts also exposed this
@@ -153,9 +330,19 @@ product from activation after BF16 rounding. These tuples remain deliberately
 unwhitelisted. Their graphs retain FP32 calls and explicit final casts; adding
 cast tolerance does not authorize a new arithmetic boundary.
 
-For narrow outputs, dispatch restricts split-K reductions to FP32 workspace
-partials or no split-K reduction, excluding reduction through the narrow output
-type. The selected bias argument carries an explicit dtype and operand index;
+Every complete whitelist row explicitly selects its reduction-scheme mask.
+FP32 and FP64 output rows allow all schemes (`0x7`). Narrow-output
+rows select compute-type workspace partials (`0x2`), preserving FP32 partial
+sums and excluding reduction through the narrow output type. Both masks allow
+`NONE` (`0`); neither requires split-K. Admission binds the mask from the row,
+both executable forms retain it, and dispatch translates it directly into
+`CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK`. The whitelist is the sole policy
+source; there is no independent dtype-derived mask or egglog policy relation.
+Table-validation tests check the agreed policy, and a restricted FP32 test row
+proves that changing the whitelist changes both executable forms for ordinary
+and batched calls.
+
+The selected bias argument carries an explicit dtype and operand index;
 dispatch configures its vendor type and checks capacities using its real width.
 The reference runtime has native two-byte FP16/BF16 payloads, exact widening,
 explicit narrowing, and bit-preserving payload movement for these graphs.
@@ -182,7 +369,7 @@ pre-cast F32 storage and delegates input conversion to cuBLASLt. Earlier
 narrowing remains in that storage source. Casts after multiplication/reduction
 cannot authorize this mode. The proof composes with rank-two epilogues,
 strided batches, separate destinations, in-place accumulation and subsequent
-output casts. Batched bias/activation remain outside the existing batch grammar.
+output casts. Batched activations and feature bias share these proofs.
 
 Operand storage proofs are parameterized by computation mode. A global fact
 allowing rounded operands to read pre-cast storage would also let ordinary F32
@@ -201,6 +388,34 @@ ordinary F32 calls over materialized rounded operands remain available to
 production search. The agreed environment assumption is that
 `NVIDIA_TF32_OVERRIDE` is unset. No runtime environment check is added.
 
+### FP16/BF16 input conversion over FP32 storage
+
+`CublasLtFloat32FastFloat16Computation` and
+`CublasLtFloat32FastBfloat16Computation` map to
+`CUBLAS_COMPUTE_32F_FAST_16F` and `CUBLAS_COMPUTE_32F_FAST_16BF`.
+Both operands must independently prove the same authored
+`F32 -> F16/Bf16 -> F32` cast chain. Input conversion follows the existing
+nearest-even FP16/BF16 cast contract; widening is exact and accumulation is
+FP32. A/B storage descriptors remain FP32. Each mode has 448 explicit complete
+whitelist rows covering host/device FP32 alpha/beta, optional FP32 C, and the
+existing FP32-output epilogues. Final output casts remain after the full call.
+
+The mode-specific operand proof may read pre-cast FP32 storage. Ordinary FP32
+calls continue to consume materialized rounded operands, including narrow
+storage when its widening is proved. Earlier casts remain in the source;
+rounding after a product or reduction never authorizes input conversion.
+Pure views, one-axis batches, independently broadcast A/B inputs, and both
+destination forms share the existing recognition/layout/emission machinery.
+
+The FAST compute enum alone does not guarantee this conversion: CUDA 12.8/A100
+probes selected full-FP32 or TF32 algorithms for some shapes. Dispatch sets
+`CUBLASLT_MATMUL_PREF_IMPL_MASK` to require `INPUT_16F` or `INPUT_16BF`, just as
+TF32 requires `INPUT_TF32`. The vendor's
+[implementation flags](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltnumericalimplflags-t)
+describe the inner dot-product input precision. If no matching algorithm is
+available, preparation refuses the candidate and materialized-rounding
+alternatives remain available. Reduction masks stay in the whitelist.
+
 ## Element strides and strided batches
 
 Core represents coefficients with `ElementStrideExact IntExpr` and
@@ -213,7 +428,7 @@ simplification can erase at singleton extents.
 The batched recognizer matches `A[B,m,k]` and `B[B,k,n]` broadcast into the exact
 `[B,m,n,k]` multiply domain followed by reduction over k. Both maps must use the
 batch coordinate, even when a matrix extent happens to equal B. A static B=1
-also permits its coordinate to be literal zero. Arithmetic remains F32, with
+also permits its coordinate to be literal zero. Arithmetic is F16, F32 or F64, with
 explicit narrow-input widening handled by the shared storage-reading proofs. An
 authored final BF16/FP16 cast can select the matching narrow D and C storage.
 
@@ -247,20 +462,144 @@ and legal leading dimension. This relation is used only for A and B. Every
 vendor descriptor still carries the common logical batch count; sharing is
 represented by stride zero, not a descriptor count of one. The independent
 [layout attributes](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatrixlayoutattribute-t)
-are dispatched unchanged. Precision/storage proofs and the complete 2,176-row
+are dispatched unchanged. Precision/storage proofs and the complete 4,096-row
 configuration whitelist remain shared with ordinary batches.
 
-Read sharing never publishes a disjoint matrix or destination proof. C and D
-retain the full padded, non-overlapping batch footprint, including in-place
-calls. Thus a shared A/B reading cannot authorize an overlapping output or a
-shared C/D write. Partial matrix overlap remains unsupported.
+Read sharing never publishes a disjoint matrix or destination proof. Every D
+retains the full padded, non-overlapping batch footprint, including in-place
+calls. C has a separate read-only relation for shared matrices and broadcast
+vectors; those permissions never authorize a shared C/D write. Partial matrix
+overlap remains unsupported.
 
-Batched admission currently covers a product and product+C, without
-bias or activation. C and D share shape, dtype, order and count but may have
-independent leading dimensions and batch strides. In-place emission additionally
-requires identical complete descriptions and layouts. Multiple batch axes and
-arbitrary flattening are not part of this grammar. Unproved cases retain generic
+Batched admission covers a scaled product and scaled product+C, optionally
+followed by feature bias and ReLU or GELU. It reuses the shared typed activation recognizers,
+including both frontend GELU spellings, and the existing precision-specific
+storage/scalar proofs. Recognition describes the complete expression before its
+final output cast. Intervening casts remain arithmetic boundaries: rounding
+before activation cannot be moved after activation. Native narrow-output GELU
+and INT8 epilogues remain excluded by the existing whitelist.
+
+Activations require column-major vendor D. Dense row-major logical outputs use
+a pure `[batch,m,n] -> [batch,n,m]` view of the complete activated expression,
+with `B^T`, `A^T` and optional `C^T` as operands. The inverse view restores the
+logical result, preserving the batch coordinate throughout. These are existing
+`LogicalIndexMapApply` views, not materialized transposes. Both direct and
+transposed frames join the same complete whitelist rows; no new configurations
+or dispatch modes are needed. The 1,152 no-bias activation rows admit batched
+calls as well as ordinary calls, including 576 in-place configurations.
+Exact transpose views are recognized after cast commuting, and two transposes
+cancel. This keeps the same equivalence available below explicit casts and
+prevents inverse result views from creating an unbounded cast/view ladder.
+
+C and D share shape, dtype, order and count but may have independent leading
+dimensions and batch strides. In-place emission additionally requires identical
+complete descriptions and layouts. Multiple batch axes and arbitrary flattening
+are not part of this grammar. Unproved cases retain generic
 operations/materialization.
+
+### Batched feature bias alongside residual C
+
+The native bias argument is independent of C. The authored expression is
+`activation(alpha * A[b] @ B[b] + beta * C[b] + bias[b])`; without C, beta is
+zero. For example:
+
+```rust,ignore
+let residual = graph.tensor([g, m, n], DType::F32);
+let bias = graph.tensor([g, n], DType::F32).expand_dim(1, m);
+let y = (a.matmul(b) + residual + bias).relu();
+```
+
+A shared `[n]` bias instead explicitly expands over m and g. In either form,
+bias storage is a packed feature vector: unit feature stride, zero broadcast
+stride, and batch pitch zero (shared) or a disjoint pitch covering n elements.
+Per-batch pitches must preserve **16-byte alignment**: multiples of four F32,
+two F64 or eight F16/BF16 elements. Padded and symbolic pitches are supported
+when the proof establishes these properties. This is a conservative safety
+contract: CUDA 12.8/A100's heuristic selected a TF32 kernel that faults with a
+nine-F32 bias pitch, while aligned pitches passed. Unaligned layouts retain
+legal copy/unfused alternatives; no unsafe pitch is emitted. The underlying
+[`BIAS_BATCH_STRIDE` attribute](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmuldescattributes-t)
+is in elements and defaults to zero.
+
+Recognition carries the full logical broadcast into the whole-expression
+transpose frame. Storage proofs then check the vendor bias axis, including
+when m, n and batch extents happen to be equal. The full C input keeps its own
+descriptor and may use full/shared matrices or a compatible broadcast layout.
+C/D still share API order: a native feature bias composes with a feature-vector
+C broadcast; a C vector varying over the other matrix axis needs full-matrix
+materialization before the biased call.
+Exact-storage proofs preserve casts; bias is not reassociated across C addition
+or activation. Separate and in-place emission share the complete admission
+proof, and bias remains read-only in both. The bias descriptor owns its dtype
+and batch pitch; D owns the row length and batch count. Capacity validation
+checks the last vector, and capture dependencies include bias-only symbols.
+
+All **1,536 existing native-bias whitelist rows** now accept batched geometry:
+ordinary F32, F16/BF16 inputs with F32 output, F64, native F16, TF32 and both fast
+F32-storage conversion modes. Bias dtype still follows the complete row.
+The 4,096-row whitelist is unchanged. F32-compute narrow-output bias/GELU and
+INT8 native epilogues remain unwhitelisted. The rule tests require both shared
+and per-batch witnesses for every admitted row, including both executable forms
+for C-present configurations. Device tests execute those 4,608 witnesses and
+compare compiled graphs with `ReferenceRuntime`, including symbolic bias pitch
+replay, typed live coefficients and retained C/bias.
+
+### Read-only broadcast C
+
+The C-specific batch reading accepts ordinary disjoint matrices, a matrix
+explicitly shared across batches, and packed row/column vectors. For example:
+
+```rust,ignore
+let c = graph.tensor([g, n], DType::F32).expand_dim(1, m);
+let y = a.matmul(b) + c; // each batch reads its own packed feature vector
+```
+
+A single `[n]` vector expanded over both m and g instead uses batch stride
+zero. `[g,m]` expanded over n gives the column-vector form. Broadcasting is
+authored by the frontend; backend rules consume its complete shape-owned stride
+certificate. The broadcast matrix axis must have an exact zero coefficient,
+and the vector's minor stride must be unit (or locally free on a singleton).
+C uses leading dimension zero; distinct vectors require a batch pitch covering
+the whole vector, including any inter-vector padding. An exact zero batch stride
+shares the vector. Partial vector overlap and non-packed vectors retain generic
+materialization alternatives.
+
+C and D still require the same vendor memory order. Row-major C with zero
+leading dimension broadcasts rows; column-major C broadcasts columns. The
+whole-expression transpose frame carries C with the activated result. As in
+rank-two admission, the chosen D layout must support that broadcast orientation;
+the column-vector execution tests use column-major matrix output boundaries.
+
+`cublaslt-strided-batch-C-matrix-reading` alone grants these read permissions.
+It never publishes a destination or disjoint-matrix reading. Every destination
+keeps a positive leading dimension and full padded batch pitch; native broadcast
+or shared C therefore cannot become an in-place destination. Existing in-place
+calls over ordinary full C storage retain their identical-descriptor proof.
+The flat descriptors, dtype/precision proofs, alpha/beta arguments, complete
+whitelist tuples and dispatch are unchanged. In particular, this does not add
+native bias epilogues or admit the excluded narrow-output bias/GELU tuples.
+
+Broadcast-C regressions prove and execute all 1,280 existing no-bias C-present
+configurations on CUDA 12.8/A100. Reference comparisons cover both vector axes,
+shared vectors/matrices, all eleven storage/computation families, live device
+coefficients, padded vector pitches, retained read-only inputs and changing
+batch counts. Large FP16/BF16 cancellation fixtures check that C is added before
+the authored final narrowing. Negative tests reject incomplete whitelist rows,
+partial vector/matrix overlap, non-packed vectors and writable broadcast layouts.
+The whitelist remains 4,096 rows; these are additional geometry proofs for its
+existing tuples.
+
+`cublaslt_batched_epilogues` proves all 1,152 no-bias activation configurations
+and executes all 1,728 separate/in-place batched witnesses against independent
+arithmetic on CUDA 12.8/A100. Compiled reference comparisons cover the ten
+floating storage/computation families, both GELU spellings, shared A/B/both,
+host/device coefficients, retained C, final narrowing and symbolic batch replay.
+These execution tests restrict the selectable registry to fused calls, pure
+views and scalar constants, so a materialized operand cannot conceal a missing
+shared-storage proof. The
+production registry retains its legal materialization alternatives. Admission
+tests also cover complete-row ablation, cast boundaries and independent C/D
+pitches. The explicit whitelist remains 4,096 rows.
 
 Experimental literal-expression discovery is separately scheduled through
 `element-stride-discovery`; production schedules do not run it. Native stride
@@ -377,6 +716,23 @@ All 17 device-enabled batch regressions pass, including the original 1,152
 disjoint-batch witnesses. Formatting and device-enabled CUDA Lite Clippy with
 `-D warnings` pass. The five-package landing sweep passes 681 tests with 54
 existing ignores.
+
+At the FP64 checkpoint, the table contains **2,304 configurations** and
+**1,152 in-place configurations**. The A100 execution boards cover all of them,
+plus **1,344 disjoint-batch witnesses** and **4,032 shared-A/B/both witnesses**.
+The FP64 numerical checks use matrix values and coefficients with significant
+bits beyond FP32 precision. Seven FP64 regressions cover typed default scalars,
+full-width host literals, GPU inputs, mixed host/device coefficients,
+GPU-produced coefficients, authored operand orders, shared storage, in-place
+C preservation, and symbolic batch-count/coefficient replay against the
+reference runtime. Whitelist ablation and wrong scalar ABI/capacity refusal
+remain explicit admission checks.
+
+The five-package landing sweep passes **777 tests with 54 existing ignores**.
+The seven device-enabled cuBLASLt suites cover **67 distinct passing tests**;
+FP64 is rerun with the final double-precision reduction preference. Formatting,
+workspace Clippy with the CI exclusions, and device-enabled CUDA Lite Clippy
+with `-D warnings` pass.
 
 The benchmark below is historical: it measures the older 48-row foundation on
 `77d3060f`, before this restored 672-row vocabulary and batched support. Its

@@ -555,6 +555,14 @@ impl CudaRuntime {
             &bounds.ranges(),
             &self.externals,
         )?);
+        outcome.intermediate_budget_bytes = crate::search::resolve_intermediate_budget(
+            outcome.arena_budget_bytes,
+            self.storage
+                .as_ref()
+                .expect("storage was just planned")
+                .peak_boundary_bytes,
+            options.intermediate_budget_bytes,
+        );
         self.plan = Some(outcome.best_plan.clone());
         self.bounds = bounds.clone();
         self.dims = profile_dims.clone();

@@ -95,8 +95,8 @@ pub const RMS_NORM_HEAD_EPS: f32 = 1e-6;
 pub const ROPE_THETA: f32 = 2000.0;
 pub const ROPE_AXES: [usize; 4] = [32, 32, 32, 32];
 
-/// Logical parameter dtype. Checkpoint residency (BF16 in the released
-/// weights) is a runtime binding decision, not part of the model graph.
+/// Default logical parameter dtype. Full-model applications can select the
+/// released BF16 checkpoint contract through [`Flux2Transformer::init_with_dtype`].
 pub const WEIGHT_DTYPE: DType = DType::F32;
 
 // =============================================================================
@@ -107,16 +107,20 @@ fn linear_no_bias(x: GraphTensor, w: GraphTensor) -> GraphTensor {
     if x.dtype == w.dtype {
         x.matmul(w.t())
     } else {
-        x.cast(w.dtype).matmul(w.t()).cast(x.dtype)
+        assert_eq!(x.dtype, DType::F32);
+        assert_eq!(w.dtype, DType::Bf16);
+        x.cast(DType::Bf16)
+            .cast(DType::F32)
+            .matmul(w.cast(DType::F32).t())
     }
 }
 
 /// Pre-norm RMSNorm over the trailing axis with weight (`scale`); no shift.
 fn rmsnorm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
-    let w = if weight.dtype == DType::F32 {
+    let w = if weight.dtype == x.dtype {
         weight
     } else {
-        weight.cast(DType::F32)
+        weight.cast(x.dtype)
     };
     let x_rank = x.dims().len();
     let w_rank = w.dims().len();
@@ -168,7 +172,9 @@ fn apply_rope(x: GraphTensor, cos: GraphTensor, sin: GraphTensor) -> GraphTensor
 
     let cos_b = cos.expand_dim(1, h);
     let sin_b = sin.expand_dim(1, h);
-    x.cast(DType::F32) * cos_b.cast(DType::F32) + x_rot.cast(DType::F32) * sin_b.cast(DType::F32)
+    assert_eq!(x.dtype, cos_b.dtype);
+    assert_eq!(x.dtype, sin_b.dtype);
+    x * cos_b + x_rot * sin_b
 }
 
 /// Scaled dot-product attention with NO mask, no causal: standard SDPA.
@@ -290,17 +296,17 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn new(prefix: &str, dim: usize, mlp_hidden: usize, cx: &mut Graph) -> Self {
+    fn new(prefix: &str, dim: usize, mlp_hidden: usize, dtype: DType, cx: &mut Graph) -> Self {
         Self {
             linear_in: cx.named_tensor(
                 format!("{prefix}.linear_in.weight"),
                 vec![mlp_hidden * 2, dim],
-                WEIGHT_DTYPE,
+                dtype,
             ),
             linear_out: cx.named_tensor(
                 format!("{prefix}.linear_out.weight"),
                 vec![dim, mlp_hidden],
-                WEIGHT_DTYPE,
+                dtype,
             ),
         }
     }
@@ -332,9 +338,9 @@ struct DoubleStreamAttn {
 }
 
 impl DoubleStreamAttn {
-    fn new(prefix: &str, cx: &mut Graph) -> Self {
+    fn new(prefix: &str, dtype: DType, cx: &mut Graph) -> Self {
         let lin = |n: &str, cx: &mut Graph| -> GraphTensor {
-            cx.named_tensor(format!("{prefix}.{n}"), vec![HIDDEN, HIDDEN], WEIGHT_DTYPE)
+            cx.named_tensor(format!("{prefix}.{n}"), vec![HIDDEN, HIDDEN], dtype)
         };
         Self {
             to_q: lin("to_q.weight", cx),
@@ -343,25 +349,17 @@ impl DoubleStreamAttn {
             add_q_proj: lin("add_q_proj.weight", cx),
             add_k_proj: lin("add_k_proj.weight", cx),
             add_v_proj: lin("add_v_proj.weight", cx),
-            norm_q: cx.named_tensor(
-                format!("{prefix}.norm_q.weight"),
-                vec![HEAD_DIM],
-                WEIGHT_DTYPE,
-            ),
-            norm_k: cx.named_tensor(
-                format!("{prefix}.norm_k.weight"),
-                vec![HEAD_DIM],
-                WEIGHT_DTYPE,
-            ),
+            norm_q: cx.named_tensor(format!("{prefix}.norm_q.weight"), vec![HEAD_DIM], dtype),
+            norm_k: cx.named_tensor(format!("{prefix}.norm_k.weight"), vec![HEAD_DIM], dtype),
             norm_added_q: cx.named_tensor(
                 format!("{prefix}.norm_added_q.weight"),
                 vec![HEAD_DIM],
-                WEIGHT_DTYPE,
+                dtype,
             ),
             norm_added_k: cx.named_tensor(
                 format!("{prefix}.norm_added_k.weight"),
                 vec![HEAD_DIM],
-                WEIGHT_DTYPE,
+                dtype,
             ),
             to_out: lin("to_out.0.weight", cx),
             to_add_out: lin("to_add_out.weight", cx),
@@ -447,28 +445,20 @@ struct SingleStreamAttn {
 }
 
 impl SingleStreamAttn {
-    fn new(prefix: &str, cx: &mut Graph) -> Self {
+    fn new(prefix: &str, dtype: DType, cx: &mut Graph) -> Self {
         let qkv_mlp_out = 3 * HIDDEN + 2 * MLP_HIDDEN; // 18432 + 36864 = 55296
         Self {
             to_qkv_mlp_proj: cx.named_tensor(
                 format!("{prefix}.to_qkv_mlp_proj.weight"),
                 vec![qkv_mlp_out, HIDDEN],
-                WEIGHT_DTYPE,
+                dtype,
             ),
-            norm_q: cx.named_tensor(
-                format!("{prefix}.norm_q.weight"),
-                vec![HEAD_DIM],
-                WEIGHT_DTYPE,
-            ),
-            norm_k: cx.named_tensor(
-                format!("{prefix}.norm_k.weight"),
-                vec![HEAD_DIM],
-                WEIGHT_DTYPE,
-            ),
+            norm_q: cx.named_tensor(format!("{prefix}.norm_q.weight"), vec![HEAD_DIM], dtype),
+            norm_k: cx.named_tensor(format!("{prefix}.norm_k.weight"), vec![HEAD_DIM], dtype),
             to_out: cx.named_tensor(
                 format!("{prefix}.to_out.weight"),
                 vec![HIDDEN, HIDDEN + MLP_HIDDEN],
-                WEIGHT_DTYPE,
+                dtype,
             ),
         }
     }
@@ -524,12 +514,18 @@ struct DoubleStreamBlock {
 }
 
 impl DoubleStreamBlock {
-    fn new(idx: usize, cx: &mut Graph) -> Self {
+    fn new(idx: usize, dtype: DType, cx: &mut Graph) -> Self {
         let prefix = format!("transformer_blocks.{idx}");
         Self {
-            attn: DoubleStreamAttn::new(&format!("{prefix}.attn"), cx),
-            ff: FeedForward::new(&format!("{prefix}.ff"), HIDDEN, MLP_HIDDEN, cx),
-            ff_context: FeedForward::new(&format!("{prefix}.ff_context"), HIDDEN, MLP_HIDDEN, cx),
+            attn: DoubleStreamAttn::new(&format!("{prefix}.attn"), dtype, cx),
+            ff: FeedForward::new(&format!("{prefix}.ff"), HIDDEN, MLP_HIDDEN, dtype, cx),
+            ff_context: FeedForward::new(
+                &format!("{prefix}.ff_context"),
+                HIDDEN,
+                MLP_HIDDEN,
+                dtype,
+                cx,
+            ),
         }
     }
 
@@ -593,10 +589,10 @@ struct SingleStreamBlock {
 }
 
 impl SingleStreamBlock {
-    fn new(idx: usize, cx: &mut Graph) -> Self {
+    fn new(idx: usize, dtype: DType, cx: &mut Graph) -> Self {
         let prefix = format!("single_transformer_blocks.{idx}");
         Self {
-            attn: SingleStreamAttn::new(&format!("{prefix}.attn"), cx),
+            attn: SingleStreamAttn::new(&format!("{prefix}.attn"), dtype, cx),
         }
     }
 
@@ -733,7 +729,15 @@ impl Flux2Transformer {
     /// The complete black-forest-labs/FLUX.2-dev transformer: 8 double-stream
     /// blocks followed by 48 single-stream blocks.
     pub fn init(cx: &mut Graph) -> Self {
-        let bf16 = WEIGHT_DTYPE;
+        Self::init_with_dtype(cx, WEIGHT_DTYPE)
+    }
+
+    /// Build the released model with an explicit checkpoint storage dtype.
+    /// BF16 parameters retain F32 activations and accumulation; projection
+    /// inputs are rounded explicitly at each mixed-precision boundary.
+    pub fn init_with_dtype(cx: &mut Graph, dtype: DType) -> Self {
+        assert!(matches!(dtype, DType::F32 | DType::Bf16));
+        let bf16 = dtype;
         let mk = |name: &str, shape: (usize, usize), cx: &mut Graph| -> GraphTensor {
             cx.named_tensor(name, vec![shape.0, shape.1], bf16)
         };
@@ -786,10 +790,10 @@ impl Flux2Transformer {
         );
 
         let transformer_blocks = (0..NUM_LAYERS)
-            .map(|i| DoubleStreamBlock::new(i, cx))
+            .map(|i| DoubleStreamBlock::new(i, dtype, cx))
             .collect();
         let single_transformer_blocks = (0..NUM_SINGLE_LAYERS)
-            .map(|i| SingleStreamBlock::new(i, cx))
+            .map(|i| SingleStreamBlock::new(i, dtype, cx))
             .collect();
 
         Self {
@@ -826,10 +830,12 @@ impl Flux2Transformer {
         // pipeline-level interface) and we mirror the *1000 here.
         let timestep = timestep * 1000.0_f32;
         let guidance = guidance * 1000.0_f32;
-        let t_proj = timesteps_proj(timestep, TIMESTEP_GUIDANCE_CHANNELS);
+        let t_proj =
+            timesteps_proj(timestep, TIMESTEP_GUIDANCE_CHANNELS).cast(self.time_t1_w.dtype);
         let t1 = linear_no_bias(t_proj, self.time_t1_w).silu();
         let t_emb = linear_no_bias(t1, self.time_t2_w);
-        let g_proj = timesteps_proj(guidance, TIMESTEP_GUIDANCE_CHANNELS);
+        let g_proj =
+            timesteps_proj(guidance, TIMESTEP_GUIDANCE_CHANNELS).cast(self.guidance_t1_w.dtype);
         let g1 = linear_no_bias(g_proj, self.guidance_t1_w).silu();
         let g_emb = linear_no_bias(g1, self.guidance_t2_w);
         t_emb + g_emb

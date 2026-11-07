@@ -1,7 +1,7 @@
-//! Every kernel that calls a CUDA math-library function names the
-//! function for its operands' dtype — `sqrtf` for F32, `sqrt` for F64 —
-//! and refuses every other dtype instead of letting C++ convert the
-//! value at the call. Codegen runs on any host, so this needs no device.
+//! Every direct logical math kernel names the CUDA function and conversions
+//! for its operands' dtype: F32 calls the `f` function, F64 calls the double
+//! function, and F16/BF16 explicitly use F32 opmath before rounding to the
+//! declared destination. Codegen runs on any host, so this needs no device.
 
 use crate::kernels::{CodegenCtx, KernelOp};
 use luminal::dtype::PlanDtype;
@@ -134,21 +134,42 @@ fn f64_operands_call_the_double_function() {
     }
 }
 
-/// A narrow float is storage: the kernel refuses it rather than computing
-/// in float behind the graph's back, and so does every non-float dtype.
 #[test]
-fn every_other_dtype_is_refused_by_name() {
+fn narrow_floats_use_explicit_f32_opmath_and_round_to_the_destination() {
     for kernel in math_kernels() {
-        for dtype in [PlanDtype::F16, PlanDtype::Bf16, PlanDtype::Int] {
-            let error = source(&kernel, dtype).expect_err("non-F32/F64 math must refuse");
-            let message = error.to_string();
+        for dtype in [PlanDtype::F16, PlanDtype::Bf16] {
+            let source = source(&kernel, dtype).expect("narrow-float codegen");
+            let call = format!("{}((float)(a[i])", kernel.f32_name);
             assert!(
-                message.contains(&format!("has no {dtype:?} arm"))
-                    && message.contains(kernel.f64_name),
-                "{}: unexpected refusal `{message}`",
-                kernel.f64_name
+                source.contains(&call),
+                "{} {dtype:?}: missing `{call}`:\n{source}",
+                kernel.f32_name,
+            );
+            let dest = crate::kernels::cuda_type((kernel.dest)(dtype)).unwrap();
+            assert!(
+                source.contains(&format!("({dest})({}", kernel.f32_name)),
+                "{} {dtype:?}: result is not explicitly converted to {dest}:\n{source}",
+                kernel.f32_name,
+            );
+            assert!(
+                !source.contains(&format!("{}(", kernel.f64_name)),
+                "{} {dtype:?}: narrow kernel calls the F64 function:\n{source}",
+                kernel.f32_name,
             );
         }
+    }
+}
+
+#[test]
+fn non_float_math_is_refused_by_name() {
+    for kernel in math_kernels() {
+        let error = source(&kernel, PlanDtype::Int).expect_err("integer math must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("has no Int arm") && message.contains(kernel.f64_name),
+            "{}: unexpected refusal `{message}`",
+            kernel.f64_name
+        );
     }
 }
 

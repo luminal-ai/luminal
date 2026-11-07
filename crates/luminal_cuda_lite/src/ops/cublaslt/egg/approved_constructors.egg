@@ -5,13 +5,24 @@
 (datatype CublasLtMatrixOrder (CublasLtRowMajor) (CublasLtColumnMajor))
 (datatype CublasLtMatrixOperation (CublasLtNoTranspose) (CublasLtTranspose))
 (datatype CublasLtComputationType
+  (CublasLtFloat16Computation)
   (CublasLtFloat32Computation)
-  (CublasLtTensorFloat32Computation))
+  (CublasLtTensorFloat32Computation)
+  (CublasLtFloat32FastFloat16Computation)
+  (CublasLtFloat32FastBfloat16Computation)
+  (CublasLtFloat64Computation))
+; This is selected by the complete whitelist row, not inferred from storage.
+; NONE (zero) is allowed by either mask; neither mask forces split-K.
+(datatype CublasLtReductionSchemeMask
+  (CublasLtReductionSchemeMaskAll)
+  (CublasLtReductionSchemeMaskComputeType))
 ; Pointer location is an approved API capability; values belong to the call.
 (datatype CublasLtScalarPointerMode
   (CublasLtHostScalarPointerMode) (CublasLtDeviceScalarPointerMode))
 (datatype CublasLtScalarArguments
+  (CublasLtHostFloat16ScalarArguments f64 f64)
   (CublasLtHostScalarArguments f64 f64)
+  (CublasLtHostFloat64ScalarArguments f64 f64)
   (CublasLtDeviceScalarArguments LayoutTensor LayoutTensor))
 (datatype CublasLtEpilogue
   (CublasLtDefaultEpilogue)
@@ -40,9 +51,11 @@
 (datatype CublasLtCMatrixArgument
   (CublasLtCMatrixAbsent)
   (CublasLtCMatrixInput CublasLtMatrixDescriptor))
-(datatype CublasLtBiasArgument (CublasLtBiasAbsent) (CublasLtBiasInput LayoutTensor Dtype))
+; Packed bias storage and its vendor batch stride in elements. Rank-two calls
+; and shared vectors explicitly use stride zero; the D descriptor owns count/m.
+(datatype CublasLtBiasArgument (CublasLtBiasAbsent) (CublasLtBiasInput LayoutTensor Dtype IntExpr))
 ; Full configuration: compute, scale, A/B/D storage, C/bias storage or absence,
-; scalar pointer mode, epilogue, A/B/D orders, A/B operations. Matrix and batch
+; scalar pointer mode, epilogue, A/B/D orders, A/B operations, reduction mask. Matrix and batch
 ; geometry live in the descriptors and require the corresponding layout proofs.
 (datatype CublasLtConfiguration
   (CublasLtConfigurationOf
@@ -59,7 +72,8 @@
     CublasLtMatrixOrder        ; B order
     CublasLtMatrixOrder        ; D order; C must have the same order
     CublasLtMatrixOperation    ; op(A)
-    CublasLtMatrixOperation))  ; op(B)
+    CublasLtMatrixOperation    ; op(B)
+    CublasLtReductionSchemeMask)) ; allowed intermediate reduction schemes
 ; A frame ties every component to one complete expression. The first tensor
 ; is the original expression; the second is the output in the API call frame.
 (datatype CublasLtExpressionFrame
@@ -71,8 +85,8 @@
     CublasLtLogicalCMatrix   ; logical C matrix, or explicit absence
     CublasLtLogicalBias      ; logical bias vector, or explicit absence
     CublasLtEpilogue
-    LogicalTensor           ; alpha, rank-zero F32
-    LogicalTensor))         ; beta, rank-zero F32
+    LogicalTensor           ; alpha, rank-zero arithmetic dtype
+    LogicalTensor))         ; beta, rank-zero arithmetic dtype
 (constructor LayoutTensorOpCublasLtCall
   (CublasLtConfiguration       ; complete approved configuration
     CublasLtMatrixDescriptor   ; A matrix descriptor
@@ -98,6 +112,6 @@
     CublasLtScalarArguments)
   LayoutTensorOp)
 
-; Computation contract, semantic F32 operand, physical descriptor source.
+; Computation contract, semantic arithmetic operand, physical descriptor source.
 ; Bypassing a rounding cast is valid only for the computation that performs it.
 (relation cublaslt-operand-storage-reading (CublasLtComputationType LogicalTensor LogicalTensor))

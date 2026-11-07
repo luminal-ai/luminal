@@ -220,7 +220,7 @@ fn narrow_and_wide_arithmetic_stay_in_distinct_eclasses() {
 }
 
 #[test]
-fn narrow_matmul_followed_by_widening_never_mints_cublaslt() {
+fn narrow_matmul_followed_by_widening_preserves_its_product_contract() {
     for dtype in [DType::Bf16, DType::F16] {
         for with_bias in [false, true] {
             let mut cx = Graph::new();
@@ -236,13 +236,39 @@ fn narrow_matmul_followed_by_widening_never_mints_cublaslt() {
             let _out = product.cast(DType::F32);
             let runtime = CudaRuntime::load(&cx).unwrap();
             let egraph = runtime.saturated_egraph(&Default::default()).unwrap();
-            assert!(
-                !egraph
-                    .nodes
-                    .values()
-                    .any(|node| node.op.starts_with("LayoutTensorOpCublasLt")),
-                "{dtype:?} arithmetic, bias={with_bias}, cannot become F32 accumulation"
-            );
+            use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
+            use luminal_cuda_lite::ops::cublaslt::approved::{
+                ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
+            };
+            use luminal_cuda_lite::ops::cublaslt::exec::LtComputation;
+            let index = SerializedIndex::new(&egraph);
+            let mut count = 0;
+            for (node_id, node) in &egraph.nodes {
+                if node.subsumed || node.op != CONSTRUCTOR {
+                    continue;
+                }
+                let op = ApprovedCublasLtMatcher.extract(&ExtractionSite {
+                    egraph: &egraph,
+                    node_id,
+                    node,
+                    index: &index,
+                });
+                let op = op.as_any().downcast_ref::<ApprovedCublasLt>().unwrap();
+                match dtype {
+                    DType::Bf16 => {
+                        assert_eq!(op.computation, LtComputation::Float32);
+                        assert_eq!(op.a.dtype, luminal::dtype::PlanDtype::Bf16);
+                        assert_eq!(op.b.dtype, luminal::dtype::PlanDtype::Bf16);
+                        assert_eq!(op.d.dtype, luminal::dtype::PlanDtype::Bf16);
+                        assert_eq!(op.scale, luminal::dtype::PlanDtype::F32);
+                        assert!(op.bias.is_none());
+                    }
+                    DType::F16 => assert_eq!(op.computation, LtComputation::Float16),
+                    _ => unreachable!(),
+                }
+                count += 1;
+            }
+            assert!(count > 0);
         }
     }
 }

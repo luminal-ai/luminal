@@ -156,7 +156,7 @@ fn singleton_freedom_requires_proof_and_appears_after_shape_specialization() {
 }
 
 #[test]
-fn input_widening_and_output_widening_remain_different_arithmetic() {
+fn native_bf16_and_explicitly_widened_products_remain_distinct() {
     let inputs = input("a", "(IntLit 3)", "(IntLit 8)", None, "Bf16")
         + &input("b", "(IntLit 8)", "(IntLit 4)", None, "Bf16");
     let after = run(
@@ -164,10 +164,15 @@ fn input_widening_and_output_widening_remain_different_arithmetic() {
             + "(let p (LogicalHelperMatrixMultiply a b))\n(let out (LogicalCast p (F32)))\n"),
         "",
     );
-    assert!(
-        calls(&after).is_empty(),
-        "widening after narrow arithmetic must not mint a vendor F32 product"
-    );
+    let native = calls(&after);
+    assert!(!native.is_empty());
+    assert!(native.iter().all(|op| {
+        op.computation == luminal_cuda_lite::ops::cublaslt::exec::LtComputation::Float32
+            && op.a.dtype == PlanDtype::Bf16
+            && op.b.dtype == PlanDtype::Bf16
+            && op.d.dtype == PlanDtype::Bf16
+            && op.scale == PlanDtype::F32
+    }));
     let before = run(
         &(inputs
             + "(let aw (LogicalCast a (F32)))\n(let bw (LogicalCast b (F32)))\n(let p (LogicalHelperMatrixMultiply aw bw))\n"),
@@ -207,19 +212,40 @@ fn c_then_bias_is_the_only_fully_fused_addition_order() {
 }
 
 #[test]
-fn only_f32_calls_are_minted() {
-    for dtype in ["F32", "F16", "Bf16"] {
+fn direct_products_require_an_explicitly_admitted_arithmetic_dtype() {
+    use luminal_cuda_lite::ops::cublaslt::exec::LtComputation;
+    for (dtype, expected) in [
+        (
+            "F32",
+            Some((LtComputation::Float32, PlanDtype::F32, PlanDtype::F32)),
+        ),
+        (
+            "F16",
+            Some((LtComputation::Float16, PlanDtype::F16, PlanDtype::F16)),
+        ),
+        (
+            "F64",
+            Some((LtComputation::Float64, PlanDtype::F64, PlanDtype::F64)),
+        ),
+        (
+            "Bf16",
+            Some((LtComputation::Float32, PlanDtype::Bf16, PlanDtype::F32)),
+        ),
+    ] {
         let body = input("a", "(IntLit 3)", "(IntLit 8)", None, dtype)
             + &input("b", "(IntLit 8)", "(IntLit 4)", None, dtype)
             + "(let p (LogicalHelperMatrixMultiply a b))\n";
         let graph = run(&body, "");
-        let count = graph
-            .nodes
-            .values()
-            .filter(|node| node.op == CONSTRUCTOR)
-            .count();
-        assert_eq!(count > 0, dtype == "F32", "dtype={dtype}, calls={count}");
-        println!("WHITELIST {dtype}: {count} calls");
+        let calls = calls(&graph);
+        assert_eq!(!calls.is_empty(), expected.is_some(), "dtype={dtype}");
+        for call in calls {
+            let (computation, storage, scale) = expected.unwrap();
+            assert_eq!(call.computation, computation);
+            assert_eq!(
+                (call.a.dtype, call.b.dtype, call.d.dtype, call.scale),
+                (storage, storage, storage, scale)
+            );
+        }
     }
 }
 

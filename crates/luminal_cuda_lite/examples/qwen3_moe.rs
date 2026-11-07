@@ -28,7 +28,7 @@ fn run() -> anyhow::Result<()> {
     const SLOTS: usize = 4;
     let dims = Qwen3MoeDims::qwen3_30b_a3b();
     let mut cx = Graph::new();
-    let model = Qwen3Moe::init(&mut cx, &dims);
+    let model = Qwen3Moe::init_with_dtype(&mut cx, &dims, DType::Bf16);
     let token = cx.tensor(vec![1], DType::Int);
     let q_pos = cx.tensor(vec![1], DType::Int);
     let rope_cos = cx.tensor(vec![1, dims.head_dim], DType::F32);

@@ -26,6 +26,22 @@ use luminal_nn::{
     AttentionGeometry, CacheAccess, KvCache, KvCachePool, TopKRoutes, causal_bias, paged_attention,
 };
 
+/// Run an F32 projection from BF16-resident operands with explicit BF16
+/// input rounding and F32 accumulation. CUDA backends may consume both
+/// rounded operands directly from narrow storage.
+fn linear(input: GraphTensor, weight: GraphTensor, bias: Option<GraphTensor>) -> GraphTensor {
+    if input.dtype == weight.dtype {
+        return luminal_nn::linear(input, weight, bias);
+    }
+    assert_eq!(input.dtype, DType::F32);
+    assert_eq!(weight.dtype, DType::Bf16);
+    luminal_nn::linear(
+        input.cast(DType::Bf16).cast(DType::F32),
+        weight.cast(DType::F32),
+        bias.map(|value| value.cast(DType::F32)),
+    )
+}
+
 #[derive(Clone)]
 pub struct Qwen3MoeDims {
     pub vocab: usize,
@@ -106,14 +122,15 @@ impl Qwen3MoeFfn {
     }
 
     fn forward(&self, input: GraphTensor) -> GraphTensor {
-        let probabilities =
-            luminal_nn::linear(input, self.router_weight, self.router_bias).softmax(vec![1]);
+        let probabilities = linear(input, self.router_weight, self.router_bias).softmax(vec![1]);
         let expert_ids = probabilities.topk_indexes(self.top_k, 1);
         let routes = TopKRoutes::from_scores(probabilities, expert_ids).normalize();
 
         let gate_up = routes.select(self.gate_up).cast(DType::F32);
         let projected = routes
             .dispatch(input)
+            .cast(self.gate_up.dtype)
+            .cast(DType::F32)
             .expand_dim(2, 1)
             .matmul(gate_up.permute(vec![0, 1, 3, 2]))
             .squeeze(2);
@@ -123,6 +140,8 @@ impl Qwen3MoeFfn {
 
         let down = routes.select(self.down).cast(DType::F32);
         let routed_output = hidden_states
+            .cast(self.down.dtype)
+            .cast(DType::F32)
             .expand_dim(2, 1)
             .matmul(down.permute(vec![0, 1, 3, 2]))
             .squeeze(2);
@@ -159,11 +178,14 @@ impl Qwen3MoeBlock {
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         Self {
-            attn_norm_weight: Some(cx.named_tensor(
-                ns.child("input_layernorm").leaf("weight"),
-                vec![d.hidden],
-                dtype,
-            )),
+            attn_norm_weight: Some(
+                cx.named_tensor(
+                    ns.child("input_layernorm").leaf("weight"),
+                    vec![d.hidden],
+                    dtype,
+                )
+                .cast(DType::F32),
+            ),
             attn_norm_bias: None,
             attn_norm_epsilon: d.rms_eps,
             wq_weight: cx.named_tensor(
@@ -196,11 +218,14 @@ impl Qwen3MoeBlock {
             k_norm: cx
                 .named_tensor(attn.child("k_norm").leaf("weight"), vec![d.head_dim], dtype)
                 .cast(DType::F32),
-            ffn_norm_weight: Some(cx.named_tensor(
-                ns.child("post_attention_layernorm").leaf("weight"),
-                vec![d.hidden],
-                dtype,
-            )),
+            ffn_norm_weight: Some(
+                cx.named_tensor(
+                    ns.child("post_attention_layernorm").leaf("weight"),
+                    vec![d.hidden],
+                    dtype,
+                )
+                .cast(DType::F32),
+            ),
             ffn_norm_bias: None,
             ffn_norm_epsilon: d.rms_eps,
             moe: Qwen3MoeFfn::new(&mlp, d, dtype, cx),
@@ -231,7 +256,7 @@ impl Qwen3MoeBlock {
         );
         let q = luminal_nn::rotary_apply(
             luminal_nn::rms_norm_heads(
-                luminal_nn::linear(normed, self.wq_weight, self.wq_bias),
+                linear(normed, self.wq_weight, self.wq_bias),
                 self.head_dim,
                 self.q_norm,
                 1e-6,
@@ -243,7 +268,7 @@ impl Qwen3MoeBlock {
         );
         let k = luminal_nn::rotary_apply(
             luminal_nn::rms_norm_heads(
-                luminal_nn::linear(normed, self.wk_weight, self.wk_bias),
+                linear(normed, self.wk_weight, self.wk_bias),
                 self.head_dim,
                 self.k_norm,
                 1e-6,
@@ -257,14 +282,14 @@ impl Qwen3MoeBlock {
         let result = paged_attention(
             q,
             k,
-            luminal_nn::linear(normed, self.wv_weight, self.wv_bias),
+            linear(normed, self.wv_weight, self.wv_bias),
             KvCache::new(k_cache, v_cache),
             CacheAccess::new(scatter_idx, gather_idx),
             causal_bias(q_pos, context_positions),
             AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
-        let x = x + luminal_nn::linear(attn, self.wo_weight, self.wo_bias);
+        let x = x + linear(attn, self.wo_weight, self.wo_bias);
         let ff = self.moe.forward(luminal_nn::rms_norm(
             x,
             self.ffn_norm_weight,
@@ -288,7 +313,11 @@ pub struct Qwen3Moe {
 
 impl Qwen3Moe {
     pub fn init(cx: &mut Graph, dims: &Qwen3MoeDims) -> Self {
-        let dtype = DType::F32;
+        Self::init_with_dtype(cx, dims, DType::F32)
+    }
+
+    pub fn init_with_dtype(cx: &mut Graph, dims: &Qwen3MoeDims, dtype: DType) -> Self {
+        assert!(matches!(dtype, DType::F32 | DType::Bf16));
         let blocks = (0..dims.layers)
             .map(|l| Qwen3MoeBlock::new(l, dims, dtype, cx))
             .collect();
@@ -311,7 +340,8 @@ impl Qwen3Moe {
                         .leaf("weight"),
                     vec![dims.hidden],
                     dtype,
-                ),
+                )
+                .cast(DType::F32),
             ),
             final_norm_bias: None,
             final_norm_epsilon: dims.rms_eps,
@@ -337,7 +367,7 @@ impl Qwen3Moe {
         scatter_idx: GraphTensor,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         assert_eq!(tokens.dtype, DType::Int);
-        let mut x = luminal_nn::embedding(tokens, self.embed);
+        let mut x = luminal_nn::embedding(tokens, self.embed).cast(DType::F32);
         let mut caches_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
             let (next, k_cache, v_cache) = block.forward(
@@ -354,7 +384,7 @@ impl Qwen3Moe {
             x = next;
             caches_out.push((k_cache, v_cache));
         }
-        let logits = luminal_nn::linear(
+        let logits = linear(
             luminal_nn::rms_norm(
                 x,
                 self.final_norm_weight,

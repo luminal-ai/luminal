@@ -353,18 +353,20 @@ impl CompiledGraph {
     }
 
     /// Saturate and search.
-    #[pyo3(signature = (generations = None, *, search_log = false, device_budget_bytes = None, max_intermediate_bytes = None))]
+    #[pyo3(signature = (generations = None, *, search_log = false, device_budget_bytes = None, intermediate_budget_bytes = None, max_intermediate_bytes = None))]
     fn search(
         &mut self,
         generations: Option<usize>,
         search_log: bool,
         device_budget_bytes: Option<usize>,
+        intermediate_budget_bytes: Option<usize>,
         max_intermediate_bytes: Option<usize>,
     ) -> PyResult<()> {
         self.run_search(
             generations,
             search_log,
             device_budget_bytes,
+            intermediate_budget_bytes,
             max_intermediate_bytes,
         )
         .map_err(to_py)
@@ -479,6 +481,7 @@ impl CompiledGraph {
         generations: Option<usize>,
         search_log: bool,
         device_budget_bytes: Option<usize>,
+        intermediate_budget_bytes: Option<usize>,
         max_intermediate_bytes: Option<usize>,
     ) -> Result<()> {
         // Profiling allocates synthetic boundary storage. Actual executions use
@@ -490,6 +493,7 @@ impl CompiledGraph {
         }
         options.search_log = search_log;
         options.device_budget_bytes = device_budget_bytes;
+        options.intermediate_budget_bytes = intermediate_budget_bytes;
         options.max_intermediate_bytes = max_intermediate_bytes;
         self.runtime
             .search(&self.bounds, &self.dims, &data, &options)?;
@@ -1449,7 +1453,7 @@ mod tests {
         )]
         .into();
         let err = compiled_with(translation, &layouts)
-            .run_search(Some(1), false, None, None)
+            .run_search(Some(1), false, None, None, None)
             .expect_err("no kernel writes a left-major destination");
         let text = format!("{err:#}");
         assert!(text.contains(&format!("v{out_value}")), "{text}");

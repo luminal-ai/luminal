@@ -8,6 +8,7 @@ use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::ops::cublaslt::approved::{
     ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR,
 };
+use luminal_cuda_lite::ops::cublaslt::exec::LtComputation;
 
 fn logical_of(graph: &EGraph, layout_tensor: &ClassId) -> ClassId {
     let node = graph
@@ -46,6 +47,53 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
         };
         let op = ApprovedCublasLtMatcher.extract(&site);
         let call = op.as_any().downcast_ref::<ApprovedCublasLt>().unwrap();
+        if call.computation == LtComputation::Float16 {
+            assert_eq!(site.logical_dtype(&call.logical_a), Some(PlanDtype::F16));
+            assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::F16));
+            assert_eq!(
+                (call.a.dtype, call.b.dtype, call.d.dtype, call.scale),
+                (
+                    PlanDtype::F16,
+                    PlanDtype::F16,
+                    PlanDtype::F16,
+                    PlanDtype::F16
+                )
+            );
+            assert_eq!(logical_of(&egraph, &call.a.tensor), call.logical_a);
+            assert_eq!(logical_of(&egraph, &call.b.tensor), call.logical_b);
+            assert_eq!(site.logical_dtype(&call.logical_out), Some(PlanDtype::F16));
+            assert_eq!(site.logical_dtype(&call.logical_root), Some(PlanDtype::F16));
+            // The API frame may transpose the complete expression while the
+            // original caller-facing root keeps its orientation.
+            assert!(
+                call.logical_out == call.logical_root
+                    || egraph.nodes.values().any(|node| {
+                        node.eclass == call.logical_out
+                            && node.op == "LogicalHelperMatrixTranspose"
+                            && egraph.nodes[&node.children[0]].eclass == call.logical_root
+                    })
+            );
+            specifications.push(call.clone());
+            continue;
+        }
+        if site.logical_dtype(&call.logical_a) == Some(PlanDtype::Bf16) {
+            assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::Bf16));
+            assert_eq!(call.computation, LtComputation::Float32);
+            assert_eq!(
+                (call.a.dtype, call.b.dtype, call.d.dtype, call.scale),
+                (
+                    PlanDtype::Bf16,
+                    PlanDtype::Bf16,
+                    PlanDtype::Bf16,
+                    PlanDtype::F32
+                )
+            );
+            assert_eq!(logical_of(&egraph, &call.a.tensor), call.logical_a);
+            assert_eq!(logical_of(&egraph, &call.b.tensor), call.logical_b);
+            assert_eq!(site.logical_dtype(&call.logical_out), Some(PlanDtype::Bf16));
+            specifications.push(call.clone());
+            continue;
+        }
         assert_eq!(site.logical_dtype(&call.logical_a), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_out), Some(call.d.dtype));
@@ -66,12 +114,37 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
             other => panic!("unsupported call output {other:?}"),
         }
         assert_eq!(call.a.dtype, call.b.dtype);
+        let input_rounding = match call.computation {
+            LtComputation::Float32 => None,
+            LtComputation::TensorFloat32 => Some("TF32"),
+            LtComputation::Float32FastFloat16 => Some("F16"),
+            LtComputation::Float32FastBfloat16 => Some("Bf16"),
+            LtComputation::Float16 | LtComputation::Float64 => {
+                unreachable!("these fixtures use FP32 arithmetic")
+            }
+        };
         for (semantic, descriptor) in [(&call.logical_a, &call.a), (&call.logical_b, &call.b)] {
             let physical = logical_of(&egraph, &descriptor.tensor);
             assert_eq!(site.logical_dtype(&physical), Some(descriptor.dtype));
             match descriptor.dtype {
-                PlanDtype::F32 => assert_eq!(*semantic, physical),
-                PlanDtype::Bf16 | PlanDtype::F16 => assert!(
+                PlanDtype::F32 => {
+                    if let Some(rounding) = input_rounding {
+                        assert!(
+                            egraph.nodes.values().any(|outer| {
+                                if outer.eclass != *semantic || outer.op != "LogicalCast" {
+                                    return false;
+                                }
+                                let narrowed = &egraph.nodes[&outer.children[0]].eclass;
+                                has_cast(&egraph, semantic, narrowed, "F32")
+                                    && has_cast(&egraph, narrowed, &physical, rounding)
+                            }),
+                            "pre-cast FP32 storage requires the exact mode-specific roundtrip"
+                        );
+                    } else {
+                        assert_eq!(*semantic, physical);
+                    }
+                }
+                PlanDtype::I8 | PlanDtype::Bf16 | PlanDtype::F16 => assert!(
                     has_cast(&egraph, semantic, &physical, "F32"),
                     "narrow storage must be the source of this exact operand's widening cast"
                 ),
@@ -156,7 +229,7 @@ fn both_input_casts_are_required_for_bf16_storage() {
 }
 
 #[test]
-fn output_casts_do_not_authorize_changing_narrow_arithmetic() {
+fn output_casts_do_not_change_the_admitted_matmul_arithmetic() {
     for arithmetic in [DType::Bf16, DType::F16, DType::F32] {
         for destination in [DType::Bf16, DType::F16, DType::F32] {
             let mut graph = Graph::new();
@@ -166,7 +239,7 @@ fn output_casts_do_not_authorize_changing_narrow_arithmetic() {
             let calls = candidates(&graph);
             assert_eq!(
                 !calls.is_empty(),
-                arithmetic == DType::F32,
+                matches!(arithmetic, DType::Bf16 | DType::F16 | DType::F32),
                 "arithmetic={arithmetic:?}, destination={destination:?}"
             );
         }
@@ -190,7 +263,8 @@ fn product_and_reduction_precision_must_both_match() {
             let calls = candidates(&graph);
             assert_eq!(
                 !calls.is_empty(),
-                product_dtype == DType::F32 && reduction_dtype == DType::F32,
+                product_dtype == reduction_dtype
+                    && matches!(product_dtype, DType::Bf16 | DType::F16 | DType::F32),
                 "product={product_dtype:?}, reduction={reduction_dtype:?}"
             );
         }

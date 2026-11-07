@@ -25,6 +25,21 @@ use luminal_nn::{
     sliding_window_bias,
 };
 
+/// Run an F32 projection from BF16-resident operands with explicit BF16
+/// input rounding and F32 accumulation.
+fn linear(input: GraphTensor, weight: GraphTensor, bias: Option<GraphTensor>) -> GraphTensor {
+    if input.dtype == weight.dtype {
+        return luminal_nn::linear(input, weight, bias);
+    }
+    assert_eq!(input.dtype, DType::F32);
+    assert_eq!(weight.dtype, DType::Bf16);
+    luminal_nn::linear(
+        input.cast(DType::Bf16).cast(DType::F32),
+        weight.cast(DType::F32),
+        bias.map(|value| value.cast(DType::F32)),
+    )
+}
+
 pub const SLIDING_WINDOW: usize = 1024;
 
 #[derive(Clone)]
@@ -140,31 +155,31 @@ pub struct Gemma4MoeFfn {
 }
 
 impl Gemma4MoeFfn {
-    fn new(ns: &Namespace, d: &Gemma4Dims, cx: &mut Graph) -> Self {
+    fn new(ns: &Namespace, d: &Gemma4Dims, dtype: DType, cx: &mut Graph) -> Self {
         let router = ns.child("router");
         let experts = ns.child("experts");
         Self {
             router_proj_weight: cx.named_tensor(
                 router.child("proj").leaf("weight"),
                 vec![d.hidden, d.experts],
-                DType::F32,
+                dtype,
             ),
             router_proj_bias: None,
-            router_scale: cx.named_tensor(router.leaf("scale"), vec![d.hidden], DType::F32),
-            per_expert_scale: cx.named_tensor(
-                router.leaf("per_expert_scale"),
-                vec![d.experts],
-                DType::F32,
-            ),
+            router_scale: cx
+                .named_tensor(router.leaf("scale"), vec![d.hidden], dtype)
+                .cast(DType::F32),
+            per_expert_scale: cx
+                .named_tensor(router.leaf("per_expert_scale"), vec![d.experts], dtype)
+                .cast(DType::F32),
             gate_up: cx.named_tensor(
                 experts.leaf("gate_up_proj"),
                 vec![d.experts, 2 * d.moe_intermediate, d.hidden],
-                DType::F32,
+                dtype,
             ),
             down: cx.named_tensor(
                 experts.leaf("down_proj"),
                 vec![d.experts, d.hidden, d.moe_intermediate],
-                DType::F32,
+                dtype,
             ),
             hidden: d.hidden,
             intermediate: d.moe_intermediate,
@@ -180,7 +195,7 @@ impl Gemma4MoeFfn {
         // Router: std-normed raw stream × router.scale × 1/sqrt(hidden).
         let scale = self.router_scale.expand_lhs(&raw.dims()[..1]);
         let router_hidden = raw.std_norm(vec![1], self.rms_eps) * scale * (h as f32).sqrt().recip();
-        let probs = luminal_nn::linear(
+        let probs = linear(
             router_hidden,
             self.router_proj_weight,
             self.router_proj_bias,
@@ -191,9 +206,11 @@ impl Gemma4MoeFfn {
         let scaled_weights = routes.weights() * routes.select(self.per_expert_scale);
         let routes = routes.with_weights(scaled_weights);
 
-        let gate_up = routes.select(self.gate_up);
+        let gate_up = routes.select(self.gate_up).cast(DType::F32);
         let projected = routes
             .dispatch(normed)
+            .cast(self.gate_up.dtype)
+            .cast(DType::F32)
             .expand_dim(2, 1)
             .matmul(gate_up.permute(vec![0, 1, 3, 2]))
             .squeeze(2);
@@ -202,8 +219,10 @@ impl Gemma4MoeFfn {
         let up = projected.slice_along(self.intermediate.., 2);
         let hidden_states = gemma_gelu(gate) * up;
 
-        let down = routes.select(self.down);
+        let down = routes.select(self.down).cast(DType::F32);
         let routed_output = hidden_states
+            .cast(self.down.dtype)
+            .cast(DType::F32)
             .expand_dim(2, 1)
             .matmul(down.permute(vec![0, 1, 3, 2]))
             .squeeze(2);
@@ -263,7 +282,7 @@ pub struct Gemma4Block {
 }
 
 impl Gemma4Block {
-    fn new(l: usize, d: &Gemma4Dims, cx: &mut Graph) -> Self {
+    fn new(l: usize, d: &Gemma4Dims, dtype: DType, cx: &mut Graph) -> Self {
         let sliding = d.is_sliding(l);
         let head_dim = d.head_dim(l);
         let kv_heads = d.kv_heads(l);
@@ -278,7 +297,10 @@ impl Gemma4Block {
         let mlp = ns.child("mlp");
         let rms = |segment: &str, cx: &mut Graph| {
             (
-                Some(cx.named_tensor(ns.child(segment).leaf("weight"), vec![d.hidden], DType::F32)),
+                Some(
+                    cx.named_tensor(ns.child(segment).leaf("weight"), vec![d.hidden], dtype)
+                        .cast(DType::F32),
+                ),
                 None,
                 d.rms_eps,
             )
@@ -320,17 +342,19 @@ impl Gemma4Block {
                 post_ff_norm_2_weight,
                 post_ff_norm_2_bias,
                 post_ff_norm_2_epsilon,
-                layer_scalar: cx.named_tensor(ns.leaf("layer_scalar"), vec![1], DType::F32),
+                layer_scalar: cx
+                    .named_tensor(ns.leaf("layer_scalar"), vec![1], dtype)
+                    .cast(DType::F32),
                 wq_weight: cx.named_tensor(
                     attn.child("q_proj").leaf("weight"),
                     vec![d.hidden, q_dim],
-                    DType::F32,
+                    dtype,
                 ),
                 wq_bias: None,
                 wk_weight: cx.named_tensor(
                     attn.child("k_proj").leaf("weight"),
                     vec![d.hidden, kv_dim],
-                    DType::F32,
+                    dtype,
                 ),
                 wk_bias: None,
                 wv: sliding.then(|| {
@@ -338,7 +362,7 @@ impl Gemma4Block {
                         cx.named_tensor(
                             attn.child("v_proj").leaf("weight"),
                             vec![d.hidden, kv_dim],
-                            DType::F32,
+                            dtype,
                         ),
                         None,
                     )
@@ -346,38 +370,34 @@ impl Gemma4Block {
                 wo_weight: cx.named_tensor(
                     attn.child("o_proj").leaf("weight"),
                     vec![q_dim, d.hidden],
-                    DType::F32,
+                    dtype,
                 ),
                 wo_bias: None,
-                q_norm: cx.named_tensor(
-                    attn.child("q_norm").leaf("weight"),
-                    vec![head_dim],
-                    DType::F32,
-                ),
-                k_norm: cx.named_tensor(
-                    attn.child("k_norm").leaf("weight"),
-                    vec![head_dim],
-                    DType::F32,
-                ),
+                q_norm: cx
+                    .named_tensor(attn.child("q_norm").leaf("weight"), vec![head_dim], dtype)
+                    .cast(DType::F32),
+                k_norm: cx
+                    .named_tensor(attn.child("k_norm").leaf("weight"), vec![head_dim], dtype)
+                    .cast(DType::F32),
                 gate_weight: cx.named_tensor(
                     mlp.child("gate_proj").leaf("weight"),
                     vec![d.hidden, d.dense_intermediate],
-                    DType::F32,
+                    dtype,
                 ),
                 gate_bias: None,
                 up_weight: cx.named_tensor(
                     mlp.child("up_proj").leaf("weight"),
                     vec![d.hidden, d.dense_intermediate],
-                    DType::F32,
+                    dtype,
                 ),
                 up_bias: None,
                 down_weight: cx.named_tensor(
                     mlp.child("down_proj").leaf("weight"),
                     vec![d.dense_intermediate, d.hidden],
-                    DType::F32,
+                    dtype,
                 ),
                 down_bias: None,
-                moe: Gemma4MoeFfn::new(&ns, d, cx),
+                moe: Gemma4MoeFfn::new(&ns, d, dtype, cx),
                 sliding,
                 head_dim,
                 kv_heads,
@@ -405,10 +425,10 @@ impl Gemma4Block {
             self.input_norm_bias,
             self.input_norm_epsilon,
         );
-        let q_raw = luminal_nn::linear(normed, self.wq_weight, self.wq_bias);
-        let k_raw = luminal_nn::linear(normed, self.wk_weight, self.wk_bias);
+        let q_raw = linear(normed, self.wq_weight, self.wq_bias);
+        let k_raw = linear(normed, self.wk_weight, self.wk_bias);
         let v_raw = match &self.wv {
-            Some(wv) => luminal_nn::linear(normed, wv.0, wv.1),
+            Some(wv) => linear(normed, wv.0, wv.1),
             None => k_raw, // full layers: V IS the K projection output
         };
         let q = luminal_nn::rotary_apply(
@@ -443,14 +463,14 @@ impl Gemma4Block {
         );
         let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
         let x = x + luminal_nn::rms_norm(
-            luminal_nn::linear(attn, self.wo_weight, self.wo_bias),
+            linear(attn, self.wo_weight, self.wo_bias),
             self.post_attn_norm_weight,
             self.post_attn_norm_bias,
             self.post_attn_norm_epsilon,
         );
 
-        let dense = luminal_nn::linear(
-            gemma_gelu(luminal_nn::linear(
+        let dense = linear(
+            gemma_gelu(linear(
                 luminal_nn::rms_norm(
                     x,
                     self.pre_ff_norm_weight,
@@ -459,7 +479,7 @@ impl Gemma4Block {
                 ),
                 self.gate_weight,
                 self.gate_bias,
-            )) * luminal_nn::linear(
+            )) * linear(
                 luminal_nn::rms_norm(
                     x,
                     self.pre_ff_norm_weight,
@@ -519,23 +539,27 @@ pub struct Gemma4Moe {
 
 impl Gemma4Moe {
     pub fn init(cx: &mut Graph, dims: &Gemma4Dims) -> Self {
+        Self::init_with_dtype(cx, dims, DType::F32)
+    }
+
+    pub fn init_with_dtype(cx: &mut Graph, dims: &Gemma4Dims, dtype: DType) -> Self {
+        assert!(matches!(dtype, DType::F32 | DType::Bf16));
         let text = Namespace::root().child("model").child("language_model");
         let blocks = (0..dims.layers)
-            .map(|l| Gemma4Block::new(l, dims, cx))
+            .map(|l| Gemma4Block::new(l, dims, dtype, cx))
             .collect();
         Self {
             dims: dims.clone(),
             embed: cx.named_tensor(
                 text.child("embed_tokens").leaf("weight"),
                 vec![dims.vocab, dims.hidden],
-                DType::F32,
+                dtype,
             ),
             blocks,
-            final_norm_weight: Some(cx.named_tensor(
-                text.child("norm").leaf("weight"),
-                vec![dims.hidden],
-                DType::F32,
-            )),
+            final_norm_weight: Some(
+                cx.named_tensor(text.child("norm").leaf("weight"), vec![dims.hidden], dtype)
+                    .cast(DType::F32),
+            ),
             final_norm_bias: None,
             final_norm_epsilon: dims.rms_eps,
         }
@@ -556,7 +580,8 @@ impl Gemma4Moe {
         scatter_idx: GraphTensor,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         assert_eq!(tokens.dtype, DType::Int);
-        let mut x = luminal_nn::embedding(tokens, self.embed) * (self.dims.hidden as f32).sqrt();
+        let mut x = luminal_nn::embedding(tokens, self.embed).cast(DType::F32)
+            * (self.dims.hidden as f32).sqrt();
         let mut caches_out = Vec::with_capacity(self.blocks.len());
         for (layer, block) in self.blocks.iter().enumerate() {
             let (cos, sin, rot) = if block.sliding {
@@ -579,14 +604,15 @@ impl Gemma4Moe {
             x = next;
             caches_out.push((k_cache, v_cache));
         }
-        let logits = luminal_nn::embedding_projection(
+        let logits = linear(
             luminal_nn::rms_norm(
                 x,
                 self.final_norm_weight,
                 self.final_norm_bias,
                 self.final_norm_epsilon,
             ),
-            self.embed,
+            self.embed.permute(vec![1, 0]),
+            None,
         );
         let softcap = self.dims.logit_softcap;
         let logits = (logits * (1.0 / softcap)).tanh() * softcap;
