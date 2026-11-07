@@ -221,7 +221,8 @@ def create_app(backend: str, local_project_dir: Path):
                 arg for arg in pytest_args if arg not in {"--profile", "--profile-svg"}
             ]
             if fail_fast and not any(
-                arg in {"-x", "--exitfirst", "--maxfail"} or arg.startswith("--maxfail=")
+                arg in {"-x", "--exitfirst", "--maxfail"}
+                or arg.startswith("--maxfail=")
                 for arg in sanitized_pytest_args
             ):
                 sanitized_pytest_args.append("--maxfail=1")
