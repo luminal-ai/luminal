@@ -289,7 +289,10 @@ def test_captured_dynamic_region_keeps_its_parameter_staging():
     size = env.create_symintnode(env.create_symbol(3, LocalSource("tokens")), hint=3)
     with FakeTensorMode(shape_env=env):
         examples = [torch.empty((size, 4), device="cuda") for _ in range(2)]
-        region = export_region(_add_graph(), examples, dynamic_range=(2, 8))
+    module = _add_graph()
+    for node, value in zip(module.graph.nodes, examples):
+        node.meta["example_value"] = value
+    region = export_region(module, examples, dynamic_range=(2, 8))
     compiled = compile_region(
         region, device_type="cuda", static_outputs=True, external_cuda_graph=True
     )

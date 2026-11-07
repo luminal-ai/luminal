@@ -596,7 +596,16 @@ class CompiledModel:
                     )
                 declared = tuple(declared_strides(binding, shape, dims))
                 elected = tuple(self._graph.output_elected_strides(name))
-                if elected != declared:
+                # Match check_binding's significant-stride contract: an
+                # empty tensor addresses nothing, and singleton axes never
+                # advance an address. Allocate at eager's declared strides.
+                if len(elected) != len(declared) or (
+                    0 not in shape
+                    and any(
+                        size > 1 and got != want
+                        for size, got, want in zip(shape, elected, declared)
+                    )
+                ):
                     raise RuntimeError(
                         f"luminal_cuda_lite: output {name!r} is elected at element "
                         f"strides {elected}, and eager's are {declared}. This backend "
