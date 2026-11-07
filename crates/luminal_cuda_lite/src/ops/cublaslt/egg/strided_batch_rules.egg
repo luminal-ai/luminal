@@ -565,7 +565,8 @@
    (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order ?D_matrix_descriptor)
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_inputs)
-   (= ?scalar_data_type (dtype-of ?A_operand))
+   (= ?arithmetic_data_type (dtype-of ?A_operand))
+   (cublaslt-scale-data-type ?computation_type ?arithmetic_data_type ?scalar_data_type)
    (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_data_type
      ?A_storage_data_type ?B_storage_data_type (CublasLtNoCMatrixDataType) ?D_storage_data_type
      ?bias_data_type ?scalar_pointer_mode ?epilogue
@@ -608,7 +609,8 @@
    (cublaslt-strided-batch-destination-reading ?D_layout_tensor ?BatchCount ?m ?n ?D_storage_data_type
      ?D_matrix_order ?D_matrix_descriptor)
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_inputs)
-   (= ?scalar_data_type (dtype-of ?A_operand))
+   (= ?arithmetic_data_type (dtype-of ?A_operand))
+   (cublaslt-scale-data-type ?computation_type ?arithmetic_data_type ?scalar_data_type)
    (= ?configuration (CublasLtConfigurationOf ?computation_type ?scalar_data_type
      ?A_storage_data_type ?B_storage_data_type (CublasLtCMatrixDataTypeOf ?D_storage_data_type) ?D_storage_data_type
      ?bias_data_type ?scalar_pointer_mode ?epilogue

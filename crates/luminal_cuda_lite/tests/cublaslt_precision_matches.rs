@@ -76,6 +76,24 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
             specifications.push(call.clone());
             continue;
         }
+        if site.logical_dtype(&call.logical_a) == Some(PlanDtype::Bf16) {
+            assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::Bf16));
+            assert_eq!(call.computation, LtComputation::Float32);
+            assert_eq!(
+                (call.a.dtype, call.b.dtype, call.d.dtype, call.scale),
+                (
+                    PlanDtype::Bf16,
+                    PlanDtype::Bf16,
+                    PlanDtype::Bf16,
+                    PlanDtype::F32
+                )
+            );
+            assert_eq!(logical_of(&egraph, &call.a.tensor), call.logical_a);
+            assert_eq!(logical_of(&egraph, &call.b.tensor), call.logical_b);
+            assert_eq!(site.logical_dtype(&call.logical_out), Some(PlanDtype::Bf16));
+            specifications.push(call.clone());
+            continue;
+        }
         assert_eq!(site.logical_dtype(&call.logical_a), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_out), Some(call.d.dtype));
@@ -211,7 +229,7 @@ fn both_input_casts_are_required_for_bf16_storage() {
 }
 
 #[test]
-fn output_casts_do_not_authorize_changing_narrow_arithmetic() {
+fn output_casts_do_not_change_the_admitted_matmul_arithmetic() {
     for arithmetic in [DType::Bf16, DType::F16, DType::F32] {
         for destination in [DType::Bf16, DType::F16, DType::F32] {
             let mut graph = Graph::new();
@@ -221,7 +239,7 @@ fn output_casts_do_not_authorize_changing_narrow_arithmetic() {
             let calls = candidates(&graph);
             assert_eq!(
                 !calls.is_empty(),
-                matches!(arithmetic, DType::F32 | DType::F16),
+                matches!(arithmetic, DType::Bf16 | DType::F16 | DType::F32),
                 "arithmetic={arithmetic:?}, destination={destination:?}"
             );
         }
@@ -246,7 +264,7 @@ fn product_and_reduction_precision_must_both_match() {
             assert_eq!(
                 !calls.is_empty(),
                 product_dtype == reduction_dtype
-                    && matches!(product_dtype, DType::F32 | DType::F16),
+                    && matches!(product_dtype, DType::Bf16 | DType::F16 | DType::F32),
                 "product={product_dtype:?}, reduction={reduction_dtype:?}"
             );
         }
