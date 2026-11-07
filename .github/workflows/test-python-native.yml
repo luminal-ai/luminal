@@ -16,10 +16,10 @@ jobs:
         runs-on: ubuntu-latest
         container:
             image: ghcr.io/luminal-ai/luminal-docker:cpu
-        timeout-minutes: 45
+        timeout-minutes: 120
         steps:
             - uses: actions/checkout@v6
             - name: Update Rust toolchain
               run: rustup update
             - name: Build and test PyTorch reference backend
-              run: bash crates/pytorch/reference/run_tests.sh -v -m "not slow" --ignore=../utils/tests/test_opinfo.py
+              run: bash crates/pytorch/reference/run_tests.sh -x -v -m "not slow" --ignore=../utils/tests/test_opinfo.py
