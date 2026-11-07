@@ -20,6 +20,7 @@ def create_app(backend: str, local_project_dir: Path):
     if backend not in {"reference", "cuda_lite"}:
         raise ValueError(f"Unknown PyTorch backend: {backend}")
     app = modal.App(f"luminal-{backend}-tests")
+    fail_fast = os.environ.get("GITHUB_ACTIONS") == "true"
 
     DEFAULT_TIMEOUT = 2 * 60 * 60
     CUDARC_CUDA_VERSION = "12080"
@@ -231,6 +232,11 @@ def create_app(backend: str, local_project_dir: Path):
             sanitized_pytest_args = [
                 arg for arg in pytest_args if arg not in {"--profile", "--profile-svg"}
             ]
+            if fail_fast and not any(
+                arg in {"-x", "--exitfirst", "--maxfail"} or arg.startswith("--maxfail=")
+                for arg in sanitized_pytest_args
+            ):
+                sanitized_pytest_args.append("--maxfail=1")
             if profile_enabled:
                 sanitized_pytest_args.append("--profile")
                 if dot_available:
