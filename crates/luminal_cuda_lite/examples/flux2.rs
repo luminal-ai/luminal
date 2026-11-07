@@ -32,14 +32,16 @@ fn run() -> anyhow::Result<()> {
     const TOKENS: usize = TEXT_TOKENS + IMAGE_TOKENS;
 
     let mut cx = Graph::new();
-    let model = Flux2Transformer::init(&mut cx);
-    let latent = cx.tensor(vec![IMAGE_TOKENS, IN_CHANNELS], DType::F32);
-    let text = cx.tensor(vec![TEXT_TOKENS, JOINT_ATTENTION_DIM], DType::F32);
-    let rope_cos = cx.tensor(vec![TOKENS, HEAD_DIM], DType::F32);
-    let rope_sin = cx.tensor(vec![TOKENS, HEAD_DIM], DType::F32);
+    let model = Flux2Transformer::init_with_dtype(&mut cx, DType::Bf16);
+    let latent = cx.tensor(vec![IMAGE_TOKENS, IN_CHANNELS], DType::Bf16);
+    let text = cx.tensor(vec![TEXT_TOKENS, JOINT_ATTENTION_DIM], DType::Bf16);
+    let rope_cos = cx.tensor(vec![TOKENS, HEAD_DIM], DType::Bf16);
+    let rope_sin = cx.tensor(vec![TOKENS, HEAD_DIM], DType::Bf16);
     let timestep = cx.tensor(vec![1], DType::F32);
     let guidance = cx.tensor(vec![1], DType::F32);
-    let velocity = model.forward(latent, text, rope_cos, rope_sin, timestep, guidance);
+    let velocity = model
+        .forward(latent, text, rope_cos, rope_sin, timestep, guidance)
+        .cast(DType::F32);
 
     let (cos, sin) = build_rope_tables(TEXT_TOKENS, IMAGE_HEIGHT, IMAGE_WIDTH);
     let pairs = support::device::seeded_graph_inputs(
@@ -47,14 +49,14 @@ fn run() -> anyhow::Result<()> {
         vec![
             (
                 latent.id,
-                support::weights(IMAGE_TOKENS * IN_CHANNELS, 11_000).into(),
+                support::device::bf16(support::weights(IMAGE_TOKENS * IN_CHANNELS, 11_000))?,
             ),
             (
                 text.id,
-                support::weights(TEXT_TOKENS * JOINT_ATTENTION_DIM, 11_001).into(),
+                support::device::bf16(support::weights(TEXT_TOKENS * JOINT_ATTENTION_DIM, 11_001))?,
             ),
-            (rope_cos.id, cos.into()),
-            (rope_sin.id, sin.into()),
+            (rope_cos.id, support::device::bf16(cos)?),
+            (rope_sin.id, support::device::bf16(sin)?),
             (timestep.id, vec![0.5f32].into()),
             (guidance.id, vec![4.0f32].into()),
         ],
