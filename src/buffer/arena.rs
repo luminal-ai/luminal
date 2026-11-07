@@ -212,6 +212,14 @@ pub struct ArenaPlan {
     pub slab_bytes: usize,
     /// Peak simultaneous reservations, including parameters and scratch.
     pub peak_live_bytes: usize,
+    /// Peak simultaneous caller/escaping boundary reservations. This is
+    /// reported separately so runtimes can derive an intermediate allowance
+    /// from a device-wide arena budget without counting model inputs twice.
+    pub peak_boundary_bytes: usize,
+    /// Peak simultaneous program-temporary reservations, including operation
+    /// workspaces and the dynamic-parameter block. Escaping outputs are
+    /// boundary storage, not intermediates.
+    pub peak_intermediate_bytes: usize,
     pub slices: FxHashMap<BufferId, ArenaSlice>,
     /// Scratch is live only during its owning operation's child graph.
     pub workspaces: FxHashMap<NodeIndex, ArenaSlice>,
@@ -470,6 +478,7 @@ struct Lifetime {
     start: usize,
     end: usize,
     bytes: usize,
+    intermediate: bool,
 }
 
 /// The same allocator serves device memory and pinned host memory. Only their
@@ -479,7 +488,7 @@ fn pack(
     alignment: usize,
     capacity: usize,
     algorithm: SlabAlgorithm,
-) -> Result<(Vec<ArenaSlice>, usize, usize)> {
+) -> Result<(Vec<ArenaSlice>, usize, usize, usize, usize)> {
     ensure!(alignment > 0, "slab alignment must be positive");
     let SlabAlgorithm::FirstFit = algorithm;
     let mut events = Vec::with_capacity(lifetimes.len() * 2);
@@ -493,7 +502,11 @@ fn pack(
     let mut free_list = FreeList::default();
     let mut live = BTreeMap::<usize, usize>::new();
     let mut live_bytes = 0usize;
+    let mut live_boundary_bytes = 0usize;
+    let mut live_intermediate_bytes = 0usize;
     let mut peak = 0;
+    let mut peak_boundary = 0;
+    let mut peak_intermediate = 0;
     for (_, alloc, id) in events {
         let bytes = lifetimes[id].bytes;
         let need = bytes
@@ -523,7 +536,18 @@ fn pack(
             live_bytes = live_bytes
                 .checked_add(need)
                 .ok_or_else(|| anyhow!("live size overflow"))?;
+            if lifetimes[id].intermediate {
+                live_intermediate_bytes = live_intermediate_bytes
+                    .checked_add(need)
+                    .ok_or_else(|| anyhow!("live intermediate size overflow"))?;
+            } else {
+                live_boundary_bytes = live_boundary_bytes
+                    .checked_add(need)
+                    .ok_or_else(|| anyhow!("live boundary size overflow"))?;
+            }
             peak = peak.max(live_bytes);
+            peak_boundary = peak_boundary.max(live_boundary_bytes);
+            peak_intermediate = peak_intermediate.max(live_intermediate_bytes);
             slices[id] = ArenaSlice { offset, bytes };
         } else {
             let offset = slices[id].offset;
@@ -532,10 +556,21 @@ fn pack(
                 "release of non-live range"
             );
             live_bytes -= need;
+            if lifetimes[id].intermediate {
+                live_intermediate_bytes -= need;
+            } else {
+                live_boundary_bytes -= need;
+            }
             free_list.free(offset, need);
         }
     }
-    Ok((slices, free_list.top, peak))
+    Ok((
+        slices,
+        free_list.top,
+        peak,
+        peak_boundary,
+        peak_intermediate,
+    ))
 }
 
 /// Plan device storage for a bufferized program. Caller boundary storage stays
@@ -666,6 +701,7 @@ pub fn plan_external_over<L: PlanLayout>(
             start: 0,
             end: steps.len().max(1),
             bytes: parameter_bytes,
+            intermediate: true,
         });
         0
     });
@@ -681,6 +717,8 @@ pub fn plan_external_over<L: PlanLayout>(
                 start: at,
                 end: at + 1,
                 bytes: bytes_of(&plan.buffers[id])?,
+                intermediate: plan.buffers[id].owner == Owner::System
+                    && plan.buffers[id].freed_by == FreedBy::Program,
             });
         }
         Ok(())
@@ -717,6 +755,7 @@ pub fn plan_external_over<L: PlanLayout>(
                         start: at,
                         end: at + 1,
                         bytes: scratch,
+                        intermediate: true,
                     });
                 }
             }
@@ -732,7 +771,7 @@ pub fn plan_external_over<L: PlanLayout>(
             intervals[i].end = steps.len().max(1);
         }
     }
-    let (slices, slab_bytes, peak_live_bytes) =
+    let (slices, slab_bytes, peak_live_bytes, peak_boundary_bytes, peak_intermediate_bytes) =
         pack(&intervals, ARENA_ALIGN, usize::MAX, SlabAlgorithm::FirstFit)?;
     let parameters = parameter.map(|i| slices[i]).unwrap_or_default();
     let buffers: FxHashMap<_, _> = buffers.into_iter().map(|(id, i)| (id, slices[i])).collect();
@@ -746,6 +785,8 @@ pub fn plan_external_over<L: PlanLayout>(
         steps,
         slab_bytes,
         peak_live_bytes,
+        peak_boundary_bytes,
+        peak_intermediate_bytes,
         slices: buffers,
         workspaces,
         parameters,
@@ -972,6 +1013,8 @@ mod tests {
              ({members} members, sum {sum}):\n{}",
             plan.summary()
         );
+        assert_eq!(arena.peak_boundary_bytes, 2 * RESERVED);
+        assert_eq!(arena.peak_intermediate_bytes, 2 * RESERVED);
         assert!(
             arena.slab_bytes < sum,
             "peak {} must be under the sum {sum}",
@@ -1194,10 +1237,11 @@ mod tests {
                             start,
                             end: start + 1 + next() % 15,
                             bytes: next() % 2049,
+                            intermediate: next().is_multiple_of(2),
                         }
                     })
                     .collect();
-                let (slices, total, peak) =
+                let (slices, total, peak, peak_boundary, peak_intermediate) =
                     pack(&lives, alignment, usize::MAX, SlabAlgorithm::FirstFit).unwrap();
                 let reservation = |bytes: usize| bytes.max(1).div_ceil(alignment) * alignment;
                 let expected_peak = (0..55)
@@ -1211,6 +1255,22 @@ mod tests {
                     .max()
                     .unwrap();
                 assert_eq!(peak, expected_peak);
+                let expected_class_peak = |intermediate| {
+                    (0..55)
+                        .map(|t| {
+                            lives
+                                .iter()
+                                .filter(|l| {
+                                    l.intermediate == intermediate && l.start <= t && t < l.end
+                                })
+                                .map(|l| reservation(l.bytes))
+                                .sum::<usize>()
+                        })
+                        .max()
+                        .unwrap()
+                };
+                assert_eq!(peak_boundary, expected_class_peak(false));
+                assert_eq!(peak_intermediate, expected_class_peak(true));
                 assert!(total >= peak);
                 for (i, a) in lives.iter().enumerate() {
                     let sa = slices[i];
@@ -1279,7 +1339,8 @@ mod tests {
                 &[Lifetime {
                     start: 0,
                     end: 1,
-                    bytes: usize::MAX
+                    bytes: usize::MAX,
+                    intermediate: true,
                 }],
                 ARENA_ALIGN,
                 usize::MAX,
@@ -1292,7 +1353,8 @@ mod tests {
                 &[Lifetime {
                     start: 2,
                     end: 2,
-                    bytes: 1
+                    bytes: 1,
+                    intermediate: false,
                 }],
                 1,
                 usize::MAX,

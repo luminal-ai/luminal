@@ -4,7 +4,7 @@
 //! with fixed dimensions. Generation needs no GPU; `device` compiles and runs it.
 
 use crate::symbolic::Expr;
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use luminal::bufferize::SlotDescriptor;
 use luminal::dtype::PlanDtype;
@@ -589,23 +589,27 @@ pub(crate) fn unary(ctx: &CodegenCtx, expr: &str) -> Result<Vec<KernelSource>> {
     elementwise(ctx, expr, &["a"], &sig, to)
 }
 
-/// The CUDA math-library function a kernel calls for its operands' dtype:
-/// `f32_name` (`sqrtf`) for F32 and `f64_name`, its double-precision twin
-/// (`sqrt`), for F64. The library has no other float overloads, and passing
-/// any other dtype to one of these would convert it at the call — a double
-/// to float loses precision and range, a half widens to float. So every
-/// other dtype is refused BY NAME, like the reference runtime's arithmetic
-/// kernels: narrow floats are storage, and a frontend computes on them
-/// only after an explicit widening cast (torch's opmath).
+/// Build a CUDA math-library call for the operands' dtype. F32 calls
+/// `f32_name` (`sqrtf`), F64 calls its double-precision twin (`sqrt`), and
+/// F16/BF16 explicitly widen each argument to F32 before calling `f32_name`.
+/// A narrow result is explicitly converted back to the plan's destination
+/// dtype, making the opmath boundary part of this physical implementation
+/// rather than an implicit C++ overload conversion.
 ///
 /// `inputs` counts the value operands; the destination-passing slot that
 /// follows them carries the result dtype, which a truncating cast changes.
-pub(crate) fn math_function(
+pub(crate) fn math_call(
     ctx: &CodegenCtx,
     inputs: usize,
     f32_name: &'static str,
     f64_name: &'static str,
-) -> Result<&'static str> {
+    arguments: &[&str],
+) -> Result<String> {
+    ensure!(
+        arguments.len() == inputs,
+        "{f64_name} expects {inputs} codegen arguments, got {}",
+        arguments.len()
+    );
     let Some((&dtype, rest)) = ctx
         .operand_dtypes
         .get(..inputs)
@@ -619,14 +623,30 @@ pub(crate) fn math_function(
     if let Some(other) = rest.iter().find(|other| **other != dtype) {
         bail!("{f64_name} operands disagree on dtype: {dtype:?} and {other:?}");
     }
-    Ok(match dtype {
-        PlanDtype::F32 => f32_name,
-        PlanDtype::F64 => f64_name,
-        other => bail!(
-            "cuda-lite {f64_name} has no {other:?} arm (cast at the call site; \
-             a silent bridge through f32 would hide a precision change)"
-        ),
-    })
+    let (function, widen) = match dtype {
+        PlanDtype::F32 => (f32_name, false),
+        PlanDtype::F64 => (f64_name, false),
+        PlanDtype::F16 | PlanDtype::Bf16 => (f32_name, true),
+        other => bail!("cuda-lite {f64_name} has no {other:?} arm"),
+    };
+    let arguments = arguments
+        .iter()
+        .map(|argument| {
+            if widen {
+                format!("(float)({argument})")
+            } else {
+                (*argument).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let call = format!("{function}({arguments})");
+    let dest = ctx.dest_dtypes[0];
+    if widen || dest != dtype {
+        Ok(format!("({})({call})", cuda_type(dest)?))
+    } else {
+        Ok(call)
+    }
 }
 
 /// The signed and same-width unsigned CUDA types of a wrapping integer

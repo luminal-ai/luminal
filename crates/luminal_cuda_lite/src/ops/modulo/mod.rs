@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{CodegenCtx, KernelOp, KernelSource, binary, math_function};
+use crate::kernels::{CodegenCtx, KernelOp, KernelSource, binary, math_call};
 use anyhow::Result;
 
 /// `ModFunctionalGeneric(lhs, rhs) -> out` — pure dataflow form.
@@ -94,8 +94,7 @@ impl LayoutIrOp for ModFunctionalDps {}
 impl KernelOp for ModFunctionalDps {
     fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
         // Float mod mirrors the reference kernel's fmod semantics.
-        let function = math_function(ctx, 2, "fmodf", "fmod")?;
-        binary(ctx, &format!("{function}(a[i], b[i])"))
+        binary(ctx, &math_call(ctx, 2, "fmodf", "fmod", &["a[i]", "b[i]"])?)
     }
 }
 
