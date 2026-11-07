@@ -191,21 +191,36 @@ impl Translator<'_> {
     pub(super) fn translate_gelu(&mut self, node: &Node) -> Result<GraphTensor> {
         let x = self.unary_input(node)?;
         let result = x.gelu();
-        let output_dtype = self.output_meta_dtype(node)?;
         let cpu = self
             .device
             .as_ref()
             .is_some_and(|device| device.kind == "cpu");
-        if cpu && output_dtype != DType::F64 {
-            // ATen's CPU GELU kernel canonicalizes every exact zero to +0 for
-            // FP16/BF16/FP32. CUDA and CPU FP64 preserve the input sign at an
-            // underflowed zero, so this normalization is deliberately gated
-            // by both the captured placement and authored output dtype.
-            let zero = self.constant_like(result, 0.0);
-            Ok(self.is_zero(result).select(zero, result))
-        } else {
-            Ok(result)
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if cpu && std::is_x86_feature_detected!("avx2") {
+            // ATen dispatches CPU GELU through a SIMD implementation when
+            // AVX2 is available. That implementation preserves negative
+            // underflowed zeros but yields NaN for positive infinity; keep
+            // those target-kernel semantics rather than substituting the
+            // scalar/aarch64 behavior.
+            let zero = self.constant_like(x, 0.0);
+            let positive_inf = self.is_inf(x).logical_and(x.gt(zero));
+            let nan = zero / zero;
+            return Ok(positive_inf.select(nan, result));
         }
+
+        if cpu {
+            let output_dtype = self.output_meta_dtype(node)?;
+            if output_dtype != DType::F64 {
+                // ATen's aarch64/scalar CPU path canonicalizes every exact
+                // FP16/BF16/FP32 zero to +0. CUDA and CPU FP64 preserve the
+                // input sign at an underflowed zero.
+                let zero = self.constant_like(result, 0.0);
+                return Ok(self.is_zero(result).select(zero, result));
+            }
+        }
+
+        Ok(result)
     }
 
     /// Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
