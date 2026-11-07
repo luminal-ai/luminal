@@ -172,10 +172,39 @@ impl MetalRuntime {
                 }
                 let dps = prototype.to_dps();
                 let executable = dps.as_deref().unwrap_or(prototype);
-                crate::as_kernel_op(executable).is_some()
+                crate::as_kernel_op(executable).is_some() || crate::as_host_op(executable).is_some()
             })
             .map(|entry| entry.matcher.egglog_constructor())
             .collect()
+    }
+
+    /// Select a deterministic viable plan without running rank-local timing
+    /// loops. Collective graphs must use this entry point instead of search.
+    pub fn compile(&mut self, bounds: &shape::SymbolBounds, dims: &shape::DynMap) -> Result<()> {
+        bounds.validate_values(dims)?;
+        let (snapshot, _) = self.assemble_and_saturate(
+            bounds,
+            Some(crate::saturation::DEFAULT_ALGEBRA_MATCH_BUDGET),
+        )?;
+        let plan = luminal::collective::compile_first(
+            &snapshot,
+            &self.decoders,
+            &self.matchers,
+            &self.allow,
+        )?;
+        self.storage = Some(crate::storage::plan_storage(
+            &plan,
+            &bounds.ranges(),
+            &self.externals,
+        )?);
+        self.plan = Some(plan);
+        self.bounds = bounds.clone();
+        self.dims = dims.clone();
+        #[cfg(target_os = "macos")]
+        if self.device.is_none() {
+            self.device = Some(crate::device::MetalDevice::new()?.executable());
+        }
+        Ok(())
     }
 
     pub fn saturated_egraph(
@@ -261,6 +290,13 @@ impl MetalRuntime {
         bounds.validate_values(profile_dims)?;
         let (mut serialized, program) =
             self.assemble_and_saturate(bounds, options.algebra_match_budget)?;
+        ensure!(
+            !serialized
+                .nodes
+                .values()
+                .any(|n| n.op == "LogicalAllGather"),
+            "AllGather graphs require compile(), not rank-local autotuning"
+        );
         let shapes = crate::symbolic::ShapeEnv {
             bounds: bounds.ranges(),
             values: profile_dims.clone(),

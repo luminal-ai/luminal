@@ -177,18 +177,17 @@ fn int64_gcd_finishes_the_worst_case_fibonacci_pairs() {
     assert_eq!(actual, expected);
 }
 
-/// Torch's int64 gcd is the true gcd wrapped to I64: `gcd(MIN, 0)` is
-/// `2^63`, which wraps to MIN. As a divisor, MIN's magnitude once wrapped to
-/// MIN and clamped to 1, which ended Euclid early: gcd(MAX, MIN) came out
-/// as MIN instead of 1 (LUM-1134).
+/// ATen takes wrapping abs before its signed Euclid loop. MIN therefore
+/// remains negative and gcd(MIN, MAX) returns -1, while gcd(MIN, 0)
+/// remains MIN. Preserve these same-width results (LUM-1134).
 #[test]
 fn int64_gcd_at_the_minimum_matches_torch() {
     let (min, max) = (i64::MIN, i64::MAX);
     let cases = [
-        ((max, min), 1),
-        ((min, max), 1),
-        ((6, min), 2),
-        ((min, 6), 2),
+        ((max, min), -1),
+        ((min, max), -1),
+        ((6, min), -2),
+        ((min, 6), -2),
         ((-1, min), 1),
         ((min, -1), 1),
         ((0, min), min),

@@ -530,6 +530,14 @@ impl ExtractionSite<'_> {
         Some(self.egraph.nodes.get(child)?.eclass.clone())
     }
 
+    /// Read a quoted String metadata child, refusing schema drift.
+    pub fn child_string(&self, index: usize) -> String {
+        let class = self.child_class(index);
+        self.members(&class)
+            .find_map(|node| serde_json::from_str::<String>(&node.op).ok())
+            .expect("String metadata must be a quoted literal")
+    }
+
     /// The matched enode's child at `index` as a literal i64. Panics when it
     /// is not one — for a constructor whose schema declares a primitive i64
     /// child, anything else is schema drift (see the validity contract).

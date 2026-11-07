@@ -73,6 +73,49 @@ impl Graph {
             ctx: self.ctx.clone(),
         })
     }
+    /// Append a snapshot to another library's active capture and make later
+    /// stream work depend on it. CUDA graph launches themselves are not a
+    /// substitute for inserting a child node into the capture DAG.
+    pub fn append_to_capture(&self, stream: &Arc<CudaStream>) -> Result<()> {
+        let mut status = cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        let mut parent = ptr::null_mut();
+        let mut dependencies = ptr::null();
+        let mut count = 0;
+        unsafe {
+            cu::cuStreamGetCaptureInfo_v3(
+                stream.cu_stream(),
+                &mut status,
+                ptr::null_mut(),
+                &mut parent,
+                &mut dependencies,
+                ptr::null_mut(),
+                &mut count,
+            )
+            .result()
+            .context("query outer CUDA capture graph")?;
+        }
+        ensure!(
+            status == cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE,
+            "stream has no active capture"
+        );
+        let mut node = ptr::null_mut();
+        unsafe {
+            cu::cuGraphAddChildGraphNode(&mut node, parent, dependencies, count, self.raw)
+                .result()
+                .context("append prepared child to outer CUDA capture")?;
+            cu::cuStreamUpdateCaptureDependencies_v2(
+                stream.cu_stream(),
+                &mut node,
+                ptr::null(),
+                1,
+                cu::CUstreamUpdateCaptureDependencies_flags::CU_STREAM_SET_CAPTURE_DEPENDENCIES
+                    as u32,
+            )
+            .result()
+            .context("update outer CUDA capture dependencies")?;
+        }
+        Ok(())
+    }
     pub fn copy(&self, deps: &[Node], params: &cu::CUDA_MEMCPY3D) -> Result<Node> {
         let mut node = ptr::null_mut();
         unsafe {

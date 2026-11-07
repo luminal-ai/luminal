@@ -52,6 +52,7 @@
 pub mod arena;
 pub mod binding_check;
 pub mod bindings;
+pub mod collective;
 pub mod egraph_postpass;
 /// The e-graph walk, in core (#420/#422 rejoin Phase 8): every runtime
 /// calls it with its own matcher list and it names no runtime type.

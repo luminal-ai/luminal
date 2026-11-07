@@ -4,6 +4,7 @@ pub mod arena;
 pub mod bindings;
 pub mod egraph_postpass;
 pub mod finalists;
+pub mod host;
 pub mod host_buffer;
 pub mod kernels;
 pub mod layouts;
@@ -27,7 +28,7 @@ pub use layouts::MetalPlan;
 pub use metal::{Buffer, Device, MTLResourceOptions};
 #[cfg(target_os = "macos")]
 pub use objc::rc::autoreleasepool;
-pub use op::{MetalOpInterface, as_kernel_op};
+pub use op::{MetalOpInterface, as_host_op, as_kernel_op};
 pub use ops::{RegisteredOp, metal_registry, metal_registry_filtered};
 pub use runtime::MetalRuntime;
 pub use search::{CompileOptions, Evaluator, SearchOutcome, harness_search_options};

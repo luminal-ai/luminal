@@ -35,10 +35,14 @@ def test_dynamic_dim_reuse_no_recompile(device: torch.device):
 
     model = DynamicSeqModel().eval().to(device)
 
-    # Compile once with dynamic seq dim (auto-detected for integer inputs).
-    # Factory capsule is auto-detected from example.device.
+    # Export the sequence domain explicitly; an unspecified export is static.
     example = torch.tensor([[1, 2, 3, 4]], device=device)
-    compiled = luminal_compile(model, example, search_iterations=5)
+    compiled = luminal_compile(
+        model,
+        example,
+        search_iterations=5,
+        dynamic_shapes=({1: torch.export.Dim("sequence", min=1, max=8)},),
+    )
 
     # Execute with multiple different seq lengths — each call reuses the
     # same compiled graph, updating dynamic dims in-place.

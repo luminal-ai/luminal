@@ -192,6 +192,8 @@ impl CudaStaging {
 pub struct CudaExecutable {
     // Retire graph resources before cached modules. Caller storage is borrowed.
     installed: Option<Installed>,
+    // Outer graphs can outlive later plan rebuilds and host-variant eviction.
+    captured_resources: Vec<Rc<HostVariant>>,
     /// True when `stream` was borrowed from another library; the device must
     /// not destroy it, and the outer owner is responsible for ordering work
     /// submitted through it.
@@ -221,6 +223,7 @@ impl CudaExecutable {
     pub fn new(device: &CudaDevice) -> Self {
         Self {
             installed: None,
+            captured_resources: vec![],
             stream_is_borrowed: false,
             pending_async: false,
             cache: device.cache.clone(),
@@ -389,6 +392,12 @@ impl CudaExecutable {
         asynchronous: bool,
     ) -> Result<()> {
         self.ctx.bind_to_thread()?;
+        let capturing = self.stream.capture_status()?
+            == cu::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE;
+        ensure!(
+            !capturing || asynchronous,
+            "external capture requires asynchronous execution"
+        );
         ensure!(
             staging.bytes() >= self.stats.staging_bytes,
             "host staging is too small"
@@ -404,6 +413,10 @@ impl CudaExecutable {
             "arena pointer must be non-null and 256-byte aligned"
         );
         if self.stats.arena_base != arena.ptr {
+            ensure!(
+                !capturing,
+                "warm up the capture arena before external capture"
+            );
             if self.pending_async {
                 self.stream.synchronize()?;
                 self.pending_async = false;
@@ -443,7 +456,27 @@ impl CudaExecutable {
                 || c.external.len() != external.len()
                 || !external.keys().all(|id| c.external.contains_key(id))
         });
+        if capturing {
+            ensure!(
+                !stale,
+                "warm up execution resources before external capture"
+            );
+            let compiled = installed.compiled.as_ref().unwrap();
+            ensure!(
+                compiled.last_dims == *dims,
+                "warm up the capture shape before external capture"
+            );
+            ensure!(
+                compiled.external == external
+                    || !compiled
+                        .actions
+                        .iter()
+                        .any(|a| matches!(a, Action::Host(_))),
+                "warm up library calls with the capture's actual input allocations"
+            );
+        }
         if self.pending_async
+            && !capturing
             && (!asynchronous
                 || stale
                 || installed
@@ -478,7 +511,7 @@ impl CudaExecutable {
         // A plan compiled this execution already addresses these pointers.
         // Rebind when the caller addresses or dimensions change; stable
         // addresses retain the executable for external graph capture.
-        if !stale && (compiled.external != external || dimensions_changed) {
+        if !capturing && !stale && (compiled.external != external || dimensions_changed) {
             compiled.rebind_addresses(
                 &installed.plan,
                 &installed.storage,
@@ -489,16 +522,46 @@ impl CudaExecutable {
                 &mut self.stats,
             )?;
         }
-        let result = compiled.launch(
-            dims,
-            &mut staging.storage,
-            &self.stream,
-            &mut self.stats,
-            asynchronous,
-        );
+        let result = if capturing {
+            let result = compiled.record_capture(
+                &installed.plan,
+                &installed.storage,
+                dims,
+                self.stats.arena_base,
+                &external,
+                &staging.storage,
+                &self.stream,
+                &mut self.stats,
+            );
+            if result.is_ok() {
+                for action in &compiled.actions {
+                    if let Action::Host(host) = action {
+                        let variant = host.variants.front().unwrap();
+                        if !self
+                            .captured_resources
+                            .iter()
+                            .any(|v| Rc::ptr_eq(v, variant))
+                        {
+                            self.captured_resources.push(variant.clone());
+                        }
+                    }
+                }
+            }
+            result
+        } else {
+            compiled.launch(
+                dims,
+                &mut staging.storage,
+                &self.stream,
+                &mut self.stats,
+                asynchronous,
+            )
+        };
         installed.compiled = Some(compiled);
         if result.is_err() {
-            self.stream.synchronize()?;
+            if !capturing {
+                self.stream.synchronize()?;
+            }
             self.pending_async = false;
         } else {
             self.pending_async = asynchronous;
@@ -659,6 +722,7 @@ struct CompiledPlan {
     live_resources: Vec<Rc<HostVariant>>,
     actions: Vec<Action>,
     params: ArenaSlice,
+    empty_copy_source: u64,
     schema: Vec<Symbol>,
     deps: BTreeMap<Symbol, Vec<usize>>,
     last_dims: DynMap,
@@ -874,6 +938,7 @@ impl CompiledPlan {
             live_resources: vec![],
             actions: vec![],
             params,
+            empty_copy_source: staging.ptr() as u64,
             schema,
             deps: BTreeMap::new(),
             last_dims: dims.clone(),
@@ -1121,7 +1186,18 @@ impl CompiledPlan {
                     kind,
                     bytes,
                     ..
-                } => graph.copy(&deps, &copy_params(*src, *dst, *bytes, *kind))?,
+                } => {
+                    // CUDA validates even disabled memcpy nodes. Empty
+                    // external tensors may have null addresses, so use a
+                    // valid one-byte staging copy until this node is enabled.
+                    // A later memory-kind change takes the normal rebuild path.
+                    let params = if *bytes == 0 {
+                        copy_params(self.empty_copy_source, self.base, 1, CopyKind::HtoD)
+                    } else {
+                        copy_params(*src, *dst, *bytes, *kind)
+                    };
+                    graph.copy(&deps, &params)?
+                }
                 Action::Host(h) => graph.child(&deps, &h.variants.front().unwrap().graph)?,
                 Action::Kernel {
                     func, args, launch, ..
@@ -1346,6 +1422,77 @@ impl CompiledPlan {
         self.external = external.clone();
         Ok(())
     }
+    fn check_async_parameters(&self, dims: &DynMap, staging: &Pinned) -> Result<()> {
+        ensure!(
+            self.parameter_dims.as_ref() == Some(dims),
+            "warm up this shape synchronously before asynchronous execution"
+        );
+        for (i, symbol) in self.schema.iter().enumerate() {
+            let expected = i64::try_from(dims[symbol])?.to_ne_bytes();
+            ensure!(
+                self.params.bytes(staging)[i * 8..i * 8 + 8] == expected,
+                "host staging changed; warm up synchronously before asynchronous execution"
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_capture(
+        &self,
+        plan: &CudaPlan,
+        storage: &ArenaPlan,
+        dims: &DynMap,
+        base: u64,
+        external: &ExternalBuffers,
+        staging: &Pinned,
+        stream: &Arc<CudaStream>,
+        stats: &mut GraphStats,
+    ) -> Result<()> {
+        self.check_async_parameters(dims, staging)?;
+        // A capture is an independent snapshot. Resolve its current addresses
+        // without changing the normal executable or its binding cache.
+        let graph = Graph::new(stream.context())?;
+        let mut previous = None;
+        for action in &self.actions {
+            let deps: Vec<_> = previous.into_iter().collect();
+            let node = match action {
+                Action::Copy {
+                    src_ref,
+                    dst_ref,
+                    kind,
+                    bytes,
+                    ..
+                } if *bytes != 0 => {
+                    let src = resolve(src_ref, plan, storage, base, external, dims)?;
+                    let dst = resolve(dst_ref, plan, storage, base, external, dims)?;
+                    graph.copy(&deps, &copy_params(src, dst, *bytes, *kind))?
+                }
+                Action::Kernel {
+                    func,
+                    args,
+                    refs,
+                    launch,
+                    ..
+                } if launch.enabled() => {
+                    let mut args = args.clone();
+                    for (arg, address) in args.iter_mut().zip(refs) {
+                        *arg = resolve(address, plan, storage, base, external, dims)?;
+                    }
+                    let mut pointers: Vec<_> =
+                        args.iter_mut().map(|p| (p as *mut u64).cast()).collect();
+                    graph.kernel(&deps, &launch.params(*func, &mut pointers))?
+                }
+                Action::Host(host) => graph.child(&deps, &host.variants.front().unwrap().graph)?,
+                _ => continue,
+            };
+            previous = Some(node);
+        }
+        graph.append_to_capture(stream)?;
+        stats.launches += 1;
+        Ok(())
+    }
+
     fn launch(
         &mut self,
         dims: &DynMap,
@@ -1355,17 +1502,7 @@ impl CompiledPlan {
         asynchronous: bool,
     ) -> Result<()> {
         if asynchronous {
-            ensure!(
-                self.parameter_dims.as_ref() == Some(dims),
-                "warm up this shape synchronously before asynchronous execution"
-            );
-            for (i, symbol) in self.schema.iter().enumerate() {
-                let expected = i64::try_from(dims[symbol])?.to_ne_bytes();
-                ensure!(
-                    self.params.bytes(staging)[i * 8..i * 8 + 8] == expected,
-                    "host staging changed; warm up synchronously before asynchronous execution"
-                );
-            }
+            self.check_async_parameters(dims, staging)?;
         } else {
             // Caller-owned parameter staging may have been used by another
             // program. Never assume its bytes

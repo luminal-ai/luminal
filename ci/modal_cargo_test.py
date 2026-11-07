@@ -4,7 +4,8 @@ import subprocess
 
 import modal
 
-gpu_type = os.environ.get("GPU_TYPE", "T4")
+# The precision suites exercise BF16 and TF32 cuBLASLt modes (SM80+).
+gpu_type = os.environ.get("GPU_TYPE", "A100")
 modal_timeout = int(os.environ.get("MODAL_TIMEOUT", "7200"))
 CUDARC_CUDA_VERSION = "12080"
 
@@ -74,6 +75,22 @@ def run_cargo_test():
     )
 
 
+@app.function(image=cuda_image, gpu="T4:2", timeout=modal_timeout)
+def run_nccl_all_gather():
+    """Exercise the native collective on two ranks and two CUDA devices."""
+    subprocess.run(
+        [
+            "cargo", "test", "--release", "-p", "luminal_cuda_lite",
+            "--features", "device", "--test", "all_gather",
+            "nccl_all_gather_replays_with_new_shapes_and_arenas",
+            "--", "--ignored", "--nocapture",
+        ],
+        cwd=WORKDIR,
+        check=True,
+    )
+
+
 @app.local_entrypoint()
 def main():
     run_cargo_test.remote()
+    run_nccl_all_gather.remote()

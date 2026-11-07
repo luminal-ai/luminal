@@ -288,6 +288,9 @@ def test_symbolic_scalar_operand_real_path(stage_one_only, name):
     # dimension, never the hint it was traced at.
     for rows in (3, 5, 8):
         x = torch.linspace(-2.0, 2.0, rows * 2).reshape(rows, 2)
+        # Device arenas require a finite declared domain for every free axis.
+        for axis in range(x.ndim):
+            torch._dynamo.mark_dynamic(x, axis, min=2, max=64)
         _assert_same(compiled(x), model(x), exact)
 
 
@@ -387,7 +390,7 @@ class ScalarComparisons(torch.nn.Module):
             torch.ne(a, NAN),
             torch.le(a, NAN),
             torch.ge(a, NAN),
-            a != a,
+            a != a,  # noqa: PLR0124 -- IEEE NaN self-comparison is the regression.
         )
 
 

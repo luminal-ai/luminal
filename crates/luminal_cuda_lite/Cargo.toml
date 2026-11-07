@@ -15,7 +15,7 @@ experimental-stride-primitive = ["luminal/experimental-stride-primitive"]
 experimental-element-stride = ["luminal/experimental-element-stride"]
 # Train 3: the cuBLASLt host-call dispatch rides the same feature —
 # cudarc's `cublaslt` module (result layer) joins the driver/NVRTC set.
-device = ["dep:cudarc", "cudarc/cublaslt"]
+device = ["dep:cudarc", "cudarc/cublaslt", "cudarc/nccl"]
 
 [dependencies]
 luminal = { path = "../.." }

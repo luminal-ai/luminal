@@ -47,6 +47,10 @@ SUPPORTED_DTYPES: dict[torch.dtype, str] = {
     torch.uint8: "U8",
     torch.int8: "I8",
     torch.int16: "I16",
+    torch.float8_e4m3fn: "F8E4M3FN",
+    torch.float8_e5m2: "F8E5M2",
+    torch.float8_e4m3fnuz: "F8E4M3FNUZ",
+    torch.float8_e5m2fnuz: "F8E5M2FNUZ",
 }
 
 

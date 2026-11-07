@@ -501,6 +501,8 @@ impl OpWire {
             ("ops::BitsToBoolsDps", serde_json::json!(v.width))
         } else if let Some(v) = any.downcast_ref::<ops::BoolsToBitsDps>() {
             ("ops::BoolsToBitsDps", serde_json::json!(v.width))
+        } else if let Some(v) = any.downcast_ref::<ops::AllGatherDps>() {
+            ("ops::AllGatherDps", serde_json::json!((&v.spec, v.dtype)))
         } else if let Some(v) = any.downcast_ref::<ops::ConstantDps>() {
             ("ops::ConstantDps", serde_json::json!(v.value.to_bits()))
         } else if let Some(v) = any.downcast_ref::<ops::GatherDps>() {
@@ -590,6 +592,10 @@ impl OpWire {
             "ops::BoolsToBitsDps" => Box::new(ops::BoolsToBitsDps {
                 width: serde_json::from_value(payload)?,
             }),
+            "ops::AllGatherDps" => {
+                let (spec, dtype) = serde_json::from_value(payload)?;
+                Box::new(ops::AllGatherDps { spec, dtype })
+            }
             "ops::ConstantDps" => Box::new(ops::ConstantDps {
                 value: f64::from_bits(serde_json::from_value(payload)?),
             }),
