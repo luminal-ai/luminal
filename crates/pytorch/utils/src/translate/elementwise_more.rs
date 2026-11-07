@@ -352,39 +352,37 @@ impl Translator<'_> {
         // The round count is a function of the operands' dtype, taken
         // before the widening cast below (see `gcd_euclid_rounds`).
         let rounds = gcd_euclid_rounds(gcd_magnitude_bound(lhs.dtype));
+        // PyTorch takes abs in the operand dtype before Euclid. That ordering
+        // is observable at MIN: same-width wrapping abs leaves MIN negative,
+        // while widening first would make (for example) I32::MIN positive.
+        let lhs = self.torch_int_abs(lhs);
+        let rhs = self.torch_int_abs(rhs);
         let mut lhs = lhs.cast(DType::I64);
         let mut rhs = rhs.cast(DType::I64);
         let one = self.constant_like(lhs, 1.0);
         let zero = self.constant_like(lhs, 0.0);
-        // |MIN| is not an I64, so MIN cannot be Euclid's divisor: its wrapped
-        // magnitude is MIN, `maximum(MIN, 1)` is 1, and the loop would stop
-        // on gcd(MAX, MIN) == MIN. gcd is symmetric, so MIN moves to the
-        // dividend. Every later divisor is a remainder, smaller in magnitude
-        // than a representable divisor, so this one swap is enough. (Both
-        // MIN gives |MIN| wrapped to MIN, as torch does.)
-        let rhs_is_min = self.torch_int_abs(rhs).lt(zero);
-        (lhs, rhs) = (rhs_is_min.select(rhs, lhs), rhs_is_min.select(lhs, rhs));
         for _ in 0..rounds {
             let finished = self.exact_is_zero(rhs);
-            // Zero-free divisor: `maximum(|rhs|, 1)` is `|rhs|` whenever
-            // `rhs != 0` and `1` when `rhs == 0`. Euclid is invariant under
-            // the divisor's sign, so `|rhs|` is correct for signed inputs,
-            // and the structural max bound rule derives its lower bound `1`
-            // statically — the proof the I64 `trunc_rem` needs. (The previous
-            // `finished.select(1, rhs)` was correct but had only the generic
-            // union bounds, which included 0.)
+            // `maximum(|rhs|, 1)` gives the ordinary remainder a statically
+            // positive divisor. I64::MIN is the sole exception because its
+            // wrapping magnitude remains negative. Division by I64::MIN has
+            // a simple exact spelling over I64: `lhs % MIN` is `0` for MIN
+            // and `lhs` otherwise. Selecting that spelling preserves
+            // PyTorch's signed Euclid state without weakening the remainder
+            // proof gate or evaluating an overflowing MIN / -1 division.
             let magnitude = self.torch_int_abs(rhs);
+            let divisor_is_min = magnitude.lt(zero);
             let safe_rhs = magnitude.maximum(one);
-            let remainder = lhs.trunc_rem(safe_rhs);
+            let ordinary_remainder = lhs.trunc_rem(safe_rhs);
+            let min_remainder = lhs.eq(rhs).select(zero, lhs);
+            let remainder = divisor_is_min.select(min_remainder, ordinary_remainder);
             lhs = finished.select(lhs, rhs);
             rhs = finished.select(zero, remainder);
         }
-        // Every Euclid state is an operand or a remainder smaller in
-        // magnitude than one, so `lhs` fits the output dtype and this cast
-        // is exact. The magnitude is taken AFTER it, at the output dtype, so
-        // `gcd(MIN, 0)` wraps to MIN the way torch's same-width abs does.
-        let signed = lhs.cast(output_dtype);
-        Ok(self.torch_int_abs(signed))
+        // Do not take another abs here. A wrapped MIN operand can make the
+        // final signed remainder negative (for example gcd(MIN, 6) == -2),
+        // and that sign is part of PyTorch's authored result.
+        Ok(lhs.cast(output_dtype))
     }
 
     pub(super) fn translate_exp2(&mut self, node: &Node) -> Result<GraphTensor> {
