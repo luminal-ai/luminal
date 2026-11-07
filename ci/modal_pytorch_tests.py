@@ -43,7 +43,9 @@ def create_app(backend: str, local_project_dir: Path):
 
     image = (
         modal.Image.from_registry(
-            f"ghcr.io/luminal-ai/luminal-docker:{'cuda' if backend == 'cuda_lite' else 'cpu'}"
+            f"ghcr.io/luminal-ai/luminal-docker:{'cuda' if backend == 'cuda_lite' else 'cpu'}",
+            # Serialized class bytecode must match the launcher interpreter.
+            add_python=f"{sys.version_info.major}.{sys.version_info.minor}",
         )
         .env({"CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION})
         .workdir(PROJECT_DIR)
