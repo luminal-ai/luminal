@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cudarc::{
-    driver::{CudaContext, CudaStream, result, sys as cu},
+    driver::{CudaContext, CudaEvent, CudaStream, result, sys as cu},
     nvrtc::{CompileOptions, compile_ptx_with_opts},
 };
 use luminal::{
@@ -186,6 +186,48 @@ pub struct CudaStaging {
 impl CudaStaging {
     pub fn bytes(&self) -> usize {
         self.storage.bytes().len()
+    }
+}
+
+/// Profiling records timing-enabled events immediately around the graph launch,
+/// after host-side validation, updates and parameter staging. Both events use
+/// the launch stream, so the stop covers every kernel/copy/child graph.
+#[derive(Clone, Copy)]
+pub(crate) enum ExecutionMode<'a> {
+    Synchronous,
+    Asynchronous,
+    Profile {
+        start: &'a CudaEvent,
+        stop: &'a CudaEvent,
+    },
+}
+impl ExecutionMode<'_> {
+    fn asynchronous(self) -> bool {
+        matches!(self, Self::Asynchronous)
+    }
+    fn launch(self, executable: &Executable, stream: &Arc<CudaStream>) -> Result<()> {
+        let launched = (|| -> Result<()> {
+            if let ExecutionMode::Profile { start, .. } = self {
+                start.record(stream)?;
+            }
+            executable.launch(stream)?;
+            if let ExecutionMode::Profile { stop, .. } = self {
+                // Record before synchronizing: otherwise host wakeup latency
+                // would become part of the device interval.
+                stop.record(stream)?;
+            }
+            Ok(())
+        })();
+        // Synchronous callers regain storage when device work completes.
+        // Async callers retain storage and order access on the borrowed stream.
+        if !self.asynchronous() || launched.is_err() {
+            let completed = stream.synchronize();
+            launched?;
+            completed?;
+        } else {
+            launched?;
+        }
+        Ok(())
     }
 }
 
@@ -377,7 +419,13 @@ impl CudaExecutable {
         dims: &DynMap,
         external_ptrs: &FxHashMap<i64, ExternalPtr>,
     ) -> Result<()> {
-        self.execute_external_mode(arena, staging, dims, external_ptrs, false)
+        self.execute_external_mode(
+            arena,
+            staging,
+            dims,
+            external_ptrs,
+            ExecutionMode::Synchronous,
+        )
     }
 
     pub(crate) fn execute_external_mode(
@@ -386,8 +434,9 @@ impl CudaExecutable {
         staging: &mut CudaStaging,
         dims: &DynMap,
         external_ptrs: &FxHashMap<i64, ExternalPtr>,
-        asynchronous: bool,
+        mode: ExecutionMode<'_>,
     ) -> Result<()> {
+        let asynchronous = mode.asynchronous();
         self.ctx.bind_to_thread()?;
         ensure!(
             staging.bytes() >= self.stats.staging_bytes,
@@ -494,7 +543,7 @@ impl CudaExecutable {
             &mut staging.storage,
             &self.stream,
             &mut self.stats,
-            asynchronous,
+            mode,
         );
         installed.compiled = Some(compiled);
         if result.is_err() {
@@ -1352,8 +1401,9 @@ impl CompiledPlan {
         staging: &mut Pinned,
         stream: &Arc<CudaStream>,
         stats: &mut GraphStats,
-        asynchronous: bool,
+        mode: ExecutionMode<'_>,
     ) -> Result<()> {
+        let asynchronous = mode.asynchronous();
         if asynchronous {
             ensure!(
                 self.parameter_dims.as_ref() == Some(dims),
@@ -1376,17 +1426,74 @@ impl CompiledPlan {
             }
             self.parameter_dims = Some(dims.clone());
         }
-        let launched = self.executable.as_ref().unwrap().launch(stream);
-        // Synchronous callers regain storage when device work completes.
-        // Async callers retain storage and order access on the borrowed stream.
-        if !asynchronous || launched.is_err() {
-            let completed = stream.synchronize();
-            launched?;
-            completed?;
-        } else {
-            launched?;
-        }
+        mode.launch(self.executable.as_ref().unwrap(), stream)?;
         stats.launches += 1;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn profiling_events_cover_child_graph_work_and_can_be_reused() -> Result<()> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.new_stream()?;
+        // Two sequential 5 ms kernels, one nested in a child graph. The GPU
+        // global timer is in nanoseconds, independent of changing SM clocks.
+        let ptx = compile_ptx_with_opts(
+            r#"extern "C" __global__ void k() {
+                unsigned long long start, now;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+                do {
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+                } while (now - start < 5000000ULL);
+            }"#,
+            nvrtc_compile_options(),
+        )?;
+        let image = CString::new(ptx.to_src())?;
+        // SAFETY: the live context owns the module and Module outlives all graphs.
+        let raw = unsafe { result::module::load_data(image.as_ptr().cast())? };
+        let module = Module {
+            raw,
+            func: unsafe { result::module::get_function(raw, CString::new("k")?)? },
+            ctx: ctx.clone(),
+        };
+        let launch = Launch {
+            grid: [1; 3],
+            block: [1; 3],
+            shared: 0,
+        };
+        let params = launch.params(module.func, &mut []);
+        let child = Graph::new(&ctx)?;
+        child.kernel(&[], &params)?;
+        let graph = Graph::new(&ctx)?;
+        let first = graph.kernel(&[], &params)?;
+        graph.child(&[first], &child)?;
+        let executable = graph.instantiate()?;
+        ExecutionMode::Synchronous.launch(&executable, &stream)?;
+        let start = ctx.new_event(Some(cu::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let stop = ctx.new_event(Some(cu::CUevent_flags::CU_EVENT_DEFAULT))?;
+        for _ in 0..3 {
+            ExecutionMode::Profile {
+                start: &start,
+                stop: &stop,
+            }
+            .launch(&executable, &stream)?;
+            assert!(
+                stop.is_complete(),
+                "profile mode must return completed storage"
+            );
+            let elapsed = start.elapsed_ms(&stop)?;
+            assert!(
+                elapsed >= 9.5,
+                "must include both 5 ms kernels: {elapsed} ms"
+            );
+            // Host delay after completion cannot inflate the measurement.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert_eq!(start.elapsed_ms(&stop)?, elapsed);
+        }
         Ok(())
     }
 }
