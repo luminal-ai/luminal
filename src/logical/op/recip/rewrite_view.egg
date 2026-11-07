@@ -1,0 +1,15 @@
+; The reciprocal of a pure index view is the view of the reciprocal: a view
+; only chooses which element each output coordinate reads (a padding view
+; clamps its read, the fill is a select), so taking the reciprocal before or
+; after it reads the same value with the same rounding. torch's division by
+; a scalar (`x / s`, a VAE resnet's `/ output_scale_factor`) is recorded as
+; `x * recip(expand(s))`; with this rule the divisor's reciprocal is also
+; the broadcast of a one-element reciprocal, where it was only a full-size
+; tensor the size of `x`. One direction: the view's operand gains a
+; reciprocal, the view itself is never pushed inside one.
+(rule
+  ((= ?recip (LogicalRecip (LogicalIndexMapApply ?input ?map ?output_shape))))
+  ((union ?recip (LogicalIndexMapApply (LogicalRecip ?input) ?map ?output_shape)))
+  :ruleset main_ruleset
+  :name "recip/rewrite_view: the reciprocal of a view is the view of the reciprocal"
+)
