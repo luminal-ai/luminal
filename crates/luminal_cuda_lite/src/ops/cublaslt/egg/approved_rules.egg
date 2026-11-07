@@ -1,9 +1,18 @@
 ; Arithmetic precision supplies typed identities and the scalar ABI. Storage
 ; never selects it; both semantic operands must have this same arithmetic dtype.
 (relation cublaslt-arithmetic-type (Dtype LogicalTensor LogicalTensor))
+(cublaslt-arithmetic-type (Bf16) (LogicalCast (LogicalConstant 0.0) (Bf16)) (LogicalCast (LogicalConstant 1.0) (Bf16)))
 (cublaslt-arithmetic-type (F16) (LogicalCast (LogicalConstant 0.0) (F16)) (LogicalCast (LogicalConstant 1.0) (F16)))
 (cublaslt-arithmetic-type (F32) (LogicalConstant 0.0) (LogicalConstant 1.0))
 (cublaslt-arithmetic-type (F64) (LogicalConstantF64 0.0) (LogicalConstantF64 1.0))
+(relation cublaslt-scale-data-type (CublasLtComputationType Dtype Dtype))
+(cublaslt-scale-data-type (CublasLtFloat32Computation) (Bf16) (F32))
+(cublaslt-scale-data-type (CublasLtFloat16Computation) (F16) (F16))
+(cublaslt-scale-data-type (CublasLtFloat32Computation) (F32) (F32))
+(cublaslt-scale-data-type (CublasLtTensorFloat32Computation) (F32) (F32))
+(cublaslt-scale-data-type (CublasLtFloat32FastFloat16Computation) (F32) (F32))
+(cublaslt-scale-data-type (CublasLtFloat32FastBfloat16Computation) (F32) (F32))
+(cublaslt-scale-data-type (CublasLtFloat64Computation) (F64) (F64))
 (relation cublaslt-exact-storage-reading (Dtype LogicalTensor LogicalTensor))
 ; Production proof relations. None of these helper facts is an executable call.
 (relation cublaslt-approved-configuration (CublasLtConfiguration))
@@ -700,8 +709,9 @@
    (cublaslt-destination-reading ?D_layout_tensor ?m ?n ?D_storage_data_type ?D_matrix_order
      ?D_matrix_descriptor)
    (= (dtype-of ?output_expression) ?D_storage_data_type)
-   (= ?scalar_data_type (dtype-of ?A_operand))
-   (= (dtype-of ?B_operand) ?scalar_data_type)
+   (= ?arithmetic_data_type (dtype-of ?A_operand))
+   (= (dtype-of ?B_operand) ?arithmetic_data_type)
+   (cublaslt-scale-data-type ?computation_type ?arithmetic_data_type ?scalar_data_type)
    (cublaslt-C-matrix-argument ?expression_frame ?D_matrix_descriptor ?C_matrix_argument ?C_matrix_data_type
      ?C_input_tensors)
    (cublaslt-bias-argument ?expression_frame ?m ?bias_argument ?bias_data_type ?bias_input_tensors)
@@ -743,6 +753,17 @@
   ((cublaslt-operand-storage-reading (CublasLtFloat32Computation) ?logical_operand ?storage_source))
   :ruleset backend
   :name "cublaslt: F32 computation reads exact widened storage")
+
+; cuBLASLt has no BF16 computation enum. Its BF16 matrix contract stores A/B/D
+; in BF16, accumulates in F32, and rounds once when writing D. Keep this direct
+; reading distinct from explicit BF16-to-F32 widening and restrict its scalar
+; proof to the exact unscaled-product identities in scalar_rules.egg.
+(rule
+  ((= (dtype-of ?logical_operand) (Bf16)))
+  ((cublaslt-operand-storage-reading (CublasLtFloat32Computation)
+     ?logical_operand ?logical_operand))
+  :ruleset backend
+  :name "cublaslt: BF16 product uses BF16 storage with F32 accumulation")
 
 ; Signed INT8 widens exactly to F32. This A/B-only proof does not grant
 ; INT8 C/bias storage or move narrowing, scaling, or offsets across the cast.

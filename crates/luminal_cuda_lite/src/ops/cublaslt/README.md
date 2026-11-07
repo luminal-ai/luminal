@@ -88,6 +88,15 @@ scalars; FP64 computation uses FP64 scalars.
 Alpha and beta are general values in that arithmetic dtype; absent C still
 requires a literal beta zero in the same dtype. Storage never chooses arithmetic
 precision. Only an authored exact widening permits direct BF16/FP16/I8 A/B readings.
+
+A direct BF16 matrix product may also use the vendor's BF16 matrix contract:
+BF16 A/B/D storage, FP32 accumulation, and one BF16 rounding when D is written.
+Because cuBLASLt has no BF16 scale ABI, this path admits only the exact host
+identities for an unscaled product (`alpha = 1`, `beta = 0`). It does not move
+arbitrary BF16 coefficients, residual C, or bias across the matrix-product
+boundary. Explicit BF16-to-F32 operand casts remain the separate FP32-arithmetic
+contract described above.
+
 Casts between multiplication,
 reduction, C addition, bias addition and activation remain boundaries; earlier
 narrowing is preserved. A separate output-storage proof recognizes an authored

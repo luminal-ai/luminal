@@ -475,3 +475,45 @@ fn production_and_decomposed_search_are_measured_with_identical_precision_and_da
         }
     }
 }
+
+#[test]
+fn native_bf16_product_is_elected_and_executes_through_cublaslt() {
+    let mut graph = Graph::new();
+    let a = graph.tensor([64, 128], DType::Bf16);
+    let b = graph.tensor([128, 64], DType::Bf16);
+    let out = a.matmul(b);
+    let input = |value| {
+        HostBuffer::new(
+            PlanDtype::Bf16,
+            raw(&vec![value; 64 * 128], PlanDtype::Bf16),
+        )
+        .unwrap()
+    };
+    let inputs = FxHashMap::from_iter([(a.id, input(1.0)), (b.id, input(0.0625))]);
+    let mut runtime = CudaRuntime::load(&graph).unwrap();
+    runtime
+        .search(
+            &Default::default(),
+            &Default::default(),
+            &inputs,
+            &luminal_cuda_lite::harness_search_options(),
+        )
+        .unwrap();
+    assert!(runtime.plan().unwrap().dag.node_weights().any(|node| {
+        matches!(node, luminal::bufferize::BufferNode::Compute { op, .. }
+            if op.label() == "CublasLtCall")
+    }));
+
+    let mut arena = support::allocate_arena(&runtime).unwrap();
+    let mut staging = runtime.allocate_staging().unwrap();
+    for (id, data) in inputs {
+        runtime.upload(&mut arena, id, data).unwrap();
+    }
+    runtime.execute(arena.arena(), &mut staging).unwrap();
+    let result = runtime.download(&arena, out.id).unwrap().0;
+    let expected = half::bf16::from_f32(8.0).to_bits();
+    assert_eq!(result.dtype, PlanDtype::Bf16);
+    assert!(result.bytes.chunks_exact(2).all(|chunk| {
+        u16::from_ne_bytes(chunk.try_into().expect("two-byte BF16 element")) == expected
+    }));
+}

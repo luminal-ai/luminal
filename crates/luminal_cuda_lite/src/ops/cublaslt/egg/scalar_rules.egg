@@ -89,6 +89,18 @@
      (CublasLtHostScalarArguments ?alpha_value ?beta_value) (LayoutTensorNil)))
   :ruleset backend
   :name "cublaslt: literal FP32 alpha and beta use host scalar pointers")
+
+; Native BF16 products use the vendor's required FP32 scale ABI. Only the
+; exact unscaled-product identities are admitted: arbitrary BF16 coefficients
+; would need an explicit, separately represented widening boundary.
+(rule
+  ((cublaslt-scalar-demand ?alpha ?beta)
+   (= ?alpha (LogicalCast (LogicalConstant 1.0) (Bf16)))
+   (= ?beta (LogicalCast (LogicalConstant 0.0) (Bf16))))
+  ((cublaslt-scalar-arguments ?alpha ?beta (F32) (CublasLtHostScalarPointerMode)
+     (CublasLtHostScalarArguments 1.0 0.0) (LayoutTensorNil)))
+  :ruleset backend
+  :name "cublaslt: unscaled BF16 product uses exact FP32 host identities")
 (rule
   ((cublaslt-scalar-demand ?alpha ?beta)
    (= (shape-of ?alpha) (ShapeLit (IntExprNil)))
