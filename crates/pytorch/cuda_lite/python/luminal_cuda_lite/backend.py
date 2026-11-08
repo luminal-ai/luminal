@@ -24,10 +24,11 @@ tensor the caller receives is the one the runtime wrote rather than a copy
 of it. Its layout must be the one eager gives it: an output whose elected
 strides are not the declared ones is refused by name, because this backend
 returns outputs in eager's layout. Nothing is copied to the host and no
-layout is reinterpreted — a tensor the runtime cannot bind, one whose
-storage offset is non-zero among them, is refused by name. Aliasing has
-one spelling: two bindings naming one buffer id, which is how a writeback
-and the input it mutates share a pointer.
+layout is reinterpreted. A standalone input whose storage offset is
+non-zero is refused by name; a returned alias instead carries its owner
+and relative byte offset and is reconstructed as the authored view.
+Runtime write aliasing has one spelling: two bindings naming one buffer
+id, which is how a writeback and the input it mutates share a pointer.
 
 STREAM AND ARENA: the runtime always launches captured CUDA graphs, which
 the legacy default stream cannot host, so it runs on a dedicated
