@@ -212,6 +212,16 @@ def test_a_storage_offset_is_refused_by_name():
     assert boundary.boundary_layout("x", _Boundary((4, 4), (1, 8))) == _chain((1, 8))
 
 
+def test_an_output_alias_can_state_its_offset_separately_from_its_layout():
+    """Output aliases have an owner plus byte offset in the compiled
+    boundary. Their layout therefore describes strides from the aliased
+    starting address without pretending that the offset is zero."""
+    value = _Boundary((4, 4), (4, 1), offset=8)
+    assert boundary.boundary_layout("out", value, allow_storage_offset=True) == _chain(
+        (4, 1)
+    )
+
+
 def test_a_storage_offset_is_refused_at_call_time_too():
     """Dynamo guards shapes, not storage offsets, so a program compiled on
     a tensor at its storage's base can be called with one that is not:

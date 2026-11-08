@@ -8,14 +8,10 @@
 //! once, in the vocabulary of [`luminal_cuda_lite::CudaBindings`]: one buffer
 //! id per boundary tensor, the layout the caller declared for it, and
 //! `Placement::External` — the storage is the caller's own live device
-//! allocation, never host-staged and never given an arena range. Aliasing has
-//! one spelling, the same buffer id: a writeback binds on the buffer of the
-//! input it mutates, and an output that shares storage with an earlier
-//! boundary tensor (a view of an input, of a writeback, or of another
-//! output — read off the export's traced storage) binds on that tensor's
-//! buffer at its own layout. A user-visible output is bound at eager's exact
-//! strides, so the tensor the caller receives is laid out the way the
-//! uncompiled program lays it out.
+//! allocation, never host-staged and never given an arena range. A writeback
+//! binds on the buffer of the input it mutates. Python returns every read-only
+//! output alias as a view of its owner; aliases are not runtime outputs because
+//! a buffer cannot hold several distinct final logical views at once.
 //! Python addresses buffers, not tensors: `set_device_ptr(buffer, ptr, bytes)`
 //! before each execution.
 //!
@@ -77,6 +73,9 @@ pub struct CompiledGraph {
     /// spelled the way the caller spelled it. A writeback repeats the row of
     /// the input it mutates.
     output_layouts: Vec<(String, Vec<String>)>,
+    /// Runtime output slot by graph output name. Read-only aliases are
+    /// reconstructed by Python and deliberately have no runtime slot.
+    output_slots: HashMap<String, usize>,
     searched: bool,
     /// Current concrete value of every symbolic dim, seeded from the exported
     /// hints and updated from real input shapes as they are bound.
@@ -111,6 +110,7 @@ impl CompiledGraph {
             input_buffers: self.input_buffers.clone(),
             output_buffers: self.output_buffers.clone(),
             output_layouts: self.output_layouts.clone(),
+            output_slots: self.output_slots.clone(),
             dims: self.dims.clone(),
             bounds: self.bounds.clone(),
             searched: true,
@@ -463,15 +463,12 @@ impl CompiledGraph {
 
 impl CompiledGraph {
     /// The graph value one output name names.
-    /// A translation output's position, which is its slot in the bound
-    /// program: outputs are bound in translation order, one slot each, so a
-    /// value returned under two names has two slots and each name finds its own.
+    /// A materialized translation output's slot in the bound program.
+    /// Read-only aliases are returned as owner views and have no slot.
     fn output_position(&self, name: &str) -> PyResult<usize> {
-        self.translation
-            .outputs
-            .iter()
-            .position(|output| output.graph_name == name)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("{name:?} is not a graph output")))
+        self.output_slots.get(name).copied().ok_or_else(|| {
+            PyRuntimeError::new_err(format!("{name:?} is not a materialized graph output"))
+        })
     }
 
     /// Saturate and search. What this states is what Python reads: the
@@ -681,6 +678,7 @@ struct Boundary {
     input_buffers: Vec<i64>,
     output_buffers: Vec<i64>,
     output_layouts: Vec<(String, Vec<String>)>,
+    output_slots: HashMap<String, usize>,
 }
 
 /// The CUDA-lite boundary for a translated program: every input is the
@@ -688,13 +686,12 @@ struct Boundary {
 /// its own buffer; every user-visible output is a fresh caller-owned device
 /// buffer at the layout the caller declared for it — eager's exact strides —
 /// except a writeback, which binds on the buffer of the input it mutates, at
-/// that input's layout — two bindings naming one buffer id being the single
-/// spelling of aliasing.
+/// that input's layout. Read-only aliases are rebuilt as owner views by Python.
 fn bind(
     translation: &Translation,
     input_layouts: &HashMap<String, DeclaredLayout>,
     output_layouts: &HashMap<String, DeclaredLayout>,
-    aliases: &HashMap<String, String>,
+    aliases: &HashMap<String, (String, i64)>,
 ) -> Result<Boundary> {
     for name in input_layouts.keys() {
         ensure!(
@@ -735,6 +732,7 @@ fn bind(
     }
     let mut output_buffers = Vec::with_capacity(translation.outputs.len());
     let mut spellings = Vec::with_capacity(translation.outputs.len());
+    let mut output_slots = HashMap::new();
     for output in &translation.outputs {
         let (buffer, layout) = match &output.mutation_target {
             Some(target) => {
@@ -757,6 +755,7 @@ fn bind(
                 // must say so.
                 bindings.declare(buffer, Access::ReadWrite, FreedBy::Caller);
                 bindings.output_on_with(output.tensor, buffer, layout.layout.clone());
+                output_slots.insert(output.graph_name.clone(), bindings.outputs().len() - 1);
                 (buffer, layout)
             }
             None => {
@@ -767,13 +766,11 @@ fn bind(
                     )
                 })?;
                 match aliases.get(&output.graph_name) {
-                    // A user-visible output that shares its storage with an
-                    // earlier boundary tensor — a view of an input, of a
-                    // writeback, or of another output — is bound on THAT
-                    // tensor's buffer at its own layout. Aliasing has one
-                    // spelling, the same buffer id; the caller receives a
-                    // view of the tensor it already holds.
-                    Some(owner) => {
+                    // Python reconstructs an authored output alias as a view
+                    // of `owner` after execution. It is deliberately not a
+                    // runtime output: even at byte offset zero, different
+                    // logical views cannot all be final values of one buffer.
+                    Some((owner, offset)) => {
                         let buffer = if let Some(index) = translation
                             .inputs
                             .iter()
@@ -784,7 +781,7 @@ fn bind(
                             .outputs
                             .iter()
                             .position(|earlier| &earlier.graph_name == owner)
-                            && index < output_buffers.len()
+                            .filter(|index| *index < output_buffers.len())
                         {
                             output_buffers[index]
                         } else {
@@ -794,7 +791,12 @@ fn bind(
                                 output.graph_name
                             )
                         };
-                        bindings.output_on_with(output.tensor, buffer, layout.layout.clone());
+                        // A read-only alias is a distinct logical view even at
+                        // byte offset zero. Keep it in the declaration cone,
+                        // but never demand that the owner buffer hold several
+                        // distinct final values. Python reconstructs the view.
+                        let _ = offset;
+                        bindings.root(output.tensor);
                         (buffer, layout.clone())
                     }
                     // Otherwise the caller's own fresh device allocation,
@@ -802,6 +804,8 @@ fn bind(
                     None => {
                         let buffer =
                             bindings.output_external_with(output.tensor, layout.layout.clone());
+                        output_slots
+                            .insert(output.graph_name.clone(), bindings.outputs().len() - 1);
                         (buffer, layout.clone())
                     }
                 }
@@ -809,6 +813,23 @@ fn bind(
         };
         output_buffers.push(buffer);
         spellings.push(layout.spelling());
+    }
+    // A program whose only results are read-only views still
+    // needs one extraction root. No work is required to produce those views;
+    // root the authored input value that owns their storage instead. Python
+    // returns the views themselves from the recorded boundary metadata.
+    if bindings.outputs().is_empty() {
+        let input = translation
+            .inputs
+            .first()
+            .context("an alias-only program has no graph input to root")?;
+        let layout = input_layouts.get(&input.graph_name).ok_or_else(|| {
+            anyhow!(
+                "alias-only root input {:?} has no declared boundary layout",
+                input.graph_name
+            )
+        })?;
+        bindings.output_on_with(input.tensor, input_buffers[0], layout.layout.clone());
     }
     luminal_pytorch_utils::declare(
         &mut bindings,
@@ -820,6 +841,7 @@ fn bind(
         input_buffers,
         output_buffers,
         output_layouts: spellings,
+        output_slots,
     })
 }
 
@@ -830,13 +852,14 @@ fn bind(
 /// expression over the exported program's symbols. A writeback takes no row —
 /// it writes the storage of the input it mutates, at that input's layout.
 /// `output_aliases` names each output that shares its storage with an earlier
-/// boundary tensor (`(output, owner)`); it is bound on the owner's buffer.
+/// boundary tensor (`(output, owner, byte_offset)`). Aliases are reconstructed
+/// by Python and are not runtime outputs.
 #[pyfunction]
 fn compile(
     pt2_path: &str,
     input_layouts: Vec<(String, String, Vec<String>)>,
     output_layouts: Vec<(String, String, Vec<String>)>,
-    output_aliases: Vec<(String, String)>,
+    output_aliases: Vec<(String, String, i64)>,
 ) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
@@ -846,7 +869,10 @@ fn compile(
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let inputs = layout_table(&translation, "input", &input_layouts).map_err(to_py)?;
     let outputs = layout_table(&translation, "output", &output_layouts).map_err(to_py)?;
-    let aliases: HashMap<String, String> = output_aliases.into_iter().collect();
+    let aliases: HashMap<String, (String, i64)> = output_aliases
+        .into_iter()
+        .map(|(output, owner, offset)| (output, (owner, offset)))
+        .collect();
     let boundary = bind(&translation, &inputs, &outputs, &aliases)
         .context("declaring the translated program's boundary")
         .map_err(to_py)?;
@@ -863,6 +889,7 @@ fn compile(
         input_buffers: boundary.input_buffers,
         output_buffers: boundary.output_buffers,
         output_layouts: boundary.output_layouts,
+        output_slots: boundary.output_slots,
         searched: false,
         dims,
         bounds,
@@ -1052,6 +1079,7 @@ mod tests {
             input_buffers: boundary.input_buffers,
             output_buffers: boundary.output_buffers,
             output_layouts: boundary.output_layouts,
+            output_slots: boundary.output_slots,
             searched: false,
             bounds: SymbolBounds::exact(&dims).unwrap(),
             dims,

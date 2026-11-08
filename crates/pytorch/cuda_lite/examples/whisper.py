@@ -402,6 +402,12 @@ def download_default_audio() -> Path:
     return destination
 
 
+def find_default_audio() -> Path | None:
+    """Return the cached sample when present, without requiring network access."""
+    path = Path(__file__).resolve().parent / "assets" / "jfk.wav"
+    return path if path.is_file() else None
+
+
 def main() -> None:
     from luminal_cuda_lite import Compiler
 

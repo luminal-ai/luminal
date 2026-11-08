@@ -258,10 +258,13 @@ def test_complex_scatter_aliases_preserve_duplicate_updates():
     module = ComplexScatterAliases()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        expected = module(value, index, source)
+        # Eager CUDA does not implement complex scatter reductions. CPU eager
+        # is the authored ATen semantic reference; the compiled path still
+        # receives the original CUDA tensors.
+        expected = module(value.cpu(), index.cpu(), source.cpu())
         actual = _compile_and_run(module, value, index, source)
     for result, reference in zip(actual, expected):
-        _assert_close(result, reference, rtol=3e-4, atol=3e-5)
+        _assert_close(result, reference.to(result.device), rtol=3e-4, atol=3e-5)
 
 
 class MixedComplexReal(torch.nn.Module):

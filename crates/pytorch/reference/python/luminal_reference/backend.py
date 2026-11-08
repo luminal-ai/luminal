@@ -17,6 +17,7 @@ from . import _luminal
 from .dimensions import export_specs, profile_value
 from .export_utils import (
     _box_scalar_graph_outputs,
+    _canonicalize_tensor_scale_sdpa,
     _decomp_table,
     _drop_dead_data_dependent_ops,
     _drop_input_guards,
@@ -278,6 +279,7 @@ def _prepare_local_graph(
     # mutating it here would corrupt that bookkeeping. The copy shares the
     # module's weights (see private_graph_copy).
     gm = private_graph_copy(gm)
+    _canonicalize_tensor_scale_sdpa(gm)
     scalar_output_positions = _box_scalar_graph_outputs(gm)
 
     # The graph-module preprocessing above runs first; `_dynamic_export` then

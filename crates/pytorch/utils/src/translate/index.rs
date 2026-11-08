@@ -885,6 +885,173 @@ impl Translator<'_> {
         Ok(if squeeze { result.squeeze(0) } else { result })
     }
 
+    /// Complex scatter lowered over its real component tensors. Overwrite and
+    /// addition are component-wise. Multiplication must update both components
+    /// from the same prior complex value, so duplicate destinations are
+    /// unrolled in update order rather than reduced independently.
+    pub(super) fn translate_complex_scatter_components(
+        &mut self,
+        node: &Node,
+        kind: u8,
+        real: GraphTensor,
+        imag: GraphTensor,
+        update_real: GraphTensor,
+        update_imag: GraphTensor,
+    ) -> Result<(GraphTensor, GraphTensor)> {
+        let rank = real.rank();
+        let raw_dim = self.get_int_arg(node, 1)?;
+        let dim = if rank == 0 {
+            if !matches!(raw_dim, -1 | 0) {
+                bail!("scatter dim {raw_dim} out of range for a scalar");
+            }
+            0
+        } else {
+            normalize_dim(raw_dim, rank)
+        };
+        let indices = self.operand(&node.inputs[2])?.cast(DType::Int);
+        let reduction = match kind {
+            0 | 1 => None,
+            2 | 3 => Some(self.idx_legacy_reduction(node)?),
+            4 => Some(IdxReduce::Sum),
+            5 => Some(self.idx_modern_reduction(node)?),
+            other => bail!("complex scatter variant {other} is not ported"),
+        };
+        let include_self = if kind == 5 {
+            self.idx_include_self(node)
+        } else {
+            true
+        };
+        anyhow::ensure!(
+            include_self,
+            "complex scatter_reduce with include_self=false is not ported"
+        );
+        let (real, imag, indices, update_real, update_imag, squeeze) = if rank == 0 {
+            (
+                real.unsqueeze(0),
+                imag.unsqueeze(0),
+                indices.unsqueeze(0),
+                update_real.unsqueeze(0),
+                update_imag.unsqueeze(0),
+                true,
+            )
+        } else {
+            (real, imag, indices, update_real, update_imag, false)
+        };
+        let index = self.idx_normalize(indices, real.dims()[dim]);
+        let update_dims = index.dims();
+        let update_real = self.idx_crop_to(update_real, &update_dims);
+        let update_real = self.idx_cast_like(update_real, real.dtype);
+        let update_imag = self.idx_crop_to(update_imag, &update_dims);
+        let update_imag = self.idx_cast_like(update_imag, imag.dtype);
+        let plan = Self::idx_scatter_plan(update_dims.len(), dim, index);
+        let (real, imag) = match reduction {
+            None => {
+                self.idx_complex_scatter_overwrite(real, imag, &plan, update_real, update_imag)?
+            }
+            Some(IdxReduce::Sum) => (
+                self.idx_scatter_reduce(real, plan.clone(), update_real, IdxReduce::Sum, true)?,
+                self.idx_scatter_reduce(imag, plan, update_imag, IdxReduce::Sum, true)?,
+            ),
+            Some(IdxReduce::Prod) => {
+                self.idx_complex_scatter_prod(real, imag, &plan, update_real, update_imag)?
+            }
+            Some(IdxReduce::Mean | IdxReduce::Max | IdxReduce::Min) => {
+                bail!("unsupported complex {} reduction", node.target)
+            }
+        };
+        Ok(if squeeze {
+            (real.squeeze(0), imag.squeeze(0))
+        } else {
+            (real, imag)
+        })
+    }
+
+    fn idx_complex_scatter_prod(
+        &mut self,
+        mut real: GraphTensor,
+        mut imag: GraphTensor,
+        plan: &[IdxCoord],
+        update_real: GraphTensor,
+        update_imag: GraphTensor,
+    ) -> Result<(GraphTensor, GraphTensor)> {
+        let update_dims = update_real.dims();
+        let count = idx_numel(&update_dims)
+            .context("complex scatter product requires a concrete update element count")?;
+        if count == 0 || idx_numel(&real.dims()) == Some(0) {
+            return Ok((real, imag));
+        }
+        let coords: Vec<GraphTensor> = self
+            .idx_coordinate_tensors(plan, &update_dims)
+            .into_iter()
+            .map(GraphTensor::flatten)
+            .collect();
+        let update_real = update_real.flatten();
+        let update_imag = update_imag.flatten();
+        let storage_dtype = real.dtype;
+        let compute_dtype = if storage_dtype.is_narrow_float() {
+            DType::F32
+        } else {
+            storage_dtype
+        };
+        for step in 0..count {
+            let dest: Vec<GraphTensor> = coords
+                .iter()
+                .map(|coord| coord.slice_along(step..step + 1, 0))
+                .collect();
+            let current_real = real.gather(&dest).cast(compute_dtype);
+            let current_imag = imag.gather(&dest).cast(compute_dtype);
+            let incoming_real = update_real
+                .slice_along(step..step + 1, 0)
+                .cast(compute_dtype);
+            let incoming_imag = update_imag
+                .slice_along(step..step + 1, 0)
+                .cast(compute_dtype);
+            let next_real = util::round_to_storage(
+                current_real * incoming_real - current_imag * incoming_imag,
+                storage_dtype,
+            );
+            let next_imag = util::round_to_storage(
+                current_real * incoming_imag + current_imag * incoming_real,
+                storage_dtype,
+            );
+            real = real.scatter(&dest, next_real);
+            imag = imag.scatter(&dest, next_imag);
+        }
+        Ok((real, imag))
+    }
+
+    fn idx_complex_scatter_overwrite(
+        &mut self,
+        mut real: GraphTensor,
+        mut imag: GraphTensor,
+        plan: &[IdxCoord],
+        update_real: GraphTensor,
+        update_imag: GraphTensor,
+    ) -> Result<(GraphTensor, GraphTensor)> {
+        let update_dims = update_real.dims();
+        let count = idx_numel(&update_dims)
+            .context("complex scatter overwrite requires a concrete update element count")?;
+        if count == 0 || idx_numel(&real.dims()) == Some(0) {
+            return Ok((real, imag));
+        }
+        let coords: Vec<GraphTensor> = self
+            .idx_coordinate_tensors(plan, &update_dims)
+            .into_iter()
+            .map(GraphTensor::flatten)
+            .collect();
+        let update_real = update_real.flatten();
+        let update_imag = update_imag.flatten();
+        for step in 0..count {
+            let dest: Vec<GraphTensor> = coords
+                .iter()
+                .map(|coord| coord.slice_along(step..step + 1, 0))
+                .collect();
+            real = real.scatter(&dest, update_real.slice_along(step..step + 1, 0));
+            imag = imag.scatter(&dest, update_imag.slice_along(step..step + 1, 0));
+        }
+        Ok((real, imag))
+    }
+
     /// `index_put_`/`index_put`: `data[indices...] = values` (functional
     /// SSA; the boundary handles the in-place writeback).
     pub(super) fn translate_index_put(&mut self, node: &Node) -> Result<GraphTensor> {

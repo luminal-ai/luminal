@@ -51,6 +51,7 @@ import torch
 from luminal_reference.dimensions import export_specs, profile_value
 from luminal_reference.export_utils import (
     _box_scalar_graph_outputs,
+    _canonicalize_tensor_scale_sdpa,
     _decomp_table,
     _drop_dead_data_dependent_ops,
     _drop_input_guards,
@@ -246,7 +247,13 @@ def _output_layout_rows(ep: Any) -> list[tuple[str, str, list[str]]]:
             continue
         fake = _output_fake(name, fakes)
         stated.add(name)
-        tag, strides = layout_spec(boundary_layout(name, fake))
+        # A returned view may start inside an earlier boundary tensor. Its
+        # alias row states that byte offset; its own layout still states the
+        # strides from that starting address. Inputs cannot do this because a
+        # standalone input binding has no owner/offset row.
+        tag, strides = layout_spec(
+            boundary_layout(name, fake, allow_storage_offset=True)
+        )
         rows.append((name, tag, list(strides)))
     return rows
 
@@ -284,6 +291,14 @@ def _output_alias_rows(ep: Any) -> list[tuple[str, str, int]]:
         storage = fake.untyped_storage()._cdata
         owner = owner_by_storage.setdefault(storage, name)
         if owner != name and name in outputs:
+            # Conjugate/negative are tensor metadata, not storage layout. A
+            # plain set_ view cannot recreate a different metadata bit from
+            # its owner, so those outputs must be materialized normally.
+            if (
+                fake.is_conj() != fakes[owner].is_conj()
+                or fake.is_neg() != fakes[owner].is_neg()
+            ):
+                continue
             offset = (
                 int(fake.storage_offset()) * fake.element_size()
                 - int(fakes[owner].storage_offset()) * fakes[owner].element_size()
@@ -439,6 +454,16 @@ class CompiledModel:
             self._output_aliases,
         )
 
+    @property
+    def dim_params(self) -> tuple[str, ...]:
+        """The PT2 names of dimensions that remain symbolic at runtime."""
+        return tuple(self._graph.dim_symbols)
+
+    @property
+    def has_dynamic_dims(self) -> bool:
+        """Whether this compiled graph has any runtime dimension parameters."""
+        return bool(self.dim_params)
+
     def _boundary_tensor(
         self,
         name: str,
@@ -514,9 +539,13 @@ class CompiledModel:
                 f"luminal_cuda_lite expected {len(self._input_bindings)} inputs, "
                 f"got {len(inputs)}"
             )
-        if not inputs:
-            raise RuntimeError("luminal_cuda_lite requires at least one tensor input")
-        device = inputs[0].device
+        device = (
+            inputs[0].device
+            if inputs
+            else next(iter(self._held.values())).device
+            if self._held
+            else torch.device("cuda", torch.cuda.current_device())
+        )
         for value in inputs:
             if value.device != device:
                 raise RuntimeError(
@@ -619,12 +648,14 @@ class CompiledModel:
                     out_spans.append(None)
                     continue
                 name = binding.name
-                logical_shape = tuple(output_shapes[index])
-                shape = (
-                    (*logical_shape, 2)
-                    if complex_component_dtype(binding.dtype) is not None
-                    else logical_shape
-                )
+                if name in self._output_aliases:
+                    out_tensors.append(None)
+                    out_spans.append(None)
+                    continue
+                # The translated graph exposes physical boundary shapes. A
+                # complex value therefore already has its trailing extent-2
+                # real/imaginary storage axis here.
+                shape = tuple(output_shapes[index])
                 # The plan was retargeted onto the caller's buffer at search;
                 # a plan that writes this output somewhere else is a runtime
                 # invariant broken, not a call this caller can fix.
@@ -775,12 +806,7 @@ class CompiledModel:
                     owner_name, offset_bytes = self._output_aliases[binding.name]
                     owner = self._boundary_tensor(owner_name, inputs, out_tensors)
                     component = complex_component_dtype(binding.dtype)
-                    logical_output_shape = tuple(output_shapes[index])
-                    storage_output_shape = (
-                        (*logical_output_shape, 2)
-                        if component is not None
-                        else logical_output_shape
-                    )
+                    storage_output_shape = tuple(output_shapes[index])
                     storage_output_strides = tuple(
                         declared_strides(binding, storage_output_shape, dims)
                     )
@@ -956,7 +982,26 @@ def _compile_graph(
     # mutating it here would corrupt that bookkeeping. The copy shares the
     # module's weights (see private_graph_copy).
     gm = private_graph_copy(gm)
+    _canonicalize_tensor_scale_sdpa(gm)
     scalar_output_positions = _box_scalar_graph_outputs(gm)
+    # Dynamo may already have boxed an authored Python scalar with
+    # torch.scalar_tensor, whose default device is CPU. The box is an internal
+    # backend boundary value (CompiledModel restores `.item()`); place it on
+    # the same CUDA device as the graph so export does not invent a CPU tensor
+    # in an otherwise CUDA program.
+    tensor_device = next(
+        (value.device for value in example_inputs if isinstance(value, torch.Tensor)),
+        None,
+    )
+    if tensor_device is not None:
+        for node in gm.graph.nodes:
+            if node.op == "call_function" and node.target in (
+                torch.scalar_tensor,
+                torch.ops.aten.scalar_tensor.default,
+            ):
+                node.kwargs = {**node.kwargs, "device": tensor_device}
+        gm.graph.lint()
+        gm.recompile()
 
     # The graph-module preprocessing above runs first; `_dynamic_export` then
     # rewrites the SymInt placeholders onto `sym_size` and runs the nested
@@ -1041,7 +1086,7 @@ def compile_exported(
                 pt2_path,
                 declared,
                 declared_outputs,
-                [(name, owner) for name, owner, _ in aliases],
+                aliases,
             )
         tensors = {name: value for name, _, value, _ in rows}
         return (
@@ -1102,7 +1147,17 @@ def compile_exported(
             )
     graph.bind_input_shapes(
         [
-            (name, [profile_value(size) for size in storage_shape(tensors[name])])
+            (
+                name,
+                [
+                    profile_value(size)
+                    for size in (
+                        (*tensors[name].shape, 2)
+                        if complex_component_dtype(tensors[name].dtype) is not None
+                        else tensors[name].shape
+                    )
+                ],
+            )
             for name in graph.input_names
         ]
     )
