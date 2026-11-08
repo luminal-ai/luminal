@@ -196,19 +196,6 @@ impl Translator<'_> {
             .as_ref()
             .is_some_and(|device| device.kind == "cpu");
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if cpu && std::is_x86_feature_detected!("avx2") {
-            // ATen dispatches CPU GELU through a SIMD implementation when
-            // AVX2 is available. That implementation preserves negative
-            // underflowed zeros but yields NaN for positive infinity; keep
-            // those target-kernel semantics rather than substituting the
-            // scalar/aarch64 behavior.
-            let zero = self.constant_like(x, 0.0);
-            let positive_inf = self.is_inf(x).logical_and(x.gt(zero));
-            let nan = self.constant_like(x, f64::NAN);
-            return Ok(positive_inf.select(nan, result));
-        }
-
         if cpu {
             let output_dtype = self.output_meta_dtype(node)?;
             if output_dtype != DType::F64 {
