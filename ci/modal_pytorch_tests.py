@@ -369,6 +369,21 @@ def create_app(backend: str, local_project_dir: Path):
         if pytest_args and pytest_args[0] == "--":
             pytest_args = pytest_args[1:]
         pytest_suites = parsed.pytest_suite
+        if not pytest_suites:
+            # ``pull_request_target`` evaluates workflow YAML from the base
+            # branch.  During the transition to ``--pytest-suite``, an older
+            # workflow can therefore invoke a newer checked-out launcher with
+            # the three historical positional roots.  Recognize those roots
+            # here as suites as well so sibling conftests remain isolated even
+            # before the workflow change itself lands on the base branch.
+            legacy_suites = {
+                f"{backend}/tests",
+                "utils/tests",
+                "reference/tests/models",
+            }
+            pytest_suites = [arg for arg in pytest_args if arg in legacy_suites]
+            if pytest_suites:
+                pytest_args = [arg for arg in pytest_args if arg not in legacy_suites]
         if not pytest_args and not pytest_suites:
             pytest_suites = [f"{backend}/tests", "utils/tests"]
             if backend == "cuda_lite":
