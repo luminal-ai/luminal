@@ -500,20 +500,26 @@ fn scatter_lowers_all_read_side_folds() {
         ],
         "scatter all-folds write launch",
     );
-    // Integer addition is commutative in the e-graph. Both emitted forms
-    // address the same row-offset slice; the representative may change when
-    // additional layout proofs are registered.
-    assert!(
-        [
-            "long long src_idx = (((c0 * 3LL) + 3LL) + c1);",
-            "long long src_idx = ((3LL + (c0 * 3LL)) + c1);",
-            "long long src_idx = ((c1 + (c0 * 3LL)) + 3LL);",
-        ]
-        .iter()
-        .any(|index| sources[1].contains(index)),
-        "scatter source must address (row + 1) * 3 + column: {}",
-        sources[1]
-    );
+    // Algebraically equivalent address expressions may have any associative
+    // or commutative spelling. Pin the complete source address function.
+    let source = plan
+        .dag
+        .node_weights()
+        .find_map(|node| match node {
+            BufferNode::Compute {
+                op, operand_info, ..
+            } if op.label() == "ScatterFunctionalGeneric" => Some(&operand_info[1].layout),
+            _ => None,
+        })
+        .unwrap();
+    for row in 0..2 {
+        for column in 0..3 {
+            assert_eq!(
+                source.element_index(&[row, column]).unwrap(),
+                (row + 1) * 3 + column
+            );
+        }
+    }
     // Three composed reads, three raw index computations, zero checks.
     for source in &sources {
         assert_no_traps(source);
