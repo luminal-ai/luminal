@@ -4,6 +4,7 @@ import luminal_reference
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from luminal_reference.backend import _compile_local_graph
 
 
 def _check(model: nn.Module, *inputs: torch.Tensor, atol: float = 1e-4) -> None:
@@ -80,6 +81,37 @@ def test_sdpa_gqa() -> None:
         torch.randn(2, 2, 5, 8),
         torch.randn(2, 2, 5, 8),
     )
+
+
+def test_sdpa_tensor_scale_stays_runtime_bound() -> None:
+    torch.manual_seed(0)
+    q = torch.randn(2, 5, 8)
+    k = torch.randn(2, 5, 8)
+    v = torch.randn(2, 5, 8)
+    graph = torch.fx.Graph()
+    q_node = graph.placeholder("q")
+    k_node = graph.placeholder("k")
+    v_node = graph.placeholder("v")
+    scale_node = graph.placeholder("scale")
+    scale_item = graph.call_function(torch.ops.aten.item.default, (scale_node,))
+    attention = graph.call_function(
+        torch.ops.aten.scaled_dot_product_attention.default,
+        (q_node, k_node, v_node),
+        {"scale": scale_item},
+    )
+    graph.output((attention,))
+    module = torch.fx.GraphModule({}, graph)
+    compiled = _compile_local_graph(module, (q, k, v, torch.tensor(0.125)))
+
+    outputs = []
+    for value in (0.125, 0.75):
+        scale = torch.tensor(value)
+        (actual,) = compiled(q, k, v, scale)
+        expected = F.scaled_dot_product_attention(q, k, v, scale=scale.item())
+        torch.testing.assert_close(actual, expected)
+        outputs.append(actual)
+
+    assert not torch.equal(outputs[0], outputs[1])
 
 
 def test_upsample_nearest() -> None:

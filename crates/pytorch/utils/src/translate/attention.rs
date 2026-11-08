@@ -404,6 +404,7 @@ impl Translator<'_> {
         let target = node
             .target
             .strip_prefix("torch.ops.aten.")
+            .or_else(|| node.target.strip_prefix("torch.ops."))
             .unwrap_or(&node.target);
         let slots = sdpa_slots(target)
             .with_context(|| format!("SDPA: no return schema for {}", node.target))?;

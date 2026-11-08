@@ -192,6 +192,132 @@ def _box_scalar_graph_outputs(gm, *, should_box=None):
 
 
 # ---------------------------------------------------------------------------
+# Tensor-backed SDPA scale canonicalization
+# ---------------------------------------------------------------------------
+
+
+_tensor_scale_sdpa_op = None
+
+
+def _get_tensor_scale_sdpa_op():
+    """An opaque export spelling for SDPA whose scale is a rank-zero tensor.
+
+    ATen's public SDPA schema accepts a Python float for ``scale``. Dynamo can
+    nevertheless capture a model parameter as ``scale_tensor.item()``; nested
+    non-strict export then tries to guard that data-dependent float. Keeping
+    the tensor in the custom-op schema lets PT2 carry the authored runtime
+    value to the translator without specializing it.
+    """
+    global _tensor_scale_sdpa_op
+    if _tensor_scale_sdpa_op is not None:
+        return _tensor_scale_sdpa_op
+
+    import torch
+
+    @torch.library.custom_op("luminal::sdpa_tensor_scale", mutates_args=())
+    def sdpa_tensor_scale(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        dropout_p: float,
+        is_causal: bool,
+        scale: torch.Tensor,
+        enable_gqa: bool,
+    ) -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale.item(),
+            enable_gqa=enable_gqa,
+        )
+
+    @sdpa_tensor_scale.register_fake
+    def _fake(
+        query,
+        key,
+        value,
+        attn_mask,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa,
+    ):
+        del key, attn_mask, dropout_p, is_causal, scale, enable_gqa
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+    # FX nodes target dispatcher overloads. ``torch.library.custom_op`` returns
+    # a ``CustomOpDef`` wrapper, which is callable but has no ``__name__`` and
+    # therefore cannot be inserted with ``Graph.call_function``.
+    _tensor_scale_sdpa_op = torch.ops.luminal.sdpa_tensor_scale.default
+    return _tensor_scale_sdpa_op
+
+
+def _canonicalize_tensor_scale_sdpa(gm):
+    """Replace only ``SDPA(..., scale=t.item())`` with its tensor-scale op."""
+    import torch
+
+    sdpa_targets = {
+        torch.nn.functional.scaled_dot_product_attention,
+        torch._C._nn.scaled_dot_product_attention,
+        torch.ops.aten.scaled_dot_product_attention.default,
+    }
+
+    def argument(node, position, name, default):
+        if name in node.kwargs:
+            return node.kwargs[name]
+        return node.args[position] if len(node.args) > position else default
+
+    changed = False
+    graph = gm.graph
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target not in sdpa_targets:
+            continue
+        scale_item = argument(node, 6, "scale", None)
+        if not isinstance(scale_item, torch.fx.Node):
+            continue
+        is_item = (scale_item.op == "call_method" and scale_item.target == "item") or (
+            scale_item.op == "call_function"
+            and getattr(scale_item.target, "_overloadpacket", None)
+            is torch.ops.aten.item
+        )
+        if not is_item or not scale_item.args:
+            continue
+        scale_tensor = scale_item.args[0]
+        if not isinstance(scale_tensor, torch.fx.Node):
+            continue
+
+        with graph.inserting_before(node):
+            replacement = graph.call_function(
+                _get_tensor_scale_sdpa_op(),
+                (
+                    node.args[0],
+                    node.args[1],
+                    node.args[2],
+                    argument(node, 3, "attn_mask", None),
+                    argument(node, 4, "dropout_p", 0.0),
+                    argument(node, 5, "is_causal", False),
+                    scale_tensor,
+                    argument(node, 7, "enable_gqa", False),
+                ),
+            )
+            replacement.meta = node.meta.copy()
+        node.replace_all_uses_with(replacement)
+        graph.erase_node(node)
+        changed = True
+
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+        gm.recompile()
+    return changed
+
+
+# ---------------------------------------------------------------------------
 # Decomposition table
 # ---------------------------------------------------------------------------
 
@@ -381,6 +507,7 @@ def _drop_dead_data_dependent_ops(gm):
 
 __all__ = [
     "_box_scalar_graph_outputs",
+    "_canonicalize_tensor_scale_sdpa",
     "_decomp_table",
     "_drop_dead_data_dependent_ops",
     "_drop_input_guards",
