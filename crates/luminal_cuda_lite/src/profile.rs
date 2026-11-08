@@ -73,7 +73,31 @@ pub fn profile_candidate_at(
     device: &mut CudaExecutable,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &HostBuffer>,
+    trials: usize,
+    best_so_far: Option<u128>,
+    candidate_timeout: Option<Duration>,
+    shapes: &crate::symbolic::ShapeEnv,
+    arena_budget: Option<usize>,
+) -> Result<Measurement, ProfileFailure> {
+    profile_candidate_external_at(
+        device,
+        plan,
+        staged,
+        &Default::default(),
+        trials,
+        best_so_far,
+        candidate_timeout,
+        shapes,
+        arena_budget,
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn profile_candidate_external_at(
+    device: &mut CudaExecutable,
+    plan: &BufferIrGraph<DecodedLayout>,
+    staged: &FxHashMap<i64, &HostBuffer>,
+    external_ptrs: &FxHashMap<i64, crate::device::ExternalPtr>,
     trials: usize,
     best_so_far: Option<u128>,
     candidate_timeout: Option<Duration>,
@@ -81,7 +105,7 @@ pub fn profile_candidate_at(
     arena_budget: Option<usize>,
 ) -> Result<Measurement, ProfileFailure> {
     // 1. PREPARE: compile + stage + one untimed run (warmup + validity).
-    let staged = prepare_candidate(device, plan, staged, shapes, arena_budget)
+    let staged = prepare_candidate(device, plan, staged, external_ptrs, shapes, arena_budget)
         .map_err(ProfileFailure::Prepare)?;
     let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())
         .map_err(ProfileFailure::Prepare)?;
@@ -91,7 +115,7 @@ pub fn profile_candidate_at(
     initialize_inputs(device, plan, &mut arena, &staged, &shapes.values)
         .map_err(ProfileFailure::Prepare)?;
     device
-        .execute(arena.arena(), &mut staging, &shapes.values)
+        .execute_external(arena.arena(), &mut staging, &shapes.values, external_ptrs)
         .map_err(ProfileFailure::Prepare)?;
 
     let total = trials.max(1);
@@ -102,7 +126,7 @@ pub fn profile_candidate_at(
             .map_err(ProfileFailure::Prepare)?;
         let start = Instant::now();
         device
-            .execute(arena.arena(), &mut staging, &shapes.values)
+            .execute_external(arena.arena(), &mut staging, &shapes.values, external_ptrs)
             .map_err(ProfileFailure::Execute)?;
         sum += start.elapsed().as_nanos();
         let completed = trial + 1;
@@ -167,6 +191,7 @@ fn prepare_candidate<'a>(
     device: &mut CudaExecutable,
     plan: &BufferIrGraph<DecodedLayout>,
     staged: &FxHashMap<i64, &'a HostBuffer>,
+    external_ptrs: &FxHashMap<i64, crate::device::ExternalPtr>,
 
     shapes: &crate::symbolic::ShapeEnv,
     arena_budget: Option<usize>,
@@ -186,9 +211,9 @@ fn prepare_candidate<'a>(
             owned.insert(lit, data);
         }
     }
-    // Profiling supplies host stand-ins for external boundaries. Their storage
-    // belongs to this profiling invocation, not the installed executable.
-    let bindings = Default::default();
+    // Caller-owned read-only boundaries use their live pointers. Every other
+    // boundary receives a private stand-in in this profiling invocation.
+    let bindings = external_ptrs.keys().copied().collect();
     device.install_with_bindings(
         (plan.clone(), shapes.bounds.clone()),
         bindings,
@@ -230,14 +255,15 @@ pub(crate) fn warmup_candidate(
     device: &mut CudaExecutable,
     plan: &BufferIrGraph<DecodedLayout>,
     inputs: &FxHashMap<i64, &HostBuffer>,
+    external_ptrs: &FxHashMap<i64, crate::device::ExternalPtr>,
     shapes: &crate::symbolic::ShapeEnv,
     arena_budget: Option<usize>,
 ) -> anyhow::Result<()> {
-    let inputs = prepare_candidate(device, plan, inputs, shapes, arena_budget)?;
+    let inputs = prepare_candidate(device, plan, inputs, external_ptrs, shapes, arena_budget)?;
     let mut arena = ProfilingMemory::new(device.stream().clone(), device.slab_bytes())?;
     initialize_inputs(device, plan, &mut arena, &inputs, &shapes.values)?;
     let mut staging = device.allocate_staging(device.stats().staging_bytes)?;
-    device.execute(arena.arena(), &mut staging, &shapes.values)
+    device.execute_external(arena.arena(), &mut staging, &shapes.values, external_ptrs)
 }
 
 use crate::CudaArena;

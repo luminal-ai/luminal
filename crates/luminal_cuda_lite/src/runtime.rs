@@ -498,16 +498,42 @@ impl CudaRuntime {
                     .map(|data| (bound.buffer, data))
             })
             .collect();
+        let profile_externals: std::collections::BTreeSet<i64> = self
+            .device_ptrs
+            .keys()
+            .filter(|buffer| !program.outputs.iter().any(|out| &out.buffer == *buffer))
+            .copied()
+            .collect();
         #[cfg(feature = "device")]
         if self.device.is_none() {
             self.device = Some(crate::device::CudaDevice::new(0)?.executable());
         }
+        #[cfg(feature = "device")]
+        let external_ptrs: FxHashMap<i64, crate::device::ExternalPtr> = self
+            .device_ptrs
+            .iter()
+            // Candidate profiling may read caller-owned parameters directly,
+            // but must never apply a functionalized buffer writeback to the
+            // caller while trying alternative plans. A buffer named by an
+            // output remains in the private profiling arena.
+            .filter(|(buffer, _)| !program.outputs.iter().any(|out| out.buffer == **buffer))
+            .map(|(buffer, (ptr, bytes))| {
+                (
+                    *buffer,
+                    crate::device::ExternalPtr {
+                        ptr: *ptr,
+                        bytes: *bytes,
+                    },
+                )
+            })
+            .collect();
         let mut evaluator = {
             #[cfg(feature = "device")]
             {
                 crate::search::Evaluator::Device {
                     device: self.device.as_mut().expect("device initialized"),
                     staged: &staged,
+                    external_ptrs: &external_ptrs,
                 }
             }
             #[cfg(not(feature = "device"))]
@@ -549,7 +575,7 @@ impl CudaRuntime {
             Some(outcome.best_plan.clone()),
         )
         .with_shapes(shapes)
-        .with_external_bindings(self.externals.clone());
+        .with_external_bindings(profile_externals);
         let (finalist, rejections) =
             crate::search::select_finalist(finalists, options, &mut evaluator)?;
         outcome.finalist_rejections = rejections;
