@@ -20,7 +20,7 @@ from .backend import _compile_local_graph
 from .dimensions import profile_value
 from .distributed_compile import DeferredRegion, RegionBatch
 from .distributed_compile import enabled as distributed_compile_enabled
-from .export_utils import private_graph_copy
+from .export_utils import _box_scalar_graph_outputs, private_graph_copy
 
 
 @dataclass
@@ -81,10 +81,29 @@ def _compile_region(
     compile_local=None,
 ):
     graph = private_graph_copy(gm)
+    # AOTAutograd otherwise classifies a data-dependent integer `item()` as an
+    # unbacked SymInt output and tries to recover it from shape bindings. It is
+    # model data, not a dimension. Put every scalar output through the same
+    # typed rank-zero boundary used by the local backends; the surrounding AOT
+    # graph restores the authored Python scalar after local execution.
+    from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
+
+    _box_scalar_graph_outputs(graph, should_box=has_free_unbacked_symbols)
     placeholders = [n for n in graph.graph.nodes if n.op == "placeholder"]
     input_positions = {node: i for i, node in enumerate(placeholders)}
     output = next(n for n in graph.graph.nodes if n.op == "output")
     leaves, spec = tree_flatten(output.args[0])
+    # Dynamo's outer wrapper retains `.item()` for floating scalar outputs,
+    # but models integer/bool items as terminal SymInt/SymBool outputs. The
+    # latter therefore need restoration at this AOT boundary.
+    boxed_integer_positions = {
+        i
+        for i, leaf in enumerate(leaves)
+        if isinstance(leaf, torch.fx.Node)
+        and leaf.op == "call_function"
+        and leaf.target in (torch.scalar_tensor, torch.ops.aten.scalar_tensor.default)
+        and leaf.kwargs.get("dtype") in (torch.int64, torch.bool)
+    }
     # AOT can carry opaque DTensor metadata through forward/backward, as well
     # as saved inputs and missing gradients. Only computed tensor outputs go
     # through PT2. Forwarded inputs keep their original identity and aliases.
@@ -224,7 +243,9 @@ def _compile_region(
             raise RuntimeError("local compiler changed the AOT output arity")
         result = list(leaves)
         for position, value in zip(positions, values):
-            result[position] = value
+            result[position] = (
+                value.item() if position in boxed_integer_positions else value
+            )
         for position, index in passthrough.items():
             result[position] = args[index]
         if symbolic_outputs:
