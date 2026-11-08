@@ -143,6 +143,12 @@ def _scatter_inputs(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
 
 INDEX = torch.tensor([0, 1, 2, 0, 3, 3])
 
+
+@pytest.fixture(autouse=True)
+def index_device(device, monkeypatch):
+    monkeypatch.setitem(globals(), "INDEX", INDEX.to(device))
+
+
 SCATTERS = (
     pytest.param(lambda t, u: t.scatter_add(0, INDEX, u), id="scatter_add"),
     pytest.param(lambda t, u: t.index_add(0, INDEX, u), id="index_add"),

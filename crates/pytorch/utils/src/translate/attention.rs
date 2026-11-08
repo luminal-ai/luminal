@@ -59,7 +59,9 @@ fn sdpa_slots(target: &str) -> Option<&'static [(&'static str, SdpaSlot)]> {
     use SdpaSlot::*;
     const LSE: SdpaSlot = LogSumExp { pad: None };
     Some(match target {
-        "scaled_dot_product_attention.default" => &[("output", Output)],
+        "scaled_dot_product_attention.default" | "luminal.sdpa_tensor_scale.default" => {
+            &[("output", Output)]
+        }
         "_scaled_dot_product_flash_attention_for_cpu.default" => {
             &[("output", Output), ("logsumexp", LSE)]
         }
@@ -273,14 +275,19 @@ impl Translator<'_> {
 
         // Default scale 1/sqrt(head_dim) needs a concrete head_dim;
         // symbolic-shape HF graphs always pass `scale` explicitly.
-        let scale = match self.named_float_arg(node, "scale") {
-            Some(v) => v,
-            None => {
+        let scale_tensor = match named_input(node, "scale") {
+            Some(input) => self.optional_raw_operand(input)?,
+            None => None,
+        };
+        let scale = match (scale_tensor, self.named_float_arg(node, "scale")) {
+            (Some(_), _) => None,
+            (None, Some(value)) => Some(value),
+            (None, None) => {
                 let head_dim = query.dims().last().and_then(|d| d.to_usize()).context(
                     "SDPA: query head_dim must be concrete to derive the default \
                          scale (pass `scale` explicitly for symbolic head dims)",
                 )?;
-                1.0_f64 / (head_dim as f64).sqrt()
+                Some(1.0_f64 / (head_dim as f64).sqrt())
             }
         };
 
@@ -324,8 +331,11 @@ impl Translator<'_> {
         let (q_for_mm, k_for_mm) =
             util::ensure_same_dtype(query, key.transpose(q_ndim - 2, q_ndim - 1));
         let scores = q_for_mm.matmul(k_for_mm);
-        let scale_const = self.constant_like(scores, scale);
-        let mut scores = scores * scale_const;
+        let scale = match scale_tensor {
+            Some(value) => super::convert(value, scores.dtype).expand_rhs(scores.dims()),
+            None => self.constant_like(scores, scale.expect("literal/default SDPA scale")),
+        };
+        let mut scores = scores * scale;
 
         // Masking: an inadmissible key's score is set to exactly -inf by a
         // native select, never by a finite stand-in such as -1e9, so that

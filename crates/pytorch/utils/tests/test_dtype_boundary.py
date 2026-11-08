@@ -311,12 +311,21 @@ def test_item_returns_exact_python_scalar(
 ) -> None:
     """HLIR keeps item values as typed rank-zero tensors and the backend
     reconstructs the Python scalar only at its output boundary."""
-    model = ItemModel()
-    compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
-    x = torch.tensor(value, dtype=dtype)
+    # PyTorch's global default-device mode currently erases a CUDA `.item()`
+    # backend graph into `return (None,)`. Disable that frontend mode for this
+    # capture while keeping the authored tensor explicitly on the selected
+    # execution device.
+    device = torch.get_default_device()
+    torch.set_default_device(None)
+    try:
+        model = ItemModel()
+        compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
+        x = torch.tensor(value, dtype=dtype, device=device)
 
-    expected = model(x)
-    actual = compiled(x)
+        expected = model(x)
+        actual = compiled(x)
+    finally:
+        torch.set_default_device(device)
 
     assert type(actual) is python_type
     assert type(actual) is type(expected)

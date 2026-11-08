@@ -626,6 +626,11 @@ impl Translator<'_> {
     /// A scalar literal as a rank-0 tensor of `dtype`. A Python float is
     /// read at the dtype the op computes in (F64 keeps the double).
     fn scalar(&mut self, input: &NodeInput, dtype: DType) -> Result<GraphTensor> {
+        if let Some(name) = input.arg.as_value_name()
+            && let Some(value) = self.values.get(name).copied()
+        {
+            return Ok(convert(value, dtype));
+        }
         if let Some(v) = input.arg.as_float() {
             return Ok(self.typed_scalar(v, dtype));
         }
@@ -646,6 +651,72 @@ impl Translator<'_> {
             input.name,
             input.arg
         )
+    }
+
+    /// The value category of Python scalar dataflow. `item()` turns every
+    /// floating tensor value into a Python `float` (double) and every integer
+    /// value into a Python `int`; subsequent `_operator.*` nodes therefore do
+    /// not compute at the tensor's storage dtype.
+    fn python_scalar_input_dtype(&self, node: &Node) -> DType {
+        if node.inputs.iter().any(|input| {
+            input.arg.as_float().is_some()
+                || input
+                    .arg
+                    .as_value_name()
+                    .and_then(|name| self.values.get(name))
+                    .is_some_and(|value| is_float(value.dtype))
+        }) {
+            DType::F64
+        } else if node.inputs.iter().any(|input| {
+            input.arg.as_int().is_some()
+                || input
+                    .arg
+                    .as_value_name()
+                    .and_then(|name| self.values.get(name))
+                    .is_some_and(|value| value.dtype != DType::Bool)
+        }) {
+            DType::I64
+        } else {
+            DType::Bool
+        }
+    }
+
+    fn python_scalar_output_dtype(&self, node: &Node) -> Result<DType> {
+        let output = node
+            .outputs
+            .first()
+            .with_context(|| format!("{} has no scalar output", node.target))?;
+        if output.as_sym_float.is_some() {
+            Ok(DType::F64)
+        } else if output.as_sym_int.is_some() {
+            Ok(DType::I64)
+        } else if output.as_sym_bool.is_some() {
+            Ok(DType::Bool)
+        } else {
+            bail!("{} does not declare a scalar output", node.target)
+        }
+    }
+
+    fn python_scalar_binary(
+        &mut self,
+        node: &Node,
+        op: impl FnOnce(GraphTensor, GraphTensor) -> GraphTensor,
+    ) -> Result<GraphTensor> {
+        let dtype = self.python_scalar_output_dtype(node)?;
+        let lhs = self.scalar(&node.inputs[0], dtype)?;
+        let rhs = self.scalar(&node.inputs[1], dtype)?;
+        Ok(op(lhs, rhs))
+    }
+
+    fn python_scalar_comparison(
+        &mut self,
+        node: &Node,
+        op: impl FnOnce(GraphTensor, GraphTensor) -> GraphTensor,
+    ) -> Result<GraphTensor> {
+        let dtype = self.python_scalar_input_dtype(node);
+        let lhs = self.scalar(&node.inputs[0], dtype)?;
+        let rhs = self.scalar(&node.inputs[1], dtype)?;
+        Ok(op(lhs, rhs))
     }
 
     /// An arithmetic op's ATen `Scalar` as a rank-0 tensor of `dtype`: a
@@ -1048,7 +1119,15 @@ impl Translator<'_> {
 
         // Shape comparisons feed export's scalar assertions. They contain no
         // tensor data; Dynamo/export owns their guards at the call boundary.
-        if !node.outputs.is_empty() && node.outputs.iter().all(|out| out.as_sym_bool.is_some()) {
+        if !node.outputs.is_empty()
+            && node.outputs.iter().all(|out| out.as_sym_bool.is_some())
+            && !node.inputs.iter().any(|input| {
+                input
+                    .arg
+                    .as_value_name()
+                    .is_some_and(|name| self.values.contains_key(name))
+            })
+        {
             return Ok(());
         }
 
@@ -1123,6 +1202,62 @@ impl Translator<'_> {
                     "AllGather needs a named, nonempty group"
                 );
                 input.all_gather(group, width, sequence)
+            }
+            "_operator.add" => self.python_scalar_binary(node, |a, b| a + b)?,
+            "_operator.sub" => self.python_scalar_binary(node, |a, b| a - b)?,
+            "_operator.mul" => self.python_scalar_binary(node, |a, b| a * b)?,
+            "_operator.truediv" => self.python_scalar_binary(node, |a, b| a / b)?,
+            "_operator.eq" => self.python_scalar_comparison(node, |a, b| a.eq(b))?,
+            "_operator.ne" => self.python_scalar_comparison(node, |a, b| a.ne(b))?,
+            "_operator.lt" => self.python_scalar_comparison(node, |a, b| a.lt(b))?,
+            "_operator.le" => self.python_scalar_comparison(node, |a, b| a.le(b))?,
+            "_operator.gt" => self.python_scalar_comparison(node, |a, b| a.gt(b))?,
+            "_operator.ge" => self.python_scalar_comparison(node, |a, b| a.ge(b))?,
+            "_operator.neg" => {
+                let dtype = self.python_scalar_output_dtype(node)?;
+                -self.scalar(&n[0], dtype)?
+            }
+            "torch.sym_int" => {
+                let input_dtype = self.python_scalar_input_dtype(node);
+                convert(self.scalar(&n[0], input_dtype)?, DType::I64)
+            }
+            "torch.sym_float" => self.scalar(&n[0], DType::F64)?,
+            "torch.sym_not" => self.scalar(&n[0], DType::Bool)?.logical_not(),
+            target @ ("math.trunc" | "math.floor" | "math.ceil") => {
+                let input_dtype = self.python_scalar_input_dtype(node);
+                let input = self.scalar(&n[0], input_dtype)?;
+                let rounded = if is_float(input_dtype) {
+                    match target {
+                        "math.floor" => input.floor(),
+                        "math.ceil" => input.ceil(),
+                        _ => input.trunc(),
+                    }
+                } else {
+                    input
+                };
+                convert(rounded, DType::I64)
+            }
+            "torch.sym_ite" => {
+                // Export uses a SymBool reference for predicates produced by
+                // scalar-valued nodes such as `item`; it is backed by the
+                // rank-zero value recorded for that scalar, not a TensorArg.
+                let condition = self.scalar(&n[0], DType::Bool)?;
+                let dtype = n[1..]
+                    .iter()
+                    .filter_map(|input| input.arg.as_value_name())
+                    .find_map(|name| self.values.get(name).map(|value| value.dtype))
+                    .unwrap_or_else(|| {
+                        if n[1..].iter().any(|input| input.arg.as_float().is_some()) {
+                            DType::F64
+                        } else if n[1..].iter().any(|input| input.arg.as_int().is_some()) {
+                            DType::I64
+                        } else {
+                            DType::Bool
+                        }
+                    });
+                let lhs = self.scalar(&n[1], dtype)?;
+                let rhs = self.scalar(&n[2], dtype)?;
+                self.select(condition, lhs, rhs)
             }
             "mvlgamma.default" => self.translate_mvlgamma(node)?,
             "lu_unpack.default" => {
@@ -1425,7 +1560,9 @@ impl Translator<'_> {
             // ---- batch 10: distances, norms, histograms, segment reduce ----
             "dist.default" => self.translate_dist(node, DistVariant::Dist)?,
             "_cdist_forward.default" => self.translate_dist(node, DistVariant::Cdist)?,
-            "_pdist_forward.default" => self.translate_dist(node, DistVariant::Pdist)?,
+            "pdist.default" | "_pdist_forward.default" => {
+                self.translate_dist(node, DistVariant::Pdist)?
+            }
             "_trilinear.default" => self.translate_trilinear(node)?,
             "linalg_vector_norm.default" => self.translate_linalg_vector_norm(node)?,
             "histc.default" => self.translate_histc(node)?,
@@ -1489,6 +1626,7 @@ impl Translator<'_> {
             "log_softmax.int" | "_log_softmax.default" => self.translate_softmax(node, true)?,
             // ---- attention (batch 6) ----
             "scaled_dot_product_attention.default"
+            | "luminal.sdpa_tensor_scale.default"
             | "_scaled_dot_product_efficient_attention.default"
             | "_scaled_dot_product_flash_attention.default"
             | "_scaled_dot_product_flash_attention_for_cpu.default"
@@ -1539,6 +1677,10 @@ impl Translator<'_> {
             "avg_pool3d.default" => self.translate_avg_pool(node, 3)?,
             "_adaptive_avg_pool2d.default" => self.translate_adaptive_avg_pool(node, 2)?,
             "_adaptive_avg_pool3d.default" => self.translate_adaptive_avg_pool(node, 3)?,
+            "max_pool1d_with_indices.default" => {
+                self.translate_max_pool(node, 1)?;
+                return Ok(());
+            }
             "max_pool2d_with_indices.default" => {
                 self.translate_max_pool(node, 2)?;
                 return Ok(());
@@ -1961,6 +2103,7 @@ fn exact_arithmetic_target(target: &str) -> bool {
             | "median.dim"
             | "nanmedian.default"
             | "nanmedian.dim"
+            | "max_pool1d_with_indices.default"
             | "max_pool2d_with_indices.default"
             | "max_pool3d_with_indices.default"
             | "adaptive_max_pool2d.default"
@@ -2082,6 +2225,7 @@ fn opmath_target(target: &str) -> bool {
             // opmath (F32 for half: ATen's acc_type) and rounds once.
             | "dist.default"
             | "_cdist_forward.default"
+            | "pdist.default"
             | "_pdist_forward.default"
             // softmax and the normalizations
             | "softmax.int"
@@ -2123,6 +2267,7 @@ fn opmath_target(target: &str) -> bool {
             | "grid_sampler_3d.default"
             // attention
             | "scaled_dot_product_attention.default"
+            | "luminal.sdpa_tensor_scale.default"
             | "_scaled_dot_product_efficient_attention.default"
             | "_scaled_dot_product_flash_attention.default"
             | "_scaled_dot_product_flash_attention_for_cpu.default"

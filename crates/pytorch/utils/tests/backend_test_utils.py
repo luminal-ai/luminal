@@ -57,10 +57,11 @@ def device():
 
 @pytest.fixture(autouse=True)
 def execution_device(device):
-    # Bare tensor constructors in the shared cases must use the selected device,
-    # rather than quietly exercising the reference runtime in a CUDA run.
-    with torch.device(device):
-        yield
+    # pytest_configure installs this default before collection, including for
+    # module-level constants. Avoid a nested DeviceContext here: PyTorch cannot
+    # temporarily disable nested default-device modes while capturing `.item()`.
+    assert torch.get_default_device().type == device.type
+    yield
 
 
 @pytest.fixture
