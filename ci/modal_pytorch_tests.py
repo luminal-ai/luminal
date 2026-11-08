@@ -202,6 +202,7 @@ def create_app(backend: str, local_project_dir: Path):
         def run(
             self,
             pytest_args: list[str],
+            pytest_suites: list[str] | None = None,
             pytest_addopts: str = "",
             profile_enabled: bool = False,
         ) -> dict[str, Any]:
@@ -241,26 +242,38 @@ def create_app(backend: str, local_project_dir: Path):
                     )
 
             svg_requested = profile_enabled and dot_available
-            cmd = [
-                "uv",
-                "run",
-                "--project",
-                f"{PROJECT_DIR}/{backend}",
-                "--group",
-                "dev",
-                "python",
-                "-m",
-                "pytest",
-                "-c",
-                f"{PROJECT_DIR}/{backend}/pyproject.toml",
-                *sanitized_pytest_args,
-            ]
-            exit_code = subprocess.run(
-                cmd,
-                check=False,
-                env=env,
-                cwd=str(scratch_dir) if scratch_dir is not None else PROJECT_DIR,
-            ).returncode
+            exit_code = 0
+            # Pytest registers fixtures from every explicitly supplied
+            # conftest in one global plugin manager. Running backend-owned,
+            # shared-parity, and model roots together therefore lets an
+            # autouse fixture from one sibling tree change another tree's
+            # tensor device. Keep the extension build and Modal container
+            # shared, but give independently rooted suites independent pytest
+            # sessions so each sees only its own conftest hierarchy.
+            for suite in pytest_suites or [None]:
+                cmd = [
+                    "uv",
+                    "run",
+                    "--project",
+                    f"{PROJECT_DIR}/{backend}",
+                    "--group",
+                    "dev",
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-c",
+                    f"{PROJECT_DIR}/{backend}/pyproject.toml",
+                ]
+                if suite is not None:
+                    cmd.append(suite)
+                cmd.extend(sanitized_pytest_args)
+                completed = subprocess.run(
+                    cmd,
+                    check=False,
+                    env=env,
+                    cwd=str(scratch_dir) if scratch_dir is not None else PROJECT_DIR,
+                )
+                exit_code = max(exit_code, completed.returncode)
             HF_CACHE_VOLUME.commit()
             finished_at = _utc_now()
 
@@ -315,7 +328,7 @@ def create_app(backend: str, local_project_dir: Path):
 
     def _parse_cli_args(
         cli_args: tuple[str, ...],
-    ) -> tuple[str, int, bool, str | None, list[str]]:
+    ) -> tuple[str, int, bool, str | None, list[str], list[str]]:
         parser = argparse.ArgumentParser(
             prog="modal run modal_pytest_runner.py",
             add_help=False,
@@ -342,14 +355,24 @@ def create_app(backend: str, local_project_dir: Path):
             "--profile-output-dir",
             help="Directory to download profiling artifacts into when profiling is enabled.",
         )
+        parser.add_argument(
+            "--pytest-suite",
+            action="append",
+            default=[],
+            help=(
+                "Run this pytest root in an isolated session. Repeat for sibling "
+                "trees with independent conftest hierarchies."
+            ),
+        )
         parsed, pytest_args = parser.parse_known_args(cli_args)
 
         if pytest_args and pytest_args[0] == "--":
             pytest_args = pytest_args[1:]
-        if not pytest_args:
-            pytest_args = [f"{backend}/tests", "utils/tests"]
+        pytest_suites = parsed.pytest_suite
+        if not pytest_args and not pytest_suites:
+            pytest_suites = [f"{backend}/tests", "utils/tests"]
             if backend == "cuda_lite":
-                pytest_args.append("reference/tests/models")
+                pytest_suites.append("reference/tests/models")
 
         return (
             parsed.gpu,
@@ -357,12 +380,18 @@ def create_app(backend: str, local_project_dir: Path):
             parsed.profile,
             parsed.profile_output_dir,
             pytest_args,
+            pytest_suites,
         )
 
     def main(*cli_args: str):
-        gpu, timeout, cli_profile, profile_output_dir, pytest_args = _parse_cli_args(
-            cli_args
-        )
+        (
+            gpu,
+            timeout,
+            cli_profile,
+            profile_output_dir,
+            pytest_args,
+            pytest_suites,
+        ) = _parse_cli_args(cli_args)
         profile_enabled = _profiling_enabled(cli_profile, pytest_args)
         pytest_addopts = os.environ.get("PYTEST_ADDOPTS", "")
         timeout = _effective_timeout(timeout)
@@ -375,6 +404,7 @@ def create_app(backend: str, local_project_dir: Path):
         runner = TestRunner.with_options(**runner_options)()
         result = runner.run.remote(
             pytest_args=pytest_args,
+            pytest_suites=pytest_suites,
             pytest_addopts=pytest_addopts,
             profile_enabled=profile_enabled,
         )
