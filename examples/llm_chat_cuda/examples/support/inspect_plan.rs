@@ -199,6 +199,9 @@ pub fn main() -> Result<()> {
                 .iter()
                 .filter_map(|b| data.get(&b.value).map(|v| (b.buffer, v)))
                 .collect();
+            // This diagnostic path owns only host-side inputs, so it has no
+            // caller-owned device allocations to bind during profiling.
+            let external_ptrs = FxHashMap::default();
             let mut device = luminal_cuda_lite::device::CudaDevice::new(0)?.executable();
             search_implementations(
                 egraph,
@@ -210,6 +213,7 @@ pub fn main() -> Result<()> {
                 Evaluator::Device {
                     device: &mut device,
                     staged: &staged,
+                    external_ptrs: &external_ptrs,
                 },
             )?
         } else {
