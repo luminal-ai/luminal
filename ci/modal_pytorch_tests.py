@@ -282,7 +282,7 @@ def create_app(backend: str, local_project_dir: Path):
                     cwd=str(scratch_dir) if scratch_dir is not None else PROJECT_DIR,
                 )
                 exit_code = max(exit_code, completed.returncode)
-            HF_CACHE_VOLUME.commit()
+            modal.Volume.from_name(HF_CACHE_VOLUME_NAME).commit()
             finished_at = _utc_now()
 
             if not profile_enabled:
@@ -322,7 +322,7 @@ def create_app(backend: str, local_project_dir: Path):
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            PROFILE_VOLUME.commit()
+            modal.Volume.from_name(PROFILE_VOLUME_NAME).commit()
 
             return {
                 "exit_code": exit_code,
