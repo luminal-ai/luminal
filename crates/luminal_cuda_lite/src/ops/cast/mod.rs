@@ -123,7 +123,8 @@ impl KernelOp for CastDps {
         if ({finite}) {{
             if (fraction == (1 << m) - 1) return nanf("");
         }} else {{
-            return fraction ? nanf("") : (bits & 128 ? -INFINITY : INFINITY);
+            float infinity = __uint_as_float(0x7f800000u);
+            return fraction ? nanf("") : (bits & 128 ? -infinity : infinity);
         }}
     }}
     float value = ldexpf((float)(fraction + (exponent ? 1 << m : 0)),
