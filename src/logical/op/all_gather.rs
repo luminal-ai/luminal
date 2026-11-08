@@ -1,6 +1,6 @@
 use super::{LogicalOp, LogicalRender};
 use crate::egglog_snippet::{EgglogSnippet, SpliceCategory};
-use egraph_serialize::Node;
+use crate::snapshot::compact::Node;
 
 /// Rank-local input stacked in communicator order. Group and sequence are part
 /// of value identity, so separate collective calls cannot be merged.

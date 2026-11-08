@@ -145,6 +145,9 @@ impl TcpAllGather {
         );
         let deadline = Instant::now() + timeout;
         let configure = |stream: &TcpStream| -> Result<()> {
+            // Accepted sockets inherit O_NONBLOCK on BSD/macOS. The wire
+            // protocol uses blocking reads/writes bounded by these timeouts.
+            stream.set_nonblocking(false)?;
             stream.set_nodelay(true)?;
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))?;
@@ -309,7 +312,7 @@ impl AllGatherTransport for TcpAllGather {
 /// Build a deterministic viable plan without running it. Distributed programs
 /// must not execute collectives in rank-local timing/autotuning loops.
 pub fn compile_first(
-    graph: &egraph_serialize::EGraph,
+    graph: &crate::snapshot::compact::EGraph,
     decoders: &crate::egglog_utils::eclass::ConstructorRegistry,
     matchers: &[Box<dyn crate::layout_ir::OpMatcher>],
     allow: &[&str],

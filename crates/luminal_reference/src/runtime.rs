@@ -485,9 +485,7 @@ impl ReferenceRuntime {
         let mut egraph = luminal::egglog_snippet::new_egraph();
         egraph.parse_and_run_program(None, &text)?;
         crate::decoder_registry().check(&egraph)?;
-        let snapshot = egraph
-            .serialize(luminal::prelude::egglog::SerializeConfig::default())
-            .egraph;
+        let snapshot = egraph.serialize_compact_filtered(|_| true);
         let allow = spec
             .ops
             .unwrap_or_else(crate::runtime::reference_allow_list);
