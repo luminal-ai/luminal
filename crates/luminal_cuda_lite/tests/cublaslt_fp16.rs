@@ -651,13 +651,14 @@ fn run_compiled_half_case(
             }
         }
         if !searched {
+            // This case validates the direct shared-batch descriptor. Without
+            // an explicit constraint, device timing may legitimately select
+            // the equivalent tiny materialized broadcast instead, whose B
+            // descriptor has a dense (nonzero) batch stride.
+            let mut options = luminal_cuda_lite::harness_search_options();
+            options.max_intermediate_bytes = Some(0);
             runtime
-                .search(
-                    &Default::default(),
-                    &Default::default(),
-                    &data,
-                    &luminal_cuda_lite::harness_search_options(),
-                )
+                .search(&Default::default(), &Default::default(), &data, &options)
                 .unwrap();
             reference
                 .search(
