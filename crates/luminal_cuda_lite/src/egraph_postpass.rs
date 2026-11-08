@@ -17,6 +17,10 @@ pub struct PostPassContext<'a> {
     pub decoders: &'a ConstructorRegistry,
     pub bounds: &'a crate::symbolic::Bounds,
     pub arena_budget_bytes: usize,
+    /// Boundary buffers backed by already-live caller allocations during
+    /// candidate profiling. They consume no arena range, so the early
+    /// materialization filter must not reject their layout by itself.
+    pub external_buffers: &'a BTreeSet<i64>,
     /// Optional cap on a single non-boundary materialization. Boundary inputs
     /// and outputs still obey the total arena budget.
     pub max_intermediate_bytes: Option<usize>,
@@ -54,11 +58,12 @@ pub fn run(
             })
             .transpose()
     };
-    let mut report = prune_oversized_materializations(
+    let mut report = prune_oversized_materializations_with_external(
         graph,
         context.decoders,
         context.arena_budget_bytes,
         capacity,
+        context.external_buffers,
     )
     .map_err(|error| {
         anyhow!(
@@ -68,9 +73,16 @@ pub fn run(
     })?;
     if let Some(limit) = context.max_intermediate_bytes {
         let transparent = transparent_producers(graph, context.matchers);
-        let intermediate =
-            prune_materializations(graph, context.decoders, limit, capacity, true, &transparent)
-                .map_err(|error| anyhow!("{limit}-byte intermediate budget: {error:#}"))?;
+        let boundaries = boundary_classes(graph);
+        let intermediate = prune_materializations(
+            graph,
+            context.decoders,
+            limit,
+            capacity,
+            &boundaries,
+            &transparent,
+        )
+        .map_err(|error| anyhow!("{limit}-byte intermediate budget: {error:#}"))?;
         report.oversized_tensors += intermediate.oversized_tensors;
         report.producer_classes += intermediate.producer_classes;
         report.removed_nodes += intermediate.removed_nodes;
@@ -99,7 +111,79 @@ pub fn prune_oversized_materializations(
     budget: usize,
     capacity: impl Fn(&DecodedLayout) -> Result<Option<usize>>,
 ) -> Result<MemoryPruning> {
-    prune_materializations(graph, decoders, budget, capacity, false, &BTreeSet::new())
+    prune_oversized_materializations_with_external(
+        graph,
+        decoders,
+        budget,
+        capacity,
+        &BTreeSet::new(),
+    )
+}
+
+fn prune_oversized_materializations_with_external(
+    graph: &mut EGraph,
+    decoders: &ConstructorRegistry,
+    budget: usize,
+    capacity: impl Fn(&DecodedLayout) -> Result<Option<usize>>,
+    external_buffers: &BTreeSet<i64>,
+) -> Result<MemoryPruning> {
+    let preserved = external_boundary_classes(graph, external_buffers);
+    prune_materializations(
+        graph,
+        decoders,
+        budget,
+        capacity,
+        &preserved,
+        &BTreeSet::new(),
+    )
+}
+
+fn boundary_classes(graph: &EGraph) -> BTreeSet<ClassId> {
+    graph
+        .nodes
+        .values()
+        .filter(|node| node.op == "BufferTensorLit")
+        .filter_map(|node| node.children.first())
+        .filter_map(|id| graph.nodes.get(id))
+        .map(|node| node.eclass.clone())
+        .collect()
+}
+
+/// LayoutTensor classes attached to caller-owned buffers that already have a
+/// live pointer for profiling. `BufferLit` carries its id through a numeric
+/// child class; no op-name or layout assumption is involved.
+fn external_boundary_classes(
+    graph: &EGraph,
+    external_buffers: &BTreeSet<i64>,
+) -> BTreeSet<ClassId> {
+    let numeric = |class: &ClassId| {
+        graph
+            .nodes
+            .values()
+            .filter(|node| &node.eclass == class)
+            .find_map(|node| node.op.parse::<i64>().ok())
+    };
+    let buffer_lit = |class: &ClassId| {
+        graph
+            .nodes
+            .values()
+            .filter(|node| &node.eclass == class && node.op == "BufferLit")
+            .find_map(|node| node.children.first())
+            .and_then(|id| graph.nodes.get(id))
+            .and_then(|node| numeric(&node.eclass))
+    };
+    graph
+        .nodes
+        .values()
+        .filter(|node| node.op == "BufferTensorLit")
+        .filter_map(|node| {
+            let tensor = node.children.first().and_then(|id| graph.nodes.get(id))?;
+            let buffer = node.children.get(1).and_then(|id| graph.nodes.get(id))?;
+            external_buffers
+                .contains(&buffer_lit(&buffer.eclass)?)
+                .then(|| tensor.eclass.clone())
+        })
+        .collect()
 }
 
 fn transparent_producers(
@@ -136,25 +220,18 @@ fn prune_materializations(
     decoders: &ConstructorRegistry,
     budget: usize,
     capacity: impl Fn(&DecodedLayout) -> Result<Option<usize>>,
-    preserve_boundaries: bool,
+    preserved_boundaries: &BTreeSet<ClassId>,
     transparent: &BTreeSet<ClassId>,
 ) -> Result<MemoryPruning> {
     // Before bufferization, BufferTensorLit declarations describe boundary
     // storage. Keep those exact tensor classes, not every layout with the same
     // shape: a temporary with a boundary's layout still needs the tighter cap.
-    let boundaries: BTreeSet<_> = graph
-        .nodes
-        .values()
-        .filter(|node| node.op == "BufferTensorLit")
-        .filter_map(|node| node.children.first())
-        .map(|id| graph.nodes[id].eclass.clone())
-        .collect();
     let view = EGraphView::new(graph, decoders);
     let mut sizes = BTreeMap::new();
     let mut oversized = BTreeSet::new();
     let mut largest = 0;
     for node in graph.nodes.values().filter(|n| n.op == "LayoutTensorLit") {
-        if preserve_boundaries && boundaries.contains(&node.eclass) {
+        if preserved_boundaries.contains(&node.eclass) {
             continue;
         }
         let layout_id = node
@@ -351,6 +428,26 @@ pub fn remove_classes(graph: &mut EGraph, classes: &BTreeSet<ClassId>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_external_buffer_preserves_its_boundary_tensor_class() {
+        let mut graph = EGraph::default();
+        add(&mut graph, "tensor", "tensor", "LayoutTensorLit", &[]);
+        add(&mut graph, "seven", "seven", "7", &[]);
+        add(&mut graph, "buffer", "buffer", "BufferLit", &["seven"]);
+        add(
+            &mut graph,
+            "binding",
+            "binding",
+            "BufferTensorLit",
+            &["tensor", "buffer"],
+        );
+        assert_eq!(
+            external_boundary_classes(&graph, &[7].into_iter().collect()),
+            [ClassId::from("tensor")].into_iter().collect()
+        );
+        assert!(external_boundary_classes(&graph, &BTreeSet::new()).is_empty());
+    }
     use luminal::prelude::egraph_serialize::Node;
 
     fn add(graph: &mut EGraph, id: &str, class: &str, op: &str, children: &[&str]) {
@@ -461,6 +558,7 @@ mod tests {
             decoders: &decoders,
             bounds: &bounds,
             arena_budget_bytes: 1024 * 1024,
+            external_buffers: &Default::default(),
             max_intermediate_bytes: None,
             matchers: &[],
         };
@@ -529,6 +627,7 @@ mod tests {
             decoders: &decoders,
             bounds: &bounds,
             arena_budget_bytes: 4 * 1024 * 1024,
+            external_buffers: &Default::default(),
             max_intermediate_bytes: Some(1024 * 1024),
             matchers: &[],
         };
@@ -583,6 +682,7 @@ mod tests {
                 decoders: &decoders,
                 bounds: &BTreeMap::new(),
                 arena_budget_bytes: 1024,
+                external_buffers: &Default::default(),
                 max_intermediate_bytes: None,
                 matchers: &[],
             },

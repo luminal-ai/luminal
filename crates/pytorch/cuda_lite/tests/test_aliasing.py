@@ -18,6 +18,31 @@ import luminal_cuda_lite  # noqa: E402
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 
 
+@cuda
+def test_large_read_only_view_is_not_charged_twice_to_the_search_arena():
+    """A returned view names its input's read-only external buffer.
+
+    The input already occupies caller-owned CUDA memory when compilation
+    starts. A small explicit arena cap therefore constrains intermediates,
+    not a second phantom copy of that input.
+    """
+
+    def fn(x):
+        return x.view(1024, 1024)
+
+    x = torch.randn(1024 * 1024, device="cuda")
+    compiled = torch.compile(
+        fn,
+        backend=luminal_cuda_lite.Compiler(
+            search_iterations=1,
+            device_budget_bytes=1024 * 1024,
+        ),
+    )
+    got = compiled(x)
+    assert got.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+    torch.testing.assert_close(got, fn(x))
+
+
 @pytest.fixture(autouse=True)
 def _fresh_dynamo():
     torch._dynamo.reset()
@@ -203,15 +228,20 @@ def test_writes_through_storage_sharing_inputs_are_refused_by_name():
 
 
 @cuda
-def test_returned_view_at_a_storage_offset_is_refused_by_name():
-    """Until the boundary can state a base offset (LUM-852) this is a named
-    refusal, never a tensor holding the wrong row."""
+def test_returned_view_at_a_storage_offset_aliases_the_input():
+    """An output alias carries its byte offset separately from its strides."""
 
     def fn(x):
         return x[1]
 
-    with pytest.raises(Exception, match="storage offset"):
-        torch.compile(fn, backend=luminal_cuda_lite.Compiler())(_x())
+    x = _x()
+    expected = fn(x).clone()
+    got = torch.compile(fn, backend=luminal_cuda_lite.Compiler())(x)
+    torch.testing.assert_close(got, expected)
+    assert got.data_ptr() == x[1].data_ptr()
+    assert got.storage_offset() == x[1].storage_offset()
+    got.add_(10)
+    torch.testing.assert_close(x[1], expected + 10)
 
 
 def test_functionalising_without_decomposing_keeps_linear():

@@ -472,6 +472,7 @@ pub fn search_implementations(
             decoders: &decoders,
             bounds: &shapes.bounds,
             arena_budget_bytes,
+            external_buffers: &external_bindings,
             max_intermediate_bytes: options.max_intermediate_bytes,
             matchers,
         },

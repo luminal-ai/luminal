@@ -95,6 +95,10 @@ pub struct CudaRuntime {
     storage: Option<crate::arena::ArenaPlan>,
     /// Boundaries supplied as caller-owned device pointers.
     externals: std::collections::BTreeSet<i64>,
+    /// External buffers that candidate profiling may safely read in place.
+    /// Read/write buffers are deliberately absent so trying a candidate can
+    /// never mutate the caller's authored input.
+    profiling_externals: std::collections::BTreeSet<i64>,
     device_budget_bytes: Option<usize>,
     intermediate_budget_bytes: Option<usize>,
     /// The caller's device address for each External buffer, supplied before
@@ -150,6 +154,7 @@ impl CudaRuntime {
             output_buffers: self.output_buffers.clone(),
             output_slots: self.output_slots.clone(),
             externals: self.externals.clone(),
+            profiling_externals: self.profiling_externals.clone(),
             device_budget_bytes: self.device_budget_bytes,
             intermediate_budget_bytes: self.intermediate_budget_bytes,
             capacity_bounds: self.capacity_bounds.clone(),
@@ -220,6 +225,16 @@ impl CudaRuntime {
         bindings: crate::bindings::CudaBindings,
         registry: Vec<crate::ops::RegisteredOp>,
     ) -> Result<Self> {
+        let profiling_externals = bindings
+            .inputs()
+            .iter()
+            .filter(|bound| {
+                bound.placement == crate::bindings::Placement::External
+                    && bindings.buffers()[&bound.buffer].access
+                        == luminal::layout_ir::Access::ReadOnly
+            })
+            .map(|bound| bound.buffer)
+            .collect();
         let bound = bindings
             .bind(&graph.logical)
             .map_err(|reason| anyhow!("load refused: {reason}"))?;
@@ -273,6 +288,7 @@ impl CudaRuntime {
             output_slots,
             output_buffers,
             externals,
+            profiling_externals,
             ..Self::default()
         })
     }
@@ -540,7 +556,7 @@ impl CudaRuntime {
         let profile_externals: std::collections::BTreeSet<i64> = self
             .device_ptrs
             .keys()
-            .filter(|buffer| !program.outputs.iter().any(|out| &out.buffer == *buffer))
+            .filter(|buffer| self.profiling_externals.contains(buffer))
             .copied()
             .collect();
         #[cfg(feature = "device")]
@@ -553,9 +569,10 @@ impl CudaRuntime {
             .iter()
             // Candidate profiling may read caller-owned parameters directly,
             // but must never apply a functionalized buffer writeback to the
-            // caller while trying alternative plans. A buffer named by an
-            // output remains in the private profiling arena.
-            .filter(|(buffer, _)| !program.outputs.iter().any(|out| out.buffer == **buffer))
+            // caller while trying alternative plans. Read/write is the
+            // buffer declaration's contract; merely returning an input or a
+            // view of it does not make that read-only buffer mutable.
+            .filter(|(buffer, _)| self.profiling_externals.contains(buffer))
             .map(|(buffer, (ptr, bytes))| {
                 (
                     *buffer,
