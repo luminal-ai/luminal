@@ -96,6 +96,7 @@ pub struct CudaRuntime {
     /// Boundaries supplied as caller-owned device pointers.
     externals: std::collections::BTreeSet<i64>,
     device_budget_bytes: Option<usize>,
+    intermediate_budget_bytes: Option<usize>,
     /// The caller's device address for each External buffer, supplied before
     /// each execution ([`Self::set_device_ptr`]). Keyed by buffer id, which
     /// is also how the bindings spell aliasing: a mutation sink and its
@@ -112,6 +113,10 @@ pub struct CudaRuntime {
     /// by tensor: [`Self::output_slot_index`] refuses the ambiguity
     /// rather than picking one.
     output_slots: FxHashMap<NodeIndex, Vec<usize>>,
+    /// Physical storage domain installed for the selected plan. This may be a
+    /// finite bucket inside an authored open-ended semantic domain and grows
+    /// before an execution that needs a larger in-range extent.
+    capacity_bounds: shape::SymbolBounds,
     bounds: shape::SymbolBounds,
     dims: shape::DynMap,
     /// Live execution context and code/graph caches, attached explicitly or lazily.
@@ -146,6 +151,8 @@ impl CudaRuntime {
             output_slots: self.output_slots.clone(),
             externals: self.externals.clone(),
             device_budget_bytes: self.device_budget_bytes,
+            intermediate_budget_bytes: self.intermediate_budget_bytes,
+            capacity_bounds: self.capacity_bounds.clone(),
             #[cfg(feature = "device")]
             device: self
                 .device
@@ -465,8 +472,9 @@ impl CudaRuntime {
             "candidate search requires a CUDA GPU"
         );
         let (mut serialized, program) = self.assemble_and_saturate(bounds)?;
+        let capacity_bounds = crate::symbolic::initial_capacity_bounds(bounds, profile_dims)?;
         let shapes = crate::symbolic::ShapeEnv {
-            bounds: bounds.ranges(),
+            bounds: capacity_bounds.clone(),
             values: profile_dims.clone(),
         };
         let native = self
@@ -552,7 +560,7 @@ impl CudaRuntime {
         Self::retarget_external_outputs(&mut outcome.best_plan, &native.bound.outputs)?;
         self.storage = Some(crate::storage::plan_storage(
             &outcome.best_plan,
-            &bounds.ranges(),
+            &capacity_bounds,
             &self.externals,
         )?);
         outcome.intermediate_budget_bytes = crate::search::resolve_intermediate_budget(
@@ -564,9 +572,11 @@ impl CudaRuntime {
             options.intermediate_budget_bytes,
         );
         self.plan = Some(outcome.best_plan.clone());
+        self.capacity_bounds = shape::SymbolBounds::from_ranges(capacity_bounds)?;
         self.bounds = bounds.clone();
         self.dims = profile_dims.clone();
-        self.device_budget_bytes = options.device_budget_bytes;
+        self.device_budget_bytes = Some(outcome.arena_budget_bytes);
+        self.intermediate_budget_bytes = Some(outcome.intermediate_budget_bytes);
         Ok(outcome)
     }
 
@@ -704,6 +714,63 @@ impl CudaRuntime {
         Ok(crate::storage::plan_storage(&program.0, &program.1, &self.externals)?.slab_bytes)
     }
 
+    /// Grow an open-ended physical allocation bucket to cover the current
+    /// semantic dimension assignment. The selected implementation is
+    /// unchanged; only its lifetime/storage plan is recomputed. Growth is
+    /// validated against the same total and intermediate budgets used during
+    /// search before any installed CUDA graph or arena can be reused.
+    pub fn ensure_capacity_for_dims(&mut self) -> Result<bool> {
+        self.bounds.validate_values(&self.dims)?;
+        let mut ranges = self.capacity_bounds.ranges();
+        let mut changed = false;
+        for (symbol, semantic) in self.bounds.iter() {
+            let value = self.dims[symbol];
+            let (_, current_hi) = ranges[symbol];
+            if value <= current_hi {
+                continue;
+            }
+            let grown = current_hi
+                .max(1)
+                .checked_next_power_of_two()
+                .unwrap_or(semantic.max())
+                .saturating_mul(2)
+                .max(value)
+                .min(semantic.max());
+            ranges.get_mut(symbol).expect("capacity symbol exists").1 = grown;
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("search before growing storage capacity"))?;
+        let storage = crate::storage::plan_storage(plan, &ranges, &self.externals)?;
+        if let Some(budget) = self.device_budget_bytes {
+            ensure!(
+                storage.slab_bytes <= budget,
+                "grown CUDA arena needs {} bytes, exceeding budget {budget}",
+                storage.slab_bytes
+            );
+        }
+        if let Some(budget) = self.intermediate_budget_bytes {
+            ensure!(
+                storage.peak_intermediate_bytes <= budget,
+                "grown CUDA arena needs {} peak intermediate bytes, exceeding budget {budget}",
+                storage.peak_intermediate_bytes
+            );
+        }
+        #[cfg(feature = "device")]
+        if let Some(device) = self.device.as_mut() {
+            device.uninstall();
+        }
+        self.capacity_bounds = shape::SymbolBounds::from_ranges(ranges)?;
+        self.storage = Some(storage);
+        Ok(true)
+    }
+
     /// The searched plan re-asked of the External output bindings, on any
     /// host: [`Self::ensure_external_output_slots_are_literal`] over the
     /// plans `execute` would install.
@@ -818,7 +885,7 @@ impl CudaRuntime {
             .plan
             .as_ref()
             .ok_or_else(|| anyhow!("search before installing a program"))?;
-        Ok((plan.clone(), self.bounds.ranges()))
+        Ok((plan.clone(), self.capacity_bounds.ranges()))
     }
 
     /// Native CUDA stream after attaching a device or searching. Tensor storage

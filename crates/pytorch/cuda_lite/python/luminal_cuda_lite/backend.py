@@ -552,6 +552,16 @@ class CompiledModel:
         self._graph.bind_input_shapes(
             [(binding.name, list(value.shape)) for binding, value in bound]
         )
+        arena_bytes = self._graph.arena_bytes()
+        if arena_bytes != self._arena_bytes:
+            if capturing:
+                raise RuntimeError(
+                    "a dynamic shape grew the Luminal arena during CUDA capture; "
+                    "warm up this shape before capture"
+                )
+            self._arena_bytes = arena_bytes
+            self._region_arena = None
+            self._region_execution_state.clear()
 
         # Output shapes depend on this call's dims, so they are read after
         # the input shapes are bound rather than cached at compile time.
