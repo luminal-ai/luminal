@@ -125,7 +125,7 @@ def _register_cache_serialization():
 # ---------------------------------------------------------------------------
 
 
-def _box_scalar_graph_outputs(gm):
+def _box_scalar_graph_outputs(gm, *, should_box=None):
     """Represent backend scalar outputs as typed zero-dimensional tensors.
 
     Dynamo's backend graph may return SymInt/SymFloat/SymBool values even
@@ -169,6 +169,9 @@ def _box_scalar_graph_outputs(gm):
         if dtype is None:
             # Non-value outputs such as None remain outside the compiled tensor
             # output list, matching the existing PT2 parser behavior.
+            boxed_outputs.append(value)
+            continue
+        if should_box is not None and not should_box(example):
             boxed_outputs.append(value)
             continue
 

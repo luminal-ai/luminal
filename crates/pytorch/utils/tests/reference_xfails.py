@@ -157,30 +157,11 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
     ),
     KnownFailure(
-        ticket="LUM-1103",
-        url="https://linear.app/luminalai/issue/LUM-1103/runtime-scalar-outputs-item-local-scalar-dense-unbacked-symints",
-        reason=(
-            "runtime scalar outputs (item / _local_scalar_dense / unbacked symints) are unsupported on the reference AOT path"
-        ),
-        tests=(
-            "test_constructors.py::test_constructors_accept_tensor_backed_runtime_scalars",
-            "test_dtype_boundary.py::test_item_returns_exact_python_scalar[bfloat16]",
-            "test_dtype_boundary.py::test_item_returns_exact_python_scalar[bool]",
-            "test_dtype_boundary.py::test_item_returns_exact_python_scalar[float16]",
-            "test_dtype_boundary.py::test_item_returns_exact_python_scalar[float32]",
-            "test_dtype_boundary.py::test_item_returns_exact_python_scalar[float64-precision-sensitive]",
-            "test_dtype_boundary.py::test_item_returns_exact_python_scalar[int32]",
-            "test_dtype_boundary.py::test_item_returns_exact_python_scalar[int64]",
-        ),
-    ),
-    KnownFailure(
         ticket="LUM-1104",
         url="https://linear.app/luminalai/issue/LUM-1104/pt2-translator-gaps-arange-non-integer-start-full-with-unresolved-sym",
         reason=("PT2 translator does not port this ATen variant yet"),
         tests=(
             "test_constructors.py::test_full_supports_symbolic_shapes",
-            "test_dtype_boundary.py::test_arange_uses_exported_shape_and_declared_dtype[bool-scalars]",
-            "test_dtype_boundary.py::test_arange_uses_exported_shape_and_declared_dtype[empty]",
             "test_dtype_boundary.py::test_arange_uses_exported_shape_and_declared_dtype[fractional-to-int]",
             "test_fft.py::test_stft_decomposition_uses_composed_r2c_lowering",
             "test_hlir_ops.py::test_onehot",
