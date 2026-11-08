@@ -7,9 +7,11 @@ discovered from the chain itself in the e-graph, so this module states
 what the tensor has and never interprets it. A tensor the runtime cannot
 address as it lies is refused by name, never repacked.
 
-A binding names a buffer's BASE, so a boundary tensor whose storage
-offset is non-zero is refused: two bindings on one buffer share that
-base, and there is no way to say "same buffer, different offset".
+A standalone input binding names a buffer's BASE, so an input whose
+storage offset is non-zero is refused: two bindings on one buffer share
+that base. Returned aliases are different: the compiled boundary states
+their owner plus a relative byte offset, and Python reconstructs the
+authored view after execution.
 
 A stride is stated in the exported program's own vocabulary. Given a fake
 example value, an axis strided by a dynamic dimension states THAT
