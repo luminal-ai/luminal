@@ -699,13 +699,6 @@ pub fn search_implementations(
                         continue;
                     }
                 };
-            let boundary_literals = plan
-                .buffers
-                .values()
-                .filter_map(|buffer| buffer.lit)
-                .collect::<std::collections::BTreeSet<_>>();
-            let matched_external_literals =
-                boundary_literals.intersection(&external_bindings).count();
             let arena_overage = arena.slab_bytes.saturating_sub(arena_budget_bytes);
             let intermediate_budget_bytes = resolve_intermediate_budget(
                 arena_budget_bytes,
@@ -727,12 +720,8 @@ pub fn search_implementations(
                 if refusals.len() < 8 {
                     refusals.push(if arena_overage > 0 && intermediate_overage > 0 {
                         format!(
-                            "arena: {} bytes exceeds total budget {arena_budget_bytes}; peak intermediates {} bytes exceed budget {intermediate_budget_bytes}; external IDs {}, boundary literals {}, matched {}",
-                            arena.slab_bytes,
-                            arena.peak_intermediate_bytes,
-                            external_bindings.len(),
-                            boundary_literals.len(),
-                            matched_external_literals,
+                            "arena: {} bytes exceeds total budget {arena_budget_bytes}; peak intermediates {} bytes exceed budget {intermediate_budget_bytes}",
+                            arena.slab_bytes, arena.peak_intermediate_bytes
                         )
                     } else if arena_overage > 0 {
                         format!(

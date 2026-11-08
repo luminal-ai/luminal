@@ -1033,12 +1033,26 @@ def compile_exported(
         held_bindings.append(binding)
         held[name] = value
 
-    graph.search(
-        search_iterations,
-        search_log=search_log,
-        device_budget_bytes=device_budget_bytes,
-        max_intermediate_bytes=max_intermediate_bytes,
-    )
+    # Search runs during this first real call, so its example user tensors are
+    # live too. Bind read-only inputs while profiling just like parameters:
+    # otherwise the arena planner allocates a second copy even though actual
+    # execution reads the caller's storage directly. The Rust runtime keeps
+    # declared read/write inputs private, so trying candidates cannot mutate
+    # an authored input. Per-call addresses must not survive compilation;
+    # CompiledModel installs the current call's pointers later.
+    for binding in input_bindings:
+        value = tensors[binding.name]
+        graph.set_device_ptr(binding.buffer, value.data_ptr(), buffer_nbytes(value))
+    try:
+        graph.search(
+            search_iterations,
+            search_log=search_log,
+            device_budget_bytes=device_budget_bytes,
+            max_intermediate_bytes=max_intermediate_bytes,
+        )
+    finally:
+        for binding in input_bindings:
+            graph.clear_device_ptr(binding.buffer)
 
     # WHICH OUTPUTS THE PROGRAM HAS IS THE TRANSLATION'S TO SAY, not the
     # export signature's: the translator resolves a returned alias of a

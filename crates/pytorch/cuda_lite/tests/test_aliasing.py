@@ -18,6 +18,26 @@ import luminal_cuda_lite  # noqa: E402
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 
 
+@cuda
+def test_large_read_only_view_is_not_charged_twice_to_the_search_arena():
+    """The live input is external during search, then rebound for execution."""
+
+    def fn(x):
+        return x.view(1024, 1024)
+
+    x = torch.randn(1024 * 1024, device="cuda")
+    compiled = torch.compile(
+        fn,
+        backend=luminal_cuda_lite.Compiler(
+            search_iterations=1,
+            device_budget_bytes=1024 * 1024,
+        ),
+    )
+    got = compiled(x)
+    assert got.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+    torch.testing.assert_close(got, fn(x))
+
+
 @pytest.fixture(autouse=True)
 def _fresh_dynamo():
     torch._dynamo.reset()
