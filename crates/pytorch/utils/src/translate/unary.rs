@@ -205,7 +205,7 @@ impl Translator<'_> {
             // scalar/aarch64 behavior.
             let zero = self.constant_like(x, 0.0);
             let positive_inf = self.is_inf(x).logical_and(x.gt(zero));
-            let nan = zero / zero;
+            let nan = self.constant_like(x, f64::NAN);
             return Ok(positive_inf.select(nan, result));
         }
 
