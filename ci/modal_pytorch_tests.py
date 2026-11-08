@@ -356,6 +356,14 @@ def create_app(backend: str, local_project_dir: Path):
         timeout = _effective_timeout(timeout)
         runner_options = {"gpu": gpu} if gpu else {}
         hf_token_secret = _hf_token_secret()
+
+        # These volumes are attached dynamically through `Cls.with_options`,
+        # so Modal does not hydrate them while processing the static class
+        # decorator. The serialized class closes over both objects (for cache
+        # commits and profile export); resolve their object IDs before Modal
+        # serializes that closure.
+        HF_CACHE_VOLUME.hydrate()
+        PROFILE_VOLUME.hydrate()
         runner_volumes = {HF_CACHE_PATH: HF_CACHE_VOLUME}
         runner_options["timeout"] = timeout
         if profile_enabled:
