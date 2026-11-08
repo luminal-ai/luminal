@@ -71,9 +71,12 @@ from .boundary import (
     buffer_nbytes,
     call_dim_values,
     check_binding,
+    complex_component_dtype,
     declared_strides,
     layout_from_spec,
     layout_spec,
+    storage_dtype,
+    storage_shape,
     storage_span,
 )
 
@@ -270,8 +273,9 @@ def _output_alias_rows(ep: Any) -> list[tuple[str, str, int]]:
         for spec in ep.graph_signature.output_specs
         if spec.kind.name == "USER_OUTPUT"
     }
-    # Rows carry the view's element offset RELATIVE to its owner, so the
-    # returned view addresses the owner's storage where eager's does.
+    # Rows carry the view's BYTE offset relative to its owner. Byte units are
+    # required when a complex owner and one of its real component views have
+    # different element sizes.
     rows: list[tuple[str, str, int]] = []
     for name in names:
         fake = fakes.get(name)
@@ -280,7 +284,10 @@ def _output_alias_rows(ep: Any) -> list[tuple[str, str, int]]:
         storage = fake.untyped_storage()._cdata
         owner = owner_by_storage.setdefault(storage, name)
         if owner != name and name in outputs:
-            offset = int(fake.storage_offset()) - int(fakes[owner].storage_offset())
+            offset = (
+                int(fake.storage_offset()) * fake.element_size()
+                - int(fakes[owner].storage_offset()) * fakes[owner].element_size()
+            )
             rows.append((name, owner, offset))
     return rows
 
@@ -334,15 +341,29 @@ def _allocate_output(
     declared strides, and reaches no further than the span the runtime
     computed from the same layout.
     """
-    dense = torch.empty_strided(shape, strides, dtype=binding.dtype, device=device)
+    component_dtype = storage_dtype(binding.dtype)
+    dense_storage = torch.empty_strided(
+        shape, strides, dtype=component_dtype, device=device
+    )
+    dense = (
+        torch.view_as_complex(dense_storage)
+        if complex_component_dtype(binding.dtype) is not None
+        else dense_storage
+    )
     if span <= dense.untyped_storage().nbytes():
         return dense, dense.data_ptr(), buffer_nbytes(dense)
     base = torch.empty(span, dtype=torch.uint8, device=device)
     # A span that is not a whole number of elements is viewed as the whole
     # elements it holds; the trailing bytes stay the runtime's to write.
-    element = dense.element_size()
-    whole = base[: span - span % element].view(binding.dtype)
-    return whole.as_strided(shape, strides), base.data_ptr(), span
+    element = torch.empty((), dtype=component_dtype).element_size()
+    whole = base[: span - span % element].view(component_dtype)
+    storage_view = whole.as_strided(shape, strides)
+    tensor = (
+        torch.view_as_complex(storage_view)
+        if complex_component_dtype(binding.dtype) is not None
+        else storage_view
+    )
+    return tensor, base.data_ptr(), span
 
 
 class CompiledModel:
@@ -564,7 +585,7 @@ class CompiledModel:
         # input would check it against what the call before left behind.
         # Refused here, before any pointer is set.
         self._graph.bind_input_shapes(
-            [(binding.name, list(value.shape)) for binding, value in bound]
+            [(binding.name, list(storage_shape(value))) for binding, value in bound]
         )
         arena_bytes = self._graph.arena_bytes()
         if arena_bytes != self._arena_bytes:
@@ -598,7 +619,12 @@ class CompiledModel:
                     out_spans.append(None)
                     continue
                 name = binding.name
-                shape = tuple(output_shapes[index])
+                logical_shape = tuple(output_shapes[index])
+                shape = (
+                    (*logical_shape, 2)
+                    if complex_component_dtype(binding.dtype) is not None
+                    else logical_shape
+                )
                 # The plan was retargeted onto the caller's buffer at search;
                 # a plan that writes this output somewhere else is a runtime
                 # invariant broken, not a call this caller can fix.
@@ -746,12 +772,44 @@ class CompiledModel:
                 if binding.name in self._output_aliases:
                     # Eager returns a view of a tensor the caller already
                     # holds; so does this call, at the strides eager gives it.
-                    owner_name, offset = self._output_aliases[binding.name]
+                    owner_name, offset_bytes = self._output_aliases[binding.name]
                     owner = self._boundary_tensor(owner_name, inputs, out_tensors)
-                    shape = tuple(output_shapes[index])
-                    strides = tuple(declared_strides(binding, shape, dims))
-                    tensor = owner.as_strided(
-                        shape, strides, owner.storage_offset() + offset
+                    component = complex_component_dtype(binding.dtype)
+                    logical_output_shape = tuple(output_shapes[index])
+                    storage_output_shape = (
+                        (*logical_output_shape, 2)
+                        if component is not None
+                        else logical_output_shape
+                    )
+                    storage_output_strides = tuple(
+                        declared_strides(binding, storage_output_shape, dims)
+                    )
+                    shape = (
+                        storage_output_shape[:-1]
+                        if component is not None
+                        else storage_output_shape
+                    )
+                    strides = (
+                        tuple(stride // 2 for stride in storage_output_strides[:-1])
+                        if component is not None
+                        else storage_output_strides
+                    )
+                    item_size = torch.empty((), dtype=binding.dtype).element_size()
+                    byte_offset = (
+                        owner.storage_offset() * owner.element_size() + offset_bytes
+                    )
+                    if byte_offset % item_size:
+                        raise RuntimeError(
+                            f"luminal_cuda_lite: output {binding.name!r} starts at byte "
+                            f"offset {byte_offset}, not aligned for {binding.dtype}"
+                        )
+                    tensor = torch.empty(
+                        0, dtype=binding.dtype, device=owner.device
+                    ).set_(
+                        owner.untyped_storage(),
+                        byte_offset // item_size,
+                        shape,
+                        strides,
                     )
                 # Scalar graph outputs were boxed into rank-zero tensors before
                 # export; restore the Python scalar backend contract here.
@@ -1044,7 +1102,7 @@ def compile_exported(
             )
     graph.bind_input_shapes(
         [
-            (name, [profile_value(size) for size in tensors[name].shape])
+            (name, [profile_value(size) for size in storage_shape(tensors[name])])
             for name in graph.input_names
         ]
     )
@@ -1106,13 +1164,15 @@ def compile_exported(
         Binding(
             name,
             buffer,
-            _torch_dtype(dtype_code),
+            tensors[mutation].dtype
+            if mutation is not None
+            else _output_fake(name, fakes).dtype,
             shapes[mutation]
             if mutation is not None
             else boundary_shape(_output_fake(name, fakes)),
             layout_from_spec(name, tag, strides),
         )
-        for name, buffer, dtype_code, mutation, (tag, strides) in zip(
+        for name, buffer, _dtype_code, mutation, (tag, strides) in zip(
             graph.output_names,
             graph.output_buffers,
             graph.output_dtypes,

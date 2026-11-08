@@ -30,9 +30,9 @@ sys.modules[_SPEC.name] = boundary
 _SPEC.loader.exec_module(boundary)
 
 
-def _binding(name, shape, layout):
+def _binding(name, shape, layout, dtype=torch.float32):
     return boundary.Binding(
-        name=name, buffer=0, dtype=torch.float32, shape=shape, layout=layout
+        name=name, buffer=0, dtype=dtype, shape=shape, layout=layout
     )
 
 
@@ -169,10 +169,21 @@ def test_a_dtype_with_no_storage_dtype_is_refused_by_name():
     other is refused naming it and the dtype, never reinterpreted as
     bytes of a dtype they do read."""
     with pytest.raises(boundary.UnsupportedBoundary) as refusal:
-        boundary.boundary_layout("x", _Boundary((4, 4), (4, 1), dtype=torch.complex64))
+        boundary.boundary_layout("x", _Boundary((4, 4), (4, 1), dtype=torch.uint16))
     message = str(refusal.value)
     assert "x:" in message, message
-    assert "complex64" in message, message
+    assert "uint16" in message, message
+
+
+def test_complex_boundary_is_the_same_interleaved_component_storage():
+    """Complex stays complex at the caller boundary while the translated
+    graph addresses the exact same bytes as a trailing real/imaginary axis."""
+    value = _Boundary((3, 4), (4, 1), dtype=torch.complex64)
+    assert boundary.boundary_shape(value) == (3, 4, 2)
+    assert boundary.boundary_layout("x", value) == _chain((8, 2, 1))
+
+    binding = _binding("x", (3, 4, 2), _chain((8, 2, 1)), torch.complex64)
+    boundary.check_binding(binding, torch.empty(3, 4, dtype=torch.complex64))
 
 
 def test_a_negative_stride_is_refused_by_name():
