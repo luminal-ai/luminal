@@ -629,14 +629,14 @@ mod execution {
         use luminal::layout_ir::Access;
         for dtype in [DType::F16, DType::Bf16] {
             for with_c in [false, true] {
-                for activation in [0, 1] {
-                    execute(
-                        fixture_with_c(dtype, false, true, !with_c, activation, with_c),
-                        false,
-                        Access::ReadOnly,
-                        false,
-                    );
-                }
+                // Frontend activations have stricter exceptional-value
+                // semantics and exercise the F32 fallback below.
+                execute(
+                    fixture_with_c(dtype, false, true, !with_c, 0, with_c),
+                    false,
+                    Access::ReadOnly,
+                    false,
+                );
             }
         }
     }
@@ -755,14 +755,14 @@ mod execution {
     fn packed_bias_via_broadcast_c_preserves_cancellation_before_final_rounding() {
         use luminal::layout_ir::Access;
         for dtype in [DType::F16, DType::Bf16] {
-            for activation in [0, 1] {
-                execute(
-                    cancellation_fixture(dtype, false, activation),
-                    false,
-                    Access::ReadOnly,
-                    false,
-                );
-            }
+            // Cancellation can stay inside the narrow call only when no
+            // separate frontend activation observes its F32 result.
+            execute(
+                cancellation_fixture(dtype, false, 0),
+                false,
+                Access::ReadOnly,
+                false,
+            );
         }
     }
 
@@ -772,7 +772,7 @@ mod execution {
         for dtype in [DType::F16, DType::Bf16] {
             for with_c in [false, true] {
                 for activation in [0, 1, 2] {
-                    if !with_c && activation != 2 {
+                    if !with_c && activation == 0 {
                         continue;
                     }
                     let mut f = cancellation_fixture(dtype, with_c, activation);
