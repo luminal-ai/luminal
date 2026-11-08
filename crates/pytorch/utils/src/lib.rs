@@ -22,7 +22,9 @@ pub use dtype::TorchDType;
 pub use pt2_parser::{InputKind, ParsedPT2, parse_pt2};
 pub use torch_device::TorchDevice;
 pub use torch_layout::TorchLayout;
-pub use translate::{TranslatedInput, TranslatedOutput, Translation, translate};
+pub use translate::{
+    TranslatedInput, TranslatedOutput, Translation, translate, translate_with_cpu_capability,
+};
 
 /// Preserve the exported domain for every translated dimension. Missing finite
 /// endpoints retain PyTorch's signed shape range; profiling hints never narrow it.

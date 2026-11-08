@@ -196,15 +196,13 @@ impl Translator<'_> {
             .as_ref()
             .is_some_and(|device| device.kind == "cpu");
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if cpu && std::is_x86_feature_detected!("avx2") && !std::is_x86_feature_detected!("avx512f")
-        {
+        if cpu && self.cpu_capability.as_deref() == Some("AVX2") {
             // This is observable PyTorch behavior, not a compiler-selected
             // approximation: ATen's AVX2 CPU GELU returns NaN for positive
             // infinity and preserves negative underflowed zeros. Its AVX-512
-            // and scalar/aarch64 kernels return +infinity and canonicalize
-            // those zeros. Match the eager kernel for the authored CPU
-            // placement; GitHub's x86 runners expose both capability classes.
+            // and scalar kernels return +infinity and canonicalize those
+            // zeros. Match the actual eager dispatch class reported by
+            // PyTorch, rather than approximating it from host ISA bits.
             let zero = self.constant_like(x, 0.0);
             let positive_inf = self.is_inf(x).logical_and(x.gt(zero));
             let nan = self.constant_like(x, f64::NAN);

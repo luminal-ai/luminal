@@ -160,6 +160,10 @@ struct Translator<'a> {
     /// The single device stated by the exported program. Some ATen
     /// operations have observable device-specific IEEE edge behavior.
     device: Option<crate::torch_device::TorchDevice>,
+    /// The exact CPU dispatch class selected by the originating PyTorch
+    /// process. Host ISA bits are not equivalent: PyTorch also considers
+    /// which kernels its wheel contains and `ATEN_CPU_CAPABILITY` overrides.
+    cpu_capability: Option<String>,
     values: HashMap<String, GraphTensor>,
     /// Input values by graph name.
     input_values: HashMap<String, GraphTensor>,
@@ -206,6 +210,17 @@ pub fn parse_dim_expr(translation: &Translation, expr: &str) -> Result<IntExpr> 
 
 /// Translate a parsed PT2 program into the recorder frontend.
 pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
+    translate_with_cpu_capability(parsed, None)
+}
+
+/// Translate with the CPU dispatch class reported by the originating PyTorch
+/// process (`torch.backends.cpu.get_cpu_capability()`). This is part of the
+/// authored CPU operation's observable semantics for kernels whose IEEE edge
+/// behavior differs between ATen dispatch implementations.
+pub fn translate_with_cpu_capability(
+    parsed: &ParsedPT2,
+    cpu_capability: Option<&str>,
+) -> Result<Translation> {
     let mut tensors: Vec<(&String, &TensorMeta)> = parsed
         .program
         .graph_module
@@ -223,6 +238,7 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
     let mut t = Translator {
         cx: Graph::new(),
         device: device.clone(),
+        cpu_capability: cpu_capability.map(str::to_owned),
         values: HashMap::new(),
         input_values: HashMap::new(),
         symbols: sym_dim_map.sym_to_symbol.clone(),

@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
-use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
+use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate_with_cpu_capability};
 use luminal_reference::{CompileOptions, ReferenceBindings, ReferenceRuntime, TypedBuffer};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -661,11 +661,18 @@ fn bind(translation: &Translation) -> Result<(ReferenceBindings, Vec<i64>)> {
 
 /// Parse, translate, and load a `.pt2` on the reference runtime.
 #[pyfunction]
-fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
+fn compile(py: Python<'_>, pt2_path: &str) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
-    let translation = translate(&parsed).map_err(to_py)?;
+    let cpu_capability: String = py
+        .import("torch")?
+        .getattr("backends")?
+        .getattr("cpu")?
+        .call_method0("get_cpu_capability")?
+        .extract()?;
+    let translation =
+        translate_with_cpu_capability(&parsed, Some(&cpu_capability)).map_err(to_py)?;
     let bounds = luminal_pytorch_utils::symbol_bounds(&translation, &parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let (bindings, output_buffers) = bind(&translation)
