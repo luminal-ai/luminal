@@ -20,6 +20,7 @@ def create_app(backend: str, local_project_dir: Path):
     if backend not in {"reference", "cuda_lite"}:
         raise ValueError(f"Unknown PyTorch backend: {backend}")
     app = modal.App(f"luminal-{backend}-tests")
+    fail_fast = os.environ.get("GITHUB_ACTIONS") == "true"
 
     DEFAULT_TIMEOUT = 2 * 60 * 60
     CUDARC_CUDA_VERSION = "12080"
@@ -44,7 +45,8 @@ def create_app(backend: str, local_project_dir: Path):
     image = (
         modal.Image.from_registry(
             f"ghcr.io/luminal-ai/luminal-docker:{'cuda' if backend == 'cuda_lite' else 'cpu'}",
-            add_python="3.11",
+            # Serialized class bytecode must match the launcher interpreter.
+            add_python=f"{sys.version_info.major}.{sys.version_info.minor}",
         )
         .env({"CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION})
         .workdir(PROJECT_DIR)
@@ -230,6 +232,12 @@ def create_app(backend: str, local_project_dir: Path):
             sanitized_pytest_args = [
                 arg for arg in pytest_args if arg not in {"--profile", "--profile-svg"}
             ]
+            if fail_fast and not any(
+                arg in {"-x", "--exitfirst", "--maxfail"}
+                or arg.startswith("--maxfail=")
+                for arg in sanitized_pytest_args
+            ):
+                sanitized_pytest_args.append("--maxfail=1")
             if profile_enabled:
                 sanitized_pytest_args.append("--profile")
                 if dot_available:
@@ -274,7 +282,7 @@ def create_app(backend: str, local_project_dir: Path):
                     cwd=str(scratch_dir) if scratch_dir is not None else PROJECT_DIR,
                 )
                 exit_code = max(exit_code, completed.returncode)
-            HF_CACHE_VOLUME.commit()
+            modal.Volume.from_name(HF_CACHE_VOLUME_NAME).commit()
             finished_at = _utc_now()
 
             if not profile_enabled:
@@ -314,7 +322,7 @@ def create_app(backend: str, local_project_dir: Path):
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            PROFILE_VOLUME.commit()
+            modal.Volume.from_name(PROFILE_VOLUME_NAME).commit()
 
             return {
                 "exit_code": exit_code,
