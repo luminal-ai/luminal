@@ -4,7 +4,10 @@ import subprocess
 
 import modal
 
-gpu_type = os.environ.get("GPU_TYPE", "T4")
+# The cuBLASLt device suites exercise BF16-fast configurations that require
+# Ampere or newer hardware. Keep this overridable for focused probes, but run
+# the complete default board on the A100 it is validated against.
+gpu_type = os.environ.get("GPU_TYPE", "A100")
 modal_timeout = int(os.environ.get("MODAL_TIMEOUT", "7200"))
 CUDARC_CUDA_VERSION = "12080"
 

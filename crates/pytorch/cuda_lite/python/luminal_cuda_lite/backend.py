@@ -57,6 +57,7 @@ from luminal_reference.export_utils import (
     _drop_input_guards,
     _lower_sym_sum,
     _register_cache_serialization,
+    _run_decompositions_without_guards,
     private_graph_copy,
 )
 from torch.export import export
@@ -551,6 +552,16 @@ class CompiledModel:
         self._graph.bind_input_shapes(
             [(binding.name, list(value.shape)) for binding, value in bound]
         )
+        arena_bytes = self._graph.arena_bytes()
+        if arena_bytes != self._arena_bytes:
+            if capturing:
+                raise RuntimeError(
+                    "a dynamic shape grew the Luminal arena during CUDA capture; "
+                    "warm up this shape before capture"
+                )
+            self._arena_bytes = arena_bytes
+            self._region_arena = None
+            self._region_execution_state.clear()
 
         # Output shapes depend on this call's dims, so they are read after
         # the input shapes are bound rather than cached at compile time.
@@ -878,7 +889,7 @@ def _compile_graph(
     # composites the translator lowers directly (aten.linear) survive. The
     # translator reads mutations from the specs and refuses in-place ops.
     try:
-        ep = ep.run_decompositions({})
+        ep = _run_decompositions_without_guards(ep, {})
     except AssertionError as exc:
         # torch's export functionalisation cannot express a write to an
         # input that shares storage with another input (its alias wrapper
@@ -967,7 +978,7 @@ def compile_exported(
         # un-decomposed graph.
         if "unsupported ATen op" not in str(exc):
             raise
-        ep = ep.run_decompositions(_decomp_table())
+        ep = _run_decompositions_without_guards(ep, _decomp_table())
         _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
         graph, tensors, layouts, shapes, aliases = _save_and_compile(ep)

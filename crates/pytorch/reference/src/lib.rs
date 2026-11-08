@@ -6,15 +6,20 @@
 //! the runtime.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use luminal::layout_ir::{Access, FreedBy};
 use luminal::prelude::{DType, DynMap, IntExpr, NodeIndex, Symbol};
 
-use luminal_pytorch_utils::{InputKind, TorchDType, Translation, translate};
+use luminal_pytorch_utils::{
+    CpuGeluBehavior, CpuGeluSemantics, InputKind, TorchDType, Translation,
+    translate_with_cpu_gelu_semantics,
+};
 use luminal_reference::{CompileOptions, ReferenceBindings, ReferenceRuntime, TypedBuffer};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 use rustc_hash::FxHashMap;
 
 use luminal::shape::SymbolBounds;
@@ -659,13 +664,65 @@ fn bind(translation: &Translation) -> Result<(ReferenceBindings, Vec<i64>)> {
     Ok((bindings, output_buffers))
 }
 
+fn probe_cpu_gelu_behavior(
+    py: Python<'_>,
+    torch: &Bound<'_, PyModule>,
+    dtype_name: &str,
+) -> PyResult<CpuGeluBehavior> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", torch.getattr(dtype_name)?)?;
+    let zero = torch.call_method("tensor", (0.0,), Some(&kwargs))?;
+    let positive_infinity = torch.call_method("tensor", (f64::INFINITY,), Some(&kwargs))?;
+    let negative_infinity = torch.call_method("tensor", (f64::NEG_INFINITY,), Some(&kwargs))?;
+    let smallest_negative = torch.call_method1("nextafter", (&zero, &negative_infinity))?;
+    let values = PyList::new(py, [&positive_infinity, &smallest_negative])?;
+    let values = torch.call_method1("stack", (values,))?;
+    let result = torch
+        .getattr("nn")?
+        .getattr("functional")?
+        .call_method1("gelu", (&values,))?;
+    let positive_infinity_is_nan = torch
+        .call_method1("isnan", (result.get_item(0)?,))?
+        .call_method0("item")?
+        .extract()?;
+    let negative_underflow = result.get_item(1)?;
+    let negative_underflow_is_zero =
+        negative_underflow.call_method0("item")?.extract::<f64>()? == 0.0;
+    let negative_underflow_has_sign = torch
+        .call_method1("signbit", (&negative_underflow,))?
+        .call_method0("item")?
+        .extract()?;
+    Ok(CpuGeluBehavior {
+        positive_infinity_is_nan,
+        preserves_negative_underflow_zero: negative_underflow_is_zero
+            && negative_underflow_has_sign,
+    })
+}
+
+fn cpu_gelu_semantics(py: Python<'_>) -> PyResult<CpuGeluSemantics> {
+    static SEMANTICS: OnceLock<CpuGeluSemantics> = OnceLock::new();
+    if let Some(semantics) = SEMANTICS.get() {
+        return Ok(*semantics);
+    }
+    let torch = py.import("torch")?;
+    let semantics = CpuGeluSemantics {
+        f16: probe_cpu_gelu_behavior(py, &torch, "float16")?,
+        bf16: probe_cpu_gelu_behavior(py, &torch, "bfloat16")?,
+        f32: probe_cpu_gelu_behavior(py, &torch, "float32")?,
+        f64: probe_cpu_gelu_behavior(py, &torch, "float64")?,
+    };
+    let _ = SEMANTICS.set(semantics);
+    Ok(*SEMANTICS.get().unwrap_or(&semantics))
+}
+
 /// Parse, translate, and load a `.pt2` on the reference runtime.
 #[pyfunction]
-fn compile(pt2_path: &str) -> PyResult<CompiledGraph> {
+fn compile(py: Python<'_>, pt2_path: &str) -> PyResult<CompiledGraph> {
     let parsed = luminal_pytorch_utils::parse_pt2(pt2_path)
         .with_context(|| format!("parsing {pt2_path}"))
         .map_err(to_py)?;
-    let translation = translate(&parsed).map_err(to_py)?;
+    let translation =
+        translate_with_cpu_gelu_semantics(&parsed, Some(cpu_gelu_semantics(py)?)).map_err(to_py)?;
     let bounds = luminal_pytorch_utils::symbol_bounds(&translation, &parsed).map_err(to_py)?;
     let dims: DynMap = translation.dims.iter().map(|(k, v)| (*k, *v)).collect();
     let (bindings, output_buffers) = bind(&translation)

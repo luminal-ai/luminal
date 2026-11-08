@@ -5,7 +5,7 @@
 use anyhow::Result;
 use luminal::prelude::*;
 
-use super::Translator;
+use super::{CpuGeluBehavior, Translator};
 use crate::pt2_schema::{Argument, Node};
 
 impl Translator<'_> {
@@ -186,6 +186,43 @@ impl Translator<'_> {
         let x = self.unary_input(node)?;
         let one = self.constant_like(x, 1.0);
         Ok(one - self.real_erf(x))
+    }
+
+    pub(super) fn translate_gelu(&mut self, node: &Node) -> Result<GraphTensor> {
+        let x = self.unary_input(node)?;
+        let result = x.gelu();
+        let cpu = self
+            .device
+            .as_ref()
+            .is_some_and(|device| device.kind == "cpu");
+        let output_dtype = self.output_meta_dtype(node)?;
+        let behavior = self
+            .cpu_gelu_semantics
+            .and_then(|semantics| semantics.for_dtype(output_dtype))
+            .unwrap_or(CpuGeluBehavior {
+                positive_infinity_is_nan: false,
+                preserves_negative_underflow_zero: output_dtype == DType::F64,
+            });
+
+        let result = if cpu && behavior.positive_infinity_is_nan {
+            // This is observable PyTorch behavior, not a compiler-selected
+            // approximation. Match the selected eager kernel as observed in
+            // the originating process rather than guessing its dispatch from
+            // host ISA bits or PyTorch's process-wide capability label.
+            let zero = self.constant_like(x, 0.0);
+            let positive_inf = self.is_inf(x).logical_and(x.gt(zero));
+            let nan = self.constant_like(x, f64::NAN);
+            positive_inf.select(nan, result)
+        } else {
+            result
+        };
+
+        if cpu && !behavior.preserves_negative_underflow_zero {
+            let zero = self.constant_like(result, 0.0);
+            return Ok(self.is_zero(result).select(zero, result));
+        }
+
+        Ok(result)
     }
 
     /// Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).

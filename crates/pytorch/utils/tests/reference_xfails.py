@@ -218,8 +218,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype2]",
             "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype3]",
             "test_complex.py::test_acos_and_acosh_take_the_side_of_the_cut_from_a_signed_zero[torch.float64]",
-            "test_remaining_existing_hlir_lowerings.py::test_nanmedian_slot_matches_eager_on_the_backend_path",
-            "test_unary.py::test_erf_family_is_odd_through_an_exact_sign[gelu]",
         ),
         machines=("x86_64", "AMD64"),
     ),
@@ -232,7 +230,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         tests=(
             "test_hlir_ops.py::test_repeat_leading_and_tile",
             "test_hlir_ops.py::test_repeat_leading_dims",
-            "test_llama3.py::test_hf_llama3_1b_bf16_error_within_fp32_floor",
             "test_reduction.py::test_scalar_log_softmax_preserves_ieee_behavior",
             "test_tiny_llm.py::test_tiny_llm_dynamic_context_reuses_one_compile",
         ),

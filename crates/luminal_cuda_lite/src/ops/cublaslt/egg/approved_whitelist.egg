@@ -9,14 +9,18 @@
 ;   A transpose operation, B transpose operation
 ;   allowed reduction-scheme mask
 ;
-; This table is the sole reduction-policy source. FP32/TF32 -> FP32 and
-; FP64 -> FP64 and native FP16 -> FP16 allow all schemes (0x7). FP32 -> FP16/BF16 allows only
+; This table records vendor reduction capabilities. FP32/TF32 -> FP32 and
+; FP64 -> FP64 and native FP16 -> FP16 record all schemes (0x7). FP32 -> FP16/BF16 records only
 ; compute-type partials (0x2), preserving FP32 intermediate sums. NONE (0)
-; is always allowed; the mask permits schemes without requiring split-K.
+; is always recorded; the mask permits schemes without requiring split-K.
+; Matmul reduction order is unspecified, so these schemes are valid when they
+; retain the authored accumulator/output dtype and explicit rounding boundaries.
+; Capability is otherwise not semantic permission: complete admission must
+; separately prove the behavior valid for the authored logical operator.
 ; Accumulation and scalars use the declared FP16, FP32 or FP64 computation contract.
 ; TF32, FP16 and BF16 input conversion over F32 storage have distinct computation variants.
-; ReLU accepts the selected vendor kernel's NaN handling and sign of zero.
-; GELU accepts the vendor approximation.
+; ReLU/GELU rows describe vendor capabilities only. Current expression rules do
+; not promote frontend activations because their full semantics are not equal.
 ; Activation and bias epilogues require column-major D.
 ; Alpha/beta values are separately proved call arguments; absent C requires beta zero.
 
@@ -25378,8 +25382,8 @@
     (CublasLtTranspose) (CublasLtTranspose)
     (CublasLtReductionSchemeMaskAll)))
 
-; FP64 bias and activation epilogues: column-major D, full-width bias/scalars.
-; GELU accepts the vendor approximation, as for FP32-output calls.
+; FP64 bias and activation capabilities: column-major D, full-width bias/scalars.
+; Activation rows remain unreachable without an exact expression proof.
 
 (cublaslt-approved-configuration
   (CublasLtConfigurationOf
@@ -43508,8 +43512,9 @@
     (CublasLtTranspose) (CublasLtTranspose)
     (CublasLtReductionSchemeMaskAll)))
 
-; Native FP16 ReLU and ReLU+bias. The selected cuBLASLt kernel determines
-; whether a NaN propagates or becomes zero; admission explicitly accepts both.
+; Native FP16 ReLU and ReLU+bias capabilities. The selected cuBLASLt kernel can
+; vary on NaN behavior, so these rows are not reachable from current frontend
+; ReLU expressions.
 (cublaslt-approved-configuration
   (CublasLtConfigurationOf
     (CublasLtFloat16Computation) (F16)

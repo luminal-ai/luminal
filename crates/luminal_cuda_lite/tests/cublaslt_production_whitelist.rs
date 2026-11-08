@@ -1,6 +1,7 @@
 //! Every production call must be admitted by the complete configuration table.
 use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::approved::{
@@ -30,7 +31,7 @@ fn saturate(model: &Graph, whitelist: &str) -> EGraph {
             ),
         )
         .unwrap();
-    graph.serialize(Default::default()).egraph
+    graph.serialize_compact_filtered(|_| true)
 }
 
 fn calls(graph: &EGraph) -> Vec<ApprovedCublasLt> {
@@ -159,13 +160,13 @@ fn removing_an_accumulation_configuration_disables_both_executable_forms() {
 }
 
 #[test]
-fn approved_relu_fuses_the_complete_accumulation_and_bias_expression() {
+fn activation_capability_rows_do_not_replace_the_frontend_relu_expression() {
     let calls = calls(&saturate(&fixture(), WHITELIST));
     assert!(!calls.is_empty());
     assert!(
         calls
             .iter()
-            .any(|call| call.activation == LtActivation::RectifiedLinear)
+            .all(|call| call.activation == LtActivation::Identity)
     );
     assert!(
         calls
@@ -327,20 +328,26 @@ fn whitelist_mask_reaches_both_executable_forms_for_matrices_and_batches() {
 }
 
 #[test]
-fn every_approved_configuration_has_a_real_graph_witness_and_no_others_exist() {
+fn every_semantically_admitted_configuration_has_a_real_graph_witness_and_no_others_exist() {
     let witnesses = whitelist::witnesses();
     assert_eq!(whitelist::approved_keys().len(), 4096);
+    let admitted = whitelist::approved_keys()
+        .into_iter()
+        .filter(|key| {
+            key.contains("(CublasLtDefaultEpilogue)") || key.contains("(CublasLtBiasEpilogue)")
+        })
+        .collect();
     assert_eq!(
         witnesses
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        whitelist::approved_keys()
+        admitted
     );
 }
 
 #[test]
-fn symbolic_bias_and_relu_have_a_complete_production_extraction() {
+fn symbolic_bias_and_generic_relu_have_a_complete_production_extraction() {
     let mut model = Graph::new();
     let a = model.tensor(vec![IntExpr::from('m'), 4.into()], DType::F32);
     let b = model.tensor(vec![4.into(), IntExpr::from('n')], DType::F32);
@@ -380,5 +387,6 @@ fn symbolic_bias_and_relu_have_a_complete_production_extraction() {
         }
     }
     assert_eq!(library, 1);
-    assert!(select > 0 || fused_relu);
+    assert!(!fused_relu);
+    assert!(select > 0);
 }

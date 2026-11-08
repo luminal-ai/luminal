@@ -16,6 +16,7 @@
 //! bind identically on both sides.
 
 use anyhow::{Context, Result, anyhow, ensure};
+use luminal::prelude::CompactSnapshotExt;
 use petgraph::algo::toposort;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
@@ -517,9 +518,7 @@ impl ReferenceRuntime {
         crate::decoder_registry().check(&egraph)?;
         let saturation_nanos = saturation_start.elapsed().as_nanos();
         let serialize_start = std::time::Instant::now();
-        let mut serialized = egraph
-            .serialize(luminal::prelude::egglog::SerializeConfig::default())
-            .egraph;
+        let mut serialized = egraph.serialize_compact_filtered(|_| true);
         let serialize_nanos = serialize_start.elapsed().as_nanos();
         let mut outcome = crate::search::search_implementations_with_ops(
             &mut serialized,
@@ -1143,6 +1142,7 @@ mod tests {
     use crate::typed_buffer::TypedBuffer;
     use luminal::dtype::DType;
     use luminal::graph::Graph;
+    use luminal::prelude::CompactSnapshotExt;
     use luminal::shape::IntExpr;
     use luminal::shape::SliceRange;
     use rustc_hash::FxHashMap;
@@ -2127,9 +2127,7 @@ mod tests {
         egraph
             .parse_and_run_program(None, &text)
             .expect("program runs");
-        let serialized = egraph
-            .serialize(luminal::prelude::egglog::SerializeConfig::default())
-            .egraph;
+        let serialized = egraph.serialize_compact_filtered(|_| true);
         let allow = crate::reference_allow_list();
         let extracted = crate::extractor::extract_layout_ir_with_ops_and_matchers(
             &serialized,

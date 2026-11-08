@@ -694,7 +694,7 @@ fn producer_op_names(egraph: &EGraph, class: &ClassId) -> BTreeSet<String> {
             .filter(|sibling| sibling.eclass == node.eclass && !sibling.subsumed)
         {
             if sibling.op.starts_with("LayoutTensorOp") && sibling.op != "LayoutTensorOpLit" {
-                names.insert(sibling.op.clone());
+                names.insert(sibling.op.to_string());
             }
         }
     }

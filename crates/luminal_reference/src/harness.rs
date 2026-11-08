@@ -6,6 +6,7 @@
 //! Core keeps only the runtime-neutral pieces (`TestGraph`, the mocks,
 //! `harness_search_options`).
 
+use luminal::prelude::CompactSnapshotExt;
 use std::fs;
 
 use crate::extractor;
@@ -71,8 +72,6 @@ pub fn producer_index_with_ops(
 /// Run `test_scripts/<script>` through egglog (with the full preamble) and
 /// hand back the serialized e-graph — the selection tooling's raw material.
 pub fn serialize_fixture(script: &str) -> egraph_serialize::EGraph {
-    use luminal::prelude::egglog::SerializeConfig;
-
     let preamble = crate::assembled_program();
     let source = fs::read_to_string(fixture_path(script))
         .unwrap_or_else(|_| panic!("fixture script {script} readable"));
@@ -82,7 +81,7 @@ pub fn serialize_fixture(script: &str) -> egraph_serialize::EGraph {
     egraph
         .parse_and_run_program(Some(script.to_string()), &program)
         .unwrap_or_else(|err| panic!("egglog failed on fixture {script}: {err}"));
-    egraph.serialize(SerializeConfig::default()).egraph
+    egraph.serialize_compact_filtered(|_| true)
 }
 
 /// Build a TOTAL genome over a fixture's produced classes: each class takes
@@ -187,9 +186,7 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("saturation: {err}"))?;
     eprintln!("[plain-plan] saturation {:?}", start.elapsed());
     let start = std::time::Instant::now();
-    let serialized = egraph
-        .serialize(luminal::prelude::egglog::SerializeConfig::default())
-        .egraph;
+    let serialized = egraph.serialize_compact_filtered(|_| true);
     eprintln!(
         "[plain-plan] serialize {:?} ({} nodes, {} classes)",
         start.elapsed(),

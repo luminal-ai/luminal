@@ -1,4 +1,5 @@
 use luminal::layout_ir::{ExtractionSite, OpMatcher, SerializedIndex};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal::prelude::*;
 use luminal_cuda_lite::ops::cublaslt::accumulate_in_place::{
@@ -39,7 +40,7 @@ fn saturate(model: &Graph, table: &str) -> EGraph {
             ),
         )
         .unwrap();
-    graph.serialize(Default::default()).egraph
+    graph.serialize_compact_filtered(|_| true)
 }
 
 fn calls(graph: &EGraph) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccumulateInPlace>) {
@@ -436,17 +437,9 @@ mod execution {
                 // The reference owns the F32 calculation. Use the established
                 // half codecs for narrow outputs that reference does not store.
                 let expected = reference(&graph, value, &inputs);
-                let registry = whitelist::tf32_registry()
+                let registry = whitelist::tf32_c_bias_registry()
                     .into_iter()
-                    .filter(|row| {
-                        !matches!(
-                            row.label(),
-                            "AddFunctionalGeneric"
-                                | "SelectFunctionalGeneric"
-                                | "MulFunctionalGeneric"
-                                | "CublasLtAccumulateInPlace"
-                        )
-                    })
+                    .filter(|row| row.label() != "CublasLtAccumulateInPlace")
                     .collect();
                 let (runtime, actual) = execute(
                     &graph,

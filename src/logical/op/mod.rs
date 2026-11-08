@@ -9,7 +9,7 @@
 //! nothing else: the renderer and the program assembler both consult this
 //! registry.
 
-use egraph_serialize::Node;
+use crate::snapshot::compact::Node;
 
 use crate::egglog_snippet::EgglogSnippet;
 

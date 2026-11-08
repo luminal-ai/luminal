@@ -43,7 +43,7 @@ fn strided_lists_authored_pitch_climbs_the_ladder() {
             .nodes
             .values()
             .filter(|m| m.eclass == n.eclass)
-            .map(|m| m.op.clone())
+            .map(|m| m.op.to_string())
             .collect();
         println!("class {:?} spellings {:?}", n.eclass, ops);
         // The pitched class is the one that is NOT right-major contiguous.

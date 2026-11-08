@@ -76,24 +76,6 @@ fn candidates(graph: &Graph) -> Vec<ApprovedCublasLt> {
             specifications.push(call.clone());
             continue;
         }
-        if site.logical_dtype(&call.logical_a) == Some(PlanDtype::Bf16) {
-            assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::Bf16));
-            assert_eq!(call.computation, LtComputation::Float32);
-            assert_eq!(
-                (call.a.dtype, call.b.dtype, call.d.dtype, call.scale),
-                (
-                    PlanDtype::Bf16,
-                    PlanDtype::Bf16,
-                    PlanDtype::Bf16,
-                    PlanDtype::F32
-                )
-            );
-            assert_eq!(logical_of(&egraph, &call.a.tensor), call.logical_a);
-            assert_eq!(logical_of(&egraph, &call.b.tensor), call.logical_b);
-            assert_eq!(site.logical_dtype(&call.logical_out), Some(PlanDtype::Bf16));
-            specifications.push(call.clone());
-            continue;
-        }
         assert_eq!(site.logical_dtype(&call.logical_a), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_b), Some(PlanDtype::F32));
         assert_eq!(site.logical_dtype(&call.logical_out), Some(call.d.dtype));
@@ -239,7 +221,7 @@ fn output_casts_do_not_change_the_admitted_matmul_arithmetic() {
             let calls = candidates(&graph);
             assert_eq!(
                 !calls.is_empty(),
-                matches!(arithmetic, DType::Bf16 | DType::F16 | DType::F32),
+                matches!(arithmetic, DType::F16 | DType::F32),
                 "arithmetic={arithmetic:?}, destination={destination:?}"
             );
         }
@@ -264,7 +246,7 @@ fn product_and_reduction_precision_must_both_match() {
             assert_eq!(
                 !calls.is_empty(),
                 product_dtype == reduction_dtype
-                    && matches!(product_dtype, DType::Bf16 | DType::F16 | DType::F32),
+                    && matches!(product_dtype, DType::F16 | DType::F32),
                 "product={product_dtype:?}, reduction={reduction_dtype:?}"
             );
         }
@@ -380,7 +362,7 @@ fn c_and_bias_sources_keep_their_own_explicit_widening_casts() {
 }
 
 #[test]
-fn relu_cannot_cross_a_narrowing_cast() {
+fn relu_remains_outside_cublaslt_with_or_without_a_narrowing_cast() {
     for barrier in [false, true] {
         let mut graph = Graph::new();
         let left = graph.tensor([3, 8], DType::Bf16).cast(DType::F32);
@@ -394,10 +376,7 @@ fn relu_cannot_cross_a_narrowing_cast() {
         let _output = product.relu().cast(DType::F16);
         let calls = candidates(&graph);
         assert!(!calls.is_empty());
-        assert_eq!(
-            calls.iter().any(|call| call.activation
-                == luminal_cuda_lite::ops::cublaslt::exec::LtActivation::RectifiedLinear),
-            !barrier
-        );
+        assert!(calls.iter().all(|call| call.activation
+            == luminal_cuda_lite::ops::cublaslt::exec::LtActivation::Identity));
     }
 }

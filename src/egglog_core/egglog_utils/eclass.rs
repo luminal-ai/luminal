@@ -35,34 +35,46 @@
 //! through `ArcSort::name()`), so the collision is a reading hazard and
 //! not a compile one.
 
+use crate::snapshot::compact::{ClassId, EGraph, Node, NodeId};
 use anyhow::{Result, anyhow, bail};
-use egraph_serialize::{ClassId, EGraph, Node, NodeId};
-use std::any::Any;
-use std::collections::HashMap;
-use std::sync::Arc;
+use rustc_hash::FxHashMap as HashMap;
+use std::any::{Any, TypeId};
+use std::sync::{Arc, Mutex};
 
 // =============================================================================
 // The view, the class, the node
 // =============================================================================
 
 /// Read-only view of one serialized e-graph plus the decoders that know
-/// its constructors. Two references; `Copy`.
-#[derive(Clone, Copy)]
+/// its constructors. Clones share a read cache scoped to this immutable graph.
+#[derive(Clone)]
 pub struct EGraphView<'g> {
     egraph: &'g EGraph,
     decoders: &'g ConstructorRegistry,
+    nodes: Arc<Mutex<NodeReadCache<'g>>>,
+    reads: Arc<Mutex<ValueReadCache>>,
 }
+
+type ValueReadCache =
+    HashMap<(ClassId, &'static str, Option<ClassId>, TypeId), Box<dyn Any + Send + Sync>>;
+
+type NodeReadCache<'g> = HashMap<(ClassId, Option<String>), Arc<Vec<(&'g NodeId, &'g Node)>>>;
 
 impl<'g> EGraphView<'g> {
     pub fn new(egraph: &'g EGraph, decoders: &'g ConstructorRegistry) -> Self {
-        Self { egraph, decoders }
+        Self {
+            egraph,
+            decoders,
+            nodes: Arc::default(),
+            reads: Arc::default(),
+        }
     }
 
     /// TOTAL: an id with no nodes yields a class whose [`EClass::nodes`]
     /// is empty (asking about an absent class is a question, not a bug).
     pub fn class(&self, id: &ClassId) -> EClass<'g> {
         EClass {
-            view: *self,
+            view: self.clone(),
             id: id.clone(),
         }
     }
@@ -85,7 +97,7 @@ impl std::fmt::Debug for EGraphView<'_> {
     }
 }
 
-/// One e-class of the view. Cheap to clone (the id is an `Arc<str>`).
+/// One e-class of the view. Production numeric identities are cheap to clone.
 #[derive(Clone)]
 pub struct EClass<'g> {
     view: EGraphView<'g>,
@@ -103,12 +115,44 @@ impl std::fmt::Debug for EClass<'_> {
 }
 
 impl<'g> EClass<'g> {
+    /// Memoize a complete pure read of this immutable snapshot. Contextual
+    /// parsers must include their owner/domain, and only enter here at a fresh
+    /// top-level traversal: in-progress cycle failures must remain local.
+    pub(crate) fn cached_read<T: Clone + Send + Sync + 'static>(
+        &self,
+        kind: &'static str,
+        owner: Option<&ClassId>,
+        read: impl FnOnce() -> T,
+    ) -> T {
+        let key = (self.id.clone(), kind, owner.cloned(), TypeId::of::<T>());
+        if let Some(value) = self
+            .view
+            .reads
+            .lock()
+            .expect("e-class read cache poisoned")
+            .get(&key)
+            .and_then(|value| value.downcast_ref::<T>())
+            .cloned()
+        {
+            return value;
+        }
+        // Decoding can recursively read other classes. Never hold the cache
+        // lock while invoking a decoder.
+        let value = read();
+        self.view
+            .reads
+            .lock()
+            .expect("e-class read cache poisoned")
+            .insert(key, Box::new(value.clone()));
+        value
+    }
+
     pub fn id(&self) -> &ClassId {
         &self.id
     }
 
     pub fn view(&self) -> EGraphView<'g> {
-        self.view
+        self.view.clone()
     }
 
     /// `class_data[id].typ` — the egglog sort name the serializer
@@ -124,34 +168,48 @@ impl<'g> EClass<'g> {
     /// Every e-node in the class: UNSUBSUMED FIRST, then by `NodeId`.
     /// THE ONLY PLACE ORDER IS DECIDED.
     pub fn nodes(&self) -> Vec<ENode<'g>> {
-        let Some(class) = self.view.egraph.classes().get(&self.id) else {
-            return Vec::new();
-        };
-        let mut ids: Vec<&'g NodeId> = class.nodes.iter().collect();
-        ids.sort();
-        let mut out: Vec<ENode<'g>> = Vec::with_capacity(ids.len());
-        for want_subsumed in [false, true] {
-            for id in &ids {
-                let Some(node) = self.view.egraph.nodes.get(*id) else {
-                    continue;
-                };
-                if node.subsumed == want_subsumed {
-                    out.push(ENode {
-                        view: self.view,
-                        id,
-                        node,
-                    });
-                }
-            }
-        }
-        out
+        self.ordered_nodes(None)
+    }
+
+    fn ordered_nodes(&self, op: Option<&str>) -> Vec<ENode<'g>> {
+        let key = (self.id.clone(), op.map(str::to_owned));
+        let mut cache = self.view.nodes.lock().expect("e-class read cache poisoned");
+        let nodes = cache
+            .entry(key)
+            .or_insert_with(|| {
+                let mut nodes: Vec<_> = self
+                    .view
+                    .egraph
+                    .classes()
+                    .get(&self.id)
+                    .into_iter()
+                    .flat_map(|class| class.nodes.iter())
+                    .filter_map(|id| self.view.egraph.nodes.get(id).map(|node| (id, node)))
+                    .filter(|(_, node)| op.is_none_or(|op| node.op == op))
+                    .collect();
+                // Filtering before sorting preserves the same order while avoiding
+                // repeatedly sorting huge arithmetic classes for one IntLit row.
+                nodes.sort_by(|(a_id, a), (b_id, b)| {
+                    a.subsumed.cmp(&b.subsumed).then(a_id.cmp(b_id))
+                });
+                Arc::new(nodes)
+            })
+            .clone();
+        drop(cache);
+        nodes
+            .iter()
+            .map(|(id, node)| ENode {
+                view: self.view.clone(),
+                id,
+                node,
+            })
+            .collect()
     }
 
     /// The class's nodes whose op is exactly `op`, in [`EClass::nodes`]
     /// order.
     pub fn nodes_named(&self, op: &str) -> impl Iterator<Item = ENode<'g>> + '_ {
-        let op = op.to_string();
-        self.nodes().into_iter().filter(move |n| n.op() == op)
+        self.ordered_nodes(Some(op)).into_iter()
     }
 
     /// Every distinct `op` in the class, in [`EClass::nodes`] order —
@@ -170,16 +228,20 @@ impl<'g> EClass<'g> {
     /// renders base values with `{:?}`, so an i64 literal is a digit
     /// string).
     pub fn i64_literal(&self) -> Option<i64> {
-        self.nodes()
-            .into_iter()
-            .find_map(|n| n.op().parse::<i64>().ok())
+        self.cached_read("i64_literal", None, || {
+            self.nodes()
+                .into_iter()
+                .find_map(|n| n.op().parse::<i64>().ok())
+        })
     }
 
     /// Any node in the class whose op is a quoted string literal, unescaped.
     pub fn string_literal(&self) -> Option<String> {
-        self.nodes()
-            .into_iter()
-            .find_map(|n| crate::shape::Symbol::decode_serialized(n.op()))
+        self.cached_read("string_literal", None, || {
+            self.nodes()
+                .into_iter()
+                .find_map(|n| crate::shape::Symbol::decode_serialized(n.op()))
+        })
     }
 
     // ---- typed, registry-free: the call site names the constructor ----
@@ -244,6 +306,10 @@ impl<'g> EClass<'g> {
     /// Every registered constructor of `S` present in the class,
     /// decoded — registry order, then node order.
     pub fn spellings<S: Sort>(&self) -> Spellings<S> {
+        self.cached_read("spellings", None, || self.spellings_uncached::<S>())
+    }
+
+    fn spellings_uncached<S: Sort>(&self) -> Spellings<S> {
         let nodes = self.nodes();
         let mut decoded: Vec<Arc<S::Facts>> = Vec::new();
         let mut present: Vec<&'static str> = Vec::new();
@@ -300,7 +366,7 @@ impl<'g> EClass<'g> {
 }
 
 /// One e-node: its op name plus its children as CLASSES.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ENode<'g> {
     view: EGraphView<'g>,
     id: &'g NodeId,
@@ -807,10 +873,10 @@ mod tests {
 
     fn node(op: &str, children: &[&str], eclass: &str, subsumed: bool) -> Node {
         Node {
-            op: op.to_string(),
+            op: op.into(),
             children: children.iter().map(|c| NodeId::from(*c)).collect(),
             eclass: ClassId::from(eclass),
-            cost: egraph_serialize::Cost::new(1.0).unwrap(),
+            cost: crate::snapshot::compact::Cost::new(1.0).unwrap(),
             subsumed,
         }
     }

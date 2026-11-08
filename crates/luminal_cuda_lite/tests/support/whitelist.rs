@@ -227,6 +227,23 @@ pub fn tf32_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
     table_registry(TABLE.as_str())
 }
 
+/// Force TF32 input rounding while also requiring the call to consume the F32
+/// C matrix and bias. Exact frontend activations and final casts stay separate.
+pub fn tf32_c_bias_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        approved_keys()
+            .into_iter()
+            .filter(|key| {
+                key.contains("CublasLtTensorFloat32Computation")
+                    && key.contains("(CublasLtCMatrixDataTypeOf (F32))")
+                    && key.contains("(CublasLtBiasDataTypeOf (F32))")
+            })
+            .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+            .collect()
+    });
+    table_registry(TABLE.as_str())
+}
+
 pub fn int8_registry(device: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
     static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
         std::array::from_fn(|index| {
@@ -277,6 +294,30 @@ pub fn fast16_registry(bfloat: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
             approved_keys()
                 .into_iter()
                 .filter(|key| key.contains(mode))
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(bfloat)])
+}
+
+/// Require F32-fast input rounding while also forcing the call to consume the
+/// authored F32 C matrix and bias. Exact frontend activations remain separate
+/// because their exceptional-value semantics are not vendor epilogues.
+pub fn fast16_c_bias_registry(bfloat: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        [
+            "CublasLtFloat32FastFloat16Computation",
+            "CublasLtFloat32FastBfloat16Computation",
+        ]
+        .map(|mode| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains(mode)
+                        && key.contains("(CublasLtCMatrixDataTypeOf (F32))")
+                        && key.contains("(CublasLtBiasDataTypeOf (F32))")
+                })
                 .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
                 .collect()
         })

@@ -6,13 +6,13 @@ fn shared_and_per_batch_bias_keep_c_and_feature_axis_separate() {
     for shared in [true, false] {
         let mut case = Case::new(Family::all()[0]);
         case.bias = Some(shared);
-        case.activation = 2;
+        case.activation = 0;
         let f = fixture(case);
         let (separate, tied) = calls(&saturate(&f.graph, WHITELIST));
         let matches = |call: &LtCall| {
             call.c.is_some()
                 && call.bias.is_some()
-                && call.activation == LtActivation::GaussianErrorLinear
+                && call.activation == LtActivation::Identity
                 && call.m == N as i64
                 && call.n == M as i64
                 && call.bias.unwrap().batch_stride_in_elements == if shared { 0 } else { N as i64 }
@@ -88,13 +88,13 @@ fn bias_table(family: Family) -> String {
                     plan_dtype(family.arithmetic)
                 ),
                 "(CublasLtNoBiasDataType)",
-            )) && !key.contains("CublasLtNoBiasDataType")
+            )) && key.contains("(CublasLtBiasEpilogue)")
         })
         .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
         .collect()
 }
 
-// Keep the actual rows and authored graphs connected. Each bias row must have
+// Keep the exact bias-only rows and authored graphs connected. Each such row must have
 // both shared/per-batch witnesses; C-present rows must also admit in-place.
 static BIAS_WITNESSES: std::sync::LazyLock<
     std::collections::BTreeMap<(String, bool, bool), LtCall>,
@@ -157,9 +157,9 @@ static BIAS_WITNESSES: std::sync::LazyLock<
 fn every_existing_native_bias_row_has_both_batch_bias_layouts() {
     let expected: std::collections::BTreeSet<_> = whitelist::approved_keys()
         .into_iter()
-        .filter(|key| !key.contains("CublasLtNoBiasDataType"))
+        .filter(|key| key.contains("(CublasLtBiasEpilogue)"))
         .collect();
-    assert_eq!(expected.len(), 1536);
+    assert_eq!(expected.len(), 512);
     for shared in [true, false] {
         for alias in [false, true] {
             let wanted: std::collections::BTreeSet<_> = expected
@@ -182,7 +182,7 @@ fn every_existing_native_bias_row_has_both_batch_bias_layouts() {
             );
         }
     }
-    assert_eq!(BIAS_WITNESSES.len(), 4608);
+    assert_eq!(BIAS_WITNESSES.len(), 1536);
 }
 
 #[test]
@@ -355,7 +355,7 @@ fn all_native_bias_rows_dispatch_with_shared_and_per_batch_storage() {
     let _execution = execution::DEVICE_EXECUTION.lock().unwrap();
     let context = cudarc::driver::CudaContext::new(0).unwrap();
     let stream = context.new_stream().unwrap();
-    assert_eq!(BIAS_WITNESSES.len(), 4608);
+    assert_eq!(BIAS_WITNESSES.len(), 1536);
     for ((_, alias, _), call) in BIAS_WITNESSES.iter() {
         match call.computation {
             LtComputation::Float16 => support::fp16::execute_call(&stream, call, *alias),

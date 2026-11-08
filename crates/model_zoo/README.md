@@ -4,6 +4,17 @@
 Its only dependencies are `luminal` and `luminal_nn`. Model definitions construct
 graphs; runtime crates own weight loading, compilation, execution, and I/O.
 
+Each Rust model definition is the functional specification. Its dependency
+order, dtype conversions, accumulator and output dtypes, explicit rounding boundaries,
+shapes, constants, parameter sharing, and any authored sharding are immutable
+compiler inputs. Runtime and backend code may select only equivalent physical
+implementations. Do not alter a model to make search succeed or to fit a device;
+fix the compiler, or refuse compilation when the exact model cannot run.
+
+Reduction association/order is unspecified unless the model explicitly uses an
+ordered or sequential operation. Backends may reassociate within that contract,
+but cannot change dtypes or cross explicit cast/rounding boundaries.
+
 Import full models by family and small fixtures through `mini`:
 
 ```rust
@@ -30,6 +41,11 @@ let output = luminal_nn::linear(input, weight_port, None);
 let checkpoint_source = graph.input_source(weight_port.id, DType::F16);
 // Bind F16 bytes to checkpoint_source.id; weight_port and output remain F32.
 ```
+
+That explicit source conversion is part of the authored model semantics.
+Checkpoint storage dtype alone never authorizes the compiler to change the
+logical arithmetic dtype, and a backend cannot infer a precision policy from
+what a device library happens to support.
 
 Neither `linear` nor `matmul` casts operands implicitly. Inputs, weights, and
 biases must agree in dtype before invoking `linear`.

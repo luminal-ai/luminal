@@ -36,6 +36,7 @@
 //! Both halves are CPU-side: the e-graph the search reads
 //! (`CudaRuntime::saturated_egraph`) and the search itself.
 
+use luminal::prelude::CompactSnapshotExt;
 use std::collections::{BTreeMap, BTreeSet};
 
 use luminal::dtype::DType;
@@ -235,7 +236,7 @@ fn cleanup_marks_exactly_the_ops_that_produce_an_input_layout_tensor() {
                 .values()
                 .filter(|n| n.eclass == *op_class && !n.subsumed)
                 .filter(|n| n.op.starts_with("LayoutTensorOp"))
-                .map(|n| n.op.clone())
+                .map(|n| n.op.to_string())
                 .collect::<BTreeSet<String>>();
             (op_class.clone(), ops)
         })
@@ -446,9 +447,7 @@ fn saturate_with_schedule(cx: &Graph, schedule: &str) -> EGraph {
     egraph
         .parse_and_run_program(None, &full)
         .expect("saturation");
-    egraph
-        .serialize(luminal::prelude::egglog::SerializeConfig::default())
-        .egraph
+    egraph.serialize_compact_filtered(|_| true)
 }
 
 /// The name a `LogicalId` class carries, read the way the renderer reads
@@ -476,7 +475,7 @@ fn name_bearing_spellings(egraph: &EGraph) -> Vec<(String, String, ClassId, bool
             let (name, id_subsumed) = logical_id_name(egraph, &id_class)?;
             Some((
                 name,
-                n.op.clone(),
+                n.op.to_string(),
                 n.eclass.clone(),
                 n.subsumed || id_subsumed,
             ))
@@ -490,7 +489,7 @@ fn name_bearing_spellings(egraph: &EGraph) -> Vec<(String, String, ClassId, bool
 fn subsumed_ops(egraph: &EGraph) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for node in egraph.nodes.values().filter(|n| n.subsumed) {
-        *counts.entry(node.op.clone()).or_default() += 1;
+        *counts.entry(node.op.to_string()).or_default() += 1;
     }
     counts
 }

@@ -5,6 +5,15 @@ followed by an optional epilogue. Arithmetic recognition, layout proofs, approve
 API configurations, and executable emission are separate stages. Rust decodes
 the elected call and dispatches its descriptors unchanged.
 
+This backend is governed by the repository-wide
+[model semantic authority](../../../../docs/design/semantic-authority.md).
+The whitelist records vendor capabilities; a row is executable only when
+egglog also proves that the complete call preserves the authored logical
+function, including dtype, casts, explicit rounding boundaries, exceptional
+values, and sharding. Reduction order may change when the logical operator
+leaves it unspecified; a vendor feature or close numerical result is otherwise
+never sufficient.
+
 ## Rule ownership and style
 
 | File | Responsibility |
@@ -57,8 +66,8 @@ including beta zero, never change the selected storage tie.
 
 ## Approved configurations and precision
 
-The table contains **4,096 complete configurations**: 2,048 for host scalar
-pointers and 2,048 for device scalar pointers. Each pointer mode admits:
+The table contains **4,096 vendor capability configurations**: 2,048 for host
+scalar pointers and 2,048 for device scalar pointers. Each pointer mode records:
 
 - 1,344 FP32-output rows: ordinary FP32 computation with matching F32, BF16 or
   FP16 A/B storage, plus explicit TF32, FP16 or BF16 input conversion over F32
@@ -89,13 +98,11 @@ Alpha and beta are general values in that arithmetic dtype; absent C still
 requires a literal beta zero in the same dtype. Storage never chooses arithmetic
 precision. Only an authored exact widening permits direct BF16/FP16/I8 A/B readings.
 
-A direct BF16 matrix product may also use the vendor's BF16 matrix contract:
-BF16 A/B/D storage, FP32 accumulation, and one BF16 rounding when D is written.
-Because cuBLASLt has no BF16 scale ABI, this path admits only the exact host
-identities for an unscaled product (`alpha = 1`, `beta = 0`). It does not move
-arbitrary BF16 coefficients, residual C, or bias across the matrix-product
-boundary. Explicit BF16-to-F32 operand casts remain the separate FP32-arithmetic
-contract described above.
+The vendor's BF16 matrix contract stores A/B (and optionally D) in BF16 but
+accumulates in FP32. It therefore requires authored BF16-to-FP32 operand casts;
+a logical BF16 reduction rounds every addition and is not equivalent. An
+authored final cast may still select BF16 D storage and round the completed FP32
+expression once.
 
 Casts between multiplication,
 reduction, C addition, bias addition and activation remain boundaries; earlier
@@ -103,23 +110,13 @@ narrowing is preserved. A separate output-storage proof recognizes an authored
 final cast of the complete FP32 expression. Pure-view transposition carries that
 whole rounded expression into the API frame and back to the caller's output.
 
-F32 reduction reassociation and FMA contraction follow the existing compiler
-policy. ReLU accepts a difference in the sign of zero and the selected vendor
-kernel's NaN handling: a NaN may propagate or become zero. This explicit
-relaxation applies to all approved ReLU epilogues, including native FP16 and
-FP32 computation with narrow storage/output. NaN behavior can vary with the
-algorithm and geometry; arithmetic dtype alone does not select it. Generic and
-reference ReLU remain NaN-preserving, so fused and decomposed paths need not
-agree on NaNs under this admission policy. Finite values and infinities retain
-the ordinary ReLU contract. cuBLASLt describes ReLU as
-[`max(x, 0)`](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltepilogue-t)
-without an explicit NaN-propagation guarantee, and an
-[NVIDIA forum report](https://forums.developer.nvidia.com/t/incorrect-result-of-cublasltmatmul-with-cublaslt-epilogue-relu-when-input-is-nan/329783)
-records the same NaN-to-zero behavior. Strict fused NaN propagation is deferred.
-
-The FP32-output GELU rows accept the vendor tanh approximation. These are
-explicit admission policies, not claims of bitwise equivalence. FP8 and mixed
-A/B storage have no approved configurations.
+No numerical relaxation is an admission policy. In particular, the vendor
+ReLU epilogue can differ from the frontend expression for NaNs and signed zero,
+and the vendor GELU epilogue is an approximation. The current rules therefore
+do not promote recognized frontend ReLU or GELU expressions to those epilogues.
+Their rows remain capability metadata for a future exact proof or a distinct,
+explicitly authored logical operator with that precise contract. FP8 and mixed
+A/B storage have no recorded configurations.
 
 ### General alpha and beta
 
@@ -155,13 +152,13 @@ pointer modes are not inferred from tensor shapes. The selected vendor
 algorithm's pointer-mode capability is checked during preparation; unsupported
 geometries/modes are refused without substituting another precision contract.
 
-Scaling follows the practical cuBLAS numerical contract, including FMA and
-reduction-order differences. A zero coefficient may suppress a matrix read,
-so NaNs in a zero-weighted matrix need not propagate as they would through
-separate elementwise multiplication. A present C remains structurally present,
-including when beta is zero; this does not grant extra alias permissions or
-remove the scalar's graph dependency. Tests compare finite numerical inputs
-and retain explicit cast boundaries.
+Scaling must preserve the authored arithmetic contract. Vendor FMA,
+reduction-order freedom, or suppression of a matrix read for a zero coefficient
+is usable only when it is within that logical operator's defined semantics or
+when egglog proves the behavior equivalent over the full matched domain. A
+present C remains structurally present, including when beta is zero; the value
+does not grant extra alias permissions, erase its graph dependency, or waive
+exceptional-value behavior.
 
 ### Signed INT8 storage with FP32 arithmetic
 
@@ -186,8 +183,9 @@ complete rows admit only the default epilogue, both scalar pointer modes,
 both destination orders, every A/B order/transpose combination, and optional
 FP32 C. New storage permission is specific to A/B; INT8 C or bias must still
 materialize their FP32 widenings. Final output casts and activations remain
-outside the call. All reduction schemes are permitted through the whitelist
-because both the computation and output are FP32.
+outside the call. The whitelist records all vendor reduction schemes for this
+family; complete admission still requires the selected implementation to meet
+the authored logical contract.
 
 Ordinary and one-axis strided batches share the same flat descriptors and
 admission, including independently shared A/B, independent C/D pitches,
@@ -201,8 +199,8 @@ The observed implementations report FMA instructions, INT8 inputs and FP32
 accumulators through the [numerical implementation flags](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltnumericalimplflags-t).
 This feature makes no integer Tensor Core performance promise. It avoids
 separate FP32 input buffers; library availability remains descriptor-dependent,
-and preparation refuses unsupported candidates. FP32 reassociation/FMA and
-zero-coefficient read suppression follow the existing practical BLAS policy.
+and preparation refuses unsupported candidates. Descriptor availability does
+not relax the authored FP32 arithmetic or exceptional-value contract.
 
 ### Native FP16 arithmetic and scalar storage
 
@@ -222,13 +220,11 @@ All 448 rows also support one-axis strided batches, including independently
 shared A/B and shared or per-batch feature bias (see the layout requirements below).
 Subsequent casts remain separate.
 
-Native ReLU and ReLU+bias follow the vendor NaN policy above. CUDA 12.8/A100
-probes found both NaN-preserving and NaN-suppressing kernels for native half
-computation and for FP32 computation with FP16 storage/output. Tests require
-fused epilogues with host/device scalars, compare finite results against the
-reference, and accept either NaN or zero when a ReLU input is NaN. Independent
-C outputs retain their original bits, including NaNs. Bias and GELU retain
-their separate special-value regression coverage.
+CUDA 12.8/A100 probes found both NaN-preserving and NaN-suppressing ReLU
+kernels for native half computation and for FP32 computation with FP16
+storage/output. That variability is evidence that the epilogue is not a valid
+replacement for the current frontend ReLU expression; it is not an accepted
+tolerance. Independent C outputs retain their original bits, including NaNs.
 
 Host literals are explicit F32 constants cast to F16. Decoding performs that
 same nearest-even conversion once and retains the two-byte payload in a distinct
@@ -238,29 +234,17 @@ GPU-produced F16 casts remain ordinary graph dependencies. Bounds checks use
 two-byte scalar elements. No FP32 pointer is passed under an FP16 descriptor.
 
 The [vendor compute contract](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublascomputetype-t)
-permits compute and intermediates of at least FP16 precision, Tensor Cores,
-reduction reassociation and FMA contraction. Native half GEMM follows this same
-practical BLAS policy; it does not promise the reference's sequential reduction
-or a separately rounded product at every multiply. Explicit intermediate casts
-remain boundaries. All reduction schemes are permitted by these rows because
-compute and output types are both FP16. As for the other modes, zero coefficients
-may suppress matrix reads. The reference implements authored FP16 add, multiply
-and sequential sum with half rounding at each step; exact dyadic witnesses
-compare the fused and decomposed paths independently of permitted association.
+permits FP16 intermediates, Tensor Cores, reduction reassociation, and FMA
+contraction. Reassociation and contraction are valid here because logical
+matmul leaves reduction order unspecified, provided the call preserves the
+authored accumulator/output dtype and explicit intermediate cast or rounding
+boundaries. Exact dyadic witnesses are useful regressions but do not prove the
+remaining contract over the complete domain.
 
-Native FP16 GELU follows the existing vendor tanh-approximation policy for both
-frontend tanh and erf spellings. Its coefficient proofs recognize each authored
-F32 literal explicitly cast to F16, including log2(e); the proof records the
-source literal, without claiming that its rounded half value equals that source.
-The reference rounds each exp2 and reciprocal output to F16, as it does add and
-multiply. The legacy smoothed-sign erf spelling is excluded for half arithmetic:
-its epsilon underflows to zero and would produce 0/0 at zero. Explicit casts
-inside the expression remain fusion boundaries. Tests use exact dyadic answers
-for bias/ReLU and an absolute-plus-relative `0.003 + 0.002 * abs(reference)`
-bound for the permitted half GELU approximation. A CUDA 12.8/A100 scan across
-[-6, 6] found a maximum absolute difference of 0.001953125 from the decomposed
-half tanh spelling, with and without C/bias and in both scalar pointer modes.
-These samples validate the implementation; they are not a universal error bound.
+The vendor FP16 GELU is likewise not substituted for either decomposed frontend
+spelling. Its coefficient recognizers describe the authored graph only; they do
+not authorize an approximate epilogue. Observed small error on a finite sample
+is diagnostic evidence, not a semantic proof or universal error bound.
 
 CUDA 12.8/A100 probes and tests verify genuine half-accumulator algorithms,
 host/device scalar pointers, ordinary/batched descriptors, shared inputs,
@@ -289,17 +273,18 @@ column-major D; whole-expression transposition carries frontend feature bias
 into the vendor's per-row frame. Bias remains packed FP64 storage, and both
 forms consume the shared exact storage proof keyed by arithmetic dtype.
 
-ReLU accepts the vendor's sign-of-zero difference. Both frontend GELU spellings
-accept the vendor tanh approximation under the same policy as FP32-output calls.
-Native probing found about `2.5e-10` maximum absolute
-GELU error on its finite fixture against an independent double tanh formula.
-Activation matching proves every constant's dtype and value. The frontend's
-F32 literals widened to F64 retain their exact authored F32 values; no arbitrary
-cast chain is folded. Casts between GEMM and an epilogue remain boundaries.
+Native probing found a finite-fixture difference between vendor GELU and the
+decomposed frontend expressions, while vendor ReLU can differ on signed zero.
+Those observations disqualify the general fusions; they do not create a
+tolerance policy. Activation matching proves every constant's dtype and value
+but does not by itself authorize an epilogue. The frontend's F32 literals
+widened to F64 retain their exact authored F32 values; no arbitrary cast chain
+is folded. Casts between GEMM and an epilogue remain boundaries.
 
 Explicit final output casts remain separate operations. FP64 reduction order
-and FMA contraction follow the same practical BLAS policy, including
-zero-coefficient read suppression, at double precision. The
+and FMA contraction may vary within matmul's unspecified-order contract.
+Zero-coefficient behavior must still preserve the authored exceptional-value
+contract. The
 [vendor dtype table](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html#cublasltmatmul)
 specifies the FP64 computation and scalar ABI.
 
@@ -330,11 +315,12 @@ product from activation after BF16 rounding. These tuples remain deliberately
 unwhitelisted. Their graphs retain FP32 calls and explicit final casts; adding
 cast tolerance does not authorize a new arithmetic boundary.
 
-Every complete whitelist row explicitly selects its reduction-scheme mask.
-FP32 and FP64 output rows allow all schemes (`0x7`). Narrow-output
-rows select compute-type workspace partials (`0x2`), preserving FP32 partial
-sums and excluding reduction through the narrow output type. Both masks allow
-`NONE` (`0`); neither requires split-K. Admission binds the mask from the row,
+Every complete whitelist row explicitly selects its vendor reduction-scheme
+capability mask. FP32 and FP64 output rows record all schemes (`0x7`).
+Narrow-output rows record compute-type workspace partials (`0x2`), preserving
+FP32 partial sums and excluding reduction through the narrow output type. Both
+masks include `NONE` (`0`); neither requires split-K. This descriptor policy is
+not permission to change the logical reduction semantics. Admission binds the mask from the row,
 both executable forms retain it, and dispatch translates it directly into
 `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK`. The whitelist is the sole policy
 source; there is no independent dtype-derived mask or egglog policy relation.
@@ -608,8 +594,10 @@ Unsupported arithmetic view maps deliberately stall.
 
 ## Extending the backend
 
-1. State the logical arithmetic and rounding contract, including exceptional
-   values, optional arguments, and allowed approximations.
+1. State the exact logical arithmetic and rounding contract, including
+   exceptional values and optional arguments. An approximation requires a
+   distinct operator explicitly authored with that approximation; it cannot be
+   introduced while implementing another logical operator.
 2. Add local egglog recognition and complete shape-owned layout proofs. Reuse
    the flat vendor descriptor; give every new geometry field an explicit proof.
 3. Join the complete configuration whitelist at admission. Add only supported

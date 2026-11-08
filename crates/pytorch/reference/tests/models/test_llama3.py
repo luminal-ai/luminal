@@ -366,43 +366,24 @@ def test_hf_llama38b_full(device: torch.device):
     _assert_bf16_logits_match(out.logits, ref.logits)
 
 
-def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
-    """Prototype: luminal's bf16 error stays within the bf16 rounding floor.
+def _run_hf_llama_bf16_error_within_fp32_floor(
+    model: torch.nn.Module,
+    id_lists: list[list[int]],
+    device: torch.device,
+):
+    """Check Luminal's bf16 error against the eager bf16 rounding floor.
 
     Rather than comparing a single luminal run to eager bf16 with a fixed atol,
     this measures the *average* absolute logit error of luminal vs an fp32
     reference, and of PyTorch-eager bf16 vs the same fp32 reference (the bf16
-    rounding floor), across several prompts of varying length, and asserts
+    rounding floor), across several token sequences of varying length, and asserts
     luminal adds no more than a small factor over that floor.
 
     The luminal graph is compiled ONCE with the sequence dimension marked
-    dynamic and reused for every prompt length (verified via a counting backend).
+    dynamic and reused for every sequence length.
     """
-    from transformers import AutoConfig, AutoTokenizer, LlamaForCausalLM
-
-    config = AutoConfig.from_pretrained("NousResearch/Llama-3.2-1B")
-    config.use_cache = False
-    config._attn_implementation = "eager"
-    model = (
-        LlamaForCausalLM.from_pretrained("NousResearch/Llama-3.2-1B", config=config)
-        .eval()
-        .to(device)
-    )
-    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-3.2-1B")
-
-    prompts = [
-        "Hello",
-        "The capital of France is",
-        "In 1969 the first humans landed on the Moon during the",
-        "Machine learning models are trained on large datasets to learn "
-        "patterns and make predictions about",
-        "Once upon a time in a distant kingdom there lived a curious young "
-        "inventor who spent every waking hour tinkering with gears, springs, "
-        "and strange contraptions that nobody else could understand",
-    ]
-    id_lists = [tokenizer.encode(p) for p in prompts]
     lengths = [len(t) for t in id_lists]
-    print(f"prompt token lengths: {lengths}")
+    print(f"token sequence lengths: {lengths}")
 
     # luminal's average error vs fp32 may exceed the bf16 floor by at most this.
     factor = 1.5
@@ -422,7 +403,7 @@ def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
         first = torch.tensor([id_lists[0]], device=device)
         torch._dynamo.mark_dynamic(first, 1, min=min(lengths), max=max(lengths))
 
-        # Phase A — bf16: luminal (one graph, reused) + PyTorch eager, per prompt.
+        # Phase A — bf16: Luminal (one graph, reused) + PyTorch eager, per sequence.
         ids_all, lum_logits, bf16_logits = [], [], []
         agree_positions, total_positions = 0, 0
         with torch.no_grad():
@@ -431,7 +412,7 @@ def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
                 out_lum = compiled(ids).logits.detach().float()
                 ref_bf16 = model(ids).logits.detach().float()
                 # Per-position argmax agreement vs eager bf16, accumulated across
-                # prompts. We do NOT require exact equality per run: at a near-tie
+                # sequences. We do NOT require exact equality per run: at a near-tie
                 # (logit gap < the bf16 floor) luminal and eager bf16 can pick
                 # different tokens, exactly as two correct bf16 runs disagree with
                 # fp32 there. Threshold-assert the aggregate below instead.
@@ -460,13 +441,13 @@ def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
             for ids in ids_all:
                 f32_logits.append(model(ids).logits.detach())
 
-        # Per-prompt mean absolute logit error vs the fp32 reference, then average.
+        # Per-sequence mean absolute logit error vs the fp32 reference, then average.
         e_bf16 = sum(
             (b - f).abs().mean().item() for b, f in zip(bf16_logits, f32_logits)
-        ) / len(prompts)
+        ) / len(id_lists)
         e_lum = sum(
             (lg - f).abs().mean().item() for lg, f in zip(lum_logits, f32_logits)
-        ) / len(prompts)
+        ) / len(id_lists)
         ratio = e_lum / e_bf16 if e_bf16 > 0 else float("inf")
         print(
             f"avg |bf16 - fp32| = {e_bf16:.4e}   "
@@ -480,3 +461,67 @@ def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
         torch._dynamo.config.automatic_dynamic_shapes = prev_auto
         torch._dynamo.config.cache_size_limit = prev_cache
         torch._dynamo.reset()
+
+
+@pytest.mark.skipif(
+    selected_backend() != "reference",
+    reason="Reduced Llama covers the reference backend's decomposed matmul path",
+)
+def test_hf_llama_small_bf16_error_within_fp32_floor(device: torch.device):
+    """Run BF16 dynamic-shape coverage within reference memory limits."""
+    from transformers import LlamaForCausalLM
+
+    # Keep the complete HuggingFace Llama operation mix while bounding the
+    # reference backend's currently decomposed matmul intermediates. At the
+    # maximum sequence length below, the largest product field is the LM head:
+    # 37 * 256 * 1024 * sizeof(f32) = 37 MiB.
+    config = _make_llama_config(
+        hidden_size=256,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        num_hidden_layers=1,
+        intermediate_size=512,
+        vocab_size=1024,
+    )
+    config._attn_implementation = "eager"
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(config).eval().to(device=device, dtype=torch.bfloat16)
+
+    lengths = [2, 6, 14, 16, 37]
+    id_lists = [
+        [((position * 17) + length) % config.vocab_size for position in range(length)]
+        for length in lengths
+    ]
+    _run_hf_llama_bf16_error_within_fp32_floor(model, id_lists, device)
+
+
+@pytest.mark.skipif(
+    selected_backend() != "cuda_lite",
+    reason="The full pretrained Llama-3.2-1B regression requires CUDA-lite",
+)
+def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
+    """Run the normal pretrained Llama-3.2-1B BF16 regression on CUDA-lite."""
+    from transformers import AutoConfig, AutoTokenizer, LlamaForCausalLM
+
+    config = AutoConfig.from_pretrained("NousResearch/Llama-3.2-1B")
+    config.use_cache = False
+    config._attn_implementation = "eager"
+    model = (
+        LlamaForCausalLM.from_pretrained("NousResearch/Llama-3.2-1B", config=config)
+        .eval()
+        .to(device)
+    )
+    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-3.2-1B")
+
+    prompts = [
+        "Hello",
+        "The capital of France is",
+        "In 1969 the first humans landed on the Moon during the",
+        "Machine learning models are trained on large datasets to learn "
+        "patterns and make predictions about",
+        "Once upon a time in a distant kingdom there lived a curious young "
+        "inventor who spent every waking hour tinkering with gears, springs, "
+        "and strange contraptions that nobody else could understand",
+    ]
+    id_lists = [tokenizer.encode(prompt) for prompt in prompts]
+    _run_hf_llama_bf16_error_within_fp32_floor(model, id_lists, device)

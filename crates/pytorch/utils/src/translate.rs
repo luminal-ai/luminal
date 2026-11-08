@@ -20,6 +20,7 @@ use std::mem::{Discriminant, discriminant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use luminal::prelude::*;
+use rustc_hash::FxHashMap;
 
 #[cfg(test)]
 mod add_sub_tests;
@@ -137,6 +138,36 @@ pub struct Translation {
     pub device: Option<crate::torch_device::TorchDevice>,
 }
 
+/// Observable IEEE-edge behavior of one PyTorch CPU GELU kernel.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuGeluBehavior {
+    pub positive_infinity_is_nan: bool,
+    pub preserves_negative_underflow_zero: bool,
+}
+
+/// PyTorch's selected CPU GELU behavior for every translated floating dtype.
+/// This is probed from the originating process because an ATen dispatch stub
+/// may fall back independently of the process-wide CPU capability label.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuGeluSemantics {
+    pub f16: CpuGeluBehavior,
+    pub bf16: CpuGeluBehavior,
+    pub f32: CpuGeluBehavior,
+    pub f64: CpuGeluBehavior,
+}
+
+impl CpuGeluSemantics {
+    pub(crate) fn for_dtype(self, dtype: DType) -> Option<CpuGeluBehavior> {
+        match dtype {
+            DType::F16 => Some(self.f16),
+            DType::Bf16 => Some(self.bf16),
+            DType::F32 => Some(self.f32),
+            DType::F64 => Some(self.f64),
+            _ => None,
+        }
+    }
+}
+
 /// The dtypes a torch op performs its math in: tensor operands meet at
 /// `common` (torch's TensorIterator common dtype, which for arithmetic is
 /// the declared result dtype) and the math runs at `compute`.
@@ -156,6 +187,13 @@ pub(crate) fn opmath_compute(common: DType) -> DType {
 
 struct Translator<'a> {
     cx: Graph,
+    /// The single device stated by the exported program. Some ATen
+    /// operations have observable device-specific IEEE edge behavior.
+    device: Option<crate::torch_device::TorchDevice>,
+    /// Exact GELU edge semantics observed from the originating PyTorch CPU
+    /// process. Host ISA bits and the process capability label are not enough
+    /// to identify an individual ATen dispatch stub's fallback.
+    cpu_gelu_semantics: Option<CpuGeluSemantics>,
     values: HashMap<String, GraphTensor>,
     /// Input values by graph name.
     input_values: HashMap<String, GraphTensor>,
@@ -163,6 +201,9 @@ struct Translator<'a> {
     symbols: HashMap<String, Symbol>,
     /// PT2 symbol name -> torch's exported range constraint.
     ranges: HashMap<String, RangeConstraint>,
+    /// Recorder symbols with the same exported ranges, used when shape
+    /// equivalence depends on the valid dynamic-shape domain.
+    symbol_ranges: FxHashMap<Symbol, sympy::ExprBounds>,
     /// Complex-is-a-virtual-type table: value name -> the two real
     /// components that carry it. HLIR never sees a complex dtype.
     complex_tensors: HashMap<String, complex::ComplexTensor>,
@@ -199,6 +240,16 @@ pub fn parse_dim_expr(translation: &Translation, expr: &str) -> Result<IntExpr> 
 
 /// Translate a parsed PT2 program into the recorder frontend.
 pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
+    translate_with_cpu_gelu_semantics(parsed, None)
+}
+
+/// Translate with the CPU GELU edge semantics observed from the originating
+/// PyTorch process. They are part of the authored CPU operation's observable
+/// behavior and cannot be reconstructed reliably from host feature flags.
+pub fn translate_with_cpu_gelu_semantics(
+    parsed: &ParsedPT2,
+    cpu_gelu_semantics: Option<CpuGeluSemantics>,
+) -> Result<Translation> {
     let mut tensors: Vec<(&String, &TensorMeta)> = parsed
         .program
         .graph_module
@@ -212,12 +263,16 @@ pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
     }
     let device = crate::torch_device::program_device(parsed)?;
     let sym_dim_map = parsed.build_sym_dim_map();
+    let symbol_ranges = sympy::sym_char_ranges(&sym_dim_map);
     let mut t = Translator {
         cx: Graph::new(),
+        device: device.clone(),
+        cpu_gelu_semantics,
         values: HashMap::new(),
         input_values: HashMap::new(),
         symbols: sym_dim_map.sym_to_symbol.clone(),
         ranges: sym_dim_map.ranges,
+        symbol_ranges,
         complex_tensors: HashMap::new(),
         parsed,
         dims: HashMap::new(),
@@ -648,7 +703,90 @@ impl Translator<'_> {
             Some(tensor) => tensor,
             None => self.scalar_operand(rhs, dtype)?,
         };
-        Ok(broadcast_pair(a, b))
+        Ok(self.broadcast_pair(a, b))
+    }
+
+    /// Right-aligned PyTorch broadcasting over the complete exported shape
+    /// domain. Shape expressions produced by decomposition can be equivalent
+    /// only under an input's range constraint (for example, a slice length
+    /// containing ``min(s, 1)`` when export states ``s >= 1``), so structural
+    /// equality alone is insufficient.
+    fn broadcast_pair(&self, a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
+        let ad = a.dims();
+        let bd = b.dims();
+        let rank = ad.len().max(bd.len());
+        let mut out = Vec::with_capacity(rank);
+        for i in 0..rank {
+            let ax = ad.len().checked_sub(rank - i).and_then(|j| ad.get(j));
+            let bx = bd.len().checked_sub(rank - i).and_then(|j| bd.get(j));
+            let dim = match (ax, bx) {
+                (Some(x), Some(y)) => {
+                    if let Some(equal) = sympy::canonical_equal_expr(*x, *y, &self.symbol_ranges) {
+                        equal
+                    } else {
+                        let x = sympy::simplify_expr_with_ranges(*x, &self.symbol_ranges);
+                        let y = sympy::simplify_expr_with_ranges(*y, &self.symbol_ranges);
+                        if x.to_usize() == Some(1) {
+                            y
+                        } else if y.to_usize() == Some(1) {
+                            x
+                        } else {
+                            panic!("broadcast: incompatible dims {x:?} and {y:?}");
+                        }
+                    }
+                }
+                (Some(x), None) => *x,
+                (None, Some(y)) => *y,
+                (None, None) => unreachable!(),
+            };
+            out.push(dim);
+        }
+        (
+            self.broadcast_to_proven(a, &out),
+            self.broadcast_to_proven(b, &out),
+        )
+    }
+
+    /// Broadcast to `target`, permitting an axis to be respelled when its
+    /// equality has been proved over the exported shape domain. Core's public
+    /// `expand` deliberately accepts only structural equality or a singleton;
+    /// the PT2 translator has the additional range proof and records the same
+    /// coordinate identity map with the canonical extent spelling.
+    fn broadcast_to_proven(&self, mut tensor: GraphTensor, target: &[IntExpr]) -> GraphTensor {
+        while tensor.rank() < target.len() {
+            tensor = tensor.unsqueeze(0);
+        }
+        let current = tensor.dims();
+        if current == target {
+            return tensor;
+        }
+        let rank = target.len();
+        let entries = current
+            .iter()
+            .zip(target)
+            .enumerate()
+            .map(|(axis, (source, destination))| {
+                if source == destination
+                    || sympy::same_expr_with_ranges(*source, *destination, &self.symbol_ranges)
+                {
+                    luminal::graph::MapEntry::Coord {
+                        from_end: rank - 1 - axis,
+                        extent: *destination,
+                    }
+                } else if source.to_usize() == Some(1) {
+                    luminal::graph::MapEntry::Lit(0.into())
+                } else {
+                    panic!("broadcast: incompatible dims {source:?} and {destination:?}");
+                }
+            })
+            .collect::<Vec<_>>();
+        let id = tensor.graph().logical.view_op(
+            &(tensor.id, current),
+            &entries,
+            target.to_vec(),
+            tensor.dtype,
+        );
+        GraphTensor::from_id(id, target, tensor.graph_ref, tensor.dtype)
     }
 
     /// A tensor operand of an opmath op: rounded to the op's common dtype
@@ -1087,7 +1225,7 @@ impl Translator<'_> {
                 self.torch_neg(x)
             }
             "silu.default" => self.operand(&n[0])?.silu(),
-            "gelu.default" => self.operand(&n[0])?.gelu(),
+            "gelu.default" => self.translate_gelu(node)?,
             "reciprocal.default" => self.operand(&n[0])?.reciprocal(),
             "sin.default" => self.operand(&n[0])?.sin(),
             "square.default" => {
@@ -1743,36 +1881,6 @@ fn broadcast_to(t: GraphTensor, target: &[IntExpr]) -> GraphTensor {
         view = view.unsqueeze(0);
     }
     view.expand(target.to_vec()).finish()
-}
-
-/// Broadcast a binary pair to a common shape.
-fn broadcast_pair(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphTensor) {
-    let ad = a.dims();
-    let bd = b.dims();
-    let rank = ad.len().max(bd.len());
-    let mut out = Vec::with_capacity(rank);
-    for i in 0..rank {
-        let ax = ad.len().checked_sub(rank - i).and_then(|j| ad.get(j));
-        let bx = bd.len().checked_sub(rank - i).and_then(|j| bd.get(j));
-        let dim = match (ax, bx) {
-            (Some(x), Some(y)) => {
-                if x == y {
-                    *x
-                } else if x.to_usize() == Some(1) {
-                    *y
-                } else if y.to_usize() == Some(1) {
-                    *x
-                } else {
-                    panic!("broadcast: incompatible dims {x:?} and {y:?}");
-                }
-            }
-            (Some(x), None) => *x,
-            (None, Some(y)) => *y,
-            (None, None) => unreachable!(),
-        };
-        out.push(dim);
-    }
-    (broadcast_to(a, &out), broadcast_to(b, &out))
 }
 
 /// Convert a value to `dtype`: `cast` is lossless-only, so a float -> int

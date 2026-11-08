@@ -22,6 +22,7 @@ from .export_utils import (
     _drop_input_guards,
     _lower_sym_sum,
     _register_cache_serialization,
+    _run_decompositions_without_guards,
     private_graph_copy,
 )
 
@@ -295,7 +296,7 @@ def _prepare_local_graph(
     # composites the translator lowers directly (aten.linear) survive. The
     # translator reads mutations from the specs and refuses in-place ops.
     try:
-        ep = ep.run_decompositions({})
+        ep = _run_decompositions_without_guards(ep, {})
     except AssertionError as exc:
         # torch's export functionalisation cannot express a write to an
         # input that shares storage with another input (its alias wrapper
@@ -375,7 +376,7 @@ def compile_exported(
         # un-decomposed graph.
         if "unsupported ATen op" not in str(exc):
             raise
-        ep = ep.run_decompositions(_decomp_table())
+        ep = _run_decompositions_without_guards(ep, _decomp_table())
         _drop_dead_data_dependent_ops(ep.graph_module)
         _lower_sym_sum(ep)
         graph = _save_and_compile(ep)

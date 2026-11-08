@@ -20,6 +20,19 @@ memory options on the compiler, for example `Compiler(search_log=True)`.
 PyTorch 2.14.0 or newer is required; package imports enforce the minimum before
 loading native extensions.
 
+## Semantic authority
+
+The PyTorch model is the single source of functional truth. Export,
+decomposition, translation, egglog rewriting, extraction, and runtime execution
+must preserve PyTorch operations, dtypes, casts, accumulator/output dtypes and
+explicit rounding boundaries, shapes, aliasing/mutation, DTensor placements, shards, collectives, and
+collective order. Backend libraries and search may change only the physical
+implementation. They may not silently insert mixed precision, quantization,
+resharding, replication, or an alternative collective plan. Unsupported exact
+semantics are a compilation error, not permission to return a close result.
+Reduction order may change where PyTorch leaves it unspecified; an explicitly
+ordered scan or reduction remains ordered.
+
 For AOTAutograd and DTensor SPMD, see [reference/README.md](reference/README.md)
 and the inference-only [SPMD example](reference/examples/spmd.py).
 

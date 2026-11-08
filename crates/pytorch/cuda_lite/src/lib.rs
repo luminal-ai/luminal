@@ -581,6 +581,9 @@ impl CompiledGraph {
                 self.runtime.set_dim(symbol, value);
             }
         }
+        if self.searched {
+            self.runtime.ensure_capacity_for_dims()?;
+        }
         Ok(())
     }
 }

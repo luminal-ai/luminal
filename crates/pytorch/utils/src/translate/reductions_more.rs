@@ -742,10 +742,13 @@ mod scalar_precision_tests {
         let parsed = parsed_nodes(Vec::new(), &[], &[], &[]);
         let mut translator = Translator {
             cx: Graph::new(),
+            device: None,
+            cpu_gelu_semantics: None,
             values: HashMap::new(),
             input_values: HashMap::new(),
             symbols: HashMap::new(),
             ranges: HashMap::new(),
+            symbol_ranges: Default::default(),
             complex_tensors: HashMap::new(),
             parsed: &parsed,
             dims: HashMap::new(),

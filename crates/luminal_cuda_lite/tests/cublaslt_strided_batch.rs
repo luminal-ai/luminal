@@ -3,6 +3,7 @@
 //! exercise the restored source and compare descriptors to independent addresses.
 use luminal::dtype::PlanDtype;
 use luminal::layout_ir::{Bufferizable, ExtractionSite, OpMatcher, SerializedIndex};
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::egraph_serialize::EGraph;
 use luminal::prelude::*;
 use luminal_cuda_lite::CudaRuntime;
@@ -198,7 +199,7 @@ fn saturate(model: &Graph, table: &str) -> EGraph {
             ),
         )
         .unwrap();
-    egraph.serialize(Default::default()).egraph
+    egraph.serialize_compact_filtered(|_| true)
 }
 
 #[test]

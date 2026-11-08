@@ -1,4 +1,5 @@
 //! Complete-expression transposition must reach a finite fixed point.
+use luminal::prelude::CompactSnapshotExt;
 use luminal::prelude::*;
 #[test]
 fn complete_expression_transposition_reaches_a_fixed_point() {
@@ -23,7 +24,7 @@ fn complete_expression_transposition_reaches_a_fixed_point() {
             );
             let mut e = luminal::egglog_snippet::new_egraph();
             e.parse_and_run_program(None, &script).unwrap();
-            e.serialize(Default::default()).egraph.nodes.len()
+            e.serialize_compact_filtered(|_| true).nodes.len()
         })
         .collect();
     assert!(

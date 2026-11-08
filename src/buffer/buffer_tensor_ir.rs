@@ -19,8 +19,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 
+use crate::snapshot::compact::ClassId;
 use anyhow::Result;
-use egraph_serialize::ClassId;
 use fixedbitset::FixedBitSet;
 use petgraph::graph::{DiGraph, NodeIndex};
 

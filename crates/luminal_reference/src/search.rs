@@ -628,7 +628,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use luminal::prelude::egglog::SerializeConfig;
+    use luminal::prelude::CompactSnapshotExt;
     use rustc_hash::FxHashMap;
 
     use luminal::dtype::DType;
@@ -697,7 +697,7 @@ mod tests {
         egraph
             .parse_and_run_program(None, &text)
             .expect("program runs");
-        let mut serialized = egraph.serialize(SerializeConfig::default()).egraph;
+        let mut serialized = egraph.serialize_compact_filtered(|_| true);
 
         let mut inputs = FxHashMap::default();
         inputs.insert(x2.id, x_data.clone().into());

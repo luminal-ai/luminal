@@ -507,6 +507,7 @@ fn scatter_lowers_all_read_side_folds() {
         [
             "long long src_idx = (((c0 * 3LL) + 3LL) + c1);",
             "long long src_idx = ((3LL + (c0 * 3LL)) + c1);",
+            "long long src_idx = ((c1 + (c0 * 3LL)) + 3LL);",
         ]
         .iter()
         .any(|index| sources[1].contains(index)),

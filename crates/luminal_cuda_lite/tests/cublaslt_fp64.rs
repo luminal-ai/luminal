@@ -188,7 +188,7 @@ fn calls(graph: &Graph, table: &str) -> (Vec<ApprovedCublasLt>, Vec<CublasLtAccu
             ),
         )
         .unwrap();
-    let graph = egraph.serialize(Default::default()).egraph;
+    let graph = egraph.serialize_compact_filtered(|_| true);
     let index = SerializedIndex::new(&graph);
     let mut separate = Vec::new();
     let mut tied = Vec::new();
@@ -351,7 +351,7 @@ fn fp64_admission_requires_exact_configuration_and_scalar_precision() {
 }
 
 #[test]
-fn fp64_epilogues_keep_typed_bias_scalars_and_column_destinations() {
+fn fp64_bias_epilogues_keep_typed_bias_scalars_and_column_destinations() {
     for device in [false, true] {
         for bias in [false, true] {
             for activation in 0..4 {
@@ -365,7 +365,7 @@ fn fp64_epilogues_keep_typed_bias_scalars_and_column_destinations() {
                 let matching = |call: &luminal_cuda_lite::ops::cublaslt::exec::LtCall| {
                     call.c.is_some()
                         && call.bias.is_some() == bias
-                        && call.activation == f.activation
+                        && call.activation == LtActivation::Identity
                         && matches!(call.scalars, LtScalars::Device { .. }) == device
                 };
                 let separate: Vec<_> = separate
@@ -386,7 +386,7 @@ fn fp64_epilogues_keep_typed_bias_scalars_and_column_destinations() {
                     assert_eq!(call.computation, LtComputation::Float64);
                     assert_eq!(call.scale_dtype, PlanDtype::F64);
                     assert_eq!(matches!(call.scalars, LtScalars::Device { .. }), device);
-                    if bias || activation != 0 {
+                    if bias {
                         assert_eq!(call.d.order, LtOrder::Col);
                     }
                     if let Some(bias) = call.bias {
@@ -399,14 +399,12 @@ fn fp64_epilogues_keep_typed_bias_scalars_and_column_destinations() {
 }
 
 #[test]
-fn fp64_epilogues_require_the_complete_row_and_exact_bias_storage() {
-    let f = epilogue_fixture([Source::Host(ALPHA), Source::Host(BETA)], true, 1);
+fn fp64_bias_requires_the_complete_row_and_exact_storage() {
+    let f = epilogue_fixture([Source::Host(ALPHA), Source::Host(BETA)], true, 0);
     let (separate, _) = calls(&f.graph, WHITELIST);
     let op = separate
         .iter()
-        .find(|op| {
-            op.c.is_some() && op.bias.is_some() && op.activation == LtActivation::RectifiedLinear
-        })
+        .find(|op| op.c.is_some() && op.bias.is_some() && op.activation == LtActivation::Identity)
         .unwrap();
     let key = whitelist::key(op);
     let table = format!("(cublaslt-approved-configuration {key})");
@@ -694,7 +692,8 @@ mod execution {
     }
 
     #[test]
-    fn fp64_epilogues_execute_fused_with_host_device_scalars_and_c_preservation() {
+    #[ignore = "vendor activation epilogues are capability-only; frontend activations remain generic"]
+    fn vendor_fp64_activation_capabilities_execute_with_host_device_scalars() {
         for alias in [false, true] {
             for device in [false, true] {
                 for bias in [false, true] {
@@ -727,7 +726,8 @@ mod execution {
     }
 
     #[test]
-    fn fp64_relu_accepts_vendor_nan_policy_and_preserves_other_special_values() {
+    #[ignore = "vendor ReLU is capability-only; frontend ReLU remains generic"]
+    fn vendor_fp64_relu_capability_exposes_its_nan_behavior() {
         for alias in [false, true] {
             let mut f = epilogue_fixture([Source::Host(1.0); 2], false, 1);
             f.inputs[0].1.fill(0.0);
