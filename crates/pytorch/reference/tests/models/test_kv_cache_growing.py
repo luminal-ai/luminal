@@ -19,7 +19,7 @@ from backend_test_utils import luminal_backend
 NUM_DECODE_STEPS = 5
 
 
-def test_kv_cache_growing():
+def test_kv_cache_growing(device: torch.device):
     """Multi-step prefill + decode loop showing KV cache growth."""
     from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -40,10 +40,10 @@ def test_kv_cache_growing():
         max_position_embeddings=128,
         use_cache=True,
     )
-    model = LlamaForCausalLM(config).eval()
+    model = LlamaForCausalLM(config).eval().to(device)
     compiled = torch.compile(model, backend=luminal_backend)
 
-    input_ids = torch.tensor([[1, 2, 3, 4]])
+    input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
 
     # ---- Prefill ----
     with torch.no_grad():

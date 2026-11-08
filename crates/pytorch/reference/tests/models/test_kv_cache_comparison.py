@@ -24,7 +24,7 @@ def _capturing_backend(captured):
     return backend
 
 
-def test_kv_cache_decode_loop():
+def test_kv_cache_decode_loop(device: torch.device):
     """Full prefill -> decode loop through luminal with KV cache."""
     from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -41,8 +41,8 @@ def test_kv_cache_decode_loop():
         max_position_embeddings=128,
         use_cache=True,
     )
-    model = LlamaForCausalLM(config).eval()
-    input_ids = torch.tensor([[1, 2, 3, 4]])
+    model = LlamaForCausalLM(config).eval().to(device)
+    input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
 
     captured = []
     compiled = torch.compile(model, backend=_capturing_backend(captured))
