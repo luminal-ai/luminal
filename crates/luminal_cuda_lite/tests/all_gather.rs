@@ -36,6 +36,20 @@ fn all_gather_is_claimed_and_uses_a_host_operation() {
     }
 }
 
+#[test]
+fn collective_compile_retains_dynamic_capacity_bounds() {
+    let mut graph = Graph::new();
+    let input = graph.tensor(['n'], DType::F32);
+    input.all_gather("workers", 2, 0);
+    let bounds = SymbolBounds::from_ranges([('n'.into(), (0, 7))]).unwrap();
+    let dims = [('n'.into(), 3)].into_iter().collect();
+    let mut rt = CudaRuntime::load(&graph).unwrap();
+
+    rt.compile(&bounds, &dims).unwrap();
+
+    assert!(rt.staging_bytes().unwrap() >= 1);
+}
+
 #[cfg(feature = "device")]
 mod native {
     use super::support::TestTransfers;

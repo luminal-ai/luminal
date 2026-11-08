@@ -396,6 +396,11 @@ impl CudaRuntime {
             &self.externals,
         )?);
         self.plan = Some(plan);
+        // Collective compilation installs the full authored domain as its
+        // physical allocation domain. Keep the replanning source in sync with
+        // the storage plan above: staging/arena queries deliberately rebuild
+        // from `capacity_bounds`, just like searched programs do.
+        self.capacity_bounds = bounds.clone();
         self.bounds = bounds.clone();
         self.dims = dims.clone();
         #[cfg(feature = "device")]
