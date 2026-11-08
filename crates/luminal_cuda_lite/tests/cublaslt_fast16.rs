@@ -288,6 +288,12 @@ mod execution {
             })
             .collect()
     }
+    fn activation_registry(dtype: DType) -> Vec<luminal_cuda_lite::RegisteredOp> {
+        whitelist::fast16_c_bias_registry(dtype == DType::Bf16)
+            .into_iter()
+            .filter(|row| row.label() != "CublasLtAccumulateInPlace")
+            .collect()
+    }
     fn check_plan(runtime: &CudaRuntime, dtype: DType, in_place: bool) {
         let mut found = false;
         for node in runtime.plan().unwrap().dag.node_weights() {
@@ -449,10 +455,12 @@ mod execution {
                     out,
                     CudaBindings::dense(&graph.logical, &[out.id]),
                     &inputs,
-                    registry(dtype, false),
+                    activation_registry(dtype),
                 );
-                // The authored final cast is intentionally outside the F32 call.
-                assert!(runtime.plan().unwrap().dag.node_weights().any(|node|matches!(node,BufferNode::Compute{op,..} if op.as_any().downcast_ref::<ApprovedCublasLt>().is_some_and(|op|op.computation==mode(dtype)&&op.bias.is_some()))));
+                // The authored final cast and exact frontend activation are
+                // intentionally outside the F32 call. The restricted table
+                // still requires the call itself to consume both C and bias.
+                assert!(runtime.plan().unwrap().dag.node_weights().any(|node|matches!(node,BufferNode::Compute{op,..} if op.as_any().downcast_ref::<ApprovedCublasLt>().is_some_and(|op|op.computation==mode(dtype)&&op.c.is_some()&&op.bias.is_some()))));
                 let rounded = |value| {
                     if dtype == DType::F16 {
                         half::f16::from_f32(value).to_f32()

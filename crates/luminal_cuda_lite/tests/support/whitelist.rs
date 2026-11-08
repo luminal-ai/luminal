@@ -284,6 +284,30 @@ pub fn fast16_registry(bfloat: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
     table_registry(&TABLES[usize::from(bfloat)])
 }
 
+/// Require F32-fast input rounding while also forcing the call to consume the
+/// authored F32 C matrix and bias. Exact frontend activations remain separate
+/// because their exceptional-value semantics are not vendor epilogues.
+pub fn fast16_c_bias_registry(bfloat: bool) -> Vec<luminal_cuda_lite::RegisteredOp> {
+    static TABLES: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock::new(|| {
+        [
+            "CublasLtFloat32FastFloat16Computation",
+            "CublasLtFloat32FastBfloat16Computation",
+        ]
+        .map(|mode| {
+            approved_keys()
+                .into_iter()
+                .filter(|key| {
+                    key.contains(mode)
+                        && key.contains("(CublasLtCMatrixDataTypeOf (F32))")
+                        && key.contains("(CublasLtBiasDataTypeOf (F32))")
+                })
+                .map(|key| format!("(cublaslt-approved-configuration {key})\n"))
+                .collect()
+        })
+    });
+    table_registry(&TABLES[usize::from(bfloat)])
+}
+
 /// Require a complete narrow-output row; generic FP32 calls cannot hide a
 /// missing final-rounding or narrow C/bias proof in these execution tests.
 pub fn narrow_registry() -> Vec<luminal_cuda_lite::RegisteredOp> {
