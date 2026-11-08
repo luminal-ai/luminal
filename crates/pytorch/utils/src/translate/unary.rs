@@ -5,7 +5,7 @@
 use anyhow::Result;
 use luminal::prelude::*;
 
-use super::Translator;
+use super::{CpuGeluBehavior, Translator};
 use crate::pt2_schema::{Argument, Node};
 
 impl Translator<'_> {
@@ -195,29 +195,31 @@ impl Translator<'_> {
             .device
             .as_ref()
             .is_some_and(|device| device.kind == "cpu");
+        let output_dtype = self.output_meta_dtype(node)?;
+        let behavior = self
+            .cpu_gelu_semantics
+            .and_then(|semantics| semantics.for_dtype(output_dtype))
+            .unwrap_or(CpuGeluBehavior {
+                positive_infinity_is_nan: false,
+                preserves_negative_underflow_zero: output_dtype == DType::F64,
+            });
 
-        if cpu && self.cpu_capability.as_deref() == Some("AVX2") {
+        let result = if cpu && behavior.positive_infinity_is_nan {
             // This is observable PyTorch behavior, not a compiler-selected
-            // approximation: ATen's AVX2 CPU GELU returns NaN for positive
-            // infinity and preserves negative underflowed zeros. Its AVX-512
-            // and scalar kernels return +infinity and canonicalize those
-            // zeros. Match the actual eager dispatch class reported by
-            // PyTorch, rather than approximating it from host ISA bits.
+            // approximation. Match the selected eager kernel as observed in
+            // the originating process rather than guessing its dispatch from
+            // host ISA bits or PyTorch's process-wide capability label.
             let zero = self.constant_like(x, 0.0);
             let positive_inf = self.is_inf(x).logical_and(x.gt(zero));
             let nan = self.constant_like(x, f64::NAN);
-            return Ok(positive_inf.select(nan, result));
-        }
+            positive_inf.select(nan, result)
+        } else {
+            result
+        };
 
-        if cpu {
-            let output_dtype = self.output_meta_dtype(node)?;
-            if output_dtype != DType::F64 {
-                // ATen's aarch64/scalar CPU path canonicalizes every exact
-                // FP16/BF16/FP32 zero to +0. CUDA and CPU FP64 preserve the
-                // input sign at an underflowed zero.
-                let zero = self.constant_like(result, 0.0);
-                return Ok(self.is_zero(result).select(zero, result));
-            }
+        if cpu && !behavior.preserves_negative_underflow_zero {
+            let zero = self.constant_like(result, 0.0);
+            return Ok(self.is_zero(result).select(zero, result));
         }
 
         Ok(result)

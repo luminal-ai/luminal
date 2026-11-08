@@ -138,6 +138,36 @@ pub struct Translation {
     pub device: Option<crate::torch_device::TorchDevice>,
 }
 
+/// Observable IEEE-edge behavior of one PyTorch CPU GELU kernel.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuGeluBehavior {
+    pub positive_infinity_is_nan: bool,
+    pub preserves_negative_underflow_zero: bool,
+}
+
+/// PyTorch's selected CPU GELU behavior for every translated floating dtype.
+/// This is probed from the originating process because an ATen dispatch stub
+/// may fall back independently of the process-wide CPU capability label.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuGeluSemantics {
+    pub f16: CpuGeluBehavior,
+    pub bf16: CpuGeluBehavior,
+    pub f32: CpuGeluBehavior,
+    pub f64: CpuGeluBehavior,
+}
+
+impl CpuGeluSemantics {
+    pub(crate) fn for_dtype(self, dtype: DType) -> Option<CpuGeluBehavior> {
+        match dtype {
+            DType::F16 => Some(self.f16),
+            DType::Bf16 => Some(self.bf16),
+            DType::F32 => Some(self.f32),
+            DType::F64 => Some(self.f64),
+            _ => None,
+        }
+    }
+}
+
 /// The dtypes a torch op performs its math in: tensor operands meet at
 /// `common` (torch's TensorIterator common dtype, which for arithmetic is
 /// the declared result dtype) and the math runs at `compute`.
@@ -160,10 +190,10 @@ struct Translator<'a> {
     /// The single device stated by the exported program. Some ATen
     /// operations have observable device-specific IEEE edge behavior.
     device: Option<crate::torch_device::TorchDevice>,
-    /// The exact CPU dispatch class selected by the originating PyTorch
-    /// process. Host ISA bits are not equivalent: PyTorch also considers
-    /// which kernels its wheel contains and `ATEN_CPU_CAPABILITY` overrides.
-    cpu_capability: Option<String>,
+    /// Exact GELU edge semantics observed from the originating PyTorch CPU
+    /// process. Host ISA bits and the process capability label are not enough
+    /// to identify an individual ATen dispatch stub's fallback.
+    cpu_gelu_semantics: Option<CpuGeluSemantics>,
     values: HashMap<String, GraphTensor>,
     /// Input values by graph name.
     input_values: HashMap<String, GraphTensor>,
@@ -210,16 +240,15 @@ pub fn parse_dim_expr(translation: &Translation, expr: &str) -> Result<IntExpr> 
 
 /// Translate a parsed PT2 program into the recorder frontend.
 pub fn translate(parsed: &ParsedPT2) -> Result<Translation> {
-    translate_with_cpu_capability(parsed, None)
+    translate_with_cpu_gelu_semantics(parsed, None)
 }
 
-/// Translate with the CPU dispatch class reported by the originating PyTorch
-/// process (`torch.backends.cpu.get_cpu_capability()`). This is part of the
-/// authored CPU operation's observable semantics for kernels whose IEEE edge
-/// behavior differs between ATen dispatch implementations.
-pub fn translate_with_cpu_capability(
+/// Translate with the CPU GELU edge semantics observed from the originating
+/// PyTorch process. They are part of the authored CPU operation's observable
+/// behavior and cannot be reconstructed reliably from host feature flags.
+pub fn translate_with_cpu_gelu_semantics(
     parsed: &ParsedPT2,
-    cpu_capability: Option<&str>,
+    cpu_gelu_semantics: Option<CpuGeluSemantics>,
 ) -> Result<Translation> {
     let mut tensors: Vec<(&String, &TensorMeta)> = parsed
         .program
@@ -238,7 +267,7 @@ pub fn translate_with_cpu_capability(
     let mut t = Translator {
         cx: Graph::new(),
         device: device.clone(),
-        cpu_capability: cpu_capability.map(str::to_owned),
+        cpu_gelu_semantics,
         values: HashMap::new(),
         input_values: HashMap::new(),
         symbols: sym_dim_map.sym_to_symbol.clone(),

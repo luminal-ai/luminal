@@ -23,7 +23,8 @@ pub use pt2_parser::{InputKind, ParsedPT2, parse_pt2};
 pub use torch_device::TorchDevice;
 pub use torch_layout::TorchLayout;
 pub use translate::{
-    TranslatedInput, TranslatedOutput, Translation, translate, translate_with_cpu_capability,
+    CpuGeluBehavior, CpuGeluSemantics, TranslatedInput, TranslatedOutput, Translation, translate,
+    translate_with_cpu_gelu_semantics,
 };
 
 /// Preserve the exported domain for every translated dimension. Missing finite

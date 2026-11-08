@@ -743,7 +743,7 @@ mod scalar_precision_tests {
         let mut translator = Translator {
             cx: Graph::new(),
             device: None,
-            cpu_capability: None,
+            cpu_gelu_semantics: None,
             values: HashMap::new(),
             input_values: HashMap::new(),
             symbols: HashMap::new(),
