@@ -437,17 +437,9 @@ mod execution {
                 // The reference owns the F32 calculation. Use the established
                 // half codecs for narrow outputs that reference does not store.
                 let expected = reference(&graph, value, &inputs);
-                let registry = whitelist::tf32_registry()
+                let registry = whitelist::tf32_c_bias_registry()
                     .into_iter()
-                    .filter(|row| {
-                        !matches!(
-                            row.label(),
-                            "AddFunctionalGeneric"
-                                | "SelectFunctionalGeneric"
-                                | "MulFunctionalGeneric"
-                                | "CublasLtAccumulateInPlace"
-                        )
-                    })
+                    .filter(|row| row.label() != "CublasLtAccumulateInPlace")
                     .collect();
                 let (runtime, actual) = execute(
                     &graph,

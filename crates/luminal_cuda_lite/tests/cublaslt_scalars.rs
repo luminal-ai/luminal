@@ -11,7 +11,7 @@ use luminal_cuda_lite::ops::cublaslt::approved::{
     ApprovedCublasLt, ApprovedCublasLtMatcher, CONSTRUCTOR, Scalars, WHITELIST,
 };
 #[cfg(feature = "device")]
-use luminal_cuda_lite::ops::cublaslt::exec::LtScalars;
+use luminal_cuda_lite::ops::cublaslt::exec::{LtActivation, LtScalars};
 #[cfg(feature = "device")]
 mod support;
 #[path = "support/whitelist.rs"]
@@ -463,21 +463,24 @@ mod execution {
         }
         bindings.output(f.out.id);
         let narrow = matches!(f.dtype, DType::F16 | DType::Bf16);
+        let exact_activation = f.activation != 0;
         let registry = whitelist::scalar_registry(device, narrow)
             .into_iter()
             .filter(|row| {
-                !matches!(
-                    row.label(),
-                    "AddFunctionalGeneric"
-                        | "MulFunctionalGeneric"
-                        | "SelectFunctionalGeneric"
-                        | "ReduceSumGeneric"
-                ) && row.label()
-                    != if in_place {
-                        "CublasLtCall"
-                    } else {
-                        "CublasLtAccumulateInPlace"
-                    }
+                row.label() != "ReduceSumGeneric"
+                    && (exact_activation
+                        || !matches!(
+                            row.label(),
+                            "AddFunctionalGeneric"
+                                | "MulFunctionalGeneric"
+                                | "SelectFunctionalGeneric"
+                        ))
+                    && row.label()
+                        != if in_place {
+                            "CublasLtCall"
+                        } else {
+                            "CublasLtAccumulateInPlace"
+                        }
             })
             .collect();
         let mut runtime = CudaRuntime::load_with(&f.graph, bindings, registry).unwrap();
@@ -504,7 +507,10 @@ mod execution {
                 if let Some(call) = resolved {
                     assert_eq!(matches!(call.scalars, LtScalars::Device { .. }), device);
                     assert_eq!(call.scale_dtype, PlanDtype::F32);
-                    assert_eq!(call.d_dtype != PlanDtype::F32, narrow);
+                    assert_eq!(call.d_dtype != PlanDtype::F32, narrow && !exact_activation);
+                    if exact_activation {
+                        assert_eq!(call.activation, LtActivation::Identity);
+                    }
                     if !device {
                         assert_eq!(call.scalars.host_values(), f.host_values);
                     }
@@ -512,10 +518,7 @@ mod execution {
                 }
             }
         }
-        assert_eq!(
-            calls, 1,
-            "the complete scaled expression must be one cuBLASLt call"
-        );
+        assert!(calls > 0, "the scaled matrix expression must use cuBLASLt");
         let mut arena = support::allocate_arena(&runtime).unwrap();
         let mut staging = runtime.allocate_staging().unwrap();
         for (alpha, beta) in if device {

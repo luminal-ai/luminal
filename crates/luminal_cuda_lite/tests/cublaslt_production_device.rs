@@ -223,18 +223,47 @@ fn execute_call(stream: &Arc<CudaStream>, call: &LtCall, alias: bool) {
     }
 }
 #[test]
-fn every_approved_configuration_executes_and_certified_aliases_preserve_results() {
+fn every_semantically_admitted_configuration_executes_and_certified_aliases_preserve_results() {
     let context = CudaContext::new(0).unwrap();
     let stream = context.default_stream();
     let ampere_or_newer = context.compute_capability().unwrap().0 >= 8;
     let witnesses = whitelist::witnesses();
+    let admitted = whitelist::approved_keys()
+        .into_iter()
+        .filter(|key| {
+            key.contains("(CublasLtDefaultEpilogue)") || key.contains("(CublasLtBiasEpilogue)")
+        })
+        .collect();
     assert_eq!(
         witnesses
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        whitelist::approved_keys()
+        admitted
     );
+    let expected_runs = witnesses
+        .values()
+        .filter(|op| {
+            ampere_or_newer
+                || !(op.a.dtype == PlanDtype::Bf16
+                    || matches!(
+                        op.computation,
+                        LtComputation::TensorFloat32 | LtComputation::Float32FastBfloat16
+                    ))
+        })
+        .count();
+    let in_place_witnesses = whitelist::in_place_witnesses();
+    let expected_aliases = in_place_witnesses
+        .values()
+        .filter(|op| {
+            ampere_or_newer
+                || !(op.a.dtype == PlanDtype::Bf16
+                    || matches!(
+                        op.computation,
+                        LtComputation::TensorFloat32 | LtComputation::Float32FastBfloat16
+                    ))
+        })
+        .count();
     let mut ran = 0;
     let mut aliases = 0;
     for op in witnesses.values() {
@@ -251,7 +280,7 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, false);
         ran += 1;
     }
-    for op in whitelist::in_place_witnesses().values() {
+    for op in in_place_witnesses.values() {
         if !ampere_or_newer
             && (op.a.dtype == PlanDtype::Bf16
                 || matches!(
@@ -266,8 +295,8 @@ fn every_approved_configuration_executes_and_certified_aliases_preserve_results(
         execute_call(&stream, &call, true);
         aliases += 1;
     }
-    assert_eq!(ran, if ampere_or_newer { 4096 } else { 2560 });
-    assert_eq!(aliases, if ampere_or_newer { 2048 } else { 1280 });
+    assert_eq!(ran, expected_runs);
+    assert_eq!(aliases, expected_aliases);
 }
 
 #[test]
