@@ -3,6 +3,13 @@ use itertools::Itertools;
 use crate::graph::{MapEntry, Movement, movement_entries};
 use crate::prelude::*;
 
+/// Extent equality is semantic, not a property of one expression spelling.
+/// Keep the original expressions on recorded shapes; simplification is only
+/// the proof used to choose between an identity coordinate and a broadcast.
+fn equivalent_extent(left: IntExpr, right: IntExpr) -> bool {
+    left == right || left.simplify().egglog_equal(right.simplify())
+}
+
 /// ONE-APPLY view composer for macro interiors (Austin's ratified rule
 /// 2026-08-26: "one user call = one view node; macro interiors also mint
 /// ONE apply per logical construct, never per-axis loops"). A chain of
@@ -108,13 +115,18 @@ impl ViewChain {
     pub fn expand(mut self, new_shape: impl ToShape) -> Self {
         let target = new_shape.to_shape();
         assert_eq!(target.len(), self.rank(), "expand rank mismatch");
-        if self.dims == target {
+        if self
+            .dims
+            .iter()
+            .zip(&target)
+            .all(|(&left, &right)| equivalent_extent(left, right))
+        {
             return self;
         }
         let rank = target.len();
         let step_entries: Vec<MapEntry> = (0..rank)
             .map(|p| {
-                if self.dims[p] == target[p] {
+                if equivalent_extent(self.dims[p], target[p]) {
                     MapEntry::Coord {
                         from_end: rank - 1 - p,
                         extent: target[p],
@@ -286,12 +298,16 @@ impl GraphTensor {
         assert_eq!(target.len(), self.rank(), "expand rank mismatch");
         let current = self.dims();
         let rank = target.len();
-        if current == target {
+        if current
+            .iter()
+            .zip(&target)
+            .all(|(&left, &right)| equivalent_extent(left, right))
+        {
             return self;
         }
         let entries: Vec<crate::graph::MapEntry> = (0..rank)
             .map(|p| {
-                if current[p] == target[p] {
+                if equivalent_extent(current[p], target[p]) {
                     crate::graph::MapEntry::Coord {
                         from_end: rank - 1 - p,
                         extent: target[p],
@@ -1171,6 +1187,23 @@ mod tests {
         let y = x.merge_dims(0, 1).split_dims(0, 'w');
         assert_eq!(y.dims().len(), 3);
         assert!(y.dims()[0].simplify().egglog_equal(IntExpr::from('h')));
+    }
+
+    #[test]
+    fn expand_accepts_equivalent_symbolic_extent_spellings() {
+        let mut cx = Graph::new();
+        let symbol = IntExpr::from('s');
+        let source = symbol + 1;
+        let target = IntExpr::from(1) + symbol;
+        assert_ne!(source, target);
+        assert!(source.simplify().egglog_equal(target.simplify()));
+
+        let x = cx.named_tensor("x", vec![source], DType::F32);
+        let direct = x.expand(vec![target]);
+        let chained = x.view().expand(vec![target]).finish();
+        for tensor in [direct, chained] {
+            assert!(tensor.dims()[0].simplify().egglog_equal(target.simplify()));
+        }
     }
 
     proptest! {
