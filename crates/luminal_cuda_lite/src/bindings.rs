@@ -142,7 +142,6 @@ pub struct BufferDecl {
 pub struct CudaBindings {
     inputs: Vec<Bound>,
     outputs: Vec<Bound>,
-    roots: Vec<ValueId>,
     buffers: BTreeMap<i64, BufferDecl>,
     next: i64,
     facts: String,
@@ -384,14 +383,6 @@ impl CudaBindings {
         &self.outputs
     }
 
-    /// Keep a logical value in the rendered cone without declaring it as a
-    /// runtime output. This is for metadata-only boundary values such as an
-    /// authored nonzero-offset view: the caller reconstructs the view, while
-    /// declarations about the logical value still need its definition.
-    pub fn root(&mut self, value: ValueId) {
-        self.roots.push(value);
-    }
-
     pub fn buffers(&self) -> &BTreeMap<i64, BufferDecl> {
         &self.buffers
     }
@@ -500,7 +491,6 @@ impl CudaBindings {
             .iter()
             .map(|b| b.value)
             .chain(self.inputs.iter().map(|b| b.value))
-            .chain(self.roots.iter().copied())
             .collect();
         let cone = graph.cone(&roots);
         for input in graph.inputs() {
